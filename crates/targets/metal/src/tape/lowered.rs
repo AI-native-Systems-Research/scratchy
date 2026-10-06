@@ -1585,6 +1585,52 @@ impl RuntimeBindingKind {
 }
 
 impl Binding {
+    /// The buffer index it binds at.
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::ArenaSlot { binding_index, .. }
+            | Self::Source { binding_index, .. }
+            | Self::Runtime { binding_index, .. }
+            | Self::Scratch { binding_index }
+            | Self::RopedKScratch { binding_index }
+            | Self::AttnUnfusedScratch { binding_index, .. }
+            | Self::MoeScratch { binding_index, .. } => binding_index,
+        }
+    }
+
+    /// The same buffer, bound at `index`.
+    pub const fn at(self, index: u8) -> Self {
+        let binding_index = index;
+        match self {
+            Self::ArenaSlot { slot, .. } => Self::ArenaSlot {
+                slot,
+                binding_index,
+            },
+            Self::Source {
+                ix, which, layer, ..
+            } => Self::Source {
+                ix,
+                which,
+                layer,
+                binding_index,
+            },
+            Self::Runtime { kind, .. } => Self::Runtime {
+                kind,
+                binding_index,
+            },
+            Self::Scratch { .. } => Self::Scratch { binding_index },
+            Self::RopedKScratch { .. } => Self::RopedKScratch { binding_index },
+            Self::AttnUnfusedScratch { offset, .. } => Self::AttnUnfusedScratch {
+                offset,
+                binding_index,
+            },
+            Self::MoeScratch { byte_offset, .. } => Self::MoeScratch {
+                binding_index,
+                byte_offset,
+            },
+        }
+    }
+
     /// Advance every layer this binding names by `by` loop iterations.
     pub fn bump_layer(self, by: u32) -> Self {
         match self {
@@ -1840,9 +1886,13 @@ pub enum LoweringError {
     /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
     /// runs only on a TurboQuant model.
     CodecStepOnDenseModel,
-    /// A one-row matvec fold — a gated matvec, a matvec's ends, a router's pre-norm — in a bucket
-    /// of `bucket_m` rows: its kernel computes one row, and the fold applies to that bucket only.
+    /// A one-row fold — a gated matvec, a matvec's ends, a router's pre-norm, a decode attention
+    /// running its KV writer — in a bucket of `bucket_m` rows: its kernel computes one row, and
+    /// the fold applies to that bucket only.
     OneRowFold { bucket_m: u32 },
+    /// A decode attention running its KV writer whose writer or attention lowered to other than
+    /// one command, or whose writer binds a buffer the fused command has no place for.
+    RopedAttentionShape { index: usize },
     /// A row program's instruction names a weight it holds no layer for.
     RowProgramWeight,
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
@@ -1910,9 +1960,12 @@ impl std::fmt::Display for LoweringError {
             Self::CodecStepOnDenseModel => f.write_str(
                 "lowering: a KV codec step in the tape of a model whose KV cache is dense",
             ),
-            Self::OneRowFold { bucket_m } => write!(
+            Self::OneRowFold { bucket_m } => {
+                write!(f, "lowering: a one-row fold in the {bucket_m}-row bucket")
+            }
+            Self::RopedAttentionShape { index } => write!(
                 f,
-                "lowering: a one-row matvec fold in the {bucket_m}-row bucket"
+                "lowering: step {index}'s decode attention cannot run its KV writer's command"
             ),
             Self::RowProgramWeight => f.write_str(
                 "lowering: a row program instruction reads a weight it has no layer for",

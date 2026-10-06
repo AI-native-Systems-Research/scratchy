@@ -41,7 +41,9 @@ struct TqEncoded {
 // threadgroup floats, `codes` `N * dim` threadgroup uints. Each vector's arithmetic is the same
 // op for op, in the same order — the norm's pairwise sums widest stride first, the butterfly's
 // stages narrowest first — whichever way a stage's partners exchange and however many vectors
-// encode together, so its codes are the same bits. Threadgroup-uniform; `dim` a power of two.
+// encode together, so its codes are the same bits. Threadgroup-uniform; `dim` a power of two. A
+// threadgroup wider than `dim` (a decode attention's) runs it whole: its threads past `dim` keep
+// every barrier and touch no memory.
 template <uint N>
 inline array<TqEncoded, N> tq_encode(array<float, N> x, uint elem, uint dim, uint bits,
                                      uint vals_per_word, uint packed_dim, uint centroids,
@@ -52,9 +54,11 @@ inline array<TqEncoded, N> tq_encode(array<float, N> x, uint elem, uint dim, uin
     threadgroup float* other = scratch + N * dim;
     threadgroup float* total = scratch + 2 * N * dim;
     const uint lane = elem % TQ_SIMD;
+    const bool live = elem < dim;
 
     // The norm: the squares summed pairwise, stride halving; simdgroup 0 takes the last strides.
-    for (uint n = 0; n < N; n++) sq[n * dim + elem] = x[n] * x[n];
+    if (live)
+        for (uint n = 0; n < N; n++) sq[n * dim + elem] = x[n] * x[n];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint s = dim / 2;
     for (; s > TQ_SIMD; s >>= 1) {
@@ -84,7 +88,7 @@ inline array<TqEncoded, N> tq_encode(array<float, N> x, uint elem, uint dim, uin
     for (uint n = 0; n < N; n++) {
         const float vec_norm = sqrt(total[n]);
         const float safe_norm = max(vec_norm, 1e-8f);
-        y[n] = (x[n] / safe_norm) * signs[elem];
+        y[n] = live ? (x[n] / safe_norm) * signs[elem] : 0.0f;
         out[n].norm = vec_norm;
     }
 
@@ -99,23 +103,25 @@ inline array<TqEncoded, N> tq_encode(array<float, N> x, uint elem, uint dim, uin
     // every thread reaches only after its reads of it; the norm's sums are dead past the one above.
     for (bool odd = false; h < dim; h <<= 1, odd = !odd) {
         threadgroup float* buf = odd ? other : sq;
-        for (uint n = 0; n < N; n++) buf[n * dim + elem] = y[n];
+        if (live)
+            for (uint n = 0; n < N; n++) buf[n * dim + elem] = y[n];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint n = 0; n < N; n++) {
-            const float p = buf[n * dim + (elem ^ h)];
-            y[n] = (elem & h) ? p - y[n] : y[n] + p;
-        }
+        if (live)
+            for (uint n = 0; n < N; n++) {
+                const float p = buf[n * dim + (elem ^ h)];
+                y[n] = (elem & h) ? p - y[n] : y[n] + p;
+            }
     }
 
     for (uint n = 0; n < N; n++) {
         uint idx = 0;
         for (uint b = 0; b < centroids - 1; b++) if (y[n] > boundaries[b]) idx++;
-        codes[n * dim + elem] = idx;
+        if (live) codes[n * dim + elem] = idx;
         out[n].code = idx;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint word_idx = elem / vals_per_word, pos_in_word = elem % vals_per_word;
-    if (pos_in_word == 0 && word_idx < packed_dim)
+    if (live && pos_in_word == 0 && word_idx < packed_dim)
         for (uint n = 0; n < N; n++) {
             uint word = 0;
             for (uint i = 0; i < vals_per_word && (word_idx * vals_per_word + i) < dim; i++)

@@ -317,6 +317,17 @@ pub enum MetalStep {
     SampleRows(AffineMatmul, SampleRowsStep),
     /// A group of row-wise steps over one width as one command (`MetalFusion::RowProgram`).
     RowProgram(Box<RowProgram>),
+    /// A one-row step's decode attention that runs its KV writer (`MetalFusion::RopedAttention`).
+    RopedAttention(Box<RopedAttention>),
+}
+
+/// A decode attention and the KV writer it runs: each as it lowers on its own. The row's first
+/// `writer_sources` weight sources are the writer's, the rest the attention's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RopedAttention {
+    pub writer: MetalStep,
+    pub attention: MetalStep,
+    pub writer_sources: usize,
 }
 
 /// The instructions a row program holds, at most.
@@ -523,12 +534,17 @@ impl MetalStep {
                 l.0 += by;
             }
         }
+        // The attention's layer is the step's; its writer's moves with it.
+        if let MetalStep::RopedAttention(f) = &mut self {
+            f.writer = f.writer.clone().advanced(by);
+        }
         self
     }
 
     fn layer_mut(&mut self) -> Option<&mut LayerId> {
         use MetalStep as S;
         match self {
+            S::RopedAttention(f) => f.attention.layer_mut(),
             S::RmsNorm(_, _, l, ..)
             | S::ScalarOffsetRmsNorm(_, _, l, ..)
             | S::MeanSubRmsNorm(_, _, l, _)

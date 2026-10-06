@@ -28,7 +28,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
-#include "turboquant_offset.h"
+#include "kv_writer.h"
 using namespace metal;
 
 
@@ -299,6 +299,18 @@ constant uint ATTN_SPLITS = ATTN_SPLITS_FC_SET ? ATTN_SPLITS_FC : 1u;
 // The decode merge's output slices per barrier round (`attn_decode_merge`): its scratch holds
 // this many 32 x 32 transposes.
 constant constexpr uint ATTN_MERGE_SLICES = 4u;
+
+// 19 / 20  ATTN_FOLD_ROT_DIM / ATTN_FOLD_PAIR_OFF — set: a one-row step's decode attention runs
+//     its KV writer (`MetalFusion::RopedAttention`), roping as the writer would — NeoX pairs
+//     (d, d + pair off), d < rot dim / 2. It ropes its query heads in place, builds the new K/V
+//     row in threadgroup memory, where the key loop reads the step's own key, and the threadgroup
+//     owning the KV head writes the row to the cache and, under TurboQuant, encodes it into the
+//     packed store, exactly as `rope_append_*` does. Buffers 17..22: the raw K and V rows, the
+//     positions, the codebook's boundaries, the writer's rotary table and its rotated K bias's.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_FOLD_ROT_DIM, 19);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_FOLD_PAIR_OFF, 20);
+constant constexpr bool ATTN_FOLD = ATTN_FOLD_ROT_DIM_SET;
+constant constexpr uint ATTN_FOLD_DIM = ATTN_FOLD ? ATTN_HEAD_DIM : 1u;
 
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
@@ -720,7 +732,7 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2(
     device       T* output         [[buffer(0)]],
-    device const T* q              [[buffer(1)]],
+    device       T* q              [[buffer(1)]],
     device const uint* seq_used_k  [[buffer(2)]],
     device const uint* block_table [[buffer(3)]],
     device const uint64_t* k_cache [[buffer(4)]],
@@ -731,16 +743,22 @@ template <typename T>
     // for addressing), so there is NO separate flag buffer. Only
     // accessed when ATTN_ROPE_ON_READ; dead-eliminated otherwise.
     device const T*     cos_sin      [[buffer(6)]],
-    device const uint*  tq_packed_k  [[buffer(7)]],
-    device const uint*  tq_packed_v  [[buffer(8)]],
-    device const float* tq_norms_k   [[buffer(9)]],
-    device const float* tq_norms_v   [[buffer(10)]],
+    device       uint*  tq_packed_k  [[buffer(7)]],
+    device       uint*  tq_packed_v  [[buffer(8)]],
+    device       float* tq_norms_k   [[buffer(9)]],
+    device       float* tq_norms_v   [[buffer(10)]],
     device const float* tq_signs     [[buffer(11)]],
     device const float* tq_centroids [[buffer(12)]],
     device const uint*  slot_mapping [[buffer(13)]],
     device const T*     tq_k_bias    [[buffer(14)]],
     device const T*     tq_v_bias    [[buffer(15)]],
     device       float* attn_partials [[buffer(16)]],
+    device const T*     fold_k        [[buffer(17)]],
+    device const T*     fold_v        [[buffer(18)]],
+    device const uint*  positions     [[buffer(19)]],
+    device const float* tq_boundaries [[buffer(20)]],
+    device const T*     fold_cos_sin  [[buffer(21)]],
+    device const T*     tq_bias_cos_sin [[buffer(22)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
@@ -787,6 +805,73 @@ template <typename T>
     device const T*    q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
     device       T*    o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
     device const uint* row_block_table = block_table + seq_idx * max_blocks;
+
+    // Fold: the step's KV writer, run here (`ATTN_FOLD`). The threadgroup ropes its query heads in
+    // place and builds its KV head's new row in `fold_kv` (K, then V), each element rounded to T as
+    // the writer rounds it, K left unrotated where the writer leaves it (a span block). The
+    // threadgroup owning the KV head, its first query head's, writes the row to the cache and
+    // encodes it into the packed store; no other threadgroup reads that slot this step.
+    threadgroup T fold_kv[2u * ATTN_FOLD_DIM];
+    const uint fold_slot = ATTN_FOLD ? slot_mapping[seq_idx] : 0xFFFFFFFFu;
+    if (ATTN_FOLD) {
+        const uint tid = simd_gid * uint(BD) + simd_lid;
+        const uint half_rot = ATTN_FOLD_ROT_DIM / 2u;
+        const uint pair_off = ATTN_FOLD_PAIR_OFF;
+        const uint pos = positions[seq_idx];
+        device const T* cos_row = fold_cos_sin + pos * ATTN_FOLD_ROT_DIM;
+        device const T* sin_row = cos_row + half_rot;
+        device T* q_own = q + (seq_idx * num_q + q_head_idx) * head_dim;
+        for (uint p = tid; p < heads * half_rot; p += uint(BN * BD)) {
+            device T* qh = q_own + (p / half_rot) * head_dim;
+            const uint d = p % half_rot;
+            const float2 r = rope_rotate(float(qh[d]), float(qh[pair_off + d]), float(cos_row[d]),
+                                         float(sin_row[d]));
+            qh[d] = T(r.x);
+            qh[pair_off + d] = T(r.y);
+        }
+        threadgroup T* fk = fold_kv;
+        threadgroup T* fv = fold_kv + ATTN_FOLD_DIM;
+        const uint row = (seq_idx * num_kv + kv_head_idx) * head_dim;
+        if (tid < head_dim) {
+            fk[tid] = fold_k[row + tid];
+            fv[tid] = fold_v[row + tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const bool skip_k_rot = (ATTN_ROR != 0u) && ((fold_slot & 0x80000000u) != 0u);
+        if (tid < half_rot && !skip_k_rot) {
+            const float2 r = rope_rotate(float(fk[tid]), float(fk[pair_off + tid]),
+                                         float(cos_row[tid]), float(sin_row[tid]));
+            fk[tid] = T(r.x);
+            fk[pair_off + tid] = T(r.y);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        if (q_head_idx % group_ratio == 0u && fold_slot != 0xFFFFFFFFu) {
+            const uint phys = (ATTN_ROR != 0u) ? (fold_slot & 0x7FFFFFFFu) : fold_slot;
+            const uint block = phys / block_size;
+            const uint chunk = (ATTN_BLOCKS_PER_CHUNK == 0u) ? 0u : block / ATTN_BLOCKS_PER_CHUNK;
+            const uint blk_in_chunk =
+                (ATTN_BLOCKS_PER_CHUNK == 0u) ? block : block % ATTN_BLOCKS_PER_CHUNK;
+            const uint at = blk_in_chunk * kv_blk_stride + kv_head_idx * kv_head_stride
+                + (phys % block_size) * kv_tok_stride;
+            if (tid < head_dim) {
+                ((device T*)k_cache[chunk])[at + tid] = fk[tid];
+                ((device T*)v_cache[chunk])[at + tid] = fv[tid];
+            }
+            if (ATTN_TQ != 0u) {
+                // The encode's scratch is the merge's, free until the key loop is done.
+                const uint vpw = 32u / ATTN_TQ;
+                threadgroup float* scratch = tg_outputs;
+                threadgroup uint* codes = (threadgroup uint*)(tg_outputs + tq_encode_floats(2u, head_dim));
+                const bool live = tid < head_dim;
+                kv_row_encode<T>(live ? float(fk[tid]) : 0.0f, live ? float(fv[tid]) : 0.0f, tid,
+                                 head_dim, num_kv, kv_head_idx, fold_slot, pos, ATTN_TQ, vpw,
+                                 (head_dim + vpw - 1u) / vpw, ATTN_TQ_KB ? 2u : 0u,
+                                 ATTN_TQ_VB ? 1u : 0u, ATTN_FOLD_ROT_DIM, pair_off, tq_signs,
+                                 tq_boundaries, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
+                                 tq_k_bias, tq_v_bias, tq_bias_cos_sin, scratch, codes);
+            }
+        }
+    }
 
     // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
     // Element ownership follows attn_elem_off (contiguous, or co-resident
@@ -913,6 +998,8 @@ template <typename T>
         // TurboQuant: every key but the tail comes from the packed store,
         // indexed by physical slot (bit 31 stripped — spans or not).
         const bool packed = (ATTN_TQ != 0u) && !(tail_in_cache && i + 1u == kv_len);
+        // Fold: the step's own key, from the row this threadgroup built.
+        const bool fold_tail = ATTN_FOLD && fold_slot != 0xFFFFFFFFu && i + 1u == kv_len;
         const uint tq_row =
             ((bt_raw & 0x7FFFFFFFu) * block_size + token_in_block) * num_kv + kv_head_idx;
 
@@ -1015,7 +1102,8 @@ template <typename T>
             // parity guarantee).
             U k_loc[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                const uint e = attn_elem_off(simd_lid, j, qk_per_thread, head_dim);
+                k_loc[j] = U(fold_tail ? fold_kv[e] : k_ptr[e]);
             }
             if (do_rot) {
                 attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
@@ -1060,13 +1148,14 @@ template <typename T>
             // The tail's plain V into the codebook domain: s²·D·H·(H·D·v) = v.
             // Centered like the packed codes; the bias returns at the output.
             for (uint j = 0; j < qk_per_thread; ++j) {
-                const U v = U(v_ptr[tq_e + j]);
+                const U v = U(fold_tail ? fold_kv[ATTN_FOLD_DIM + tq_e + j] : v_ptr[tq_e + j]);
                 v_loc[j] = (ATTN_TQ_VB ? v - U(vb[tq_e + j]) : v) * tq_signs[tq_e + j];
             }
             tq_wht(v_loc, qk_per_thread, simd_lid);
         } else {
             for (uint j = 0; j < qk_per_thread; ++j) {
-                v_loc[j] = U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                const uint e = attn_elem_off(simd_lid, j, qk_per_thread, head_dim);
+                v_loc[j] = U(fold_tail ? fold_kv[ATTN_FOLD_DIM + e] : v_ptr[e]);
             }
         }
         for (uint h = 0; h < heads; ++h) {

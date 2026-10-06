@@ -161,20 +161,26 @@ pub fn lower_subtile_tape_to_metal(
             )
         })
     };
-    // A KV writer encodes when it binds the packed store.
+    // A KV writer encodes when it binds the packed store — a coded attention running its writer
+    // too ([`ATTN_FOLD`]).
     let encodes = |c: &GatedCommand| {
-        matches!(
-            c.command.kernel,
-            KernelId::RopeAppend | KernelId::RopeAppendNormed
-        ) && c.command.bindings.iter().any(|b| {
-            matches!(
-                b,
-                Binding::Runtime {
-                    kind: RuntimeBindingKind::TqPackedK { .. },
-                    ..
-                }
-            )
-        })
+        let writes = match c.command.kernel {
+            KernelId::RopeAppend | KernelId::RopeAppendNormed => true,
+            KernelId::AttentionViaCacheTq => {
+                c.command.constants.iter().any(|k| k.index == ATTN_FOLD.0)
+            }
+            _ => false,
+        };
+        writes
+            && c.command.bindings.iter().any(|b| {
+                matches!(
+                    b,
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::TqPackedK { .. },
+                        ..
+                    }
+                )
+            })
     };
     if p.kv_codec.is_turboquant()
         && bb.commands.iter().any(binds_kv_cache)
@@ -724,6 +730,72 @@ fn tq_attention_command(
         bindings: baked(bindings),
         ..*attn
     }
+}
+
+/// The slots of a decode attention running its KV writer (`attention.metal`'s
+/// `ATTN_FOLD_ROT_DIM` / `ATTN_FOLD_PAIR_OFF`): the writer's rotation, set only on such a command.
+const ATTN_FOLD: (u16, u16) = (19, 20);
+
+/// Where a decode attention running its KV writer (`attention.metal`'s `ATTN_FOLD`) binds the
+/// writer's buffers, by the writer's binding index (`rope.metal`): `None` where the attention
+/// binds that buffer itself — the query it ropes in place, the layer's cache and packed store, the
+/// codebook's signs and the operands' biases.
+const FOLD_WRITER_BINDINGS: [(u8, Option<u8>); 17] = [
+    (0, None),
+    (1, Some(17)),
+    (2, Some(18)),
+    (3, Some(21)),
+    (4, Some(19)),
+    (5, Some(13)),
+    (6, None),
+    (7, None),
+    (16, None),
+    (17, Some(20)),
+    (18, None),
+    (19, None),
+    (20, None),
+    (21, None),
+    (22, None),
+    (23, None),
+    (24, Some(22)),
+];
+
+/// The decode attention `attention` running its KV `writer`'s work (`MetalFusion::RopedAttention`):
+/// its own constants and bindings, the writer's rotation ([`ATTN_FOLD`], from the writer's slots
+/// 3 / 6), and the writer's buffers where [`FOLD_WRITER_BINDINGS`]
+/// places them. `None` when the writer binds a buffer the table has no place for, or one the
+/// attention already binds there to another.
+fn roped_attention_command(
+    attention: &LoweredCommand,
+    writer: &LoweredCommand,
+) -> Option<LoweredCommand> {
+    let writer_constant = |slot: u16| writer.constants.iter().find(|c| c.index == slot);
+    let (rot_dim, pair_off) = (writer_constant(3)?, writer_constant(6)?);
+    let mut constants = attention.constants.to_vec();
+    constants.extend([
+        ConstantValue::uint(ATTN_FOLD.0, rot_dim.bits),
+        ConstantValue::uint(ATTN_FOLD.1, pair_off.bits),
+    ]);
+    let mut bindings = attention.bindings.to_vec();
+    for b in writer.bindings.iter() {
+        let (_, to) = FOLD_WRITER_BINDINGS
+            .iter()
+            .find(|(from, _)| *from == b.index())?;
+        let Some(to) = *to else {
+            continue;
+        };
+        let moved = b.at(to);
+        match attention.bindings.iter().find(|a| a.index() == to) {
+            Some(a) if *a == moved => {}
+            Some(_) => return None,
+            None => bindings.push(moved),
+        }
+    }
+    Some(LoweredCommand {
+        constants: baked(constants),
+        bindings: baked(bindings),
+        ..*attention
+    })
 }
 
 /// The rope-once scratch's bytes, `dims` multiplied wide: refused at the KV cap rung `block_cap`
@@ -1313,6 +1385,40 @@ fn lower_one(
     use MetalStep as I;
 
     let cmd = match inst {
+        // ── A one-row decode attention running its KV writer ──
+        I::RopedAttention(f) => {
+            if bucket_m != 1 {
+                return Err(LoweringError::OneRowFold { bucket_m });
+            }
+            let (writer_site, attention_site) = w.site.split_at(f.writer_sources.min(w.site.len()));
+            let mut part = |step: &MetalStep, site| {
+                lower_one(
+                    p,
+                    chunked,
+                    step,
+                    RowSources { site, ..w },
+                    bucket_m,
+                    layer_offset,
+                    splitk_scratch_bytes,
+                    moe_scratch_bytes,
+                    roped_k_scratch_bytes,
+                    attn_unfused_scratch_bytes,
+                    block_cap,
+                    profile,
+                    m_divisor,
+                )
+            };
+            let writer = part(&f.writer, writer_site)?;
+            let attention = part(&f.attention, attention_site)?;
+            let shape = || LoweringError::RopedAttentionShape { index: w.index };
+            let ([writer], [attention]) = (writer.as_slice(), attention.as_slice()) else {
+                return Err(shape());
+            };
+            return roped_attention_command(attention, writer)
+                .map(|c| vec![c])
+                .ok_or_else(shape);
+        }
+
         // ── A row program: row-wise steps over one width as one command ──
         I::RowProgram(r) => {
             use crate::tape::step::RowInstr as R;
@@ -7256,6 +7362,74 @@ mod tests {
         bucket_m: u32,
     ) -> Result<LoweredMetalTape, LoweringError> {
         lower_subtile_tape_to_metal(&row_tape(rows), p, bake_point(bucket_m, None))
+    }
+
+    /// A one-row step's decode attention running its KV writer lowers to ONE command: the
+    /// attention's, plus the writer's rotation (`ATTN_FOLD`, from the writer's slots 3 / 6) and
+    /// the writer's raw K and V, positions, rotary table, slot mapping and — encoding — codebook
+    /// boundaries and bias table, where `FOLD_WRITER_BINDINGS` places them. It is the only KV
+    /// writer a coded tape needs. Any other bucket refuses it.
+    #[test]
+    fn roped_attention_lowers_to_one_command_in_the_one_row_bucket() {
+        use crate::tape::step::RopedAttention;
+        let packed = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
+        let cases = [
+            (
+                tp(),
+                KvWrite::Pool,
+                attention(MetalStep::AttentionViaCache, 0, NeoX),
+            ),
+            (tq_consts(), KvWrite::PoolAndPacked, packed),
+        ];
+        for (p, write, attention) in cases {
+            let MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, _) =
+                tq_writer(0, Causal, LLAMA_KV)
+            else {
+                unreachable!()
+            };
+            let writer = MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, write);
+            let fused = MetalStep::RopedAttention(Box::new(RopedAttention {
+                writer: writer.clone(),
+                attention: attention.clone(),
+                writer_sources: TEST_SITE.len(),
+            }));
+            let tape = MetalStepTape {
+                backbone: plain(&[fused]),
+                backbone_barriers: vec![true],
+                backbone_sources: vec![[TEST_SITE.clone(), TEST_SITE.clone()].concat()],
+                ..MetalStepTape::default()
+            };
+            let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
+                .expect("a one-row fold lowers");
+            assert_eq!(lowered.commands.len(), 1, "one command");
+            let one = &lowered.commands[0];
+            let (cmd, w) = (&one.command, lower_tq(&p, plain(&[writer]), 1));
+            let writer = &w.commands[0].command;
+            let constant = |c: &LoweredCommand, slot: u16| {
+                c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
+            };
+            assert_eq!(constant(cmd, ATTN_FOLD.0), constant(writer, 3));
+            assert_eq!(constant(cmd, ATTN_FOLD.1), constant(writer, 6));
+            let bound = |i: u8| cmd.bindings.iter().any(|b| b.index() == i);
+            let tq = write == KvWrite::PoolAndPacked;
+            assert_eq!(
+                cmd.kernel,
+                if tq {
+                    KernelId::AttentionViaCacheTq
+                } else {
+                    KernelId::AttentionViaCache
+                }
+            );
+            for i in [13, 17, 18, 19, 21] {
+                assert!(bound(i), "binding {i}");
+            }
+            assert_eq!((bound(20), bound(22)), (tq, false));
+            let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
+            assert!(matches!(
+                two,
+                Err(LoweringError::OneRowFold { bucket_m: 2 })
+            ));
+        }
     }
 
     /// A dense model's tape carries no TurboQuant command and gates nothing on

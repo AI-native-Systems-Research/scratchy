@@ -14,8 +14,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
-#include "turboquant_encode.h"
-#include "turboquant_offset.h"
+#include "kv_writer.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -126,9 +125,7 @@ constant constexpr uint ROPE_TQ_CODES = ROPE_TQ_BITS_SET ? 2u * ROPE_HEAD_DIM : 
     device const T*     tq_cos_sin    [[buffer(24)]],
 
 // Encode the row pair this owning threadgroup just wrote to the pool — element `d` of K and of V —
-// into the packed store at the token's slot, each operand's offset removed first: the same codes
-// `tq_compress_paged` makes of them read back from the pool, K's and V's encodes sharing every
-// barrier. Threadgroup-uniform.
+// into the packed store at the token's slot (`kv_writer.h`). Threadgroup-uniform.
 template <typename T>
 inline void rope_tq_encode(float k, float v, uint d, uint kv_head, uint slot_raw, uint pos,
                            device const float* signs, device const float* boundaries,
@@ -136,17 +133,10 @@ inline void rope_tq_encode(float k, float v, uint d, uint kv_head, uint slot_raw
                            device float* norms_v, device const T* k_bias, device const T* v_bias,
                            device const T* cos_sin, threadgroup float* scratch,
                            threadgroup uint* codes) {
-    const uint dim = ROPE_HEAD_DIM;
-    const uint store = (slot_raw & 0x7FFFFFFFu) * ROPE_NUM_KV_HEADS + kv_head;
-    const bool unrotated = (slot_raw & 0x80000000u) != 0u;
-    const float k_off = tq_offset<T>(ROPE_TQ_K_OFFSET, k_bias + kv_head * dim, cos_sin, ROPE_ROT_DIM,
-                                     ROPE_PAIR_OFF, pos, unrotated, d);
-    const float v_off = tq_offset<T>(ROPE_TQ_V_OFFSET, v_bias + kv_head * dim, cos_sin, ROPE_ROT_DIM,
-                                     ROPE_PAIR_OFF, pos, unrotated, d);
-    tq_encode<2>({k - k_off, v - v_off}, d, dim, ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD,
-                 ROPE_TQ_PACKED_DIM, 1u << ROPE_TQ_BITS, signs, boundaries,
-                 {packed_k + store * ROPE_TQ_PACKED_DIM, packed_v + store * ROPE_TQ_PACKED_DIM},
-                 {norms_k + store, norms_v + store}, scratch, codes);
+    kv_row_encode<T>(k, v, d, ROPE_HEAD_DIM, ROPE_NUM_KV_HEADS, kv_head, slot_raw, pos,
+                     ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD, ROPE_TQ_PACKED_DIM, ROPE_TQ_K_OFFSET,
+                     ROPE_TQ_V_OFFSET, ROPE_ROT_DIM, ROPE_PAIR_OFF, signs, boundaries, packed_k,
+                     norms_k, packed_v, norms_v, k_bias, v_bias, cos_sin, scratch, codes);
 }
 
 #if SCRATCHY_COMPILES(rope_append_f16_specialized)
@@ -200,8 +190,9 @@ kernel void rope_append_f16_specialized(
         const float s  = float(sin_row[d]);
         const float x0 = float(q_row[d]);
         const float x1 = float(q_row[pair_off + d]);
-        q_row[d]            = half(x0 * c - x1 * s);
-        q_row[pair_off + d] = half(x1 * c + x0 * s);
+        const float2 r = rope_rotate(x0, x1, c, s);
+        q_row[d]            = half(r.x);
+        q_row[pair_off + d] = half(r.y);
     }
 
     // ── K/V rotation + paged write (only owning q_head per kv_head) ─
@@ -217,8 +208,9 @@ kernel void rope_append_f16_specialized(
         const float s  = float(sin_row[d]);
         const float x0 = float(k_row[d]);
         const float x1 = float(k_row[pair_off + d]);
-        k_row[d]            = half(x0 * c - x1 * s);
-        k_row[pair_off + d] = half(x1 * c + x0 * s);
+        const float2 r = rope_rotate(x0, x1, c, s);
+        k_row[d]            = half(r.x);
+        k_row[pair_off + d] = half(r.y);
     }
     // Fence the K writes — the paged write below has thread `d` read
     // `k_row[d]`, which (for d ≥ half_dim) was written by thread
@@ -319,8 +311,9 @@ kernel void rope_append_bf16_specialized(
         const float s  = float(sin_row[d]);
         const float x0 = float(q_row[d]);
         const float x1 = float(q_row[pair_off + d]);
-        q_row[d]            = bfloat(x0 * c - x1 * s);
-        q_row[pair_off + d] = bfloat(x1 * c + x0 * s);
+        const float2 r = rope_rotate(x0, x1, c, s);
+        q_row[d]            = bfloat(r.x);
+        q_row[pair_off + d] = bfloat(r.y);
     }
 
     if (q_head % group_r != 0) return;
@@ -335,8 +328,9 @@ kernel void rope_append_bf16_specialized(
         const float s  = float(sin_row[d]);
         const float x0 = float(k_row[d]);
         const float x1 = float(k_row[pair_off + d]);
-        k_row[d]            = bfloat(x0 * c - x1 * s);
-        k_row[pair_off + d] = bfloat(x1 * c + x0 * s);
+        const float2 r = rope_rotate(x0, x1, c, s);
+        k_row[d]            = bfloat(r.x);
+        k_row[pair_off + d] = bfloat(r.y);
     }
     threadgroup_barrier(mem_flags::mem_device);
 
@@ -527,8 +521,9 @@ template <typename T_act, typename T_scale>
         const float s  = float(sin_row[d]);
         const float x0 = float(q_tg[d]);
         const float x1 = float(q_tg[pair_off + d]);
-        q_row[d]            = T_act(x0 * c - x1 * s);
-        q_row[pair_off + d] = T_act(x1 * c + x0 * s);
+        const float2 r = rope_rotate(x0, x1, c, s);
+        q_row[d]            = T_act(r.x);
+        q_row[pair_off + d] = T_act(r.y);
     } else if (d < pair_off || d >= pair_off + half_dim) {
         // Lanes outside every rotation pair pass the normed value
         // through (proportional rope: lanes [half, pair_off) and
@@ -569,8 +564,9 @@ template <typename T_act, typename T_scale>
         const float s  = float(sin_row[d]);
         const float x0 = float(k_tg[d]);
         const float x1 = float(k_tg[pair_off + d]);
-        k_tg[d]            = T_act(x0 * c - x1 * s);
-        k_tg[pair_off + d] = T_act(x1 * c + x0 * s);
+        const float2 r = rope_rotate(x0, x1, c, s);
+        k_tg[d]            = T_act(r.x);
+        k_tg[pair_off + d] = T_act(r.y);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
