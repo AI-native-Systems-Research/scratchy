@@ -469,17 +469,26 @@ def conc_chart(m, mid, base, prev=None):
 </figure>"""
 
 
-def ratio_tint(r):
-    """Diverging tint for a "how many times faster is scratchy" ratio: blue
-    above 1, red below, plain grey inside the run-to-run noise band. Starts
-    clearly visible (25%) and reaches its strongest at 2x either way, where
-    this page's differences actually sit. Capped at 70%: past that, text in
-    the dark theme drops under 4.5:1 on the red end."""
-    if r is None or abs(r - 1) < NOISE:
+# ColorBrewer RdBu, 7 classes: diverging, colour-blind safe, stepped so "a bit
+# faster" and "much faster" read differently. Bounds are symmetric in log space
+# (x0.8 is as far from x1 as x1.25) and the middle class is the noise band.
+# The colours themselves live in styles.css as .hm0 to .hm6.
+HEAT_BOUNDS = [0.5, 0.8, 1 - NOISE, 1 + NOISE, 1.25, 2]
+HEAT_LABELS = ["much slower (x0.5 or less)", "slower", "a bit slower", "about the same",
+               "a bit faster", "faster", "much faster (x2 or more)"]
+
+
+def heat_legend():
+    """One swatch per class, slowest to fastest."""
+    return "".join(f'<span><i class="sw hm{i}"></i>{esc(label)}</span>' for i, label in enumerate(HEAT_LABELS))
+
+
+def heat_class(r):
+    """The RdBu class for a "how many times faster is scratchy" ratio: hm0 (much
+    slower) to hm6 (much faster), hm3 inside the noise band; "" with no ratio."""
+    if r is None:
         return ""
-    k = 25 + 45 * min(abs(math.log2(r)), 1)
-    pole = "var(--div-pos)" if r >= 1 else "var(--div-neg)"
-    return f' style="background: color-mix(in oklab, {pole} {k:.0f}%, var(--heat-mid))"'
+    return f"hm{sum(r >= b for b in HEAT_BOUNDS)}"
 
 
 def faster_tput(s, o):
@@ -545,7 +554,7 @@ def grid_maps(m, run):
                            else why(cs, "scratchy") if s is None else why(cr, rival))
                     small = (f"vs {other} ×{r_o:.2f}{mark(cs, co)}" if r_o is not None
                              else "" if s is None or not other else why(co, other))
-                tds.append(f'<td{ratio_tint(r_r)} tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
+                tds.append(f'<td class="{heat_class(r_r)}" tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
                            f'data-tip="{tip(tiprows)}"><b>{big}</b><span>{small}</span></td>')
             rows.append(f'<tr><th scope="row">{i}</th>{"".join(tds)}</tr>')
         head = "".join(f'<th scope="col">{o}</th>' for o in outs)
@@ -568,9 +577,7 @@ def grid_maps(m, run):
                 + (f"; the small line is the same against {other}" if other else "")
                 + ". Hover for every engine's value")
         scale = (f'<div class="scale"><span class="scalekey">Colour and large number, scratchy vs {esc(rival)}:</span>'
-                 f'<span><i class="sw neg"></i>{esc(rival)} faster</span>'
-                 '<span><i class="sw mid"></i>about the same</span>'
-                 '<span><i class="sw pos"></i>scratchy faster</span></div>')
+                 f'{heat_legend()}</div>')
     return f"""<figure class="mfig">
   <figcaption><h4>Prompt size × answer size</h4>
     <p class="msub">{esc(conc)} users at once; {esc(note)}.</p></figcaption>
@@ -674,7 +681,7 @@ def glance(machines):
                 value = f"×{r:.2f}{mark}" if r is not None else "no comparison"
                 # A square with nothing to compare is hollow, so it never reads
                 # as "about the same".
-                squares.append(f'<span class="gsq{"" if r is not None else " gnil"}"{ratio_tint(r)} data-head="{esc(chip)} · {esc(stem)} · {i} in × {o} out" '
+                squares.append(f'<span class="gsq {heat_class(r) or "gnil"}" data-head="{esc(chip)} · {esc(stem)} · {i} in × {o} out" '
                                f'data-tip="{tip([[value, "vs " + rival, "s1"]])}"></span>')
         span = f"×{min(ratios):.2f} to ×{max(ratios):.2f}" if ratios else "no ratios"
         return (f'<td><a class="gmini" href="#{slug(chip)}-{slug(stem)}" '
@@ -698,7 +705,7 @@ def glance(machines):
   coloured by how many times faster scratchy is than mlx-lm (ollama where a run has no mlx-lm).
   Hover a square for its ratio; click a grid for its model.</p>
   <div class="heatrow">{''.join(tables)}</div>
-  <div class="scale"><span><i class="sw neg"></i>scratchy slower</span><span><i class="sw mid"></i>about the same</span><span><i class="sw pos"></i>scratchy faster</span><span><i class="sw nil"></i>no comparison</span></div>
+  <div class="scale"><span class="scalekey">scratchy is:</span>{heat_legend()}<span><i class="sw nil"></i>no comparison</span></div>
 </section>"""
 
 

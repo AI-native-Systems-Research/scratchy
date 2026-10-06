@@ -518,8 +518,6 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
   --s1: #2a78d6;           /* scratchy */
   --s2: #d95926;           /* mlx-lm */
   --s3: #1baf7a;           /* ollama */
-  --div-pos: #2a78d6;      /* scratchy faster */
-  --div-neg: #e34948;      /* scratchy slower */
 }
 .metalpage {
   padding: 0 var(--cds-spacing-07, 2rem) var(--cds-spacing-10, 4rem);
@@ -609,14 +607,24 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .heat td { background: var(--heat-mid); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
 .heat td b { display: block; font-size: 1rem; }
 /* Text ink, not muted grey: on a strong tint grey loses its contrast. */
-.heat td span { display: block; color: var(--fg); font-size: var(--cds-label-01-font-size, 0.75rem); }
+.heat td span { display: block; color: inherit; font-size: var(--cds-label-01-font-size, 0.75rem); }
 .heat td:hover, .heat td:focus-visible { outline: 1px solid var(--fg); outline-offset: -1px; }
 .scale { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-top: 0.5rem; }
 .scale .scalekey { color: var(--fg); }
 .scale .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.35rem; }
-.scale .sw.neg { background: color-mix(in oklab, var(--div-neg) 70%, var(--heat-mid)); }
-.scale .sw.mid { background: var(--heat-mid); border: 1px solid var(--line); }
-.scale .sw.pos { background: color-mix(in oklab, var(--div-pos) 70%, var(--heat-mid)); }
+/* Heat map: ColorBrewer RdBu, 7 classes (build_metal.py's HEAT_BOUNDS). The
+ * same fills in both themes, so each class picks its own ink: white on the two
+ * darkest, near-black on the rest, every pair at least 5.9:1. The middle
+ * class is the site's neutral, so "about the same" never glares in dark.
+ * hm, not h: the docs table of contents already uses .h3. */
+.sw.hm0, .heat td.hm0, .gsq.hm0 { background: #b2182b; color: #fff; }
+.sw.hm1, .heat td.hm1, .gsq.hm1 { background: #ef8a62; color: #161616; }
+.sw.hm2, .heat td.hm2, .gsq.hm2 { background: #fddbc7; color: #161616; }
+.sw.hm3, .heat td.hm3, .gsq.hm3 { background: var(--heat-mid); color: var(--fg); }
+.sw.hm4, .heat td.hm4, .gsq.hm4 { background: #d1e5f0; color: #161616; }
+.sw.hm5, .heat td.hm5, .gsq.hm5 { background: #67a9cf; color: #161616; }
+.sw.hm6, .heat td.hm6, .gsq.hm6 { background: #2166ac; color: #fff; }
+.scale .sw.hm3 { border: 1px solid var(--line); }
 
 /* At a glance: one small grid per machine and model, colour only. */
 .heat .gtable td { background: none; min-width: 0; padding: 0.4rem 0.75rem 0.6rem 0; text-align: left; }
