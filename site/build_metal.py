@@ -478,6 +478,12 @@ HEAT_LABELS = ["much slower (x0.5 or less)", "slower", "a bit slower", "about th
                "a bit faster", "faster", "much faster (x2 or more)"]
 
 
+# Heat maps always sit on Carbon's dark theme (cds--g100 scoped to the block,
+# the rest of the page follows the reader's theme): the RdBu steps read with
+# more contrast against a dark ground.
+DARK = "cds--g100 mdark"
+
+
 def heat_legend():
     """One swatch per class, slowest to fastest."""
     return "".join(f'<span><i class="sw hm{i}"></i>{esc(label)}</span>' for i, label in enumerate(HEAT_LABELS))
@@ -581,10 +587,12 @@ def grid_maps(m, run):
     return f"""<figure class="mfig">
   <figcaption><h4>Prompt size × answer size</h4>
     <p class="msub">{esc(conc)} users at once; {esc(note)}.</p></figcaption>
+  <div class="{DARK}">
   <div class="heatrow">
   {"".join(one(metric, title, faster) for metric, title, faster in GRID_METRICS)}
   </div>
   {scale}
+  </div>
 </figure>"""
 
 
@@ -704,8 +712,10 @@ def glance(machines):
   one cell of the full grid (rows: prompt, short to long; columns: answer, short to long),
   coloured by how many times faster scratchy is than mlx-lm (ollama where a run has no mlx-lm).
   Hover a square for its ratio; click a grid for its model.</p>
+  <div class="{DARK}">
   <div class="heatrow">{''.join(tables)}</div>
   <div class="scale"><span class="scalekey">scratchy is:</span>{heat_legend()}<span><i class="sw nil"></i>no comparison</span></div>
+  </div>
 </section>"""
 
 
