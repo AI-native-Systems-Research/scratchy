@@ -55,6 +55,7 @@
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
 use crate::{Refusal, Result};
+use std::collections::HashMap;
 
 const PASS: &str = "DistributeWork";
 
@@ -207,6 +208,11 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
         .with_attr(AttrKey::Value, Attr::Int(DEFAULT_NUM_CORES));
 
     // --- Step 4: the index->i32 bridge(s), built into the loop body.
+    // The old-value rewires are collected here and applied as ONE walk after
+    // the bridges are built -- the per-old `replace_all_uses` walked the whole
+    // module per routed value. A bridge's `to` is a fresh SSA, so no pair can
+    // chain.
+    let mut rewires: HashMap<Ssa, Ssa> = HashMap::new();
     let mut bridges: Vec<Op> = Vec::new();
     if !multi_axis {
         // SINGLE AXIS 0, the banked path: exactly one bare index_cast of the IV. No
@@ -218,7 +224,7 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
                 .with_operands([iv]),
         );
         for old in by_axis.get(&0).cloned().unwrap_or_default() {
-            walk::replace_all_uses(module, old, pid_i32);
+            rewires.insert(old, pid_i32);
         }
     } else {
         let mut stride = 1i64;
@@ -264,7 +270,7 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
                         .with_operands([cur]),
                 );
                 for old in olds {
-                    walk::replace_all_uses(module, old, as_i32);
+                    rewires.insert(old, as_i32);
                 }
             }
             stride *= extents[axis as usize];
@@ -312,6 +318,10 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
     keep.insert(anchor + 2, nb);
     keep.insert(anchor + 3, loopp);
     *block = keep;
+
+    // The rewire runs over the module AFTER the loop is planted: uses of the
+    // routed values live in the body, which now sits inside the loop's region.
+    walk::replace_all_uses_many(module, &rewires);
     Ok(())
 }
 

@@ -126,9 +126,15 @@ fn walk_1_descriptors(module: &mut Module) -> Result<()> {
         pending_rewires.push((result, cast_result));
     }
     walk::splice_many(module, edits);
-    for (from, to) in pending_rewires {
-        walk::replace_all_uses(module, from, to);
-    }
+    // ONE walk for every descriptor's rewire -- the per-pair loop walked the
+    // whole module per descriptor. A descriptor's `to` is a cast the splice
+    // just planted, never another descriptor's erased result, so the pairs
+    // cannot chain; `flatten_rewire_map` is a no-op on them and kept for the
+    // one-walk contract's uniformity.
+    walk::replace_all_uses_many(
+        module,
+        &walk::flatten_rewire_map(&pending_rewires.into_iter().collect::<HashMap<_, _>>()),
+    );
     Ok(())
 }
 

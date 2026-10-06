@@ -292,6 +292,24 @@ pub fn replace_all_uses_many(module: &mut Module, map: &HashMap<Ssa, Ssa>) {
     });
 }
 
+/// Resolve every `to` through the map until it is absent -- the chain-flatten
+/// that [`replace_all_uses_many`]'s contract requires of callers whose pairs
+/// may chain (`a→b, b→c` must send an `a` use all the way to `c`). A cycle, if
+/// a caller ever builds one, terminates at a value it has already visited only
+/// by the caller's own map being cyclic -- the same loop would not have
+/// terminated under per-victim `replace_all_uses` either.
+pub fn flatten_rewire_map(map: &HashMap<Ssa, Ssa>) -> HashMap<Ssa, Ssa> {
+    map.iter()
+        .map(|(from, to)| {
+            let mut end = *to;
+            while let Some(next) = map.get(&end) {
+                end = *next;
+            }
+            (*from, end)
+        })
+        .collect()
+}
+
 /// Every value USED anywhere in the module.
 ///
 /// A value used only inside a nested region still counts, which is the whole

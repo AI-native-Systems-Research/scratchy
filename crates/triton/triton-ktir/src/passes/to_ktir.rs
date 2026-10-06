@@ -271,8 +271,13 @@ fn fold_pointer_casts(module: &mut Module) -> Result<()> {
         })
         .collect();
     let index = module.def_index();
-    for path in victims.into_iter().rev() {
-        let op = walk::at(module, &path).expect("path").clone();
+    // ONE walk + ONE erase for every cast -- the per-victim loop walked the
+    // whole module per bridge. Each cast's operand is a pointer and its result
+    // an index, so a `to` can never be another victim's `from`: the pairs are
+    // disjoint by type.
+    let mut map: HashMap<Ssa, Ssa> = HashMap::new();
+    for path in &victims {
+        let op = walk::at(module, path).expect("path");
         let in_ty = op.operands.first().and_then(|v| index.type_of(*v));
         let out_ty = op.result_type().cloned();
         if op.operands.len() != 1 || op.results.len() != 1 || in_ty != out_ty {
@@ -281,10 +286,10 @@ fn fold_pointer_casts(module: &mut Module) -> Result<()> {
                  pointer-to-index bridge; the scheduler has no lowering for it",
             ));
         }
-        let (from, to) = (op.results[0], op.operands[0]);
-        walk::replace_all_uses(module, from, to);
-        walk::erase(module, &[path]);
+        map.insert(op.results[0], op.operands[0]);
     }
+    walk::replace_all_uses_many(module, &walk::flatten_rewire_map(&map));
+    walk::erase(module, &victims);
     Ok(())
 }
 
@@ -1378,9 +1383,18 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
             // zero iterations.
             let block = walk::block_mut(module, &path).expect("path");
             block.remove(path.index());
-            for (res, init) in loopp.results.iter().zip(loopp.operands[3..].iter()) {
-                walk::replace_all_uses(module, *res, *init);
-            }
+            // ONE walk for the loop's every iter_arg result -- the per-result
+            // loop walked the whole module per carry. Applied immediately (not
+            // deferred past the next victim) because later victims' operand
+            // reads must see the rewired inits, the same visibility the
+            // per-result walks gave.
+            let rewires: HashMap<Ssa, Ssa> = loopp
+                .results
+                .iter()
+                .zip(loopp.operands[3..].iter())
+                .map(|(res, init)| (*res, *init))
+                .collect();
+            walk::replace_all_uses_many(module, &rewires);
             continue;
         }
         let trips = (ub - lb + step - 1) / step;
@@ -1510,9 +1524,15 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
         }
         // The loop's results are the LAST trip's carries. Rewired after the splice, so the
         // epilogue below the loop reads the final accumulator rather than a value nothing defines.
-        for (res, carry) in loopp.results.iter().zip(carries.iter()) {
-            walk::replace_all_uses(module, *res, *carry);
-        }
+        // ONE walk for the whole result set -- the per-result loop walked the
+        // module per carry.
+        let rewires: HashMap<Ssa, Ssa> = loopp
+            .results
+            .iter()
+            .zip(carries.iter())
+            .map(|(res, carry)| (*res, *carry))
+            .collect();
+        walk::replace_all_uses_many(module, &rewires);
     }
     Ok(())
 }

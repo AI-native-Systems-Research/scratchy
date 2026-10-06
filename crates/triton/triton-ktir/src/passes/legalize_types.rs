@@ -47,6 +47,7 @@
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
 use crate::{Refusal, Result};
+use std::collections::HashMap;
 
 const PASS: &str = "LegalizeTypes";
 
@@ -100,12 +101,19 @@ fn step_1_remove_extf(module: &mut Module) {
             in_elem == Some(DType::F16) && out_elem == Some(DType::F32)
         })
         .collect();
-    for path in victims.into_iter().rev() {
-        let op = walk::at(module, &path).expect("path").clone();
-        let (from, to) = (op.results[0], op.operands[0]);
-        walk::replace_all_uses(module, from, to);
-        walk::erase(module, &[path]);
+    // ONE `replace_all_uses_many` + ONE `erase` for every victim -- the
+    // per-victim loop paid a whole-module walk per cast, quadratic at kernel
+    // scale. `from` (an f32 result) can never be a `to` (an f16 operand), so
+    // the pairs are disjoint by type; the flatten loop is kept anyway because
+    // `replace_all_uses_many` gives each operand ONE lookup and a chain left
+    // unflattened would strand a use on a value the erase deletes.
+    let mut map: HashMap<Ssa, Ssa> = HashMap::with_capacity(victims.len());
+    for path in &victims {
+        let op = walk::at(module, path).expect("path");
+        map.insert(op.results[0], op.operands[0]);
     }
+    walk::replace_all_uses_many(module, &walk::flatten_rewire_map(&map));
+    walk::erase(module, &victims);
 }
 
 /// --- Step 2: the gated f32 -> f16 retype, to a forward fixed point.
@@ -261,12 +269,16 @@ fn step_3_remove_truncf(module: &mut Module) {
             in_elem == Some(DType::F16) && out_elem == Some(DType::F16)
         })
         .collect();
-    for path in victims.into_iter().rev() {
-        let op = walk::at(module, &path).expect("path").clone();
-        let (from, to) = (op.results[0], op.operands[0]);
-        walk::replace_all_uses(module, from, to);
-        walk::erase(module, &[path]);
+    // The same ONE-walk shape as step 1. Chains are REAL here: truncf f16->f16
+    // feeding another truncf's operand is exactly the shape a folded island can
+    // leave, so the flatten loop is load-bearing, not defensive.
+    let mut map: HashMap<Ssa, Ssa> = HashMap::with_capacity(victims.len());
+    for path in &victims {
+        let op = walk::at(module, path).expect("path");
+        map.insert(op.results[0], op.operands[0]);
     }
+    walk::replace_all_uses_many(module, &walk::flatten_rewire_map(&map));
+    walk::erase(module, &victims);
 }
 
 /// --- RED-stop: refuse to leave genuine f32 in the compute domain.
