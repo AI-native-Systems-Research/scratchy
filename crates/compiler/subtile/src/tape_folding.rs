@@ -297,6 +297,9 @@ pub struct ModelFoldFacts {
     pub matvec_ends: bool,
     /// The free row-wise steps group into row programs ([`RowFold`]).
     pub row_programs: bool,
+    /// Every row's final hidden state is read after the forward ran (an MTP head's next input):
+    /// like the result, its op is an output no fold may leave unwritten.
+    pub hidden_out: bool,
 }
 
 /// What a fused command computes beyond its driver step.
@@ -559,12 +562,19 @@ pub fn fold_tape<K: Copy + PartialEq>(
             }
         }
     }
-    if lowered.input.result < n {
-        consumers[lowered.input.result] += 1;
+    // The ops read after the forward ran: its result, and its final hidden state when exported.
+    let hidden = lowered.input.hidden().filter(|_| model.hidden_out);
+    let observed: Vec<usize> = std::iter::once(lowered.input.result)
+        .chain(hidden)
+        .filter(|&o| o < n)
+        .collect();
+    for &o in &observed {
+        consumers[o] += 1;
     }
     let mut folder = Folder {
         ops,
         consumers,
+        observed,
         model,
         absorbed: vec![None; n],
         epilogue: vec![None; n],
@@ -744,6 +754,8 @@ struct Peeled {
 struct Folder<'a, K> {
     ops: Ops<'a>,
     consumers: Vec<usize>,
+    /// The ops read after the forward ran ([`fold_tape`]).
+    observed: Vec<usize>,
     model: ModelFoldFacts,
     absorbed: Vec<Option<usize>>,
     epilogue: Vec<Option<usize>>,
@@ -923,7 +935,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let readers: Vec<Vec<usize>> = (0..n)
             .map(|p| (0..n).filter(|&c| reads(c, p)).collect())
             .collect();
-        let result = self.ops.lowered.input.result;
+        let observed = self.observed.clone();
         // A step reading a graph source that is not a weight (the embedded rows) stays on its
         // own: a target places that source's buffer itself.
         let weight = |t: &TensorId| {
@@ -980,7 +992,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 for p in producers {
                     let joins = !group.contains(&p)
                         && !taken[p]
-                        && p != result
+                        && !observed.contains(&p)
                         && free(self, p)
                         && self.ops.cols[p] == self.ops.cols[d]
                         && self.ops.rows[p] == self.ops.rows[d]
@@ -994,10 +1006,10 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 }
             }
             group.sort_by_key(|&m| self.ops.pos[m]);
-            // A member read outside the group (or the result) is a buffer the command writes.
+            // A member read outside the group (or after the forward) is a buffer the command writes.
             let written: Vec<bool> = group
                 .iter()
-                .map(|&m| m == result || readers[m].iter().any(|c| !group.contains(c)))
+                .map(|&m| observed.contains(&m) || readers[m].iter().any(|c| !group.contains(c)))
                 .collect();
             // The activation rows it reads from outside: other steps'.
             let inputs: std::collections::BTreeSet<usize> = group
@@ -1799,6 +1811,7 @@ mod tests {
         fold_projections: false,
         matvec_ends: false,
         row_programs: false,
+        hidden_out: false,
     };
 
     const ADD: ArchOp = SubOp::Elementwise(EwKind::Add);
@@ -1883,6 +1896,7 @@ mod tests {
         fold_projections: false,
         matvec_ends: true,
         row_programs: false,
+        hidden_out: false,
     };
 
     #[test]
@@ -1917,6 +1931,22 @@ mod tests {
             &TABLE,
             ENDS,
         );
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    /// A forward's final hidden state is an output when the model exports it (an MTP head reads
+    /// it): the one-row vocabulary matvec reading it no longer absorbs its norm.
+    #[test]
+    fn an_exported_final_hidden_keeps_its_norm() {
+        let ops = vec![norm(vec![Ext(0), Ext(1)]), gemm(64, vec![Op(0), Ext(2)])];
+        let src = [(1, 64), (1, 64), (64, 64)];
+        let (s, f) = fold(&src, weights(3), ops.clone(), &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[0]), StepRole::Absorbed { into: s[1] });
+        let exported = ModelFoldFacts {
+            hidden_out: true,
+            ..ENDS
+        };
+        let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, exported);
         assert_eq!(f.role(s[0]), StepRole::Kept);
     }
 
@@ -2144,6 +2174,7 @@ mod tests {
         fold_projections: false,
         matvec_ends: false,
         row_programs: true,
+        hidden_out: false,
     };
 
     #[test]
@@ -2445,6 +2476,7 @@ mod tests {
             fold_projections: true,
             matvec_ends: false,
             row_programs: false,
+            hidden_out: false,
         };
         let (_, joined) = fold(&src, weights(4), ops(), &[], &TABLE, fused);
         assert_eq!(split.absorbed().collect::<Vec<_>>(), [(s[2], s[3])]);

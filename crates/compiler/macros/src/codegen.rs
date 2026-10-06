@@ -7200,6 +7200,7 @@ fn emit_canonical_params_impl(
     let gdn_head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
     let gdn_conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
     let gdn_conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as usize;
+    let spec_drafts = *model.bounds.get("spec_drafts").unwrap_or(&0) as u32;
 
     // Vision-tower constants. Set in `#[vision_forward]` configs via
     // `vision_num_heads` / `vision_head_dim` bounds; absent in text
@@ -7354,6 +7355,7 @@ fn emit_canonical_params_impl(
     let gdn_head_v_dim_lit = proc_macro2::Literal::u32_unsuffixed(gdn_head_v_dim);
     let gdn_conv_kernel_lit = proc_macro2::Literal::u32_unsuffixed(gdn_conv_kernel);
     let gdn_conv_dim_lit = proc_macro2::Literal::usize_unsuffixed(gdn_conv_dim);
+    let spec_drafts_lit = proc_macro2::Literal::u32_unsuffixed(spec_drafts);
     let norm_weight_offset_lit =
         proc_macro2::Literal::f32_suffixed(norm_weight_runtime_offset(model));
     // RMSNorm eps from config (Qwen3.5: 1e-6). Without this the metal
@@ -7697,6 +7699,7 @@ fn emit_canonical_params_impl(
             gdn_head_v_dim,
             gdn_conv_kernel,
             gdn_conv_dim,
+            spec_drafts,
         });
     }
 
@@ -7734,6 +7737,7 @@ fn emit_canonical_params_impl(
             const GDN_HEAD_V_DIM: u32 = #gdn_head_v_dim_lit;
             const GDN_CONV_KERNEL: u32 = #gdn_conv_kernel_lit;
             const GDN_CONV_DIM: usize = #gdn_conv_dim_lit;
+            const SPEC_DRAFTS: u32 = #spec_drafts_lit;
             const NORM_WEIGHT_OFFSET: f32 = #norm_weight_offset_lit;
             const RMS_NORM_EPS: f32 = #rms_norm_eps_lit;
             const ROT_DIM: u32 = #rot_dim_lit;
@@ -7796,6 +7800,8 @@ pub fn emit_gdn_runtime_config_arm_body(
     let num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
     let head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
     let head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
+    let spec_drafts = u8::try_from(*model.bounds.get("spec_drafts").unwrap_or(&0))
+        .expect("spec_drafts: a slot's checkpoints count in a u8");
     let bits = linear.iter().copied();
     Some(quote! {
         ::core::option::Option::Some(
@@ -7807,6 +7813,7 @@ pub fn emit_gdn_runtime_config_arm_body(
                 head_k_dim: #head_k_dim,
                 head_v_dim: #head_v_dim,
                 linear_layers: ::std::vec![ #(#bits),* ],
+                spec_drafts: #spec_drafts,
             },
         )
     })

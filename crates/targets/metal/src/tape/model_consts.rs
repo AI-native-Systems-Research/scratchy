@@ -56,6 +56,8 @@ pub struct MetalModelConsts {
     pub gdn_head_v_dim: u32,
     pub gdn_conv_kernel: u32,
     pub gdn_conv_dim: usize,
+    /// The drafts each sequence of a verify step carries ([`scratchy_ir::CanonicalParams`]).
+    pub spec_drafts: u32,
 }
 
 impl MetalModelConsts {
@@ -102,6 +104,7 @@ impl MetalModelConsts {
             gdn_head_v_dim: W::GDN_HEAD_V_DIM,
             gdn_conv_kernel: W::GDN_CONV_KERNEL,
             gdn_conv_dim: W::GDN_CONV_DIM,
+            spec_drafts: W::SPEC_DRAFTS,
         }
     }
 }
