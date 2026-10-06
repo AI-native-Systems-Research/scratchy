@@ -18,6 +18,12 @@ pub struct HeadRegistration {
     /// head's tensors from the target and publishes them alone): inserted before the target
     /// repo's last `-`-delimited token. `None`: it ships only inside its target's checkpoint.
     pub repo_infix: Option<&'static str>,
+    /// The tokens it drafts each step (`spec_drafts`, its arch.json): its target's verify steps
+    /// carry them, as both models' kernels bake them.
+    pub drafts: u8,
+    /// The most sequences a step drafts for (`spec_max_seqs`, its arch.json): a step of more runs
+    /// as its target alone.
+    pub max_seqs: u8,
 }
 
 impl HeadRegistration {

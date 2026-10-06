@@ -1776,6 +1776,30 @@ pub fn compile_carrier(
                 }
             }
         };
+        let spec_drafts_tokens = {
+            let drafts = |a: &DispatchArm| {
+                let sm = solved.iter().find(|sm| a.model_ident == sm.mod_name);
+                sm.and_then(|sm| sm.model.bounds.get("spec_drafts").copied())
+                    .unwrap_or(0)
+            };
+            match arch_dispatch_arms.iter().all(|a| drafts(a) == 0) {
+                true => proc_macro2::TokenStream::new(),
+                false => {
+                    let arms = arch_dispatch_arms.iter().map(|a| {
+                        let variant_ident = pascal_case(&a.model_ident);
+                        let lit = proc_macro2::Literal::u32_unsuffixed(drafts(a) as u32);
+                        quote! { Weights::#variant_ident(_) => #lit, }
+                    });
+                    quote! {
+                        fn spec_drafts(&self) -> u32 {
+                            match self {
+                                #(#arms)*
+                            }
+                        }
+                    }
+                }
+            }
+        };
         // Per-variant `rope_on_read` arms — spans / position-independent KV.
         // Rope-on-read is the universal default for rope-using models; this
         // mirrors the `ROPE_ON_READ` CanonicalParams const (both derive from
@@ -1821,7 +1845,14 @@ pub fn compile_carrier(
         // loader can place a target's tensors under the head's names before the head loads —
         // every head variant must agree on them.
         // The target architectures it drafts for, and how its repo is named from the target's.
-        type HeadFacts = (bool, [Option<String>; 2], u64, Vec<String>, Option<String>);
+        type HeadFacts = (
+            bool,
+            [Option<String>; 2],
+            u64,
+            Vec<String>,
+            Option<String>,
+            [u64; 2],
+        );
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
             .map(|sm| {
@@ -1834,9 +1865,11 @@ pub fn compile_carrier(
                     .map(|w| codegen::lent_weight_prefix(&sm.prog, sm.model, w));
                 let vocab = sm.model.bounds.get("vocab_size").copied().unwrap_or(0);
                 let (drafts_for, infix) = (&sm.model.drafts_for, &sm.model.drafter_repo_infix);
+                let spec = ["spec_drafts", "spec_max_seqs"]
+                    .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0));
                 (
                     sm.mod_name.clone(),
-                    (reads, lent, vocab, drafts_for.clone(), infix.clone()),
+                    (reads, lent, vocab, drafts_for.clone(), infix.clone(), spec),
                 )
             })
             .collect();
@@ -1885,11 +1918,14 @@ pub fn compile_carrier(
                 u64,
                 &'a [String],
                 &'a Option<String>,
+                [u64; 2],
             );
             let heads: Vec<Head<'_>> = head_facts
                 .values()
                 .filter(|(reads, ..)| *reads)
-                .map(|(_, lent, vocab, drafts_for, infix)| (lent, *vocab, &drafts_for[..], infix))
+                .map(|(_, lent, vocab, drafts_for, infix, spec)| {
+                    (lent, *vocab, &drafts_for[..], infix, *spec)
+                })
                 .collect();
             match heads.first() {
                 None => quote! { ::core::option::Option::None },
@@ -1897,10 +1933,11 @@ pub fn compile_carrier(
                     assert!(
                         heads.iter().all(|head| head == first),
                         "{arch_ident}: its head variants disagree on where they load lent weights, \
-                         how many lm_head rows they read, or whose head they are ({heads:?}); a \
-                         loader must know them before the head loads"
+                         how many lm_head rows they read, whose head they are or how many tokens \
+                         they draft ({heads:?}); a loader must know them before the head loads"
                     );
-                    let ([Some(embed_tokens), Some(lm_head)], vocab, drafts_for, infix) = first
+                    let ([Some(embed_tokens), Some(lm_head)], vocab, drafts_for, infix, spec) =
+                        first
                     else {
                         panic!(
                             "{arch_ident}: a head reading `target_hidden` must name embed_tokens \
@@ -1908,6 +1945,8 @@ pub fn compile_carrier(
                         );
                     };
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*vocab as u32);
+                    let [drafts, max_seqs] =
+                        spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
                     let infix = match infix {
                         Some(infix) => quote! { ::core::option::Option::Some(#infix) },
                         None => quote! { ::core::option::Option::None },
@@ -1919,6 +1958,8 @@ pub fn compile_carrier(
                             lm_head_rows: #lm_head_rows,
                             drafts_for: &[#(#drafts_for),*],
                             repo_infix: #infix,
+                            drafts: #drafts,
+                            max_seqs: #max_seqs,
                         })
                     }
                 }
@@ -1927,6 +1968,7 @@ pub fn compile_carrier(
         let gdn_runtime_config_tokens = quote! {
             #gdn_runtime_config_tokens
             #per_layer_kv_elems_tokens
+            #spec_drafts_tokens
             #rope_on_read_tokens
             #head_tokens
         };

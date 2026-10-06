@@ -122,7 +122,6 @@ impl GdnSlotAllocator {
             let step = GdnStep {
                 start: std::mem::replace(&mut state.start, GdnStart::Slot),
                 checkpoint_rows,
-                pool_rows: slot_rows,
                 records: state.records,
             };
             state.records = step.after();
@@ -300,7 +299,6 @@ mod tests {
             GdnStep {
                 start,
                 checkpoint_rows,
-                pool_rows: rows,
                 records,
             }
             .encode()

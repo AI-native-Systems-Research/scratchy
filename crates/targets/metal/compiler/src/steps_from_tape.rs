@@ -287,16 +287,15 @@ impl OpColours {
     /// Every row's final hidden state: the vocabulary projection's activation (its sampled rows
     /// put it back), or the result of a forward that ends without one.
     pub fn hidden(&self, l: &LoweredDecode) -> Result<Slot, StepRefusal> {
-        let od = &l.input.ops[l.input.result];
-        match (od.op, od.inputs.first()) {
-            (SubOp::MatmulTile { .. } | SubOp::AllRowsMatmul, Some(&InputRef::Op(j))) => {
+        match l.input.hidden() {
+            Some(j) => {
                 let why = |why| StepRefusal {
                     op: Some((j, l.input.ops[j].op.name())),
                     why,
                 };
                 self.of(l, j).map_err(why)
             }
-            _ => Ok(Slot(self.result.index())),
+            None => Ok(Slot(self.result.index())),
         }
     }
 }

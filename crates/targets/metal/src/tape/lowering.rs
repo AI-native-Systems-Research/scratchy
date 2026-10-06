@@ -4935,8 +4935,7 @@ fn lower_one(
 
             // 1. Causal depthwise conv1d (+SiLU), varlen + stateful.
             cmds.push(recurrent_conv(
-                dtype,
-                (conv_dim, kernel),
+                p,
                 arena(qkv_slot, 1),
                 weight(WeightTensor::GdnConv1d, 2),
                 layer_id,
@@ -4997,8 +4996,7 @@ fn lower_one(
             let layout = GdnScratchLayout::compute(bucket_m, conv_dim, heads, d_inner);
             *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
             let mut cmds = vec![recurrent_conv(
-                dequant_dtype_for(p),
-                (conv_dim, p.gdn_conv_kernel),
+                p,
                 zx(1),
                 weight(WeightTensor::GdnConv1d, 2),
                 layer_id,
@@ -6267,8 +6265,7 @@ impl ColumnSlice {
 /// Mamba-2's in-projection rows with its conv bias (`sliced`). Grid (num_seqs[set via
 /// seq_axis=X], ceil(conv_dim/tg_y), 1).
 fn recurrent_conv(
-    dtype: DequantDtype,
-    (conv_dim, kernel): (u32, u32),
+    p: &MetalModelConsts,
     input: Binding,
     conv_w: Binding,
     layer: super::ids::LayerId,
@@ -6281,9 +6278,11 @@ fn recurrent_conv(
         kind,
         binding_index,
     };
+    let conv_dim = p.gdn_conv_dim as u32;
     let mut constants = vec![
         ConstantValue::uint(0, conv_dim),
-        ConstantValue::uint(1, kernel),
+        ConstantValue::uint(1, p.gdn_conv_kernel),
+        ConstantValue::uint(5, p.spec_drafts),
     ];
     let mut bindings = vec![
         Binding::MoeScratch {
@@ -6306,7 +6305,7 @@ fn recurrent_conv(
     LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_conv1d_varlen",
-        function: gdn_conv1d_varlen_static_name(dtype),
+        function: gdn_conv1d_varlen_static_name(dequant_dtype_for(p)),
         constants: baked(constants),
         dispatch: DispatchShape {
             threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
@@ -6377,6 +6376,7 @@ fn recurrent_scan(
         ConstantValue::uint(2, hk),
         ConstantValue::uint(3, hv),
         ConstantValue::float(4, (hk as f32).powf(-0.5)),
+        ConstantValue::uint(8, p.spec_drafts),
     ];
     scan_constants.extend(dt.map(|_| ConstantValue::boolean(5, true)));
     let state = [

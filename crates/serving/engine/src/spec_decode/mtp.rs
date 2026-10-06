@@ -20,8 +20,12 @@
 //! The head's KV pool has the target's blocks, so it shares the target's block table. Only a
 //! sequence that produced a token this step drafts; an intermediate prefill chunk still runs its
 //! rows through pass 1, priming the head's KV for the prompt.
+//!
+//! A step of more than the head's `max_seqs` sequences (its compiled `spec_max_seqs`) runs no head
+//! forward, so it costs what its target alone does. Its sequences' head KV then misses the step's
+//! rows, so they draft no more (`stale`) until a recompute runs them from their first position.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::backend::{
     BackendError, ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend,
@@ -35,6 +39,8 @@ pub struct MtpProposerConfig {
     pub model: String,
     /// Drafts per step (`k`): one pass-1 row plus `k - 1` chained passes.
     pub num_speculative_tokens: usize,
+    /// The most sequences a step drafts for (module docs).
+    pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
 }
@@ -47,11 +53,16 @@ const HEAD_KV: KvPoolHandle = KvPoolHandle(1);
 #[derive(Debug)]
 pub struct MtpProposer {
     config: MtpProposerConfig,
+    /// Requests whose head KV missed a step's rows (module docs): they draft no more.
+    stale: HashSet<String>,
 }
 
 impl MtpProposer {
     pub fn new(config: MtpProposerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            stale: HashSet::new(),
+        }
     }
 
     pub fn config(&self) -> &MtpProposerConfig {
@@ -221,16 +232,31 @@ impl Proposer for MtpProposer {
         let Some(backend) = ctx.backend.as_deref_mut() else {
             return HashMap::new();
         };
-        // No head forward for a step none of whose requests takes drafts.
-        let drafts_any = seed.req_ids.iter().any(|r| (ctx.takes_drafts)(r));
-        if self.config.num_speculative_tokens == 0 || !drafts_any {
+        // A request gone drafts no more; one run from its first position has its head KV whole.
+        self.stale.retain(|r| (ctx.takes_drafts)(r));
+        for (i, r) in seed.req_ids.iter().enumerate() {
+            if seed.positions.get(seed.cu_seqlens_q[i] as usize) == Some(&0) {
+                self.stale.remove(r);
+            }
+        }
+        // A step of more sequences than the head drafts for runs as the target alone.
+        if seed.req_ids.len() > self.config.max_seqs {
+            self.stale.extend(seed.req_ids.iter().cloned());
             return HashMap::new();
         }
-        self.propose(seed, produced, ctx.get_all_tokens, backend)
+        // No head forward for a step none of whose requests drafts.
+        let drafts = |r: &String| (ctx.takes_drafts)(r) && !self.stale.contains(r);
+        if self.config.num_speculative_tokens == 0 || !seed.req_ids.iter().any(drafts) {
+            return HashMap::new();
+        }
+        let mut proposed = self
+            .propose(seed, produced, ctx.get_all_tokens, backend)
             .unwrap_or_else(|e| {
                 tracing::warn!("MTP proposer: no drafts this step: {e:?}");
                 HashMap::new()
-            })
+            });
+        proposed.retain(|r, _| !self.stale.contains(r));
+        proposed
     }
 }
 
@@ -322,12 +348,9 @@ mod tests {
 
     /// A step of two sequences: `a` verified three drafts at positions 10..=13 and kept one (its
     /// newest token, the bonus, sits at 12, produced by the row at 11); `b` ran an intermediate
-    /// prefill chunk, 0..=2 of an 8-token prompt. Pass 1 runs `a` through its newest row and all
-    /// of `b`; `a` alone drafts, chaining at 12 and 13.
-    #[test]
-    fn pass_one_runs_each_sequence_through_its_newest_row() {
-        let history_a: Vec<u32> = (500..513).collect();
-        let history_b: Vec<u32> = (700..708).collect();
+    /// prefill chunk, 0..=2 of an 8-token prompt. Its seed, the tokens it produced, and the
+    /// requests' histories.
+    fn two_sequence_step() -> (DraftSeedInputs, Vec<Vec<u32>>, Vec<u32>, Vec<u32>) {
         let seed = DraftSeedInputs {
             input_ids: Vec::new(),
             positions: vec![10, 11, 12, 13, 0, 1, 2],
@@ -352,16 +375,29 @@ mod tests {
             target_hidden: (0..7u8).flat_map(|r| [r; ROW_BYTES]).collect(),
         };
         let produced = vec![vec![511, 512], Vec::new()];
+        (seed, produced, (500..513).collect(), (700..708).collect())
+    }
+
+    fn proposer(max_seqs: usize) -> MtpProposer {
+        MtpProposer::new(MtpProposerConfig {
+            model: "head".into(),
+            num_speculative_tokens: 3,
+            max_seqs,
+            max_model_len: 4096,
+        })
+    }
+
+    /// [`two_sequence_step`]: pass 1 runs `a` through its newest row and all of `b`; `a` alone
+    /// drafts, chaining at 12 and 13.
+    #[test]
+    fn pass_one_runs_each_sequence_through_its_newest_row() {
+        let (seed, produced, history_a, history_b) = two_sequence_step();
         let history = |id: &str| match id {
             "a" => Some(history_a.clone()),
             "b" => Some(history_b.clone()),
             _ => None,
         };
-        let proposer = MtpProposer::new(MtpProposerConfig {
-            model: "head".into(),
-            num_speculative_tokens: 3,
-            max_model_len: 4096,
-        });
+        let proposer = proposer(4);
         let mut backend = Recorder::default();
         let drafts = proposer
             .propose(&seed, &produced, &history, &mut backend)
@@ -399,5 +435,56 @@ mod tests {
         assert_eq!(backend.forwards, want);
         let want_drafts = HashMap::from([("a".to_string(), vec![1001, 2000, 3000])]);
         assert_eq!(drafts, want_drafts);
+    }
+
+    /// A step of more sequences than the head drafts for runs no head forward, and its sequences
+    /// draft no more — their head KV missed its rows — until a recompute runs one from its first
+    /// position.
+    #[test]
+    fn a_step_past_the_head_s_sequences_skips_it_and_stales_them() {
+        let (seed, produced, history_a, history_b) = two_sequence_step();
+        let history = |id: &str| match id {
+            "a" => Some(history_a.clone()),
+            "b" => Some(history_b.clone()),
+            _ => None,
+        };
+        let takes = |_: &str| true;
+        let step = |proposer: &mut MtpProposer, backend: &mut Recorder, seed: &DraftSeedInputs| {
+            let mut ctx = ProposerStepCtx {
+                scheduled_req_ids: &[],
+                get_all_tokens: &history,
+                worker_drafts: None,
+                backend: Some(backend),
+                draft_seed: Some(seed),
+                sampled_token_ids: Some(&produced),
+                takes_drafts: &takes,
+            };
+            proposer.propose_for_step(&mut ctx)
+        };
+
+        // Two sequences, a head that drafts for one: no head forward.
+        let mut proposer = proposer(1);
+        let mut backend = Recorder::default();
+        assert!(step(&mut proposer, &mut backend, &seed).is_empty());
+        assert!(backend.forwards.is_empty(), "no head forward");
+
+        // Within its sequences again: `a` is stale, so it takes no drafts.
+        proposer.config.max_seqs = 2;
+        let mut backend = Recorder::default();
+        assert!(step(&mut proposer, &mut backend, &seed).is_empty());
+
+        // `a` recomputed from its first position — its whole history in one chunk, positions
+        // 0..=11, then `b`'s 0..=2: whole again, it drafts.
+        let (mut recomputed, ..) = two_sequence_step();
+        recomputed.positions = (0..12).chain(0..3).collect();
+        recomputed.slot_mapping = (48..60).chain(80..83).collect();
+        recomputed.cu_seqlens_q = vec![0, 12, 15];
+        recomputed.seqused_k = vec![12, 3];
+        recomputed.num_tokens = 15;
+        recomputed.q_lens = vec![12, 3];
+        recomputed.target_hidden = (0..15u8).flat_map(|r| [r; ROW_BYTES]).collect();
+        let mut backend = Recorder::default();
+        let drafts = step(&mut proposer, &mut backend, &recomputed);
+        assert!(drafts.contains_key("a"), "{drafts:?}");
     }
 }

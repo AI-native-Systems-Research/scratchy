@@ -188,6 +188,7 @@ fn dispatch_scan(
     hk: usize,
     hv: usize,
     num_tokens: usize,
+    drafts: u8,
 ) -> Option<Vec<f32>> {
     let value_dim = nv * hv;
     let scale = (hk as f32).powf(-0.5);
@@ -200,6 +201,7 @@ fn dispatch_scan(
             ConstantValue::uint(2, hk as u32),
             ConstantValue::uint(3, hv as u32),
             ConstantValue::float(4, scale),
+            ConstantValue::uint(5, u32::from(drafts)),
         ],
     );
     let pipeline = baked_build(cache, &key).expect("gdn_scan_varlen pipeline");
@@ -515,6 +517,7 @@ fn gdn_conv1d_varlen_matches_reference() {
         vec![
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
+            ConstantValue::uint(2, 0),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -585,6 +588,7 @@ fn gdn_conv1d_varlen_continuity() {
         vec![
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
+            ConstantValue::uint(2, 0),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -680,6 +684,7 @@ fn gdn_scan_varlen_matches_reference() {
         hk,
         hv,
         t,
+        0,
     ) else {
         return;
     };
@@ -734,6 +739,7 @@ fn gdn_scan_varlen_production_head_dim() {
         hk,
         hv,
         t,
+        0,
     ) else {
         return;
     };
@@ -793,6 +799,7 @@ fn gdn_scan_varlen_continuity() {
         hk,
         hv,
         5,
+        0,
     ) else {
         return;
     };
@@ -812,6 +819,7 @@ fn gdn_scan_varlen_continuity() {
         hk,
         hv,
         1,
+        0,
     ) else {
         return;
     };
@@ -872,6 +880,7 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
+                ConstantValue::uint(5, 0),
             ]
         };
         let size = |width, height, depth| MTLSize {
@@ -1303,6 +1312,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         vec![
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
+            ConstantValue::uint(2, u32::from(rows.0)),
         ],
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
@@ -1319,7 +1329,6 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
             &[GdnStep {
                 start,
                 checkpoint_rows,
-                pool_rows: rows,
                 records: RecordArea::First,
             }
             .encode()],
@@ -1401,7 +1410,6 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
         [GdnStep {
             start,
             checkpoint_rows,
-            pool_rows: rows,
             records,
         }
         .encode()]
@@ -1423,6 +1431,7 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
             hk,
             hv,
             n,
+            rows.0,
         )
     };
     let none = CheckpointRows::NONE;
@@ -1506,7 +1515,6 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         let step = GdnStep {
             start,
             checkpoint_rows,
-            pool_rows: rows,
             records,
         };
         slot.set(step.after());
@@ -1529,6 +1537,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
             hk,
             hv,
             num_tokens,
+            rows.0,
         )
     };
 
@@ -1586,7 +1595,6 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         [GdnStep {
             start,
             checkpoint_rows: CheckpointRows::NONE,
-            pool_rows: rows,
             records: RecordArea::First,
         }
         .encode()]
@@ -1664,6 +1672,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
+                ConstantValue::uint(5, u32::from(rows.0)),
             ],
         ),
     )
@@ -1692,6 +1701,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
                 let cu = [0, t as i32];
                 dispatch_scan(
                     &device, &cache, conv, &g, &beta, state, &cu, &entry, &code, nk, nv, hk, hv, t,
+                    rows.0,
                 )
             }
             Scan::Simd => {
@@ -1747,7 +1757,6 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
         [GdnStep {
             start,
             checkpoint_rows: CheckpointRows::NONE,
-            pool_rows: rows,
             records: RecordArea::First,
         }
         .encode()]
@@ -1786,7 +1795,6 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
             let step = GdnStep {
                 start,
                 checkpoint_rows,
-                pool_rows: rows,
                 records,
             };
             slot.set(step.after());

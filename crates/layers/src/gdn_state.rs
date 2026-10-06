@@ -106,16 +106,15 @@ pub struct GdnStep {
     pub start: GdnStart,
     /// The step's drafts — a verify step's: it checkpoints the conv state after, and records the
     /// ssm inputs of, its `drafts + 1` rows. [`CheckpointRows::NONE`] outside speculative decoding.
+    /// The slot layout is the model's drafts, which its kernels bake (`SPEC_DRAFTS`).
     pub checkpoint_rows: CheckpointRows,
-    /// The pool's: the most drafts a slot keeps (its layout, `GdnStatePool::checkpoint_rows`).
-    pub pool_rows: CheckpointRows,
     /// The slot's record area before the step: the previous verify step's rows.
     pub records: RecordArea,
 }
 
 impl GdnStep {
     /// The kernels' encoding: bits 0–7 the start (`0` slot, `1` fresh, `2 + r` checkpoint `r`),
-    /// bits 8–15 the step's drafts, bits 16–23 the pool's, bit 24 the record area.
+    /// bits 8–15 the step's drafts, bit 16 the record area.
     pub fn encode(self) -> u32 {
         let start = match self.start {
             GdnStart::Slot => 0,
@@ -123,10 +122,7 @@ impl GdnStep {
             GdnStart::Checkpoint(r) => 2 + u32::from(r),
         };
         let records = u32::from(self.records == RecordArea::Second);
-        start
-            | (u32::from(self.checkpoint_rows.0) << 8)
-            | (u32::from(self.pool_rows.0) << 16)
-            | (records << 24)
+        start | (u32::from(self.checkpoint_rows.0) << 8) | (records << 16)
     }
 
     /// The slot's record area once the step ran: a verify step records its rows to the other
@@ -177,7 +173,11 @@ impl GdnStateDims {
     /// checkpoints a slot's ssm memory is its entry, `[slots, heads, head_v, head_k]`; with them a
     /// flat row per slot ([`Self::ssm_slot_len`]).
     fn shapes(self, slots: usize, rows: CheckpointRows) -> ([usize; 3], Vec<usize>) {
-        let conv = [slots * rows.conv_entries_per_slot(), self.conv_dim, self.conv_state_len()];
+        let conv = [
+            slots * rows.conv_entries_per_slot(),
+            self.conv_dim,
+            self.conv_state_len(),
+        ];
         let ssm = match rows.0 {
             0 => vec![slots, self.num_v_heads, self.head_v_dim, self.head_k_dim],
             _ => vec![slots, self.ssm_slot_len(rows)],
