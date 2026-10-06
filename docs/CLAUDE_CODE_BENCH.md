@@ -18,7 +18,7 @@ is a defect: a later reader cannot tell silence from a tested claim.
 | [Method and metrics](#method-and-metrics) | owned by the agreed method, not restated here |
 | [Exact commands](#exact-commands) | scratchy side recorded; ollama side **T0.4** |
 | [Results](#results) | empty — phase 4 |
-| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5** |
+| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2's pair audited and pinned — **T0.6** |
 | [Blocked](#blocked) | recorded |
 | [Artifacts](#artifacts) | empty — phase 4 |
 
@@ -181,38 +181,176 @@ preset supplies only the global default.** The precedence chain is
 
 #### R1 — "what a user gets"
 
-| model | scratchy | ollama |
-|---|---|---|
-| `gemma-4-12b-it` | as pinned above | `gemma4:12b` — manifest digest and the quantization the tag actually carries: **T0.4** |
-| `gemma-4-26b-a4b-it` | as pinned above | `gemma4:26b` — same: **T0.4** |
-| `qwen3.6-35b-a3b` | as pinned above | `qwen3.6:35b` — same: **T0.4** |
+| model | scratchy | ollama | tag carries (read 2026-10-06, **T0.6**) |
+|---|---|---|---|
+| `gemma-4-12b-it` | as pinned above | `gemma4:12b` | `gguf` / `Q4_K_M`, 8.02 GB, **+ a GGUF draft model** |
+| `gemma-4-26b-a4b-it` | as pinned above | `gemma4:26b` | `gguf` / `Q4_K_M`, 18.73 GB, **+ a 462 MB GGUF draft model** + a 1.19 GB vision projector |
+| `qwen3.6-35b-a3b` | as pinned above | `qwen3.6:35b` | `gguf` / `Q4_K_M`, 22.62 GB, no draft model |
+
+Digests for all three are in
+[R2's table below](#how-this-was-established-and-how-to-re-verify-it). **T0.4**
+still owns the rest of the ollama side (context length, parallelism, keep-alive,
+pinned engine version, and the no-truncation proof).
 
 The two sides load checkpoints produced by **different quantizers**
-(mlx-community affine 4-bit against ollama's default GGUF). That is disclosed on
-every R1 row rather than normalised away: R1 answers "what does a user get", and
-only R2 isolates the engine.
+(mlx-community affine 4-bit against ollama's default GGUF `Q4_K_M`). That is
+disclosed on every R1 row rather than normalised away: R1 answers "what does a
+user get", and only R2 isolates the engine. Two of the three default tags also
+ship a trained draft model that scratchy has no equivalent of — see R2's
+disclosure 1, which applies to R1 identically.
 
 #### R2 — "matched weights"
 
-| model | scratchy | ollama |
+**Audited — T0.6, 2026-10-06. The `-mlx` tags are not mlx-community's
+checkpoint, so R2 at 4 bits does not exist and the pre-declared fallback takes
+effect.** The tags are ollama's *own* requantization of the same base models into
+**microscaling float** formats — NVFP4 and MXFP8 — not MLX affine int4. Read from
+each tag's registry manifest and its per-tensor safetensors `__metadata__`
+(method below; no full pull required):
+
+| ollama tag | ollama's own label | what the tensors actually are | main-model bytes vs scratchy's 4-bit |
+|---|---|---|---|
+| `gemma4:12b-mlx` | `safetensors`, `file_type` **empty** | **NVFP4** `g16` on every language-model matmul, `embed_tokens` included; **bf16** vision tower, audio tower and the bundled draft model | 6.804 GB vs 6.741 GB — **+0.93%** |
+| `gemma4:26b-mlx` | `safetensors`, `file_type` `nvfp4` | **mixed**: NVFP4 `g16` on `q/k/o_proj`, `mlp.{gate,up}_proj`, `experts.gate_up_proj`; **MXFP8 `g32`** on `v_proj`, `mlp.down_proj`, `experts.down_proj` and `embed_tokens`; **bf16** `router.proj` and the whole vision tower | 17.431 GB vs 15.341 GB — **+13.62%** |
+| `qwen3.6:35b-mlx` | `safetensors`, `file_type` `nvfp4` | **NVFP4** `g16` on attention, the GDN `linear_attn` projections, experts and shared expert; **bf16** `embed_tokens`, `lm_head`, `mlp.gate`, the whole visual tower, and a 1.690 GB `mtp` multi-token-prediction head | 21.890 GB vs 20.402 GB — **+7.29%** |
+
+`gemma4:12b-mlx` is byte-identical to `gemma4:12b-nvfp4`, and `qwen3.6:35b-mlx`
+to `qwen3.6:35b-a3b-nvfp4` (same manifest digest) — on those two, `-mlx` *is* the
+pure-NVFP4 build. On the 26b it is not: `gemma4:26b-mlx` and `gemma4:26b-nvfp4`
+are different manifests, and **both** are mixed-precision, differing in which
+roles get 8 bits. There is no uniform-4-bit ollama artifact for the 26b at all.
+
+**Different storage would not matter; different dequantization math does.** The
+same tensor, `…layers.0.self_attn.k_proj`, on the 12b:
+
+| | scratchy — `mlx-community/gemma-4-12B-it-4bit` | ollama — `gemma4:12b-mlx` |
 |---|---|---|
-| `gemma-4-12b-it` | **unchanged from R1** — that is the point | `gemma4:12b-mlx` — same checkpoint? **T0.6** |
-| `gemma-4-26b-a4b-it` | unchanged from R1 | `gemma4:26b-mlx` — same checkpoint? **T0.6** |
-| `qwen3.6-35b-a3b` | unchanged from R1 | `qwen3.6:35b-mlx` — same checkpoint? **T0.6** |
+| packed weight | `U32 [2048, 480]` | `U32 [2048, 480]` |
+| companions | `.scales` `BF16 [2048, 60]`, `.biases` `BF16 [2048, 60]` | `.scale` `U8 [2048, 240]`, `.global_scale` `F32 []` |
+| scheme | affine int4, scale **and zero-point**, group **64** (`3840/64 = 60`) | NVFP4 E2M1, E4M3 block scale, **no** zero-point, group **16** (`3840/16 = 240`), plus one tensor-wide FP32 scale |
 
-**R2 is gated, not assumed.** `gemma4:26b-mlx` reports 18 GB against the
-mlx-community 4-bit's ~15.4 GB, so the tags are not obviously the same artifact.
-T0.6 — the `-mlx` tag audit — pulls them and reads the manifest and config, and
-R2 exists only once it names a concrete pair.
+The packed weight shape is **identical**, which is exactly why the 12b's +0.93%
+size delta would have passed a footprint check and still been the wrong artifact.
+The 26b's 18-vs-15.4 GB gap that prompted this task was the easy case; the 12b was
+the trap. **Footprint does not identify a checkpoint — per-tensor metadata does.**
 
-**The fallback, written down now so it is not invented later.** If T0.6 shows the
-`-mlx` tags are a different checkpoint, R2 falls back to **bf16 against f16-GGUF
-on `gemma-4-12b-it` only** — the smallest model in the set, so the one where a
-conversion-based control is affordable. On the scratchy side that is a build with
-no quant preset named (the dense/bf16 emission a preset would otherwise replace,
-[`BUILD.md`](BUILD.md)), at 2 bytes per parameter rather than 4 bits — several
-times the footprint, which is why the fallback is scoped to one model and not the
-set.
+**ollama's own labels do not identify it either.** `gemma4:26b-mlx` declares
+`file_type: nvfp4` while four of its weight roles — `v_proj`, `mlp.down_proj`,
+`experts.down_proj`, `embed_tokens` — are MXFP8 at twice the bit width;
+`gemma4:12b-mlx` declares no `file_type` at all; and the `config.json` these
+tags ship carries **no `quantization` block** and says `dtype: bfloat16`,
+describing the *base* model rather than the artifact. Only the per-tensor
+`__metadata__` is truthful.
+
+##### R2 as it will run — the concrete pair
+
+The pre-declared fallback, now pinned to artifacts. **One model, `gemma-4-12b-it`,
+bf16 on both sides** — and better than the fallback anticipated: not "bf16 against
+f16-GGUF" but bf16 against bf16, in the same MLX-native safetensors, with no GGUF
+quantizer anywhere in the comparison.
+
+| side | artifact | build / invocation |
+|---|---|---|
+| scratchy | `mlx-community/gemma-4-12B-it-bf16` @ `afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b`, 23.920 GB of safetensors | **no quant preset named** — the dense/bf16 emission a preset would otherwise replace ([`BUILD.md`](BUILD.md)): `-F metal,serve,model/gemma-4-12b-it` |
+| ollama | `gemma4:12b-mlx-bf16`, manifest `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179`, pushed 2026-08-14, `requires 0.31.0` | `ollama run gemma4:12b-mlx-bf16` |
+
+**This pair is verified by bytes, not by size.** Summing the tag's non-`draft`
+tensor blobs gives 23,919,548,728 B against the HF repo's 23,919,548,177 B — 551 B
+apart on 23.92 GB, which is safetensors header overhead (ollama stores one
+single-tensor file per tensor, HF five sharded headers). Byte-equality was then
+confirmed directly on three tensors drawn from three different HF shards, by
+range-reading each shard at its header's `data_offsets` and SHA-256'ing the
+payload against the corresponding ollama blob's payload:
+
+| tensor | dtype / shape | SHA-256 (both sides) |
+|---|---|---|
+| `…layers.0.self_attn.k_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `079b15ff2455b027198ec39c…` |
+| `…layers.30.self_attn.v_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `1b7fa0c2b32c86752fed90b2…` |
+| `…norm.weight` | `BF16 [3840]`, 7,680 B | `d059a0bcfebeba413a5fd8d6…` |
+
+Three disclosures ride with this pair, none of which the weight match removes:
+
+1. **ollama's tag carries a draft model; scratchy's build has no equivalent.**
+   0.846 GB of bf16 under the `draft.` prefix, architecture
+   `Gemma4AssistantForCausalLM`, wired as `draft` in the tag's config blob — so
+   **speculative decoding is on by default on ollama's side**, with a *trained*
+   draft model rather than scratchy's n-gram. This is true on **both** rungs: the
+   R1 GGUF tags `gemma4:12b` and `gemma4:26b` ship a `image.draft` layer too
+   (462 MB on the 26b). It must be disabled or disclosed on every row, and it is
+   what phase 4's spec-decode ablation is actually measured against.
+   The qwen tags carry no `draft` entry, but `qwen3.6:35b-mlx` ships a **1.690 GB
+   bf16 `mtp` multi-token-prediction head** — the same capability by another
+   mechanism, and ollama publishes separate `qwen3.6:35b-a3b-mtp-*` GGUF tags,
+   which implies the plain `qwen3.6:35b` does not carry one. Whether the engine
+   actually *uses* either is a runtime question for **T0.4**, not a manifest one;
+   what T0.6 establishes is that the capability is in the artifact.
+2. **R2 changes ollama's engine, not only its weights.** R1's tags are
+   `model_format: gguf` / `file_type: Q4_K_M` (llama.cpp); every `-mlx` and
+   `-mlx-bf16` tag is `model_format: safetensors` with `requires ≥ 0.31.0`
+   (ollama's MLX engine). R2 therefore isolates "scratchy against ollama-on-MLX at
+   matched weights", and an R1→R2 delta on ollama's side mixes a quantizer change
+   with an engine change. Both must be named on the row.
+3. **Footprint.** 24.83 GB on disk for the tag against 23.95 GB for scratchy's
+   side (the difference is the draft model plus two 32 MB tokenizers), at 2 bytes
+   per parameter rather than 4 bits.
+
+**The pair cannot extend to the other two models, and now there are numbers for
+why.** `gemma4:26b-mlx-bf16` is 52.52 GB and `qwen3.6:35b-a3b-mlx-bf16` is
+71.92 GB — the latter exceeds the machine's 64 GB outright, before any KV cache.
+That is what scopes R2 to the 12b; the 12b is also the dense control, so R2
+lands on the model whose R1 row it is most useful beside.
+
+**What would restore a 4-bit R2, recorded so it is not re-derived.** scratchy
+already has an `nvfp4` preset at `group_size 16` — matching ollama's — but only
+the `llama` arch declares it, and there is no MXFP8 support in the tree at all
+(`crates/models/quantization/presets/nvfp4.json`,
+`crates/layers/src/layers.rs:237-240`). Matching `-mlx` at 4 bits would need
+NVFP4 declared on `gemma4`/`gemma4-moe`/`qwen3-5-moe`, MXFP8 added for the 26b,
+**and** a way to feed scratchy ollama's per-tensor blob store, since these weights
+are published nowhere else. That is an epic, not a phase-0 task.
+
+##### How this was established, and how to re-verify it
+
+No full pull was needed, and none was made: ollama's registry serves manifests and
+blobs over plain HTTPS, and a tensor's quantization is in the first ~300 bytes of
+its blob.
+
+```bash
+# the manifest: every tensor as its own named layer
+curl -s https://registry.ollama.ai/v2/library/gemma4/manifests/26b-mlx | jq .
+
+# the pinnable identity (tag -> digest) and when it was pushed
+curl -sI -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  https://registry.ollama.ai/v2/library/gemma4/manifests/26b-mlx \
+  | grep -i 'ollama-content-digest\|ollama-push-time'
+
+# one tensor's quantization, from its safetensors header
+curl -sL -H 'Range: bytes=0-4095' \
+  https://registry.ollama.ai/v2/library/gemma4/blobs/sha256:<tensor-digest> \
+  | python3 -c 'import sys,struct,json; d=sys.stdin.buffer.read(); \
+n=struct.unpack("<Q",d[:8])[0]; print(json.dumps(json.loads(d[8:8+n]),indent=1))'
+```
+
+**Pin ollama tags by manifest digest, not by tag name — they float.** Measured
+here: the `gemma4:26b` manifest pulled to this machine on 2026-09-29 names config
+`sha256:62b183484ba7…` with a 16,947,541,728 B model layer, while the registry on
+2026-10-06 serves config `sha256:cd16db7156ed…` with a 17,074,419,072 B one. The
+tag was republished 2026-09-30 02:35 UTC and the weights moved by 127 MB under a
+fixed name. Digests for every tag named in this document, as of 2026-10-06:
+
+| tag | pushed (UTC) | manifest digest |
+|---|---|---|
+| `gemma4:12b` | 2026-09-30 02:34 | `sha256:6114515d63c17436a7c0417d82820ac65ad643e2806c5a3c89cb62846436ed0b` |
+| `gemma4:12b-mlx` | 2026-08-27 18:23 | `sha256:ded7a27350032202d9e9b2a6071e8aa89959ab156771b5228f30863c741c4970` |
+| `gemma4:12b-mlx-bf16` | 2026-08-14 18:22 | `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179` |
+| `gemma4:26b` | 2026-09-30 02:35 | `sha256:001e5dafc3c77684c2307ebc6ab8e336e10c9b18eca52acf547d72fc83c3ca8c` |
+| `gemma4:26b-mlx` | 2026-08-27 18:23 | `sha256:f0fc7e0ae4947d382989b1f57db3d098a86b87c5b6e9523b9561ba81a2a64879` |
+| `qwen3.6:35b` | 2026-09-30 19:53 | `sha256:a7eb95c53bcf96b4bdd008d0fab4a5dac88047d9c1a7a9ab88ed453423fbd87c` |
+| `qwen3.6:35b-mlx` | 2026-08-27 18:23 | `sha256:e92a3e94bbca90a85491dc34e9257bfee2318cedaa16360828c4d8edf14295b9` |
+
+A load is still the acceptance test, the same bar T0.1 sets: these digests say
+what the artifacts *are*, not that either engine opens them. R2's pair is pulled
+and served before any R2 number is quoted.
 
 #### What a rung does not pin
 
@@ -265,8 +403,10 @@ an estimate.
 
 | cell | blocked on | resolved by |
 |---|---|---|
-| R1, ollama side — tag digest and the quantization each default tag carries | **T0.4** | pulling `gemma4:12b` / `gemma4:26b` / `qwen3.6:35b` and reading the manifest |
-| R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit? | **T0.6** | manifest + config of `gemma4:{12b,26b}-mlx` and `qwen3.6:35b-mlx`; R2 names a concrete pair, or the fallback above takes effect |
+| ~~R1, ollama side — tag digest and the quantization each default tag carries~~ | — | **resolved, T0.6**: all three are `gguf`/`Q4_K_M`; digests and sizes recorded in [R1](#r1--what-a-user-gets) and [R2](#how-this-was-established-and-how-to-re-verify-it) |
+| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — they are ollama's own NVFP4/MXFP8 requantization, so 4-bit R2 does not exist. The fallback took effect and R2 now names a pinned, byte-verified pair on `gemma-4-12b-it` |
+| whether either engine actually loads R2's pair | phase 4 setup | pulling `gemma4:12b-mlx-bf16` and building scratchy's no-preset bf16 `gemma-4-12b-it`; T0.6 identified the artifacts, it did not serve them |
+| ollama's draft model — disabled, or measured and disclosed? | **T0.4** + phase 4's spec-decode ablation | R2 disclosure 1: two of three default tags and every `gemma4` `-mlx` tag ship a trained draft model |
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
 | no-truncation proof on both sides | **T0.4** + the phase 2 harness | per-turn token accounting in the replay client and the live driver |
 | KV-quant deferral and its layer-coverage evidence | **T0.8** | the [Scope and deferrals](#scope-and-deferrals) section above |
