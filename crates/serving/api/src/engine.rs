@@ -1931,6 +1931,10 @@ impl AsyncEngine {
                 ModelRunnerOutput,
             )> = None;
             let mut gpu_in_flight: u32 = 0;
+            // A step in flight that drafts (the worker's head drafts the next step's tokens) or
+            // verifies (the next step's positions depend on how many drafts it keeps): nothing is
+            // scheduled behind it until it is finalized.
+            let mut awaits_step = false;
             let mut last_progress = Instant::now();
 
             loop {
@@ -1971,6 +1975,8 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
+                    // The last step sent is finalized once none is in flight.
+                    awaits_step &= gpu_in_flight > 0;
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             route_step_outputs(&requests, outputs).await;
@@ -1991,9 +1997,10 @@ impl AsyncEngine {
                 // 3. Pre-schedule: fill the pipeline up to 2 in-flight
                 //    batches. With placeholder tracking, the scheduler
                 //    correctly accounts for tokens still on the GPU.
-                while gpu_in_flight < 2 {
+                while gpu_in_flight < 2 && !awaits_step {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
+                            let speculative = sched.is_speculative();
                             if sched_tx
                                 .send(ExecutorWork::Execute(Box::new(sched)))
                                 .await
@@ -2002,6 +2009,7 @@ impl AsyncEngine {
                                 break; // Executor thread exited.
                             }
                             gpu_in_flight += 1;
+                            awaits_step = speculative;
                         }
                         Ok(None) => break, // Nothing to schedule.
                         Err(e) => {
