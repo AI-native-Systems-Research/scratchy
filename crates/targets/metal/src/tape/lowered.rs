@@ -1895,6 +1895,9 @@ pub enum LoweringError {
     RopedAttentionShape { index: usize },
     /// A row program's instruction names a weight it holds no layer for.
     RowProgramWeight,
+    /// An expert combine with ends in a bake that does not gather: only the gathered command
+    /// computes them.
+    CombineEndsUngathered,
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.
     ScratchTooLarge {
@@ -1967,6 +1970,9 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: step {index}'s decode attention cannot run its KV writer's command"
             ),
+            Self::CombineEndsUngathered => {
+                f.write_str("lowering: an expert combine's ends in a bake that does not gather")
+            }
             Self::RowProgramWeight => f.write_str(
                 "lowering: a row program instruction reads a weight it has no layer for",
             ),

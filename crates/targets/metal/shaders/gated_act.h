@@ -8,6 +8,13 @@
 
 #include <metal_stdlib>
 
+// A shared expert's combine, `routed + shared · σ(g)` (Qwen3.5-MoE), in float: `gate_scale.metal`
+// and the expert combine that stores it (`quantized_qmv.metal`) both compute it here.
+inline float gate_scale_f(float routed, float shared, float g) {
+  float sig_g = 1.0f / (1.0f + metal::exp(-g));
+  return routed + shared * sig_g;
+}
+
 // SiLU(g) * u, SiLU(g) = g / (1 + exp(-g)) — kept in float so the denormalized tail of the
 // half/bfloat exp() stays representable.
 inline float silu_mul_f(float g, float u) {

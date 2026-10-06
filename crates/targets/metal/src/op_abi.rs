@@ -349,6 +349,9 @@ pub enum MetalFusion {
     /// A one-row step's decode attention that runs its KV writer: it ropes its query, writes the
     /// new row (and encodes it) and reads the step's own key itself.
     RopedAttention,
+    /// A one-row step's gathered expert combine that adds a shared expert's gated rows and the
+    /// residual as it stores each row.
+    CombineEpilogue,
 }
 
 /// The KV writers a decode attention runs itself (`MetalFusion::RopedAttention`): the plain rope
@@ -381,10 +384,11 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     biased: F::MeanSubRmsNormBiasAdd,
                 },
                 FoldPattern::MatvecEpilogue {
-                    matmul: K::MatmulTile,
-                    weights: GemmWeightKind::Affine,
-                    bias: K::BiasAdd,
-                    scale: K::ScalarMul,
+                    anchor: K::MatmulTile,
+                    weights: Some(GemmWeightKind::Affine),
+                    bias: Some(K::BiasAdd),
+                    scale: Some(K::ScalarMul),
+                    gate_scale: None,
                     add: K::Add,
                     gated: &[K::Silu, K::Gelu, K::Mul],
                     kernel: F::QmvEpilogue,
@@ -495,6 +499,17 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     rope: K::RopeAppend,
                     writers: ROPED_ATTENTION_WRITERS,
                     kernel: F::RopedAttention,
+                },
+                // After the expert folds: the combine's command is the down's and the unsort's.
+                FoldPattern::MatvecEpilogue {
+                    anchor: K::ExpertCombine,
+                    weights: None,
+                    bias: None,
+                    scale: None,
+                    gate_scale: Some(K::GateScale),
+                    add: K::Add,
+                    gated: &[],
+                    kernel: F::CombineEpilogue,
                 },
             ],
         ],

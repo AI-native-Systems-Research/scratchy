@@ -1126,11 +1126,11 @@ impl Recording<'_> {
                 self.shared_expert_owned(i)?;
                 let d = self.expert_matmul(self.op_at(i, down)?)?;
                 let out = self.colour(i)?;
-                let step = MoeStep::DownCombine(d.step, out);
+                let step = MoeStep::DownCombine(d.step, out, st::CombineEnds::default());
                 let mut e = self.moe(i, step, &d.reads, &[out], Some(d.weight))?;
                 e.sig.op_scratch = Access::Write;
                 if let Some(raw) = d.raw {
-                    let raw = MoeStep::DownCombine(raw, out);
+                    let raw = MoeStep::DownCombine(raw, out, st::CombineEnds::default());
                     e.raw = Some(MetalStep::Moe(self.block(i)?, raw));
                 }
                 Ok(e)
@@ -1160,6 +1160,43 @@ impl Recording<'_> {
                 let rope = self.fused(w, last)?;
                 let attention = self.kept(i)?.ok_or_else(shape)?;
                 Ok(roped_attention(rope, attention))
+            }
+            // The combine's command — its expert fold's — computing the shared expert's gated rows
+            // and the residual add as it stores each row, into the chain's last buffer.
+            (
+                F::CombineEpilogue,
+                Sh::MatvecEpilogue {
+                    gate_scale, add, ..
+                },
+            ) => {
+                let shape = || self.no(i, Refused::FusionShape);
+                let driven = self.folds.driven(self.steps.slot[i]);
+                let base = driven.len().checked_sub(2).map(|b| &driven[b]);
+                let mut e = self.fused(i, base.ok_or_else(shape)?)?;
+                let mut ends = st::CombineEnds::default();
+                let mut reads = Vec::new();
+                if let Some((_, [shared, g])) = gate_scale {
+                    let pair = (self.read_operand(i, shared)?, self.read_operand(i, g)?);
+                    reads.extend([pair.0, pair.1]);
+                    ends.gate_scale = Some(pair);
+                }
+                if let Some((_, residual)) = add {
+                    reads.push(self.read_operand(i, residual)?);
+                    ends.residual = true;
+                }
+                let last = add.map(|(a, _)| a).or(gate_scale.map(|(c, _)| c));
+                let out = self.colour(self.op_at(i, last.ok_or_else(shape)?)?)?;
+                let with = |step: &MetalStep| match step {
+                    MetalStep::Moe(b, MoeStep::DownCombine(d, _, _)) => {
+                        Ok(MetalStep::Moe(*b, MoeStep::DownCombine(*d, out, ends)))
+                    }
+                    _ => Err(shape()),
+                };
+                e.step = with(&e.step)?;
+                e.raw = e.raw.as_ref().map(with).transpose()?;
+                e.sig.reads.extend(reads);
+                e.sig.writes = vec![out];
+                Ok(e)
             }
             // The writer's command — its earlier fold's, else its own — writing the packed store too.
             (F::KvEncoded, Sh::Encoded { .. }) => {
@@ -1544,7 +1581,16 @@ impl Recording<'_> {
                     ends.norm = Some(st::RowNorm { layer, eps, offset });
                     site.extend(self.site(nrm, WeightKind::RmsNorm, self.weight_of(nrm)?)?);
                 }
-                FusedShape::MatvecEpilogue { bias, scale, add } => {
+                FusedShape::MatvecEpilogue {
+                    bias,
+                    scale,
+                    gate_scale,
+                    add,
+                } => {
+                    // A matvec's store computes no gate scale.
+                    if gate_scale.is_some() {
+                        return Err(self.no(mm, Refused::FusionShape));
+                    }
                     ends.bias = bias.map(|_| match weight {
                         GemmWeight::Affine { .. } => st::BiasStorage::Affine,
                         GemmWeight::Dense | GemmWeight::Fp8Dynamic => st::BiasStorage::Dense,

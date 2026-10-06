@@ -279,7 +279,19 @@ pub fn lower_canonical(
         let tp = crate::tape_program::tape_program(l, stem, m);
         let folds = fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model)
             .map_err(CanonicalRefusal::Fold)?;
-        waved = wave_order(l, metal_colour_rule, folds.absorbed_ops());
+        // What runs no command of its own: a step a fold computes inside another, and the expert
+        // sort of a bake that gathers (its readers bind what it views).
+        let mut free = vec![false; l.input.ops.len()];
+        for &(a, _) in folds.absorbed_ops() {
+            free[a] = true;
+        }
+        for (j, od) in l.input.ops.iter().enumerate() {
+            if let scratchy_subtile::subtile_ir::SubOp::ExpertSort { k, .. } = od.op {
+                free[j] |= od.m.saturating_mul(k.get())
+                    < scratchy_target_metal::op_abi::METAL_SORTED_PAIRS;
+            }
+        }
+        waved = wave_order(l, metal_colour_rule, folds.absorbed_ops(), &free);
         &waved
     } else {
         l

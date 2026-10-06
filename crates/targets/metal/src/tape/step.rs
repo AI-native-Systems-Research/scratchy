@@ -413,6 +413,15 @@ pub struct QmvEnds {
     pub residual: bool,
 }
 
+/// What a gathered expert combine computes as it stores each row (`MetalFusion::CombineEpilogue`):
+/// a shared expert's `(rows, gate)` added scaled by σ of the token's gate (`GateScale`), then the
+/// add into the residual stream its output buffer holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CombineEnds {
+    pub gate_scale: Option<(Slot, Slot)>,
+    pub residual: bool,
+}
+
 /// The RMSNorm a matvec applies to its input: the norm's layer (its gain's), epsilon and gain
 /// offset (`rmsnorm(x, w + offset)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,8 +480,9 @@ pub enum MoeStep {
     /// up reads the gate's rows, layer and group size — routing the block's token first with
     /// `routing` and storing its picks and scores (`MetalFusion::MoeRouted`).
     GateUpAct(ExpertMatmul, ExpertWidth, GatedAct, Option<RouteProgram>),
-    /// `(down, out)`: the down projection, the unsort and the combine into `out`.
-    DownCombine(ExpertMatmul, Slot),
+    /// `(down, out, ends)`: the down projection, the unsort and the combine into `out`, and what
+    /// it computes as it stores each row.
+    DownCombine(ExpertMatmul, Slot, CombineEnds),
     /// The routing from the router logits to the top-k indices and scores.
     Route(RouteProgram),
 }
@@ -580,7 +590,7 @@ impl MetalStep {
                 | MoeStep::ExpertScale(l)
                 | MoeStep::ExpertMatmul(ExpertMatmul { layer: l, .. })
                 | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
-                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, _)
+                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, ..)
                 | MoeStep::Route(RouteProgram {
                     expert_scale: Some(l),
                     ..

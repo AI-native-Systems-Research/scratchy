@@ -55,12 +55,15 @@ pub fn wave_levels(input: &LoweringInput) -> Vec<usize> {
 /// such a step's level is also past every earlier reader of any value living in a buffer it may
 /// write. A read no operand names ([`LoweredDecode::unnamed_reads`]) is an edge like any other.
 /// Nor do data edges order a fold's driver after the steps it absorbed, whose operands its command
-/// reads: each `(ahead, op)` pair — `ahead` before `op` in tape order — keeps `ahead` ahead. The
-/// result is a permutation of the ops: the same steps compute the same values.
+/// reads: each `(ahead, op)` pair — `ahead` before `op` in tape order — keeps `ahead` ahead. An
+/// op the target dispatches nothing for (`free`: a step a fold computes inside another, a view)
+/// takes no level of its own: its readers may run at its level. The result is a permutation of the
+/// ops: the same steps compute the same values.
 pub fn wave_order(
     l: &LoweredDecode,
     rule: fn(&ArchOp) -> ColourRule,
     ahead: &[(usize, usize)],
+    free: &[bool],
 ) -> LoweredDecode {
     let ops = &l.input.ops;
     let n = ops.len();
@@ -98,14 +101,16 @@ pub fn wave_order(
         kept_ahead[op].push(a);
     }
     let mut level = vec![0usize; n];
+    // The first level an op's readers may take: past its own, or at it when it dispatches nothing.
+    let mut ready = vec![0usize; n];
     for i in 0..n {
         for &a in &kept_ahead[i] {
-            level[i] = level[i].max(level[a] + 1);
+            level[i] = level[i].max(ready[a]);
         }
         let mut over: Vec<usize> = Vec::new();
         for input in &ops[i].inputs {
             if let InputRef::Op(j) = input {
-                level[i] = level[i].max(level[*j] + 1);
+                level[i] = level[i].max(ready[*j]);
                 if writes_over(i) {
                     over.push(owner[*j]);
                     // A norm folding the step it reads writes over that step's delta.
@@ -123,6 +128,7 @@ pub fn wave_order(
                 level[i] = level[i].max(level[r] + 1);
             }
         }
+        ready[i] = level[i] + usize::from(!free.get(i).copied().unwrap_or(false));
     }
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| (level[i], i));
@@ -256,10 +262,10 @@ mod tests {
             mul(vec![Op(3)]),
             mul(vec![Op(2), Op(4)]),
         ]);
-        let w = wave_order(&l, in_place_add, &[]);
+        let w = wave_order(&l, in_place_add, &[], &[]);
         assert_eq!(tiles(&w), [0, 3, 1, 4, 2, 5]);
         // An op kept ahead of another holds it back: 3 stays after 2.
-        let kept = wave_order(&l, in_place_add, &[(2, 3)]);
+        let kept = wave_order(&l, in_place_add, &[(2, 3)], &[]);
         assert_eq!(tiles(&kept), [0, 1, 2, 3, 4, 5]);
         // The join reads the two ops it read, wherever they went; it is still the result.
         assert_eq!(w.input.ops[5].inputs, [Op(4), Op(3)]);
@@ -279,11 +285,11 @@ mod tests {
             op(vec![Ext(0), Op(0)]),
             mul(vec![Op(3), Op(4)]),
         ]);
-        let w = wave_order(&l, in_place_add, &[]);
+        let w = wave_order(&l, in_place_add, &[], &[]);
         let at = |tile: u32| tiles(&w).iter().position(|t| *t == tile).unwrap();
         assert!(at(3) < at(4), "{:?}", tiles(&w));
         // A fresh-buffer op with the same operands moves up to its data level.
-        let fresh = wave_order(&l, |_| ColourRule::FRESH, &[]);
+        let fresh = wave_order(&l, |_| ColourRule::FRESH, &[], &[]);
         assert_eq!(tiles(&fresh), [0, 1, 2, 4, 3, 5]);
     }
 
@@ -298,11 +304,11 @@ mod tests {
             mul(vec![Op(1), Op(2)]),
         ]);
         assert_eq!(
-            tiles(&wave_order(&l, |_| ColourRule::FRESH, &[])),
+            tiles(&wave_order(&l, |_| ColourRule::FRESH, &[], &[])),
             [0, 2, 1, 3]
         );
         l.unnamed_reads = vec![(1, 2)];
-        let w = wave_order(&l, |_| ColourRule::FRESH, &[]);
+        let w = wave_order(&l, |_| ColourRule::FRESH, &[], &[]);
         assert_eq!(tiles(&w), [0, 1, 2, 3]);
         // The pair follows its ops.
         assert_eq!(w.unnamed_reads, [(1, 2)]);

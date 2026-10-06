@@ -887,3 +887,92 @@ fn bench_moe_fused() {
         );
     }
 }
+
+/// The combine computing a shared expert's gated rows and the residual add as it stores each row
+/// (`MetalFusion::CombineEpilogue`) leaves the same residual as the combine, `gate_scale`, then
+/// `residual_add`, bit for bit; the same combine without the gate scale leaves another.
+#[test]
+fn combine_ends_match_gate_scale_then_the_residual_add() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    for tokens in [1, 3] {
+        let block = Block::new(&device, tokens, false, EXPERTS);
+        let mut rng = Lcg(0xc0de);
+        let n = tokens * HIDDEN;
+        let shared = common::shared_slice(&device, &rng.bf16s(n, -1.0, 1.0));
+        let g = common::shared_slice(&device, &rng.bf16s(tokens, -3.0, 3.0));
+        let h = rng.bf16s(n, -4.0, 4.0);
+        let residual = common::shared_slice(&device, &h);
+        let gated_rows = common::shared_zeroed(&device, n * 2);
+        // The reference: the fused chain into `fused_out`, then the two kernels.
+        let elementwise = |d: &common::Device, symbol: (&'static str, &'static str), c| {
+            baked_pipeline(d, symbol.0, symbol.1, c).expect(symbol.1)
+        };
+        let gate_scale = elementwise(
+            &device,
+            ("gate_scale", "gate_scale_bf16"),
+            vec![
+                ConstantValue::uint(ConstSlot(0), n as u32),
+                ConstantValue::uint(ConstSlot(1), HIDDEN as u32),
+            ],
+        );
+        let add = elementwise(
+            &device,
+            ("elementwise", "residual_add_bf16_specialized"),
+            vec![],
+        );
+        run(&device, 1, 1, |_| {
+            let mut chain = block.fused(0);
+            chain.extend([
+                Dispatch {
+                    pso: &gate_scale,
+                    buffers: vec![
+                        (&gated_rows, 0),
+                        (&block.fused_out, 1),
+                        (&shared, 2),
+                        (&g, 3),
+                    ],
+                    groups: size(n.div_ceil(256), 1, 1),
+                    threads: size(256, 1, 1),
+                },
+                Dispatch {
+                    pso: &add,
+                    buffers: vec![(&residual, 0), (&gated_rows, 1)],
+                    groups: size(n / 256, 1, 1),
+                    threads: size(256, 1, 1),
+                },
+            ]);
+            chain
+        });
+        let want = bits(&residual, n);
+        assert_ne!(
+            want,
+            bits(&common::shared_slice(&device, &h), n),
+            "tokens={tokens}: no add"
+        );
+        // The combine with its ends (and with the residual add alone), into copies of `h`.
+        let rows = GatherRows::Tokens(TopK(TOP_K as u32));
+        for gate_scaled in [true, false] {
+            let mut c = block.down.constants(rows);
+            c.extend(gate_scaled.then(|| ConstantValue::boolean(ConstSlot(18), true)));
+            c.push(ConstantValue::boolean(ConstSlot(19), true));
+            let ends = block.down.pipeline(&device, "affine_gather_qmv_combine", c);
+            let into = common::shared_slice(&device, &h);
+            run(&device, 1, 1, |_| {
+                let mut chain = block.fused(0);
+                let combine = chain.last_mut().expect("the combine");
+                combine.pso = &ends;
+                for b in combine.buffers.iter_mut().filter(|(_, i)| *i == 7) {
+                    b.0 = &into;
+                }
+                combine.buffers.extend([(&shared, 8), (&g, 9)]);
+                chain
+            });
+            let got = bits(&into, n);
+            match gate_scaled {
+                true => assert_eq!(got, want, "tokens={tokens}: gate scale + residual add"),
+                false => assert_ne!(got, want, "tokens={tokens}: the gate scale matters"),
+            }
+        }
+    }
+}

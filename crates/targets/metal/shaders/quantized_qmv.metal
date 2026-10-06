@@ -1844,6 +1844,14 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 }
 #endif
 
+// 18 / 19: what the combine computes as it stores each row (`MetalFusion::CombineEpilogue`) —
+// 18 the shared expert's rows (buffer 8) scaled by σ of the token's gate (buffer 9) added, as
+// `gate_scale` computes them; 19 the residual add into `out`, as `residual_add` adds it.
+SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_GATE_SCALE_FC, 18);
+SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_RESIDUAL_FC, 19);
+constant constexpr bool COMBINE_GATE_SCALE = COMBINE_GATE_SCALE_FC_SET && COMBINE_GATE_SCALE_FC;
+constant constexpr bool COMBINE_RESIDUAL = COMBINE_RESIDUAL_FC_SET && COMBINE_RESIDUAL_FC;
+
 // The MoE block's down projection and its weighted combine:
 // `out[n, d] = Σ_k down[n, k, d] · scores[n, k]`, summed in slot order (as `moe_weighted_sum`).
 // Each pair's x row is its own (the gated activation's rows); GATHER_PER_ROW is the top-k.
@@ -1863,6 +1871,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     device T_act*          y           [[buffer(5)]],
     const device T_act*    scores      [[buffer(6)]],
     device T_act*          out         [[buffer(7)]],
+    const device T_act*    shared_y    [[buffer(8)]],
+    const device T_act*    gate        [[buffer(9)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
@@ -1880,7 +1890,15 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
                 float(scores[n * uint(GATHER_PER_ROW) + uint(k)]),
                 acc);
     }
-    out[size_t(n) * size_t(OUT_VEC_SIZE) + row] = T_act(acc);
+    const size_t at = size_t(n) * size_t(OUT_VEC_SIZE) + row;
+    T_act v = T_act(acc);
+    if (COMBINE_GATE_SCALE) {
+      v = T_act(gate_scale_f(float(v), float(shared_y[at]), float(gate[n])));
+    }
+    if (COMBINE_RESIDUAL) {
+      v = out[at] + v;
+    }
+    out[at] = v;
   }
 }
 #endif

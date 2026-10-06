@@ -788,12 +788,24 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
 pub struct AffineCombineQmvConstants {
     pub qmv: AffineQmvConstants,
     pub top_k: TopK,
+    /// What it computes as it stores each row: slot 18 a shared expert's gated rows, slot 19 the
+    /// residual add (`COMBINE_GATE_SCALE` / `COMBINE_RESIDUAL`). Unset when it stores the sum alone.
+    pub gate_scale: bool,
+    pub residual: bool,
 }
 
 impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
     fn from(c: AffineCombineQmvConstants) -> Self {
         let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(2), c.top_k.get() as i32));
+        v.extend(
+            c.gate_scale
+                .then(|| ConstantValue::boolean(ConstSlot(18), true)),
+        );
+        v.extend(
+            c.residual
+                .then(|| ConstantValue::boolean(ConstSlot(19), true)),
+        );
         v
     }
 }

@@ -179,17 +179,20 @@ pub enum FoldPattern<K: 'static> {
         gathered_below: u32,
         kernel: K,
     },
-    /// A `matmul` of `weights` read by one step alone, down a chain of such steps: at most a
-    /// `bias`, then a `scale`, then a residual `add` reading the chain as either operand. The
-    /// chain folds into the matmul, which computes it as it stores its rows: the steps before the
-    /// last are absorbed, the last is its epilogue. A chain without an add ends before a step of
-    /// `gated` kinds (the gated folds take the matmul whole). Only on a model whose matvecs take
-    /// their ends ([`ModelFoldFacts::matvec_ends`]).
+    /// An `anchor` (of `weights`, when it carries one) read by one step alone, down a chain of
+    /// such steps: at most a `bias`, then a `scale`, then a `gate_scale` reading the chain as its
+    /// operand 0 (`chain + shared · σ(g)`), then a residual `add` reading the chain as either
+    /// operand — each stage the target's anchor computes, and every operand outside the chain
+    /// computed before the anchor. The chain folds into the anchor, which computes it as it
+    /// stores its rows: the steps before the last are absorbed, the last is its epilogue. A chain
+    /// without an add ends before a step of `gated` kinds (the gated folds take a matmul whole).
+    /// Only on a model whose matvecs take their ends ([`ModelFoldFacts::matvec_ends`]).
     MatvecEpilogue {
-        matmul: SubOpKind,
-        weights: GemmWeightKind,
-        bias: SubOpKind,
-        scale: SubOpKind,
+        anchor: SubOpKind,
+        weights: Option<GemmWeightKind>,
+        bias: Option<SubOpKind>,
+        scale: Option<SubOpKind>,
+        gate_scale: Option<SubOpKind>,
         add: SubOpKind,
         gated: &'static [SubOpKind],
         kernel: K,
@@ -226,7 +229,7 @@ impl<K> FoldPattern<K> {
             Self::Encoded { writer, .. } => *writer,
             Self::NormedMatvecs { norm, .. } => *norm,
             Self::RoutedExperts { top_k, .. } => *top_k,
-            Self::MatvecEpilogue { matmul, .. } => *matmul,
+            Self::MatvecEpilogue { anchor, .. } => *anchor,
             Self::RopedAttention { attention, .. } => *attention,
         }
     }
@@ -359,11 +362,13 @@ pub enum FusedShape {
     RowProgram {
         steps: [Option<SlotId>; ROW_PROGRAM_STEPS],
     },
-    /// The chain this matmul's rows pass through, each step there: its bias, its scale, and the
-    /// residual add (with the add's other operand). The command writes the chain's last buffer.
+    /// The chain this anchor's rows pass through, each step there: its bias, its scale, its gate
+    /// scale (with its `shared` and `g` operands), and the residual add (with the add's other
+    /// operand). The command writes the chain's last buffer.
     MatvecEpilogue {
         bias: Option<SlotId>,
         scale: Option<SlotId>,
+        gate_scale: Option<(SlotId, [StepOperand; 2])>,
         add: Option<(SlotId, StepOperand)>,
     },
 }
@@ -809,14 +814,22 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 Ok(())
             }
             FoldPattern::MatvecEpilogue {
+                anchor,
                 weights,
                 bias,
                 scale,
+                gate_scale,
                 add,
                 gated,
                 kernel,
-                ..
-            } => self.matvec_epilogue(i, weights, [bias, scale, add], gated, kernel),
+            } => self.matvec_epilogue(
+                i,
+                (anchor, weights),
+                [bias, scale, gate_scale],
+                add,
+                gated,
+                kernel,
+            ),
             FoldPattern::RopedAttention {
                 rope,
                 writers,
@@ -1010,20 +1023,33 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
     fn matvec_epilogue(
         &mut self,
         i: usize,
-        weights: GemmWeightKind,
-        [bias, scale, add]: [SubOpKind; 3],
+        (anchor, weights): (SubOpKind, Option<GemmWeightKind>),
+        [bias, scale, gate_scale]: [Option<SubOpKind>; 3],
+        add: SubOpKind,
         gated: &[SubOpKind],
         kernel: K,
     ) -> Result<(), FoldError> {
-        if !self.model.matvec_ends || !self.is_matvec(i, weights) || self.absorbed[i].is_some() {
+        let anchors = match weights {
+            Some(w) => self.is_matvec(i, w),
+            None => self.ops.kind(i) == anchor,
+        };
+        if !self.model.matvec_ends || !anchors || self.absorbed[i].is_some() {
             return Ok(());
         }
         let free = |f: &Self, j: usize| {
             f.absorbed[j].is_none() && f.epilogue[j].is_none() && f.fusions[j].is_empty()
         };
+        // An operand outside the chain: computed before the anchor, which reads it as it stores.
+        let ready = |f: &Self, c: usize, k: u8| -> Result<bool, FoldError> {
+            let r = f.ops.in_op(c, k)?;
+            Ok(r.is_none_or(|r| f.ops.pos[r] < f.ops.pos[i]))
+        };
         let (mut chain, mut cur) = (Vec::new(), i);
         let mut taken = [None; 2];
         for (stage, kind) in [bias, scale].into_iter().enumerate() {
+            let Some(kind) = kind else {
+                continue;
+            };
             let Some(c) = self.sole_reader(cur) else {
                 break;
             };
@@ -1033,20 +1059,27 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             (taken[stage], cur) = (Some(c), c);
             chain.push(c);
         }
+        let mut gate = None;
+        if let Some(kind) = gate_scale
+            && let Some(c) = self.sole_reader(cur)
+            && self.ops.kind(c) == kind
+            && free(self, c)
+            && self.ops.first_op(c) == Some(cur)
+            && ready(self, c, 1)?
+            && ready(self, c, 2)?
+        {
+            gate = Some((c, [self.ops.operand(c, 1), self.ops.operand(c, 2)]));
+            cur = c;
+            chain.push(c);
+        }
         let mut residual = None;
         if let Some(c) = self.sole_reader(cur)
             && self.ops.kind(c) == add
             && free(self, c)
         {
             let at = (0..2u8).find(|&k| self.ops.in_op(c, k).ok().flatten() == Some(cur));
-            // The command adds the residual as it stores its rows: a step must have computed it
-            // by then.
-            let ready = |k: u8| -> Result<bool, FoldError> {
-                let r = self.ops.in_op(c, 1 - k)?;
-                Ok(r.is_none_or(|r| self.ops.pos[r] < self.ops.pos[i]))
-            };
             if let Some(k) = at
-                && ready(k)?
+                && ready(self, c, 1 - k)?
             {
                 residual = Some((c, self.ops.operand(c, 1 - k)));
                 chain.push(c);
@@ -1075,6 +1108,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let shape = FusedShape::MatvecEpilogue {
             bias: taken[0].map(slot),
             scale: taken[1].map(slot),
+            gate_scale: gate.map(|(c, operands)| (slot(c), operands)),
             add: residual.map(|(c, r)| (slot(c), r)),
         };
         self.record(i, kernel, shape);
@@ -1608,10 +1642,11 @@ mod tests {
                     biased: Kern::CentredBiased,
                 },
                 FoldPattern::MatvecEpilogue {
-                    matmul: K::MatmulTile,
-                    weights: GemmWeightKind::Dense,
-                    bias: K::BiasAdd,
-                    scale: K::ScalarMul,
+                    anchor: K::MatmulTile,
+                    weights: Some(GemmWeightKind::Dense),
+                    bias: Some(K::BiasAdd),
+                    scale: Some(K::ScalarMul),
+                    gate_scale: None,
                     add: K::Add,
                     gated: &[K::Gelu, K::Mul],
                     kernel: Kern::Epilogue,
@@ -2044,6 +2079,7 @@ mod tests {
             shape: FusedShape::MatvecEpilogue {
                 bias: Some(s[1]),
                 scale: Some(s[2]),
+                gate_scale: None,
                 add: Some((
                     s[3],
                     StepOperand {

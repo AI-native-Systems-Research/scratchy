@@ -20,6 +20,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "gated_act.h"
 
 using namespace metal;
 
@@ -38,11 +39,7 @@ template <typename T>
     return;
   }
   uint row = gid / GATE_SCALE_COLS;
-  float r = float(routed[gid]);
-  float s = float(shared_y[gid]);
-  float gv = float(g[row]);
-  float sig_g = 1.0f / (1.0f + exp(-gv));
-  out[gid] = static_cast<T>(r + s * sig_g);
+  out[gid] = static_cast<T>(gate_scale_f(float(routed[gid]), float(shared_y[gid]), float(g[row])));
 }
 
 #define INST_GATE_SCALE(dtype_tag, mtl_type) \

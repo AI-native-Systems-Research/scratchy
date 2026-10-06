@@ -7125,23 +7125,32 @@ fn lower_moe_step(
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
         // grid-adjacency (simdgroup k = pair k), which the sort permutes apart — so a sorted or
         // grouped bake runs each step's own commands.
-        S::DownCombine(down, out)
+        S::DownCombine(down, out, ends)
             if s.grouping != MoeGrouping::Gathered || matches!(down.rows, MoeRows::Tokens(_)) =>
         {
+            // Only the gathered command computes the combine's ends.
+            if ends != crate::tape::step::CombineEnds::default() {
+                return Err(LoweringError::CombineEndsUngathered);
+            }
             let steps = [S::ExpertMatmul(down), S::Unsort, S::Combine(out)];
             each_step(&steps, moe_scratch_bytes)?
         }
-        S::DownCombine(down, Slot(out)) => {
+        S::DownCombine(down, Slot(out), ends) => {
             let (AffineGroupSize(gs), bits) = (down.group_size, down.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::DownCombine, hidden, inter, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Down, down.layer, 0)?.to_vec();
             let (x, indices) = (rows_of(&s, 3, down.rows), s.at(4, R::TopKIndices));
             bindings.extend([x, indices, s.at(5, R::ExpertDown)]);
             bindings.extend([s.at(6, R::TopKScores), arena_at(7, out)]);
+            if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {
+                bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
+            }
             let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
             let constants = AffineCombineQmvConstants {
                 qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
                 top_k: b.top_k,
+                gate_scale: ends.gate_scale.is_some(),
+                residual: ends.residual,
             }
             .into();
             vec![cmd(
