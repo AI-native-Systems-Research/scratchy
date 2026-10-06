@@ -765,26 +765,14 @@ pub fn compile_carrier(
     if quantizations_path.exists() {
         tracked_paths.insert(quantizations_path);
     }
-    // ⭐ THE TRITON SPLICE'S KERNELS. `scratchy-triton-splice` reads
-    // `crates/targets/spyre/kernels/*.py` with `std::fs` inside this
-    // expansion, and rustc does not see that read — so without this,
-    // editing a kernel leaves the caller's baked tape stale with no
-    // error (review finding on the splice PR). Same include_str!
-    // mechanism as the JSONs above: the path becomes a declared source
-    // input and cargo rebuilds. UNCONDITIONAL, because the splice is
-    // the only producer: the registry itself decides which kernels
-    // exist; if the directory is absent or empty this adds nothing.
-    {
-        let kernels_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../targets/spyre/kernels");
-        if let Ok(entries) = std::fs::read_dir(&kernels_dir) {
-            for e in entries.flatten() {
-                if e.path().extension().is_some_and(|x| x == "py") {
-                    tracked_paths.insert(e.path());
-                }
-            }
-        }
-    }
+    // The Triton splice's kernels need NO entry here: the splice
+    // `include_str!`s every `.py` it compiles (its registry rows),
+    // which is cargo's own dependency edge — editing a kernel
+    // rebuilds the splice and every caller, on spyre builds only,
+    // with a missing kernel a compile error rather than a silent
+    // fs miss. (The read_dir block this replaces tracked the
+    // directory for EVERY backend and could silently track nothing
+    // on a read error — the stale-bake bug it existed to prevent.)
     // De-dupe before emitting; multiple variants share preset /
     // override paths. Target profile is no longer a separate file —
     // it's compiled into scratchy-target-cuda, so cargo's normal

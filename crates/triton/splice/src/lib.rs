@@ -58,30 +58,22 @@
 //!
 //! # THE GATE, AND WHY IT IS AT THE DESCRIPTOR LEVEL
 //!
-//! Every registry row lands WITH its byte-identity golden: the descriptors the spliced
-//! path emits must be byte-identical to the builder path's (`tests/triton_splice_golden.rs`
-//! keeps the builder bodies as the control for exactly this). The comparison is at the
-//! **EmittedOp/descriptor level, not the KTIR level** — the two producers legitimately
-//! spell the program differently (the builder writes `math.sqrt(mean + eps)` with an f32
-//! island and a divisor; the kernel writes `rsqrt((mean + eps).to(f32)).to(f16)` with a
-//! folded reciprocal), and the consumer (`lower_ktir_to_superdsc`) assembles its
-//! descriptors from `regions()` + the program's stated constants, not from the op soup.
-//! Descriptor identity is therefore the strongest gate that is not also a false one.
+//! The golden (`tests/triton_splice_golden.rs`) checks the splice's `EmittedOp`s: the
+//! `op_name` (the builder's naming law), the attention arm the shape took, and an
+//! emulator `max_abs` numeric comparison for the families the emulator runs (matmul,
+//! elementwise, gelu, rope, fp8 matmul). The builder that preceded the splice is
+//! DELETED — there is no byte-identity control anymore, and nothing in this crate
+//! should claim one. The strongest surviving gates are the numeric ones and the
+//! canonical card A/B per model/quant pair at the PR level.
 //!
 //! # ⛔ THE SHAPE WORK LIST, AS NAMED ERRORS
 //!
 //! The kernel families here state ONE whole-tensor tile at corner 0. A node whose shape
-//! needs more than that is refused LOUDLY, naming the kernel capability that must land:
-//!
-//! * **windowed regions** (the front end's column chunking, production `nb = 8192`) — a
-//!   kernel that states the chunk's access-tile corner;
-//! * **LX row-blocking** (a whole region whose live set exceeds `EW_LX_ELEMS`) — a kernel
-//!   that states multiple row blocks;
-//! * **odd-N result-width matmuls** (granite's 49155 vocab) — a ladder PlanCorelets shape;
-//! * **the prefill lm-head fold** (a vocab-wide matmul at m>1, `!rows_are_requests`).
-//!
-//! Each dies when its kernel lands; none is a fallthrough to a second producer, because
-//! there is no second producer for a spliced kind.
+//! needs more than that is refused LOUDLY, naming the kernel capability that must land.
+//! The historical items (windowed regions, LX row-blocking, the odd-N vocab matmul, the
+//! prefill lm-head fold) have all LANDED — their kernels state the corner (`C_START`),
+//! the row blocks, the device width, and the fold (`lmlast.py` + the m=1 tail); what
+//! remains is whatever the current guards name, which is the honest work list.
 //!
 //! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
 //! against the door: `rope_at` derives every fact it needs (`mq`, `total`, `hd`) from the
@@ -98,7 +90,6 @@
 //! view's `is_fp8`, cross-checked against arity, exactly as the builder's program is.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
@@ -110,16 +101,27 @@ use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 
-/// One registry row: the kernel's file and entry, and the STATED classification — declared
-/// data, not logic. Adding a kernel is a row; nothing else in this crate changes.
-pub struct TritonKernelRow {
-    /// The kernel's file, under `crates/targets/spyre/kernels/`.
-    pub kernel: &'static str,
-    /// The `@triton.jit` function's name inside that file.
-    pub entry: &'static str,
-    /// The stated classification — what `lower_ktir_to_superdsc` dispatches on, and the
-    /// same value the builder path's `finish_shaped` states for this op.
-    pub program: Program,
+/// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
+/// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
+///
+/// ⭐ THE SOURCE RIDES THE ROW AS `include_str!` — a missing kernel file is a COMPILE
+/// error in this crate, not a runtime file-read failure at `#[forward]` expansion. The
+/// include is also cargo's own dependency edge: editing a `.py` rebuilds every caller,
+/// so the tracking block the macros crate used to carry (reading this directory with
+/// `std::fs` per expansion) is gone.
+pub enum TritonKernelRow {
+    /// A kernel this crate can compile: its full source, its entry, its classification.
+    Spliced {
+        src: &'static str,
+        file: &'static str,
+        entry: &'static str,
+        program: Program,
+    },
+    /// A family member whose device realization does not exist yet — DECLARED, never
+    /// discovered at expansion. The message is the refusal the splice states if the
+    /// routing ever hands it here, and the arm keeps the family match exhaustive (E0004
+    /// stays the failure mode for a new family member, not a runtime miss).
+    Refused(&'static str),
 }
 
 // ── THE TOTAL REGISTRY, FAMILY BY FAMILY ─────────────────────────────────────────
@@ -135,8 +137,9 @@ pub struct TritonKernelRow {
 /// kernel + door support land together.
 pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
     match gain {
-        GainConvention::Scale => TritonKernelRow {
-            kernel: "rmsnorm.py",
+        GainConvention::Scale => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/rmsnorm.py"),
+            file: "rmsnorm.py",
             entry: "rmsnorm_fwd",
             program: Program::RmsNorm,
         },
@@ -148,11 +151,11 @@ pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
         // wrong. The arm is the compile-time enumeration; the realization lands here
         // when the door states the offset (metal's own `ScalarOffsetRmsNorm`, whose
         // kernel applies `weight + offset`, is the precedent shape).
-        GainConvention::OnePlusScale => TritonKernelRow {
-            kernel: "rmsnorm.py",
-            entry: "rmsnorm_one_plus_scale_fwd",
-            program: Program::RmsNorm,
-        },
+        GainConvention::OnePlusScale => TritonKernelRow::Refused(
+            "the (1 + w) gain convention: the door's rmsnorm body assembles xn·gamma from \
+             the loaded gain and has no +1 offset statement — the Scale kernel would scale \
+             every activation by roughly nothing. The kernel + door support land together",
+        ),
     }
 }
 
@@ -162,8 +165,9 @@ pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
 /// is a compile error here until the kernel lands.
 pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
     match weight {
-        GemmWeight::Dense => TritonKernelRow {
-            kernel: "matmul.py",
+        GemmWeight::Dense => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/matmul.py"),
+            file: "matmul.py",
             entry: "matmul_fwd",
             program: Program::Matmul,
         },
@@ -173,8 +177,9 @@ pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
         // so both rows reach the same `matmul` door arm. The kernel's spelled
         // `* w_scale` epilogue is what the ladder's
         // `verify_canonical_fp8_matmul_kernel` requires.
-        GemmWeight::Fp8Dynamic => TritonKernelRow {
-            kernel: "matmul_fp8.py",
+        GemmWeight::Fp8Dynamic => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/matmul_fp8.py"),
+            file: "matmul_fp8.py",
             entry: "matmul_fp8_fwd",
             program: Program::Matmul,
         },
@@ -183,11 +188,11 @@ pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
         // affine contraction on this path, so nothing constructs this node on the spyre
         // path. The arm is the compile-time enumeration — a realization lands here
         // WITH its kernel (metal's qmv family is the precedent shape).
-        GemmWeight::Affine { .. } => TritonKernelRow {
-            kernel: "matmul_affine.py",
-            entry: "matmul_affine_fwd",
-            program: Program::Matmul,
-        },
+        GemmWeight::Affine { .. } => TritonKernelRow::Refused(
+            "the affine weight scheme: the wavefront lowering skips affine presets before \
+             a tape is lowered, so no node of this shape is constructed on the spyre path. \
+             A realization lands here WITH its kernel",
+        ),
     }
 }
 
@@ -195,26 +200,31 @@ pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
 /// with the same names the consumer's own refusal uses, so wiring one in fails at E0004
 /// until a producer-side decomposition lands.
 pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
+    let ew_src = || include_str!("../../../targets/spyre/kernels/elementwise.py");
     match kind {
         // Add AND BiasAdd share `add_fwd` — both map to `Elementwise::Add` and the same
         // `add_s{id}` name (the builder's own law).
-        EwKind::Add | EwKind::BiasAdd => TritonKernelRow {
-            kernel: "elementwise.py",
+        EwKind::Add | EwKind::BiasAdd => TritonKernelRow::Spliced {
+            src: ew_src(),
+            file: "elementwise.py",
             entry: "add_fwd",
             program: Program::Elementwise(Elementwise::Add),
         },
-        EwKind::Mul => TritonKernelRow {
-            kernel: "elementwise.py",
+        EwKind::Mul => TritonKernelRow::Spliced {
+            src: ew_src(),
+            file: "elementwise.py",
             entry: "mul_fwd",
             program: Program::Elementwise(Elementwise::Mul),
         },
-        EwKind::Sub => TritonKernelRow {
-            kernel: "elementwise.py",
+        EwKind::Sub => TritonKernelRow::Spliced {
+            src: ew_src(),
+            file: "elementwise.py",
             entry: "sub_fwd",
             program: Program::Elementwise(Elementwise::Sub),
         },
-        EwKind::Silu => TritonKernelRow {
-            kernel: "elementwise.py",
+        EwKind::Silu => TritonKernelRow::Spliced {
+            src: ew_src(),
+            file: "elementwise.py",
             entry: "silu_fwd",
             program: Program::Elementwise(Elementwise::Silu),
         },
@@ -223,8 +233,9 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
         // form through the exp island (the frontend has no `tanh`), which is the same
         // approximation the `"gelu"` primitive itself makes — see `elementwise.py`'s
         // `gelu_fwd`.
-        EwKind::Gelu => TritonKernelRow {
-            kernel: "elementwise.py",
+        EwKind::Gelu => TritonKernelRow::Spliced {
+            src: ew_src(),
+            file: "elementwise.py",
             entry: "gelu_fwd",
             program: Program::Elementwise(Elementwise::Gelu),
         },
@@ -234,18 +245,19 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
         // consumer's own `elementwise_op_func` refusal names exactly this). A
         // realization must DECOMPOSE producer-side (its building blocks — sigmoid,
         // mul — ARE primitives), which is a kernel family of its own.
-        EwKind::QuickGelu => TritonKernelRow {
-            kernel: "elementwise.py",
-            entry: "quickgelu_fwd",
-            program: Program::Elementwise(Elementwise::QuickGelu),
-        },
+        EwKind::QuickGelu => TritonKernelRow::Refused(
+            "quick-gelu: x·σ(1.702x) is a different function from the DDL's tanh-polynomial \
+             gelu, and the DDL has no quick-gelu primitive — substituting `gelu` would run \
+             the wrong model and report success. A realization must decompose \
+             producer-side (sigmoid and mul ARE primitives)",
+        ),
         // ⛔ SAME LAW: exact-erf gelu is the erf form, not the tanh polynomial, and the
         // consumer has no `erf` op either, so a decomposition cannot lower today.
-        EwKind::GeluErf => TritonKernelRow {
-            kernel: "elementwise.py",
-            entry: "gelu_erf_fwd",
-            program: Program::Elementwise(Elementwise::GeluErf),
-        },
+        EwKind::GeluErf => TritonKernelRow::Refused(
+            "exact-erf gelu: the erf form, not the tanh polynomial the DDL primitive makes, \
+             and there is no `erf` op to decompose with — the realization is a kernel \
+             family of its own",
+        ),
     }
 }
 
@@ -254,8 +266,9 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
 /// family — the row is declared here so the registry's own law holds ("adding a
 /// kernel is a row; nothing else in this crate changes").
 pub fn lmlast_row() -> TritonKernelRow {
-    TritonKernelRow {
-        kernel: "lmlast.py",
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/lmlast.py"),
+        file: "lmlast.py",
         entry: "lmlast_fwd",
         program: Program::LmLast,
     }
@@ -265,29 +278,32 @@ pub fn lmlast_row() -> TritonKernelRow {
 /// constexpr-selected arms (the causal one-pass, decode, prefill continuation) are the
 /// builder's own three arms restated, so the row does not branch on shape at all.
 pub fn attn_row() -> TritonKernelRow {
-    TritonKernelRow {
-        kernel: "attn.py",
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/attn.py"),
+        file: "attn.py",
         entry: "attn_fwd",
         program: Program::Attn,
     }
 }
 
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
-/// splice is one of the five families below; the ops the spyre target has no kernel AT
-/// ALL for (attention, the expansion ops, reshape, …) never reach this crate —
-/// `lower_one_node`'s own arms own those refusals by name.
+/// splice is one of the five families below (attention rides its own `lower_attn` entry);
+/// the ops the spyre target has no kernel AT ALL for (the expansion ops, reshape, …)
+/// never reach this crate — `lower_one_node`'s own arms own those refusals by name.
 pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKernelRow {
     match op {
         SubOp::RmsNorm { gain, .. } => rmsnorm_row(*gain),
         SubOp::MatmulTile { weight, .. } => matmul_row(weight),
         SubOp::Elementwise(kind) => elementwise_row(*kind),
-        SubOp::SiluMul => TritonKernelRow {
-            kernel: "silumul.py",
+        SubOp::SiluMul => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/silumul.py"),
+            file: "silumul.py",
             entry: "silumul_fwd",
             program: Program::SiluMul,
         },
-        SubOp::ScalarMul { .. } => TritonKernelRow {
-            kernel: "scalarmul.py",
+        SubOp::ScalarMul { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/scalarmul.py"),
+            file: "scalarmul.py",
             entry: "scalarmul_fwd",
             program: Program::ScalarMul,
         },
@@ -295,17 +311,19 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // and the KV-cache destinations flow through GRAPH edges — the builder's own
         // `lower_rope_node` reads `inputs[0..3]`), so the kernel consumes x/cos/sin/out
         // and the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow {
-            kernel: "rope.py",
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/rope.py"),
+            file: "rope.py",
             entry: "rope_fwd",
             program: Program::Rope,
         },
-        // ATTENTION SPLICES. The builder's `KtirFunc::attn` is the golden's control; the
-        // kernel states the same three arms as constexpr-selected cases, and the door
-        // (`attn_operands`) reads every fact — the q/out views, the swept rung, the scale
-        // — off the program itself. `lower_all_attn` is the entry (the attention needs
-        // door-order bindings, the mask binding, and the dead-prefix view injection that
-        // no pure-Triton program can state).
+        // ATTENTION SPLICES — `lower_attn` is the entry: the kernel states the same
+        // three arms as constexpr-selected cases, and the door (`attn_operands`) reads
+        // every fact — the q/out views, the swept rung, the scale — off the program
+        // itself. This row exists so `row()` stays exhaustive; the walk never routes
+        // attention through `lower_one` (attention needs door-order bindings, the mask
+        // binding, and the dead-prefix view injection that no pure-Triton program can
+        // state).
         SubOp::AttnDecode { .. } => attn_row(),
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
@@ -331,11 +349,11 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
         | SubOp::Mean
-        | scratchy_subtile::expansion_ops!() => TritonKernelRow {
-            kernel: "ROUTED-ELSEWHERE",
-            entry: "ROUTED-ELSEWHERE",
-            program: Program::LmLast,
-        },
+        | scratchy_subtile::expansion_ops!() => TritonKernelRow::Refused(
+            "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \
+             host routing, or its own by-name refusal); reaching the splice means the \
+             routing changed, and the fix is a family function plus a kernel",
+        ),
     }
 }
 
@@ -430,20 +448,29 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
-    let row = row(&node.op); // ⛔ THE ROUTING IS `lower_one_node`'S EXHAUSTIVE MATCH, and this guard is its echo:
-    // the kinds that never route here carry the ROUTED-ELSEWHERE sentinel row, and a
-    // node that reaches this check means the routing changed without adding a family
-    // function — the message names the owner. It is unreachable through
-    // `lower_one_node` by construction (its match is exhaustive over the same enum),
-    // and this is a public fn, so the echo exists for the direct caller.
-    if row.kernel == "ROUTED-ELSEWHERE" {
+    // ⛔ THE ROUTING IS `lower_one_node`'s EXHAUSTIVE MATCH, and a `Refused` row here
+    // is its echo: the kinds that never route here carry one, and a node that reaches
+    // this check means the routing changed without adding a family function — the
+    // message names the owner. Unreachable through `lower_one_node` by construction
+    // (its match is exhaustive over the same enum); this is a public fn, so the echo
+    // exists for the direct caller.
+    let row = row(&node.op);
+    let TritonKernelRow::Spliced {
+        src,
+        file,
+        entry,
+        program,
+    } = &row
+    else {
+        let TritonKernelRow::Refused(why) = &row else {
+            unreachable!()
+        };
         return Err(format!(
-            "triton splice: {:?} is not a spliced kind — `lower_one_node` owns its lowering \
-             (attention's geometry door, the host-routed pair, or its own by-name refusal). \
-             Routing it here means adding a family function and a kernel",
+            "triton splice: {:?} — {why}. Routing it here means adding a family \
+             function and a kernel",
             node.op
         ));
-    }
+    };
     // ⛔ THE LM-HEAD TAIL'S FOLD IS `lower_all`'s now — the vocab-wide m>1 matmul is
     // rewritten THERE (last-row extraction + the re-lowered m=1 matmul), so a
     // MatmulTile reaching THIS one-op body with m>1 over the result cols means the
@@ -521,7 +548,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
                     "triton splice: {} t{} has a windowed region (not the whole tensor) — the \
                      one-tile kernels state corner 0 only; the windowed-kernel family (access-tile \
                      corners stated from the region) has not landed",
-                    program_stem(node, &row),
+                    program_stem(node, program),
                     node.output.tensor.index()
                 ));
             }
@@ -538,7 +565,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
                     "triton splice: {} t{} has a nonzero ROW corner — the pointwise kernels \
                      load row 0 (`start_m * BLOCK_M` at a [1] grid); a row-windowed kernel is the \
                      prefill-fold worklist item",
-                    program_stem(node, &row),
+                    program_stem(node, program),
                     node.output.tensor.index()
                 ));
             }
@@ -573,25 +600,22 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => {
             return Err(format!(
-                "triton splice: {} has a registry row but no arity — the row is incomplete",
-                row.kernel
+                "triton splice: {file} has a registry row but no arity — the row is incomplete"
             ));
         }
     };
     if node.inputs.len() < arity {
         return Err(format!(
-            "triton splice: {} t{} expects at least {} operand(s), found {}",
-            row.kernel,
+            "triton splice: {file} t{} expects at least {} operand(s), found {}",
             node.output.tensor.index(),
             arity,
             node.inputs.len()
         ));
     }
-    let src = read_kernel(row.kernel)?;
-    let spec = kernel_spec(node, ir, &row)?;
-    let m = compile_kernel(&src, &spec, &grid(node, ir)?)?;
-    let k = mint(node, m, &row)?;
-    let name = format!("{}_s{}", program_stem(node, &row), node.id.index());
+    let spec = kernel_spec(node, ir, file, entry)?;
+    let m = compile_kernel(src, &spec, &grid(node, ir)?)?;
+    let k = mint(node, m, program)?;
+    let name = format!("{}_s{}", program_stem(node, program), node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
     Ok(e)
@@ -638,7 +662,10 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let last_hidden = ktir_superdsc::reserved_tids::LAST_HIDDEN_TID;
 
     // ── Half 1: the extraction, through the lmlast kernel. ──
-    let src = read_kernel("lmlast.py")?;
+    let src = match lmlast_row() {
+        TritonKernelRow::Spliced { src, .. } => src,
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for p in ["desc_src", "desc_dst"] {
@@ -662,7 +689,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
         signature: signature.clone(),
         constexprs: constexprs.clone(),
     };
-    let module = compile_kernel(&src, &spec, &[1])?;
+    let module = compile_kernel(src, &spec, &[1])?;
     let extraction_node = SubtileNode {
         id: node.id,
         op: node.op,
@@ -675,7 +702,11 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
             },
         },
     };
-    let mut k = mint(&extraction_node, module, &lmlast_row())?;
+    let lmlast_program = match lmlast_row() {
+        TritonKernelRow::Spliced { program, .. } => program,
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    let mut k = mint(&extraction_node, module, &lmlast_program)?;
     // The KtirNode's own fields: `node_out_tid` names the TAIL'S output (the door
     // names its copies `lmlast{j}_o{tid}` after it), and the name is the builder's
     // `lmlast_s{id}` law.
@@ -712,13 +743,6 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(vec![extract, matmul])
 }
 
-/// Read a kernel file from `crates/targets/spyre/kernels/`.
-fn read_kernel(kernel: &str) -> Result<String, String> {
-    let path = kernels_dir().join(kernel);
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("triton splice: cannot read {}: {e}", path.display()))
-}
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  ATTENTION — the one spliced kind whose program is NOT a straight parameter-for-tensor
 //  substitution, which is why it gets its own entry rather than riding `lower_one`:
@@ -750,6 +774,10 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
 ) -> Result<EmittedOp, String> {
     let row = attn_row();
+    let (src, attn_program) = match &row {
+        TritonKernelRow::Spliced { src, program, .. } => (*src, program),
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
     let SubOp::AttnDecode { geom, scale, .. } = &node.op else {
         return Err(
             "triton splice: lower_attn called on a node that is not an AttnDecode — the \
@@ -818,7 +846,6 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
     // carries exactly the value `program_score_scale` reads back — the door resolves the
     // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.
-    let src = read_kernel(row.kernel)?;
     let spec = attn_kernel_spec(
         node,
         &AttnFacts {
@@ -836,7 +863,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             one_pass,
         },
     )?;
-    let mut module = compile_kernel(&src, &spec, &[1])?;
+    let mut module = compile_kernel(src, &spec, &[1])?;
     // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
     // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
     // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
@@ -860,7 +887,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     if !has_mask {
         truncate_unused_mask_param(&mut module)?;
     }
-    let k = mint_attn(node, ir, module, &row, has_mask)?;
+    let k = mint_attn(node, ir, module, attn_program, has_mask)?;
     let name = format!("attn_s{}", node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
@@ -970,7 +997,7 @@ fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         kernel: "attn_fwd".to_string(),
         signature,
         constexprs,
-        file: kernels_dir().join("attn.py").to_string_lossy().into_owned(),
+        file: "attn.py".to_string(),
     })
 }
 
@@ -1102,10 +1129,10 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     module: triton_ktir::ir::Module,
-    row: &TritonKernelRow,
+    program: &Program,
     mask_bound: bool,
 ) -> Result<KtirNode, String> {
-    let positional = triton_ktir_superdsc::node_for(&module, row.program)
+    let positional = triton_ktir_superdsc::node_for(&module, *program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
     // kc (inputs[1]), kd (inputs[3]), vc (inputs[2]), vd (inputs[4]) — the order
@@ -1150,16 +1177,6 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     })
 }
 
-/// `crates/targets/spyre/kernels/` — resolved from THIS crate's manifest dir.
-fn kernels_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../targets/spyre/kernels")
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../targets/spyre/kernels")
-        })
-}
-
 /// THE KERNEL'S LAUNCH CONTRACT, stated from the node's own shapes — the signature (one
 /// descriptor per operand plus the output), the constexprs (the node's facts as
 /// `tl.constexpr`s, the monomorphisation key), all in the case-table's own shape
@@ -1167,13 +1184,14 @@ fn kernels_dir() -> PathBuf {
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    row: &TritonKernelRow,
+    file: &str,
+    entry: &str,
 ) -> Result<KernelSpec, String> {
     let out = &node.output;
     let (m, c) = (out.region.rows.len, out.region.cols.len);
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    match (&node.op, row.entry) {
+    match (&node.op, entry) {
         (SubOp::RmsNorm { eps, .. }, "rmsnorm_fwd") => {
             // The fixture's own parameter spellings: desc_x, desc_w, desc_o, then the
             // constexprs M / D_MODEL / BLOCK_M / EPS / INV_D. Every constexpr is BOTH a
@@ -1491,13 +1509,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
     }
     Ok(KernelSpec {
-        kernel: row.entry.to_string(),
+        kernel: entry.to_string(),
         signature,
         constexprs,
-        file: kernels_dir()
-            .join(row.kernel)
-            .to_string_lossy()
-            .into_owned(),
+        file: file.to_string(),
     })
 }
 
@@ -1773,10 +1788,10 @@ fn compile_kernel_uncached(
 fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     module: triton_ktir::ir::Module,
-    row: &TritonKernelRow,
+    program: &Program,
 ) -> Result<KtirNode, String> {
     // The adapter's mint: `to_ktir_emit::lower` over the module, positional buffer ids.
-    let positional = triton_ktir_superdsc::node_for(&module, row.program)
+    let positional = triton_ktir_superdsc::node_for(&module, *program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⛔ BINDINGS ARE THE TAPE'S TENSOR INDICES, in the node's operand order, with the
     // output LAST — the exact law `KtirFunc::finish_shaped` states. `regions()` reads
@@ -1797,7 +1812,11 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     bindings.push(BufferId::new(node.output.tensor.index() as u32));
     // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key are
     // identical between the two paths — the byte-identity golden's requirement.
-    let name = Arena::global().str(format!("{}_s{}", program_stem(node, row), node.id.index()));
+    let name = Arena::global().str(format!(
+        "{}_s{}",
+        program_stem(node, program),
+        node.id.index()
+    ));
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
         return Err(format!(
@@ -1824,7 +1843,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// row may therefore mint several stems; the node states which.
 fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
-    row: &TritonKernelRow,
+    program: &Program,
 ) -> &'static str {
     if let SubOp::Elementwise(kind) = &node.op {
         return match kind {
@@ -1839,7 +1858,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
             other => unreachable!("elementwise kind {other:?} has no program stem"),
         };
     }
-    match row.program {
+    match program {
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
