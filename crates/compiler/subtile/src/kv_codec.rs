@@ -33,6 +33,12 @@ pub enum CodecGuard {
 }
 
 impl CodecGuard {
+    /// Whether a step under this guard runs on a decode step of a coded model. A dense model's
+    /// steps carry no guard.
+    pub const fn at_decode(self) -> bool {
+        matches!(self, Self::Codec | Self::CodecDecode)
+    }
+
     /// The guard that holds exactly when this one does not, where the vocabulary has one.
     pub const fn negation(self) -> Option<Self> {
         match self {

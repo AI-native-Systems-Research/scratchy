@@ -345,6 +345,35 @@ struct ExpertRecord {
     weight: (WeightKind, usize),
 }
 
+/// A decode attention running its KV writer's record (`MetalFusion::RopedAttention`): both steps,
+/// touching what either touches, the writer's weight sources first.
+fn roped_attention(rope: Emission, attention: Emission) -> Emission {
+    let (r, a) = (rope.sig, attention.sig);
+    let sig = HazardSig {
+        reads: [r.reads, a.reads].concat(),
+        writes: [r.writes, a.writes].concat(),
+        kv_w: r.kv_w.or(a.kv_w),
+        kv_r: a.kv_r.or(r.kv_r),
+        op_scratch: r.op_scratch.max(a.op_scratch),
+        codec_staging: r.codec_staging.max(a.codec_staging),
+        group: a.group,
+        metadata: false,
+    };
+    let step = MetalStep::RopedAttention(Box::new(st::RopedAttention {
+        writer: rope.step,
+        attention: attention.step,
+        writer_sources: rope.sites.len(),
+    }));
+    Emission {
+        step,
+        gate: attention.gate,
+        raw: None,
+        sig,
+        sites: [rope.sites, attention.sites].concat(),
+        lm_head: false,
+    }
+}
+
 fn em(step: MetalStep, reads: &[Slot], writes: &[Slot], sites: Vec<WeightSlot>) -> Emission {
     let sig = HazardSig {
         reads: reads.to_vec(),
@@ -692,9 +721,12 @@ impl Recording<'_> {
         let rope = |j: &usize| matches!(self.op(*j), SubOp::RopeAppend { .. });
         let no = || self.no(i, Refused::CodecUnanchored);
         let w = self.group(encode).find(rope).ok_or_else(no)?;
-        let StepRole::Drives(f) = self.folds.role(self.steps.slot[w]) else {
-            return Err(no());
-        };
+        // The writer's command — its last fold's — whether it runs it or the attention does.
+        let f = self
+            .folds
+            .driven(self.steps.slot[w])
+            .last()
+            .ok_or_else(no)?;
         let e = self.fused(w, f)?;
         let (layer, pairing, class, offsets) = match e.step {
             MetalStep::RopeAppend(.., l, p, c, offsets, _) => (l, p, c, offsets),
@@ -1120,6 +1152,15 @@ impl Recording<'_> {
                 kept.ok_or_else(|| self.no(i, Refused::FusionShape))
             }
             (F::RowProgram, Sh::RowProgram { steps }) => self.row_program(i, &steps),
+            // The attention's own record, running its writer's — the writer's last fold's.
+            (F::RopedAttention, Sh::RopedAttention { writer }) => {
+                let w = self.op_at(i, writer)?;
+                let shape = || self.no(i, Refused::FusionShape);
+                let last = self.folds.driven(writer).last().ok_or_else(shape)?;
+                let rope = self.fused(w, last)?;
+                let attention = self.kept(i)?.ok_or_else(shape)?;
+                Ok(roped_attention(rope, attention))
+            }
             // The writer's command — its earlier fold's, else its own — writing the packed store too.
             (F::KvEncoded, Sh::Encoded { .. }) => {
                 let driven = self.folds.driven(self.steps.slot[i]);

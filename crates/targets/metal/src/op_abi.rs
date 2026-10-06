@@ -342,7 +342,14 @@ pub enum MetalFusion {
     NormAdd,
     /// A group of row-wise steps over one width.
     RowProgram,
+    /// A one-row step's decode attention that runs its KV writer: it ropes its query, writes the
+    /// new row (and encodes it) and reads the step's own key itself.
+    RopedAttention,
 }
+
+/// The KV writers a decode attention runs itself (`MetalFusion::RopedAttention`): the plain rope
+/// writer and its folded-in encode, not the normed one.
+const ROPED_ATTENTION_WRITERS: &[MetalFusion] = &[MetalFusion::RopeAppend, MetalFusion::KvEncoded];
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
 /// (operands 1..) out of the cache its rope wrote, so only its query is a consumer edge.
@@ -471,6 +478,19 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     sort: K::ExpertSort,
                     gathered_below: METAL_SORTED_PAIRS,
                     kernel: F::MoeRouted,
+                },
+                // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.
+                FoldPattern::RopedAttention {
+                    attention: K::AttnDecode,
+                    rope: K::RopeAppend,
+                    writers: ROPED_ATTENTION_WRITERS,
+                    kernel: F::RopedAttention,
+                },
+                FoldPattern::RopedAttention {
+                    attention: K::AttnPackedKv,
+                    rope: K::RopeAppend,
+                    writers: ROPED_ATTENTION_WRITERS,
+                    kernel: F::RopedAttention,
                 },
             ],
         ],

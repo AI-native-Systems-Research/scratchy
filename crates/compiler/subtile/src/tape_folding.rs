@@ -194,6 +194,17 @@ pub enum FoldPattern<K: 'static> {
         gated: &'static [SubOpKind],
         kernel: K,
     },
+    /// A one-row step's decode `attention` — one that runs on a decode step, which every one-row
+    /// step is — absorbs the `rope` KV writer its query (operand 0) comes out of: it ropes the
+    /// query, writes the row and reads the step's own key itself. Only a writer whose every fold
+    /// is one of `writers`, unabsorbed, whose outputs no step that runs on a decode step reads but
+    /// the attention. Apply it after the writer's own folds.
+    RopedAttention {
+        attention: SubOpKind,
+        rope: SubOpKind,
+        writers: &'static [K],
+        kernel: K,
+    },
 }
 
 /// The stages a routing fold's scores may pass through after the gather.
@@ -216,6 +227,7 @@ impl<K> FoldPattern<K> {
             Self::NormedMatvecs { norm, .. } => *norm,
             Self::RoutedExperts { top_k, .. } => *top_k,
             Self::MatvecEpilogue { matmul, .. } => *matmul,
+            Self::RopedAttention { attention, .. } => *attention,
         }
     }
 }
@@ -337,6 +349,11 @@ pub enum FusedShape {
     /// [`FusedShape::Route`] fold.
     Routed {
         top_k: SlotId,
+    },
+    /// The KV writer the attention runs: its command is the writer's folds' last, which the
+    /// attention's absorbs.
+    RopedAttention {
+        writer: SlotId,
     },
     /// A row program's steps, in tape order, the driver last.
     RowProgram {
@@ -479,7 +496,7 @@ impl std::fmt::Display for FoldError {
 /// `lowered` carries the op list `graph` was lowered from (the table is keyed on its ops), the
 /// source bindings (a weight operand is one bound to a weight), and each op's canonical tile — the
 /// node order a matcher over the canonical graph meets candidates in.
-pub fn fold_tape<K: Copy>(
+pub fn fold_tape<K: Copy + PartialEq>(
     graph: &SubtileIR,
     tape: &SubtileTape,
     lowered: &LoweredDecode,
@@ -693,7 +710,7 @@ struct Folder<'a, K> {
     fusions: Vec<Vec<Fusion<K>>>,
 }
 
-impl<K: Copy> Folder<'_, K> {
+impl<K: Copy + PartialEq> Folder<'_, K> {
     fn apply(&mut self, pattern: &FoldPattern<K>, i: usize) -> Result<(), FoldError> {
         match *pattern {
             FoldPattern::Sibling {
@@ -792,7 +809,61 @@ impl<K: Copy> Folder<'_, K> {
                 kernel,
                 ..
             } => self.matvec_epilogue(i, weights, [bias, scale, add], gated, kernel),
+            FoldPattern::RopedAttention {
+                rope,
+                writers,
+                kernel,
+                ..
+            } => self.roped_attention(i, rope, writers, kernel),
         }
+    }
+
+    /// One-row attention `i` absorbing the `rope` writer its query comes out of
+    /// ([`FoldPattern::RopedAttention`]).
+    fn roped_attention(
+        &mut self,
+        i: usize,
+        rope: SubOpKind,
+        writers: &[K],
+        kernel: K,
+    ) -> Result<(), FoldError> {
+        let expansion = &self.ops.lowered.op_expansion;
+        let at_decode = |j: usize| {
+            expansion[j]
+                .and_then(|x| x.guard)
+                .is_none_or(|g| g.at_decode())
+        };
+        if self.ops.rows[i] != 1 || !at_decode(i) {
+            return Ok(());
+        }
+        let Some(q) = self.ops.in_op(i, 0)? else {
+            return Ok(());
+        };
+        let w = match self.absorbed[q] {
+            Some(w) if self.ops.kind(w) == rope => w,
+            None if self.ops.kind(q) == rope => q,
+            _ => return Ok(()),
+        };
+        let folds = &self.fusions[w];
+        if self.absorbed[w].is_some()
+            || folds.is_empty()
+            || !folds.iter().all(|f| writers.contains(&f.kernel))
+        {
+            return Ok(());
+        }
+        // The writer's group: the writer and what its folds took.
+        let group = |x: usize| x == w || self.absorbed[x] == Some(w);
+        for j in (0..self.ops.slot.len()).filter(|&j| j != i && !group(j)) {
+            let reads_group = self.ops.args[j]
+                .iter()
+                .any(|a| matches!(a, Arg::Op(x) if group(*x)));
+            if reads_group && at_decode(j) {
+                return Ok(());
+            }
+        }
+        let writer = self.ops.slot[w];
+        self.absorb(i, &[w], kernel, FusedShape::RopedAttention { writer });
+        Ok(())
     }
 
     /// Every free row-wise step into row programs, from the tape's end ([`RowFold`]).
@@ -1498,6 +1569,7 @@ mod tests {
         Epilogue,
         Rows,
         Routed,
+        RopedAttention,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -2384,6 +2456,79 @@ mod tests {
         for e in [k, v] {
             assert_eq!(f.role(s[e]), StepRole::Kept);
         }
+    }
+
+    /// A one-row step's coded attention — its decode twin — absorbs the KV writer its query comes
+    /// out of, with every fold the writer made; its not-decode anchor, which never runs on a
+    /// one-row step, stays. A two-row step folds nothing, nor does a writer with a fold the target
+    /// does not list.
+    #[test]
+    fn a_one_row_decode_attention_absorbs_its_kv_writer() {
+        const ROPED: &[&[FoldPattern<Kern>]] = &[
+            SWEEPS[0],
+            SWEEPS[1],
+            SWEEPS[2],
+            &[FoldPattern::RopedAttention {
+                attention: SubOpKind::AttnPackedKv,
+                rope: SubOpKind::RopeAppend,
+                writers: &[Kern::Rope, Kern::Encoded],
+                kernel: Kern::RopedAttention,
+            }],
+        ];
+        const TABLE_ROPED: FusionTable<Kern> = FusionTable {
+            counted: &[],
+            sweeps: ROPED,
+            rows: None,
+        };
+        const PLAIN_ONLY: FusionTable<Kern> = FusionTable {
+            counted: &[],
+            sweeps: &[
+                SWEEPS[0],
+                SWEEPS[1],
+                SWEEPS[2],
+                &[FoldPattern::RopedAttention {
+                    attention: SubOpKind::AttnPackedKv,
+                    rope: SubOpKind::RopeAppend,
+                    writers: &[Kern::Rope],
+                    kernel: Kern::RopedAttention,
+                }],
+            ],
+            rows: None,
+        };
+        let coded = |m: u32| {
+            let mut input = one_layer_input_shaped(256, 64, 512, 64);
+            input.ops.iter_mut().for_each(|od| od.m = m);
+            // The activation and its rotary rows: one per token.
+            for x in [0, 5, 6] {
+                input.sources[x].rows = m;
+            }
+            expand_kv_codec(&front_end_lowered(input), &TURBOQUANT_SHAPED_CODEC).expect("expands")
+        };
+        let l = coded(1);
+        let at = |name| l.input.ops.iter().position(|od| od.op.name() == name);
+        let (writer, twin) = (at("RopeAppend").unwrap(), at("AttnPackedKv").unwrap());
+        let anchor = at("AttnDecode").unwrap();
+        let (s, f) = fold_lowered(&l, &TABLE_ROPED, SPLIT);
+        let roped = Fusion {
+            kernel: Kern::RopedAttention,
+            shape: FusedShape::RopedAttention { writer: s[writer] },
+        };
+        assert_eq!(f.role(s[twin]), StepRole::Drives(&roped));
+        assert_eq!(f.role(s[writer]), StepRole::Absorbed { into: s[twin] });
+        assert_eq!(
+            f.driven(s[writer]).len(),
+            2,
+            "the writer's own folds stay recorded"
+        );
+        assert_eq!(f.role(s[anchor]), StepRole::Kept);
+
+        let (s, f) = fold_lowered(&coded(2), &TABLE_ROPED, SPLIT);
+        assert_eq!(f.role(s[twin]), StepRole::Kept);
+        assert!(matches!(f.role(s[writer]), StepRole::Drives(_)));
+
+        let (s, f) = fold_lowered(&l, &PLAIN_ONLY, SPLIT);
+        assert_eq!(f.role(s[twin]), StepRole::Kept);
+        assert!(matches!(f.role(s[writer]), StepRole::Drives(_)));
     }
 
     #[test]
