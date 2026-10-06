@@ -81,7 +81,8 @@ template <typename T>
   int slot = state_indices[seq];
   uint code = gdn_step[seq];
   uint start = code & 0xffu;
-  uint drafts = (code >> 8) & 0xffu;
+  // A model without drafts (`GDN_CONV_DRAFTS` 0) neither replays nor checkpoints.
+  uint drafts = GDN_CONV_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   uint entry = uint(slot) * (GDN_CONV_DRAFTS == 0u ? 1u : GDN_CONV_DRAFTS + 2u);
   // A verify step checkpoints the window after each of its rows.
   uint checkpoint_rows = drafts == 0u ? 0u : drafts + 1u;
@@ -95,7 +96,8 @@ template <typename T>
 
   // Seed the causal window from the start entry (zero when fresh).
   device float* state_ptr = conv_state + (entry * conv_dim + d) * state_len;
-  const device float* start_ptr = state_ptr + (start >= 2u ? (start - 1u) * entry_len : 0u);
+  const device float* start_ptr =
+      state_ptr + (GDN_CONV_DRAFTS > 0u && start >= 2u ? (start - 1u) * entry_len : 0u);
   float window[GDN_CONV_KMAX];
   for (uint ki = 0; ki < state_len; ki++) {
     window[ki] = start == 1u ? 0.0f : start_ptr[ki];

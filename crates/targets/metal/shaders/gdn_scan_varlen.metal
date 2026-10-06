@@ -95,9 +95,11 @@ template <typename T>
   if (slot_ix < 0) {
     return;
   }
+  // A model without drafts (`GDN_SCAN_DRAFTS` 0) neither replays nor records: its scan compiles to
+  // the plain one.
   uint code = gdn_step[i_n];
   uint start = code & 0xffu;
-  uint drafts = (code >> 8) & 0xffu;
+  uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   uint area = (code >> 16) & 1u;
 
   // The slot: its state entry, then (with drafts) two record areas of `GDN_SCAN_DRAFTS + 1` rows,
@@ -110,7 +112,7 @@ template <typename T>
   device float* state_row = slot + (i_hv * Vd + i_v) * K;
   const device float* kept = slot + entry_len + area * area_len;
   device float* recorded = slot + entry_len + (1u - area) * area_len;
-  int replayed = start >= 2u ? int(start - 1u) : 0;
+  int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
 
   float b_h[GDN_SCAN_KMAX];
   for (uint ki = 0; ki < K; ki++) {
@@ -246,9 +248,11 @@ template <typename T>
   if (seq_len <= 0 || slot_ix < 0 || i_v >= Vd) {
     return;
   }
+  // A model without drafts (`GDN_SCAN_DRAFTS` 0) neither replays nor records: its scan compiles to
+  // the plain one.
   const uint code = gdn_step[i_n];
   const uint start = code & 0xffu;
-  const uint drafts = (code >> 8) & 0xffu;
+  const uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   const uint area = (code >> 16) & 1u;
 
   // The slot, as `gdn_scan_varlen` lays it out.
@@ -260,7 +264,7 @@ template <typename T>
   device float* state_row = slot + (i_hv * Vd + i_v) * K + lane * NPT;
   const device float* kept = slot + entry_len + area * area_len;
   device float* recorded = slot + entry_len + (1u - area) * area_len;
-  const int replayed = start >= 2u ? int(start - 1u) : 0;
+  const int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
 
   float st[NPT];
   for (uint i = 0; i < NPT; i++) {
