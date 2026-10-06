@@ -176,6 +176,13 @@ struct Diag {
     /// `SCRATCHY_SDSC_OPTRACE`: after each on-card op, D2H every segment and print nonzero-count +
     /// max|.| — the op index where the signal collapses IS the divergence.
     optrace: bool,
+    /// `SCRATCHY_SDSC_TENSORDUMP=<dir>`: after each on-card op, D2H the readable segments and write
+    /// every placement whose bytes MOVED since the last dump as LE-f32 files named to match the
+    /// emulator's `SCRATCHY_EMU_TENSORDUMP` (`prog{idx}_seg{seg}_t{tid}.bin` + `.n`, plus a
+    /// `op{op}_…` timeline copy and an `ops.txt` mapping op numbers to programs) — the bisection
+    /// instrument for a card-vs-emulator divergence. The prog index is a per-FINGERPRINT global in
+    /// first-dumped order, and `progs.txt` records the assignment so a diff never has to guess it.
+    tensordump: Option<std::path::PathBuf>,
     /// `SCRATCHY_SDSC_LAUNCH_MARK`: one line BEFORE each submit naming the op and rep.
     ///
     /// ⭐ IT EXISTS FOR THE ONE FAULT NO OTHER PATH CAN ATTRIBUTE. `RAS::PCI::BusFence` (0xa35e) is
@@ -207,6 +214,8 @@ impl Diag {
                 phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
                 prep_time: on("SCRATCHY_SDSC_PREP_TIME"),
                 optrace: on("SCRATCHY_SDSC_OPTRACE"),
+                tensordump: std::env::var_os("SCRATCHY_SDSC_TENSORDUMP")
+                    .map(std::path::PathBuf::from),
                 launch_mark: on("SCRATCHY_SDSC_LAUNCH_MARK"),
                 reset_probe: std::env::var("SCRATCHY_SDSC_RESET_PROBE")
                     .ok()
@@ -551,6 +560,34 @@ pub struct Executor {
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
+    /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
+    /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
+    /// and its own op counter. `None` unless the env gate is set.
+    dump: Option<TensorDump>,
+}
+
+/// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
+struct TensorDump {
+    /// This fingerprint's program index, assigned from the process-global first-dumped registry.
+    prog: usize,
+    /// This session's op counter (one per launch group, prefix/body/suffix alike).
+    op: usize,
+    /// Last-seen device bytes per placement (sen format, exactly what D2H brought back).
+    snap: std::collections::HashMap<bundle::PlaceId, Vec<u8>>,
+}
+
+/// The process-global fingerprint → program-index registry for the tensordump, in first-dumped
+/// order. On the card the sessions are built prefill-first-then-decode, which is the emulator's
+/// program order (`new_multi`: prefill first, then the decode cap buckets), so the indices line up
+/// with an `SCRATCHY_EMU_TENSORDUMP` of the same run for the two sessions that actually run — the
+/// ladder rungs that never launch never claim an index.
+fn dump_prog_index(fp: &str) -> usize {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let reg = REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let n = reg.len();
+    *reg.entry(fp.to_string()).or_insert(n)
 }
 
 // Driven single-threaded by the worker thread (the session moves between forwards, as the C++
@@ -683,6 +720,7 @@ impl Executor {
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
+            dump: None,
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -2463,6 +2501,9 @@ impl Executor {
             if d.optrace {
                 self.optrace(oi)?;
             }
+            if d.tensordump.is_some() {
+                self.tensordump(oi, op)?;
+            }
         }
         Ok(())
     }
@@ -2769,6 +2810,150 @@ impl Executor {
             line.push_str(&format!(" | seg{i} {stat}"));
         }
         eprintln!("{line}");
+        Ok(())
+    }
+
+    /// ⭐ CARD-SIDE TENSORDUMP (`SCRATCHY_SDSC_TENSORDUMP=<dir>`) — the emulator-diff half of the
+    /// bisection instrument. After the op at `oi` settles, D2H every readable segment and write each
+    /// placement whose bytes MOVED since the last dump:
+    ///
+    /// * `prog{P}_seg{S}_t{T}.bin` + `.n` — the LATEST value, named to match the emulator's
+    ///   `SCRATCHY_EMU_TENSORDUMP` (`ktir-emulator/src/resident.rs`) so a diff joins on
+    ///   (program, tensor id). The emulator's `seg` is ITS planned-segment index (a run of fused
+    ///   nodes) while ours is the memory segment — the join key is (prog, tid), never the seg number.
+    /// * `op{O}_prog{P}_seg{S}_t{T}.bin` + `.n` — the timeline copy, one file per write, so the
+    ///   FIRST divergent op for a tensor is the first `op…` file that disagrees with the emulator's
+    ///   trajectory for that tid.
+    /// * `ops.txt` — one line per op: `op{O} prog{P} list-oi {label}`. `progs.txt` — the
+    ///   fingerprint → program-index assignment.
+    ///
+    /// First-writer semantics match the emulator's dump law (only tensors the segment actually
+    /// wrote), by CHANGE DETECTION on the host shadow rather than by an output list: a card launch
+    /// group carries its program's arg→tensor mapping but no direction, and a byte-move is the same
+    /// evidence the emulator's `PROBE6` change detection uses. A recolored slot whose bytes moved
+    /// under an ALIASED tensor fires here too — the diff script must tolerate a card-only dump file
+    /// (the emulator has no entry for that tid at that point), which is why every file is
+    /// self-describing via `.n`.
+    ///
+    /// Elements are LE f32 converted from the device's SEN169 fp16 (2 B/elem) — the same
+    /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, in
+    /// `raw_ids`) are dumped as i32→f32 with `.n = size/4` so the file stays comparable; the
+    /// emulator never dumps those (host-bound sources), so they simply have no reference file.
+    /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
+    /// with one `skip.txt` line so the gap is visible rather than silent.
+    fn tensordump(&mut self, oi: usize, op: &OpProg) -> Result<()> {
+        let Some(dir) = Diag::get().tensordump.clone() else {
+            return Ok(());
+        };
+        if self.dump.is_none() {
+            let prog = dump_prog_index(&self.code.fp);
+            let _ = std::fs::create_dir_all(&dir);
+            // Append (never truncate): a run may build several sessions, and the registry line for
+            // each is one row.
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("progs.txt"))
+            {
+                let _ = writeln!(f, "prog{prog} fp={}", self.code.fp);
+            }
+            self.dump = Some(TensorDump {
+                prog,
+                op: 0,
+                snap: std::collections::HashMap::new(),
+            });
+        }
+        let _ = self.stream_ref()?.synchronize();
+        // D2H every segment a placement can live in. seg2's shadow is one page (clamped read), and
+        // an aliased segment's device region belongs to its owner — reading it back is still SOUND
+        // (a read never writes), it just reflects the owner's bytes, which is exactly what this
+        // session's launches compute against.
+        let mut got = [0usize; NUM_SEGMENTS];
+        for (i, g) in got.iter_mut().enumerate() {
+            if self.seg_addr[i].is_none() {
+                continue;
+            }
+            *g = self
+                .d2h_seg_clamped(SegIdx::checked(i as i64).expect("< NUM_SEGMENTS"))
+                .unwrap_or(0);
+        }
+        let dump = self.dump.as_mut().expect("just initialized");
+        dump.op += 1;
+        let (prog, opno) = (dump.prog, dump.op);
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("ops.txt"))
+            {
+                let _ = writeln!(f, "op{opno} prog{prog} list-oi={oi} {}", op.label());
+            }
+        }
+        let mut skipped = String::new();
+        for (id, p) in &self.places {
+            if p.bank != 0 || p.size == 0 {
+                continue; // a banked weight is not in its segment's region
+            }
+            let i = p.segment as usize;
+            if i >= NUM_SEGMENTS || self.seg_addr[i].is_none() {
+                continue;
+            }
+            // Only whole-tensor reads that the clamped D2H actually brought back: a placement past
+            // the shadow's window would read stale host bytes and masquerade as a write.
+            let avail = got[i] as u64;
+            if avail == 0 || p.offset + p.size > avail {
+                if p.segment as usize == SEG_WEIGHT.get() {
+                    // The weight segment's shadow is full-size; a miss there is a layout shock.
+                    skipped.push_str(&format!(
+                        "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
+                        p.segment, p.offset, p.size, avail
+                    ));
+                }
+                continue;
+            }
+            let cur = &self.seg_host[i][p.offset as usize..][..p.size as usize];
+            let moved = match dump.snap.get(id) {
+                Some(prev) => prev.as_slice() != cur,
+                None => cur.iter().any(|b| *b != 0),
+            };
+            if !moved {
+                continue;
+            }
+            dump.snap.insert(*id, cur.to_vec());
+            let raw = self.raw_ids.contains(id);
+            let elems = if raw { p.size as usize / 4 } else { p.size as usize / 2 };
+            let mut vals = Vec::with_capacity(elems);
+            if raw {
+                for c in cur.as_chunks::<4>().0 {
+                    vals.push(i32::from_le_bytes(*c) as f32);
+                }
+            } else {
+                for c in cur.as_chunks::<2>().0 {
+                    vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(u16::from_le_bytes(
+                        *c,
+                    ))));
+                }
+            }
+            let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let stem = format!("prog{prog}_seg{}_t{id}", p.segment);
+            let tl = format!("op{opno}_prog{prog}_seg{}_t{id}", p.segment);
+            let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
+            let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
+            let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
+            let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+        }
+        if !skipped.is_empty() {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("skip.txt"))
+            {
+                let _ = write!(f, "{skipped}");
+            }
+        }
         Ok(())
     }
 
