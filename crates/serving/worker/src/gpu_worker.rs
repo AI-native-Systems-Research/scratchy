@@ -5577,6 +5577,8 @@ impl Worker for MetalWorker {
         // ── 8. The head's drafts ────────────────────────────────
         // For the requests the engine planned, from this step's rows and the tokens just
         // committed; the engine schedules them into the next step.
+        // TODO: the step's tokens wait for these passes, so a prompt's first token waits for the
+        // head's pass over every prompt row (`spec_decode::mtp`'s module docs).
         let plan = &scheduler_output.draft_req_ids;
         let draft_token_ids = match (self.mtp_drafter, draft_seed_inputs.as_ref()) {
             (Some(drafter), Some(seed)) if !plan.is_empty() => {

@@ -23,6 +23,11 @@ pub struct HeadRegistration {
     pub drafts: u8,
     /// The most sequences a step drafts for (`spec_max_seqs`, its arch.json): a step of more runs
     /// as its target alone.
+    ///
+    /// TODO: one gate per declared device profile and target, computed at expansion from the
+    /// verify and plain tapes' costs, in place of one count for every GPU and every target of the
+    /// arch (`scratchy_serving_engine::spec_decode::mtp`'s module docs: what it is measured at,
+    /// and what blocks it).
     pub max_seqs: u8,
 }
 
