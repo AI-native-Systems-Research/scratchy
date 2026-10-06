@@ -601,12 +601,13 @@ pub enum Attr {
     SplatFloat(FloatBits),
     /// An affine map, as its printed body (`"(d0, d1) -> (d1, d0)"`).
     ///
-    /// Kept as text ON PURPOSE, and it is the one place this module does. The
-    /// passes ported here only ever build identity maps, permutations of them, and
-    /// the three fixed `linalg.generic` maps; NONE of them inspects a map's
-    /// interior. scratchy has a real `AffineMap` (1378 lines of `affine.rs`) and a
-    /// swap adopts it -- which is exactly why this stays behind [`Attr`] instead
-    /// of being spread through the passes.
+    /// Kept as text ON PURPOSE, and it is the one place this module does. The passes
+    /// ported here only ever build identity maps, permutations of them, and the three
+    /// fixed `linalg.generic` maps; no pass inspects a map's interior — the one reader
+    /// (`dot_to_linalg`'s `weight_is_n_by_k`) compares whole strings against its own
+    /// `TRANSPOSED_B_MAPS` const. scratchy has a real `AffineMap` (1378 lines of
+    /// `affine.rs`) and a swap adopts it — which is exactly why this stays behind
+    /// [`Attr`] instead of being spread through the passes.
     AffineMap(String),
     AffineMapList(Vec<String>),
     /// An affine set (`ktdp` coordinate/tile sets), same reasoning as
