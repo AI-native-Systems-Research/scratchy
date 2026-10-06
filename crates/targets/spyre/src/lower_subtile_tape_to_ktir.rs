@@ -112,30 +112,8 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
-    // The negative-symbol-id counter and the bundle layout are the CONSUMER's facts now:
-    // every spliced kind hands the door a program, and `ktir_superdsc`'s own walk mints
-    // both. They remain parameters because the re-rolled walk's other consumers thread
-    // them; the spliced arms state them through the splice's own mint instead.
-    _sym_id_base: &mut i64,
-    _layout: Option<&BundleLayout>,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
-    // ── PREFILL (m>1) LM-HEAD TAIL, FOLDED TO m=1 — the prefill bundle produces the FIRST generated
-    // token's logits itself, so TTFT is ONE forward, not two. ──
-    // The vocab-wide (≈49159-col) lm_head cannot run at m>1: it ALWAYS time-tiles, and per-row (m>1)
-    // time-tiling is unimplemented (design-risk-4 Err). Only the LAST prompt token's logits are ever
-    // read, so the tail runs at m=1 over `last_hidden[1, hidden]` = row `selector_lastrow_col(mq)` of the
-    // final-norm output — which is exactly the shape the PROVEN decode path lowers. See
-    // [`LAST_HIDDEN_TID`] for why the extraction is per-stick copies rather than a one-hot matmul.
-    //
-    // DETECT BY VOCAB-WIDTH, not `output tid == ir.result`: granite has a LOGITS ScalarMul AFTER the
-    // lm_head matmul, so `ir.result` is the ScalarMul's output — the matmul's OWN tid never equals it (the
-    // observed miss: the lm_head matmul t1129 kept time-tiling because ir.result was the ScalarMul t1130).
-    // The lm_head matmul AND the logits ScalarMul are the ONLY ops whose output spans the result cols
-    // (vocab); every intermediate is hidden/intermediate width. So BOTH re-lower at m=1.
-    // The mq=1 DECODE bundle is UNAFFECTED (out_rows==1 ⇒ not the prefill tail ⇒ lowered as before).
-    let result_cols = ir.tensors[ir.result.index() as u32 as usize].cols;
-    let _ = result_cols; // retained: the lm-head tail shapes are now the splice's to state
     match &node.op {
         // The rest of the arch vocabulary. It reaches this emitter because the SHARED
         // front end expresses every op instead of asserting the unsupported ones away
@@ -286,14 +264,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
     let bundle_layout =
         compute_bundle_layout(ir, weight_ids, rows_are_requests, &Default::default())?;
-    let layout = Some(&bundle_layout);
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
-    // The SINGLE monotonic negative-symbol-id counter for the WHOLE bundle (design
-    // risk #1): every tiled tensor/core gets `-(++sym_id_base)`, threaded through
-    // each node-lowering so ids never collide across ops in one bundle (torch-spyre
-    // `symbol_id_offset_counter`). A per-op restart would alias addresses and
-    // silently corrupt — we assert disjointness below.
-    let mut sym_id_base: i64 = 0;
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
     // partial (silently-wrong) bundle is never baked (guard-every-crash rule).
@@ -307,14 +278,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
     for node in &ir.nodes {
-        match lower_one_node(
-            node,
-            ir,
-            active_cap,
-            rows_are_requests,
-            &mut sym_id_base,
-            layout,
-        ) {
+        match lower_one_node(node, ir, active_cap, rows_are_requests) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -461,18 +425,10 @@ pub fn graph_wiring<F: RopeForm>(
     // ⛔ NO LAYER CLASSES, for the same reason [`lower_graph_to_superdsc`] passes none: this walks
     // the UNROLLED graph, which has no layer loop and so no boundary a weight BANK may fall on.
     let layout = compute_bundle_layout(ir, weight_ids, false, &Default::default())?;
-    let mut sym_id_base: i64 = 0;
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
     for node in &ir.nodes {
-        let lowered = lower_one_node(
-            node,
-            ir,
-            ActiveCap::FULL,
-            false,
-            &mut sym_id_base,
-            Some(&layout),
-        );
+        let lowered = lower_one_node(node, ir, ActiveCap::FULL, false);
         let ops = match lowered {
             NodeLowering::Ops(v) => v,
             // A host-routed op runs off the device, so it has no program and binds nothing. It
@@ -633,8 +589,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             }
         }
     }
-    let layout = Some(&bundle_layout);
-    let mut sym_id_base: i64 = 0;
     let (mut prefix, mut body, mut suffix): (Vec<EmittedOp>, Vec<EmittedOp>, Vec<EmittedOp>) =
         (Vec::new(), Vec::new(), Vec::new());
     let mut iters: u32 = 0;
@@ -793,14 +747,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         group_weight_banks[(seg as usize).min(2)].insert(p.bank);
                     }
                 }
-                match lower_one_node(
-                    n,
-                    ir,
-                    active_cap,
-                    rows_are_requests,
-                    &mut sym_id_base,
-                    layout,
-                ) {
+                match lower_one_node(n, ir, active_cap, rows_are_requests) {
                     NodeLowering::Ops(v) => match seg {
                         0 => prefix.extend(v),
                         1 => body.extend(v),

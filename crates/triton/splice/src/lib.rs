@@ -377,10 +377,10 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     let is_prefill_lm_head_tail = node.output.region.cols.len == result_cols
         && node.output.region.rows.len > 1
         && !rows_are_requests;
-    if let SubOp::MatmulTile { .. } = &node.op {
-        if is_prefill_lm_head_tail {
-            return lower_prefill_lm_head_fold(node, ir);
-        }
+    if let SubOp::MatmulTile { .. } = &node.op
+        && is_prefill_lm_head_tail
+    {
+        return lower_prefill_lm_head_fold(node, ir);
     }
     // ⭐ THE LOGITS SCALARMUL IS THE TAIL'S SECOND HALF — main's own law
     // (`lower_scalarmul_node(&node_at_one_row(node), …)` under the same
@@ -389,11 +389,11 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     // too. Left un-folded it scales mq × vocab logits of which mq−1 rows were
     // never written — row 0 is still right (which is why text A/Bs pass), but
     // the device pays mq−1 rows of reads of unwritten logits for nothing.
-    if let SubOp::ScalarMul { .. } = &node.op {
-        if is_prefill_lm_head_tail {
-            let at_m1 = node_at_one_row(node);
-            return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
-        }
+    if let SubOp::ScalarMul { .. } = &node.op
+        && is_prefill_lm_head_tail
+    {
+        let at_m1 = node_at_one_row(node);
+        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
     }
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
 }
@@ -419,7 +419,7 @@ fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     SubtileNode {
         id: node.id,
-        op: node.op.clone(),
+        op: node.op,
         inputs,
         output: one_row(&node.output),
     }
@@ -1699,6 +1699,12 @@ fn compile_kernel(
     // never leak into the key, or two identical specs could miss. `Val::Float` is keyed
     // by its BITS: -0.0 and 0.0 compile identically but `f64::to_bits` distinguishes
     // them, and distinguishing is the safe direction for a cache key.
+    // ⛔ AND A VARIANT WITH NO INJECTIVE SPELLING SITS THE WHOLE SPEC OUT of the memo:
+    // `Dtype`/`Seq`/`Ir`/`Desc`/`Slice` carry payloads this key does not spell, so two
+    // specs differing only inside one would share a key and the second would be served
+    // the first's module. No row binds them today; a row that ever does pays a full
+    // compile per call (correct, just unmemoized) rather than risking a wrong hit.
+    let mut memo_eligible = true;
     let mut cvals: BTreeMap<&str, String> = BTreeMap::new();
     for (name, v) in &spec.constexprs {
         let s = match v {
@@ -1707,15 +1713,10 @@ fn compile_kernel(
             Val::Bool(b) => format!("b{b}"),
             Val::Str(s) => format!("s{s}"),
             Val::None => "none".to_string(),
-            // A dtype or a sequence cannot be a top-level constexpr binding in any
-            // kernel this splice states (the rows bind ints, floats and bools only);
-            // spelling the discriminant keeps the key total rather than panicking on
-            // a future row.
-            Val::Dtype(_) => "dtype".to_string(),
-            Val::Seq(_) => "seq".to_string(),
-            Val::Ir(_) => "ir".to_string(),
-            Val::Desc { .. } => "desc".to_string(),
-            Val::Slice => "slice".to_string(),
+            Val::Dtype(_) | Val::Seq(_) | Val::Ir(_) | Val::Desc { .. } | Val::Slice => {
+                memo_eligible = false;
+                continue;
+            }
         };
         cvals.insert(name.as_str(), s);
     }
@@ -1731,11 +1732,13 @@ fn compile_kernel(
     }
     key.push('\0');
     key.push_str(src);
-    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    if memo_eligible && let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return Ok(hit);
     }
     let module = compile_kernel_uncached(src, spec, grid)?;
-    CACHE.with(|c| c.borrow_mut().insert(key, module.clone()));
+    if memo_eligible {
+        CACHE.with(|c| c.borrow_mut().insert(key, module.clone()));
+    }
     Ok(module)
 }
 
