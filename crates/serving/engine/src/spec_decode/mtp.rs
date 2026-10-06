@@ -116,9 +116,8 @@
 //! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
 //!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
 //!   optional, and refuse a value that differs from the head's.
-//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +407
-//!   lines net against main, 41 of them declared tables (`op_abi.rs`); shaders +220; the metal
-//!   compiler +34.
+//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +413
+//!   lines net against main, 47 of them in `op_abi.rs`; shaders +226; the metal compiler +49.
 
 use std::collections::{HashMap, HashSet};
 
