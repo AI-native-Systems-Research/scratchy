@@ -135,10 +135,10 @@ Both engines are asked to run "the same model". But the file each one loads was
 output. One comparison therefore cannot separate the engine from the quantizer,
 so the comparison runs two rungs:
 
-| rung | the question it answers | engines | what differs |
-|---|---|---|---|
-| **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | scratchy vs **ollama** | engine **and** quantizer |
-| **R2** "matched weights" | is scratchy's engine competitive when the weights are identical? | scratchy vs **mlx-lm** | engine only — the *same files*, at 4 bits |
+| rung | the question it answers | engines | what differs | lane / endpoint |
+|---|---|---|---|---|
+| **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | scratchy vs **ollama** | engine **and** quantizer | A **and** B, `/v1/messages` |
+| **R2** "matched weights" | is scratchy's engine competitive when the weights are identical? | scratchy vs **mlx-lm** | engine only — the *same files*, at 4 bits | **A only**, `/v1/chat/completions` — mlx-lm has no Anthropic surface ([why](#r2-as-it-will-run--the-concrete-pair)) |
 
 R1 is the headline. R2 keeps it from being dismissed as a quantizer comparison.
 
@@ -288,15 +288,47 @@ byte-equality proof — there is one file. That also lifts the restriction the
 bf16 fallback carried: **R2 covers the whole model set, not just the 12b**, since
 nothing here is 4× its quantized footprint.
 
-Two disclosures ride with this rung:
+Three disclosures ride with this rung, and the third is a hard scope limit:
 
-1. **KV-cache dtype is still unmatched, and now it is the only axis that is.**
-   `metal` implies `turboquant` while mlx-lm uses an uncompressed cache — exactly
-   the disclosure `docs/BENCHMARKING.md` §4 already carries, and the same
-   match-or-disclose resolution as [item 1 below](#what-a-rung-does-not-pin).
+1. **KV-cache dtype is still unmatched, and now it is the only *weights-adjacent*
+   axis that is.** `metal` implies `turboquant` while mlx-lm uses an uncompressed
+   cache — exactly the disclosure `docs/BENCHMARKING.md` §4 already carries, and
+   the same match-or-disclose resolution as
+   [item 1 below](#what-a-rung-does-not-pin).
 2. **Process shape differs** — scratchy is one static binary, mlx-lm is CPython
    plus MLX (`docs/BENCHMARKING.md:199`). It bears on startup and RSS, not on
    steady-state decode, and a published row says which.
+3. **R2 cannot run on `/v1/messages`, so it is Lane A only and spans-blind.**
+   `mlx_lm.server` serves `/v1/completions`, `/v1/chat/completions`,
+   `/chat/completions`, `/v1/models` and `/health`; **`/v1/messages` 404s** —
+   there is no Anthropic surface and no `anthropic-version` handling
+   (`mlx_lm/server.py`, `do_POST`'s `request_factories`). Three consequences,
+   none of which a weight match removes:
+   - **R2 is Lane A only.** Claude Code speaks the Anthropic API exclusively, so
+     the live driver cannot point at mlx-lm at all. Every R2 number is a replay
+     number; no R2 row may carry an outcome claim.
+   - **R2 must be driven on `/v1/chat/completions` on *both* sides**, scratchy
+     included, so the rung stays internally consistent. scratchy serves that
+     endpoint too (`crates/e2e/src/client.rs:92-188`), so this costs an adapter
+     in the replay client, not a second build.
+   - **R1 and R2 numbers are not cross-comparable**, because they are taken on
+     different endpoints with different request translation. R2 answers "is
+     scratchy's engine competitive at matched weights"; it cannot be subtracted
+     from an R1 row.
+
+   **And per-tool relocatable spans are unmeasurable on R2.** The spans path
+   exists only on `/v1/messages` (`crates/serving/api/src/anthropic.rs:431-436`),
+   so the one *specifically* Claude Code optimization in the tree is inert on the
+   matched-weights rung by construction. It is R1-only evidence, which is a
+   sharper constraint than the epic's "inert while prefix caching is off" note for
+   qwen — that one is architectural, this one is endpoint-structural.
+
+   This revises the epic's stated foundation. #158 says both engines expose
+   `/v1/messages`, "so one client measures both with no per-engine adapter — that
+   is the fact the whole method rests on." It holds for **R1**, where both
+   engines do; it does not hold for R2's comparator, and the replay client needs
+   an OpenAI-compatible target it was not specified to have (a knock-on for
+   #164's T2.1).
 
 ###### Why R2 is not ollama at bf16
 
@@ -520,6 +552,9 @@ an estimate.
 | ~~R1, ollama side — tag digest and the quantization each default tag carries~~ | — | **resolved, T0.6**: all three are `gguf`/`Q4_K_M`; digests and sizes recorded in [R1](#r1--what-a-user-gets) and [R2](#how-this-was-established-and-how-to-re-verify-it) |
 | ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — ollama's own NVFP4/MXFP8 requantization, so ollama cannot supply matched 4-bit weights. R2 re-scoped to **scratchy vs mlx-lm** on the shared mlx-community checkpoint, all three models |
 | whether mlx-lm loads the three pinned checkpoints, and its pinned version | phase 4 setup | `mlx_lm.server` against each repo; T0.6 identified artifacts, it served nothing |
+| an OpenAI-compatible target in the replay client, for R2 | **#164 T2.1** | mlx-lm has no `/v1/messages`, so R2 needs `/v1/chat/completions` on both sides — the client was specified for the Anthropic path only |
+| R1-vs-R2 comparability | **not resolvable** | different endpoints and different request translation; each rung is read on its own, and no R2 figure is subtracted from an R1 row |
+| a matched-weights measurement of **per-tool spans** | **not resolvable** | spans exist only on `/v1/messages`, which R2's comparator does not serve — spans are R1-only evidence |
 | does `ollama create` preserve an mlx-community affine-int4 checkpoint? | open — cheap to test | if it does, ollama rejoins a matched-weights rung at 4 bits; if it requantizes, the path is closed. Read the resulting manifest's per-tensor `__metadata__` |
 | does ollama's MLX engine draft when `draft_num_predict` is **unset**? | **T0.4** | every `-mlx` tag ships draft weights with the knob unset; unset is not off. Measure it — a manifest cannot answer it |
 | ollama spec decode — disabled, or measured and disclosed, on **R1**? | **T0.4** + phase 4's spec-decode ablation | all three default tags set `draft_num_predict` 2–3; prefer overriding it on the default tag over switching to the older non-MTP builds |
