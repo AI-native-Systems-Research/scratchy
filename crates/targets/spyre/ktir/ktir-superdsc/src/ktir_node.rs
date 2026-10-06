@@ -375,8 +375,8 @@ pub struct KtirNode {
     ///
     /// ⛔ AND IT CANNOT BE THE PROGRAM'S NAME. A program is named `<kind>_s<node index>` and MUST be
     /// (the emulator keys functions by name and the front end column-chunks one wide node into
-    /// several nodes sharing ONE output tensor, so `_o{tid}` collides — MEASURED, see `KtirFunc`'s
-    /// note). So the node's output tensor is stated here, by the producer that built both halves.
+    /// several nodes sharing ONE output tensor, so `_o{tid}` collides — MEASURED, see the deleted
+    /// builder's note). So the node's output tensor is stated here, by the producer that built both halves.
     ///
     /// ⭐ THIS ONE STAYS, AND IT IS A BINDING, NOT A SIDECAR. Unlike the shapes and the constants that
     /// used to sit beside it, no reading can recover this: the extraction's parameters are the staging

@@ -84,7 +84,7 @@ pub fn matmul_dims<DF: DataFormat>(
 // ⚠️ SCOPED SURVIVOR, AND IT IS A PERFORMANCE GATE — NOT A SEMANTIC AUTHORITY.
 //
 // The row KIND now lives in a type (`sdsc_abstract::QueryRows<ROWS_ARE_REQUESTS>`) and is threaded
-// through the signatures that make SEMANTIC decisions (`lower_rope_node`, `lower_attn_node`). What
+// through the signatures that make SEMANTIC decisions (main's `lower_rope_node`, `lower_attn_node`). What
 // remains here is one PERF/COMPATIBILITY choice: "a decode batch must not split `mb`", whose purpose is
 // to leave prefill's hardware-proven bundles byte-identical while stopping a decode batch from reloading
 // the stationary weight per split. It is not a correctness fact about what a row means.

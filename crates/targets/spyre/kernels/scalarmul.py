@@ -22,7 +22,7 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE LOAD NAMES THE WINDOW — the front end's
 column chunking (`n_blocks(out_cols, nb)`, production `nb = 8192`) splits one wide
 pointwise op into chunks that share one output tensor, and the builder's own program
-states each chunk's access-tile corner (`KtirFunc::load_region` honors
+states each chunk's access-tile corner (main's `KtirFunc::load_region` honors
 `region.cols.start`). The descriptor's shape/strides are therefore the TENSOR's
 (`[M, N_TOTAL]` / `[N_TOTAL, 1]`), never the chunk's, and the load/store corner is
 `C_START` — stating the chunk's width as the descriptor's would stride the store

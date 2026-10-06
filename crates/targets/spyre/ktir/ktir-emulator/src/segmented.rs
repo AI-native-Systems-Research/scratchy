@@ -210,7 +210,7 @@ pub(crate) fn apply_attention_rewrites<'a>(a: &'a Arena, module: &mut IRModule<'
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(crate::memory::lx_fusion_budget);
-    // ⭐ MATMUL LX-FIT TILING FIRST. `KtirFunc` emits ONE untiled `linalg.matmul` per contraction,
+    // ⭐ MATMUL LX-FIT TILING FIRST. The producer emits ONE untiled `linalg.matmul` per contraction,
     // because the tiling is a property of the device that runs it — the card DECLARES its work
     // division (`WorkPlan::divide` / `time_tile_for_lx`) and never wants a loop nest. This emulator
     // executes the ops against a real 2 MB LX and cannot hold `W[2048, 2048]` fp16 (8 MB) whole, so

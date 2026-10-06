@@ -19,7 +19,7 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 * CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N`, `M_TOTAL` — stated by
   the splice from the node's own regions (`A is [M, K]`, the out tile is `[M, N]`,
   all blocks the whole extents — ONE tile, the same whole-region law
-  `KtirFunc::matmul` states).
+  main's `KtirFunc::matmul` states).
 * GRID: `[1]`.
 
 THE ORIENTATION: the weight descriptor is the PRESENTED weight's own on-disk `[n, k]`
@@ -27,7 +27,7 @@ buffer (the region the executor binds verbatim on the emulator path), and the `.
 the single-dot canonical verifier's transposed form — `verify_canonical_matmul_kernel`
 admits `tt.trans` directly over the weight load, and `dot_to_linalg` folds that trans
 into the transpose-B `indexing_maps = [[0,2],[1,2],[0,1]]`: the EXACT maps scratchy's
-own `KtirFunc::matmul` states (it views the weight `view_shaped(w, n, k)` and carries
+own `KtirFunc::matmul` from main states (it views the weight `view_shaped(w, n, k)` and carries
 the transposition in the maps). The two paths therefore not only emit byte-identical
 descriptors but also contract the same bytes the same way on EVERY executor, with no
 orientation seam between the door and the program.
@@ -70,7 +70,7 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
     # presented weight's own `[N, K]` on-disk region at the DEVICE width (the
     # zero-padded staging); the `.T` below is the transposed canonical form
     # (`tt.trans` directly over the load), which `dot_to_linalg` folds into the
-    # transpose-B indexing maps — the same maps `KtirFunc::matmul` states over the
+    # transpose-B indexing maps — the same maps main's `KtirFunc::matmul` states over the
     # same bytes.
     # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — the out
     # descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N]` (the storage the
@@ -101,6 +101,6 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
     # wide accumulator to keep.
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float16)
     # ONE dot, no K-loop: BLOCK_K == K, the same single-tile whole-region law
-    # `KtirFunc::matmul` states (one `linalg.matmul`, no scf.for).
+    # `KtirFunc::matmul` from main states (one `linalg.matmul`, no scf.for).
     p = tl.dot(a, w, acc)
     o_desc.store([start_m, start_m], p)

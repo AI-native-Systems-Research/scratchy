@@ -8492,7 +8492,7 @@ fn emit_superdsc_wiring(
             .collect()
     };
     // ⭐ EVERY COMPILE-TIME SCALAR THE KTIR READS, from the bake's own registry — not recomputed
-    // here from the config. `KtirFunc::splat_scale` bakes the INDEX into each program, so the list
+    // here from the config. The programs bake the INDEX into themselves, so the list
     // the worker binds has to be the same list, in the same order, that the lowering indexed.
     let scalarmul_scale_lits: Vec<proc_macro2::Literal> = gk
         .scalarmul_scales

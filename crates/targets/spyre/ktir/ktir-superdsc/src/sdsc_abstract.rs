@@ -2458,7 +2458,7 @@ impl Stk<KernelTag> {
 /// K cache as a `[hd, cap]` cap-sticked KERNEL, decodes it as the correct score. This is EXACTLY the
 /// consumer's device-address model evaluated at `(in=d, out=slot)` — i.e. `dev_off(&[hd, cap], 1,
 /// &[d, slot])` — so producer and consumer cannot diverge by construction. It is the single source of
-/// truth shared by: (a) the emitter's per-element build guard (`lower_attn_node`), (b) the interpreter
+/// truth shared by: (a) the deleted builder's per-element build guard (`lower_attn_node`), (b) the interpreter
 /// proof below, and (c) (mirrored in C++) the shim's `host_kv_write` scatter. `stk` = elems per stick.
 ///
 /// The bug this replaces: the cachewr used to write NATURAL slot-major `slot*hd + d`, which differs
@@ -4661,8 +4661,8 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
 /// new tokens, query row `row` (0-based within the chunk) attends new-token column `col` iff `col <= row`
 /// — the token attends itself + all EARLIER new tokens, never a LATER one. Additive mask: 0 when valid,
 /// −∞ when `col > row`. This is the `[mq,mq]` causal block that folds (jointly with the prefix score
-/// [mq,cap]) into ONE softmax per query row. SINGLE SOURCE OF TRUTH shared by (a) the emitter's `cmask`
-/// fill for the mq>1 attention (`lower_attn_node`, the batched-prefill path replacing the mq>1 build-Err)
+/// [mq,cap]) into ONE softmax per query row. SINGLE SOURCE OF TRUTH shared by (a) the deleted builder's
+/// `cmask` fill for the mq>1 attention (`lower_attn_node`, the batched-prefill path replacing the mq>1 build-Err)
 /// and (b) the Kani proof (`prefill_causal_mask_partition_ok`). An off-by-one here (`col < row`, dropping
 /// the diagonal self-term) or wrong direction (`col >= row`) scrambles causal attention — a
 /// coherence bug with a preserved-ish norm, so it MUST be pinned, not eyeballed.
@@ -4918,7 +4918,7 @@ const fn unreachable_nonzero() -> NonZeroU32 {
 
 /// THE GQA HEAD MAP: query head `qh` attends the KV head `qh / gqa` (each contiguous group of `gqa` query
 /// heads shares one K/V head; `gqa = num_q_heads / num_kv_heads`). SINGLE SOURCE OF TRUTH shared by (a) the
-/// emitter's K/V GQA-replication in `lower_attn_node` (`copy(new_k, kvh*hd, krep, qh*hd)`) and (b) the Kani
+/// deleted builder's K/V GQA-replication in `lower_attn_node` (`copy(new_k, kvh*hd, krep, qh*hd)`) and (b) the Kani
 /// proof (`gqa_replicate_*`). If this map were wrong, query heads would attend the WRONG KV head — scrambled
 /// attention with a preserved-ish norm (still a real head's K/V), a norm-preserving-direction-shift class.
 pub fn gqa_kv_head(qh: usize, gqa: usize) -> usize {
@@ -4929,8 +4929,8 @@ pub fn gqa_kv_head(qh: usize, gqa: usize) -> usize {
 /// With the K/V caches sized to the `nkvh` DISTINCT heads (not the `nqh` GQA-expanded heads — 4× less
 /// restickify traffic + 4× smaller resident KV), query head `qh`'s score matmul (kernel `kct[hd,cap]`)
 /// and value bmm (kernel `vc[cap,hd]`) must read the SHARED kv-head `gqa_kv_head(qh,gqa)` at head-base
-/// `gqa_kv_head(qh,gqa) * hd * cap`. SINGLE SOURCE OF TRUTH shared by the emitter (`lower_attn_node`
-/// score & value kernel offsets, the restickify loop head index) and the Kani proof
+/// `gqa_kv_head(qh,gqa) * hd * cap`. SINGLE SOURCE OF TRUTH shared by the deleted builder's
+/// (`lower_attn_node` score & value kernel offsets, the restickify loop head index) and the Kani proof
 /// (`gqa_dedup_kernel_base_ok`). ⚠️ Passing a RAW `qh` here (the pre-dedup `qh*hd*cap`) indexes OOB /
 /// a wrong kv-head once the cache is `nkvh`-sized — the proof's in-bounds assert fails first on that.
 pub fn gqa_dedup_kv_kernel_base(qh: usize, gqa: usize, hd: usize, cap: usize) -> usize {
@@ -8107,7 +8107,7 @@ pub fn attn_reference(
 /// The SubtileIR `RopeRotate` reference (NeoX rotate-half): per head `h`, dim `d`:
 /// `out[h,d] = x[h,d]·cos[d] + rotate_half(x)[h,d]·sin[d]`, where
 /// `rotate_half(x)[h,d] = -x[h,d+half]` for `d<half` and `+x[h,d-half]` for `d>=half`.
-/// This is the math the emitter's permutation-matmul form (`rot = x·P; out = x·cos + rot·sin`,
+/// This is the math the deleted builder's permutation-matmul form (`rot = x·P; out = x·cos + rot·sin`,
 /// `lower_rope_node`) must reproduce. Returns `[heads*hd]` row-major.
 pub fn rope_reference(
     x: &dyn Fn(usize, usize) -> f64, // (h,d)
@@ -8132,7 +8132,8 @@ pub fn rope_reference(
 }
 
 /// The DEVICE element offset of row `r`, head `h`'s `[1,hd]` RoPE sub-block inside the roped Q/K
-/// tensor `[mq, total]` (`total = heads·hd`), sticked on its last dim. `lower_rope_node` emits ONE
+/// tensor `[mq, total]` (`total = heads·hd`), sticked on its last dim. The deleted builder's
+/// `lower_rope_node` emits ONE
 /// `mb=1 [1,hd]` op per `(r,h)` at this offset (the proven `mb=1` primitive). This is the FIX for the
 /// mq>1 prefill collapse: the old code looped `for h` only (offset `h·hd`), writing ROW 0 for every
 /// head and NEVER rows `1..mq` → roped Q/K came back with only row 0 non-zero → K-cache 1 slot →
@@ -8143,7 +8144,7 @@ pub fn rope_reference(
 /// `rope_prefill_offset_is_devoff_*`). This is why the naïve flat `r·total + h·hd` failed: it wrote
 /// where the consumer (attention matmul reading q as `[mq,total]`) never reads for `r>0`. DEGENERATES
 /// to the decode offset at `mq=1` (`r=0 ⇒ h·hd`), byte-identical. hd>64 in prefill is a build error
-/// (a head spans hd/64 NON-contiguous sticks — `lower_rope_node` guards it).
+/// (a head spans hd/64 NON-contiguous sticks — the deleted builder guards it).
 /// ```
 /// use ktir_superdsc::sdsc_abstract::{rope_prefill_block_offset, dev_off};
 /// // granite Q: mq=8, heads=32, hd=64. Matches the stick-scattered device address of [r, h·hd]:

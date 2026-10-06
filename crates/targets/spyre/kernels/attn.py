@@ -6,7 +6,7 @@ BODY PROVENANCE: `crates/triton/test-fixtures/attention_flash.py`'s numerics (th
 tutorial-derived flash form this tree card-validated), restated in the SPLICE's own
 launch contract — which is NOT the fixture's delta-8 layout. The fixture's
 transposed/splat-source staging belongs to the old ladder path; the splice presents
-the tensors the WAY THE BUILDER'S OWN PROGRAM VIEWS THEM (`KtirFunc::attn`), because
+the tensors the WAY THE BUILDER'S OWN PROGRAM VIEWS THEM (main's `KtirFunc::attn`), because
 the door (`ktir_superdsc_door::attn` → `attn_operands`) reads every fact — the q/out
 `[mq, nqh·hd]` views, the kv `[cap, nkvh·hd]` views, q's first tile's `hd` width, the
 cache's swept row extent — off the program itself.
@@ -30,7 +30,7 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   (`KC_ROW/KC_COL/KD_ROW/KD_COL`), `NEW_LEN`, `HAS_MASK`, `ONE_PASS` — all stated
   by the splice from the node's own payload and regions, never inferred.
 
-⛔ THE THREE SHAPES, exactly the builder's own arms (`KtirFunc::attn`):
+⛔ THE THREE SHAPES, exactly the builder's own arms (main's `KtirFunc::attn`):
 
 1. DECODE (`MQ == 1`): per head, the two live segments (resident prefix swept
    `SWEPT` rows + the one new row) scored, online-softmax-combined across them —

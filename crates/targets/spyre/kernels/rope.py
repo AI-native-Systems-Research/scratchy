@@ -34,12 +34,13 @@ which, written per half (x1 = x[..., :d//2], x2 = x[..., d//2:]), is
 THE SPLICE'S CONTRACT — the door (`ktir_superdsc_door::rope`) derives the node's facts
 from the program's own views and access tiles, so the kernel states them:
 
-* the x/out descriptors are `[MQ * H, HEAD_DIM]` — the WORKER's staging. `KtirFunc::rope`
-  views x as `[rows*heads, hd]` over the same bytes, so the view extents agree.
+* the x/out descriptors are `[MQ * H, HEAD_DIM]` — the WORKER's staging. Main's
+  `KtirFunc::rope` views x as `[rows*heads, hd]` over the same bytes, so the view extents
+  agree.
 * ONE ACCESS TILE PER POSITION, `[H, HALF]` — the door reads `heads` off the FIRST access
   tile's row extent (`Region::r_len`) and `mq` as `v_rows / heads`, so a whole-tensor
-  tile would state `heads = MQ*H` and mis-derive everything. The builder's own program
-  takes exactly these tiles (`KtirFunc::rope`'s `tile(x_view, ri*heads, 0, heads, half)`).
+  tile would state `heads = MQ*H` and mis-derive everything. Main's builder program
+  takes exactly these tiles (main's `KtirFunc::rope`'s `tile(x_view, ri*heads, 0, heads, half)`).
 * ONE WORK ITEM (grid `[1]`) with the position loop UNROLLED by the ladder
   (`to_ktir::unroll_constant_trip_loops`): constant-trip `tl.range(0, MQ, 1)`, each trip
   a copy of the per-position body. The spliced program is straight-line, like the
@@ -67,7 +68,7 @@ def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
     tl.static_assert(HALF + HALF == HEAD_DIM)
     y_dim = MQ * H
     # The x/out views over the worker-staged plane, `[mq*heads, hd]` — the same extents
-    # `KtirFunc::rope` states (`view_shaped(x_t, mh, hd)`), so the door's derivation of
+    # main's `KtirFunc::rope` states (`view_shaped(x_t, mh, hd)`), so the door's derivation of
     # `heads` and `mq` from the view and its access tiles reads the right facts.
     x_desc = tl.make_tensor_descriptor(desc_x, shape=[y_dim, HEAD_DIM],
                                        strides=[HEAD_DIM, 1],

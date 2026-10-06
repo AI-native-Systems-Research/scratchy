@@ -73,8 +73,8 @@ pub(crate) struct BundleMeta {
     /// Every compile-time scalar this bundle's KTIR reads, in registry order — entry `i` is bound at
     /// `scalarmul_scale_tid(i)` as a `[1,1]` tile.
     ///
-    /// ⛔ THE EMULATOR MUST BIND THESE OR THE OUTPUT IS SILENTLY WRONG. `KtirFunc::splat_scale`
-    /// reads a model constant (a scale, an RMSNorm epsilon or divisor) and the algebraic identities
+    /// ⛔ THE EMULATOR MUST BIND THESE OR THE OUTPUT IS SILENTLY WRONG. The programs read
+    /// a model constant (a scale, an RMSNorm epsilon or divisor) and the algebraic identities
     /// `0`/`1` off reserved tids rather than baking them as KTIR immediates, because
     /// `dxp_standalone` has no immediate operand and the card path needs a real address. Those tids
     /// are ordinary `func.arguments` of the program the emulator runs too, so an unbound one is a

@@ -7,8 +7,8 @@ vocab-wide lm_head matmul re-lowers at m=1 over a tensor whose row 0 is the last
 prompt token — `mq`-times less work for the one row of logits the first generated
 token reads.
 
-BODY PROVENANCE: `KtirFunc::last_row_extract` (the builder control
-`lower_prefill_lm_head_at_m1`'s own extraction body), stated as a Triton kernel —
+BODY PROVENANCE: main's `KtirFunc::last_row_extract` (the builder control
+`lower_prefill_lm_head_at_m1`'s own extraction body, from main), stated as a Triton kernel —
 `hidden/64` single-stick copies, one `[1, 64]` tile per stick-group. That per-stick
 form is not a style choice: the source buffer is DEVICE-TILED `[hidden/64, mq, 64]`
 (stick-major), so row `mq-1`'s stick-group `j` is 64 CONTIGUOUS elements, and no

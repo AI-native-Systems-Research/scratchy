@@ -35,7 +35,7 @@ THE ORIENTATION: same law as `matmul.py` — the weight descriptor is the
 checkpoint's own on-disk `[n, k]` buffer (fp8 bytes stay 1-byte verbatim on
 the emulator path, `spyre_load.rs`), loaded and widened `.to(tl.float16)`
 then `.T`, which `dot_to_linalg`'s fp8 arm folds into the transpose-B
-indexing maps — the exact maps `KtirFunc::matmul_fp8` states over the same
+indexing maps — the exact maps main's `KtirFunc::matmul_fp8` states over the same
 bytes.
 """
 

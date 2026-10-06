@@ -2,8 +2,8 @@
 //! Matmul LX-FIT TILING pass — `M` across the grid, `N` in column blocks, `K` as an accumulating
 //! loop.
 //!
-//! ⭐⭐⭐ THIS IS A SCHEDULING DECISION, AND IT BELONGS TO THE EMULATOR ALONE. The construction in
-//! `lower_subtile_tape_to_superdsc.rs`'s `KtirFunc::matmul` now emits ONE untiled `linalg.matmul`
+//! ⭐⭐⭐ THIS IS A SCHEDULING DECISION, AND IT BELONGS TO THE EMULATOR ALONE. The producer
+//! (`lower_subtile_tape_to_ktir.rs`, now the Triton splice) emits ONE untiled `linalg.matmul`
 //! over the whole `[m, k] × [k, n]`, because that is what the IR means. Who tiles it, and how, is a
 //! property of the DEVICE that runs it:
 //!
@@ -13,8 +13,8 @@
 //! * The **card** does not. `SubtileIR → SuperDSC` hands `assemble_matmul` a whole GEMM and the
 //!   work division is DECLARED, not built: `WorkPlan::divide` fills `numWkSlicesPerDim_` for dxp's
 //!   scheduler and `WorkPlan::time_tile_for_lx` fills `OpSpec.time_tile`, which `render_dxp_input`
-//!   expands into trips. `lower_matmul_node` says it outright — "the Spyre tape does NOT K-chunk
-//!   (each `MatmulTile` is a whole GEMM; SuperDSC owns the K-split via the cost model)".
+//!   expands into trips. main's `lower_matmul_node` says it outright — "the Spyre tape does NOT
+//!   K-chunk (each `MatmulTile` is a whole GEMM; SuperDSC owns the K-split via the cost model)".
 //!
 //! ⛔ SO A PRE-TILED KTIR WAS A BUG FOR ONE OF ITS TWO CONSUMERS. The nest below used to be built
 //! during KTIR construction, which meant `KTIR → SuperDSC` received a 64-trip `scf.for` where the
@@ -24,8 +24,9 @@
 //! consumer that needs it, is the same decision made in the right place.
 //!
 //! ⭐ MOVED VERBATIM, and that is the correctness argument. Every extent, block size, op order and
-//! attribute below is what `KtirFunc::matmul` built before, so the emulator sees the same KTIR it
-//! already runs at its measured rate. This pass is a relocation, not a redesign.
+//! attribute below is what the producer's `KtirFunc::matmul` built before (the splice reproduces it
+//! byte-for-byte), so the emulator sees the same KTIR it already runs at its measured rate. This
+//! pass is a relocation, not a redesign.
 
 use crate::head_rewrite::NameGen;
 use ktir_core::affine::{AffineExpr, AffineMap};
@@ -89,7 +90,7 @@ struct Untiled {
     /// interpreter the per-iteration `linalg.matmul` then refuses with `outs shape [31, 512] !=
     /// product shape [1, 512]` (the Metal/NAX offload never runs the body, so macOS never saw
     /// it — the Linux CI gate did). The splat's SCALAR operand, however, is what must be kept
-    /// alive: `KtirFunc::splat_zero` splats an immediate scalar (`scalar(0.0)`), and minting a
+    /// alive: the splat zeroes an immediate scalar (`scalar(0.0)`), and minting a
     /// fresh constant in place of the operand would orphan the original splat's parameter —
     /// the `dce` below then drops its view chain and the emulator refuses with `no shape
     /// derivable for tensor t4294967275` (`u32::MAX - 20`, registry slot 0).
@@ -99,7 +100,7 @@ struct Untiled {
     k: i64,
     elem: DType,
     /// ⭐ THE DEQUANT SCALE, when the store drains a trailing `arith.mulf(matmul, scale)` instead
-    /// of the matmul itself. Both fp8 producers end that way — the builder's
+    /// of the matmul itself. Both fp8 producers end that way — the deleted builder's
     /// `KtirFunc::matmul_fp8` and the spliced `matmul_fp8_fwd` (whose ladder lowering spells the
     /// same `p * ws` the kernel states) — and WITHOUT recognizing it the whole `[n, k]` weight
     /// tile loads UNTILED: at granite-2b's q_proj that is a `[2048, 2048]` fp8 tile (4 MB)
@@ -126,8 +127,8 @@ fn shape_of(op: &Operation<'_>) -> Option<Vec<i64>> {
         .or_else(|| op.result_type.and_then(|t| t.dims().map(|d| d.to_vec())))
 }
 
-/// Recognize the untiled form [`Self`] tiles. Deliberately narrow: it matches exactly what
-/// `KtirFunc::matmul` emits and nothing else, so an unrecognized matmul is LEFT ALONE rather than
+/// Recognize the untiled form [`Self`] tiles. Deliberately narrow: it matches exactly what the
+/// producer's matmul emits and nothing else, so an unrecognized matmul is LEFT ALONE rather than
 /// rewritten on a guess.
 fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
     let def: HashMap<Ssa, (usize, &Operation<'_>)> = func
@@ -187,8 +188,8 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         else {
             continue;
         };
-        // The `outs` seed must be a `tensor.splat` over a scalar — the form
-        // `KtirFunc::splat_zero` emits. The SCALAR is what the rewrite reuses;
+        // The `outs` seed must be a `tensor.splat` over a scalar — the form the
+        // producer's zero-seed emits. The SCALAR is what the rewrite reuses;
         // the splat itself is `[m, n]`-shaped and gets rebuilt per N-block.
         let Some(&init_scalar) = def.get(&init).and_then(|(_, o)| o.operands.first()) else {
             continue;
@@ -202,8 +203,9 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             continue;
         };
         let Some(res) = op.result else { continue };
-        // ⭐ THE STORE DRAINS EITHER THE MATMUL OR ITS DEQUANT SCALE — `KtirFunc::matmul`
-        // stores the contraction directly, while BOTH fp8 producers (`KtirFunc::matmul_fp8`,
+        // ⭐ THE STORE DRAINS EITHER THE MATMUL OR ITS DEQUANT SCALE — the dense
+        // program stores the contraction directly, while BOTH fp8 producers (the deleted
+        // builder's `KtirFunc::matmul_fp8`,
         // the spliced `matmul_fp8_fwd`) end `linalg.matmul → arith.mulf(part, scale) →
         // ktdp.store`. The mulf is admitted ONLY as the exact fp8 epilogue: one operand must
         // BE the matmul result and the other a loaded `[1, n]` scale row whose width is this
@@ -234,7 +236,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
                         mulf.operands[0]
                     };
                     // The scale side must be a loaded `[1, n]` row — the load chain
-                    // every fp8 producer's wscale read states (`KtirFunc::matmul_fp8`'s
+                    // every fp8 producer's wscale read states (the builder's
                     // `tile(scale_view, 0, 0, 1, n)`; the ladder's ws descriptor `[1, N]`),
                     // possibly through collapse/broadcast (see `through_scale`).
                     let Some(s_dims) = through_scale(other) else {
@@ -273,7 +275,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             continue;
         };
         // ⭐ THE W TILE IS THE BUILDER'S OWN `[n, k]` FRAMING (transpose-B) — every
-        // producer this pass rewrites (the builder's `KtirFunc::matmul`, the spliced
+        // producer this pass rewrites (the deleted builder's `KtirFunc::matmul`, the spliced
         // kernels, whose `.T` `dot_to_linalg` folds into the same transpose-B maps)
         // loads the weight as its on-disk `[n, k]` region. A `[k, n]` W tile is a
         // foreign plain-B form — not ours, left alone rather than contracted the
@@ -416,7 +418,7 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             // construction emitted (`dense<0.0> : tensor<1x{bw}>` in the old textual
             // builder). Both the loop's `iter_args` init and the per-iteration matmul
             // `outs` seed are splats of the UNTILED FORM'S OWN SCALAR operand — the
-            // one `KtirFunc::splat_zero` bound — so the parameter keeps its consumer
+            // one the zero-seed bound — so the parameter keeps its consumer
             // (and its derivable shape) while the splats themselves carry this block's
             // `[1, bw]` shape. Reusing the untiled `[m, n]` splat wholesale is only
             // shape-correct at m=1 and one block (decode); see `Untiled::init_scalar`.

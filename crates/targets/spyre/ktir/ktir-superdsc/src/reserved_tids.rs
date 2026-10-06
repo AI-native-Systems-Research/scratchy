@@ -14,7 +14,7 @@
 
 /// RESERVED tensor id for the RoPE rotate-half permutation matrix `P` (in-bundle
 /// RoPE). It is NOT a SubtileIR tensor (no model source produces it) — the emitter
-/// references it as `t{ROPE_P_TID}` in `lower_rope_node`'s `matmul(x, P)`, places it
+/// references it as `t{ROPE_P_TID}` in main's `lower_rope_node` `matmul(x, P)`, places it
 /// as a seg0 ACTIVATION in `compute_bundle_layout` (re-bound per step like RMS_SEED —
 /// a seg1 weight is only H2D'd at PrepareModel, which binds ONLY the manifest weights,
 /// so a synthetic seg1 P would stay ZERO), and the WORKER recognizes this id to

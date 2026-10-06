@@ -58,9 +58,11 @@ pub fn lower_tape_to_tile_ir<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// mechanically from `n.output`/`n.inputs`, never a hidden branch. The iteration domain mirrors the
 /// existing builders' `[mb, out, y]` convention (`reduce_opspec_df`/`pointwise_broadcast_opspec_df` in
 /// `lower_subtile_tape_to_superdsc.rs`) so the TileIR→SdscOp pass reuses their tensor-layout logic
-/// unchanged. `pub(crate)`: called directly by the LIVE per-node lowering (`lower_elementwise_node`
-/// et al. in `lower_subtile_tape_to_superdsc.rs`) — a node needs no tape/graph context beyond itself
-/// to become `TileOp`(s), so the live path calls this without going through a whole `SubtileTape`.
+/// unchanged. `pub(crate)`: main's per-node lowering (`lower_elementwise_node`
+/// et al. in `lower_subtile_tape_to_superdsc.rs`) called this directly — a node needs no tape/graph
+/// context beyond itself to become `TileOp`(s), so the live path called it without going through a
+/// whole `SubtileTape`. That lowering is gone (the splice replaced it), and what remains are these
+/// tests plus the declaration law `lower_ktir_to_superdsc` cites this file for.
 pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
     n: &SubtileNode<F>,
 ) -> Result<Vec<TileOp>, String> {
@@ -167,7 +169,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         // width, not the logical `cols`: a ScalarMul on padded logits (`[.,49159]`) must address the
         // SAME device layout its producer matmul emitted (`DeviceWidth::for_output`, ≥2^20 macs bumps
         // to ≥8-core-splittable) — `for_pointwise` is that rule for a pointwise CONSUMER, a pure
-        // function of `cols` alone (no `m`/rows term), matching `lower_scalarmul_node` exactly. A
+        // function of `cols` alone (no `m`/rows term), matching main's `lower_scalarmul_node` exactly. A
         // no-op for 64-aligned tensors (residual/embedding), so decode/prefill/padded-logits all hit
         // this ONE formula.
         SubOp::ScalarMul { .. } => {
@@ -216,7 +218,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
           // either a later IR-to-IR transformation on TileIR, or the TileIR→SdscOp step itself (which is
           // where "translate to a lower level of abstraction" legitimately happens). Lowering only
           // TRANSLATES; it does not SCHEDULE. `n_operands` = every declared input (RopeRotate: 3;
-          // RopeAppend: 6, including the cache-write operands `lower_rope_node` currently drops from its
+          // RopeAppend: 6, including the cache-write operands main's `lower_rope_node` dropped from its
           // OWN rotation math) + the output — no cherry-picking which inputs "count".
           // AttnDecode: PURE SYNTAX, same convention as every arm above — the node's own [rows,cols]
           // output shape and its own declared input count (Q + alternating (K_seg,V_seg) pairs) + the
@@ -226,25 +228,6 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
           // says does NOT belong in lowering. `PointwiseOrReduce{n_operands}` is a true, non-invented
           // statement here: the node reads `n_operands-1` tensors and writes 1, at this shape — nothing more.
     }
-}
-
-/// Convenience for a caller that KNOWS (by `SubOp` kind) its node decomposes into exactly one
-/// `TileOp` — `Elementwise`/`SumReduce`/`SiluMul`/`ScalarMul`/`RmsNorm*`/`MatmulTile`, everything
-/// except the composite RoPE mapping. `Err` if that expectation is violated (a future `node_to_tile_ops`
-/// change making a kind multi-op would surface here as a build-time-adjacent error, not a silent
-/// wrong pick of `tile_ops[0]`).
-pub(crate) fn node_to_single_tile_op<F: scratchy_subtile::subtile_ir::RopeForm>(
-    n: &SubtileNode<F>,
-) -> Result<TileOp, String> {
-    let mut ops = node_to_tile_ops(n)?;
-    if ops.len() != 1 {
-        return Err(format!(
-            "node {}: expected exactly 1 TileOp, node_to_tile_ops produced {}",
-            n.id.index(),
-            ops.len()
-        ));
-    }
-    Ok(ops.remove(0))
 }
 
 #[cfg(test)]

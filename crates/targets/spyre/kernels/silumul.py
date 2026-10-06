@@ -4,8 +4,8 @@
 BODY PROVENANCE: derived from `crates/triton/test-fixtures/swiglu_mlp.py`'s activation
 body (deltas 5/6/8 there) — the same four-op chain (`e = exp(-g)` → `s = g / (1+e)` →
 `h = s * u`) that fixture card-validated through this repo's KTIR→SuperDSC lowering,
-stated standalone over whole-region tiles the way the builder's own `KtirFunc::silu_mul`
-states them. It is NOT one tl.dot of that fixture: `SubOp::SiluMul` is the activation
+stated standalone over whole-region tiles the way the builder's own
+`KtirFunc::silu_mul` from main states them. It is NOT one tl.dot of that fixture: `SubOp::SiluMul` is the activation
 alone, with the projections' matmuls their own nodes.
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
@@ -22,7 +22,7 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   columns 8192.. of that tensor, not its base.
 * GRID: `[1]`.
 
-⭐ ROW BLOCKING, THE BUILDER'S OWN LAW (`KtirFunc::silu_mul`): eight tiles are live
+⭐ ROW BLOCKING, THE BUILDER'S OWN LAW (main's `KtirFunc::silu_mul`): eight tiles are live
 here (gate, up, neg, exp, the splat, denom, silu, y), so a whole `[mq, intermediate]`
 region does not fit a core's LX at prefill — the widest live set in the model. The
 kernel takes `N_BLOCKS` full `[BLOCK_M, N]` tiles (BLOCK_M = the builder's own
@@ -62,7 +62,7 @@ def silumul_fwd(desc_g, desc_u, desc_o,  #
         offs_m = blk * BLOCK_M
         g = g_desc.load([offs_m, C_START])
         u = u_desc.load([offs_m, C_START])
-        # silu(g) = g / (1 + exp(-g)) — the same chain `KtirFunc::silu_mul` writes.
+        # silu(g) = g / (1 + exp(-g)) — the same chain main's `KtirFunc::silu_mul` writes.
         # `tl.sigmoid` refuses an f16 tensor outright (swiglu delta 5, `math.exp` is
         # @_check_dtype(["fp32","fp64"])), and the ladder's LegalizeTypes collapses
         # the widen/truncate island this spells, so the emitted KTIR carries

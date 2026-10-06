@@ -9,7 +9,7 @@
 //! Every entry point in [`super::lower_ktir_to_superdsc`] reads a function's PARAMETER LIST as one
 //! op's operands: [`super::lower_ktir_to_superdsc::split_out`] takes the parameter written by a
 //! `ktdp.store` as the output, counts the rest as inputs, and refuses when the count is not the
-//! body's arity. That is exact for a function that IS one op, which is what `KtirFunc` emits — one
+//! body's arity. That is exact for a function that IS one op, which is what the splice emits — one
 //! program per model-graph node.
 //!
 //! It is not the only legitimate KTIR. **IBM's C++ toolchain — the reference KTIR producer — puts a
@@ -148,7 +148,7 @@ pub struct SiluMulChain {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BOrient {
     /// `[[d0,d2],[d1,d2],[d0,d1]]` — B's map ends in the reduction dim, so B's REGION is `[n, k]` and
-    /// the contraction reduces over k in place. scratchy's `KtirFunc::matmul` emits this
+    /// the contraction reduces over k in place. scratchy's matmul producer emits this
     /// unconditionally for a presented weight ("W BINDS VERBATIM as its on-disk `[out, in]` = `[n, k]`
     /// buffer … so there is no transpose and no strided gather"), and the host stage is where its bytes
     /// are placed into the kernel slot's `[k, n]` device order.
@@ -205,7 +205,7 @@ pub fn matmul_b_orientation(
         "{}: this `{:?}`'s `indexing_maps` are NEITHER of the two contraction forms this door \
          lowers. The assumed one is transpose-B, `[[d0,d2],[d1,d2],[d0,d1]]` — B's map ends in the \
          reduction dim, so B is its on-disk `[out, in]` = `[n, k]` buffer and the contraction reduces \
-         over k in place; that is the contract scratchy's `KtirFunc::matmul` states at its own \
+         over k in place; that is the contract scratchy's matmul producer states at its own \
          definition and emits unconditionally. The other is MLIR's plain \
          `[[d0,d2],[d2,d1],[d0,d1]]` (B as `[k, n]`), which is lowered by TRANSPOSING B into the \
          assumed orientation first. Anything else — a permuted A or C, a batch dim, a broadcast map — \
@@ -2638,7 +2638,7 @@ mod matmul_orientation_tests {
     }
 
     /// ⭐ THE PRESENTED-WEIGHT FORM: B's map ends in the reduction dim `d2`, so B's REGION is `[n, k]`
-    /// and the contraction reduces over k in place. scratchy's `KtirFunc::matmul` emits this
+    /// and the contraction reduces over k in place. scratchy's matmul producer emits this
     /// unconditionally, and the host stage is where such a weight's bytes are placed into the kernel
     /// slot's `[k, n]` device order.
     #[test]

@@ -57,9 +57,8 @@ pub use scratchy_spyre_bundle as bundle;
 // codegen: `superdsc::graph_wiring`, `superdsc::unroll_layers`) keep resolving through this module's
 // path after the SubtileIR → KTIR construction moved to its own file.
 pub use crate::lower_subtile_tape_to_ktir::{
-    BundleWiring, NodeArgs, graph_wiring, lower_elementwise_node, lower_graph_to_ktir,
-    lower_graph_to_superdsc, lower_matmul_node, lower_rmsnorm_node, lower_scalarmul_node,
-    lower_silumul_node, lower_subtile_tape_to_ktir,
+    BundleWiring, NodeArgs, graph_wiring, lower_graph_to_ktir, lower_graph_to_superdsc,
+    lower_subtile_tape_to_ktir,
 };
 // ⭐⭐⭐ THE REQUEST TYPE LIVES IN `ktir_superdsc::ktir_node` — `KtirNode` and the decode ladder rung
 // `ActiveCap`. Not a device fact and not the caller's own plan: what a KTIR producer hands in.
@@ -589,7 +588,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         bank_weight_segment(&mut placements, &mut seg_bytes, per_layer_ext)?
     };
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
-    // any RopeRotate/RopeAppend, `lower_rope_node` emits `rot = matmul(x, P)` (the
+    // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
     // a FIXED permutation-sign matrix the worker synthesizes + binds (it is NOT a
     // model/safetensors weight, so it gets the reserved id ROPE_P_TID). Place it in
@@ -691,7 +690,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // lived at that byte range — potentially large magnitude, not bounded "stale K-vector" data. The
         // causal mask (mask_neg, a moderate ~-32752 fp16 constant) only reliably neutralizes BOUNDED
         // garbage; it does not guarantee correctness against arbitrary aliased memory. Placed here
-        // (unconditional, any mq with attention) so `lower_attn_node` can emit a real zero-copy into the
+        // (unconditional, any mq with attention) so main's `lower_attn_node` can emit a real zero-copy into the
         // padding rows before GQA-replicate ever reads them, instead of relying on masking alone.
         // SIZE IS `mq_pad`, NOT ONE STICK (2026-07-29). The worker binds this as `[mq_pad, hd]` zeros
         // (`vec![0.0f32; mq_pad*hd]`, narrowed to 2-byte f16), and `mq_pad = mq.div_ceil(64)*64` — so a
@@ -921,7 +920,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // THE SAME DOOR AS THE EMIT — `PaddedMq::of_bundle`, the one parse boundary from a
             // bundle's runtime width to the pad law, so the placements and the ops they hold cannot
             // be sized by different pads (a decode width must be a baked ladder rung here exactly as
-            // it must be in `lower_attn_node`). The placements below spend it in TWO roles and each
+            // it must be in main's `lower_attn_node`). The placements below spend it in TWO roles and each
             // names its own: the staging tensors' ROW extent and the causal mask's SCORE width.
             let mq_pad = scratchy_subtile::sdsc_abstract::PaddedMq::of_bundle(
                 mq32,
@@ -1304,7 +1303,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     seg_bytes[a] = align128(bioff + bibytes);
                 }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
-                // [mq_pad, nkvh·hd]. lower_attn_node copies layer-0 new_v here; the worker reads it to split
+                // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split
                 // the structural inf (matmul vs selector). Never reused ⇒ survives to post-prefill readback.
                 if mq > 1 {
                     let npoff = seg_bytes[a];
@@ -1364,8 +1363,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
 
     // ── granite ScalarMul scale constants ── collect the DISTINCT scale values (embedding / residual /
     //    attention / logits multipliers) and place a `[1,1]` worker-bound const per scale in seg0
-    //    (ACTIVATION, exactly like ATTN_SCALE). `lower_scalarmul_node` reads the index here → the const TID
-    //    the pointwise `mul` multiplies by; the worker binds each `t{tid}=[scale]`. NO weight-fold, NO
+    //    (ACTIVATION, exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index
+    //    here → the const TID it multiplies by; the worker binds each `t{tid}=[scale]`. NO weight-fold, NO
     //    host-route — a real on-device pointwise multiply (the ATTN_SCALE mechanism).
     let mut scalarmul_scales: Vec<f32> = Vec::new();
     let push_scale = |scale: f32, scalarmul_scales: &mut Vec<f32>| {
@@ -1382,7 +1381,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // (`SCALARMUL_SCALE_BASE - i`). Two algebraic identities (`0.0`, `1.0`) were once pushed FIRST
     // for the KTIR construction's `linalg.*` `outs` seeds, which shifted every model scale by two
     // slots and so changed the address every constant reaches the card at. Those seeds are
-    // immediates in the KTIR now (`KtirFunc::splat_zero`/`splat_one`) and never reach a descriptor,
+    // immediates in the KTIR now and never reach a descriptor,
     // because the ported bodies fold the accumulator seed into the contraction exactly as
     // `subtile→superdsc` does.
     for node in &ir.nodes {
@@ -4747,8 +4746,7 @@ mod tests {
         // lowering of a vocab-wide matmul); (2) the m=1 DECODE bundle stays a single bare matmul —
         // the fold never fires at m=1; (3) the CONSUMER half of the fold
         // (`lower_ktir_to_superdsc::lmlast`, main's copy loop verbatim) still refuses a nameless
-        // extraction — pinned through the pub builder control `lower_prefill_lm_head_at_m1`, the
-        // card-proven body the splice's fold kernel reproduces.
+        // extraction — pinned through the splice's own fold program below.
         use scratchy_subtile::subtile_ir::{
             SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
         };
@@ -4829,7 +4827,7 @@ mod tests {
             vec!["matmul_o2".to_string()]
         );
 
-        // ⛔ NEGATIVE CONTROL FOR THE NAME'S OWN FACT, through the pub builder control.
+        // ⛔ NEGATIVE CONTROL FOR THE NAME'S OWN FACT, through the splice's own fold.
         // `lmlast` names its copies from `KtirNode::node_out_tid`, and a MISSING one must
         // REFUSE — not fall back to the program's own output, which is the reserved
         // `LAST_HIDDEN_TID` and is exactly the wrong name this test pins. Strip the fact off
@@ -4838,16 +4836,8 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
         let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
             .expect("the tail's layout mints");
-        let mut sym = 0i64;
-        let mut fp8q = std::collections::HashSet::new();
-        let mut programs = crate::lower_subtile_tape_to_ktir::lower_prefill_lm_head_at_m1(
-            &node,
-            &ir,
-            &mut sym,
-            Some(&layout),
-            &mut fp8q,
-        )
-        .expect("the builder control mints the tail");
+        let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
+            .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
             .find(|e| e.op_name.starts_with("lmlast"))

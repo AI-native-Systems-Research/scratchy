@@ -2390,7 +2390,7 @@ pub fn emit_sdsc(
             // SEN143_FP8 (1-byte, the packed fp8 W8A8 path); `Df::Bf16` → BF16E; else SEN169_FP16. INERT for
             // the working build (every fp16 arg keeps `Df::Fp16`, so the numbers are byte-identical).
             // `Df::Bf16` is DORMANT (no arg carries it; the score path stays SEN169_FP16 — bf16-output matmul
-            // is dxp-rejected, see lower_attn_node). The matmul PSUM accumulates in SEN169_FP16 (DeepTools
+            // is dxp-rejected, see main's `lower_attn_node`). The matmul PSUM accumulates in SEN169_FP16 (DeepTools
             // `bmm.ddl`: `%ptsum_fp`/`%pesum` are both `%type_fp16 = SEN169_FP16` — RCUDD1A has NO fp32 psum;
             // only `bmm_sen1p5.ddl` binds IEEE_FP32). NOTE: SEN169_FP16 is 1-6-9 (6-bit exp, bias 31) ⇒ max
             // finite ≈ 4.3e9, NOT 65504 (that is IEEE-fp16's 5-bit-exp max). Kani-proven

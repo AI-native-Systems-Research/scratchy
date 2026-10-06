@@ -109,7 +109,7 @@ pub const EW_BINARY_LIVE_TILES: u32 = 3;
 pub const SILU_MUL_LIVE_TILES: u32 = 8;
 
 /// How many ROWS of a `cols`-wide region keep `live` tiles inside [`EW_LX_ELEMS`] —
-/// ONE LAW, shared by the builder's row-block arms (`lower_elementwise_node_rows`,
+/// ONE LAW, shared by the deleted builder's row-block arms (`lower_elementwise_node_rows`,
 /// `lower_scalarmul_node`'s `by_row`, `KtirFunc::silu_mul`) and the Triton splice's
 /// pointwise constexprs, so the two paths cannot disagree about a block height and
 /// emit windows that overlap or leave a gap.
@@ -268,7 +268,7 @@ pub enum Df {
     SenInt8,
     /// BF16E — 2-byte / 64-stick (fp16 geometry, wider exponent). DORMANT: no emitter site creates a
     /// bf16 dataspace today (the score path stays SEN169_FP16; bf16-output matmul is dxp-rejected). Kept
-    /// representable for the `lower_attn_node` bf16-operand check.
+    /// representable for main's `lower_attn_node` bf16-operand check.
     Bf16,
     /// ⭐ SENUINT32 — 4-byte / 32-stick. A GATHER'S INDEX TENSOR AND NOTHING ELSE. See [`SenUint32`]
     /// for why it cannot be the value operand's format.

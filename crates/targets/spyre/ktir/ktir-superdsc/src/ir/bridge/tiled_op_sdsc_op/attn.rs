@@ -1830,7 +1830,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // left, because a pair it would have fudged cannot instantiate this function.
     let gqa = geom.gqa();
 
-    // Per KV-head (dedup, K-side — see lower_attn_node's attn_krep/cachewr_k comment): transpose this
+    // Per KV-head (dedup, K-side — see main's `lower_attn_node` attn_krep/cachewr_k comment): transpose this
     // step's new-K block [mq_pad,hd] -> Kᵀ_new [hd,mq_pad]. new_k_scaled is nkvh-wide now (deduped, not
     // GQA-replicated), matching kct's own resident convention — one transpose per DISTINCT kv-head,
     // not one per query head (cuts this loop nqh(32)->nkvh(8) too). The new-block score matmul below
@@ -2445,7 +2445,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     //    REPRESENTATIVE query head qh=kvh*gqa (V dedup — `vc` stays nqh-SIZED, unlike `kct`'s compact
     //    nkvh storage, so this is qh*cap*hd, NOT the kct-style compact kvh*hd*cap
     //    `gqa_dedup_kv_kernel_base` gives). Matches cachewr_v's own now-representative-slot-only
-    //    writes (see lower_attn_node) — same discipline as kct_base, applied to a differently-shaped
+    //    writes (see main's `lower_attn_node`) — same discipline as kct_base, applied to a differently-shaped
     //    (still nqh-sized) tensor. ──
     // The prefix fold: ONE variant, re-launched once per page of resident prefix with that page's
     // own validity row. Emitted by POSITION so a rename cannot drop an op out of the fold.

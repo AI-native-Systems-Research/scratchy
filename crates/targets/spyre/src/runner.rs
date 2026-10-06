@@ -275,7 +275,7 @@ mod tests {
     use crate::manifest::attn_mask_fill;
 
     /// Semantics lock for the attention runtime length-mask the emitter emits
-    /// (`KtirFunc::attn`): the prefix scores `addf` a shared
+    /// (the attention program): the prefix scores `addf` a shared
     /// `[1, capacity]` mask tile the host fills via [`attn_mask_fill`] — 0 on
     /// valid columns, large-negative past `decode_position`. This drives the
     /// exact emitted op (`ktdp.load` the mask + `arith.addf`) through ktir_emulator
@@ -291,7 +291,7 @@ mod tests {
     const OUT: u64 = 2;
 
     /// A `[1, 4]` HBM view over parameter `ptr`, its whole-tile access window, and the loaded tile —
-    /// the same three ops `KtirFunc::view_of` / `tile` / `load_tile` emit, built here directly so
+    /// the same three ops a program's `view_of` / `tile` / `load_tile` emit, built here directly so
     /// the test drives CONSTRUCTED IR rather than a second, parsed copy of it.
     fn view_load(
         a: &'static ktir_core::arena::Arena,
@@ -342,7 +342,7 @@ mod tests {
     }
 
     /// Semantics lock for the attention runtime length-mask the emitter emits
-    /// (`KtirFunc::attn`): the prefix scores `addf` a shared `[1, capacity]` mask tile the host
+    /// (the attention program): the prefix scores `addf` a shared `[1, capacity]` mask tile the host
     /// fills via [`attn_mask_fill`] — 0 on valid columns, large-negative past the decode position.
     /// This drives the exact emitted ops (`ktdp.load` the mask + `arith.addf`) through the REAL
     /// launch path — `SpyreSession::new_multi` / `run_step`, keyed by tensor id — and asserts

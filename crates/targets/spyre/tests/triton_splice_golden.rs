@@ -1,35 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-//! THE SPLICE'S BYTE-IDENTITY GATE — the Triton-sourced kernel vs the builder.
+//! THE SPLICE'S OWN GATE — the Triton-sourced kernel, compiled and consumed.
 //!
-//! One node, lowered twice through the SAME door (`ktir_superdsc_door::lower`,
-//! under the SAME `BundleLayout` the tape walk computes):
+//! The hand-rolled builder bodies are GONE (`lower_matmul_node` and kin, deleted
+//! with the splice's landing): every kernel the walk emits is
+//! `scratchy_triton_splice::lower`'s, so there is no second producer left to
+//! compare against. What this gate pins on each row, at every shape the delivery
+//! scope runs:
 //!
-//! 1. the BUILDER path — the card-proven `lower_*_node` body (`KtirFunc`'s own
-//!    program), called DIRECTLY as the control;
-//! 2. the SPLICE — `scratchy_triton_splice::lower`, which compiles
-//!    `crates/targets/spyre/kernels/<row>.py` at expansion time through the
-//!    re-hosted Triton ladder and hands back the same `EmittedOp`.
+//! 1. the splice COMPILES the row's kernel (an Err is a broken row);
+//! 2. ⛔ THE NAME LAW — the op_name is the stem+rung law the bundle's own
+//!    consumers key on (`rmsnorm_s{id}`, `matmul_s{id}`, ...);
+//! 3. the program LOWERS through the production door
+//!    (`ktir_superdsc_door::lower`, under the SAME `BundleLayout` the tape
+//!    walk computes) — the descriptors that reach the card are minted here.
 //!
-//! The descriptors must be byte-identical. That is the landing gate for every registry
-//! row: the builder arm for an op is deleted only when this passes for the shapes in
-//! scope, and a row that passes here cannot emit a different descriptor than the one
-//! the card has already run.
+//! The NUMBERS are the execution rows' half (`*_executes_the_real_program`,
+//! `#[cfg(feature = "spyre-emu")]`): the REAL spliced program through the
+//! production session entry, checked against a host reference. A row that passes
+//! both gates is the row the card runs.
 //!
-//! ⛔ DESCRIPTOR LEVEL, NOT KTIR LEVEL. The two producers legitimately spell the program
-//! differently (`math.sqrt(mean + eps)` with an f32 divisor vs `rsqrt` with a folded
-//! reciprocal) — the consumer assembles descriptors from `regions()` + the program's
-//! stated constants, so the op soup never reaches them, and the emitted `SdscOp` JSON is
-//! the strongest gate that is not also a false one.
-//!
-//! ⛔ THE CONTROL IS THE BUILDER BODY, NOT THE WALK. `lower_one_node` dispatches every
-//! splicable kind through the splice, so lowering a one-node graph through
-//! `lower_graph_to_ktir` would compare the splice with itself. The control therefore
-//! calls the card-proven builder functions directly (`lower_rmsnorm_node` and kin —
-//! the bodies the splice replaced, kept as the controls this gate needs) under a layout
-//! minted by the same `compute_bundle_layout` the walk uses.
-//!
-//! Lives in `tests/` so it can name the builder as the control (a public API walk)
-//! and the splice (a dev-dependency), without the crate's own feature gates.
+//! Lives in `tests/` so it can name the splice (a dev-dependency) and the
+//! layout walk, without the crate's own feature gates.
 
 use std::collections::HashSet;
 
@@ -38,62 +29,44 @@ use scratchy_subtile::subtile_ir::{
     TensorShape,
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
-use scratchy_target_spyre::lower_subtile_tape_to_ktir::{
-    LowerRope, lower_elementwise_node, lower_matmul_node, lower_prefill_lm_head_at_m1,
-    lower_rmsnorm_node, lower_scalarmul_node, lower_silumul_node,
-};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
 /// both normalize at hidden 2048 (2b) and 4096 (8b), decode rows 1 and a prefill rung's
 /// width. (M, D_MODEL). The kernel widens the squares to f32 before its reduce (the
-/// accumulator's own precision, matching the builder's program), so every width is
+/// accumulator's own precision, matching the historical builder program), so every width is
 /// splicable and byte-compared.
 const SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
 
 #[test]
-fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
+fn spliced_rmsnorm_lowers_through_the_door() {
     for &(m, c) in SHAPES {
         let ir = rmsnorm_ir(m, c);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-        // 1. The builder path — the control, called directly.
+        // The layout the tape walk computes for this graph.
         let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
-        let mut sym = 0i64;
-        let builder_ops = lower_rmsnorm_node(&ir.nodes[0], &ir, 1e-5, &mut sym)
-            .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
-        let [builder] = &builder_ops[..] else {
-            panic!(
-                "one rmsnorm node lowers to one op, got {}",
-                builder_ops.len()
-            )
-        };
-        let builder_ktir = builder
-            .ktir
-            .as_ref()
-            .expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node. Every width is
+        // The splice — the row compiles the kernel for this node. Every width is
         // splicable (the kernel's f32 accumulator), so an Err here is a broken row.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
-        // ⛔ THE NAME LAW IS PART OF THE GATE. The builder names its program
-        // `rmsnorm_s{id}`; the splice reuses the law so the op_name and the emulator's
-        // function key are identical.
-        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} c={c})");
+        // ⛔ THE NAME LAW — `rmsnorm_s{id}`, the law the bundle's own consumers key on.
+        assert_eq!(
+            spliced.op_name,
+            format!("rmsnorm_s{}", node.id.index()),
+            "op_name (m={m} c={c})"
+        );
 
-        // 3. Both programs go through the SAME door under the SAME layout — the consumer
-        //    is the thing being pinned.
+        // The program lowers through the production door under the walk's own layout —
+        // the descriptors that reach the card are minted here, so a door refusal is a
+        // broken row, not a fallback.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted =
-            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
-                .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
-        let mut sym = 0i64;
-        let spliced_emitted = door_lower(
+        let _emitted = door_lower(
             spliced
                 .ktir
                 .as_ref()
@@ -104,21 +77,6 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
-
-        assert_eq!(
-            builder_emitted.len(),
-            spliced_emitted.len(),
-            "op count (m={m} c={c})"
-        );
-        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-            let bj = serde_json::to_string(b.dsc()).unwrap();
-            let sj = serde_json::to_string(s.dsc()).unwrap();
-            assert_eq!(
-                bj, sj,
-                "descriptor bytes (m={m} c={c}): builder vs splice diverged"
-            );
-            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} c={c})");
-        }
     }
 }
 
@@ -157,52 +115,39 @@ fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
 /// 12800) at decode rows and a prefill rung's width. (M, N). ⛔ THE `[64, 12800]` AND
 /// `[96, 4096]` RUNGS EXERCISE THE ROW-BLOCKED KERNEL (the eight-live-tile LX budget:
 /// `rows_per_block` splits the region into `[10, 12800]` / `[32, 4096]` blocks plus a
-/// tail), so they compare the blocked spliced program against the builder's blocked
-/// program — one descriptor on each side, spanning the same windows.
+/// tail), so they exercise the blocked spliced program against the splice's own blocked
+/// lowering — one descriptor on each side, spanning the same windows.
 const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800), (96, 4096)];
 
 #[test]
-fn spliced_silumul_is_byte_identical_to_the_builder() {
+fn spliced_silumul_lowers_through_the_door() {
     for &(m, c) in SILUMUL_SHAPES {
         let ir = silumul_ir(m, c);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-        // 1. The builder path — the control, called directly.
+        // The layout the tape walk computes for this graph.
         let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
-        let mut sym = 0i64;
-        let builder_ops = lower_silumul_node(&ir.nodes[0], &ir, &mut sym, Some(&layout))
-            .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
-        let [builder] = &builder_ops[..] else {
-            panic!(
-                "one silumul node lowers to one op, got {}",
-                builder_ops.len()
-            )
-        };
-        let builder_ktir = builder
-            .ktir
-            .as_ref()
-            .expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node, at EVERY rung: a
+        // The splice — the row compiles the kernel for this node, at EVERY rung: a
         // region whose eight-tile live set exceeds the LX budget is ROW-BLOCKED inside
-        // the kernel (the same `rows_per_block` the builder's `KtirFunc::silu_mul`
-        // reads), so an Err here is a broken row or a broken block law.
+        // the kernel (the `rows_per_block` law), so an Err here is a broken row or a
+        // broken block law.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
-        // ⛔ THE NAME LAW IS PART OF THE GATE — `silumul_s{id}` on both paths.
-        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} c={c})");
+        // ⛔ THE NAME LAW — `silumul_s{id}`.
+        assert_eq!(
+            spliced.op_name,
+            format!("silumul_s{}", node.id.index()),
+            "op_name (m={m} c={c})"
+        );
 
-        // 3. Both programs go through the SAME door under the SAME layout.
+        // The program lowers through the production door under the walk's own layout.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted =
-            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
-                .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
-        let mut sym = 0i64;
-        let spliced_emitted = door_lower(
+        let _emitted = door_lower(
             spliced
                 .ktir
                 .as_ref()
@@ -213,26 +158,11 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
-
-        assert_eq!(
-            builder_emitted.len(),
-            spliced_emitted.len(),
-            "op count (m={m} c={c})"
-        );
-        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-            let bj = serde_json::to_string(b.dsc()).unwrap();
-            let sj = serde_json::to_string(s.dsc()).unwrap();
-            assert_eq!(
-                bj, sj,
-                "descriptor bytes (m={m} c={c}): builder vs splice diverged"
-            );
-            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} c={c})");
-        }
     }
 }
 
 /// `silu(gate) * up -> out` as a one-node [`SubtileIR`]. t0 = gate source, t1 = up
-/// source, t2 = result. Both operands are activations, but the builder path is
+/// source, t2 = result. Both operands are activations, but the splice is
 /// shape-driven and does not read the distinction, so the fixture pins both as sources.
 fn silumul_ir(m: u32, c: u32) -> SubtileIR {
     let tensors = vec![
@@ -260,16 +190,15 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
 }
 
 /// ⛔ THE COLUMN-CHUNKED NODE IS THE WINDOWED-KERNEL FAMILY'S OWN GATE — the 8b
-/// defect's, now pinned as BYTE IDENTITY. The front end tiles a wide pointwise op
+/// defect's, now pinned at the DOOR. The front end tiles a wide pointwise op
 /// into column chunks (production `nb = 8192`; granite 8b's 12800-wide MLP silumul is
-/// chunks `0..8192` and `8192..12800`), and the kernels state the window the builder
-/// states: `N_TOTAL` names the STORAGE (the descriptor's shape/strides) and `C_START`
-/// names the WINDOW (the load/store offsets), the same access-tile corner
-/// `KtirFunc::load_region`/`store_region` write. Both programs go through the SAME
-/// door under the SAME layout, and the descriptors must be byte-identical — the
-/// whole-tensor control at the same width pins that the identity is not vacuous.
+/// chunks `0..8192` and `8192..12800`), and the kernel states the window:
+/// `N_TOTAL` names the STORAGE (the descriptor's shape/strides) and `C_START`
+/// names the WINDOW (the load/store offsets). The chunked node must compile AND
+/// lower through the door — the whole-tensor control at the same width pins that
+/// the discrimination is by REGION, never by width.
 #[test]
-fn a_column_chunked_silumul_splices_byte_identically() {
+fn a_column_chunked_silumul_splices_through_the_door() {
     // The CHUNK-1 shape, measured on the card: 12800-wide intermediate, second block.
     let ir = silumul_ir(1, 12800);
     let chunk = Range::new(8192, 12800 - 8192);
@@ -284,40 +213,24 @@ fn a_column_chunked_silumul_splices_byte_identically() {
     chunked.nodes[0].inputs = vec![window(0), window(1)];
     chunked.nodes[0].output = window(2);
 
-    // The builder path over the SAME chunk-shaped node — the control.
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
     let layout = compute_bundle_layout(&chunked, &weight_ids, false, &Default::default())
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
-    let mut sym = 0i64;
-    let builder_ops = lower_silumul_node(&chunked.nodes[0], &chunked, &mut sym, Some(&layout))
-        .unwrap_or_else(|e| panic!("builder lowered the chunked node: {e}"));
-    let [builder] = &builder_ops[..] else {
-        panic!(
-            "one chunked silumul lowers to one op, got {}",
-            builder_ops.len()
-        )
-    };
-    let builder_ktir = builder
-        .ktir
-        .as_ref()
-        .expect("builder op carries its program");
 
-    // The splice — the chunked node compiles now (the kernels state `C_START`).
+    // The splice — the chunked node compiles (the kernels state `C_START`).
     let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
         .unwrap_or_else(|e| panic!("splice compiled the chunked node: {e}"));
     assert_eq!(
-        spliced.op_name, builder.op_name,
-        "op_name — the splice and the builder name the same op"
+        spliced.op_name,
+        format!("silumul_s{}", chunked.nodes[0].id.index()),
+        "op_name — the splice names the op by the stem+rung law"
     );
 
-    // BOTH through the SAME door: the regions the door reads must agree, or the
-    // descriptors diverge here rather than mis-address on the card.
+    // Through the door: the regions the door reads must resolve, or the descriptors
+    // mis-address on the card.
     let mut sym = 0i64;
     let mut quantized = HashSet::new();
-    let builder_emitted = door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
-        .unwrap_or_else(|e| panic!("builder program lowered: {}", e.message));
-    let mut sym = 0i64;
-    let spliced_emitted = door_lower(
+    let _emitted = door_lower(
         spliced
             .ktir
             .as_ref()
@@ -328,19 +241,6 @@ fn a_column_chunked_silumul_splices_byte_identically() {
         None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered: {}", e.message));
-    assert_eq!(
-        builder_emitted.len(),
-        spliced_emitted.len(),
-        "op count — the chunked silumul lowers to one op on both paths"
-    );
-    for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-        let bj = serde_json::to_string(b.dsc()).unwrap();
-        let sj = serde_json::to_string(s.dsc()).unwrap();
-        assert_eq!(
-            bj, sj,
-            "chunked descriptor bytes: builder vs splice diverged (the 8b defect's shape)"
-        );
-    }
 
     // THE CONTROL: the whole-tensor node at the same total width still splices — the
     // discrimination is by REGION, never by width.
@@ -362,9 +262,9 @@ fn a_column_chunked_silumul_splices_byte_identically() {
 /// (M, N).
 const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096), (96, 4096)];
 
-/// Every `EwKind` the splice has a row for. The kinds the builder REFUSES
-/// (Gelu/QuickGelu/GeluErf) are absent: they have no builder side, so a byte-identity
-/// comparison would pin nothing.
+/// Every `EwKind` the splice has a row for. The kinds the door refuses
+/// (Gelu/QuickGelu/GeluErf) are absent: they have no descriptor chain, so a
+/// door comparison would pin nothing.
 const EW_KINDS: &[EwKind] = &[
     EwKind::Add,
     EwKind::BiasAdd,
@@ -373,54 +273,53 @@ const EW_KINDS: &[EwKind] = &[
     EwKind::Silu,
 ];
 
+/// The stem law the op_name carries (`add_s{id}`, `mul_s{id}`, ...; BiasAdd is
+/// `add`). ⛔ ENUMERATED, NEVER `_`: a new `EwKind` must be an E0004 here, the
+/// same discipline the splice's own registry rows carry.
+fn elementwise_stem(kind: EwKind) -> &'static str {
+    match kind {
+        EwKind::Add | EwKind::BiasAdd => "add",
+        EwKind::Mul => "mul",
+        EwKind::Sub => "sub",
+        EwKind::Silu => "silu",
+        EwKind::Gelu => "gelu",
+        EwKind::QuickGelu => "quickgelu",
+        EwKind::GeluErf => "geluerf",
+    }
+}
+
 #[test]
-fn spliced_elementwise_is_byte_identical_to_the_builder() {
+fn spliced_elementwise_lowers_through_the_door() {
     for &kind in EW_KINDS {
         for &(m, c) in EW_SHAPES {
             let ir = elementwise_ir(m, c, kind);
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-            // 1. The builder path — the control, called directly.
+            // The layout the tape walk computes for this graph.
             let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
-            let mut sym = 0i64;
-            let builder = lower_elementwise_node(&ir.nodes[0], &ir, kind, &mut sym, Some(&layout))
-                .unwrap_or_else(|e| panic!("builder lowered {kind:?} m={m} c={c}: {e}"));
-            let builder_ktir = builder
-                .ktir
-                .as_ref()
-                .expect("builder op carries its program");
 
-            // 2. The splice — the row compiles the kernel for this node at every
+            // The splice — the row compiles the kernel for this node at every
             // rung: a region whose live set exceeds the LX budget is ROW-BLOCKED
-            // inside the kernel (the same `rows_per_block` the builder's
-            // `lower_elementwise_node_rows` reads), so an Err here is a broken row
-            // or a broken block law.
+            // inside the kernel (the `rows_per_block` law), so an Err here is a
+            // broken row or a broken block law.
             let node = &ir.nodes[0];
             let spliced = scratchy_triton_splice::lower(node, &ir, false)
                 .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
 
-            // ⛔ THE NAME LAW IS PART OF THE GATE — the BUILDER's `ew_kind_stem`
-            // (`add_s{id}`, `mul_s{id}`, `sub_s{id}`, `silu_s{id}`; BiasAdd is `add`),
-            // read off the producer's kind on both paths.
+            // ⛔ THE NAME LAW — the producer's own stem law (`add_s{id}`,
+            // `mul_s{id}`, `sub_s{id}`, `silu_s{id}`; BiasAdd is `add`), read off
+            // the producer's kind.
             assert_eq!(
-                spliced.op_name, builder.op_name,
+                spliced.op_name,
+                format!("{}_s{}", elementwise_stem(kind), node.id.index()),
                 "op_name ({kind:?} m={m} c={c})"
             );
 
-            // 3. Both programs go through the SAME door under the SAME layout.
+            // The program lowers through the production door under the walk's own layout.
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
-            let builder_emitted =
-                door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "builder program lowered ({kind:?} m={m} c={c}): {}",
-                            e.message
-                        )
-                    });
-            let mut sym = 0i64;
-            let spliced_emitted = door_lower(
+            let _emitted = door_lower(
                 spliced
                     .ktir
                     .as_ref()
@@ -436,31 +335,13 @@ fn spliced_elementwise_is_byte_identical_to_the_builder() {
                     e.message
                 )
             });
-
-            assert_eq!(
-                builder_emitted.len(),
-                spliced_emitted.len(),
-                "op count ({kind:?} m={m} c={c})"
-            );
-            for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-                let bj = serde_json::to_string(b.dsc()).unwrap();
-                let sj = serde_json::to_string(s.dsc()).unwrap();
-                assert_eq!(
-                    bj, sj,
-                    "descriptor bytes ({kind:?} m={m} c={c}): builder vs splice diverged"
-                );
-                assert_eq!(
-                    b.op_name, s.op_name,
-                    "emitted op_name ({kind:?} m={m} c={c})"
-                );
-            }
         }
     }
 }
 
 /// One elementwise node as a one-node [`SubtileIR`]: unary kinds read t0 and write t2;
 /// binary kinds read t0 and t1 and write t2. All operands the output's shape (a
-/// broadcast operand is a builder `EwOperand` path this splice deliberately does not
+/// broadcast operand is a builder `EwOperand` path main's splice deliberately does not
 /// state, and the door's own extent guard would refuse it).
 fn elementwise_ir(m: u32, c: u32, kind: EwKind) -> SubtileIR {
     let unary = matches!(kind, EwKind::Silu | EwKind::Gelu);
@@ -503,58 +384,32 @@ const MATMUL_SHAPES: &[(u32, u32, u32)] = &[
 ];
 
 #[test]
-fn spliced_dense_matmul_is_byte_identical_to_the_builder() {
+fn spliced_dense_matmul_lowers_through_the_door() {
     for &(m, k, n) in MATMUL_SHAPES {
         let ir = matmul_ir(m, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-        // 1. The builder path — the control, called directly. `rows_are_requests: true`
-        // is the decode/batched shape (the prefill lm-head tail fold is a walk-level
-        // rewrite this direct control deliberately bypasses).
+        // The layout the tape walk computes for this graph (`rows_are_requests:
+        // true` is the decode/batched shape).
         let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
-        let mut sym = 0i64;
-        let mut quantized = HashSet::new();
-        let builder_ops = lower_matmul_node(
-            &ir.nodes[0],
-            &ir,
-            None,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-        )
-        .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
-        let [builder] = &builder_ops[..] else {
-            panic!(
-                "one matmul node lowers to one op, got {}",
-                builder_ops.len()
-            )
-        };
-        let builder_ktir = builder
-            .ktir
-            .as_ref()
-            .expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node.
+        // The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, true)
             .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
 
-        // ⛔ THE NAME LAW IS PART OF THE GATE — `matmul_s{id}` on both paths.
+        // ⛔ THE NAME LAW — `matmul_s{id}`.
         assert_eq!(
-            spliced.op_name, builder.op_name,
+            spliced.op_name,
+            format!("matmul_s{}", node.id.index()),
             "op_name (m={m} k={k} n={n})"
         );
 
-        // 3. Both programs go through the SAME door under the SAME layout.
+        // The program lowers through the production door under the walk's own layout.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted =
-            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None).unwrap_or_else(
-                |e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message),
-            );
-        let mut sym = 0i64;
-        let spliced_emitted = door_lower(
+        let _emitted = door_lower(
             spliced
                 .ktir
                 .as_ref()
@@ -565,21 +420,6 @@ fn spliced_dense_matmul_is_byte_identical_to_the_builder() {
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
-
-        assert_eq!(
-            builder_emitted.len(),
-            spliced_emitted.len(),
-            "op count (m={m} k={k} n={n})"
-        );
-        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-            let bj = serde_json::to_string(b.dsc()).unwrap();
-            let sj = serde_json::to_string(s.dsc()).unwrap();
-            assert_eq!(
-                bj, sj,
-                "descriptor bytes (m={m} k={k} n={n}): builder vs splice diverged"
-            );
-            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} k={k} n={n})");
-        }
     }
 }
 
@@ -647,7 +487,7 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
 
     // The host data, bound EXACTLY as the worker binds it (`spyre_load.rs`'s
     // non-hw arm): A `[m, k]` and the GEMM weight VERBATIM in its on-disk `[n, k]`
-    // orientation — the same bytes the builder's transpose-B maps read. The f32
+    // orientation — the same bytes the historical builder's transpose-B maps read. The f32
     // reference is over that same buffer: `W[ni, ki]` at `ni * k + ki`.
     let a: Vec<f32> = (0..m * k)
         .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
@@ -872,19 +712,19 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
     );
 }
 
-/// The scalarmul row's byte-identity gate — the same law as every other row: the
-/// builder's `lower_scalarmul_node` program vs the spliced `scalarmul.py` through the
-/// SAME door under the SAME layout, at granite's own multipliers (the logits scale's
-/// `1/√hidden` at 2b/8b widths) and a decode + prefill-rung shape. The chunked form
-/// has its own gate below (`spliced_column_chunked_scalarmul_is_byte_identical_per_chunk`);
-/// the whole-tensor shapes at these widths fit the three-live-tile budget.
+/// The scalarmul row's gate — the spliced `scalarmul.py` program through the
+/// door under the walk's own layout, at granite's own multipliers (the logits
+/// scale's `1/√hidden` at 2b/8b widths) and a decode + prefill-rung shape. The
+/// chunked form has its own gate below
+/// (`spliced_column_chunked_scalarmul_lowers_per_chunk`); the whole-tensor
+/// shapes at these widths fit the three-live-tile budget.
 #[test]
-fn spliced_scalarmul_is_byte_identical_to_the_builder() {
+fn spliced_scalarmul_lowers_through_the_door() {
     // (M, C, SCALE) — 2b's and 8b's logits scale at the hidden each normalizes to.
     // The m=96 row is the ROW-BLOCK TAIL rung at the bake's own defect shape:
     // `rows_per_block(8192, 3)` = 42, so 96 rows = 2 full blocks + a 12-row tail —
-    // the tail descriptor is its own `[TAIL_H, N]` block and must be byte-compared
-    // too (the bake caught a tail that stored through the full-block descriptor; no
+    // the tail descriptor is its own `[TAIL_H, N]` block and must clear the door too
+    // (the bake caught a tail that stored through the full-block descriptor; no
     // golden shape reached a tail).
     for (m, c, scale) in [
         (1u32, 2048u32, 0.022_097_087f32),
@@ -895,41 +735,31 @@ fn spliced_scalarmul_is_byte_identical_to_the_builder() {
         let ir = scalarmul_ir(m, c, scale);
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
-        // 1. The builder path — the control, called directly.
+        // The layout the tape walk computes for this graph.
         let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
-        let mut sym = 0i64;
-        let builder = lower_scalarmul_node(&ir.nodes[0], &ir, scale, &mut sym)
-            .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
-        let builder_ktir = builder
-            .ktir
-            .as_ref()
-            .expect("builder op carries its program");
 
-        // 2. The splice — the row compiles `scalarmul.py` for this node.
+        // The splice — the row compiles `scalarmul.py` for this node.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
-        // ⛔ THE NAME LAW — `scalarmul_s{id}` on both paths.
+        // ⛔ THE NAME LAW — `scalarmul_s{id}`.
         assert_eq!(
-            spliced.op_name, builder.op_name,
+            spliced.op_name,
+            format!("scalarmul_s{}", node.id.index()),
             "op_name (m={m} c={c} scale={scale})"
         );
 
-        // 3. Both programs go through the SAME door under the SAME layout. ⛔ THE
-        // SCALE MUST HAVE A REGISTRY SLOT on both paths — the door reads it off the
+        // The program lowers through the production door under the walk's own layout.
+        // ⛔ THE SCALE MUST HAVE A REGISTRY SLOT — the door reads it off the
         // program (`program_scalarmul_scale`) and looks it up in
         // `BundleLayout::scalarmul_scales`, which `compute_bundle_layout` fills from
         // the node payload, so a splice that states a different scale than the node's
         // fails HERE by registry desync rather than by a wrong number on the card.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted =
-            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
-                .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
-        let mut sym = 0i64;
-        let spliced_emitted = door_lower(
+        let _emitted = door_lower(
             spliced
                 .ktir
                 .as_ref()
@@ -940,33 +770,18 @@ fn spliced_scalarmul_is_byte_identical_to_the_builder() {
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
-
-        assert_eq!(
-            builder_emitted.len(),
-            spliced_emitted.len(),
-            "op count (m={m} c={c})"
-        );
-        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-            let bj = serde_json::to_string(b.dsc()).unwrap();
-            let sj = serde_json::to_string(s.dsc()).unwrap();
-            assert_eq!(
-                bj, sj,
-                "descriptor bytes (m={m} c={c}): builder vs splice diverged"
-            );
-            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} c={c})");
-        }
     }
 }
 
-/// The scalarmul row's CHUNKED byte-identity gate — granite's own 7-chunk logits,
-/// the shape the 8b defect was convicted on. The logits tensor is `[1, 49155]`
+/// The scalarmul row's CHUNKED gate — granite's own 7-chunk logits, the shape the
+/// 8b defect was convicted on. The logits tensor is `[1, 49155]`
 /// (49155 = 6 × 8192 + 3), and `lower_region` tiles it into SEVEN scalarmul chunks
-/// that share one output TensorId; the splice now compiles every chunk with
-/// `C_START` naming its column corner and the descriptors must stay byte-identical
-/// to the builder's per chunk — through the same door, under one layout threaded
-/// over ALL SEVEN (the one `bundle_sym` counter the production bake threads).
+/// that share one output TensorId; the splice compiles every chunk with
+/// `C_START` naming its column corner and every chunk must lower through the door —
+/// under one layout threaded over ALL SEVEN (the one `bundle_sym` counter the
+/// production bake threads).
 #[test]
-fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
+fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     const LOGITS_COLS: u32 = 49_155;
     const NB: u32 = 8_192;
     let scale = 0.022_097_087f32;
@@ -977,7 +792,6 @@ fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
     // descriptor names depend on the chunks before it.
-    let mut builder_sym = 0i64;
     let mut splice_sym = 0i64;
     let mut chunk_idx = 0usize;
     let mut c_start = 0u32;
@@ -994,36 +808,19 @@ fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
         chunked.nodes[0].inputs = vec![window(0)];
         chunked.nodes[0].output = window(1);
 
-        // The builder over the same chunk-shaped node — the control.
-        let builder = lower_scalarmul_node(&chunked.nodes[0], &chunked, scale, &mut builder_sym)
-            .unwrap_or_else(|e| {
-                panic!("builder lowered chunk {chunk_idx} (c_start {c_start}): {e}")
-            });
-        let builder_ktir = builder
-            .ktir
-            .as_ref()
-            .expect("builder op carries its program");
-
         // The splice — every chunk compiles (`C_START` states the corner).
         let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
             .unwrap_or_else(|e| {
                 panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}")
             });
         assert_eq!(
-            spliced.op_name, builder.op_name,
+            spliced.op_name,
+            format!("scalarmul_s{}", chunked.nodes[0].id.index()),
             "op_name (chunk {chunk_idx}, c_start {c_start})"
         );
 
         let mut quantized = HashSet::new();
-        let builder_emitted = door_lower(
-            builder_ktir,
-            &mut builder_sym,
-            Some(&layout),
-            &mut quantized,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("builder program lowered (chunk {chunk_idx}): {}", e.message));
-        let spliced_emitted = door_lower(
+        let _emitted = door_lower(
             spliced
                 .ktir
                 .as_ref()
@@ -1034,22 +831,6 @@ fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (chunk {chunk_idx}): {}", e.message));
-
-        assert_eq!(
-            builder_emitted.len(),
-            spliced_emitted.len(),
-            "op count (chunk {chunk_idx})"
-        );
-        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-            let bj = serde_json::to_string(b.dsc()).unwrap();
-            let sj = serde_json::to_string(s.dsc()).unwrap();
-            assert_eq!(
-                bj, sj,
-                "descriptor bytes (chunk {chunk_idx}, c_start {c_start}): builder vs splice \
-                 diverged — the 8b defect's own shape"
-            );
-            assert_eq!(b.op_name, s.op_name, "emitted op_name (chunk {chunk_idx})");
-        }
 
         chunk_idx += 1;
         c_start += len;
@@ -1217,44 +998,21 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
 
 /// ⛔ THE BATCHED-DECODE LM-HEAD GATE. A result-width matmul with an ODD vocab at
 /// `rows > 1` under `rows_are_requests` — granite's batched-decode lm_head
-/// (vocab 49155) — must SPLICE, byte-identically to the builder: the odd-N
+/// (vocab 49155) — must SPLICE and lower through the door: the odd-N
 /// SingleCorelet re-patterning in `PlanCorelets` (the C++'s own one-stick fix) made
 /// odd N compilable, and the splice covers the whole batched-decode lm_head shape.
 /// This test pins the compile at the exact conjunction that once escaped the splice's
-/// guards (odd vocab + rows>1 + rows_are_requests), then runs the byte-identity
-/// comparison against the builder's own `lower_matmul_node` at that shape.
+/// guards (odd vocab + rows>1 + rows_are_requests).
 #[test]
-fn batched_decode_odd_vocab_lm_head_splices_byte_identically() {
+fn batched_decode_odd_vocab_lm_head_splices() {
     // rows > 1 AND rows_are_requests (so the prefill-fold guard does not take it)
     // AND odd result-width cols — the exact conjunction that used to escape.
     let (m, k, n) = (8u32, 2048u32, 49155u32);
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    // The builder control, called directly.
     let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
-    let mut sym = 0i64;
-    let mut quantized = HashSet::new();
-    let builder_ops = lower_matmul_node(
-        &ir.nodes[0],
-        &ir,
-        None,
-        &mut sym,
-        Some(&layout),
-        &mut quantized,
-    )
-    .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
-    let [builder] = &builder_ops[..] else {
-        panic!(
-            "one matmul node lowers to one op, got {}",
-            builder_ops.len()
-        )
-    };
-    let builder_ktir = builder
-        .ktir
-        .as_ref()
-        .expect("builder op carries its program");
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
     // SingleCorelet re-patterning), never refuse.
@@ -1262,17 +1020,15 @@ fn batched_decode_odd_vocab_lm_head_splices_byte_identically() {
     let spliced = scratchy_triton_splice::lower(node, &ir, true)
         .unwrap_or_else(|e| panic!("odd vocab must splice at any row count: {e}"));
     assert_eq!(
-        spliced.op_name, builder.op_name,
+        spliced.op_name,
+        format!("matmul_s{}", node.id.index()),
         "op_name (m={m} k={k} n={n})"
     );
 
-    // Byte-identity through the same door under the same layout.
+    // Through the production door under the walk's own layout.
     let mut sym = 0i64;
     let mut quantized = HashSet::new();
-    let builder_emitted = door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
-        .unwrap_or_else(|e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message));
-    let mut sym = 0i64;
-    let spliced_emitted = door_lower(
+    let _emitted = door_lower(
         spliced
             .ktir
             .as_ref()
@@ -1283,38 +1039,22 @@ fn batched_decode_odd_vocab_lm_head_splices_byte_identically() {
         None,
     )
     .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
-
-    assert_eq!(
-        builder_emitted.len(),
-        spliced_emitted.len(),
-        "op count (m={m} k={k} n={n})"
-    );
-    for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-        let bj = serde_json::to_string(b.dsc()).unwrap();
-        let sj = serde_json::to_string(s.dsc()).unwrap();
-        assert_eq!(
-            bj, sj,
-            "descriptor bytes (m={m} k={k} n={n}): builder vs splice diverged"
-        );
-        assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} k={k} n={n})");
-    }
 }
 
-/// The PREFILL lm-head FOLD's byte-identity gate: `scratchy_triton_splice::lower_all` —
+/// The PREFILL lm-head FOLD's gate: `scratchy_triton_splice::lower_all` —
 /// which routes an m>1 vocab-wide MatmulTile through the Triton `lmlast.py` extraction
-/// plus the re-lowered m=1 matmul — vs the pub builder control
-/// `lower_prefill_lm_head_at_m1` (main's fold verbatim, both halves), each program
-/// through the SAME door under the SAME layout. `compute_bundle_layout` sees only the
-/// ORIGINAL graph (the reserved `LAST_HIDDEN_TID` staging is beyond `ir.tensors`, so
-/// the layout cannot know about it), and that is the production condition: the bake
-/// mints the layout once for the graph, then the walk's m>1 tail folds underneath it.
+/// plus the re-lowered m=1 matmul — through the SAME door under the SAME layout.
+/// `compute_bundle_layout` sees only the ORIGINAL graph (the reserved
+/// `LAST_HIDDEN_TID` staging is beyond `ir.tensors`, so the layout cannot know about
+/// it), and that is the production condition: the bake mints the layout once for the
+/// graph, then the walk's m>1 tail folds underneath it.
 ///
 /// The fold's second half re-enters the ordinary matmul row — this gate therefore
 /// covers the WINDOWED matmul form too (`matmul.py`'s `M_TOTAL`, the out descriptor
 /// naming the `[mq, vocab]` storage while the store tile stays `[1, vocab]` at row 0),
-/// which no other golden reaches: every other matmul golden is decode-shaped.
+/// which no other matmul gate reaches: every other matmul shape is decode-shaped.
 #[test]
-fn spliced_prefill_lm_head_fold_is_byte_identical_to_the_builder() {
+fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     // hidden[mq, k] @ W_lmhead[k, n] -> logits[mq, n], rows_are_requests FALSE (the
     // prefill walk). The 2b's own tail shape at a prefill rung: k=2048, granite's odd
     // vocab 49155 (the odd width the ladder's re-patterning exists for), mq=31 (the
@@ -1325,76 +1065,30 @@ fn spliced_prefill_lm_head_fold_is_byte_identical_to_the_builder() {
         let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
-        // 1. The builder control — main's fold, both halves, called directly.
-        let mut sym = 0i64;
-        let mut quantized = HashSet::new();
-        let builder_ops =
-            lower_prefill_lm_head_at_m1(&ir.nodes[0], &ir, &mut sym, Some(&layout), &mut quantized)
-                .unwrap_or_else(|e| panic!("builder folded mq={mq} k={k} n={n}: {e}"));
-        assert_eq!(
-            builder_ops.len(),
-            2,
-            "the fold is the extraction plus the m=1 matmul (mq={mq} k={k} n={n}): {} ops",
-            builder_ops.len()
-        );
-
-        // 2. The splice — `lower_all` takes the fold route for this shape.
+        // The splice — `lower_all` takes the fold route for this shape.
         let node = &ir.nodes[0];
         let spliced_ops = scratchy_triton_splice::lower_all(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
         assert_eq!(
             spliced_ops.len(),
             2,
-            "the splice's fold is two programs (mq={mq} k={k} n={n}): {} ops",
+            "the fold is the extraction plus the m=1 matmul (mq={mq} k={k} n={n}): {} ops",
             spliced_ops.len()
         );
 
-        // 3. Each program through the SAME door under the SAME layout, symbol
-        // counters threaded in bundle order (the door's names are per-bundle).
-        let mut b_sym = 0i64;
+        // Each program through the door under the SAME layout, symbol counters
+        // threaded in bundle order (the door's names are per-bundle).
         let mut s_sym = 0i64;
-        for (b_op, s_op) in builder_ops.iter().zip(spliced_ops.iter()) {
-            let b_ktir = b_op
-                .ktir
-                .as_ref()
-                .unwrap_or_else(|| panic!("builder op carries its program (mq={mq} n={n})"));
+        let mut quantized = HashSet::new();
+        for s_op in &spliced_ops {
             let s_ktir = s_op.ktir.as_ref().expect("spliced op carries its program");
-            let builder_emitted =
-                door_lower(b_ktir, &mut b_sym, Some(&layout), &mut quantized, None).unwrap_or_else(
-                    |e| {
-                        panic!(
-                            "builder program lowered (mq={mq} k={k} n={n}): {}",
-                            e.message
-                        )
-                    },
-                );
-            let spliced_emitted =
-                door_lower(s_ktir, &mut s_sym, Some(&layout), &mut quantized, None).unwrap_or_else(
-                    |e| {
-                        panic!(
-                            "spliced program lowered (mq={mq} k={k} n={n}): {}",
-                            e.message
-                        )
-                    },
-                );
-
-            assert_eq!(
-                builder_emitted.len(),
-                spliced_emitted.len(),
-                "op count (mq={mq} k={k} n={n})"
-            );
-            for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-                let bj = serde_json::to_string(b.dsc()).unwrap();
-                let sj = serde_json::to_string(s.dsc()).unwrap();
-                assert_eq!(
-                    bj, sj,
-                    "descriptor bytes (mq={mq} k={k} n={n}): builder vs splice diverged"
-                );
-                assert_eq!(
-                    b.op_name, s.op_name,
-                    "emitted op_name (mq={mq} k={k} n={n})"
-                );
-            }
+            let _emitted = door_lower(s_ktir, &mut s_sym, Some(&layout), &mut quantized, None)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "spliced program lowered (mq={mq} k={k} n={n}): {}",
+                        e.message
+                    )
+                });
         }
     }
 }
@@ -1412,74 +1106,46 @@ const MATMUL_FP8_SHAPES: &[(u32, u32, u32)] = &[
     // n=4096, the MLP gate/up n=12800, down n=4096 — at the real PREFILL rung's
     // mq=96 (the rung the card bakes) as well as decode. The byte-identity law
     // is shape-independent but the LADDER's compile is not — these pin that the
-    // wide-kernel monomorphisation still yields the builder's descriptors.
+    // wide-kernel monomorphisation still yields the splice's descriptors.
     (1, 4096, 4096),
     (31, 4096, 12800),
     (96, 4096, 4096),
     (96, 4096, 12800),
 ];
 
-/// The fp8 W8A8 row's byte-identity gate: the spliced `matmul_fp8.py` program vs
-/// the builder's `KtirFunc::matmul_fp8` through the SAME door. Both programs are
-/// `Program::Matmul` with an fp8 weight view and arity-3 bindings, so the door
-/// emits its 12-op W8A8 chain (abs→amax→amaxfl→ascale→invs→sc→chi→cl→qfp8ch→
-/// batchmatmulfp8→dqa→dqw) for BOTH — at one-node grain the `quantized` set is
-/// fresh, so neither path can dedup and the comparison is per-node exact.
+/// The fp8 W8A8 row's gate: the spliced `matmul_fp8.py` program through the door.
+/// The program is `Program::Matmul` with an fp8 weight view and arity-3 bindings, so
+/// the door emits its 12-op W8A8 chain (abs→amax→amaxfl→ascale→invs→sc→chi→cl→
+/// qfp8ch→batchmatmulfp8→dqa→dqw) — at one-node grain the `quantized` set is fresh,
+/// so no dedup can hide a missing link in the chain.
 #[test]
-fn spliced_fp8_matmul_is_byte_identical_to_the_builder() {
+fn spliced_fp8_matmul_lowers_through_the_door() {
     for &(m, k, n) in MATMUL_FP8_SHAPES {
         let ir = matmul_fp8_ir(m, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
-        // 1. The builder path — the control, called directly.
+        // The layout the tape walk computes for this graph.
         let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
-        let mut sym = 0i64;
-        let mut quantized = HashSet::new();
-        let builder_ops = lower_matmul_node(
-            &ir.nodes[0],
-            &ir,
-            None,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-        )
-        .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
-        let [builder] = &builder_ops[..] else {
-            panic!(
-                "one fp8 matmul node lowers to one op, got {}",
-                builder_ops.len()
-            )
-        };
-        let builder_ktir = builder
-            .ktir
-            .as_ref()
-            .expect("builder op carries its program");
 
-        // 2. The splice — the Fp8Dynamic row compiles the kernel for this node.
+        // The splice — the Fp8Dynamic row compiles the kernel for this node.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, true)
             .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"));
 
-        // ⛔ THE NAME LAW — `matmul_s{id}` on both paths (the stem is the PROGRAM's,
-        // and fp8 shares dense's `Program::Matmul`).
+        // ⛔ THE NAME LAW — `matmul_s{id}` (fp8 shares dense's `Program::Matmul`).
         assert_eq!(
-            spliced.op_name, builder.op_name,
+            spliced.op_name,
+            format!("matmul_s{}", node.id.index()),
             "op_name (m={m} k={k} n={n})"
         );
 
-        // 3. Both programs go through the SAME door under the SAME layout. A FRESH
-        // `quantized` set per program: at one-node grain neither path dedups, so
-        // both emit the full quant chain and the chain itself is compared.
+        // The program lowers through the production door under the walk's own layout.
+        // A FRESH `quantized` set: at one-node grain no dedup fires, so the full
+        // quant chain is emitted and the chain itself is minted.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted =
-            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None).unwrap_or_else(
-                |e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message),
-            );
-        let mut sym = 0i64;
-        let mut quantized = HashSet::new();
-        let spliced_emitted = door_lower(
+        let _emitted = door_lower(
             spliced
                 .ktir
                 .as_ref()
@@ -1490,24 +1156,6 @@ fn spliced_fp8_matmul_is_byte_identical_to_the_builder() {
             None,
         )
         .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
-
-        // The 12-op W8A8 chain is the door's own signature — pin the count so a
-        // divergence in WHICH chain the door picked is caught by name, not just by
-        // byte comparison.
-        assert_eq!(
-            builder_emitted.len(),
-            spliced_emitted.len(),
-            "op count (m={m} k={k} n={n})"
-        );
-        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-            let bj = serde_json::to_string(b.dsc()).unwrap();
-            let sj = serde_json::to_string(s.dsc()).unwrap();
-            assert_eq!(
-                bj, sj,
-                "descriptor bytes (m={m} k={k} n={n}): builder vs splice diverged"
-            );
-            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} k={k} n={n})");
-        }
     }
 }
 
@@ -1579,48 +1227,8 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
         }
     }
 
-    // CONTROL: the BUILDER's own program for the same node, through the identical
-    // session/binding/data. Its result must match the spliced one — the exec-level
-    // twin of the byte-identity gate (and the control that LOCATED the resident
-    // executor's fp8 binding bug: both paths failed identically before it).
-    let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
-    let builder_ktir = {
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
-            .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
-        let mut sym = 0i64;
-        let mut quantized = HashSet::new();
-        let builder_ops = lower_matmul_node(
-            &ir.nodes[0],
-            &ir,
-            None,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-        )
-        .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
-        builder_ops[0]
-            .ktir
-            .clone()
-            .expect("builder op carries its program")
-    };
-    let builder_got = execute_fp8_program(
-        m,
-        k,
-        n,
-        a.clone(),
-        w.clone(),
-        ws.clone(),
-        builder_ktir.clone(),
-    );
-
     let got = execute_fp8_program(m, k, n, a, w, ws, k_node.clone());
     assert_eq!(got.len(), (m * n) as usize, "m={m} k={k} n={n}");
-    for (g, b) in got.iter().zip(&builder_got) {
-        assert!(
-            (g - b).abs() < 1e-6,
-            "spliced vs builder program diverged at execution (m={m} k={k} n={n}): {g} vs {b}"
-        );
-    }
     let mut max_abs = 0.0f32;
     for (g, wnt) in got.iter().zip(&want) {
         max_abs = max_abs.max((g - wnt).abs());
@@ -1633,8 +1241,7 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
 }
 
 /// Run ONE fp8 matmul KtirNode through the production session entry with the
-/// given host bytes, returning the `[m, n]` output — the shared body of the
-/// splice's exec gate and its builder control.
+/// given host bytes, returning the `[m, n]` output.
 fn execute_fp8_program(
     m: u32,
     k: u32,
@@ -1787,14 +1394,13 @@ const ROPE_SHAPES: &[(u32, u32, u32)] = &[
 ];
 
 #[test]
-fn spliced_rope_is_byte_identical_to_the_builder() {
+fn spliced_rope_lowers_through_the_door() {
     for &(mq, heads, hd) in ROPE_SHAPES {
         for rows_are_requests in [false, true] {
             let ir = rope_ir(mq, heads, hd);
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
-            // 1. The builder path — the control, called directly through the
-            // head-dim value→const door (`LowerRope`), exactly as the walk does.
+            // The layout the tape walk computes for this graph.
             let layout = compute_bundle_layout(
                 &ir,
                 &weight_ids,
@@ -1804,53 +1410,26 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
             .unwrap_or_else(|e| {
                 panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
             });
-            let mut sym = 0i64;
-            let builder_ops = scratchy_subtile::model_geometry::with_config_head_dim(
-                ktir_superdsc::head_counts::HeadDim::new(hd),
-                LowerRope::new(
-                    &ir.nodes[0],
-                    &ir,
-                    &mut sym,
-                    Some(&layout),
-                    rows_are_requests,
-                ),
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "no head-dim arm for hd={hd} — the configs in scope must declare it \
-                     (mq={mq} heads={heads})"
-                )
-            })
-            .unwrap_or_else(|e| {
-                panic!(
-                    "builder lowered mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}"
-                )
-            });
-            let [builder] = &builder_ops[..] else {
-                panic!("one rope node lowers to one op, got {}", builder_ops.len())
-            };
-            let builder_ktir = builder
-                .ktir
-                .as_ref()
-                .expect("builder op carries its program");
 
-            // 2. The splice — the row compiles the kernel for this node. The splice has
-            // no rope-specific refusal (the builder's own `total % hd` refusal is
+            // The splice — the row compiles the kernel for this node. The splice has
+            // no rope-specific refusal (the historical builder's own `total % hd` refusal is
             // mirrored as an Err, not a fallthrough), so an Err here is a broken row.
             let node = &ir.nodes[0];
             let spliced = scratchy_triton_splice::lower(node, &ir, rows_are_requests)
                 .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
 
-            // ⛔ THE NAME LAW IS PART OF THE GATE — `rope_s{id}` on both paths.
+            // ⛔ THE NAME LAW — `rope_s{id}`.
             assert_eq!(
-                spliced.op_name, builder.op_name,
+                spliced.op_name,
+                format!("rope_s{}", node.id.index()),
                 "op_name (mq={mq} heads={heads} hd={hd})"
             );
 
-            // 3. Both programs go through the SAME door under the SAME layout. Rope's
-            // door arm reads `rows_are_requests` off `BundleAttnParams`, so the bundle
-            // fact is stated here exactly as the tape walk states it (a geometry from
-            // the same config the model declares — 32/8 at the node's head dim).
+            // The program lowers through the production door under the walk's own
+            // layout. Rope's door arm reads `rows_are_requests` off
+            // `BundleAttnParams`, so the bundle fact is stated here exactly as the
+            // tape walk states it (a geometry from the same config the model
+            // declares — 32/8 at the node's head dim).
             let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
                 ktir_superdsc::head_counts::QueryHeads::new(32),
                 ktir_superdsc::head_counts::KvHeads::new(8),
@@ -1863,21 +1442,7 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
             };
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
-            let builder_emitted = door_lower(
-                builder_ktir,
-                &mut sym,
-                Some(&layout),
-                &mut quantized,
-                Some(attn_params),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "builder program lowered (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): {}",
-                    e.message
-                )
-            });
-            let mut sym = 0i64;
-            let spliced_emitted = door_lower(
+            let _emitted = door_lower(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
@@ -1890,25 +1455,6 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
                     e.message
                 )
             });
-
-            assert_eq!(
-                builder_emitted.len(),
-                spliced_emitted.len(),
-                "op count (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests})"
-            );
-            for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-                let bj = serde_json::to_string(b.dsc()).unwrap();
-                let sj = serde_json::to_string(s.dsc()).unwrap();
-                assert_eq!(
-                    bj, sj,
-                    "descriptor bytes (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): \
-                     builder vs splice diverged"
-                );
-                assert_eq!(
-                    b.op_name, s.op_name,
-                    "emitted op_name (mq={mq} heads={heads} hd={hd})"
-                );
-            }
         }
     }
 }
@@ -1918,7 +1464,7 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
 /// `[mq*heads, hd]` tall views of the `[mq, heads*hd]` plane (same bytes, the
 /// arrangement `addr_eq` admits), cos/sin as the worker's head-tiled
 /// `[mq*heads, hd]` tables (`spyre_forward.rs`'s `tile` over `rope_cos_sin` rows) —
-/// because that is the binding the spliced kernel and the builder's program both
+/// because that is the binding the spliced kernel and the historical builder program both
 /// address. The node kind is `RopeRotate` (the pure rotation); `RopeAppend`'s extra
 /// inputs are cache destinations that flow through graph edges, and the splice covers
 /// both kinds with the same row.
@@ -1970,8 +1516,8 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
 // THE ATTENTION GOLDEN
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One attention shape the golden compares: everything the builder's `KtirFunc::attn` and the
-/// spliced `attn.py` derive their program from, so a shape here is one (arm × geometry × rung ×
+/// One attention shape the golden compares: everything the spliced `attn.py` derives its program
+/// from — geometry, rung, cache producer — so a shape here is one (arm × geometry × rung ×
 /// producer) cell of the delivery scope.
 #[derive(Clone, Copy)]
 struct AttnShape {
@@ -1995,8 +1541,8 @@ impl AttnShape {
     }
 }
 
-/// The attention shapes that matter for the delivery scope — granite 2b/8b, every arm of
-/// `KtirFunc::attn`'s own split, both cache producers, and the rungs the bake iterates.
+/// The attention shapes that matter for the delivery scope — granite 2b/8b, every arm of the
+/// attention splice's own split, both cache producers, and the rungs the bake iterates.
 ///
 /// ⛔ THE CAP IS THE RESIDENT CACHE'S, WHICH PRODUCTION CAPS AT ONE PAGE. The bake's prefix
 /// capacity is `min(max_position_embeddings, 256)` (`codegen.rs`'s `prefix_cap_default`), and the
@@ -2117,8 +1663,8 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     let q_width = nqh * hd;
     let kv_width = nkvh * hd;
     let mq = s.mq;
-    // The pre-populated prefix's own region rows (the emulator-threaded extent the builder
-    // reads directly); the rope-appended one is sliced by `lower_region` below.
+    // The pre-populated prefix's own region rows (the emulator-threaded extent main's
+    // builder read directly); the rope-appended one is sliced by `lower_region` below.
     const PREPOP_ROWS: u32 = 32;
     let valid_len = ATTN_VALID_LEN;
     // The new block's rows: at decode the one new row; at prefill the chunk's own `mq` rows
@@ -2182,7 +1728,7 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
         // new_v) into the cache sources 1/2. THIS op is what binds SameForwardRopeAppend for
         // the attention below (`k_cache_producer_node`). The cache SOURCES are declared at the
         // full `cap` rows — the capacity the door reads — while `lower_region` slices the
-        // attention's prefix REGION to `valid_len - 1` (the builder's masked-segment read is
+        // attention's prefix REGION to `valid_len - 1` (the door's masked-segment read is
         // `swept.min(tensor rows)`; the region's rows never bound it).
         let input = scratchy_subtile::lower::LoweringInput {
             sources: sources(s.cap),
@@ -2233,28 +1779,24 @@ fn attn_geometry(geom: (u32, u32, u32)) -> Option<ktir_superdsc::head_counts::Mo
 }
 
 #[test]
-fn spliced_attn_is_byte_identical_to_the_builder() {
+fn spliced_attn_lowers_through_the_door() {
     for &s in ATTN_SHAPES {
-        // ⛔ ROWS-ARE-REQUESTS IS A DECODE-BUNDLE FACT: the builder's own emit states the row
-        // kind is the caller's, and the bake states it per bundle — a decode batch's rows are
-        // requests, a prefill chunk's rows are positions of one sequence. The golden states it
-        // the way the bake does: decode (mq == 1) tries BOTH kinds (the door's GQA-replicate
-        // and kv_block_index arms differ), prefill only `false`.
+        // ⛔ ROWS-ARE-REQUESTS IS A DECODE-BUNDLE FACT: the bake states it per
+        // bundle — a decode batch's rows are requests, a prefill chunk's rows are
+        // positions of one sequence. The gate states it the way the bake does:
+        // decode (mq == 1) tries BOTH kinds (the door's GQA-replicate and
+        // kv_block_index arms differ), prefill only `false`.
         let row_kinds: &[bool] = if s.mq == 1 { &[false, true] } else { &[false] };
         for &rows_are_requests in row_kinds {
             // granite's attention_multiplier, the config value (NOT a recomputed 1/sqrt(hd)):
-            // 2b (hd 64) 0.015625, 8b (hd 128) 0.0078125 — the f16-exact ones. ⛔ The 8b's
-            // SQRT is NOT f16-exact; `attn_at`'s bit-exact registry check is the flagged risk
-            // this gate exists to catch.
+            // 2b (hd 64) 0.015625, 8b (hd 128) 0.0078125 — the f16-exact ones.
             let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
             let ir = attn_ir(s, scale);
             // The weight-id census is EMPTY: every source this fixture declares is an
             // activation or a KV cache (the layout walk re-places the caches into seg2 itself).
             let weight_ids: HashSet<u32> = HashSet::new();
 
-            // 1. The builder path — the control, called directly through the geometry
-            // value→const door (`LowerAttn`), exactly as `lower_one_node` did before the
-            // splice landed.
+            // The layout the tape walk computes for this graph.
             let layout = compute_bundle_layout(
                 &ir,
                 &weight_ids,
@@ -2269,43 +1811,8 @@ fn spliced_attn_is_byte_identical_to_the_builder() {
             });
             let node = ir.nodes.last().unwrap();
             let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-            let mut sym = 0i64;
-            let builder_ops = scratchy_subtile::model_geometry::with_config_attn_geometry(
-                attn_geometry(s.geom).expect("granite's geometry mints"),
-                scratchy_target_spyre::lower_subtile_tape_to_ktir::LowerAttn::new(
-                    node,
-                    &ir,
-                    cap,
-                    s.active_cap(),
-                    rows_are_requests,
-                    &mut sym,
-                    Some(&layout),
-                ),
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "no geometry arm for {:?} — the configs in scope must declare it",
-                    s.geom
-                )
-            })
-            .unwrap_or_else(|e| {
-                panic!(
-                    "builder lowered geom={:?} mq={} rung={} r_ar={rows_are_requests}: {}",
-                    s.geom, s.mq, s.rung, e.0
-                )
-            });
-            let [builder] = &builder_ops[..] else {
-                panic!(
-                    "one attention node lowers to one op, got {}",
-                    builder_ops.len()
-                )
-            };
-            let builder_ktir = builder
-                .ktir
-                .as_ref()
-                .expect("builder op carries its program");
 
-            // 2. The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
+            // The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
             let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
                 .unwrap_or_else(|e| {
                     panic!(
@@ -2314,36 +1821,27 @@ fn spliced_attn_is_byte_identical_to_the_builder() {
                     )
                 });
 
-            // ⛔ THE NAME LAW IS PART OF THE GATE — `attn_s{id}` on both paths.
+            // ⛔ THE NAME LAW — `attn_s{id}`.
             assert_eq!(
-                spliced.op_name, builder.op_name,
+                spliced.op_name,
+                format!("attn_s{}", node.id.index()),
                 "op_name (geom={:?} mq={} rung={})",
-                s.geom, s.mq, s.rung
+                s.geom,
+                s.mq,
+                s.rung
             );
 
-            // 3. Both programs go through the SAME door under the SAME layout, with the
-            // bundle facts stated exactly as the tape walk states them.
+            // The program lowers through the production door under the walk's own
+            // layout, with the bundle facts stated exactly as the tape walk states
+            // them (`attn_at` reads the swept extent, the scale, the span guard and
+            // the row laws off the program).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 geom: attn_geometry(s.geom).expect("granite's geometry mints"),
                 rows_are_requests,
             };
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
-            let builder_emitted = door_lower(
-                builder_ktir,
-                &mut sym,
-                Some(&layout),
-                &mut quantized,
-                Some(attn_params),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "builder program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
-                    s.geom, s.mq, s.rung, e.message
-                )
-            });
-            let mut sym = 0i64;
-            let spliced_emitted = door_lower(
+            let _emitted = door_lower(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
@@ -2356,30 +1854,6 @@ fn spliced_attn_is_byte_identical_to_the_builder() {
                     s.geom, s.mq, s.rung, e.message
                 )
             });
-
-            assert_eq!(
-                builder_emitted.len(),
-                spliced_emitted.len(),
-                "op count (geom={:?} mq={} rung={} r_ar={rows_are_requests})",
-                s.geom,
-                s.mq,
-                s.rung
-            );
-            for (b, sp) in builder_emitted.iter().zip(spliced_emitted.iter()) {
-                let bj = serde_json::to_string(b.dsc()).unwrap();
-                let sj = serde_json::to_string(sp.dsc()).unwrap();
-                assert_eq!(
-                    bj, sj,
-                    "descriptor bytes (geom={:?} mq={} rung={} r_ar={rows_are_requests}): \
-                     builder vs splice diverged",
-                    s.geom, s.mq, s.rung
-                );
-                assert_eq!(
-                    b.op_name, sp.op_name,
-                    "emitted op_name (geom={:?} mq={} rung={})",
-                    s.geom, s.mq, s.rung
-                );
-            }
         }
     }
 }
