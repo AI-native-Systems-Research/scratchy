@@ -1159,7 +1159,9 @@ dependencies = [
 
 [[package]]
 name = "cudaforge"
-version = "0.1.4"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d475ff95b9e4096878f47fe0ca5dbad0e23849a79fc225305ea06c2f25771cd"
 dependencies = [
  "anyhow",
  "fs2",
@@ -1435,6 +1437,15 @@ name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -2024,7 +2035,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
- "dirs",
+ "dirs 6.0.0",
  "etcetera",
  "fs-err",
  "fs2",
@@ -2312,9 +2323,8 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "hf-hub-downloader"
 version = "0.1.0"
 dependencies = [
- "dirs",
+ "dirs 7.0.0",
  "hex",
- "rayon",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -3000,6 +3010,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktir-core"
+version = "0.1.0"
+
+[[package]]
+name = "ktir-superdsc"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "ktir-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3567,8 +3591,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.1",
- "block2",
- "libc",
  "objc2",
  "objc2-core-foundation",
 ]
@@ -3594,7 +3616,6 @@ dependencies = [
  "block2",
  "dispatch2",
  "objc2",
- "objc2-core-foundation",
  "objc2-foundation",
 ]
 
@@ -3996,16 +4017,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "prettyplease"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
-dependencies = [
- "proc-macro2",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -4726,7 +4737,6 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -4796,9 +4806,8 @@ name = "scratchy-builder-cuda"
 version = "0.1.0"
 dependencies = [
  "cudaforge",
- "dirs",
+ "dirs 7.0.0",
  "minijinja",
- "scratchy-models",
 ]
 
 [[package]]
@@ -4825,11 +4834,13 @@ name = "scratchy-core-model"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "hf-hub-downloader",
+ "indicatif",
  "scratchy-core-common",
- "scratchy-core-config",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -4837,10 +4848,8 @@ name = "scratchy-forward-compiler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "block2",
  "inventory",
  "objc2",
- "objc2-foundation",
  "objc2-metal",
  "scratchy-ir",
  "scratchy-layers",
@@ -4853,7 +4862,7 @@ dependencies = [
 name = "scratchy-forward-compiler-macro"
 version = "0.1.0"
 dependencies = [
- "prettyplease",
+ "ktir-superdsc",
  "proc-macro2",
  "quote",
  "rayon",
@@ -4863,9 +4872,8 @@ dependencies = [
  "scratchy-target-cuda",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
- "serde",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.4",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4910,7 +4918,6 @@ dependencies = [
  "scratchy-target-metal",
  "scratchy-vision",
  "serde_json",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -4933,9 +4940,6 @@ name = "scratchy-serving-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
- "chrono",
- "http",
  "indicatif",
  "inventory",
  "itertools",
@@ -4968,9 +4972,6 @@ name = "scratchy-serving-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
- "hf-hub-downloader",
- "indicatif",
  "inventory",
  "scratchy-core-common",
  "scratchy-core-config",
@@ -4998,13 +4999,14 @@ dependencies = [
 name = "scratchy-serving-transport"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "rmp-serde",
  "scratchy-core-common",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
- "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5012,12 +5014,10 @@ name = "scratchy-serving-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
  "cudarc",
  "half",
  "inventory",
  "objc2",
- "objc2-foundation",
  "objc2-metal",
  "rand 0.9.5",
  "scratchy-builder-cuda",
@@ -5026,15 +5026,14 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-models",
- "scratchy-quantizations",
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
+ "scratchy-serving-transport",
  "scratchy-target-cuda",
  "scratchy-target-metal",
  "serde",
  "serde_json",
  "tokenizers",
- "tokio",
  "tracing",
 ]
 
@@ -5042,9 +5041,7 @@ dependencies = [
 name = "scratchy-subtile"
 version = "0.1.0"
 dependencies = [
- "dirs",
- "half",
- "serde",
+ "ktir-superdsc",
  "serde_json",
 ]
 
@@ -5054,7 +5051,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cudarc",
- "dirs",
+ "dirs 7.0.0",
  "half",
  "hf-hub-downloader",
  "inventory",
@@ -5090,6 +5087,7 @@ dependencies = [
  "libc",
  "memmap2",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
  "objc2-metal",
  "rand 0.9.5",
@@ -5116,7 +5114,7 @@ dependencies = [
  "scratchy-subtile",
  "scratchy-target-metal",
  "serde",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -5380,7 +5378,7 @@ version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
 ]
 
 [[package]]
@@ -5917,7 +5915,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6163,7 +6160,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
