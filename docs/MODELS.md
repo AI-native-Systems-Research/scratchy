@@ -219,8 +219,12 @@ Open work (each item, with its measurements, in the module docs of
   the rest of its life — at a gate of 1, once a second request arrives,
   neither drafts again. A prefix-cache hit on such blocks reuses head KV
   that was never written (fewer drafts accepted, output unaffected).
-- **Verify cost past one sequence**: dense projections at 17–32 rows, the
-  Gated-DeltaNet scan's serial rows.
+- **Verify cost past one sequence**: the experts its rows pick, and, past 2
+  sequences, the 64-row prefill-shaped tape (verify-sized rungs should
+  derive from the gate).
+- **The scan's replay at prefill**: a build with a head runs its
+  Gated-DeltaNet scan 24% slower per prompt token, the price of a bit-exact
+  replay in one loop body; without a head it compiles out.
 - **Time to first token** pays the head's pass over the prompt (about
   0.19 s on a 5.4k-token prompt, base M5).
 - **`k` per bucket**, and re-measuring `k = 3` since the fold fix.
