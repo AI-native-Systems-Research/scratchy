@@ -198,6 +198,35 @@ spec/mtp,quant/mlx-affine-b4-g64-qembed
 scr serve mlx-community/Qwen3.6-35B-A3B-4bit
 ```
 
+The head drafts only for a step of at most `spec_max_seqs` sequences (its
+`arch.json`, 1); a larger step runs as its target alone, at the target's
+cost. The gate exists because a verify step carries `spec_drafts + 1` rows
+a sequence, and on a MoE target those rows read more distinct experts: on
+the base M5, Qwen3.6-35B-A3B's verify step costs 1.6 plain steps at 1
+sequence and 2.65 at 8, against about 2.3 tokens a verify step. One
+sequence is the point measured to pay on both GPUs measured (base M5, M5
+Max); the base M5 also paid at up to 4.
+
+Open work (each item, with its measurements, in the module docs of
+`crates/serving/engine/src/spec_decode/mtp.rs`):
+
+- **A gate per device and target**, derived at expansion from the verify
+  and plain tapes' costs on each declared device profile, in place of one
+  count for every GPU and every target of the head arch. Blocked on a metal
+  tape cost model.
+- **Stale requests never draft again**: a request that shares a step past
+  the gate misses head KV for that step's rows, so it drafts no more for
+  the rest of its life — at a gate of 1, once a second request arrives,
+  neither drafts again. A prefix-cache hit on such blocks reuses head KV
+  that was never written (fewer drafts accepted, output unaffected).
+- **Verify cost past one sequence**: dense projections at 17–32 rows, the
+  Gated-DeltaNet scan's serial rows.
+- **Time to first token** pays the head's pass over the prompt (about
+  0.19 s on a 5.4k-token prompt, base M5).
+- **`k` per bucket**, and re-measuring `k = 3` since the fold fix.
+- **The M5 Max at the current build**, and `--num-speculative-tokens`,
+  which a head ignores.
+
 ## Recipe for a new model architecture
 
 All arches share the one `scratchy-models` crate (`crates/models/arch/`) —

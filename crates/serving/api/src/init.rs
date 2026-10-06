@@ -741,6 +741,9 @@ fn draft_head(
 /// names it. A head drafts what it was compiled to (`HeadRegistration::drafts`) — its target's
 /// verify steps carry exactly those rows, which both models' kernels bake — so
 /// `--num-speculative-tokens` is not a head's: it counts an n-gram or draft model's drafts.
+///
+/// TODO: a `--num-speculative-tokens` given with a head is ignored, and the flag's default (2)
+/// cannot be told from a given value: make it optional, and refuse one that is not the head's.
 fn resolve_speculative_decoding(config: &VllmConfig) -> Result<std::borrow::Cow<'_, VllmConfig>> {
     let head = match config.speculative_model.as_deref() {
         Some("ngram") => None,

@@ -28,6 +28,86 @@
 //! `spec_max_seqs`) plans none: it costs what its target alone does. Its sequences' head KV then
 //! misses the step's rows, so they draft no more (`stale`) until a recompute runs them from their
 //! first position.
+//!
+//! # TODO
+//!
+//! Measured on Qwen3.6-35B-A3B (`mlx-community/Qwen3.6-35B-A3B-4bit` with its MLX head), the one
+//! target with a head config; "sampled" is the model's default sampling, "greedy" temperature 0.
+//!
+//! **The gate** (`spec_max_seqs`, the head's `arch.json`):
+//!
+//! - TODO: derive the gate per device, at expansion. It is 1 sequence on every GPU, the one point
+//!   measured to pay on both GPUs measured: one request, base M5 output tok/s 1.36-1.38x sampled;
+//!   M5 Max TPOT 1.14x sampled, 1.28x greedy (an earlier build of this head, at
+//!   `--max-num-seqs 1`). Past it, where drafting stops paying depends on the GPU: on the base M5,
+//!   before the gate came down to 1, sampled output tok/s was 1.07-1.18x at 2 sequences and
+//!   1.03-1.17x at 4, greedy 0.96-1.06x at 4 (two rounds each); the M5 Max was not measured past
+//!   one request. A verify step
+//!   of `B` sequences runs `B * (k + 1)` rows, and a MoE target reads every distinct expert those
+//!   rows pick (Qwen3.6: 256 experts, 8 a row; at 8 sequences the verify step's 24 rows pick about
+//!   135, the plain step's 8 about 57, under uniform routing). So on the base M5 a verify step
+//!   costs 1.6 / 2.0 / 2.2 / 2.65 plain steps at 1 / 2 / 4 / 8 sequences, against about 2.3 tokens
+//!   a verify step. The gate wanted is the largest `B` whose verify step and head passes cost less
+//!   than the plain steps of the tokens they produce. That is a comparison of two compiled tapes'
+//!   costs on a device, so it belongs at expansion: one gate per declared device profile
+//!   (`MetalTargetProfile`: bandwidth, fp16 peak), the worker picking its device's as it picks
+//!   kernels by GPU generation. Blocked on a metal tape cost model: a roofline from the profile
+//!   alone predicts 2.0x at 8 sequences against the measured 2.65x.
+//! - TODO: key the gate on the target, not the head arch. `spec_max_seqs` is the head arch's bound
+//!   default, so every target of `qwen3-5-mtp` shares it, but its cost is the target's: a dense
+//!   target's verify rows cost far less than a MoE's (Llama-3.2-3B: a 4-row step costs 1.27x a
+//!   1-row step), so a dense Qwen3.5/3.6 target would pay at more sequences.
+//! - TODO: let stale requests draft again. A request that shares one step past the gate drafts no
+//!   more for the rest of its life, even once it runs alone again: at a gate of 1, once a second
+//!   request arrives (its prompt's step counts), neither drafts again. Two ways back: run pass 1
+//!   KV-only on a gated step (the head's layer over the step's rows; no lm_head, no drafts), so no
+//!   request goes stale, at the head's per-row cost on every step past the gate; or keep a stale
+//!   request's target hidden rows (4 KiB a token at Qwen3.6's 2048-wide 16-bit hidden) and run them
+//!   through pass 1 once its steps are back under the gate.
+//! - TODO: a prefix-cache hit can reuse head KV that was never written. The head's KV lives in the
+//!   target's blocks, so a request that hits cached blocks reuses their head KV too, and blocks
+//!   written while their request was stale hold none: a request drafting over them gets fewer
+//!   drafts accepted (the target verifies every draft, so the output is unaffected). Not measured.
+//!   A KV-only pass 1 on gated steps closes it; a catch-up does not for blocks cached before it
+//!   runs.
+//!
+//! **Cost:**
+//!
+//! - TODO: a verify step's cost past one sequence, which is what holds the gate down. Base M5, 8
+//!   sequences: a plain step is 38.4 ms and a verify step yields about 2.3 tokens, so the verify
+//!   step must fit in about 87 ms to break even. The experts take about 60 ms of it, the
+//!   memory-bandwidth floor for the experts 24 rows pick (uniform routing), so the rest must fit in
+//!   about 27 ms; it takes about 44 (dense projections 25 ms against about 13 at 8 rows; the
+//!   Gated-DeltaNet scan 10-12 ms, each sequence's rows and the kept rows it replays one after
+//!   another; attention 3; the rest about 6) plus the head's about 5. The dense projections at
+//!   17-32 rows are a kernel choice for those buckets; the scan's serial rows are its recurrence.
+//! - TODO: time to first token pays the head's pass over the prompt (about 0.19 s on a 5.4k-token
+//!   prompt, base M5): the worker returns a step's tokens with its drafts, so the first token waits
+//!   for pass 1 over every prompt row. The next step needs the drafts, the client does not: return
+//!   the step's tokens before the head runs, or run the head inside the target's submission (#240:
+//!   a speculative step as one compiled tape).
+//! - TODO: choose `k` per bucket. `spec_drafts` (2) is one constant for every bucket, because the
+//!   target's verify rows a sequence and its Gated-DeltaNet record areas are baked from it; a
+//!   bucket-specific `k` needs both sized to the largest. Greedy tokens a verify step at
+//!   k = 1 / 2 / 3 were 1.77 / 2.20 / 2.36 against the MLX oracle's 1.80 / 2.43 / 2.82, measured
+//!   before the fold fix that keeps an exported final hidden written (after a verify step that
+//!   kept no draft, the second draft matched the oracle's 5 times in 23 before it, 28 in 28
+//!   after); k = 3 is not re-measured since.
+//!
+//! **Measurement, interface, size:**
+//!
+//! - TODO: measure the M5 Max at this build. Its numbers above predate worker-side drafting and the
+//!   gate of 1; the PR's two-build scripts (without `spec/mtp` vs with it, every serving knob at
+//!   its default) are the measurement.
+//! - TODO: on a 32 GB Mac Qwen3.6 does not start at the default 128 sequences, with or without a
+//!   head (the Gated-DeltaNet state pool alone is 8 GiB; main too), so base-M5 numbers here are
+//!   development runs at `--max-num-seqs 8`. Sizing the state pool is its own fix.
+//! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
+//!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
+//!   optional, and refuse a value that differs from the head's.
+//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +407
+//!   lines net against main, 41 of them declared tables (`op_abi.rs`); shaders +220; the metal
+//!   compiler +34.
 
 use std::collections::{HashMap, HashSet};
 
@@ -284,6 +364,7 @@ impl Proposer for MtpProposer {
             .keys()
             .filter(|r| takes_drafts(r));
         // A step of more sequences than the head drafts for runs as the target alone.
+        // TODO: its requests go stale for good (module docs: two ways back).
         if sched.num_scheduled_tokens.len() > self.config.max_seqs {
             self.stale.extend(scheduled.cloned());
             return HashSet::new();
