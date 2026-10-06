@@ -782,6 +782,11 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
     for (cu, fresh) in [
         (vec![0, 1, 2], vec![0u32, 1]),
         (vec![0, 3, 4], vec![1u32, 0]),
+        // Prefill-shaped: long sequences, mixed continued/fresh — the regime
+        // the lowering routes to `gdn_scan_simd` at every bucket since the
+        // bucket_m cap came off. The equivalence this test pins must hold at
+        // prefill lengths, not only decode steps.
+        (vec![0, 517, 521], vec![1u32, 0]),
     ] {
         let t = *cu.last().expect("a sequence") as usize;
         let seqs = cu.len() - 1;
