@@ -4525,9 +4525,6 @@ fn lower_one(
             let value_dim = nv * hv;
             let scale = (hk as f32).powf(-0.5);
 
-            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
-            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
-
             // One source for the whole bundle; `which` picks the sub-tensor.
             let ix = w.of(WeightKind::GatedDeltaNet, 0)?;
             let weight = |which, binding_index| source(ix, which, layer_id, binding_index);
@@ -4535,6 +4532,77 @@ fn lower_one(
                 kind,
                 binding_index,
             };
+            let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
+                slot: *slot,
+                binding_index,
+            };
+            let scan_constants = || {
+                vec![
+                    ConstantValue::uint(0, nk),
+                    ConstantValue::uint(1, nv),
+                    ConstantValue::uint(2, hk),
+                    ConstantValue::uint(3, hv),
+                    ConstantValue::float(4, scale),
+                ]
+            };
+            // head_k a multiple of 32: lanes split it (`gdn_scan_simd`, `gdn_decode`).
+            let simd_scan = hk.is_multiple_of(32) && hv.is_multiple_of(4);
+
+            // The one-row bucket's token is one command, not three a barrier apart
+            // (`gdn_decode`): a threadgroup of 1024 per key head runs its conv channels, its
+            // value heads' scan and their norm. Its shader's static asserts are these bounds.
+            let per_key = nv / nk.max(1);
+            if bucket_m == 1
+                && simd_scan
+                && nv.is_multiple_of(nk)
+                && 2 * hk + per_key * hv <= 1024
+                && (per_key * hv).is_multiple_of(32)
+                && hv.is_multiple_of(32)
+                && hv <= 256
+                && kernel <= 8
+            {
+                let mut constants = scan_constants();
+                constants.extend([
+                    ConstantValue::uint(5, kernel),
+                    ConstantValue::float(6, p.rms_norm_eps),
+                ]);
+                let bindings = vec![
+                    arena(out_slot, 0),
+                    arena(qkv_slot, 1),
+                    arena(z_slot, 2),
+                    arena(a_slot, 3),
+                    arena(b_slot, 4),
+                    weight(WeightTensor::GdnConv1d, 5),
+                    runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 6),
+                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, 7),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 8),
+                    runtime(RuntimeBindingKind::GdnStateIndices, 9),
+                    runtime(RuntimeBindingKind::GdnIsFresh, 10),
+                    weight(WeightTensor::GdnALog, 11),
+                    weight(WeightTensor::GdnDtBias, 12),
+                    weight(WeightTensor::GdnNorm, 13),
+                ];
+                return Ok(vec![LoweredCommand {
+                    kernel: KernelId::GatedDeltaNet,
+                    library: "gdn_decode",
+                    function: gdn_decode_static_name(dtype),
+                    constants: baked(constants),
+                    dispatch: DispatchShape {
+                        threadgroups: (1, nk, 1),
+                        threads_per_threadgroup: (1024, 1, 1),
+                        m_scaling: Some(MScaling {
+                            axis: MScaleAxis::Z,
+                            bucket_m: BucketM(1),
+                            seq_axis: Some(MScaleAxis::Z),
+                        }),
+                    },
+                    bindings: baked(bindings),
+                    gemm_dims: None,
+                }]);
+            }
+
+            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
 
             let mut cmds = Vec::with_capacity(4);
 
@@ -4581,7 +4649,7 @@ fn lower_one(
 
             // head_k a multiple of 32: the gating and the scan run as one
             // command, mlx-lm's simdgroup-per-value-dim mapping
-            // (`gdn_scan_simd`); then the norm. Used at EVERY bucket size,
+            // (`gdn_scan_simd`); then the norm. Used at every other bucket size,
             // prefill included: the mapping is sequence-serial either way, but
             // a simdgroup's 32 lanes split head_k (4 state elements per lane,
             // dots via `simd_sum`) where `gdn_scan_varlen`'s CUDA-faithful
@@ -4589,16 +4657,6 @@ fn lower_one(
             // measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill
             // forward (64%, ~8 µs/token/layer) on the per-thread kernel.
             // Non-divisible geometries fall back to the varlen kernel.
-            let simd_scan = hk.is_multiple_of(32) && hv.is_multiple_of(4);
-            let scan_constants = || {
-                baked(vec![
-                    ConstantValue::uint(0, nk),
-                    ConstantValue::uint(1, nv),
-                    ConstantValue::uint(2, hk),
-                    ConstantValue::uint(3, hv),
-                    ConstantValue::float(4, scale),
-                ])
-            };
             let scan_state = |first: u8| {
                 [
                     runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, first),
@@ -4608,10 +4666,6 @@ fn lower_one(
                 ]
             };
             if simd_scan {
-                let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
-                    slot: *slot,
-                    binding_index,
-                };
                 let mut bindings = vec![
                     Binding::MoeScratch {
                         binding_index: 0,
@@ -4633,7 +4687,7 @@ fn lower_one(
                     kernel: KernelId::GatedDeltaNet,
                     library: "gdn_scan_varlen",
                     function: gdn_scan_simd_static_name(dtype),
-                    constants: scan_constants(),
+                    constants: baked(scan_constants()),
                     dispatch: DispatchShape {
                         threadgroups: (1, nv * hv / 4, 1),
                         threads_per_threadgroup: (32, 4, 1),
@@ -4696,7 +4750,7 @@ fn lower_one(
                     kernel: KernelId::GatedDeltaNet,
                     library: "gdn_scan_varlen",
                     function: "gdn_scan_varlen_f32",
-                    constants: scan_constants(),
+                    constants: baked(scan_constants()),
                     dispatch: {
                         let tgx = hv.clamp(1, THREADS_PER_GROUP);
                         DispatchShape {
@@ -5512,6 +5566,13 @@ fn gdn_scan_pipelined_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gdn_scan_pipelined_f16",
         DequantDtype::Bf16 => "gdn_scan_pipelined_bf16",
+    }
+}
+
+fn gdn_decode_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_decode_f16",
+        DequantDtype::Bf16 => "gdn_decode_bf16",
     }
 }
 
