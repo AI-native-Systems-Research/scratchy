@@ -1,6 +1,6 @@
 ---
 name: metal-bench
-description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm and ollama on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
+description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX and mistral.rs on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
 ---
 
 # Metal benchmark run (one Mac → one JSON → the site)
@@ -19,20 +19,43 @@ a separate terminal window, then wait until they say it's done. The agent
 runs everything else.
 
 **Two kinds of run:**
-- A **full run** is what goes on the site: the default models (or the
-  small-RAM set from step 2), every rung, and default reps, priming and
-  scaling. It takes hours.
-- A **smoke run** checks the setup in a few minutes. It runs granite only,
-  with one rep, no scaling and output in `/tmp`. Its JSON never goes on the
-  site, so after step 4 you're done.
+- A **full run** is what goes on the site: a whole round of models, every
+  rung, every installed engine, all of them pinned, and default reps, priming
+  and scaling. It takes hours. The default round is the MoE models
+  (qwen3.6-35b-a3b, gemma-4-26b-a4b-it, glm-4.5-air); `--models full` adds the
+  dense ones (qwen3.6-27b, gemma-4-31b-it), and `--models dense` runs those
+  alone.
+- A **smoke run** checks the setup. It runs gemma-4-26b-a4b-it only, the
+  smallest model left, with one rep, no scaling and output in `/tmp`. Its
+  JSON never goes on the site, so after step 4 you're done.
 
 ## 1. One-time setup (per Mac)
+
+Install every comparison engine at the versions agreed for this round (the
+pins in step 3). The script runs each one it finds and prints it as skipped
+otherwise:
 
 ```bash
 # mlx-lm in its own venv; the script finds it via $VIRTUAL_ENV
 ~/.venvs/mlx/bin/python -c 'import mlx_lm' 2>/dev/null \
   || { python3 -m venv ~/.venvs/mlx && ~/.venvs/mlx/bin/pip install -U mlx-lm; }
-command -v ollama || brew install ollama   # the CLI, not the desktop app
+command -v ollama || brew install ollama           # the CLI, not the desktop app
+command -v llama-server || brew install llama.cpp
+command -v vllm || { brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal \
+                     && brew install vllm-project/vllm-metal/vllm-metal; }
+command -v mistralrs || curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | MISTRALRS_INSTALL_TAG=<tag> sh
+```
+
+oMLX goes in from source, with its native kernels: a plain install (Homebrew
+included) skips them, and the Qwen3.5/3.6 family then falls back to much
+slower paths. Building them needs full Xcode, not only the Command Line Tools:
+
+```bash
+git clone --branch <tag> https://github.com/jundot/omlx ~/omlx && cd ~/omlx
+python3.13 -m venv .venv && OMLX_WITH_CUSTOM_KERNEL=1 .venv/bin/pip install -e .
+.venv/bin/python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+ln -s ~/omlx/.venv/bin/omlx /opt/homebrew/bin/omlx   # the script looks for omlx on PATH
 ```
 
 **Passwordless `purge`.** The frozen rung runs `sudo -n purge` throughout a
@@ -43,15 +66,17 @@ installing it, because a broken file in `/etc/sudoers.d` breaks `sudo`
 entirely:
 
 ```bash
-echo "$(whoami) ALL=(root) NOPASSWD: /usr/sbin/purge, /usr/bin/true" > /tmp/bench-purge
+echo "$(whoami) ALL=(root) NOPASSWD: /usr/sbin/purge" > /tmp/bench-purge
 sudo visudo -cf /tmp/bench-purge && sudo install -m 0440 -o root -g wheel /tmp/bench-purge /etc/sudoers.d/bench-purge
 ```
 
-Then check the rule. `sudo -k` drops any cached unlock first, so a pass
-proves the rule itself works:
+Then check the rule the way the harness does, by asking sudo whether it may
+run `purge` without a password (it lists the rule rather than running it).
+`sudo -k` drops any cached unlock first, so a pass proves the rule itself
+works. An older rule that also lists `/usr/bin/true` still works:
 
 ```bash
-sudo -k && sudo -n true && echo "rule works"
+sudo -k && sudo -n -l /usr/sbin/purge >/dev/null && echo "rule works"
 ```
 
 **Without the rule** (the user would rather not add it, or can't), pass
@@ -59,9 +84,10 @@ sudo -k && sudo -n true && echo "rule works"
 no frozen rung, so treat it like any partial run in step 5.
 
 **Done when:** `~/.venvs/mlx/bin/python -c 'import mlx_lm'` exits 0,
-`command -v ollama` prints a path, and the check prints `rule works` without
-asking for a password, or the user has chosen to run without the frozen
-rung.
+`command -v` prints a path for `ollama`, `llama-server`, `vllm`, `omlx` and
+`mistralrs` (or the user has chosen to leave one out), oMLX's kernel status
+shows them available, and the check prints `rule works` without asking for a
+password, or the user has chosen to run without the frozen rung.
 
 ## 2. Pre-flight (every run)
 
@@ -78,7 +104,7 @@ pmset -g batt | head -1
 sysctl -n hw.memsize | awk '{print $1/2^30 " GB"}'
 osascript -e 'quit app "Ollama"' 2>/dev/null   # the desktop app competes for memory
 sleep 2; pkill -f '/Applications/Ollama.app/'  # quitting the app leaves its `ollama serve` on :11434
-pgrep -fl 'bench_metal_matrix|scr bench|mlx_lm.server|caffeinate -dims'   # leftovers from an earlier run
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'   # leftovers from an earlier run
 lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 ```
 
@@ -94,65 +120,81 @@ lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 - **Leftovers:** if `pgrep` or `lsof` prints anything, an earlier run is
   still going or didn't clean up. Ask before stopping it (see **Stopping a
   run** under step 3).
-- **16 or 24 GB of RAM:** pass `--models granite-3.3-2b-instruct,qwen2.5-7b`.
-  gemma-4-26b-a4b-it has 15.4 GB of weights and doesn't fit next to the
-  other engines.
-- **36 GB of RAM:** gemma runs, but macOS pages its weights out, so its RSS
-  reads low. Point that out when you report the results.
+- **Memory:** the script skips a model that can't fit and records why
+  (`skipped: needs 64 GB, this Mac has 36 GB`), so the default round runs as
+  is. glm-4.5-air (46.8 GB) runs only on a 64 GB Mac, at no more than 4 users
+  at once. No model in the current rounds fits a 16 or 24 GB Mac: don't run
+  there.
+- **64 GB Macs:** GLM's longest cells need about 53 GB, above the GPU's
+  default limit (about 48 GB). Ask the user to raise it to the agreed value
+  with `sudo sysctl iogpu.wired_limit_mb=<MB>` (it resets on reboot); the
+  run records it as `machine.gpu_wired_limit_mb`.
 - **First run on this Mac:** it downloads the HF weights and ollama's models,
   so it needs internet.
 
 **Done when:** the user has chosen the commit to benchmark,
 `git status --short` prints nothing, `pmset` says `'AC Power'`, the
 `pkill`/`pgrep`/`lsof` lines leave nothing running, and you've decided on
-the `--models` flag.
+the `--models` flag (none for the default MoE round, or `--models full`).
 
 ## 3. Run
 
-Full run:
+Full run. Pin every installed engine and scratchy's commit to the versions
+agreed for this round, so all the Macs run the same thing; the script refuses
+to start while any pin is missing or doesn't match, and lists what's wrong.
+Names match in any case, scratchy's pin is a commit prefix, and llama.cpp's
+is its build number:
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast [--models ...] 2>&1 | tee ~/metal-matrix-run.log
+caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast [--models full] \
+  --pin scratchy=<sha> --pin mlx-lm=<v> --pin ollama=<v> --pin llama.cpp=b<build> \
+  --pin vllm-metal=<v> --pin oMLX=<v> --pin mistral.rs=<v> 2>&1 | tee ~/metal-matrix-run.log
 echo "exit ${PIPESTATUS[0]}"
 ```
+
+`--unpinned` runs without pins and records that in the JSON (`pinned:
+false`); use it only for a smoke run or a test the user asked for.
 
 Smoke run (a few minutes when the builds are cached):
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --models granite-3.3-2b-instruct \
+caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gemma-4-26b-a4b-it \
   --reps 1 --prime 1 --no-scaling --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
 echo "exit ${PIPESTATUS[0]}"
 ```
 
 The script exits 1 when a model got no scratchy numbers. `tee` would hide
 that, which is why `PIPESTATUS[0]` is printed. `--fail-fast` stops at the
-first scratchy build failure, instead of spending hours measuring only the
-other engines. It does **not** stop on a parity-gate failure: the run moves
-on to the next model.
+first scratchy build or parity-gate failure, instead of going on to the next
+model.
 
 Before timing each model, the script runs a blocking **parity gate**: `scr
 chat` and `mlx_lm.generate`, both greedy, must give exactly the same answer
 to a few short prompts that have one right answer. A model that fails the
-gate isn't timed on any engine, ollama included, because there would be no
-scratchy numbers to compare against. The gate needs mlx-lm, so it runs on
-every full and smoke run. Rules and rationale are in `docs/BENCHMARKING.md`
-(fairness rule 3).
+gate isn't timed on any engine, because there would be no scratchy numbers
+to compare against. The gate needs mlx-lm, so it runs on every full and
+smoke run. Rules and rationale are in `docs/BENCHMARKING.md` (fairness
+rule 3).
 
 Run the command in the background, so a full run doesn't hit a shell timeout,
 and wait for it to finish. While it runs, watch the log for these lines and
 act on each one as it appears:
 
-- the `mlx-lm  :` and `ollama  :` header lines: if either says `skipped`,
-  stop the run and go back to step 1.
+- the engine lines in the header, one per engine (`llama.cpp : <path>
+  (<version>)`): a `skipped` line under one means it isn't installed or
+  `--engines` left it out. If it's an engine the user meant to run, stop the
+  run and go back to step 1.
+- `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
 - `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or
   `PARITY FAILED — not timing <stem>`. On a failure, tell the user right
-  away: that model will have no numbers, and the run will exit 1. Ask
-  whether to let it finish the other models or stop it (**Stopping a run**
-  below). Then go to **On a parity failure** below.
+  away: that model has no numbers, and with `--fail-fast` the run stops
+  there (without it, it moves on and exits 1 at the end). The lines under it
+  show both answers; `the ... child crashed` means one side crashed rather
+  than disagreed. Then go to **On a parity failure** below.
 - `json -> <path>`: the run has finished writing its JSON.
 
 **On a build failure:** check whether it's a regression on `main` or a
@@ -207,16 +249,17 @@ steps, and the `scr bench` and server it started keep running. Stop all of
 them:
 
 ```bash
-pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.server|caffeinate -dims'
+pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'
+pkill -TERM -f ' chat -m .* --device metal'    # the parity gate's scratchy side
 sleep 10
-pgrep -fl 'bench_metal_matrix|scr bench|mlx_lm.server|caffeinate -dims'
-lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # the ollama serve the run started
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'
+lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # whatever server the run started
 ```
 
-**Done when:** the header shows real paths for both `mlx-lm  :` and
-`ollama  :`, every model printed `PARITY OK`, the log ends with a
-`json -> <path>` line, and `exit 0` is printed. A parity failure also exits
-1, with `(parity gate failed)` on the final `FAILED:` line.
+**Done when:** the header shows a real path for every engine the user meant
+to run, every model printed `PARITY OK`, the log ends with a
+`json -> <path>` line, and `exit 0` is printed. A parity failure exits 1,
+with `(parity gate failed)` on the final `FAILED:` line.
 
 ## 4. Check the JSON
 
@@ -236,11 +279,16 @@ from collections import Counter
 d = json.load(open(sys.argv[1])); c = d["config"]
 print("chip   ", d["machine"]["chip"], "|", d["machine"]["power"])
 print("repo   ", d["repo"]["sha"][:8], d["repo"]["branch"], "dirty=" + str(d["repo"]["dirty"]))
-print("engines", c["comparison"])
+for e in c.get("engines") or []:
+    print("engine ", f"{e['label']:16}", "installed=" + str(e["installed"]),
+          e.get("version") or "-", "pin=" + (e.get("pin") or "-"))
+print("pinned ", c.get("pinned"), c.get("pin_problems") or "")
 for m in d["models"]:
     reps = Counter(r["scenario"] for r in m.get("cache_ladder") or [])
     print("model  ", m["stem"], "built=" + str(m.get("built")),
           "parity=" + str(m.get("parity_mlx_lm")), dict(reps))
+for x in d.get("skipped_models") or []:
+    print("skipped", x["stem"], x["reason"])
 full = (c["scenarios"] == ["frozen", "cold", "warm"] and c["cold_priming_launches"] == 3
         and c["scaling"] is not None and not c["scratchy_serve_args"]
         and all(Counter(r["scenario"] for r in m.get("cache_ladder") or []).get("frozen") == 3
@@ -250,21 +298,23 @@ EOF
 ```
 
 **Done when:** you've reported every line to the user. These all have to
-hold for a run to go on the site: `AC Power`, `dirty=False`, both engines
-`True`, and every model `built=True` and `parity=True`. `parity=False` means
-the model failed the gate and has no numbers. `parity=None` on a built model
-means the gate didn't run, so its numbers were never checked. If any of
-these fails, report it and let the user decide whether the run is usable.
-Report the `commit` and `scope` lines too, but they don't fail the run on
-their own; step 5 asks about them.
+hold for a run to go on the site: `AC Power`, `dirty=False`, `installed=True`
+for every engine the user meant to run, `pinned True` (each version equal to
+its pin), and every model `built=True` and `parity=True`. `parity=False`
+means the model failed the gate and has no numbers. `parity=None` on a built
+model means the gate didn't run, so its numbers were never checked. A
+`skipped` model is fine when its reason is memory. If any of these fails,
+report it and let the user decide whether the run is usable. Report the
+`commit` and `scope` lines too, but they don't fail the run on their own;
+step 5 asks about them.
 A smoke run ends here.
 
 ## 5. Copy into the site
 
 Before copying, ask the user to confirm if any of these is true:
 - `scope` is `PARTIAL`
-- the run has fewer models than the default three (or fewer than the
-  small-RAM pair on a 16/24 GB Mac)
+- the run has fewer models than the round it ran (the three MoE models, or
+  all five with `--models full`), not counting a model skipped for memory
 - `commit` isn't upstream `main`
 - any model's `parity` isn't `True`
 
