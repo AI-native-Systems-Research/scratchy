@@ -38,9 +38,9 @@
 #           OLLAMA_NUM_PARALLEL / OLLAMA_CONTEXT_LENGTH sized for that axis.
 # No parity gate: it needs CLI mode and this ladder runs in server mode.
 #
-# --serve-args "..." replaces the extra `scr serve` flags (recorded in the JSON).
-# The default caps batches at 2048 tokens: at 4096 the scheduler can build a
-# 4097-token batch, the Metal worker panics (NoBucketFits) and the server hangs.
+# --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
+# by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
+# prefill bucket, the same as any user gets.
 # --cell-timeout-s bounds each scaling cell; a timed-out cell skips the rest of
 # that server's cells, since a hung server would hang them all.
 set -euo pipefail
@@ -96,7 +96,7 @@ SETTLE_S=""
 # --exec's 600 s default timed out gemma-4-31b-it (18.4 GB) on this class of machine.
 READY_TIMEOUT_S=1800
 CELL_TIMEOUT_S=3600
-SERVE_ARGS="--max-num-batched-tokens 2048"
+SERVE_ARGS=""
 SEED=""
 MLX_PYTHON=""
 MLX_AUTO=1
@@ -179,7 +179,11 @@ chip="$(sysctl -n machdep.cpu.brand_string)"
 slug="$(echo "${chip}" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9-]//g')"
 : "${OUT_DIR:="${ROOT}/bench_results/metal_matrix"}"
 RAW="${OUT_DIR}/${slug}"
-JSON="${OUT_DIR}/${slug}.json"
+# Named <machine>-<date>-<sha8>.json, the name site/build_metal.py requires, so
+# a finished run drops straight into site/data/metal/. One timestamp feeds both
+# the name and generated_utc, so the two can never disagree.
+STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+JSON="${OUT_DIR}/${slug}-${STARTED_UTC:0:10}-$(git -C "${ROOT}" rev-parse HEAD | cut -c1-8).json"
 mkdir -p "${RAW}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -198,11 +202,14 @@ echo "ollama  : ${OLLAMA_BIN:-skipped (brew install ollama)}"
 echo "output  : ${JSON}"
 
 # ---- machine block ----------------------------------------------------------
-export SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
+# Launches actually discarded before COLD: the harness always primes once, and
+# run_ladder's throwaway call adds the rest (so 2 rounds up to 3).
+PRIME_LAUNCHES=$(( PRIME > 2 ? PRIME : (PRIME > 1 ? 3 : 1) ))
+export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S
 python3 - "${JSON}" "${chip}" <<'PY'
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys
 out, chip = sys.argv[1:3]
 e = os.environ
 ints = lambda k: [int(x) for x in e[k].split(",") if x]
@@ -211,7 +218,7 @@ sysctl = lambda k: sh("sysctl", "-n", k)
 batt = sh("pmset", "-g", "batt")
 json.dump({
   "schema": 2, "issue": 91, "epic": 3,
-  "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+  "generated_utc": e["STARTED_UTC"],
   "generator": "scripts/bench_metal_matrix.sh",
   "measured_by": {"footprint": "this runner (cargo build, stat)",
                   "cache_ladder": "scr bench startup --exec",
@@ -230,6 +237,9 @@ json.dump({
            "branch": sh("git", "rev-parse", "--abbrev-ref", "HEAD"),
            "dirty": bool(sh("git", "status", "--porcelain"))},
   "config": {"scenarios": e["SCENARIOS"].split(","),
+             "cold_priming_launches": int(e["PRIME_LAUNCHES"]),
+             "startup_request": {"input_len": int(e["INPUT_LEN"]), "output_len": int(e["OUTPUT_LEN"]),
+                                 "warm_requests": int(e["WARM_REQUESTS"])},
              "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
              "scratchy_serve_args": e["SERVE_ARGS"] or None,
              "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
@@ -494,10 +504,24 @@ for entry in "${MODELS[@]}"; do
             parts+=("${out%.json}.rest.json")
         fi
         python3 - "${out}" ${parts[@]+"${parts[@]}"} <<'PY'
-import json, os, sys
+import json, os, statistics, sys
 runs = [r for p in sys.argv[2:] if os.path.exists(p) for r in json.load(open(p))]
 if runs:
     json.dump(runs, open(sys.argv[1], "w"), indent=2)
+# FROZEN and COLD ran as separate harness calls, so the harness's own
+# frozen-vs-cold checks never saw both; repeat them here, same rules.
+def med(sc, k):
+    v = [r[k] for r in runs if r.get("scenario") == sc and r.get(k) is not None]
+    return statistics.median(v) if v else None
+ff, fc = med("frozen", "major_faults"), med("cold", "major_faults")
+tf, tc = med("frozen", "ttft_exec_s"), med("cold", "ttft_exec_s")
+if ff is not None and fc is not None:
+    print("    frozen vs cold")
+    print(f"    - {'PASS' if ff > fc else '**FAIL**'} — FROZEN major faults {ff:.0f} vs COLD {fc:.0f} "
+          f"({'eviction took effect' if ff > fc else 'eviction did NOT take effect'})")
+    if tf is not None and tc is not None:
+        print(f"    - {'PASS' if tf > tc else '**FAIL**'} — FROZEN ttft_exec {tf:.3f}s vs COLD {tc:.3f}s"
+              f"{'' if tf > tc else '  (a frozen start should never be faster)'}")
 PY
     }
 

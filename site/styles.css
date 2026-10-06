@@ -34,6 +34,11 @@ cds-code-snippet:not(:defined),
 cds-side-nav:not(:defined),
 cds-side-nav-items:not(:defined),
 cds-side-nav-link:not(:defined),
+cds-side-nav-menu:not(:defined),
+cds-side-nav-menu-item:not(:defined),
+cds-toggletip:not(:defined),
+cds-accordion:not(:defined),
+cds-accordion-item:not(:defined),
 cds-select:not(:defined),
 diff-view-element:not(:defined),
 zero-md:not(:defined) {
@@ -501,3 +506,145 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 @media (max-width: 900px) {
   .archbar cds-select { min-width: 100%; }
 }
+
+/* ---- Metal performance page (built by build_metal.py) ----------------------
+ * Engine colours are fixed per engine and the same in both themes: blue,
+ * orange, aqua from the data-viz reference palette, validated as a set
+ * (all pairs, CVD and normal vision) against cds--white and cds--g100
+ * surfaces. Aqua is under 3:1 on white, so every chart carries direct end
+ * labels and a table view. Every Carbon size token here has a fallback:
+ * this site only resolves Carbon's colour tokens. */
+.metalpage, .mtip {
+  --s1: #2a78d6;           /* scratchy */
+  --s2: #d95926;           /* mlx-lm */
+  --s3: #1baf7a;           /* ollama */
+}
+.metalpage {
+  padding: 0 var(--cds-spacing-07, 2rem) var(--cds-spacing-10, 4rem);
+  max-width: 72rem;
+}
+/* Three heading levels, each clearly a step below the last: machine, model,
+ * then the parts of a model. */
+.metalpage h2 { font-size: 2rem; font-weight: 600; line-height: 1.25; margin: 4rem 0 0.5rem;
+  padding-top: 1.5rem; border-top: 2px solid var(--fg); }
+/* The first section follows the title, not another machine: no need for the
+ * full gap that separates machines. */
+.metalpage #glance h2 { margin-top: 1.5rem; }
+.metalpage h3 { font-size: 1.5rem; font-weight: 600; line-height: 1.3; margin: 2.5rem 0 0.25rem; }
+.metalpage h3 .onmachine { font-size: 1rem; font-weight: 400; color: var(--muted); margin-left: 0.4rem; }
+.metalpage h4 { font-size: 1.125rem; font-weight: 600; line-height: 1.4; margin: 0 0 0.15rem; }
+.metalpage .msub { color: var(--muted); font-size: var(--cds-body-01-font-size, 0.875rem); margin: 0 0 0.75rem; max-width: 48rem; }
+.metalpage .mpart { margin: 1.75rem 0; }
+.metalpage .mmeta { color: var(--muted); margin: 0 0 1rem; font-size: var(--cds-body-01-font-size, 0.875rem); }
+.metalpage .dim { color: var(--muted); font-weight: 400; }
+.metalpage b { font-weight: 600; }
+/* Toggletips sit inline with the text or heading they explain. */
+.metalpage .minfo { display: inline-flex; vertical-align: middle; }
+.metalpage .mabout { margin: 1rem 0 0; color: var(--muted); }
+.metalpage .empty { color: var(--muted); }
+/* Each model is a Carbon tile (the cds--tile class, so its numbers never wait
+ * on a script). Inside it the surface is --bg-soft, so the heat-map neutral
+ * steps up to --panel and chart dots ring in the tile's own colour. */
+.metalpage { --heat-mid: var(--bg-soft); }
+.metalpage .mmodel { margin-top: 1.5rem; padding: 0.5rem 1.5rem 1rem; --heat-mid: var(--panel); }
+.metalpage .mmodel .mchart .dot { stroke: var(--bg-soft); }
+.metalpage .mfold { margin: 0.5rem 0 0; }
+
+/* Wide tables scroll inside their own box, never the page. */
+.mtable { overflow-x: auto; margin: 0 0 1rem; }
+.mtable table { border-collapse: collapse; font-size: var(--cds-body-01-font-size, 0.875rem); }
+.mtable th, .mtable td { padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+.mtable thead th { color: var(--muted); font-weight: 600; vertical-align: bottom; }
+.mtable th[scope="row"], .mtable th.first { text-align: left; font-weight: 600; }
+.mtable th[scope="colgroup"] { text-align: center; border-bottom: 1px solid var(--line); }
+.mtable td { font-variant-numeric: tabular-nums; }
+.mtable td.gap { text-align: left; color: var(--muted); font-style: italic; }
+
+.key, .lkey { display: inline-block; vertical-align: middle; margin-right: 0.45rem; }
+.key { width: 8px; height: 8px; border-radius: 50%; }
+.lkey { width: 14px; height: 2px; border-radius: 1px; }
+.key.s1, .lkey.s1 { background: var(--s1); }
+.key.s2, .lkey.s2 { background: var(--s2); }
+.key.s3, .lkey.s3 { background: var(--s3); }
+.lkey.prev { background: var(--muted); opacity: 0.7; }
+
+/* Before/after badge under a scratchy number: the arrow carries better/worse
+ * in Carbon's support colours; the figure itself stays in text ink. */
+.delta { display: block; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); font-weight: 600; }
+.delta i { font-style: normal; margin-right: 0.15rem; }
+.delta i.better { color: var(--cds-support-success); }
+.delta i.worse { color: var(--cds-support-error); }
+
+.mfig { margin: 2rem 0; }
+.mfig figcaption { margin-bottom: 0.5rem; }
+.legend { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--fg); margin-bottom: 0.25rem; }
+.chartrow { display: flex; flex-wrap: wrap; gap: 1.5rem 2.5rem; }
+.chartpane { flex: 1 1 22rem; max-width: 34rem; min-width: 0; }
+.mchart { width: 100%; height: auto; display: block; overflow: visible; }
+.mchart .grid { stroke: var(--line); stroke-width: 1; }
+.mchart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.mchart .axis { fill: var(--muted); font-size: 11px; }
+.mchart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.mchart .dot { stroke: var(--bg); stroke-width: 2; }
+.mchart .ln.s1 { stroke: var(--s1); } .mchart .dot.s1 { fill: var(--s1); }
+.mchart .ln.s2 { stroke: var(--s2); } .mchart .dot.s2 { fill: var(--s2); }
+.mchart .ln.s3 { stroke: var(--s3); } .mchart .dot.s3 { fill: var(--s3); }
+/* The previous run: de-emphasis grey, thinner, hollow dots, behind the rest. */
+.mchart .ln.prev { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
+.mchart .dot.prev { fill: var(--bg); stroke: var(--muted); stroke-width: 1.5; opacity: 0.8; }
+.mchart .endlbl { fill: var(--fg); font-size: 12px; }
+.mchart .leader, .mchart .xhair { stroke: var(--muted); stroke-width: 1; }
+.mchart .hit { fill: transparent; outline: none; }
+.mchart .hit:focus-visible { fill: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+.heatrow { display: flex; flex-wrap: wrap; gap: 2rem; }
+/* Flex items default to min-width: auto, which lets a wide grid stretch the
+ * whole page past a phone's width; 0 makes it scroll inside its own box. */
+.heatrow > .heat { min-width: 0; max-width: 100%; }
+.heatttl { font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-bottom: 0.25rem; }
+.heat table { border-collapse: separate; border-spacing: 2px; font-size: var(--cds-body-01-font-size, 0.875rem); }
+.heat th { color: var(--muted); font-weight: 600; padding: 0.25rem 0.5rem; text-align: right; }
+.heat td { background: var(--heat-mid); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
+.heat td b { display: block; font-size: 1rem; }
+/* Text ink, not muted grey: on a strong tint grey loses its contrast. */
+.heat td span { display: block; color: inherit; font-size: var(--cds-label-01-font-size, 0.75rem); }
+.heat td:hover, .heat td:focus-visible { outline: 1px solid var(--fg); outline-offset: -1px; }
+.scale { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-top: 0.5rem; }
+.scale .scalekey { color: var(--fg); }
+.scale .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.35rem; }
+/* Heat map: ColorBrewer RdBu, 7 classes (build_metal.py's HEAT_BOUNDS). The
+ * same fills in both themes, so each class picks its own ink: white on the two
+ * darkest, near-black on the rest, every pair at least 5.9:1. The middle
+ * class is the site's neutral, so "about the same" never glares in dark.
+ * hm, not h: the docs table of contents already uses .h3. */
+.sw.hm0, .heat td.hm0, .gsq.hm0 { background: #b2182b; color: #fff; }
+.sw.hm1, .heat td.hm1, .gsq.hm1 { background: #ef8a62; color: #161616; }
+.sw.hm2, .heat td.hm2, .gsq.hm2 { background: #fddbc7; color: #161616; }
+.sw.hm3, .heat td.hm3, .gsq.hm3 { background: var(--heat-mid); color: var(--fg); }
+.sw.hm4, .heat td.hm4, .gsq.hm4 { background: #d1e5f0; color: #161616; }
+.sw.hm5, .heat td.hm5, .gsq.hm5 { background: #67a9cf; color: #161616; }
+.sw.hm6, .heat td.hm6, .gsq.hm6 { background: #2166ac; color: #fff; }
+.scale .sw.hm3 { border: 1px solid var(--line); }
+
+/* At a glance: one small grid per machine and model, colour only. */
+.heat .gtable td { background: none; min-width: 0; padding: 0.4rem 0.75rem 0.6rem 0; text-align: left; }
+.heat .gtable th { text-align: left; padding-left: 0; }
+.gtable td, .gtable th { vertical-align: top; }
+/* Popover text always wraps at normal weight, whatever its trigger sits in. */
+.minfo-body { display: block; white-space: normal; text-align: left; font-weight: 400; }
+.gtable td.gnone { color: var(--muted); font-style: italic; font-size: var(--cds-label-01-font-size, 0.75rem); }
+.gmini { display: grid; gap: 2px; width: 4.5rem; text-decoration: none; }
+.gmini:focus-visible { outline: 2px solid var(--cds-focus, var(--accent)); outline-offset: 2px; }
+.gsq { display: block; aspect-ratio: 1; background: var(--heat-mid); border-radius: 2px; }
+.gsq:hover { outline: 1px solid var(--fg); }
+.gsq.gnil, .scale .sw.nil { background: none; border: 1px solid var(--line); }
+.grange { display: block; margin-top: 0.3rem; color: var(--muted); font-size: var(--cds-label-01-font-size, 0.75rem); white-space: nowrap; }
+
+.mtip { position: absolute; z-index: 10; pointer-events: none; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 0.5rem 0.65rem; font-size: var(--cds-label-01-font-size, 0.75rem);
+  font-variant-numeric: tabular-nums; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
+.mtip .mtiphead { color: var(--muted); margin-bottom: 0.25rem; }
+@media (max-width: 672px) {
+  .metalpage { padding: 0 1rem 3rem; }
+}
+.mtip b { font-weight: 600; }
