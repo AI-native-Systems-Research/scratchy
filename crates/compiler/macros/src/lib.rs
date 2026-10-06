@@ -353,7 +353,7 @@ fn fmt_us(us: f64) -> String {
 /// the affordable subset is chosen per device at load time by
 /// `select_prefill_bucket` (Metal prunes its colored arena, CUDA its captured
 /// graph shapes). Mirrors the llama arch's historical ladder.
-const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096];
+const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
 
 /// Default KV-cache-span (`sk_bucket`) ladder. Every `#[forward]` arch that
 /// does not explicitly override `sk_buckets` solves at THESE spans; all
