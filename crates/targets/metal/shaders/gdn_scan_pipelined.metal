@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Gated-DeltaNet prefill scan: the software-pipelined block-staged kernel.
+//
+// The design is omlx Kernel P's (omlx/custom_kernels/qwen35_prefill/gdn.py,
+// `gated_delta_pipelined`, Apache-2.0) — the proven prefill mapping for this
+// recurrence — under this crate's kernel contracts. Where Kernel P receives
+// q/k/v pre-split, pre-normalized and with g/beta precomputed on the host,
+// this kernel reads the SAME buffers `gdn_scan_simd` does (f32 `conv_out` in
+// the [q|k|v] interleaved layout, raw a/b, A_log/dt_bias weights) and
+// computes the L2 norms and the gating inline. Per token the math is exactly
+// `gdn_scan_simd`'s — the SAME eps-inside-sqrt norms, fused-stable softplus
+// and fma/recurrence order — with the two head_k dots reduced by an xor
+// butterfly over the row's 8 lanes, the summation order simd_sum builds, so
+// the two kernels agree to f32 rounding (the parity test pins this).
+//
+// Mapping (Kernel P): 8 lanes own one value row, each holding head_k/8 state
+// channels in four float4 granules at columns seg, seg+8, seg+16, seg+24; a
+// 128-thread threadgroup covers 16 value rows, so value_dim/16 threadgroups
+// spread evenly over the cores (the decode kernel's 4-simdgroup groups
+// under-fill them at prefill). The block's k/q rows (the key head's head_k
+// channels), the 16-row v slice and the raw a/b scalars are staged
+// cooperatively into threadgroup memory and prefetched into registers one
+// block ahead, so the recurrence's per-token reads hit registers or
+// threadgroup memory, never device memory.
+//
+// `conv_out` and `o` are f32; `a`/`b`/`dt_bias` are `T`; `ssm_state` is f32
+// with the cuda-symmetric layout [num_slots, HV, head_v, head_k].
+//
+// Baked constants (every compile sets every one):
+//   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
+//   GDN_PIPE_HEAD_K (K), GDN_PIPE_HEAD_V (head_v), GDN_PIPE_SCALE,
+//   GDN_PIPE_TB (tokens per block; multiple of 4).
+// Requires K == 128 (8 lanes × four float4s) and head_v % 16 == 0.
+//
+// Dispatch: grid (head_v*HV/16, 1, num_seqs); threads (128, 1, 1). The
+// lowering routes PREFILL here and keeps decode on `gdn_scan_simd` (whose
+// 4-simdgroup groups are the right shape for one token).
+
+#include <metal_stdlib>
+#include "baked.h"
+
+using namespace metal;
+
+SCRATCHY_CONSTANT(uint, GDN_PIPE_NUM_K_HEADS, 0);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_NUM_V_HEADS, 1);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_K, 2);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_V, 3);
+SCRATCHY_CONSTANT(float, GDN_PIPE_SCALE, 4);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 5);
+
+template <typename T>
+[[kernel]] void gdn_scan_pipelined(
+    device       float* o             [[buffer(0)]],
+    const device float* conv_out      [[buffer(1)]],
+    const device T*     a             [[buffer(2)]],
+    const device T*     b             [[buffer(3)]],
+    device       float* ssm_state     [[buffer(4)]],
+    const device int*   cu_seqlens    [[buffer(5)]],
+    const device int*   state_indices [[buffer(6)]],
+    const device uint*  is_fresh      [[buffer(7)]],
+    const device float* a_log         [[buffer(8)]],
+    const device T*     dt_bias       [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tpig [[thread_position_in_threadgroup]])
+{
+  constexpr uint TB = GDN_PIPE_TB;
+  constexpr uint NT = 128;
+  constexpr uint KR = 8;   // lanes per value row (head_k == 8*KR channels)
+  constexpr uint DB = 16;  // value rows per threadgroup
+  const uint H = GDN_PIPE_NUM_K_HEADS;
+  const uint HV = GDN_PIPE_NUM_V_HEADS;
+  const uint K = GDN_PIPE_HEAD_K;
+  const uint Vd = GDN_PIPE_HEAD_V;
+  const uint key_dim = H * K;
+  const uint value_dim = HV * Vd;
+  const uint conv_dim = 2u * key_dim + value_dim;
+
+  const uint row0 = tgid.x * DB;
+  const uint tid = tpig.x;
+  const uint rg = tid / KR;   // value row within the threadgroup
+  const uint seg = tid % KR;  // lane within the row
+  const uint i_n = tgid.z;    // sequence
+  const uint vr = row0 + rg;  // global value row = i_hv*Vd + i_v
+  const uint i_hv = vr / Vd;
+  const uint i_v = vr % Vd;
+  const uint i_h = i_hv / (HV / H);
+  if (vr >= value_dim) {
+    return;
+  }
+
+  const int bos = cu_seqlens[i_n];
+  const int eos = cu_seqlens[i_n + 1];
+  const int seq_len = eos - bos;
+  const int slot = state_indices[i_n];
+  if (seq_len <= 0 || slot < 0) {
+    return;
+  }
+  const bool fresh = is_fresh[i_n] != 0u;
+
+  // Per-head scalars, off the recurrence path.
+  const float neg_a = -exp(a_log[i_hv]);
+  const float dtb = float(dt_bias[i_hv]);
+  const float scale = GDN_PIPE_SCALE;
+
+  device float* state_row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
+  // State fragment in registers: channels 4*(seg + 8*i) .. +3, i = 0..3.
+  float4 st[4];
+  {
+    const device float4* S_in = (const device float4*)(state_row + 4u * seg);
+    for (uint i = 0; i < 4; i++) {
+      st[i] = fresh ? 0.0f : S_in[8u * i];
+    }
+  }
+
+  // ── Block staging ──────────────────────────────────────────────────
+  // k/q: this key head's head_k channels per token (4 float4s per lane).
+  // v: the threadgroup's 16 value rows. a/b: per token, RAW — the softplus
+  // and sigmoid are applied at the use site, never staged. The row's 8
+  // lanes sit in one simdgroup (rg*KR+seg stays within a 32-thread
+  // boundary), so the butterflies never cross simdgroups.
+  threadgroup float4 k_s[TB][KR][4];
+  threadgroup float4 q_s[TB][KR][4];
+  threadgroup float v_s[TB][DB];
+  threadgroup float g_s[TB];
+  threadgroup float b_s[TB];   // RAW b input — sigmoid applied at the use site
+
+  const device float* qk_base = conv_out + uint(bos) * conv_dim;
+  const uint qk_off = i_h * K;  // q's offset in the row; k's is +key_dim
+  // v's section starts at 2*key_dim; a value row's offset within it is the
+  // GLOBAL row vr (row0 + rg), already spanning heads.
+  const device float* v_base = qk_base + 2u * key_dim;
+
+  // Register prefetch of one block: the thread's share of the k and q
+  // float4s (TB*KR*4 each — each lane owns four, channels 4*(lane+8*i)),
+  // of the v slice (TB*DB floats), and one raw a/b pair — the cooperative
+  // loads Kernel P's GDN_PIPE_FETCH performs.
+  constexpr uint NKQ = (TB * KR * 4 + NT - 1) / NT;
+  constexpr uint NV = (TB * DB + NT - 1) / NT;
+  float4 pk[NKQ], pq[NKQ];
+  float pv[NV];
+  float pg = 0.0f, pb = 0.0f;
+
+#define GDN_PIPE_FETCH(T0N, TTN)                                          \
+  {                                                                       \
+    const int ttn = (TTN);                                                \
+    _Pragma("unroll")                                                     \
+    for (uint j = 0; j < NKQ; j++) {                                      \
+      const uint p = tid + j * NT;                                        \
+      if (p < uint(ttn) * KR * 4) {                                       \
+        const uint t = p / (KR * 4);                                      \
+        const uint lane = (p % (KR * 4)) / 4;                             \
+        const uint i = p % 4;                                             \
+        const device float4* kf = (const device float4*)(                 \
+            qk_base + (uint(T0N) + t) * conv_dim + key_dim + qk_off +     \
+            4u * (lane + 8u * i));                                        \
+        pk[j] = *kf;                                                      \
+      }                                                                   \
+    }                                                                     \
+    _Pragma("unroll")                                                     \
+    for (uint j = 0; j < NKQ; j++) {                                      \
+      const uint p = tid + j * NT;                                        \
+      if (p < uint(ttn) * KR * 4) {                                       \
+        const uint t = p / (KR * 4);                                      \
+        const uint lane = (p % (KR * 4)) / 4;                             \
+        const uint i = p % 4;                                             \
+        const device float4* qf = (const device float4*)(                 \
+            qk_base + (uint(T0N) + t) * conv_dim + qk_off +               \
+            4u * (lane + 8u * i));                                        \
+        pq[j] = *qf;                                                      \
+      }                                                                   \
+    }                                                                     \
+    _Pragma("unroll")                                                     \
+    for (uint j = 0; j < NV; j++) {                                       \
+      const uint p = tid + j * NT;                                        \
+      if (p < uint(ttn) * DB) {                                           \
+        const uint t = p / DB, r = p % DB;                                \
+        pv[j] = v_base[(uint(T0N) + t) * conv_dim + row0 + r];            \
+      }                                                                   \
+    }                                                                     \
+    if (tid < uint(ttn)) {                                                \
+      pg = float(a[(uint(bos) + uint(T0N) + tid) * HV + i_hv]);           \
+      pb = float(b[(uint(bos) + uint(T0N) + tid) * HV + i_hv]);           \
+    }                                                                     \
+  }
+
+  int t0 = 0;
+  while (t0 < seq_len) {
+    const uint tt = uint(min((int)TB, seq_len - t0));
+    GDN_PIPE_FETCH(t0, (int)tt)
+    // Store the prefetch into threadgroup memory (cooperative).
+    _Pragma("unroll")
+    for (uint j = 0; j < NKQ; j++) {
+      const uint p = tid + j * NT;
+      if (p < tt * KR * 4) {
+        const uint t = p / (KR * 4);
+        const uint lane = (p % (KR * 4)) / 4;
+        const uint i = p % 4;
+        k_s[t][lane][i] = pk[j];
+        q_s[t][lane][i] = pq[j];
+      }
+    }
+    _Pragma("unroll")
+    for (uint j = 0; j < NV; j++) {
+      const uint p = tid + j * NT;
+      if (p < tt * DB) {
+        const uint t = p / DB, r = p % DB;
+        v_s[t][r] = pv[j];
+      }
+    }
+    if (tid < tt) {
+      g_s[tid] = pg;
+      b_s[tid] = pb;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Prefetch the NEXT block into registers while this one runs.
+    if (t0 + (int)TB < seq_len) {
+      const int tn = t0 + (int)TB;
+      GDN_PIPE_FETCH(tn, seq_len - tn)
+    }
+
+    // ── The steps. Each lane reads its own k/q fragments (threadgroup
+    // memory; lane seg touches columns 4*seg..4*seg+3 only), computes the
+    // norms' partials, and runs the recurrence. The butterflies reduce
+    // across the row's 8 lanes (xor 4, 2, 1).
+    for (uint t = 0; t < tt; t++) {
+      const float av = g_s[t] + dtb;
+      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+      const float decay = exp(neg_a * sp);
+      const float beta = 1.0f / (1.0f + exp(-b_s[t]));
+
+      float4 kc[4], qc[4];
+      _Pragma("unroll")
+      for (uint i = 0; i < 4; i++) {
+        kc[i] = k_s[t][seg][i];
+        qc[i] = q_s[t][seg][i];
+      }
+      float q_sq = 0.0f, k_sq = 0.0f;
+      _Pragma("unroll")
+      for (uint i = 0; i < 4; i++) {
+        q_sq += dot(qc[i], qc[i]);
+        k_sq += dot(kc[i], kc[i]);
+      }
+      float qs = q_sq, ks = k_sq;
+      _Pragma("unroll")
+      for (uint m = 4; m >= 1; m /= 2) {
+        qs += simd_shuffle_xor(qs, m);
+        ks += simd_shuffle_xor(ks, m);
+      }
+      const float q_inv = rsqrt(qs + 1e-6f) * scale;
+      const float k_inv = rsqrt(ks + 1e-6f);
+
+      // Decay, then the S·k partial dot.
+      float2 a2 = 0.0f;
+      _Pragma("unroll")
+      for (uint i = 0; i < 4; i++) {
+        st[i] = st[i] * decay;
+        a2 += float2(dot(st[i].xy, kc[i].xy * k_inv), dot(st[i].zw, kc[i].zw * k_inv));
+      }
+      float p = a2.x + a2.y;
+      _Pragma("unroll")
+      for (uint m = 4; m >= 1; m /= 2) {
+        p += simd_shuffle_xor(p, m);
+      }
+      const float v_t = v_s[t][rg];
+      const float delta = (v_t - p) * beta;
+
+      // S += k·delta; o partial = S·q.
+      float2 o2 = 0.0f;
+      _Pragma("unroll")
+      for (uint i = 0; i < 4; i++) {
+        st[i] = fma(kc[i], float4(delta * k_inv), st[i]);
+        o2 += float2(dot(st[i].xy, qc[i].xy * q_inv), dot(st[i].zw, qc[i].zw * q_inv));
+      }
+      float out = o2.x + o2.y;
+      _Pragma("unroll")
+      for (uint m = 4; m >= 1; m /= 2) {
+        out += simd_shuffle_xor(out, m);
+      }
+      if (seg == 0u) {
+        o[(uint(bos) + t0 + t) * value_dim + vr] = out;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    t0 += (int)TB;
+  }
+#undef GDN_PIPE_FETCH
+
+  {
+    device float4* S_out = (device float4*)(state_row + 4u * seg);
+    for (uint i = 0; i < 4; i++) {
+      S_out[8u * i] = st[i];
+    }
+  }
+}
+
+#define INST_GDN_SCAN_PIPELINED(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gdn_scan_pipelined_##dtype_tag, gdn_scan_pipelined<mtl_type>)
+
+INST_GDN_SCAN_PIPELINED(f16,  half)
+INST_GDN_SCAN_PIPELINED(bf16, bfloat)
+INST_GDN_SCAN_PIPELINED(f32,  float)

@@ -884,3 +884,146 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
         assert_ne!(read_f32(&simd_state, s), state0, "cu {cu:?}");
     }
 }
+
+/// `gdn_scan_pipelined_f32` — the prefill scan (gdn_scan_pipelined.metal, omlx Kernel P's
+/// 8-lanes-per-row staging under this crate's contracts) — against the gating→scan chain over
+/// the same inputs and state: outputs and state left behind must agree to f32 rounding (the
+/// butterfly's summation order is simd_sum's). Mixed continued/fresh varlen batches including a
+/// decode-shaped 1-token continuation; block-tail lengths exercise the partial block.
+#[test]
+fn gdn_scan_pipelined_is_the_gating_then_scan() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+    // Same head dims and grouping as production (hk=hv=128, 3 v-heads per
+    // k-head); fewer heads keeps the reference tractable.
+    let (nk, nv, hk, hv) = (2usize, 6usize, 128usize, 128usize);
+    let (key_dim, value_dim) = (nk * hk, nv * hv);
+    let conv_dim = 2 * key_dim + value_dim;
+    let scale = (hk as f32).powf(-0.5);
+    let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
+    for (cu, fresh) in [
+        // Prefill lengths around TB=12 boundaries: 25 = 2*12 + 1 (tail of 1).
+        (vec![0, 25], vec![1u32]),
+        (vec![0, 24, 37], vec![0u32, 1]),
+        (vec![0, 13, 26], vec![1u32, 0]),
+        // Decode-shaped: one token on a carried state.
+        (vec![0, 1], vec![0u32]),
+    ] {
+        let t = *cu.last().expect("a sequence") as usize;
+        let seqs = cu.len() - 1;
+        let n = t * nv;
+        let conv_out = fill(t * conv_dim);
+        let (a, b, a_log, dt_bias) = (fill(n), shifted(n, 3), fill(nv), shifted(nv, 5));
+        let state0 = shifted(seqs * nv * hv * hk, 11);
+        let si: Vec<i32> = (0..seqs as i32).collect();
+        let build = |lib: &'static str, name: &'static str, c: Vec<ConstantValue>| {
+            baked_build(&cache, &PipelineKey::new(lib, name, c)).expect(name)
+        };
+        let scan_consts = || {
+            vec![
+                ConstantValue::uint(0, nk as u32),
+                ConstantValue::uint(1, nv as u32),
+                ConstantValue::uint(2, hk as u32),
+                ConstantValue::uint(3, hv as u32),
+                ConstantValue::float(4, scale),
+            ]
+        };
+        let pipe_consts = || {
+            vec![
+                ConstantValue::uint(0, nk as u32),
+                ConstantValue::uint(1, nv as u32),
+                ConstantValue::uint(2, hk as u32),
+                ConstantValue::uint(3, hv as u32),
+                ConstantValue::float(4, scale),
+                ConstantValue::uint(5, 12), // TB
+            ]
+        };
+        let size = |width, height, depth| MTLSize {
+            width,
+            height,
+            depth,
+        };
+        let (cu_buf, si_buf) = (buf_i32(&device, &cu), buf_i32(&device, &si));
+        let (fresh_buf, conv_buf) = (buf_u32(&device, &fresh), buf_f32(&device, &conv_out));
+        let (a_buf, b_buf) = (buf_f32(&device, &a), buf_f32(&device, &b));
+        let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
+
+        // The chain: gating then the per-thread varlen scan (the canonical reference).
+        let gating = build(
+            "gdn_gating",
+            "gdn_gating_f32",
+            vec![
+                ConstantValue::uint(0, n as u32),
+                ConstantValue::uint(1, nv as u32),
+            ],
+        );
+        let (g_buf, beta_buf) = (buf_zero_f32(&device, n), buf_zero_f32(&device, n));
+        let bufs = [&g_buf, &beta_buf, &a_buf, &b_buf, &alog_buf, &dt_buf];
+        let grid = size(n.div_ceil(256), 1, 1);
+        if !common::dispatch_threadgroups(&device, &gating, &bufs, grid, size(256, 1, 1)) {
+            return;
+        }
+        let scan = build("gdn_scan_varlen", "gdn_scan_varlen_f32", scan_consts());
+        let chain_o = buf_zero_f32(&device, t * value_dim);
+        let chain_state = buf_f32(&device, &state0);
+        let bufs = [
+            &chain_o,
+            &conv_buf,
+            &g_buf,
+            &beta_buf,
+            &chain_state,
+            &cu_buf,
+            &si_buf,
+            &fresh_buf,
+        ];
+        let grid = size(1, nv, seqs);
+        if !common::dispatch_threadgroups(&device, &scan, &bufs, grid, size(hv, 1, 1)) {
+            return;
+        }
+
+        // The pipelined scan.
+        let pipe = build(
+            "gdn_scan_pipelined",
+            "gdn_scan_pipelined_f32",
+            pipe_consts(),
+        );
+        let pipe_o = buf_zero_f32(&device, t * value_dim);
+        let pipe_state = buf_f32(&device, &state0);
+        let bufs = [
+            &pipe_o,
+            &conv_buf,
+            &a_buf,
+            &b_buf,
+            &pipe_state,
+            &cu_buf,
+            &si_buf,
+            &fresh_buf,
+            &alog_buf,
+            &dt_buf,
+        ];
+        let grid = size(value_dim / 16, 1, seqs);
+        if !common::dispatch_threadgroups(&device, &pipe, &bufs, grid, size(128, 1, 1)) {
+            return;
+        }
+
+        let close = |what: &str, got: Vec<f32>, want: Vec<f32>| {
+            let scale = want.iter().fold(0f32, |m, w| m.max(w.abs()));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-5 * scale,
+                    "{what}[{i}]: {g} vs {w}, cu {cu:?}"
+                );
+            }
+        };
+        let rows = t * value_dim;
+        close("o", read_f32(&pipe_o, rows), read_f32(&chain_o, rows));
+        let s = state0.len();
+        close("state", read_f32(&pipe_state, s), read_f32(&chain_state, s));
+        assert_ne!(read_f32(&pipe_state, s), state0, "cu {cu:?}");
+    }
+}
