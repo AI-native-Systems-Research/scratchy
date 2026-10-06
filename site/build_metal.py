@@ -267,6 +267,20 @@ USERS_INFO = info("Requests in flight at once. An engine may batch fewer than it
 # scrolls sideways inside its own box, which would clip a popover opened from it.
 
 
+def settings(run):
+    """The run settings that change scratchy's numbers on their own: its serve
+    flags and KV cache setting, as the runner recorded them."""
+    c = run["config"]
+    return {"serve flags": c.get("scratchy_serve_args") or "none",
+            "KV cache": c.get("kv_cache_dtype") or "default"}
+
+
+def settings_changed(run, prev):
+    """Human-readable differences in settings between two runs, or ""."""
+    now, then = settings(run), settings(prev)
+    return "; ".join(f"{k} {then[k]} then, {now[k]} now" for k in now if now[k] != then[k])
+
+
 def summary_table(m, run, prev=None):
     base = (run["config"].get("scaling") or {}).get("base") or {}
     shape = f"{base.get('input', '?')} in / {base.get('output', '?')} out" if base else ""
@@ -304,6 +318,10 @@ def summary_table(m, run, prev=None):
     if prev is not None:
         vs = (f' Under scratchy: change since its previous run here ({esc(prev[0]["generated_utc"][:10])}, '
               f'<code>{esc(str(prev[0]["repo"]["sha"])[:8])}</code>); ≈ is within 3%.')
+        changed = settings_changed(run, prev[0])
+        if changed:
+            vs += (f' <b>Settings differ from that run</b> ({esc(changed)}), so a change is not '
+                   'the code alone.')
     return f"""<div class="mpart">
   <h4>Startup and single-user speed</h4>
   <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.{vs}
@@ -399,7 +417,7 @@ def line_svg(series, xs, cid, ylabel, nd, title, head, notes=None):
     return "".join(out)
 
 
-def conc_chart(m, mid, base, prev=None):
+def conc_chart(m, mid, base, run, prev=None):
     """Throughput and time per output token against offered users, side by
     side: two measures, so two charts on one x axis rather than two y axes."""
     cells = {key: {c["rung"]: c for c in m.get(sk) or [] if c.get("axis") == "conc"}
@@ -410,7 +428,10 @@ def conc_chart(m, mid, base, prev=None):
 
     # The previous run's scratchy line, drawn first so it sits behind.
     pcs = {c["rung"]: c for c in (prev[1].get("scaling") if prev else None) or [] if c.get("axis") == "conc"}
-    plabel = f"previous ({prev[0]['generated_utc'][5:10]})" if prev else ""
+    plabel = ""
+    if prev:
+        plabel = f"previous ({prev[0]['generated_utc'][5:10]}" + (
+            ", different settings)" if settings_changed(run, prev[0]) else ")")
 
     def series(metric):
         out = []
@@ -476,12 +497,6 @@ def conc_chart(m, mid, base, prev=None):
 HEAT_BOUNDS = [0.5, 0.8, 1 - NOISE, 1 + NOISE, 1.25, 2]
 HEAT_LABELS = ["much slower (x0.5 or less)", "slower", "a bit slower", "about the same",
                "a bit faster", "faster", "much faster (x2 or more)"]
-
-
-# Heat maps always sit on Carbon's dark theme (cds--g100 scoped to the block,
-# the rest of the page follows the reader's theme): the RdBu steps read with
-# more contrast against a dark ground.
-DARK = "cds--g100 mdark"
 
 
 def heat_legend():
@@ -587,12 +602,10 @@ def grid_maps(m, run):
     return f"""<figure class="mfig">
   <figcaption><h4>Prompt size × answer size</h4>
     <p class="msub">{esc(conc)} users at once; {esc(note)}.</p></figcaption>
-  <div class="{DARK}">
   <div class="heatrow">
   {"".join(one(metric, title, faster) for metric, title, faster in GRID_METRICS)}
   </div>
   {scale}
-  </div>
 </figure>"""
 
 
@@ -635,11 +648,12 @@ def runs_table(runs):
             '</td>'
             f'<td>{esc(", ".join(c.get("scenarios") or []))}</td>'
             f'<td>{esc(prime) if prime is not None else "not recorded"}</td>'
-            f'<td>{esc(c.get("kv_cache_dtype") or "")}</td>'
+            f'<td>{esc(settings(run)["KV cache"])}</td>'
+            f'<td><code>{esc(settings(run)["serve flags"])}</code></td>'
             f'<td><a href="data/metal/{esc(run["_file"].name)}">json</a></td></tr>')
     return fold(f"Runs on this machine ({len(runs)})", f"""<div class="mtable"><table>
   <thead><tr><th scope="col">when</th><th scope="col">scratchy</th><th scope="col">steps</th>
-  <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">data</th></tr></thead>
+  <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">scratchy serve flags</th><th scope="col">data</th></tr></thead>
   <tbody>{''.join(rows)}</tbody></table></div>""")
 
 
@@ -712,10 +726,8 @@ def glance(machines):
   one cell of the full grid (rows: prompt, short to long; columns: answer, short to long),
   coloured by how many times faster scratchy is than mlx-lm (ollama where a run has no mlx-lm).
   Hover a square for its ratio; click a grid for its model.</p>
-  <div class="{DARK}">
   <div class="heatrow">{''.join(tables)}</div>
   <div class="scale"><span class="scalekey">scratchy is:</span>{heat_legend()}<span><i class="sw nil"></i>no comparison</span></div>
-  </div>
 </section>"""
 
 
@@ -746,7 +758,7 @@ def machine_section(chip, runs, latest, seen):
       · {esc(m.get("quant") or "default")}{build}
       · run {esc(run["generated_utc"][:10])}, <code>{esc(str(run["repo"]["sha"])[:8])}</code></p>
     {summary_table(m, run, prev)}
-    {conc_chart(m, mid, base, prev)}
+    {conc_chart(m, mid, base, run, prev)}
     {grid_maps(m, run)}
     {history(seen[stem])}
   </article>""")
@@ -814,15 +826,9 @@ PAGE = r"""<!doctype html>
 <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/toggle-tip.min.js"></script>
 <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/accordion.min.js"></script>
 <script>
-(function () {
-  var mq = window.matchMedia('(prefers-color-scheme: dark)');
-  function apply(dark) {
-    document.documentElement.classList.remove('cds--g100', 'cds--white');
-    document.documentElement.classList.add(dark ? 'cds--g100' : 'cds--white');
-  }
-  apply(mq.matches);
-  mq.addEventListener('change', function (e) { apply(e.matches); });
-})();
+// Always Carbon's light theme: the heat-map steps and series colours are
+// chosen and checked against it, whatever the reader's system setting.
+document.documentElement.classList.add('cds--white');
 </script>
 </head>
 <body>

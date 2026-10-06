@@ -5,11 +5,7 @@
  * preference — so this file carries no light/dark branching of its own. */
 @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap");
 
-:root,
-/* Redeclared on any element carrying its own Carbon theme class: a custom
- * property resolves where it is declared, so without this a dark block
- * inside a light page would inherit the light values. */
-.cds--g100, .cds--white {
+:root {
   --bg: var(--cds-background);
   --bg-soft: var(--cds-layer-01);
   --panel: var(--cds-layer-02);
@@ -18,8 +14,6 @@
   --muted: var(--cds-text-secondary);
   --accent: var(--cds-link-primary);
   --accent-2: var(--cds-link-primary);
-}
-:root {
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --wide: 1080px;
@@ -555,9 +549,6 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .metalpage .mmodel { margin-top: 1.5rem; padding: 0.5rem 1.5rem 1rem; --heat-mid: var(--panel); }
 .metalpage .mmodel .mchart .dot { stroke: var(--bg-soft); }
 .metalpage .mfold { margin: 0.5rem 0 0; }
-/* A heat-map block on Carbon's dark theme, whatever the page's theme. */
-.metalpage .mdark { --heat-mid: var(--bg-soft); background: var(--bg); color: var(--fg);
-  padding: 1rem 1.25rem; border-radius: 4px; }
 
 /* Wide tables scroll inside their own box, never the page. */
 .mtable { overflow-x: auto; margin: 0 0 1rem; }
