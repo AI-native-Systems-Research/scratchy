@@ -26,9 +26,9 @@
 //!   tape's buffers are `t37/t41/t42`: well-formed, and wrong.
 //! * **The kind.** The row states the [`Program`] classification, the same value the
 //!   builder path's `finish_shaped` states. The standalone triton-spyre position had to
-//!   INFER this from the op soup; scratchy has the tape, so it STATES it, and a mis-stated
-//!   row is caught by the byte-identity golden rather than by a classifier that could
-//!   mis-recognize.
+//!   INFER this from the op soup; scratchy has the tape, so it STATES it, and the golden
+//!   pins the `op_name` this row's stem produces rather than trusting a classifier that
+//!   could mis-recognize.
 //!
 //! # ⛔⭐ TOTALITY BY CONSTRUCTION — NO LOOKUP, NO FALLTHROUGH, NO REFUSAL
 //!
@@ -288,8 +288,8 @@ pub fn attn_row() -> TritonKernelRow {
 
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice is one of the five families below (attention rides its own `lower_attn` entry);
-/// the ops the spyre target has no kernel AT ALL for (the expansion ops, reshape, …)
-/// never reach this crate — `lower_one_node`'s own arms own those refusals by name.
+/// the ops the spyre target has no kernel FOR (the expansion ops, reshape, …) never reach
+/// this crate — `lower_one_node`'s own arms own those refusals by name.
 pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKernelRow {
     match op {
         SubOp::RmsNorm { gain, .. } => rmsnorm_row(*gain),
@@ -367,8 +367,8 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
 /// shape, and the end state has none.
 ///
 /// The name is the builder's own law — `rmsnorm_s{node.id}` — so the spliced op's
-/// `op_name` and the emulator's function key are IDENTICAL to the builder path's. That
-/// is the byte-identity golden's requirement.
+/// `op_name` and the emulator's function key follow the same naming law the builder
+/// path established. That is what the golden's `op_name` pins.
 ///
 /// ⭐ ONE NODE MAY LOWER TO MORE THAN ONE OP, and only the splice knows which kinds:
 /// [`lower_all`] is the entry the walk calls, and it routes every one-op kind here.
@@ -880,10 +880,10 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // pre-populated cache at decode, a continuation chunk) traces no view over it, and the
     // handoff refuses an unaddressed parameter rather than inventing a width. The builder's
     // own maskless arm mints NO mask parameter (`KtirFunc::attn` registers the mask tile
-    // only under `mask_prefix` / the one-pass arm), so the byte-identity requirement is the
-    // same one: the parameter must not survive. `desc_mask` is the LAST parameter — the
-    // consumer numbers its buffers by parameter position, so removing the tail renumbers
-    // nothing (the handoff's own law).
+    // only under `mask_prefix` / the one-pass arm), so the same law holds here: the
+    // parameter must not survive. `desc_mask` is the LAST parameter — the consumer numbers
+    // its buffers by parameter position, so removing the tail renumbers nothing (the
+    // handoff's own law).
     if !has_mask {
         truncate_unused_mask_param(&mut module)?;
     }
@@ -1264,9 +1264,9 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // logits scalarmul, whose chunk-6 window is `for_pointwise`-padded) needs
             // the VIEW to hold the tile. `for_matmul` is IDEMPOTENT at a padded width
             // and the weight-holds drop is the door's, applied to both paths — so this
-            // spelling and the builder's logical one reach the same emit,
-            // byte-identical. The fp8 arm stays LOGICAL: its door arm returns early
-            // through `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
+            // spelling and the builder's logical one reach the same emit. The fp8 arm
+            // stays LOGICAL: its door arm returns early through
+            // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
             let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(m, *n, k, false).get();
             ce("M", Val::Int(i128::from(m)))?;
@@ -1810,8 +1810,8 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         .map(|tr| BufferId::new(tr.tensor.index() as u32))
         .collect();
     bindings.push(BufferId::new(node.output.tensor.index() as u32));
-    // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key are
-    // identical between the two paths — the byte-identity golden's requirement.
+    // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key
+    // follow the same law the builder path established — what the golden pins.
     let name = Arena::global().str(format!(
         "{}_s{}",
         program_stem(node, program),
