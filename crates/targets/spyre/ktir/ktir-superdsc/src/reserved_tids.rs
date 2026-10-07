@@ -364,6 +364,9 @@ pub fn identity_class_tid(idx: usize) -> u32 {
 ///     mb-broadcast in the rank compare's `equal`-leg multiply.
 ///   * **`topk_iota`** — the `[1,W]` iota row `h ↦ h`, the value RouteTopK's selector
 ///     sum multiplies its match mask by.
+///   * **`topk_targets`** — the `[k,W]` target-rank table, row `j` a UNIFORM splat
+///     of `E−k+j`: a full-width `equal` compare needs its scalar as a row
+///     broadcast, the one operand mode a pointwise compare can take.
 ///   * **`identity`** — the `[W,W]` identity table, row `j` = the one-hot row with lane `j`
 ///     hot, the row the combine-chain shape writes logical lane `j` of an output stick
 ///     through. ONE table, not k one-hot rows: the argsort reads one row per RANKED
@@ -376,9 +379,10 @@ pub fn identity_class_tid(idx: usize) -> u32 {
 /// Same mechanism as the rope-P classes: the DOOR resolves the row/table's tid here, the
 /// placement pass mints its seg0 footprint, and the worker's load-time bind
 /// (`wiring::synthetic_constants`) builds the value from the same bake-carried geometry.
-/// SIZED IN SLOTS: one `rank_tie`, one `identity`, one `topk_iota`, one `pad_hi`, one
-/// `pad_lo`, one `pad_mask` — six, all E-derived (never k-derived: the argsort reads one
-/// identity row per RANKED EXPERT, so a k-sized anything under-reserves it).
+/// SIZED IN SLOTS: one `rank_tie`, one `identity`, one `topk_iota`, one `topk_targets`,
+/// one `pad_hi`, one `pad_lo`, one `pad_mask` — seven; the first four are E/W-derived,
+/// `topk_targets` is the one k-sized placement (k rows of splats, the top-k door's own
+/// compare factors, and the checked-in k ≤ 8 fits one region comfortably).
 pub const ROUTER_CONST_BASE: u32 = u32::MAX - 137;
 
 /// The `[W,W]` stable-argsort tie-break table `tie[j,h'] = 𝟙[h' < j]` (j on rows, h' on
@@ -400,15 +404,22 @@ pub fn router_topk_iota_tid() -> u32 {
     reserved_region("router_const").at(2)
 }
 
+/// The `[k,W]` target-rank table, row `j` a uniform splat of `E−k+j` — the top-k
+/// door's compare factor. k-DERIVED (the one k-sized router const), placed only when
+/// the tape has a RouteTopK node.
+pub fn router_topk_targets_tid() -> u32 {
+    reserved_region("router_const").at(3)
+}
+
 /// The `[1,W]` +inf sanitize row (argsort pad: sorts last, so pad lanes never win ranks).
 pub fn router_pad_hi_tid() -> u32 {
-    reserved_region("router_const").at(3)
+    reserved_region("router_const").at(4)
 }
 
 /// The `[1,W]` −inf sanitize row (softmax/gather pad: `exp(−inf)=0`, so pad lanes never
 /// contribute to scores).
 pub fn router_pad_lo_tid() -> u32 {
-    reserved_region("router_const").at(4)
+    reserved_region("router_const").at(5)
 }
 
 /// The `[1,W]` ARGSORT PAD-MASK row: `0` in lanes `0..E` (the real experts — `maximum(x, mask)`
@@ -417,7 +428,7 @@ pub fn router_pad_lo_tid() -> u32 {
 /// [`router_pad_hi_tid`] (the uniform +inf row the softmax-side sanitize and the top-k one-hot
 /// forms use): this row is E-dependent, so its VALUE comes from the geometry handoff.
 pub fn router_pad_mask_tid() -> u32 {
-    reserved_region("router_const").at(5)
+    reserved_region("router_const").at(6)
 }
 
 /// Does `tid` name a KERNEL-TABLE class table of family `what` (`"rope-P"` or `"identity"`)?
@@ -501,15 +512,15 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
         slots: 8,
     },
     // ⭐ THE ROUTER CONST REGION — the MoE router doors' token-independent factors (see
-    // [`ROUTER_CONST_BASE`]): the tie table, the identity table, the iota row, the sanitize
-    // rows. 6 slots: 1 tie + 1 identity + 1 iota + 2 sanitize + 1 argsort pad-mask — every
-    // one E-sized, none k-sized (the argsort reads one identity row per RANKED EXPERT).
-    // Sits in the top of the gap below `identity_class` (whose floor is MAX-136) and above
-    // `kct_resident` (MAX-1_000_171).
+    // [`ROUTER_CONST_BASE`]): the tie table, the identity table, the iota row, the
+    // target-rank table, the sanitize rows. 7 slots: 1 tie + 1 identity + 1 iota +
+    // 1 targets + 2 sanitize + 1 argsort pad-mask. Sits in the top of the gap below
+    // `identity_class` (whose floor is MAX-136) and above `kct_resident`
+    // (MAX-1_000_171).
     TidRegion {
         name: "router_const",
         base: ROUTER_CONST_BASE,
-        slots: 6,
+        slots: 7,
     },
     // ⛔ THE GAP FROM MAX-137 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
     // block/zero/down_proj regions, which are gone with the K-split itself. `kct_resident` keeps

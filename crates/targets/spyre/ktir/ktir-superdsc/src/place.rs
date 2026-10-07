@@ -104,6 +104,12 @@ pub enum SynthRole {
     ARank,
     /// The one-hot product accumulator `[m, W]` (the combine chain's shape).
     AAcc,
+    /// The top-k per-slot match mask `𝟙[rank == E−k+j]` `[m, W]`.
+    AMatch,
+    /// The top-k per-slot selector `match · iota` `[m, W]` (the reduce's data).
+    ASel,
+    /// The top-k per-slot reduce accum `[m, stick]` (the expert index at lane 0).
+    AIdx,
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -184,6 +190,9 @@ impl fmt::Display for SynthRole {
             Self::ACnt => f.write_str("acnt"),
             Self::ARank => f.write_str("arank"),
             Self::AAcc => f.write_str("aacc"),
+            Self::AMatch => f.write_str("amatch"),
+            Self::ASel => f.write_str("asel"),
+            Self::AIdx => f.write_str("aidx"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),

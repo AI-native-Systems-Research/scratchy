@@ -156,12 +156,12 @@ pub fn lower(
         // with every token riding the mb axis (see the door's own doc for the
         // 7E+1 chain and the pad-mask sanitize that makes it correct).
         Program::RouteArgsort => lk::route_argsort(name, &r, sym_id_base, layout),
-        Program::RouteTopK => Err(Error {
-            message: format!(
-                "{name}: RouteTopK (the last k sorted indices of each row) has no SuperDSC \
-                 lowering yet: on card it is a k-wide slice of `topk.ddl`'s `topkindex` output"
-            ),
-        }),
+        // The last k sorted indices of each row — the rank-vector INVERSION
+        // (a one-hot selector sum, never a trailing-column slice of the rank
+        // vector: that reads "the ranks of the last k columns" and picks
+        // wrong experts — measured on the metal track). 4k ops, per slot,
+        // every token riding mb; see the door's own doc.
+        Program::RouteTopK => lk::route_topk(name, &r, sym_id_base, layout),
         Program::RouteGatherScores => Err(Error {
             message: format!(
                 "{name}: RouteGatherScores (the scores at the chosen indices) has no SuperDSC \

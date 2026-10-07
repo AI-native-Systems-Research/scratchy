@@ -152,11 +152,15 @@ pub struct BakeFacts {
     /// router_const region's own placements: W from the `[W,W]` tie table's size
     /// (`sqrt(size/2)`), and E from the layout's own `router_experts` registry entry — the one
     /// fact no placement size carries, because the pad-mask row's VALUE needs the UNPADDED
-    /// count (0 below E, +inf above). k is deliberately NOT here: every router const is
-    /// E-sized (the argsort reads one identity row per RANKED expert), so a k-sized fact has
-    /// no consumer. `(0, 0)` when the bundle has no MoE router. Same "asked of the artifact"
-    /// law as `ones_reduce_len`.
+    /// count (0 below E, +inf above). k rides the top-k targets table's OWN PLACEMENT (its
+    /// row count), read back by the bind when the table exists — a bundle with no RouteTopK
+    /// node places no targets table and binds no k. `(0, 0)` when the bundle has no MoE
+    /// router. Same "asked of the artifact" law as `ones_reduce_len`.
     pub router: (usize, usize),
+    /// The top-k row count, off the `[k,W]` TARGETS table's own placement — the bind
+    /// builds the target ranks `E−k+j` from it. 0 when the bundle placed no targets
+    /// table (no RouteTopK node).
+    pub router_k: usize,
     /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
     /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
     /// step and the launch must stage a block table.
@@ -179,6 +183,7 @@ impl BakeFacts {
         scalarmul_scales: &[],
         gathers_kv: false,
         router: (0, 0),
+        router_k: 0,
     };
 
     /// Read them off the generated layout.
@@ -188,7 +193,8 @@ impl BakeFacts {
         // The router geometry, off the tie table's placement and the layout's own
         // `router_experts` registry entry (the E fact no placement size carries — the
         // pad-mask row's VALUE needs the unpadded count). The placement pass mints the tie
-        // table at exactly `[W, W]` fp16, so `sqrt(size/2)` IS W.
+        // table at exactly `[W, W]` fp16, so `sqrt(size/2)` IS W. k rides the targets
+        // table's own placement (`[k, W]` ⇒ `size/2/W` rows).
         let router = match layout.place_of_tid(sd::router_rank_tie_tid()) {
             Some(p) => {
                 let w = ((p.size / 2) as f64).sqrt() as usize;
@@ -197,12 +203,18 @@ impl BakeFacts {
             }
             None => (0, 0),
         };
+        let router_k = layout
+            .place_of_tid(sd::router_topk_targets_tid())
+            .map(|p| (p.size / 2) as usize / router.0.max(1))
+            .filter(|&k| k > 0)
+            .unwrap_or(0);
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
             router,
+            router_k,
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -258,6 +270,7 @@ impl BakeFacts {
             attn_class_hds: w.attn_class_hds,
             rms_invcols: w.rms_invcols,
             router: self.router,
+            router_k: self.router_k,
         }
     }
 }
@@ -908,9 +921,13 @@ pub struct ConstantEnv {
     /// expert count E)`. W derives from the router_const region's placement exactly as the
     /// placement pass minted it (W = the `[W,W]` tie table's placement width), E from the
     /// layout's `router_experts` registry entry (the pad-mask row's value needs it and no
-    /// placement size carries it). k is deliberately absent — every router const is E-sized.
-    /// `(0, 0)` when the bundle has no MoE router — a non-MoE model binds nothing.
+    /// placement size carries it). `(0, 0)` when the bundle has no MoE router — a non-MoE
+    /// model binds nothing.
     pub router: (usize, usize),
+    /// The top-k row count, off the `[k,W]` TARGETS table's own placement (`size/2/W`) —
+    /// the bind builds the target ranks `E−k+j` from it. 0 when the bundle placed no
+    /// targets table (no RouteTopK node), and then no targets are bound.
+    pub router_k: usize,
 }
 
 // ── THE CONSTANTS THAT ARE LITERALLY CONSTANT ───────────────────────────────
@@ -1152,6 +1169,19 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
         // The iota row `h ↦ h` (the value the top-k selector's match mask multiplies).
         let iota: Vec<f32> = (0..w).map(|h| h as f32).collect();
         out.push((sd::router_topk_iota_tid(), ConstValues::Owned(iota)));
+        // The top-k TARGET-RANK table `[k,W]`, row j a uniform splat of `E−k+j` — the
+        // compare factor the top-k door's full-width `equal` reads mb-broadcast.
+        // Bound only when the bundle PLACED it (a tape with a RouteTopK node); the
+        // row count is the placement's own.
+        if env.router_k > 0 {
+            let k = env.router_k;
+            let mut targets = vec![0.0f32; k * w];
+            for j in 0..k {
+                let t = (e - k + j) as f32;
+                targets[j * w..(j + 1) * w].fill(t);
+            }
+            out.push((sd::router_topk_targets_tid(), ConstValues::Owned(targets)));
+        }
         // The two uniform sanitize rows: +inf (sorts last) and −inf (zeroes under exp).
         out.push((
             sd::router_pad_hi_tid(),
@@ -1389,6 +1419,7 @@ mod constant_tape_tests {
             rms_invcols: Vec::leak(vec![1.0f32 / 2048.0; 64]),
             // No MoE router in this fixture's model — the router consts bind nothing.
             router: (0, 0),
+            router_k: 0,
         }
     }
 

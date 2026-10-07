@@ -8643,6 +8643,11 @@ fn synth_role_tokens(
         R::ACnt => quote! { #b::ACnt },
         R::ARank => quote! { #b::ARank },
         R::AAcc => quote! { #b::AAcc },
+        // The route-top-k scratch: the per-slot match mask, the selector
+        // product, and the reduce accum ([`lk::route_topk`]'s own synths).
+        R::AMatch => quote! { #b::AMatch },
+        R::ASel => quote! { #b::ASel },
+        R::AIdx => quote! { #b::AIdx },
     }
 }
 

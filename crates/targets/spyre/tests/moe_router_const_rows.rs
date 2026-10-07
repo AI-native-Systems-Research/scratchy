@@ -131,6 +131,13 @@ fn the_router_consts_are_placed_at_the_padded_geometry() {
             "{what} must be [1, W] fp16"
         );
     }
+    // The [k,W] targets table — the ONE k-sized router const, placed because
+    // this tape has a RouteTopK node.
+    assert_eq!(
+        l.placements.get(&rt::router_topk_targets_tid()).map(|p| p.size),
+        Some(K as u64 * W as u64 * 2),
+        "the targets table must be [k, W] fp16"
+    );
 }
 
 /// ⭐ A ROUTER-ONLY TAPE PLACES EVERYTHING: the placement gate is `RouterLogits`
@@ -241,6 +248,7 @@ fn the_bind_builds_the_declared_values() {
         attn_class_hds: &[],
         rms_invcols: &[],
         router: (W as usize, E as usize),
+        router_k: K as usize,
     };
     let consts = scratchy_target_spyre::wiring::synthetic_constants(&env);
     let get = |tid: u32| -> Vec<f32> {
@@ -268,6 +276,19 @@ fn the_bind_builds_the_declared_values() {
     assert_eq!(iota.len(), W as usize);
     for (h, &v) in iota.iter().enumerate() {
         assert_eq!(v, h as f32, "iota lane {h}");
+    }
+    // The top-k target-rank table: row j a UNIFORM splat of E−k+j — the
+    // compare factor the top-k door's full-width `equal` reads.
+    let targets = get(rt::router_topk_targets_tid());
+    assert_eq!(targets.len(), (K * W) as usize);
+    for j in 0..K {
+        let want = (E - K + j) as f32;
+        for (lane, &v) in targets[(j * W) as usize..((j + 1) * W) as usize]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(v, want, "targets row {j} lane {lane}");
+        }
     }
     // The identity table: row j is the one-hot row with lane j hot — ONE
     // [W,W] table, E-sized (row per ranked expert), never k-sized.
@@ -305,7 +326,7 @@ fn the_bind_builds_the_declared_values() {
     }
 }
 
-/// ⭐ A NON-ROUTER ENV BINDS NOTHING: `router: (0, 0, 0)` produces no
+/// ⭐ A NON-ROUTER ENV BINDS NOTHING: `router: (0, 0)` produces no
 /// router_const entries at all — the byte-identity half of the guard.
 #[test]
 fn a_non_router_env_binds_no_router_consts() {
@@ -322,12 +343,14 @@ fn a_non_router_env_binds_no_router_consts() {
         attn_class_hds: &[],
         rms_invcols: &[],
         router: (0, 0),
+        router_k: 0,
     };
     let consts = scratchy_target_spyre::wiring::synthetic_constants(&env);
     for (tid, what) in [
         (rt::router_rank_tie_tid(), "the tie table"),
         (rt::router_identity_tid(), "the identity table"),
         (rt::router_topk_iota_tid(), "the iota row"),
+        (rt::router_topk_targets_tid(), "the top-k targets"),
         (rt::router_pad_mask_tid(), "the argsort pad-mask"),
     ] {
         assert!(
