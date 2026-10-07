@@ -14,7 +14,7 @@ is a defect: a later reader cannot tell silence from a tested claim.
 |---|---|
 | [Headline](#headline) | empty — phase 4 measures, phase 5 writes it |
 | [Machine and toolchain](#machine-and-toolchain) | recorded; nothing measured on it yet |
-| [Scope and deferrals](#scope-and-deferrals) | **recorded — T0.8** |
+| [Scope and deferrals](#scope-and-deferrals) | **recorded — T0.8**; the KV ablation is in scope, prediction on record |
 | [Method and metrics](#method-and-metrics) | owned by the agreed method, not restated here |
 | [Exact commands](#exact-commands) | scratchy side recorded; ollama side **T0.4** |
 | [Results](#results) | empty — phase 4 |
@@ -58,151 +58,174 @@ capture stamps whichever version it ran.
 
 ## Scope and deferrals
 
-**Recorded — T0.8.** Phase 4 ablates every optimization scratchy has on metal
-except one. This section is that exception, written down so a missing row reads
-as a disclosed decision and not as a measured null result. **Nothing here is
-measured.** Every number is arithmetic over the checked-in configs and the code
-that consumes them, and none of it is a result.
+**Recorded — T0.8.** This section says what phase 4 measures and what it does
+not, so a missing row reads as a decision rather than as a result nobody
+noticed. **Nothing here is measured.** The numbers below are arithmetic over the
+checked-in configs and the code that reads them, and they are written down
+*before* the run on purpose.
 
-### Deferred: the TurboQuant KV-cache ablation
+### TurboQuant KV cache: measured, with the prediction on record
 
-scratchy can store a model's KV cache as 4-bit TurboQuant codes instead of
-fp16. Phase 4's ablation list (**T4.5**) carries that row struck out and points
-here. Three reasons, in the order they matter.
+TurboQuant stores a model's KV cache — the per-token keys and values a model
+keeps so it does not have to re-read the conversation for each new word — as
+4-bit codes instead of fp16. T0.8 originally deferred this ablation on the
+grounds below. **It is now in scope:** a measured near-zero is worth more than
+an argued one, and if the number is near zero we want to know why from data.
+The arithmetic stays here as a prediction rather than as a reason to skip.
 
-**1. It is a build axis, not a flag.** `metal` implies `turboquant`
-(`crates/cli/scr/Cargo.toml:45`); the codec is picked at expansion from that
-feature plus the model's geometry (`kv_codec_for`,
-`crates/compiler/macros/src/codegen.rs:7115-7150`) and baked into the binary.
-`--kv-cache-dtype` can only *assert* what was built and refuses to start when it
-disagrees (`crates/serving/worker/src/gpu_worker.rs:3322-3337`). The off arm is
-therefore a second build of all three models — the same cost as a second rung,
-for one ablation, and the same shape of cross-build comparison as the tool-span
-axis in [point 3](#what-a-rung-does-not-pin) below.
+#### It is already on in every build we ship
 
-**2. The codec reaches a minority of each model's layers.** TurboQuant
-compresses the **full-context** layers only. On a hybrid-SWA arch
-`is_global[L] = (group_of(L) == 0)`, so each sliding layer stays fp16 and gets a
+Worth stating first, because it is the opposite of what "add TurboQuant to the
+comparison" sounds like. On `scratchy-cli` the `metal` feature includes
+`turboquant` (`crates/cli/scr/Cargo.toml:45`), and all three models clear the
+codec's threshold, so **every build in [Exact commands](#exact-commands)
+already runs 4-bit KV.** There is nothing to switch on. What the ablation needs
+is the *dense* arm.
+
+#### What the dense arm costs
+
+Cargo features only add, so `--features metal` cannot ask for metal without
+`turboquant`, and `--kv-cache-dtype fp16` only asserts what the binary already
+does — it refuses to start on a TurboQuant build rather than changing it
+(`crates/serving/worker/src/gpu_worker.rs:3322-3337`). The dense arm therefore
+needs `"turboquant"` dropped from that one feature list and named explicitly
+instead, plus a second compile of each model.
+
+That is a change to the build graph, not to the codec, the threshold, or the
+policy — so it still measures TurboQuant exactly as implemented today. Phase 4
+should confirm that reading before spending the compiles.
+
+#### A first data point that costs nothing
+
+Four lines the server already prints at startup say what is compressed and how
+big the pool is, on the builds we are shipping, with no second compile and no
+A/B:
+
+| line | from | gives |
+|---|---|---|
+| `KV cache codec: … (built in)` | `gpu_worker.rs:3338` | dense or TurboQuant, and the bit width |
+| `TurboQuant KV: N-bit codebook (… n/m global layers compressed)` | `targets/metal/src/turboquant.rs:76` | how many layers the codec actually covers |
+| `KvCachePool: … = N MB` | `layers/src/kv_cache.rs:247`, `:396` | the pool's real size |
+| `GdnStatePool: n/m linear layers × k slots` | `layers/src/gdn_state.rs:144` | how much of Qwen3.6 holds recurrent state instead of KV |
+
+Recording those three sets of lines is the cheapest way to confirm or break
+every prediction below, and it should happen before the dense builds are
+queued.
+
+#### The prediction
+
+Two reasons to expect a small effect. If the measurement disagrees, the model of
+the mechanism below is wrong, which is itself worth having.
+
+**1. The codec covers a minority of layers.** It compresses full-context layers
+only; on a mixed-attention model each sliding layer stays fp16 and gets a
 16-byte placeholder the tape never binds
-(`crates/compiler/macros/src/codegen.rs:12637-12646` and
-`crates/targets/metal/src/turboquant.rs:61-140`, which logs
-`N/M global layers compressed` at startup):
+(`crates/compiler/macros/src/codegen.rs:12637-12646`,
+`crates/targets/metal/src/turboquant.rs:61-140`).
 
-| model | layers | hold a cache that grows with the session | the rest |
+| model | layers | keep a cache that grows with the session | the rest |
 |---|---|---|---|
-| `gemma-4-12b-it` | 48 | **8** full-attention | 40 capped at a 1024-token sliding window — 8 MiB each, fp16, flat in session length |
+| `gemma-4-12b-it` | 48 | **8** full-attention | 40 capped at a 1024-token window — 8 MiB each, fp16, flat in session length |
 | `gemma-4-26b-a4b-it` | 30 | **5** full-attention | 25 windowed, same |
-| `qwen3.6-35b-a3b` | 40 | **10** full-attention | 30 hold GDN recurrent conv/ssm state — not a KV cache at all |
+| `qwen3.6-35b-a3b` | 40 | **10** full-attention | 30 hold GDN recurrent state, not a KV cache |
 
-**3. What is left to compress is small, because the architecture already
-compressed it.** gemma-4's full-context layers carry **1 and 2** KV heads
-against the sliding class's 8 (`num_global_key_value_heads`; the per-layer
-geometry is `hybrid_layer_geometry`, `crates/core/model/src/weight.rs:446-468`),
-and Qwen3.6's carry 2. At the 65536-token context `scr launch claude` pins:
+**2. What is left is small, because the architecture already shrank it.**
+gemma-4's full-context layers carry 1 and 2 KV heads where its sliding layers
+carry 8 (`num_global_key_value_heads`; per-layer geometry in
+`crates/core/model/src/weight.rs:446-468`), and Qwen3.6's carry 2. At the 65536
+tokens `scr launch claude` pins:
 
-| model | the coded layers' row | KV at 65536 tokens | a 4-bit codec reclaims | of a 64 GiB box |
+| model | the compressed layers' cost | KV at 65536 tokens | 4-bit saves | of a 64 GiB box |
 |---|---|---|---|---|
-| `gemma-4-12b-it` | 8 × 2 × 1 × 512 × 2 B = **16 KiB/token** | 1.00 GiB coded + 320 MiB fp16 windows | ~0.75 GiB | **~1.2%** |
-| `gemma-4-26b-a4b-it` | 5 × 2 × 2 × 512 × 2 B = **20 KiB/token** | 1.25 GiB coded + 200 MiB fp16 windows | ~0.94 GiB | **~1.5%** |
-| `qwen3.6-35b-a3b` | 10 × 2 × 2 × 256 × 2 B = **20 KiB/token** | 1.25 GiB coded | ~0.94 GiB | **~1.5%** |
+| `gemma-4-12b-it` | 8 × 2 × 1 × 512 × 2 B = **16 KiB/token** | 1.00 GiB coded + 320 MiB fp16 windows | ~0.75 GiB | ~1.2% |
+| `gemma-4-26b-a4b-it` | 5 × 2 × 2 × 512 × 2 B = **20 KiB/token** | 1.25 GiB coded + 200 MiB fp16 windows | ~0.94 GiB | ~1.5% |
+| `qwen3.6-35b-a3b` | 10 × 2 × 2 × 256 × 2 B = **20 KiB/token** | 1.25 GiB coded | ~0.94 GiB | ~1.5% |
 
-(`2 ×` is K and V; the codec's own footprint is packed codes plus an f32 norm
-per head-vector plus one layer of fp16 staging scratch,
-`kv_bytes_per_token` and `bytes_per_vec` (`crates/layers/src/turboquant.rs:391`
-and `:228`), so the ratio is a little under 4× rather than exactly 4×.)
+(`2 ×` is K and V; the codec also stores an f32 norm per head-vector and one
+layer of fp16 staging scratch, so the ratio is a little under 4× —
+`kv_bytes_per_token` and `bytes_per_vec`,
+`crates/layers/src/turboquant.rs:391` and `:228`.)
 
-A GiB on a 64 GiB box, against weights several times larger, in 8 to 10 of 30
-to 48 layers' attention. On a machine where the weights bind and the KV pool
-does not, the expected effect on TTFT, TPOT and peak RSS is small enough that
-the run would be measuring metal's own run-to-run variance. Phase 4 states an
-expected direction before every ablation it runs; this one has no direction to
-state that the ladder could resolve.
+scratchy's own threshold agrees with that reading. `codec_for` keeps a model
+dense below 24 KiB/token because *"TurboQuant trades fidelity for KV CAPACITY.
+Below this, the capacity is not the constraint and the trade is a bad one"*
+(`crates/layers/src/turboquant.rs:276-291`). All three models sit at
+16–20 KiB/token of growing cache, i.e. under that bar. They are built with the
+codec anyway because the threshold is measured over all layers — correct for a
+model where every layer keeps a cache, 4× to 24× high for these three:
 
-**scratchy's own policy says the same thing, for the same reason.** `codec_for`
-keeps a model dense below 24 KiB/token, because *"TurboQuant trades fidelity for
-KV CAPACITY. Below this, the capacity is not the constraint and the trade is a
-bad one"* (`crates/layers/src/turboquant.rs:276-291`, `:348-380`). That is
-exactly the finding above, reached independently.
-
-The threshold is *defined* over all layers, K+V, and `kv_codec_for` feeds it
-`num_hidden_layers × num_key_value_heads × head_dim` accordingly
-(`crates/compiler/macros/src/codegen.rs:7126-7133`). On a uniform model that
-figure **is** the row that grows, so the policy and the capacity it reasons
-about are the same number. On a hybrid model they diverge — the estimate charges
-every layer the *sliding* class's row:
-
-| model | all-layers figure the threshold saw | the row that actually grows | diverge by |
+| model | all-layers figure the threshold saw | the part that grows | apart by |
 |---|---|---|---|
 | `gemma-4-12b-it` | 384 KiB/token | 16 KiB/token | **24×** |
 | `gemma-4-26b-a4b-it` | 240 KiB/token | 20 KiB/token | **12×** |
 | `qwen3.6-35b-a3b` | 80 KiB/token | 20 KiB/token | **4×** |
 
-Both of the threshold's calibration points are uniform full-attention models
-(`qwen2.5-0.5b` at 12 KiB/token → dense, `llama-3.2-1b` at 32 → coded), so the
-divergence is not a mistake in it — it is a case the policy was not set on.
-What follows for this document is only the narrow conclusion: **"the build
-enabled TurboQuant" is not evidence that these three models have a KV cache
-worth compressing.** By the capacity rationale the threshold itself states, they
-sit under the bar.
+#### Where to look for the effect
 
-#### What this deferral is not
+The codec's own rationale is **capacity, not speed** — it trades fidelity for
+how much KV fits. So the run most likely to show something is the
+context-ceiling one (**T4.4**: how far each engine gets on 64 GB and where it
+dies), not per-turn TTFT and TPOT at a 65536-token cap where the pool is about a
+GiB either way. Report peak RSS, the pool size from the log lines above, and the
+ceiling; report TTFT and TPOT too, with the expectation that they move inside
+run-to-run noise.
 
-It is **not** the claim that KV quantization does not help agentic serving.
-Three near-zero rows published next to each other would read as exactly that,
-and this model set cannot support it: the three were chosen for the epic's other
-questions — a dense control, a MoE, a MoE with GDN — and all three happen to be
-designs that keep very little long-lived KV. The supportable statement is the
-narrow one: **on these three models, at this context length, on this machine,
-there is almost no KV to compress.** An ablation here would characterise the
-model set, not the optimization.
+One thing to settle while measuring, since it changes what the memory numbers
+mean: **output fidelity.** The codec is lossy, so the dense and 4-bit arms are
+not guaranteed to produce the same text. A capacity win paid for in output
+quality is the same trap as the tool-span arm in [point
+3](#what-a-rung-does-not-pin) below, and the same disclosure applies.
 
-#### What would un-defer it
+#### What a near-zero result would and would not say
 
-A model whose growing KV row clears the 24 KiB/token bar on its own terms rather
-than through the uniform estimate. **`qwen3.6-27b` is one, and it is already
-in-tree** (`model/qwen3.6-27b`, `configs/qwen3-5/qwen3.6-27b.json`): 64 layers,
-16 of them full-attention at 4 KV heads × 256, so **64 KiB/token** that actually
-grows — 4 GiB of coded KV at 65536 tokens, where a codec has something to do.
-T0.7
-independently proposes adding it to the runner's tables. If it joins the set,
-this row stops being deferred and becomes measurable on one model without a
-second build of the other three.
+If the numbers come back flat, that is a result **about these three models**,
+not about KV quantization. All three were chosen for the epic's other questions
+— a dense control, an MoE, an MoE with GDN — and all three happen to keep very
+little long-lived KV. The publishable sentence is the narrow one: *on these
+three models, at this context length, there is almost nothing to compress.*
+
+A model where the codec has real work to do is already in the tree:
+**`qwen3.6-27b`** (`model/qwen3.6-27b`,
+`configs/qwen3-5/qwen3.6-27b.json`) keeps full-context KV in 16 of 64 layers at
+4 KV heads × 256 — **64 KiB/token**, three to four times these three, and about
+4 GiB at 65536 tokens. T0.7 already proposes adding it to the runner's tables.
+If the ablation is flat on the three, running it there is what turns "flat on
+our set" into something general.
 
 #### Two things found establishing this, each worth its own issue
 
-Neither changes the deferral, and neither is a bench result. They are recorded
-because the numbers above do not reproduce without them.
+Neither is a bench result. Both change what the measurement means, so they are
+recorded here.
 
 1. **`qwen3.6-35b-a3b` provisions a KV cache for all 40 layers; 10 hold one.**
    The per-layer sizing override is emitted only for arches with
    `OpKind::SlidingAttention` tiles
-   (`emit_per_layer_kv_token_elems_arm_body`,
-   `crates/compiler/macros/src/codegen.rs:7827-7886`), and this arch's non-full
-   layers are `GatedDeltaNet`, not sliding — so it returns `None`, the pool takes
-   the uniform path at `model.num_hidden_layers()` = 40
+   (`crates/compiler/macros/src/codegen.rs:7827-7886`), and this arch's
+   non-full layers are `GatedDeltaNet`, so it returns `None`, the pool takes the
+   uniform path at `model.num_hidden_layers()` = 40
    (`crates/serving/worker/src/gpu_worker.rs:3400-3410`), and the 30 GDN layers
    each get K and V buffers the forward never writes. TurboQuant follows: a
    uniform arch's `is_global` map is all-true, so packed stores and norms are
-   provisioned for those 30 layers too. The pages are never touched, so RSS is
-   largely spared — but the **block count is not**: `compute_num_blocks` divides
-   the KV budget by 40 layers' worth of row
-   (`crates/serving/api/src/init.rs:3900-3927`), so the context that fits a given
-   budget is computed ~4× too conservatively. The fix shape already exists
-   ~200 lines further down the same function (`:3594-3626`) —
-   `GdnStatePool::new` takes the
-   `linear_layers` mask and allocates only the layers that need state, and says
-   so in its own words: *"Unlike `KvCachePool`, which allocates every layer…"*
+   provisioned for those 30 layers too — the codec is compressing 30 layers of
+   cache nothing uses. The pages are never touched, so RSS is largely spared,
+   but the **block count is not**: `compute_num_blocks` divides the budget by 40
+   layers' worth of cache (`crates/serving/api/src/init.rs:3900-3927`), so the
+   context that fits is computed ~4× too conservatively. The fix shape already
+   exists ~200 lines down the same function (`:3594-3626`) —
+   `GdnStatePool::new` takes a `linear_layers` mask and allocates only the
+   layers that need state, and says so in its own words: *"Unlike
+   `KvCachePool`, which allocates every layer…"*
    (`crates/layers/src/gdn_state.rs:20-24`). The KV pool wants that mask's
-   complement.
+   complement. **This one is worth fixing before T4.4 reads a context
+   ceiling on this model**, since it is the ceiling it would be reading.
 
-2. **The TurboQuant threshold has no hybrid-arch case** — the 4× to 24×
-   divergence above. The constant is defined over all layers and was calibrated
-   on two uniform models, so hybrid-SWA and hybrid-GDN arches are the first
-   models to meet it on a figure that is not their growing row. Whether 16–20
-   KiB/token *should* be coded is a policy call, and the threshold is documented
-   as a policy knob rather than a law — the point is only that the call is
-   currently made on a number that, for these arches, is not the capacity the
-   policy reasons about.
+2. **The 24 KiB/token threshold has no mixed-attention case.** It is defined
+   over all layers and was calibrated on two models where every layer keeps a
+   cache (`qwen2.5-0.5b` at 12 KiB/token → dense, `llama-3.2-1b` at 32 →
+   coded), so hybrid-window and hybrid-recurrent arches are the first to meet it
+   on a figure that is not the part of their cache that grows. Not a mistake in
+   the constant; a case it was not set on. Whether 16–20 KiB/token *should* be
+   coded stays a policy call, and the ablation is now the thing that answers it.
 
 ## Method and metrics
 
@@ -376,9 +399,10 @@ still appear on every published row:
    | `qwen3.6-35b-a3b` | 40 | 10 full-attention; the other 30 hold recurrent conv/ssm state, not KV |
 
    Those counts are also what the codec reaches — it compresses the
-   full-context layers only — which is why the KV-quant ablation is deferred
-   rather than reported. [Scope and deferrals](#scope-and-deferrals) carries
-   the arithmetic (**T0.8**).
+   full-context layers only. That is a disclosure about the engines being
+   unmatched on KV dtype, which is separate from scratchy's own dense-vs-4-bit
+   ablation; the latter is in phase 4's scope with its expected direction
+   written down in [Scope and deferrals](#scope-and-deferrals) (**T0.8**).
 
 2. **Context length.** `scr launch claude` emits `--max-model-len 65536`
    (`crates/cli/scr/src/commands/launch.rs:215`), well under these checkpoints'
@@ -414,7 +438,7 @@ an estimate.
 | R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit? | **T0.6** | manifest + config of `gemma4:{12b,26b}-mlx` and `qwen3.6:35b-mlx`; R2 names a concrete pair, or the fallback above takes effect |
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
 | no-truncation proof on both sides | **T0.4** + the phase 2 harness | per-turn token accounting in the replay client and the live driver |
-| ~~KV-quant deferral and its layer-coverage evidence~~ | — | **recorded (T0.8)** in [Scope and deferrals](#scope-and-deferrals) |
+| KV ablation: dense-vs-4-bit numbers | phase 4 | the dense arm needs `turboquant` split out of `metal` and a second compile per model; the prediction and the free startup-log measurement are recorded (**T0.8**) |
 | server-side proof that the engine under test served the traffic | **T0.9** + phase 2's provenance check | request count and token totals recorded from the server, not from the client |
 | every number | phase 4 | — |
 
