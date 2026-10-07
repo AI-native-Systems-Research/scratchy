@@ -81,6 +81,15 @@ pub enum SynthRole {
     RSub,
     /// `rowsum(exp(x − rowmax(x)))` — one `[rows, stick]` reduce, the softmax's denominator.
     RDen,
+    // ── expert-combine scratch (the MoE pair-row weighted sum) ──
+    // The combine is `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]` with the
+    // accumulator in f32 (metal's `moe_weighted_sum` keeps `float acc` and narrows
+    // once). Indexed per SLOT like `Blk`: each slot's `[m, hidden]` product is a
+    // distinct buffer, so the fold legs cannot overlap them.
+    /// Slot `j`'s `rows_j · score_j` product, one `[m, hidden]` f32 buffer.
+    ECombP(u32),
+    /// The running f32 accumulator, one `[m, hidden]` buffer.
+    ECombAcc,
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -154,6 +163,8 @@ impl fmt::Display for SynthRole {
             Self::RMax => f.write_str("rmax"),
             Self::RSub => f.write_str("rsub"),
             Self::RDen => f.write_str("rden"),
+            Self::ECombP(j) => write!(f, "ecombp{j}"),
+            Self::ECombAcc => f.write_str("ecombacc"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),

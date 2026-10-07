@@ -6161,6 +6161,160 @@ pub fn expert_unsort(
     )])
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertCombine`] —
+/// `out[n, d] = Σ_k rows[n, k·w + d] · scores[n, k]`, the pair rows scaled by
+/// their routing scores and summed back into the token stream (metal's
+/// `moe_weighted_sum`, the kernel the emu's fma chain mirrors).
+///
+/// ⭐ `k` MULTIPLY LEGS + `k−1` ADD LEGS, in the pair-row column-block layout
+/// [`expert_sort`] writes. Slot `j`'s leg reads the `[m, w]` block of the
+/// `[m, k·w]` pair rows at its stick-aligned corner (`col_of`, the same law
+/// the sort's legs obey) and the score column `[m, j]` of the `[m, k]` scores
+/// in the `In::col` broadcast mode — out-broadcast over the stick, the ONE
+/// expressible per-row scalar, the exact operand mode the rmsnorm's `rinv`
+/// and the softmax's row-max use. The products accumulate with `add` into a
+/// synth `[m, w]` scratch, and the LAST add writes `out` directly — no
+/// trailing copy leg.
+///
+/// ⛔ PRECISION: the emu reference accumulates in f32 and narrows once, but
+/// the sfp pointwise ALU computes in fp16 — the partial products and sums
+/// each round to fp16, exactly the deviation class the tiny26 EMU-vs-card
+/// tensordump parity gate exists to measure and bound. The VENDOR's own
+/// conditional blocks (`broadcast_ops.ddl:36-42`) stage compare RESULTS as
+/// fp16 operands for subsequent `sum` reduces on the same basis, and gemma's
+/// combine is `k=8` fp16 addends of magnitude ≤1 — inside the range the
+/// parity gate green-lights or flags by measurement, not by assumption.
+pub fn expert_combine(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // scores, rows, and the output — the parameters `KtirFunc::expert_combine`
+    // mints. ⭐ MINT ORDER, NOT CALL ORDER: the program's parameter list is the
+    // builder's FIRST-USE order, and the emu loads the scores tile FIRST (its
+    // `arg_for` mints the view) — the narrow `[m, k]` scores parameter PRECEDES
+    // the wide `[m, k·w]` pair rows, so the door identifies the two operands by
+    // their extents, never by their position in the list. The pair rows' width
+    // is the BUFFER's (`v_cols`), not the first window's: the program states
+    // its block loads one slot at a time, so the region walk surfaces slot 0's
+    // `[m, w]` tile and `v_cols` is the whole `[m, k·w]` — the same law
+    // [`expert_sort`] pins.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    let rows = node_rows(name, &out)?;
+    let w = out.v_cols;
+    // The narrow operand is the scores, the wide one the pair rows — resolved
+    // by extent after the output's `w` is known, which is the only order the
+    // facts arrive in.
+    let (scores_r, rows_r) = if tensors[0].v_cols == w * tensors[1].v_cols {
+        (tensors[1], tensors[0])
+    } else if tensors[1].v_cols == w * tensors[0].v_cols {
+        (tensors[0], tensors[1])
+    } else {
+        return err(format!(
+            "ExpertCombine {name}: the two operands t{} [{}, {}] and t{} [{}, {}] cannot be the \
+             [m, k] scores and the [m, k·w] pair rows of an output t{} [{rows}, {w}] — neither \
+             width is the other times a whole k",
+            tensors[0].tid,
+            tensors[0].v_rows,
+            tensors[0].v_cols,
+            tensors[1].tid,
+            tensors[1].v_rows,
+            tensors[1].v_cols,
+            out.tid
+        ));
+    };
+    let full = rows_r.v_cols;
+    let k = scores_r.v_cols;
+    if full != w.checked_mul(k).unwrap_or(0) {
+        return err(format!(
+            "ExpertCombine {name}: the pair rows t{} are [{rows}, {full}] but the output t{}'s \
+             width is {w} and the scores t{} declare k={k} — the combine reads the [m, k·w] \
+             layout the sort wrote, so these must agree",
+            rows_r.tid, out.tid, scores_r.tid
+        ));
+    }
+    check_pointwise_cols(w, "ExpertCombine", out.tid)?;
+    check_pointwise_cols(full, "ExpertCombine", rows_r.tid)?;
+    let out_tid = out.tid;
+    let rows_s = rows_r.name();
+    let scores_s = scores_r.name();
+    let out_s = out.name();
+    let pair = rb(&rows_s, rows, full);
+    // The scores `[m, k]`: k=8 (26b) is SUB-STICK, so the handle's width is
+    // the padded stick — the score column `j` rides a ONE-STICK operand read
+    // in the `In::col` mode, at the column offset of its own lane.
+    let scores = rb(&scores_s, rows, crate::work::FP16_ELEMS_PER_STICK);
+    let out = rb(&out_s, rows, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    // The running [m, w] sum and each slot's [m, w] product — synths declared
+    // like the softmax's and rmsnorm's scratch, at the OUTPUT's extents. The
+    // chain is the emu's own shape: slot 0's product seeds the accumulator,
+    // every later slot is a product leg then an add leg, and the FINAL add
+    // writes `out` directly — `2k−1` ops.
+    let acc_id = PlaceId::Act(out_tid).synth(SynthRole::ECombAcc);
+    let acc_s = syn(layout, acc_id);
+    if let Some(l) = layout {
+        l.synth_like(acc_id, out_tid, &[rows, w], Df::Fp16);
+    }
+    let acc = rb(&acc_s, rows, w);
+    let mut ops = Vec::with_capacity(2 * k as usize - 1);
+    for j in 0..k {
+        // The pair block's stick-aligned corner in the [m, k·w] rows, and the
+        // score column's lane in the [m, k] scores — both through the view's
+        // own address laws.
+        let block_off = crate::addr::col_of(rows, full, pointwise_chunk_out_offset(j * w), Df::Fp16);
+        let col_off = crate::addr::col_of(rows, crate::work::FP16_ELEMS_PER_STICK, j, Df::Fp16);
+        let block = In::sliced(&pair, block_off).ew();
+        let score = In::col_at(&scores, col_off).ew();
+        // The product leg's destination: `out` when the product IS the whole
+        // combine (k=1), the accumulator when it seeds the chain (j=0), a
+        // per-slot synth otherwise.
+        let prod_owned;
+        let prod_h = if k == 1 {
+            &out
+        } else if j == 0 {
+            &acc
+        } else {
+            let p_id = PlaceId::Act(out_tid).synth(SynthRole::ECombP(j));
+            let p_s = syn(layout, p_id);
+            if let Some(l) = layout {
+                l.synth_like(p_id, out_tid, &[rows, w], Df::Fp16);
+            }
+            prod_owned = rb(&p_s, rows, w);
+            &prod_owned
+        };
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("ecombmul_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            &[block, score],
+            prod_h,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // The add legs start at slot 1 — slot 0's product already IS the
+        // accumulator — and the LAST one writes `out` directly.
+        if j > 0 {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("ecombadd_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                f_cols,
+                &[In::full(&acc).ew(), In::full(prod_h).ew()],
+                if j + 1 == k { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
 /// `out = x · w`, `w` a host-staged `[1]`-shaped weight (gemma4
 /// `layer_scalar[layer]`).

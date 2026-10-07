@@ -849,6 +849,26 @@ fn lower_expert_combine_node<F: RopeForm>(
             node.inputs.len()
         )));
     }
+    // ⛔ A SHARED EXPERT IS REFUSED HERE — the LAST place the bound is
+    // visible before a program is minted. The chain this builder emits has
+    // no term for a shared expert's contribution (the emu's own doc: "a
+    // shared expert's contribution would be an extra `fma` term on the same
+    // accumulator"), so a bundle that declares one cannot be lowered — the
+    // refusal names the bound, per the no-refusals law that a missing
+    // capability is a named error, not a silent drop. The loader-level gate
+    // (to_wavefront's Qwen path) is the FIRST line; this is the second.
+    let SubOp::ExpertCombine { shared, .. } = &node.op else {
+        unreachable!("the caller matched this op");
+    };
+    if let Some(shared_inter) = shared.0 {
+        return Err(SuperDscError(format!(
+            "ExpertCombine t{} declares a shared expert (intermediate width {shared_inter}): the \
+             KTIR combine is the k-slot fma chain over the routed pair rows, and a shared expert's \
+             contribution is an extra term that chain does not state — shared-expert models are \
+             the loader's worklist, not a silent drop",
+            node.output.tensor.index() as u32
+        )));
+    }
     let mut st = KtirFunc::new(ir);
     let name = Arena::global().str(format!("expertcombine_s{}", node.id.index()));
     st.expert_combine(&node.inputs[0], &node.inputs[1], &node.output);

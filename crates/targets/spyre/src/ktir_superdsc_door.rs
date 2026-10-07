@@ -187,13 +187,11 @@ pub fn lower(
         // The pair rows back in token order — ONE identity over the whole
         // `[m, k·w]` tile, the materialized no-op of the same regime.
         Program::ExpertUnsort => lk::expert_unsort(name, &r, sym_id_base, layout),
-        Program::ExpertCombine => Err(Error {
-            message: format!(
-                "{name}: ExpertCombine (each token's pair rows summed by its scores) has no \
-                 SuperDSC lowering yet: a k-way weighted row sum — a segment reduce over the \
-                 pair rows, gated on the same pair-row layout the sort/unsort pair carries"
-            ),
-        }),
+        // The pair rows weighted by their routing scores and summed back into
+        // the token stream — the per-slot fma chain, the add legs
+        // accumulating into one scratch (in place, the softmax's own
+        // destination-reuse law) and the final add writing the output.
+        Program::ExpertCombine => lk::expert_combine(name, &r, sym_id_base, layout),
         Program::ExpertMatmul => Err(Error {
             message: format!(
                 "{name}: ExpertMatmul (one projection of each pair's expert, over the stacked \
