@@ -1948,7 +1948,9 @@ mod tests {
     #[test]
     fn a_norm_a_router_gathered_experts_and_a_shared_matvec_read_folds_into_each() {
         use crate::lower::ExpertQuant;
-        use crate::subtile_ir::{ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, TopK};
+        use crate::subtile_ir::{
+            ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, TopK,
+        };
         use std::num::NonZeroU32;
         let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
         let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
@@ -1956,7 +1958,17 @@ mod tests {
         let matmul = |proj, m, inputs| {
             let quant = ExpertQuant::declared(64, 4);
             let n = 32;
-            op(SubOp::ExpertMatmul { proj, n, k, quant, bundle }, m, inputs)
+            op(
+                SubOp::ExpertMatmul {
+                    proj,
+                    n,
+                    k,
+                    quant,
+                    bundle,
+                },
+                m,
+                inputs,
+            )
         };
         let dense = SubOp::MatmulTile {
             n: 64,
@@ -1967,13 +1979,27 @@ mod tests {
         let ops = |m: u32| {
             vec![
                 op(RMS, m, vec![Ext(0), Ext(1)]),
-                op(SubOp::RouterLogits { experts, router }, m, vec![Op(0), Ext(2)]),
+                op(
+                    SubOp::RouterLogits { experts, router },
+                    m,
+                    vec![Op(0), Ext(2)],
+                ),
                 op(SubOp::RouteArgsort, m, vec![Op(1)]),
                 op(SubOp::RouteTopK { k }, m, vec![Op(2)]),
-                op(SubOp::ExpertSort { experts, k, bundle }, m, vec![Op(0), Op(3)]),
+                op(
+                    SubOp::ExpertSort { experts, k, bundle },
+                    m,
+                    vec![Op(0), Op(3)],
+                ),
                 matmul(ExpertProj::Gate, m, vec![Op(4), Op(4), Ext(3)]),
                 matmul(ExpertProj::Up, m, vec![Op(4), Op(4), Ext(3)]),
-                op(SubOp::ExpertGatedAct { act: GatedAct::Silu }, m, vec![Op(5), Op(6)]),
+                op(
+                    SubOp::ExpertGatedAct {
+                        act: GatedAct::Silu,
+                    },
+                    m,
+                    vec![Op(5), Op(6)],
+                ),
                 op(dense, m, vec![Op(0), Ext(4)]),
                 op(MUL, m, vec![Op(7), Op(8)]),
             ]

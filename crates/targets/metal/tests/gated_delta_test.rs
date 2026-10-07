@@ -1052,7 +1052,11 @@ fn gdn_decode_is_the_conv_scan_norm() {
         height,
         depth,
     };
-    for ((nk, nv), fresh) in [((2usize, 4usize), [0u32, 1]), ((2, 6), [1, 0]), ((2, 2), [0, 0])] {
+    for ((nk, nv), fresh) in [
+        ((2usize, 4usize), [0u32, 1]),
+        ((2, 6), [1, 0]),
+        ((2, 2), [0, 0]),
+    ] {
         let (key_dim, value_dim) = (nk * hk, nv * hv);
         let conv_dim = 2 * key_dim + value_dim;
         let (t, slots) = (2usize, 2usize);
@@ -1159,18 +1163,27 @@ fn gdn_decode_is_the_conv_scan_norm() {
             let (got, want) = (read_f32(got, n), read_f32(want, n));
             let scale = want.iter().fold(0f32, |m, w| m.max(w.abs()));
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!((g - w).abs() <= 1e-5 * scale, "{what}[{i}]: {g} vs {w}, {geometry}");
+                assert!(
+                    (g - w).abs() <= 1e-5 * scale,
+                    "{what}[{i}]: {g} vs {w}, {geometry}"
+                );
             }
         };
         let n = conv0.len();
-        assert_eq!(read_f32(&conv_state, n), read_f32(&chain_conv, n), "{geometry}");
+        assert_eq!(
+            read_f32(&conv_state, n),
+            read_f32(&chain_conv, n),
+            "{geometry}"
+        );
         close("ssm state", &ssm, &chain_ssm, ssm0.len());
         close("out", &out, &chain_out, t * value_dim);
         // The step moved both states and wrote every output: agreeing on untouched buffers
         // would pass the comparisons above by accident.
         assert_ne!(read_f32(&ssm, ssm0.len()), ssm0, "{geometry}");
         assert_ne!(read_f32(&conv_state, conv0.len()), conv0, "{geometry}");
-        assert!(read_f32(&out, t * value_dim).iter().all(|v| *v != 0.0), "{geometry}");
+        assert!(
+            read_f32(&out, t * value_dim).iter().all(|v| *v != 0.0),
+            "{geometry}"
+        );
     }
 }
-

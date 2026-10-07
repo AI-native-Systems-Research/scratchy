@@ -564,7 +564,7 @@ impl MetalStep {
                     rows: MoeRows::Normed(_, norm),
                     ..
                 },
-                ..
+                ..,
             ),
         ) = &mut self
         {

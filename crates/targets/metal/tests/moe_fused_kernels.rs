@@ -1095,7 +1095,11 @@ fn a_normed_gated_kernel_is_as_close_to_the_exact_normed_rows_as_the_norm_then_t
             .zip(&exact)
             .position(|(g, &(e, bound))| (f64::from(g.to_f32()) - e).abs() > bound)
     };
-    assert_eq!(outside(How::NormThenKernel), None, "the norm, then the gated kernel");
+    assert_eq!(
+        outside(How::NormThenKernel),
+        None,
+        "the norm, then the gated kernel"
+    );
     assert_eq!(outside(How::Normed), None, "the normed gated kernel");
     assert!(
         outside(How::Raw).is_some(),
