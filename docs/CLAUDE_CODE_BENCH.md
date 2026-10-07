@@ -22,8 +22,10 @@ is a defect: a later reader cannot tell silence from a tested claim.
 | [Blocked](#blocked) | recorded |
 | [Artifacts](#artifacts) | empty — phase 4 |
 
-Task ids are the work breakdown's: `T0.x` are phase 0 (parity plumbing), and
-each one is named where it is first cited.
+Task ids are the work breakdown's, not this document's: `T0.x` are phase 0
+(parity plumbing) and `T4.x` phase 4 (the runs and ablations). Each is named
+where it is first cited; the lists they come from live in the work breakdown,
+so a `T4.x` here is a pointer out of this file rather than to a table in it.
 
 ---
 
@@ -192,10 +194,10 @@ A model where the codec has real work to do is already in the tree:
 If the ablation is flat on the three, running it there is what turns "flat on
 our set" into something general.
 
-#### Two things found establishing this, each worth its own issue
+#### Two things found establishing this, both filed
 
 Neither is a bench result. Both change what the measurement means, so they are
-recorded here.
+recorded here and tracked in **#280** and **#281**.
 
 1. **`qwen3.6-35b-a3b` provisions a KV cache for all 40 layers; 10 hold one.**
    The per-layer sizing override is emitted only for arches with
@@ -211,13 +213,15 @@ recorded here.
    but the **block count is not**: `compute_num_blocks` divides the budget by 40
    layers' worth of cache (`crates/serving/api/src/init.rs:3900-3927`), so the
    context that fits is computed ~4× too conservatively. The fix shape already
-   exists ~200 lines down the same function (`:3594-3626`) —
+   exists ~200 lines below the KV pool's own construction, in the same
+   `initialize_cache` (`crates/serving/worker/src/gpu_worker.rs:3594-3626`):
    `GdnStatePool::new` takes a `linear_layers` mask and allocates only the
    layers that need state, and says so in its own words: *"Unlike
    `KvCachePool`, which allocates every layer…"*
    (`crates/layers/src/gdn_state.rs:20-24`). The KV pool wants that mask's
-   complement. **This one is worth fixing before T4.4 reads a context
-   ceiling on this model**, since it is the ceiling it would be reading.
+   complement. Filed as **#280**, and **worth fixing before T4.4 reads a
+   context ceiling on this model**, since it is the ceiling it would be
+   reading.
 
 2. **The 24 KiB/token threshold has no mixed-attention case.** It is defined
    over all layers and was calibrated on two models where every layer keeps a
@@ -226,6 +230,7 @@ recorded here.
    on a figure that is not the part of their cache that grows. Not a mistake in
    the constant; a case it was not set on. Whether 16–20 KiB/token *should* be
    coded stays a policy call, and the ablation is now the thing that answers it.
+   Filed as **#281**.
 
 ## Method and metrics
 
