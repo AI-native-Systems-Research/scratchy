@@ -17,11 +17,16 @@
 //! lowering: the tape states the dataflow, and a part that does not run leaves the buffer it would
 //! rewrite in place as it was. A canonical of one row per sequence is left as it is. A target that
 //! samples no rows never calls this.
+//!
+//! The result may be the matmul's logit tail instead ([`under_logit_tail`]): the construct then
+//! takes the matmul's place under it, and the tail reads the construct's end over every row, as it
+//! read the matmul. After 1–3 it caps or scales the sampled rows (the others are stale and never
+//! read); after 4, every row.
 
 use std::cmp::Ordering;
 
 use crate::handoff::{Expansion, ExpansionId, LoweredDecode};
-use crate::lower::{GemmWeightKind, InputRef, OpDesc};
+use crate::lower::{GemmWeightKind, InputRef, LoweringInput, OpDesc};
 use crate::subtile_ir::SubOp;
 
 /// A target's sampled rows, as data.
@@ -50,13 +55,33 @@ impl std::fmt::Display for SampleRowsError {
     }
 }
 
-/// Wrap `l`'s result matmul in its sampled rows, when `facts` sample its weight and the canonical
-/// has more than one row per sequence.
+/// The op under the result's logit tail: the chain of row-wise post-ops on the logits a decoder
+/// can end on (Gemma's final soft cap, Granite's `logits_scaling`, Command-R's `logit_scale`),
+/// each the only reader of the op it reads. The result itself when it has none.
+fn under_logit_tail(input: &LoweringInput) -> usize {
+    let only_reader = |j: usize| {
+        (input.ops.iter().flat_map(|od| &od.inputs))
+            .filter(|i| **i == InputRef::Op(j))
+            .count()
+            == 1
+    };
+    let mut r = input.result;
+    while let (SubOp::TanhSoftCap | SubOp::ScalarMul { .. }, [InputRef::Op(j)]) =
+        (input.ops[r].op, input.ops[r].inputs.as_slice())
+        && only_reader(*j)
+    {
+        r = *j;
+    }
+    r
+}
+
+/// Wrap `l`'s result matmul, under its logit tail, in its sampled rows, when `facts` sample its
+/// weight and the canonical has more than one row per sequence.
 pub fn expand_sample_rows(
     l: &LoweredDecode,
     facts: &SampleRowsFacts,
 ) -> Result<LoweredDecode, SampleRowsError> {
-    let r = l.input.result;
+    let r = under_logit_tail(&l.input);
     let od = &l.input.ops[r];
     let SubOp::MatmulTile { weight, .. } = od.op else {
         return Ok(l.clone());
@@ -102,7 +127,7 @@ pub fn expand_sample_rows(
         od.inputs.iter_mut().for_each(|i| *i = input(i));
     }
     x.input.ops.splice(r..=r, construct);
-    x.input.result = all_rows;
+    x.input.result = at(l.input.result);
     // The gather is its activation's buffer; the scatter and the all-rows matmul the matmul's.
     let rows_tile = match *rows {
         InputRef::Op(j) => l.op_tiles[j],
@@ -234,17 +259,60 @@ mod tests {
         };
         unchanged(head(1, affine(256)));
         unchanged(head(2, GemmWeight::Dense));
-        let mut capped = head(2, affine(256));
-        let cap = OpDesc {
-            op: SubOp::TanhSoftCap,
-            m: 2,
-            inputs: vec![Op(1)],
-        };
-        capped.input.ops.push(cap);
-        capped.input.result = 2;
-        capped.op_tiles.push(Some((2, 0)));
-        capped.op_expansion.push(None);
-        unchanged(capped);
+        unchanged(then(head(1, affine(256)), SubOp::TanhSoftCap, 1));
+        // A cap over the norm, and a scale beside another reader of the matmul: neither is the
+        // matmul's tail.
+        unchanged(then(head(2, affine(256)), SubOp::TanhSoftCap, 0));
+        let scale = SubOp::ScalarMul { scale: 0.25 };
+        unchanged(then(
+            then(head(2, affine(256)), SubOp::TanhSoftCap, 1),
+            scale,
+            1,
+        ));
+    }
+
+    /// `l` with `op` over op `of`'s output appended as its result, on a tile of its own.
+    fn then(mut l: LoweredDecode, op: crate::lower::ArchOp, of: usize) -> LoweredDecode {
+        let m = l.input.ops[of].m;
+        l.input.ops.push(OpDesc {
+            op,
+            m,
+            inputs: vec![Op(of)],
+        });
+        l.input.result = l.input.ops.len() - 1;
+        l.op_tiles.push(Some((l.input.ops.len() as u32 - 1, 0)));
+        l.op_expansion.push(None);
+        l
+    }
+
+    /// A result matmul under its logit tail (a soft cap, then a scale) is sampled as a result
+    /// matmul is: the construct takes the matmul's place, the tail reads its end and stays the
+    /// result, on its own tiles and outside the construct.
+    #[test]
+    fn a_result_matmul_under_its_logit_tail_is_sampled() {
+        let capped = then(head(2, affine(256)), SubOp::TanhSoftCap, 1);
+        let tailed = then(capped, SubOp::ScalarMul { scale: 0.25 }, 2);
+        let x = expand_sample_rows(&tailed, &AFFINE).expect("expands");
+        assert_eq!(
+            names(&x),
+            [
+                "RmsNorm",
+                "SampleRowsGather",
+                "MatmulTile",
+                "SampleRowsScatter",
+                "AllRowsMatmul",
+                "TanhSoftCap",
+                "ScalarMul"
+            ]
+        );
+        let ins = |i: usize| x.input.ops[i].inputs.clone();
+        assert_eq!(ins(4), [Op(1), Op(3), Ext(2)]);
+        assert_eq!((ins(5), ins(6)), (vec![Op(4)], vec![Op(5)]));
+        assert_eq!(x.input.result, 6);
+        let (t0, t1) = (Some((0, 0)), Some((1, 0)));
+        assert_eq!(x.op_tiles, [t0, t0, t1, t1, t1, Some((2, 0)), Some((3, 0))]);
+        assert!(x.op_expansion[1..5].iter().all(Option::is_some));
+        assert_eq!(x.op_expansion[5..], [None, None]);
     }
 
     /// A result matmul some construct already expanded to is refused, by name.
@@ -274,8 +342,8 @@ mod tests {
     }
 
     /// Under a target's in-place facts for the construct, the sampled canonical colours as the
-    /// plain one does: every inserted step aliases a buffer the plain tape already holds, so the
-    /// colour count and the result's colour are the matmul's.
+    /// plain one does, under a logit tail or not: every inserted step aliases a buffer the plain
+    /// tape already holds, so the colour count and the result's colour are the plain tape's.
     #[test]
     fn the_construct_colours_as_the_plain_matmul() {
         fn rule(op: &SubOp) -> ColourRule {
@@ -299,8 +367,10 @@ mod tests {
                 .expect("colours");
             (c.count(), c.result())
         };
-        let plain = head(2, affine(256));
-        let sampled = expand_sample_rows(&plain, &AFFINE).expect("expands");
-        assert_eq!(colours(&sampled), colours(&plain));
+        let capped = then(head(2, affine(256)), SubOp::TanhSoftCap, 1);
+        for plain in [head(2, affine(256)), capped] {
+            let sampled = expand_sample_rows(&plain, &AFFINE).expect("expands");
+            assert_eq!(colours(&sampled), colours(&plain));
+        }
     }
 }
