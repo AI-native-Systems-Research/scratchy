@@ -3314,6 +3314,14 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         OpFunc::Fp32ToDl16 => (Df::Fp32, Df::Fp16),
         // qfp8ch: f16 activation → SEN143_FP8 (E4M3). The DDL `matmulfp8` then consumes the fp8 stick.
         OpFunc::Qfp8ch => (Df::Fp16, Df::Fp8),
+        // fp32toint32: fp16/fp32 value → SENUINT32 index. The DDL binds the cast itself in fp32 mode
+        // (ICVT imm=8) while `%inptensor` carries `[%type_fp16, %type_fp32]` (unary_parallel.ddl:20,50),
+        // so the fp16 top-k output converts in ONE op — and the OUTPUT's type list is
+        // `[%type_uint32, %type_int32]` (line 22), the two spellings of "32-bit integer" that let the
+        // same op name the gather's `SENUINT32` index dataspace. Each arg's own df drives its
+        // `stickSize_` (input 64, output 32) — the two distinct `primaryDsInfo_` entries a convert
+        // needs, exactly the KERNEL_IDX stick [32] vs value stick [64] split of the gather fixtures.
+        OpFunc::Fp32ToInt32 => (Df::Fp16, Df::SenUint32),
         _ => (Df::Fp16, Df::Fp16),
     }
 }
@@ -3379,7 +3387,13 @@ fn convert_opspec(
     // needs. torch-spyre keeps dtype-converts RANK-3 (superdsc.py:756 "a type-conversion op requires an outer
     // spatial dim beyond the stick"). So keep qfp8ch stick-major; force the fp16↔fp32 converts rank-3.
     let is_fp32_convert = matches!(op, OpFunc::Dl16ToFp32 | OpFunc::Fp32ToDl16);
-    let stickmajor = rows > 1 && !is_fp32_convert;
+    // ⛔ fp32toint32 NARROWS TOO (output stick 32 < input 64) — the same rank-3 requirement: a
+    // rank-2 collapse drops the `y` dim dxp's buffer walk indexes (the `getBufferCapacityForNode`
+    // crash recorded above). Kept a SEPARATE flag from `is_fp32_convert` because that one also
+    // drives the RowBlocked arrangement pair, and the u32 output is a GATHER INDEX whose rows are
+    // consecutive u32 entries — the arrangement the index's own declaration states, not a residual's.
+    let is_narrowing_convert = is_fp32_convert || matches!(op, OpFunc::Fp32ToInt32);
+    let stickmajor = rows > 1 && !is_narrowing_convert;
     let time_tile = plan
         .time_tile_for_lx(|p, opt| pointwise_lx_resident(p, 2, opt, Df::Fp16), "out")
         .map_err(|e| e.0)?;
@@ -4860,6 +4874,7 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "sigmoid" => OpFunc::Sigmoid,
         "dl16tofp32" => OpFunc::Dl16ToFp32,
         "fp32todl16" => OpFunc::Fp32ToDl16,
+        "fp32toint32" => OpFunc::Fp32ToInt32,
         "gelu" => OpFunc::Gelu,
         "mish" => OpFunc::Mish,
         "tanh" => OpFunc::Tanh,
@@ -5603,6 +5618,107 @@ mod gather_cut {
             .is_ok(),
             "one index stick in one leg emits"
         );
+    }
+}
+
+/// ⭐ `fp32toint32` — the MoE expert gather's INDEX PRODUCER, and the descriptor properties the
+/// vendor DDL states for it (unary_parallel.ddl:50, datastage lines 879-889).
+///
+/// `cargo test` cannot run a bake. What it CAN pin is every property the gather's DT_CHECKs are a
+/// function of — so a change to any of them is a test failure saying "re-run the card leg" instead
+/// of a silent bake refusal (`L3DlOpsScheduler.cpp:5928` wants index `wordLength == 4`;
+/// `GatherIndexConversion.cpp:133` wants `dataFormat_ == SENUINT32`).
+#[cfg(test)]
+mod fp32toint32_convert_law {
+    use super::*;
+
+    /// The convert at the MoE router's own geometry: the top-k output's `[m, W]` rows over the
+    /// router's padded expert width (tiny26: m=2, E=8, W=64).
+    fn op(rows: u32) -> OpSpec {
+        convert_opspec(OpFunc::Fp32ToInt32, rows, 64, "rt_topk", "moe_idx")
+            .expect("the convert emits")
+    }
+
+    /// The output arg (arg 1, the non-input) — the INDEX dataspace-to-be.
+    fn out_arg(op: &OpSpec) -> &AnyTensorArg {
+        op.args
+            .iter()
+            .find(|a| !a.view().is_input)
+            .expect("an output arg")
+    }
+
+    /// ⭐ THE OUTPUT IS SENUINT32 AT 4 BYTES — the two numbers the gather's DT_CHECKs read. The
+    /// input stays fp16/2 (the DDL binds the cast in fp32 MODE; the input TENSOR may be fp16), so
+    /// the pair (2, 4) is also the control that the two operands were not collapsed onto one df.
+    #[test]
+    fn the_output_is_senuint32_at_four_bytes_and_the_input_stays_fp16() {
+        let o = op(2);
+        let out = out_arg(&o);
+        assert_eq!(out.view().df, Df::SenUint32, "the gather's index format");
+        assert_eq!(out.view().df.word_length(), 4, "DT_CHECK wordLength == 4");
+        let inp = o
+            .args
+            .iter()
+            .find(|a| a.view().is_input)
+            .expect("an input arg");
+        assert_eq!(inp.view().df, Df::Fp16, "the top-k output's own format");
+        assert_eq!(inp.view().df.word_length(), 2, "the input stays 2-byte");
+    }
+
+    /// ⭐ THE TWO STICKS DIFFER — input 64 (fp16), output 32 (u32) — the two `primaryDsInfo_`
+    /// entries a convert needs, and the exact `KERNEL_IDX stickSize_ [32]` vs value-stick `[64]`
+    /// split of every vendor gather fixture.
+    #[test]
+    fn each_operand_carries_its_own_formats_stick() {
+        let o = op(2);
+        let inp = o
+            .args
+            .iter()
+            .find(|a| a.view().is_input)
+            .expect("an input arg");
+        assert_eq!(
+            inp.view().df.elems_per_stick(),
+            64,
+            "the fp16 input's stick"
+        );
+        let out = out_arg(&o);
+        assert_eq!(
+            out.view().df.elems_per_stick(),
+            32,
+            "the u32 output's stick"
+        );
+    }
+
+    /// ⭐ THE NARROWING CONVERT STAYS RANK-3 — the `y` dim dxp's buffer walk indexes (the rank-2
+    /// collapse of the fp16↔fp32 converts crashed `getBufferCapacityForNode` on a real pod). Pinned
+    /// as the OUTPUT arg's rank, the side whose stick narrowed; the fp16↔fp32 pair drives the same
+    /// law through `is_fp32_convert`, which is why the check here is the shared flag's effect
+    /// (`is_narrowing_convert`) and not a copy of its body.
+    #[test]
+    fn the_narrowing_convert_stays_rank_3() {
+        let o = op(2);
+        let out = out_arg(&o);
+        assert!(
+            matches!(out, AnyTensorArg::R3(_)),
+            "a narrowing convert's operands keep the `y` dim"
+        );
+    }
+
+    /// ⭐ THE OPFUNC SPELLING — `fp32toint32`, the name `dscdefn.cpp` recognizes; a wrong name is
+    /// an on-card `Unrecognized opFunc` refusal, and the string round-trip through
+    /// `op_func_from_str` is what every assembler uses.
+    #[test]
+    fn the_name_round_trips() {
+        assert_eq!(OpFunc::Fp32ToInt32.name(), "fp32toint32");
+        assert_eq!(op_func_from_str("fp32toint32"), OpFunc::Fp32ToInt32);
+    }
+
+    /// ⭐ THE EX UNIT IS SFP — the cast runs on the SFP unit (the DDL datastage's `sfp`/`lxsu`
+    /// units), which `OpFunc::ex_unit` derives structurally; pinned so a reclassification of the
+    /// converts cannot silently move the op to `pt`.
+    #[test]
+    fn the_ex_unit_is_sfp() {
+        assert_eq!(OpFunc::Fp32ToInt32.ex_unit().as_str(), "sfp");
     }
 }
 

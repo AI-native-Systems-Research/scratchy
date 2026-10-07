@@ -1326,6 +1326,19 @@ pub enum OpFunc {
     /// converts the fp32 accumulator → f16 for the output.
     Dl16ToFp32,
     Fp32ToDl16,
+    /// `fp32toint32` — the SFP VALUE CAST fp32 → 32-bit integer (unary_parallel.ddl:50, ICVT imm=8;
+    /// "the conversion is carried out in fp32 mode"). The MoE expert gather's index producer: the
+    /// router's top-k ids, computed on device as fp16 lane values, become the `SENUINT32` entries a
+    /// gather's index tensor must carry ([`SenUint32`]'s DT_CHECK law). The output tensor's DDL type
+    /// list accepts EITHER 32-bit integer format (unary_parallel.ddl:22) — `[%type_uint32,
+    /// %type_int32]` — so an IEEE_INT32 OUTPUT and a SENUINT32 INDEX are the same op under two type
+    /// spellings, which is what lets [`crate::emit::convert_dtypes`] pair `Df::Fp32` input with
+    /// `Df::SenUint32` output here while the vendor binds only the int32 side. Round-to-nearest is
+    /// the fp32 mode's conversion; every caller feeds ids that are already whole numbers, so the
+    /// rounding direction never reaches a value. ⛔ OUTPUT STICK NARROWER THAN THE INPUT (64→32):
+    /// the SAME rank-3 law as the fp16↔fp32 converts — a rank-2 collapse of a narrowing convert
+    /// drops the `y` dim dxp's buffer walk needs (see [`crate::emit::convert_opspec`]).
+    Fp32ToInt32,
     Sum,
     Max,
     Mean,
@@ -1420,6 +1433,7 @@ impl OpFunc {
             OpFunc::Tanh => "tanh",
             OpFunc::Dl16ToFp32 => "dl16tofp32",
             OpFunc::Fp32ToDl16 => "fp32todl16",
+            OpFunc::Fp32ToInt32 => "fp32toint32",
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",
