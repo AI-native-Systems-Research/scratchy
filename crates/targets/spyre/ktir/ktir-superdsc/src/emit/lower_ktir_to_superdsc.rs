@@ -1005,6 +1005,32 @@ pub fn elementwise(
             ins.len(),
         ));
     }
+    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A COLUMN CORNER, AND ONE NEVER REACHES
+    // THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
+    // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
+    // one-stick output at the buffer base — neither form can state "columns
+    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor", which is what a column-blocked
+    // chunk is. The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`,
+    // `SiluMul`) is all DENSE, so a corner arriving at either arm is a producer shape this door
+    // refuses BY NAME rather than mis-addressing — the same contract `base_addressed` states for
+    // a row corner. The DENSE arm below carries the corner; this guard is what keeps the other
+    // two from silently dropping it.
+    if (bcast.iter().any(Option::is_some) || out.c_len == 1)
+        && (out.c_start != 0 || ins.iter().any(|x| x.c_start != 0))
+    {
+        let (who, cs) = ins
+            .iter()
+            .find(|x| x.c_start != 0)
+            .map(|x| (format!("input t{}", x.tid), x.c_start))
+            .unwrap_or_else(|| (format!("the output t{}", out.tid), out.c_start));
+        return err(format!(
+            "Elementwise({kind:?}) {name}: {who} states column corner {cs} of its view, and the \
+             arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
+             addresses its operands at the BUFFER BASE or at a broadcast mode — neither can place \
+             a column window. A column-blocked chunk is DENSE elementwise; the dense arm carries \
+             the corner, so give the broadcast/per-row chains whole-tensor regions.",
+        ));
+    }
     if bcast.iter().any(Option::is_some) {
         return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
     }
@@ -1027,20 +1053,95 @@ pub fn elementwise(
     // them. A comment claiming we emit the table describes the bug, not the fix.
     let cols = out.c_len;
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
-    let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
-    let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
+    let rows = pointwise_rows(name, &out)?;
     let op_name = format!("{op_func}_o{}", out.tid);
-    let tile_op = pointwise_tile_op(pointwise_rows(name, &out)?, cols, arity as u32 + 1);
-    let op = assemble_pointwise_seeded_from_tile(
+    // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
+    // EVERY OPERAND — the 12b gemma-4 garbage. `subtile_ir.rs`'s column-tiling set
+    // (`EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`) splits a wide op into nb-blocks that
+    // SHARE one output tensor; `SiluMul`'s body (`silumul`) and `ExpertGatedAct`'s (`gated_act`)
+    // carry each chunk's `region.cols.start` through `col_of`, but this door emitted every chunk
+    // at offset 0 — so chunk 1 RE-COMPUTED chunk 0's columns at base 0 and the columns past the
+    // first block were NEVER WRITTEN. MEASURED on the 12b card run: the gated-act product
+    // `t1121[8192..15360]` read back ALL ZERO at every one of 48 layers, the down-GEMM contracted
+    // a half-zero activation (residual row-norm correlates 0.937 with the chunk-1 activation
+    // norm), and |d_card|/|d_emu| = 0.687 against sqrt(8192/15360) = 0.73 predicted for a missing
+    // chunk. The tiny fixture never split (one block), which is why the class was invisible at
+    // small geometry. The fix is `silumul`'s own mechanism, verbatim: every read `In::sliced`
+    // through `col_of(rows, full_cols, c_start)`, the write at the same corner, `full_cols` the
+    // WHOLE tensor width (`c_start + c_len`) because the nest's row stride is a property of the
+    // storage, not of this chunk's view.
+    //
+    // ⭐ A WHOLE-TENSOR PROGRAM KEEPS THE SEEDED EMISSION, BYTE-IDENTICAL. The `broadcast_off`
+    // path and the seeded path produce different `TensorArg` forms at offset 0 (rank-2
+    // stick-major vs the seeded rank-3), and every whole-tensor elementwise program this crate
+    // has ever baked went through the seeded one — nine-plus fixtures verified on card. The
+    // offset is the ONLY thing this change adds, so it is the only thing that may change the
+    // bytes: any corner on any operand routes to the offset form, and a corner-free program does
+    // not.
+    if out.c_start == 0 && ins.iter().all(|x| x.c_start == 0) {
+        let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
+        let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
+        let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+        let op = assemble_pointwise_seeded_from_tile(
+            &op_name,
+            &tile_op,
+            op_func,
+            &in_refs,
+            &out.name(),
+            sym_id_base,
+            layout,
+        );
+        return Ok(vec![op]);
+    }
+    // ⛔ THE EXTENTS LAW RESTATED FOR THE CHUNK: `pointwise_extents_agree` compared
+    // `(v_rows, c_len)` — the window's width, which every chunk's operands share — so it cannot
+    // catch a chunk whose operands carry DIFFERENT corners. Every operand of a column-blocked
+    // op reads the same window of the same-width tensors, so the corners must be equal; a
+    // mismatch would address one operand's window at another's corner.
+    if !ins.iter().all(|x| x.c_start == out.c_start) {
+        let who: Vec<String> = ins
+            .iter()
+            .map(|x| format!("t{}@{}", x.tid, x.c_start))
+            .collect();
+        return err(format!(
+            "Elementwise({kind:?}) {name}: the output t{}'s window starts at column {} but its \
+             inputs sit at [{}] — a column-blocked chunk reads and writes ONE window shared by \
+             every operand, so unequal corners would address one operand's columns at another's. \
+             The tiling front end mints one block per operand set; unequal corners mean a producer \
+             windowed the operands by hand.",
+            out.tid, out.c_start, who.join(", "),
+        ));
+    }
+    let full_cols = out.c_start + out.c_len;
+    let out_off = crate::addr::col_of(rows, full_cols, pointwise_chunk_out_offset(out.c_start), Df::Fp16);
+    // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
+    // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
+    let out_h = rb(&out.name(), rows, cols);
+    let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
+    let ew: Vec<_> = in_handles
+        .iter()
+        .zip(&ins)
+        .map(|(h, x)| {
+            In::sliced(
+                h,
+                crate::addr::col_of(rows, full_cols, pointwise_chunk_out_offset(x.c_start), Df::Fp16),
+            )
+            .ew()
+        })
+        .collect();
+    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
         op_func,
-        &in_refs,
-        &out.name(),
+        rows,
+        cols,
+        &ew,
+        &out_h,
+        out_off.into_raw_elems(),
         sym_id_base,
         layout,
-    );
-    Ok(vec![op])
+    )])
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -1224,9 +1325,10 @@ fn elementwise_broadcast(
         cols,
         &ew,
         &out_h,
-        // WHOLE-TENSOR, like the dense arm: this door's regions are un-windowed (its caller refuses a
-        // column corner), so there is no chunk offset to apply. A column-blocked broadcast op would
-        // need `crate::addr::col_of` here, as `silumul` does.
+        // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
+        // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
+        // neither of which can place a column window), so the offset is 0 by proof, not by
+        // default.
         0,
         sym_id_base,
         layout,
@@ -5049,6 +5151,304 @@ mod elementwise_tests {
             (Elementwise::Sub, 2),
         ] {
             assert_eq!(elementwise_op_func("p", k).unwrap().1, want, "{k:?} arity");
+        }
+    }
+
+    // ── THE COLUMN-BLOCKED CHUNK — the 12b gemma-4 garbage class ─────────────────────────────
+    //
+    // ⛔⛔⛔ THE MEASURED DEFECT. `subtile_ir.rs` column-tiles a wide `EwKind::Mul` (and `Add`/
+    // `Silu`/`ScalarMul`) into nb-blocks sharing ONE output tensor; this door emitted every
+    // chunk at offset 0, so chunk 1 re-computed chunk 0's columns at base 0 and the columns past
+    // the first block were NEVER WRITTEN. On the 12b card run the gated-act product
+    // `t1121[8192..15360]` was ALL ZERO at every one of 48 layers and the down-GEMM contracted a
+    // half-zero activation into garbage. The tiny fixture never split (one block), which is why
+    // the class was invisible at small geometry. `silumul`/`gated_act` already carried their
+    // corners; these tests pin the DENSE door doing the same.
+
+    /// A region whose window is the column block `[c_start, c_start+c_len)` of a wider
+    /// `[rows, v_cols]` view — the shape `regions()` reports for a column-chunked node's
+    /// parameters (`load_region`/`store_region` put the corner on the access tile).
+    fn chunked(tid: u32, rows: u32, c_start: u32, c_len: u32, v_cols: u32, is_out: bool) -> Region {
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols,
+            r_start: 0,
+            c_start,
+            r_len: rows,
+            c_len,
+            r_cover: (0, rows),
+            is_out,
+            is_fp8: false,
+        }
+    }
+
+    /// The second chunk of a `[25, 15360]` MLP intermediate — THE measured node: the 12b gemma-4
+    /// gated-act product, blocked at nb=8192 into `[0,8192)` + `[8192,15360)`. Descriptor 594
+    /// (`594_multiply_o1121`, out=7168) was field-identical to descriptor 593 except width — no
+    /// offset anywhere — and `t1121[:, 8192:15360]` read back zero.
+    fn mlp_chunks() -> (Vec<Region>, u32, u32, u32) {
+        let rows = 25u32;
+        let c0 = 8192u32;
+        let c1 = 7168u32;
+        let r = vec![
+            chunked(5, rows, c0, c1, 15360, false),
+            chunked(6, rows, c0, c1, 15360, false),
+            chunked(7, rows, c0, c1, 15360, true),
+        ];
+        (r, rows, c0, c1)
+    }
+
+    /// ⛔ THE OUTPUT'S PER-CORE START SITS AT THE CHUNK'S STICK-BLOCK CORNER, NOT AT BASE 0.
+    /// Column `c` of a `[rows, full_cols]` stick-blocked tensor starts at
+    /// `(c/64)·(rows·64)` elements — NOT `c` (the flat index), which is equal only at `rows==1`.
+    /// This is the number the card's `startAddressCoreCorelet_` carries, so it is the number the
+    /// 12b dump measured zero against.
+    #[test]
+    fn a_column_blocked_chunk_writes_at_its_stick_block_corner() {
+        let (r, rows, c0, c1) = mlp_chunks();
+        let mut sym = 0i64;
+        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("a dense column-blocked chunk is exactly the arm that exists for it");
+        assert_eq!(ops.len(), 1);
+        let dsc = ops[0]
+            .op
+            .as_ref()
+            .expect("a dense elementwise op carries a descriptor")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        // The output operand is the LAST allocate node (inputs first, output last).
+        let out_node = dsc
+            .scheduleTree_
+            .iter()
+            .filter(|n| n.nodeType_ == "allocate")
+            .next_back()
+            .expect("an allocate node per operand, the output last");
+        let start: u64 = out_node
+            .startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address");
+        // The intra-tensor element offset: `(8192/64)·(25·64)` = 128·1600 = 204800 elements = 409600 B.
+        // The per-core start folds the (single-core) work-slice offset onto the segment base, so the
+        // DELTA from the segment base is the corner — computed here as the difference against the
+        // chunk-0 twin's start, which cancels every segment/arg term both share.
+        let (r0, ..) = mlp_chunks_at_zero();
+        let mut sym0 = 0i64;
+        let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
+            .expect("chunk 0 lowers identically");
+        let dsc0 = ops0[0]
+            .op
+            .as_ref()
+            .expect("descriptor")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        let out0 = dsc0
+            .scheduleTree_
+            .iter()
+            .filter(|n| n.nodeType_ == "allocate")
+            .next_back()
+            .expect("output allocate");
+        let start0: u64 = out0
+            .startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address");
+        let expect = ((c0 / FP16_ELEMS_PER_STICK) as u64)
+            * (rows as u64)
+            * (FP16_ELEMS_PER_STICK as u64)
+            * 2;
+        assert_eq!(
+            start - start0,
+            expect,
+            "chunk 1's output start must sit {expect} B past chunk 0's — the stick-block corner \
+             `(c/64)·(rows·64)` of the [25, 15360] intermediate, not the flat {c0}·2 = {} B",
+            c0 * 2
+        );
+        let _ = c1;
+    }
+
+    /// Chunk 0 of the same pair — whole-tensor-shaped windows at corner 0 (the control the
+    /// delta above cancels against).
+    fn mlp_chunks_at_zero() -> (Vec<Region>, u32, u32, u32) {
+        let rows = 25u32;
+        let r = vec![
+            chunked(5, rows, 0, 8192, 15360, false),
+            chunked(6, rows, 0, 8192, 15360, false),
+            chunked(7, rows, 0, 8192, 15360, true),
+        ];
+        (r, rows, 0, 8192)
+    }
+
+    /// ⛔ AND THE INPUTS READ AT THE SAME CORNER — a multiply whose operands sit at base 0 while
+    /// its output writes the corner would recompute chunk 0's values into chunk 1's columns.
+    #[test]
+    fn a_column_blocked_chunk_reads_its_inputs_at_the_same_corner() {
+        let (r, rows, c0, _c1) = mlp_chunks();
+        let mut sym = 0i64;
+        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("the chunk lowers");
+        let (r0, ..) = mlp_chunks_at_zero();
+        let mut sym0 = 0i64;
+        let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
+            .expect("chunk 0 lowers");
+        let starts = |ops: &Vec<EmittedOp>| -> Vec<u64> {
+            let dsc = ops[0]
+                .op
+                .as_ref()
+                .expect("descriptor")
+                .dscs_[0]
+                .values()
+                .next()
+                .expect("one dsc");
+            dsc.scheduleTree_
+                .iter()
+                .filter(|n| n.nodeType_ == "allocate")
+                .map(|n| {
+                    n.startAddressCoreCorelet_
+                        .data_
+                        .values()
+                        .next()
+                        .expect("a per-core address")
+                        .parse::<u64>()
+                        .expect("decimal")
+                })
+                .collect()
+        };
+        let s1 = starts(&ops);
+        let s0 = starts(&ops0);
+        assert_eq!(s1.len(), s0.len(), "same operand count");
+        let expect = ((c0 / FP16_ELEMS_PER_STICK) as u64)
+            * (rows as u64)
+            * (FP16_ELEMS_PER_STICK as u64)
+            * 2;
+        for (a, b) in s1.iter().zip(s0.iter()) {
+            assert_eq!(a - b, expect, "every operand — inputs and output alike — moves by the corner");
+        }
+    }
+
+    /// ⛔ UNEQUAL CORNERS ARE REFUSED, not zipped: the tiling front end mints ONE window shared
+    /// by every operand of a chunk, so a producer that windowed operands by hand is a shape this
+    /// door names rather than guessing which corner to use.
+    #[test]
+    fn unequal_input_corners_are_refused_by_name() {
+        let rows = 25u32;
+        let r = vec![
+            chunked(5, rows, 8192, 7168, 15360, false),
+            chunked(6, rows, 0, 7168, 15360, false),
+            chunked(7, rows, 8192, 7168, 15360, true),
+        ];
+        let mut sym = 0i64;
+        let Err(e) = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None) else {
+            panic!("operands at different corners must refuse, not pick one")
+        };
+        assert!(
+            e.message.contains("t6@0"),
+            "names the operand and its corner: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE BROADCAST/PER-ROW ARMS CANNOT CARRY A CORNER — refused by name, the same contract
+    /// `base_addressed` states for a row corner.
+    #[test]
+    fn a_column_corner_on_a_broadcast_or_per_row_operand_is_refused() {
+        let rows = 25u32;
+        // A broadcast operand at a corner (the Col flag shape, input 1 `[25,1]`).
+        let rb = vec![
+            chunked(5, rows, 8192, 7168, 15360, false),
+            chunked(6, rows, 8192, 1, 15360, false),
+            chunked(7, rows, 8192, 7168, 15360, true),
+        ];
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &rb,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a broadcast arm at a column corner must refuse")
+        };
+        assert!(
+            e.message.contains("column corner"),
+            "names the corner and the arm: {}",
+            e.message
+        );
+        // The per-row chain: a `[rows, 1]` output at a corner (a binary Sub, the softmax's
+        // running-subtract shape).
+        let pr = vec![
+            chunked(5, rows, 8192, 8192, 15360, false),
+            chunked(6, rows, 8192, 8192, 15360, false),
+            chunked(7, rows, 8192, 1, 15360, true),
+        ];
+        let Err(e2) = elementwise("sub_s3", Elementwise::Sub, &pr, &[], &mut sym, None) else {
+            panic!("the per-row arm at a column corner must refuse")
+        };
+        assert!(
+            e2.message.contains("column corner"),
+            "names the corner and the arm: {}",
+            e2.message
+        );
+    }
+
+    /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,
+    /// byte-identical to every whole-tensor program this crate has ever baked. The offset is the
+    /// only thing the chunked arm adds, so a corner-free program must not change form. The
+    /// discriminator is the allocate nodes' `layoutDimOrder_`: the seeded path's `rows > 1` op
+    /// takes the rank-2 stick-major form (no `y`), while the offset path's column corner is not
+    /// block-aligned so it presents rank-3 flat (`y` present) — `pointwise_broadcast_opspec_
+    /// from_tile`'s own `stickmajor` predicate decides, and the two arms land on opposite sides.
+    #[test]
+    fn a_chunk_at_corner_zero_keeps_the_seeded_emission() {
+        let orders = |ops: &Vec<EmittedOp>| -> Vec<Vec<&'static str>> {
+            let dsc = ops[0]
+                .op
+                .as_ref()
+                .expect("descriptor")
+                .dscs_[0]
+                .values()
+                .next()
+                .expect("one dsc");
+            dsc.scheduleTree_
+                .iter()
+                .filter(|n| n.nodeType_ == "allocate")
+                .map(|n| n.layoutDimOrder_.clone())
+                .collect()
+        };
+        let (r0, ..) = mlp_chunks_at_zero();
+        let mut sym = 0i64;
+        let ops = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym, None)
+            .expect("chunk 0 lowers");
+        assert_eq!(ops.len(), 1);
+        for o in orders(&ops) {
+            assert!(
+                !o.contains(&"y"),
+                "a corner-free chunk keeps the seeded rank-2 stick-major form (got {o:?})"
+            );
+        }
+        // And the chunked op — the SAME regions at corner 8192 — takes the offset form.
+        let (r1, ..) = mlp_chunks();
+        let mut sym1 = 0i64;
+        let ops1 = elementwise("mul_s23", Elementwise::Mul, &r1, &[], &mut sym1, None)
+            .expect("chunk 1 lowers");
+        for o in orders(&ops1) {
+            assert!(
+                o.contains(&"y"),
+                "the offset form presents rank-3 flat — a column corner is not block-aligned, so \
+                 the stickmajor predicate keeps it flat (got {o:?})"
+            );
         }
     }
 }
