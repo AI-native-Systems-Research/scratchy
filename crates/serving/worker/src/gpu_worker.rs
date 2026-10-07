@@ -764,19 +764,39 @@ fn target_block_bytes(
     }
 }
 
-/// Bytes one block of the DRAFT pool costs: it is allocated dense in full
-/// (`initialize_draft_cache_metal`), and a TurboQuant draft's codec buffers
-/// come on top of it.
+/// Bytes one block of the DRAFT pool costs: a dense draft's rows; a TurboQuant one's codes and
+/// norms (its dense pool a one-chunk seed, as the target's: `initialize_draft_cache_metal`) and
+/// its fp16 scratch — none of the scratch when it stages through its target's
+/// ([`DraftScratch::Target`]).
 #[cfg(feature = "metal")]
 fn draft_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
+    scratch: DraftScratch,
 ) -> usize {
-    let codec = match model.kv_codec() {
-        scratchy_forward_compiler::KvCodec::Dense => 0,
-        codec => block_size.saturating_mul(pool_bytes_per_token(model, codec, METAL_KV_ELEM_BYTES)),
+    let codec = model.kv_codec();
+    if !codec.is_turboquant() {
+        return kv_per_block_bytes(model, block_size);
+    }
+    let lent = match scratch {
+        DraftScratch::Own => 0,
+        DraftScratch::Target => scratchy_target_metal::turboquant::scratch_bytes_per_token(
+            model.num_key_value_heads() as usize,
+            model.head_dim() as usize,
+        ),
     };
-    kv_per_block_bytes(model, block_size).saturating_add(codec)
+    let per_token = pool_bytes_per_token(model, codec, METAL_KV_ELEM_BYTES).saturating_sub(lent);
+    block_size.saturating_mul(per_token)
+}
+
+/// Where a TurboQuant draft stages its KV: its own fp16 scratch, or — a head, which runs after its
+/// target and never beside it, of the target's KV geometry — the target's
+/// (`LentActivation::tq_scratch`).
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftScratch {
+    Own,
+    Target,
 }
 
 // `compute_available_kv_bytes`, `PrefillBucketSelection`, and
@@ -1296,6 +1316,27 @@ impl MetalWorker {
         (self.draft_model.as_ref()).is_some_and(|m| m.reads_target_hidden())
     }
 
+    /// Where the draft's TurboQuant KV stages ([`DraftScratch`]): a head whose KV geometry is its
+    /// TurboQuant target's stages through the target's scratch, as `build_tq_provision` places it.
+    fn draft_scratch(&self) -> DraftScratch {
+        let bs = self.config.block_size;
+        let lends = match (self.model.as_deref(), self.draft_model.as_deref()) {
+            (Some(target), Some(draft)) => {
+                self.draft_is_head()
+                    && uniform_turboquant(target, bs)
+                    && uniform_turboquant(draft, bs)
+                    && target.num_key_value_heads() == draft.num_key_value_heads()
+                    && target.head_dim() == draft.head_dim()
+            }
+            _ => false,
+        };
+        if lends {
+            DraftScratch::Target
+        } else {
+            DraftScratch::Own
+        }
+    }
+
     /// The device a draft forward runs on: the target's device and allocator, on the draft queue
     /// when there is one (a draft model runs beside the target). A head runs after the target, on
     /// its queue, each forward waited on, so it places its pool's buffers in the target's.
@@ -1794,6 +1835,13 @@ impl MetalWorker {
         let chunk_bytes_logical_draft =
             blocks_per_chunk * per_block_elems_draft * cache_dtype.size_bytes();
 
+        // A TurboQuant draft's dense rows are never read (its KV binds the TurboQuant scratch), so
+        // its pool is a one-chunk seed, as the target's (`initialize_cache`).
+        let draft_chunks = if uniform_turboquant(model.as_ref(), self.config.block_size) {
+            1
+        } else {
+            num_chunks_total_draft
+        };
         let kv_mapper = self.kv_mapper.clone().ok_or_else(|| {
             ExecutorError::WorkerInit("draft KV pool before the target's KvMapper".into())
         })?;
@@ -1805,7 +1853,7 @@ impl MetalWorker {
                 &residency,
                 &kv_mapper,
                 chunk_bytes_logical_draft,
-                num_chunks_total_draft,
+                draft_chunks,
             )
             .map_err(|e| ExecutorError::WorkerInit(format!("draft SparseKvLayer: {e}")))?;
             draft_layers.push(layer);
@@ -1817,13 +1865,13 @@ impl MetalWorker {
 
         let pool = unsafe {
             // Layer-major iteration: outer for layer, inner for chunk.
-            // Draft uses `initial_chunks = num_chunks_total` (eager: the
+            // Draft uses `initial_chunks = draft_chunks` (eager: the
             // spec-decode draft forward path has no growth hook). The slot
             // formula `(c / (2 * chunks_per_layer)) * 2 + c % 2` matches
             // the call sequence L0_K_c0, L0_V_c0, L0_K_c1, L0_V_c1, ...
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
             let draft_layers_ref = &mut draft_layers;
-            let chunks_per_layer = num_chunks_total_draft;
+            let chunks_per_layer = draft_chunks;
             KvCachePool::new_metal_chunked(
                 num_layers_draft,
                 draft_blocks,
@@ -1839,7 +1887,7 @@ impl MetalWorker {
                 None,
                 cache_dtype,
                 blocks_per_chunk,
-                usize::MAX,
+                draft_chunks,
                 |bytes| {
                     let c = alloc_chunk_counter.get();
                     alloc_chunk_counter.set(c + 1);
@@ -4044,15 +4092,16 @@ impl Worker for MetalWorker {
             _ => arena_peak,
         };
         // A uniform TurboQuant pool still reserves one fp16 chunk per layer
-        // (`initialize_cache`), whatever its block count.
-        let tq_seed = self
-            .model
-            .as_deref()
+        // (`initialize_cache`, `initialize_draft_cache_metal`), whatever its block count.
+        let tq_seed = [self.model.as_deref(), self.draft_model.as_deref()]
+            .into_iter()
+            .flatten()
             .filter(|m| uniform_turboquant(*m, self.config.block_size))
-            .map_or(0, |m| {
+            .map(|m| {
                 scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
                     * kv_per_block_bytes(m, self.config.block_size)
-            });
+            })
+            .sum::<usize>();
         // `total` already folds in `gpu_memory_utilization` (and the KV floor's fixed point
         // above), so pass util=1.0 here — applying it again would shrink the KV budget a second
         // time below the headroom the bucket selector just split.
@@ -4069,8 +4118,8 @@ impl Worker for MetalWorker {
         let reach = match self.model.as_deref() {
             Some(target) if target.per_layer_kv_token_elems().is_none() => {
                 let draft = self.draft_model.as_deref();
-                let pair =
-                    target_block_bytes(target, bs) + draft.map_or(0, |d| draft_block_bytes(d, bs));
+                let draft_pb = draft.map_or(0, |d| draft_block_bytes(d, bs, self.draft_scratch()));
+                let pair = target_block_bytes(target, bs) + draft_pb;
                 kv_left(self.metal_peak_activation_estimate(None, None, Some(total), 1)?)
                     / pair.max(1)
             }
@@ -4096,7 +4145,7 @@ impl Worker for MetalWorker {
             let target = self.model.as_ref().expect("model loaded before draft");
             let bs = self.config.block_size;
             let t_pb = target_block_bytes(target.as_ref(), bs);
-            let d_pb = draft_block_bytes(draft.as_ref(), bs);
+            let d_pb = draft_block_bytes(draft.as_ref(), bs, self.draft_scratch());
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
             let scaled = (available as u128 * t_pb as u128 / denom as u128) as usize;

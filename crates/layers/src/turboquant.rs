@@ -399,9 +399,15 @@ pub fn kv_bytes_per_token(
         KvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
         KvCodec::TurboQuant(bits) => {
             num_layers * 2 * num_kv_heads * bytes_per_vec(head_dim, bits.get())
-                + 2 * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES
+                + scratch_bytes_per_token(num_kv_heads, head_dim)
         }
     }
+}
+
+/// Bytes one token costs in a TurboQuant pool's one-layer fp16 scratch, K and V: what a model
+/// staging through another pool's scratch does not pay.
+pub fn scratch_bytes_per_token(num_kv_heads: usize, head_dim: usize) -> usize {
+    2 * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES
 }
 
 /// Single-stream TurboQuant KV store — the mechanism of arozanov's

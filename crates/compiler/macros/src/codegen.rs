@@ -7420,6 +7420,9 @@ pub fn fuf_uses_kv_cache(fuf: &Fuf) -> bool {
 /// The model's KV codec. TurboQuant under the `turboquant` feature, on metal
 /// only, wherever `codec_for` takes its geometry; dense everywhere else. A
 /// model the feature would compress but can't is named in the build output.
+/// The geometry is the KV pool's: a head's KV is its target's capacity, a
+/// pool mirroring the target's blocks, so it is decided at the target's layer
+/// count (`target_num_hidden_layers`) — the target's codec.
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
@@ -7431,8 +7434,11 @@ fn kv_codec_for(
     {
         use scratchy_ir::{DenseReason, KvGeometry, codec_for};
         let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
+        let pool_layers = (model.bounds.get("target_num_hidden_layers"))
+            .or(model.bounds.get("num_hidden_layers"))
+            .map_or(0, |&n| n as usize);
         let geometry = KvGeometry {
-            num_layers: bound("num_hidden_layers"),
+            num_layers: pool_layers,
             num_kv_heads: bound("num_key_value_heads"),
             head_dim,
             global_head_dim,
@@ -13153,7 +13159,7 @@ pub fn emit_model(
                     .map(|(l, &g)| g == 0 && !__LINEAR_LAYERS.get(l).copied().unwrap_or(false))
                     .collect();
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
-                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev| {
+                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev, lent| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
                         let max_bps =
                             <Weights as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ
@@ -13174,12 +13180,15 @@ pub fn emit_model(
                         let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
                             ::scratchy_target_metal::turboquant::build_tq_provision(
                                 dev,
-                                &__tq_is_global,
-                                __tq_nb,
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE as usize,
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
-                                ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
+                                ::scratchy_target_metal::turboquant::TqPool {
+                                    is_global: &__tq_is_global,
+                                    num_blocks: __tq_nb,
+                                    block_size: <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE as usize,
+                                    num_kv_heads: <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
+                                    blocks_per_chunk: ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
+                                },
                                 codebook,
+                                lent.tq_scratch.as_ref(),
                             )
                         });
                         ::scratchy_target_metal::interpreter::metal::RuntimeBindings {
@@ -13222,7 +13231,7 @@ pub fn emit_model(
                                 .map(|p| {
                                     (0..num_layers)
                                         .map(|l| if __tq_is_global[l] {
-                                            p.scratch_k_table.clone()
+                                            p.scratch.k_table.clone()
                                         } else {
                                             kv_k[l].clone()
                                         })
@@ -13234,7 +13243,7 @@ pub fn emit_model(
                                 .map(|p| {
                                     (0..num_layers)
                                         .map(|l| if __tq_is_global[l] {
-                                            p.scratch_v_table.clone()
+                                            p.scratch.v_table.clone()
                                         } else {
                                             kv_v[l].clone()
                                         })
