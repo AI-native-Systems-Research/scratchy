@@ -210,8 +210,8 @@ pub fn qmv_kernel_static_name(
     group_size: u32,
 ) -> &'static str {
     debug_assert!(
-        matches!(bits, 4 | 8),
-        "qmv_kernel_static_name: only bits 4 and 8 are wired (got {bits})"
+        matches!(bits, 3 | 4 | 8),
+        "qmv_kernel_static_name: only bits 3, 4 and 8 are wired (got {bits})"
     );
     let key = (kernel, dtype, scale_dtype, group_size, bits);
     use std::collections::HashMap;
@@ -485,13 +485,13 @@ pub fn qmm_t_kernel_static_name(
     aligned_n: bool,
 ) -> &'static str {
     debug_assert!(
-        matches!(bits, 4 | 8),
-        "qmm_t_kernel_static_name: only bits 4 and 8 are wired (got {bits})"
+        matches!(bits, 3 | 4 | 8),
+        "qmm_t_kernel_static_name: only bits 3, 4 and 8 are wired (got {bits})"
     );
     debug_assert!(
-        !(bits == 8 && matches!(kernel, QmmTKernel::SplitK { .. })),
+        !(matches!(bits, 3 | 8) && matches!(kernel, QmmTKernel::SplitK { .. })),
         "qmm_t_kernel_static_name: SplitK only instantiates bits=4 — \
-         the lowering arm must route 8-bit weights to Standard or Nax"
+         the lowering arm must route 3-bit and 8-bit weights to Standard or Nax"
     );
     let key = (
         std::mem::discriminant(&kernel),

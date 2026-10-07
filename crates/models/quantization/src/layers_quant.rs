@@ -16,12 +16,12 @@ use scratchy_tensors::GpuTensor;
 
 /// MLX-native affine INT4 quantized linear layer (Metal backend only).
 ///
-/// Storage layout matches `mlx-community/*-4bit` checkpoints exactly:
-/// weights packed `[N, K / pack_factor]` U32 (`pack_factor = 32 / bits =
-/// 8` for bits=4); per-group affine offset (`scales`, `biases`) stored
-/// `[N, K / group_size]` F16. Activation dtype is bf16 or f16 per
-/// `torch_dtype`. The kernel reads scales/biases as `T_scale = half`
-/// and casts to float in registers.
+/// Storage layout matches `mlx-community` affine checkpoints exactly:
+/// weights packed `[N, ceil(K*bits/32)]` U32 (bits=3 packs a continuous
+/// LSB-first bitstream, 8 elements per 3 bytes); per-group affine offset
+/// (`scales`, `biases`) stored `[N, K / group_size]` F16. Activation dtype
+/// is bf16 or f16 per `torch_dtype`. The kernel reads scales/biases as
+/// `T_scale = half` and casts to float in registers.
 ///
 /// "biases" here is MLX's per-group affine offset, NOT the linear-layer
 /// bias. The optional fp linear-layer bias (when models like Phi-3 / some
@@ -31,7 +31,7 @@ use scratchy_tensors::GpuTensor;
 /// macro-emitted `Instruction<W>` stream and dispatch via the worker
 /// resolver, not direct method calls.
 pub struct AffineQuantLinear {
-    /// Packed 4-bit weights, shape `[N, K / pack_factor]`, dtype `U32`.
+    /// Packed quantized weights, shape `[N, ceil(K*bits/32)]`, dtype `U32`.
     pub weight: GpuTensor,
     /// Per-group scales, shape `[N, K / group_size]`, dtype `F16`.
     pub scales: GpuTensor,
@@ -107,23 +107,22 @@ impl Nvfp4Linear {
 // AffineQuantEmbedding — MLX-affine int4 quantized token embedding
 // ---------------------------------------------------------------------------
 
-/// MLX-affine int4 quantized token-embedding table. Mirrors
-/// `AffineQuantLinear` (the int4 Linear) but for an embedding's
+/// MLX-affine quantized token-embedding table. Mirrors
+/// `AffineQuantLinear` (the quantized Linear) but for an embedding's
 /// `[vocab_size, hidden_size]` layout. Stored as packed U32 weights
-/// (`[vocab, hidden / pack_factor]`, `pack_factor = 32 / bits = 8` for
-/// bits=4) plus per-group `scales` / `affine_biases`
-/// (`[vocab, hidden / group_size]` F16). MLX terminology: "biases" is
-/// the per-group affine offset, NOT a linear-layer bias — embeddings
-/// have no fp bias term at all.
+/// (`[vocab, ceil(hidden*bits/32)]`) plus per-group `scales` /
+/// `affine_biases` (`[vocab, hidden / group_size]` F16). MLX
+/// terminology: "biases" is the per-group affine offset, NOT a
+/// linear-layer bias — embeddings have no fp bias term at all.
 ///
 /// Used by P6's `Instruction::AffineEmbed`: forward-time gather +
-/// dequant via `affine_embed_<dtype>_gs_<gs>_b_4`. The macro emits this
+/// dequant via `affine_embed_<dtype>_gs_<gs>_b_<bits>`. The macro emits this
 /// type instead of `Embedding` when `model.embed_tokens` carries
 /// `(weight=U32, scales, biases)` safetensors keys. Tied lm_head reuses
 /// the same buffer triple (GpuTensor is Copy under metal — it's a thin
 /// pointer wrapper) via `LinearLayer::AffineQuant`.
 pub struct AffineQuantEmbedding {
-    /// Packed 4-bit weights, shape `[vocab_size, hidden_size / pack_factor]`,
+    /// Packed quantized weights, shape `[vocab_size, ceil(hidden*bits/32)]`,
     /// dtype `U32`.
     pub weight: GpuTensor,
     /// Per-group scales, shape `[vocab_size, hidden_size / group_size]`,

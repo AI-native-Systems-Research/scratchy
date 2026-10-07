@@ -1150,21 +1150,41 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 
 // ─────────────────────────────────────────────────────────────────
 // dequantize — quantized.h:482-556. Decode one quantized block
-// (scale * q + bias) into w_local. Bits 4 and 8 only (the wide
-// kernel's instantiations); the other branches dropped rather than
-// kept dead — this copy exists solely for qmv_wide_impl.
+// (scale * q + bias) into w_local. Bits 3, 4 and 8 (the wide kernel's
+// instantiations); the other branches dropped rather than kept dead —
+// this copy exists solely for qmv_wide_impl.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
-      bits == 4 || bits == 8,
-      "dequantize: scratchy instantiates bits 4 and 8 only");
+      bits == 3 || bits == 4 || bits == 8,
+      "dequantize: scratchy instantiates bits 3, 4 and 8 only");
 
   const float s = float(scale);
   const float b = float(bias);
 
-  if (bits == 4) {
+  if (bits == 3) {
+    // Continuous LSB-first bitstream, byte-anchored every 8 elements
+    // (group_size is a multiple of 8): 8 codes span exactly 3 bytes.
+    // Verbatim MLX `qdot` bits==3 shifts (quantized_loader.h:64-77) —
+    // no XOR path exists for 3-bit codes (`AffineCodes::Offset8` is
+    // 4-bit-only), so the codes read as written.
+    for (int i = 0; i < (N / 8); i++) {
+      const device uint8_t* wb = w + 3 * i;
+      U* wl = w_local + 8 * i;
+      wl[0] = static_cast<U>((wb[0] & 0x7) * s + b);
+      wl[1] = static_cast<U>(((wb[0] & 0x38) >> 3) * s + b);
+      wl[2] = static_cast<U>((((wb[0] & 0xc0) >> 6) + ((wb[1] & 0x1) << 2)) * s + b);
+      wl[3] = static_cast<U>(((wb[1] & 0xe) >> 1) * s + b);
+      wl[4] = static_cast<U>(((wb[1] & 0x70) >> 4) * s + b);
+      wl[5] = static_cast<U>((((wb[1] & 0x80) >> 7) + ((wb[2] & 0x3) << 1)) * s + b);
+      wl[6] = static_cast<U>(((wb[2] & 0x1c) >> 2) * s + b);
+      wl[7] = static_cast<U>(((wb[2] & 0xe0) >> 5) * s + b);
+    }
+  }
+
+  else if (bits == 4) {
     // Codes as stored are UNSIGNED in MLX; our storage may hold them
     // XOR 0x88 (signed q - 8, `AffineCodes::Offset8`, baked constant
     // 5) — the same `AFFINE_CODES_XOR` every other kernel in this file
@@ -1382,6 +1402,25 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 INST_QMV_ALL_B8(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
 
+// 3-bit instantiations (GLM-4.5-Air-3bit: 3-bit g64). Same story as the
+// 8-bit family above: the template bodies already carry the MLX bits==3
+// packing (a continuous LSB-first bitstream — 8 elements per 3 bytes, so
+// packed cols are ceil(K*3/32), NOT K/(32/3)); only the entry points were
+// missing. bf16/bf16 = the GLM production combo; f16/f16 for unit tests.
+// batch_0 + batch_1 for the fast/plain qmv (attention projections decode
+// at both). NO quad rows: qmv_quad_impl's `pack_factor = 32 / bits` index
+// math is only exact for power-of-two bits — MLX never dispatches quad at
+// odd widths (`dispatch_qmv` gates on `is_power_of_2(bits)`) and neither
+// do we (`pick_qmv_kernel_wide`'s `pow2_bits`).
+#define INST_QMV_ALL_B3(act_tag, act_type, scale_tag, scale_type, gs)                       \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3, 0)     \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3, 1)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3, 0)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3, 1)
+
+INST_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
+
 // qmv_wide instantiations — the small-M band (2 ≤ M < vector_limit).
 // k_lanes=8 (the affine pick, quantized.cpp:567): 4 output rows per
 // simdgroup × 2 simdgroups = 8 rows per threadgroup. vecs_per_tg in
@@ -1406,6 +1445,16 @@ INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
 INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 64)
 INST_QMV_WIDE_ALL(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_WIDE_ALL(f16, half, f16, half, 64)
+
+// 3-bit wide rows (GLM-4.5-Air-3bit): same decode band, b_3 packing.
+#define INST_QMV_WIDE_ALL_B3(act_tag, act_type, scale_tag, scale_type, gs)          \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 2, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 3, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 4, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 3, 5, 8)
+
+INST_QMV_WIDE_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_WIDE_ALL_B3(f16, half, f16, half, 64)
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
@@ -1735,10 +1784,12 @@ METAL_FUNC void gather_qmv_pair(
     uint simd_lid,
     const device T_scale*  gain) {
 
-  // Per-expert weight slab strides: w is packed int4 with
-  // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
+  // Per-expert weight slab strides: w is packed with the ceil(K*bits/32)
+  // law — for bits=4 that's in_vec/8 uint32 per row, for bits=8 in_vec/4,
+  // and for bits=3 in_vec*3/32 (8 codes per 3 bytes; exact since K is a
+  // multiple of group_size, hence of 32). Scales/biases hold
   // `in_vec/gs * out_vec` per expert.
-  size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
+  size_t expert_stride_w = size_t(IN_VEC_SIZE * bits / 32) * size_t(OUT_VEC_SIZE);
   size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
   const device uint32_t* w_e = w + expert_idx * expert_stride_w;
   const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
@@ -1963,3 +2014,15 @@ INST_GATHER_QMV_ALL_B8(f16,  half,   bf16, bfloat, 64)
 INST_GATHER_QMV_ALL_B8(f16,  half,   bf16, bfloat, 128)
 INST_QMV_ALL(bf16, bfloat, f16, half,  64)
 INST_QMV_ALL(bf16, bfloat, f16, half, 128)
+
+// 3-bit gather-qmv (GLM-4.5-Air-3bit MoE decode). Template bodies carry
+// the MLX bits==3 packing; only entry points were missing.
+#define INST_GATHER_QMV_ALL_B3(act_tag, act_type, scale_tag, scale_type, gs) \
+  INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 3) \
+  INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 3) \
+  INST_GATHER_QMV(affine_qmv_gated,          act_tag, act_type, scale_tag, scale_type, gs, 3) \
+  INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 3)
+INST_GATHER_QMV_ALL_B3(f16,  half,   f16, half,    64)
+INST_GATHER_QMV_ALL_B3(bf16, bfloat, f16, half,    64)
+INST_GATHER_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
+INST_GATHER_QMV_ALL_B3(f16,  half,   bf16, bfloat, 64)

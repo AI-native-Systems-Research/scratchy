@@ -108,16 +108,14 @@ pub struct AffineInt4 {
 }
 
 impl AffineInt4 {
-    /// The packed widths a metal qmv kernel family exists for.
-    const SUPPORTED_BITS: [u32; 2] = [4, 8];
-
     /// `Some` iff `bits` names a kernel family and `group_size` tiles `k` exactly.
     pub const fn mint(bits: u32, group_size: u32, k: u32) -> Option<Self> {
         if group_size == 0 || k == 0 || !k.is_multiple_of(group_size) {
             return None;
         }
-        // `const fn` cannot iterate a slice; state the membership directly.
-        if bits != Self::SUPPORTED_BITS[0] && bits != Self::SUPPORTED_BITS[1] {
+        // Membership mirrors the metal qmv kernel families (b_3, b_4, b_8);
+        // a const fn cannot iterate a table, so state it directly.
+        if !matches!(bits, 3 | 4 | 8) {
             return None;
         }
         Some(Self {

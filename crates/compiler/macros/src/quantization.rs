@@ -243,7 +243,7 @@ pub enum QuantMethod {
     ///     `mlx-community/Meta-Llama-3-8B-Instruct-4bit`.
     ///   * `true` (`mlx-affine-b<bits>-g<gs>-qembed` preset) —
     ///     newer convert behavior: `embed_tokens` is also quantized
-    ///     to the full affine triple `[vocab, hidden / pack_factor]`
+    ///     to the full affine triple `[vocab, ceil(hidden*bits/32)]`
     ///     U32 + `.scales`/`.biases` F16. Verified against
     ///     `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`.
     ///
@@ -503,10 +503,10 @@ fn parse_affine_no_method(
             field: "group_size",
             reason: "missing or not a u64",
         })? as u32;
-    if !matches!(bits, 4 | 8) {
+    if !matches!(bits, 3 | 4 | 8) {
         return Err(ParseError::BadField {
             field: "bits",
-            reason: "MLX-affine scratchy path handles a 4-bit or 8-bit default",
+            reason: "MLX-affine scratchy path handles a 3-bit, 4-bit or 8-bit default",
         });
     }
     if !matches!(group_size, 32 | 64 | 128) {
@@ -589,10 +589,10 @@ fn parse_affine_no_method(
             .get("group_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(group_size as u64) as u32;
-        if !matches!(mb, 4 | 8) {
+        if !matches!(mb, 3 | 4 | 8) {
             return Err(ParseError::BadField {
                 field: "quantization.<module>.bits",
-                reason: "per-module MLX-affine bits must be 4 or 8",
+                reason: "per-module MLX-affine bits must be 3, 4 or 8",
             });
         }
         if !matches!(mg, 32 | 64 | 128) {

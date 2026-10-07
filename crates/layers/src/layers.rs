@@ -335,7 +335,7 @@ impl LinearLayer {
         }
     }
 
-    /// Access the affine-quantized packed weight tensor (`[N, K / pack_factor]`
+    /// Access the affine-quantized packed weight tensor (`[N, ceil(K*bits/32)]`
     /// U32). Panics on every other LinearLayer arm — affine accessors
     /// are meaningful only on Affine layers (Metal builds).
     pub fn affine_weight(&self) -> GpuTensor {

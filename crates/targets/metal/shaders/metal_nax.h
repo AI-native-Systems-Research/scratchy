@@ -994,9 +994,28 @@ inline constexpr short get_bytes_per_pack() {
 template <typename Tdst, typename Tsc, int N, int bits, bool offset8 = false>
 inline void
 dequantize(const device uint8_t* w, Tdst scale, Tdst bias, threadgroup Tdst* w_local) {
-  static_assert(bits == 4 || bits == 8, "NAX dequantize: bits in {4,8}");
+  static_assert(bits == 3 || bits == 4 || bits == 8, "NAX dequantize: bits in {3,4,8}");
 
-  if (bits == 4) {
+  if (bits == 3) {
+    // Continuous LSB-first bitstream: 8 codes span exactly 3 bytes, and
+    // every 8-code run is byte-anchored (group_size is a multiple of 8).
+    // Shifts are MLX's own `qdot` bits==3 branch (quantized.h:47-76); no
+    // XOR path — offset8 is 4-bit-only by construction.
+    for (int i = 0; i < (N / 8); i++) {
+      const device uint8_t* wb = w + 3 * i;
+      threadgroup Tdst* wl = w_local + 8 * i;
+      wl[0] = (wb[0] & 0x7) * scale + bias;
+      wl[1] = ((wb[0] & 0x38) >> 3) * scale + bias;
+      wl[2] = (((wb[0] & 0xc0) >> 6) + ((wb[1] & 0x1) << 2)) * scale + bias;
+      wl[3] = ((wb[1] & 0xe) >> 1) * scale + bias;
+      wl[4] = ((wb[1] & 0x70) >> 4) * scale + bias;
+      wl[5] = (((wb[1] & 0x80) >> 7) + ((wb[2] & 0x3) << 1)) * scale + bias;
+      wl[6] = ((wb[2] & 0x1c) >> 2) * scale + bias;
+      wl[7] = ((wb[2] & 0xe0) >> 5) * scale + bias;
+    }
+  }
+
+  else if (bits == 4) {
     Tdst s[2] = {scale, scale / static_cast<Tdst>(16.0f)};
     if (offset8) {
       const Tdst bias8 = bias + static_cast<Tdst>(8.0f) * scale;
@@ -1131,7 +1150,7 @@ struct QuantizedBlockLoader {
   static_assert(
       group_size % BCOLS == 0,
       "The group size should be divisible by the columns");
-  static_assert(bits == 4 || bits == 8, "NAX loader: bits in {4,8}");
+  static_assert(bits == 3 || bits == 4 || bits == 8, "NAX loader: bits in {3,4,8}");
 
   STEEL_CONST short pack_factor = get_pack_factor<bits, 8>();
   STEEL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();

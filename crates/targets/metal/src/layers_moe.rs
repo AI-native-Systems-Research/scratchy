@@ -275,7 +275,6 @@ fn load_stacked_experts(
     use crate::dtype::DType;
     use crate::tensor::GpuTensor;
 
-    let pack_factor = (32 / bits) as usize;
     let gs = group_size as usize;
 
     // Build the pre-stacked tensor name `{prefix}[.{infix}].{proj}.{kind}`.
@@ -322,11 +321,14 @@ fn load_stacked_experts(
     // Per-expert path: stack into pre-allocated MTLBuffers.
     let elem_w = DType::U32.size_bytes();
     let elem_sb = scales_dtype.size_bytes();
-    // gate_proj / up_proj: out=intermediate, in=hidden.
-    let per_gate_w = intermediate_size * (hidden_size / pack_factor);
+    // gate_proj / up_proj: out=intermediate, in=hidden. Packed cols follow
+    // the ceil(in*bits/32) law (exact: in is a multiple of group_size).
+    let packed_hidden = crate::layers_quant::affine_packed_cols(hidden_size, bits);
+    let packed_inter = crate::layers_quant::affine_packed_cols(intermediate_size, bits);
+    let per_gate_w = intermediate_size * packed_hidden;
     let per_gate_sb = intermediate_size * (hidden_size / gs);
     // down_proj: out=hidden, in=intermediate.
-    let per_down_w = hidden_size * (intermediate_size / pack_factor);
+    let per_down_w = hidden_size * packed_inter;
     let per_down_sb = hidden_size * (intermediate_size / gs);
 
     // Experts are WEIGHTS: the weight pool, not the wired activation
@@ -398,37 +400,22 @@ fn load_stacked_experts(
         }
     }
 
-    let mk = |ptr, n_out: usize, n_in: usize, div: usize, dt: DType| unsafe {
-        GpuTensor::new(ptr, &[num_experts, n_out, n_in / div], dt)
+    let mk_w = |ptr: *mut u8, n_out: usize, packed_in: usize, dt: DType| unsafe {
+        GpuTensor::new(ptr, &[num_experts, n_out, packed_in], dt)
+    };
+    let mk_sb = |ptr: *mut u8, n_out: usize, n_in: usize, dt: DType| unsafe {
+        GpuTensor::new(ptr, &[num_experts, n_out, n_in / gs], dt)
     };
     Ok((
-        mk(
-            gate_w_ptr,
-            intermediate_size,
-            hidden_size,
-            pack_factor,
-            DType::U32,
-        ),
-        mk(gate_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(gate_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(
-            up_w_ptr,
-            intermediate_size,
-            hidden_size,
-            pack_factor,
-            DType::U32,
-        ),
-        mk(up_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(up_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(
-            down_w_ptr,
-            hidden_size,
-            intermediate_size,
-            pack_factor,
-            DType::U32,
-        ),
-        mk(down_s_ptr, hidden_size, intermediate_size, gs, scales_dtype),
-        mk(down_b_ptr, hidden_size, intermediate_size, gs, scales_dtype),
+        mk_w(gate_w_ptr, intermediate_size, packed_hidden, DType::U32),
+        mk_sb(gate_s_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_sb(gate_b_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_w(up_w_ptr, intermediate_size, packed_hidden, DType::U32),
+        mk_sb(up_s_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_sb(up_b_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_w(down_w_ptr, hidden_size, packed_inter, DType::U32),
+        mk_sb(down_s_ptr, hidden_size, intermediate_size, scales_dtype),
+        mk_sb(down_b_ptr, hidden_size, intermediate_size, scales_dtype),
     ))
 }
 
@@ -741,16 +728,15 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             shared_expert_gate,
         ) = if shared_expert_intermediate_size > 0 {
             anyhow::ensure!(
-                bits == 4 || bits == 8,
-                "AffineSharedFusedMoELayer: only bits ∈ {{4, 8}} supported (got {bits})"
+                matches!(bits, 3 | 4 | 8),
+                "AffineSharedFusedMoELayer: only bits ∈ {{3, 4, 8}} supported (got {bits})"
             );
-            let pack_factor = (32 / bits) as usize;
             let shared_inter = shared_expert_intermediate_size;
             // Two cases for shared gate+up: either fused on-disk
             // (`shared_expert.gate_up_proj`) or split (the more common
             // Qwen-MoE shape with separate gate_proj/up_proj). The
             // affine_gather_qmv lowering wants a single packed
-            // `[2*shared_inter, hidden / pack_factor]` triple, so we
+            // `[2*shared_inter, ceil(hidden*bits/32)]` triple, so we
             // stack split-on-disk variants by allocating and copying
             // gate then up into adjacent halves.
             let has_fused = gw.contains(&format!("{prefix}.shared_expert.gate_up_proj.weight"));
@@ -768,11 +754,14 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             let elem_sb = scales_dtype.size_bytes();
             let gs = group_size as usize;
 
-            // Allocate destination buffers.
+            // Allocate destination buffers. Packed cols follow the
+            // ceil(in*bits/32) law (exact: in is a multiple of group_size).
+            let packed_hidden = crate::layers_quant::affine_packed_cols(hidden_size, bits);
+            let packed_shared_inter = crate::layers_quant::affine_packed_cols(shared_inter, bits);
             let two_si = 2 * shared_inter;
-            let gu_w_bytes = two_si * (hidden_size / pack_factor) * elem_w;
+            let gu_w_bytes = two_si * packed_hidden * elem_w;
             let gu_sb_bytes = two_si * (hidden_size / gs) * elem_sb;
-            let down_w_bytes = hidden_size * (shared_inter / pack_factor) * elem_w;
+            let down_w_bytes = hidden_size * packed_shared_inter * elem_w;
             let down_sb_bytes = hidden_size * (shared_inter / gs) * elem_sb;
 
             // Shared-expert weights: same pool rule as the routed
@@ -807,7 +796,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
                 }
             } else {
                 // Split → stack into [gate_half | up_half].
-                let half_w_bytes = shared_inter * (hidden_size / pack_factor) * elem_w;
+                let half_w_bytes = shared_inter * packed_hidden * elem_w;
                 let half_sb_bytes = shared_inter * (hidden_size / gs) * elem_sb;
                 unsafe {
                     let _ = gw.take_into_metal(
@@ -853,7 +842,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             }
 
             let gu_w = unsafe {
-                GpuTensor::new(gu_w_ptr, &[two_si, hidden_size / pack_factor], DType::U32)
+                GpuTensor::new(gu_w_ptr, &[two_si, packed_hidden], DType::U32)
             };
             let gu_s =
                 unsafe { GpuTensor::new(gu_s_ptr, &[two_si, hidden_size / gs], scales_dtype) };
@@ -862,7 +851,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             let d_w = unsafe {
                 GpuTensor::new(
                     down_w_ptr,
-                    &[hidden_size, shared_inter / pack_factor],
+                    &[hidden_size, packed_shared_inter],
                     DType::U32,
                 )
             };

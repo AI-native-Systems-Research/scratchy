@@ -37,6 +37,15 @@ use crate::weights::GpuWeights;
 /// that used to live in `GpuWeights::take_affine_dequant_b4_bytes`. NOTE: the
 /// `take_cpu` read copies the small packed 4-bit weight (vs the old zero-copy
 /// mmap read) — one extra small copy at load, correctness-preserving.
+/// Number of u32 columns MLX-affine packing produces for `k` elements at
+/// `bits` width: a continuous LSB-first bitstream, `ceil(k * bits / 32)`
+/// columns. bits=3 packs 8 elements per 3 bytes (24 bits) — the group is
+/// byte-anchored since group_size ∈ {32, 64, 128} is a multiple of 8; bits=4
+/// and bits=8 give the familiar `k / (32 / bits)` exact division.
+pub(crate) const fn affine_packed_cols(k: usize, bits: u32) -> usize {
+    (k * bits as usize).div_ceil(32)
+}
+
 fn affine_dequant_b4_bytes<W: WeightSource + ?Sized>(
     weights: &mut W,
     prefix: &str,
@@ -45,8 +54,8 @@ fn affine_dequant_b4_bytes<W: WeightSource + ?Sized>(
     dtype_out: DType,
 ) -> Result<(Vec<u8>, usize, usize)> {
     anyhow::ensure!(
-        bits == 4 || bits == 8,
-        "affine_dequant_b4: only bits=4 or bits=8 supported, got bits={bits}"
+        matches!(bits, 3 | 4 | 8),
+        "affine_dequant_b4: only bits=3, bits=4 or bits=8 supported, got bits={bits}"
     );
     anyhow::ensure!(
         matches!(dtype_out, DType::F16 | DType::BF16),
@@ -79,11 +88,20 @@ fn affine_dequant_b4_bytes<W: WeightSource + ?Sized>(
         w_shape.len(),
     );
 
-    // pack_factor = 32 / bits (8 for bits=4 U32-packed nibbles; 4 for bits=8
-    // U32-packed bytes). The packed weight is `[N, K / pack_factor]`.
-    let pack_factor = (32 / bits) as usize;
+    // Recover K from the packed width. MLX packs a continuous LSB-first
+    // bitstream, so packed cols = ceil(K * bits / 32) — with K a multiple of
+    // group_size (hence of 32) the division is exact and K = cols * 32 / bits
+    // (8 for bits=4 nibbles, 4 for bits=8 bytes, 3-byte groups of 8 for
+    // bits=3). The round-trip check below rejects a checkpoint quantized at a
+    // different width than this build's preset.
+    let packed_cols = w_shape[1];
     let n = w_shape[0];
-    let k = w_shape[1] * pack_factor;
+    let k = packed_cols * 32 / bits as usize;
+    anyhow::ensure!(
+        packed_cols * 32 % bits as usize == 0 && affine_packed_cols(k, bits) == packed_cols,
+        "affine_dequant_b4: packed `.weight` width {packed_cols} is not an exact \
+         bits={bits} packing of a K that is a multiple of group_size={group_size}"
+    );
     anyhow::ensure!(
         k.is_multiple_of(group_size as usize),
         "affine_dequant_b4: K={k} not divisible by group_size={group_size}"
@@ -161,7 +179,7 @@ fn affine_dequant_b4_concat<W: WeightSource + ?Sized>(
              in_features={k} at bits={bits} (pack_factor={}); this build expects \
              in_features={expected_in_features}. The checkpoint is quantized at a different \
              bit-width than this build's preset.",
-            32 / bits,
+            32f64 / bits as f64,
         );
         if let Some(prev_k) = k_shared {
             anyhow::ensure!(
@@ -257,7 +275,7 @@ fn take_affine_scales(weights: &mut GpuWeights, name: String) -> Result<GpuTenso
 
 impl MetalAffineQuantOps for AffineQuantLinear {
     /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
-    /// (`U32`, `[N, K/pack_factor]`), `<prefix>.scales` (`F16`,
+    /// (`U32`, `[N, ceil(K*bits/32)]`), `<prefix>.scales` (`F16`,
     /// `[N, K/group_size]`), `<prefix>.biases` (`F16`, same shape),
     /// and optional `<prefix>.bias` (model dtype, `[N]`).
     ///
@@ -277,7 +295,11 @@ impl MetalAffineQuantOps for AffineQuantLinear {
     ) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
         // The qmv / qmm_t / qvm / qmm_n kernels read scales and biases as
-        // the model's `SCALE_DTYPE` and cast to `T_act` in-register.
+        // the model's `SCALE_DTYPE` and cast to `T_act` in-register. Here the
+        // weight stays packed: in_features is recovered from the packed width
+        // via the ceil(K*bits/32) law (exact when K is a multiple of
+        // group_size; the round-trip check rejects a checkpoint quantized at
+        // a different width than this build's preset).
         let scales = take_affine_scales(weights, format!("{prefix}.scales"))?;
         let affine_biases = take_affine_scales(weights, format!("{prefix}.biases"))?;
         let bias_name = format!("{prefix}.bias");
@@ -286,21 +308,28 @@ impl MetalAffineQuantOps for AffineQuantLinear {
         } else {
             None
         };
-        let pack_factor = (32 / bits) as usize;
+        let packed_cols = weight.dim(1);
         let out_features = weight.dim(0);
-        let in_features = weight.dim(1) * pack_factor;
-        // Alignment check: the on-disk packed `.weight` must have exactly
-        // `K / pack_factor` columns for the compiled `bits`. If it doesn't,
-        // the checkpoint is quantized at a different bit-width than this
-        // build's quantization preset — reject it instead of running the
-        // qmv kernel against a mis-derived in_features (silent garbage).
+        let in_features = packed_cols * 32 / bits as usize;
+        let pack_factor = 32f64 / bits as f64;
+        // Alignment check: the on-disk packed `.weight` must be an exact
+        // bits-packing of the compiled `bits`. If it isn't, the checkpoint is
+        // quantized at a different bit-width than this build's quantization
+        // preset — reject it instead of running the qmv kernel against a
+        // mis-derived in_features (silent garbage).
         anyhow::ensure!(
-            in_features == expected_in_features as usize,
+            packed_cols * 32 % bits as usize == 0
+                && affine_packed_cols(in_features, bits) == packed_cols,
             "affine quant checkpoint/preset mismatch at `{prefix}`: packed `.weight` is \
-             [{out_features}, {}], implying in_features={in_features} at bits={bits} \
+             [{out_features}, {packed_cols}], implying in_features={in_features} at bits={bits} \
              (pack_factor={pack_factor}); this build expects in_features={expected_in_features}. \
              The checkpoint is quantized at a different bit-width than this build's preset.",
-            weight.dim(1),
+        );
+        anyhow::ensure!(
+            in_features == expected_in_features as usize,
+            "affine quant checkpoint/preset mismatch at `{prefix}`: packed `.weight` implies \
+             in_features={in_features} at bits={bits}, but this build expects \
+             in_features={expected_in_features}",
         );
         Ok(Self {
             weight,
@@ -540,7 +569,7 @@ pub trait MetalAffineEmbedOps {
 
 impl MetalAffineEmbedOps for AffineQuantEmbedding {
     /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
-    /// (`U32`, `[vocab, hidden / pack_factor]`), `<prefix>.scales`
+    /// (`U32`, `[vocab, ceil(hidden*bits/32)]`), `<prefix>.scales`
     /// (`F16`, `[vocab, hidden / group_size]`), `<prefix>.biases`
     /// (`F16`, same shape).
     ///
@@ -551,12 +580,12 @@ impl MetalAffineEmbedOps for AffineQuantEmbedding {
     fn load(weights: &mut GpuWeights, prefix: &str, group_size: u32, bits: u32) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
         // The affine_embed kernel reads scales and biases as the model's
-        // `SCALE_DTYPE` and casts to `T_act` in-register.
+        // `SCALE_DTYPE` and casts to `T_act` in-register. hidden_size is
+        // recovered from the packed width via the ceil(K*bits/32) law.
         let scales = take_affine_scales(weights, format!("{prefix}.scales"))?;
         let affine_biases = take_affine_scales(weights, format!("{prefix}.biases"))?;
-        let pack_factor = (32 / bits) as usize;
         let vocab_size = weight.dim(0);
-        let hidden_size = weight.dim(1) * pack_factor;
+        let hidden_size = weight.dim(1) * 32 / bits as usize;
         Ok(Self {
             weight,
             scales,

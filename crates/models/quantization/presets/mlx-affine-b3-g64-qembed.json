@@ -1,0 +1,7 @@
+{
+  "quantization_config": {
+    "bits": 3,
+    "group_size": 64,
+    "quant_embed": true
+  }
+}

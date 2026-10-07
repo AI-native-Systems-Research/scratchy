@@ -248,7 +248,7 @@ enum FieldLoad {
         bits: u32,
         /// In-features (K) the arch manifest declares for this linear.
         /// The metal loader asserts the on-disk packed `.weight` width is
-        /// `K / (32 / bits)`, rejecting a checkpoint quantized at different
+        /// `ceil(K*bits/32)`, rejecting a checkpoint quantized at different
         /// bits/group_size than this build's preset (else geometry is
         /// silently mis-derived from the on-disk shape).
         in_features: u32,
@@ -266,7 +266,7 @@ enum FieldLoad {
         bits: u32,
         /// Shared in-features (K) across the fused sources (gate_up / qkv all
         /// share K). The metal loader asserts each prefix's on-disk packed
-        /// `.weight` width is `K / (32 / bits)`. See [`FieldLoad::LinearAffine`].
+        /// `.weight` width is `ceil(K*bits/32)`. See [`FieldLoad::LinearAffine`].
         in_features: u32,
     },
     /// NVFP4 int4 quantized linear (Metal-only), single source. Emits
@@ -1691,7 +1691,7 @@ fn plan_field_load(
 
                     // Resolve the declared in_features (K) from the arch
                     // manifest so the loader can align the on-disk packed
-                    // `.weight` width against `K / (32 / bits)` and reject a
+                    // `.weight` width against `ceil(K*bits/32)` and reject a
                     // checkpoint quantized at different bits/group_size than
                     // this build's preset. Fused sources (gate_up / qkv) share
                     // K; a mismatch is an upstream manifest authoring error.
@@ -2430,7 +2430,10 @@ fn emit_fingerprint_check(
             // variant then gets the `ArchNotSupported` error (pointing at
             // quantizations.json) instead of corrupt output, and one that
             // DOES have a matching variant is routed to it deterministically
-            // regardless of variant registration order.
+            // regardless of variant registration order. (bits are
+            // discriminated by the `affine_bit_map_gate` below, which
+            // reads the effective per-role bits rather than the section
+            // default.)
             let scales_groups =
                 proc_macro2::Literal::usize_unsuffixed(hidden_size as usize / *group_size as usize);
             quote! {
@@ -2679,8 +2682,8 @@ fn emit_fingerprint_check(
     //   * dense `[vocab, hidden]` — every non-affine variant, AND
     //     the older mlx-affine convention for untied checkpoints
     //     (e.g. Llama-3-8B-Instruct-4bit).
-    //   * packed `[vocab, hidden / pack_factor]` (pack_factor =
-    //     32 / bits, so 8 for bits=4) — every mlx-affine TIED
+    //   * packed `[vocab, ceil(hidden*bits/32)]` (8 for bits=4) — every
+    //     mlx-affine TIED checkpoint
     //     checkpoint (embed IS the quantized lm_head, e.g.
     //     Llama-3.2-{1B,3B}-4bit) PLUS untied checkpoints whose
     //     preset opted in via `quant_embed: true` (e.g.
@@ -2717,10 +2720,11 @@ fn emit_fingerprint_check(
             // Use the embed's OWN bits, not the section default: MLX
             // mixed/dynamic checkpoints (OptiQ) pack `embed_tokens` at
             // 8-bit (hidden/4) while the default is 4-bit (hidden/8).
+            // Packed width follows the ceil(hidden*bits/32) law — bits=3
+            // packs 8 elements per 3 bytes, so it is NOT hidden/(32/bits).
             let bits = crate::quantization::affine_embed_bits(method).unwrap_or(4);
-            let pack_factor = 32u64 / (bits as u64);
-            let packed = hidden_size / pack_factor;
-            let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
+            let packed = (hidden_size * bits as u64).div_ceil(32) as usize;
+            let lit = proc_macro2::Literal::usize_unsuffixed(packed);
             quote! { #lit }
         }
         _ => quote! { #hidden_lit },

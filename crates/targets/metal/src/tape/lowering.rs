@@ -2299,10 +2299,13 @@ fn lower_one(
                 // `_b_8_` instantiations (byte-per-element W-loader,
                 // same MMA) — the dominant Gemma4 prefill lever (the
                 // b8 MLP was ~77% of prefill GPU time on the Standard
-                // kernel). SplitK stays b4-only, so a b8 SplitK pick
-                // downgrades to Standard.
+                // kernel). 3-bit has `_b_3_` instantiations too (the
+                // QuantizedBlockLoader's index math is bits=3-exact;
+                // MLX's own qdot bits==3 shifts are vendored into
+                // metal_nax.h's dequantize). SplitK stays b4-only, so
+                // any non-b4 SplitK pick downgrades to Standard.
                 let kernel = match pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs, is_nax) {
-                    QmmTKernel::SplitK { .. } if *bits == 8 => QmmTKernel::Standard,
+                    QmmTKernel::SplitK { .. } if *bits != 4 => QmmTKernel::Standard,
                     k => k,
                 };
                 // NAX tile is 64×64 so align check uses 64; Standard/SplitK use 32.
@@ -2328,7 +2331,8 @@ fn lower_one(
                     // flip to an 8-bit weight would mis-resolve to a b4 symbol
                     // (the with-compute name builder omits `bits`) and decode
                     // 8-bit as 4-bit → silent garbage (OptiQ on M1). 8-bit
-                    // keeps same-compute bf16 → the existing b8 kernel.
+                    // keeps same-compute bf16 → the existing b8 kernel; 3-bit
+                    // likewise has no `_c_f16_` instantiation.
                     && bits_v == 4;
                 let compute_dtype = if f16_compute_eligible {
                     DequantDtype::F16
@@ -2342,6 +2346,11 @@ fn lower_one(
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax)
                         && codes == super::kernel_constants::AffineCodes::Offset8
+                        // Offset8 already implies b4 (`for_bits`), but state
+                        // it: the W4A8 GEMM multiplies int4 codes on the
+                        // matrix unit's int8 lane — a 3-bit bitstream would
+                        // misalign there.
+                        && bits_v == 4
                         && matches!(gs, 64 | 128)
                         && k_v.is_multiple_of(64)
                         && bucket_m.is_multiple_of(W4A8_TILE_ROWS)
@@ -2885,10 +2894,11 @@ fn lower_one(
             let bits_v = *bits;
             let gs = *group_size;
             assert!(
-                matches!(bits_v, 4 | 8),
-                "AffineEmbed: only bits ∈ {{4, 8}} is wired (4-bit default; \
+                matches!(bits_v, 3 | 4 | 8),
+                "AffineEmbed: only bits ∈ {{3, 4, 8}} is wired (4-bit default; \
                  8-bit for MLX-native mixed/dynamic quant like OptiQ whose \
-                 embed_tokens is 8-bit); got bits={bits_v}"
+                 embed_tokens is 8-bit; 3-bit for GLM-4.5-Air-3bit's quantized \
+                 embed); got bits={bits_v}"
             );
             assert!(
                 matches!(gs, 32 | 64 | 128),
@@ -2904,11 +2914,17 @@ fn lower_one(
             // wrong width yielded out-of-bounds `gindex` into scales
             // and garbage embed output (silent, no fault).
             let hidden_size = p.hidden_size as u32;
-            // Packed bytes per token row = hidden * bits / 8: bits=4 packs
-            // 2 codes/byte (hidden/2), bits=8 packs 1 code/byte (hidden).
-            // One thread per packed byte.
-            let bytes_per_row = hidden_size * bits_v / 8;
-            let groups_x = bytes_per_row.div_ceil(THREADS_PER_GROUP);
+            // Grid: bits=4 packs 2 codes/byte (hidden/2 threads), bits=8
+            // packs 1 code/byte (hidden threads) — one thread per packed
+            // byte. bits=3 packs 8 codes per 3 bytes — one thread per
+            // 8-element pack (hidden/8 threads), since the group is
+            // byte-anchored (group_size is a multiple of 8).
+            let packs_per_row = if bits_v == 3 {
+                hidden_size / 8
+            } else {
+                hidden_size * bits_v / 8
+            };
+            let groups_x = packs_per_row.div_ceil(THREADS_PER_GROUP);
             LoweredCommand {
                 kernel: KernelId::AffineEmbed,
                 library: "quantized_dequantize",
@@ -5980,10 +5996,11 @@ fn rope_append_normed_kernel_static_name(
 }
 
 /// Format the kernel symbol name for an `AffineEmbed` lowering.
-/// Matches the `DEFINE_AFFINE_EMBED_B{4,8}` macro invocations in
+/// Matches the `DEFINE_AFFINE_EMBED_B{3,4,8}` macro invocations in
 /// `shaders/quantized_dequantize.metal`
 /// (`affine_embed_<dtype>_s_<scale_dtype>_gs_<gs>_b_<bits>`). bits=8 is
-/// for MLX-native mixed/dynamic quant (OptiQ) 8-bit embeddings.
+/// for MLX-native mixed/dynamic quant (OptiQ) 8-bit embeddings; bits=3
+/// for GLM-4.5-Air-3bit's quantized embed.
 fn affine_embed_kernel_static_name(
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
@@ -5995,8 +6012,8 @@ fn affine_embed_kernel_static_name(
         "affine_embed_kernel_static_name: unsupported group_size={group_size} — only 32/64/128"
     );
     assert!(
-        matches!(bits, 4 | 8),
-        "affine_embed_kernel_static_name: unsupported bits={bits} — only 4/8 instantiated"
+        matches!(bits, 3 | 4 | 8),
+        "affine_embed_kernel_static_name: unsupported bits={bits} — only 3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     leak_symbol(format!("affine_embed_{d}_s_{s}_gs_{group_size}_b_{bits}"))
@@ -6264,8 +6281,8 @@ fn affine_gather_qmv_kernel(
         "affine_gather_qmv_kernel: unsupported group_size={group_size} — only 32/64/128 instantiated"
     );
     assert!(
-        matches!(bits, 4 | 8),
-        "affine_gather_qmv_kernel: unsupported bits={bits} — only 4/8 instantiated"
+        matches!(bits, 3 | 4 | 8),
+        "affine_gather_qmv_kernel: unsupported bits={bits} — only 3/4/8 instantiated"
     );
     // MLX-native mixed/dynamic quant (OptiQ) ships 8-bit experts on the
     // sensitive edge layers; the `_b_{bits}` suffix selects the matching
@@ -6297,8 +6314,8 @@ fn affine_gather_qmm_t_symbol(
         "affine_gather_qmm_t_symbol: unsupported group_size={group_size} — only 32/64/128"
     );
     assert!(
-        matches!(bits, 4 | 8),
-        "affine_gather_qmm_t_symbol: unsupported bits={bits} — only 4/8 instantiated"
+        matches!(bits, 3 | 4 | 8),
+        "affine_gather_qmm_t_symbol: unsupported bits={bits} — only 3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     let aln = if aligned_n { "true" } else { "false" };
@@ -6321,8 +6338,8 @@ fn affine_gather_qmm_t_nax_symbol(
         "affine_gather_qmm_t_nax_symbol: unsupported group_size={group_size} — NAX gather is gs 64/128 only"
     );
     assert!(
-        matches!(bits, 4 | 8),
-        "affine_gather_qmm_t_nax_symbol: unsupported bits={bits} — only 4/8 instantiated"
+        matches!(bits, 3 | 4 | 8),
+        "affine_gather_qmm_t_nax_symbol: unsupported bits={bits} — only 3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     leak_symbol(format!(
@@ -7044,7 +7061,12 @@ fn lower_moe_step(
             }
             if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
-                let use_nax = at.is_nax && n_out.is_multiple_of(64) && matches!(gs, 64 | 128);
+                // bits=3 rides NAX like 4/8: the loader's index math is
+                // bits=3-exact and metal_nax.h carries the dequantize branch.
+                let use_nax = at.is_nax
+                    && n_out.is_multiple_of(64)
+                    && matches!(gs, 64 | 128)
+                    && matches!(bits, 3 | 4 | 8);
                 let (kernel, library, symbol, tile) = if use_nax {
                     let symbol = affine_gather_qmm_t_nax_symbol(dtype, scale_dtype, gs, bits);
                     (
@@ -8871,7 +8893,10 @@ mod tests {
         };
         let k = ConstantValue::uint;
         let bits = TQ_BITS.get();
-        let (hd, vpw) = (p.head_dim, 32 / bits);
+        // vpw comes from `vals_per_word` (10 at bits=3 — no straddling), not
+        // `32 / bits`, which only agrees with it by floor-division coincidence.
+        let vpw = scratchy_layers::turboquant::vals_per_word(bits) as u32;
+        let hd = p.head_dim;
         let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
         let writer = tape.commands[0].command;
         assert_eq!(writer.kernel, KernelId::RopeAppend);
