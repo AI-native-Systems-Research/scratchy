@@ -4870,6 +4870,10 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "maximum" => OpFunc::Maximum,
         "minimum" => OpFunc::Minimum,
         "qfp8ch" => OpFunc::Qfp8ch,
+        "lesserthan" => OpFunc::LesserThan,
+        "equal" => OpFunc::Equal,
+        "notequal" => OpFunc::NotEqual,
+        "where3" => OpFunc::Where3,
         other => panic!(
             "op_func_from_str: unknown op name {other:?} — would have silently become `add` \
              (wrong op). Add an explicit arm or fix the caller."

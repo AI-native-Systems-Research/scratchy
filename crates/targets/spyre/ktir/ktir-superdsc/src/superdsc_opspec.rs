@@ -1348,6 +1348,25 @@ pub enum OpFunc {
     /// compute step, not an unproven skip. (If we ever drop the clamp it MUST be gated by a Kani proof of
     /// the fp16 bound.) Output tensor is `_fp8`-named so the residency + `matmulfp8` dispatch activate.
     Qfp8ch,
+    /// `lesserthan` — elementwise `a < b` as a 0/1 fp16 tensor (SFP unit; broadcast_ops.ddl:40).
+    /// The vendor realizes it as `LESSERTHAN` into a BOOL state reg, then `SELECT(plus1, zero)` —
+    /// so the wire-level result IS fp16 0.0/1.0, the exact shape every pointwise assembler here
+    /// already emits (same arity-2 broadcast op as `maximum`/`minimum`). NaN compares FALSE on the
+    /// SFP unit, matching the emulator's ordered `cmpf olt` — the MoE argsort's NaN→+inf sanitize
+    /// runs BEFORE this op, so no unsanitized NaN ever reaches one.
+    LesserThan,
+    /// `equal` — elementwise `a == b` as 0/1 fp16 (SFP unit; broadcast_ops.ddl:41, `EQUAL` +
+    /// SELECT). Used by the MoE router's one-hot selectors: `equal(x, splat(target))` masks a
+    /// single matching lane and the `sum` reduce extracts it.
+    Equal,
+    /// `notequal` — elementwise `a != b` as 0/1 fp16 (SFP unit; broadcast_ops.ddl:42, `NOTEQUAL` +
+    /// SELECT).
+    NotEqual,
+    /// `where3` — elementwise `cond ? a : b` over THREE fp16 tensors (SFP unit;
+    /// broadcast_ops.ddl:36): `NOTEQUAL(cond, zero)` into the state reg, then `SELECT(a, b)`. The
+    /// select primitive of the MoE port's sanitize/extract chains; the `cond` operand may
+    /// broadcast.
+    Where3,
 }
 
 impl OpFunc {
@@ -1408,6 +1427,12 @@ impl OpFunc {
             OpFunc::Maximum => "maximum",
             OpFunc::Minimum => "minimum",
             OpFunc::Qfp8ch => "qfp8ch",
+            // dxp's recognized names, per broadcast_ops.ddl's operation_binds and
+            // dscdefn.cpp opFuncsToString (LESSERTHAN/EQUAL/NOTEQUAL/WHERE3 enums).
+            OpFunc::LesserThan => "lesserthan",
+            OpFunc::Equal => "equal",
+            OpFunc::NotEqual => "notequal",
+            OpFunc::Where3 => "where3",
         }
     }
 
