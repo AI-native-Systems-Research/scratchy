@@ -1555,7 +1555,7 @@ fn check_per_row(c: Case, kernel: PerRow) {
                 "attention_steel_nax_paged",
                 nax.symbol.to_owned(),
                 Some(steel_debug),
-                q_blocks(64),
+                q_blocks(nax.bq as usize),
                 tg(nax.threads as usize, 1, 1),
             )
         }

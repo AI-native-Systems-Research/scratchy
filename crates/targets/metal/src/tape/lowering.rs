@@ -3357,7 +3357,28 @@ fn lower_one(
         // 4 block_table, 5 K cache (per-layer), 6 V cache (per-layer).
         // Dispatch matches `AttentionPrefillSdpa` (1 Q per
         // threadgroup, head on grid X, Q on grid Y, 1024 threads).
-        I::AttentionPrefillPaged(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing) => {
+        I::AttentionPrefillPaged(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing)
+        | I::SlidingAttentionPrefillPaged(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing) =>
+        {
+            // One paged prefill for both attention classes: the GLOBAL class's geometry (on
+            // uniform arches the only one), or the SLIDING class's (Gemma's local layers) with its
+            // window. A windowed tile kernel skips K-tiles wholly older than the window, making
+            // windowed prefill O(T·window).
+            let sliding = matches!(inst, I::SlidingAttentionPrefillPaged(..));
+            debug_assert!(
+                !sliding || p.sliding_window > 0,
+                "SlidingAttentionPrefillPaged lowered with SLIDING_WINDOW <= 0"
+            );
+            let (head_dim, num_kv_heads, block_size, window) = if sliding {
+                (p.head_dim, p.num_kv_heads, p.block_size, p.sliding_window)
+            } else {
+                (
+                    p.global_head_dim,
+                    p.num_global_kv_heads,
+                    p.global_block_size,
+                    0,
+                )
+            };
             // ── hd512 UNFUSED attention (gemma4 GLOBAL class, head_dim 512) ──
             // The fused gqa_shared kernel is O(T²) and slow for head_dim 512
             // (it dominated 30k prefill). Replace it with mlx-style UNFUSED
@@ -3400,18 +3421,32 @@ fn lower_one(
             // The unfused kernels read sequence 0 only (`seq_used[0]`,
             // `cu_seqlens_q[1] - cu_seqlens_q[0]`): they serve single-sequence
             // steps, and the paged attention below the rest.
+            let steel_dtype_tag: &str = match p.metal_dtype {
+                crate::tape::lowered::MetalDtype::Bf16 => "bf16",
+                _ => "f16",
+            };
+            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+            let nax_kernel = if is_nax {
+                crate::steel_paged::nax_paged_kernel(steel_dtype_tag, head_dim, block_size)
+            } else {
+                None
+            };
+            // The fused NAX kernel takes the hd512 global class where it has an instantiation.
             #[allow(clippy::overly_complex_bool_expr)]
-            let hd512_unfused =
-                HD512_UNFUSED_CONTINUATION_OK && p.global_head_dim > 256 && p.rope_on_read;
+            let hd512_unfused = HD512_UNFUSED_CONTINUATION_OK
+                && !sliding
+                && head_dim > 256
+                && p.rope_on_read
+                && nax_kernel.is_none();
             let unfused = if hd512_unfused {
                 use crate::specialized_pipeline_cache::ConstantValue as CV;
                 let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
-                let (rd, po, _on, _bind) = rope_on_read_params(p, true);
+                let (rd, po, _on, _bind) = rope_on_read_params(p, !sliding);
                 let nh = p.num_q_heads;
-                let nkv = p.num_global_kv_heads.max(1);
+                let nkv = num_kv_heads.max(1);
                 let gqa = nh / nkv;
-                let hd = p.global_head_dim;
-                let bs = p.global_block_size;
+                let hd = head_dim;
+                let bs = block_size;
                 let lq = bucket_m;
                 let too_large = || LoweringError::ScratchTooLarge {
                     scratch: super::lowered::ScratchKind::AttnUnfused,
@@ -3450,7 +3485,7 @@ fn lower_one(
                     kind,
                     binding_index: bi,
                 };
-                let table = w.table(true)?;
+                let table = w.table(!sliding)?;
                 let cossin = |bi: u8| source(table, WeightTensor::Weight, lid, bi);
                 let tg1 = |g: (u32, u32, u32)| DispatchShape {
                     threadgroups: (g.0.div_ceil(64), g.1, g.2),
@@ -3545,7 +3580,7 @@ fn lower_one(
                                 CV::int(0, hd as i32), // QMM_K = hd; N is live (seq_used)
                                 CV::int(2, lq as i32), // QMM_M = Lq
                                 // QK_SPAN_BLOCK_NAX = span_ids block size (== the
-                                // gather's `bs` = p.global_block_size), drives the
+                                // gather's `bs` = block_size), drives the
                                 // block-diagonal bound. MUST match span_ids layout.
                                 CV::uint(3, bs),
                             ],
@@ -3556,7 +3591,7 @@ fn lower_one(
                             "gemm",
                             "gemm_bf16_qk",
                             // GEMM_M=Lq, GEMM_K=hd; QK_SPAN_BLOCK = span_ids block
-                            // size (== the gather's `bs` = p.global_block_size).
+                            // size (== the gather's `bs` = block_size).
                             vec![CV::uint(0, lq), CV::uint(2, hd), CV::uint(3, bs)],
                             tg_gemm_steel(max_kv, lq),
                         )
@@ -3695,13 +3730,12 @@ fn lower_one(
             // means the (library, function, KERNEL_ID) trio comes from
             // one source. Bug class #8 — drift between the three
             // independent `&'static str` fields — can't recur.
-            use crate::steel_paged::{nax_paged_kernel, steel_paged_symbol};
-            // Spans rope-on-read (GLOBAL class). All-None when !ROPE_ON_READ.
-            let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, true);
+            use crate::steel_paged::steel_paged_symbol;
+            // Spans rope-on-read, the class's. All-None when !ROPE_ON_READ.
+            let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, !sliding);
+            // The simdgroup steel kernel's Q rows a threadgroup; a NAX instantiation carries its own
+            // (`NaxPagedKernel::bq`).
             const BQ_STEEL: u32 = 32;
-            // NAX kernel tiles queries in BQ=64 blocks (4 warps × 16-row
-            // NAX Q-frags), vs the simdgroup steel kernel's BQ=32.
-            const BQ_NAX: u32 = 64;
             // Steel attention paged needs an instantiation in
             // `attention_steel_paged.metal` for the model's HEAD_DIM
             // (BD template arg). The instantiation list is owned by
@@ -3715,27 +3749,17 @@ fn lower_one(
             // instance lookup fails or, worse, links to the wrong
             // `_bd<X>_` symbol — verified on Llama-3.2-1B, HEAD_DIM=64,
             // before the lookup-driven gate landed).
-            let steel_dtype_tag: &str = match p.metal_dtype {
-                crate::tape::lowered::MetalDtype::Bf16 => "bf16",
-                _ => "f16",
-            };
             // NAX matrix-accelerator paged attention (M5+/A19+ only —
             // `is_nax_capable` gates on arch gen ≥ 17). The NAX kernel
-            // (`attention_steel_nax_paged`, BQ64/BK32/BD128) drives the
-            // Apple matrix accelerator via MPP `matmul2d` and runs ~3.56×
-            // the simdgroup steel kernel on the Llama-3B prefill shape
-            // (11.76 vs 3.3 TFLOP/s). Only instantiated for head_dim 128,
-            // so it serves Llama-3.x (hd 128) prefill; everything else
-            // falls through to the simdgroup steel path below.
-            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
-            let nax_kernel = if is_nax {
-                nax_paged_kernel(steel_dtype_tag, p.global_head_dim, p.global_block_size)
-            } else {
-                None
-            };
+            // (`attention_steel_nax_paged`) drives the Apple matrix accelerator via
+            // MPP `matmul2d`: ~3.5× the simdgroup steel kernel on the Llama-3B
+            // prefill shape (11.8 vs 3.3 TFLOP/s) and on Qwen3.6's head_dim 256
+            // (8.5 vs 2.5). Instantiated for head_dims 64 / 128 / 256 over 16-token
+            // pages (`nax_paged_kernel`); everything else falls through to the
+            // simdgroup steel path below.
             // Class head_dim: 512 has no steel instantiation, so
             // Gemma4 global prefill auto-falls-back to SDPA-paged.
-            let steel_symbol = steel_paged_symbol(steel_dtype_tag, p.global_head_dim);
+            let steel_symbol = steel_paged_symbol(steel_dtype_tag, head_dim);
             // Chunked-prefill long-context correctness (the launch-claude bug):
             // the steel/NAX/gqa_shared paged prefill reads pre-roped K from the
             // rope-once-to-scratch buffer (`p.rope_on_read` is the universal
@@ -3754,18 +3778,22 @@ fn lower_one(
             // share the same bindings/constants and a per-(BQ-block, q_head)
             // grid with seq on Z.
             let use_nax = use_steel && nax_kernel.is_some();
-            let bq_steel = if use_nax { BQ_NAX } else { BQ_STEEL };
+            let bq_steel = match nax_kernel.filter(|_| use_nax) {
+                Some(nax) => nax.bq,
+                None => BQ_STEEL,
+            };
             // GQA-cooperative fallback selection (see the longer comment at the
             // dispatch site below). Computed early so `constants.k_scratch` (slot
             // 11) can be set when the gqa_shared kernel reads pre-roped K from
             // the rope-once scratch. head_dim 512 (gemma4 global) has no steel
             // instantiation → use_steel is false → this path is taken.
-            let gqa = p.num_q_heads / p.num_global_kv_heads.max(1);
-            let use_gqa_shared = !use_steel
+            let gqa = p.num_q_heads / num_kv_heads.max(1);
+            let use_gqa_shared = !sliding
+                && !use_steel
                 && (8..=32).contains(&gqa)
-                && p.global_head_dim.is_multiple_of(32)
-                && p.global_head_dim <= 512
-                && p.global_block_size <= 64;
+                && head_dim.is_multiple_of(32)
+                && head_dim <= 512
+                && block_size <= 64;
             // Spans rope-once-to-scratch on the gqa_shared path: K is roped ONCE
             // into the shared scratch by a preceding RopeOnceGqaShared command,
             // and the attention reads pre-roped K (slot 7 = scratch, ATTN_K_SCRATCH
@@ -3775,6 +3803,13 @@ fn lower_one(
             // single-sequence steps.
             let rope_once = p.rope_on_read && unfused.is_none();
             let gqa_shared_spans = use_gqa_shared && rope_once;
+            let nax_spans = use_nax && rope_once;
+            let steel_spans = use_steel && !use_nax && rope_once;
+            // The sliding class's simdgroup steel spans reads pre-roped K from the scratch with
+            // rope-on-read off, so the kb-loop span seek runs on its own gate (`self_only`): a
+            // Relocatable span must not attend the preamble at any sliding layer, or its K/V is
+            // not a pure function of its bytes (the spans reuse contract).
+            let sliding_steel_spans = sliding && steel_spans;
             let constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 // Paged prefill attends the whole cached sequence on a
                 // continuation chunk → FullSeqUsed. Resolved once here; the
@@ -3782,23 +3817,23 @@ fn lower_one(
                 geom: super::continuation_witness::KvGeometry::resolve(
                     super::continuation_witness::KvAxis::FullSeqUsed,
                 ),
-                // GLOBAL class on hybrid arches; identity on uniform
+                // The class's: GLOBAL or SLIDING on hybrid arches; identity on uniform
                 // models (see the decode arm note).
-                head_dim: super::ids::HeadDim(p.global_head_dim),
+                head_dim: super::ids::HeadDim(head_dim),
                 num_q_heads: super::ids::NumQHeads(p.num_q_heads),
-                num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
+                num_kv_heads: super::ids::NumKvHeads(num_kv_heads),
                 attn_scale: super::ids::AttnScale(p.attn_scale),
-                // GLOBAL class block size (page-unified; Gemma4: 32).
-                block_size: super::ids::BlockSize(p.global_block_size),
+                // The class's block size (page-unified; Gemma4 global: 32).
+                block_size: super::ids::BlockSize(block_size),
                 // Prefill kernels (steel + sdpa paged) stay at the standard
                 // BPC; the steel loader (paged_loader.h) has its own chunk
                 // arithmetic that hasn't been adapted to the BPC=0 fast
                 // path. Decode reader (AttentionViaCache) is the only kernel
                 // currently consulting `attention_blocks_per_chunk(chunked)`.
                 blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-                // Full attention: window disabled (both kernels read
-                // slot 7; 0 folds every window branch away).
-                window: super::ids::AttnWindow(0),
+                // The sliding class's window; 0 (full attention) folds every window branch
+                // away. Every kernel here reads slot 7.
+                window: super::ids::AttnWindow(window),
                 // Steel kernel reads slot 99; omitting it leaves Metal
                 // undefined and the kernel can hit a diagnostic path
                 // (the b3ddb3b46 regression). sdpa_vector ignores it.
@@ -3809,13 +3844,10 @@ fn lower_one(
                 },
                 rot_dim: ror_rd,
                 pair_off: ror_po,
-                rope_on_read: ror_on,
+                rope_on_read: if sliding_steel_spans { None } else { ror_on },
                 // Slot 11: gqa_shared reads pre-roped K from the scratch.
                 k_scratch: if gqa_shared_spans { Some(1) } else { None },
-                // This arm runs the span seek via ATTN_PAGED_ROR (ror_on above);
-                // the decoupled self-only gate is only needed by the sliding
-                // arm, which runs with ROR off.
-                self_only: None,
+                self_only: if sliding_steel_spans { Some(1) } else { None },
             };
             // Spans (rope-once-to-scratch): when a steel-family kernel (NAX
             // matrix-accel OR simdgroup steel) OR the GQA-cooperative shared
@@ -3835,8 +3867,6 @@ fn lower_one(
             // row and re-roping flagged (bit-31) blocks in-kernel — sdpa-paged
             // for steel/NAX, gqa_shared without the scratch for gqa_shared.
             // `route_by_sequence_count` attaches the gates.
-            let nax_spans = use_nax && rope_once;
-            let steel_spans = use_steel && !use_nax && rope_once;
             // NAX, simdgroup steel, and gqa_shared all read pre-roped K from the
             // shared `Binding::RopedKScratch` at slot 7 (the rope-once-to-scratch
             // pattern); they share the scratch-source binding flag.
@@ -3862,11 +3892,14 @@ fn lower_one(
             let plain_constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 rope_on_read: None,
                 k_scratch: None,
+                self_only: None,
                 ..constants
             };
             let reroping_constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 debug_mode: None,
                 k_scratch: None,
+                rope_on_read: ror_on,
+                self_only: None,
                 ..constants
             };
             let sdpa_paged =
@@ -3889,10 +3922,10 @@ fn lower_one(
                 // because BD lives in the symbol name; see the
                 // comment in `kernel_identity.rs`.
                 //
-                // NAX (matrix-accelerator) wins when its symbol is present
-                // (M5+, head_dim 128); it shares the simdgroup steel
-                // kernel's bindings/constants and only swaps the
-                // library/function pair. Falls back to the simdgroup
+                // NAX (matrix-accelerator) wins when it has an instantiation
+                // (M5+, `nax_paged_kernel`); it shares the simdgroup steel
+                // kernel's bindings/constants and swaps the library/function
+                // pair and the thread count. Falls back to the simdgroup
                 // `attention_steel_paged` symbol otherwise.
                 let (library, function, threads) = match nax_kernel.filter(|_| use_nax) {
                     Some(nax) => ("attention_steel_nax_paged", nax.symbol, nax.threads),
@@ -3917,15 +3950,16 @@ fn lower_one(
                     // steel/NAX attention reads pre-roped K from the scratch;
                     // (3) its sdpa-paged twin for steps with several sequences.
                     // Pick the rope-once kernel matching the selected attention
-                    // kernel: NAX (hd128 only) → `rope_once_nax`; simdgroup steel
-                    // (hd 64/96/128/256, incl. SmolLM hd64) → `rope_once_steel`.
+                    // kernel: NAX → `rope_once_nax`; simdgroup steel (hd
+                    // 64/96/128/256, incl. SmolLM hd64) → `rope_once_steel`.
                     let (rope_kernel, rope_library, rope_sym) = if use_nax {
                         (
                             KernelId::RopeOnceNax,
                             "attention_steel_nax_paged",
                             crate::steel_paged::rope_once_nax_symbol(
                                 steel_dtype_tag,
-                                p.global_head_dim,
+                                head_dim,
+                                block_size,
                             )
                             .expect("rope_once_nax_symbol is Some when use_nax is true"),
                         )
@@ -3933,14 +3967,11 @@ fn lower_one(
                         (
                             KernelId::RopeOnceSteel,
                             "attention_steel_paged",
-                            crate::steel_paged::rope_once_steel_symbol(
-                                steel_dtype_tag,
-                                p.global_head_dim,
-                            )
-                            .expect(
-                                "rope_once_steel_symbol is Some when use_steel is true \
+                            crate::steel_paged::rope_once_steel_symbol(steel_dtype_tag, head_dim)
+                                .expect(
+                                    "rope_once_steel_symbol is Some when use_steel is true \
                                  (steel head_dim instantiated)",
-                            ),
+                                ),
                         )
                     };
                     let elem_bytes = match p.metal_dtype {
@@ -3952,23 +3983,17 @@ fn lower_one(
                     // continuation attends the whole sequence, so the scratch must
                     // hold every logical block the attention reads. The grid's y is
                     // the step's block-table width, which the worker sets per step.
-                    let bucket_pages = bucket_m.div_ceil(p.global_block_size);
+                    let bucket_pages = bucket_m.div_ceil(block_size);
                     let num_pages = block_cap.max(bucket_pages);
                     let scratch_bytes = roped_k_bytes(
-                        [
-                            num_pages,
-                            p.num_global_kv_heads,
-                            p.global_block_size,
-                            p.global_head_dim,
-                            elem_bytes,
-                        ],
+                        [num_pages, num_kv_heads, block_size, head_dim, elem_bytes],
                         block_cap,
                     )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
                     // y = one logical block per row (the bucket's, until the worker sets the step's).
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
-                    let rope_threads = p.num_global_kv_heads * p.global_block_size * rot_half;
+                    let rope_threads = num_kv_heads * block_size * rot_half;
                     let rope_cmd = LoweredCommand {
                         kernel: rope_kernel,
                         library: rope_library,
@@ -3982,7 +4007,7 @@ fn lower_one(
                         },
                         bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
                             kv_layer: super::ids::LayerId(*layer + layer_offset),
-                            table: w.table(true)?,
+                            table: w.table(!sliding)?,
                         }
                         .into_baked(),
                         gemm_dims: None,
@@ -4012,7 +4037,7 @@ fn lower_one(
                             // One TG per (kv_head, query); `32 × gqa`
                             // threads = one simdgroup per q-head (gqa <=
                             // 32 keeps this within the 1024-thread cap).
-                            threadgroups: (p.num_global_kv_heads, bucket_m, 1),
+                            threadgroups: (num_kv_heads, bucket_m, 1),
                             threads_per_threadgroup: (32 * gqa, 1, 1),
                             m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                                 seq_axis: None,
@@ -4043,16 +4068,10 @@ fn lower_one(
                     // continuation attends the whole sequence, so the scratch must
                     // hold every logical block the attention reads. The grid's y is
                     // the step's block-table width, which the worker sets per step.
-                    let bucket_pages = bucket_m.div_ceil(p.global_block_size);
+                    let bucket_pages = bucket_m.div_ceil(block_size);
                     let num_pages = block_cap.max(bucket_pages);
                     let scratch_bytes = roped_k_bytes(
-                        [
-                            num_pages,
-                            p.num_global_kv_heads,
-                            p.global_block_size,
-                            p.global_head_dim,
-                            elem_bytes,
-                        ],
+                        [num_pages, num_kv_heads, block_size, head_dim, elem_bytes],
                         block_cap,
                     )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
@@ -4060,7 +4079,7 @@ fn lower_one(
                     // y = one logical block per row (the bucket's, until the worker sets the step's).
                     // Same decode as the rope_once_gqa_shared kernel's gid.x.
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
-                    let rope_threads = p.num_global_kv_heads * p.global_block_size * rot_half;
+                    let rope_threads = num_kv_heads * block_size * rot_half;
                     let rope_cmd = LoweredCommand {
                         kernel: KernelId::RopeOnceGqaShared,
                         library: "attention",
@@ -4076,7 +4095,7 @@ fn lower_one(
                         // table, k_cache, seq_used_k, class-resolved cos_sin).
                         bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
                             kv_layer: super::ids::LayerId(*layer + layer_offset),
-                            table: w.table(true)?,
+                            table: w.table(!sliding)?,
                         }
                         .into_baked(),
                         gemm_dims: None,
@@ -4151,195 +4170,6 @@ fn lower_one(
                 }
                 .into_baked(),
                 gemm_dims: None,
-            }
-        }
-
-        // ── Sliding-window paged prefill (Gemma2/3/4 local layers) ──
-        // Same steel-vs-SDPA routing as `AttentionPrefillPaged`, with
-        // the BASE-class geometry (sliding head_dim/kv heads) and
-        // `ATTN_WINDOW = p.sliding_window` (fn-const slot 7, read by
-        // both kernels). The steel kernel additionally SKIPS K-tiles
-        // entirely older than the window (`kb_start`), making windowed
-        // prefill O(T·window) — the dominant Gemma-family TTFT lever
-        // (sliding layers are 40 of Gemma4-12B's 48).
-        I::SlidingAttentionPrefillPaged(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing) => {
-            debug_assert!(
-                p.sliding_window > 0,
-                "SlidingAttentionPrefillPaged lowered with SLIDING_WINDOW <= 0"
-            );
-            use crate::steel_paged::steel_paged_symbol;
-            // Spans rope-on-read (SLIDING class). All-None when !ROPE_ON_READ.
-            let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, false);
-            const BQ_STEEL: u32 = 32;
-            let steel_dtype_tag: &str = match p.metal_dtype {
-                crate::tape::lowered::MetalDtype::Bf16 => "bf16",
-                _ => "f16",
-            };
-            // BASE class head_dim (sliding layers) — Gemma4: 256,
-            // which IS instantiated, so sliding prefill gets steel
-            // while the 512-wide global class falls back to SDPA.
-            let steel_symbol = steel_paged_symbol(steel_dtype_tag, p.head_dim);
-            let use_steel = steel_symbol.is_some() && bucket_m >= BQ_STEEL;
-            // Spans rope-once-to-scratch (SLIDING class): when the sliding
-            // steel kernel (hd256, never NAX/gqa_shared) is selected AND
-            // rope-on-read is active, K is roped ONCE into the shared scratch
-            // by a preceding RopeOnceSteel command (SLIDING geometry +
-            // SLIDING cos_sin), and the attention reads pre-roped K from the
-            // scratch (slot 7) with no in-kernel rotation. Mirrors the
-            // `steel_spans` path in the global AttentionPrefillPaged arm.
-            let steel_spans = use_steel && p.rope_on_read;
-            let constants = super::kernel_constants::AttentionPrefillPagedConstants {
-                // Paged prefill attends the whole cached sequence on a
-                // continuation chunk → FullSeqUsed. Resolved once here; the
-                // witness is a required field so no arm can skip it.
-                geom: super::continuation_witness::KvGeometry::resolve(
-                    super::continuation_witness::KvAxis::FullSeqUsed,
-                ),
-                head_dim: super::ids::HeadDim(p.head_dim),
-                num_q_heads: super::ids::NumQHeads(p.num_q_heads),
-                num_kv_heads: super::ids::NumKvHeads(p.num_kv_heads),
-                attn_scale: super::ids::AttnScale(p.attn_scale),
-                block_size: super::ids::BlockSize(p.block_size),
-                blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-                window: super::ids::AttnWindow(p.sliding_window),
-                // Steel reads slot 99 (the b3ddb3b46 lesson);
-                // sdpa_vector declares no slot 99.
-                debug_mode: if use_steel {
-                    Some(super::ids::AttnDebugMode(0))
-                } else {
-                    None
-                },
-                rot_dim: ror_rd,
-                pair_off: ror_po,
-                // Steel spans reads pre-roped K from the scratch, so the
-                // in-kernel rope is OFF; the non-spans path keeps ror_on.
-                rope_on_read: if steel_spans { None } else { ror_on },
-                // Sliding prefill is the steel/sdpa path, not gqa_shared;
-                // steel reads its pre-roped K via ATTN_PAGED_ROR (slot 7
-                // scratch), not the gqa_shared ATTN_K_SCRATCH (slot 11), so
-                // slot 11 stays unset (matches the global steel_spans arm).
-                k_scratch: None,
-                // Self-only span masking, decoupled from rope-on-read: this arm
-                // sets `rope_on_read: None` (the K-source is the plain cache),
-                // which also gated off the kb-loop span seek — so a Relocatable
-                // span attended the preamble at every sliding layer and its K/V
-                // was NOT a pure function of its bytes, breaking the spans
-                // design's content-addressed reuse contract. Gate the seek on
-                // its own constant so span isolation holds on all 30 layers.
-                self_only: if steel_spans { Some(1) } else { None },
-            };
-            // Steel spans reads pre-roped K from the scratch (slot 7), so it
-            // does NOT bind cos_sin there; the non-spans path keeps the
-            // in-kernel cos_sin binding. Sliding prefill uses the simdgroup
-            // steel kernel (hd256), never NAX (hd128 only).
-            let rotary = w.rotary(ror_bind)?;
-            let bindings_for = |scratch: bool, reropes: bool| {
-                super::kernel_bindings::AttentionPrefillPagedBindingSet {
-                    output: super::ids::ArenaSlotIdx(*out_slot),
-                    q: super::ids::ArenaSlotIdx(*q_slot),
-                    kv_layer: super::ids::LayerId(*layer + layer_offset),
-                    rope_on_read: if reropes { rotary } else { None },
-                    nax_roped_k_scratch: scratch,
-                }
-            };
-            let bindings = bindings_for(steel_spans, !steel_spans);
-            if use_steel {
-                let function = steel_symbol.expect("steel_symbol is Some when use_steel is true");
-                let attn_cmd = LoweredCommand {
-                    kernel: KernelId::AttentionPrefillSdpaPaged,
-                    library: "attention_steel_paged",
-                    function,
-                    constants: constants.into_baked(),
-                    dispatch: steel_paged_dispatch(p, bucket_m, BQ_STEEL, 128),
-                    bindings: bindings.into_baked(),
-                    gemm_dims: None,
-                };
-                if steel_spans {
-                    // Three commands: (1) RopeOnceSteel ropes the cache's K into
-                    // the shared scratch using SLIDING geometry (HEAD_DIM 256,
-                    // NUM_KV_HEADS, BLOCK_SIZE) + the SLIDING-class cos_sin
-                    // (is_global: false — gemma4 uses a different rope theta for
-                    // local vs global layers); (2) the steel attention reads
-                    // pre-roped K from the scratch (slot 7); (3) its sdpa-paged
-                    // twin, for steps with several sequences — the scratch holds
-                    // one sequence's keys. Mirrors the global
-                    // AttentionPrefillPaged steel_spans path.
-                    let rope_sym =
-                        crate::steel_paged::rope_once_steel_symbol(steel_dtype_tag, p.head_dim)
-                            .expect(
-                                "rope_once_steel_symbol is Some when sliding use_steel is true \
-                         (steel head_dim instantiated)",
-                            );
-                    // f16 and bf16 are both 2 B/elem.
-                    let elem_bytes = 2u32;
-                    // Per-sequence block capacity (see the GLOBAL site above).
-                    let bucket_pages = bucket_m.div_ceil(p.block_size);
-                    let num_pages = block_cap.max(bucket_pages);
-                    let scratch_bytes = roped_k_bytes(
-                        [
-                            num_pages,
-                            p.num_kv_heads,
-                            p.block_size,
-                            p.head_dim,
-                            elem_bytes,
-                        ],
-                        block_cap,
-                    )?;
-                    *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
-                    // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = one logical block per row (the bucket's, until the worker sets the step's).
-                    let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
-                    let rope_threads = p.num_kv_heads * p.block_size * rot_half;
-                    let rope_cmd = LoweredCommand {
-                        kernel: KernelId::RopeOnceSteel,
-                        library: "attention_steel_paged",
-                        function: rope_sym,
-                        constants: constants.into_baked(),
-                        dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
-                            threads_per_threadgroup: (64, 1, 1),
-                            // The worker sets y to the step's block-table width.
-                            m_scaling: None,
-                        },
-                        // SLIDING-class cos_sin (is_global: false).
-                        bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
-                            kv_layer: super::ids::LayerId(*layer + layer_offset),
-                            table: w.table(false)?,
-                        }
-                        .into_baked(),
-                        gemm_dims: None,
-                    };
-                    // The plain twin reads the cache's roped K as is (no span
-                    // gate); the re-roping twin is sdpa-paged (in-kernel rope, no
-                    // steel debug slot).
-                    let plain = LoweredCommand {
-                        constants: super::kernel_constants::AttentionPrefillPagedConstants {
-                            rope_on_read: None,
-                            self_only: None,
-                            ..constants
-                        }
-                        .into_baked(),
-                        bindings: bindings_for(false, false).into_baked(),
-                        ..attn_cmd
-                    };
-                    let reroping_constants =
-                        super::kernel_constants::AttentionPrefillPagedConstants {
-                            debug_mode: None,
-                            rope_on_read: ror_on,
-                            self_only: None,
-                            ..constants
-                        };
-                    let reroping = sdpa_paged_command(
-                        p,
-                        reroping_constants,
-                        bindings_for(false, true),
-                        bucket_m,
-                    );
-                    return Ok(vec![rope_cmd, attn_cmd, plain, reroping]);
-                }
-                attn_cmd
-            } else {
-                sdpa_paged_command(p, constants, bindings, bucket_m)
             }
         }
 
@@ -8209,10 +8039,11 @@ mod tests {
         assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
     }
 
-    /// The NAX paged attention reads 16-token pages, one fragment a page: a cache of other pages
-    /// (Gemma 4's 32-token global blocks) gets none of its instantiations, whatever the head dim.
+    /// The NAX paged attention is instantiated for the pages it reads: 16-token pages at head_dims
+    /// 64 / 128 / 256, 32-token pages at 512 (Gemma 4's global layers); a cache of other pages
+    /// gets none of its instantiations.
     #[test]
-    fn nax_paged_attention_takes_only_16_token_pages() {
+    fn nax_paged_attention_takes_only_its_instantiated_pages() {
         use crate::steel_paged::nax_paged_kernel;
         for head_dim in [64, 128, 256] {
             assert!(
@@ -8224,10 +8055,67 @@ mod tests {
                 "{head_dim}"
             );
         }
+        assert!(nax_paged_kernel("bf16", 512, 16).is_none());
+        let wide = |hd, bs| nax_paged_kernel("f16", hd, bs).map(|k| (k.threads, k.bq));
+        assert_eq!(wide(256, 16), Some((256, 64)));
+        assert_eq!(wide(512, 32), Some((256, 32)));
+    }
+
+    /// The sliding class's paged prefill lowers through the global class's arm with its own
+    /// geometry and window: on an M5 the head_dim 256 NAX kernel takes it, rope-on-read on (its
+    /// span seek, the scratch read) as the global class runs it; without the matrix accelerators
+    /// its simdgroup steel spans keep rope-on-read off and the span seek on `self_only`, as the
+    /// sliding arm ran them.
+    #[test]
+    fn sliding_prefill_lowers_through_the_one_paged_prefill_arm() {
+        let p = MetalModelConsts {
+            head_dim: 256,
+            num_kv_heads: 8,
+            block_size: 16,
+            sliding_window: 1024,
+            rope_on_read: true,
+            ..tp()
+        };
+        let rows = plain(&[attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX)]);
+        let lower = |profile| {
+            lower_subtile_tape_to_metal(&row_tape(rows.clone()), &p, bake_point(64, profile))
+                .expect("lower_subtile_tape_to_metal")
+        };
+        let constant = |c: &LoweredCommand, slot: u16| {
+            (c.constants.iter())
+                .find(|k| k.index == slot)
+                .map(|k| k.bits)
+        };
+        let m5 = lower(Some(&crate::targets::M5_10CORE));
+        let kernels = |t: &LoweredMetalTape| {
+            (t.commands.iter())
+                .map(|c| c.command.kernel)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kernels(&m5)[0], KernelId::RopeOnceNax);
+        let nax = &m5.commands[1].command;
         assert_eq!(
-            nax_paged_kernel("f16", 256, 16).map(|k| k.threads),
-            Some(256)
+            (
+                nax.library,
+                nax.function,
+                nax.dispatch.threads_per_threadgroup
+            ),
+            (
+                "attention_steel_nax_paged",
+                "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16",
+                (256, 1, 1)
+            )
         );
+        assert_eq!(constant(nax, 7), Some(1024));
+        assert_eq!((constant(nax, 10), constant(nax, 14)), (Some(1), None));
+
+        let steel = lower(None);
+        assert_eq!(kernels(&steel)[0], KernelId::RopeOnceSteel);
+        let attn = &steel.commands[1].command;
+        assert_eq!(attn.library, "attention_steel_paged");
+        assert_eq!(attn.dispatch.threads_per_threadgroup, (128, 1, 1));
+        assert_eq!(constant(attn, 7), Some(1024));
+        assert_eq!((constant(attn, 10), constant(attn, 14)), (None, Some(1)));
     }
 
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass

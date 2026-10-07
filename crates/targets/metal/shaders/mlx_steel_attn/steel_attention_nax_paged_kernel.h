@@ -357,8 +357,11 @@ void attention_nax_paged(
       BQ >= (WM * kU) && BQ % (WM * kU) == 0,
       "Each simdgroup must host atleast 1 NAX matrix along Q sequence.");
   static_assert(
-      BLOCK_SIZE_ == kU,
-      "NAX paged kernel assumes BLOCK_SIZE == 16 (one NAX frag = one page).");
+      BLOCK_SIZE_ % kU == 0,
+      "NAX paged kernel reads whole pages of 16-row NAX frags (16 or 32 tokens).");
+  // A K/V fragment `f` (16 keys) lives in page f / kFragsPerPage, kU rows times f %
+  // kFragsPerPage into it.
+  constexpr int kFragsPerPage = BLOCK_SIZE_ / kU;
 
   constexpr int TQ = BQ / (WM * kU);      // Q-seq frags per warp
   constexpr int TD = BD / kU / WN;        // head-dim frags per warp
@@ -446,14 +449,16 @@ void attention_nax_paged(
   // K comes PRE-ROPED from the dense scratch (rope_once_nax wrote it). Else:
   // straight from the paged cache. The branch is on the baked ROR,
   // so the compiler keeps only one path per pipeline variant.
-  auto resolve_k = [&](int lb) -> const device T* {
+  auto resolve_k = [&](int f) -> const device T* {
+    const int lb = f / kFragsPerPage;
+    const int rows = (f % kFragsPerPage) * kU * per_token_stride;
     if (NAXP_ROR != 0u) {
       return nax_resolve_scratch<T>(
-          k_scratch, lb, num_pages, kv_blk_stride, kv_head_off);
+          k_scratch, lb, num_pages, kv_blk_stride, kv_head_off) + rows;
     }
     return nax_resolve_block<T>(
         k_cache, row_block_table, lb, num_pages,
-        int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off);
+        int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off) + rows;
   };
 
   // ── S = Q @ K^T loading K DIRECTLY from device into NAX frags (NO
@@ -622,10 +627,11 @@ void attention_nax_paged(
         }
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          const int lb = kb_ * TK + ik;
+          const int f = kb_ * TK + ik;
           const device T* Vp = nax_resolve_block<T>(
-              v_cache, row_block_table, lb, num_pages,
-              int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off);
+              v_cache, row_block_table, f / kFragsPerPage, num_pages,
+              int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off)
+              + (f % kFragsPerPage) * kU * per_token_stride;
           const short vlim = short(lim_rows_k - ik * kU);
 
           NAXTile<T, 1, 2> Vtile;
