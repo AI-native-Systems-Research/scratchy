@@ -339,6 +339,74 @@ pub fn erase(module: &mut Module, victims: &[OpPath]) {
     }
 }
 
+/// Erase the ops at `victims` in ONE rebuild per block instead of one `Vec::remove`
+/// per victim. `Vec::remove` shifts the whole tail of the block, so a batch of V
+/// victims in an N-op block costs O(V·N); at kernel scale (the unrolled attention
+/// bodies DCE eats through) that is the quadratic the bake pays on every pass. Same
+/// result as [`erase`] — an op is gone or it is not — with [`erase`]'s
+/// deepest-first ordering law kept: see the DEEPEST FIRST note in the body.
+/// An `erase_many` victim list grouped by block. `BlockKey` is `splice_many`'s own
+/// (line above) — the same block identity law: the path prefix of the op holding
+/// the block, plus the region index.
+pub fn erase_many(module: &mut Module, victims: &[OpPath]) {
+    // A victim's last path pair is (region, op index): the region names the block
+    // INSIDE the op the rest of the path names, the index the victim inside it. The
+    // block key is therefore (prefix, region) — the same reading `block_mut` gives
+    // the victim's own path — and the root block's key is an empty prefix.
+    let mut by_block: HashMap<BlockKey, Vec<usize>> = HashMap::new();
+    for p in victims {
+        let (region, idx) = p.0[p.0.len() - 1];
+        let prefix = p.0[..p.0.len() - 1].to_vec();
+        by_block.entry((prefix, region)).or_default().push(idx);
+    }
+    // DEEPEST FIRST. Every prefix is a list of (region, op index) positions into
+    // blocks that must still be intact when the group resolves it, and an erase in
+    // an ancestor block -- a group with a SHORTER prefix -- shifts exactly those
+    // positions. Processing groups by descending prefix length means root-level
+    // erases (empty prefix) land last, after every nested group has already
+    // resolved its path; erases inside one subtree never shift positions in
+    // another. HashMap iteration order decides nothing.
+    let mut groups: Vec<(BlockKey, Vec<usize>)> = by_block.into_iter().collect();
+    groups.sort_by_key(|(k, _)| std::cmp::Reverse(k.0.len()));
+    for ((prefix, region), mut idxs) in groups {
+        idxs.sort_unstable();
+        idxs.dedup();
+        // Resolve the block: walk the prefix op-by-op, then take `region` of the last.
+        let block = if prefix.is_empty() {
+            Some(&mut module.ops)
+        } else {
+            module.ops.get_mut(prefix[0].1).and_then(|op| {
+                walk_prefix(op, &prefix[1..])
+                    .and_then(|op| op.regions.get_mut(region))
+                    .map(|r| &mut r.ops)
+            })
+        };
+        let Some(block) = block else { continue };
+        let mut kept: Vec<Op> = Vec::with_capacity(block.len().saturating_sub(idxs.len()));
+        let mut vit = idxs.into_iter();
+        let mut next_victim = vit.next();
+        for (i, op) in block.drain(..).enumerate() {
+            if Some(i) == next_victim {
+                next_victim = vit.next();
+                continue;
+            }
+            kept.push(op);
+        }
+        *block = kept;
+    }
+}
+
+/// Descend `op` along the `(region, index)` pairs, returning the op each pair names.
+/// [`erase_many`]'s block resolver, stated once because borrow-checker gymnastics
+/// hide the shape inline.
+fn walk_prefix<'a>(op: &'a mut Op, pairs: &[(usize, usize)]) -> Option<&'a mut Op> {
+    let mut op = op;
+    for (r, i) in pairs {
+        op = op.regions.get_mut(*r)?.ops.get_mut(*i)?;
+    }
+    Some(op)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

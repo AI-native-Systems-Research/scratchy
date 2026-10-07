@@ -114,17 +114,26 @@ pub fn run(module: &mut Module) -> Result<()> {
     }
     let single_dot_kernel = dots.len() == 1;
 
+    // The def/type resolutions this pass makes are read-only and its rewrite is
+    // IN PLACE -- kind change and operand rewire, no insertion or deletion -- so
+    // one `DefIndex` snapshot taken before the loop holds for every dot. The
+    // alternative is `module.def_of`/`module.type_of`, whole-module linear scans
+    // that a multi-dot unrolled kernel pays per dot per operand, quadratic at
+    // ~170k ops (the same law `distribute_work`/`legalize_types`/`plan_corelets`
+    // already follow).
+    let index = module.def_index();
+
     for path in &dots {
         let dot = walk::at(module, path).expect("collected path").clone();
         let a_ty = dot
             .operands
             .first()
-            .and_then(|v| module.type_of(*v))
+            .and_then(|v| index.type_of(*v))
             .ok_or_else(|| Refusal::new(PASS, "expected 2-D ranked tensor operands"))?;
         let b_ty = dot
             .operands
             .get(1)
-            .and_then(|v| module.type_of(*v))
+            .and_then(|v| index.type_of(*v))
             .ok_or_else(|| Refusal::new(PASS, "expected 2-D ranked tensor operands"))?;
         let d_ty = dot
             .result_type()
@@ -166,7 +175,7 @@ pub fn run(module: &mut Module) -> Result<()> {
             let mut v = dot.operands[1];
             let mut peeled = 0;
             loop {
-                match module
+                match index
                     .def_of(v)
                     .filter(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
                 {
@@ -178,11 +187,11 @@ pub fn run(module: &mut Module) -> Result<()> {
                 }
             }
             // The peeled chain is the fp8 leg ONLY IF it lands on an fp8-typed load.
-            let fp8 = module
+            let fp8 = index
                 .def_of(v)
                 .filter(|o| o.kind == OpKind::TtDescriptorLoad)
                 .and_then(|ld| ld.operands.first().copied())
-                .and_then(|desc| module.type_of(desc))
+                .and_then(|desc| index.type_of(desc))
                 .is_some_and(|t| t.elem() == Some(DType::Fp8E4m3));
             if fp8 {
                 is_fp8_kernel = true;
@@ -205,7 +214,7 @@ pub fn run(module: &mut Module) -> Result<()> {
         // anywhere else keeps the direct-load guard's refusal.
         let gathered_b = {
             let mut v = dot.operands[1];
-            if let Some(t) = module.def_of(v).filter(|o| o.kind == OpKind::TtTrans) {
+            if let Some(t) = index.def_of(v).filter(|o| o.kind == OpKind::TtTrans) {
                 v = t.operands[0];
             }
             module
@@ -227,11 +236,11 @@ pub fn run(module: &mut Module) -> Result<()> {
                 // below, so the dot's operand is still the extf/trans chain. The peel in
                 // `run` checked the fp8 elem; this function checks everything else.
                 let b_load = fp8_b_load.expect("is_fp8_kernel implies the peeled load");
-                verify_canonical_fp8_matmul_kernel(module, path, b_load)?;
+                verify_canonical_fp8_matmul_kernel(module, &index, path, b_load)?;
             } else if let Some(g) = gathered_b {
-                verify_canonical_paged_matmul_kernel(module, path, g)?;
+                verify_canonical_paged_matmul_kernel(module, &index, path, g)?;
             } else {
-                verify_canonical_matmul_kernel(module, path)?;
+                verify_canonical_matmul_kernel(module, &index, path)?;
             }
             true
         } else {
@@ -293,12 +302,12 @@ pub fn run(module: &mut Module) -> Result<()> {
         // -- is folded into the maps exactly as an f16 weight's is: the presented buffer's
         // bytes are placed by the host stage either way.
         let fp8_peeled = fp8_b_load.filter(|&src| src != dot.operands[1]);
-        let b_trans_src = module
+        let b_trans_src = index
             .def_of(b)
             .filter(|o| o.kind == OpKind::TtTrans)
             .and_then(|o| o.operands.first().copied())
             .filter(|src| {
-                module
+                index
                     .def_of(*src)
                     .is_some_and(|d| d.kind == OpKind::TtDescriptorLoad)
             })
@@ -358,7 +367,11 @@ pub fn run(module: &mut Module) -> Result<()> {
 /// non-standard stride, a shifted offset, an extra store, an extra dot, or any
 /// other compute would be SILENTLY DROPPED. So recognize ONLY the exact canonical
 /// pattern and RED-stop every deviation.
-fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<()> {
+fn verify_canonical_matmul_kernel(
+    module: &Module,
+    index: &DefIndex,
+    dot_path: &OpPath,
+) -> Result<()> {
     let dot = walk::at(module, dot_path).expect("path");
     let a = dot.operands[0];
     let b = dot.operands[1];
@@ -379,16 +392,16 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     // and its load offset is `[pid, k]` (an n ROW selected by pid, k in place).
     // Anything else between the load and the dot -- a reshape, a second trans, a
     // gather -- is refused here exactly as before.
-    let b_trans = module.def_of(b).filter(|o| o.kind == OpKind::TtTrans);
+    let b_trans = index.def_of(b).filter(|o| o.kind == OpKind::TtTrans);
     let b_load_val = match b_trans {
         Some(t) => t.operands.first().copied(),
         None => Some(b),
     };
-    let a_ld = module
+    let a_ld = index
         .def_of(a)
         .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let b_ld = b_load_val.and_then(|v| {
-        module
+        index
             .def_of(v)
             .filter(|o| o.kind == OpKind::TtDescriptorLoad)
     });
@@ -396,21 +409,21 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
         return Err(refuse("A and B must be direct tt.descriptor_load results"));
     };
 
-    let a_ty = module.type_of(a).ok_or_else(|| refuse("A has no type"))?;
-    let b_ty = module.type_of(b).ok_or_else(|| refuse("B has no type"))?;
+    let a_ty = index.type_of(a).ok_or_else(|| refuse("A has no type"))?;
+    let b_ty = index.type_of(b).ok_or_else(|| refuse("B has no type"))?;
     let (bm, bk) = (a_ty.dims().unwrap()[0], a_ty.dims().unwrap()[1]);
     let bn = b_ty.dims().unwrap()[1];
 
-    let a_desc = descriptor_of(module, a_ld)?;
-    let b_desc = descriptor_of(module, b_ld)?;
-    let (m, k) = desc_shape2(module, a_desc)
+    let a_desc = descriptor_of(index, a_ld)?;
+    let b_desc = descriptor_of(index, b_ld)?;
+    let (m, k) = desc_shape2(index, a_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
     // B's descriptor extents, framed by the orientation: plain B is `[k, ns]`, a `.T`
     // B is the presented weight's own `[ns, k]` (the fold in `run` states the
     // transpose-B maps over exactly this view). The axis that equals A's k names the
     // reduction dim; the other one is n. (A square `[k, k]` satisfies both readings
     // and gives the same `ns` either way.)
-    let ns = match desc_shape2(module, b_desc) {
+    let ns = match desc_shape2(index, b_desc) {
         Some((d0, d1)) if d0 == k => d1,
         Some((d0, d1)) if d1 == k => d0,
         Some((d0, d1)) => {
@@ -500,18 +513,18 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     // Descriptor shapes/strides/blocks: contiguous row-major, canonical layout. B is
     // framed by the orientation: plain `[k, ns]` blocking `[bk, bn]`, or the `.T`
     // form's presented `[ns, k]` blocking `[bn, bk]`.
-    check_desc(module, a_desc, "A", m, k, bm, bk)?;
+    check_desc(index, a_desc, "A", m, k, bm, bk)?;
     if b_trans.is_some() {
-        check_desc(module, b_desc, "B", ns, k, bn, bk)?;
+        check_desc(index, b_desc, "B", ns, k, bn, bk)?;
     } else {
-        check_desc(module, b_desc, "B", k, ns, bk, bn)?;
+        check_desc(index, b_desc, "B", k, ns, bk, bn)?;
     }
     let store = all
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
-    let c_desc = descriptor_of(module, store)?;
-    check_desc_c(module, c_desc, m, ns, bm, bn)?;
+    let c_desc = descriptor_of(index, store)?;
+    check_desc_c(index, c_desc, m, ns, bm, bn)?;
 
     // Base-pointer provenance: the emitted DFIR has NO pointer arguments -- buffers
     // are bound POSITIONALLY -- so A/B/C MUST read args 0/1/2 IN THAT ORDER. That
@@ -555,15 +568,15 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
                 return Err(refuse("K-loop does not carry the matmul result"));
             }
             let init = forr.operands[3 + idx];
-            if !is_zero_const(module, init) {
+            if !is_zero_const_index(index, init) {
                 return Err(refuse(
                     "matmul accumulator is not zero-initialized (a bias/fused init would \
                      be dropped)",
                 ));
             }
-            let lo = const_int(module, forr.operands[0]);
-            let hi = const_int(module, forr.operands[1]);
-            let st = const_int(module, forr.operands[2]);
+            let lo = const_int_index(index, forr.operands[0]);
+            let hi = const_int_index(index, forr.operands[1]);
+            let st = const_int_index(index, forr.operands[2]);
             if lo != Some(0) || st != Some(bk) || hi != Some(k) {
                 return Err(refuse(format!(
                     "K-loop does not contract the full K: expected 0..{k} step {bk}"
@@ -585,7 +598,7 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
                      K={k})"
                 )));
             }
-            if !is_zero_const(module, c) {
+            if !is_zero_const_index(index, c) {
                 return Err(refuse("single-tile matmul accumulator is not zero"));
             }
             (None, d)
@@ -597,7 +610,7 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     // -- the no-loop branch previously skipped it.
     let is_k_idx = |v: Ssa| match k_iv {
         Some(iv) => v == iv,
-        None => const_int(module, v) == Some(0),
+        None => const_int_index(index, v) == Some(0),
     };
     let a_idx = &a_ld.operands[1..];
     let b_idx = &b_ld.operands[1..];
@@ -685,6 +698,7 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
 /// every deviation is refused by name.
 fn verify_canonical_fp8_matmul_kernel(
     module: &Module,
+    index: &DefIndex,
     dot_path: &OpPath,
     b_load: Ssa,
 ) -> Result<()> {
@@ -696,7 +710,7 @@ fn verify_canonical_fp8_matmul_kernel(
         .ok_or_else(|| refuse("the dot defines no result"))?;
 
     // A is a DIRECT f16 load, as in the f16 contract.
-    let a_ld = module
+    let a_ld = index
         .def_of(a)
         .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let Some(a_ld) = a_ld else {
@@ -708,7 +722,7 @@ fn verify_canonical_fp8_matmul_kernel(
     // BEFORE the rewire and the dot's second operand is still the extf/trans chain. Its
     // VALUE type is f16 (the spelled `.to(tl.float16)`); its DESCRIPTOR's elem is what
     // says fp8, and the peel in `run` checked exactly that.
-    let b_ld = module
+    let b_ld = index
         .def_of(b_load)
         .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let Some(b_ld) = b_ld else {
@@ -719,19 +733,19 @@ fn verify_canonical_fp8_matmul_kernel(
     };
     let b = b_load;
 
-    let a_ty = module.type_of(a).ok_or_else(|| refuse("A has no type"))?;
-    let b_ty = module.type_of(b).ok_or_else(|| refuse("B has no type"))?;
+    let a_ty = index.type_of(a).ok_or_else(|| refuse("A has no type"))?;
+    let b_ty = index.type_of(b).ok_or_else(|| refuse("B has no type"))?;
     let (bm, bk) = (a_ty.dims().unwrap()[0], a_ty.dims().unwrap()[1]);
     // ⭐ THE LOAD's OWN SHAPE, not the dot's post-transpose operand: `b` is the weight
     // load's result, whose layout is `[n, k]` (the `.T` that swapped the axes is on the
     // peeled chain). The descriptor and the block are checked against THESE extents.
     let bn = b_ty.dims().unwrap()[0];
 
-    let a_desc = descriptor_of(module, a_ld)?;
-    let b_desc = descriptor_of(module, b_ld)?;
-    let (m, k) = desc_shape2(module, a_desc)
+    let a_desc = descriptor_of(index, a_ld)?;
+    let b_desc = descriptor_of(index, b_ld)?;
+    let (m, k) = desc_shape2(index, a_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
-    let (w_r, w_c) = desc_shape2(module, b_desc)
+    let (w_r, w_c) = desc_shape2(index, b_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
 
     // ⛔ THE WEIGHT VIEW IS `[N, K]` AND THE KERNEL'S BLOCK IS THE WHOLE TILE. The fp8 door
@@ -760,7 +774,7 @@ fn verify_canonical_fp8_matmul_kernel(
     }
 
     // Zero-init accumulator, as in the f16 contract (a bias/fused init would be dropped).
-    if !is_zero_const(module, c) {
+    if !is_zero_const_index(index, c) {
         return Err(refuse("fp8 matmul accumulator is not zero"));
     }
 
@@ -851,14 +865,14 @@ fn verify_canonical_fp8_matmul_kernel(
 
     // Descriptor shapes/strides: contiguous row-major, canonical layout -- A [m,k], W
     // [n,k], C [m,n].
-    check_desc(module, a_desc, "A", m, k, bm, bk)?;
-    check_desc(module, b_desc, "W", bn, k, bn, bk)?;
+    check_desc(index, a_desc, "A", m, k, bm, bk)?;
+    check_desc(index, b_desc, "W", bn, k, bn, bk)?;
     let store = all
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
-    let c_desc = descriptor_of(module, store)?;
-    check_desc_c(module, c_desc, m, bn, bm, bn)?;
+    let c_desc = descriptor_of(index, store)?;
+    check_desc_c(index, c_desc, m, bn, bm, bn)?;
 
     // ⭐⭐⭐ POSITIONAL BINDING: A=arg0, W=arg1, ws=arg2, C=arg3. The emitted DFIR binds
     // buffers positionally, and the fp8 door reads the THIRD input as the scale -- so a
@@ -894,14 +908,14 @@ fn verify_canonical_fp8_matmul_kernel(
                 && o.result() != Some(b_load)
         })
         .expect("counted three loads");
-    let ws_desc = descriptor_of(module, ws_ld)?;
+    let ws_desc = descriptor_of(index, ws_ld)?;
     if base(ws_desc) != Some(args[2]) {
         return Err(refuse(
             "the scale load does not read arg2; the W8A8 door binds w_scale as the THIRD \
              buffer, positionally",
         ));
     }
-    let (ws_r, ws_c) = desc_shape2(module, ws_desc)
+    let (ws_r, ws_c) = desc_shape2(index, ws_desc)
         .ok_or_else(|| refuse("the scale descriptor has non-constant shape/strides"))?;
     if ws_r != 1 || ws_c != bn {
         return Err(refuse(format!(
@@ -921,15 +935,15 @@ fn verify_canonical_fp8_matmul_kernel(
     // the IDIOMATIC `offs_m = pid * BLOCK_M` (`arith.muli`), admitted with its own guard:
     // one operand must BE the pid and the other the constant BLOCK_M -- anything else
     // scales the row by a value the emitter never reads and would silently misplace.
-    let is_zero_idx = |v: Ssa| const_int(module, v) == Some(0);
+    let is_zero_idx = |v: Ssa| const_int_index(index, v) == Some(0);
     let is_row_idx = |v: Ssa| -> bool {
         if v == pid {
             return true;
         }
-        match module.def_of(v).filter(|o| o.kind == OpKind::ArithMuli) {
+        match index.def_of(v).filter(|o| o.kind == OpKind::ArithMuli) {
             Some(mu) => {
-                (mu.operands[0] == pid && const_int(module, mu.operands[1]).is_some())
-                    || (mu.operands[1] == pid && const_int(module, mu.operands[0]).is_some())
+                (mu.operands[0] == pid && const_int_index(index, mu.operands[1]).is_some())
+                    || (mu.operands[1] == pid && const_int_index(index, mu.operands[0]).is_some())
             }
             None => false,
         }
@@ -969,7 +983,7 @@ fn verify_canonical_fp8_matmul_kernel(
         .ok_or_else(|| refuse("the scale mulf defines no result"))?;
     // Trace one value back through at most one tt.broadcast.
     let through_bcast = |v: Ssa| -> Ssa {
-        match module.def_of(v).filter(|o| o.kind == OpKind::TtBroadcast) {
+        match index.def_of(v).filter(|o| o.kind == OpKind::TtBroadcast) {
             Some(bc) => bc.operands[0],
             None => v,
         }
@@ -1061,6 +1075,7 @@ fn verify_canonical_fp8_matmul_kernel(
 /// tt.descriptor_store}` is admitted and every deviation is refused by name.
 fn verify_canonical_paged_matmul_kernel(
     module: &Module,
+    index: &DefIndex,
     dot_path: &OpPath,
     gathered_b: Ssa,
 ) -> Result<()> {
@@ -1072,7 +1087,7 @@ fn verify_canonical_paged_matmul_kernel(
         .ok_or_else(|| refuse("the dot defines no result"))?;
 
     // A is a DIRECT f16 load, exactly as in the f16 contract.
-    let a_ld = module
+    let a_ld = index
         .def_of(a)
         .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let Some(a_ld) = a_ld else {
@@ -1080,7 +1095,7 @@ fn verify_canonical_paged_matmul_kernel(
             "paged matmul: A must be a direct tt.descriptor_load result (the gather is B's)",
         ));
     };
-    let gather = module
+    let gather = index
         .def_of(gathered_b)
         .filter(|o| o.kind == OpKind::TtDescriptorGather)
         .ok_or_else(|| refuse("paged matmul: B's gather is not a tt.descriptor_gather"))?;
@@ -1100,11 +1115,11 @@ fn verify_canonical_paged_matmul_kernel(
         ));
     }
 
-    let a_ty = module.type_of(a).ok_or_else(|| refuse("A has no type"))?;
+    let a_ty = index.type_of(a).ok_or_else(|| refuse("A has no type"))?;
     let (bm, bk) = (a_ty.dims().unwrap()[0], a_ty.dims().unwrap()[1]);
     // The gather's result is `[rows, HEAD_DIM]` -- the contraction's K rows gathered,
     // each a full head. This is B's own shape: no trans sits between it and the dot.
-    let g_ty = module
+    let g_ty = index
         .type_of(gathered_b)
         .ok_or_else(|| refuse("the gathered B has no type"))?;
     let g_dims = g_ty
@@ -1119,12 +1134,12 @@ fn verify_canonical_paged_matmul_kernel(
     }
     let (rows, hd) = (g_dims[0], g_dims[1]);
 
-    let a_desc = descriptor_of(module, a_ld)?;
-    let v_desc = descriptor_of(module, gather)?;
-    let (m, a_cols) = desc_shape2(module, a_desc)
+    let a_desc = descriptor_of(index, a_ld)?;
+    let v_desc = descriptor_of(index, gather)?;
+    let (m, a_cols) = desc_shape2(index, a_desc)
         .ok_or_else(|| refuse("A descriptor M/K are not compile-time constants"))?;
     // The V table is `[V, HEAD_DIM]`: V rows in the pool, HEAD_DIM the contraction's N.
-    let (v_full, head_dim) = desc_shape2(module, v_desc)
+    let (v_full, head_dim) = desc_shape2(index, v_desc)
         .ok_or_else(|| refuse("the gather's descriptor shape is not compile-time"))?;
     if head_dim != hd {
         return Err(refuse(format!(
@@ -1165,7 +1180,7 @@ fn verify_canonical_paged_matmul_kernel(
 
     // Zero-init accumulator, as in both sibling contracts (a bias/fused init would be
     // silently dropped).
-    if !is_zero_const(module, c) {
+    if !is_zero_const_index(index, c) {
         return Err(refuse("paged matmul accumulator is not zero"));
     }
 
@@ -1236,14 +1251,14 @@ fn verify_canonical_paged_matmul_kernel(
     // Descriptor shapes/strides: contiguous row-major -- A [m, rows], V [V, head], C
     // [m, head]. The gather's block is one row (`[1, head]`), which the descriptor's own
     // block type states.
-    check_desc(module, a_desc, "A", m, a_cols, bm, bk)?;
-    check_desc(module, v_desc, "V", v_full, head_dim, 1, head_dim)?;
+    check_desc(index, a_desc, "A", m, a_cols, bm, bk)?;
+    check_desc(index, v_desc, "V", v_full, head_dim, 1, head_dim)?;
     let store = all
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
-    let c_desc = descriptor_of(module, store)?;
-    check_desc(module, c_desc, "C", m, hd, bm, hd)?;
+    let c_desc = descriptor_of(index, store)?;
+    check_desc(index, c_desc, "C", m, hd, bm, hd)?;
 
     // ⭐⭐⭐ POSITIONAL BINDING: A=arg0, V=arg1, ids=arg2, O=arg3. The emitted DFIR binds
     // buffers positionally and the whole-function door numbers its windows by parameter
@@ -1259,7 +1274,7 @@ fn verify_canonical_paged_matmul_kernel(
         )));
     }
     let base = |d: &Op| d.operands.first().copied();
-    let ids_desc = descriptor_of(module, ids_ld)?;
+    let ids_desc = descriptor_of(index, ids_ld)?;
     if base(a_desc) != Some(args[0])
         || base(v_desc) != Some(args[1])
         || base(ids_desc) != Some(args[2])
@@ -1295,7 +1310,7 @@ fn verify_canonical_paged_matmul_kernel(
     // Canonical offsets, the single-tile grid-1 form: every load/store/gather corner is
     // the constant 0. A pid-scaled offset is the f16/fp8 arms' form and admits a follow-
     // on; here a nonzero corner would be silently dropped by the whole-function door.
-    let is_zero_idx = |v: Ssa| const_int(module, v) == Some(0);
+    let is_zero_idx = |v: Ssa| const_int_index(index, v) == Some(0);
     let a_idx = &a_ld.operands[1..];
     if a_idx.len() != 2 || !is_zero_idx(a_idx[0]) || !is_zero_idx(a_idx[1]) {
         return Err(refuse(
@@ -1359,15 +1374,15 @@ fn verify_canonical_paged_matmul_kernel(
 /// A contiguous row-major 2-D `tt.make_tensor_descriptor` of the given full shape
 /// and block. The emitter derives the layout from the shape ALONE and assumes
 /// contiguous row-major, so a non-standard stride would be silently ignored.
-fn check_desc(module: &Module, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: i64) -> Result<()> {
-    let (s0, s1) = desc_shape2(module, d)
+fn check_desc(index: &DefIndex, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: i64) -> Result<()> {
+    let (s0, s1) = desc_shape2(index, d)
         .ok_or_else(|| refuse(format!("{nm} has non-constant shape/strides")))?;
     if s0 != d0 || s1 != d1 {
         return Err(refuse(format!(
             "{nm} shape [{s0},{s1}] != expected [{d0},{d1}]"
         )));
     }
-    check_desc_common(module, d, nm, d1, b0, b1)
+    check_desc_common(index, d, nm, d1, b0, b1)
 }
 
 /// ⭐ C's OWN ADMISSION — the STORED-WINDOW form. The C descriptor may name the
@@ -1380,21 +1395,21 @@ fn check_desc(module: &Module, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: 
 /// window (`s0 < d0` would be a store that runs past its buffer, and is refused).
 /// Everything else about C is the strict form: contiguous row-major, the full `n`,
 /// the `[m, n]` block.
-fn check_desc_c(module: &Module, d: &Op, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
+fn check_desc_c(index: &DefIndex, d: &Op, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
     let (s0, s1) =
-        desc_shape2(module, d).ok_or_else(|| refuse("C has non-constant shape/strides"))?;
+        desc_shape2(index, d).ok_or_else(|| refuse("C has non-constant shape/strides"))?;
     if s0 < m || s1 != ns {
         return Err(refuse(format!(
             "C shape [{s0},{s1}] does not hold the stored [{m},{ns}] tile — the output \
              descriptor must name either the tile or the storage that holds it"
         )));
     }
-    check_desc_common(module, d, "C", ns, bm, bn)
+    check_desc_common(index, d, "C", ns, bm, bn)
 }
 
 /// The strides/block half of [`check_desc`], shared by the strict and windowed forms.
-fn check_desc_common(module: &Module, d: &Op, nm: &str, d1: i64, b0: i64, b1: i64) -> Result<()> {
-    let (t0, t1) = desc_strides2(module, d)
+fn check_desc_common(index: &DefIndex, d: &Op, nm: &str, d1: i64, b0: i64, b1: i64) -> Result<()> {
+    let (t0, t1) = desc_strides2(index, d)
         .ok_or_else(|| refuse(format!("{nm} has non-constant shape/strides")))?;
     if t0 != d1 || t1 != 1 {
         return Err(refuse(format!(
@@ -1413,13 +1428,13 @@ fn check_desc_common(module: &Module, d: &Op, nm: &str, d1: i64, b0: i64, b1: i6
 }
 
 /// The `tt.make_tensor_descriptor` behind an access op's `desc` operand.
-fn descriptor_of<'m>(module: &'m Module, access: &Op) -> Result<&'m Op> {
+fn descriptor_of<'a>(index: &'a DefIndex, access: &Op) -> Result<&'a Op> {
     let desc = access
         .operands
         .first()
         .copied()
         .ok_or_else(|| refuse("an access op with no descriptor operand"))?;
-    module
+    index
         .def_of(desc)
         .filter(|o| o.kind == OpKind::TtMakeTensorDescriptor)
         .ok_or_else(|| refuse("A/B descriptors are not 2-D tt.make_tensor_descriptor"))
@@ -1428,32 +1443,32 @@ fn descriptor_of<'m>(module: &'m Module, access: &Op) -> Result<&'m Op> {
 /// `tt.make_tensor_descriptor %base, [%s0, %s1], [%t0, %t1]` -- the operands are
 /// base, then the shape values, then the stride values, so the split is at the
 /// declared rank (from the block type).
-fn desc_shape_strides(module: &Module, d: &Op) -> Option<(Vec<i64>, Vec<i64>)> {
+fn desc_shape_strides(index: &DefIndex, d: &Op) -> Option<(Vec<i64>, Vec<i64>)> {
     let rank = d.result_type()?.rank();
     if rank == 0 || d.operands.len() < 1 + 2 * rank {
         return None;
     }
     let mut shape = Vec::new();
     for i in 0..rank {
-        shape.push(const_int(module, d.operands[1 + i])?);
+        shape.push(const_int_index(index, d.operands[1 + i])?);
     }
     let mut strides = Vec::new();
     for i in 0..rank {
-        strides.push(const_int(module, d.operands[1 + rank + i])?);
+        strides.push(const_int_index(index, d.operands[1 + rank + i])?);
     }
     Some((shape, strides))
 }
 
-fn desc_shape2(module: &Module, d: &Op) -> Option<(i64, i64)> {
-    let (s, _) = desc_shape_strides(module, d)?;
+fn desc_shape2(index: &DefIndex, d: &Op) -> Option<(i64, i64)> {
+    let (s, _) = desc_shape_strides(index, d)?;
     if s.len() != 2 {
         return None;
     }
     Some((s[0], s[1]))
 }
 
-fn desc_strides2(module: &Module, d: &Op) -> Option<(i64, i64)> {
-    let (_, t) = desc_shape_strides(module, d)?;
+fn desc_strides2(index: &DefIndex, d: &Op) -> Option<(i64, i64)> {
+    let (_, t) = desc_shape_strides(index, d)?;
     if t.len() != 2 {
         return None;
     }

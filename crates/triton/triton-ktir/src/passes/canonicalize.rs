@@ -49,7 +49,7 @@
 //! treating a value used only inside a loop body as dead drops every attention
 //! bundle's key pointer. The test at the bottom of this file is that regression.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::Result;
 use crate::ir::*;
@@ -220,28 +220,72 @@ fn group_by_block(module: &Module, out: &mut Vec<Vec<OpPath>>) {
 ///
 /// The fixed point is the point. A one-sweep DCE leaves the second link of a dead
 /// chain behind, and a dead `muli(divsi(index_cast(...)))` chain is not free: the
-/// scheduler hoists it into a view start where it is refused. So iterate until
-/// nothing more is dead -- rewired AND erased.
+/// scheduler hoists it into a view start where it is refused.
+///
+/// The fixpoint is reached in ONE worklist liveness pass, not a re-scan per round:
+/// roots are the non-pure or region-bearing ops (side effects and control flow are
+/// uses DCE cannot erase, and an `scf.for`'s operands carry its iter_args' init
+/// values, so the loop-carried chains stay live through the loop's own root-ness);
+/// liveness then flows backwards along use→def edges until nothing new is live.
+/// Region block arguments have no defining op, so they can never be victims. The
+/// old loop re-walked the module once per chain link (each erase freed exactly one
+/// more op), which is quadratic at kernel scale: the unrolled attention bodies
+/// carry chains of dead index arithmetic thousands of links long, and this pass
+/// was the dominant cost of the 2b bake. Same result as the loop — a value is live
+/// iff a live op reads it — computed in O(ops + edges) instead of O(rounds × ops).
 fn dce(module: &mut Module) -> bool {
-    let mut changed = false;
-    loop {
-        let used = walk::used_values(module);
-        let victims: Vec<OpPath> = walk::paths(module)
-            .into_iter()
-            .filter(|p| {
-                let op = walk::at(module, p).expect("path");
-                op.kind.is_pure()
-                    && op.regions.is_empty()
-                    && !op.results.is_empty()
-                    && op.results.iter().all(|r| !used.contains(r))
-            })
-            .collect();
-        if victims.is_empty() {
-            return changed;
+    // value -> the flat index of the op that DEFINES it, so liveness can flow
+    // backwards from a reader to its producers. Built in one walk that also
+    // collects the candidate set (pure, region-free, has results).
+    let mut definers: HashMap<Ssa, usize> = HashMap::new();
+    // walk::paths is program order and visits an op before its regions, so the flat
+    // index in this table matches the `here` offsets below.
+    let paths: Vec<OpPath> = walk::paths(module);
+    let mut table: Vec<(bool, bool)> = Vec::new(); // (root, candidate), indexed by flat offset
+    for (i, p) in paths.iter().enumerate() {
+        let op = walk::at(module, p).expect("path");
+        let root = !op.kind.is_pure() || !op.regions.is_empty();
+        let candidate = op.kind.is_pure() && op.regions.is_empty() && !op.results.is_empty();
+        table.push((root, candidate));
+        // Region block arguments have no defining op; liveness for them is the
+        // region's own contract, and `definers` simply never names them.
+        for r in &op.results {
+            definers.insert(*r, i);
         }
-        walk::erase(module, &victims);
-        changed = true;
     }
+
+    // Backward liveness from the roots, through definer edges.
+    let mut live_ops: HashSet<usize> = HashSet::new();
+    let mut work: Vec<usize> = table
+        .iter()
+        .enumerate()
+        .filter(|(_, (root, _))| *root)
+        .map(|(i, _)| i)
+        .collect();
+    while let Some(i) = work.pop() {
+        if !live_ops.insert(i) {
+            continue;
+        }
+        let op = walk::at(module, &paths[i]).expect("path");
+        for v in &op.operands {
+            if let Some(&d) = definers.get(v) {
+                work.push(d);
+            }
+        }
+    }
+
+    // A candidate is dead iff it never became live.
+    let victims: Vec<OpPath> = paths
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| table[*i].1 && !live_ops.contains(i))
+        .map(|(_, p)| p)
+        .collect();
+    if victims.is_empty() {
+        return false;
+    }
+    walk::erase_many(module, &victims);
+    true
 }
 
 //===----------------------------------------------------------------------===//
