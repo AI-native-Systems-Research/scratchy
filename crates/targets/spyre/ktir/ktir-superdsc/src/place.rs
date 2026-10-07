@@ -90,6 +90,20 @@ pub enum SynthRole {
     ECombP(u32),
     /// The running f32 accumulator, one `[m, hidden]` buffer.
     ECombAcc,
+    // ── route-argsort scratch (the rank vector's compare/reduce chain) ──
+    // One `[m, W]` buffer each (W = the padded expert width), shared across the
+    // per-j legs: nothing reads a leg's output after its consumer leg, so the
+    // chain reuses two scratches rather than minting E of them.
+    /// The sanitized scores `maximum(x, pad_mask)` — pad lanes forced to +inf.
+    AXSan,
+    /// The per-j `lesserthan` / one-hot product scratch.
+    ALt,
+    /// The per-j `equal·tie + lt` count scratch (the reduce's data operand).
+    ACnt,
+    /// The per-j reduce accum `[m, stick]` (the per-row rank scalar at lane 0).
+    ARank,
+    /// The one-hot product accumulator `[m, W]` (the combine chain's shape).
+    AAcc,
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -165,6 +179,11 @@ impl fmt::Display for SynthRole {
             Self::RDen => f.write_str("rden"),
             Self::ECombP(j) => write!(f, "ecombp{j}"),
             Self::ECombAcc => f.write_str("ecombacc"),
+            Self::AXSan => f.write_str("axsan"),
+            Self::ALt => f.write_str("alt"),
+            Self::ACnt => f.write_str("acnt"),
+            Self::ARank => f.write_str("arank"),
+            Self::AAcc => f.write_str("aacc"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),

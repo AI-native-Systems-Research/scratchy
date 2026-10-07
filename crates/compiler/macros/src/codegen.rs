@@ -8635,6 +8635,14 @@ fn synth_role_tokens(
             quote! { #b::ECombP(#j) }
         }
         R::ECombAcc => quote! { #b::ECombAcc },
+        // The route-argsort scratch: the sanitized scores, the per-j compare
+        // and product scratch, the count scratch, the reduce accum, and the
+        // one-hot product accumulator ([`lk::route_argsort`]'s own synths).
+        R::AXSan => quote! { #b::AXSan },
+        R::ALt => quote! { #b::ALt },
+        R::ACnt => quote! { #b::ACnt },
+        R::ARank => quote! { #b::ARank },
+        R::AAcc => quote! { #b::AAcc },
     }
 }
 

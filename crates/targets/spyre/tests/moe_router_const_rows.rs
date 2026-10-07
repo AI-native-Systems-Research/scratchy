@@ -3,14 +3,16 @@
 //! (`RouteArgsort`/`RouteTopK`/`RouteGatherScores`/`RouteExpertScale`).
 //!
 //! The router doors read four kinds of token-INDEPENDENT factors — the
-//! `[W,W]` stable-argsort tie table, the `[1,W]` iota row, `k` one-hot
-//! rows, and the two sanitize rows — and this file pins the STAGING chain
-//! that delivers them:
+//! `[W,W]` stable-argsort tie table, the `[W,W]` identity table (row j = the
+//! one-hot row with lane j hot — ONE table serves both the argsort's
+//! per-expert lane writes and the top-k selector's per-slot writes), the
+//! `[1,W]` iota row, and the two sanitize rows — and this file pins the
+//! STAGING chain that delivers them:
 //!
 //! ```text
 //! compute_bundle_layout  →  places the router_const tids at [W,W]/[1,W]
 //! bake_layout            →  carries the placements into the bundle
-//! BakeFacts::of          →  reads the geometry (W, k) back off them
+//! BakeFacts::of          →  reads the geometry (W, E) back off them
 //! synthetic_constants    →  builds the VALUES from that geometry
 //! ```
 //!
@@ -99,22 +101,29 @@ fn layout_of(ir: &SubtileIR<NeoX>) -> ktir_superdsc::placement::BundleLayout {
 use ktir_superdsc::reserved_tids as rt;
 
 /// ⭐ EVERY ROUTER CONST TID IS PLACED, AT THE PADDED GEOMETRY, and nothing
-/// else in the layout moved: the tie table at `[W, W]` fp16 (W = the padded
-/// expert width, NOT E — the narrow-tensor law), the iota row and the two
-/// sanitize rows at `[1, W]`, and exactly `k` one-hot rows at `[1, W]`.
+/// else in the layout moved: the tie table and the identity table at `[W, W]`
+/// fp16 (W = the padded expert width, NOT E — the narrow-tensor law), and the
+/// iota row and the two sanitize rows at `[1, W]`. Every const is E-SIZED —
+/// the identity table holds one row per RANKED expert, so a router-only tape
+/// (no RouteTopK node at all) still places everything it needs.
 #[test]
 fn the_router_consts_are_placed_at_the_padded_geometry() {
     let l = layout_of(&router_ir());
-    let tie = l.placements.get(&rt::router_rank_tie_tid());
-    assert_eq!(
-        tie.map(|p| p.size),
-        Some(W as u64 * W as u64 * 2),
-        "the tie table must be [W, W] fp16 at the PADDED width"
-    );
+    for (tid, what) in [
+        (rt::router_rank_tie_tid(), "the tie table"),
+        (rt::router_identity_tid(), "the identity table"),
+    ] {
+        assert_eq!(
+            l.placements.get(&tid).map(|p| p.size),
+            Some(W as u64 * W as u64 * 2),
+            "{what} must be [W, W] fp16 at the PADDED width"
+        );
+    }
     for (tid, what) in [
         (rt::router_topk_iota_tid(), "the iota row"),
         (rt::router_pad_hi_tid(), "the +inf sanitize row"),
         (rt::router_pad_lo_tid(), "the -inf sanitize row"),
+        (rt::router_pad_mask_tid(), "the argsort pad-mask row"),
     ] {
         assert_eq!(
             l.placements.get(&tid).map(|p| p.size),
@@ -122,19 +131,60 @@ fn the_router_consts_are_placed_at_the_padded_geometry() {
             "{what} must be [1, W] fp16"
         );
     }
-    for j in 0..K {
-        assert_eq!(
-            l.placements.get(&rt::router_topk_onehot_tid(j)).map(|p| p.size),
-            Some(W as u64 * 2),
-            "one-hot row {j} must be [1, W] fp16"
-        );
-    }
-    // And NO one-hot row past k: an over-placed row is a registry/placement
-    // desync in the other direction (the bind would read a placement the
-    // geometry does not account for).
-    assert!(
-        l.placements.get(&rt::router_topk_onehot_tid(K)).is_none(),
-        "one row past k must not be placed"
+}
+
+/// ⭐ A ROUTER-ONLY TAPE PLACES EVERYTHING: the placement gate is `RouterLogits`
+/// alone (E), never the top-k — the argsort door reads one identity row per
+/// RANKED expert, so a tape whose router chain stops at the argsort (or whose
+/// RouteTopK node lives in another bundle) must still have its consts. This is
+/// the defect the door's own first run surfaced: a k-gated placement left an
+/// argsort-only tape with NO consts and the bake panicked on an undeclared tid.
+#[test]
+fn a_router_only_tape_places_its_consts() {
+    let r0 = TensorRegion {
+        tensor: TensorId::from_index(0),
+        region: TensorShape { rows: M, cols: E }.whole(),
+    };
+    let r1 = TensorRegion {
+        tensor: TensorId::from_index(1),
+        region: TensorShape { rows: M, cols: E }.whole(),
+    };
+    let ir = SubtileIR {
+        result: TensorId::from_index(1),
+        tensors: vec![
+            TensorShape { rows: M, cols: E }, // t0 logits
+            TensorShape { rows: M, cols: E }, // t1 argsort out
+        ],
+        num_sources: 1,
+        nodes: vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::RouterLogits {
+                    experts: NumExperts::new(std::num::NonZeroU32::new(E).unwrap()),
+                    router: RouterBundle::Gemma,
+                },
+                inputs: vec![r0.clone()],
+                output: r1.clone(),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::RouteArgsort,
+                inputs: vec![r1.clone()],
+                output: r1,
+            },
+        ],
+        op_output: Vec::new(),
+    };
+    let l = layout_of(&ir);
+    assert_eq!(
+        l.placements.get(&rt::router_identity_tid()).map(|p| p.size),
+        Some(W as u64 * W as u64 * 2),
+        "an argsort-only tape (no RouteTopK) still places the identity table"
+    );
+    assert_eq!(
+        l.placements.get(&rt::router_pad_mask_tid()).map(|p| p.size),
+        Some(W as u64 * 2),
+        "an argsort-only tape still places the pad-mask row"
     );
 }
 
@@ -190,7 +240,7 @@ fn the_bind_builds_the_declared_values() {
         rope_class_hds: &[],
         attn_class_hds: &[],
         rms_invcols: &[],
-        router: (W as usize, E as usize, K as usize),
+        router: (W as usize, E as usize),
     };
     let consts = scratchy_target_spyre::wiring::synthetic_constants(&env);
     let get = |tid: u32| -> Vec<f32> {
@@ -219,15 +269,19 @@ fn the_bind_builds_the_declared_values() {
     for (h, &v) in iota.iter().enumerate() {
         assert_eq!(v, h as f32, "iota lane {h}");
     }
-    // One-hot rows: lane j hot, every other lane 0.
-    for j in 0..K {
-        let row = get(rt::router_topk_onehot_tid(j));
-        assert_eq!(row.len(), W as usize);
-        for (lane, &v) in row.iter().enumerate() {
+    // The identity table: row j is the one-hot row with lane j hot — ONE
+    // [W,W] table, E-sized (row per ranked expert), never k-sized.
+    let ident = get(rt::router_identity_tid());
+    assert_eq!(ident.len(), (W * W) as usize);
+    for j in 0..W {
+        for (lane, &v) in ident[(j * W) as usize..((j + 1) * W) as usize]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(
                 v,
                 if lane == j as usize { 1.0 } else { 0.0 },
-                "one-hot row {j} lane {lane}"
+                "identity row {j} lane {lane}"
             );
         }
     }
@@ -267,17 +321,18 @@ fn a_non_router_env_binds_no_router_consts() {
         rope_class_hds: &[],
         attn_class_hds: &[],
         rms_invcols: &[],
-        router: (0, 0, 0),
+        router: (0, 0),
     };
     let consts = scratchy_target_spyre::wiring::synthetic_constants(&env);
-    assert!(
-        consts
-            .iter()
-            .all(|(t, _)| *t != rt::router_rank_tie_tid()),
-        "no tie table may be bound without a router"
-    );
-    assert!(
-        consts.iter().all(|(t, _)| *t != rt::router_topk_iota_tid()),
-        "no iota row may be bound without a router"
-    );
+    for (tid, what) in [
+        (rt::router_rank_tie_tid(), "the tie table"),
+        (rt::router_identity_tid(), "the identity table"),
+        (rt::router_topk_iota_tid(), "the iota row"),
+        (rt::router_pad_mask_tid(), "the argsort pad-mask"),
+    ] {
+        assert!(
+            consts.iter().all(|(t, _)| *t != tid),
+            "no {what} may be bound without a router"
+        );
+    }
 }

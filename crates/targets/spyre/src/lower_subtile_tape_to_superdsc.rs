@@ -184,8 +184,8 @@ pub use ktir_superdsc::reserved_tids::{
     ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
     SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, identity_class_tid, is_kernel_table_class_tid,
     kct_resident_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
-    router_pad_hi_tid, router_pad_lo_tid, router_pad_mask_tid, router_rank_tie_tid,
-    router_topk_iota_tid, router_topk_onehot_tid,
+    router_identity_tid, router_pad_hi_tid, router_pad_lo_tid, router_pad_mask_tid,
+    router_rank_tie_tid, router_topk_iota_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -925,11 +925,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
     }
 
     // ── ROUTER CONST ROWS (the MoE router doors' token-independent factors) ──
-    // The tie matrix `[W,W]`, the iota row, the one-hot rows and the two sanitize rows the
-    // router doors read, worker-bound like the rope-P tables above (see `ROUTER_CONST_BASE`'s
-    // own doc in reserved_tids.rs for the full law). GEOMETRY OFF THE TAPE'S OWN NODES:
-    // `experts` off a RouterLogits, `k` off the tape's RouteTopK/ExpertSort (a model has one
-    // top-k). W = the padded stick width `next_multiple_of(64, E)`, the same pad the router
+    // The tie matrix `[W,W]`, the identity table `[W,W]`, the iota row and the two sanitize
+    // rows the router doors read, worker-bound like the rope-P tables above (see
+    // `ROUTER_CONST_BASE`'s own doc in reserved_tids.rs for the full law). GEOMETRY OFF THE
+    // TAPE'S OWN NODES: `experts` off a RouterLogits — E ALONE gates the placement, because
+    // every const is E-sized (the argsort reads one identity row per RANKED expert; k never
+    // sizes a placement, a door that needs k rows reads k rows of the E-sized identity).
+    // W = the padded stick width `next_multiple_of(64, E)`, the same pad the router
     // buffers' own views carry (the narrow-tensor law: lanes E..W are pad, forced inert by the
     // sanitize rows). ⛔ OUTSIDE the attention-class guard: a router tape with no AttnDecode
     // node still needs its consts placed — the guard is the tape's own router nodes, nothing
@@ -939,20 +941,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
         SubOp::RouterLogits { experts, .. } => Some(experts.get()),
         _ => None,
     });
-    let router_k = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::RouteTopK { k } | SubOp::ExpertSort { k, .. } => Some(k.get()),
-            _ => None,
-        })
-        .max();
-    if let (Some(e), Some(k)) = (router_experts, router_k) {
+    if let Some(e) = router_experts {
         let stk = ktir_superdsc::superdsc_opspec::Fp16::ELEMS_PER_STICK as u64; // 64
         let w = e.next_multiple_of(stk as u32) as u64; // padded expert width, whole sticks
         let seg = SegRole::Activation.segment();
-        // ONE placement per const row/table: the [W,W] tie table, the [1,W] iota row, k
-        // [1,W] one-hot rows, and the two [1,W] sanitize rows. All fp16 (the router tensors'
+        // ONE placement per const row/table: the [W,W] tie table, the [W,W] identity table,
+        // the [1,W] iota row, and the two [1,W] sanitize rows. All fp16 (the router tensors'
         // own dtype), all bound at load by `wiring::synthetic_constants`.
         let mut place_const = |tid: u32, rows: u64, cols: u64, seg_bytes: &mut [u64; 7]| {
             let off = seg_bytes[seg];
@@ -971,10 +965,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
             seg_bytes[seg] = align128(off + sz);
         };
         place_const(router_rank_tie_tid(), w, w, &mut seg_bytes);
+        place_const(router_identity_tid(), w, w, &mut seg_bytes);
         place_const(router_topk_iota_tid(), 1, w, &mut seg_bytes);
-        for j in 0..k {
-            place_const(router_topk_onehot_tid(j), 1, w, &mut seg_bytes);
-        }
         place_const(router_pad_hi_tid(), 1, w, &mut seg_bytes);
         place_const(router_pad_lo_tid(), 1, w, &mut seg_bytes);
         place_const(router_pad_mask_tid(), 1, w, &mut seg_bytes);

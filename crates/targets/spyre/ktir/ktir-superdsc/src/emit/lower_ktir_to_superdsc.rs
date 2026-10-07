@@ -6315,6 +6315,273 @@ pub fn expert_combine(
     Ok(ops)
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteArgsort`] —
+/// each row's expert indices sorted by ascending score, AS THE RANK VECTOR:
+/// `rank[i, j] = |{h' : x[i,h'] < x[i,j]}| + |{h' : x[i,h'] == x[i,j] ∧ h' < j}|`,
+/// the stable ascending argsort (MLX `block_sort`'s ordering, ties by index).
+///
+/// ⭐ THE COMPARE/REDUCE FORM, ONE `j` AT A TIME, BATCHED OVER ALL TOKENS. The
+/// emu builds the full `[m, E, E]` compare product; the card's iteration space
+/// is 2-D `[mb, out]`, so the door fixes the RANKED expert `j` (one group of
+/// ops per `j`) and lets the token axis ride `mb` — every token's compare at
+/// once, `7W + 1` ops total (W = the padded expert width — the loop covers
+/// the pad lanes too, so the downstream full-stick compare never reads a
+/// stale rank), independent of `m`:
+///
+/// ```text
+/// xsan   = maximum(x, pad_mask)            pad lanes → +inf, sort last
+/// lt_j   = lesserthan(xsan, xsan[:, j])    𝟙[x[i,h'] < x[i,j]] over [m, W]
+/// eq_j   = equal(xsan, xsan[:, j])         𝟙[x[i,h'] == x[i,j]]
+/// tie_j  = eq_j · tie_row_j                the stable tie-break, h' < j
+/// cnt_j  = lt_j + tie_j
+/// rank_j = sum(cnt_j, cols)                the [m, stick] reduce (lane 0)
+/// prod_j = rank_j · onehot_j               per-row scalar × the one-hot row
+/// out   += prod_j                          accumulate; lane j of the output
+/// ```
+///
+/// ⛔ THE PAD-MASK SANITIZE IS LOAD-BEARING, NOT COSMETIC. The producer's
+/// device-width pad (`DeviceWidth::for_output`) zero-fills lanes `E..W`, and a
+/// ZERO pad lane outranks every negative real score — the rank vector would
+/// count pad lanes among the smallest and the top-k would read pad "experts".
+/// `maximum(x, pad_mask)` forces them to +inf (sorts last) while leaving real
+/// lanes bit-identical (`maximum(v, 0) = v` for `v ≠ NaN`). A NaN logit
+/// propagates through `maximum` as NaN (IEEE), winning neither compare — the
+/// emu's explicit NaN→+inf select is defense-in-depth the first card landing
+/// does not replicate; the tiny26 EMU-vs-card parity gate owns the question,
+/// and a real NaN divergence there upgrades the sanitize to the select chain.
+///
+/// ⛔ THE `x[:, j]` READ IS THE COMBINE DOOR'S OWN LAW: `In::col_at` at the
+/// lane offset `col_of(rows, W, j)` — the RedStick per-row single-element read
+/// the score lanes of [`expert_combine`] already use, card-proven. The tie
+/// table's row `j` rides `In::mb_at` at `rc_of(W, W, j, 0)` — a whole-row
+/// shift of the `[W,W]` const, the same block-aligned base-offset law the
+/// per-head norm windows use.
+///
+/// ⛔ THE OUTPUT LANE WRITE IS THE COMBINE CHAIN'S OWN SHAPE: a cols-reduce
+/// lands its per-row scalar at LANE 0 of the `[m, stick]` accum, and pointwise
+/// ops are position-blind — so lane `j` of the `[m, W]` output is written as
+/// `rank_j · onehot_j`, the per-row scalar times the mb-broadcast one-hot row,
+/// accumulated with `add` (slot 0's product seeds the accumulator, exactly
+/// the combine door's chain). The output's lanes `E..W` hold the pad lanes'
+/// ranks, WRITTEN (the loop runs to W): +inf inputs sort last with the stable
+/// tie-break, so pad lane `e+t` carries rank `e+t` — a value the downstream
+/// top-k's `equal(rank, E−k+j)` never matches for `j < k`. ⛔ Writing them is
+/// load-bearing, not cosmetic: a cols-compare over the full stick reads
+/// whatever is there, and a STALE pad lane can spuriously match a target and
+/// mint a phantom expert.
+pub fn route_argsort(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    // x and the output — the parameters `KtirFunc::route_argsort` mints
+    // (shape-preserving: out is [m, E] like x).
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let rows = node_rows(name, &out)?;
+    // The logical expert count off the OUTPUT's view (the buffer's whole-tensor
+    // truth, the sort door's `v_cols` law), the padded width off the layout's
+    // own router registry — the same geometry the const placements were minted
+    // at, so the tie table's [W,W] and the one-hot rows' [1,W] agree with the
+    // buffers this door addresses.
+    let e = out.v_cols;
+    let w = e.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || e == 0 || w % crate::work::FP16_ELEMS_PER_STICK != 0 {
+        return err(format!(
+            "RouteArgsort {name}: the output t{}'s view states [{rows}, {e}] — the expert count \
+             must be positive and its padded width a whole 64-stick (got {w})",
+            out.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteArgsort", out.tid)?;
+    let out_tid = out.tid;
+    let x_s = tensors[0].name();
+    let out_s = out.name();
+    // The const tids — the reserved rows this door reads. Their placements are
+    // minted by the router-const block in `compute_bundle_layout` and their
+    // values bound at load by `wiring::synthetic_constants`. The one-hot row j
+    // is ROW j of the [W,W] identity table — the same whole-row mb shift the
+    // tie table's rows use, so one table serves every per-slot one-hot read
+    // (the argsort reads one row per ranked expert; the future top-k selector
+    // reads one row per slot — both are rows of the same E-sized identity).
+    let tie_tid = crate::reserved_tids::router_rank_tie_tid();
+    let mask_tid = crate::reserved_tids::router_pad_mask_tid();
+    let ident_tid = crate::reserved_tids::router_identity_tid();
+    let tie_s = crate::place::act_name(tie_tid);
+    let mask_s = crate::place::act_name(mask_tid);
+    let ident = rb(&crate::place::act_name(ident_tid), w, w);
+    // Synths: the sanitized scores [m, W], the per-j compare/sum [m, W], the
+    // per-j reduce accum [m, stick], and the output accumulator [m, W].
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    let xsan_s = syn(R::AXSan);
+    let lt_s = syn(R::ALt);
+    let cnt_s = syn(R::ACnt);
+    let rank_s = syn(R::ARank);
+    let acc_s = syn(R::AAcc);
+    if let Some(l) = layout {
+        l.synth_like(out_id.synth(R::AXSan), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ALt), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ACnt), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ARank), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::AAcc), out_tid, &[rows, w], Df::Fp16);
+    }
+    // Handles: x/out/xsan/lt/cnt/acc at the padded [m, W]; the per-row reduced
+    // rank at one stick; the consts at their own placements' shapes.
+    let x = rb(&x_s, rows, w);
+    let out = rb(&out_s, rows, w);
+    let xsan = rb(&xsan_s, rows, w);
+    let lt = rb(&lt_s, rows, w);
+    let cnt = rb(&cnt_s, rows, w);
+    let rank = rb(&rank_s, rows, w);
+    let acc = rb(&acc_s, rows, w);
+    let tie = rb(&tie_s, w, w);
+    let mask = rb(&mask_s, 1, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(1 + 7 * w as usize);
+    // 0. THE SANITIZE: pad lanes → +inf (sorts last). One op, whole [m, W].
+    ops.push(pw2(
+        &format!("rasan_o{out_tid}"),
+        "maximum",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::mb(&mask),
+        &xsan,
+        sym_id_base,
+        layout,
+    ));
+    // ⭐ THE LOOP RUNS TO THE PADDED WIDTH, NOT E. The downstream top-k's
+    // `equal(rank, target)` compare reads the FULL [m, W] stick (a partial
+    // stick is not an addressable thing), so a pad lane holding a stale
+    // garbage value can spuriously MATCH a target rank and mint a phantom
+    // expert. Writing every pad lane's rank makes them well-defined (a +inf
+    // pad lane outranks everything real, so its rank is e + its index among
+    // the pads, and the one-hot write still lands each at its own lane) —
+    // a target `e - k + j` for `j < k` is always < e, so no pad rank can
+    // ever match one. For a whole-stick E (26b: E=128=W) this is free; only
+    // a sub-stick E pays the extra groups.
+    for j in 0..w {
+        // The ranked expert j's lane in the [m, W] scores — the combine door's
+        // own col_at law. The tie table's row j and the identity's row j as
+        // whole-row mb shifts of the [W,W] consts.
+        let lane = crate::addr::col_of(rows, w, j, Df::Fp16);
+        let tie_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        let ident_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        let onehot = In::mb_at(&ident, ident_row);
+        // 1. lt_j = 𝟙[x[i,h'] < x[i,j]] — the row (full) against the column
+        //    (per-row scalar at lane j).
+        ops.push(pw2(
+            &format!("ralt_j{j}_o{out_tid}"),
+            "lesserthan",
+            t_rows,
+            f_cols,
+            In::full(&xsan),
+            In::col_at(&xsan, lane),
+            &lt,
+            sym_id_base,
+            layout,
+        ));
+        // 2-4. cnt_j = lt_j + equal(x[i,h'], x[i,j]) · tie_row_j — the compare
+        //      pair plus the stable tie-break, over a shared [m, W] scratch
+        //      (the equal's product reuses `lt`'s buffer: nothing reads `lt`
+        //      after this leg).
+        ops.push(pw2(
+            &format!("raeq_j{j}_o{out_tid}"),
+            "equal",
+            t_rows,
+            f_cols,
+            In::full(&xsan),
+            In::col_at(&xsan, lane),
+            &cnt,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("ratie_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            &[In::full(&cnt).ew(), In::mb_at(&tie, tie_row).ew()],
+            &cnt,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("racnt_j{j}_o{out_tid}"),
+            "add",
+            t_rows,
+            f_cols,
+            &[In::full(&lt).ew(), In::full(&cnt).ew()],
+            &cnt,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 5. rank_j = Σ_h' cnt_j — the native cols reduce, [m, stick].
+        ops.push(assemble_reduce_off(
+            &format!("rarnk_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols,
+            &cnt,
+            crate::addr::DevOff::ZERO,
+            &rank,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 6-7. lane j of the output = rank_j · onehot_j, accumulated — the
+        //      combine chain's own shape (slot 0 seeds the accumulator, the
+        //      last add writes `out` directly).
+        // The product leg: the per-row rank scalar (lane 0 of the reduce
+        // accum, read in the col mode) times the mb-broadcast one-hot row —
+        // row j of the [W,W] identity const.
+        ops.push(pw2(
+            &format!("raprd_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::col(&rank),
+            onehot,
+            &lt,
+            sym_id_base,
+            layout,
+        ));
+        // The accumulate leg: j==0 seeds the accumulator with the product
+        // itself; every later j adds into it; the LAST add writes `out`.
+        if j == 0 {
+            ops.push(pw1(
+                &format!("raseed_o{out_tid}"),
+                "identity",
+                t_rows,
+                f_cols,
+                In::full(&lt),
+                &acc,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("raacc_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                f_cols,
+                &[In::full(&acc).ew(), In::full(&lt).ew()],
+                if j + 1 == e { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
 /// `out = x · w`, `w` a host-staged `[1]`-shaped weight (gemma4
 /// `layer_scalar[layer]`).

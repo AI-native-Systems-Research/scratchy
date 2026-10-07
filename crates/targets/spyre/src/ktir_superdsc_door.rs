@@ -151,14 +151,11 @@ pub fn lower(
         // substitution would compute a different function. The EMULATOR runs
         // these programs' ops directly (`ktir_groups` ignores the Program
         // field off-card), so this refusal only fires under `-Fspyre-hw`.
-        Program::RouteArgsort => Err(Error {
-            message: format!(
-                "{name}: RouteArgsort (each row's expert indices sorted by ascending score) has \
-                 no SuperDSC lowering yet: on card it is the vendor `topk.ddl` `topkindex` op \
-                 (SFP unit, k-dim worksplit across cores, internal state regs) — the rank-vector \
-                 compare/reduce form the program states is the emulator's"
-            ),
-        }),
+        // Each row's expert indices sorted by ascending score, AS THE RANK
+        // VECTOR — the compare/reduce form the emu states, one `j` at a time
+        // with every token riding the mb axis (see the door's own doc for the
+        // 7E+1 chain and the pad-mask sanitize that makes it correct).
+        Program::RouteArgsort => lk::route_argsort(name, &r, sym_id_base, layout),
         Program::RouteTopK => Err(Error {
             message: format!(
                 "{name}: RouteTopK (the last k sorted indices of each row) has no SuperDSC \
