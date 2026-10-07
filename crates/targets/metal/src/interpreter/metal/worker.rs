@@ -916,6 +916,7 @@ fn is_fused(id: KernelId) -> bool {
             | K::RopeAppendNormed
             | K::NormAddScalarMul
             | K::AttentionViaCacheTq
+            | K::AttentionDecodeGqaTq
     )
 }
 
@@ -937,6 +938,8 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::RopeOnceGqaShared => KernelKind::Rope,
         K::AttentionViaCache
         | K::AttentionViaCacheTq
+        | K::AttentionDecodeGqaTq
+        | K::AttentionDecodeCombine
         | K::AttentionPrefillSdpaPaged
         | K::AttnGatherKRope
         | K::AttnGatherVCopyT

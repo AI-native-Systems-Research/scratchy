@@ -166,7 +166,7 @@ pub fn lower_subtile_tape_to_metal(
     let encodes = |c: &GatedCommand| {
         let writes = match c.command.kernel {
             KernelId::RopeAppend | KernelId::RopeAppendNormed => true,
-            KernelId::AttentionViaCacheTq => {
+            KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
                 c.command.constants.iter().any(|k| k.index == ATTN_FOLD.0)
             }
             _ => false,
@@ -1017,6 +1017,122 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
     out
 }
 
+/// The keys of the rung's KV cap one threadgroup of `attention_decode_gqa_tq` takes.
+const ATTN_SPLIT_KEYS: u32 = 1024;
+
+/// At most this many threadgroups a KV head's keys spread over.
+const ATTN_MAX_SPLITS: u32 = 16;
+
+/// The query heads `attention_decode_gqa_tq` serves a KV head.
+const GQA_HEADS: u32 = 8;
+
+/// A one-row bucket's TurboQuant decode attention (the codec's packed twin, or it running its KV
+/// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
+/// head_dim a multiple of 128 up to 512, KV blocks of whole 8-key blocks, no projection bias, a
+/// rotary pair's partner a whole lane stride away — serves each KV head's query heads together:
+/// its keys decode once for all 8, where `attention_via_cache_v2` decodes them once per head
+/// group. Its keys spread over the threadgroups the rung's KV cap calls for (`ATTN_SPLITS`,
+/// [`ATTN_SPLIT_KEYS`] of the cap each, at most [`ATTN_MAX_SPLITS`]), each storing its heads'
+/// partials at the op scratch's front, `[num_q_heads, splits, 2 + head_dim]` floats, and a
+/// combine merges them into the output.
+fn decode_attention_per_kv_head(
+    p: &MetalModelConsts,
+    step: &MetalStep,
+    cmds: Vec<GatedCommand>,
+    at: &BakePoint<'_>,
+    moe_scratch_bytes: &mut u32,
+) -> Vec<GatedCommand> {
+    let attention = match step {
+        MetalStep::RopedAttention(f) => &f.attention,
+        step => step,
+    };
+    let full = matches!(
+        attention,
+        MetalStep::AttnPackedKv(_, _, _, _, AttnMask::Causal, _)
+    );
+    let hd = p.global_head_dim;
+    let lane_stride = |c: &LoweredCommand| {
+        (c.constants.iter())
+            .find(|k| k.index == 9)
+            .is_none_or(|pair_off| pair_off.bits % (hd / 32) == 0)
+    };
+    let takes = |c: &LoweredCommand| {
+        c.kernel == KernelId::AttentionViaCacheTq
+            && !c.constants.iter().any(|k| matches!(k.index, 14 | 15))
+            && lane_stride(c)
+    };
+    let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
+        && p.num_q_heads == GQA_HEADS * p.num_global_kv_heads
+        && hd.is_multiple_of(128)
+        && hd <= 512
+        && p.global_block_size.is_multiple_of(8);
+    if at.bucket_m != 1 || !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
+        return cmds;
+    }
+    let keys = at.block_cap.saturating_mul(p.global_block_size);
+    let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
+    let partials = p.num_q_heads * splits * (2 + hd) * 4;
+    *moe_scratch_bytes = (*moe_scratch_bytes).max(partials);
+    let partials = scratch_at(16, 0);
+    let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
+    let mut out = Vec::with_capacity(cmds.len() + 1);
+    for GatedCommand { command, gate } in cmds {
+        if !takes(&command) {
+            out.push(GatedCommand { command, gate });
+            continue;
+        }
+        // The heads it serves are the kernel's own: no TurboQuant heads variant binds it.
+        let mut constants: Vec<_> = (command.constants.iter())
+            .filter(|k| k.ty != super::constants::ConstantType::TqHeads)
+            .copied()
+            .collect();
+        constants.push(ConstantValue::uint(18, splits));
+        let (x, _, _) = command.dispatch.threadgroups;
+        let attention = LoweredCommand {
+            kernel: KernelId::AttentionDecodeGqaTq,
+            function: symbol(
+                "attention_decode_gqa_tq_f16_specialized",
+                "attention_decode_gqa_tq_bf16_specialized",
+            ),
+            constants: baked(constants.clone()),
+            dispatch: DispatchShape {
+                threadgroups: (x, p.num_global_kv_heads, splits),
+                threads_per_threadgroup: (hd, 1, 1),
+                ..command.dispatch
+            },
+            bindings: baked(
+                (command.bindings.iter().copied())
+                    .chain([partials])
+                    .collect(),
+            ),
+            ..command
+        };
+        // The output, the rotation's signs and the V bias: the combine's buffers 0, 11 and 15.
+        let kept = (command.bindings.iter())
+            .filter(|b| matches!(b.index(), 0 | 11 | 15))
+            .copied();
+        let combine = LoweredCommand {
+            kernel: KernelId::AttentionDecodeCombine,
+            library: "attention",
+            function: symbol(
+                "attention_via_cache_v2_combine_f16_specialized",
+                "attention_via_cache_v2_combine_bf16_specialized",
+            ),
+            constants: baked(constants),
+            dispatch: DispatchShape {
+                threadgroups: (x, p.num_q_heads, 1),
+                threads_per_threadgroup: (32, 1, 1),
+                ..command.dispatch
+            },
+            bindings: baked(kept.chain([partials]).collect()),
+            gemm_dims: None,
+        };
+        let gated = |command| GatedCommand { command, gate };
+        out.extend([gated(attention), gated(combine)]);
+    }
+    out
+}
+
 /// A gated row's `gate` on every command of it. A command its realization already gated cannot
 /// take a second: [`LoweringError::DoubleGate`].
 fn row_gate(
@@ -1218,6 +1334,7 @@ fn lower(
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
                 let cmds = route_gdn(p, step, cmds);
+                let cmds = decode_attention_per_kv_head(p, step, cmds, at, &mut moe_scratch_bytes);
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = row_gate(cmds, *gate, i)?;
                 let cmds = route_by_sequence_count(i, cmds)?;
@@ -7949,6 +8066,145 @@ mod tests {
             .iter()
             .map(|c| (c.command.kernel, c.gate))
             .collect()
+    }
+
+    /// A one-row bucket's TurboQuant decode at `attention_decode_gqa_tq`'s geometry (8 query
+    /// heads a KV head, head_dim 256) serves each KV head's heads together: the packed twin's
+    /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
+    /// front, its constants less the TurboQuant heads and plus the rung's split count, a
+    /// threadgroup per (KV head, split) of head_dim threads — then a combine of one simdgroup a
+    /// query head. A many-row bucket's decode, and a geometry it cannot take, keep the
+    /// per-head-group kernel.
+    #[test]
+    fn turboquant_decode_serves_each_kv_heads_query_heads_together() {
+        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
+        let p = MetalModelConsts {
+            global_head_dim: 256,
+            num_global_kv_heads: 4,
+            global_block_size: 16,
+            ..tq_consts()
+        };
+        let rows = || {
+            coded(
+                tq_writer(0, Causal, LLAMA_KV),
+                attention(MetalStep::AttentionViaCache, 0, Interleaved),
+            )
+        };
+        let tape = lower_tq(&p, rows(), 1);
+        assert_eq!(
+            gated_steps(&tape),
+            [
+                (KernelId::RopeAppend, None),
+                (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
+            ]
+        );
+        let (gqa, combine) = (&tape.commands[2].command, &tape.commands[3].command);
+        let twin = MetalModelConsts {
+            num_global_kv_heads: 2,
+            ..p
+        };
+        let twin = lower_tq(&twin, rows(), 1);
+        let twin = &twin.commands[2].command;
+        assert_eq!(twin.kernel, KernelId::AttentionViaCacheTq);
+        // 128 blocks of 16 keys: two threadgroups of `ATTN_SPLIT_KEYS`.
+        let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
+        assert_eq!(splits, 2);
+        assert_eq!(
+            (
+                gqa.function,
+                gqa.dispatch.threadgroups,
+                gqa.dispatch.threads_per_threadgroup
+            ),
+            (
+                "attention_decode_gqa_tq_bf16_specialized",
+                (1, 4, splits),
+                (256, 1, 1)
+            )
+        );
+        let heads = super::super::constants::ConstantType::TqHeads;
+        assert!(twin.constants.iter().any(|k| k.ty == heads));
+        let without_heads = (twin.constants.iter()).filter(|k| k.ty != heads).copied();
+        let constants: Vec<_> = without_heads
+            .chain([ConstantValue::uint(18, splits)])
+            .collect();
+        let constants: Vec<_> = constants
+            .into_iter()
+            .map(|k| match k.index {
+                2 => ConstantValue::uint(2, 4),
+                _ => k,
+            })
+            .collect();
+        assert_eq!(*gqa.constants, *constants);
+        let partials = scratch_at(16, 0);
+        assert_eq!(*gqa.bindings, [twin.bindings, &[partials]].concat());
+        assert_eq!(
+            (combine.function, combine.dispatch.threadgroups),
+            (
+                "attention_via_cache_v2_combine_bf16_specialized",
+                (1, p.num_q_heads, 1)
+            )
+        );
+        assert_eq!(combine.dispatch.threads_per_threadgroup, (32, 1, 1));
+        assert_eq!(combine.constants, gqa.constants);
+        let out_and_signs = (twin.bindings.iter()).filter(|b| matches!(b.index(), 0 | 11));
+        assert_eq!(
+            *combine.bindings,
+            out_and_signs.copied().chain([partials]).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tape.moe_scratch_bytes,
+            p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+        );
+
+        let kernels = |tape: &LoweredMetalTape| {
+            (tape.commands.iter())
+                .map(|c| c.command.kernel)
+                .collect::<Vec<_>>()
+        };
+        assert!(!kernels(&lower_tq(&p, rows(), 2)).contains(&KernelId::AttentionDecodeGqaTq));
+        let narrow = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
+        assert!(kernels(&narrow).contains(&KernelId::AttentionViaCacheTq));
+
+        // Running its KV writer (Gemma 4's global layers), it is the tape's only encoder.
+        use crate::tape::step::RopedAttention;
+        let MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, _) =
+            tq_writer(0, Causal, LLAMA_KV)
+        else {
+            unreachable!()
+        };
+        let writer =
+            MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, pr, c, o, KvWrite::PoolAndPacked);
+        let fused = MetalStep::RopedAttention(Box::new(RopedAttention {
+            writer,
+            attention: MetalStep::AttnPackedKv(
+                Slot(3),
+                Slot(6),
+                LayerId(0),
+                NeoX,
+                Causal,
+                LLAMA_KV,
+            ),
+            writer_sources: TEST_SITE.len(),
+        }));
+        let folded = MetalStepTape {
+            backbone: plain(&[fused]),
+            backbone_barriers: vec![true],
+            backbone_sources: vec![[TEST_SITE.clone(), TEST_SITE.clone()].concat()],
+            ..MetalStepTape::default()
+        };
+        let folded = lower_subtile_tape_to_metal(&folded, &p, bake_point(1, None))
+            .expect("a folded per-KV-head decode encodes");
+        assert_eq!(
+            kernels(&folded),
+            [
+                KernelId::AttentionDecodeGqaTq,
+                KernelId::AttentionDecodeCombine
+            ]
+        );
+        let fold = &folded.commands[0].command;
+        assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
     }
 
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass

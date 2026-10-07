@@ -2,7 +2,8 @@
 //! A one-row decode attention that runs its KV writer (`ATTN_FOLD`, `MetalFusion::RopedAttention`)
 //! leaves the same bits as the writer then the attention: the output, the roped query, the cache
 //! and the packed store. The attention alone (no writer) leaves another output — the step's own
-//! key matters — so the match is not vacuous.
+//! key matters — so the match is not vacuous. `attention_decode_gqa_tq` (a KV head's 8 query heads
+//! together, its partials merged by `attention_via_cache_v2_combine`) leaves the query unroped.
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
@@ -74,6 +75,8 @@ struct Case {
     /// Keys including the step's own.
     ctx: usize,
     blocks_per_chunk: usize,
+    /// `attention_decode_gqa_tq` over this many threadgroups a KV head.
+    gqa: Option<usize>,
 }
 
 struct Lcg(u64);
@@ -281,8 +284,15 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             ConstantValue::uint(10, 1),
         ]);
     }
-    let heads = match c.bits {
-        Some(b) => {
+    let heads = match (c.bits, c.gqa) {
+        (Some(b), Some(splits)) => {
+            attn_constants.extend([
+                ConstantValue::uint(13, b),
+                ConstantValue::uint(18, splits as u32),
+            ]);
+            1
+        }
+        (Some(b), None) => {
             attn_constants.push(ConstantValue::uint(13, b));
             if c.biased {
                 attn_constants.extend([ConstantValue::uint(14, 1), ConstantValue::uint(15, 1)]);
@@ -290,7 +300,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             attn_constants.push(ConstantValue::uint(16, c.heads as u32));
             c.heads
         }
-        None => 1,
+        (None, _) => 1,
     };
     if how == Run::Fold {
         attn_constants.extend([
@@ -298,13 +308,28 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             ConstantValue::uint(20, c.pair_off as u32),
         ]);
     }
-    let attn_name: &'static str =
-        Box::leak(format!("attention_via_cache_v2_{}_specialized", c.dtype.tag()).into_boxed_str());
+    let kernel = match c.gqa {
+        Some(_) => "attention_decode_gqa_tq",
+        None => "attention_via_cache_v2",
+    };
+    let leak = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
+    let attn_name = leak(format!("{kernel}_{}_specialized", c.dtype.tag()));
+    let combine_name = leak(format!(
+        "attention_via_cache_v2_combine_{}_specialized",
+        c.dtype.tag()
+    ));
+    let combine = baked_build(
+        &cache,
+        &PipelineKey::new("attention", combine_name, attn_constants.clone()),
+    )
+    .expect("combine");
     let attention = baked_build(
         &cache,
         &PipelineKey::new("attention", attn_name, attn_constants),
     )
     .expect("attention");
+    // NaN: the combine reads only the partials the attention stored.
+    let partials = shared(&device, &vec![f32::NAN; nq * c.gqa.unwrap_or(1) * (hd + 2)]);
 
     let resident = [&pool_k.data, &pool_v.data];
     let mut batch = Mtl4DispatchBatch::begin(&device)?;
@@ -352,6 +377,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         (&slots, 13),
         (&kb, 14),
         (&vb, 15),
+        (&partials, 16),
     ];
     if how == Run::Fold {
         binds.extend([
@@ -363,15 +389,28 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             (&cos_sin, 22),
         ]);
     }
-    batch.encode(
-        &attention,
-        &binds,
-        &[],
-        &[],
-        &resident,
-        tg(1, nq / heads),
-        tg(1024, 1),
-    );
+    match c.gqa {
+        Some(splits) => {
+            let grid = MTLSize {
+                width: 1,
+                height: nkv,
+                depth: splits,
+            };
+            batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1));
+            batch.barrier();
+            let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
+            batch.encode(&combine, &binds, &[], &[], &[], tg(1, nq), tg(32, 1));
+        }
+        None => batch.encode(
+            &attention,
+            &binds,
+            &[],
+            &[],
+            &resident,
+            tg(1, nq / heads),
+            tg(1024, 1),
+        ),
+    }
     batch.commit(true);
 
     let pool_elems = N_BLOCKS * BLOCK_SIZE * nkv * hd;
@@ -402,7 +441,10 @@ fn check(name: &str, c: Case) {
         writer.out, alone.out,
         "{name}: the step's own key changes nothing"
     );
-    assert_eq!(fold.q, writer.q, "{name}: roped query");
+    match c.gqa {
+        None => assert_eq!(fold.q, writer.q, "{name}: roped query"),
+        Some(_) => assert_eq!(fold.q, alone.q, "{name}: the query left unroped"),
+    }
     assert_eq!(fold.pool_k, writer.pool_k, "{name}: K cache");
     assert_eq!(fold.pool_v, writer.pool_v, "{name}: V cache");
     assert_eq!(fold.packed_k, writer.packed_k, "{name}: packed K");
@@ -428,6 +470,7 @@ fn llama(dtype: Dtype, bits: Option<u32>, heads: usize) -> Case {
         write_skipped: false,
         ctx: 41,
         blocks_per_chunk: 4,
+        gqa: None,
     }
 }
 
@@ -500,6 +543,36 @@ fn write_skipped_tail() {
             ..llama(Dtype::Bf16, Some(4), 3)
         },
     );
+}
+
+/// A KV head's 8 query heads together (`attention_decode_gqa_tq`), whole and over 3 threadgroups:
+/// the step's own key (the 41st) falls to the last, which reads it from its own copy of the row
+/// while the first writes it to the cache and the packed store.
+#[test]
+fn gqa_turboquant() {
+    let gqa = |splits| Case {
+        num_q_heads: 16,
+        num_kv_heads: 2,
+        gqa: Some(splits),
+        ..llama(Dtype::Bf16, Some(4), 1)
+    };
+    for splits in [1, 3] {
+        check("gqa turboquant", gqa(splits));
+        check(
+            "gqa spans turboquant",
+            Case {
+                spans: true,
+                ..gqa(splits)
+            },
+        );
+        check(
+            "gqa skipped turboquant",
+            Case {
+                write_skipped: true,
+                ..gqa(splits)
+            },
+        );
+    }
 }
 
 #[test]

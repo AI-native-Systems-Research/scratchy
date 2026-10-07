@@ -1827,6 +1827,11 @@ impl Recording<'_> {
                 let step = S::AttnPackedKv(q, out, layer, pairing, class, offsets);
                 let mut e = em(step, &[q, out], &[out], sites);
                 e.sig.kv_r = Some(layer);
+                // A one-row full-attention decode may pass its partials through the op scratch
+                // (`attention_decode_gqa_tq`).
+                if class == AttnMask::Causal && self.l.input.ops[i].m <= 1 {
+                    e.sig.op_scratch = Access::Write;
+                }
                 e
             }
             L::Elementwise(E::Mul) => return Err(self.no(i, Refused::NoGatedFold)),

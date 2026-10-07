@@ -470,6 +470,13 @@ pub enum KernelId {
     /// decode step never dequantizes the context. Same symbol as
     /// `AttentionViaCache`.
     AttentionViaCacheTq,
+    /// A one-row TurboQuant decode attention serving each KV head's 8 query heads together
+    /// (`attention_decode_gqa_tq_*`): its threadgroups count KV heads and `ATTN_SPLITS` key runs,
+    /// whatever TurboQuant heads the variant serves.
+    AttentionDecodeGqaTq,
+    /// [`Self::AttentionDecodeGqaTq`]'s second pass (`attention_via_cache_v2_combine_*`): merges
+    /// each query head's partials into its output.
+    AttentionDecodeCombine,
 }
 
 /// Which sequences of a step a command computes correctly.
@@ -572,7 +579,9 @@ impl KernelId {
             | Self::TqStageRotated
             | Self::TqRotateRows
             | Self::RowProgram
-            | Self::AttentionViaCacheTq => SeqScope::AllRows,
+            | Self::AttentionViaCacheTq
+            | Self::AttentionDecodeGqaTq
+            | Self::AttentionDecodeCombine => SeqScope::AllRows,
         }
     }
 }
