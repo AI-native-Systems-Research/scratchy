@@ -7,8 +7,8 @@
 //! (`attention.metal`).
 
 use objc2_metal::MTLDevice;
-pub use scratchy_layers::turboquant::kv_bytes_per_token;
 use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
+pub use scratchy_layers::turboquant::{kv_bytes_per_token, scratch_bytes_per_token};
 
 use crate::argmax::Buffer;
 
@@ -43,6 +43,16 @@ impl TqCodebook {
     }
 }
 
+/// The KV pool a TurboQuant provision serves, at its GLOBAL (full-context) geometry.
+#[derive(Clone, Copy)]
+pub struct TqPool<'a> {
+    pub is_global: &'a [bool],
+    pub num_blocks: usize,
+    pub block_size: usize,
+    pub num_kv_heads: usize,
+    pub blocks_per_chunk: usize,
+}
+
 /// Build the TurboQuant provisioning for one worker at the GLOBAL (full-context)
 /// geometry. `num_blocks` is the shared KV pool capacity (the packed store is the
 /// canonical cache of that size); the scratch is ONE layer's fp16 (num_blocks
@@ -58,15 +68,23 @@ impl TqCodebook {
 /// placeholder buffer that the tape never binds (the KV codec pass codes only
 /// the global KV writers). Uniform arches pass all-true → every layer real
 /// (byte-identical to before, when `is_global` was implicitly all-true).
+///
+/// `lent` is a scratch of a pool whose forwards never overlap this one's (a head's target's,
+/// [`crate::interpreter::metal::LentActivation::tq_scratch`]): of this geometry, the provision
+/// stages through it and allocates none of its own.
 pub fn build_tq_provision(
     allocator: &crate::MetalAllocator,
-    is_global: &[bool],
-    num_blocks: usize,
-    block_size: usize,
-    num_kv_heads: usize,
-    blocks_per_chunk: usize,
+    pool: TqPool<'_>,
     codebook: &TqCodebook,
+    lent: Option<&crate::interpreter::metal::runtime::TqScratch>,
 ) -> crate::interpreter::metal::runtime::TqRuntimeBuffers {
+    let TqPool {
+        is_global,
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        blocks_per_chunk,
+    } = pool;
     use objc2_metal::{MTLBuffer, MTLResourceOptions};
     let device = allocator.device();
     let (bits, head_dim) = (codebook.bits.get(), codebook.signs.len());
@@ -94,10 +112,16 @@ pub fn build_tq_provision(
     let packed = (block_size * num_kv_heads * pdim * 4, false);
     let norms = (block_size * num_kv_heads * 4, true);
     let scratch = (per_block_elems * SCRATCH_ELEM_BYTES, true);
+    // A lent scratch of this geometry is staged through, and none of this pool's own is laid out:
+    // its stores are its lender's, mapped as far as the same blocks are reached.
+    let chunk_bytes = blocks_per_chunk * scratch.0;
+    let scratch_bytes = num_blocks * scratch.0;
+    let lent = lent.filter(|s| s.bytes == scratch_bytes && s.chunk_bytes == chunk_bytes);
+    let own_scratch = if lent.is_some() { 0 } else { 2 };
     let layout: Vec<(usize, bool)> = [packed, packed, norms, norms]
         .into_iter()
         .flat_map(|store| std::iter::repeat_n(store, n_global))
-        .chain([scratch; 2])
+        .chain(std::iter::repeat_n(scratch, own_scratch))
         .collect();
     let stores = crate::sparse_kv::SparseStores::new(
         device,
@@ -122,19 +146,30 @@ pub fn build_tq_provision(
         is_global.iter().map(&mut one).collect()
     };
     let (packed_k, packed_v, norms_k, norms_v) = (by_layer(), by_layer(), by_layer(), by_layer());
-    let (scratch_k_data, scratch_v_data) = (next.next(), next.next());
-    let scratch_k_data = scratch_k_data.expect("K scratch");
-    let scratch_v_data = scratch_v_data.expect("V scratch");
     // Contiguous scratch data + a chunk-table of gpuAddresses at chunk offsets (the kernels
     // deref it).
     let n_chunks = num_blocks.div_ceil(blocks_per_chunk.max(1));
-    let chunk_bytes = blocks_per_chunk * scratch.0;
     let table = |data: &Buffer| {
         let base = data.gpuAddress();
         let vals: Vec<u64> = (0..n_chunks)
             .map(|c| base + (c * chunk_bytes) as u64)
             .collect();
         crate::argmax::upload_shared_buffer(device, &vals)
+    };
+    let scratch = match lent {
+        Some(s) => s.clone(),
+        None => {
+            let k_data = next.next().expect("K scratch");
+            let v_data = next.next().expect("V scratch");
+            crate::interpreter::metal::runtime::TqScratch {
+                k_table: table(&k_data),
+                v_table: table(&v_data),
+                k_data,
+                v_data,
+                bytes: scratch_bytes,
+                chunk_bytes,
+            }
+        }
     };
     let mapped = stores.mapped();
     let registry = allocator.sparse_kv.lock();
@@ -149,10 +184,7 @@ pub fn build_tq_provision(
         signs: crate::argmax::upload_shared_buffer(device, codebook.signs),
         boundaries: crate::argmax::upload_shared_buffer(device, codebook.boundaries),
         centroids: crate::argmax::upload_shared_buffer(device, codebook.centroids),
-        scratch_k_table: table(&scratch_k_data),
-        scratch_v_table: table(&scratch_v_data),
-        scratch_k_data,
-        scratch_v_data,
+        scratch,
         mapped,
     }
 }
@@ -333,12 +365,15 @@ mod tests {
         for bits in [TqBits::new(3), TqBits::new(4)] {
             let tq = build_tq_provision(
                 &crate::MetalAllocator::new(device.clone()),
-                &vec![true; num_layers],
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                128,
+                TqPool {
+                    is_global: &vec![true; num_layers],
+                    num_blocks,
+                    block_size,
+                    num_kv_heads,
+                    blocks_per_chunk: 128,
+                },
                 &TqCodebook::compute(head_dim, bits),
+                None,
             );
             let len = |b: &Buffer| b.length();
             let allocated: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
@@ -346,8 +381,8 @@ mod tests {
                 .flatten()
                 .map(len)
                 .sum::<usize>()
-                + len(&tq.scratch_k_data)
-                + len(&tq.scratch_v_data);
+                + len(&tq.scratch.k_data)
+                + len(&tq.scratch.v_data);
             assert_eq!(
                 allocated,
                 num_blocks
@@ -362,6 +397,45 @@ mod tests {
                 "{bits:?}"
             );
         }
+    }
+
+    /// A provision lent a scratch of its own geometry (a head's, its target's) stages through
+    /// those very buffers and allocates no scratch of its own; one of another geometry — another
+    /// block count, so other chunk offsets in the tables — is not its to use, and it builds its own.
+    #[test]
+    fn a_provision_stages_through_a_lent_scratch_of_its_geometry() {
+        let Some(device) = crate::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let codebook = TqCodebook::compute(64, TqBits::new(4));
+        let is_global = [true];
+        let pool = |num_blocks| TqPool {
+            is_global: &is_global,
+            num_blocks,
+            block_size: 16,
+            num_kv_heads: 2,
+            blocks_per_chunk: 4,
+        };
+        let allocator = crate::MetalAllocator::new(device.clone());
+        let target = build_tq_provision(&allocator, pool(8), &codebook, None);
+        let same = |a: &Buffer, b: &Buffer| a.gpuAddress() == b.gpuAddress();
+        let head = build_tq_provision(&allocator, pool(8), &codebook, Some(&target.scratch));
+        for (h, t) in [
+            (&head.scratch.k_table, &target.scratch.k_table),
+            (&head.scratch.v_table, &target.scratch.v_table),
+            (&head.scratch.k_data, &target.scratch.k_data),
+            (&head.scratch.v_data, &target.scratch.v_data),
+        ] {
+            assert!(same(h, t), "the head stages through the target's scratch");
+        }
+        assert!(
+            !same(&head.packed_k[0], &target.packed_k[0]),
+            "its codes are its own"
+        );
+        let other = build_tq_provision(&allocator, pool(12), &codebook, Some(&target.scratch));
+        assert!(!same(&other.scratch.k_data, &target.scratch.k_data));
+        assert_eq!(other.scratch.bytes, 12 * 16 * 2 * 64 * SCRATCH_ELEM_BYTES);
     }
 
     /// `tq_compress_paged` in place at every (head_dim, bits) the metal path
