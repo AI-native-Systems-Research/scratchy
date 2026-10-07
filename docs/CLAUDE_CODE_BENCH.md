@@ -18,7 +18,7 @@ is a defect: a later reader cannot tell silence from a tested claim.
 | [Method and metrics](#method-and-metrics) | owned by the agreed method, not restated here |
 | [Exact commands](#exact-commands) | scratchy side recorded; ollama side **T0.4** |
 | [Results](#results) | empty — phase 4 |
-| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2's pair audited, pinned and scoped — **T0.6** |
+| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2's pair audited, pinned and **verified by load** — **T0.6** |
 | [Blocked](#blocked) | recorded |
 | [Artifacts](#artifacts) | empty — phase 4 |
 
@@ -136,7 +136,7 @@ so the comparison runs two rungs:
 | rung | the question it answers | engines | what differs | scope |
 |---|---|---|---|---|
 | **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | scratchy vs ollama | engine **and** quantizer | all three models, Lane A **and** B |
-| **R2** "matched weights" | how much of R1 was the engine | scratchy vs ollama | engine only — byte-identical weights, **at bf16** | `gemma-4-12b-it` only, and **prefill-side metrics only** ([why](#r2-is-a-prefill-side-control-not-a-decode-one)) |
+| **R2** "matched weights" | how much of R1 was the engine | scratchy vs ollama | engine only — **the same 4-bit files**, imported into ollama | `gemma-4-12b-it` only ([why](#what-r2-does-not-cover-and-why-it-is-one-model)); every metric readable |
 
 R1 is the headline. R2 keeps it from being dismissed as a quantizer comparison.
 
@@ -153,18 +153,18 @@ reason, not an oversight:
 | candidate for R2 | matched weights? | serves `/v1/messages`? | verdict |
 |---|---|---|---|
 | ollama `-mlx` tags, 4-bit | **no** — ollama's own NVFP4/MXFP8 ([audit](#r2--matched-weights)) | yes | ruled out: not the same checkpoint |
-| **ollama `gemma4:12b-mlx-bf16`** | **yes, byte-verified** | **yes** | **R2**, at bf16, caveated |
+| ollama `gemma4:12b-mlx-bf16` | yes, byte-verified | yes | ruled out: bf16 only, bandwidth-bound, one model |
+| **the mlx-community 4-bit checkpoint, `ollama create`d** | **yes, byte-verified** | **yes** | **R2** — same files, 4-bit, every metric readable |
 | mlx-lm on the 4-bit checkpoint | yes — literally the same files | **no** | ruled out: cannot serve this workload |
 
-**What R2 costs, stated plainly.** bf16 is the only width at which ollama and
-scratchy can be given identical weights, so R2 pays for its weight match in
-*regime*: it moves 23.920 GB per token against 6.741 GB at 4 bits. That is a real
-limitation, not a formality, and it is written out under
-[R2 is a prefill-side control](#r2-is-a-prefill-side-control-not-a-decode-one)
-and repeated on every R2 row. R2 also reaches **one model of three**, so the two
-MoE models' R1 rows inherit their quantizer control by analogy from the dense
-sibling rather than directly — see
-[What R2 does not cover](#what-r2-does-not-cover).
+**What R2 costs, stated plainly.** Not regime — `ollama create` imports the
+mlx-community checkpoint *preserving its quantization*, so R2 runs the same
+4-bit weights users run, and every metric is readable. What it costs is
+**coverage**: ollama's importer discards per-tensor bit-width overrides, which
+only the 12b has none of, so R2 reaches **one model of three** and the two MoE
+models' R1 rows inherit their quantizer control by analogy from the dense sibling
+rather than directly. Measured per model under
+[What R2 does not cover](#what-r2-does-not-cover-and-why-it-is-one-model).
 
 #### The scratchy side, pinned — the same on both rungs
 
@@ -237,7 +237,8 @@ rows, not just R2's.
 #### R2 — "matched weights"
 
 **Audited — T0.6, 2026-10-06. The `-mlx` tags are not mlx-community's
-checkpoint, which is why R2 runs at bf16 rather than at 4 bits.** The tags
+checkpoint, which is why R2 imports that checkpoint into ollama instead of
+pulling a tag.** The tags
 are ollama's *own* requantization of the same base models into
 **microscaling float** formats — NVFP4 and MXFP8 — not MLX affine int4. Read from
 each tag's registry manifest and its per-tensor safetensors `__metadata__`
@@ -279,88 +280,135 @@ describing the *base* model rather than the artifact. Only the per-tensor
 
 ##### R2 as it will run — the concrete pair
 
-**One model, `gemma-4-12b-it`, bf16 on both sides, on `/v1/messages`.** This is
-the only pairing in which ollama and scratchy can be handed identical weights
-while both still serve the endpoint Claude Code speaks.
+**One model, `gemma-4-12b-it`, the *same 4-bit files* on both sides, on
+`/v1/messages`.** scratchy's side is its R1 build, unchanged. ollama's side is the
+mlx-community checkpoint imported into ollama with `ollama create`, which
+**preserves the source quantization** rather than requantizing — so both engines
+read the identical affine-int4 weights at the width users actually run.
 
-| side | artifact | build / invocation |
+| side | artifact | invocation |
 |---|---|---|
-| scratchy | `mlx-community/gemma-4-12B-it-bf16` @ `afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b`, 23.920 GB of safetensors | **no quant preset named** — the dense/bf16 emission a preset would otherwise replace ([`BUILD.md`](BUILD.md)): `-F metal,serve,model/gemma-4-12b-it`, run with `-m mlx-community/gemma-4-12B-it-bf16` |
-| ollama | `gemma4:12b-mlx-bf16`, manifest `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179`, pushed 2026-08-14, `requires 0.31.0` | `ollama run gemma4:12b-mlx-bf16` |
+| scratchy | `mlx-community/gemma-4-12B-it-4bit` @ `73bcf09092aa277861d5a191b989b666f7f32e8f` — **its R1 build and preset, unchanged** | `-F metal,serve,model/gemma-4-12b-it,quant/mlx-affine-b4-g64` |
+| ollama | the **same HF snapshot directory**, imported | `printf 'FROM <snapshot-dir>\n' > Modelfile && ollama create cc-g12-mlx4 -f Modelfile` |
 
-Because both sides answer `/v1/messages`, R2 keeps what the discarded mlx-lm
-option would have cost: it runs on **both lanes**, one client drives both engines
-with no per-engine adapter, and per-tool spans remain measurable at matched
-weights rather than being structurally out of reach.
+The snapshot path carries the revision, so provenance is structural rather than
+recorded by hand:
+`~/.cache/huggingface/hub/models--mlx-community--gemma-4-12B-it-4bit/snapshots/73bcf09092aa…/`.
+This is **better provenance than a published tag**, which floats (see
+[the republication finding](#how-this-was-established-and-how-to-re-verify-it)).
 
-**The pair is verified by bytes, not by size.** Summing the tag's non-`draft`
-tensor blobs gives 23,919,548,728 B against the HF repo's 23,919,548,177 B — 551 B
-apart on 23.92 GB, which is safetensors header overhead (ollama stores one
-single-tensor file per tensor, HF five sharded headers). Byte-equality was then
-confirmed on three tensors drawn from three *different* HF shards, by range-reading
-each shard at its header's `data_offsets` and SHA-256'ing that payload against the
-corresponding ollama blob's. Names differ by scheme — ollama keeps upstream's
-`model.language_model.…`, mlx-community remaps to `language_model.model.…` — so
-both are given, since re-verification needs them:
+**Verified end to end on this host, 2026-10-06, ollama 0.34.2** — a load and a
+tool call, which is T0.1's bar, not a size comparison:
 
-| tensor (ollama name / mlx-community name) | dtype / shape | SHA-256 (both sides) |
-|---|---|---|
-| `model.language_model.layers.0.self_attn.k_proj.weight` / `language_model.model.layers.0.self_attn.k_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `079b15ff2455b027198ec39c…` |
-| `model.language_model.layers.30.self_attn.v_proj.weight` / `language_model.model.layers.30.self_attn.v_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `1b7fa0c2b32c86752fed90b2…` |
-| **final** norm — `model.language_model.norm.weight` / `language_model.model.norm.weight` (*not* one of the per-layer `norm.weight` tensors) | `BF16 [3840]`, 7,680 B | `d059a0bcfebeba413a5fd8d6…` |
-
-###### R2 is a prefill-side control, not a decode one
-
-**This caveat travels on every R2 row.** bf16 is the only width at which the two
-engines can be given identical weights, and that match is paid for in regime: the
-pair moves **23.920 GB per token against 6.741 GB at 4 bits, a 3.55× increase in
-weight traffic** (both measured — the table above and the 4-bit repo).
-
-Decode reads every weight of a dense model once per token, so on Metal it is
-bandwidth-bound. Two engines pinned against the memory wall converge, and an R2
-decode number would largely report the weight format rather than the engine —
-which is the one thing R2 exists to isolate. **Prefill is compute-bound**, so it
-does not collapse the same way, and this workload is overwhelmingly prefill: the
-epic's premise is a 10k+ token prompt re-sent in full every turn. So the split is
-not a hedge, it is where the rung is and is not readable:
-
-| R2 metric | readable? |
+| check | result |
 |---|---|
-| TTFT, re-prefill cost by turn index, prefix-cache hit effect, spans effect | **yes** — prefill is compute-bound |
-| TPOT, ITL, steady-state tok/s | **no** — quote R1 for these; at bf16 both engines are bandwidth-saturated |
-| outcome / task completion (Lane B) | yes, but see the spec-decode disclosure below |
+| import | `1341 tensors, preserving source quantization` → `file_type: int4`, per-tensor `__metadata__: {"group_size": "64", "quant_type": "int4"}` |
+| total bytes | 6,773,236,528 B — the HF repo's own 6.773 GB |
+| weights byte-identical | `.weight`, **`.scale` and `.bias`** all SHA-256 equal to the source on every tensor sampled (ollama renames `.scales`/`.biases` → `<name>.weight.scale`/`.bias`; bytes unchanged) |
+| generation | `"What is the capital of France?"` → `"The capital of France is Paris."` — dequant is correct, not merely non-crashing |
+| `/v1/messages` + tools | real `tool_use` block, `stop_reason: "tool_use"`, with `renderer`/`parser` `gemma4` |
 
-A published R2 row carries this table's verdict for the metric it reports. bf16 is
-also a configuration no scratchy user runs, so no R2 figure is ever presented as
-"what a user gets" — that is R1's job, and R1 is the headline.
+**Three things this pairing fixes outright**, rather than caveating:
 
-###### What R2 does not cover
+1. **Regime.** 6.741 GB per token on both sides, not 23.920 GB. The
+   bandwidth-bound objection to a bf16 rung does not apply, so **every metric is
+   readable — TPOT and ITL included.**
+2. **No speculative-decoding asymmetry.** The import carries no `image.draft`
+   layer, no `draft.*` tensors and **no `params` blob**, so no `draft_num_predict`
+   — unlike the published `gemma4:12b`, which sets it to 3
+   ([below](#speculative-decoding-on-the-ollama-side)). On R2 both engines decode
+   one token at a time, so R2 isolates the engine *more* cleanly than R1 does.
+3. **bf16 is not needed at all.** The byte-identical bf16 pair this audit also
+   found (`gemma4:12b-mlx-bf16` against `mlx-community/gemma-4-12B-it-bf16`, equal
+   to 551 B on 23.92 GB) is kept only as a recorded alternative; R2 does not use
+   it, because a 4-bit match on the same files is strictly better.
 
-**One model of three.** The bf16 artifacts for the other two are
-`gemma4:26b-mlx-bf16` at 52.52 GB and `qwen3.6:35b-a3b-mlx-bf16` at 71.92 GB —
-the latter past this host's 64 GiB outright, before any KV cache. So R2 lands on
-the dense 12b, and **the two MoE models' R1 rows inherit their quantizer control
-by analogy rather than directly.** If an R1 result on the 26b or qwen is
-challenged as a quantizer artifact, the strict rebuttal covers the 12b only and
-the MoE case rests on the quantizer effect measured on a dense sibling carrying
-over. That is weaker than silence would imply, so it is stated here rather than
-left to a reader to notice.
+Two disclosures remain:
 
-**It changes ollama's engine as well as its weights.** R1's tags are
-`model_format: gguf` / `file_type: Q4_K_M` (llama.cpp); every `-mlx` and
-`-mlx-bf16` tag is `model_format: safetensors` with `requires ≥ 0.31.0` (ollama's
-MLX engine). An R1→R2 delta on ollama's side therefore mixes a format change with
-an engine change, and both are named on the row.
+- **Storage layout differs, contents do not.** ollama stores one single-tensor
+  safetensors file per tensor; HF ships five shards. Same bytes, different file
+  granularity, which can touch load/mmap behaviour — so it is named on
+  startup-time rows, not on steady-state ones.
+- **KV-cache dtype stays unmatched.** `metal` implies `turboquant` and the codec
+  is fixed at build time; matching it would mean a second build, not a flag. Same
+  match-or-disclose resolution as [item 1 below](#what-a-rung-does-not-pin).
 
-**KV-cache dtype stays unmatched.** `metal` implies `turboquant` and the codec is
-fixed at build time; matching it would mean a second build, not a flag. Same
-match-or-disclose resolution as [item 1 below](#what-a-rung-does-not-pin).
+###### What R2 does not cover, and why it is one model
 
-**Footprint.** 24.83 GB on disk for the tag against 23.95 GB for scratchy's side —
-the difference is the bundled draft model plus two 32 MB tokenizers.
+**`ollama create` drops per-tensor bit-width overrides.** It copies tensor bytes
+faithfully but writes the checkpoint's *global* width onto every quantized
+tensor, discarding the per-tensor exceptions the
+[scratchy table](#the-scratchy-side-pinned--the-same-on-both-rungs) lists. That is
+survivable only for a checkpoint with no exceptions — which, of the three, is the
+12b alone. Measured per model:
 
-Speculative decoding is a disclosure on **both** rungs; it is written out once
-below.
+| checkpoint | per-tensor overrides | `ollama create` | result |
+|---|---|---|---|
+| `gemma-4-12B-it-4bit` | **none** | clean | ✅ **R2** |
+| `Qwen3.6-35B-A3B-4bit` | 80 — `mlp.gate`, `mlp.shared_expert_gate` at 8 bits | imports, **relabels them `int4`** | ❌ load panics |
+| `gemma-4-26b-a4b-it-4bit` | 30 — `router.proj` at 8 bits | **prints success, creates nothing** | ❌ no model |
+
+The qwen failure is worth quoting, because it is this epic's own footgun seen from
+the other side. `…layers.0.mlp.gate.weight` is `U32 [256, 512]` with scales
+`[256, 32]`; at `hidden 2048` and `group_size 64` the scales fix `in_features` at
+`32 × 64 = 2048`, and `2048 / 512 = 4` values per `u32` — **8 bits**, exactly as
+the checkpoint's override declares. ollama labels it `int4` and its runtime then
+refuses the tensor it was handed:
+
+```
+mlx: [quantized_matmul] The shapes of the weight and scales are incompatible
+based on bits and group_size. w.shape() == (256,512) and scales.shape() == (256,32)
+with group_size=64 and bits=4
+```
+
+Compare T0.1's scratchy-side failure on the same role,
+`affine_dequant_b4: scales shape [256, 32] != [256, 16]`. Same tensor, same
+arithmetic, same lesson in both engines: **per-tensor quantization detail comes
+from the checkpoint; a global default is not a substitute.** It fails loudly,
+which is the good outcome — a mislabel that *ran* would be far worse.
+
+The 26b's failure mode is worse than the qwen's and should be treated as a trap:
+`ollama create` prints `writing manifest` and
+`successfully imported mlxtest-g26 with 1048 layers`, **exits 0, never contacts
+the daemon, and creates no model** — `ollama list` does not show it afterwards.
+Any automation that trusts that exit code will record a model it does not have.
+**The runner must assert the model exists after an import, not trust `create`.**
+
+**So R2 is the dense 12b, and the two MoE models' R1 rows inherit their quantizer
+control by analogy** from the dense sibling rather than directly. If an R1 result
+on the 26b or qwen is challenged as a quantizer artifact, the strict rebuttal
+covers the 12b only. That is weaker than silence would imply, so it is stated
+rather than left for a reader to notice.
+
+Worth separating, because it changes what the limitation *is*: this is now an
+**ollama importer bug**, not a physical constraint. The earlier bf16 framing was
+bounded by this host's 64 GiB; this one would lift the moment ollama preserves
+per-tensor widths, or if the two MoE checkpoints were republished without
+exceptions. It is listed under [Blocked](#blocked) as upstream-fixable, not closed.
+
+One non-option, recorded so it is not proposed later: stripping the overrides from
+the checkpoint's `config.json` to force a uniform 4-bit import would make the
+labels agree with nothing — the gate *data* is still 8-bit — and would corrupt
+exactly the way scratchy's `-mlp8-router8` preset does. The fix is upstream, not
+in the config.
+
+###### One gotcha for any future import: `mode` must be declared
+
+An older mlx-community checkpoint whose `config.json` gives
+`quantization: {group_size, bits}` **without** `"mode": "affine"` imports with
+empty per-tensor metadata and then panics at load:
+
+```
+mlx: [dequantize] Invalid quantization mode ''.
+```
+
+Measured on `mlx-community/SmolLM-135M-Instruct-4bit`, which lacks the field;
+adding `"mode": "affine"` to the config makes the same import emit
+`{"group_size": "64", "quant_type": "int4"}` and run. All three checkpoints in
+this comparison declare `mode: affine` already, so none needs patching — but a
+fourth model might, and the symptom names neither the cause nor the fix.
+
+Speculative decoding is a disclosure on **R1**; it is written out once below.
 
 ##### Speculative decoding on the ollama side
 
@@ -380,7 +428,8 @@ either a bundled draft model or the model's own multi-token-prediction head:
 | `gemma4:12b-mlx` | — | bf16 draft model, 0.85 GB | `Gemma4UnifiedAssistantForCausalLM` | unset |
 | `gemma4:26b-mlx` | — | bf16 draft model, 0.84 GB | `Gemma4AssistantForCausalLM` | unset |
 | `qwen3.6:35b-mlx` | — | native **MTP** head, 1.69 GB bf16 | — (in-model) | unset |
-| `gemma4:12b-mlx-bf16` | bf16 control | bf16 draft model, 0.85 GB | `Gemma4UnifiedAssistantForCausalLM` | unset |
+| `gemma4:12b-mlx-bf16` | recorded alternative | bf16 draft model, 0.85 GB | `Gemma4UnifiedAssistantForCausalLM` | unset |
+| **R2's import** (`ollama create`) | **R2** | **none — no draft layer, no `params` blob** | — | **absent** |
 
 **The drafter is not one architecture across tags.** Both GGUF tags declare
 `gemma4-assistant`, but on the MLX side the 12b ships
@@ -422,8 +471,9 @@ are not in the file. Any qwen MTP comparison needs a checkpoint that retains the
 that is a checkpoint problem before it is a scratchy feature request.
 
 **What it would take to put *ollama* on a matched-weights rung, recorded so it is
-not re-derived.** This is what it would take to move R2 off bf16 and onto the
-4-bit regime users actually run. scratchy already has an `nvfp4` preset
+not re-derived.** R2 no longer needs this — `ollama create` supplies matched
+4-bit weights on the 12b. It is what it would take to compare against ollama's
+*own published* `-mlx` artifacts instead. scratchy already has an `nvfp4` preset
 at `group_size 16`, matching ollama's, but only the `llama` arch declares it, and
 there is no MXFP8 support in the tree at all
 (`crates/models/quantization/presets/nvfp4.json`,
@@ -529,10 +579,12 @@ an estimate.
 | cell | blocked on | resolved by |
 |---|---|---|
 | ~~R1, ollama side — tag digest and the quantization each default tag carries~~ | — | **resolved, T0.6**: all three are `gguf`/`Q4_K_M`; digests and sizes recorded in [R1](#r1--what-a-user-gets) and [R2](#how-this-was-established-and-how-to-re-verify-it) |
-| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — ollama's own NVFP4/MXFP8 requantization. R2 therefore runs at **bf16** on `gemma-4-12b-it`, the one pairing with byte-identical weights on both sides that still serves `/v1/messages`; prefill-side metrics only |
-| whether either engine loads R2's pair | phase 4 setup | pulling `gemma4:12b-mlx-bf16` and building scratchy's no-preset bf16 `gemma-4-12b-it`; T0.6 identified the artifacts, it served nothing |
-| a matched-weights control for the **two MoE models** | **not resolvable on this host** | their bf16 artifacts are 52.52 GB and 71.92 GB; the MoE R1 rows inherit the 12b's quantizer control by analogy, disclosed per row |
-| does `ollama create` preserve an mlx-community affine-int4 checkpoint? | open — cheap to test | if it does, ollama rejoins a matched-weights rung at 4 bits; if it requantizes, the path is closed. Read the resulting manifest's per-tensor `__metadata__` |
+| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — ollama's own NVFP4/MXFP8 requantization. But `ollama create` imports mlx-community's checkpoint *preserving its quantization*, so R2 runs the **same 4-bit files** on both engines on `gemma-4-12b-it`, verified by load and a `tool_use` round-trip |
+| ~~whether either engine loads R2's pair~~ | — | **resolved, T0.6**: verified on this host — import preserves the quantization byte-for-byte, generates correctly, and round-trips a `tool_use` on `/v1/messages` |
+| per-tensor bit-width overrides dropped by `ollama create` | **upstream ollama** | blocks R2 on the 26b and qwen; fails loudly on load (qwen) or silently at import (26b). Not a host limit — it lifts if ollama preserves per-tensor widths |
+| `ollama create` can exit 0 having created nothing | **T0.7 runner** | assert the model is in `ollama list` after an import; never trust the exit code |
+| a matched-weights control for the **two MoE models** | **upstream ollama** (was: this host's RAM) | the importer drops their 8-bit router/gate overrides; the MoE R1 rows inherit the 12b's control by analogy, disclosed per row |
+| ~~does `ollama create` preserve an mlx-community affine-int4 checkpoint?~~ | — | **resolved, T0.6**: **yes** for a uniformly-quantized checkpoint — that is what R2 now rests on. No for one with per-tensor overrides (row above) |
 | does ollama's MLX engine draft when `draft_num_predict` is **unset**? | **T0.4** | every `-mlx` tag ships draft weights with the knob unset; unset is not off. Measure it — a manifest cannot answer it |
 | ollama spec decode — disabled, or measured and disclosed, on **R1**? | **T0.4** + phase 4's spec-decode ablation | all three default tags set `draft_num_predict` 2–3; prefer overriding it on the default tag over switching to the older non-MTP builds |
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
