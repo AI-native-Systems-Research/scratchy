@@ -33,7 +33,7 @@ use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, Pipeline};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::steel_paged::{nax_paged_symbol, steel_paged_symbol};
+use scratchy_target_metal::steel_paged::{nax_paged_kernel, steel_paged_symbol};
 use scratchy_target_metal::tape::ids::{
     BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, NumQHeads, RopePairOff, RotDim, TqCodeBits,
     TqDecodeHeads,
@@ -1549,15 +1549,16 @@ fn check_per_row(c: Case, kernel: PerRow) {
             q_blocks(32),
             tg(128, 1, 1),
         ),
-        PerRow::Nax => (
-            "attention_steel_nax_paged",
-            nax_paged_symbol(tag, hd as u32)
-                .expect("NAX instance")
-                .to_owned(),
-            Some(steel_debug),
-            q_blocks(64),
-            tg(128, 1, 1),
-        ),
+        PerRow::Nax => {
+            let nax = nax_paged_kernel(tag, hd as u32, c.block_size as u32).expect("NAX instance");
+            (
+                "attention_steel_nax_paged",
+                nax.symbol.to_owned(),
+                Some(steel_debug),
+                q_blocks(64),
+                tg(nax.threads as usize, 1, 1),
+            )
+        }
     };
     let function: &'static str = Box::leak(function.into_boxed_str());
     let pso = baked_build(
