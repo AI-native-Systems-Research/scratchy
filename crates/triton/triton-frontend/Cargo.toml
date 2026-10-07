@@ -3,7 +3,7 @@ name = "triton-frontend"
 description = "Python -> TTIR, in Rust: bridge one of Triton -> KTIR -> SuperDSC, with no Python at runtime"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license.workspace = true
 publish = false
 
 # Re-hosted from triton-spyre's third_party/spyre/rust/triton-frontend (see

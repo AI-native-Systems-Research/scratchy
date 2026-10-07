@@ -1,6 +1,4 @@
-// Copyright (c) 2026 IBM Corporation. All rights reserved.
-//
-// Licensed under the MIT terms in the crate root.
+// SPDX-License-Identifier: Apache-2.0
 
 //! WHAT `ktir_superdsc::emit::lower_ktir_to_superdsc::regions` READS OFF WHAT WE HAND OVER.
 //!

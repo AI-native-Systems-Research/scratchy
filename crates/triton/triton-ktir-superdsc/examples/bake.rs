@@ -1,6 +1,4 @@
-// Copyright (c) 2026 IBM Corporation. All rights reserved.
-//
-// Licensed under the MIT terms in the crate root.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bake one fixture's `ktir-superdsc` descriptors into a `dxp_standalone` input directory.
 //!

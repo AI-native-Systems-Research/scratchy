@@ -12,7 +12,7 @@ name = "triton-ktir-superdsc"
 description = "adapter: our KTIR value -> ktir-superdsc's KtirNode + per-kind entry points"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license.workspace = true
 publish = false
 
 [dependencies]

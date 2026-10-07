@@ -1,6 +1,4 @@
-// Copyright (c) 2026 IBM Corporation. All rights reserved.
-//
-// Licensed under the MIT terms in the crate root.
+// SPDX-License-Identifier: Apache-2.0
 
 //! ⛔⛔⛔ THE WHOLE-FUNCTION DOOR DROPS A `linalg.matmul`'s THIRD OPERAND, UNREAD AND UNDIAGNOSED —
 //! AND FLASH ATTENTION'S OUTPUT ACCUMULATOR IS THAT OPERAND.

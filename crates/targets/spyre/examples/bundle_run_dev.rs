@@ -1,6 +1,4 @@
-// Copyright (c) 2026 IBM Corporation. All rights reserved.
-//
-// Licensed under the MIT terms in the crate root.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Bring-up driver for [`scratchy_target_spyre::bundle_run`], so iterating on it does not rebuild
 //! the whole CLI.

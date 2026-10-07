@@ -1,6 +1,4 @@
-// Copyright (c) 2026 IBM Corporation. All rights reserved.
-//
-// Licensed under the MIT terms in the crate root.
+// SPDX-License-Identifier: Apache-2.0
 
 //! ⛔⛔⛔ THE fp8 W8A8 DOOR IS OP-BLIND, SO ITS CONTRACT IS OURS TO REFUSE — NOT THEIRS.
 //!
