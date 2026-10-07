@@ -149,8 +149,12 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         // tensor so the routing Gemm step in `lower_moe_step`
         // (Step 1) reads it as a normal `[E, hidden]` BF16/F16
         // weight — same shape contract as the cuda Dense path.
-        // GLM-4.5 keeps its router DENSE (`{prefix}.gate.weight`
-        // bf16, no scales/biases) — taken as-is.
+        // GLM-4.5 keeps its router DENSE (`{prefix}.gate.weight` bf16,
+        // no scales/biases) — taken as-is. The discriminator is the
+        // SCALES SIBLING, not the weight key: a quantized router ALSO
+        // carries `{prefix}.gate.weight` (the packed bitstream), so
+        // probing the weight alone would hand the routing gemm raw
+        // nibbles as logits.
         // Choose dequant dtype from the model's target_dtype (BF16
         // on every metal build path today).
         let router_dtype = gw.target_dtype().unwrap_or(DType::BF16);
@@ -158,14 +162,16 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
             matches!(router_dtype, DType::BF16 | DType::F16),
             "AffineFusedMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        let router_gate = match gw.contains(&format!("{prefix}.gate.weight")) {
-            true => gw.take(&format!("{prefix}.gate.weight"))?,
-            false => gw.take_affine_dequant_b4(
+        let router_is_dense = !gw.contains(&format!("{prefix}.gate.scales"));
+        let router_gate = if router_is_dense {
+            gw.take(&format!("{prefix}.gate.weight"))?
+        } else {
+            gw.take_affine_dequant_b4(
                 &format!("{prefix}.gate"),
                 group_size,
                 gate_bits,
                 router_dtype,
-            )?,
+            )?
         };
 
         // Probe for the switch_mlp pre-stacked layout. Qwen3-MoE-4bit
@@ -883,9 +889,15 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
 
         // GLM-4.5's F32 `e_score_correction_bias` (`{prefix}.gate.e_score_correction_bias`) —
         // present on every sigmoid-routed MoE (noaux_tc), absent on every softmax-routed one
-        // (Qwen, Mixtral). Probed, never assumed.
+        // (Qwen, Mixtral). Probed, never assumed. `take_keep_dtype`, NOT `take`: the routing
+        // kernels read it as `const device float*` (`moe_route.metal` buffer 4,
+        // `quantized_qmv.metal` buffer 13), so the F32 bytes must reach the device un-cast —
+        // `take` would truncate them to the model's target dtype (BF16) and the kernels would
+        // reassemble half-pairs as F32 garbage. The cuda loader casts this tensor to F32 for
+        // the same reason (`weights_quant.rs`: "vLLM always casts this to F32 before the
+        // routing kernel; we match"); every noaux_tc checkpoint ships it F32 on disk.
         let e_score_correction_bias = match gw.contains(&format!("{prefix}.gate.e_score_correction_bias")) {
-            true => Some(gw.take(&format!("{prefix}.gate.e_score_correction_bias"))?),
+            true => Some(gw.take_keep_dtype(&format!("{prefix}.gate.e_score_correction_bias"))?),
             false => None,
         };
 
