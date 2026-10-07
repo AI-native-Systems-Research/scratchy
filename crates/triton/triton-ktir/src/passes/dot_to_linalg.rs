@@ -1374,7 +1374,15 @@ fn verify_canonical_paged_matmul_kernel(
 /// A contiguous row-major 2-D `tt.make_tensor_descriptor` of the given full shape
 /// and block. The emitter derives the layout from the shape ALONE and assumes
 /// contiguous row-major, so a non-standard stride would be silently ignored.
-fn check_desc(index: &DefIndex, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: i64) -> Result<()> {
+fn check_desc(
+    index: &DefIndex,
+    d: &Op,
+    nm: &str,
+    d0: i64,
+    d1: i64,
+    b0: i64,
+    b1: i64,
+) -> Result<()> {
     let (s0, s1) = desc_shape2(index, d)
         .ok_or_else(|| refuse(format!("{nm} has non-constant shape/strides")))?;
     if s0 != d0 || s1 != d1 {
