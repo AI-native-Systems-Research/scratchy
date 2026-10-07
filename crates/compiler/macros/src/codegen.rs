@@ -84,18 +84,8 @@ fn safetensors_prefix(
     // on the dotted DSL path, applied BEFORE the vision subtree
     // resolution below so renamed segments flow into subtree paths.
     let mut segs = segs;
-    for (dsl_leaf, disk_leaf) in &program.weight_leaf_renames {
-        if joined == *dsl_leaf {
-            joined = disk_leaf.clone();
-            segs = joined.split('.').map(str::to_string).collect();
-            break;
-        }
-        if let Some(head) = joined.strip_suffix(&format!(".{dsl_leaf}")) {
-            joined = format!("{head}.{disk_leaf}");
-            segs = joined.split('.').map(str::to_string).collect();
-            break;
-        }
-    }
+    joined = program.rename_dotted(&joined);
+    segs = joined.split('.').map(str::to_string).collect();
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     if is_vision {
         // The per-arch vision layout is a REQUIRED declaration

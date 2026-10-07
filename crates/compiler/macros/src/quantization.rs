@@ -1049,20 +1049,13 @@ fn parse_fp8(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMe
 /// Apply the arch's DSL-leaf → disk-leaf renames to a dotted role path
 /// so it matches the on-disk safetensors key (Gemma4:
 /// `self_attn.q_proj_global` → `self_attn.q_proj`). Mirrors the rename
-/// step of `codegen::safetensors_prefix` (first exact-or-suffix match
-/// wins). Quantized MoE/attention roles carry no `_<digit>` submodule
+/// step of `codegen::safetensors_prefix` (both delegate to
+/// `Program::rename_dotted`: whole-segment match, longest key wins).
+/// Quantized MoE/attention roles carry no `_<digit>` submodule
 /// suffixes, so the digit-suffix translation `safetensors_prefix` also
 /// does is a no-op here and is omitted.
 fn disk_role_dotted(program: &Program, dotted: &str) -> String {
-    for (dsl_leaf, disk_leaf) in &program.weight_leaf_renames {
-        if dotted == dsl_leaf.as_str() {
-            return disk_leaf.clone();
-        }
-        if let Some(head) = dotted.strip_suffix(&format!(".{dsl_leaf}")) {
-            return format!("{head}.{disk_leaf}");
-        }
-    }
-    dotted.to_string()
+    program.rename_dotted(dotted)
 }
 
 /// Look a weight up in the MLX-native per-module quant map. The map is

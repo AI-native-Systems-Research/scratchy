@@ -653,6 +653,49 @@ pub struct Program {
     pub weight_leaf_renames: Vec<(String, String)>,
 }
 
+impl Program {
+    /// Rewrite a dotted DSL weight path under the arch's
+    /// `weight_leaf_renames`, keyed by SEGMENT RUN (a whole number of
+    /// dot-separated segments), so both trailing renames
+    /// (`self_attn.q_proj_global` → `self_attn.q_proj`) and MID-PATH
+    /// ones (GLM-4.5: `mlp.shared_expert.down_proj` →
+    /// `mlp.shared_experts.down_proj`) express in one mechanism.
+    ///
+    /// Longest key wins; every occurrence is rewritten. Callers
+    /// (`codegen::safetensors_prefix`, `quantization::disk_role_dotted`,
+    /// the `_<digit>` leaf warning in lib.rs) mirror this — keep them
+    /// in lockstep.
+    pub fn rename_dotted(&self, dotted: &str) -> String {
+        let mut pairs: Vec<&(String, String)> =
+            self.weight_leaf_renames.iter().collect();
+        pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+        let mut out = dotted.to_string();
+        for (dsl_leaf, disk_leaf) in pairs {
+            // Whole-segment boundaries only: the char before a match
+            // (if any) and the char after (if any) must be `.`.
+            // Exact match and trailing match both fall out of the
+            // suffix arm; a leading segment run falls out of the
+            // prefix arm; interior occurrences go through the
+            // `.<leaf>.` replace loop.
+            if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str()) {
+                if stripped.is_empty() || stripped.ends_with('.') {
+                    out = format!("{stripped}{disk_leaf}");
+                    continue;
+                }
+            }
+            let pat = format!(".{dsl_leaf}.");
+            let rep = format!(".{disk_leaf}.");
+            while let Some(pos) = out.find(&pat) {
+                out.replace_range(pos..pos + pat.len(), &rep);
+            }
+            if let Some(tail) = out.strip_prefix(&format!("{dsl_leaf}.")) {
+                out = format!("{disk_leaf}.{tail}");
+            }
+        }
+        out
+    }
+}
+
 /// Side table: `LocalId` → debug ident.
 #[derive(Clone, Debug, Default)]
 pub struct LocalTable {
@@ -858,4 +901,70 @@ pub enum Expr {
     /// builder folds to `ScalarLit(scalars[name])` (or its
     /// reciprocal) per-model.
     ConfigScalar { name: Ident, recip: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prog_with_renames(pairs: &[(&str, &str)]) -> Program {
+        Program {
+            statements: Vec::new(),
+            locals: LocalTable::default(),
+            weights: WeightTable::default(),
+            reshape_targets: Default::default(),
+            prelude: Prelude::Decoder,
+            decoder_safetensors_prefix: None,
+            weight_leaf_renames: pairs
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        }
+    }
+
+    /// `rename_dotted` must match WHOLE SEGMENT RUNS — never a
+    /// prefix of a longer segment — so `mlp.shared_expert.*`
+    /// (GLM-4.5: plural `shared_experts` on disk) renames MID-PATH,
+    /// while a leaf merely CONTAINING the key text stays put.
+    /// Longest key wins, per the codegen consumers' contract.
+    #[test]
+    fn rename_dotted_matches_whole_segment_runs() {
+        let p = prog_with_renames(&[
+            ("moe", "mlp"),
+            ("mlp.shared_expert", "mlp.shared_experts"),
+        ]);
+        // Mid-path run: the GLM-4.5 shared-expert leaves.
+        assert_eq!(
+            p.rename_dotted("mlp.shared_expert.down_proj"),
+            "mlp.shared_experts.down_proj"
+        );
+        assert_eq!(
+            p.rename_dotted("mlp.shared_expert.gate_proj"),
+            "mlp.shared_experts.gate_proj"
+        );
+        // Trailing match still works (Gemma4-style leaf rename).
+        assert_eq!(
+            p.rename_dotted("self_attn.q_proj_global"),
+            "self_attn.q_proj_global"
+        );
+        let g = prog_with_renames(&[("self_attn.q_proj_global", "self_attn.q_proj")]);
+        assert_eq!(
+            g.rename_dotted("self_attn.q_proj_global"),
+            "self_attn.q_proj"
+        );
+        assert_eq!(
+            g.rename_dotted("model.layers.0.self_attn.q_proj_global"),
+            "model.layers.0.self_attn.q_proj"
+        );
+        // No substring false-positives: a LONGER segment containing
+        // the key text is not a match.
+        let s = prog_with_renames(&[("norm", "renorm")]);
+        assert_eq!(s.rename_dotted("input_layernorm"), "input_layernorm");
+        assert_eq!(s.rename_dotted("norm"), "renorm");
+        assert_eq!(s.rename_dotted("model.layers.0.norm"), "model.layers.0.renorm");
+        // Leading-segment run (top-level `moe` → `mlp`).
+        let m = prog_with_renames(&[("moe", "mlp")]);
+        assert_eq!(m.rename_dotted("moe.router"), "mlp.router");
+        assert_eq!(m.rename_dotted("moell"), "moell");
+    }
 }
