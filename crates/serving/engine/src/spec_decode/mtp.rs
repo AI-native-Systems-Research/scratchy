@@ -115,13 +115,15 @@
 //!   its default) are the measurement.
 //! - TODO: on a 32 GB Mac (base M5) Qwen3.6 serves one sequence at its defaults (#255), with or
 //!   without a head, so the base-M5 numbers above at 2 and 8 sequences are development runs at
-//!   `--max-num-seqs 8`. There the head's memory (weights+overhead 19.3 -> 19.8 GiB, and its
-//!   layer's KV in every block) halves the KV cache, 145,936 -> 75,456 tokens; the prefill bucket
-//!   stays 2048.
+//!   `--max-num-seqs 8`. There the head costs its KV cache 145,936 -> 89,520 tokens (-39%): its
+//!   weights (weights+overhead 19.3 -> 19.8 GiB) come out of a KV budget of about 1 GiB, and its
+//!   layer's KV takes 528 bytes a token beside the target's 7,328 (its target's TurboQuant codes,
+//!   staged through its target's scratch). The prefill bucket stays 2048. Winning the weights'
+//!   share back on a small Mac means shrinking something else there, such as the prefill bucket.
 //! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
 //!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
 //!   optional, and refuse a value that differs from the head's.
-//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +606
+//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +697
 //!   lines net against main, 47 of them in `op_abi.rs`; shaders +251; the metal compiler +50.
 
 use std::collections::{HashMap, HashSet};
