@@ -887,3 +887,222 @@ fn bench_moe_fused() {
         );
     }
 }
+
+/// The combine computing a shared expert's gated rows and the residual add as it stores each row
+/// (`MetalFusion::CombineEpilogue`) leaves the same residual as the combine, `gate_scale`, then
+/// `residual_add`, bit for bit; the same combine without the gate scale leaves another.
+#[test]
+fn combine_ends_match_gate_scale_then_the_residual_add() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    for tokens in [1, 3] {
+        let block = Block::new(&device, tokens, false, EXPERTS);
+        let mut rng = Lcg(0xc0de);
+        let n = tokens * HIDDEN;
+        let shared = common::shared_slice(&device, &rng.bf16s(n, -1.0, 1.0));
+        let g = common::shared_slice(&device, &rng.bf16s(tokens, -3.0, 3.0));
+        let h = rng.bf16s(n, -4.0, 4.0);
+        let residual = common::shared_slice(&device, &h);
+        let gated_rows = common::shared_zeroed(&device, n * 2);
+        // The reference: the fused chain into `fused_out`, then the two kernels.
+        let elementwise = |d: &common::Device, symbol: (&'static str, &'static str), c| {
+            baked_pipeline(d, symbol.0, symbol.1, c).expect(symbol.1)
+        };
+        let gate_scale = elementwise(
+            &device,
+            ("gate_scale", "gate_scale_bf16"),
+            vec![
+                ConstantValue::uint(ConstSlot(0), n as u32),
+                ConstantValue::uint(ConstSlot(1), HIDDEN as u32),
+            ],
+        );
+        let add = elementwise(
+            &device,
+            ("elementwise", "residual_add_bf16_specialized"),
+            vec![],
+        );
+        run(&device, 1, 1, |_| {
+            let mut chain = block.fused(0);
+            chain.extend([
+                Dispatch {
+                    pso: &gate_scale,
+                    buffers: vec![
+                        (&gated_rows, 0),
+                        (&block.fused_out, 1),
+                        (&shared, 2),
+                        (&g, 3),
+                    ],
+                    groups: size(n.div_ceil(256), 1, 1),
+                    threads: size(256, 1, 1),
+                },
+                Dispatch {
+                    pso: &add,
+                    buffers: vec![(&residual, 0), (&gated_rows, 1)],
+                    groups: size(n / 256, 1, 1),
+                    threads: size(256, 1, 1),
+                },
+            ]);
+            chain
+        });
+        let want = bits(&residual, n);
+        assert_ne!(
+            want,
+            bits(&common::shared_slice(&device, &h), n),
+            "tokens={tokens}: no add"
+        );
+        // The combine with its ends (and with the residual add alone), into copies of `h`.
+        let rows = GatherRows::Tokens(TopK(TOP_K as u32));
+        for gate_scaled in [true, false] {
+            let mut c = block.down.constants(rows);
+            c.extend(gate_scaled.then(|| ConstantValue::boolean(ConstSlot(18), true)));
+            c.push(ConstantValue::boolean(ConstSlot(19), true));
+            let ends = block.down.pipeline(&device, "affine_gather_qmv_combine", c);
+            let into = common::shared_slice(&device, &h);
+            run(&device, 1, 1, |_| {
+                let mut chain = block.fused(0);
+                let combine = chain.last_mut().expect("the combine");
+                combine.pso = &ends;
+                for b in combine.buffers.iter_mut().filter(|(_, i)| *i == 7) {
+                    b.0 = &into;
+                }
+                combine.buffers.extend([(&shared, 8), (&g, 9)]);
+                chain
+            });
+            let got = bits(&into, n);
+            match gate_scaled {
+                true => assert_eq!(got, want, "tokens={tokens}: gate scale + residual add"),
+                false => assert_ne!(got, want, "tokens={tokens}: the gate scale matters"),
+            }
+        }
+    }
+}
+
+/// The gated kernel normalizing its token rows as it loads them (`MetalFusion::NormedQmv`: the
+/// MoE block's input norm folded into its gathered experts) skips the normed row's rounding: its up
+/// rows must be as close to the exact `up · rmsnorm(x, gain)` as the norm, then the kernel, are —
+/// and the kernel over the raw rows, which the same bound must reject, shows the bound sees a
+/// missing norm.
+#[test]
+fn a_normed_gated_kernel_is_as_close_to_the_exact_normed_rows_as_the_norm_then_the_kernel() {
+    use half::bf16;
+    use scratchy_target_metal::tape::ids::{BucketM, QSize, RmsNormEps};
+    use scratchy_target_metal::tape::kernel_constants::{NORM_THREADS, RmsNormConstants};
+    use scratchy_target_metal::tape::step::{Eps, GainOffset, RowNorm};
+    #[derive(Clone, Copy, Debug)]
+    enum How {
+        NormThenKernel,
+        Normed,
+        Raw,
+    }
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    const EPS: f32 = 1e-6;
+    let block = Block::new(&device, 1, false, EXPERTS);
+    let gain = Lcg(0x6a1).bf16s(HIDDEN, 0.5, 1.5);
+    let gain_buf = common::shared_slice(&device, &gain);
+    let rows = GatherRows::Tokens(TopK(TOP_K as u32));
+    let mut c = block.gate.constants(rows);
+    c.push(ConstantValue::int(ConstSlot(3), 0));
+    let norm = RowNorm {
+        layer: LayerId(0),
+        eps: Eps(EPS),
+        offset: GainOffset(0.0),
+    };
+    c.extend(Vec::<ConstantValue>::from(norm));
+    let normed = block.gate.pipeline(&device, "affine_gather_qmv_gated", c);
+    let rmsnorm = RmsNormConstants {
+        bucket_m: BucketM(1),
+        q_size: QSize(HIDDEN as u32),
+        rms_norm_eps: RmsNormEps(EPS),
+        weight_offset: 0.0,
+    };
+    let rmsnorm = baked_pipeline(
+        &device,
+        "rmsnorm",
+        "rmsnorm_bf16_s_bf16_specialized",
+        rmsnorm.into(),
+    )
+    .expect("rmsnorm");
+    let pairs = TOP_K;
+    // The SiLU gated kernel's up rows over the token's row, as `how` reads it.
+    let up_rows = |how: How| {
+        let up_y = common::shared_zeroed(&device, pairs * INTER * 2);
+        let gate_y = common::shared_zeroed(&device, pairs * INTER * 2);
+        let normed_x = common::shared_zeroed(&device, HIDDEN * 2);
+        run(&device, 1, 1, |_| {
+            let mut chain = Vec::new();
+            let (pso, x) = match how {
+                How::NormThenKernel => {
+                    chain.push(Dispatch {
+                        pso: &rmsnorm,
+                        buffers: vec![(&normed_x, 0), (&block.x, 1), (&gain_buf, 2)],
+                        groups: size(1, 1, 1),
+                        threads: size(NORM_THREADS as usize, 1, 1),
+                    });
+                    (&block.gated, &normed_x)
+                }
+                How::Normed => (&normed, &block.x),
+                How::Raw => (&block.gated, &block.x),
+            };
+            let mut gated = block.gate.bindings().to_vec();
+            gated.extend([(x, 3), (&block.indices[0], 4), (&gate_y, 5)]);
+            gated.extend([(&block.up.w, 6), (&block.up.s, 7), (&block.up.b, 8)]);
+            gated.push((&up_y, 9));
+            if let How::Normed = how {
+                gated.push((&gain_buf, 15));
+            }
+            chain.push(Dispatch {
+                pso,
+                buffers: gated,
+                groups: size(1, INTER.div_ceil(8), pairs),
+                threads: size(32, 4, 1),
+            });
+            chain
+        });
+        common::read_slice::<bf16>(&up_y, pairs * INTER)
+    };
+    // The exact up rows, each with its bound: the output's rounding, plus twice what rounding each
+    // normed input to bf16 can move its dot.
+    let x: Vec<f64> = common::read_slice::<bf16>(&block.x, HIDDEN)
+        .iter()
+        .map(|v| f64::from(v.to_f32()))
+        .collect();
+    let rms = (x.iter().map(|v| v * v).sum::<f64>() / HIDDEN as f64 + f64::from(EPS)).sqrt();
+    let xn: Vec<f64> = (x.iter().zip(&gain))
+        .map(|(v, g)| v / rms * f64::from(g.to_f32()))
+        .collect();
+    let codes = common::read_slice::<u8>(&block.up.w, EXPERTS * INTER * HIDDEN / 2);
+    let scales = common::read_slice::<bf16>(&block.up.s, EXPERTS * INTER * HIDDEN / GS);
+    let biases = common::read_slice::<bf16>(&block.up.b, EXPERTS * INTER * HIDDEN / GS);
+    let indices = common::read_slice::<u32>(&block.indices[0], pairs);
+    let u = 2f64.powi(-8);
+    let exact: Vec<(f64, f64)> = (0..pairs * INTER)
+        .map(|at| {
+            let (e, r) = (indices[at / INTER] as usize, at % INTER);
+            let terms = (0..HIDDEN).map(|k| {
+                let i = (e * INTER + r) * HIDDEN + k;
+                let code = f64::from((codes[i / 2] >> (4 * (i % 2))) & 15);
+                let (s, b) = (scales[i / GS].to_f32(), biases[i / GS].to_f32());
+                (f64::from(s) * code + f64::from(b)) * xn[k]
+            });
+            let (dot, sum) = terms.fold((0.0, 0.0), |(d, m), t| (d + t, m + t.abs()));
+            (dot, u * dot.abs() + 2.0 * u * sum)
+        })
+        .collect();
+    let outside = |how| {
+        let got = up_rows(how);
+        got.iter()
+            .zip(&exact)
+            .position(|(g, &(e, bound))| (f64::from(g.to_f32()) - e).abs() > bound)
+    };
+    assert_eq!(
+        outside(How::NormThenKernel),
+        None,
+        "the norm, then the gated kernel"
+    );
+    assert_eq!(outside(How::Normed), None, "the normed gated kernel");
+    assert!(
+        outside(How::Raw).is_some(),
+        "the bound accepts the gated kernel over the raw rows"
+    );
+}

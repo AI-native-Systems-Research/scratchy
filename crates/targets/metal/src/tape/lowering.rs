@@ -950,45 +950,32 @@ fn route_small_m(
         .collect())
 }
 
-/// A GDN layer whose geometry the block-staged pipelined scan covers
-/// (`gdn_scan_pipelined`: head_k 128 — 8 lanes own 16 state channels each in
-/// four float4 granules — and head_v a multiple of 16) lowers the simd scan
-/// ONLY on decode steps and a pipelined twin on every other step — the
-/// prefill half of the runtime-gate twin pattern `route_small_m` runs for the
-/// small-M GEMM. `lower_one` emits the simd scan command with the layer's
-/// bindings; this pass splits it: the simd command keeps its bindings under
-/// `OnlyIfDecodeStep`, and a pipelined command with the SAME bindings and its
-/// own dispatch (grid (value_dim/16, 1, 1) scaled by num_seqs on Z, threads
-/// (128,1,1)) runs under `UnlessDecodeStep`. The norm that follows reads the
-/// scan's `o` scratch, so the twin must sit between the two.
-fn route_gdn_pipelined(
-    p: &MetalModelConsts,
-    step: &MetalStep,
-    mut cmds: Vec<GatedCommand>,
-) -> Vec<GatedCommand> {
+/// A GDN layer's commands by the step they serve — the runtime-gate twin pattern
+/// `route_small_m` runs for the small-M GEMM. A decode step (every sequence one token) runs the
+/// one-command decode (`gdn_decode`) where `lower_one` emitted one ahead of the conv, scan and
+/// norm: it under `OnlyIfDecodeStep`, they under `UnlessDecodeStep`. On the steps they serve, a
+/// geometry the block-staged pipelined scan covers (`gdn_scan_pipelined`: head_k 128 — 8 lanes
+/// own 16 state channels each in four float4 granules — and head_v a multiple of 16) runs it in
+/// place of the simd scan, with the SAME bindings and its own dispatch (grid (value_dim/16, 1, 1)
+/// scaled by num_seqs on Z, threads (128,1,1)); with no decode command, the simd scan stays
+/// under `OnlyIfDecodeStep` as its twin. The norm that follows reads the scan's `o` scratch, so
+/// the scan sits between the two.
+fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
     use crate::tape::lowered::{MScaleAxis, MScaling};
-    // The pipelined twin is a per-layer replacement of the simd scan.
     if !matches!(step, MetalStep::GatedDeltaNet(..)) {
         return cmds;
     }
-    let hk = p.gdn_head_k_dim;
-    let hv = p.gdn_head_v_dim;
-    if !(hk == 128 && hv.is_multiple_of(16)) {
+    let decodes = cmds.iter().any(|c| c.command.library == "gdn_decode");
+    // A one-row bucket's every step is a decode step: the decode command alone.
+    if decodes && cmds.len() == 1 {
         return cmds;
     }
-    // Only the simd path's scan command carries the `gdn_scan_varlen`
-    // library at this point (the conv/norm commands name their own).
-    let Some(scan_index) = cmds.iter().position(|c| {
-        c.command.kernel == KernelId::GatedDeltaNet
-            && c.command.library == "gdn_scan_varlen"
-            && c.command.function == gdn_scan_simd_static_name(dequant_dtype_for(p))
-    }) else {
-        return cmds;
-    };
-    let scan = cmds.swap_remove(scan_index).command;
-    let pipelined = LoweredCommand {
+    let hv = p.gdn_head_v_dim;
+    let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(16);
+    let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
+    let pipelined = |scan: &LoweredCommand| LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_scan_pipelined",
         function: gdn_scan_pipelined_static_name(dequant_dtype_for(p)),
@@ -1011,11 +998,23 @@ fn route_gdn_pipelined(
         bindings: scan.bindings,
         gemm_dims: None,
     };
-    let simd = GatedCommand::gated(scan, OnlyIfDecodeStep);
-    let pipelined = GatedCommand::gated(pipelined, UnlessDecodeStep);
-    cmds.insert(scan_index, simd);
-    cmds.insert(scan_index + 1, pipelined);
-    cmds
+    let mut out = Vec::with_capacity(cmds.len() + 1);
+    for GatedCommand { command, .. } in cmds {
+        let scan = pipelines && command.library == "gdn_scan_varlen" && command.function == simd;
+        match (decodes, scan) {
+            (true, _) if command.library == "gdn_decode" => {
+                out.push(GatedCommand::gated(command, OnlyIfDecodeStep));
+            }
+            (true, true) => out.push(GatedCommand::gated(pipelined(&command), UnlessDecodeStep)),
+            (true, false) => out.push(GatedCommand::gated(command, UnlessDecodeStep)),
+            (false, true) => {
+                let twin = GatedCommand::gated(pipelined(&command), UnlessDecodeStep);
+                out.extend([GatedCommand::gated(command, OnlyIfDecodeStep), twin]);
+            }
+            (false, false) => out.push(GatedCommand::ungated(command)),
+        }
+    }
+    out
 }
 
 /// A gated row's `gate` on every command of it. A command its realization already gated cannot
@@ -1136,13 +1135,17 @@ fn lower(
     let mut i = 0usize;
     // One barrier flag per row, rolled: the loop body's flags serve every
     // iteration (body equivalence is what let the loop roll, so each
-    // iteration has the same hazard signature). A metadata-only row
-    // (Reshape) emits no command, so its flag is unused. A step that
-    // lowers to several commands (the SplitK matmul pair) gives its flag
-    // to the first; the rest get `true` (intra-step scratch RAW).
+    // iteration has the same hazard signature). A row that emits no command —
+    // a view, or a step its bake elides (a gathered MoE's sort) — passes its
+    // fence on to the next command: the fence orders what came before against
+    // what comes after, whichever row dispatches. A step that lowers to several
+    // commands (the SplitK matmul pair) gives its flag to the first; the rest get
+    // `true` (intra-step scratch RAW).
     let flag_for = |idx: usize| -> bool { barriers_in.get(idx).copied().unwrap_or(true) };
+    let mut carried = false;
 
     while i < rows.len() {
+        let closed = loops.len();
         close_spans(
             &mut open_spans,
             i,
@@ -1151,6 +1154,15 @@ fn lower(
             rows,
             &mut m_divisor,
         );
+        // A fence a body's last rows carry past every command reaches the next
+        // iteration's first command too.
+        if carried {
+            for l in &loops[closed..] {
+                if let Some(b) = barrier_before.get_mut(l.start as usize) {
+                    *b = true;
+                }
+            }
+        }
         match &rows[i] {
             StepRow::Loop {
                 iters,
@@ -1205,7 +1217,7 @@ fn lower(
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
-                let cmds = route_gdn_pipelined(p, step, cmds);
+                let cmds = route_gdn(p, step, cmds);
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = row_gate(cmds, *gate, i)?;
                 let cmds = route_by_sequence_count(i, cmds)?;
@@ -1221,8 +1233,11 @@ fn lower(
                 });
                 commands.extend(cmds);
                 if n_cmds >= 1 {
-                    barrier_before.push(flag_for(i) || writes_scratch);
+                    barrier_before.push(flag_for(i) || writes_scratch || carried);
                     barrier_before.extend(std::iter::repeat_n(true, n_cmds - 1));
+                    carried = false;
+                } else {
+                    carried |= flag_for(i);
                 }
                 i += 1;
             }
@@ -4509,9 +4524,6 @@ fn lower_one(
             let value_dim = nv * hv;
             let scale = (hk as f32).powf(-0.5);
 
-            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
-            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
-
             // One source for the whole bundle; `which` picks the sub-tensor.
             let ix = w.of(WeightKind::GatedDeltaNet, 0)?;
             let weight = |which, binding_index| source(ix, which, layer_id, binding_index);
@@ -4519,8 +4531,86 @@ fn lower_one(
                 kind,
                 binding_index,
             };
+            let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
+                slot: *slot,
+                binding_index,
+            };
+            let scan_constants = || {
+                vec![
+                    ConstantValue::uint(0, nk),
+                    ConstantValue::uint(1, nv),
+                    ConstantValue::uint(2, hk),
+                    ConstantValue::uint(3, hv),
+                    ConstantValue::float(4, scale),
+                ]
+            };
+            // head_k a multiple of 32: lanes split it (`gdn_scan_simd`, `gdn_decode`).
+            let simd_scan = hk.is_multiple_of(32) && hv.is_multiple_of(4);
 
-            let mut cmds = Vec::with_capacity(4);
+            // A decode step's token — every sequence's one — is one command, not three a
+            // barrier apart (`gdn_decode`): a threadgroup of 1024 per (sequence, key head) runs its
+            // conv channels, its value heads' scan and their norm. Its shader's static asserts are
+            // these bounds. `route_gdn` runs it on decode steps and the commands below on the
+            // rest; a one-row bucket's every step is a decode step, so there it runs alone.
+            let per_key = nv / nk.max(1);
+            let decode = (simd_scan
+                && nv.is_multiple_of(nk)
+                && 2 * hk + per_key * hv <= 1024
+                && (per_key * hv).is_multiple_of(32)
+                && hv.is_multiple_of(32)
+                && hv <= 256
+                && kernel <= 8)
+                .then(|| {
+                    let mut constants = scan_constants();
+                    constants.extend([
+                        ConstantValue::uint(5, kernel),
+                        ConstantValue::float(6, p.rms_norm_eps),
+                    ]);
+                    let bindings = vec![
+                        arena(out_slot, 0),
+                        arena(qkv_slot, 1),
+                        arena(z_slot, 2),
+                        arena(a_slot, 3),
+                        arena(b_slot, 4),
+                        weight(WeightTensor::GdnConv1d, 5),
+                        runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 6),
+                        runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, 7),
+                        runtime(RuntimeBindingKind::CuSeqlensQ, 8),
+                        runtime(RuntimeBindingKind::GdnStateIndices, 9),
+                        runtime(RuntimeBindingKind::GdnIsFresh, 10),
+                        weight(WeightTensor::GdnALog, 11),
+                        weight(WeightTensor::GdnDtBias, 12),
+                        weight(WeightTensor::GdnNorm, 13),
+                    ];
+                    LoweredCommand {
+                        kernel: KernelId::GatedDeltaNet,
+                        library: "gdn_decode",
+                        function: gdn_decode_static_name(dtype),
+                        constants: baked(constants),
+                        dispatch: DispatchShape {
+                            threadgroups: (1, nk, 1),
+                            threads_per_threadgroup: (1024, 1, 1),
+                            m_scaling: Some(MScaling {
+                                axis: MScaleAxis::Z,
+                                bucket_m: BucketM(1),
+                                seq_axis: Some(MScaleAxis::Z),
+                            }),
+                        },
+                        bindings: baked(bindings),
+                        gemm_dims: None,
+                    }
+                });
+            if bucket_m == 1
+                && let Some(decode) = decode
+            {
+                return Ok(vec![decode]);
+            }
+
+            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
+
+            let mut cmds = Vec::with_capacity(5);
+            cmds.extend(decode);
 
             // 1. Causal depthwise conv1d (+SiLU), varlen + stateful.
             //    grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y), 1).
@@ -4565,7 +4655,7 @@ fn lower_one(
 
             // head_k a multiple of 32: the gating and the scan run as one
             // command, mlx-lm's simdgroup-per-value-dim mapping
-            // (`gdn_scan_simd`); then the norm. Used at EVERY bucket size,
+            // (`gdn_scan_simd`); then the norm. Used at every other bucket size,
             // prefill included: the mapping is sequence-serial either way, but
             // a simdgroup's 32 lanes split head_k (4 state elements per lane,
             // dots via `simd_sum`) where `gdn_scan_varlen`'s CUDA-faithful
@@ -4573,16 +4663,6 @@ fn lower_one(
             // measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill
             // forward (64%, ~8 µs/token/layer) on the per-thread kernel.
             // Non-divisible geometries fall back to the varlen kernel.
-            let simd_scan = hk.is_multiple_of(32) && hv.is_multiple_of(4);
-            let scan_constants = || {
-                baked(vec![
-                    ConstantValue::uint(0, nk),
-                    ConstantValue::uint(1, nv),
-                    ConstantValue::uint(2, hk),
-                    ConstantValue::uint(3, hv),
-                    ConstantValue::float(4, scale),
-                ])
-            };
             let scan_state = |first: u8| {
                 [
                     runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, first),
@@ -4592,10 +4672,6 @@ fn lower_one(
                 ]
             };
             if simd_scan {
-                let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
-                    slot: *slot,
-                    binding_index,
-                };
                 let mut bindings = vec![
                     Binding::MoeScratch {
                         binding_index: 0,
@@ -4617,7 +4693,7 @@ fn lower_one(
                     kernel: KernelId::GatedDeltaNet,
                     library: "gdn_scan_varlen",
                     function: gdn_scan_simd_static_name(dtype),
-                    constants: scan_constants(),
+                    constants: baked(scan_constants()),
                     dispatch: DispatchShape {
                         threadgroups: (1, nv * hv / 4, 1),
                         threads_per_threadgroup: (32, 4, 1),
@@ -4680,7 +4756,7 @@ fn lower_one(
                     kernel: KernelId::GatedDeltaNet,
                     library: "gdn_scan_varlen",
                     function: "gdn_scan_varlen_f32",
-                    constants: scan_constants(),
+                    constants: baked(scan_constants()),
                     dispatch: {
                         let tgx = hv.clamp(1, THREADS_PER_GROUP);
                         DispatchShape {
@@ -5496,6 +5572,13 @@ fn gdn_scan_pipelined_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gdn_scan_pipelined_f16",
         DequantDtype::Bf16 => "gdn_scan_pipelined_bf16",
+    }
+}
+
+fn gdn_decode_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_decode_f16",
+        DequantDtype::Bf16 => "gdn_decode_bf16",
     }
 }
 
@@ -6539,15 +6622,27 @@ fn lower_moe_step(
         )
     };
     // Rows where the step that wrote them left them: the router's input, read before any sort.
+    // The rows of a norm the step absorbed bind only where its command normalizes them.
     let rows_at = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
-        MoeRows::Tokens(Slot(slot)) => arena_at(i, slot),
-        MoeRows::Scratch(r) => s.at(i, r),
+        MoeRows::Tokens(Slot(slot)) => Ok(arena_at(i, slot)),
+        MoeRows::Scratch(r) => Ok(s.at(i, r)),
+        MoeRows::Normed(..) => Err(LoweringError::NormedRowsUnread),
     };
     // An expert projection's rows: a sorted bake reads the token rows through the sort's own
     // copy, in sorted order.
     let rows_of = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
-        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => s.at(i, R::SortedRows),
+        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => Ok(s.at(i, R::SortedRows)),
         rows => rows_at(s, i, rows),
+    };
+    // A gathered expert matvec's rows, and the norm it applies as it loads them: its constants,
+    // and its gain at 15 — the row's `RmsNorm` weight at the norm's own layer.
+    let normed_rows = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
+        MoeRows::Normed(Slot(slot), norm) if s.grouping == MoeGrouping::Gathered => {
+            let ix = w.of(WeightKind::RmsNorm, 0)?;
+            let gain = source(ix, WeightTensor::Weight, layer(&norm.layer), 15);
+            Ok((arena_at(i, slot), Vec::from(norm), Some(gain)))
+        }
+        rows => Ok((rows_of(s, i, rows)?, Vec::new(), None)),
     };
     // The expert-index buffer a gathered matvec pairs rows with: the sort's per-row copy when
     // the bake sorted, the router's top-k indices in token order otherwise.
@@ -6588,7 +6683,7 @@ fn lower_moe_step(
     // scattered pair rows — every row is its own pair's.
     let rows_read = |s: &MoeScratch, rows| match (s.grouping, rows) {
         (MoeGrouping::Sorted, _) => GatherRows::Pairs,
-        (_, MoeRows::Tokens(_)) => GatherRows::Tokens(b.top_k),
+        (_, MoeRows::Tokens(_) | MoeRows::Normed(..)) => GatherRows::Tokens(b.top_k),
         (_, MoeRows::Scratch(_)) => GatherRows::Pairs,
     };
     let gather_kernel = |kernel, n_out, k_in, gs, bits| {
@@ -6627,11 +6722,23 @@ fn lower_moe_step(
             ]),
             gemm_dims: None,
         }],
-        // One row, its pre-norm folded in: the router scale binds as the norm's gain.
-        S::RouterLogits(rows, l, Some(eps)) => {
+        // One row, a norm folded in: its own pre-norm, the router scale binding as the norm's
+        // gain, or the RMSNorm whose rows it reads, that norm's gain (its row's `RmsNorm` weight).
+        S::RouterLogits(rows, l, norm) if norm.is_some() || matches!(rows, MoeRows::Normed(..)) => {
             if bucket_m != 1 {
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
+            let (x, eps, offset, gain) = match (rows, norm) {
+                (MoeRows::Normed(Slot(slot), n), None) => {
+                    let gain = (w.of(WeightKind::RmsNorm, 0)?, WeightTensor::Weight, n.layer);
+                    (arena_at(1, slot), n.eps, n.offset, gain)
+                }
+                (rows, Some(eps)) => {
+                    let gain = (router()?, WeightTensor::GemmaRouterScale, l);
+                    (rows_at(&s, 1, rows)?, eps, GainOffset(0.0), gain)
+                }
+                (_, None) => return Err(LoweringError::NormedRowsUnread),
+            };
             vec![LoweredCommand {
                 kernel: KernelId::NormedGemv,
                 library: "gemm",
@@ -6640,24 +6747,25 @@ fn lower_moe_step(
                     n: super::ids::NDim(e),
                     k: super::ids::KDim(hidden),
                     eps,
+                    offset,
                 }
                 .into_baked(),
                 dispatch: grid((e.div_ceil(4), 1, 1), (256, 1, 1), None),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
-                    rows_at(&s, 1, rows),
+                    x,
                     source(
                         router()?,
                         crate::op_abi::router_gate(b.router),
                         layer(&l),
                         2,
                     ),
-                    source(router()?, WeightTensor::GemmaRouterScale, layer(&l), 3),
+                    source(gain.0, gain.1, layer(&gain.2), 3),
                 ]),
                 gemm_dims: None,
             }]
         }
-        S::RouterLogits(rows, l, None) => {
+        S::RouterLogits(rows, l, _) => {
             let tiles = (bucket_m.div_ceil(GEMM_TILE_M), e.div_ceil(GEMM_TILE_N), 1);
             let gate = crate::op_abi::router_gate(b.router);
             vec![LoweredCommand {
@@ -6668,7 +6776,7 @@ fn lower_moe_step(
                 dispatch: grid(tiles, (GEMM_TILE_M, GEMM_TILE_N, 1), ms(A::X)),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
-                    rows_at(&s, 1, rows),
+                    rows_at(&s, 1, rows)?,
                     source(router()?, gate, layer(&l), 2),
                 ]),
                 gemm_dims: Some(GemmDims {
@@ -7007,6 +7115,7 @@ fn lower_moe_step(
                 let x = match rows {
                     MoeRows::Tokens(_) => s.at(3, R::SortedRows),
                     MoeRows::Scratch(r) => s.at(3, r),
+                    MoeRows::Normed(..) => return Err(LoweringError::NormedRowsUnread),
                 };
                 let mut bindings = weights.to_vec();
                 let indices = scratch_at(5, s.l.grp_indices_pad);
@@ -7023,8 +7132,9 @@ fn lower_moe_step(
             } else {
                 let (kernel, symbol) = gather_kernel(GatherQmv::Plain, n_out, k_in, gs, bits);
                 let mut bindings = weights.to_vec();
-                let (x, indices) = (rows_of(&s, 3, rows), gather_indices(&s, 4));
+                let ((x, norm, gain), indices) = (normed_rows(&s, 3, rows)?, gather_indices(&s, 4));
                 bindings.extend([x, indices, s.at(5, out)]);
+                bindings.extend(gain);
                 // A sorted bake runs the full static grid: a short step's live pairs sit past
                 // the m-scaled edge, on rows the init sentinel-filled.
                 let scaling = match s.grouping {
@@ -7032,11 +7142,12 @@ fn lower_moe_step(
                     MoeGrouping::Sorted | MoeGrouping::Grouped => None,
                 };
                 let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), scaling);
-                let qmv = AffineGatherQmvConstants {
+                let mut qmv: Vec<ConstantValue> = AffineGatherQmvConstants {
                     qmv: qmv(n_out, k_in, codes),
                     rows: rows_read(&s, rows),
                 }
                 .into();
+                qmv.extend(norm);
                 vec![cmd(kernel, "quantized_qmv", symbol, qmv, shape, bindings)]
             }
         }
@@ -7067,10 +7178,11 @@ fn lower_moe_step(
             let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
-            let (x, indices) = (rows_of(&s, 3, gate.rows), gather_indices(&s, 4));
-            bindings.extend([x, indices, s.at(5, R::ExpertGate)]);
+            let (x, norm, gain) = normed_rows(&s, 3, gate.rows)?;
+            bindings.extend([x, gather_indices(&s, 4), s.at(5, R::ExpertGate)]);
             bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
             bindings.push(s.at(9, R::ExpertUp));
+            bindings.extend(gain);
             // Full static grid when sorted — a short step's live pairs sit past the m-scaled
             // edge, on rows the init sentinel-filled.
             let scaling = match s.grouping {
@@ -7084,6 +7196,7 @@ fn lower_moe_step(
             };
             let mut constants: Vec<ConstantValue> =
                 AffineGatedQmvConstants { qmv: gather, act }.into();
+            constants.extend(norm);
             if let Some(program) = routed {
                 bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
                 if let Some(l) = program.expert_scale {
@@ -7109,23 +7222,32 @@ fn lower_moe_step(
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
         // grid-adjacency (simdgroup k = pair k), which the sort permutes apart — so a sorted or
         // grouped bake runs each step's own commands.
-        S::DownCombine(down, out)
+        S::DownCombine(down, out, ends)
             if s.grouping != MoeGrouping::Gathered || matches!(down.rows, MoeRows::Tokens(_)) =>
         {
+            // Only the gathered command computes the combine's ends.
+            if ends != crate::tape::step::CombineEnds::default() {
+                return Err(LoweringError::CombineEndsUngathered);
+            }
             let steps = [S::ExpertMatmul(down), S::Unsort, S::Combine(out)];
             each_step(&steps, moe_scratch_bytes)?
         }
-        S::DownCombine(down, Slot(out)) => {
+        S::DownCombine(down, Slot(out), ends) => {
             let (AffineGroupSize(gs), bits) = (down.group_size, down.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::DownCombine, hidden, inter, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Down, down.layer, 0)?.to_vec();
-            let (x, indices) = (rows_of(&s, 3, down.rows), s.at(4, R::TopKIndices));
+            let (x, indices) = (rows_of(&s, 3, down.rows)?, s.at(4, R::TopKIndices));
             bindings.extend([x, indices, s.at(5, R::ExpertDown)]);
             bindings.extend([s.at(6, R::TopKScores), arena_at(7, out)]);
+            if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {
+                bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
+            }
             let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
             let constants = AffineCombineQmvConstants {
                 qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
                 top_k: b.top_k,
+                gate_scale: ends.gate_scale.is_some(),
+                residual: ends.residual,
             }
             .into();
             vec![cmd(
@@ -7513,16 +7635,17 @@ mod tests {
         }
     }
 
-    /// A GDN layer whose head_k is 32 and head_v a multiple of 16 lowers its
-    /// scan as a runtime-gate twin: the 4-simdgroup mapping (the decode
-    /// shape) under `OnlyIfDecodeStep`, the block-staged pipelined kernel
-    /// under `UnlessDecodeStep`, sharing the simd command's bindings. A
-    /// geometry outside the pipelined kernel's (head_k 64) keeps the single
-    /// ungated simd command. Pure-CPU lowering checks.
+    /// A GDN layer's commands by the step they serve. A geometry the one-command decode covers
+    /// runs it on decode steps and its conv, scan and norm on the rest — the scan the
+    /// block-staged pipelined kernel where that covers the geometry too, else the simd mapping;
+    /// a one-row bucket, all decode steps, runs the decode command alone. Without the decode
+    /// command a pipelined geometry twins its scan (simd on decode steps, pipelined on the rest)
+    /// between the ungated conv and norm, and any other keeps the ungated chain. Pure-CPU
+    /// lowering checks.
     #[test]
-    fn gdn_scan_pipelined_twin_gates_on_decode_step() {
+    fn gdn_lowers_by_the_step_it_serves() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
-        let gdn_step = |nk, nv, hk, hv| {
+        let lowered = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m| {
             let p = MetalModelConsts {
                 gdn_num_k_heads: nk,
                 gdn_num_v_heads: nv,
@@ -7533,52 +7656,56 @@ mod tests {
             };
             let step =
                 MetalStep::GatedDeltaNet(Slot(0), Slot(1), Slot(2), Slot(3), Slot(4), LayerId(0));
-            (p, step)
-        };
-        // The pipelined geometry (qwen3.6-27b: nk=16, nv=48, hk=hv=128).
-        let (p, step) = gdn_step(16, 48, 128, 128);
-        let tape = lower_tq(&p, plain(&[step]), 64);
-        let scans: Vec<&GatedCommand> = tape
-            .commands
-            .iter()
-            .filter(|c| {
-                c.command.library == "gdn_scan_varlen" || c.command.library == "gdn_scan_pipelined"
-            })
-            .collect();
-        assert_eq!(scans.len(), 2, "a decode twin and a prefill twin");
-        let simd = scans[0];
-        assert_eq!(simd.command.function, "gdn_scan_simd_bf16");
-        assert_eq!(simd.gate, Some(OnlyIfDecodeStep));
-        let pipe = scans[1];
-        assert_eq!(pipe.command.function, "gdn_scan_pipelined_bf16");
-        assert_eq!(pipe.gate, Some(UnlessDecodeStep));
-        // Same bindings, same slot map — the twins read and write the same
-        // buffers, only the dispatch shape differs.
-        assert_eq!(simd.command.bindings, pipe.command.bindings);
-        assert_eq!(pipe.command.dispatch.threadgroups, (48 * 128 / 16, 1, 1));
-        assert_eq!(pipe.command.dispatch.threads_per_threadgroup, (128, 1, 1));
-        // The simd command's gate stays un-narrowed elsewhere: conv and norm
-        // commands are ungated, and the scan twin sits between them.
-        let norm = tape
-            .commands
-            .iter()
-            .find(|c| c.command.library == "gdn_rms_norm_gated")
-            .expect("the norm command");
-        assert!(norm.gate.is_none());
-        // An uncovered geometry (head_k 64) keeps the single simd command.
-        let (p, step) = gdn_step(2, 6, 64, 128);
-        let tape = lower_tq(&p, plain(&[step]), 64);
-        assert!(
-            tape.commands
+            lower_tq(&p, plain(&[step]), bucket_m)
+                .commands
                 .iter()
-                .all(|c| c.command.library != "gdn_scan_pipelined")
+                .cloned()
+                .collect::<Vec<GatedCommand>>()
+        };
+        let shape = |c: &[GatedCommand]| -> Vec<(&str, Option<_>)> {
+            c.iter().map(|c| (c.command.function, c.gate)).collect()
+        };
+        let (only, unless) = (Some(OnlyIfDecodeStep), Some(UnlessDecodeStep));
+        let (decode, conv) = ("gdn_decode_bf16", "gdn_conv1d_varlen_bf16");
+        let (simd, pipe) = ("gdn_scan_simd_bf16", "gdn_scan_pipelined_bf16");
+        let norm = "gdn_rms_norm_gated_bf16";
+        // qwen3.6-27b's geometry (nk=16, nv=48, hk=hv=128): both kernels cover it.
+        let q27 = lowered((16, 48, 128, 128), 64);
+        let want = [
+            (decode, only),
+            (conv, unless),
+            (pipe, unless),
+            (norm, unless),
+        ];
+        assert_eq!(shape(&q27), want);
+        let d = &q27[0].command.dispatch;
+        assert_eq!(
+            (d.threadgroups, d.threads_per_threadgroup),
+            ((1, 16, 1), (1024, 1, 1))
         );
-        let simd = tape
-            .commands
-            .iter()
-            .find(|c| c.command.library == "gdn_scan_varlen")
-            .expect("the simd scan command");
-        assert!(simd.gate.is_none());
+        let d = &q27[2].command.dispatch;
+        assert_eq!(
+            (d.threadgroups, d.threads_per_threadgroup),
+            ((48 * 128 / 16, 1, 1), (128, 1, 1))
+        );
+        assert_eq!(shape(&lowered((16, 48, 128, 128), 1)), [(decode, None)]);
+        // head_k 64: the decode command, then the chain with its simd scan.
+        let want = [
+            (decode, only),
+            (conv, unless),
+            (simd, unless),
+            (norm, unless),
+        ];
+        assert_eq!(shape(&lowered((2, 6, 64, 128), 64)), want);
+        // head_v 48 (not a multiple of 32): no decode command; the scan's twins, sharing the simd
+        // command's bindings — only the dispatch shape differs.
+        let twins = lowered((2, 4, 128, 48), 64);
+        let want = [(conv, None), (simd, only), (pipe, unless), (norm, None)];
+        assert_eq!(shape(&twins), want);
+        assert_eq!(twins[1].command.bindings, twins[2].command.bindings);
+        // Neither kernel covers head_k 64 with head_v 48.
+        let want = [(conv, None), (simd, None), (norm, None)];
+        assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
     }
 
     /// A dense model's tape carries no TurboQuant command and gates nothing on
@@ -8069,21 +8196,25 @@ mod tests {
         assert_eq!(tape.splitk_scratch_bytes, 0);
     }
 
-    /// Where the matmul does not lower to one qmm_t command it runs plain and ungated under its
-    /// own row's flag, and the gather, the scatter and the all-rows matmul emit nothing: one row
-    /// (bucket 1), qmv (bucket 8, under its batch limit), SplitK's pair (bucket 64), the small-M
-    /// twin (bucket 64 on a NAX device).
+    /// Where the matmul does not lower to one qmm_t command it runs plain and ungated, and the
+    /// gather, the scatter and the all-rows matmul emit nothing: one row (bucket 1), qmv (bucket
+    /// 8, under its batch limit), SplitK's pair (bucket 64), the small-M twin (bucket 64 on a NAX
+    /// device). It runs under its own row's flag and the fence its elided gather carried.
     #[test]
     fn sampled_rows_run_plain_where_the_matmul_does_not_slice() {
         use KernelId as K;
         let m5 = Some(&crate::targets::M5_10CORE);
-        let rows = sampled_rows([true, false, true, true]);
-        for (bucket_m, profile, last) in [
+        let cases = [
             (1, None, K::AffineQmvFast),
             (8, None, K::AffineQmvFast),
             (64, None, K::SplitKReduceSum),
             (64, m5, K::AffineQmmSmallM),
-        ] {
+        ];
+        for (gather_fences, (bucket_m, profile, last)) in [false, true]
+            .into_iter()
+            .flat_map(|g| cases.map(|c| (g, c)))
+        {
+            let rows = sampled_rows([gather_fences, false, true, true]);
             let at = bake_point(bucket_m, profile);
             let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
             let plain = plain_q_proj(at);
@@ -8098,9 +8229,12 @@ mod tests {
                     .any(|b| matches!(b, Binding::Scratch { .. }))
             });
             let flags: Vec<bool> = (0..tape.commands.len())
-                .map(|c| c > 0 || writes_scratch)
+                .map(|c| c > 0 || writes_scratch || gather_fences)
                 .collect();
-            assert_eq!(tape.barrier_before, flags, "bucket {bucket_m}");
+            assert_eq!(
+                tape.barrier_before, flags,
+                "bucket {bucket_m}, {gather_fences}"
+            );
             assert_eq!(tape.splitk_scratch_bytes, plain.splitk_scratch_bytes);
         }
     }

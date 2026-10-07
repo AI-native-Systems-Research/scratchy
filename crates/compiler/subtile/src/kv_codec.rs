@@ -209,6 +209,7 @@ pub fn expand_kv_codec(
         at: vec![0; ops.len()],
         read_as: vec![0; ops.len()],
         packed: HashMap::new(),
+        unnamed_reads: Vec::new(),
         next: first_id.unwrap_or(0),
     };
     for (i, od) in ops.iter().enumerate() {
@@ -243,6 +244,10 @@ pub fn expand_kv_codec(
             .map(|(op, tile)| (at[*op], *tile))
             .collect(),
         op_expansion: x.expansion,
+        unnamed_reads: (l.unnamed_reads.iter())
+            .map(|(w, r)| (at[*w], at[*r]))
+            .chain(x.unnamed_reads)
+            .collect(),
     })
 }
 
@@ -258,6 +263,9 @@ struct Expander<'a> {
     read_as: Vec<usize>,
     /// Each coded writer's encodes, by the operand they pack.
     packed: HashMap<usize, Vec<(KvOperand, usize)>>,
+    /// Each encode, after the writer whose cache half it packs; each coded attention, after the
+    /// stage steps whose staged K/V it reads.
+    unnamed_reads: Vec<(usize, usize)>,
     next: u32,
 }
 
@@ -352,6 +360,8 @@ impl Expander<'_> {
             let encode = SubOp::KvEncode { operand: g.step };
             let guard = Some(g.guard);
             let e = self.push(encode, m, inputs, None, Some(Expansion { id, guard }));
+            // It reads the cache half through the cache, not the writer.
+            self.unnamed_reads.push((at, e));
             packed.push((g.step, e));
         }
         self.packed.insert(i, packed);
@@ -380,6 +390,7 @@ impl Expander<'_> {
         let id = self.open(i)?;
         let m = self.l.input.ops[i].m;
         let mut q = self.input(self.operand(i, 0)?);
+        let mut staged = Vec::new();
         for g in around.before {
             let expansion = Some(Expansion {
                 id,
@@ -388,7 +399,7 @@ impl Expander<'_> {
             match g.step {
                 Before::Stage(operand) => {
                     let stage = SubOp::KvStage { operand };
-                    self.push(stage, m, vec![packed_of(operand)?], None, expansion);
+                    staged.push(self.push(stage, m, vec![packed_of(operand)?], None, expansion));
                 }
                 Before::RotateQuery => {
                     let rows = RotatedRows::Query;
@@ -409,6 +420,8 @@ impl Expander<'_> {
         });
         let at = self.push_own(i, anchor);
         self.ops[at].inputs[0] = q;
+        self.unnamed_reads
+            .extend(staged.into_iter().map(|s| (s, at)));
         let mut out = at;
         for g in around.after {
             let expansion = Some(Expansion {

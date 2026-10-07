@@ -693,17 +693,23 @@ impl From<&crate::tape::step::RowProgram> for Vec<ConstantValue> {
     }
 }
 
-/// A one-row matvec's [`QmvEnds`](crate::tape::step::QmvEnds), compiled in: its norm's epsilon
-/// (slot 8) and gain offset (9), whether its rows add into the residual (10), take a bias (11), and
-/// their scale (12).
+/// The norm a matvec applies to its input as it loads it (`quantized_qmv.metal`'s `QMV_NORMED`):
+/// its epsilon (slot 8) and gain offset (9).
+impl From<crate::tape::step::RowNorm> for Vec<ConstantValue> {
+    fn from(n: crate::tape::step::RowNorm) -> Self {
+        vec![
+            ConstantValue::float(ConstSlot(8), n.eps.0),
+            ConstantValue::float(ConstSlot(9), n.offset.0),
+        ]
+    }
+}
+
+/// A one-row matvec's [`QmvEnds`](crate::tape::step::QmvEnds), compiled in: its norm's
+/// ([`RowNorm`](crate::tape::step::RowNorm)'s slots 8 and 9), whether its rows add into the
+/// residual (10), take a bias (11), and their scale (12).
 impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
     fn from(e: crate::tape::step::QmvEnds) -> Self {
-        let norm = e.norm.into_iter().flat_map(|n| {
-            [
-                ConstantValue::float(ConstSlot(8), n.eps.0),
-                ConstantValue::float(ConstSlot(9), n.offset.0),
-            ]
-        });
+        let norm = e.norm.into_iter().flat_map(Vec::from);
         let residual = e
             .residual
             .then(|| ConstantValue::boolean(ConstSlot(10), true));
@@ -714,11 +720,12 @@ impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
 }
 
 /// `KernelId::NormedGemv` (`gemv_normed_<T>_s_<G>`, `gemm.metal`): the GEMM's one row (slots 0 /
-/// 1 / 2: M, N, K) and its folded norm's epsilon (5).
+/// 1 / 2: M, N, K) and its folded norm's epsilon (5) and gain offset (6).
 pub struct NormedGemvConstants {
     pub n: NDim,
     pub k: KDim,
     pub eps: crate::tape::step::Eps,
+    pub offset: crate::tape::step::GainOffset,
 }
 
 impl From<NormedGemvConstants> for Vec<ConstantValue> {
@@ -728,6 +735,7 @@ impl From<NormedGemvConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(1), c.n.get()),
             ConstantValue::uint(ConstSlot(2), c.k.get()),
             ConstantValue::float(ConstSlot(5), c.eps.0),
+            ConstantValue::float(ConstSlot(6), c.offset.0),
         ]
     }
 }
@@ -788,12 +796,24 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
 pub struct AffineCombineQmvConstants {
     pub qmv: AffineQmvConstants,
     pub top_k: TopK,
+    /// What it computes as it stores each row: slot 18 a shared expert's gated rows, slot 19 the
+    /// residual add (`COMBINE_GATE_SCALE` / `COMBINE_RESIDUAL`). Unset when it stores the sum alone.
+    pub gate_scale: bool,
+    pub residual: bool,
 }
 
 impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
     fn from(c: AffineCombineQmvConstants) -> Self {
         let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(2), c.top_k.get() as i32));
+        v.extend(
+            c.gate_scale
+                .then(|| ConstantValue::boolean(ConstSlot(18), true)),
+        );
+        v.extend(
+            c.residual
+                .then(|| ConstantValue::boolean(ConstSlot(19), true)),
+        );
         v
     }
 }

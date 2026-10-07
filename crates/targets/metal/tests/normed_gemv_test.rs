@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A one-row dense GEMM with its pre-norm folded in (`gemv_normed_*`: a router's logits,
-//! `MetalFusion::NormedRouter`) against the commands it replaces: the RMSNorm by the router scale,
-//! then the plain GEMV over its row.
+//! A one-row dense GEMM with its pre-norm folded in (`gemv_normed_*`: a router's logits, its own
+//! pre-norm or the RMSNorm whose rows it reads) against the commands it replaces: the RMSNorm, then
+//! the plain GEMV over its row.
 //!
 //! Normalizing on load dots `x ⊙ gain` and scales each row by `1 / rms(x)`, so it skips the normed
 //! row's rounding: its output must be as close to the exact `W · rmsnorm(x, gain)` as the unfused
@@ -22,7 +22,7 @@ use scratchy_target_metal::tape::ids::{BucketM, KDim, NDim, QSize, RmsNormEps};
 use scratchy_target_metal::tape::kernel_constants::{
     NORM_THREADS, NormedGemvConstants, RmsNormConstants,
 };
-use scratchy_target_metal::tape::step::Eps;
+use scratchy_target_metal::tape::step::{Eps, GainOffset};
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -64,13 +64,15 @@ impl Dtype {
     }
 }
 
-/// `n` logits of a `k`-wide row; activations and weights in `act`, the gain in `gain`.
+/// `n` logits of a `k`-wide row; activations and weights in `act`, the gain in `gain`, which the
+/// norm offsets by `offset` (`rmsnorm(x, gain + offset)`).
 #[derive(Clone, Copy, Debug)]
 struct Case {
     act: Dtype,
     gain: Dtype,
     k: usize,
     n: usize,
+    offset: f32,
 }
 
 const EPS: f32 = 1e-6;
@@ -138,6 +140,7 @@ fn rig(c: &Case) -> Option<Rig> {
         n: NDim(c.n as u32),
         k: KDim(c.k as u32),
         eps: Eps(EPS),
+        offset: GainOffset(c.offset),
     };
     let normed = build(
         "gemm",
@@ -154,7 +157,7 @@ fn rig(c: &Case) -> Option<Rig> {
         bucket_m: BucketM(1),
         q_size: QSize(c.k as u32),
         rms_norm_eps: RmsNormEps(EPS),
-        weight_offset: 0.0,
+        weight_offset: c.offset,
     };
     let norm = build(
         "rmsnorm",
@@ -195,7 +198,7 @@ fn exact(c: &Case, i: &Inputs) -> Vec<(f64, f64)> {
     let x: Vec<f64> = i.x.iter().map(|&b| c.act.value(b)).collect();
     let rms = (x.iter().map(|v| v * v).sum::<f64>() / c.k as f64 + f64::from(EPS)).sqrt();
     let xn: Vec<f64> = (x.iter().zip(&i.gain))
-        .map(|(v, &g)| v / rms * c.gain.value(g))
+        .map(|(v, &g)| v / rms * (c.gain.value(g) + f64::from(c.offset)))
         .collect();
     (0..c.n)
         .map(|r| {
@@ -261,6 +264,7 @@ fn cases() -> Vec<Case> {
         gain: Dtype::Bf16,
         k: 2816,
         n: 128,
+        offset: 0.0,
     };
     vec![
         gemma4,
@@ -268,11 +272,23 @@ fn cases() -> Vec<Case> {
             gain: Dtype::F16,
             ..gemma4
         },
+        // A zero-centred gain (Gemma's `1 + w` norms).
+        Case {
+            offset: 1.0,
+            ..gemma4
+        },
         Case {
             act: Dtype::F16,
             gain: Dtype::F16,
             k: 2048,
             n: 64,
+            offset: 0.0,
+        },
+        // Qwen3.6-35B-A3B's router over its MoE block's input norm: 256 experts, a 2048-wide row.
+        Case {
+            k: 2048,
+            n: 256,
+            ..gemma4
         },
     ]
 }

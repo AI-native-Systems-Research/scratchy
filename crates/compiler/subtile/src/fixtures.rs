@@ -618,6 +618,7 @@ pub fn front_end_lowered(input: LoweringInput) -> LoweredDecode {
         op_tiles: (0..n as u32).map(|t| Some((t, 0))).collect(),
         norm_gain_add_tiles: HashMap::from([(0, 100)]),
         op_expansion: vec![None; n],
+        unnamed_reads: Vec::new(),
         input,
     }
 }
