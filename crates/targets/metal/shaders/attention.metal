@@ -977,15 +977,16 @@ template <typename T>
     // For each key, simdgroup `vsg` of the 32 handles tokens at indices
     // vsg, vsg+BN, vsg+2*BN, ... The simdgroup that overshoots `kv_len`
     // skips its iteration and contributes 0. Split, this threadgroup runs
-    // the 32 / ATTN_SPLITS of them its z position picks.
+    // the 32 / ATTN_SPLITS of them its z position picks. A sliding window
+    // (decode Q at absolute position kv_len-1) starts each simdgroup at its
+    // first key inside the window: the same keys in the same order as walking
+    // every key and skipping the older ones, without the walk.
     const uint vsg = tg_pos.z * (uint(BN) / ATTN_SPLITS) + simd_gid;
-    for (uint i = vsg; i < kv_len; i += uint(BN)) {
-        // Sliding window: decode Q sits at absolute position kv_len-1;
-        // skip keys older than the window. Branch is simdgroup-uniform
-        // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
-        if (ATTN_WINDOW > 0 && (int(kv_len) - 1 - int(i)) >= ATTN_WINDOW) {
-            continue;
-        }
+    const uint window_lo =
+        (ATTN_WINDOW > 0 && kv_len > uint(ATTN_WINDOW)) ? kv_len - uint(ATTN_WINDOW) : 0u;
+    const uint first_key =
+        vsg + (window_lo > vsg ? (window_lo - vsg + uint(BN) - 1u) / uint(BN) * uint(BN) : 0u);
+    for (uint i = first_key; i < kv_len; i += uint(BN)) {
         // Resolve paged cache pointer for token i in this simdgroup.
         const uint logical_block = i / block_size;
         const uint bt_raw = row_block_table[logical_block];
@@ -1420,15 +1421,16 @@ SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_c
     // no longer iterate-then-`continue` past it). For non-spans span_lo==0 and
     // the visited keys/order are identical to the old `i<kv_len; if(i>q_abs_pos)`
     // form → byte-identical. For a span query the loop runs O(span), not O(N).
-    for (uint i = span_lo + simd_gid; i < kv_len; i += uint(BN)) {
-        // Causal upper bound. SPAN query (q_span != 0): BREAK — the loop is bounded
-        // [span_lo, q_abs_pos] = the span only (the real O(N)->O(span) cut). NON-spans
-        // (q_span == 0): CONTINUE, byte-identical to the original full-causal scan.
-        if (i > q_abs_pos) { if (q_span != 0u) { break; } else { continue; } }
-        // Sliding window: attend iff q_abs_pos - i < window.
-        if (ATTN_WINDOW > 0 && int(q_abs_pos) - int(i) >= ATTN_WINDOW) {
-            continue;
-        }
+    // The keys a query attends — causal (i <= q_abs_pos) and, sliding, inside the window
+    // (q_abs_pos - i < window) — walked from the first this simdgroup takes to the last: the same
+    // keys in the same order as walking all of them and skipping the rest.
+    const uint win_lo = (ATTN_WINDOW > 0 && q_abs_pos + 1u > uint(ATTN_WINDOW))
+        ? q_abs_pos + 1u - uint(ATTN_WINDOW) : 0u;
+    const uint lane_lo = span_lo + simd_gid;
+    const uint key_lo =
+        lane_lo + (win_lo > lane_lo ? (win_lo - lane_lo + uint(BN) - 1u) / uint(BN) * uint(BN) : 0u);
+    const uint key_hi = min(kv_len, q_abs_pos + 1u);
+    for (uint i = key_lo; i < key_hi; i += uint(BN)) {
 
         const uint logical_block = i / block_size;
         const uint bt_raw = row_block_table[logical_block];
@@ -1646,15 +1648,16 @@ SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_c
     // no longer iterate-then-`continue` past it). For non-spans span_lo==0 and
     // the visited keys/order are identical to the old `i<kv_len; if(i>q_abs_pos)`
     // form → byte-identical. For a span query the loop runs O(span), not O(N).
-    for (uint i = span_lo + simd_gid; i < kv_len; i += uint(BN)) {
-        // Causal upper bound. SPAN query (q_span != 0): BREAK — the loop is bounded
-        // [span_lo, q_abs_pos] = the span only (the real O(N)->O(span) cut). NON-spans
-        // (q_span == 0): CONTINUE, byte-identical to the original full-causal scan.
-        if (i > q_abs_pos) { if (q_span != 0u) { break; } else { continue; } }
-        // Sliding window: attend iff q_abs_pos - i < window.
-        if (ATTN_WINDOW > 0 && int(q_abs_pos) - int(i) >= ATTN_WINDOW) {
-            continue;
-        }
+    // The keys a query attends — causal (i <= q_abs_pos) and, sliding, inside the window
+    // (q_abs_pos - i < window) — walked from the first this simdgroup takes to the last: the same
+    // keys in the same order as walking all of them and skipping the rest.
+    const uint win_lo = (ATTN_WINDOW > 0 && q_abs_pos + 1u > uint(ATTN_WINDOW))
+        ? q_abs_pos + 1u - uint(ATTN_WINDOW) : 0u;
+    const uint lane_lo = span_lo + simd_gid;
+    const uint key_lo =
+        lane_lo + (win_lo > lane_lo ? (win_lo - lane_lo + uint(BN) - 1u) / uint(BN) * uint(BN) : 0u);
+    const uint key_hi = min(kv_len, q_abs_pos + 1u);
+    for (uint i = key_lo; i < key_hi; i += uint(BN)) {
 
         const uint logical_block = i / block_size;
         const uint bt_raw = row_block_table[logical_block];
