@@ -6781,6 +6781,200 @@ pub fn route_topk(
     Ok(ops)
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteGatherScores`] —
+/// the scores at the chosen indices, `out[i, j] = scores[i, idx[i, j]]`
+/// (`take_along_axis` at axis −1, metal's `gather_scores`).
+///
+/// ⭐ A ONE-HOT SELECT, NOT AN INDIRECT ACCESS TILE. The emu's gather is a
+/// `construct_indirect_access_tile` (dim 0 direct, dim 1 read from the index
+/// view); the door's pointwise statement of the same function is
+/// `out[i, j] = Σ_h scores[i, h] · 𝟙[h == idx[i, j]]` — exactly one lane of
+/// the scores row survives the mask, so the cols-reduce IS the gather. No
+/// data-dependent memory traffic, the same compare/reduce machinery as the
+/// argsort and top-k, and NO new consts (the iota row names the column
+/// indices, the identity table writes the lane).
+///
+/// Per top-k SLOT `j`, every token riding `mb` — `6k−2` ops, independent of
+/// `m` (the top-k door's own chain with the compare's operands swapped):
+///
+/// ```text
+/// match_j = equal(idx[:,j], iota_row)      the per-row scalar vs the column id
+/// sel_j   = match_j · scores               one lane survives
+/// val_j   = sum(sel_j, cols)               the [m, stick] reduce (lane 0)
+/// prod_j  = val_j · ident_row_j            the per-row scalar, at LANE j
+/// out     = prod_0 + … + prod_{k−1}        the combine chain (lane-wise)
+/// ```
+///
+/// ⛔ THE COMPARE'S ORIENTATION IS THE INVERSE OF THE TOP-K'S. There the full
+/// rank row was compared against a per-SLOT target; here the per-ROW index
+/// scalar (read `In::col_at` at lane j, the combine door's own law) is
+/// compared against the mb-broadcast IOTA row — so the match mask is a
+/// per-row one-hot over COLUMNS, the orientation a column gather needs. Both
+/// operands broadcast (RedStick × RedNonStick), the proven fold pair.
+///
+/// ⛔ THE OUTPUT WRITE IS THE ARGSORT'S OWN ACCUMULATION SHAPE (see
+/// [`route_topk`]'s doc for why direct writes clobber earlier slots).
+///
+/// ⛔ PAD LANES ARE INERT BY ARITHMETIC: the iota row names columns `0..W`,
+/// and an index read from the top-k output is `< e` for every real slot —
+/// so lanes `e..W` never match and the scores' pad lanes (whatever the
+/// producer left there) are masked out before the reduce.
+pub fn route_gather_scores(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    // The scores [m, E], the indices [m, k], and the [m, k] output — the
+    // parameters `KtirFunc::route_gather_scores` mints.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    let rows = node_rows(name, &out)?;
+    let k = out.v_cols;
+    let e = tensors[0].v_cols;
+    let w = e.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || e == 0 || k == 0 {
+        return err(format!(
+            "RouteGatherScores {name}: the scores t{} [{}, {}], the indices t{} [{}, {}], and \
+             the output t{} [{rows}, {k}] — the widths must be positive and E's padded width a \
+             whole 64-stick (got {w})",
+            tensors[0].tid,
+            tensors[0].v_rows,
+            tensors[0].v_cols,
+            tensors[1].tid,
+            tensors[1].v_rows,
+            tensors[1].v_cols,
+            out.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteGatherScores", out.tid)?;
+    let out_tid = out.tid;
+    let scores_s = tensors[0].name();
+    let idx_s = tensors[1].name();
+    let out_s = out.name();
+    // The consts the select reads — the iota row and the identity table,
+    // both already placed by the router-const block.
+    let iota = rb(
+        &crate::place::act_name(crate::reserved_tids::router_topk_iota_tid()),
+        1,
+        w,
+    );
+    let ident = rb(
+        &crate::place::act_name(crate::reserved_tids::router_identity_tid()),
+        w,
+        w,
+    );
+    // Synths: the match mask, the selector product, the reduce accum, and the
+    // one-hot product accumulator — the top-k door's own set (this door's
+    // output is a different tid, so the names never collide).
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    let m_s = syn(R::AMatch);
+    let sel_s = syn(R::ASel);
+    let val_s = syn(R::AIdx);
+    let acc_s = syn(R::AAcc);
+    if let Some(l) = layout {
+        l.synth_like(out_id.synth(R::AMatch), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ASel), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::AIdx), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::AAcc), out_tid, &[rows, w], Df::Fp16);
+    }
+    let scores = rb(&scores_s, rows, w);
+    let idx = rb(&idx_s, rows, w);
+    let out = rb(&out_s, rows, w);
+    let m_ = rb(&m_s, rows, w);
+    let sel = rb(&sel_s, rows, w);
+    let val = rb(&val_s, rows, w);
+    let acc = rb(&acc_s, rows, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(6 * k as usize);
+    for j in 0..k {
+        // The per-row index scalar: lane j of the [m, W] indices buffer, the
+        // combine door's own col_at law. The identity's row j for the write.
+        let lane = crate::addr::col_of(rows, w, j, Df::Fp16);
+        let ident_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        // 1. match_j = 𝟙[idx[i,j] == h] — the per-row scalar (out-broadcast
+        //    over the stick) against the column ids (mb-broadcast).
+        ops.push(pw2(
+            &format!("rgmtc_j{j}_o{out_tid}"),
+            "equal",
+            t_rows,
+            f_cols,
+            In::col_at(&idx, lane),
+            In::mb(&iota),
+            &m_,
+            sym_id_base,
+            layout,
+        ));
+        // 2. sel_j = match_j · scores — one lane of the scores row survives.
+        ops.push(pw2(
+            &format!("rgsel_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&m_),
+            In::full(&scores),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        // 3. val_j = Σ_h sel_j — the native cols reduce, [m, stick].
+        ops.push(assemble_reduce_off(
+            &format!("rgval_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols,
+            &sel,
+            crate::addr::DevOff::ZERO,
+            &val,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 4-6. lane j of the output = val_j · ident_row_j, accumulated — the
+        //      combine chain's own shape (slot 0 seeds the accumulator, the
+        //      last add writes `out` directly).
+        ops.push(pw2(
+            &format!("rgprd_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::col(&val),
+            In::mb_at(&ident, ident_row),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        if j == 0 {
+            ops.push(pw1(
+                &format!("rgseed_o{out_tid}"),
+                "identity",
+                t_rows,
+                f_cols,
+                In::full(&sel),
+                &acc,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rgacc_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                f_cols,
+                &[In::full(&acc).ew(), In::full(&sel).ew()],
+                if j + 1 == k { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
 /// `out = x · w`, `w` a host-staged `[1]`-shaped weight (gemma4
 /// `layer_scalar[layer]`).

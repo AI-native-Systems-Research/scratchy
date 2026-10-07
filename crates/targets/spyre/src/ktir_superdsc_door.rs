@@ -162,14 +162,12 @@ pub fn lower(
         // wrong experts — measured on the metal track). 4k ops, per slot,
         // every token riding mb; see the door's own doc.
         Program::RouteTopK => lk::route_topk(name, &r, sym_id_base, layout),
-        Program::RouteGatherScores => Err(Error {
-            message: format!(
-                "{name}: RouteGatherScores (the scores at the chosen indices) has no SuperDSC \
-                 lowering yet: a row-wise gather by the top-k index tensor — the \
-                 `indirectAccessIndexLabeledDs` + linked-index vocabulary of the paged KV gather, \
-                 pointed at the score rows"
-            ),
-        }),
+        // The scores at the chosen indices — a ONE-HOT SELECT over the score
+        // row (equal the per-row index against the iota columns, mask, reduce)
+        // rather than an indirect access tile: no data-dependent memory
+        // traffic, the same compare/reduce machinery as the doors before it.
+        // 6k-2 ops, per slot; see the door's own doc.
+        Program::RouteGatherScores => lk::route_gather_scores(name, &r, sym_id_base, layout),
         Program::RouteExpertScale => Err(Error {
             message: format!(
                 "{name}: RouteExpertScale (each score times its expert's learned scale) has no \
