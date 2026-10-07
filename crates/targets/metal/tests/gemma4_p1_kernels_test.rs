@@ -3337,6 +3337,24 @@ fn steel_nax_paged_bd256_matches_ref_and_vs_steel() {
         .fold(0f32, f32::max);
     eprintln!("steel nax paged bd256: max_err {max_err}");
     assert!(max_err < 2e-2, "steel nax paged bd256 max_err {max_err}");
+    // A sliding window (Gemma 4's local layers): the warps of a Q-row block start at the block's
+    // first row, so at 200 keys rows 112.. start a K-tile early and mask it whole.
+    let windowed = AttnCase {
+        window: 24,
+        kv_len: 200,
+        ..small
+    };
+    let (got, _, q_r, k_r, v_r) = run(&windowed, "attention_steel_nax_paged", nax, (64, 256), 0);
+    let positions: Vec<usize> = (0..windowed.kv_len).collect();
+    let want = attn_ref(&q_r, &k_r, &v_r, &windowed, block_size, &positions, scale);
+    let max_err = (got.iter().zip(&want))
+        .map(|(g, w)| (g - w).abs())
+        .fold(0f32, f32::max);
+    eprintln!("steel nax paged bd256 window 24: max_err {max_err}");
+    assert!(
+        max_err < 2e-2,
+        "steel nax paged bd256 window max_err {max_err}"
+    );
 
     let big = AttnCase {
         kv_len: 4096,
