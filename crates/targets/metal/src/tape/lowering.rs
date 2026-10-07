@@ -3421,9 +3421,23 @@ fn lower_one(
             // The unfused kernels read sequence 0 only (`seq_used[0]`,
             // `cu_seqlens_q[1] - cu_seqlens_q[0]`): they serve single-sequence
             // steps, and the paged attention below the rest.
+            let steel_dtype_tag: &str = match p.metal_dtype {
+                crate::tape::lowered::MetalDtype::Bf16 => "bf16",
+                _ => "f16",
+            };
+            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+            let nax_kernel = if is_nax {
+                crate::steel_paged::nax_paged_kernel(steel_dtype_tag, head_dim, block_size)
+            } else {
+                None
+            };
+            // The fused NAX kernel takes the hd512 global class where it has an instantiation.
             #[allow(clippy::overly_complex_bool_expr)]
-            let hd512_unfused =
-                HD512_UNFUSED_CONTINUATION_OK && !sliding && head_dim > 256 && p.rope_on_read;
+            let hd512_unfused = HD512_UNFUSED_CONTINUATION_OK
+                && !sliding
+                && head_dim > 256
+                && p.rope_on_read
+                && nax_kernel.is_none();
             let unfused = if hd512_unfused {
                 use crate::specialized_pipeline_cache::ConstantValue as CV;
                 let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
@@ -3716,13 +3730,12 @@ fn lower_one(
             // means the (library, function, KERNEL_ID) trio comes from
             // one source. Bug class #8 — drift between the three
             // independent `&'static str` fields — can't recur.
-            use crate::steel_paged::{nax_paged_kernel, steel_paged_symbol};
+            use crate::steel_paged::steel_paged_symbol;
             // Spans rope-on-read, the class's. All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, !sliding);
+            // The simdgroup steel kernel's Q rows a threadgroup; a NAX instantiation carries its own
+            // (`NaxPagedKernel::bq`).
             const BQ_STEEL: u32 = 32;
-            // NAX kernel tiles queries in BQ=64 blocks (4 warps × 16-row
-            // NAX Q-frags), vs the simdgroup steel kernel's BQ=32.
-            const BQ_NAX: u32 = 64;
             // Steel attention paged needs an instantiation in
             // `attention_steel_paged.metal` for the model's HEAD_DIM
             // (BD template arg). The instantiation list is owned by
@@ -3736,10 +3749,6 @@ fn lower_one(
             // instance lookup fails or, worse, links to the wrong
             // `_bd<X>_` symbol — verified on Llama-3.2-1B, HEAD_DIM=64,
             // before the lookup-driven gate landed).
-            let steel_dtype_tag: &str = match p.metal_dtype {
-                crate::tape::lowered::MetalDtype::Bf16 => "bf16",
-                _ => "f16",
-            };
             // NAX matrix-accelerator paged attention (M5+/A19+ only —
             // `is_nax_capable` gates on arch gen ≥ 17). The NAX kernel
             // (`attention_steel_nax_paged`) drives the Apple matrix accelerator via
@@ -3748,12 +3757,6 @@ fn lower_one(
             // (8.5 vs 2.5). Instantiated for head_dims 64 / 128 / 256 over 16-token
             // pages (`nax_paged_kernel`); everything else falls through to the
             // simdgroup steel path below.
-            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
-            let nax_kernel = if is_nax {
-                nax_paged_kernel(steel_dtype_tag, head_dim, block_size)
-            } else {
-                None
-            };
             // Class head_dim: 512 has no steel instantiation, so
             // Gemma4 global prefill auto-falls-back to SDPA-paged.
             let steel_symbol = steel_paged_symbol(steel_dtype_tag, head_dim);
@@ -3775,7 +3778,10 @@ fn lower_one(
             // share the same bindings/constants and a per-(BQ-block, q_head)
             // grid with seq on Z.
             let use_nax = use_steel && nax_kernel.is_some();
-            let bq_steel = if use_nax { BQ_NAX } else { BQ_STEEL };
+            let bq_steel = match nax_kernel.filter(|_| use_nax) {
+                Some(nax) => nax.bq,
+                None => BQ_STEEL,
+            };
             // GQA-cooperative fallback selection (see the longer comment at the
             // dispatch site below). Computed early so `constants.k_scratch` (slot
             // 11) can be set when the gqa_shared kernel reads pre-roped K from
@@ -3950,8 +3956,12 @@ fn lower_one(
                         (
                             KernelId::RopeOnceNax,
                             "attention_steel_nax_paged",
-                            crate::steel_paged::rope_once_nax_symbol(steel_dtype_tag, head_dim)
-                                .expect("rope_once_nax_symbol is Some when use_nax is true"),
+                            crate::steel_paged::rope_once_nax_symbol(
+                                steel_dtype_tag,
+                                head_dim,
+                                block_size,
+                            )
+                            .expect("rope_once_nax_symbol is Some when use_nax is true"),
                         )
                     } else {
                         (
@@ -8029,10 +8039,11 @@ mod tests {
         assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
     }
 
-    /// The NAX paged attention reads 16-token pages, one fragment a page: a cache of other pages
-    /// (Gemma 4's 32-token global blocks) gets none of its instantiations, whatever the head dim.
+    /// The NAX paged attention is instantiated for the pages it reads: 16-token pages at head_dims
+    /// 64 / 128 / 256, 32-token pages at 512 (Gemma 4's global layers); a cache of other pages
+    /// gets none of its instantiations.
     #[test]
-    fn nax_paged_attention_takes_only_16_token_pages() {
+    fn nax_paged_attention_takes_only_its_instantiated_pages() {
         use crate::steel_paged::nax_paged_kernel;
         for head_dim in [64, 128, 256] {
             assert!(
@@ -8044,10 +8055,10 @@ mod tests {
                 "{head_dim}"
             );
         }
-        assert_eq!(
-            nax_paged_kernel("f16", 256, 16).map(|k| k.threads),
-            Some(256)
-        );
+        assert!(nax_paged_kernel("bf16", 512, 16).is_none());
+        let wide = |hd, bs| nax_paged_kernel("f16", hd, bs).map(|k| (k.threads, k.bq));
+        assert_eq!(wide(256, 16), Some((256, 64)));
+        assert_eq!(wide(512, 32), Some((256, 32)));
     }
 
     /// The sliding class's paged prefill lowers through the global class's arm with its own

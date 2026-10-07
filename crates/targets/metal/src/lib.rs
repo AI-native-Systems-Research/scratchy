@@ -26,76 +26,96 @@ pub mod steel_paged {
         "/steel_paged_kernels_generated.rs"
     ));
 
-    /// MSL symbol for the NAX (matrix-accelerator) paged-attention kernel.
-    ///
-    /// Unlike `steel_paged_symbol` (a generated table over
-    /// `STEEL_PAGED_HEAD_DIMS`), the NAX kernel is hand-instantiated in
-    /// `attention_steel_nax_paged.metal` at a single tile shape — BQ=64,
-    /// BK=32, WM=4, WN=1, BLOCK_SIZE=16 — and ONLY for head_dim 128
-    /// (`INST_STEEL_NAX_PAGED(.., 128)`). Returns `Some` only for that
-    /// (dtype, head_dim) combo; the dispatcher falls back to the simdgroup
-    /// `steel_paged_symbol` / SDPA path otherwise.
+    /// The NAX (matrix-accelerator) paged attention instantiated for a (dtype, head_dim, page
+    /// size), in `attention_steel_nax_paged.metal`; `None` sends the dispatcher to the simdgroup
+    /// `steel_paged_symbol` / SDPA path. Warps are WM Q-row blocks × WN head-dim slices:
+    /// head_dims 64 / 128 one warp a 16-row Q block (BQ 64), 256 two (BQ 64), 512 four with two
+    /// Q-row blocks a threadgroup (BQ 32) over 32-token pages (Gemma 4's global layers).
     pub fn nax_paged_kernel(
         dtype_tag: &str,
         head_dim: u32,
         block_size: u32,
     ) -> Option<NaxPagedKernel> {
-        // Every instantiation reads 16-token pages, one NAX fragment a page.
-        if block_size != 16 {
-            return None;
-        }
-        let one = |symbol| NaxPagedKernel {
-            symbol,
-            threads: 128,
+        let at = |symbol, threads, bq| {
+            Some(NaxPagedKernel {
+                symbol,
+                threads,
+                bq,
+            })
         };
-        let two = |symbol| NaxPagedKernel {
-            symbol,
-            threads: 256,
-        };
-        match (dtype_tag, head_dim) {
-            ("f16", 64) => Some(one(
+        match (dtype_tag, head_dim, block_size) {
+            ("f16", 64, 16) => at(
                 "attention_steel_nax_paged_f16_bq64_bk32_bd64_wm4_wn1_bs16",
-            )),
-            ("bf16", 64) => Some(one(
+                128,
+                64,
+            ),
+            ("bf16", 64, 16) => at(
                 "attention_steel_nax_paged_bf16_bq64_bk32_bd64_wm4_wn1_bs16",
-            )),
-            ("f16", 128) => Some(one(
+                128,
+                64,
+            ),
+            ("f16", 128, 16) => at(
                 "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
-            )),
-            ("bf16", 128) => Some(one(
+                128,
+                64,
+            ),
+            ("bf16", 128, 16) => at(
                 "attention_steel_nax_paged_bf16_bq64_bk32_bd128_wm4_wn1_bs16",
-            )),
-            ("f16", 256) => Some(two(
+                128,
+                64,
+            ),
+            ("f16", 256, 16) => at(
                 "attention_steel_nax_paged_f16_bq64_bk32_bd256_wm4_wn2_bs16",
-            )),
-            ("bf16", 256) => Some(two(
+                256,
+                64,
+            ),
+            ("bf16", 256, 16) => at(
                 "attention_steel_nax_paged_bf16_bq64_bk32_bd256_wm4_wn2_bs16",
-            )),
+                256,
+                64,
+            ),
+            ("f16", 512, 32) => at(
+                "attention_steel_nax_paged_f16_bq32_bk32_bd512_wm2_wn4_bs32",
+                256,
+                32,
+            ),
+            ("bf16", 512, 32) => at(
+                "attention_steel_nax_paged_bf16_bq32_bk32_bd512_wm2_wn4_bs32",
+                256,
+                32,
+            ),
             _ => None,
         }
     }
 
-    /// An instantiation of the NAX paged attention: its symbol, and the threads its warps make
-    /// (`WM × WN × 32`; head_dim 256 splits each Q-row block's head dims over two warps).
+    /// An instantiation of the NAX paged attention: its symbol, the threads its warps make
+    /// (`WM × WN × 32`), and the Q rows a threadgroup takes (`BQ`, its grid's x tile).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct NaxPagedKernel {
         pub symbol: &'static str,
         pub threads: u32,
+        pub bq: u32,
     }
 
     /// MSL symbol for the spans rope-once kernel (`rope_once_nax`), which
     /// ropes a request's K ONCE into the dense scratch so the NAX attention
     /// reads pre-roped K with no per-tile rotation. Lives in the same
     /// `attention_steel_nax_paged` library and is instantiated at the same
-    /// (dtype, head_dim 128) combos as `nax_paged_symbol`.
-    pub fn rope_once_nax_symbol(dtype_tag: &str, head_dim: u32) -> Option<&'static str> {
-        match (dtype_tag, head_dim) {
-            ("f16", 64) => Some("rope_once_nax_f16_bd64_bs16"),
-            ("bf16", 64) => Some("rope_once_nax_bf16_bd64_bs16"),
-            ("f16", 128) => Some("rope_once_nax_f16_bd128_bs16"),
-            ("bf16", 128) => Some("rope_once_nax_bf16_bd128_bs16"),
-            ("f16", 256) => Some("rope_once_nax_f16_bd256_bs16"),
-            ("bf16", 256) => Some("rope_once_nax_bf16_bd256_bs16"),
+    /// (dtype, head_dim, page size) combos as `nax_paged_kernel`.
+    pub fn rope_once_nax_symbol(
+        dtype_tag: &str,
+        head_dim: u32,
+        block_size: u32,
+    ) -> Option<&'static str> {
+        match (dtype_tag, head_dim, block_size) {
+            ("f16", 64, 16) => Some("rope_once_nax_f16_bd64_bs16"),
+            ("bf16", 64, 16) => Some("rope_once_nax_bf16_bd64_bs16"),
+            ("f16", 128, 16) => Some("rope_once_nax_f16_bd128_bs16"),
+            ("bf16", 128, 16) => Some("rope_once_nax_bf16_bd128_bs16"),
+            ("f16", 256, 16) => Some("rope_once_nax_f16_bd256_bs16"),
+            ("bf16", 256, 16) => Some("rope_once_nax_bf16_bd256_bs16"),
+            ("f16", 512, 32) => Some("rope_once_nax_f16_bd512_bs32"),
+            ("bf16", 512, 32) => Some("rope_once_nax_bf16_bd512_bs32"),
             _ => None,
         }
     }

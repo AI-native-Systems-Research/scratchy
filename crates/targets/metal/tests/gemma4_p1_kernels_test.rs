@@ -797,12 +797,13 @@ fn steel_nax_paged_limiter_bench() {
 // oracle the simdgroup steel kernel's `rope_on_read_steel_*` tests use.
 struct NaxRopeCase {
     name: &'static str,
-    head_dim: usize, // a NAX instantiation's: 64, 128 or 256
+    head_dim: usize, // a NAX instantiation's: 64, 128, 256 (16-token pages) or 512 (32)
     rot_dim: usize,
     pair_off: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     kv_len: usize,
+    block_size: usize,
 }
 
 /// Run the NAX paged attention kernel at hd128 with rope-on-read ON
@@ -825,8 +826,9 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
         num_q_heads,
         num_kv_heads,
         kv_len,
+        block_size: block_size_case,
     } = case;
-    let block_size = 16usize; // NAX bs16 instantiation
+    let block_size = block_size_case;
     let num_blocks = kv_len.div_ceil(block_size);
     let kv_elems = num_blocks * num_kv_heads * block_size * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -878,16 +880,23 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     ];
     // Rope-once kernel reads constants 1,2,5,6,8,9 + the cache; instantiated
     // per (dtype, head_dim) like the attention kernel.
-    let rope_symbol =
-        scratchy_target_metal::steel_paged::rope_once_nax_symbol("f16", head_dim as u32)
-            .expect("rope_once_nax instance");
+    let rope_symbol = scratchy_target_metal::steel_paged::rope_once_nax_symbol(
+        "f16",
+        head_dim as u32,
+        block_size as u32,
+    )
+    .expect("rope_once_nax instance");
     let rope_pipe = baked_build(
         &cache,
         &PipelineKey::new("attention_steel_nax_paged", rope_symbol, consts.clone()),
     )
     .expect("rope_once_nax pipeline");
-    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", head_dim as u32, 16)
-        .expect("NAX instance");
+    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel(
+        "f16",
+        head_dim as u32,
+        block_size as u32,
+    )
+    .expect("NAX instance");
     let key = PipelineKey::new("attention_steel_nax_paged", nax.symbol, consts);
     let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
@@ -921,7 +930,7 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     // ── Pass 2: attention reads PRE-ROPED K from the scratch (v_buf via
     // v_tab). A prior dispatch fully completes before the next, so the
     // roped scratch is visible to this pass.
-    let nq_blocks = total_q.div_ceil(64);
+    let nq_blocks = total_q.div_ceil(nax.bq as usize);
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -1003,6 +1012,7 @@ fn rope_on_read_nax_full_neox_hd128() {
         num_q_heads: 8,
         num_kv_heads: 8,
         kv_len: 70,
+        block_size: 16,
     });
 }
 
@@ -1018,6 +1028,24 @@ fn rope_on_read_nax_qwen36_hd256() {
         num_q_heads: 16,
         num_kv_heads: 2,
         kv_len: 70,
+        block_size: 16,
+    });
+}
+
+/// Gemma 4's global layers: head_dim 512 over four warps a Q-row block, 32-token pages (two NAX
+/// fragments a page), proportional rope (128 rotary dims, pairs 256 apart), 8 query heads a KV
+/// head.
+#[test]
+fn rope_on_read_nax_gemma4_global_hd512() {
+    run_rope_on_read_nax_case(NaxRopeCase {
+        name: "gemma4-global-hd512",
+        head_dim: 512,
+        rot_dim: 128,
+        pair_off: 256,
+        num_q_heads: 16,
+        num_kv_heads: 2,
+        kv_len: 70,
+        block_size: 32,
     });
 }
 
@@ -1033,6 +1061,7 @@ fn rope_on_read_nax_gqa4_hd128() {
         num_q_heads: 8,
         num_kv_heads: 2,
         kv_len: 70,
+        block_size: 16,
     });
 }
 
