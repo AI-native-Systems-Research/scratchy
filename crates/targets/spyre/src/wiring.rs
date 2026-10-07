@@ -148,6 +148,15 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ THE ROUTER CONST GEOMETRY `(padded expert width W, expert count E, top-k)`, off the
+    /// router_const region's own placements: W from the `[W,W]` tie table's size
+    /// (`sqrt(size/2)`), k from the count of PLACED one-hot rows (`router_topk_onehot_tid(0..)`),
+    /// and E from the argsort pad-mask's own value need — the mask row is E-dependent (0 below E,
+    /// +inf above), so the placement pass bakes E into the region by placing the mask only when a
+    /// router exists, and the geometry it hands the bind carries the count the mask needs.
+    /// `(0, 0, 0)` when the bundle has no MoE router. Same "asked of the artifact" law as
+    /// `ones_reduce_len`.
+    pub router: (usize, usize, usize),
     /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
     /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
     /// step and the launch must stage a block table.
@@ -169,17 +178,35 @@ impl BakeFacts {
         uses_identity: false,
         scalarmul_scales: &[],
         gathers_kv: false,
+        router: (0, 0, 0),
     };
 
     /// Read them off the generated layout.
     pub fn of(layout: &'static bundle::BundleLayout<'static>) -> Self {
         use crate::lower_subtile_tape_to_superdsc as sd;
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
+        // The router geometry, off the tie table's placement, the one-hot rows' count, and the
+        // layout's own `router_experts` registry entry (the E fact no placement size carries —
+        // the pad-mask row's VALUE needs it). The placement pass mints the tie table at exactly
+        // `[W, W]` fp16, so `sqrt(size/2)` IS W.
+        let router = match layout.place_of_tid(sd::router_rank_tie_tid()) {
+            Some(p) => {
+                let w = ((p.size / 2) as f64).sqrt() as usize;
+                let k = (0..)
+                    .map(|j| sd::router_topk_onehot_tid(j))
+                    .take_while(|&tid| layout.place_of_tid(tid).is_some())
+                    .count();
+                let e = layout.router_experts as usize;
+                (w, e, k)
+            }
+            None => (0, 0, 0),
+        };
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
+            router,
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -234,6 +261,7 @@ impl BakeFacts {
             rope_class_hds: w.rope_class_hds,
             attn_class_hds: w.attn_class_hds,
             rms_invcols: w.rms_invcols,
+            router: self.router,
         }
     }
 }
@@ -880,6 +908,13 @@ pub struct ConstantEnv {
     /// as a subslice rather than copied into a fresh `vec![sc]` per scale per forward. The array
     /// is already a `static` the macro emitted onto the layout, so the borrow is real.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ THE ROUTER CONST GEOMETRY, off the bundle's own placements: `(padded expert width W,
+    /// expert count E, top-k)`. W and k derive from the router_const region's placements exactly
+    /// as the placement pass minted them (W = the `[W,W]` tie table's placement width; k = the
+    /// count of placed one-hot rows), E from the layout's `router_experts` registry entry (the
+    /// pad-mask row's value needs it and no placement size carries it). `(0, 0, 0)` when the
+    /// bundle has no MoE router — a non-MoE model binds nothing.
+    pub router: (usize, usize, usize),
 }
 
 // ── THE CONSTANTS THAT ARE LITERALLY CONSTANT ───────────────────────────────
@@ -1094,6 +1129,55 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
             ConstValues::Borrowed(&env.scalarmul_scales[i..=i]),
         ));
     }
+
+    // ⭐ THE ROUTER CONST ROWS — the MoE router doors' token-independent factors, BUILT HERE at
+    // load exactly like the identity/rope-P tables: the values are pure functions of the router
+    // geometry the placements carry, so the bake ships only the geometry and this bind stages the
+    // bytes. `(0, 0, 0)` (no MoE router) binds nothing — a non-MoE model is byte-identical.
+    let (w, e, k) = env.router;
+    if w > 0 && e > 0 && k > 0 {
+        // The stable-argsort tie-break table `tie[j,h'] = 𝟙[h' < j]` — j on rows, h' on lanes,
+        // the orientation the rank compare's mb-broadcast multiply reads. fp16 0/1.
+        let mut tie = vec![0.0f32; w * w];
+        for j in 0..w {
+            for h in 0..j {
+                tie[j * w + h] = 1.0;
+            }
+        }
+        out.push((sd::router_rank_tie_tid(), ConstValues::Owned(tie)));
+        // The iota row `h ↦ h` (the value the top-k selector's match mask multiplies).
+        let iota: Vec<f32> = (0..w).map(|h| h as f32).collect();
+        out.push((sd::router_topk_iota_tid(), ConstValues::Owned(iota)));
+        // One one-hot row per top-k slot: lane j hot, the row the combine-chain shape writes
+        // logical lane j of an output stick through.
+        for j in 0..k {
+            let mut row = vec![0.0f32; w];
+            row[j] = 1.0;
+            out.push((sd::router_topk_onehot_tid(j as u32), ConstValues::Owned(row)));
+        }
+        // The two uniform sanitize rows: +inf (sorts last) and −inf (zeroes under exp).
+        out.push((
+            sd::router_pad_hi_tid(),
+            ConstValues::Fill {
+                value: f32::INFINITY,
+                len: w,
+            },
+        ));
+        out.push((
+            sd::router_pad_lo_tid(),
+            ConstValues::Fill {
+                value: f32::NEG_INFINITY,
+                len: w,
+            },
+        ));
+        // The ARGSORT PAD-MASK row: 0 in lanes 0..E (the real experts — `maximum(x, mask)` leaves
+        // them alone), +inf in lanes E..W (the producer's zero-padded lanes — `maximum` forces
+        // them to sort last, so a zero pad lane can never outrank a negative real score).
+        let mask: Vec<f32> = (0..w)
+            .map(|h| if h < e { 0.0 } else { f32::INFINITY })
+            .collect();
+        out.push((sd::router_pad_mask_tid(), ConstValues::Owned(mask)));
+    }
     out
 }
 
@@ -1306,6 +1390,8 @@ mod constant_tape_tests {
             rope_class_hds: &[64],
             attn_class_hds: &[64],
             rms_invcols: Vec::leak(vec![1.0f32 / 2048.0; 64]),
+            // No MoE router in this fixture's model — the router consts bind nothing.
+            router: (0, 0, 0),
         }
     }
 

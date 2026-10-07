@@ -8723,6 +8723,7 @@ fn layout_tokens(
         places,
         kernel_weights,
         scalarmul_scales,
+        router_experts,
         kv_request_stride_bytes,
     } = l;
     let segs = segment_bytes
@@ -8739,6 +8740,7 @@ fn layout_tokens(
         .iter()
         .map(|s| proc_macro2::Literal::f32_suffixed(*s));
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
+    let rexperts = proc_macro2::Literal::u32_unsuffixed(*router_experts);
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
@@ -8746,6 +8748,7 @@ fn layout_tokens(
             places: ::std::borrow::Cow::Borrowed(&[#(#places),*]),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
+            router_experts: #rexperts,
             kv_request_stride_bytes: #krs,
         }
     }

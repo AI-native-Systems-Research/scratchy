@@ -349,6 +349,73 @@ pub fn identity_class_tid(idx: usize) -> u32 {
     reserved_region("identity_class").at(idx as u32 - 1)
 }
 
+/// ⭐⭐⭐⭐⭐ THE ROUTER **CONST** REGION — the token-independent rows and tables the MoE router
+/// doors read, worker-bound like the rope-P tables.
+///
+/// The router quartet's doors (`RouteArgsort`, `RouteTopK`, `RouteGatherScores`,
+/// `RouteExpertScale`) decompose the emu's compare/reduce semantics into pointwise
+/// `lesserthan`/`equal` over broadcast operands plus native row reduces — the
+/// `broadcast_ops.ddl` compare/select family, the same wire shape as the card-proven
+/// add/maximum. Every one of those forms needs a FACTOR that is a pure function of the
+/// router's geometry (the expert count), not of the tokens:
+///
+///   * **`rank_tie`** — the stable-argsort tie-break matrix `tie[j,h'] = 𝟙[h' < j]`, a
+///     `[W,W]` 0/1 table (W = the padded expert width, 64-lane sticks), read
+///     mb-broadcast in the rank compare's `equal`-leg multiply.
+///   * **`topk_iota`** — the `[1,W]` iota row `h ↦ h`, the value RouteTopK's selector
+///     sum multiplies its match mask by.
+///   * **`topk_onehot(j)`** — the `[1,W]` one-hot row with lane `j` hot, the row the
+///     combine-chain shape writes logical lane `j` of an output stick through.
+///   * **`pad_hi`/`pad_lo`** — the `[1,W]` sanitize rows (+inf sorts last under
+///     `lesserthan`, −inf zeroes under softmax's `exp`), the narrow-tensor law's remedy:
+///     `maximum(x, pad_row)` forces lanes `E..W` of a padded router stick inert.
+///
+/// Same mechanism as the rope-P classes: the DOOR resolves the row/table's tid here, the
+/// placement pass mints its seg0 footprint, and the worker's load-time bind
+/// (`wiring::synthetic_constants`) builds the value from the same bake-carried geometry.
+/// SIZED IN SLOTS: one `rank_tie`, one `topk_iota`, one `pad_hi`, one `pad_lo`, one
+/// `pad_mask`, and one `topk_onehot` per top-k slot — k ≤ 16 covers every checked-in MoE
+/// config (the widest is k=8), and a config beyond it overflows the region and fails the
+/// bake rather than aliasing a neighbouring tensor's tid.
+pub const ROUTER_CONST_BASE: u32 = u32::MAX - 137;
+
+/// The `[W,W]` stable-argsort tie-break table `tie[j,h'] = 𝟙[h' < j]` (j on rows, h' on
+/// lanes — the orientation the rank compare's mb-broadcast multiply reads).
+pub fn router_rank_tie_tid() -> u32 {
+    reserved_region("router_const").at(0)
+}
+
+/// The `[1,W]` iota row `h ↦ h` the top-k selector sums its match mask against.
+pub fn router_topk_iota_tid() -> u32 {
+    reserved_region("router_const").at(1)
+}
+
+/// The `[1,W]` one-hot row with lane `j` hot (one slot per top-k index).
+pub fn router_topk_onehot_tid(j: u32) -> u32 {
+    reserved_region("router_const").at(2 + j)
+}
+
+/// The `[1,W]` +inf sanitize row (argsort pad: sorts last, so pad lanes never win ranks).
+pub fn router_pad_hi_tid() -> u32 {
+    reserved_region("router_const").at(19)
+}
+
+/// The `[1,W]` −inf sanitize row (softmax/gather pad: `exp(−inf)=0`, so pad lanes never
+/// contribute to scores).
+pub fn router_pad_lo_tid() -> u32 {
+    reserved_region("router_const").at(20)
+}
+
+/// The `[1,W]` ARGSORT PAD-MASK row: `0` in lanes `0..E` (the real experts — `maximum(x, mask)`
+/// leaves them alone) and `+inf` in lanes `E..W` (the producer's zero-pad — `maximum` forces them
+/// to sort last, so a zero pad lane can never outrank a negative real score). Distinct from
+/// [`router_pad_hi_tid`] (the uniform +inf row the softmax-side sanitize and the top-k one-hot
+/// forms use): this row is E-dependent, so its VALUE comes from the geometry handoff the same way
+/// the one-hot count does.
+pub fn router_pad_mask_tid() -> u32 {
+    reserved_region("router_const").at(21)
+}
+
 /// Does `tid` name a KERNEL-TABLE class table of family `what` (`"rope-P"` or `"identity"`)?
 ///
 /// The load-time placement cross-check walks every PLACED tid and asks this, because the reverse
@@ -393,7 +460,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 6] = [
+pub const RESERVED_REGIONS: [TidRegion; 7] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -428,6 +495,16 @@ pub const RESERVED_REGIONS: [TidRegion; 6] = [
         name: "identity_class",
         base: IDENTITY_CLASS_BASE,
         slots: 8,
+    },
+    // ⭐ THE ROUTER CONST REGION — the MoE router doors' token-independent factors (see
+    // [`ROUTER_CONST_BASE`]): the tie table, the iota row, the one-hot rows, the sanitize rows.
+    // 22 slots: 1 tie + 1 iota + 16 one-hots + 2 sanitize + 1 argsort pad-mask. Sits in the top
+    // of the gap below `identity_class` (whose floor is MAX-136) and above `kct_resident`
+    // (MAX-1_000_171).
+    TidRegion {
+        name: "router_const",
+        base: ROUTER_CONST_BASE,
+        slots: 22,
     },
     // ⛔ THE GAP FROM MAX-137 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
     // block/zero/down_proj regions, which are gone with the K-split itself. `kct_resident` keeps
@@ -502,6 +579,8 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("kv_block_index").base == KV_BLOCK_INDEX_TID);
     assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
+    assert!(reserved_region("router_const").base == ROUTER_CONST_BASE);
+    assert!(reserved_region("router_const").floor() < ROUTER_CONST_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
 };
 

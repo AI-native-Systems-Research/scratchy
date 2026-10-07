@@ -422,6 +422,8 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // scalarmul multiplier; a bundle whose ops read none states an empty one, and an empty one is
         // what every current Triton-derived bundle states.
         scalarmul_scales: std::borrow::Cow::Owned(Vec::new()),
+        // No MoE router in a single-kernel Triton bundle.
+        router_experts: 0,
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
     };

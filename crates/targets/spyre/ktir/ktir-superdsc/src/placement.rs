@@ -220,6 +220,13 @@ pub struct BundleLayout {
     /// the wide class's upper lanes (dump-proven on gemma-4 tiny-allglobal).
     #[serde(default)]
     pub attn_class_hds: Vec<u32>,
+    /// ⭐ THE ROUTER EXPERT COUNT — the MoE router's `E`, the one geometry fact the router const
+    /// placements cannot carry by size alone (the tie table is `[W,W]` at the PADDED width; W does
+    /// not reveal E). The argsort pad-mask row's VALUE is E-dependent (0 below E, +inf above), so
+    /// the bake states it here and the worker's bind reads it — the same registry law
+    /// `rope_class_hds` established for the rope-P tables. 0 when the tape has no router.
+    #[serde(default)]
+    pub router_experts: u32,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
     /// rmsnorm's `{out}_sq/mean/meps/inv/tmp/eps`) are NOT SubtileIR tensors, so
     /// they have no `t{id}` placement. They are lazily assigned a STABLE offset in

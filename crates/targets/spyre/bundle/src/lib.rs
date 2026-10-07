@@ -216,6 +216,11 @@ pub struct BundleLayout<'a> {
     /// `scalarmul_scale_tid(i)`, which the worker binds as a `[1,1]` const so the on-device
     /// pointwise `mul` gets its real multiplier (unbound = 0 = wrong output).
     pub scalarmul_scales: Cow<'a, [f32]>,
+    /// ⭐ THE ROUTER EXPERT COUNT `E` — the one router-const geometry fact no placement size
+    /// carries (the tie table is `[W,W]` at the PADDED width; W does not reveal E). The argsort
+    /// pad-mask row's VALUE is E-dependent, so the bake states it here and the worker's bind
+    /// reads it. 0 when the tape has no MoE router.
+    pub router_experts: u32,
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,
