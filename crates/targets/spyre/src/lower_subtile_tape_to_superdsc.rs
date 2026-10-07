@@ -185,7 +185,7 @@ pub use ktir_superdsc::reserved_tids::{
     SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, identity_class_tid, is_kernel_table_class_tid,
     kct_resident_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
     router_identity_tid, router_pad_hi_tid, router_pad_lo_tid, router_pad_mask_tid,
-    router_rank_tie_tid, router_topk_iota_tid, router_topk_targets_tid,
+    router_rank_tie_tid, router_sm_mask_tid, router_topk_iota_tid, router_topk_targets_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -979,6 +979,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         place_const(router_topk_iota_tid(), 1, w, &mut seg_bytes);
         if let Some(k) = router_k {
             place_const(router_topk_targets_tid(), k as u64, w, &mut seg_bytes);
+            // The softmax's k-boundary mask row (0 below k, −inf above) — the
+            // row that makes the padded-width softmax's denominator ignore the
+            // pad lanes.
+            place_const(router_sm_mask_tid(), 1, w, &mut seg_bytes);
         }
         place_const(router_pad_hi_tid(), 1, w, &mut seg_bytes);
         place_const(router_pad_lo_tid(), 1, w, &mut seg_bytes);

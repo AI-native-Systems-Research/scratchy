@@ -1181,6 +1181,13 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
                 targets[j * w..(j + 1) * w].fill(t);
             }
             out.push((sd::router_topk_targets_tid(), ConstValues::Owned(targets)));
+            // The SOFTMAX PAD-MASK row: 0 in lanes 0..k (the real top-k scores —
+            // `x + mask` leaves them bit-identical), −inf in lanes k..W (the pad —
+            // `exp(−inf)=0`, so a pad lane never contributes to the denominator).
+            let sm_mask: Vec<f32> = (0..w)
+                .map(|h| if h < k { 0.0 } else { f32::NEG_INFINITY })
+                .collect();
+            out.push((sd::router_sm_mask_tid(), ConstValues::Owned(sm_mask)));
         }
         // The two uniform sanitize rows: +inf (sorts last) and −inf (zeroes under exp).
         out.push((

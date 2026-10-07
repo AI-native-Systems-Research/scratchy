@@ -422,6 +422,15 @@ pub fn router_pad_lo_tid() -> u32 {
     reserved_region("router_const").at(5)
 }
 
+/// The `[1,W]` SOFTMAX PAD-MASK row: `0` in lanes `0..k` (the real top-k
+/// scores — `x + mask` leaves them bit-identical) and `−inf` in lanes `k..W`
+/// (the producer's pad — `exp(−inf) = 0`, so a pad lane never contributes to
+/// the softmax's denominator). k-DEPENDENT like the targets table, placed only
+/// when the tape has a RouteTopK node.
+pub fn router_sm_mask_tid() -> u32 {
+    reserved_region("router_const").at(7)
+}
+
 /// The `[1,W]` ARGSORT PAD-MASK row: `0` in lanes `0..E` (the real experts — `maximum(x, mask)`
 /// leaves them alone) and `+inf` in lanes `E..W` (the producer's zero-pad — `maximum` forces them
 /// to sort last, so a zero pad lane can never outrank a negative real score). Distinct from
@@ -513,14 +522,14 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
     },
     // ⭐ THE ROUTER CONST REGION — the MoE router doors' token-independent factors (see
     // [`ROUTER_CONST_BASE`]): the tie table, the identity table, the iota row, the
-    // target-rank table, the sanitize rows. 7 slots: 1 tie + 1 identity + 1 iota +
-    // 1 targets + 2 sanitize + 1 argsort pad-mask. Sits in the top of the gap below
-    // `identity_class` (whose floor is MAX-136) and above `kct_resident`
-    // (MAX-1_000_171).
+    // target-rank table, the sanitize rows. 8 slots: 1 tie + 1 identity + 1 iota +
+    // 1 targets + 2 sanitize + 1 softmax pad-mask + 1 argsort pad-mask. Sits in the
+    // top of the gap below `identity_class` (whose floor is MAX-136) and above
+    // `kct_resident` (MAX-1_000_171).
     TidRegion {
         name: "router_const",
         base: ROUTER_CONST_BASE,
-        slots: 7,
+        slots: 8,
     },
     // ⛔ THE GAP FROM MAX-137 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
     // block/zero/down_proj regions, which are gone with the K-split itself. `kct_resident` keeps

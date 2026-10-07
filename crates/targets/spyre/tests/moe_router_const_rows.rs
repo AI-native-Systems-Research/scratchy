@@ -290,6 +290,22 @@ fn the_bind_builds_the_declared_values() {
             assert_eq!(v, want, "targets row {j} lane {lane}");
         }
     }
+    // The SOFTMAX pad-mask row: 0 below k (the real top-k scores — `x + mask`
+    // leaves them bit-identical), −inf above (the pad — `exp(−inf)=0`, so a
+    // pad lane never contributes to the denominator).
+    let sm_mask = get(rt::router_sm_mask_tid());
+    assert_eq!(sm_mask.len(), W as usize);
+    for (h, &v) in sm_mask.iter().enumerate() {
+        assert_eq!(
+            v,
+            if h < K as usize {
+                0.0
+            } else {
+                f32::NEG_INFINITY
+            },
+            "sm_mask lane {h}"
+        );
+    }
     // The identity table: row j is the one-hot row with lane j hot — ONE
     // [W,W] table, E-sized (row per ranked expert), never k-sized.
     let ident = get(rt::router_identity_tid());

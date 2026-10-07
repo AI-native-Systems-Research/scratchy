@@ -5986,11 +5986,29 @@ pub fn gated_act(
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::RouteSoftmax`] —
-/// `out = softmax(x, dim=-1)` over `[rows, cols]`, the MoE router's score softmax.
+/// `out = softmax(x, dim=-1)` over `[rows, cols]`, the MoE router's score
+/// softmax.
 ///
-/// ONE tensor parameter (the scores), no registry const — the whole chain is
-/// data-driven — and the body is [`assemble_row_softmax`]: the rmsnorm structure
-/// with `max`/`exp`/`sum`/`realdiv` in place of `mean`/`rsqrt`/`multiply`.
+/// ⭐ THE CHAIN RUNS AT THE PADDED WIDTH, NOT THE LOGICAL `k`. The router's
+/// score buffer is `[m, k]` with `k` SUB-STICK (gemma-4: k=8 of a 64-lane
+/// stick), and `assemble_pointwise` emits no coordinate masking — so the door
+/// pads the whole computation to the stick and forces the pad lanes inert
+/// FIRST, with ONE sanitize add:
+///
+/// ```text
+/// xsan = x + sm_mask        0 in lanes 0..k (bit-identical), −inf above
+/// ```
+///
+/// `−inf` is inert through the whole softmax by arithmetic: the row-max
+/// ignores it (`max(real, −inf) = real`), `exp(−inf − m) = 0` keeps it out of
+/// the denominator, and the output's pad lanes land at a DEFINED 0 rather
+/// than stale bytes. ⛔ WITHOUT THE SANITIZE THE PAD LANES ARE LOAD-BEARING
+/// GARBAGE: a sub-stick `[m, k]` view rides a whole-stick buffer whose lanes
+/// `k..W` hold whatever the producer left there, and 62 zero lanes would each
+/// contribute `e^{−max}` to every row's denominator — a silently wrong
+/// softmax even when the pads happen to be zero.
+///
+/// ONE leading `add` + [`assemble_row_softmax`]'s five ops, all at `[m, W]`.
 pub fn route_softmax(
     name: &str,
     r: &[Region],
@@ -5999,20 +6017,60 @@ pub fn route_softmax(
 ) -> Result<Vec<EmittedOp>, Error> {
     // x and the output — the parameters `KtirFunc::route_softmax` mints.
     let (tensors, out) = split_out(name, r, layout, 1)?;
-    check_pointwise_cols(out.c_len, "RouteSoftmax", out.tid)?;
     let rows = node_rows(name, &out)?;
-    let cols = out.c_len;
-    let x = tensors[0].name();
-    let t = out.tid;
-    Ok(assemble_row_softmax(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        PlaceId::Act(t),
+    let k = out.v_cols;
+    let w = k.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || k == 0 {
+        return err(format!(
+            "RouteSoftmax {name}: the output t{} states [{rows}, {k}] — the score count must be \
+             positive (got padded width {w})",
+            out.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteSoftmax", out.tid)?;
+    let out_tid = out.tid;
+    let x_s = tensors[0].name();
+    // The k-boundary mask row (0 below k, −inf above) — placed by the
+    // router-const block when the tape has a RouteTopK node, bound at load.
+    let sm_mask = rb(
+        &crate::place::act_name(crate::reserved_tids::router_sm_mask_tid()),
+        1,
+        w,
+    );
+    // The sanitized scores [m, W] — the buffer the softmax chain reads.
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let xsan_s = crate::placement::syn(layout, out_id.synth(R::AXSan));
+    if let Some(l) = layout {
+        l.synth_like(out_id.synth(R::AXSan), out_tid, &[rows, w], Df::Fp16);
+    }
+    let x = rb(&x_s, rows, w);
+    let xsan = rb(&xsan_s, rows, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(6);
+    // 0. THE SANITIZE: pad lanes → −inf (exp kills them), real lanes untouched.
+    ops.push(pw2(
+        &format!("rssan_o{out_tid}"),
+        "add",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::mb(&sm_mask),
+        &xsan,
         sym_id_base,
         layout,
-    ))
+    ));
+    ops.extend(assemble_row_softmax(
+        &format!("o{out_tid}"),
+        rows,
+        w,
+        &xsan_s,
+        out_id,
+        sym_id_base,
+        layout,
+    ));
+    Ok(ops)
 }
 
 /// The per-`Program` door for the renorm form — `out = x / rowsum(x, dim=-1)`,
