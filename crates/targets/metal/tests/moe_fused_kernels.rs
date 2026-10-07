@@ -994,7 +994,7 @@ fn combine_ends_match_gate_scale_then_the_residual_add() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
     for tokens in [1, 3] {
-        let block = Block::new(&device, tokens, false, EXPERTS);
+        let block = Block::new(&device, tokens, false, EXPERTS, SharedExperts::Apart);
         let mut rng = Lcg(0xc0de);
         let n = tokens * HIDDEN;
         let shared = common::shared_slice(&device, &rng.bf16s(n, -1.0, 1.0));
@@ -1095,12 +1095,15 @@ fn a_normed_gated_kernel_is_as_close_to_the_exact_normed_rows_as_the_norm_then_t
     let Some(d) = detect_device() else { return };
     let device = d.device;
     const EPS: f32 = 1e-6;
-    let block = Block::new(&device, 1, false, EXPERTS);
+    let block = Block::new(&device, 1, false, EXPERTS, SharedExperts::Apart);
     let gain = Lcg(0x6a1).bf16s(HIDDEN, 0.5, 1.5);
     let gain_buf = common::shared_slice(&device, &gain);
     let rows = GatherRows::Tokens(TopK(TOP_K as u32));
     let mut c = block.gate.constants(rows);
-    c.push(ConstantValue::int(ConstSlot(3), 0));
+    c.extend([
+        ConstantValue::int(ConstSlot(3), 0),
+        SharedExperts::Apart.constant(),
+    ]);
     let norm = RowNorm {
         layer: LayerId(0),
         eps: Eps(EPS),
@@ -1152,7 +1155,7 @@ fn a_normed_gated_kernel_is_as_close_to_the_exact_normed_rows_as_the_norm_then_t
             chain.push(Dispatch {
                 pso,
                 buffers: gated,
-                groups: size(1, INTER.div_ceil(8), pairs),
+                groups: size(pairs, INTER.div_ceil(8), 1),
                 threads: size(32, 4, 1),
             });
             chain
