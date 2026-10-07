@@ -83,16 +83,18 @@
 //!   32-row verify-sized rungs. Those rungs cost short prompts their first token, and the gate of
 //!   1 keeps verify steps at 3 rows, so they are gone (`METAL_VERIFY_ROWS`, 8): past 2 sequences
 //!   a verify step runs the 64-row prefill-shaped tape until the rungs derive from the gate.
-//! - TODO: a build with a head runs its Gated-DeltaNet kernels slower on every decode step: a
-//!   2-sequence decode step's 30 scans 1.69 -> 2.20 ms and its 30 convs 0.13 -> 0.46 ms (base M5,
-//!   a one-step kernel probe). The simd scan's per-token loop also replays a verify step's kept
-//!   rows, one loop body so the replay is bit-exact (`gdn_scan_simd_resumes_from_checkpoint`),
-//!   which costs every row it runs; the conv replays nothing (it starts from a checkpoint entry),
-//!   and its cost is not localized. A plain prefill of Qwen3.6's geometry runs the pipelined scan
-//!   (#263), which neither replays nor records; decode steps, verify steps and the step after one
-//!   run the simd scan. Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`,
-//!   `GDN_CONV_DRAFTS` 0). Two loops calling one inlined row lost the bit-exactness (the varlen
-//!   scan's replay 1 ULP off): the compiler contracts each copy apart.
+//! - TODO: a build with a head runs the steps that replay or record — a verify step and the step
+//!   after one — on Gated-DeltaNet kernels that cost more per row. A plain step runs what it runs
+//!   without the head (Qwen3.6's geometry: a decode step #265's one-command decode, a prefill #263's
+//!   pipelined scan; the drafts only stride their slots). The others run the conv, the simd scan
+//!   and the norm, whose loops carry the replay: before #265, when every decode step ran them, a
+//!   2-sequence decode step's 30 scans went 1.69 -> 2.20 ms with the head and its 30 convs 0.13 ->
+//!   0.46 ms (base M5, a one-step kernel probe; the conv replays nothing — it starts from a
+//!   checkpoint entry — and its cost is not localized). Not measured on the verify steps. The
+//!   simd scan's replay is in its per-token loop, one loop body so the replay is bit-exact
+//!   (`gdn_scan_simd_resumes_from_checkpoint`): two loops calling one inlined row lost the
+//!   bit-exactness (the varlen scan's replay 1 ULP off), the compiler contracting each copy apart.
+//!   Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`, `GDN_CONV_DRAFTS` 0).
 //! - TODO: time to first token pays the head's pass over the prompt (about 0.19 s on a 5.4k-token
 //!   prompt, base M5): the worker returns a step's tokens with its drafts, so the first token waits
 //!   for pass 1 over every prompt row. The next step needs the drafts, the client does not: return
@@ -119,8 +121,8 @@
 //! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
 //!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
 //!   optional, and refuse a value that differs from the head's.
-//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +482
-//!   lines net against main, 47 of them in `op_abi.rs`; shaders +238; the metal compiler +49.
+//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +606
+//!   lines net against main, 47 of them in `op_abi.rs`; shaders +251; the metal compiler +50.
 
 use std::collections::{HashMap, HashSet};
 
