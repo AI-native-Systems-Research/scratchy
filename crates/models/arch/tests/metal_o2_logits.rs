@@ -659,4 +659,8 @@ o2_cases! {
     "qwen2.5-7b" => o2_qwen2_5_7b_mlx_qembed("mlx-community/Qwen2.5-7B-Instruct-4bit", Sampled);
     "qwen2-vl-2b-mlx-text-only" => o2_qwen2_vl_2b_text_mlx_qembed("mlx-community/Qwen2-VL-2B-Instruct-4bit", Sampled);
     "granite-4.1-3b" => o2_granite_4_1_3b_mlx_g32("mlx-community/granite-4.1-3b-4bit", Sampled);
+    // mlx-affine-b3-g64-qembed: GLM-4.5-Air — first 3-bit checkpoint, first
+    // dense-router (no scales sibling) + sigmoid-bias (noaux_tc) MoE, first
+    // q/k/v attention biases on the affine stack.
+    "glm-4.5-air" => o2_glm_4_5_air_mlx("mlx-community/GLM-4.5-Air-3bit", Sampled);
 }
