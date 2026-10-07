@@ -125,6 +125,31 @@ impl GdnStep {
         start | (u32::from(self.checkpoint_rows.0) << 8) | (records << 16)
     }
 
+    /// The step an [`Self::encode`] code describes.
+    pub fn decode(code: u32) -> Self {
+        let [start, drafts, records, _] = code.to_le_bytes();
+        Self {
+            start: match start {
+                0 => GdnStart::Slot,
+                1 => GdnStart::Fresh,
+                s => GdnStart::Checkpoint(s - 2),
+            },
+            checkpoint_rows: CheckpointRows(drafts),
+            records: match records & 1 {
+                0 => RecordArea::First,
+                _ => RecordArea::Second,
+            },
+        }
+    }
+
+    /// The step starts from the slot's state or from zero and carries no drafts: it neither
+    /// replays the record area nor records, so a scan that knows only the slot's state entry
+    /// runs it.
+    pub fn is_plain(self) -> bool {
+        matches!(self.start, GdnStart::Slot | GdnStart::Fresh)
+            && self.checkpoint_rows == CheckpointRows::NONE
+    }
+
     /// The slot's record area once the step ran: a verify step records its rows to the other
     /// area, any other step leaves it.
     pub fn after(self) -> RecordArea {
@@ -383,5 +408,37 @@ impl<M: PoolMemory> GdnStatePool<M> {
         self._ssm_ptrs[layer]
             .as_ref()
             .expect("GdnStatePool::ssm_layer_mem: layer is not a GDN layer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every step the pool can describe decodes back from its code, and only a slot or fresh
+    /// start without drafts is plain.
+    #[test]
+    fn a_step_code_decodes_to_its_step() {
+        let starts = [
+            GdnStart::Slot,
+            GdnStart::Fresh,
+            GdnStart::Checkpoint(0),
+            GdnStart::Checkpoint(2),
+        ];
+        for start in starts {
+            for rows in [CheckpointRows::NONE, CheckpointRows(2)] {
+                for records in [RecordArea::First, RecordArea::Second] {
+                    let step = GdnStep {
+                        start,
+                        checkpoint_rows: rows,
+                        records,
+                    };
+                    assert_eq!(GdnStep::decode(step.encode()), step);
+                    let plain = matches!(start, GdnStart::Slot | GdnStart::Fresh)
+                        && rows == CheckpointRows::NONE;
+                    assert_eq!(step.is_plain(), plain, "{step:?}");
+                }
+            }
+        }
     }
 }
