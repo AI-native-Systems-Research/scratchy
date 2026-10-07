@@ -2591,6 +2591,19 @@ fn collect_kernel0<F: RopeForm>(n: &SubtileNode<F>, out: &mut Vec<(u32, u32, u32
             .get(),
         ));
     }
+    // ⭐ THE EXPERT BANKS — the MoE projections' stacked `[E·n, in]` fp8 codes. The wavefront
+    // wires `ExpertMatmul` as `[rows, pairs, w, s]`, so the bank is `inputs[2]` and its OWN
+    // region already carries the full stacked extents (`[E·n, in]`, the launch source's declared
+    // shape) — no `n`/`E` arithmetic here, the region IS the truth. The scale `inputs[3]`
+    // `[E·n, 1]` stays FLAT: a bf16 scale bank is read by the dequant's per-channel row, not by
+    // a matmul kernel, so no retile manifest entry belongs to it.
+    if matches!(n.op, SubOp::ExpertMatmul { .. }) && n.inputs.len() == 4 {
+        out.push((
+            n.inputs[2].tensor.index() as u32,
+            n.inputs[2].region.cols.len,
+            n.inputs[2].region.rows.len,
+        ));
+    }
 }
 
 pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
@@ -3109,8 +3122,21 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let fp8_weight_tids: std::collections::HashSet<u32> = ir
         .nodes
         .iter()
-        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-        .map(|n| n.inputs[1].tensor.index() as u32)
+        // ⭐ THE EXPERT BANKS ARE fp8 TOO — every MoE projection's stacked `[E·n, in]` codes.
+        // UNCONDITIONALLY: the spyre `SwitchGluExpertsLayer` loader covers the
+        // fp8-dynamic-per-channel checkpoint ONLY (a dense/bf16 checkpoint bails at load, before
+        // any staging), and the wavefront's `ExpertQuant` is declared for every ExpertMatmul —
+        // so on this target an expert bank reaching the manifest is an fp8 bank by construction.
+        // The input position differs per op: `inputs[1]` for a dense MatmulTile, `inputs[2]` for
+        // the `[rows, pairs, w, s]` ExpertMatmul wiring.
+        .filter(|n| {
+            matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3
+                || matches!(n.op, SubOp::ExpertMatmul { .. }) && n.inputs.len() == 4
+        })
+        .map(|n| {
+            let i = if matches!(n.op, SubOp::MatmulTile { .. }) { 1 } else { 2 };
+            n.inputs[i].tensor.index() as u32
+        })
         .collect();
     for (w_tid, in_k, out_n) in &kernel0 {
         let desc = if fp8_weight_tids.contains(w_tid) {
@@ -3122,6 +3148,16 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             // The [.,.,2,64] order (2 K-rows as two separate 64-N blocks) and a FLAT 128-stick layout BOTH
             // scramble the weights → garbage; only this [.,.,64,2] order runs coherent (on-card 2026-07-16,
             // `scr chat` → "Paris"). (K even + N%64==0 hold for every granite fp8 proj.)
+            //
+            // ⭐ THE EXPERT BANKS ARE THE SAME MAP AT `n = E·out`. The bank's host form is the
+            // expert-major stack `[E·out, in]` — expert e's slab is rows `[e·out, (e+1)·out)`, i.e.
+            // host elements `[e·out·in, (e+1)·out·in)` — and the device form this map resolves
+            // (`host[o·k + i]`, `o ∈ [0, E·out)`) makes rows `o` and `o+1` DEVICE-ADJACENT within a
+            // 64-row n-stick block and every slab a whole number of such blocks (E·out ≡ 0 mod 64
+            // whenever out ≡ 0 mod 64, which the guard below states). So expert e's packed slab is
+            // CONTIGUOUS at device elements `[e·out·in, (e+1)·out·in)` — no E-outermost axis is
+            // needed and none is declared: the slab boundary the MoE gather copy reads (one entry =
+            // one expert's whole packed slab) is a row boundary of this very map.
             let k = *in_k as u64;
             let n = *out_n as u64;
             if !k.is_multiple_of(2) || !n.is_multiple_of(64) {

@@ -369,4 +369,62 @@ mod tests {
         assert_eq!(Element::from_word_length(2), Some(Element::F16));
         assert_eq!(Element::from_word_length(4), None);
     }
+
+    /// ⭐⭐⭐⭐⭐ THE EXPERT BANK'S PACKED SLABS ARE DEVICE-CONTIGUOUS — the property the MoE
+    /// gather copy's ENTRY UNIT is. The bank is the expert-major stack `[E·out, in]` (the spyre
+    /// `SwitchGluExpertsLayer` loader stacks the per-expert fp8 files), and the manifest emits the
+    /// SAME dense-fp8 descriptor for it at `n = E·out`:
+    ///
+    /// ```text
+    ///   device_size [ (E·out)/64, in/2, 64, 2 ]   stride_map [ 64·in, 2, in, 1 ]
+    /// ```
+    ///
+    /// `host[o·in + i]` with `o ∈ [0, E·out)` resolves every coordinate, and expert e's slab —
+    /// host rows `[e·out, (e+1)·out)`, a WHOLE number of 64-row n-sticks — lands at DEVICE
+    /// elements `[e·out·in, (e+1)·out·in)` as ONE contiguous range. The bytes inside that range
+    /// are the PACKED order (k-pairs interleaved), and that is exactly what the consumer needs:
+    /// the range is byte-identical to a STANDALONE retile of expert e alone, which is the layout
+    /// a `matmulfp8` kernel operand for that expert states. So one gather entry = one expert's
+    /// whole packed slab (`gather_copy_opspec`'s `page` = the slab's stick-rows, `cols` = one
+    /// 128-elem fp8 stick), and the scratch the copy fills reads as a legal `[out, in]` fp8
+    /// kernel operand with no relayout — if the map ever scattered a slab across the range
+    /// boundary, the copy would hand the matmul fragments of two experts from a clean bake.
+    ///
+    /// Pinned at a tiny26-shaped geometry (E=8 experts, out=128 rows, in=128). The dense
+    /// single-expert form is the `e = 0` control the granite on-card run already covers.
+    #[test]
+    fn the_expert_banks_packed_slabs_are_device_contiguous() {
+        let (e, out, inn) = (8u64, 128, 128);
+        let n = e * out;
+        let ds = [n / 64, inn / 2, 64, 2];
+        let sm = [64 * inn, 2, inn, 1];
+        let walk = RetileWalk {
+            device_size: &ds,
+            stride_map: &sm,
+        };
+        // Distinct host bytes: host[o * inn + i] = ((o*inn + i) mod 251) — 251 prime, so a wrong
+        // map cannot pass by permutation luck; every element's identity is its own host offset.
+        let host: Vec<u8> = (0..(n * inn) as usize).map(|x| (x % 251) as u8).collect();
+        let mut dev = vec![0u8; host.len()];
+        stage_weight_tiled(&host, &mut dev, walk, Element::Fp8);
+        assert_eq!(dev, naive(&host, walk, Element::Fp8), "fast path = naive");
+        // ⭐ THE CLAIM: expert e's device RANGE is byte-identical to the STANDALONE packed retile
+        // of that expert's host rows — same descriptor shape, local n-sticks [0, out/64).
+        let slab = (out * inn) as usize;
+        let one_ds = [out / 64, inn / 2, 64, 2];
+        let one_sm = [64 * inn, 2, inn, 1];
+        let one = RetileWalk {
+            device_size: &one_ds,
+            stride_map: &one_sm,
+        };
+        for e in 0..e as usize {
+            let base = e * slab;
+            let standalone = naive(&host[base..base + slab], one, Element::Fp8);
+            assert_eq!(
+                &dev[base..base + slab],
+                &standalone,
+                "expert {e}'s device range is its standalone packed retile, contiguous at {base}"
+            );
+        }
+    }
 }
