@@ -180,21 +180,13 @@ pub fn lower(
                  `router.per_expert_scale` instead of the scores, then a pointwise mul"
             ),
         }),
-        Program::ExpertSort => Err(Error {
-            message: format!(
-                "{name}: ExpertSort (the (token, expert) pair rows) has no SuperDSC lowering \
-                 yet: on card it is the vendor `topk.ddl` sort/mask vocabulary over pair rows, \
-                 plus the pair-row layout `[m, k·w]` the target must derive from the registered \
-                 `[m]` row count"
-            ),
-        }),
-        Program::ExpertUnsort => Err(Error {
-            message: format!(
-                "{name}: ExpertUnsort (the pair rows back in token order) has no SuperDSC \
-                 lowering yet: ExpertSort's inverse permutation — the same sort/mask vocabulary \
-                 with the routing read backwards"
-            ),
-        }),
+        // The (token, slot) pair rows — `k` identity legs at stick-aligned column
+        // offsets, the gathered regime's own statement that the permutation is a
+        // no-op (metal's gathered bake emits nothing and reads token rows k times).
+        Program::ExpertSort => lk::expert_sort(name, &r, sym_id_base, layout),
+        // The pair rows back in token order — ONE identity over the whole
+        // `[m, k·w]` tile, the materialized no-op of the same regime.
+        Program::ExpertUnsort => lk::expert_unsort(name, &r, sym_id_base, layout),
         Program::ExpertCombine => Err(Error {
             message: format!(
                 "{name}: ExpertCombine (each token's pair rows summed by its scores) has no \

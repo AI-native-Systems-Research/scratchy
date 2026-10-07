@@ -6041,6 +6041,126 @@ pub fn route_renorm(
     ))
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertSort`] — the
+/// (token, slot) pair rows, GATHERED semantics: a blockwise copy `[m, w] →
+/// [m, k·w]` whose output column block `j` is the input row again.
+///
+/// ⭐ `k` `identity` LEGS, ONE PER SLOT, at stick-aligned column offsets. The
+/// sort's permutation is a no-op in the gathered regime (the program's own
+/// builder states it: "numerically identical to metal's gathered bake, which
+/// emits nothing and reads token rows `k` times"), so the descriptor-level
+/// truth is exactly `k` copies of the `[m, w]` tile into slot `j`'s block of
+/// the `[m, k·w]` output. Each leg is the `silumul` chunk-offset pattern: the
+/// input read at `DevOff::ZERO` (base-addressed, `split_out`'s law), the output
+/// written at `pointwise_chunk_out_offset(j·w)` — the column-block law
+/// `silumul_chunks_cover_output` already locks for column-split wide ops, which
+/// this is (`k` blocks of one shared source).
+///
+/// ⛔ BOTH WIDTHS ARE STICK-LEGAL BY THE PRODUCER'S OWN GEOMETRY, and a
+/// violation is refused here rather than mis-addressed: `w` is a model width
+/// (2816/128 — 64-multiples), and `j·w` is a whole stick for the same reason.
+/// The one thing this door adds is the GUARD that says so, on both the block
+/// corner and the output extent, so a future model with a sub-stick expert
+/// width is a build error naming it, not a silently mis-strided copy.
+pub fn expert_sort(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::expert_sort` mints. The
+    // indices ride along in the GRAPH (every projection reads them through this
+    // node's output routing) but the program states only the tile it copies:
+    // the copy is data-independent, so the builder never binds them as a view
+    // and `split_out` would refuse an arity-2 count against a 2-parameter
+    // program (x, out) — the count this door states is the program's own.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let x = tensors[0];
+    let rows = node_rows(name, &out)?;
+    // ⭐ THE WIDTHS ARE THE BUFFERS' OWN (`v_cols`), NOT THE FIRST WINDOW'S. The
+    // program states its store windows one per slot — the FIRST access tile the
+    // region walk surfaces is slot 0's `[m, w]` window, so `c_len` understates
+    // the output by exactly the factor this door exists to divide out. The
+    // buffer's declared view is the whole `[m, k·w]`, and `k` is its ratio to
+    // the input's `[m, w]` — a graph constant, read here the way `matmul` reads
+    // `m`/`n` off the stored output tile's extents.
+    let w = x.v_cols;
+    let full = out.v_cols;
+    if full % w != 0 {
+        return err(format!(
+            "ExpertSort {name}: the output t{} is [{rows}, {full}] but the input t{}'s width is \
+             {w}, and {full} is not a whole number of slot blocks — the pair-row layout is \
+             `[m, k·w]` over the SAME `w` the projections contract",
+            out.tid, x.tid
+        ));
+    }
+    let k = full / w;
+    check_pointwise_cols(w, "ExpertSort", x.tid)?;
+    check_pointwise_cols(full, "ExpertSort", out.tid)?;
+    let out_tid = out.tid;
+    let x_s = x.name();
+    let out_s = out.name();
+    let x = rb(&x_s, rows, w);
+    let out = rb(&out_s, rows, full);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(k as usize);
+    for j in 0..k {
+        // Slot `j`'s block is the same `[m, w]` tile again, written at its column
+        // offset — `col_of` computes the stick-blocked address law from the
+        // output's own extents, so the leg cannot mis-stride.
+        let off = crate::addr::col_of(rows, full, pointwise_chunk_out_offset(j * w), Df::Fp16);
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("esort_j{j}_o{out_tid}"),
+            "identity",
+            t_rows,
+            f_cols,
+            &[In::full(&x).ew()],
+            &out,
+            off,
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertUnsort`] — the
+/// identity copy in the same (token, slot) layout the sort wrote.
+///
+/// ONE `identity` over the whole `[m, k·w]` pair rows: all `m·k·w` elements
+/// moved once, no arithmetic, no permutation — the materialized form of the
+/// no-op metal's gathered bake emits nothing for. The routing (the graph's
+/// second input) rides along exactly as the sort's indices do and is no more a
+/// parameter of THIS program than they are.
+pub fn expert_unsort(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    check_pointwise_cols(cols, "ExpertUnsort", out.tid)?;
+    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out)?;
+    let x_s = tensors[0].name();
+    let out_s = out.name();
+    let out_tid = out.tid;
+    let x = rb(&x_s, rows, cols);
+    let out = rb(&out_s, rows, cols);
+    Ok(vec![pw1(
+        &format!("eunsort_o{out_tid}"),
+        "identity",
+        crate::sdsc_abstract::RowCount::of_token_rows(rows),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        In::full(&x),
+        &out,
+        sym_id_base,
+        layout,
+    )])
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
 /// `out = x · w`, `w` a host-staged `[1]`-shaped weight (gemma4
 /// `layer_scalar[layer]`).

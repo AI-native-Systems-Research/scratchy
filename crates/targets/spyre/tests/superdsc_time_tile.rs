@@ -77,9 +77,17 @@ fn opfunc_names_are_dxp_recognized() {
         "abs",
         "maximum",
         "minimum",
+        // The compare/select family of broadcast_ops.ddl (:36-42) — the gemma-4
+        // MoE port's rank-vector/one-hot vocabulary. Each name is the
+        // `operation_bind`'s own `opFuncName` string in the vendor template,
+        // which is the same evidence class as the on-card names above.
+        "lesserthan",
+        "equal",
+        "notequal",
+        "where3",
     ];
-    // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY THE FOUR ABOVE COULD GO MISSING. `OpFunc` has 27
-    // variants; this loop names 21. A new variant is NOT an E0004 here, so it joins the emitter
+    // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY OPS COULD GO MISSING. `OpFunc` has 31
+    // variants; this loop names 25. A new variant is NOT an E0004 here, so it joins the emitter
     // unguarded — exactly how `realdiv`/`abs`/`maximum`/`minimum` did. Making it exhaustive is the real
     // fix and is deliberately NOT done here: the six left out (`Transpose`, `Restickify`, `Identity`,
     // `Qfp8ch`, `Dl16ToFp32`, `Fp32ToDl16`) would each need their dxp name confirmed against
@@ -109,6 +117,10 @@ fn opfunc_names_are_dxp_recognized() {
         OpFunc::Abs,
         OpFunc::Maximum,
         OpFunc::Minimum,
+        OpFunc::LesserThan,
+        OpFunc::Equal,
+        OpFunc::NotEqual,
+        OpFunc::Where3,
     ] {
         assert!(
             RECOGNIZED.contains(&f.name()),
