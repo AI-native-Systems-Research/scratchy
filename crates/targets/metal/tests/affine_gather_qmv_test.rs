@@ -91,9 +91,8 @@ fn dispatch_gather_qmv(
     scale_dtype: ScaleDtype,
 ) -> bool {
     let bits: u32 = 4;
-    // Same Fast-vs-Generic heuristic as `execute`: Fast requires
-    // N%8==0 && K%512==0.
-    let kernel = if n_out.is_multiple_of(8) && k.is_multiple_of(512) {
+    // The lowering's Fast-vs-Generic rule.
+    let kernel = if scratchy_target_metal::tape::quantized::qmv_fast_covers(n_out, k) {
         "affine_gather_qmv_fast"
     } else {
         "affine_gather_qmv"
@@ -1127,11 +1126,12 @@ fn affine_gather_qmv_b8_bf16_qwen3_5_optiq_fast() {
         let y_buf = zeros_buf(&mdev.device, num_tokens * top_k * n_out * 2);
 
         // Build + dispatch the b_8 fast gather (mirrors dispatch_gather_qmv, bits=8).
-        let kernel = if (n_out as u32).is_multiple_of(8) && (k as u32).is_multiple_of(512) {
-            "affine_gather_qmv_fast"
-        } else {
-            "affine_gather_qmv"
-        };
+        let kernel =
+            if scratchy_target_metal::tape::quantized::qmv_fast_covers(n_out as u32, k as u32) {
+                "affine_gather_qmv_fast"
+            } else {
+                "affine_gather_qmv"
+            };
         let name = format!("{kernel}_bf16_s_bf16_gs_{group_size}_b_{bits}");
         let constants = gather_constants(k as u32, n_out as u32, top_k as u32).into();
         let pipeline = baked_pipeline(&mdev.device, "quantized_qmv", &name, constants)

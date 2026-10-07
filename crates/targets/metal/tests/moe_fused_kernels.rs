@@ -97,7 +97,10 @@ impl Experts {
 
     /// `kernel`'s symbol for this projection's shape (`_fast` as `affine_gather_qmv_symbol`).
     fn symbol(&self, kernel: &str) -> String {
-        let fast = self.n_out.is_multiple_of(8) && self.k_in.is_multiple_of(512);
+        let fast = scratchy_target_metal::tape::quantized::qmv_fast_covers(
+            self.n_out as u32,
+            self.k_in as u32,
+        );
         let fast = if fast { "_fast" } else { "" };
         format!("{kernel}{fast}_bf16_s_bf16_gs_64_b_4")
     }
@@ -781,7 +784,7 @@ fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
         .collect();
     let x = common::shared_slice(device, &rng.bf16s(k_in, -1.0, 1.0));
     let y = common::shared_zeroed(device, n_out * 2);
-    let fast = n_out.is_multiple_of(8) && k_in.is_multiple_of(512);
+    let fast = scratchy_target_metal::tape::quantized::qmv_fast_covers(n_out as u32, k_in as u32);
     let fast = if fast { "_fast" } else { "" };
     let name = format!("affine_qmv{fast}_bf16_s_bf16_gs_64_b_4_batch_0");
     let constants = AffineQmvConstants {

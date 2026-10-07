@@ -292,6 +292,10 @@ fn qmv_dispatcher_routes_test_shapes_correctly() {
     ));
     // qmv_fast sample: K=512, N=64
     assert_eq!(pick_qmv_kernel(64, 512, 4), QmvKernel::Fast);
+    // and a row past its whole 512-value blocks: Gemma 4's 2816, 2112 and 704
+    for k in [2816, 2112, 704] {
+        assert_eq!(pick_qmv_kernel(64, k, 4), QmvKernel::Fast, "K={k}");
+    }
     // qmv generic sample: K=384, N=12
     assert_eq!(pick_qmv_kernel(12, 384, 4), QmvKernel::Generic);
 }
@@ -642,6 +646,37 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_down_proj_shape() {
          worst abs_err={abs_err:.5} at idx {idx} \
          (allowed {allowed:.5}; metal={mv}, cpu={ev})"
     );
+}
+
+#[test]
+fn affine_qmv_fast_b4_bf16_finishes_a_partial_block() {
+    // N%8==0, K past its whole 512-value blocks by 256, 64 and 192 (Gemma 4's hidden, dense and
+    // expert widths): the fast kernel's lanes below the remainder take one more chunk.
+    let m = 1;
+    let n = 64;
+    for k in [2816usize, 2112, 704] {
+        for &group_size in &[32usize, 64, 128] {
+            if k % group_size != 0 {
+                continue;
+            }
+            let seed = 0xF457_u64 ^ (k as u64) << 8 ^ group_size as u64;
+            let (packed, scales, biases, x) = make_inputs_bf16(seed, n, k, m, group_size);
+            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let Some(metal) =
+                run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
+            else {
+                eprintln!("skipping: no Metal 4 GPU");
+                return;
+            };
+            let (idx, mv, ev, abs_err, allowed) =
+                worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+            assert!(
+                abs_err <= allowed,
+                "qmv_fast K={k} gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────

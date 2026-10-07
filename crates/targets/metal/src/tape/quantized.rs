@@ -64,8 +64,9 @@ pub enum QmvKernel {
     /// be a power of two. Most efficient on tiny K (e.g. head_dim
     /// projections). MLX `qmv_quad`.
     Quad { d: u32 },
-    /// `affine_qmv_fast_*` — `N % 8 == 0 && K % 512 == 0`. The decode
-    /// hot path for Llama / Qwen / Gemma. MLX `qmv_fast`.
+    /// `affine_qmv_fast_*` — [`qmv_fast_covers`]: whole 8-row tiles, a row of whole lane
+    /// chunks. The decode hot path for Llama / Qwen / Gemma. MLX `qmv_fast`, which takes only
+    /// whole 512-value blocks; ours finishes the row's last partial block too.
     Fast,
     /// `affine_qmv_*` — generic fallback with bounds-checked tail.
     Generic,
@@ -99,11 +100,22 @@ pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) ->
         QmvKernel::Wide {
             nv: m.div_ceil(n_tiles),
         }
-    } else if n.is_multiple_of(8) && k.is_multiple_of(512) {
+    } else if qmv_fast_covers(n, k) {
         QmvKernel::Fast
     } else {
         QmvKernel::Generic
     }
+}
+
+/// The values one lane of `qmv_fast_impl` loads a block, at its widest over the bit widths it
+/// serves (`quantized_qmv.metal`: 16 at 2-5 bits, 8 at 6 and 8).
+pub const QMV_FAST_K_STEP: u32 = 16;
+
+/// Whether `qmv_fast_impl` computes an `n × k` matvec: whole 8-row tiles, and a row whose part
+/// past its whole 512-value blocks is whole lane chunks. Gemma's 2816, 2112 and 704 are; MLX's
+/// `qmv_fast` takes only multiples of 512 and leaves them to the half-width `qmv`.
+pub const fn qmv_fast_covers(n: u32, k: u32) -> bool {
+    n.is_multiple_of(8) && k.is_multiple_of(QMV_FAST_K_STEP)
 }
 
 /// The M=1 form — `pick_qmv_kernel_wide` with `m = 1, wide_ok = false`.
@@ -1084,14 +1096,14 @@ mod tests {
     use crate::tape::targets::AppleSiliconGen;
 
     #[test]
-    fn qmv_kernel_pick_matches_mlx_dispatch_qmv() {
+    fn qmv_kernel_pick_follows_mlx_dispatch_qmv() {
         // K==64 + pow2 bits → quad
         assert_eq!(pick_qmv_kernel(2048, 64, 4), QmvKernel::Quad { d: 64 });
         assert_eq!(pick_qmv_kernel(2048, 128, 4), QmvKernel::Quad { d: 128 });
-        // K==96 → fast/generic, not quad
-        assert_eq!(pick_qmv_kernel(2048, 96, 4), QmvKernel::Generic);
+        // K==96 → fast, not quad: a partial block of six lane chunks
+        assert_eq!(pick_qmv_kernel(2048, 96, 4), QmvKernel::Fast);
         // bits=3 (not power of 2) at K=64 → not quad
-        assert_eq!(pick_qmv_kernel(2048, 64, 3), QmvKernel::Generic);
+        assert_eq!(pick_qmv_kernel(2048, 64, 3), QmvKernel::Fast);
 
         // N%8==0 && K%512==0 → fast (Llama-1B q_proj: K=2048, N=2048)
         assert_eq!(pick_qmv_kernel(2048, 2048, 4), QmvKernel::Fast);
@@ -1102,9 +1114,14 @@ mod tests {
         // Llama-1B down_proj: K=8192, N=2048 → fast
         assert_eq!(pick_qmv_kernel(2048, 8192, 4), QmvKernel::Fast);
 
-        // K%512!=0 → generic
+        // Gemma 4's hidden, dense MLP and expert widths: MLX's generic, our fast
+        assert_eq!(pick_qmv_kernel(2048, 2816, 4), QmvKernel::Fast);
+        assert_eq!(pick_qmv_kernel(2048, 2112, 4), QmvKernel::Fast);
+        assert_eq!(pick_qmv_kernel(2048, 704, 4), QmvKernel::Fast);
+        // K%16!=0 → generic
         assert_eq!(pick_qmv_kernel(2048, 1024, 4), QmvKernel::Fast);
         assert_eq!(pick_qmv_kernel(2048, 1023, 4), QmvKernel::Generic);
+        assert_eq!(pick_qmv_kernel(2048, 1032, 4), QmvKernel::Generic);
         // N%8!=0 → generic
         assert_eq!(pick_qmv_kernel(2049, 2048, 4), QmvKernel::Generic);
     }

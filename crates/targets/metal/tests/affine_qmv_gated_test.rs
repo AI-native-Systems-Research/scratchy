@@ -59,7 +59,7 @@ struct Case {
 impl Case {
     /// `affine_qmv_fast`'s shape rule, as the lowering picks it.
     fn fast(&self) -> bool {
-        self.n.is_multiple_of(8) && self.k.is_multiple_of(512)
+        scratchy_target_metal::tape::quantized::qmv_fast_covers(self.n as u32, self.k as u32)
     }
 }
 
