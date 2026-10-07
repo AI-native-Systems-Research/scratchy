@@ -350,19 +350,22 @@ void attention_nax_paged(
 
   // ----- NAX tile geometry -------------------------------------------------
   constexpr short kU = 16; // NAX fragment edge (rows/cols)
-  constexpr int kNWarps = WM * WN;
+  // Warps: WM blocks of Q rows × WN slices of the head dims. A warp holds its slice of O and
+  // computes S over it; with WN > 1 the slices' partial S meet in threadgroup memory every
+  // K-tile (head_dim 256: half a head's O a warp, as head_dim 128's whole one).
   static_assert(
-      BQ >= (kNWarps * kU) && BQ % (kNWarps * kU) == 0,
+      BQ >= (WM * kU) && BQ % (WM * kU) == 0,
       "Each simdgroup must host atleast 1 NAX matrix along Q sequence.");
   static_assert(
       BLOCK_SIZE_ == kU,
       "NAX paged kernel assumes BLOCK_SIZE == 16 (one NAX frag = one page).");
 
-  constexpr int TQ = BQ / (kNWarps * kU); // Q-seq frags per warp
-  constexpr int TD = BD / kU;             // head-dim frags
+  constexpr int TQ = BQ / (WM * kU);      // Q-seq frags per warp
+  constexpr int TD = BD / kU / WN;        // head-dim frags per warp
   constexpr short TK = BK / kU;           // KV-seq frags per K-tile (== pages)
 
   static_assert(TQ == 1, "Check TQ");
+  static_assert(BD % (kU * WN) == 0, "whole head-dim frags a warp");
 
   // Rope-on-read (spans): when NAXP_ROR is set, K is read from the scratch
   // (already roped once by `rope_once_nax`) via `resolve_k`, so attention does
@@ -376,10 +379,11 @@ void attention_nax_paged(
   otile_t Otile;
   Otile.clear();
 
-  // Q row offset this warp owns.
-  const short tm = kU * TQ * simd_group_id;
-  Q += tm * Q_stride_tok;
-  O += tm * Q_stride_tok;
+  // Q row offset and head-dim slice this warp owns.
+  const short tm = kU * TQ * short(simd_group_id / WN);
+  const int td = int(simd_group_id % WN) * TD * kU;
+  Q += tm * Q_stride_tok + td;
+  O += tm * Q_stride_tok + td;
 
   const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
   const short sm = simd_coord.y;
@@ -403,9 +407,12 @@ void attention_nax_paged(
   if (kb_lim > kv_tiles_total) kb_lim = kv_tiles_total;
   const int kb_min_causal = abs_q_min / BK;
 
+  // With WN > 1 the warps of a threadgroup meet every K-tile: they share its first row's start
+  // (a later warp's extra leading tiles are masked whole).
+  const int abs_q_first = WN > 1 ? int(prefix_len) + int(q_block_base) : abs_q_min;
   int kb_start = 0;
   if (NAXP_WINDOW > 0) {
-    const int first_k = abs_q_min - NAXP_WINDOW + 1;
+    const int first_k = abs_q_first - NAXP_WINDOW + 1;
     if (first_k > 0) kb_start = first_k / BK;
   }
   // Block-diagonal span attention: a SPAN-UNIFORM Q tile (all rows in one span)
@@ -421,7 +428,7 @@ void attention_nax_paged(
   // the full causal range. Raising kb_start skips leading tiles directly (the
   // kb-loop honors it; no loader.seek() — NAX resolves per-block each iter).
   if (NAXP_ROR != 0u) {
-    const uint sf = span_ids[uint(abs_q_min)];
+    const uint sf = span_ids[uint(abs_q_first)];
     const uint sl = span_ids[uint(abs_q_max_excl - 1)];
     if (sf != 0u && sf == sl) {
       const int span_kb = (int(sf) - 1) / int(BK);
@@ -473,7 +480,7 @@ void attention_nax_paged(
           NAXTile<T, 1, 1> Ktile0;
           NAXTile<T, 1, 1> Ktile1;
           const int Q_load_off = iq * kU * Q_stride_tok + id * kU;
-          const int K_load_off = id * kU;
+          const int K_load_off = td + id * kU;
           if (lim_rows_q < BQ) {
             Qtile.load_rows(Q + Q_load_off, Q_stride_tok, short(lim_rows_q - iq * kU));
           } else {
@@ -622,7 +629,7 @@ void attention_nax_paged(
           const short vlim = short(lim_rows_k - ik * kU);
 
           NAXTile<T, 1, 2> Vtile;
-          const int V_load_off = id * kU;
+          const int V_load_off = td + id * kU;
           if (vlim < kU) {
             Vtile.load_rows(Vp + V_load_off, per_token_stride, vlim);
           } else {
@@ -648,9 +655,30 @@ void attention_nax_paged(
   // folds on the baked ROR — so the spans path runs at the
   // non-spans baseline (the rope was done ONCE by rope_once_nax). V is always
   // read from the cache (never roped).
+  // WN > 1: each warp's partial S, lane by lane (the slices share one fragment layout).
+  constexpr int kSx = WN > 1 ? WM * WN * 32 * stile_t::kElemsPerTile : 1;
+  threadgroup AccumType sx[kSx];
   for (int kb = kb_start; kb < kb_lim; kb++) {
     stile_t Stile;
     do_qk_direct(kb, Stile);
+    if (WN > 1) {
+      threadgroup AccumType* mine = sx + simd_group_id * 32 * stile_t::kElemsPerTile;
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+        mine[ii * 32 + simd_lane_id] = Stile.elems()[ii];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const uint row0 = (simd_group_id / WN) * WN;
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+        AccumType sum = 0;
+        for (uint w = 0; w < uint(WN); w++) {
+          sum += sx[((row0 + w) * stile_t::kElemsPerTile + ii) * 32 + simd_lane_id];
+        }
+        Stile.elems()[ii] = sum;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     scale_and_mask(kb, Stile);
     softmax_update(Stile);
     simdgroup_barrier(mem_flags::mem_none);

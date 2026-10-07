@@ -15,6 +15,9 @@
 
 #define INST_STEEL_NAX_PAGED(dt_tag, dt_type, bd) \
   SCRATCHY_KERNEL(attention_steel_nax_paged_##dt_tag##_bq64_bk32_bd##bd##_wm4_wn1_bs16, attention_nax_paged<dt_type, 64, 32, bd, 4, 1, 16, float>)
+// Two warps a Q-row block, each half the head dims.
+#define INST_STEEL_NAX_PAGED_WN2(dt_tag, dt_type, bd) \
+  SCRATCHY_KERNEL(attention_steel_nax_paged_##dt_tag##_bq64_bk32_bd##bd##_wm4_wn2_bs16, attention_nax_paged<dt_type, 64, 32, bd, 4, 2, 16, float>)
 
 INST_STEEL_NAX_PAGED(f16, half, 128)
 INST_STEEL_NAX_PAGED(bf16, bfloat, 128)
@@ -23,6 +26,10 @@ INST_STEEL_NAX_PAGED(bf16, bfloat, 128)
 // the simdgroup steel kernel.
 INST_STEEL_NAX_PAGED(f16, half, 64)
 INST_STEEL_NAX_PAGED(bf16, bfloat, 64)
+// head_dim 256 (Qwen3.6's full attention, Gemma 4's sliding layers): same tiling, twice the
+// head-dim fragments a warp.
+INST_STEEL_NAX_PAGED_WN2(f16, half, 256)
+INST_STEEL_NAX_PAGED_WN2(bf16, bfloat, 256)
 
 // Rope-once kernel (spans rope-on-read): ropes a request's K ONCE into the
 // dense scratch, so the attention reads pre-roped K with no per-tile rotation.
@@ -35,3 +42,5 @@ INST_ROPE_ONCE_NAX(f16, half, 128)
 INST_ROPE_ONCE_NAX(bf16, bfloat, 128)
 INST_ROPE_ONCE_NAX(f16, half, 64)
 INST_ROPE_ONCE_NAX(bf16, bfloat, 64)
+INST_ROPE_ONCE_NAX(f16, half, 256)
+INST_ROPE_ONCE_NAX(bf16, bfloat, 256)

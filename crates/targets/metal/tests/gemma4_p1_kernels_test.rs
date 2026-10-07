@@ -797,7 +797,7 @@ fn steel_nax_paged_limiter_bench() {
 // oracle the simdgroup steel kernel's `rope_on_read_steel_*` tests use.
 struct NaxRopeCase {
     name: &'static str,
-    head_dim: usize, // 128 (the only NAX instantiation)
+    head_dim: usize, // a NAX instantiation's: 64, 128 or 256
     rot_dim: usize,
     pair_off: usize,
     num_q_heads: usize,
@@ -878,20 +878,17 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     ];
     // Rope-once kernel reads constants 1,2,5,6,8,9 + the cache; instantiated
     // per (dtype, head_dim) like the attention kernel.
+    let rope_symbol =
+        scratchy_target_metal::steel_paged::rope_once_nax_symbol("f16", head_dim as u32)
+            .expect("rope_once_nax instance");
     let rope_pipe = baked_build(
         &cache,
-        &PipelineKey::new(
-            "attention_steel_nax_paged",
-            "rope_once_nax_f16_bd128_bs16",
-            consts.clone(),
-        ),
+        &PipelineKey::new("attention_steel_nax_paged", rope_symbol, consts.clone()),
     )
     .expect("rope_once_nax pipeline");
-    let key = PipelineKey::new(
-        "attention_steel_nax_paged",
-        "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
-        consts,
-    );
+    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", head_dim as u32)
+        .expect("NAX instance");
+    let key = PipelineKey::new("attention_steel_nax_paged", nax.symbol, consts);
     let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
     // ── Pass 1: rope K ONCE into the scratch (k_buf read via k_tab). ──
@@ -945,7 +942,7 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
             depth: 1,
         },
         MTLSize {
-            width: 128,
+            width: nax.threads as usize,
             height: 1,
             depth: 1,
         },
@@ -1005,6 +1002,21 @@ fn rope_on_read_nax_full_neox_hd128() {
         pair_off: 64,
         num_q_heads: 8,
         num_kv_heads: 8,
+        kv_len: 70,
+    });
+}
+
+/// Qwen3.6's full attention: head_dim 256 over two warps a Q-row block, 64 rotary dims, pairs 32
+/// apart, 8 query heads a KV head.
+#[test]
+fn rope_on_read_nax_qwen36_hd256() {
+    run_rope_on_read_nax_case(NaxRopeCase {
+        name: "qwen36-hd256",
+        head_dim: 256,
+        rot_dim: 64,
+        pair_off: 32,
+        num_q_heads: 16,
+        num_kv_heads: 2,
         kv_len: 70,
     });
 }
@@ -3229,4 +3241,117 @@ fn rope_on_read_decode_parity_bench() {
         rot_ratio < 2.0,
         "rope-on-read rotation path regressed: {rot_ratio:.3}x (bar 2.0x)"
     );
+}
+
+/// The NAX paged attention at head_dim 256 (Qwen3.6's full attention: 16 query / 2 KV heads):
+/// against the CPU reference over 70 keys (multi-tile, a partial tail, GQA 8:1), then timed
+/// against the simdgroup steel kernel at a 4096-token prefill. `--nocapture` for the timing.
+#[test]
+fn steel_nax_paged_bd256_matches_ref_and_vs_steel() {
+    let Some(di) = detect_nax_device() else {
+        return;
+    };
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+    let block_size = 16usize;
+    // `symbol` over `case`'s whole prompt: its output, seconds a call over `reps` calls, and the
+    // inputs rounded to f16.
+    let run = |case: &AttnCase,
+               library: &'static str,
+               symbol: &'static str,
+               (bq, width): (usize, usize),
+               reps: usize| {
+        let num_blocks = case.kv_len.div_ceil(block_size);
+        let kv_elems = num_blocks * case.num_kv_heads * block_size * case.head_dim;
+        let (k_host, v_host) = (pseudo(101, kv_elems, 1.0), pseudo(103, kv_elems, 1.0));
+        let (k_buf, v_buf) = (buf_f16(&device, &k_host), buf_f16(&device, &v_host));
+        let k_tab = buf_u64(&device, &[k_buf.gpuAddress()]);
+        let v_tab = buf_u64(&device, &[v_buf.gpuAddress()]);
+        let bt_buf = buf_u32(&device, &(0..num_blocks as u32).collect::<Vec<_>>());
+        let total_q = case.kv_len;
+        let q_host = pseudo(109, total_q * case.num_q_heads * case.head_dim, 1.0);
+        let q_buf = buf_f16(&device, &q_host);
+        let out_buf = buf_zero(&device, total_q * case.num_q_heads * case.head_dim * 2);
+        let cu_seqlens = buf_u32(&device, &[0, total_q as u32, 0, 0]);
+        let seq_used = buf_u32(&device, &[case.kv_len as u32]);
+        let mut consts = attn_constants(case, block_size, num_blocks);
+        consts[6] = ConstantValue::uint(6, num_blocks.next_power_of_two() as u32);
+        let pipeline =
+            baked_build(&cache, &PipelineKey::new(library, symbol, consts)).expect("pipeline");
+        let bufs = [
+            &out_buf,
+            &q_buf,
+            &cu_seqlens,
+            &seq_used,
+            &bt_buf,
+            &k_tab,
+            &v_tab,
+            &k_buf,
+            &v_buf,
+        ];
+        let grid = MTLSize {
+            width: total_q.div_ceil(bq),
+            height: case.num_q_heads,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        };
+        assert!(common::dispatch_threadgroups(
+            &device, &pipeline, &bufs, grid, threads
+        ));
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads);
+        }
+        let secs = t.elapsed().as_secs_f64() / reps.max(1) as f64;
+        let out = read_f16(&out_buf, total_q * case.num_q_heads * case.head_dim);
+        let r = |h: &[f32]| {
+            h.iter()
+                .map(|&x| f16::from_f32(x).to_f32())
+                .collect::<Vec<_>>()
+        };
+        (out, secs, r(&q_host), r(&k_host), r(&v_host))
+    };
+    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", 256)
+        .expect("NAX bd256")
+        .symbol;
+    let steel =
+        scratchy_target_metal::steel_paged::steel_paged_symbol("f16", 256).expect("steel bd256");
+
+    let small = AttnCase {
+        num_q_heads: 16,
+        num_kv_heads: 2,
+        head_dim: 256,
+        kv_len: 70,
+        window: 0,
+    };
+    let (got, _, q_r, k_r, v_r) = run(&small, "attention_steel_nax_paged", nax, (64, 256), 0);
+    let positions: Vec<usize> = (0..small.kv_len).collect();
+    let scale = 1.0 / (small.head_dim as f32).sqrt();
+    let want = attn_ref(&q_r, &k_r, &v_r, &small, block_size, &positions, scale);
+    let max_err = (got.iter().zip(&want))
+        .map(|(g, w)| (g - w).abs())
+        .fold(0f32, f32::max);
+    eprintln!("steel nax paged bd256: max_err {max_err}");
+    assert!(max_err < 2e-2, "steel nax paged bd256 max_err {max_err}");
+
+    let big = AttnCase {
+        kv_len: 4096,
+        ..small
+    };
+    let flop = 2.0 * 2.0 * (4096f64 * 4096.0 / 2.0) * 256.0 * 16.0;
+    for (name, library, symbol, bq) in [
+        ("steel", "attention_steel_paged", steel, (32, 128)),
+        ("nax", "attention_steel_nax_paged", nax, (64, 256)),
+    ] {
+        let (_, secs, ..) = run(&big, library, symbol, bq, 20);
+        eprintln!(
+            "BENCH {name} paged bd256 m=4096 16q/2kv: {:.3} ms/call, {:.2} TFLOP/s",
+            secs * 1e3,
+            flop / secs / 1e12
+        );
+    }
 }

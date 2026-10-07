@@ -1474,10 +1474,15 @@ fn sdpa_paged_command(
 /// The steel/NAX paged prefill attention's grid: one threadgroup per
 /// (BQ-block of queries, q head), and one Z-layer per sequence
 /// (`tid.z = seq_idx`) so a BQ-block never straddles a sequence boundary.
-fn steel_paged_dispatch(p: &MetalModelConsts, bucket_m: u32, bq: u32) -> DispatchShape {
+fn steel_paged_dispatch(
+    p: &MetalModelConsts,
+    bucket_m: u32,
+    bq: u32,
+    threads: u32,
+) -> DispatchShape {
     DispatchShape {
         threadgroups: (bucket_m.div_ceil(bq), p.num_q_heads, 1),
-        threads_per_threadgroup: (128, 1, 1),
+        threads_per_threadgroup: (threads, 1, 1),
         m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
             seq_axis: Some(crate::interpreter::metal::lowered::MScaleAxis::Z),
             axis: crate::tape::lowered::MScaleAxis::X,
@@ -3690,7 +3695,7 @@ fn lower_one(
             // means the (library, function, KERNEL_ID) trio comes from
             // one source. Bug class #8 — drift between the three
             // independent `&'static str` fields — can't recur.
-            use crate::steel_paged::{nax_paged_symbol, steel_paged_symbol};
+            use crate::steel_paged::{nax_paged_kernel, steel_paged_symbol};
             // Spans rope-on-read (GLOBAL class). All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, true);
             const BQ_STEEL: u32 = 32;
@@ -3723,8 +3728,8 @@ fn lower_one(
             // so it serves Llama-3.x (hd 128) prefill; everything else
             // falls through to the simdgroup steel path below.
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
-            let nax_symbol = if is_nax {
-                nax_paged_symbol(steel_dtype_tag, p.global_head_dim)
+            let nax_kernel = if is_nax {
+                nax_paged_kernel(steel_dtype_tag, p.global_head_dim)
             } else {
                 None
             };
@@ -3743,12 +3748,12 @@ fn lower_one(
             // block-table width in the worker (worker.rs, the `tq_dequant_max_blocks`
             // pattern). Steel stays ON (the fast kernel).
             let use_steel =
-                (steel_symbol.is_some() || nax_symbol.is_some()) && bucket_m >= BQ_STEEL;
+                (steel_symbol.is_some() || nax_kernel.is_some()) && bucket_m >= BQ_STEEL;
             // Prefer the NAX kernel when its symbol is present AND steel is
             // selected. Its grid uses BQ=64 (vs steel's BQ=32); both kernels
             // share the same bindings/constants and a per-(BQ-block, q_head)
             // grid with seq on Z.
-            let use_nax = use_steel && nax_symbol.is_some();
+            let use_nax = use_steel && nax_kernel.is_some();
             let bq_steel = if use_nax { BQ_NAX } else { BQ_STEEL };
             // GQA-cooperative fallback selection (see the longer comment at the
             // dispatch site below). Computed early so `constants.k_scratch` (slot
@@ -3889,23 +3894,20 @@ fn lower_one(
                 // kernel's bindings/constants and only swaps the
                 // library/function pair. Falls back to the simdgroup
                 // `attention_steel_paged` symbol otherwise.
-                let (library, function) = if use_nax {
-                    (
-                        "attention_steel_nax_paged",
-                        nax_symbol.expect("nax_symbol is Some when use_nax is true"),
-                    )
-                } else {
-                    (
+                let (library, function, threads) = match nax_kernel.filter(|_| use_nax) {
+                    Some(nax) => ("attention_steel_nax_paged", nax.symbol, nax.threads),
+                    None => (
                         "attention_steel_paged",
                         steel_symbol.expect("steel_symbol is Some when use_steel is true"),
-                    )
+                        128,
+                    ),
                 };
                 let attn_cmd = LoweredCommand {
                     kernel: KernelId::AttentionPrefillSdpaPaged,
                     library,
                     function,
                     constants: constants.into_baked(),
-                    dispatch: steel_paged_dispatch(p, bucket_m, bq_steel),
+                    dispatch: steel_paged_dispatch(p, bucket_m, bq_steel, threads),
                     bindings: bindings.into_baked(),
                     gemm_dims: None,
                 };
@@ -3925,7 +3927,7 @@ fn lower_one(
                                 steel_dtype_tag,
                                 p.global_head_dim,
                             )
-                            .expect("rope_once_nax_symbol is Some when use_nax is true (hd128)"),
+                            .expect("rope_once_nax_symbol is Some when use_nax is true"),
                         )
                     } else {
                         (
@@ -4248,7 +4250,7 @@ fn lower_one(
                     library: "attention_steel_paged",
                     function,
                     constants: constants.into_baked(),
-                    dispatch: steel_paged_dispatch(p, bucket_m, BQ_STEEL),
+                    dispatch: steel_paged_dispatch(p, bucket_m, BQ_STEEL, 128),
                     bindings: bindings.into_baked(),
                     gemm_dims: None,
                 };
