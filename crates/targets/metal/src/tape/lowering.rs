@@ -4269,9 +4269,9 @@ fn lower_one(
         // `p.final_logit_softcapping` baked as constant 1.
         // Runs on the logits (`width` = vocab); token-parallel
         // exact-thread dispatch like `Add`.
-        // Always full-M: a softcapped lm_head's result is this cap, not
-        // the GEMM, so the GEMM stays in the backbone and the lm_head
-        // narrow path (`lower_subtile_tape_to_metal`) never sees it.
+        // Always full-M: under a sampled lm_head it caps the scattered
+        // sample rows (the rest are stale, never read) or the all-rows
+        // matmul's every row.
         I::TanhSoftCap(Slot(in_slot), Slot(out_slot), width) => {
             debug_assert!(
                 p.final_logit_softcapping > 0.0,
