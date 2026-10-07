@@ -863,7 +863,20 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             one_pass,
         },
     )?;
-    let mut module = compile_kernel(src, &spec, &[1])?;
+    // ⭐ THE GRID IS THE HEAD COUNT AT mq > 1 — the builder's own structure. `KtirFunc::attn`
+    // runs one head per program instance when `mq > 1` (`KtdpGetComputeTileId`, grid
+    // `(nq, 1)`), and the kernel states the same shape: `tl.program_id(0)` IS the head in
+    // its mq > 1 arms, so the grid folds the head axis and the program carries ONE head's
+    // body — 32x fewer ops per program than a static_range head loop unrolled into one
+    // grid-[1] program (granite: 32 query heads), which is the compile-time law the
+    // builder's form sets. Decode keeps grid [1] and the kernel's own static head loop,
+    // exactly the builder's `mq == 1` arm.
+    let grid: Vec<i64> = if mq > 1 {
+        vec![i64::from(nqh)]
+    } else {
+        vec![1]
+    };
+    let mut module = compile_kernel(src, &spec, &grid)?;
     // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
     // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
     // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
