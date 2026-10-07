@@ -156,14 +156,13 @@ pub enum FoldPattern<K: 'static> {
         encode: SubOpKind,
         kernel: K,
     },
-    /// A `norm` that only `matmul`s read, each as its operand 0 and of `weights` (`None`: a kind
-    /// that carries none, a router's logits), folds into every one of them: each normalizes the
-    /// norm's input as it loads it. Only on a model whose matvecs take their ends
-    /// ([`ModelFoldFacts::matvec_ends`]); apply it before the folds that take a norm whole.
+    /// A `norm` that only `readers` read, each once, as its operand 0, folds into every one of
+    /// them: each normalizes the norm's input as it loads it. Only on a model whose matvecs take
+    /// their ends ([`ModelFoldFacts::matvec_ends`]); apply it before the folds that take a norm
+    /// whole.
     NormedMatvecs {
         norm: SubOpKind,
-        matmul: SubOpKind,
-        weights: Option<GemmWeightKind>,
+        readers: &'static [NormReader],
         kernel: K,
     },
     /// A routing — its `top_k` step's [`Route`](Self::Route) fold — whose picks only the `sort`
@@ -212,6 +211,23 @@ pub enum FoldPattern<K: 'static> {
 
 /// The stages a routing fold's scores may pass through after the gather.
 pub const ROUTE_TAIL_STAGES: usize = 3;
+
+/// A step that normalizes a norm's input as it loads it ([`FoldPattern::NormedMatvecs`]).
+#[derive(Clone, Copy, Debug)]
+pub enum NormReader {
+    /// A matvec of `kind`, of `weights` (`None`: a kind that carries none, a router's logits).
+    Matvec {
+        kind: SubOpKind,
+        weights: Option<GemmWeightKind>,
+    },
+    /// An expert `sort` at fewer than `gathered_below` (row, pick) pairs: the target's expert
+    /// steps read each row through it by its picks, with no sorted copy, and normalize the row as
+    /// they load it.
+    Gathered {
+        sort: SubOpKind,
+        gathered_below: u32,
+    },
+}
 
 impl<K> FoldPattern<K> {
     /// The kind of step the pattern is matched at.
@@ -807,11 +823,8 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 Ok(())
             }
             FoldPattern::NormedMatvecs {
-                matmul,
-                weights,
-                kernel,
-                ..
-            } => self.normed_matvecs(i, (matmul, weights), kernel),
+                readers, kernel, ..
+            } => self.normed_matvecs(i, readers, kernel),
             FoldPattern::RoutedExperts {
                 sort,
                 gathered_below,
@@ -1128,15 +1141,26 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
     fn normed_matvecs(
         &mut self,
         i: usize,
-        (matmul, weights): (SubOpKind, Option<GemmWeightKind>),
+        kinds: &[NormReader],
         kernel: K,
     ) -> Result<(), FoldError> {
         if !self.model.matvec_ends || self.absorbed[i].is_some() || !self.fusions[i].is_empty() {
             return Ok(());
         }
         let ops = &self.ops;
-        let is_matvec =
-            |j: usize| ops.kind(j) == matmul && weights.is_none_or(|w| self.is_matvec(j, w));
+        let takes = |j: usize, r: &NormReader| match *r {
+            NormReader::Matvec { kind, weights } => {
+                ops.kind(j) == kind && weights.is_none_or(|w| self.is_matvec(j, w))
+            }
+            NormReader::Gathered {
+                sort,
+                gathered_below,
+            } => {
+                ops.kind(j) == sort
+                    && matches!(*ops.op(j), SubOp::ExpertSort { k, .. }
+                        if ops.rows[j].saturating_mul(k.get()) < gathered_below)
+            }
+        };
         let reads = |j: usize| {
             ops.args[j]
                 .iter()
@@ -1146,7 +1170,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             .filter(|&j| reads(j).count() > 0)
             .collect();
         let normalizes = |j: usize| {
-            is_matvec(j)
+            kinds.iter().any(|r| takes(j, r))
                 && self.absorbed[j].is_none()
                 && ops.first_op(j) == Some(i)
                 && reads(j).count() == 1
@@ -1667,14 +1691,28 @@ mod tests {
                 },
                 FoldPattern::NormedMatvecs {
                     norm: K::RmsNorm,
-                    matmul: K::MatmulTile,
-                    weights: Some(GemmWeightKind::Dense),
+                    readers: &[
+                        NormReader::Matvec {
+                            kind: K::MatmulTile,
+                            weights: Some(GemmWeightKind::Dense),
+                        },
+                        NormReader::Matvec {
+                            kind: K::RouterLogits,
+                            weights: None,
+                        },
+                        NormReader::Gathered {
+                            sort: K::ExpertSort,
+                            gathered_below: 64,
+                        },
+                    ],
                     kernel: Kern::Normed,
                 },
                 FoldPattern::NormedMatvecs {
                     norm: K::RouterNorm,
-                    matmul: K::RouterLogits,
-                    weights: None,
+                    readers: &[NormReader::Matvec {
+                        kind: K::RouterLogits,
+                        weights: None,
+                    }],
                     kernel: Kern::Normed,
                 },
                 FoldPattern::ResidualNorm {
@@ -1904,6 +1942,54 @@ mod tests {
         assert_eq!(f.driven(s[1]), [reads]);
         // A model whose matvecs do not take their ends.
         let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    #[test]
+    fn a_norm_a_router_gathered_experts_and_a_shared_matvec_read_folds_into_each() {
+        use crate::lower::ExpertQuant;
+        use crate::subtile_ir::{ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, TopK};
+        use std::num::NonZeroU32;
+        let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
+        let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
+        let (router, bundle) = (RouterBundle::SharedFused, ExpertBundle::SharedFused);
+        let matmul = |proj, m, inputs| {
+            let quant = ExpertQuant::declared(64, 4);
+            let n = 32;
+            op(SubOp::ExpertMatmul { proj, n, k, quant, bundle }, m, inputs)
+        };
+        let dense = SubOp::MatmulTile {
+            n: 64,
+            weight: GemmWeight::Dense,
+        };
+        // A MoE block's input norm, read by its router's logits, the expert sort its picks feed
+        // and a shared expert's matvec.
+        let ops = |m: u32| {
+            vec![
+                op(RMS, m, vec![Ext(0), Ext(1)]),
+                op(SubOp::RouterLogits { experts, router }, m, vec![Op(0), Ext(2)]),
+                op(SubOp::RouteArgsort, m, vec![Op(1)]),
+                op(SubOp::RouteTopK { k }, m, vec![Op(2)]),
+                op(SubOp::ExpertSort { experts, k, bundle }, m, vec![Op(0), Op(3)]),
+                matmul(ExpertProj::Gate, m, vec![Op(4), Op(4), Ext(3)]),
+                matmul(ExpertProj::Up, m, vec![Op(4), Op(4), Ext(3)]),
+                op(SubOp::ExpertGatedAct { act: GatedAct::Silu }, m, vec![Op(5), Op(6)]),
+                op(dense, m, vec![Op(0), Ext(4)]),
+                op(MUL, m, vec![Op(7), Op(8)]),
+            ]
+        };
+        let src = |m| [(m, 64), (1, 64), (16, 64), (32, 64), (64, 64)];
+        let (s, f) = fold(&src(1), weights(5), ops(1), &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[0]), StepRole::Absorbed { into: s[8] });
+        let reads = Fusion {
+            kernel: Kern::Normed,
+            shape: FusedShape::NormedMatvec { norm: s[0] },
+        };
+        for j in [1, 4, 8] {
+            assert_eq!(f.driven(s[j]), [reads], "step {j}");
+        }
+        // 32 rows of 2 picks: the experts read a sorted copy of the rows, which the norm writes.
+        let (s, f) = fold(&src(32), weights(5), ops(32), &[], &TABLE, ENDS);
         assert_eq!(f.role(s[0]), StepRole::Kept);
     }
 

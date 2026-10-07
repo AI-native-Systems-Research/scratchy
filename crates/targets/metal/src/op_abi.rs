@@ -31,7 +31,7 @@ use crate::tape::lowered::{RuntimeGate, WeightTensor};
 use crate::tape::step::MoeRegion;
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
 use scratchy_subtile::tape_folding::{
-    CountedOperands, FoldPattern, FusionTable, GatedKernel, RowFold,
+    CountedOperands, FoldPattern, FusionTable, GatedKernel, NormReader, RowFold,
 };
 use scratchy_subtile::tape_steps::OperandIx;
 
@@ -393,16 +393,32 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     gated: &[K::Silu, K::Gelu, K::Mul],
                     kernel: F::QmvEpilogue,
                 },
+                // A MoE block's input norm too: its router's logits, its shared expert's matvecs
+                // and its gathered experts each normalize the rows as they load them.
                 FoldPattern::NormedMatvecs {
                     norm: K::RmsNorm,
-                    matmul: K::MatmulTile,
-                    weights: Some(GemmWeightKind::Affine),
+                    readers: &[
+                        NormReader::Matvec {
+                            kind: K::MatmulTile,
+                            weights: Some(GemmWeightKind::Affine),
+                        },
+                        NormReader::Matvec {
+                            kind: K::RouterLogits,
+                            weights: None,
+                        },
+                        NormReader::Gathered {
+                            sort: K::ExpertSort,
+                            gathered_below: METAL_SORTED_PAIRS,
+                        },
+                    ],
                     kernel: F::NormedQmv,
                 },
                 FoldPattern::NormedMatvecs {
                     norm: K::RouterNorm,
-                    matmul: K::RouterLogits,
-                    weights: None,
+                    readers: &[NormReader::Matvec {
+                        kind: K::RouterLogits,
+                        weights: None,
+                    }],
                     kernel: F::NormedRouter,
                 },
                 FoldPattern::Gated {

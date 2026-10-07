@@ -464,9 +464,10 @@ kernel void gemm_bf16_pv(
 // Bindings and constants are the GEMM's: buffer(0) = output [1, N], buffer(1) = input [1, K],
 // buffer(2) = weight [N, K]; 0 / 1 / 2 = M / N / K (M must be 1).
 //
-// `gemv_normed_*` (`MetalFusion::NormedRouter`): a router's pre-norm folded in. Constant 5 is its
-// epsilon, buffer(3) its gain: each thread dots the weights with `x ⊙ gain` and sums `x²` as it
-// loads `x`, and the rows are scaled by `1 / rms(x)` when they store.
+// `gemv_normed_*` (`MetalFusion::NormedRouter`, `NormedQmv`): a router's pre-norm, or the RMSNorm
+// whose rows it reads, folded in. Constant 5 is its epsilon, 6 its gain offset, buffer(3) its
+// gain: each thread dots the weights with `x ⊙ (gain + offset)` and sums `x²` as it loads `x`,
+// and the rows are scaled by `1 / rms(x)` when they store.
 //
 // Dispatch: threadgroups (ceil(N/4), 1, 1), threads (256, 1, 1). Needs N >= 4: the last
 // threadgroup moves back to the last 4 rows.
@@ -477,6 +478,7 @@ kernel void gemm_bf16_pv(
 #endif
 
 SCRATCHY_CONSTANT_OPTIONAL(float, GEMV_NORM_EPS, 5);
+SCRATCHY_CONSTANT_OPTIONAL(float, GEMV_NORM_W_OFFSET, 6);
 constant constexpr bool GEMV_NORMED = GEMV_NORM_EPS_SET;
 
 template <typename T, typename G>
@@ -522,7 +524,7 @@ template <typename T, typename G>
         for (int tn = 0; tn < TN; tn++) {
             const float x = float(input[bn + tn]);
             sum_sq += GEMV_NORMED ? x * x : 0.0f;
-            in_buf[tn] = GEMV_NORMED ? x * float(gain[bn + tn]) : x;
+            in_buf[tn] = GEMV_NORMED ? x * (float(gain[bn + tn]) + GEMV_NORM_W_OFFSET) : x;
         }
         int mat_offset = 0;
         MLX_MTL_PRAGMA_UNROLL
@@ -545,7 +547,8 @@ template <typename T, typename G>
         for (int tn = 0; tn < TN; tn++) {
             const float x = (bn + tn < K) ? float(input[bn + tn]) : 0.0f;
             sum_sq += GEMV_NORMED ? x * x : 0.0f;
-            in_buf[tn] = GEMV_NORMED && bn + tn < K ? x * float(gain[bn + tn]) : x;
+            in_buf[tn] =
+                GEMV_NORMED && bn + tn < K ? x * (float(gain[bn + tn]) + GEMV_NORM_W_OFFSET) : x;
         }
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {

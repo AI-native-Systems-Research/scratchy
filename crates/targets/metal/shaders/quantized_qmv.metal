@@ -1711,7 +1711,8 @@ constant constexpr int ROUTED_E = ROUTED ? ROUTED_EXPERTS : 32;
 constant constexpr bool ROUTED_SOFT = ROUTED && ROUTED_PRE;
 
 // Pair `nk`'s matvec over expert `expert_idx`'s weights: output block `block` (8 rows, 4 per
-// simdgroup) of `y`'s row `nk`, reading `x`'s row `x_row`.
+// simdgroup) of `y`'s row `nk`, reading `x`'s row `x_row` — normalized by `gain` as it loads,
+// under QMV_NORMED (`MetalFusion::NormedQmv`: the MoE block's input norm, folded in).
 template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 METAL_FUNC void gather_qmv_pair(
     const device uint32_t* w,
@@ -1724,7 +1725,8 @@ METAL_FUNC void gather_qmv_pair(
     uint x_row,
     uint block,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    const device T_scale*  gain) {
 
   // Per-expert weight slab strides: w is packed int4 with
   // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
@@ -1741,11 +1743,11 @@ METAL_FUNC void gather_qmv_pair(
   if (fast) {
     qmv_fast_impl<T_act, T_scale, group_size, bits>(
         w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-        inner_tid, simd_gid, simd_lid);
+        inner_tid, simd_gid, simd_lid, gain);
   } else {
     qmv_impl<T_act, T_scale, group_size, bits>(
         w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-        inner_tid, simd_gid, simd_lid);
+        inner_tid, simd_gid, simd_lid, gain);
   }
 }
 
@@ -1757,6 +1759,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act*    x           [[buffer(3)]],
     const device uint32_t* rhs_indices [[buffer(4)]],
     device T_act*          y           [[buffer(5)]],
+    const device T_scale*  gain        [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
@@ -1765,7 +1768,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   uint nk = tid.z;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
       w, scales, biases, x, rhs_indices[nk], y, nk, nk / uint(GATHER_PER_ROW), tid.y,
-      simd_gid, simd_lid);
+      simd_gid, simd_lid, gain);
 }
 
 #ifdef SCRATCHY_CONSTANT_3
@@ -1777,6 +1780,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 //   buffer(4)   = rhs_indices                buffer(10)  = router logits, routed
 //   buffer(5)   = gate y                     buffer(11)  = scores [N, top_k], routed
 //                 [N, top_k, out_vec]        buffer(12)  = per-expert scales, routed and scaled
+//                                            buffer(15)  = the norm's gain, normed
 // Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
 // gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
 // activation to the block's rows. Every gate row is written raw only by the threadgroup that
@@ -1799,6 +1803,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act*    logits      [[buffer(10)]],
     device T_act*          scores      [[buffer(11)]],
     const device T_act*    expert_scale [[buffer(12)]],
+    const device T_scale*  gain        [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
@@ -1832,7 +1837,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
       up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
       expert, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
-      simd_lid);
+      simd_lid, gain);
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 8 + simd_lid;
   if (simd_gid == 0 && simd_lid < 8 && row < uint(OUT_VEC_SIZE)) {
@@ -1879,7 +1884,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   uint n = tid.z;
   uint nk = n * uint(GATHER_PER_ROW) + simd_gid;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      w, scales, biases, x, rhs_indices[nk], y, nk, nk, tid.y / 2, tid.y % 2, simd_lid);
+      w, scales, biases, x, rhs_indices[nk], y, nk, nk, tid.y / 2, tid.y % 2, simd_lid,
+      nullptr);
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 4 + simd_lid;
   if (simd_gid == 0 && simd_lid < 4 && row < uint(OUT_VEC_SIZE)) {

@@ -6616,15 +6616,27 @@ fn lower_moe_step(
         )
     };
     // Rows where the step that wrote them left them: the router's input, read before any sort.
+    // The rows of a norm the step absorbed bind only where its command normalizes them.
     let rows_at = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
-        MoeRows::Tokens(Slot(slot)) => arena_at(i, slot),
-        MoeRows::Scratch(r) => s.at(i, r),
+        MoeRows::Tokens(Slot(slot)) => Ok(arena_at(i, slot)),
+        MoeRows::Scratch(r) => Ok(s.at(i, r)),
+        MoeRows::Normed(..) => Err(LoweringError::NormedRowsUnread),
     };
     // An expert projection's rows: a sorted bake reads the token rows through the sort's own
     // copy, in sorted order.
     let rows_of = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
-        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => s.at(i, R::SortedRows),
+        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => Ok(s.at(i, R::SortedRows)),
         rows => rows_at(s, i, rows),
+    };
+    // A gathered expert matvec's rows, and the norm it applies as it loads them: its constants,
+    // and its gain at 15 — the row's `RmsNorm` weight at the norm's own layer.
+    let normed_rows = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
+        MoeRows::Normed(Slot(slot), norm) if s.grouping == MoeGrouping::Gathered => {
+            let ix = w.of(WeightKind::RmsNorm, 0)?;
+            let gain = source(ix, WeightTensor::Weight, layer(&norm.layer), 15);
+            Ok((arena_at(i, slot), Vec::from(norm), Some(gain)))
+        }
+        rows => Ok((rows_of(s, i, rows)?, Vec::new(), None)),
     };
     // The expert-index buffer a gathered matvec pairs rows with: the sort's per-row copy when
     // the bake sorted, the router's top-k indices in token order otherwise.
@@ -6665,7 +6677,7 @@ fn lower_moe_step(
     // scattered pair rows — every row is its own pair's.
     let rows_read = |s: &MoeScratch, rows| match (s.grouping, rows) {
         (MoeGrouping::Sorted, _) => GatherRows::Pairs,
-        (_, MoeRows::Tokens(_)) => GatherRows::Tokens(b.top_k),
+        (_, MoeRows::Tokens(_) | MoeRows::Normed(..)) => GatherRows::Tokens(b.top_k),
         (_, MoeRows::Scratch(_)) => GatherRows::Pairs,
     };
     let gather_kernel = |kernel, n_out, k_in, gs, bits| {
@@ -6704,11 +6716,23 @@ fn lower_moe_step(
             ]),
             gemm_dims: None,
         }],
-        // One row, its pre-norm folded in: the router scale binds as the norm's gain.
-        S::RouterLogits(rows, l, Some(eps)) => {
+        // One row, a norm folded in: its own pre-norm, the router scale binding as the norm's
+        // gain, or the RMSNorm whose rows it reads, that norm's gain (its row's `RmsNorm` weight).
+        S::RouterLogits(rows, l, norm) if norm.is_some() || matches!(rows, MoeRows::Normed(..)) => {
             if bucket_m != 1 {
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
+            let (x, eps, offset, gain) = match (rows, norm) {
+                (MoeRows::Normed(Slot(slot), n), None) => {
+                    let gain = (w.of(WeightKind::RmsNorm, 0)?, WeightTensor::Weight, n.layer);
+                    (arena_at(1, slot), n.eps, n.offset, gain)
+                }
+                (rows, Some(eps)) => {
+                    let gain = (router()?, WeightTensor::GemmaRouterScale, l);
+                    (rows_at(&s, 1, rows)?, eps, GainOffset(0.0), gain)
+                }
+                (_, None) => return Err(LoweringError::NormedRowsUnread),
+            };
             vec![LoweredCommand {
                 kernel: KernelId::NormedGemv,
                 library: "gemm",
@@ -6717,24 +6741,25 @@ fn lower_moe_step(
                     n: super::ids::NDim(e),
                     k: super::ids::KDim(hidden),
                     eps,
+                    offset,
                 }
                 .into_baked(),
                 dispatch: grid((e.div_ceil(4), 1, 1), (256, 1, 1), None),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
-                    rows_at(&s, 1, rows),
+                    x,
                     source(
                         router()?,
                         crate::op_abi::router_gate(b.router),
                         layer(&l),
                         2,
                     ),
-                    source(router()?, WeightTensor::GemmaRouterScale, layer(&l), 3),
+                    source(gain.0, gain.1, layer(&gain.2), 3),
                 ]),
                 gemm_dims: None,
             }]
         }
-        S::RouterLogits(rows, l, None) => {
+        S::RouterLogits(rows, l, _) => {
             let tiles = (bucket_m.div_ceil(GEMM_TILE_M), e.div_ceil(GEMM_TILE_N), 1);
             let gate = crate::op_abi::router_gate(b.router);
             vec![LoweredCommand {
@@ -6745,7 +6770,7 @@ fn lower_moe_step(
                 dispatch: grid(tiles, (GEMM_TILE_M, GEMM_TILE_N, 1), ms(A::X)),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
-                    rows_at(&s, 1, rows),
+                    rows_at(&s, 1, rows)?,
                     source(router()?, gate, layer(&l), 2),
                 ]),
                 gemm_dims: Some(GemmDims {
@@ -7084,6 +7109,7 @@ fn lower_moe_step(
                 let x = match rows {
                     MoeRows::Tokens(_) => s.at(3, R::SortedRows),
                     MoeRows::Scratch(r) => s.at(3, r),
+                    MoeRows::Normed(..) => return Err(LoweringError::NormedRowsUnread),
                 };
                 let mut bindings = weights.to_vec();
                 let indices = scratch_at(5, s.l.grp_indices_pad);
@@ -7100,8 +7126,9 @@ fn lower_moe_step(
             } else {
                 let (kernel, symbol) = gather_kernel(GatherQmv::Plain, n_out, k_in, gs, bits);
                 let mut bindings = weights.to_vec();
-                let (x, indices) = (rows_of(&s, 3, rows), gather_indices(&s, 4));
+                let ((x, norm, gain), indices) = (normed_rows(&s, 3, rows)?, gather_indices(&s, 4));
                 bindings.extend([x, indices, s.at(5, out)]);
+                bindings.extend(gain);
                 // A sorted bake runs the full static grid: a short step's live pairs sit past
                 // the m-scaled edge, on rows the init sentinel-filled.
                 let scaling = match s.grouping {
@@ -7109,11 +7136,12 @@ fn lower_moe_step(
                     MoeGrouping::Sorted | MoeGrouping::Grouped => None,
                 };
                 let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), scaling);
-                let qmv = AffineGatherQmvConstants {
+                let mut qmv: Vec<ConstantValue> = AffineGatherQmvConstants {
                     qmv: qmv(n_out, k_in, codes),
                     rows: rows_read(&s, rows),
                 }
                 .into();
+                qmv.extend(norm);
                 vec![cmd(kernel, "quantized_qmv", symbol, qmv, shape, bindings)]
             }
         }
@@ -7144,10 +7172,11 @@ fn lower_moe_step(
             let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
-            let (x, indices) = (rows_of(&s, 3, gate.rows), gather_indices(&s, 4));
-            bindings.extend([x, indices, s.at(5, R::ExpertGate)]);
+            let (x, norm, gain) = normed_rows(&s, 3, gate.rows)?;
+            bindings.extend([x, gather_indices(&s, 4), s.at(5, R::ExpertGate)]);
             bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
             bindings.push(s.at(9, R::ExpertUp));
+            bindings.extend(gain);
             // Full static grid when sorted — a short step's live pairs sit past the m-scaled
             // edge, on rows the init sentinel-filled.
             let scaling = match s.grouping {
@@ -7161,6 +7190,7 @@ fn lower_moe_step(
             };
             let mut constants: Vec<ConstantValue> =
                 AffineGatedQmvConstants { qmv: gather, act }.into();
+            constants.extend(norm);
             if let Some(program) = routed {
                 bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
                 if let Some(l) = program.expert_scale {
@@ -7200,7 +7230,7 @@ fn lower_moe_step(
             let (AffineGroupSize(gs), bits) = (down.group_size, down.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::DownCombine, hidden, inter, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Down, down.layer, 0)?.to_vec();
-            let (x, indices) = (rows_of(&s, 3, down.rows), s.at(4, R::TopKIndices));
+            let (x, indices) = (rows_of(&s, 3, down.rows)?, s.at(4, R::TopKIndices));
             bindings.extend([x, indices, s.at(5, R::ExpertDown)]);
             bindings.extend([s.at(6, R::TopKScores), arena_at(7, out)]);
             if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {

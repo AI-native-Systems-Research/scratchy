@@ -343,6 +343,8 @@ struct ExpertRecord {
     raw: Option<st::ExpertMatmul>,
     reads: Vec<Slot>,
     weight: (WeightKind, usize),
+    /// The gain of the norm its rows pass through, when it normalizes them.
+    norm: Vec<WeightSlot>,
 }
 
 /// A decode attention running its KV writer's record (`MetalFusion::RopedAttention`): both steps,
@@ -746,20 +748,57 @@ impl Recording<'_> {
         }
     }
 
-    /// Where MoE op `i`'s operand `k` rows are, and the arena slots that reads: the token rows
-    /// (through the expert sort, which a gathered bake elides — its readers bind what it views),
-    /// or a scratch region.
-    fn moe_rows(&self, i: usize, k: u8) -> Result<(MoeRows, Vec<Slot>), StepRefusal> {
+    /// The RMSNorm op `i` folded in as its operand `k` (`FusedShape::NormedMatvec`): the norm's
+    /// own input, the norm, and its gain's site.
+    fn folded_norm(
+        &self,
+        i: usize,
+        k: u8,
+    ) -> Result<Option<(Slot, st::RowNorm, Vec<WeightSlot>)>, StepRefusal> {
+        let InputRef::Op(a) = self.arg(i, k)? else {
+            return Ok(None);
+        };
+        let norm = FusedShape::NormedMatvec {
+            norm: self.steps.slot[a],
+        };
+        let driven = self.folds.driven(self.steps.slot[i]);
+        let SubOp::RmsNorm { eps, gain } = *self.op(a) else {
+            return Ok(None);
+        };
+        if !driven.iter().any(|f| f.shape == norm) {
+            return Ok(None);
+        }
+        let rows = st::RowNorm {
+            layer: self.weight_layer(a),
+            eps: st::Eps(eps),
+            offset: offset(gain),
+        };
+        let site = self.site(a, WeightKind::RmsNorm, self.weight_of(a)?)?;
+        Ok(Some((self.read(a, 0)?, rows, site)))
+    }
+
+    /// Where MoE op `i`'s operand `k` rows are, the arena slots that reads, and the gain site of
+    /// the norm it applies to them: the token rows (through the expert sort, which a gathered bake
+    /// elides — its readers bind what it views), the rows of a norm it folded in, which it
+    /// normalizes as it loads them, or a scratch region.
+    fn moe_rows(
+        &self,
+        i: usize,
+        k: u8,
+    ) -> Result<(MoeRows, Vec<Slot>, Vec<WeightSlot>), StepRefusal> {
+        if let Some((s, norm, site)) = self.folded_norm(i, k)? {
+            return Ok((MoeRows::Normed(s, norm), vec![s], site));
+        }
         let a = match self.arg(i, k)? {
             InputRef::Op(a) if metal_colour_rule(self.op(a)).residency == Residency::OffArena => a,
             _ => {
                 let s = self.read(i, k)?;
-                return Ok((MoeRows::Tokens(s), vec![s]));
+                return Ok((MoeRows::Tokens(s), vec![s], Vec::new()));
             }
         };
         match self.region(a)? {
             MoeRegion::SortedRows => self.moe_rows(a, 0),
-            r => Ok((MoeRows::Scratch(r), Vec::new())),
+            r => Ok((MoeRows::Scratch(r), Vec::new(), Vec::new())),
         }
     }
 
@@ -774,7 +813,7 @@ impl Recording<'_> {
         else {
             return Err(self.no(j, Refused::FusionShape));
         };
-        let ((rows, reads), e) = (self.moe_rows(j, 0)?, self.source_arg(j, 2)?);
+        let ((rows, reads, norm), e) = (self.moe_rows(j, 0)?, self.source_arg(j, 2)?);
         let (layer, group_size) = (self.layer(e), Gs(quant.group().get()));
         let op_bits = Bits(quant.bits().get());
         let at = |width| st::ExpertMatmul {
@@ -804,6 +843,7 @@ impl Recording<'_> {
             raw: declared.map(|_| raw),
             reads,
             weight: (bundle.weight_kind(), e),
+            norm,
         })
     }
 
@@ -1113,6 +1153,7 @@ impl Recording<'_> {
                 let step = MoeStep::GateUpAct(g.step, u.step.width, act, routing);
                 let mut e = self.moe(i, step, &g.reads, &[], Some(g.weight))?;
                 e.sites.extend(router);
+                e.sites.extend(g.norm);
                 if g.raw.is_some() || u.raw.is_some() {
                     let (gr, ur) = (g.raw.unwrap_or(g.step), u.raw.unwrap_or(u.step));
                     let raw = MoeStep::GateUpAct(gr, ur.width, act, routing);
@@ -1926,21 +1967,28 @@ impl Recording<'_> {
                 self.moe(i, step, &[x], &[], Some((router.weight_kind(), e)))?
             }
             L::RouterLogits { router, .. } => {
-                let ((mut rows, mut reads), e) = (self.moe_rows(i, 0)?, self.source_arg(i, 1)?);
-                // Its folded pre-norm: it reads the norm's rows, normalizing them as it loads.
+                let e = self.source_arg(i, 1)?;
+                // Its folded norm: an RMSNorm's rows normalize as it reads them; its own pre-norm
+                // it reads the input of, normalizing it by the router's scale as it loads.
+                let (mut rows, mut reads, sites) = self.moe_rows(i, 0)?;
                 let mut norm = None;
                 for f in self.folds.driven(self.steps.slot[i]) {
                     let FusedShape::NormedMatvec { norm: n } = f.shape else {
                         return Err(self.no(i, Refused::FusionShape));
                     };
-                    let SubOp::RouterNorm { eps, .. } = *self.op(self.op_at(i, n)?) else {
-                        return Err(self.no(i, Refused::FusionShape));
-                    };
-                    (rows, reads) = self.moe_rows(self.op_at(i, n)?, 0)?;
-                    norm = Some(st::Eps(eps));
+                    match *self.op(self.op_at(i, n)?) {
+                        SubOp::RouterNorm { eps, .. } => {
+                            (rows, reads, _) = self.moe_rows(self.op_at(i, n)?, 0)?;
+                            norm = Some(st::Eps(eps));
+                        }
+                        SubOp::RmsNorm { .. } => {}
+                        _ => return Err(self.no(i, Refused::FusionShape)),
+                    }
                 }
                 let step = MoeStep::RouterLogits(rows, self.layer(e), norm);
-                self.moe(i, step, &reads, &[], Some((router.weight_kind(), e)))?
+                let mut em = self.moe(i, step, &reads, &[], Some((router.weight_kind(), e)))?;
+                em.sites.extend(sites);
+                em
             }
             L::RouteSoftmax => {
                 let scores = match self.region(self.step_arg(i, 0)?)? {
@@ -1962,14 +2010,20 @@ impl Recording<'_> {
                 let step = MoeStep::ExpertScale(self.layer(e));
                 self.moe(i, step, &[], &[], Some((router.weight_kind(), e)))?
             }
+            // A gathered bake's sort runs no command: its readers bind what it views — the rows
+            // of a norm it folded in, which they normalize.
             L::ExpertSort { .. } => {
-                let x = self.read(i, 0)?;
+                let x = match self.folded_norm(i, 0)? {
+                    Some((x, ..)) => x,
+                    None => self.read(i, 0)?,
+                };
                 self.moe(i, MoeStep::Sort(x), &[x], &[], None)?
             }
             L::ExpertMatmul { .. } => {
                 let x = self.expert_matmul(i)?;
                 let step = MoeStep::ExpertMatmul(x.step);
                 let mut em = self.moe(i, step, &x.reads, &[], Some(x.weight))?;
+                em.sites.extend(x.norm);
                 if let Some(raw) = x.raw {
                     em.raw = Some(MetalStep::Moe(self.block(i)?, MoeStep::ExpertMatmul(raw)));
                 }

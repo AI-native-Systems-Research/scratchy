@@ -90,6 +90,9 @@ pub enum MoeScores {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRows {
     Tokens(Slot),
+    /// The token rows a norm the step absorbed reads (`MetalFusion::NormedQmv`): the step
+    /// normalizes each as it loads it. One row, gathered.
+    Normed(Slot, RowNorm),
     Scratch(MoeRegion),
 }
 
@@ -547,6 +550,25 @@ impl MetalStep {
         // The attention's layer is the step's; its writer's moves with it.
         if let MetalStep::RopedAttention(f) = &mut self {
             f.writer = f.writer.clone().advanced(by);
+        }
+        // Rows a MoE step normalizes read its norm's own layer's gain.
+        if let MetalStep::Moe(
+            _,
+            MoeStep::RouterLogits(MoeRows::Normed(_, norm), ..)
+            | MoeStep::ExpertMatmul(ExpertMatmul {
+                rows: MoeRows::Normed(_, norm),
+                ..
+            })
+            | MoeStep::GateUpAct(
+                ExpertMatmul {
+                    rows: MoeRows::Normed(_, norm),
+                    ..
+                },
+                ..
+            ),
+        ) = &mut self
+        {
+            norm.layer.0 += by;
         }
         self
     }
