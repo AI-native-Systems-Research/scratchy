@@ -168,13 +168,11 @@ pub fn lower(
         // traffic, the same compare/reduce machinery as the doors before it.
         // 6k-2 ops, per slot; see the door's own doc.
         Program::RouteGatherScores => lk::route_gather_scores(name, &r, sym_id_base, layout),
-        Program::RouteExpertScale => Err(Error {
-            message: format!(
-                "{name}: RouteExpertScale (each score times its expert's learned scale) has no \
-                 SuperDSC lowering yet: the RouteGatherScores gather reading \
-                 `router.per_expert_scale` instead of the scores, then a pointwise mul"
-            ),
-        }),
+        // Each score times its expert's learned scale — the gather door's own
+        // one-hot select with the LOADED [E] scale row as the parent, then the
+        // score riding the matched lane through the reduce. 7k-2 ops; see the
+        // door's own doc.
+        Program::RouteExpertScale => lk::route_expert_scale(name, &r, sym_id_base, layout),
         // The (token, slot) pair rows — `k` identity legs at stick-aligned column
         // offsets, the gathered regime's own statement that the permutation is a
         // no-op (metal's gathered bake emits nothing and reads token rows k times).
