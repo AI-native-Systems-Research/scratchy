@@ -36,7 +36,10 @@
 #           alone); pulls on first use. GGUF Q4_K_M weights, ignores ignore_eos,
 #           RSS misses the runner grandchild; restarted per axis with
 #           OLLAMA_NUM_PARALLEL / OLLAMA_CONTEXT_LENGTH sized for that axis.
-# No parity gate: it needs CLI mode and this ladder runs in server mode.
+# With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
+# greedy, CLI mode (the ladder is server mode, so the gate is its own call). A
+# failure skips every timing stage (all engines) for that model and is recorded as
+# "parity_mlx_lm": false.
 #
 # --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
 # by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
@@ -383,6 +386,8 @@ for e in [x for x in d["models"] if x["stem"] == only or not only]:
           f"{fmt(w.get('output_throughput'), 1):>8}")
     if not e["built"]:
         print("    BUILD FAILED — see the build log in this machine's raw/ directory")
+    elif e.get("parity_mlx_lm") is False:
+        print(f"    PARITY FAILED vs mlx-lm — not timed; see parity-{e['stem']}.log in raw/")
     elif ladder is None and not w and not e.get("scaling"):
         print("    NO SCRATCHY NUMBERS — the server never served; see the exec and serve logs in raw/")
     elif ladder is None:
@@ -525,8 +530,31 @@ if ff is not None and fc is not None:
 PY
     }
 
+    # ---- parity gate, blocking: a broken dequant path can be fast and wrong,
+    # so scratchy and mlx-lm must agree on the same greedy prompts before
+    # anything is timed. The gate needs `{prompt}` in both commands, so it is
+    # its own CLI-mode call, not part of the server-mode ladder; only its exit
+    # code matters. A failure skips every engine for this model: with no
+    # scratchy numbers there is nothing to compare against.
+    parity_ok=1
+    if (( built )) && [[ -n "${MLX_PYTHON}" ]]; then
+        echo "--- parity gate vs mlx-lm (blocking)"
+        if "${BIN}" bench startup --model "${id}" --exec --mode cli --scenarios warm --port "${PORT}" \
+                --child-cmd "${model_bin} chat -m ${id} --device metal -q {prompt} --max-tokens {output_len} --temperature 0" \
+                --backend scratchy \
+                --parity-cmd "${MLX_PYTHON} -m mlx_lm.generate --model ${id} --prompt {prompt} --max-tokens {output_len} --temp 0" \
+                --parity-backend mlx-lm \
+                --output-json "${RAW}/parity-${stem}.json" >"${RAW}/parity-${stem}.log" 2>&1; then
+            grep -E "^ +(capital|arith|count) |PARITY OK" "${RAW}/parity-${stem}.log" | sed 's/^/    /'
+        else
+            parity_ok=0
+            echo "    PARITY FAILED — not timing ${stem}; ${RAW}/parity-${stem}.log" >&2
+            grep -E " (OK|FAIL) | a: | b: |Error" "${RAW}/parity-${stem}.log" | head -12 | sed 's/^/    /' >&2
+        fi
+    fi
+
     # ---- scratchy
-    if (( built )); then
+    if (( built && parity_ok )); then
         run_ladder scratchy "${id}" \
             "${model_bin} serve ${id} --port ${PORT}${KV_CACHE_DTYPE:+ --kv-cache-dtype ${KV_CACHE_DTYPE}}${SERVE_ARGS:+ ${SERVE_ARGS}}" \
             scratchy "${RAW}/exec-${stem}.json"
@@ -551,7 +579,7 @@ PY
     fi
 
     # ---- mlx-lm
-    if [[ -n "${MLX_PYTHON}" ]]; then
+    if (( parity_ok )) && [[ -n "${MLX_PYTHON}" ]]; then
         run_ladder mlx-lm "${id}" "${MLX_PYTHON} -m mlx_lm.server --model ${id} --port ${PORT}" \
             mlx-lm "${RAW}/exec-mlx-${stem}.json"
         if (( SCALING )); then
@@ -567,7 +595,7 @@ PY
     fi
 
     # ---- ollama
-    if [[ -n "${otag}" ]]; then
+    if (( parity_ok )) && [[ -n "${otag}" ]]; then
         echo "--- ollama ${otag}"
         show() { curl -fsS -m 10 "http://127.0.0.1:${PORT}/api/show" -d "{\"model\":\"${otag}\"}"; }
         have=0
@@ -618,9 +646,9 @@ PY
     fi
 
     python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
-              "${build_secs}" "${bytes}" "${otag}" "${oquant}" <<'PY'
+              "${build_secs}" "${bytes}" "${otag}" "${oquant}" "${parity_ok}" "${MLX_PYTHON}" <<'PY'
 import glob, json, os, re, sys
-js, raw, stem, mid, quant, feats, built, secs, size, otag, oquant = sys.argv[1:12]
+js, raw, stem, mid, quant, feats, built, secs, size, otag, oquant, parity_ok, mlx_python = sys.argv[1:14]
 KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms", "median_itl_ms",
         "p99_itl_ms", "median_e2el_ms", "output_throughput", "request_throughput",
         "completed", "total_output_tokens", "duration", "unstreamed_requests"]
@@ -645,6 +673,8 @@ d = json.load(open(js))
 d["models"].append({
     "stem": stem, "model_id": mid, "quant": quant or None, "features": feats,
     "built": built == "1",
+    # null = gate not run (no mlx-lm, or no build); false = gate failed, nothing timed.
+    "parity_mlx_lm": (parity_ok == "1") if (mlx_python and built == "1") else None,
     "footprint": {"build_seconds": int(secs) if secs else None,
                   "binary_bytes": int(size) if size else None,
                   "container_image_bytes": None,
@@ -681,7 +711,8 @@ d = json.load(open(sys.argv[1]))
 bad = [e["stem"] for e in d["models"] if not e["built"]
        or (not e.get("cache_ladder") and not e.get("warm_serving") and not e.get("scaling"))]
 if bad:
-    print(f"\nFAILED: scratchy produced no numbers for {', '.join(bad)} (results still in the json)",
-          file=sys.stderr)
+    why = {e["stem"]: " (parity gate failed)" for e in d["models"] if e.get("parity_mlx_lm") is False}
+    print(f"\nFAILED: scratchy produced no numbers for {', '.join(b + why.get(b, '') for b in bad)} "
+          "(results still in the json)", file=sys.stderr)
     sys.exit(1)
 PY
