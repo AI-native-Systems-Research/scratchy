@@ -1550,7 +1550,7 @@ fn check_per_row(c: Case, kernel: PerRow) {
             tg(128, 1, 1),
         ),
         PerRow::Nax => {
-            let nax = nax_paged_kernel(tag, hd as u32).expect("NAX instance");
+            let nax = nax_paged_kernel(tag, hd as u32, c.block_size as u32).expect("NAX instance");
             (
                 "attention_steel_nax_paged",
                 nax.symbol.to_owned(),

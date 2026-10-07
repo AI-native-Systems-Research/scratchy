@@ -3729,7 +3729,7 @@ fn lower_one(
             // falls through to the simdgroup steel path below.
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             let nax_kernel = if is_nax {
-                nax_paged_kernel(steel_dtype_tag, p.global_head_dim)
+                nax_paged_kernel(steel_dtype_tag, p.global_head_dim, p.global_block_size)
             } else {
                 None
             };
@@ -8207,6 +8207,18 @@ mod tests {
         );
         let fold = &folded.commands[0].command;
         assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
+    }
+
+    /// The NAX paged attention reads 16-token pages, one fragment a page: a cache of other pages
+    /// (Gemma 4's 32-token global blocks) gets none of its instantiations, whatever the head dim.
+    #[test]
+    fn nax_paged_attention_takes_only_16_token_pages() {
+        use crate::steel_paged::nax_paged_kernel;
+        for head_dim in [64, 128, 256] {
+            assert!(nax_paged_kernel("bf16", head_dim, 16).is_some(), "{head_dim}");
+            assert!(nax_paged_kernel("bf16", head_dim, 32).is_none(), "{head_dim}");
+        }
+        assert_eq!(nax_paged_kernel("f16", 256, 16).map(|k| k.threads), Some(256));
     }
 
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass

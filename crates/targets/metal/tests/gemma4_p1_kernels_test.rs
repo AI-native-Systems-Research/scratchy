@@ -886,7 +886,7 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
         &PipelineKey::new("attention_steel_nax_paged", rope_symbol, consts.clone()),
     )
     .expect("rope_once_nax pipeline");
-    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", head_dim as u32)
+    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", head_dim as u32, 16)
         .expect("NAX instance");
     let key = PipelineKey::new("attention_steel_nax_paged", nax.symbol, consts);
     let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
@@ -3315,7 +3315,7 @@ fn steel_nax_paged_bd256_matches_ref_and_vs_steel() {
         };
         (out, secs, r(&q_host), r(&k_host), r(&v_host))
     };
-    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", 256)
+    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", 256, 16)
         .expect("NAX bd256")
         .symbol;
     let steel =

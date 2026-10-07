@@ -35,7 +35,15 @@ pub mod steel_paged {
     /// (`INST_STEEL_NAX_PAGED(.., 128)`). Returns `Some` only for that
     /// (dtype, head_dim) combo; the dispatcher falls back to the simdgroup
     /// `steel_paged_symbol` / SDPA path otherwise.
-    pub fn nax_paged_kernel(dtype_tag: &str, head_dim: u32) -> Option<NaxPagedKernel> {
+    pub fn nax_paged_kernel(
+        dtype_tag: &str,
+        head_dim: u32,
+        block_size: u32,
+    ) -> Option<NaxPagedKernel> {
+        // Every instantiation reads 16-token pages, one NAX fragment a page.
+        if block_size != 16 {
+            return None;
+        }
         let one = |symbol| NaxPagedKernel {
             symbol,
             threads: 128,
