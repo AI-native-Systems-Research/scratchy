@@ -723,7 +723,14 @@ METAL_FUNC void qmv_fast_impl(
   gain += simd_lid * values_per_thread;
   U sum_sq = 0;
 
+  // Whole blocks, then the rest of the row: K % block_size, a multiple of values_per_thread
+  // (`qmv_fast_covers`), each lane below it taking one more whole chunk — the full-width loads,
+  // where `qmv_impl` takes half a chunk per lane over the whole row.
+  const int whole = in_vec_size - in_vec_size % block_size;
   for (int k = 0; k < in_vec_size; k += block_size) {
+    if (k == whole && int(simd_lid) * values_per_thread >= in_vec_size - whole) {
+      break;
+    }
     U sum;
     if (QMV_NORMED) {
       thread U xg[values_per_thread];

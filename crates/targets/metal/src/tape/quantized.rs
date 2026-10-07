@@ -64,8 +64,9 @@ pub enum QmvKernel {
     /// be a power of two. Most efficient on tiny K (e.g. head_dim
     /// projections). MLX `qmv_quad`.
     Quad { d: u32 },
-    /// `affine_qmv_fast_*` — `N % 8 == 0 && K % 512 == 0`. The decode
-    /// hot path for Llama / Qwen / Gemma. MLX `qmv_fast`.
+    /// `affine_qmv_fast_*` — [`qmv_fast_covers`]: whole 8-row tiles, a row of whole lane
+    /// chunks. The decode hot path for Llama / Qwen / Gemma. MLX `qmv_fast`, which takes only
+    /// whole 512-value blocks; ours finishes the row's last partial block too.
     Fast,
     /// `affine_qmv_*` — generic fallback with bounds-checked tail.
     Generic,
@@ -99,11 +100,22 @@ pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) ->
         QmvKernel::Wide {
             nv: m.div_ceil(n_tiles),
         }
-    } else if n.is_multiple_of(8) && k.is_multiple_of(512) {
+    } else if qmv_fast_covers(n, k) {
         QmvKernel::Fast
     } else {
         QmvKernel::Generic
     }
+}
+
+/// The values one lane of `qmv_fast_impl` loads a block, at its widest over the bit widths it
+/// serves (`quantized_qmv.metal`: 16 at 2-5 bits, 8 at 6 and 8).
+pub const QMV_FAST_K_STEP: u32 = 16;
+
+/// Whether `qmv_fast_impl` computes an `n × k` matvec: whole 8-row tiles, and a row whose part
+/// past its whole 512-value blocks is whole lane chunks. Gemma's 2816, 2112 and 704 are; MLX's
+/// `qmv_fast` takes only multiples of 512 and leaves them to the half-width `qmv`.
+pub const fn qmv_fast_covers(n: u32, k: u32) -> bool {
+    n.is_multiple_of(8) && k.is_multiple_of(QMV_FAST_K_STEP)
 }
 
 /// The M=1 form — `pick_qmv_kernel_wide` with `m = 1, wide_ok = false`.

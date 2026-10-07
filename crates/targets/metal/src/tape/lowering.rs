@@ -2886,8 +2886,8 @@ fn lower_one(
                 },
                 act: *act,
             };
-            // `affine_qmv_fast`'s shape rule (`pick_qmv_kernel`), for both matvecs.
-            let fast = if n.is_multiple_of(8) && k.is_multiple_of(512) {
+            // `affine_qmv_fast`'s shape rule, for both matvecs.
+            let fast = if crate::tape::quantized::qmv_fast_covers(n, k) {
                 "_fast"
             } else {
                 ""
@@ -6321,7 +6321,7 @@ fn affine_gather_qmv_kernel(
     // MLX-native mixed/dynamic quant (OptiQ) ships 8-bit experts on the
     // sensitive edge layers; the `_b_{bits}` suffix selects the matching
     // gather-qmv monomorphization.
-    let fast = n_out.is_multiple_of(8) && k_in.is_multiple_of(512);
+    let fast = crate::tape::quantized::qmv_fast_covers(n_out, k_in);
     let (id, name) = match kernel {
         GatherQmv::Plain if fast => (KernelId::AffineGatherQmvFast, "affine_gather_qmv"),
         GatherQmv::Plain => (KernelId::AffineGatherQmv, "affine_gather_qmv"),
