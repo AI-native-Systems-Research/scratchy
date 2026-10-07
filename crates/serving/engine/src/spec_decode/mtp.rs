@@ -83,13 +83,16 @@
 //!   32-row verify-sized rungs. Those rungs cost short prompts their first token, and the gate of
 //!   1 keeps verify steps at 3 rows, so they are gone (`METAL_VERIFY_ROWS`, 8): past 2 sequences
 //!   a verify step runs the 64-row prefill-shaped tape until the rungs derive from the gate.
-//! - TODO: a build with a head pays its Gated-DeltaNet scan's replay at prefill. The scan's
-//!   per-token loop also replays a verify step's kept rows, one loop body so the replay is
-//!   bit-exact (`gdn_scan_simd_resumes_from_checkpoint`), which costs every prompt token: 0.207 ms
-//!   against 0.167 ms a token across the 30 scans (base M5, 1024- and 2048-row prompt chunks).
-//!   Without a head the replay compiles out (`GDN_SCAN_DRAFTS` 0). Two loops calling one inlined
-//!   row lost the bit-exactness (the varlen scan's replay 1 ULP off): the compiler contracts each
-//!   copy apart.
+//! - TODO: a build with a head runs its Gated-DeltaNet kernels slower on every decode step: a
+//!   2-sequence decode step's 30 scans 1.69 -> 2.20 ms and its 30 convs 0.13 -> 0.46 ms (base M5,
+//!   a one-step kernel probe). The simd scan's per-token loop also replays a verify step's kept
+//!   rows, one loop body so the replay is bit-exact (`gdn_scan_simd_resumes_from_checkpoint`),
+//!   which costs every row it runs; the conv replays nothing (it starts from a checkpoint entry),
+//!   and its cost is not localized. A plain prefill of Qwen3.6's geometry runs the pipelined scan
+//!   (#263), which neither replays nor records; decode steps, verify steps and the step after one
+//!   run the simd scan. Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`,
+//!   `GDN_CONV_DRAFTS` 0). Two loops calling one inlined row lost the bit-exactness (the varlen
+//!   scan's replay 1 ULP off): the compiler contracts each copy apart.
 //! - TODO: time to first token pays the head's pass over the prompt (about 0.19 s on a 5.4k-token
 //!   prompt, base M5): the worker returns a step's tokens with its drafts, so the first token waits
 //!   for pass 1 over every prompt row. The next step needs the drafts, the client does not: return
@@ -108,16 +111,16 @@
 //! - TODO: measure the M5 Max at this build. Its numbers above predate worker-side drafting and the
 //!   gate of 1; the PR's two-build scripts (without `spec/mtp` vs with it, every serving knob at
 //!   its default) are the measurement.
-//! - TODO: on a 32 GB Mac Qwen3.6 does not start at the default 128 sequences, with or without a
-//!   head (the Gated-DeltaNet state pool alone is 8 GiB; main too), so base-M5 numbers here are
-//!   development runs at `--max-num-seqs 8`. Sizing the state pool is its own fix. There, the
-//!   head's memory (weights+overhead 19.8 -> 20.4 GiB) also prunes the prefill bucket 2048 ->
-//!   1024: a 5.6k-token prompt's first token 5.1 -> 6.1 s.
+//! - TODO: on a 32 GB Mac (base M5) Qwen3.6 serves one sequence at its defaults (#255), with or
+//!   without a head, so the base-M5 numbers above at 2 and 8 sequences are development runs at
+//!   `--max-num-seqs 8`. There the head's memory (weights+overhead 19.3 -> 19.8 GiB, and its
+//!   layer's KV in every block) halves the KV cache, 145,936 -> 75,456 tokens; the prefill bucket
+//!   stays 2048.
 //! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
 //!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
 //!   optional, and refuse a value that differs from the head's.
-//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +413
-//!   lines net against main, 47 of them in `op_abi.rs`; shaders +226; the metal compiler +49.
+//! - TODO: the metal target grows, against CLAUDE.md's no net growth in target crates: `src/` +482
+//!   lines net against main, 47 of them in `op_abi.rs`; shaders +238; the metal compiler +49.
 
 use std::collections::{HashMap, HashSet};
 
