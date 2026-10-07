@@ -207,16 +207,39 @@ fn plan_loop(module: &mut Module, path: &OpPath) -> Result<()> {
             };
         }
         Pattern::IndependentRows => {
+            // ⭐ AN ODD ROW COUNT IS A SINGLE-CORELET PLAN, NOT A REFUSAL — the
+            // same re-patterning the arm below makes for `independent_subtile`'s
+            // odd N (and the C++ made for `split` at one stick): the M/2 partition
+            // must tile the rows exactly, and an odd M has no such split, but the
+            // rows are whole rows of the fused body either way — assigning the
+            // whole body to ONE corelet is the correct plan, and the halves are
+            // just [0, M]. THE SPYRE SPLICE NEEDS THIS: attention's per-program
+            // head body carries whatever MQ the rung states, and the ladder's
+            // rungs are odd as often as even (granite 2b: 7, 31, 63, ...), so the
+            // old refusal RED-stopped every odd-rung one-pass attention at
+            // make_ktir. The C++'s KTIR never met this shape — its attention is
+            // not a Triton-lowered per-head program — so there is no golden to
+            // disagree with; the arm below's precedent is the law.
+            //
+            // WHAT IS **NOT** RELAXED: `verify_plan`'s single-corelet arm still
+            // demands exactly one corelet with a two-element non-empty
+            // `data_bounds` starting at 0 — a new plan SHAPE, never a weaker
+            // verifier.
             let rows = recover_row_count(module, &loopp).ok_or_else(|| {
                 Refusal::new(
                     PASS,
-                    "independent_rows pattern cannot read a static, even row count from \
-                     the fused body's reductions (the M/2 partition must tile the rows \
-                     with no overlap). Deriving it from the lowered KTIR is required; \
-                     rounding an odd or dynamic count is not.",
+                    "independent_rows pattern cannot read a static, positive row count \
+                     from the fused body's reductions (the M/2 partition must tile the \
+                     rows with no overlap). Deriving it from the lowered KTIR is \
+                     required; rounding an odd or dynamic count is not.",
                 )
             })?;
-            corelets = fill_independent_rows(rows);
+            if rows % NUM_CORELETS == 0 {
+                corelets = fill_independent_rows(rows);
+            } else {
+                pattern = Pattern::SingleCorelet;
+                corelets = fill_single_corelet(rows);
+            }
         }
         Pattern::IndependentSubtile => {
             // ⭐ AN ODD N IS A SINGLE-CORELET PLAN, NOT A REFUSAL — the same
@@ -472,8 +495,9 @@ fn recover_any_matmul_n(loopp: &Op) -> Option<i64> {
 ///
 /// Every reduction in an `independent_rows` body reduces along the last axis, so
 /// they all share the same leading (row) extent; the matmul output agrees with it
-/// by construction. `None` when it is not static, even and positive -- the halves
-/// must tile the rows with no overlap, and an odd or dynamic count is a spec delta
+/// by construction. `None` when it is not static and positive — an odd count is
+/// returned as-is and the caller re-patterns it to `single_corelet` (the same law
+/// as `recover_any_matmul_n`'s odd N), while a dynamic count is a spec delta
 /// rather than something to round.
 fn recover_row_count(module: &Module, loopp: &Op) -> Option<i64> {
     // ONE definition snapshot: `type_of` below was a whole-module scan paid per
@@ -492,7 +516,7 @@ fn recover_row_count(module: &Module, loopp: &Op) -> Option<i64> {
             continue;
         }
         let m = dims[0];
-        if m > 0 && m != DYNAMIC && m % NUM_CORELETS == 0 {
+        if m > 0 && m != DYNAMIC {
             return Some(m);
         }
     }
