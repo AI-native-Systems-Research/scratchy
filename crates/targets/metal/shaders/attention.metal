@@ -290,12 +290,12 @@ constant uint ATTN_TQ_HEADS = ATTN_TQ_HEADS_FC_SET ? ATTN_TQ_HEADS_FC : 1u;
 //      place, so the two writes must be ordered, not concurrent.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_STAGE_PASS, 17);
 
-// 18  ATTN_SPLITS — threadgroups per decode query-head group. The key loop's 32 simdgroups (simdgroup
-//     `g` takes keys g, g + 32, ...) spread over ATTN_SPLITS threadgroups of 32 / ATTN_SPLITS each,
-//     which store their partials for `attention_via_cache_v2_combine` to merge. Unset: one
-//     threadgroup runs all 32 and merges them itself.
+// 18  ATTN_SPLITS — the threadgroups `attention_decode_gqa_tq` spreads a KV head's keys over, a
+//     constant of the bake's KV cap rung: each takes a contiguous run of the sequence's key blocks
+//     and stores its query heads' partials (the max, the sum, the unnormalized output) for
+//     `attention_via_cache_v2_combine` to merge. Unset: one.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_SPLITS_FC, 18);
-constant uint ATTN_SPLITS = ATTN_SPLITS_FC_SET ? ATTN_SPLITS_FC : 1u;
+constant constexpr uint ATTN_SPLITS = ATTN_SPLITS_FC_SET ? ATTN_SPLITS_FC : 1u;
 // The decode merge's output slices per barrier round (`attn_decode_merge`): its scratch holds
 // this many 32 x 32 transposes.
 constant constexpr uint ATTN_MERGE_SLICES = 4u;
@@ -752,7 +752,6 @@ template <typename T>
     device const uint*  slot_mapping [[buffer(13)]],
     device const T*     tq_k_bias    [[buffer(14)]],
     device const T*     tq_v_bias    [[buffer(15)]],
-    device       float* attn_partials [[buffer(16)]],
     device const T*     fold_k        [[buffer(17)]],
     device const T*     fold_v        [[buffer(18)]],
     device const uint*  positions     [[buffer(19)]],
@@ -976,12 +975,11 @@ template <typename T>
     const bool tail_in_cache = (ATTN_TQ == 0u) || (slot_mapping[seq_idx] != 0xFFFFFFFFu);
     // For each key, simdgroup `vsg` of the 32 handles tokens at indices
     // vsg, vsg+BN, vsg+2*BN, ... The simdgroup that overshoots `kv_len`
-    // skips its iteration and contributes 0. Split, this threadgroup runs
-    // the 32 / ATTN_SPLITS of them its z position picks. A sliding window
-    // (decode Q at absolute position kv_len-1) starts each simdgroup at its
-    // first key inside the window: the same keys in the same order as walking
-    // every key and skipping the older ones, without the walk.
-    const uint vsg = tg_pos.z * (uint(BN) / ATTN_SPLITS) + simd_gid;
+    // skips its iteration and contributes 0. A sliding window (decode Q at
+    // absolute position kv_len-1) starts each simdgroup at its first key inside
+    // the window: the same keys in the same order as walking every key and
+    // skipping the older ones, without the walk.
+    const uint vsg = simd_gid;
     const uint window_lo =
         (ATTN_WINDOW > 0 && kv_len > uint(ATTN_WINDOW)) ? kv_len - uint(ATTN_WINDOW) : 0u;
     const uint first_key =
@@ -1167,21 +1165,6 @@ template <typename T>
         }
     }
 
-    // ── Split: this threadgroup's simdgroups store their partials for the combine pass ──
-    if (ATTN_SPLITS > 1u) {
-        for (uint h = 0; h < heads; ++h) {
-            device float* p =
-                attn_partials + ((seq_idx * num_q + q_head_idx + h) * uint(BN) + vsg) * (head_dim + 2u);
-            if (simd_lid == 0) {
-                p[0] = max_score[h];
-                p[1] = sum_exp_score[h];
-            }
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                p[2u + simd_lid * qk_per_thread + j] = o_reg[h * qk_per_thread + j];
-            }
-        }
-        return;
-    }
     attn_decode_merge<T>(o_reg, max_score, sum_exp_score, heads, simd_gid, simd_lid, tg_outputs,
                          tg_max, tg_sum, o_row, tq_signs, vb);
 }
@@ -1189,51 +1172,507 @@ template <typename T>
 SCRATCHY_KERNEL(attention_via_cache_v2_f16_specialized, attention_via_cache_v2<half>)
 SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<bfloat>)
 
-// attention_via_cache_v2_combine_{f16,bf16}_specialized — the split decode's second pass: one
-// threadgroup per query-head group loads the 32 simdgroup partials the ATTN_SPLITS threadgroups
-// stored (buffer 16, `[batch, num_q_heads, 32, 2 + head_dim]`: max, sum, output accumulator) and
-// merges them as the one-pass kernel does. Dispatch as the one-pass kernel: threadgroups
-// (batch, num_q_heads / heads, 1), threads (1024, 1, 1).
+// attention_via_cache_v2_combine_{f16,bf16}_specialized — `attention_decode_gqa_tq`'s second pass: a
+// threadgroup per query head merges the partials its KV head's ATTN_SPLITS threadgroups stored
+// (buffer 16, `[batch, num_q_heads, ATTN_SPLITS, 2 + head_dim]`: max, sum, unnormalized output in
+// the codebook domain) and writes the head's output as `attention_via_cache_v2`'s merge does.
+// Dispatch: threadgroups (batch, num_q_heads, 1), threads (32, 1, 1).
 template <typename T>
-[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2_combine(
+[[kernel, max_total_threads_per_threadgroup(32)]] void attention_via_cache_v2_combine(
     device       T*     output        [[buffer(0)]],
     device const float* tq_signs      [[buffer(11)]],
     device const T*     tq_v_bias     [[buffer(15)]],
     device const float* attn_partials [[buffer(16)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
-    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
-    constexpr int BN = 32;
+    typedef float U;
     const uint head_dim = ATTN_HEAD_DIM;
     const uint num_q = ATTN_NUM_Q_HEADS;
     const uint qk_per_thread = head_dim / 32u;
-    const uint heads = (ATTN_TQ != 0u) ? ATTN_TQ_HEADS : 1u;
     const uint seq_idx = tg_pos.x;
-    const uint q_head_idx = tg_pos.y * heads;
+    const uint q_head_idx = tg_pos.y;
     const uint kv_head_idx = q_head_idx / (num_q / ATTN_NUM_KV_HEADS);
-    float o_reg[32];
-    float max_score[8];
-    float sum_exp_score[8];
-    for (uint h = 0; h < heads; ++h) {
-        device const float* p =
-            attn_partials + ((seq_idx * num_q + q_head_idx + h) * uint(BN) + simd_gid) * (head_dim + 2u);
-        max_score[h] = p[0];
-        sum_exp_score[h] = p[1];
+    const uint row = head_dim + 2u;
+    device const float* p = attn_partials + (seq_idx * num_q + q_head_idx) * ATTN_SPLITS * row;
+    U global_max = -FLT_MAX;
+    for (uint s = 0; s < ATTN_SPLITS; ++s) {
+        global_max = max(global_max, U(p[s * row]));
+    }
+    // Lane l the elements l·qk_per_thread + j: the codebook domain's lane slices under TurboQuant.
+    const uint e0 = simd_lid * qk_per_thread;
+    U global_sum = 0;
+    U o_loc[16];
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        o_loc[j] = 0;
+    }
+    for (uint s = 0; s < ATTN_SPLITS; ++s) {
+        const U factor = metal::fast::exp(U(p[s * row]) - global_max);
+        global_sum += U(p[s * row + 1u]) * factor;
         for (uint j = 0; j < qk_per_thread; ++j) {
-            o_reg[h * qk_per_thread + j] = p[2u + simd_lid * qk_per_thread + j];
+            o_loc[j] += U(p[s * row + 2u + e0 + j]) * factor;
         }
     }
-    threadgroup float tg_outputs[ATTN_MERGE_SLICES * BN * 32];
-    threadgroup float tg_max[BN * 8];
-    threadgroup float tg_sum[BN * 8];
-    attn_decode_merge<T>(o_reg, max_score, sum_exp_score, heads, simd_gid, simd_lid, tg_outputs,
-                         tg_max, tg_sum, output + (seq_idx * num_q + q_head_idx) * head_dim,
-                         tq_signs, tq_v_bias + kv_head_idx * head_dim);
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        o_loc[j] = global_sum != 0 ? o_loc[j] / global_sum : o_loc[j];
+    }
+    device T* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    if (ATTN_TQ != 0u) {
+        // o = s²·D·H·a, as the one-pass merge rotates it.
+        device const T* vb = tq_v_bias + kv_head_idx * head_dim;
+        tq_wht(o_loc, qk_per_thread, simd_lid);
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            const U o = o_loc[j] * tq_signs[e0 + j] / U(head_dim);
+            o_row[e0 + j] = T(ATTN_TQ_VB ? o + U(vb[e0 + j]) : o);
+        }
+    } else {
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_row[e0 + j] = T(o_loc[j]);
+        }
+    }
 }
 
 SCRATCHY_KERNEL(attention_via_cache_v2_combine_f16_specialized, attention_via_cache_v2_combine<half>)
 SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_cache_v2_combine<bfloat>)
+
+// attention_decode_gqa_tq_{f16,bf16}_specialized — the TurboQuant decode attention of a KV head's
+// 8 query heads together (`ATTN_NUM_Q_HEADS == 8 · ATTN_NUM_KV_HEADS`, 4-bit codes, no projection
+// bias): each key's codes decode once for all 8, straight into 8x8 simdgroup-matrix fragments (MLX
+// `BaseMMAFrag<T, 8, 8>`: lane `l` holds row fm = (l/4 & 4) + (l/2 % 4) and columns
+// fn = (l/4 & 2)·2 + (l % 2)·2, fn + 1; the lanes sharing a row differ in bits 0 and 3), so
+// S = Q·Kᵀ and O += P·V run on the matrix units a block of 8 keys at a time. A key group's
+// simdgroups own a slice of the head dims each, their S partials meeting in threadgroup memory
+// once a block; the threadgroup's key groups take interleaved blocks and merge at the end. A span
+// block's keys (K stored unrotated) decode to the plain domain and re-rope, a simdgroup a key or
+// two, into the same S. Threadgroup z of ATTN_SPLITS takes a contiguous run of the sequence's packed
+// keys' blocks and stores its heads' partials for `attention_via_cache_v2_combine` (one head a
+// threadgroup); the last also takes the step's own key when its writer left it in the cache, or
+// under the fold (`ATTN_FOLD`) built it here, exactly as `attention_via_cache_v2` does. Under the
+// fold each threadgroup ropes the query heads and builds the KV row in threadgroup memory, never
+// writing the query back, and split 0 writes the row to the cache and encodes it. Bindings:
+// `attention_via_cache_v2`'s, buffer 0 unread. Dispatch: threadgroups (batch, num_kv_heads,
+// ATTN_SPLITS), threads (head_dim, 1, 1).
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(ATTN_HEAD_DIM)]] void attention_decode_gqa_tq(
+    device const T*     q             [[buffer(1)]],
+    device const uint*  seq_used_k    [[buffer(2)]],
+    device const uint*  block_table   [[buffer(3)]],
+    device const uint64_t* k_cache    [[buffer(4)]],
+    device const uint64_t* v_cache    [[buffer(5)]],
+    device const T*     cos_sin       [[buffer(6)]],
+    device       uint*  tq_packed_k   [[buffer(7)]],
+    device       uint*  tq_packed_v   [[buffer(8)]],
+    device       float* tq_norms_k    [[buffer(9)]],
+    device       float* tq_norms_v    [[buffer(10)]],
+    device const float* tq_signs      [[buffer(11)]],
+    device const float* tq_centroids  [[buffer(12)]],
+    device const uint*  slot_mapping  [[buffer(13)]],
+    device const T*     tq_k_bias     [[buffer(14)]],
+    device const T*     tq_v_bias     [[buffer(15)]],
+    device       float* attn_partials [[buffer(16)]],
+    device const T*     fold_k        [[buffer(17)]],
+    device const T*     fold_v        [[buffer(18)]],
+    device const uint*  positions     [[buffer(19)]],
+    device const float* tq_boundaries [[buffer(20)]],
+    device const T*     fold_cos_sin  [[buffer(21)]],
+    device const T*     tq_bias_cos_sin [[buffer(22)]],
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr uint G = 8u;
+    constexpr uint KB = 8u;
+    // Another kernel's bake may set a head dim this one cannot take: its arrays need a size all
+    // the same (the asserts below refuse baking this kernel with one).
+    constexpr bool D_OK = ATTN_HEAD_DIM % 128u == 0u && ATTN_HEAD_DIM - 1u < 512u;
+    constexpr uint D = D_OK ? ATTN_HEAD_DIM : 128u;
+    constexpr uint NSG = D / 32u;
+    // A key group's simdgroups, each a slice of the head dims (8 at head_dim 512: 8 Q and 8 O
+    // fragments a lane), and its keys of a span block.
+    constexpr uint SG = NSG >= 16u ? 8u : 4u;
+    constexpr uint KG = NSG / SG;
+    constexpr uint KPS = KB / SG;
+    constexpr uint DS = D / SG;
+    constexpr uint TILES = DS / 8u;
+    constexpr uint QK = D / 32u;
+    constexpr uint XS_S = KG * 2u * SG * 64u;
+    constexpr uint XS_ENC = tq_encode_floats(2u, D) + 2u * D;
+    constexpr uint XS = XS_S > XS_ENC ? XS_S : XS_ENC;
+    // Checked where this kernel is baked (`sizeof(T)` defers them to its instantiation).
+    static_assert(sizeof(T) && ATTN_TQ == 4u, "a packed word holds one 8-wide tile row");
+    static_assert(sizeof(T) && ATTN_NUM_Q_HEADS == G * ATTN_NUM_KV_HEADS, "8 query heads a KV head");
+    static_assert(sizeof(T) && D_OK, "head_dim a multiple of 128, at most 512");
+    static_assert(sizeof(T) && ATTN_BLOCK_SIZE % KB == 0u, "a key block in one KV block");
+    static_assert(sizeof(T) && !ATTN_TQ_KB && !ATTN_TQ_VB, "no projection bias");
+    static_assert(sizeof(T) && ATTN_WINDOW <= 0, "full attention");
+    static_assert(sizeof(T) && (ATTN_ROR == 0u || ATTN_PAIR_OFF % QK == 0u),
+                  "a rotary pair's partner a whole lane stride away");
+    const uint num_q = ATTN_NUM_Q_HEADS;
+    const uint num_kv = ATTN_NUM_KV_HEADS;
+    const uint bs = ATTN_BLOCK_SIZE;
+    const uint pdim = D / 8u;
+    const uint kv_blk_stride = num_kv * bs * D;
+    const uint kv_head_stride = bs * D;
+    const uint seq = tg_pos.x;
+    const uint kvh = tg_pos.y;
+    const uint z = tg_pos.z;
+    const uint q0 = kvh * G;
+    const uint kv_len = seq_used_k[seq];
+    const uint tid = simd_gid * 32u + simd_lid;
+    const uint kg = simd_gid / SG;
+    const uint sg = simd_gid % SG;
+    device const uint* row_bt = block_table + seq * ATTN_MAX_BLOCKS_PER_SEQ;
+    const uint slot = slot_mapping[seq];
+    // The step's own key is not in the packed store: its writer left it in the cache, or the fold
+    // builds it here. A write-skip slot's key is packed like the rest.
+    const bool own_key = slot != 0xFFFFFFFFu;
+    const uint n_packed = kv_len - (own_key ? 1u : 0u);
+
+    threadgroup float qb[G * D];
+    threadgroup float xs[XS];
+    threadgroup T fold_kv[2u * ATTN_FOLD_DIM];
+    threadgroup float lut[16];
+    threadgroup float ml[2u * KG * G];
+    threadgroup float own_s[G];
+    if (tid < 16u) {
+        lut[tid] = tq_centroids[tid];
+    }
+
+    // The query heads' element `e` as the writer leaves it: roped under the fold, rounded to T.
+    const uint fold_pos = ATTN_FOLD ? positions[seq] : 0u;
+    auto q_plain = [&](uint h, uint e) -> float {
+        device const T* qh = q + (seq * num_q + q0 + h) * D;
+        if (!ATTN_FOLD) {
+            return float(qh[e]);
+        }
+        const uint half_rot = ATTN_FOLD_ROT_DIM / 2u;
+        const uint off = ATTN_FOLD_PAIR_OFF;
+        device const T* c = fold_cos_sin + fold_pos * ATTN_FOLD_ROT_DIM;
+        if (e < half_rot) {
+            return float(T(rope_rotate(float(qh[e]), float(qh[off + e]), float(c[e]),
+                                       float(c[half_rot + e])).x));
+        }
+        if (e >= off && e < off + half_rot) {
+            const uint d = e - off;
+            return float(T(rope_rotate(float(qh[d]), float(qh[e]), float(c[d]),
+                                       float(c[half_rot + d])).y));
+        }
+        return float(qh[e]);
+    };
+    // q in the codebook domain, `s·H·D·q / D`, a simdgroup a head; its fragments; then the plain
+    // query, scaled, for the keys the plain domain scores.
+    for (uint h = simd_gid; h < G; h += NSG) {
+        float x[QK];
+        for (uint j = 0; j < QK; ++j) {
+            const uint e = simd_lid * QK + j;
+            x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_signs[e];
+        }
+        tq_wht(x, QK, simd_lid);
+        for (uint j = 0; j < QK; ++j) {
+            qb[h * D + simd_lid * QK + j] = x[j] / float(D);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Qf[TILES];
+    for (uint t = 0; t < TILES; ++t) {
+        simdgroup_load(Qf[t], qb + sg * DS + t * 8u, D);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < G * D; i += D) {
+        qb[i] = ATTN_SCALE_FC * q_plain(i / D, i % D);
+    }
+
+    // Fold: the KV row in `fold_kv` (K, then V), K roped unless its block is a span's; split 0
+    // writes it to the cache and encodes it, as `attention_via_cache_v2`'s fold does.
+    if (ATTN_FOLD) {
+        threadgroup T* fk = fold_kv;
+        threadgroup T* fv = fold_kv + ATTN_FOLD_DIM;
+        const uint row = (seq * num_kv + kvh) * D;
+        fk[tid] = fold_k[row + tid];
+        fv[tid] = fold_v[row + tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint half_rot = ATTN_FOLD_ROT_DIM / 2u;
+        const uint off = ATTN_FOLD_PAIR_OFF;
+        const bool skip_k_rot = (ATTN_ROR != 0u) && ((slot & 0x80000000u) != 0u);
+        if (tid < half_rot && !skip_k_rot) {
+            device const T* c = fold_cos_sin + fold_pos * ATTN_FOLD_ROT_DIM;
+            const float2 r = rope_rotate(float(fk[tid]), float(fk[off + tid]), float(c[tid]),
+                                         float(c[half_rot + tid]));
+            fk[tid] = T(r.x);
+            fk[off + tid] = T(r.y);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        if (z == 0u && own_key) {
+            const uint phys = (ATTN_ROR != 0u) ? (slot & 0x7FFFFFFFu) : slot;
+            const uint block = phys / bs;
+            const uint chunk = (ATTN_BLOCKS_PER_CHUNK == 0u) ? 0u : block / ATTN_BLOCKS_PER_CHUNK;
+            const uint blk_in_chunk =
+                (ATTN_BLOCKS_PER_CHUNK == 0u) ? block : block % ATTN_BLOCKS_PER_CHUNK;
+            const uint at = blk_in_chunk * kv_blk_stride + kvh * kv_head_stride + (phys % bs) * D;
+            ((device T*)k_cache[chunk])[at + tid] = fk[tid];
+            ((device T*)v_cache[chunk])[at + tid] = fv[tid];
+            const uint vpw = 32u / ATTN_TQ;
+            threadgroup uint* codes = (threadgroup uint*)(xs + tq_encode_floats(2u, D));
+            kv_row_encode<T>(float(fk[tid]), float(fv[tid]), tid, D, num_kv, kvh, slot, fold_pos,
+                             ATTN_TQ, vpw, pdim, 0u, 0u, ATTN_FOLD_ROT_DIM, off, tq_signs,
+                             tq_boundaries, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
+                             tq_k_bias, tq_v_bias, tq_bias_cos_sin, xs, codes);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // A plain-domain K row in this lane's elements `lane·QK + j`, re-roped to key `i` when its
+    // block holds K unrotated (the partner of element e sits ATTN_PAIR_OFF / QK lanes away).
+    auto rope_row = [&](thread float* x, uint i) {
+        const uint half_rot = ATTN_ROT_DIM / 2u;
+        const uint sh = ATTN_PAIR_OFF / QK;
+        const bool first = simd_lid * QK < ATTN_PAIR_OFF;
+        const ushort src = ushort(first ? simd_lid + sh : simd_lid - sh);
+        device const T* c = cos_sin + i * ATTN_ROT_DIM;
+        for (uint j = 0; j < QK; ++j) {
+            const uint e = simd_lid * QK + j;
+            const float p = simd_shuffle(x[j], src);
+            if (e < half_rot) {
+                x[j] = rope_rotate(x[j], p, float(c[e]), float(c[half_rot + e])).x;
+            } else if (e >= ATTN_PAIR_OFF && e < ATTN_PAIR_OFF + half_rot) {
+                const uint d = e - ATTN_PAIR_OFF;
+                x[j] = rope_rotate(p, x[j], float(c[d]), float(c[half_rot + d])).y;
+            }
+        }
+    };
+    // Every query head's score against a plain K row, on every lane.
+    auto plain_scores = [&](thread float* x, thread float* s) {
+        for (uint h = 0; h < G; ++h) {
+            float acc = 0.0f;
+            for (uint j = 0; j < QK; ++j) {
+                acc += qb[h * D + simd_lid * QK + j] * x[j];
+            }
+            s[h] = simd_sum(acc);
+        }
+    };
+
+    const uint qid = simd_lid / 4u;
+    const uint fm = (qid & 4u) + ((simd_lid / 2u) % 4u);
+    const uint fn = (qid & 2u) * 2u + (simd_lid % 2u) * 2u;
+    const uint n_blocks = (n_packed + KB - 1u) / KB;
+    const uint per = (n_blocks + ATTN_SPLITS - 1u) / ATTN_SPLITS;
+    const uint b_lo = min(z * per, n_blocks);
+    const uint b_hi = min(b_lo + per, n_blocks);
+    const uint word0 = sg * TILES;
+
+    simdgroup_float8x8 Of[TILES];
+    for (uint t = 0; t < TILES; ++t) {
+        Of[t] = simdgroup_float8x8(0.0f);
+    }
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    uint buf = 0u;
+    for (uint it = 0; it < (b_hi - b_lo + KG - 1u) / KG; ++it) {
+        const uint b = b_lo + it * KG + kg;
+        const bool live = b < b_hi;
+        const uint kb = b * KB;
+        const uint bt_raw = live ? row_bt[kb / bs] : 0u;
+        const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
+        const uint base = (bt_raw & 0x7FFFFFFFu) * bs + kb % bs;
+        auto packed_row = [&](uint key) { return (base + key - kb) * num_kv + kvh; };
+        const uint k0 = kb + fn;
+        const uint k1 = k0 + 1u;
+        const bool v0 = live && k0 < n_packed;
+        const bool v1 = live && k1 < n_packed;
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        if (live && !do_rot) {
+            // S over this simdgroup's dims: Kᵀ's tile t is dims (word0 + t)·8 + fm of keys k0, k1
+            // — nibble fm of each key's word word0 + t.
+            const uint r0 = packed_row(v0 ? k0 : kb);
+            const uint r1 = packed_row(v1 ? k1 : kb);
+            const float n0 = v0 ? tq_norms_k[r0] : 0.0f;
+            const float n1 = v1 ? tq_norms_k[r1] : 0.0f;
+            device const uint* w0 = tq_packed_k + r0 * pdim + word0;
+            device const uint* w1 = tq_packed_k + r1 * pdim + word0;
+            simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
+            for (uint t = 0; t < TILES; ++t) {
+                simdgroup_float8x8 Kt;
+                Kt.thread_elements()[0] = lut[(w0[t] >> (fm * 4u)) & 15u] * n0;
+                Kt.thread_elements()[1] = lut[(w1[t] >> (fm * 4u)) & 15u] * n1;
+                simdgroup_multiply_accumulate(S, Qf[t], Kt, S);
+            }
+            s0 = S.thread_elements()[0];
+            s1 = S.thread_elements()[1];
+        } else if (live) {
+            // A span block: this simdgroup's KPS keys decoded whole, rounded to T as the dequant
+            // pass leaves them, re-roped, and scored in the plain domain.
+            float sc[KPS][G];
+            for (uint u = 0; u < KPS; ++u) {
+                const uint key = kb + KPS * sg + u;
+                for (uint h = 0; h < G; ++h) {
+                    sc[u][h] = 0.0f;
+                }
+                if (key < n_packed) {
+                    const uint r = packed_row(key);
+                    float x[QK];
+                    for (uint j = 0; j < QK; ++j) {
+                        x[j] = lut[tq_code(tq_packed_k, r * pdim, simd_lid * QK + j)];
+                    }
+                    tq_wht(x, QK, simd_lid);
+                    const float n = tq_norms_k[r] / float(D);
+                    for (uint j = 0; j < QK; ++j) {
+                        x[j] = float(T(x[j] * tq_signs[simd_lid * QK + j] * n));
+                    }
+                    rope_row(x, key);
+                    plain_scores(x, sc[u]);
+                }
+            }
+            // The whole score lands in this simdgroup's partial (the lanes holding its keys'
+            // columns), the others' hold none of it.
+            const uint c0 = fn - KPS * sg;
+            const uint c1 = c0 + 1u;
+            s0 = c0 < KPS ? sc[c0][fm] : 0.0f;
+            s1 = c1 < KPS ? sc[c1][fm] : 0.0f;
+        }
+        threadgroup float* sx = xs + (kg * 2u + buf) * SG * 64u;
+        sx[sg * 64u + fm * 8u + fn] = s0;
+        sx[sg * 64u + fm * 8u + fn + 1u] = s1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        s0 = 0.0f;
+        s1 = 0.0f;
+        for (uint g = 0; g < SG; ++g) {
+            s0 += sx[g * 64u + fm * 8u + fn];
+            s1 += sx[g * 64u + fm * 8u + fn + 1u];
+        }
+        buf ^= 1u;
+        if (!live) {
+            continue;
+        }
+        // Online softmax of row fm (head q0 + fm).
+        s0 = v0 ? s0 : -FLT_MAX;
+        s1 = v1 ? s1 : -FLT_MAX;
+        float bm = max(s0, s1);
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 8));
+        const float new_m = max(m, bm);
+        const float factor = metal::fast::exp(m - new_m);
+        const float p0 = v0 ? metal::fast::exp(s0 - new_m) : 0.0f;
+        const float p1 = v1 ? metal::fast::exp(s1 - new_m) : 0.0f;
+        float ps = p0 + p1;
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 8);
+        l = l * factor + ps;
+        m = new_m;
+        simdgroup_float8x8 P;
+        P.thread_elements()[0] = p0;
+        P.thread_elements()[1] = p1;
+        // O = O·factor + P·V: V's tile t is key kb + fm's dims (word0 + t)·8 + fn, fn + 1.
+        const uint kv_key = kb + fm;
+        const bool vv = kv_key < n_packed;
+        const uint rv = packed_row(vv ? kv_key : kb);
+        const float nv = vv ? tq_norms_v[rv] : 0.0f;
+        device const uint* wv = tq_packed_v + rv * pdim + word0;
+        for (uint t = 0; t < TILES; ++t) {
+            const uint w = wv[t];
+            simdgroup_float8x8 Vt;
+            Vt.thread_elements()[0] = lut[(w >> (fn * 4u)) & 15u] * nv;
+            Vt.thread_elements()[1] = lut[(w >> (fn * 4u + 4u)) & 15u] * nv;
+            Of[t].thread_elements()[0] *= factor;
+            Of[t].thread_elements()[1] *= factor;
+            simdgroup_multiply_accumulate(Of[t], P, Vt, Of[t]);
+        }
+    }
+
+    // The step's own key (the last split's): every head's score from the plain query, its V into
+    // the codebook domain, `H·D·v`, in `xs`.
+    const bool takes_own = own_key && z == ATTN_SPLITS - 1u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (takes_own && simd_gid == 0u) {
+        const uint i = kv_len - 1u;
+        const uint bt_raw = row_bt[i / bs];
+        const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
+        const uint phys = bt_raw & ((ATTN_ROR != 0u) ? 0x7FFFFFFFu : 0xFFFFFFFFu);
+        const uint chunk = (ATTN_BLOCKS_PER_CHUNK == 0u) ? 0u : phys / ATTN_BLOCKS_PER_CHUNK;
+        const uint blk_in_chunk =
+            (ATTN_BLOCKS_PER_CHUNK == 0u) ? phys : phys % ATTN_BLOCKS_PER_CHUNK;
+        const uint at = blk_in_chunk * kv_blk_stride + kvh * kv_head_stride + (i % bs) * D;
+        device const T* k_ptr = (device const T*)k_cache[chunk] + at;
+        device const T* v_ptr = (device const T*)v_cache[chunk] + at;
+        float x[QK];
+        float y[QK];
+        for (uint j = 0; j < QK; ++j) {
+            const uint e = simd_lid * QK + j;
+            x[j] = float(ATTN_FOLD ? fold_kv[e] : k_ptr[e]);
+            y[j] = float(ATTN_FOLD ? fold_kv[ATTN_FOLD_DIM + e] : v_ptr[e]) * tq_signs[e];
+        }
+        if (do_rot) {
+            rope_row(x, i);
+        }
+        float s[G];
+        plain_scores(x, s);
+        tq_wht(y, QK, simd_lid);
+        for (uint j = 0; j < QK; ++j) {
+            xs[simd_lid * QK + j] = y[j];
+        }
+        if (simd_lid < G) {
+            own_s[simd_lid] = s[simd_lid];
+        }
+    }
+
+    // The key groups' merge into `qb` (the plain query's last reader is above): each row's max
+    // over the groups, each group's output and sum scaled to it.
+    if (sg == 0u && (simd_lid & 9u) == 0u) {
+        ml[kg * G + fm] = m;
+        ml[KG * G + kg * G + fm] = l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gm = -FLT_MAX;
+    for (uint g = 0; g < KG; ++g) {
+        gm = max(gm, ml[g * G + fm]);
+    }
+    const float to_gm = metal::fast::exp(m - gm);
+    for (uint g = 0; g < KG; ++g) {
+        if (g == kg) {
+            for (uint t = 0; t < TILES; ++t) {
+                const uint e = fm * D + sg * DS + t * 8u + fn;
+                const float o0 = Of[t].thread_elements()[0] * to_gm;
+                const float o1 = Of[t].thread_elements()[1] * to_gm;
+                qb[e] = g == 0u ? o0 : qb[e] + o0;
+                qb[e + 1u] = g == 0u ? o1 : qb[e + 1u] + o1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Partials, `[batch, num_q_heads, ATTN_SPLITS, 2 + D]`: each head's max and sum, then its
+    // output; the step's own key folded in by the split taking it.
+    for (uint i = tid; i < G * D; i += D) {
+        const uint h = i / D;
+        float hm = -FLT_MAX;
+        for (uint g = 0; g < KG; ++g) {
+            hm = max(hm, ml[g * G + h]);
+        }
+        float hl = 0.0f;
+        for (uint g = 0; g < KG; ++g) {
+            hl += ml[KG * G + g * G + h] * metal::fast::exp(ml[g * G + h] - hm);
+        }
+        float o = qb[i];
+        if (takes_own) {
+            const float s = own_s[h];
+            const float new_m = max(hm, s);
+            const float factor = metal::fast::exp(hm - new_m);
+            const float p = metal::fast::exp(s - new_m);
+            o = o * factor + p * xs[i % D];
+            hl = hl * factor + p;
+            hm = new_m;
+        }
+        device float* part = attn_partials + ((seq * num_q + q0 + h) * ATTN_SPLITS + z) * (D + 2u);
+        if (i % D == 0u) {
+            part[0] = hm;
+            part[1] = hl;
+        }
+        part[2u + i % D] = o;
+    }
+}
+
+SCRATCHY_KERNEL(attention_decode_gqa_tq_f16_specialized, attention_decode_gqa_tq<half>)
+SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_tq<bfloat>)
 
 // ─────────────────────────────────────────────────────────────────────
 // attention_prefill_sdpa_v2_paged — paged-cache variant of the prefill

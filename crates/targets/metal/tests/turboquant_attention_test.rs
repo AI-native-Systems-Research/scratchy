@@ -4,7 +4,9 @@
 //!
 //! - Decode (one query per sequence): `attention_via_cache_v2` with
 //!   `ATTN_TQ_BITS`, reading the packed store in the codebook domain, each
-//!   threadgroup serving the production `TqDecodeHeads` query heads.
+//!   threadgroup serving the production `TqDecodeHeads` query heads; or
+//!   `attention_decode_gqa_tq`, each KV head's 8 query heads together over
+//!   `ATTN_SPLITS` threadgroups, merged by `attention_via_cache_v2_combine`.
 //! - Prefill (a chunk of queries per sequence): `tq_stage_rotated` stages K and
 //!   V in the codebook's rotated domain, `tq_rotate_rows` rotates q in and the
 //!   output back, and the production paged prefill attention runs unchanged
@@ -27,7 +29,7 @@ use scratchy_layers::turboquant::{PolarQuantizer, packed_dim, unpack_indices};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::aot::baked_kernels;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, Pipeline};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -132,6 +134,8 @@ struct Case {
     /// Query heads per decode threadgroup (`ATTN_TQ_HEADS`); `check` runs
     /// every count `TqDecodeHeads` can pick for the geometry.
     decode_heads: u32,
+    /// A decode by `attention_decode_gqa_tq` over this many threadgroups a KV head.
+    gqa: Option<u32>,
 }
 
 /// Channels of each KV head that carry the large bias.
@@ -644,7 +648,52 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     let resident = [&scratch_k.data, &scratch_v.data];
     let bits = ConstantValue::uint(13, c.bits);
     let (k_bias, v_bias) = (ConstantValue::uint(14, 1), ConstantValue::uint(15, 1));
-    if decode {
+    // Kept alive past the batch that binds them.
+    let partials = shared(
+        &device,
+        &vec![f32::NAN; n_seqs * c.num_q_heads * c.gqa.unwrap_or(1) as usize * (hd + 2)],
+    );
+    if let (true, Some(splits)) = (decode, c.gqa) {
+        let mut consts = f.attn_constants(&[bits, ConstantValue::uint(18, splits)]);
+        if c.rope.is_some_and(|r| r.coresident) {
+            consts.push(ConstantValue::uint(12, 1));
+        }
+        let binds = [
+            (&q, 1),
+            (&seq_used, 2),
+            (&block_table, 3),
+            (&scratch_k.table, 4),
+            (&scratch_v.table, 5),
+            (&cos_sin, 6),
+            (&packed_k, 7),
+            (&packed_v, 8),
+            (&norms_k, 9),
+            (&norms_v, 10),
+            (&signs, 11),
+            (&centroids, 12),
+            (&slot_mapping, 13),
+            (&partials, 16),
+        ];
+        let attention = pso(
+            "attention",
+            format!("attention_decode_gqa_tq_{}_specialized", c.dtype.tag()),
+            consts.clone(),
+        );
+        let grid = tg(n_seqs, c.num_kv_heads, splits as usize);
+        batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1, 1));
+        batch.barrier();
+        let combine = pso(
+            "attention",
+            format!(
+                "attention_via_cache_v2_combine_{}_specialized",
+                c.dtype.tag()
+            ),
+            consts,
+        );
+        let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
+        let grid = tg(n_seqs, c.num_q_heads, 1);
+        batch.encode(&combine, &binds, &[], &[], &[], grid, tg(32, 1, 1));
+    } else if decode {
         let heads = c.decode_heads;
         let mut consts = f.attn_constants(&[bits, ConstantValue::uint(16, heads)]);
         if c.rope.is_some_and(|r| r.coresident) {
@@ -850,7 +899,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
 /// Every query-head count a decode threadgroup can serve for `c` (one run for
 /// a prefill case).
 fn head_counts(c: &Case) -> Vec<Case> {
-    if !c.seqs.iter().all(|&(_, new)| new == 1) {
+    if c.gqa.is_some() || !c.seqs.iter().all(|&(_, new)| new == 1) {
         return vec![c.clone()];
     }
     TqDecodeHeads::candidates(
@@ -925,6 +974,7 @@ fn llama_3b(name: &'static str) -> Case {
         first_new_write_skipped: false,
         bias: None,
         decode_heads: 1,
+        gqa: None,
     }
 }
 
@@ -1039,6 +1089,187 @@ fn gemma4_global(name: &'static str) -> Case {
 #[test]
 fn decode_gemma4_global_head_dim_512() {
     check(gemma4_global("decode gemma4 global"));
+}
+
+/// Gemma 4's global layers, each KV head's 8 query heads together (`attention_decode_gqa_tq`),
+/// whole and over 4 and 16 threadgroups: span blocks re-roped, the step's own key (in a span
+/// block) from the cache.
+#[test]
+fn decode_gemma4_global_gqa() {
+    for splits in [1, 4, 16] {
+        check(Case {
+            gqa: Some(splits),
+            ..gemma4_global("decode gemma4 global gqa")
+        });
+    }
+}
+
+/// The step's own key in a reused span block: packed, decoded and re-roped like the others.
+#[test]
+fn decode_gemma4_global_gqa_write_skipped_key() {
+    check(Case {
+        gqa: Some(4),
+        span_blocks: vec![14],
+        first_new_write_skipped: true,
+        ..gemma4_global("decode gemma4 global gqa write-skipped key")
+    });
+}
+
+/// Eight sequences, the short ones a partial key block or only their own key.
+#[test]
+fn decode_gemma4_global_gqa_eight_sequences() {
+    check(Case {
+        gqa: Some(4),
+        span_blocks: vec![0, 3],
+        seqs: vec![
+            (900, 1),
+            (1, 1),
+            (257, 1),
+            (64, 1),
+            (17, 1),
+            (8, 1),
+            (9, 1),
+            (2, 1),
+        ],
+        ..gemma4_global("decode gemma4 global gqa eight seqs")
+    });
+}
+
+/// Head dims 256 and 128: two key groups a threadgroup, and one. Qwen3.6's full attention is the
+/// first: 64 rotary dims of 256, pairs 32 apart.
+#[test]
+fn decode_gqa_narrower_heads() {
+    for (head_dim, rot_dim, pair_off) in [(256, 64, 32), (256, 64, 128), (128, 128, 64)] {
+        check(Case {
+            gqa: Some(4),
+            head_dim,
+            attn_scale: 1.0 / (head_dim as f32).sqrt(),
+            block_size: 16,
+            rope: Some(Rope {
+                rot_dim,
+                pair_off,
+                coresident: true,
+            }),
+            span_blocks: vec![2, 56],
+            ..gemma4_global("decode gqa narrower heads")
+        });
+    }
+}
+
+/// GPU time of Gemma 4's global decode attention: the per-head-group kernel at each head count,
+/// and the per-KV-head one over each split count with its combine, at 1k and 16k keys.
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn gemma4_global_decode_timing() {
+    let Some(di) = detect_device() else {
+        return;
+    };
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+    let pso = |name: String, consts: Vec<ConstantValue>| {
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        baked_build(&cache, &PipelineKey::new("attention", name, consts)).expect("pipeline")
+    };
+    let (hd, nq, nkv, bs, bits) = (512usize, 16usize, 2usize, 16usize, 4u32);
+    let quant = PolarQuantizer::new(hd, bits, SEED);
+    let (signs, centroids) = (
+        shared(&device, quant.signs()),
+        shared(&device, quant.centroids()),
+    );
+    for kv_len in [1024usize, 16384] {
+        let blocks = kv_len.div_ceil(bs);
+        let n_rows = blocks * bs * nkv;
+        let pdim = packed_dim(hd, bits);
+        let mut rng = Lcg(3);
+        let codes: Vec<u32> = (0..n_rows * pdim).map(|_| rng.next().to_bits()).collect();
+        let norms: Vec<f32> = (0..n_rows).map(|_| 1.0 + rng.next().abs()).collect();
+        let q: Vec<u16> = (0..nq * hd)
+            .map(|_| Dtype::Bf16.bits(rng.gauss()))
+            .collect();
+        let (packed_k, packed_v) = (shared(&device, &codes), shared(&device, &codes));
+        let (norms_k, norms_v) = (shared(&device, &norms), shared(&device, &norms));
+        let q = shared(&device, &q);
+        let seq_used = shared(&device, &[kv_len as u32]);
+        let block_table = shared(&device, &(0..blocks as u32).collect::<Vec<_>>());
+        let slot_mapping = shared(&device, &[WRITE_SKIP]);
+        let table = shared(&device, &[0u64]);
+        let out = shared(&device, &vec![0u16; nq * hd]);
+        let partials = shared(&device, &vec![0f32; nq * 32 * (hd + 2)]);
+        let base = vec![
+            ConstantValue::uint(0, hd as u32),
+            ConstantValue::uint(1, nq as u32),
+            ConstantValue::uint(2, nkv as u32),
+            ConstantValue::float(3, 1.0 / (hd as f32).sqrt()),
+            ConstantValue::uint(4, bs as u32),
+            ConstantValue::uint(5, blocks as u32),
+            ConstantValue::uint(6, 0),
+            ConstantValue::int(7, 0),
+            ConstantValue::uint(13, bits),
+        ];
+        let binds = [
+            (&out, 0),
+            (&q, 1),
+            (&seq_used, 2),
+            (&block_table, 3),
+            (&table, 4),
+            (&table, 5),
+            (&table, 6),
+            (&packed_k, 7),
+            (&packed_v, 8),
+            (&norms_k, 9),
+            (&norms_v, 10),
+            (&signs, 11),
+            (&centroids, 12),
+            (&slot_mapping, 13),
+            (&partials, 16),
+        ];
+        const REPS: usize = 50;
+        let time = |steps: &[(&Pipeline, MTLSize, MTLSize)]| {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("MTL4 queue");
+                for _ in 0..REPS {
+                    for (pso, grid, threads) in steps {
+                        batch.encode(pso, &binds, &[], &[], &[], *grid, *threads);
+                        batch.barrier();
+                    }
+                }
+                let t = std::time::Instant::now();
+                batch.commit(true);
+                best = best.min(t.elapsed().as_secs_f64() / REPS as f64);
+            }
+            best * 1e6
+        };
+        for heads in [1u32, 2] {
+            let mut consts = base.clone();
+            consts.push(ConstantValue::uint(16, heads));
+            let p = pso("attention_via_cache_v2_bf16_specialized".into(), consts);
+            let grid = tg(1, nq / heads as usize, 1);
+            eprintln!(
+                "{kv_len:>6} keys  per-head-group kernel, {heads} heads/threadgroup: {:8.1} us",
+                time(&[(&p, grid, tg(1024, 1, 1))])
+            );
+        }
+        for splits in [4u32, 8, 16, 32] {
+            let mut consts = base.clone();
+            consts.push(ConstantValue::uint(18, splits));
+            let gqa = pso(
+                "attention_decode_gqa_tq_bf16_specialized".into(),
+                consts.clone(),
+            );
+            let combine = pso(
+                "attention_via_cache_v2_combine_bf16_specialized".into(),
+                consts,
+            );
+            let attention = (&*gqa, tg(1, nkv, splits as usize), tg(hd, 1, 1));
+            eprintln!(
+                "{kv_len:>6} keys  per-KV-head kernel, {splits:>2} splits: {:8.1} us, + combine {:8.1} us",
+                time(&[attention]),
+                time(&[attention, (&combine, tg(1, nq, 1), tg(32, 1, 1))])
+            );
+        }
+    }
 }
 
 // ── prefill ────────────────────────────────────────────────────────────
