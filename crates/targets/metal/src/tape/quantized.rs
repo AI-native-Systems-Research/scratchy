@@ -1096,14 +1096,14 @@ mod tests {
     use crate::tape::targets::AppleSiliconGen;
 
     #[test]
-    fn qmv_kernel_pick_matches_mlx_dispatch_qmv() {
+    fn qmv_kernel_pick_follows_mlx_dispatch_qmv() {
         // K==64 + pow2 bits → quad
         assert_eq!(pick_qmv_kernel(2048, 64, 4), QmvKernel::Quad { d: 64 });
         assert_eq!(pick_qmv_kernel(2048, 128, 4), QmvKernel::Quad { d: 128 });
-        // K==96 → fast/generic, not quad
-        assert_eq!(pick_qmv_kernel(2048, 96, 4), QmvKernel::Generic);
+        // K==96 → fast, not quad: a partial block of six lane chunks
+        assert_eq!(pick_qmv_kernel(2048, 96, 4), QmvKernel::Fast);
         // bits=3 (not power of 2) at K=64 → not quad
-        assert_eq!(pick_qmv_kernel(2048, 64, 3), QmvKernel::Generic);
+        assert_eq!(pick_qmv_kernel(2048, 64, 3), QmvKernel::Fast);
 
         // N%8==0 && K%512==0 → fast (Llama-1B q_proj: K=2048, N=2048)
         assert_eq!(pick_qmv_kernel(2048, 2048, 4), QmvKernel::Fast);
@@ -1114,9 +1114,14 @@ mod tests {
         // Llama-1B down_proj: K=8192, N=2048 → fast
         assert_eq!(pick_qmv_kernel(2048, 8192, 4), QmvKernel::Fast);
 
-        // K%512!=0 → generic
+        // Gemma 4's hidden, dense MLP and expert widths: MLX's generic, our fast
+        assert_eq!(pick_qmv_kernel(2048, 2816, 4), QmvKernel::Fast);
+        assert_eq!(pick_qmv_kernel(2048, 2112, 4), QmvKernel::Fast);
+        assert_eq!(pick_qmv_kernel(2048, 704, 4), QmvKernel::Fast);
+        // K%16!=0 → generic
         assert_eq!(pick_qmv_kernel(2048, 1024, 4), QmvKernel::Fast);
         assert_eq!(pick_qmv_kernel(2048, 1023, 4), QmvKernel::Generic);
+        assert_eq!(pick_qmv_kernel(2048, 1032, 4), QmvKernel::Generic);
         // N%8!=0 → generic
         assert_eq!(pick_qmv_kernel(2049, 2048, 4), QmvKernel::Generic);
     }
