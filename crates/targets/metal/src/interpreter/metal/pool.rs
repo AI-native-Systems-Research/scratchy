@@ -202,7 +202,7 @@ impl From<WorkerError> for PoolBuildError {
 #[derive(Clone)]
 pub struct RuntimeFactory(Arc<FactoryFn>);
 
-struct FactoryFn(Box<dyn Fn(&Device) -> RuntimeBindings>);
+struct FactoryFn(Box<dyn Fn(&Device, &LentActivation) -> RuntimeBindings>);
 
 // SAFETY: the boxed closure captures only Metal object handles (objc2
 // `Retained`, thread-safe retain/release) and POD; identical grounds to
@@ -212,13 +212,14 @@ unsafe impl Sync for FactoryFn {}
 
 impl RuntimeFactory {
     /// Wrap a per-worker `RuntimeBindings` builder.
-    pub fn new(f: impl Fn(&Device) -> RuntimeBindings + 'static) -> Self {
+    pub fn new(f: impl Fn(&Device, &LentActivation) -> RuntimeBindings + 'static) -> Self {
         Self(Arc::new(FactoryFn(Box::new(f))))
     }
 
-    /// Build a fresh set of runtime bindings for a worker on `device`.
-    pub fn build(&self, device: &Device) -> RuntimeBindings {
-        ((self.0).0)(device)
+    /// Build a fresh set of runtime bindings for a worker on `device`, placing what it can in
+    /// `lent` ([`LentActivation::tq_scratch`]).
+    pub fn build(&self, device: &Device, lent: &LentActivation) -> RuntimeBindings {
+        ((self.0).0)(device, lent)
     }
 }
 
@@ -1437,7 +1438,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     }
 
     fn spawn_worker(&self, lent: &LentActivation) -> Result<PooledWorker<W>, WorkerError> {
-        let runtime = self.runtime_factory.build(&self.device);
+        let runtime = self.runtime_factory.build(&self.device, lent);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
@@ -1451,11 +1452,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(PooledWorker { worker, runtime })
     }
 
-    /// An idle worker's arena slots and scratch, to lend a pool whose forwards never overlap this
-    /// one's ([`LentActivation`]); none while every worker is out.
+    /// An idle worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose forwards
+    /// never overlap this one's ([`LentActivation`]); none while every worker is out.
     pub fn lend_activation(&self) -> LentActivation {
         let inner = self.inner.lock().unwrap();
-        (inner.available.first()).map_or_else(LentActivation::default, |p| p.worker.activation())
+        (inner.available.first()).map_or_else(LentActivation::default, |p| LentActivation {
+            tq_scratch: p.runtime.tq.as_ref().map(|t| t.scratch.clone()),
+            ..p.worker.activation()
+        })
     }
 
     fn checkin(&self, pooled: PooledWorker<W>) {
@@ -2045,7 +2049,7 @@ mod tests {
         let (weights, allocator) = build_test_weights(&device);
 
         let arena_layout: ArenaLayout = vec![4096, 4096];
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
 
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,
@@ -2254,7 +2258,7 @@ mod tests {
         let arena_layout: ArenaLayout = vec![slot_bytes, slot_bytes];
         // Per-token runtime arrays sized for max bucket.
         let max_m_bytes = (max_m * 4).max(16);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(move |d| RuntimeBindings {
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(move |d, _| RuntimeBindings {
             input_ids: alloc(d, max_m_bytes),
             positions: alloc(d, max_m_bytes),
             slot_mappings: vec![alloc(d, max_m_bytes)],
@@ -2764,7 +2768,7 @@ mod tests {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
         let (weights, allocator) = build_test_weights(&device);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
         Some(MetalWorkerPool::<TestWeights>::for_buckets(
             device,
             &weights,
@@ -2795,7 +2799,7 @@ mod tests {
             }
         };
         let (weights, allocator) = build_test_weights(&device);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
         let res = MetalWorkerPool::<TestWeights>::for_buckets(
             device,
             &weights,

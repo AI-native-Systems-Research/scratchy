@@ -55,6 +55,8 @@ pub struct LentActivation {
     pub arena: Vec<Buffer>,
     /// Scratch: private storage, as the borrower's scratch.
     pub scratch: Vec<Buffer>,
+    /// A TurboQuant pool's fp16 scratch, staged through by a borrower of the same geometry.
+    pub tq_scratch: Option<super::runtime::TqScratch>,
 }
 
 /// One unit of execution in a bucket's plan.
@@ -301,7 +303,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// This worker's arena slots and scratch, to lend ([`LentActivation`]).
     pub fn activation(&self) -> LentActivation {
         let (arena, scratch) = (self.arena.clone(), self.scratch.clone());
-        LentActivation { arena, scratch }
+        LentActivation {
+            arena,
+            scratch,
+            tq_scratch: None,
+        }
     }
 
     /// Build a worker.
@@ -583,10 +589,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 pin(&t.centroids);
                 // The fp16 scratch (table + backing data) is bound at every
                 // layer's kv_cache slot + dereffed via the table's gpuAddress.
-                pin(&t.scratch_k_table);
-                pin(&t.scratch_v_table);
-                pin(&t.scratch_k_data);
-                pin(&t.scratch_v_data);
+                pin(&t.scratch.k_table);
+                pin(&t.scratch.v_table);
+                pin(&t.scratch.k_data);
+                pin(&t.scratch.v_data);
             }
             r.commit();
         }
