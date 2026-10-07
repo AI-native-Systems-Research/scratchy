@@ -720,8 +720,19 @@ pub enum RuntimeGate {
     /// Run unless the step's block tables hold an unrotated block: the
     /// per-row attention twin that reads the cache's already-roped K as is.
     UnlessUnrotatedBlocks,
+    /// Run only on a step whose every sequence's Gated-DeltaNet step is plain
+    /// (`GdnStep::is_plain`: it neither replays nor records): the one-command
+    /// decode and the pipelined prefill scan, which know only a slot's state
+    /// entry.
+    OnlyIfPlainGdn,
+    /// Run on a step one of whose sequences replays or records its
+    /// Gated-DeltaNet rows (a speculative verify step, the step after one):
+    /// the conv and the simd scan, which replay and record.
+    UnlessPlainGdn,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
+    /// Run when some gate in the list matches.
+    Any(&'static [RuntimeGate]),
 }
 
 impl RuntimeGate {

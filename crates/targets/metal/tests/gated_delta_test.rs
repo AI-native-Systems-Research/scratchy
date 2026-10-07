@@ -1008,6 +1008,7 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
+                ConstantValue::uint(5, 0),
             ]
         };
         let pipe_consts = || {
@@ -1017,7 +1018,8 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
-                ConstantValue::uint(5, 12), // TB
+                ConstantValue::uint(5, 0),
+                ConstantValue::uint(6, 12), // TB
             ]
         };
         let size = |width, height, depth| MTLSize {
@@ -1105,13 +1107,146 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
     }
 }
 
+/// `gdn_scan_pipelined_f32` in a drafting model's pool: slots of a state entry and two record
+/// areas. A plain prefill (fresh, or from the slot) into slot 1 of two, and two sequences into
+/// both slots, leave what `gdn_scan_simd` of the same drafts leaves — the entries to f32
+/// rounding, slot 0's when untouched and every record area as they were.
+#[test]
+fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+    let (nk, nv, hk, hv) = (2usize, 6usize, 128usize, 128usize);
+    let (key_dim, value_dim) = (nk * hk, nv * hv);
+    let conv_dim = 2 * key_dim + value_dim;
+    let scale = (hk as f32).powf(-0.5);
+    let rows = CheckpointRows(2);
+    let entry_len = nv * hv * hk;
+    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
+    let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
+    let (a_log, dt_bias) = (fill(nv), shifted(nv, 5));
+    let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
+    let pool0 = shifted(2 * slot_len, 11);
+    let scan_consts = vec![
+        ConstantValue::uint(0, nk as u32),
+        ConstantValue::uint(1, nv as u32),
+        ConstantValue::uint(2, hk as u32),
+        ConstantValue::uint(3, hv as u32),
+        ConstantValue::float(4, scale),
+        ConstantValue::uint(5, u32::from(rows.0)),
+    ];
+    let pipe_consts = [scan_consts.clone(), vec![ConstantValue::uint(6, 12)]].concat();
+    let simd = baked_build(
+        &cache,
+        &PipelineKey::new("gdn_scan_varlen", "gdn_scan_simd_f32", scan_consts),
+    )
+    .expect("gdn_scan_simd_f32");
+    let pipe = baked_build(
+        &cache,
+        &PipelineKey::new("gdn_scan_pipelined", "gdn_scan_pipelined_f32", pipe_consts),
+    )
+    .expect("gdn_scan_pipelined_f32");
+    let plain = |start| {
+        GdnStep {
+            start,
+            checkpoint_rows: CheckpointRows::NONE,
+            records: RecordArea::Second,
+        }
+        .encode()
+    };
+    let size = |width, height, depth| MTLSize {
+        width,
+        height,
+        depth,
+    };
+    for (cu, slots, starts) in [
+        (vec![0, 25], vec![1], vec![GdnStart::Fresh]),
+        (vec![0, 25], vec![1], vec![GdnStart::Slot]),
+        (
+            vec![0, 13, 26],
+            vec![1, 0],
+            vec![GdnStart::Fresh, GdnStart::Slot],
+        ),
+    ] {
+        let t = *cu.last().expect("a sequence") as usize;
+        let seqs = cu.len() - 1;
+        let (conv, a, b) = (fill(t * conv_dim), shifted(t * nv, 3), shifted(t * nv, 7));
+        let codes: Vec<u32> = starts.iter().map(|&s| plain(s)).collect();
+        let (conv_buf, a_buf, b_buf) = (
+            buf_f32(&device, &conv),
+            buf_f32(&device, &a),
+            buf_f32(&device, &b),
+        );
+        let (cu_buf, slot_buf, code_buf) = (
+            buf_i32(&device, &cu),
+            buf_i32(&device, &slots),
+            buf_u32(&device, &codes),
+        );
+        let run = |kernel, grid, threads| {
+            let (o, state) = (
+                buf_zero_f32(&device, t * value_dim),
+                buf_f32(&device, &pool0),
+            );
+            let bufs = [
+                &o, &conv_buf, &a_buf, &b_buf, &state, &cu_buf, &slot_buf, &code_buf, &alog_buf,
+                &dt_buf,
+            ];
+            common::dispatch_threadgroups(&device, kernel, &bufs, grid, threads)
+                .then(|| (read_f32(&o, t * value_dim), read_f32(&state, pool0.len())))
+        };
+        let (Some((simd_o, simd_pool)), Some((pipe_o, pipe_pool))) = (
+            run(&simd, size(1, value_dim / 4, seqs), size(32, 4, 1)),
+            run(&pipe, size(value_dim / 32, 1, seqs), size(128, 1, 1)),
+        ) else {
+            return;
+        };
+        let what = format!("cu {cu:?}, slots {slots:?}, starts {starts:?}");
+        let close = |part: &str, got: &[f32], want: &[f32]| {
+            let scale = want.iter().fold(0f32, |m, w| m.max(w.abs()));
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-5 * scale,
+                    "{what}: {part}[{i}]: {g} vs {w}"
+                );
+            }
+        };
+        close("o", &pipe_o, &simd_o);
+        for slot in 0..2 {
+            let entry = slot * slot_len..slot * slot_len + entry_len;
+            let records = entry.end..(slot + 1) * slot_len;
+            close(
+                &format!("slot {slot} entry"),
+                &pipe_pool[entry.clone()],
+                &simd_pool[entry.clone()],
+            );
+            assert_eq!(
+                pipe_pool[entry.clone()] != pool0[entry],
+                slots.contains(&(slot as i32)),
+                "{what}: slot {slot}'s entry moved only if a sequence runs in it"
+            );
+            assert_eq!(
+                pipe_pool[records.clone()],
+                pool0[records],
+                "{what}: slot {slot}'s record areas"
+            );
+        }
+    }
+}
+
 /// `gdn_decode_f32` — a decode token's conv, gating, scan and gated norm in one command — against
 /// the three commands it replaces chained over the same inputs and state: `gdn_conv1d_varlen_f32`,
 /// `gdn_scan_simd_f32`, `gdn_rms_norm_gated_f32`. Production head dims, one, two and three value
 /// heads a key head; two sequences of a token each, a continued one and a fresh one, in permuted
 /// state slots. The conv state, a copy of inputs, agrees exactly; the output and the scan state are
 /// the chain's statements in its order, which the shader compiler contracts and reassociates per
-/// kernel under fast math, so they agree to f32 rounding.
+/// kernel under fast math, so they agree to f32 rounding. A drafting model's pools too (2 drafts:
+/// conv checkpoints and ssm record areas in every slot), on plain steps whose record area is the
+/// second (code bit 16): the chain of the same drafts leaves what the one command leaves, the
+/// checkpoints and record areas as they were.
 #[test]
 fn gdn_decode_is_the_conv_scan_norm() {
     let Some(di) = detect_device() else {
@@ -1129,21 +1264,44 @@ fn gdn_decode_is_the_conv_scan_norm() {
         height,
         depth,
     };
-    for ((nk, nv), fresh) in [
-        ((2usize, 4usize), [0u32, 1]),
-        ((2, 6), [1, 0]),
-        ((2, 2), [0, 0]),
-    ] {
+    let geometries = [
+        ((2usize, 4usize), [GdnStart::Slot, GdnStart::Fresh]),
+        ((2, 6), [GdnStart::Fresh, GdnStart::Slot]),
+        ((2, 2), [GdnStart::Slot, GdnStart::Slot]),
+    ];
+    for (((nk, nv), starts), drafts) in geometries
+        .into_iter()
+        .flat_map(|g| [0u8, 2].map(move |d| (g, d)))
+    {
         let (key_dim, value_dim) = (nk * hk, nv * hv);
         let conv_dim = 2 * key_dim + value_dim;
         let (t, slots) = (2usize, 2usize);
+        let rows = CheckpointRows(drafts);
+        let conv_slot = conv_dim * (kernel - 1) * rows.conv_entries_per_slot();
+        let ssm_slot = nv * hv * hk
+            + match drafts {
+                0 => 0,
+                k => 2 * (usize::from(k) + 1) * (conv_dim + 2 * nv),
+            };
+        let records = match drafts {
+            0 => RecordArea::First,
+            _ => RecordArea::Second,
+        };
+        let fresh = starts.map(|start| {
+            GdnStep {
+                start,
+                checkpoint_rows: CheckpointRows::NONE,
+                records,
+            }
+            .encode()
+        });
         let qkv = shifted(t * conv_dim, 7);
         let z = shifted(t * value_dim, 13);
         let (a, b) = (fill(t * nv), shifted(t * nv, 3));
         let (a_log, dt_bias, norm_w) = (fill(nv), shifted(nv, 5), shifted(hv, 17));
         let conv_w = shifted(conv_dim * kernel, 19);
-        let conv0 = shifted(slots * conv_dim * (kernel - 1), 23);
-        let ssm0 = shifted(slots * nv * hv * hk, 11);
+        let conv0 = shifted(slots * conv_slot, 23);
+        let ssm0 = shifted(slots * ssm_slot, 11);
         let build = |lib: &'static str, name: &'static str, c: Vec<ConstantValue>| {
             baked_build(&cache, &PipelineKey::new(lib, name, c)).expect(name)
         };
@@ -1154,6 +1312,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
+                ConstantValue::uint(5, u32::from(drafts)),
             ]
         };
         let (cu, si) = (buf_i32(&device, &[0, 1, 2]), buf_i32(&device, &[1, 0]));
@@ -1174,6 +1333,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let conv_consts = vec![
             ConstantValue::uint(0, conv_dim as u32),
             ConstantValue::uint(1, kernel as u32),
+            ConstantValue::uint(2, u32::from(drafts)),
         ];
         let conv = build("gdn_conv1d_varlen", "gdn_conv1d_varlen_f32", conv_consts);
         let conv_out = buf_zero_f32(&device, t * conv_dim);
@@ -1208,8 +1368,8 @@ fn gdn_decode_is_the_conv_scan_norm() {
         // The one command.
         let mut consts = scan_consts();
         consts.extend([
-            ConstantValue::uint(5, kernel as u32),
-            ConstantValue::float(6, eps),
+            ConstantValue::uint(6, kernel as u32),
+            ConstantValue::float(7, eps),
         ]);
         let decode = build("gdn_decode", "gdn_decode_f32", consts);
         let out = buf_zero_f32(&device, t * value_dim);
@@ -1235,7 +1395,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
             return;
         }
 
-        let geometry = format!("nk {nk} nv {nv}");
+        let geometry = format!("nk {nk} nv {nv} drafts {drafts}");
         let close = |what: &str, got: &Buffer, want: &Buffer, n: usize| {
             let (got, want) = (read_f32(got, n), read_f32(want, n));
             let scale = want.iter().fold(0f32, |m, w| m.max(w.abs()));

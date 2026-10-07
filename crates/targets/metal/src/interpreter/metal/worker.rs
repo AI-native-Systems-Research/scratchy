@@ -286,6 +286,11 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// `tq_dequant_max_blocks`. Only a prefill attention that re-ropes K can
     /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
     pub unrotated_blocks: std::sync::atomic::AtomicBool,
+    /// Whether every sequence of the step about to run takes a plain
+    /// Gated-DeltaNet step (`GdnStep::is_plain`), set with `unrotated_blocks`.
+    /// Only such a step runs the one-command decode and the pipelined prefill
+    /// scan (`RuntimeGate::OnlyIfPlainGdn`).
+    pub gdn_plain: std::sync::atomic::AtomicBool,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -621,6 +626,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             .collect(),
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
+            gdn_plain: std::sync::atomic::AtomicBool::new(true),
             _marker: std::marker::PhantomData,
         })
     }
@@ -751,6 +757,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             unrotated_blocks: self
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
+            gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
         };
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
@@ -1480,6 +1487,7 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         num_seqs,
         has_spec_tokens,
         unrotated_blocks,
+        gdn_plain,
     } = step;
     // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
     // tokens to drop (prefill / chunked-prefill / mixed batches);
@@ -1508,8 +1516,13 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         Some(super::lowered::RuntimeGate::UnlessOneSequence) => num_seqs > 1,
         Some(super::lowered::RuntimeGate::OnlyIfUnrotatedBlocks) => unrotated_blocks,
         Some(super::lowered::RuntimeGate::UnlessUnrotatedBlocks) => !unrotated_blocks,
+        Some(super::lowered::RuntimeGate::OnlyIfPlainGdn) => gdn_plain,
+        Some(super::lowered::RuntimeGate::UnlessPlainGdn) => !gdn_plain,
         Some(super::lowered::RuntimeGate::All(gates)) => {
             gates.iter().all(|g| gate_matches(Some(*g), step))
+        }
+        Some(super::lowered::RuntimeGate::Any(gates)) => {
+            gates.iter().any(|g| gate_matches(Some(*g), step))
         }
     }
 }
@@ -1522,6 +1535,8 @@ pub struct StepFacts {
     pub has_spec_tokens: bool,
     /// Some sequence's block table has an unrotated (bit-31, span) block.
     pub unrotated_blocks: bool,
+    /// Every sequence's Gated-DeltaNet step is plain: no replay, no records.
+    pub gdn_plain: bool,
 }
 
 fn scale_tg_for_num_tokens(
@@ -1647,20 +1662,23 @@ mod tests {
 
     /// The decode-step gates follow whether every sequence contributes one
     /// token; the sequence gates follow the step's sequence count, not its
-    /// token count; the span-block gates follow the step's block tables; and
-    /// `All` needs every gate: a decode step runs none of a TurboQuant prefill
-    /// attention's variants.
+    /// token count; the span-block gates follow the step's block tables; the
+    /// plain-GDN gates follow the step's GDN codes; `All` needs every gate: a
+    /// decode step runs none of a TurboQuant prefill attention's variants; and
+    /// `Any` needs one: a replaying decode step runs a drafting model's GDN
+    /// conv, which a plain one leaves to the one-command decode.
     #[test]
     fn step_gates_follow_the_step() {
         use super::super::lowered::RuntimeGate::{
-            All, OnlyIfDecodeStep, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep,
-            UnlessOneSequence, UnlessUnrotatedBlocks,
+            All, Any, OnlyIfDecodeStep, OnlyIfOneSequence, OnlyIfPlainGdn, OnlyIfUnrotatedBlocks,
+            UnlessDecodeStep, UnlessOneSequence, UnlessPlainGdn, UnlessUnrotatedBlocks,
         };
         let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
             num_tokens,
             num_seqs,
             has_spec_tokens: false,
             unrotated_blocks,
+            gdn_plain: true,
         };
         for (tokens, seqs, decode) in [
             (1, 1, true),
@@ -1681,6 +1699,28 @@ mod tests {
             let s = step(512, 2, unrotated);
             assert_eq!(gate_matches(Some(OnlyIfUnrotatedBlocks), s), unrotated);
             assert_eq!(gate_matches(Some(UnlessUnrotatedBlocks), s), !unrotated);
+        }
+        // A drafting model's GDN commands: the one-command decode on a plain decode step, its
+        // conv on any other.
+        let (decode, conv) = (
+            All(&[OnlyIfDecodeStep, OnlyIfPlainGdn]),
+            Any(&[UnlessDecodeStep, UnlessPlainGdn]),
+        );
+        for (tokens, seqs, gdn_plain, decodes) in [
+            (1, 1, true, true),
+            (2, 2, true, true),
+            (1, 1, false, false),
+            (3, 1, false, false),
+            (512, 1, true, false),
+        ] {
+            let s = StepFacts {
+                gdn_plain,
+                ..step(tokens, seqs, false)
+            };
+            assert_eq!(gate_matches(Some(OnlyIfPlainGdn), s), gdn_plain);
+            assert_eq!(gate_matches(Some(UnlessPlainGdn), s), !gdn_plain);
+            assert_eq!(gate_matches(Some(decode), s), decodes);
+            assert_eq!(gate_matches(Some(conv), s), !decodes);
         }
         let plain = All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         assert!(gate_matches(Some(plain), step(512, 2, false)));
