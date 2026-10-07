@@ -362,6 +362,7 @@ fn the_index_declares_entries_and_every_core_reads_the_same_table() {
         "KtScratch",
         d.mb(),
         d.out(),
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex::of_scratch_rows("BlockTable".to_string(), d.page(), runs[0].index_base()),
         ktir_superdsc::superdsc_opspec::DestEntry::of_entries(runs[0].dest_entry()),
     )

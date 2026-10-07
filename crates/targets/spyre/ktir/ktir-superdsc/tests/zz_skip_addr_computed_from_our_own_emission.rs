@@ -158,6 +158,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
                 "Tensor2",
                 cp.dims().mb(),
                 ktir_superdsc::sdsc_abstract::POOL_STICK,
+                ktir_superdsc::superdsc_opspec::Df::Fp16,
                 ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
                     "BlockTable".to_string(),
                     PageExtent::of_positions(scratch.entry_page()),
@@ -233,6 +234,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                     "Tensor2",
                     cp.dims().mb(),
                     ktir_superdsc::sdsc_abstract::POOL_STICK,
+                    ktir_superdsc::superdsc_opspec::Df::Fp16,
                     ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
                         "BlockTable".to_string(),
                         PageExtent::of_positions(
@@ -325,6 +327,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
         "Tensor2",
         16,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         ktir_superdsc::superdsc_opspec::GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: axis,
@@ -454,6 +457,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
             "Tensor2",
             mb,
             POOL_STICK,
+            ktir_superdsc::superdsc_opspec::Df::Fp16,
             GatherIndex::of_scratch_rows(
                 "BlockTable".to_string(),
                 PageExtent::of_positions(pin),

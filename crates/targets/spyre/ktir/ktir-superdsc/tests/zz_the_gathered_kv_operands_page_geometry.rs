@@ -344,6 +344,7 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
         // happens to fit only at the widest page.
         page.get() * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex {
             name: "Tensor3".to_string(),
             entry_dim: axis,
@@ -368,6 +369,7 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
         // The SAME width as the gathered control above, for the same reason — one index stick.
         HD * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex::of_scratch_rows(
             "Tensor3".to_string(),
             PageExtent::of_positions(HD),

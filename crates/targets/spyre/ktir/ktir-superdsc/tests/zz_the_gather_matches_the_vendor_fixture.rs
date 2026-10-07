@@ -82,6 +82,7 @@ fn gather_copy_declared() -> ktir_superdsc::superdsc_opspec::OpSpec {
         "Tensor2",
         16,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         vendor_index("Tensor1"),
         ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )
@@ -103,6 +104,7 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
         "Tensor2",
         16,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         vendor_index("Tensor1"),
         ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )

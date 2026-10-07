@@ -38,7 +38,7 @@
 use ktir_superdsc::emit as superdsc;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{gather_copy_opspec, matmul_opspec};
 use ktir_superdsc::superdsc_opspec::{
-    GatherIndex, IndirectAccess, KernelAxis, PageExtent, SdscFoldSet,
+    Df, GatherIndex, IndirectAccess, KernelAxis, PageExtent, SdscFoldSet,
 };
 
 /// The vendor's own declaration: its value tensor is `["mb","out","x"]` with `maxDimSizes_ [1,-1,-1]`
@@ -59,6 +59,7 @@ fn gather_copy(decl: (KernelAxis, PageExtent)) -> ktir_superdsc::superdsc_opspec
         "KtScratch",
         8,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        Df::Fp16,
         GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: decl.0,
@@ -285,6 +286,7 @@ fn the_declarations_own_refusals_survive_the_move() {
             "KtScratch",
             8,
             256,
+            Df::Fp16,
             GatherIndex {
                 name: "BlockTable".to_string(),
                 entry_dim: KernelAxis::Feature,
@@ -297,5 +299,91 @@ fn the_declarations_own_refusals_survive_the_move() {
         .is_err(),
         "an `in` axis is not a dim of the gather-copy op, and a silently-dropped pin is a gather with \
          no page declared — wrong addresses from a clean build"
+    );
+}
+
+/// ⭐⭐⭐ AN FP8 GATHERED COPY BUILDS AT THE FP8 STICK — the MoE expert-slab gather's own shape.
+///
+/// The one-stick law is PER-FORMAT: an fp8 copy's `out` is one 128-elem fp8 stick (the fp8 bank's
+/// own stick), the value operands carry `Df::Fp8` (1-byte wordLength, SEN143_FP8 dataFormat), and
+/// the INDEX still carries SENUINT32 at 4 bytes — `attach_gather_index` forces it whatever the
+/// value operands are, which is the property that lets one BlockTable-style index drive an fp16 KV
+/// gather and an fp8 expert gather indifferently.
+///
+/// The control: a 64-elem fp8 copy is REFUSED — one fp16 stick is HALF an fp8 stick, and the
+/// sub-stick refusal is the same class the fp16 law states at its own width.
+#[test]
+fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
+    use ktir_superdsc::superdsc_opspec::Df;
+    // The fp8 shape: `out` = one 128-elem fp8 stick, `mb` = one index stick of 4-position entries.
+    let op = gather_copy_opspec(
+        "ExpertBank",
+        "PairScratch",
+        ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP * 4,
+        128,
+        Df::Fp8,
+        GatherIndex {
+            name: "ExpertTable".to_string(),
+            entry_dim: KernelAxis::Batch,
+            page: PageExtent::of_positions(4),
+            per_position: None,
+            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
+        },
+        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
+    )
+    .expect("the fp8 expert-slab copy builds");
+    // Both VALUE operands carry the fp8 residency — 1-byte words, the bank's own format.
+    let value_args: Vec<_> = op
+        .args
+        .iter()
+        .filter(|a| a.view().role != ktir_superdsc::superdsc_opspec::Role::Index)
+        .collect();
+    assert_eq!(value_args.len(), 2, "source and destination, no index");
+    for a in &value_args {
+        assert_eq!(a.view().df, Df::Fp8, "the bank's format on both value args");
+        assert_eq!(a.view().df.word_length(), 1, "the fp8 word length");
+    }
+    // The INDEX is SENUINT32 at 4 bytes regardless — the DT_CHECK pair GatherIndexConversion.cpp:133
+    // and L3DlOpsScheduler.cpp:5928 read, and the property that lets one BlockTable-style index
+    // drive an fp16 KV gather and an fp8 expert gather indifferently.
+    let idx_arg = op
+        .args
+        .iter()
+        .find(|a| a.view().role == ktir_superdsc::superdsc_opspec::Role::Index)
+        .expect("the declaration appended the index arg");
+    assert_eq!(idx_arg.view().df, Df::SenUint32);
+    assert_eq!(idx_arg.view().df.word_length(), 4);
+    // The declaration is present and KERNEL-less — the same role set the vendor fixture states.
+    let j = emit(&op);
+    let roles: Vec<String> = dsc(&j)["primaryDsInfo_"]
+        .as_object()
+        .expect("primaryDsInfo_")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !roles.iter().any(|r| r == "KERNEL"),
+        "the fp8 copy is KERNEL-less like every gather ({roles:?})"
+    );
+    // A 64-elem fp8 copy is REFUSED: one fp16 stick is HALF an fp8 stick, and a sub-stick operand
+    // is the scattered-block class the one-stick law exists to refuse.
+    assert!(
+        gather_copy_opspec(
+            "ExpertBank",
+            "PairScratch",
+            32,
+            64,
+            Df::Fp8,
+            GatherIndex {
+                name: "ExpertTable".to_string(),
+                entry_dim: KernelAxis::Batch,
+                page: PageExtent::of_positions(4),
+                per_position: None,
+                first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
+            },
+            ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
+        )
+        .is_err(),
+        "a 64-elem `out` is HALF an fp8 stick — the sub-stick refusal, at the fp8 width"
     );
 }

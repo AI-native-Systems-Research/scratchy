@@ -58,6 +58,13 @@ pub fn gather_copy_opspec(
     dst: &str,
     rows: u32,
     cols: u32,
+    // ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE expert
+    // slabs. The vendor's `identity` bind carries NO DDL type constraint (unary_parallel.ddl:17
+    // "identity and shuffle only move data, so their input and output are free to arrange it
+    // differently"), so the copy's df is a property of the BANK it copies, not of the op — and the
+    // ONE-STICK law below transfers per-format: an fp8 copy's `cols` is one 128-elem fp8 stick, and
+    // the RowBlocked-scatter refusal the fp16 law states is the same law at its own width.
+    df: Df,
     gather: crate::superdsc_opspec::GatherIndex,
     // ⭐⭐⭐⭐⭐ THE DESTINATION ENTRY THIS RUN STARTS AT — separate from `gather.first_entry`, and it has to
     // be. See `GatherCopy::dest_entry`: the two were one number while a run's entries and its destination
@@ -67,15 +74,17 @@ pub fn gather_copy_opspec(
     // so they cannot drift; they simply are not equal any more.
     dest_entry: crate::superdsc_opspec::DestEntry,
 ) -> Result<OpSpec, String> {
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     let cols_ext = crate::superdsc_opspec::StickExtent::<Fp16>::new(cols)?;
-    if cols != Fp16::ELEMS_PER_STICK {
+    if cols != df.elems_per_stick() {
         return Err(format!(
             "gather_copy_opspec('{src}' -> '{dst}'): `out` is {cols} elements, and a gathered copy's \
-             `out` must be exactly one fp16 stick ({}). Wider than one stick, the operand classifies \
-             stick-major and each gathered block is scattered `rows*64` apart instead of contiguous — \
-             which bakes clean and hands the score kernel another request's slots. Declare the block as \
-             `hd` one-stick sub-rows (`GatherScratch::sub_rows`) with the entry `page` covering them.",
-            Fp16::ELEMS_PER_STICK,
+             `out` must be exactly one {stick}-element stick of the value format. Wider than one \
+             stick, the operand classifies stick-major and each gathered block is scattered \
+             `rows*{stick}` apart instead of contiguous — which bakes clean and hands the consumer \
+             another entry's rows. Declare the block as one-stick sub-rows (`GatherScratch::sub_rows`) \
+             with the entry `page` covering them.",
+            stick = df.elems_per_stick(),
         ));
     }
     // ⛔ THE PAGE MUST DIVIDE THE ROWS, or the last entry covers a partial block. Refused rather than
@@ -117,7 +126,7 @@ pub fn gather_copy_opspec(
         size,
         is_reduction: false,
         is_stick,
-        df: Df::Fp16,
+        df,
     };
     let tile_op = TileOp {
         // Two operands: the gathered source and the contiguous destination. The index is APPENDED by
@@ -129,14 +138,13 @@ pub fn gather_copy_opspec(
             dim("out", cols_ext.elems(), true),
             dim("y", 1, false),
         ],
-        df: Df::Fp16,
+        df,
     };
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
         OpFunc::Identity,
         &[src],
-        dst,
-        // ⛔⛔⛔ RANK-3, AND THIS IS A CARD-MEASURED REQUIREMENT, NOT A PRESENTATION CHOICE. This flag was
+        dst,        // ⛔⛔⛔ RANK-3, AND THIS IS A CARD-MEASURED REQUIREMENT, NOT A PRESENTATION CHOICE. This flag was
         // `false`, which puts a `rows > 1` op into [`pointwise_opspec_from_tile`]'s STICK-MAJOR rank-2
         // form — and that form OMITS `y` from `layoutDimOrder_` entirely rather than sizing it 1. The
         // sibling builder records the consequence from a real pod `dxp_standalone` crash
@@ -207,6 +215,13 @@ pub fn gather_copy_opspec(
                 )
             })?,
     )?;
+    // ⭐ THE VALUE OPERANDS' OWN df — `pointwise_opspec_from_tile_split` builds args at fp16 (the
+    // residual default), so an fp8 copy re-states BOTH value args here. The index arg does not
+    // exist yet: `attach_gather_index` below appends it with SENUINT32 FORCED, the one format a
+    // gather's index may carry, whatever the value operands are.
+    for a in op.args.iter_mut() {
+        a.set_df(df);
+    }
     // ⛔ OPERAND 0 IS THE GATHERED ONE, AND IT IS NOT THE OUTPUT. `attach_gather_index` refuses the
     // output slot itself (gathering INTO a destination is a scatter), so this cannot silently become
     // one; the `?` below turns a shape it cannot express into this function's own `Err`.
@@ -281,6 +296,9 @@ pub fn assemble_gather_copy(
         dst,
         d.mb(),
         d.out(),
+        // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
+        // first fp8 caller and states its own df at its own door.
+        Df::Fp16,
         crate::superdsc_opspec::GatherIndex::of_scratch_rows(
             index.to_string(),
             d.page(),
