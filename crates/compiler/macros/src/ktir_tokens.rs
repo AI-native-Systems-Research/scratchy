@@ -430,6 +430,13 @@ fn synth_role_tokens(
             let j = proc_macro2::Literal::u32_unsuffixed(j);
             quote! { #path::FqAmaxP(#j) }
         }
+        // The expert-combine product slot — indexed for the same reason (the catch-all would
+        // render `ECombP(2)` from Debug, not an ident). `ECombAcc` is unit and rides the
+        // catch-all.
+        R::ECombP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::ECombP(#j) }
+        }
         other => {
             let v = variant(format!("{other:?}"));
             quote! { #path::#v }

@@ -8627,6 +8627,14 @@ fn synth_role_tokens(
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::LAcc(#i) }
         }
+        // The expert-combine scratch: slot `j`'s `rows_j · score_j` product and
+        // the running f32-referenced accumulator ([`lk::expert_combine`]'s own
+        // synths, the `FqAmaxP(j)` payload shape).
+        R::ECombP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(*j);
+            quote! { #b::ECombP(#j) }
+        }
+        R::ECombAcc => quote! { #b::ECombAcc },
     }
 }
 
