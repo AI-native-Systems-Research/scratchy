@@ -42,11 +42,16 @@ pub struct WorkerCreateConfig {
     pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
-    /// Maximum concurrently-resident sequences (scheduler
-    /// `max_num_seqs`). Sizes the Gated-DeltaNet state pool — one
-    /// recurrent-state slot per resident sequence for hybrid arches
-    /// (Qwen3.5 / Qwen3-Next); unused by non-hybrid arches.
-    pub max_num_seqs: usize,
+    /// Maximum concurrently-resident sequences (scheduler `max_num_seqs`).
+    /// `None` = UNSET: the worker answers it (its own batched-decode width
+    /// where it has one, else the device tier, clamped to what the device's
+    /// memory affords where the model carries per-sequence state). `Some(n)`
+    /// is the caller's explicit ask — honoured as-is; a backend that cannot
+    /// express or afford it says so loudly rather than silently replacing it.
+    /// Sizes the Gated-DeltaNet state pool — one recurrent-state slot per
+    /// resident sequence for hybrid arches (Qwen3.5 / Qwen3-Next); unused by
+    /// non-hybrid arches.
+    pub max_num_seqs: Option<usize>,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).

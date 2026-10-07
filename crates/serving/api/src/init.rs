@@ -26,11 +26,15 @@ use scratchy_core_config::{CudaGraphConfig, CudaGraphMode, SchedulerConfig, Sche
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_serving_engine::core_client::InprocClient;
 use scratchy_serving_engine::engine_core::{EngineCoreConfig, HybridKvConfig};
+use scratchy_serving_engine::gpu_budget::{MaxNumSeqsFacts, resolve_default_max_num_seqs};
 use scratchy_serving_engine::spec_decode::{
     DraftModelProposerConfig, NgramProposerConfig, ProposerConfig,
 };
 use scratchy_serving_worker::uniproc::UniProcExecutor;
 use scratchy_serving_worker::worker::Worker;
+// TP rank-alignment helpers — used only on the nccl-gated TP paths below.
+#[cfg(feature = "nccl")]
+use scratchy_serving_worker::worker::{align_all_max_num_seqs, min_max_num_seqs};
 use tracing::info;
 
 use crate::chat_template::ChatTemplate;
@@ -452,7 +456,10 @@ fn create_worker(
         // between this and the scheduler's block size silently corrupts KV slots.
         block_size: effective_block_size(config.block_size, &config.device),
         device_id,
-        max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+        // The REQUEST, not a resolved number: `None` lets the worker resolve
+        // the width itself (device tier / memory-affordable GDN slots), while
+        // `Some(n)` pins every worker-side consumer to the caller's ask.
+        max_num_seqs: config.max_num_seqs,
         enforce_eager: config.enforce_eager,
         cuda_graph_mode: config
             .cuda_graph_mode
@@ -1057,30 +1064,25 @@ fn resolve_default_max_num_batched_tokens(is_offline: bool) -> usize {
     SchedulerConfig::DEFAULT_MAX_NUM_BATCHED_TOKENS
 }
 
-/// THE CONCURRENCY DEFAULT WHEN NOBODY ASKED — the `.1` of the same device-aware pair
-/// [`resolve_default_max_num_batched_tokens`] takes its `.0` from. `.1` is equal for offline and
-/// server, so a caller with no usage context in scope may pass either.
-fn resolve_default_max_num_seqs(is_offline: bool) -> usize {
-    if let Some((total_bytes, name)) = backend_device_total_bytes_and_name() {
-        return SchedulerConfig::batch_defaults(total_bytes, &name, is_offline).1;
-    }
-    SchedulerConfig::DEFAULT_MAX_NUM_SEQS
-}
-
-/// ⭐⭐⭐ THE ONE PLACE `--max-num-seqs` IS DECIDED, and the order is WORKER, then DEVICE, then base.
+/// ⭐⭐⭐ THE ONE PLACE the SCHEDULER's `max_num_seqs` IS DECIDED, and the order is
+/// WORKER, then DEVICE, then base.
 ///
-/// Called TWICE with different knowledge, which is the whole reason it takes `worker_cap`:
+/// The REQUEST reaches workers as `Option` through `WorkerCreateConfig::max_num_seqs`:
+/// `None` tells the worker nobody asked, so it RESOLVES the width itself at the end of
+/// `load_model` (the shared `gpu_budget::resolve_default_max_num_seqs` — device tier
+/// where the backend reports facts, else the base constant, clamped to what the device's
+/// memory affords where the model carries per-sequence GDN state). AFTER `load_model`,
+/// the worker reports the width it actually built its pools, sampler arena, and capture
+/// ladder at ([`Worker::max_num_seqs_override`]) — this function honours that answer for
+/// an unset flag, so one process runs at one number. Multi-worker paths additionally
+/// ALIGN every worker to the narrowest reported width
+/// ([`Worker::align_max_num_seqs`]) before `initialize_cache`/warmup, so ranks whose
+/// memory clamps landed differently still build identical ladders.
 ///
-/// * BEFORE the worker exists (`worker_cap = None`) to fill [`WorkerCreateConfig::max_num_seqs`] —
-///   cuda sizes its Gated-DeltaNet state pool and its graph-capture ladder from it, and spyre's
-///   `declare_workload` sizes the KV pool from it, all at construction time;
-/// * AFTER `load_model` (`worker_cap = Some(..)`) for the SCHEDULER, where a backend whose decode
-///   width is fixed at BAKE time reports the widest batch it can express
-///   ([`Worker::max_num_seqs_override`]).
-///
-/// ⛔ AN EXPLICIT REQUEST IS CAPPED, NEVER REPLACED, and an unset one is ANSWERED, never guessed:
-/// `None` + a worker cap is the backend's own default, so `scr serve` with no flags runs at the
-/// width the bake can batch rather than at a generic 256 that merely happens to clamp to it.
+/// ⛔ AN EXPLICIT REQUEST IS CAPPED, NEVER REPLACED, and an unset one is ANSWERED, never
+/// guessed: `None` + a worker answer is the backend's own default, so `scr serve` with no
+/// flags runs at the width the backend sized its pools at rather than at a generic 256
+/// that merely happens to clamp to it.
 fn resolve_max_num_seqs(
     requested: Option<usize>,
     worker_cap: Option<usize>,
@@ -1098,10 +1100,32 @@ fn resolve_max_num_seqs(
             cap
         }
         (Some(want), _) => want,
-        // Nobody asked. The backend's own width IS the default when it has one.
+        // Nobody asked. The backend's answer IS the default when it has one — its baked width, or
+        // the memory-affordable count it just resolved an unset flag into.
         (None, Some(cap)) => cap,
-        // No backend answer either (cuda/metal, whose ladders track `max_num_seqs`): the device's.
-        (None, None) => resolve_default_max_num_seqs(is_offline),
+        // No backend answer either: the device tier, else the base constant.
+        // Same shared resolver the workers use, with facts built from the
+        // registered factory — one arithmetic everywhere.
+        (None, None) => {
+            let (total, name) = backend_device_total_bytes_and_name()
+                .map_or((None, None), |(t, n)| (Some(t), Some(n)));
+            resolve_default_max_num_seqs(
+                &MaxNumSeqsFacts {
+                    device_total_bytes: total,
+                    device_name: name,
+                    // The fallback only needs the TIER half: every backend
+                    // with pools to size answers through
+                    // `max_num_seqs_override` before the scheduler asks, so
+                    // this arm carries no budget to clamp against.
+                    device_budget_bytes: None,
+                    allocated_bytes: 0,
+                    peak_activation_bytes: 0,
+                    gdn_per_slot_bytes: None,
+                    sampler_bytes_per_row: 0,
+                },
+                is_offline,
+            )
+        }
     }
 }
 
@@ -1475,7 +1499,10 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 hf_token: config.hf_token.clone(),
                 block_size: config.block_size,
                 device_id: rank as i32,
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                // The request, not a resolved number: `None` lets the worker
+                // resolve the width itself, `Some(n)` pins worker-side
+                // consumers to the ask.
+                max_num_seqs: config.max_num_seqs,
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
@@ -1609,6 +1636,13 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
             supports_hybrid_swa_kv = worker.supports_hybrid_swa_kv();
             workers.push(Box::new(worker));
         }
+        // The narrowest rank's answer when the flag was unset (each rank
+        // clamps on its own memory query); the caller's ask — already built
+        // into every rank — when it was not. Align every rank to it BEFORE
+        // initialize_cache / warmup so ladders and pools all build at one
+        // width. (Engine-level helpers — one implementation, tested there.)
+        let worker_max_num_seqs = min_max_num_seqs(&workers);
+        align_all_max_num_seqs(&mut workers);
 
         let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
             min_avail,
@@ -1676,7 +1710,10 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                // The narrowest rank's answer when the flag was unset; the
+                // caller's ask (already built into every rank's pools)
+                // when it was not.
+                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
@@ -2032,7 +2069,10 @@ fn initialize_stack_multinode(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: 0,
-            max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+            // The request, not a resolved number: `None` lets the worker
+            // resolve the width itself, `Some(n)` pins worker-side
+            // consumers to the ask.
+            max_num_seqs: config.max_num_seqs,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
             cuda_graph_sizes: config
@@ -2130,7 +2170,36 @@ fn initialize_stack_multinode(
             num_gpu_blocks * config.block_size,
         );
 
-        // Step 7: Establish TCP control channel (persistent connections).
+        // Step 7: All-reduce the resolved width MIN across every node and
+        // align to it BEFORE `establish` (the control-channel listener) —
+        // every follower takes the matching side in its Step 5b, which also
+        // runs before its connect; a call placed after `establish` deadlocks
+        // (the leader sits in `accept()` while the follower retries a
+        // port+1 listener that does not exist yet). With both sides aligned
+        // from the SAME allreduce, no AlignWidth broadcast is needed — the
+        // InitCache broadcast below is the first thing to cross the channel.
+        let mut worker: Box<dyn Worker> = Box::new(worker);
+        // The width this rank resolved (unset flag → device tier / memory-
+        // affordable GDN slots) or the caller's ask.
+        let min_worker_width = worker
+            .max_num_seqs_override()
+            .map(|w| {
+                scratchy_serving_transport::tcp_store::allreduce_min(
+                    0,
+                    tp_size,
+                    w,
+                    &config.master_addr,
+                    config.master_port,
+                )
+                .context("failed to allreduce max_num_seqs")
+            })
+            .transpose()?;
+        if let Some(w) = min_worker_width {
+            worker.align_max_num_seqs(w);
+        }
+        let worker_max_num_seqs = min_worker_width.or_else(|| worker.max_num_seqs_override());
+
+        // Step 7b: Establish TCP control channel (persistent connections).
         let mut channel = scratchy_serving_transport::TcpControlChannel::establish(
             0,
             tp_size,
@@ -2142,6 +2211,8 @@ fn initialize_stack_multinode(
 
         // Step 8: Initialize cache — broadcast command to followers first,
         // then run locally. Both sides participate in any NCCL collectives.
+        // Both sides are already at the aligned width (Step 7 / follower
+        // Step 5b), so pools and ladders build at one width everywhere.
         {
             use scratchy_serving_worker::multinode::ControlMessage;
             ControlMessage::InitCache {
@@ -2151,7 +2222,6 @@ fn initialize_stack_multinode(
             .broadcast(&mut channel)
             .context("broadcast InitCache")?;
         }
-        let mut worker: Box<dyn Worker> = Box::new(worker);
         worker
             .initialize_cache(num_gpu_blocks, 0)
             .context("failed to initialize cache")?;
@@ -2195,7 +2265,8 @@ fn initialize_stack_multinode(
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                // The caller's ask, or (unset) this rank's resolved width.
+                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
@@ -2318,7 +2389,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         hf_token: config.hf_token.clone(),
         block_size: config.block_size,
         device_id: 0, // Each node has 1 GPU at device 0.
-        max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+        max_num_seqs: config.max_num_seqs,
         enforce_eager: config.enforce_eager,
         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
         cuda_graph_sizes: config
@@ -2380,6 +2451,24 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
     )
     .context("failed to allreduce memory")?;
 
+    // Step 5b: All-reduce the resolved width MIN too, and align locally from
+    // it — the leader takes the matching side BEFORE its `establish`/listener
+    // and aligns to the same number, so this ordering cannot deadlock. No
+    // AlignWidth broadcast follows: both sides hold the same allreduce answer.
+    let worker_width = worker.max_num_seqs_override();
+    let min_width = worker_width
+        .map(|w| {
+            scratchy_serving_transport::tcp_store::allreduce_min(
+                node_rank,
+                tp_size,
+                w,
+                &config.master_addr,
+                config.master_port,
+            )
+            .context("failed to allreduce max_num_seqs")
+        })
+        .transpose()?;
+
     info!(
         "Follower {}: available_memory={:.1} GB, min_across_ranks={:.1} GB",
         node_rank,
@@ -2398,9 +2487,14 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
     info!("Follower {}: TCP control channel established", node_rank);
 
     // Step 7: Wrap in UniProcExecutor and enter headless loop.
-    // The headless loop receives InitCache, Warmup, ExecuteModel, and Shutdown
-    // commands from the leader via TCP. NCCL collectives in the forward pass
-    // synchronize with the leader automatically.
+    // The headless loop receives InitCache, Warmup, ExecuteModel,
+    // and Shutdown commands from the leader via TCP. NCCL collectives in the
+    // forward pass synchronize with the leader automatically. `min_width` is
+    // the same number the leader all-reduced in its Step 8; align locally so
+    // this rank's pools and ladders build at it before InitCache arrives.
+    if let Some(w) = min_width {
+        worker.align_max_num_seqs(w);
+    }
     let executor = UniProcExecutor::new_pre_initialized(Box::new(worker));
 
     info!("Follower {}: entering headless loop", node_rank,);
@@ -2486,7 +2580,10 @@ fn initialize_stack_tp_pp(
                         hf_token: config.hf_token.clone(),
                         block_size: config.block_size,
                         device_id: global_rank as i32,
-                        max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                        // The request, not a resolved number: `None` lets
+                        // the worker resolve the width itself, `Some(n)` pins
+                        // worker-side consumers to the ask.
+                        max_num_seqs: config.max_num_seqs,
                         enforce_eager: config.enforce_eager,
                         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
                         cuda_graph_sizes: config
@@ -2657,6 +2754,13 @@ fn initialize_stack_tp_pp(
                 supports_hybrid_swa_kv = worker.supports_hybrid_swa_kv();
                 workers.push(Box::new(worker));
             }
+            // The narrowest rank's answer when the flag was unset; the
+            // caller's ask — already built into every rank — when it was
+            // not. Align every rank to it BEFORE initialize_cache / warmup
+            // so ladders and pools all build at one width. (Engine-level
+            // helpers — one implementation, tested there.)
+            let worker_max_num_seqs = min_max_num_seqs(&workers);
+            align_all_max_num_seqs(&mut workers);
 
             // num_gpu_blocks = min across ALL workers (matches Python).
             let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
@@ -2729,7 +2833,14 @@ fn initialize_stack_tp_pp(
             let engine_config = EngineCoreConfig {
                 scheduler_config: SchedulerConfig {
                     max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                    max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                    // The narrowest rank's answer when the flag was unset; the
+                    // caller's ask (already built into every rank's pools)
+                    // when it was not.
+                    max_num_seqs: resolve_max_num_seqs(
+                        config.max_num_seqs,
+                        worker_max_num_seqs,
+                        false,
+                    ),
                     policy: SchedulerPolicy::Fcfs,
                     enable_chunked_prefill: true,
                     async_scheduling: Some(use_async_scheduling),
@@ -2864,7 +2975,10 @@ fn initialize_stack_tp(
                 hf_token: config.hf_token.clone(),
                 block_size: config.block_size,
                 device_id: rank as i32,
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                // The request, not a resolved number: `None` lets the worker
+                // resolve the width itself, `Some(n)` pins worker-side
+                // consumers to the ask.
+                max_num_seqs: config.max_num_seqs,
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
@@ -3001,6 +3115,13 @@ fn initialize_stack_tp(
             supports_hybrid_swa_kv = worker.supports_hybrid_swa_kv();
             workers.push(Box::new(worker));
         }
+        // The narrowest rank's answer when the flag was unset (each rank
+        // clamps on its own memory query); the caller's ask — already built
+        // into every rank — when it was not. Align every rank to it BEFORE
+        // initialize_cache / warmup so ladders and pools all build at one
+        // width. (Engine-level helpers — one implementation, tested there.)
+        let worker_max_num_seqs = min_max_num_seqs(&workers);
+        align_all_max_num_seqs(&mut workers);
 
         let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
             min_avail,
@@ -3070,7 +3191,10 @@ fn initialize_stack_tp(
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                // The narrowest rank's answer when the flag was unset; the
+                // caller's ask (already built into every rank's pools)
+                // when it was not.
+                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
@@ -3302,7 +3426,10 @@ fn initialize_stack_external(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: local_rank as i32,
-            max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+            // The request, not a resolved number: `None` lets the worker
+            // resolve the width itself, `Some(n)` pins worker-side consumers
+            // to the ask.
+            max_num_seqs: config.max_num_seqs,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
             cuda_graph_sizes: config
@@ -3396,6 +3523,28 @@ fn initialize_stack_external(
         );
 
         let mut worker: Box<dyn Worker> = Box::new(worker);
+        // The width this rank resolved (unset flag → device tier / memory-
+        // affordable GDN slots) or the caller's ask. All-reduce MIN across
+        // every node's answer, then ALIGN this worker to it BEFORE
+        // initialize_cache / warmup — a rank that clamped lower than another
+        // must still build the same ladder shape the scheduler admits.
+        let min_worker_width = worker
+            .max_num_seqs_override()
+            .map(|w| {
+                scratchy_serving_transport::tcp_store::allreduce_min(
+                    rank,
+                    world_size,
+                    w,
+                    &master_addr,
+                    master_port,
+                )
+                .context("failed to allreduce max_num_seqs")
+            })
+            .transpose()?;
+        if let Some(w) = min_worker_width {
+            worker.align_max_num_seqs(w);
+        }
+        let worker_max_num_seqs = min_worker_width.or_else(|| worker.max_num_seqs_override());
         worker
             .initialize_cache(num_gpu_blocks, 0)
             .context("failed to initialize cache")?;
@@ -3438,7 +3587,10 @@ fn initialize_stack_external(
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, None, false),
+                // The narrowest rank's answer when the flag was unset; the
+                // caller's ask (already built into every rank's pools)
+                // when it was not.
+                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),

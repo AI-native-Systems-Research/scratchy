@@ -449,6 +449,29 @@ impl SliceTarget {
 }
 
 impl SamplerArena {
+    /// The arena's per-row byte cost — the term of `new`'s allocation that is
+    /// LINEAR in `max_rows`. The worker counts this BEFORE resolving an unset
+    /// `--max-num-seqs`, because the width it resolves sizes the very arena
+    /// allocated right after (`n·(vocab + 2·max_hist)·4` in the per-row
+    /// buffers, plus the slice-count terms that track `sliced_max(nrows)`).
+    /// Not an exact total (the fixed ~100-byte tables and the
+    /// sampler-telemetry buffers are excluded) — the rounding residue a
+    /// memory-affordable default needs to account for, nothing more.
+    pub fn bytes_per_row(vocab: u32, max_hist: u32) -> usize {
+        let n = 1usize; // per-row terms only
+        let h = max_hist.max(1) as usize;
+        // `mk(n * vocab * 4, "scratch")` + out/row_idx/reps/freqs/press (4·n)
+        // + out_ids + prompt_ids (2·n·h) + row_state (16·n).
+        n * (vocab as usize * 4 + 4 * 4 + 2 * h * 4 + 16 * 4)
+            // The sliced buffers scale with `sliced_max(nrows)` — the slice
+            // target while rows are interior, `nrows` once they alone fill
+            // the machine. Their per-row slope at small `n` is the slice
+            // target; count it so a width near the slice boundary cannot
+            // out-run the estimate. (partials 3 + counts 4 words + hist
+            // 256 words + staging 2 KiB, all × 4 B per slice.)
+            + (3 * 4 + 4 * 4 + 256 * 4 + 2 * 1024 * 4)
+    }
+
     /// Allocate + bind everything the sampler pipeline needs, once. Sizes are
     /// compile-time facts of the loaded config: the logits width `kernels`
     /// were baked for, `max_rows` from the worker's `max_num_seqs`, `max_hist`

@@ -6,6 +6,123 @@
 //! runtime nor the worker crate cycle through) so both backends can reach it
 //! without a dependency cycle.
 
+use scratchy_core_config::SchedulerConfig;
+
+/// The default `max_num_seqs` when no caller, backend, or device tier named one.
+///
+/// Mirrors Python vLLM `DEFAULT_MAX_NUM_SEQS`. A bare constant is only the
+/// LAST resort: a backend that knows its own batched-decode width answers
+/// first ([`Worker::max_num_seqs_override`]), and the device-tier table
+/// ([`SchedulerConfig::batch_defaults`]) answers before this on backends
+/// whose ladders track `max_num_seqs` (cuda/metal).
+///
+/// [`Worker::max_num_seqs_override`]: crate::worker::Worker::max_num_seqs_override
+pub const BASE_MAX_NUM_SEQS: usize = SchedulerConfig::DEFAULT_MAX_NUM_SEQS;
+
+/// The KV floor the OOM guard's flag hint reserves: at least this much of the
+/// device budget must stay spendable on KV, not per-sequence state. ONE home
+/// — both the load-time default resolver and the guard's refusal hint
+/// subtract it, so the default and the refusal can never disagree about
+/// what "affordable" means.
+pub const KV_FLOOR_BYTES: usize = 1 << 30;
+
+/// Everything the shared unset-`--max-num-seqs` resolver needs. A backend
+/// builds this at the END of `load_model` (weights resident, the model's
+/// GDN config answerable) and nothing else — the resolver is backend-neutral
+/// arithmetic, so metal and cuda can never drift into near-copies of each
+/// other again.
+#[derive(Debug, Clone)]
+pub struct MaxNumSeqsFacts {
+    /// Device total memory + name, when the backend can query them — feeds
+    /// the device-tier table (`SchedulerConfig::batch_defaults`). `None`
+    /// means "no tier answer" and resolves to the base constant: metal
+    /// reports nothing (its factory has no `device_total_bytes_and_name`),
+    /// so its default is the SAME 128 as before the memory-aware resolver
+    /// existed. Any tier bump is a separate, measured decision.
+    pub device_total_bytes: Option<u64>,
+    /// See [`Self::device_total_bytes`].
+    pub device_name: Option<String>,
+    /// The utilization-governed budget (`total × gpu_memory_utilization`).
+    /// `None` = "no budget to clamp against" (a caller that only wants the
+    /// TIER half of the resolution) — the tier answer then survives as-is.
+    pub device_budget_bytes: Option<usize>,
+    /// What this process already holds at the end of `load_model` (metal:
+    /// `currentAllocatedSize`; cuda: `total − free` from `mem_get_info`).
+    pub allocated_bytes: usize,
+    /// Peak activation estimate the OOM guard's flag-hint path uses — the
+    /// prefill-bucket arena (or full-ladder peak), rung scratch, and the
+    /// 64 MiB runtime/staging pad. Does NOT include the 150 MiB redundancy
+    /// buffer or the per-row terms below; the resolver adds those.
+    pub peak_activation_bytes: usize,
+    /// The GDN state pool's cost of ONE slot (`reserve_bytes(_, 1, ..)` —
+    /// the reservation is linear in `num_slots`). `None` = non-hybrid arch.
+    pub gdn_per_slot_bytes: Option<usize>,
+    /// The sampler arena's cost per row — the resolver sizes the arena it
+    /// itself triggers (`n·(vocab + 2·max_hist)·4` plus the sliced buffers'
+    /// terms). 0 when the backend keeps no per-row sampler arena.
+    pub sampler_bytes_per_row: usize,
+}
+
+impl MaxNumSeqsFacts {
+    /// The 150 MiB redundancy buffer `compute_available_kv_bytes` subtracts
+    /// alongside weights and activations — the resolver budgets the same
+    /// term so an unset default leaves the same KV the formula would.
+    const REDUNDANCY_BYTES: usize = 150 * 1024 * 1024;
+
+    /// The largest width whose per-sequence + fixed costs still leave the KV
+    /// floor: `budget − allocated − activations − 150 MiB pad −
+    /// n·(gdn_per_slot + sampler_row) ≥ KV_FLOOR_BYTES`. Floored at 1 — a
+    /// slot count of 0 cannot be built (`GdnStatePool::new` requires
+    /// `num_slots >= 1`) and a model always serves at least one sequence.
+    fn affordable_width(&self) -> usize {
+        // No budget = nothing to clamp against — clamping a tier on absent
+        // facts would be a silent width cut, not a memory decision.
+        let Some(budget) = self.device_budget_bytes else {
+            return usize::MAX;
+        };
+        let per_row = self
+            .gdn_per_slot_bytes
+            .unwrap_or(0)
+            .saturating_add(self.sampler_bytes_per_row);
+        let fixed = self
+            .allocated_bytes
+            .saturating_add(self.peak_activation_bytes)
+            .saturating_add(Self::REDUNDANCY_BYTES);
+        let slot_budget = budget.saturating_sub(fixed).saturating_sub(KV_FLOOR_BYTES);
+        (slot_budget / per_row.max(1)).max(1)
+    }
+}
+
+/// Resolve an UNSET `--max-num-seqs` from device memory + per-sequence state
+/// needs. The tier answer (`SchedulerConfig::batch_defaults` when the
+/// backend reports device facts, else the base constant) clamped to
+/// [`MaxNumSeqsFacts::affordable_width`] — the same terms the OOM guard's
+/// flag hint uses, so the default a bare `scr serve` runs at never trips the
+/// guard it is sized against.
+///
+/// `is_offline` selects the LLM/throughput vs online-server tier context.
+/// An explicit ask NEVER comes through here: the worker honours it verbatim
+/// and the guard refuses an unaffordable one (capping-is-not-validating).
+pub fn resolve_default_max_num_seqs(facts: &MaxNumSeqsFacts, is_offline: bool) -> usize {
+    let tier = match facts.device_total_bytes {
+        // The name only downgrades a ≥70 GiB A100 back to the small tier
+        // (large batched-token budgets regress it — Python vLLM PR #17885);
+        // a backend that reports no name (metal) can never be an A100, so
+        // `unwrap_or("")` keeps the tier decision intact.
+        Some(total) => {
+            SchedulerConfig::batch_defaults(
+                total,
+                facts.device_name.as_deref().unwrap_or(""),
+                is_offline,
+            )
+            .1
+        }
+        None => BASE_MAX_NUM_SEQS,
+    };
+    let affordable = facts.affordable_width();
+    if affordable < tier { affordable } else { tier }
+}
+
 /// Compute KV cache budget matching Python vLLM's formula exactly:
 ///   requested = total_memory * gpu_memory_utilization
 ///   non_kv_cache = weights_and_overhead + peak_activations + 150 MiB
@@ -95,6 +212,155 @@ pub fn gdn_slot_key(req_id: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     req_id.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod max_num_seqs_default_tests {
+    use super::{BASE_MAX_NUM_SEQS, KV_FLOOR_BYTES, MaxNumSeqsFacts, resolve_default_max_num_seqs};
+
+    const GIB_U64: u64 = 1024 * 1024 * 1024;
+    const GIB: usize = 1024 * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+
+    /// The roomy baseline: every per-sequence and fixed term comfortably
+    /// covered, so the tier answer survives untouched. Metal-shaped (no
+    /// device facts → the base constant, SAME 128 as before the resolver).
+    fn roomy(over: impl FnOnce(&mut MaxNumSeqsFacts)) -> MaxNumSeqsFacts {
+        let mut f = MaxNumSeqsFacts {
+            device_total_bytes: None,
+            device_name: None,
+            device_budget_bytes: Some(24 * GIB),
+            allocated_bytes: 4 * GIB,
+            peak_activation_bytes: 512 * MIB,
+            gdn_per_slot_bytes: Some(19 * MIB),
+            sampler_bytes_per_row: 8 * MIB,
+        };
+        over(&mut f);
+        f
+    }
+
+    /// The criterion the resolver must satisfy at a clamped width, checked
+    /// against the RESOLVED number rather than a recomputation of the
+    /// division: every fixed + per-row cost the facts name, PLUS the KV
+    /// floor, fits inside the budget — i.e. a default never trips the OOM
+    /// guard it is sized against.
+    fn kv_left(f: &MaxNumSeqsFacts, width: usize) -> i64 {
+        let per_row = f.gdn_per_slot_bytes.unwrap_or(0) + f.sampler_bytes_per_row;
+        let fixed = f.allocated_bytes + f.peak_activation_bytes + MaxNumSeqsFacts::REDUNDANCY_BYTES;
+        f.device_budget_bytes.unwrap_or(0) as i64 - fixed as i64 - (per_row * width) as i64
+    }
+
+    /// A starved box (budget below every fixed term) still serves one
+    /// sequence — the resolver floors at 1, never 0.
+    #[test]
+    fn a_starved_box_still_serves_one_sequence() {
+        let starved = roomy(|f| {
+            f.device_budget_bytes = Some(512 * MIB);
+            f.allocated_bytes = 0;
+        });
+        assert_eq!(resolve_default_max_num_seqs(&starved, false), 1);
+    }
+
+    #[test]
+    fn unqueryable_device_falls_back_to_the_base_constant() {
+        assert_eq!(
+            resolve_default_max_num_seqs(&roomy(|_| {}), false),
+            BASE_MAX_NUM_SEQS
+        );
+        assert_eq!(
+            resolve_default_max_num_seqs(&roomy(|_| {}), true),
+            BASE_MAX_NUM_SEQS
+        );
+    }
+
+    #[test]
+    fn small_gpu_tier_defaults_to_256_and_a_large_one_to_1024() {
+        assert_eq!(
+            resolve_default_max_num_seqs(
+                &roomy(|f| {
+                    f.device_total_bytes = Some(24 * GIB_U64);
+                    f.device_name = Some("NVIDIA L4".into());
+                }),
+                true
+            ),
+            256
+        );
+        assert_eq!(
+            resolve_default_max_num_seqs(
+                &roomy(|f| {
+                    f.device_total_bytes = Some(80 * GIB_U64);
+                    f.device_name = Some("NVIDIA H100 80GB HBM3".into());
+                    // An 80 GiB card's facts: a 72 GiB budget with the same
+                    // per-row and overhead terms comfortably covers 1024
+                    // rows, so the tier answer survives.
+                    f.device_budget_bytes = Some(72 * GIB);
+                }),
+                true
+            ),
+            1024
+        );
+    }
+
+    /// The Qwen3.5-MoE-35B "!!!!" incident as an arithmetic test: ~61 MiB per
+    /// slot on a box whose headroom after weights + activations + pads is
+    /// ~2 GiB must NOT answer the base 128 (7.9 GiB of f32 state) — it
+    /// answers what fits above the 1 GiB KV floor.
+    #[test]
+    fn the_incident_box_answers_the_affordable_count_not_the_default() {
+        let f = roomy(|f| {
+            f.device_budget_bytes = Some(5 * GIB);
+            f.allocated_bytes = 2 * GIB;
+            f.peak_activation_bytes = 300 * MIB;
+            f.gdn_per_slot_bytes = Some(61 * MIB);
+            f.sampler_bytes_per_row = 0;
+        });
+        let w = resolve_default_max_num_seqs(&f, false);
+        assert!(w < BASE_MAX_NUM_SEQS, "128 was the incident, got {w}");
+        assert!(w >= 16, "2 GiB minus floors buys ~17 slots, got {w}");
+        // The criterion, not the recomputation: the KV left at the resolved
+        // width is ≥ the floor; one more row would breach it.
+        assert!(kv_left(&f, w) >= KV_FLOOR_BYTES as i64);
+        assert!(kv_left(&f, w + 1) < KV_FLOOR_BYTES as i64);
+    }
+
+    /// The clamp must count the SAMPLER ARENA row too — the width sizes the
+    /// very arena allocated right after resolution (audit point 2: the old
+    /// clamp "leaves out the sampler arena it sizes itself").
+    #[test]
+    fn the_sampler_row_counts_against_the_width() {
+        let base = |sampler_row: usize| {
+            roomy(|f| {
+                f.device_budget_bytes = Some(6 * GIB);
+                f.allocated_bytes = 2 * GIB;
+                f.peak_activation_bytes = 300 * MIB;
+                f.gdn_per_slot_bytes = None;
+                f.sampler_bytes_per_row = sampler_row;
+            })
+        };
+        let bare = resolve_default_max_num_seqs(&base(0), false);
+        let with_arena = resolve_default_max_num_seqs(&base(32 * MIB), false);
+        assert!(
+            with_arena < bare,
+            "a per-row arena cost must shrink the width: {with_arena} vs {bare}"
+        );
+        let f = base(32 * MIB);
+        assert!(kv_left(&f, with_arena) >= KV_FLOOR_BYTES as i64);
+    }
+
+    #[test]
+    fn a_roomy_box_is_not_clamped() {
+        // 60 GiB of headroom at 61 MiB/slot affords ~970 slots — more than
+        // any tier default, so the caller keeps the default number.
+        let w = resolve_default_max_num_seqs(
+            &roomy(|f| {
+                f.device_budget_bytes = Some(64 * GIB);
+                f.allocated_bytes = 4 * GIB;
+                f.gdn_per_slot_bytes = Some(61 * MIB);
+            }),
+            false,
+        );
+        assert_eq!(w, BASE_MAX_NUM_SEQS);
+    }
 }
 
 #[cfg(test)]

@@ -235,6 +235,16 @@ pub struct MetalWorker {
     /// forward never exceeds the largest resident (pruned) bucket. `None` until
     /// `determine_available_memory` runs / on arches without a cost table.
     metal_prefill_bucket_max_m: Option<u32>,
+    /// ⭐⭐⭐ THE RESOLVED `max_num_seqs` — the width every worker-side
+    /// consumer actually builds at (GDN state pool slots, sampler-arena
+    /// rows, spec-decode chain bounds). Set at the END of `load_model` by
+    /// [`MetalWorker::resolve_max_num_seqs`]: the caller's explicit ask, or
+    /// (unset) the device tier clamped to what this device's memory affords
+    /// where the model carries per-sequence GDN state. Reported to the
+    /// engine via [`Worker::max_num_seqs_override`] so the scheduler admits
+    /// exactly this many — one process, one number. `None` until
+    /// `load_model` resolves it.
+    resolved_max_num_seqs: Option<usize>,
     /// Loaded scratchy-forward-compiler weights — `Box<dyn ScratchyWeights>`
     /// dispatched through `try_load`. The trait `forward` body
     /// collapses to the per-canonical metal `forward` fn under
@@ -741,9 +751,12 @@ pub use scratchy_serving_engine::gpu_budget::{
 // MetalWorker under metal. Step 3 fills those bodies in via the
 // per-arch `metal_pool()` factory + `MetalWorkerPool::forward`.
 
-// `gdn_slot_key` is backend-neutral; it lives in `scratchy-serving-engine`
-// (cycle-free for both the CUDA and Metal workers) and is re-exported here.
-pub use scratchy_serving_engine::gpu_budget::gdn_slot_key;
+// `gdn_slot_key` and the shared unset-`--max-num-seqs` resolver are
+// backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
+// both the CUDA and Metal workers) and are re-exported here.
+#[cfg(feature = "metal")]
+use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
+pub use scratchy_serving_engine::gpu_budget::{gdn_slot_key, resolve_default_max_num_seqs};
 
 #[cfg(feature = "metal")]
 impl MetalWorker {
@@ -776,6 +789,7 @@ impl MetalWorker {
             gpu_device: None,
             #[cfg(feature = "metal")]
             metal_prefill_bucket_max_m: None,
+            resolved_max_num_seqs: None,
             model: None,
             #[cfg(feature = "vision")]
             mm: None,
@@ -899,6 +913,208 @@ impl MetalWorker {
             .max(1)
     }
 
+    /// ⭐⭐⭐ THE UNSET `--max-num-seqs` ANSWER — called at the END of `load_model`,
+    /// after weights are resident and `model.gdn_runtime_config()` is answerable, and BEFORE every
+    /// consumer of the width (the sampler arena below, the GDN state pool + slot allocator in
+    /// `initialize_cache`, the spec-decode chain bounds).
+    ///
+    /// * `Some(n)` (the caller asked): `n`, verbatim. An ask the device cannot afford is the OOM
+    ///   guard's to refuse loudly at `determine_available_memory` — never silently replaced here
+    ///   (capping-is-not-validating).
+    /// * `None` (nobody asked): the shared backend-neutral resolver
+    ///   ([`resolve_default_max_num_seqs`]) — the base 128 (metal reports no
+    ///   device facts, so no tier answer; any tier bump is a separate,
+    ///   measured decision) clamped to what this device's budget affords,
+    ///   counting EVERY term the OOM guard counts: allocated weights, the
+    ///   peak-activation estimate (bucket arena + rung scratch + 64 MiB),
+    ///   the 150 MiB redundancy pad, the GDN per-slot bytes, AND the sampler
+    ///   arena's per-row bytes — the width sizes the very arena allocated
+    ///   right after this resolves. The clamp leaves the same
+    ///   [`scratchy_serving_engine::gpu_budget::KV_FLOOR_BYTES`] the guard's
+    ///   flag hint reserves, so a default never trips the guard it is sized
+    ///   against (the Qwen3.5-MoE-35B "!!!!" incident: on main the base 128
+    ///   × 61 MiB = 7.9 GiB of f32 recurrent state REFUSED loudly on a
+    ///   squeezed box; the default now answers an affordable width and runs).
+    ///
+    /// The resolved value lands in [`Self::resolved_max_num_seqs`] and is reported through
+    /// [`Worker::max_num_seqs_override`] so the scheduler admits exactly the width the pools were
+    /// built at. (Unlike `WorkerCreateConfig::max_num_seqs`, `self.config` keeps the REQUEST: the
+    /// OOM guard's "pass --max-num-seqs N" hint must speak about what the CALLER asked, not the
+    /// default this method substituted.)
+    fn resolve_max_num_seqs(
+        &mut self,
+        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        gpu_device: &scratchy_target_metal::GpuDevice,
+    ) -> ExecutorResult<()> {
+        if self.resolved_max_num_seqs.is_some() {
+            return Ok(());
+        }
+        let resolved = match self.config.max_num_seqs {
+            Some(asked) => asked,
+            None => {
+                // Facts for the shared resolver — everything the guard's
+                // arithmetic names, gathered here so the resolver stays
+                // backend-neutral arithmetic (no near-copy can grow in any
+                // target crate).
+                let gdn_per_slot = model.gdn_runtime_config().map(|cfg| {
+                    GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
+                        cfg.num_linear_layers(),
+                        1,
+                        cfg.conv_dim as usize,
+                        cfg.conv_kernel as usize,
+                        cfg.num_v_heads as usize,
+                        cfg.head_v_dim as usize,
+                        cfg.head_k_dim as usize,
+                    )
+                });
+                let (budget, allocated) = self
+                    .metal_device
+                    .as_ref()
+                    .map(|dev| {
+                        (
+                            (dev.device.recommendedMaxWorkingSetSize() as f64
+                                * self.config.gpu_memory_utilization)
+                                as usize,
+                            dev.device.currentAllocatedSize(),
+                        )
+                    })
+                    // No device = no budget to clamp against: the base
+                    // constant survives as-is (the OOM guard still refuses
+                    // an unaffordable pool at determine_available_memory).
+                    .map(|(b, a)| (Some(b), a))
+                    .unwrap_or((None, 0));
+                // The ONE peak-activation estimate this worker has (see
+                // `metal_peak_activation_estimate`) — already draft-doubled
+                // and rung-summed; the resolver and the OOM guard share it.
+                // The target is still a local here, not `self.model` (see
+                // the helper's parameter doc).
+                let peak = self.metal_peak_activation_estimate(Some(model), Some(gpu_device))?;
+                // The sampler arena allocated right AFTER this resolves is
+                // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
+                // the sliced buffers' terms — count its per-row cost so the
+                // default accounts for what it triggers.
+                let max_model_len = self
+                    .config
+                    .max_model_len
+                    .or_else(|| {
+                        self.hf_config
+                            .as_ref()
+                            .and_then(|c| c.max_position_embeddings())
+                    })
+                    .unwrap_or(4096);
+                let sampler_row = scratchy_target_metal::sampling::SamplerArena::bytes_per_row(
+                    u32::try_from(model.vocab_size()).unwrap_or(u32::MAX),
+                    u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
+                );
+                let facts = MaxNumSeqsFacts {
+                    // Metal reports no device facts — the base constant, the
+                    // SAME default as before the resolver existed.
+                    device_total_bytes: None,
+                    device_name: None,
+                    device_budget_bytes: budget,
+                    allocated_bytes: allocated,
+                    peak_activation_bytes: peak,
+                    gdn_per_slot_bytes: gdn_per_slot,
+                    sampler_bytes_per_row: sampler_row,
+                };
+                resolve_default_max_num_seqs(&facts, false)
+            }
+        };
+        info!(
+            "ScratchyWorker(metal): max_num_seqs = {resolved} ({}; pass \
+             --max-num-seqs to override)",
+            if self.config.max_num_seqs.is_some() {
+                "requested"
+            } else {
+                "default"
+            }
+        );
+        self.resolved_max_num_seqs = Some(resolved);
+        Ok(())
+    }
+
+    /// The peak-activation estimate BOTH the unset-`--max-num-seqs` resolver
+    /// (at the end of `load_model`) and the OOM guard
+    /// (`determine_available_memory`) budget against — ONE record of the
+    /// fact: the prefill-bucket arena the budget can afford (the full-ladder
+    /// peak when the model emits no cost table; doubled when a draft model
+    /// rides along), plus the KV cap rung's scratch for EVERY loaded model
+    /// (target + draft), and the 64 MiB runtime/staging pad.
+    fn metal_peak_activation_estimate(
+        &self,
+        // `load_model` runs this BEFORE `self.model`/`self.gpu_device` take
+        // the loaded target (width consumers sit between the two), so the
+        // caller hands the just-loaded pair in — `determine_available_memory`
+        // (after field assignment) passes `None` and the fields serve.
+        model: Option<&dyn scratchy_forward_compiler::ScratchyWeights>,
+        gpu_device: Option<&scratchy_target_metal::GpuDevice>,
+    ) -> ExecutorResult<usize> {
+        let model = model
+            .or(self.model.as_deref())
+            .ok_or_else(|| ExecutorError::WorkerInit("peak estimate: model not loaded".into()))?;
+        let total = self
+            .metal_device
+            .as_ref()
+            .map(|dev| {
+                (dev.device.recommendedMaxWorkingSetSize() as f64
+                    * self.config.gpu_memory_utilization) as usize
+            })
+            .unwrap_or(0);
+        let weights_and_overhead = self
+            .metal_device
+            .as_ref()
+            .map(|dev| dev.device.currentAllocatedSize())
+            .unwrap_or(0);
+        let bucket_costs = model.metal_bucket_arena_costs();
+        let arena_peak = if bucket_costs.is_empty() {
+            model.metal_arena_peak_bytes() as usize
+        } else {
+            // The same 0.6 arena-fraction split `determine_available_memory`
+            // runs; the pad mirrors the non-arena terms the KV formula
+            // subtracts so the headroom here equals what is actually left.
+            const ARENA_FRACTION: f64 = 0.6;
+            let pad = (64 + 150) * 1024 * 1024usize;
+            let fixed = weights_and_overhead.saturating_add(pad);
+            let sel =
+                select_prefill_bucket(total as u64, fixed as u64, bucket_costs, ARENA_FRACTION);
+            sel.arena_bytes as usize
+        };
+        // When a draft model is loaded we also need an activation arena for
+        // it: the target's prefill (M >> 1) arena is the worst case across
+        // the pair — use it for both as a safe upper bound.
+        let arena_peak_pair = if self.draft_model.is_some() {
+            arena_peak.saturating_mul(2)
+        } else {
+            arena_peak
+        };
+        // The KV cap rung's scratch for EVERY loaded model (target + draft),
+        // at the largest capacity a sequence can reach.
+        let full_cap = self.kv_block_cap(usize::MAX);
+        // `model` (the caller's or the field's) IS the target here — the
+        // field variant would be `None` mid-`load_model`.
+        let models = [Some(model), self.draft_model.as_deref()];
+        // in mid-`load_model`. Late callers (guard, draft KV) reach the
+        // field themselves; the Option here is only for the load path.
+        let dev = gpu_device.or(self.gpu_device.as_ref()).ok_or_else(|| {
+            ExecutorError::WorkerInit("peak estimate: gpu_device not initialized".into())
+        })?;
+        let rung_scratch = (models.into_iter().flatten())
+            .map(|m| {
+                self.metal_rung(m, full_cap, dev)
+                    .map(|(_, scratch)| scratch)
+            })
+            .sum::<ExecutorResult<u64>>()?;
+        Ok((arena_peak_pair.saturating_add(64 * 1024 * 1024))
+            .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX)))
+    }
+
+    /// The resolved width, floored at 1. Every consumer of the width calls
+    /// this — never `self.config.max_num_seqs`, which keeps the REQUEST so
+    /// error messages can speak about what the caller asked.
+    fn max_num_seqs_resolved(&self) -> usize {
+        self.resolved_max_num_seqs.unwrap_or(1).max(1)
+    }
+
     /// The KV cap rung `model`'s pool runs on for a capacity of `block_cap` blocks per sequence,
     /// on this worker's device and workload (`MetalRungs::pick`): `(cap, scratch bytes)`. The cap
     /// is the KV pool's block-table width; the scratch counts in the memory budget.
@@ -906,9 +1122,8 @@ impl MetalWorker {
         &self,
         model: &dyn scratchy_forward_compiler::ScratchyWeights,
         block_cap: usize,
+        dev: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<(usize, u64)> {
-        let dev = (self.gpu_device.as_ref())
-            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
         let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs());
         let (max_m, addressing) = (dev.metal_bucket_max_m, dev.kv_addressing);
         let pick = |r: &scratchy_target_metal::interpreter::metal::MetalRungs| {
@@ -1344,12 +1559,12 @@ impl MetalWorker {
         let draft_blocks = num_gpu_blocks;
         // The draft pool's block-table width: the draft model's KV cap rung for the target's
         // max_model_len, capped at the draft block count.
-        let (draft_block_cap, _) =
-            self.metal_rung(model.as_ref(), self.kv_block_cap(draft_blocks))?;
-        let device = self
+        let draft_dev = self
             .gpu_device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
+        let (draft_block_cap, _) =
+            self.metal_rung(model.as_ref(), self.kv_block_cap(draft_blocks), draft_dev)?;
 
         let cache_dtype = match model.metal_dtype() {
             scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => GpuDType::BF16,
@@ -1361,8 +1576,8 @@ impl MetalWorker {
             }
         };
 
-        let mtl_device = device.device.clone();
-        let residency = device.allocator.residency().clone();
+        let mtl_device = draft_dev.device.clone();
+        let residency = draft_dev.allocator.residency().clone();
 
         let t_pool = std::time::Instant::now();
         let blocks_per_chunk = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
@@ -2714,6 +2929,32 @@ impl Worker for MetalWorker {
         self.metal_prefill_bucket_max_m
     }
 
+    fn max_num_seqs_override(&self) -> Option<usize> {
+        // The width this worker resolved (caller's ask, or the memory-
+        // affordable default) and built every pool at. Reported so the
+        // scheduler admits exactly this many — one process, one number —
+        // including when the flag was UNSET and the worker answered it
+        // itself. `None` before `load_model`.
+        self.resolved_max_num_seqs
+    }
+
+    fn align_max_num_seqs(&mut self, width: usize) {
+        // DOWNWARD only, and only when the flag was unset: ranks each clamp
+        // on their own `currentAllocatedSize`, so the engine hands back the
+        // narrowest width and every rank builds its pools/arenas at it. An
+        // explicit ask is identical on every rank and never re-clamped.
+        if self.config.max_num_seqs.is_none()
+            && let Some(r) = self.resolved_max_num_seqs.as_mut()
+            && *r > width
+        {
+            info!(
+                "ScratchyWorker(metal): aligning max_num_seqs {} → {width} (narrowest rank)",
+                *r
+            );
+            *r = width;
+        }
+    }
+
     fn kv_max_addressable_tokens(&self) -> Option<usize> {
         // Hybrid SWA arches (gemma4): the sliding KV groups use the base
         // (smallest) block size, and every group's block table is baked at the
@@ -2862,6 +3103,10 @@ impl Worker for MetalWorker {
             model.arch_name()
         );
 
+        // Resolve `max_num_seqs` NOW — after the model's GDN config is
+        // answerable and weights are resident, before every consumer of the
+        // width (sampler arena below, GDN state pool in `initialize_cache`,
+        // spec-decode chain bounds).
         // Probe for a sibling `MultimodalForward` (vision tower) — same
         // arch filter as the text `try_load` above. Returns `Ok(None)`
         // for text-only arches and MM arches whose checkpoint has no
@@ -2887,6 +3132,16 @@ impl Worker for MetalWorker {
                 arch
             );
         }
+
+        // Resolve `max_num_seqs` NOW — AFTER the vision-tower probe above
+        // (its weights are then resident and counted in
+        // `currentAllocatedSize`, so a VL model cannot eat into the KV
+        // floor the resolver reserves) and BEFORE every consumer of the
+        // width (sampler arena below, GDN state pool in
+        // `initialize_cache`, spec-decode chain bounds). The target and the
+        // `gpu_device` it needs for rung picking are still locals here
+        // (fields assigned at the end of load_model) — pass them in.
+        self.resolve_max_num_seqs(model.as_ref(), &gpu_device)?;
 
         {
             use std::sync::atomic::Ordering;
@@ -2962,15 +3217,16 @@ impl Worker for MetalWorker {
         );
 
         // The sampler's persistent arena: every buffer + argument table,
-        // sized by the compile-time facts of this config (vocab, max_num_seqs
-        // rows, max_model_len history bound) and pinned into the allocator's
-        // residency set so every forward command buffer sees it resident.
-        // Per-step sampler work is then a pure host memcpy (`prepare_step`).
+        // sized by the compile-time facts of this config (vocab, resolved
+        // max_num_seqs rows, max_model_len history bound) and pinned into the
+        // allocator's residency set so every forward command buffer sees it
+        // resident. Per-step sampler work is then a pure host memcpy
+        // (`prepare_step`).
         let t_arena = std::time::Instant::now();
         let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
             &gpu_device.device,
             gpu_device.allocator.residency(),
-            self.config.max_num_seqs.max(1) as u32,
+            self.resolved_max_num_seqs.unwrap_or(1).max(1) as u32,
             &sampler,
             max_model_len.max(1) as u32,
         );
@@ -3107,7 +3363,7 @@ impl Worker for MetalWorker {
         // allocated). Stored on the pool; the host block-table stride (execute_model) reads it
         // back, and the pool's tapes are baked for it.
         let (pool_block_cap, _) =
-            self.metal_rung(model.as_ref(), self.kv_block_cap(num_gpu_blocks))?;
+            self.metal_rung(model.as_ref(), self.kv_block_cap(num_gpu_blocks), device)?;
         info!(
             "ScratchyWorker(metal): KV block-table capacity (max_blocks_per_seq) = {pool_block_cap} \
              (max_model_len-derived, pool {num_gpu_blocks} blocks × {} tokens/block)",
@@ -3336,7 +3592,7 @@ impl Worker for MetalWorker {
         // (`max_num_seqs`), matching the scheduler's `max_num_running_reqs`
         // so the slot allocator never exhausts.
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
-            let num_slots = self.config.max_num_seqs.max(1);
+            let num_slots = self.max_num_seqs_resolved();
             let num_layers = model.num_hidden_layers() as usize;
             let t_gdn = std::time::Instant::now();
             let gdn_pool = unsafe {
@@ -3445,7 +3701,7 @@ impl Worker for MetalWorker {
             .map(|cfg| {
                 scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
-                    self.config.max_num_seqs.max(1),
+                    self.max_num_seqs_resolved(),
                     cfg.conv_dim as usize,
                     cfg.conv_kernel as usize,
                     cfg.num_v_heads as usize,
@@ -3530,11 +3786,21 @@ impl Worker for MetalWorker {
         // rung whose scratch does not fit is refused here (the guard below), not at allocation.
         let full_cap = self.kv_block_cap(usize::MAX);
         let models = [self.model.as_deref(), self.draft_model.as_deref()];
+        let guard_dev = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
         let rung_scratch = (models.into_iter().flatten())
-            .map(|m| self.metal_rung(m, full_cap).map(|(_, scratch)| scratch))
+            .map(|m| {
+                self.metal_rung(m, full_cap, guard_dev)
+                    .map(|(_, scratch)| scratch)
+            })
             .sum::<ExecutorResult<u64>>()?;
-        let peak_activation_estimate = (arena_peak_pair.saturating_add(64 * 1024 * 1024))
-            .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX));
+        // ONE record of the peak-activation estimate:
+        // `metal_peak_activation_estimate` — the same helper the unset-
+        // `--max-num-seqs` resolver budgets against at load. (The
+        // arena/rung intermediates above stay only to feed the log line.)
+        let peak_activation_estimate = self.metal_peak_activation_estimate(None, None)?;
         // `total` already folds in `gpu_memory_utilization` and is capped at
         // the wireable `maxBufferLength`, so pass util=1.0 here — applying it
         // again would shrink the KV budget a second time below the headroom
@@ -3616,20 +3882,34 @@ impl Worker for MetalWorker {
             // entire macOS 26.5.1 "!!!!" incident; 8 slots = 0.5 GiB and
             // the model runs with 2.5 GiB of KV.
             let flag_hint = if gdn_reserve > 0 {
-                let per_slot = gdn_reserve / self.config.max_num_seqs.max(1);
+                // The pool is sized by the RESOLVED width (the caller's ask,
+                // or the memory-affordable default an unset flag resolved
+                // to). An unset flag was clamped at load by the SAME
+                // resolver arithmetic this hint uses (shared
+                // `KV_FLOOR_BYTES`, shared terms); if a trip here disagrees
+                // anyway, speak about "the default", not a flag nobody
+                // passed. (self.config keeps the REQUEST, so it knows.)
+                let slots = self.max_num_seqs_resolved();
+                let per_slot = gdn_reserve / slots;
                 let base = weights_and_overhead
                     .saturating_sub(gdn_reserve)
                     .saturating_add(peak_activation_estimate);
-                // Leave at least 1 GiB for KV after the pool.
-                let headroom = total.saturating_sub(base).saturating_sub(1 << 30);
+                // The SAME KV floor the load-time resolver subtracts — one
+                // home (`gpu_budget::KV_FLOOR_BYTES`), never re-derived.
+                let headroom = total
+                    .saturating_sub(base)
+                    .saturating_sub(scratchy_serving_engine::gpu_budget::KV_FLOOR_BYTES);
                 let affordable = (headroom / per_slot.max(1)).max(1);
-                if affordable < self.config.max_num_seqs {
+                if affordable < slots {
+                    let sized_by = match self.config.max_num_seqs {
+                        Some(_) => format!("--max-num-seqs={slots}"),
+                        None => format!("the default max_num_seqs={slots}"),
+                    };
                     format!(
                         " The GDN state pool ({:.2} GiB) is sized by \
-                         --max-num-seqs={}; pass --max-num-seqs {} (or fewer) \
+                         {sized_by}; pass --max-num-seqs {} (or fewer) \
                          to fit this model on this device.",
                         gdn_reserve as f64 / 1_073_741_824.0,
-                        self.config.max_num_seqs,
                         affordable.min(64),
                     )
                 } else {
