@@ -164,7 +164,9 @@ pub fn wave_order(
                 }
             }
         }
-        after[i].retain(|&(c, _)| c != command[i]);
+        // An absorbed step runs inside its driver's command: what it waits on there (a KV writer's
+        // encode reading back the rows the writer wrote) is no wait.
+        after[i].retain(|&(c, _)| c != command[i] && c != command[reads_in[i]]);
     }
     // `wave_levels` over commands: a command waits on every command any member waits on. A
     // command's members can follow an op reading another member in tape order, so the levels are
@@ -397,5 +399,22 @@ mod tests {
         assert_eq!(tiles(&w), [0, 1, 2, 3]);
         // The pair follows its ops.
         assert_eq!(w.unnamed_reads, [(1, 2)]);
+    }
+
+    #[test]
+    fn a_step_absorbed_into_what_it_reads_back_runs_inside_it() {
+        use InputRef::{Ext, Op};
+        // A KV writer 1 whose encode 2 reads back the rows it wrote (a read no operand names) and
+        // folds into it; the attention 3 reads the writer.
+        let mut l = decode(vec![
+            mul(vec![Ext(0)]),
+            mul(vec![Op(0)]),
+            mul(vec![Ext(0)]),
+            mul(vec![Op(1)]),
+        ]);
+        l.unnamed_reads = vec![(1, 2)];
+        let free = [false, false, true, false];
+        let w = wave_order(&l, |_| ColourRule::FRESH, &[(2, 1)], &[], &free);
+        assert_eq!(tiles(&w), [0, 2, 1, 3]);
     }
 }
