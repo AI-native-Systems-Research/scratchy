@@ -41,6 +41,7 @@ use scratchy_subtile::handoff::WeightKind;
 fn attention_blocks_per_chunk(chunked: bool) -> u32 {
     if chunked { crate::BLOCKS_PER_CHUNK } else { 0 }
 }
+use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS,
     W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
@@ -956,28 +957,100 @@ fn route_small_m(
         .collect())
 }
 
-/// A GDN layer's commands by the step they serve — the runtime-gate twin pattern
-/// `route_small_m` runs for the small-M GEMM. A decode step (every sequence one token) runs the
-/// one-command decode (`gdn_decode`) where `lower_one` emitted one ahead of the conv, scan and
-/// norm: it under `OnlyIfDecodeStep`, they under `UnlessDecodeStep`. On the steps they serve, a
-/// geometry the block-staged pipelined scan covers (`gdn_scan_pipelined`: head_k 128 — 8 lanes
-/// own 16 state channels each in four float4 granules — and head_v a multiple of 16) runs it in
-/// place of the simd scan, with the SAME bindings and its own dispatch (grid (value_dim/16, 1, 1)
-/// scaled by num_seqs on Z, threads (128,1,1)); with no decode command, the simd scan stays
-/// under `OnlyIfDecodeStep` as its twin. The norm that follows reads the scan's `o` scratch, so
-/// the scan sits between the two.
-fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
+/// What a bake knows of every step it runs, as a GDN layer's commands ask it: a one-row
+/// bucket's every step is a decode step, and a model without drafts has only plain GDN steps
+/// (`GdnStep::is_plain`) — only a verify step records, and only the step after one replays.
+#[derive(Clone, Copy)]
+struct GdnStepsKnown {
+    decode: Option<bool>,
+    plain: Option<bool>,
+}
+
+impl GdnStepsKnown {
+    fn at(p: &MetalModelConsts, bucket_m: u32) -> Self {
+        Self {
+            decode: (bucket_m == 1).then_some(true),
+            plain: (p.spec_drafts == 0).then_some(true),
+        }
+    }
+
+    /// How a command that runs on the steps `runs(decode, plain)` accepts runs at this bake: on
+    /// every step, under the gate on what the bake does not know, or not at all.
+    fn run(self, runs: impl Fn(bool, bool) -> bool) -> GuardRun {
+        use crate::tape::lowered::RuntimeGate::{
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessPlainGdn,
+        };
+        let both = [false, true];
+        let ds = self.decode.as_ref().map_or(&both[..], std::slice::from_ref);
+        let qs = self.plain.as_ref().map_or(&both[..], std::slice::from_ref);
+        let on: Vec<(bool, bool)> = (ds.iter().flat_map(|&d| qs.iter().map(move |&q| (d, q))))
+            .filter(|&(d, q)| runs(d, q))
+            .collect();
+        let decode = |d: bool| {
+            if d {
+                OnlyIfDecodeStep
+            } else {
+                UnlessDecodeStep
+            }
+        };
+        let plain = |q: bool| if q { OnlyIfPlainGdn } else { UnlessPlainGdn };
+        let only_d = |d: bool| qs.iter().all(|&q| runs(d, q) != runs(!d, q));
+        let only_q = |q: bool| ds.iter().all(|&d| runs(d, q) != runs(d, !q));
+        GuardRun::Gated(match on.as_slice() {
+            [] => return GuardRun::Dropped,
+            all if all.len() == ds.len() * qs.len() => None,
+            [(d, _), ..] if ds.len() == 2 && on.iter().all(|c| c.0 == *d) && only_d(*d) => {
+                Some(decode(*d))
+            }
+            [(_, q), ..] if qs.len() == 2 && on.iter().all(|c| c.1 == *q) && only_q(*q) => {
+                Some(plain(*q))
+            }
+            [(d, q)] => Some(All(baked(vec![decode(*d), plain(*q)]))),
+            three if three.len() == 3 => {
+                let (d, q) = (ds.iter().flat_map(|&d| qs.iter().map(move |&q| (d, q))))
+                    .find(|&(d, q)| !runs(d, q))
+                    .expect("one step of four is off");
+                Some(Any(baked(vec![decode(!d), plain(!q)])))
+            }
+            pairs => Some(Any(baked(
+                pairs
+                    .iter()
+                    .map(|&(d, q)| All(baked(vec![decode(d), plain(q)])))
+                    .collect(),
+            ))),
+        })
+    }
+}
+
+/// A GDN layer's commands by the steps they serve — the runtime-gate twin pattern
+/// `route_small_m` runs for the small-M GEMM — each command gated on what its kernel can run
+/// (`GdnStepsKnown::run`):
+/// - the one-command decode (`gdn_decode`, where `lower_one` emitted one ahead of the conv, scan
+///   and norm): a decode step (every sequence one token) whose GDN steps are all plain;
+/// - on a geometry the block-staged pipelined scan covers (`gdn_scan_pipelined`: head_k 128 — 8
+///   lanes own 16 state channels each in four float4 granules — and head_v a multiple of 16), it:
+///   any other plain step, with the SAME bindings as the simd scan and its own dispatch (grid
+///   (value_dim/16, 1, 1) scaled by num_seqs on Z, threads (128,1,1));
+/// - the simd scan: what those two leave — a step that replays or records among them, which only
+///   the conv and the simd scan can run;
+/// - the conv and the norm: every step the decode command leaves.
+///
+/// A model without drafts thus runs main's split: decode steps the decode command (a one-row
+/// bucket only it), the rest the conv, scan and norm. The norm that follows reads the scan's `o`
+/// scratch, so the scan sits between the two.
+fn route_gdn(
+    p: &MetalModelConsts,
+    step: &MetalStep,
+    cmds: Vec<GatedCommand>,
+    bucket_m: u32,
+) -> Vec<GatedCommand> {
     use crate::tape::ids::BucketM;
-    use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
     use crate::tape::lowered::{MScaleAxis, MScaling};
     if !matches!(step, MetalStep::GatedDeltaNet(..)) {
         return cmds;
     }
+    let known = GdnStepsKnown::at(p, bucket_m);
     let decodes = cmds.iter().any(|c| c.command.library == "gdn_decode");
-    // A one-row bucket's every step is a decode step: the decode command alone.
-    if decodes && cmds.len() == 1 {
-        return cmds;
-    }
     let hv = p.gdn_head_v_dim;
     let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(16);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
@@ -989,7 +1062,7 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
             scan.constants
                 .iter()
                 .copied()
-                .chain([ConstantValue::uint(5, GDN_PIPE_TB)])
+                .chain([ConstantValue::uint(6, GDN_PIPE_TB)])
                 .collect(),
         ),
         dispatch: DispatchShape {
@@ -1004,20 +1077,22 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
         bindings: scan.bindings,
         gemm_dims: None,
     };
-    let mut out = Vec::with_capacity(cmds.len() + 1);
+    let decoded = |d: bool, q: bool| decodes && d && q;
+    let piped = |d: bool, q: bool| pipelines && !d && q;
+    let gated = |command: LoweredCommand, runs: &dyn Fn(bool, bool) -> bool| match known.run(runs) {
+        GuardRun::Gated(gate) => Some(GatedCommand { command, gate }),
+        GuardRun::Dropped => None,
+    };
+    let mut out = Vec::with_capacity(cmds.len() + 2);
     for GatedCommand { command, .. } in cmds {
-        let scan = pipelines && command.library == "gdn_scan_varlen" && command.function == simd;
-        match (decodes, scan) {
-            (true, _) if command.library == "gdn_decode" => {
-                out.push(GatedCommand::gated(command, OnlyIfDecodeStep));
-            }
-            (true, true) => out.push(GatedCommand::gated(pipelined(&command), UnlessDecodeStep)),
-            (true, false) => out.push(GatedCommand::gated(command, UnlessDecodeStep)),
-            (false, true) => {
-                let twin = GatedCommand::gated(pipelined(&command), UnlessDecodeStep);
-                out.extend([GatedCommand::gated(command, OnlyIfDecodeStep), twin]);
-            }
-            (false, false) => out.push(GatedCommand::ungated(command)),
+        if command.library == "gdn_decode" {
+            out.extend(gated(command, &decoded));
+        } else if pipelines && command.library == "gdn_scan_varlen" && command.function == simd {
+            let twin = pipelined(&command);
+            out.extend(gated(command, &|d, q| !decoded(d, q) && !piped(d, q)));
+            out.extend(gated(twin, &piped));
+        } else {
+            out.extend(gated(command, &|d, q| !decoded(d, q)));
         }
     }
     out
@@ -1339,7 +1414,7 @@ fn lower(
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
-                let cmds = route_gdn(p, step, cmds);
+                let cmds = route_gdn(p, step, cmds, bucket_m);
                 let cmds = decode_attention_per_kv_head(p, step, cmds, at, &mut moe_scratch_bytes);
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = row_gate(cmds, *gate, i)?;
@@ -4710,8 +4785,9 @@ fn lower_one(
             // A decode step's token — every sequence's one — is one command, not three a
             // barrier apart (`gdn_decode`): a threadgroup of 1024 per (sequence, key head) runs its
             // conv channels, its value heads' scan and their norm. Its shader's static asserts are
-            // these bounds. `route_gdn` runs it on decode steps and the commands below on the
-            // rest; a one-row bucket's every step is a decode step, so there it runs alone.
+            // these bounds. `route_gdn` runs it on plain decode steps and the commands below on
+            // the rest; where it runs every step — a one-row bucket of a model without drafts —
+            // it runs alone.
             let per_key = nv / nk.max(1);
             let decode = (simd_scan
                 && nv.is_multiple_of(nk)
@@ -4723,8 +4799,8 @@ fn lower_one(
                 .then(|| {
                     let mut constants = scan_constants();
                     constants.extend([
-                        ConstantValue::uint(5, kernel),
-                        ConstantValue::float(6, p.rms_norm_eps),
+                        ConstantValue::uint(6, kernel),
+                        ConstantValue::float(7, p.rms_norm_eps),
                     ]);
                     let bindings = vec![
                         arena(out_slot, 0),
@@ -4760,8 +4836,8 @@ fn lower_one(
                         gemm_dims: None,
                     }
                 });
-            if bucket_m == 1
-                && let Some(decode) = decode
+            if let Some(decode) = decode
+                && GdnStepsKnown::at(p, bucket_m).run(|d, q| d && q) == GuardRun::Gated(None)
             {
                 return Ok(vec![decode]);
             }
@@ -7830,18 +7906,23 @@ mod tests {
     /// block-staged pipelined kernel where that covers the geometry too, else the simd mapping;
     /// a one-row bucket, all decode steps, runs the decode command alone. Without the decode
     /// command a pipelined geometry twins its scan (simd on decode steps, pipelined on the rest)
-    /// between the ungated conv and norm, and any other keeps the ungated chain. Pure-CPU
-    /// lowering checks.
+    /// between the ungated conv and norm, and any other keeps the ungated chain. A drafting
+    /// model's steps may replay or record, which only the conv and the simd scan run: the decode
+    /// command and the pipelined scan take the plain steps, the simd scan every other, at every
+    /// bucket — a one-row bucket's too. Pure-CPU lowering checks.
     #[test]
     fn gdn_lowers_by_the_step_it_serves() {
-        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
-        let lowered = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m| {
+        use crate::tape::lowered::RuntimeGate::{
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessPlainGdn,
+        };
+        let drafting = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m, spec_drafts| {
             let p = MetalModelConsts {
                 gdn_num_k_heads: nk,
                 gdn_num_v_heads: nv,
                 gdn_head_k_dim: hk,
                 gdn_head_v_dim: hv,
                 gdn_conv_dim: 2 * (nk * hk) as usize + (nv * hv) as usize,
+                spec_drafts,
                 ..tp()
             };
             let step =
@@ -7852,6 +7933,7 @@ mod tests {
                 .cloned()
                 .collect::<Vec<GatedCommand>>()
         };
+        let lowered = |geometry, bucket_m| drafting(geometry, bucket_m, 0);
         let shape = |c: &[GatedCommand]| -> Vec<(&str, Option<_>)> {
             c.iter().map(|c| (c.command.function, c.gate)).collect()
         };
@@ -7896,6 +7978,58 @@ mod tests {
         // Neither kernel covers head_k 64 with head_v 48.
         let want = [(conv, None), (simd, None), (norm, None)];
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
+
+        // A drafting model.
+        let plain_decode = Some(All(&[OnlyIfDecodeStep, OnlyIfPlainGdn]));
+        let plain_prefill = Some(All(&[UnlessDecodeStep, OnlyIfPlainGdn]));
+        let not_plain_decode = Some(Any(&[UnlessDecodeStep, UnlessPlainGdn]));
+        let (plain, replays) = (Some(OnlyIfPlainGdn), Some(UnlessPlainGdn));
+        let q27 = drafting((16, 48, 128, 128), 64, 2);
+        let want = [
+            (decode, plain_decode),
+            (conv, not_plain_decode),
+            (simd, replays),
+            (pipe, plain_prefill),
+            (norm, not_plain_decode),
+        ];
+        assert_eq!(shape(&q27), want);
+        // The kernels share the scan's constants, the drafts (their slot stride) at 5; the decode
+        // command's conv width and eps follow at 6 and 7, the pipelined scan's block at 6.
+        let constants = |i: usize| q27[i].command.constants;
+        assert!(constants(2).contains(&ConstantValue::uint(5, 2)));
+        assert_eq!(constants(0)[..6], constants(2)[..]);
+        assert_eq!(
+            constants(0)[6],
+            ConstantValue::uint(6, tp().gdn_conv_kernel)
+        );
+        assert_eq!(
+            constants(3),
+            [constants(2), &[ConstantValue::uint(6, GDN_PIPE_TB)][..]].concat()
+        );
+        assert_eq!(q27[2].command.bindings, q27[3].command.bindings);
+        let want = [
+            (decode, plain),
+            (conv, replays),
+            (simd, replays),
+            (norm, replays),
+        ];
+        assert_eq!(shape(&drafting((16, 48, 128, 128), 1, 2)), want);
+        let want = [
+            (decode, plain_decode),
+            (conv, not_plain_decode),
+            (simd, not_plain_decode),
+            (norm, not_plain_decode),
+        ];
+        assert_eq!(shape(&drafting((2, 6, 64, 128), 64, 2)), want);
+        let want = [
+            (conv, None),
+            (simd, Some(Any(&[OnlyIfDecodeStep, UnlessPlainGdn]))),
+            (pipe, plain_prefill),
+            (norm, None),
+        ];
+        assert_eq!(shape(&drafting((2, 4, 128, 48), 64, 2)), want);
+        let want = [(conv, None), (simd, None), (norm, None)];
+        assert_eq!(shape(&drafting((2, 4, 64, 48), 64, 2)), want);
     }
 
     /// A dense model's tape carries no TurboQuant command and gates nothing on

@@ -1559,6 +1559,14 @@ fn begin_step<W: CanonicalParams>(
         step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
         Relaxed,
     );
+    worker.worker.gdn_plain.store(
+        inputs.gdn_is_fresh.is_none_or(|codes| {
+            codes
+                .iter()
+                .all(|&c| crate::gdn_state::GdnStep::decode(c).is_plain())
+        }),
+        Relaxed,
+    );
     Ok(writes)
 }
 

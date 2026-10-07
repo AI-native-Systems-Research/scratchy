@@ -21,8 +21,14 @@
 // One token a sequence: the one-row decode bucket. q/k/v come straight from the model-dtype
 // `qkv` row, the output goes to the model-dtype `out` row; no scratch.
 //
-// Baked constants: 0-4 the scan's (num_k_heads, num_v_heads, head_k, head_v, scale), 5 the conv
-// kernel width, 6 the norm's eps.
+// The state is laid out as `gdn_conv1d_varlen` and `gdn_scan_varlen` lay a slot out: with drafts,
+// a conv slot is its entry and `GDN_DEC_DRAFTS + 1` checkpoints, an ssm slot its entry and two
+// record areas. This kernel runs only a plain step (`scratchy_layers::gdn_state::GdnStep::
+// is_plain`: `gdn_step[seq]` starts from the slot or from zero and carries no drafts), so it reads
+// and writes the entries alone; a step that replays runs the three commands.
+//
+// Baked constants: 0-5 the scan's (num_k_heads, num_v_heads, head_k, head_v, scale, the model's
+// drafts), 6 the conv kernel width, 7 the norm's eps.
 // Dispatch: grid (1, num_k_heads, num_seqs), threads (1024, 1, 1).
 
 #include <metal_stdlib>
@@ -35,8 +41,9 @@ SCRATCHY_CONSTANT(uint, GDN_DEC_NUM_V_HEADS, 1);
 SCRATCHY_CONSTANT(uint, GDN_DEC_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_DEC_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_DEC_SCALE, 4);
-SCRATCHY_CONSTANT(uint, GDN_DEC_CONV_KERNEL, 5);
-SCRATCHY_CONSTANT(float, GDN_DEC_EPS, 6);
+SCRATCHY_CONSTANT(uint, GDN_DEC_DRAFTS, 5);
+SCRATCHY_CONSTANT(uint, GDN_DEC_CONV_KERNEL, 6);
+SCRATCHY_CONSTANT(float, GDN_DEC_EPS, 7);
 
 constant constexpr uint H = GDN_DEC_NUM_K_HEADS;
 constant constexpr uint HV = GDN_DEC_NUM_V_HEADS;
@@ -54,6 +61,10 @@ constant constexpr uint THREADS = 1024u;
 constant constexpr uint SIMDGROUPS = THREADS / 32u;
 constant constexpr uint NPT = K / 32u;
 constant constexpr uint STATE_LEN = GDN_DEC_CONV_KERNEL - 1u;
+// A slot's conv entries and ssm floats, as the conv and the scan lay them out.
+constant constexpr uint CONV_ENTRIES = GDN_DEC_DRAFTS == 0u ? 1u : GDN_DEC_DRAFTS + 2u;
+constant constexpr uint SSM_SLOT_LEN =
+    HV * Vd * K + (GDN_DEC_DRAFTS == 0u ? 0u : 2u * (GDN_DEC_DRAFTS + 1u) * (CONV_DIM + 2u * HV));
 // Value dims a simdgroup scans, and how many it holds the state rows of at once.
 constant constexpr uint DIMS = RV / SIMDGROUPS;
 constant constexpr uint BATCH = 4u;
@@ -79,7 +90,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(7)]],
     const device int*   cu_seqlens    [[buffer(8)]],
     const device int*   state_indices [[buffer(9)]],
-    const device uint*  is_fresh      [[buffer(10)]],
+    const device uint*  gdn_step      [[buffer(10)]],
     const device float* a_log         [[buffer(11)]],
     const device T*     dt_bias       [[buffer(12)]],
     const device float* norm_w        [[buffer(13)]],
@@ -100,7 +111,8 @@ template <typename T>
   if (cu_seqlens[n + 1] - bos <= 0 || slot < 0) {
     return;
   }
-  const bool fresh = is_fresh[n] != 0u;
+  const bool fresh = (gdn_step[n] & 0xffu) == 1u;
+  device float* slot_ssm = ssm_state + uint(slot) * SSM_SLOT_LEN;
   const uint t = uint(bos);
 
   // The conv, a thread a channel: q, k of key head h, then v of its value heads.
@@ -111,7 +123,7 @@ template <typename T>
     for (uint ki = 0; ki <= STATE_LEN; ki++) {
       wlocal[ki] = float(conv_w[c * GDN_DEC_CONV_KERNEL + ki]);
     }
-    device float* state = conv_state + (uint(slot) * CONV_DIM + c) * STATE_LEN;
+    device float* state = conv_state + (uint(slot) * CONV_ENTRIES * CONV_DIM + c) * STATE_LEN;
     for (uint ki = 0; ki < STATE_LEN; ki++) {
       window[ki] = fresh ? 0.0f : state[ki];
     }
@@ -139,7 +151,7 @@ template <typename T>
     for (uint j = 0; j < BATCH && j0 + j < DIMS; j++) {
       const uint d = (j0 + j) * SIMDGROUPS + simd_gid;
       const uint i_hv = h * R + d / Vd;
-      device const float* row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + d % Vd) * K;
+      device const float* row = slot_ssm + (i_hv * Vd + d % Vd) * K;
       for (uint i = 0; i < NPT; i++) {
         st[j][i] = fresh ? 0.0f : row[lane * NPT + i];
       }
@@ -182,7 +194,7 @@ template <typename T>
         o[d] = od;
         sq[d] = od * od;
       }
-      device float* row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + d % Vd) * K;
+      device float* row = slot_ssm + (i_hv * Vd + d % Vd) * K;
       for (uint i = 0; i < NPT; i++) {
         row[lane * NPT + i] = st[j][i];
       }

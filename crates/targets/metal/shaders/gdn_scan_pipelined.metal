@@ -24,18 +24,24 @@
 // block ahead, so the recurrence's per-token reads hit registers or
 // threadgroup memory, never device memory.
 //
-// `conv_out` and `o` are f32; `a`/`b`/`dt_bias` are `T`; `ssm_state` is f32
-// with the cuda-symmetric layout [num_slots, HV, head_v, head_k].
+// `conv_out` and `o` are f32; `a`/`b`/`dt_bias` are `T`; `ssm_state` is f32,
+// laid out as `gdn_scan_varlen` lays a slot out: its state entry
+// [HV, head_v, head_k], then — when the model drafts — two record areas.
+// This kernel runs only a plain step (`scratchy_layers::gdn_state::GdnStep::
+// is_plain`: `gdn_step[seq]` starts from the slot or from zero and carries no
+// drafts), so it reads and writes the entry alone; a step that replays or
+// records runs `gdn_scan_simd`.
 //
-// Baked constants (every compile sets every one):
+// Baked constants (every compile sets every one; slots 0–5 are the scan's):
 //   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
 //   GDN_PIPE_HEAD_K (K), GDN_PIPE_HEAD_V (head_v), GDN_PIPE_SCALE,
+//   GDN_PIPE_DRAFTS (the model's drafts: the slot stride),
 //   GDN_PIPE_TB (tokens per block; multiple of 4).
 // Requires K == 128 (8 lanes × four float4s) and head_v % 16 == 0.
 //
 // Dispatch: grid (head_v*HV/16, 1, num_seqs); threads (128, 1, 1). The
-// lowering routes PREFILL here and keeps decode on `gdn_scan_simd` (whose
-// 4-simdgroup groups are the right shape for one token).
+// lowering routes a plain PREFILL here and keeps decode on `gdn_scan_simd`
+// (whose 4-simdgroup groups are the right shape for one token).
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -47,7 +53,8 @@ SCRATCHY_CONSTANT(uint, GDN_PIPE_NUM_V_HEADS, 1);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_PIPE_SCALE, 4);
-SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 5);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_DRAFTS, 5);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 6);
 
 template <typename T>
 [[kernel]] void gdn_scan_pipelined(
@@ -58,7 +65,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
+    const device uint*  gdn_step      [[buffer(7)]],
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -96,14 +103,19 @@ template <typename T>
   if (seq_len <= 0 || slot < 0) {
     return;
   }
-  const bool fresh = is_fresh[i_n] != 0u;
+  const bool fresh = (gdn_step[i_n] & 0xffu) == 1u;
 
   // Per-head scalars, off the recurrence path.
   const float neg_a = -exp(a_log[i_hv]);
   const float dtb = float(dt_bias[i_hv]);
   const float scale = GDN_PIPE_SCALE;
 
-  device float* state_row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
+  // The slot's stride, as `gdn_scan_varlen` lays it out: its entry, then
+  // (with drafts) two record areas of `GDN_PIPE_DRAFTS + 1` rows.
+  const uint entry_len = HV * Vd * K;
+  const uint area_len = (GDN_PIPE_DRAFTS + 1u) * (conv_dim + 2u * HV);
+  const uint slot_len = entry_len + (GDN_PIPE_DRAFTS == 0u ? 0u : 2u * area_len);
+  device float* state_row = ssm_state + uint(slot) * slot_len + (i_hv * Vd + i_v) * K;
   // State fragment in registers: channels 4*(seg + 8*i) .. +3, i = 0..3.
   float4 st[4];
   {
