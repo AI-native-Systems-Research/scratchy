@@ -1175,8 +1175,13 @@ def moe_block(x, layer_w):
             for j in range(top_k):
                 ex = int(idx[t, j])
                 out[t] += _swiglu_stacked(x[t:t+1], layer_w.w1[ex], layer_w.w2[ex], 1.0)[0] * float(weights[t, j])
-        # shared expert: plain add (no sigmoid gate)
-        out = out + _swiglu_stacked(x, layer_w.shared_gate_up, layer_w.shared_down, 1.0)
+        # shared expert: plain add (no sigmoid gate). Only when the
+        # bundle still owns it — GLM-4.5 (and any arch whose manifest
+        # declares `mlp.shared_expert.*` DSL leaves) has the shared
+        # expert carved out of the bundle (synth_trees drops the
+        # synthetic leaves), so the carrier adds it itself.
+        if hasattr(layer_w, "shared_gate_up"):
+            out = out + _swiglu_stacked(x, layer_w.shared_gate_up, layer_w.shared_down, 1.0)
         return out
     if hasattr(layer_w, "w1") and "num_local_experts" in b:
         # Mixtral: softmax over the FULL logits first, then top-k over
@@ -1511,8 +1516,14 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     save_file(out, str(ckpt_dir / "model.safetensors"))
     # config.json: the shrunk config VERBATIM — it is the config the
     # tiny stem was checked in as, so the gate's fingerprint (embed
-    # shape, layer count, theta) matches the compiled variant.
-    (ckpt_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    # shape, layer count, theta) matches the compiled variant. Quant
+    # blocks are stripped: the synthetic checkpoint is DENSE (torch
+    # oracle, unquantized) and the Rust gate's dense arm refuses a
+    # config carrying `quantization_config` (a false-green guard), so
+    # leaving them in would make the gate skip its own case.
+    cfg_out = {k: v for k, v in cfg.items()
+               if k not in ("quantization", "quantization_config")}
+    (ckpt_dir / "config.json").write_text(json.dumps(cfg_out, indent=2))
     return ckpt_dir
 
 
@@ -1841,7 +1852,14 @@ def main():
         # global KV head count also collapses if left at num_attention_heads
         # — shrink it to 1 (the real gemma4 relation: 1 global kv head vs 8
         # sliding) so the class geometry stays distinct through the shrink.
-        if "global_head_dim" in cfg and isinstance(cfg.get("num_attention_heads"), int):
+        # Gate on the class relation itself (global head_dim STRICTLY
+        # above head_dim), not the key's presence: REDERIVABLE's
+        # materialization loop above pins global_head_dim = head_dim for
+        # UNIFORM arches (GLM-4.5), and collapsing those to 1 global kv
+        # head corrupts the rotary/KV geometry the carrier then runs.
+        ghd = cfg.get("global_head_dim")
+        if isinstance(ghd, int) and ghd > cfg.get("head_dim", 0) \
+                and isinstance(cfg.get("num_attention_heads"), int):
             gkv = cfg.get("num_global_key_value_heads")
             if isinstance(gkv, int) and gkv == cfg["num_attention_heads"]:
                 cfg["num_global_key_value_heads"] = 1

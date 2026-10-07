@@ -157,6 +157,7 @@ all-arches = [
 
 # glm4-moe (1 configs)
 "glm-4.5-air" = ["arch-glm4-moe"]
+"glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
 
 # granite (21 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
@@ -347,6 +348,7 @@ all-arches = [
 ]
 "glm4-moe" = [
     "glm-4.5-air",
+    "glm-4.5-air-parity-tiny",
 ]
 "granite" = [
     "granite-3.0-2b-base",
@@ -519,6 +521,7 @@ all = [
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",
     "glm-4.5-air",
+    "glm-4.5-air-parity-tiny",
     "granite-3.0-2b-base",
     "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",
