@@ -8215,10 +8215,19 @@ mod tests {
     fn nax_paged_attention_takes_only_16_token_pages() {
         use crate::steel_paged::nax_paged_kernel;
         for head_dim in [64, 128, 256] {
-            assert!(nax_paged_kernel("bf16", head_dim, 16).is_some(), "{head_dim}");
-            assert!(nax_paged_kernel("bf16", head_dim, 32).is_none(), "{head_dim}");
+            assert!(
+                nax_paged_kernel("bf16", head_dim, 16).is_some(),
+                "{head_dim}"
+            );
+            assert!(
+                nax_paged_kernel("bf16", head_dim, 32).is_none(),
+                "{head_dim}"
+            );
         }
-        assert_eq!(nax_paged_kernel("f16", 256, 16).map(|k| k.threads), Some(256));
+        assert_eq!(
+            nax_paged_kernel("f16", 256, 16).map(|k| k.threads),
+            Some(256)
+        );
     }
 
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass
