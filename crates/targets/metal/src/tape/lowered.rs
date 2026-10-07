@@ -988,6 +988,7 @@ impl SourceRef<'_> {
                 T::MoeSharedDownS => s.shared_down_scales,
                 T::MoeSharedDownB => s.shared_down_biases,
                 T::MoeSharedExpertGate => s.shared_expert_gate,
+                T::MoeRouterBias => s.e_score_correction_bias,
                 _ => routed(&s.routed),
             },
             _ => None,
@@ -1098,6 +1099,11 @@ pub enum WeightTensor {
     /// expert output. Stored as a `Linear` (not quantized) in MLX
     /// safetensors.
     MoeSharedExpertGate,
+    /// `[num_experts]` F32 `e_score_correction_bias` on a sigmoid-routed
+    /// MoE (GLM-4 / DeepSeek-V3 `noaux_tc`). Valid against the
+    /// `SourceRef::SharedFusedMoe` bundle; the route command reads it as
+    /// its 4th buffer (the gathered expert kernels' 13th).
+    MoeRouterBias,
     // ── Gated-DeltaNet bundle tensors ───────────────────────────────
     //
     // Valid only against the `SourceRef::GatedDeltaNet` bundle.

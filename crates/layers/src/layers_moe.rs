@@ -292,6 +292,13 @@ pub struct AffineSharedFusedMoELayer {
     /// `MoeSharedExpertGate`.
     pub shared_expert_gate: Option<GpuTensor>,
 
+    /// `[num_experts]` F32 `e_score_correction_bias` for sigmoid routing
+    /// (GLM-4 / DeepSeek-V3 `noaux_tc` at `n_group = 1`): the BIASED
+    /// sigmoids order the top-k picks, the UNBIASED sigmoids are the
+    /// scores the experts scale by. `None` on every softmax-routed MoE
+    /// (Qwen, Mixtral).
+    pub e_score_correction_bias: Option<GpuTensor>,
+
     pub shared_intermediate_size: usize,
 }
 

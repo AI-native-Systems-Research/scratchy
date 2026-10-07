@@ -783,6 +783,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::ExpertUnsort => {}
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
+            SubOp::RouteSigmoidBias { router } => router.hash(h),
             SubOp::RouteTopK { k } => k.hash(h),
             SubOp::RouteScale { scale } => scale.to_bits().hash(h),
             SubOp::RouteExpertScale { router } => router.hash(h),
@@ -1124,6 +1125,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     },
     /// Row softmax. `inputs` = `[scores]`.
     RouteSoftmax,
+    /// Row sigmoid of the logits plus each expert's correction bias, in place on the logits
+    /// (GLM-4 / DeepSeek-V3 `noaux_tc` routing). The BIASED values order the top-k picks; the
+    /// buffer keeps the UNBIASED sigmoids, so the standard score gather reads the values mlx
+    /// renormalizes. `inputs` = `[logits, router]`.
+    RouteSigmoidBias { router: RouterBundle },
     /// Each row's indices sorted by ascending score. `inputs` = `[scores]`.
     RouteArgsort,
     /// The last `k` sorted indices of each row — its top-k experts. `inputs` = `[sorted]`.
@@ -2241,6 +2247,7 @@ pub fn lower_region(
             SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
             SubOp::RouteSoftmax => SubOp::RouteSoftmax,
+            SubOp::RouteSigmoidBias { router } => SubOp::RouteSigmoidBias { router },
             SubOp::RouteArgsort => SubOp::RouteArgsort,
             SubOp::RouteTopK { k } => SubOp::RouteTopK { k },
             SubOp::RouteGatherScores => SubOp::RouteGatherScores,

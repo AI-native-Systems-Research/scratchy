@@ -6873,6 +6873,10 @@ fn lower_moe_step(
                 let scale = WeightTensor::GemmaPerExpertScale;
                 bindings.push(source(router()?, scale, layer(&l), 3));
             }
+            // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
+            if let super::step::RoutePre::SigmoidBias(l) = program.pre {
+                bindings.push(source(router()?, WeightTensor::MoeRouterBias, layer(&l), 4));
+            }
             let shape = grid((1, bucket_m, 1), (bn, 1, 1), ms(A::Y));
             let constants = MoeRouteConstants {
                 experts: b.experts,
@@ -7173,6 +7177,10 @@ fn lower_moe_step(
                 if let Some(l) = program.expert_scale {
                     let scale = WeightTensor::GemmaPerExpertScale;
                     bindings.push(source(router()?, scale, layer(&l), 12));
+                }
+                // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
+                if let super::step::RoutePre::SigmoidBias(l) = program.pre {
+                    bindings.push(source(router()?, WeightTensor::MoeRouterBias, layer(&l), 13));
                 }
                 constants.extend(Vec::from(RoutedConstants {
                     experts: b.experts,

@@ -143,7 +143,7 @@ pub enum FoldPattern<K: 'static> {
     Route {
         top_k: SubOpKind,
         sort: SubOpKind,
-        pre: SubOpKind,
+        pre: &'static [SubOpKind],
         gather: SubOpKind,
         tail: &'static [&'static [SubOpKind]; ROUTE_TAIL_STAGES],
         kernel: K,
@@ -817,7 +817,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 tail,
                 kernel,
                 ..
-            } => self.route(i, [sort, pre, gather], tail, kernel),
+            } => self.route(i, sort, pre, gather, tail, kernel),
             FoldPattern::Encoded { encode, kernel, .. } => {
                 self.encoded(i, encode, kernel);
                 Ok(())
@@ -1263,7 +1263,9 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
     fn route(
         &mut self,
         i: usize,
-        [sort, pre, gather]: [SubOpKind; 3],
+        sort: SubOpKind,
+        pre: &'static [SubOpKind],
+        gather: SubOpKind,
         tail: &[&[SubOpKind]; ROUTE_TAIL_STAGES],
         kernel: K,
     ) -> Result<(), FoldError> {
@@ -1286,7 +1288,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let Some(g) = g else {
             return Ok(());
         };
-        let pre = logits.filter(|&l| ops.kind(l) == pre && self.consumers[l] == 2 && free(l));
+        let pre = logits.filter(|&l| pre.contains(&ops.kind(l)) && self.consumers[l] == 2 && free(l));
         let mut stages = [None; ROUTE_TAIL_STAGES];
         let (mut cur, mut next) = (g, 0);
         while self.consumers[cur] == 1 {
@@ -1756,7 +1758,7 @@ mod tests {
                 FoldPattern::Route {
                     top_k: K::RouteTopK,
                     sort: K::RouteArgsort,
-                    pre: K::RouteSoftmax,
+                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias],
                     gather: K::RouteGatherScores,
                     tail: &[
                         &[K::RouteScale],

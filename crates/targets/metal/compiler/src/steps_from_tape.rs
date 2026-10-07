@@ -879,6 +879,19 @@ impl Recording<'_> {
             Some((kind, e)) => self.site(i, kind, e)?,
             None => Vec::new(),
         };
+        self.moe_site(i, step, reads, writes, site)
+    }
+
+    /// [`Self::moe`] with an explicit weight site — a step that reads more than one weight of
+    /// one bundle (the route command's correction bias and per-expert scale).
+    fn moe_site(
+        &self,
+        i: usize,
+        step: MoeStep,
+        reads: &[Slot],
+        writes: &[Slot],
+        site: Vec<WeightSlot>,
+    ) -> Result<Emission, StepRefusal> {
         let mut e = em(MetalStep::Moe(self.block(i)?, step), reads, writes, site);
         e.sig.op_scratch = match moe_write(self.op(i)) {
             Some(MoeWrite::Arena) => Access::Read,
@@ -1184,8 +1197,15 @@ impl Recording<'_> {
             }
             // The routing, as the program its folded steps spell.
             (F::MoeRoute, Sh::Route { .. }) => {
-                let (program, weight) = self.route_program(i, f.shape)?;
-                self.moe(i, MoeStep::Route(program), &[], &[], weight)
+                let (program, weights) = self.route_program(i, f.shape)?;
+                let site = weights
+                    .iter()
+                    .map(|&(ref kind, e)| self.site(i, kind.clone(), e))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                self.moe_site(i, MoeStep::Route(program), &[], &[], site)
             }
             (F::NormedQmv | F::NormedRouter, Sh::NormedMatvec { .. })
             | (F::QmvEpilogue, Sh::MatvecEpilogue { .. }) => {
@@ -1264,13 +1284,13 @@ impl Recording<'_> {
         }
     }
 
-    /// The routing program top-k step `i`'s route fold `route` spells, with the router weight
-    /// its per-expert scale reads.
+    /// The routing program top-k step `i`'s route fold `route` spells, with the router weights it
+    /// reads — the per-expert scale's bundle and, on a sigmoid pre, the F32 correction bias's.
     fn route_program(
         &self,
         i: usize,
         route: FusedShape,
-    ) -> Result<(st::RouteProgram, Option<(WeightKind, usize)>), StepRefusal> {
+    ) -> Result<(st::RouteProgram, Vec<(WeightKind, usize)>), StepRefusal> {
         let FusedShape::Route {
             pre,
             tail: [scale, post, expert_scale],
@@ -1283,6 +1303,18 @@ impl Recording<'_> {
             let j = self.op_at(i, s)?;
             Ok((j, self.op(j)))
         };
+        let mut weights = Vec::new();
+        // The pre's kind, with the layer whose router bundle holds the F32 correction bias.
+        let pre = match pre.map(op).transpose()? {
+            None => st::RoutePre::None,
+            Some((_, SubOp::RouteSoftmax)) => st::RoutePre::Softmax,
+            Some((j, &SubOp::RouteSigmoidBias { router })) => {
+                let e = self.source_arg(j, 1)?;
+                weights.push((router.weight_kind(), e));
+                st::RoutePre::SigmoidBias(self.layer(e))
+            }
+            Some(_) => return Err(self.no(i, Refused::FusionShape)),
+        };
         let scale = match scale.map(op).transpose()? {
             None => None,
             Some((_, &SubOp::RouteScale { scale })) => Some(st::Scale(scale)),
@@ -1294,20 +1326,22 @@ impl Recording<'_> {
             Some((_, SubOp::RouteRenorm)) => st::RoutePost::Renorm,
             Some(_) => return Err(self.no(i, Refused::FusionShape)),
         };
-        let weight = match expert_scale.map(op).transpose()? {
+        let expert_scale = match expert_scale.map(op).transpose()? {
             None => None,
             Some((j, &SubOp::RouteExpertScale { router })) => {
-                Some((router.weight_kind(), self.source_arg(j, 2)?))
+                let e = self.source_arg(j, 2)?;
+                weights.push((router.weight_kind(), e));
+                Some(self.layer(e))
             }
             Some(_) => return Err(self.no(i, Refused::FusionShape)),
         };
         let program = st::RouteProgram {
-            pre_softmax: pre.is_some(),
+            pre,
             scale,
             post,
-            expert_scale: weight.as_ref().map(|&(_, e)| self.layer(e)),
+            expert_scale,
         };
-        Ok((program, weight))
+        Ok((program, weights))
     }
 
     /// The routing expert command `i` computes itself (`MetalFusion::MoeRouted`), if it does, with
@@ -1329,11 +1363,14 @@ impl Recording<'_> {
             _ => None,
         });
         let route = route.ok_or_else(|| self.no(i, Refused::FusionShape))?;
-        let (program, weight) = self.route_program(t, route)?;
-        let site = match weight {
-            Some((kind, e)) => self.site(t, kind, e)?,
-            None => Vec::new(),
-        };
+        let (program, weights) = self.route_program(t, route)?;
+        let site = weights
+            .iter()
+            .map(|&(ref kind, e)| self.site(t, kind.clone(), e))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok((Some(program), site))
     }
 
@@ -2003,6 +2040,11 @@ impl Recording<'_> {
                 };
                 self.moe(i, MoeStep::Softmax(scores), &[], &[], None)?
             }
+            // Fold-only: the biased values order the top-k and the unbiased sigmoids are read
+            // back as the scores — one buffer cannot hold both, so the pre runs inside the
+            // route command (`RouteProgram::pre`). A sigmoid+bias left on its own escaped the
+            // Route fold, which nothing lowers.
+            L::RouteSigmoidBias { .. } => return Err(self.no(i, Refused::Escaped)),
             L::RouteArgsort => self.moe(i, MoeStep::Argsort, &[], &[], None)?,
             L::RouteTopK { .. } => self.moe(i, MoeStep::TopK, &[], &[], None)?,
             L::RouteGatherScores => self.moe(i, MoeStep::GatherScores, &[], &[], None)?,

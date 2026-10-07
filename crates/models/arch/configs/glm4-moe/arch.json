@@ -1,0 +1,5 @@
+{
+  "_comment": "GLM's `moe` DSL weight name maps to `mlp` on disk (HF safetensors store the MoE block under `model.layers.{l}.mlp`), and the shared expert lives under `mlp.shared_experts` — PLURAL, unlike Qwen's `mlp.shared_expert` — so the DSL's singular name renames per-leaf. GLM checkpoints ship BF16 RMSNorm gains.",
+  "weight_leaf_renames": { "moe": "mlp", "mlp.shared_expert": "mlp.shared_experts" },
+  "scale_dtype": "bf16"
+}

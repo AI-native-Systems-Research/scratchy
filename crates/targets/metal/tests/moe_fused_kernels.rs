@@ -18,7 +18,7 @@ use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows, MoeRouteConstants,
     RoutedConstants,
 };
-use scratchy_target_metal::tape::step::{LayerId, RoutePost, RouteProgram, Scale};
+use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgram, Scale};
 
 const EXPERTS: usize = 128;
 const TOP_K: usize = 8;
@@ -689,13 +689,13 @@ fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
     let block = Block::new(&device, 1, true, EXPERTS);
     // Gemma-4's program, and the shared-expert router's (a softmax over every expert first).
     let gemma = RouteProgram {
-        pre_softmax: false,
+        pre: RoutePre::None,
         scale: Some(Scale(0.018_844_6)),
         post: RoutePost::Softmax,
         expert_scale: Some(LayerId(0)),
     };
     let shared = RouteProgram {
-        pre_softmax: true,
+        pre: RoutePre::Softmax,
         scale: None,
         post: RoutePost::Renorm,
         expert_scale: None,
@@ -846,7 +846,7 @@ fn bench_moe_fused() {
     }
     // The routing as its own command, then the fused kernels; the gated kernel routing itself.
     let gemma = RouteProgram {
-        pre_softmax: false,
+        pre: RoutePre::None,
         scale: Some(Scale(0.018_844_6)),
         post: RoutePost::Softmax,
         expert_scale: Some(LayerId(0)),

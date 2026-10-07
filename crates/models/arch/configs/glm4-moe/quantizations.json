@@ -1,0 +1,5 @@
+{
+  "quantizations": [
+    "mlx-affine-b3-g64-qembed"
+  ]
+}

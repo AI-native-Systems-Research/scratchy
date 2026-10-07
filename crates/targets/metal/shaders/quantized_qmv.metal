@@ -1752,19 +1752,21 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 #ifdef SCRATCHY_CONSTANT_2
 SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
 
-// 13-17 (`MetalFusion::MoeRouted`): the gated kernel routes its token itself, from the router
-// logits, by `moe_route.h`'s program — the experts (13), a softmax over them first (14), the
-// scores' scale (15), their last step (16: 1 softmax, 2 renorm) and the per-expert scale (17) —
-// and stores the picks and scores the later kernels read. Unset: they are the routing command's.
+// 13-18 (`MetalFusion::MoeRouted`): the gated kernel routes its token itself, from the router
+// logits, by `moe_route.h`'s program — the experts (13), the pre over them (14: 1 softmax, 2
+// F32 sigmoid + correction bias), the scores' scale (15), their last step (16: 1 softmax, 2
+// renorm) and the per-expert scale (17) — and stores the picks and scores the later kernels
+// read; the F32 e_score_correction_bias reads buffer(13) under 14's value 2. Unset: they are the
+// routing command's.
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_EXPERTS, 13);
-SCRATCHY_CONSTANT_OPTIONAL(bool, ROUTED_PRE, 14);
+SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_PRE, 14);
 SCRATCHY_CONSTANT_OPTIONAL(float, ROUTED_SCALE, 15);
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_POST, 16);
 SCRATCHY_CONSTANT_OPTIONAL(bool, ROUTED_EXPERT_SCALE, 17);
 constant constexpr bool ROUTED = ROUTED_EXPERTS_SET;
 // The experts a routed kernel's top-k reads (a valid shape when unrouted).
 constant constexpr int ROUTED_E = ROUTED ? ROUTED_EXPERTS : 32;
-constant constexpr bool ROUTED_SOFT = ROUTED && ROUTED_PRE;
+constant constexpr bool ROUTED_SOFT = ROUTED && ROUTED_PRE == 1;
 
 // Pair `nk`'s matvec over expert `expert_idx`'s weights: output block `block` (8 rows, 4 per
 // simdgroup) of `y`'s row `nk`, reading `x`'s row `x_row` — normalized by `gain` as it loads,
@@ -1838,7 +1840,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 //   buffer(4)   = rhs_indices                buffer(10)  = router logits, routed
 //   buffer(5)   = gate y                     buffer(11)  = scores [N, top_k], routed
 //                 [N, top_k, out_vec]        buffer(12)  = per-expert scales, routed and scaled
-//                                            buffer(15)  = the norm's gain, normed
+//                                             buffer(13) = F32 e_score_correction_bias, routed
 // Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
 // gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
 // activation to the block's rows. Every gate row is written raw only by the threadgroup that
@@ -1861,7 +1863,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act*    logits      [[buffer(10)]],
     device T_act*          scores      [[buffer(11)]],
     const device T_act*    expert_scale [[buffer(12)]],
-    const device T_scale*  gain        [[buffer(15)]],
+    const device float*    router_bias [[buffer(13)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
@@ -1877,12 +1879,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   if (ROUTED) {
     const uint n = nk / uint(GATHER_PER_ROW), lid = simd_gid * 32 + simd_lid;
     const device T_act* row = logits + size_t(n) * ROUTED_E;
-    route_top_k<T_act, ROUTED_E, GATHER_PER_ROW, ROUTED_SOFT>(
-        row, soft, routed, lid, simd_lid, simd_gid, local_a, local_b);
+    route_top_k<T_act, ROUTED_E, GATHER_PER_ROW, ROUTED_PRE>(
+        row, soft, routed, router_bias, lid, simd_lid, simd_gid, local_a, local_b);
     expert = routed[nk % uint(GATHER_PER_ROW)];
     if (tid.y == 0 && nk % uint(GATHER_PER_ROW) == 0) {
       device T_act* row_scores = scores + size_t(n) * GATHER_PER_ROW;
-      route_scores<T_act, GATHER_PER_ROW, ROUTED_SOFT, ROUTED_SCALE_SET, ROUTED_POST,
+      route_scores<T_act, GATHER_PER_ROW, ROUTED_PRE, ROUTED_SCALE_SET, ROUTED_POST,
                    ROUTED_EXPERT_SCALE>(row, soft, routed, row_scores, expert_scale,
                                         ROUTED_SCALE, lid, simd_lid, simd_gid, local_a, local_b);
       if (lid < uint(GATHER_PER_ROW)) {

@@ -130,8 +130,8 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         use crate::dtype::DType;
 
         anyhow::ensure!(
-            bits == 4 || bits == 8,
-            "AffineFusedMoELayer: only bits ∈ {{4, 8}} supported (got {bits})"
+            bits == 3 || bits == 4 || bits == 8,
+            "AffineFusedMoELayer: only bits ∈ {{3, 4, 8}} supported (got {bits})"
         );
         anyhow::ensure!(
             hidden_size.is_multiple_of(group_size as usize),
@@ -149,6 +149,8 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         // tensor so the routing Gemm step in `lower_moe_step`
         // (Step 1) reads it as a normal `[E, hidden]` BF16/F16
         // weight — same shape contract as the cuda Dense path.
+        // GLM-4.5 keeps its router DENSE (`{prefix}.gate.weight`
+        // bf16, no scales/biases) — taken as-is.
         // Choose dequant dtype from the model's target_dtype (BF16
         // on every metal build path today).
         let router_dtype = gw.target_dtype().unwrap_or(DType::BF16);
@@ -156,12 +158,15 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
             matches!(router_dtype, DType::BF16 | DType::F16),
             "AffineFusedMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        let router_gate = gw.take_affine_dequant_b4(
-            &format!("{prefix}.gate"),
-            group_size,
-            gate_bits,
-            router_dtype,
-        )?;
+        let router_gate = match gw.contains(&format!("{prefix}.gate.weight")) {
+            true => gw.take(&format!("{prefix}.gate.weight"))?,
+            false => gw.take_affine_dequant_b4(
+                &format!("{prefix}.gate"),
+                group_size,
+                gate_bits,
+                router_dtype,
+            )?,
+        };
 
         // Probe for the switch_mlp pre-stacked layout. Qwen3-MoE-4bit
         // and newer mlx-community repos ship one stacked tensor per
@@ -876,6 +881,14 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             (None, None, None, None, None, None, None)
         };
 
+        // GLM-4.5's F32 `e_score_correction_bias` (`{prefix}.gate.e_score_correction_bias`) —
+        // present on every sigmoid-routed MoE (noaux_tc), absent on every softmax-routed one
+        // (Qwen, Mixtral). Probed, never assumed.
+        let e_score_correction_bias = match gw.contains(&format!("{prefix}.gate.e_score_correction_bias")) {
+            true => Some(gw.take(&format!("{prefix}.gate.e_score_correction_bias"))?),
+            false => None,
+        };
+
         Ok(AffineSharedFusedMoELayer {
             routed,
             shared_gate_up_w,
@@ -885,6 +898,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             shared_down_scales,
             shared_down_biases,
             shared_expert_gate,
+            e_score_correction_bias,
             shared_intermediate_size: shared_expert_intermediate_size,
         })
     }
