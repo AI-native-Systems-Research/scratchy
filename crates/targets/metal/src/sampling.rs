@@ -9,12 +9,12 @@
 //! threadgroup per request row, which at chat batch sizes serialized every
 //! full-vocab pass through ONE core: 4.2 ms per sampled token at a 262k vocab
 //! (see `tests/sampling_bench.rs`). The kernels are now a pipeline of sliced
-//! passes (cast, penalties, softmax, byte-histogram descent, compaction) plus
-//! tiny one-threadgroup-per-row decision kernels, all sharing ONE argument
-//! table so the whole pipeline rides the forward's command buffer with Device
-//! barriers between the dependent dispatches, with [`encode_into`] encoding the
-//! pipeline onto the forward's own encoder. Each stage is baked per model with
-//! its logits width compiled in ([`crate::off_tape`]).
+//! passes (gather + penalties + softmax, the radix descent, compaction) and a
+//! one-threadgroup-per-row finalize; each pass makes the previous pass's
+//! cross-slice decision itself, so the pipeline is six dispatches riding the
+//! forward's command buffer with Device barriers between them, with
+//! [`encode_into`] encoding it onto the forward's own encoder. Each stage is
+//! baked per model with its logits width compiled in ([`crate::off_tape`]).
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -31,6 +31,7 @@ use crate::tape::lowered::BakedKernel;
 
 pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+type ArgumentTable = Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>;
 
 /// Threads per threadgroup — MUST equal `SAMPLING_BLOCK_SIZE` in
 /// `shaders/sampling.metal` (the kernels stride the vocab axis by exactly this
@@ -60,49 +61,34 @@ pub enum CastDtype {
 /// dispatch order and binding table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SamplerStage {
-    Cast,
-    Penalties,
     SoftmaxReduce,
-    StatsPick,
     SoftmaxMaterialize,
-    Histogram,
-    ThresholdPick,
+    DescentRound1,
+    DescentRound2,
     CountCompact,
-    QuotaPick,
-    CompactTied,
     Finalize,
 }
 
 impl SamplerStage {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 6;
     pub const ALL: [Self; Self::COUNT] = [
-        Self::Cast,
-        Self::Penalties,
         Self::SoftmaxReduce,
-        Self::StatsPick,
         Self::SoftmaxMaterialize,
-        Self::Histogram,
-        Self::ThresholdPick,
+        Self::DescentRound1,
+        Self::DescentRound2,
         Self::CountCompact,
-        Self::QuotaPick,
-        Self::CompactTied,
         Self::Finalize,
     ];
 
     fn function(self, cast: CastDtype) -> &'static str {
         match (self, cast) {
-            (Self::Cast, CastDtype::F16) => "cast_rows_f16_to_f32",
-            (Self::Cast, CastDtype::Bf16) => "cast_rows_bf16_to_f32",
-            (Self::Cast, CastDtype::F32) => "cast_rows_f32_to_f32",
-            (Self::Penalties, _) => "apply_penalties",
-            (Self::SoftmaxReduce, _) => "sample_softmax_reduce",
-            (Self::StatsPick, _) => "sample_stats_pick",
+            (Self::SoftmaxReduce, CastDtype::F16) => "sample_softmax_reduce_f16",
+            (Self::SoftmaxReduce, CastDtype::Bf16) => "sample_softmax_reduce_bf16",
+            (Self::SoftmaxReduce, CastDtype::F32) => "sample_softmax_reduce_f32",
             (Self::SoftmaxMaterialize, _) => "sample_softmax_materialize",
-            (Self::Histogram, _) => "sample_histogram_pass",
-            (Self::ThresholdPick, _) => "sample_threshold_pick",
+            (Self::DescentRound1, _) => "sample_descent_round_1",
+            (Self::DescentRound2, _) => "sample_descent_round_2",
             (Self::CountCompact, _) => "sample_count_compact",
-            (Self::QuotaPick, _) => "sample_quota_pick",
-            (Self::CompactTied, _) => "sample_compact_tied",
             (Self::Finalize, _) => "sample_finalize",
         }
     }
@@ -331,6 +317,10 @@ const SAMPLER_TELEM_K: u32 = 8;
 /// `shaders/sampling.metal`.
 const ROW_STATE_LEN: usize = 16;
 
+/// The descent's histogram words per row — MUST equal
+/// `DESCENT_ROUNDS * DESCENT_BUCKETS` in `shaders/sampling.metal`.
+const DESCENT_HIST_LEN: usize = 3 * 2048;
+
 /// The sampler's persistent GPU state: every buffer and argument table the
 /// pipeline needs, allocated and bound ONCE (at model load, like
 /// `RuntimeBindings` — vocab, max rows and history bounds are compile-time
@@ -341,8 +331,8 @@ const ROW_STATE_LEN: usize = 16;
 /// Per step, [`prepare_step`](Self::prepare_step) only writes this step's
 /// params/row-state words into the shared buffers (host memcpy — the buffers
 /// are `StorageModeShared`) and returns a lightweight [`PendingSampler`]
-/// handle; the descent state itself is reset by `sample_stats_pick` each
-/// step, so no zeroing pass is needed between steps.
+/// handle; the kernels write every GPU word of a step before any reads it,
+/// so no zeroing pass is needed between steps.
 pub struct SamplerArena {
     max_rows: u32,
     vocab: u32,
@@ -354,7 +344,6 @@ pub struct SamplerArena {
     /// Persistent pins: dropped only when the arena drops (worker teardown).
     _pins: Vec<Pinned>,
     scratch_f32: Buffer, // f32 logits → prob bits, [max_rows, vocab]
-    out_buf: Buffer,     // sampled token ids, [max_rows]
     row_idx_buf: Buffer, // [max_rows]
     out_ids_buf: Buffer, // penalties histories, [max_rows, max_hist]
     prompt_ids_buf: Buffer,
@@ -363,9 +352,9 @@ pub struct SamplerArena {
     press_buf: Buffer,
     row_state_buf: Buffer, // [max_rows, ROW_STATE_LEN]
     partials_buf: Buffer,  // [sliced_max, 3]
-    hist_buf: Buffer,      // [sliced_max, 256]
+    hist_buf: Buffer,      // [max_rows, DESCENT_HIST_LEN]
     counts_buf: Buffer,    // [sliced_max, 4]
-    staging_buf: Buffer,   // [sliced_max, 2 * MAX_CANDIDATES]
+    staging_buf: Buffer,   // [sliced_max, 4 * MAX_CANDIDATES]
     consts_buf: Buffer,    // (nslices, nrows, max_out, max_prompt)
     max_hist: u32,
     // Sampler-telemetry spill (only compiled under `sampler-telemetry`).
@@ -379,20 +368,14 @@ pub struct SamplerArena {
     telem_consts_buf: Buffer,
     // Per-stage argument tables: MTL4 binds buffer attributes by signature
     // position; each kernel's buffers sit at contiguous 0..k-1, so each stage
-    // has its own table. Built + fully bound once here; the cast's slot 1
-    // (the forward's logits) is rebound per forward by
-    // [`PendingSampler::encode_into`].
-    cast_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    penalties_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    softmax_reduce_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    stats_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    softmax_materialize_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    histogram_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    threshold_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    count_compact_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    quota_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    compact_tied_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    finalize_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    // has its own table. Built + fully bound once here; the forward's logits
+    // (the reduce's slot 1) and tokens (the finalize's slot 5) are bound per
+    // forward by [`PendingSampler::encode_into`].
+    softmax_reduce_at: ArgumentTable,
+    softmax_materialize_at: ArgumentTable,
+    descent_at: ArgumentTable,
+    count_compact_at: ArgumentTable,
+    finalize_at: ArgumentTable,
 }
 
 // SAFETY: the Retained Metal handles are created + only touched on the worker
@@ -407,9 +390,9 @@ unsafe impl Sync for SamplerArena {}
 /// [`SamplerArena`] (whose buffers `prepare_step` already filled with this
 /// step's params), encoded onto the forward's OWN command buffer
 /// ([`encode_into`](Self::encode_into)) — one commit, one host wait, no
-/// second command buffer. Read the sampled tokens after the wait via
-/// [`output`](Self::output). Holds one `Arc` refcount on the arena, so it
-/// moves freely into the forward followup.
+/// second command buffer; each sampled token lands over the step's argmax of
+/// its row. Holds one `Arc` refcount on the arena, so it moves freely into
+/// the forward followup.
 pub struct PendingSampler {
     arena: std::sync::Arc<SamplerArena>,
     njobs: u32,
@@ -431,16 +414,16 @@ impl SliceTarget {
     }
 
     /// Vocab slices a step of `nrows` rows cuts each row into — per-step data,
-    /// as the row count is. Capped at 32 (the per-slice staging is
-    /// `2 * MAX_CANDIDATES` u32 per row, and the one-threadgroup-per-row
-    /// kernels' serial walks scale with slice count). Small batches slice hard;
-    /// a full batch of rows already fills the GPU.
+    /// as the row count is. Capped at one simdgroup's lanes (the finalize gives
+    /// each slice a lane; the per-slice staging is `4 * MAX_CANDIDATES` u32 per
+    /// row, and its serial gather scales with slice count). Small batches slice
+    /// hard; a full batch of rows already fills the GPU.
     fn nslices(self, nrows: u32) -> u32 {
-        (self.0 / nrows.max(1)).clamp(1, 32)
+        (self.0 / nrows.max(1)).clamp(1, SAMPLER_WARP_SIZE as u32)
     }
 
     /// The largest `nrows * nslices(nrows)` over `1..=max_rows` — the extent
-    /// the sliced buffers (partials/hist/counts/staging) must cover: at most
+    /// the sliced buffers (partials/counts/staging) must cover: at most
     /// the target while the slice count is interior, `32 * nrows` while
     /// clamped high, and `nrows` once rows alone fill the machine.
     fn sliced_max(self, max_rows: u32) -> usize {
@@ -460,16 +443,16 @@ impl SamplerArena {
     pub fn bytes_per_row(vocab: u32, max_hist: u32) -> usize {
         let n = 1usize; // per-row terms only
         let h = max_hist.max(1) as usize;
-        // `mk(n * vocab * 4, "scratch")` + out/row_idx/reps/freqs/press (4·n)
-        // + out_ids + prompt_ids (2·n·h) + row_state (16·n).
-        n * (vocab as usize * 4 + 4 * 4 + 2 * h * 4 + 16 * 4)
+        // `mk(n * vocab * 4, "scratch")` + row_idx/reps/freqs/press (4·n)
+        // + out_ids + prompt_ids (2·n·h) + row_state (16·n) + hist.
+        n * (vocab as usize * 4 + 4 * 3 + 2 * h * 4 + 16 * 4 + DESCENT_HIST_LEN * 4)
             // The sliced buffers scale with `sliced_max(nrows)` — the slice
             // target while rows are interior, `nrows` once they alone fill
             // the machine. Their per-row slope at small `n` is the slice
             // target; count it so a width near the slice boundary cannot
-            // out-run the estimate. (partials 3 + counts 4 words + hist
-            // 256 words + staging 2 KiB, all × 4 B per slice.)
-            + (3 * 4 + 4 * 4 + 256 * 4 + 2 * 1024 * 4)
+            // out-run the estimate. (partials 3 + counts 4 words + staging
+            // 4 KiB, all × 4 B per slice.)
+            + (3 * 4 + 4 * 4 + 4 * 1024 * 4)
     }
 
     /// Allocate + bind everything the sampler pipeline needs, once. Sizes are
@@ -513,7 +496,6 @@ impl SamplerArena {
             buf
         };
         let scratch_f32 = mk(n * vocab as usize * 4, "scratch");
-        let out_buf = mk(n * 4, "out");
         let row_idx_buf = mk(n * 4, "row_idx");
         let out_ids_buf = mk(n * h * 4, "out_ids");
         let prompt_ids_buf = mk(n * h * 4, "prompt_ids");
@@ -522,9 +504,9 @@ impl SamplerArena {
         let press_buf = mk(n * 4, "press");
         let row_state_buf = mk(n * ROW_STATE_LEN * 4, "row_state");
         let partials_buf = mk(sliced_max * 3 * 4, "partials");
-        let hist_buf = mk(sliced_max * 256 * 4, "hist");
+        let hist_buf = mk(n * DESCENT_HIST_LEN * 4, "hist");
         let counts_buf = mk(sliced_max * 4 * 4, "counts");
-        let staging_buf = mk(sliced_max * 2 * 1024 * 4, "staging");
+        let staging_buf = mk(sliced_max * 4 * 1024 * 4, "staging");
         let consts_buf = mk(4 * 4, "consts");
         #[cfg(feature = "sampler-telemetry")]
         let telem_k: u32 = SAMPLER_TELEM_K;
@@ -539,54 +521,23 @@ impl SamplerArena {
             )
         };
 
-        // Per-stage argument tables, gap-filled with a zero buffer so an
-        // unused slot can never hold a stale address, then fully bound ONCE:
-        // every stage's buffers are arena-persistent, so the bindings never
-        // change. Only the cast's slot 1 (the forward's logits) is rebound
-        // per forward by `PendingSampler::encode_into`.
-        let mk_table =
-            |count: usize| -> Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>> {
-                use objc2_metal::MTL4ArgumentTable as _;
-                let desc = objc2_metal::MTL4ArgumentTableDescriptor::new();
-                desc.setMaxBufferBindCount(count);
-                let table = device
-                    .newArgumentTableWithDescriptor_error(&desc)
-                    .expect("sampler arg table alloc");
-                let zero = shared_zeroed(device, 16);
-                let zero_addr = zero.gpuAddress();
-                for i in 0..count {
-                    unsafe { table.setAddress_atIndex(zero_addr, i) };
-                }
-                table
-            };
-        // Buffer-index layouts per kernel (as in the shaders' signatures):
-        //   cast: 0=scratch, 1=logits(forward), 2=row_idx, 3=consts.
-        //   penalties: 0=scratch, 1=out_ids, 2=prompt_ids, 3=rep, 4=freq,
-        //   5=pres, 6=consts.
-        //   softmax_reduce: 0=scratch, 1=partials, 2=row_state, 3=consts.
-        //   stats_pick: 0=partials, 1=row_state, 2=consts.
-        //   softmax_materialize: 0=scratch, 1=partials, 2=row_state, 3=consts.
-        //   histogram: 0=prob_bits(scratch), 1=hist, 2=row_state, 3=consts.
-        //   threshold_pick: 0=hist, 1=row_state, 2=consts.
-        //   count_compact: 0=prob_bits, 1=counts, 2=staging, 3=row_state,
-        //   4=consts.
-        //   quota_pick: 0=counts, 1=row_state, 2=consts.
-        //   compact_tied: 0=prob_bits, 1=counts, 2=staging, 3=row_state,
-        //   4=consts.
-        //   finalize: 0=staging, 1=counts, 2=row_state, 3=prob_bits, 4=output,
-        //   5=partials, 6..9=telemetry spill (only under sampler-telemetry),
-        //   10=consts.
-        let cast_at = mk_table(4);
-        let penalties_at = mk_table(7);
-        let softmax_reduce_at = mk_table(4);
-        let stats_pick_at = mk_table(3);
-        let softmax_materialize_at = mk_table(4);
-        let histogram_at = mk_table(4);
-        let threshold_pick_at = mk_table(3);
-        let count_compact_at = mk_table(5);
-        let quota_pick_at = mk_table(3);
-        let compact_tied_at = mk_table(5);
-        let finalize_at = mk_table(11);
+        // Per-stage argument tables, each bound in full by `bind_stage_tables`.
+        let mk_table = |count: usize| -> ArgumentTable {
+            let desc = objc2_metal::MTL4ArgumentTableDescriptor::new();
+            desc.setMaxBufferBindCount(count);
+            device
+                .newArgumentTableWithDescriptor_error(&desc)
+                .expect("sampler arg table alloc")
+        };
+        let softmax_reduce_at = mk_table(12);
+        let softmax_materialize_at = mk_table(5);
+        let descent_at = mk_table(4);
+        let count_compact_at = mk_table(6);
+        let finalize_at = mk_table(if cfg!(feature = "sampler-telemetry") {
+            12
+        } else {
+            7
+        });
 
         let arena = std::sync::Arc::new(Self {
             max_rows,
@@ -595,7 +546,6 @@ impl SamplerArena {
             sliced_max,
             _pins: pins,
             scratch_f32,
-            out_buf,
             row_idx_buf,
             out_ids_buf,
             prompt_ids_buf,
@@ -617,114 +567,90 @@ impl SamplerArena {
             stats_buf,
             #[cfg(feature = "sampler-telemetry")]
             telem_consts_buf,
-            cast_at,
-            penalties_at,
             softmax_reduce_at,
-            stats_pick_at,
             softmax_materialize_at,
-            histogram_at,
-            threshold_pick_at,
+            descent_at,
             count_compact_at,
-            quota_pick_at,
-            compact_tied_at,
             finalize_at,
         });
         arena.bind_stage_tables(device);
         arena
     }
 
-    /// Bind every stage's buffers into its (already gap-filled) argument
-    /// table, reading the owning fields. Called once at construction; the
-    /// bindings never change because the buffers are arena-persistent. Only
-    /// the cast's slot 1 (the forward's logits) is rebound per forward by
-    /// [`PendingSampler::encode_into`].
+    /// Bind every stage's buffers into its argument table, in its kernel's
+    /// signature order, reading the owning fields. Called once at
+    /// construction; the bindings never change because the buffers are
+    /// arena-persistent. The forward's logits and tokens hold a zero buffer
+    /// until [`PendingSampler::encode_into`] binds them.
     fn bind_stage_tables(&self, device: &Device) {
         use objc2_metal::{MTL4ArgumentTable as _, MTLBuffer as _};
-        let scratch = self.scratch_f32.gpuAddress();
-        let partials = self.partials_buf.gpuAddress();
-        let row_state = self.row_state_buf.gpuAddress();
-        let hist = self.hist_buf.gpuAddress();
-        let counts = self.counts_buf.gpuAddress();
-        let staging = self.staging_buf.gpuAddress();
-        let consts = self.consts_buf.gpuAddress();
-        let zero_addr = shared_zeroed(device, 16).gpuAddress();
-        unsafe {
-            self.cast_at.setAddress_atIndex(scratch, 0);
-            self.cast_at.setAddress_atIndex(zero_addr, 1);
-            self.cast_at
-                .setAddress_atIndex(self.row_idx_buf.gpuAddress(), 2);
-            self.cast_at.setAddress_atIndex(consts, 3);
-            self.penalties_at.setAddress_atIndex(scratch, 0);
-            self.penalties_at
-                .setAddress_atIndex(self.out_ids_buf.gpuAddress(), 1);
-            self.penalties_at
-                .setAddress_atIndex(self.prompt_ids_buf.gpuAddress(), 2);
-            self.penalties_at
-                .setAddress_atIndex(self.reps_buf.gpuAddress(), 3);
-            self.penalties_at
-                .setAddress_atIndex(self.freqs_buf.gpuAddress(), 4);
-            self.penalties_at
-                .setAddress_atIndex(self.press_buf.gpuAddress(), 5);
-            self.penalties_at.setAddress_atIndex(consts, 6);
-            self.softmax_reduce_at.setAddress_atIndex(scratch, 0);
-            self.softmax_reduce_at.setAddress_atIndex(partials, 1);
-            self.softmax_reduce_at.setAddress_atIndex(row_state, 2);
-            self.softmax_reduce_at.setAddress_atIndex(consts, 3);
-            self.stats_pick_at.setAddress_atIndex(partials, 0);
-            self.stats_pick_at.setAddress_atIndex(row_state, 1);
-            self.stats_pick_at.setAddress_atIndex(consts, 2);
-            self.softmax_materialize_at.setAddress_atIndex(scratch, 0);
-            self.softmax_materialize_at.setAddress_atIndex(partials, 1);
-            self.softmax_materialize_at.setAddress_atIndex(row_state, 2);
-            self.softmax_materialize_at.setAddress_atIndex(consts, 3);
-            self.histogram_at.setAddress_atIndex(scratch, 0);
-            self.histogram_at.setAddress_atIndex(hist, 1);
-            self.histogram_at.setAddress_atIndex(row_state, 2);
-            self.histogram_at.setAddress_atIndex(consts, 3);
-            self.threshold_pick_at.setAddress_atIndex(hist, 0);
-            self.threshold_pick_at.setAddress_atIndex(row_state, 1);
-            self.threshold_pick_at.setAddress_atIndex(consts, 2);
-            self.count_compact_at.setAddress_atIndex(scratch, 0);
-            self.count_compact_at.setAddress_atIndex(counts, 1);
-            self.count_compact_at.setAddress_atIndex(staging, 2);
-            self.count_compact_at.setAddress_atIndex(row_state, 3);
-            self.count_compact_at.setAddress_atIndex(consts, 4);
-            self.quota_pick_at.setAddress_atIndex(counts, 0);
-            self.quota_pick_at.setAddress_atIndex(row_state, 1);
-            self.quota_pick_at.setAddress_atIndex(consts, 2);
-            self.compact_tied_at.setAddress_atIndex(scratch, 0);
-            self.compact_tied_at.setAddress_atIndex(counts, 1);
-            self.compact_tied_at.setAddress_atIndex(staging, 2);
-            self.compact_tied_at.setAddress_atIndex(row_state, 3);
-            self.compact_tied_at.setAddress_atIndex(consts, 4);
-            self.finalize_at.setAddress_atIndex(staging, 0);
-            self.finalize_at.setAddress_atIndex(counts, 1);
-            self.finalize_at.setAddress_atIndex(row_state, 2);
-            self.finalize_at.setAddress_atIndex(scratch, 3);
-            self.finalize_at
-                .setAddress_atIndex(self.out_buf.gpuAddress(), 4);
-            self.finalize_at.setAddress_atIndex(partials, 5);
-            #[cfg(feature = "sampler-telemetry")]
-            {
-                self.finalize_at
-                    .setAddress_atIndex(self.topk_probs_buf.gpuAddress(), 6);
-                self.finalize_at
-                    .setAddress_atIndex(self.topk_indices_buf.gpuAddress(), 7);
-                self.finalize_at
-                    .setAddress_atIndex(self.stats_buf.gpuAddress(), 8);
-                self.finalize_at
-                    .setAddress_atIndex(self.telem_consts_buf.gpuAddress(), 9);
+        let a = |b: &Buffer| b.gpuAddress();
+        let (scratch, row_idx, row_state) = (
+            a(&self.scratch_f32),
+            a(&self.row_idx_buf),
+            a(&self.row_state_buf),
+        );
+        let (partials, hist, consts) = (
+            a(&self.partials_buf),
+            a(&self.hist_buf),
+            a(&self.consts_buf),
+        );
+        let (counts, staging) = (a(&self.counts_buf), a(&self.staging_buf));
+        let forward = shared_zeroed(device, 16).gpuAddress();
+        let reduce = [
+            scratch,
+            forward,
+            row_idx,
+            a(&self.out_ids_buf),
+            a(&self.prompt_ids_buf),
+            a(&self.reps_buf),
+            a(&self.freqs_buf),
+            a(&self.press_buf),
+            row_state,
+            partials,
+            consts,
+            hist,
+        ];
+        let finalize = [
+            staging, counts, row_state, scratch, row_idx, forward, consts,
+        ];
+        #[cfg(feature = "sampler-telemetry")]
+        let finalize = [
+            &finalize[..],
+            &[
+                partials,
+                a(&self.topk_probs_buf),
+                a(&self.topk_indices_buf),
+                a(&self.stats_buf),
+                a(&self.telem_consts_buf),
+            ],
+        ]
+        .concat();
+        let tables: [(&ArgumentTable, &[u64]); 5] = [
+            (&self.softmax_reduce_at, &reduce),
+            (
+                &self.softmax_materialize_at,
+                &[scratch, partials, row_state, hist, consts],
+            ),
+            (&self.descent_at, &[scratch, hist, row_state, consts]),
+            (
+                &self.count_compact_at,
+                &[scratch, hist, counts, staging, row_state, consts],
+            ),
+            (&self.finalize_at, &finalize[..]),
+        ];
+        for (table, addrs) in tables {
+            for (i, &addr) in addrs.iter().enumerate() {
+                unsafe { table.setAddress_atIndex(addr, i) };
             }
-            self.finalize_at.setAddress_atIndex(consts, 10);
         }
     }
 
     /// Fill the arena's shared buffers with THIS step's sampler inputs and
     /// return the lightweight handle the forward followup encodes. Pure host
-    /// memcpy — no Metal calls, no allocation. The penalties stage always
-    /// runs (rows without penalties carry neutral coefficients + all-padding
-    /// histories, which the kernel's `count > 0` test makes a no-op), so
-    /// `any_penalty` only gates whether real histories are written.
+    /// memcpy — no Metal calls, no allocation. `any_penalty` gates the
+    /// penalties' coefficients and histories; a step without them reads empty
+    /// histories.
     pub fn prepare_step(
         self: &std::sync::Arc<Self>,
         params: &scratchy_core_common::GpuSampleParams,
@@ -760,14 +686,11 @@ impl SamplerArena {
         let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
 
         write(&self.row_idx_buf, &u32s(&params.row_indices));
-        write(&self.reps_buf, &f32s(&params.rep_penalties));
-        write(&self.freqs_buf, &f32s(&params.freq_penalties));
-        write(&self.press_buf, &f32s(&params.pres_penalties));
 
         // row_state: host words (temperature, top_k, top_p, min_p, uniform,
-        // cap). GPU words (max, sum, threshold, round, counts) are (re)written
-        // by the kernels every step — `sample_stats_pick` resets the descent
-        // state — so stale words never leak into a step.
+        // cap). The kernels write the GPU words (max, sum, the descent's
+        // thresholds and survivors) every step before any reads them, so
+        // stale words never leak into a step.
         let mut row_state: Vec<u32> = vec![0; n * ROW_STATE_LEN];
         for r in 0..n {
             let s = &mut row_state[r * ROW_STATE_LEN..(r + 1) * ROW_STATE_LEN];
@@ -788,21 +711,26 @@ impl SamplerArena {
         }
         write(&self.row_state_buf, &u32s(&row_state));
 
-        // Penalties histories: row-major [njobs, max_*] padded with `vocab`
-        // (never a real index). The arena's max_hist bound is a worker-config
-        // fact; a longer history is a config violation, not data.
-        let max_out = params.max_output_len.max(1);
-        let max_prompt = params.max_prompt_len.max(1);
-        assert!(
-            max_out <= self.max_hist && max_prompt <= self.max_hist,
-            "sampler history ({max_out}/{max_prompt}) exceeds arena max_hist ({})",
-            self.max_hist
-        );
-        let pad = self.vocab as i32;
-        let i32s = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let mut flat_out = vec![pad; n * max_out as usize];
-        let mut flat_prompt = vec![pad; n * max_prompt as usize];
-        if params.any_penalty {
+        // Penalties: only a step with a penalized row writes them — the
+        // coefficients and the histories, row-major [njobs, max_*] padded with
+        // `vocab` (never a real index). Every other step reads empty histories,
+        // which leave each logit as it is. The arena's max_hist bound is a
+        // worker-config fact; a longer history is a config violation, not data.
+        let (max_out, max_prompt) = if params.any_penalty {
+            let max_out = params.max_output_len.max(1);
+            let max_prompt = params.max_prompt_len.max(1);
+            assert!(
+                max_out <= self.max_hist && max_prompt <= self.max_hist,
+                "sampler history ({max_out}/{max_prompt}) exceeds arena max_hist ({})",
+                self.max_hist
+            );
+            write(&self.reps_buf, &f32s(&params.rep_penalties));
+            write(&self.freqs_buf, &f32s(&params.freq_penalties));
+            write(&self.press_buf, &f32s(&params.pres_penalties));
+            let pad = self.vocab as i32;
+            let i32s = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let mut flat_out = vec![pad; n * max_out as usize];
+            let mut flat_prompt = vec![pad; n * max_prompt as usize];
             // Re-key the gatherer's own [njobs, its_max_*] layout into this
             // step's strides (equal in practice; kept general).
             for r in 0..n {
@@ -823,10 +751,12 @@ impl SamplerArena {
                 flat_prompt[r * max_prompt as usize..r * max_prompt as usize + src.len()]
                     .copy_from_slice(&src);
             }
-        }
-        write(&self.out_ids_buf, &i32s(&flat_out));
-        write(&self.prompt_ids_buf, &i32s(&flat_prompt));
-
+            write(&self.out_ids_buf, &i32s(&flat_out));
+            write(&self.prompt_ids_buf, &i32s(&flat_prompt));
+            (max_out, max_prompt)
+        } else {
+            (0, 0)
+        };
         write(
             &self.consts_buf,
             &u32s(&[nslices, njobs, max_out, max_prompt]),
@@ -850,88 +780,42 @@ impl SamplerArena {
 
 impl PendingSampler {
     /// Encode the whole sample pipeline onto the forward's OWN MTL4 compute
-    /// encoder (from the argmax followup): cast (and penalties) → softmax
-    /// reduce → stats pick → materialize → 4 × (histogram, threshold pick) →
-    /// count/compact → quota pick → compact tied → finalize. Every stage
-    /// rides its own (arena-persistent) argument table; the forward's logits
-    /// buffer is bound into the cast's table (slot 1) first.
+    /// encoder (from the argmax followup): softmax reduce (the penalized f32
+    /// row and its slice partials) → materialize (row stats, probabilities,
+    /// descent round 0) → descent rounds 1 and 2 (each picking the round
+    /// before) → count/compact (round 2's pick, strict and tied candidates) → finalize
+    /// (tie quotas, sort, top-p, draw). Every stage rides its own
+    /// (arena-persistent) argument table; the forward's logits and `tokens` —
+    /// the step's argmax output, one per logits row, which each job's sampled
+    /// token overwrites at its row — are bound first.
     pub fn encode_into(
         &self,
         enc: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         logits_addr: u64,
+        tokens: &Buffer,
         kernels: &SamplerKernels,
     ) {
         use objc2_metal::MTL4ArgumentTable;
-        let rows = self.njobs;
-        let sliced = rows * self.nslices;
-        unsafe {
-            self.arena.cast_at.setAddress_atIndex(logits_addr, 1);
-        }
-
-        let stage = |s: SamplerStage,
-                     table: &Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-                     tgs: u32| {
-            encode_sampler_stage_into_mtl4(enc, kernels.stage(s), table, tgs)
-        };
         let a = &self.arena;
-
-        stage(SamplerStage::Cast, &a.cast_at, sliced);
-        // Penalties always run: rows without penalties carry neutral
-        // coefficients + all-padding histories, which the kernel's `count
-        // > 0` test makes a no-op.
-        stage(SamplerStage::Penalties, &a.penalties_at, sliced);
-
-        // Softmax: per-slice partials, merged to row stats, materialized.
-        stage(SamplerStage::SoftmaxReduce, &a.softmax_reduce_at, sliced);
-        stage(SamplerStage::StatsPick, &a.stats_pick_at, rows);
-        stage(
-            SamplerStage::SoftmaxMaterialize,
-            &a.softmax_materialize_at,
-            sliced,
-        );
-
-        // Byte-histogram descent: four rounds.
-        for _ in 0..4 {
-            stage(SamplerStage::Histogram, &a.histogram_at, sliced);
-            stage(SamplerStage::ThresholdPick, &a.threshold_pick_at, rows);
+        unsafe {
+            a.softmax_reduce_at.setAddress_atIndex(logits_addr, 1);
+            a.finalize_at.setAddress_atIndex(tokens.gpuAddress(), 5);
         }
-
-        // Compaction: strict candidates + counts, tie quotas, tied candidates.
-        stage(SamplerStage::CountCompact, &a.count_compact_at, sliced);
-        stage(SamplerStage::QuotaPick, &a.quota_pick_at, rows);
-        stage(SamplerStage::CompactTied, &a.compact_tied_at, sliced);
-
-        // Sort + top-p + draw.
-        stage(SamplerStage::Finalize, &a.finalize_at, rows);
-    }
-
-    /// Copy each job's sampled token over `tokens[its logits row]` — the step's
-    /// per-row argmax output — once the sampler is done: the next step reads the
-    /// token from there, and the arena's own output is the next step's to write.
-    pub fn copy_tokens_into(
-        &self,
-        enc: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-        tokens: &Buffer,
-    ) {
-        use objc2_metal::{
-            MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLStages,
-        };
-        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-            MTLStages::Dispatch,
-            MTLStages::Blit,
-            MTL4VisibilityOptions::Device,
-        );
-        let at = |i: usize| i * size_of::<u32>();
-        for (job, &row) in self.rows.iter().enumerate() {
-            unsafe {
-                enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    &self.arena.out_buf,
-                    at(job),
-                    tokens,
-                    at(row as usize),
-                    size_of::<u32>(),
-                );
-            }
+        let (rows, sliced) = (self.njobs, self.njobs * self.nslices);
+        let stages = [
+            (SamplerStage::SoftmaxReduce, &a.softmax_reduce_at, sliced),
+            (
+                SamplerStage::SoftmaxMaterialize,
+                &a.softmax_materialize_at,
+                sliced,
+            ),
+            (SamplerStage::DescentRound1, &a.descent_at, sliced),
+            (SamplerStage::DescentRound2, &a.descent_at, sliced),
+            (SamplerStage::CountCompact, &a.count_compact_at, sliced),
+            (SamplerStage::Finalize, &a.finalize_at, rows),
+        ];
+        for (stage, table, threadgroups) in stages {
+            encode_sampler_stage_into_mtl4(enc, kernels.stage(stage), table, threadgroups);
         }
     }
 
@@ -1039,8 +923,7 @@ mod tests {
         use objc2_metal::MTLBuffer as _;
         let logits_addr = logits_buf.gpuAddress();
         let enc = batch.encoder();
-        pending.encode_into(enc, logits_addr, kernels);
-        pending.copy_tokens_into(enc, &tokens);
+        pending.encode_into(enc, logits_addr, &tokens, kernels);
         let t0 = std::time::Instant::now();
         batch.commit(true);
         let wait = t0.elapsed();
@@ -1430,9 +1313,9 @@ mod tests {
     }
 
     // =======================================================================
-    // apply_penalties parity: rep/freq/pres must reshape logits exactly, and
-    // shift the argmax off a penalized token. Runs the cast + penalties stages
-    // of the sliced pipeline and reads the scratch back.
+    // Penalties parity: rep/freq/pres must reshape logits exactly, and shift
+    // the argmax off a penalized token. Runs the pipeline's reduce stage (which
+    // gathers and penalizes the row) and reads the scratch back.
     // =======================================================================
 
     fn golden_penalties(
@@ -1484,8 +1367,8 @@ mod tests {
         bi
     }
 
-    /// Cast + penalties stages only, on `njobs` rows; returns the scratch
-    /// (post-penalty f32 logits) for row 0 and row `njobs-1`.
+    /// The reduce stage only, on `njobs` rows; returns the scratch it writes
+    /// (the post-penalty f32 logits) for every row.
     fn run_penalties(
         device: &Device,
         params: &scratchy_core_common::GpuSampleParams,
@@ -1505,19 +1388,16 @@ mod tests {
             (pending, arena, res.pin(logits_buf.clone()))
         };
         let enc = batch.encoder();
-        // The cast + penalties stages are the pipeline's first two; the rest
-        // would consume/rewrite the scratch, so stop after penalties. Bind the
-        // logits into the cast's table first (the arena's tables are already
-        // fully bound otherwise).
+        // The reduce stage writes the penalized f32 logits to the scratch; the
+        // rest would rewrite it, so stop after it. Bind the logits into its
+        // table first (the arena's tables are already fully bound otherwise).
         use objc2_metal::MTL4ArgumentTable as _;
         unsafe {
-            arena.cast_at.setAddress_atIndex(logits_buf.gpuAddress(), 1);
+            (arena.softmax_reduce_at).setAddress_atIndex(logits_buf.gpuAddress(), 1);
         }
         let sliced = njobs * pending.nslices;
-        let cast = kernels.stage(SamplerStage::Cast);
-        encode_sampler_stage_into_mtl4(enc, cast, &arena.cast_at, sliced);
-        let penalties = kernels.stage(SamplerStage::Penalties);
-        encode_sampler_stage_into_mtl4(enc, penalties, &arena.penalties_at, sliced);
+        let reduce = kernels.stage(SamplerStage::SoftmaxReduce);
+        encode_sampler_stage_into_mtl4(enc, reduce, &arena.softmax_reduce_at, sliced);
         batch.commit(true);
         let scratch = &arena.scratch_f32;
         Some(read_slice::<f32>(scratch, njobs as usize * vocab as usize))
@@ -1777,6 +1657,466 @@ mod tests {
         assert!(
             exact >= run / 2,
             "too few exact at large vocab: {exact}/{run}"
+        );
+    }
+
+    // =======================================================================
+    // Bit-exact sampling: the probabilities, threshold and draw the pipeline
+    // forms, against cuda's `sample_top_k_top_p_core` replayed on the CPU bit
+    // for bit, at the production vocab sizes and default sampling — ties and
+    // near-ties at the top-k and top-p cuts included. Downstream of the
+    // probabilities everything is integer selection plus the finalize's
+    // sequential f32 sums, which the CPU replays exactly from the pipeline's
+    // own probability row. Of the softmax the CPU replays the slice maxima, the
+    // row max and, on rows whose max sits in every slice (each partial's
+    // rescale is then exp(0)), the merge's reduction order; equal logits must
+    // give equal probabilities. A draw that lands on tied candidates may name
+    // any of them (candidates are gathered in atomic arrival order): there
+    // the drawn probability must match and the token must be one of them.
+    // =======================================================================
+
+    /// What the pipeline formed for one job, read back after the run.
+    struct Formed {
+        nslices: usize,
+        /// Per slice: (max(logit / T), sum exp(logit / T - slice max)).
+        partials: Vec<[f32; 2]>,
+        max: f32,
+        sum: f32,
+        threshold: u32,
+        probs: Vec<u32>,
+        token: u32,
+    }
+
+    /// One pipeline on `logits` (job j samples row j of it) with `kernels`' slicing.
+    fn run_formed<T: Copy>(
+        device: &Device,
+        kernels: &SamplerKernels,
+        params: &scratchy_core_common::GpuSampleParams,
+        logits: &[T],
+    ) -> Vec<Formed> {
+        use objc2_metal::MTLBuffer as _;
+        let n = params.row_indices.len();
+        let vocab = kernels.vocab.get() as usize;
+        let logits_buf = shared_slice(device, logits);
+        let tokens = shared_slice(device, &vec![u32::MAX; n]);
+        let batch = Mtl4DispatchBatch::begin(device).expect("an MTL4 queue");
+        let res = batch.residency();
+        let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
+        let arena = SamplerArena::new(device, res, n as u32, kernels, max_hist);
+        let pending = arena.prepare_step(params, n as u32, None);
+        let pins = [res.pin(logits_buf.clone()), res.pin(tokens.clone())];
+        pending.encode_into(batch.encoder(), logits_buf.gpuAddress(), &tokens, kernels);
+        batch.commit(true);
+        drop(pins);
+        let ns = pending.nslices as usize;
+        let partials = read_slice::<f32>(&arena.partials_buf, n * ns * 3);
+        let state = read_slice::<u32>(&arena.row_state_buf, n * ROW_STATE_LEN);
+        let probs = read_slice::<u32>(&arena.scratch_f32, n * vocab);
+        let tokens = read_slice::<u32>(&tokens, n);
+        (0..n)
+            .map(|j| {
+                let st = &state[j * ROW_STATE_LEN..];
+                Formed {
+                    nslices: ns,
+                    partials: (partials[j * ns * 3..(j + 1) * ns * 3].chunks(3))
+                        .map(|p| [p[0], p[1]])
+                        .collect(),
+                    max: f32::from_bits(st[1]),
+                    sum: f32::from_bits(st[2]),
+                    threshold: st[7],
+                    probs: probs[j * vocab..(j + 1) * vocab].to_vec(),
+                    token: tokens[j],
+                }
+            })
+            .collect()
+    }
+
+    /// The sampling params of one reference case.
+    #[derive(Clone, Copy)]
+    struct Draw {
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        /// Repetition / frequency / presence penalties on the row's top tokens.
+        penalty: bool,
+    }
+
+    /// cuda's selection and draw on the pipeline's probability row: the threshold
+    /// (the cap-th largest bits, then the min-p floor over the row's max
+    /// probability), the candidates (every strict one, then each slice's share
+    /// of the tied ones, slices in order), the top-p cutoff and the draw with
+    /// the finalize's sequential f32 sums. Returns the threshold, the drawn
+    /// candidate's probability and the tokens that may carry it.
+    fn reference_draw(f: &Formed, draw: Draw, uniform: f32) -> (u32, u32, Vec<u32>) {
+        let probs = &f.probs;
+        let vocab = probs.len();
+        let cap = if draw.top_k > 0 {
+            draw.top_k as usize
+        } else {
+            MAX_CANDIDATES
+        }
+        .min(vocab);
+        assert!(
+            cap <= MAX_CANDIDATES,
+            "the reference keeps every strict candidate"
+        );
+        let mut sorted = probs.clone();
+        let kth = *sorted.select_nth_unstable_by(cap - 1, |a, b| b.cmp(a)).1;
+        let mut threshold = f32::from_bits(kth);
+        if draw.min_p > 0.0 {
+            let max_prob = f32::from_bits(*probs.iter().max().expect("a row"));
+            threshold = threshold.max(draw.min_p * max_prob);
+        }
+        let threshold = threshold.to_bits();
+        let mut cand: Vec<u32> = probs.iter().copied().filter(|&b| b > threshold).collect();
+        let mut avail =
+            (probs.iter().filter(|&&b| b == threshold).count()).min(cap - cand.len().min(cap));
+        let mut tied = Vec::new();
+        for s in 0..f.nslices {
+            let lo = s * vocab / f.nslices;
+            let hi = (s + 1) * vocab / f.nslices;
+            let here: Vec<u32> = (lo..hi)
+                .filter(|&i| probs[i] == threshold)
+                .map(|i| i as u32)
+                .collect();
+            let take = here.len().min(avail);
+            avail -= take;
+            cand.extend(std::iter::repeat_n(threshold, take));
+            if take > 0 {
+                tied.extend(here);
+            }
+        }
+        cand.sort_unstable_by(|a, b| b.cmp(a));
+        let p = |b: u32| f32::from_bits(b);
+        let mut cumsum = 0.0f32;
+        let mut cutoff = cand.len();
+        for (i, &b) in cand.iter().enumerate() {
+            cumsum += p(b);
+            if cumsum > draw.top_p {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        let total = cand[..cutoff].iter().fold(0.0f32, |t, &b| t + p(b));
+        let target = uniform * total;
+        let mut at = cutoff - 1;
+        let mut cumsum = 0.0f32;
+        for (i, &b) in cand[..cutoff].iter().enumerate() {
+            cumsum += p(b);
+            if cumsum >= target {
+                at = i;
+                break;
+            }
+        }
+        let drawn = cand[at];
+        let may = if drawn == threshold {
+            tied
+        } else {
+            (0..vocab as u32)
+                .filter(|&i| probs[i as usize] == drawn)
+                .collect()
+        };
+        (threshold, drawn, may)
+    }
+
+    /// The f32 sum of the merge's simdgroup butterfly over `v` (at most 32), zero-padded.
+    fn butterfly_sum(v: &[f32]) -> f32 {
+        let mut lanes = [0.0f32; 32];
+        lanes[..v.len()].copy_from_slice(v);
+        for offset in [16, 8, 4, 2, 1] {
+            let prev = lanes;
+            for (i, lane) in lanes.iter_mut().enumerate() {
+                *lane = prev[i] + prev[i ^ offset];
+            }
+        }
+        lanes[0]
+    }
+
+    /// Check one job against the reference; `logits` its f32 row (`exact_logits`:
+    /// unpenalized at T = 1, so the slice maxima and the ties are the logits').
+    fn check_formed(
+        f: &Formed,
+        logits: &[f32],
+        exact_logits: bool,
+        draw: Draw,
+        uniform: f32,
+    ) -> Result<(), String> {
+        let vocab = logits.len();
+        let maxima: Vec<f32> = f.partials.iter().map(|p| p[0]).collect();
+        if exact_logits {
+            for (s, &m) in maxima.iter().enumerate() {
+                let lo = s * vocab / f.nslices;
+                let hi = (s + 1) * vocab / f.nslices;
+                let want = logits[lo..hi]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if m.to_bits() != want.to_bits() {
+                    return Err(format!("slice {s} max {m} != {want}"));
+                }
+            }
+        }
+        let max = maxima.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if f.max.to_bits() != max.to_bits() {
+            return Err(format!("row max {} != {max}", f.max));
+        }
+        if maxima.iter().all(|&m| m == max) {
+            let sums: Vec<f32> = f.partials.iter().map(|p| p[1]).collect();
+            let want = butterfly_sum(&sums);
+            if f.sum.to_bits() != want.to_bits() {
+                return Err(format!("row sum {} != merged {want}", f.sum));
+            }
+        }
+        let mut by_logit = std::collections::HashMap::new();
+        for (l, &b) in logits.iter().zip(&f.probs).filter(|_| exact_logits) {
+            if *by_logit.entry(l.to_bits()).or_insert(b) != b {
+                return Err(format!("equal logits {l} gave unequal probabilities"));
+            }
+        }
+        let (threshold, drawn, may) = reference_draw(f, draw, uniform);
+        if f.threshold != threshold {
+            return Err(format!("threshold {:08x} != {threshold:08x}", f.threshold));
+        }
+        let got = f.probs.get(f.token as usize).copied();
+        if got != Some(drawn) || !may.contains(&f.token) {
+            return Err(format!(
+                "drew {} (prob {got:08x?}), the reference draws prob {drawn:08x} from {} token(s) {:?}",
+                f.token,
+                may.len(),
+                &may[..may.len().min(4)]
+            ));
+        }
+        Ok(())
+    }
+
+    /// Uniforms on the draw's cumsum boundaries of the first candidates (and one
+    /// ulp either side), from a run's own probabilities.
+    fn boundary_uniforms(f: &Formed, draw: Draw) -> Vec<f32> {
+        let (threshold, _, _) = reference_draw(f, draw, 0.5);
+        let mut cand: Vec<f32> = (f.probs.iter().copied())
+            .filter(|&b| b >= threshold)
+            .map(f32::from_bits)
+            .collect();
+        cand.sort_unstable_by(|a, b| b.total_cmp(a));
+        let total: f32 = cand.iter().take(64).fold(0.0, |t, &p| t + p);
+        let mut cumsum = 0.0f32;
+        let mut out = Vec::new();
+        for &p in cand.iter().take(6) {
+            cumsum += p;
+            let u = cumsum / total;
+            for b in [u.to_bits() - 1, u.to_bits(), u.to_bits() + 1] {
+                if (0.0..1.0).contains(&f32::from_bits(b)) {
+                    out.push(f32::from_bits(b));
+                }
+            }
+        }
+        out
+    }
+
+    /// A logits row of `kind`, each value representable in `bf16` when `quant`.
+    fn reference_row(kind: usize, vocab: usize, k: usize, seed: u64, quant: bool) -> Vec<f32> {
+        let mut rng = Rng(seed ^ ((kind as u64) << 40) ^ vocab as u64 ^ ((k as u64) << 20));
+        let q = |x: f32| {
+            if quant {
+                half::bf16::from_f32(x).to_f32()
+            } else {
+                x
+            }
+        };
+        let up = |x: f32| {
+            if quant {
+                half::bf16::from_bits(half::bf16::from_f32(x).to_bits() + 1).to_f32()
+            } else {
+                f32::from_bits(x.to_bits() + 1)
+            }
+        };
+        let mut v: Vec<f32> = (0..vocab).map(|_| q(rng.range(-15.0, 0.0))).collect();
+        let mut at = |m: usize| -> Vec<usize> { (0..m).map(|_| rng.usize(0, vocab)).collect() };
+        match kind {
+            // A strong token over noise with a tail of mid tokens.
+            0 => {
+                for (j, i) in at(64).into_iter().enumerate() {
+                    v[i] = q(if j == 0 { 20.0 } else { 6.0 + j as f32 * 0.07 });
+                }
+            }
+            // k - 3 distinct tops, then 8 tied at the cut (more tied than slots).
+            1 => {
+                for (j, i) in at(k - 3).into_iter().enumerate() {
+                    v[i] = q(10.0 + j as f32 * 0.25);
+                }
+                for i in at(8) {
+                    v[i] = q(9.0);
+                }
+            }
+            // As 1, the 8 at the cut alternating 9 and one ulp above it.
+            2 => {
+                for (j, i) in at(k - 3).into_iter().enumerate() {
+                    v[i] = q(10.0 + j as f32 * 0.25);
+                }
+                for (j, i) in at(8).into_iter().enumerate() {
+                    v[i] = if j % 2 == 0 { q(9.0) } else { up(q(9.0)) };
+                }
+            }
+            // Tied groups straddling the top-p cut.
+            3 => {
+                for i in at(5) {
+                    v[i] = q(12.0);
+                }
+                for i in at(40) {
+                    v[i] = q(10.0);
+                }
+            }
+            // 200 tied at the top: no strict candidate.
+            4 => {
+                for i in at(200) {
+                    v[i] = q(8.0);
+                }
+            }
+            // A dense cluster one ulp apart at the top.
+            5 => {
+                for (j, i) in at(60).into_iter().enumerate() {
+                    v[i] = [q(11.0), up(q(11.0)), up(up(q(11.0)))][j % 3];
+                }
+            }
+            // The max in every slice (the merge rescales by exp(0)), a tail below.
+            _ => {
+                for (s, i) in at(64).into_iter().enumerate() {
+                    v[s * (vocab / 64) + i % (vocab / 64)] = q(12.0);
+                }
+                for (j, i) in at(40).into_iter().enumerate() {
+                    v[i] = q(11.0 - j as f32 * 0.125);
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn sampling_is_bit_exact_at_the_production_vocab_sizes() {
+        let Some(device) = crate::device::detect_device() else {
+            eprintln!("skipping: no metal device");
+            return;
+        };
+        let device = device.device.clone();
+        if Mtl4DispatchBatch::begin(&device).is_none() {
+            eprintln!("skipping: no MTL4 queue");
+            return;
+        }
+        let mut rng = Rng(0x0B17_E8AC_7000_0008);
+        let mut failures = Vec::new();
+        let (mut draws, mut tied) = (0usize, 0usize);
+        let mut check = |f: &Formed, logits: &[f32], exact: bool, d: Draw, u: f32, tag: &str| {
+            draws += 1;
+            tied += usize::from(reference_draw(f, d, u).2.len() > 1);
+            if let Err(e) = check_formed(f, logits, exact, d, u) {
+                failures.push(format!("{tag} u={u}: {e}"));
+            }
+        };
+        let base = |top_k| Draw {
+            top_k,
+            top_p: 0.95,
+            min_p: 0.0,
+            penalty: false,
+        };
+        for (vocab, dtype) in [
+            (262_144usize, CastDtype::Bf16),
+            (248_320, CastDtype::Bf16),
+            (248_320, CastDtype::F32),
+        ] {
+            let kernels = baked(&device, vocab, dtype);
+            let mut wide = baked(&device, vocab, dtype);
+            wide.slicing = SliceTarget(64);
+            let quant = dtype == CastDtype::Bf16;
+            for (k, kind, seed) in (0..7).flat_map(|kind| [(64, kind, 0u64), (20, kind, 1)]) {
+                let logits = reference_row(kind, vocab, k, seed, quant);
+                let tag = format!("vocab {vocab} {dtype:?} top_k {k} kind {kind}");
+                let draw = base(k as i32);
+                let mut cases = vec![draw];
+                if kind < 2 {
+                    cases.push(Draw {
+                        min_p: 0.05,
+                        ..draw
+                    });
+                    cases.push(Draw { top_k: 0, ..draw });
+                    cases.push(Draw {
+                        penalty: true,
+                        ..draw
+                    });
+                }
+                // The penalized tokens: the row's top three, twice in the output.
+                let mut top: Vec<usize> = (0..vocab).collect();
+                top.select_nth_unstable_by(3, |&a, &b| logits[b].total_cmp(&logits[a]));
+                let history: Vec<i32> = top[..3].iter().flat_map(|&t| [t as i32; 2]).collect();
+                for d in cases {
+                    let exact = !d.penalty;
+                    let params = |us: &[f32]| {
+                        let n = us.len();
+                        let pen = |on: f32, off: f32| vec![if d.penalty { on } else { off }; n];
+                        let hist = if d.penalty {
+                            history.repeat(n)
+                        } else {
+                            Vec::new()
+                        };
+                        scratchy_core_common::GpuSampleParams {
+                            row_indices: (0..n as u32).collect(),
+                            temperatures: vec![1.0; n],
+                            top_ks: vec![d.top_k; n],
+                            top_ps: vec![d.top_p; n],
+                            min_ps: vec![d.min_p; n],
+                            uniforms: us.to_vec(),
+                            rep_penalties: pen(1.3, 1.0),
+                            freq_penalties: pen(0.4, 0.0),
+                            pres_penalties: pen(0.2, 0.0),
+                            max_output_len: if d.penalty { history.len() as u32 } else { 0 },
+                            output_token_ids: hist,
+                            any_penalty: d.penalty,
+                            ..Default::default()
+                        }
+                    };
+                    let run = |kernels: &SamplerKernels, us: &[f32]| -> Vec<Formed> {
+                        let rows: Vec<f32> = logits.repeat(us.len());
+                        match dtype {
+                            CastDtype::F32 => run_formed(&device, kernels, &params(us), &rows),
+                            _ => {
+                                let bf: Vec<half::bf16> =
+                                    rows.iter().map(|&x| half::bf16::from_f32(x)).collect();
+                                run_formed(&device, kernels, &params(us), &bf)
+                            }
+                        }
+                    };
+                    // One row on the device's slices and on 32; then the cumsum
+                    // boundaries as a batch (one slice a row) and four rows.
+                    let u = rng.unit();
+                    let one = run(&kernels, &[u]).remove(0);
+                    check(&one, &logits, exact, d, u, &tag);
+                    let u = rng.unit();
+                    check(&run(&wide, &[u]).remove(0), &logits, exact, d, u, &tag);
+                    let us = boundary_uniforms(&one, d);
+                    for (f, &u) in run(&kernels, &us).iter().zip(&us) {
+                        check(f, &logits, exact, d, u, &tag);
+                    }
+                    let us: Vec<f32> = (0..4).map(|_| rng.unit()).collect();
+                    for (f, &u) in run(&kernels, &us).iter().zip(&us) {
+                        check(f, &logits, exact, d, u, &tag);
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[bit_exact] {draws} draws, {tied} on tied candidates, {} failures",
+            failures.len()
+        );
+        for f in failures.iter().take(12) {
+            eprintln!("  {f}");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} draws differ from the reference",
+            failures.len()
+        );
+        assert!(
+            tied > draws / 10 && tied < draws,
+            "ties exercised: {tied} of {draws}"
         );
     }
 

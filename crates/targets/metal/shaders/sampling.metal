@@ -15,75 +15,67 @@
 // ARITHMETIC — the same softmax, the same bit-serial radix threshold, the
 // same tie-aware compaction, sort, top-p cutoff and categorical draw — but
 // splits each full-vocab pass across many threadgroups (one per vocab slice)
-// and replaces the 32 bit-serial passes with a 4-round byte-histogram descent
-// that provably selects the same threshold: the bit-serial greedy keeps
-// threshold bit b iff count(bits >= candidate) >= k, which over
-// monotonically-ordered nonneg-float bits equals picking, per byte from the
-// top, the largest b whose suffix count reaches k. Cross-slice decisions run
-// in tiny one-threadgroup-per-row kernels; all inter-kernel state lives in a
-// per-row `row_state` block so every dispatch shares one binding table and
-// the whole pipeline rides one command buffer with Device barriers.
+// and replaces the 32 bit-serial passes with a 3-round radix descent over
+// 11/11/10-bit digits that provably selects the same threshold: the
+// bit-serial greedy keeps threshold bit b iff count(bits >= candidate) >= k,
+// which over monotonically-ordered nonneg-float bits equals picking, per digit
+// from the top, the largest d whose suffix count reaches k. Every cross-slice
+// decision (the row's softmax stats, each round's digit, the tie quotas) is
+// made by the next pass's threadgroups themselves from what the pass before
+// left in device memory, so the pipeline is six dispatches riding one command
+// buffer with Device barriers; all inter-kernel state lives in a per-row
+// `row_state` block.
 //
 // Pipeline (host dispatch order):
-//   cast_rows_{f16,bf16}_to_f32  (row × slice)  logits row → f32 scratch
-//   apply_penalties              (row × slice)  in-place on the f32 scratch
-//   sample_softmax_reduce        (row × slice)  per-slice (max, sum) partials
-//   sample_stats_pick            (row)          merge partials → row max/sum
-//   sample_softmax_materialize   (row × slice)  probs, as bits, in place
-//   sample_histogram_pass        (row × slice)  byte histogram of the round's
-//                                              survivors (round in row_state)
-//   sample_threshold_pick        (row)          ×4: pick the round's byte,
-//                                              advance the round; the last
-//                                              round applies min-p
-//   sample_count_compact         (row × slice)  per-slice strict/tied counts +
-//                                              strict candidates to staging
-//   sample_quota_pick            (row)          tie quotas per slice,
-//                                              in index order
-//   sample_compact_tied          (row × slice)  tied candidates to staging
-//   sample_finalize              (row)          gather, bitonic sort desc,
-//                                              top-p cutoff, categorical draw
+//   sample_softmax_reduce_{f16,bf16}
+//                                (row × slice)  logits row, penalized → f32
+//                                              scratch; per-slice (max, sum)
+//                                              partials
+//   sample_softmax_materialize   (row × slice)  merge partials → row max/sum;
+//                                              probs, as bits, in place;
+//                                              round 0's histogram
+//   sample_descent_round_{1,2}   (row × slice)  pick the round before;
+//                                              this round's histogram
+//   sample_count_compact         (row × slice)  pick the last round, min-p;
+//                                              per-slice strict/tied counts,
+//                                              strict and tied candidates
+//   sample_finalize              (row)          tie quotas, gather, bitonic
+//                                              sort desc, top-p cutoff,
+//                                              categorical draw
 //
-// Design (matches cuda's f32 "slow" sampling path): only the CAST kernel is
-// dtype-specialized (f16/bf16); penalties + sampling are f32-only. The
+// Design (matches cuda's f32 "slow" sampling path): only the reduce is
+// dtype-specialized (f16/bf16 logits); penalties + sampling are f32-only. The
 // per-request `uniform_random` is drawn host-side from the request RNG, so no
 // on-GPU Philox is needed.
 //
 // Sliced kernels use threadgroups = (nrows * nslices, 1, 1),
 // threadsPerThreadgroup = (SAMPLING_BLOCK_SIZE, 1, 1); row = tg / nslices,
 // slice = tg % nslices, and each threadgroup strides its contiguous slice of
-// the vocab axis. `nslices` follows the step's row count (host-chosen); the
-// vocab is the model's, compiled in (`SAMPLER_VOCAB`).
+// the vocab axis. `nslices` follows the step's row count (host-chosen, at
+// most WARP_SIZE); the vocab is the model's, compiled in (`SAMPLER_VOCAB`).
 //
-// SHARED BINDING TABLE (one table serves every kernel; each kernel reads
-// only the slots named in its comment):
-//    0  f32 scratch / prob bits   [nrows, vocab]
-//    1  logits                     [total_n, vocab]   (cast in)
-//    2  row_indices                [nrows] uint
-//    3  output_token_ids           [nrows, max_out]   (penalties)
-//    4  prompt_token_ids           [nrows, max_prompt]
-//    5  rep_penalties              [nrows] f32
-//    6  freq_penalties             [nrows] f32
-//    7  pres_penalties             [nrows] f32
-//    8  row_state                  [nrows, 16] uint   (layout below)
-//    9  partials                   [nrows, nslices, 3] uint
-//   10  hist                       [nrows, nslices, 256] uint
-//   11  counts                     [nrows, nslices, 4] uint
-//   12  staging                    [nrows, nslices, 2*MAX_CANDIDATES] uint
-//   13  output                     [nrows] uint
-//   14  consts                     (nslices, nrows, max_out, max_prompt)
-//   15  telemetry topk_probs       (sampler-telemetry only)
-//   16  telemetry topk_indices
-//   17  telemetry stats_out
-//   18  telemetry consts           (telem_on, telem_k)
+// Each kernel binds its buffers at contiguous slots, in signature order:
+//   f32 scratch / prob bits   [nrows, vocab]
+//   logits                    [total_n, vocab]   (the reduce reads them)
+//   row_indices               [nrows] uint
+//   output / prompt token ids [nrows, max_out / max_prompt] (penalties)
+//   rep / freq / pres         [nrows] f32
+//   row_state                 [nrows, 16] uint   (layout below)
+//   partials                  [nrows, nslices, 3] uint
+//   hist                      [nrows, DESCENT_ROUNDS, DESCENT_BUCKETS] uint
+//   counts                    [nrows, nslices, 4] uint
+//   staging                   [nrows, nslices, 4*MAX_CANDIDATES] uint
+//   tokens                    [total_n] uint     (the step's argmax; each
+//                                                 job's draw overwrites its row)
+//   consts                    (nslices, nrows, max_out, max_prompt)
+//   telemetry spill           (sampler-telemetry only)
 //
 // row_state[row] layout (u32 words; host writes 0..8, GPU the rest):
 //    0  temperature bits     1  max_logit bits      2  sum_exp bits
 //    3  top_k (raw)          4  top_p bits          5  min_p bits
-//    6  uniform bits         7  threshold bits (descent accumulator)
-//    8  cap = effective k    9  strict_total       10  tied_total
-//   11  round (descent rounds done)
-//   12  num_candidates      13  survived (count strictly above the prefix)
-//   14  pad                 15  pad
+//    6  uniform bits         7  threshold bits (after min-p)
+//    8  cap = effective k    9..12  (threshold, survivors) before rounds 1, 2
+//   13..15  pad
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -97,7 +89,6 @@ SCRATCHY_CONSTANT(uint, SAMPLER_VOCAB, 0);
 #define MAX_CANDIDATES 1024
 #define WARP_SIZE 32
 #define NUM_WARPS (SAMPLING_BLOCK_SIZE / WARP_SIZE)
-#define HIST_BUCKETS 256
 #define ROW_STATE_LEN 16
 
 // The block reductions split the threadgroup into whole 32-lane simdgroups
@@ -210,59 +201,136 @@ inline uint2 slice_bounds(uint vocab, uint nslices, uint slice) {
 }
 
 // ---------------------------------------------------------------------------
-// Row-gather cast: for row r, slice s, copy logits[row_indices[r], s's slice]
-// converted to f32 into out[r, slice]. `nslices` threadgroups per row so the
-// copy uses the whole GPU instead of one core per row. Mirrors cuda
-// `cast_to_f32_kernel` with a per-row source index.
+// The radix descent: three digits of the prob bits from the top — bits 31..21,
+// 20..10 and 9..0. Round r histograms its digit over the round's survivors
+// (elements whose already-fixed high digits equal the threshold's so far) per
+// slice in threadgroup memory and adds the slice's counts into the row's
+// histogram `hist` [nrows, DESCENT_ROUNDS, DESCENT_BUCKETS], zeroed by the
+// reduce; the next pass's threadgroups each pick the round's digit from it.
+// row_state[DESCENT_STATE + 2 r - 2 ..] holds (threshold, survivors) before
+// round r's pick, for the pass that picks it (round 0 starts from zero).
 // ---------------------------------------------------------------------------
 
-template <typename T>
-[[kernel]] void cast_rows(
-    device       float* out          [[buffer(0)]],
-    device const T*     logits       [[buffer(1)]],
-    device const uint*  row_indices  [[buffer(2)]],
-    constant     uint*  consts       [[buffer(3)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    uint vocab = SAMPLER_VOCAB;
-    uint nslices = consts[0];
-    uint row = tgp / nslices;
-    uint slice = tgp % nslices;
-    uint src_row = row_indices[row];
-    device const T* in = logits + (size_t)src_row * vocab;
-    device float* dst = out + (size_t)row * vocab;
-    uint2 b = slice_bounds(vocab, nslices, slice);
-    for (uint i = b.x + tid; i < b.y; i += SAMPLING_BLOCK_SIZE) {
-        dst[i] = float(in[i]);
+#define DESCENT_ROUNDS 3
+#define DESCENT_BUCKETS 2048  // 2^11, the widest digit
+#define DESCENT_PER_THREAD (DESCENT_BUCKETS / SAMPLING_BLOCK_SIZE)
+#define DESCENT_STATE 9
+
+// Round r's digit is bits [DIGIT_SHIFT[r], DIGIT_SHIFT[r - 1]) (32 for r = 0).
+constant uint DIGIT_SHIFT[DESCENT_ROUNDS] = {21, 10, 0};
+
+inline uint digit_mask(uint round) {
+    return (1u << ((round == 0 ? 32u : DIGIT_SHIFT[round - 1]) - DIGIT_SHIFT[round])) - 1u;
+}
+
+// The fixed high digits before round r.
+inline uint prefix_mask(uint round) {
+    return round == 0 ? 0u : ~0u << DIGIT_SHIFT[round - 1];
+}
+
+inline device uint* descent_hist(device uint* hist, uint row, uint round) {
+    return hist + ((size_t)row * DESCENT_ROUNDS + round) * DESCENT_BUCKETS;
+}
+
+inline uint2 descent_state(device const uint* state, uint round) {
+    return round == 0 ? uint2(0u, 0u)
+                      : uint2(state[DESCENT_STATE + 2 * round - 2],
+                              state[DESCENT_STATE + 2 * round - 1]);
+}
+
+// A slice's histogram of the round's digits, in threadgroup memory.
+inline void descent_clear(threadgroup atomic_uint* local, uint tid) {
+    for (uint j = 0; j < DESCENT_PER_THREAD; j++) {
+        atomic_store_explicit(local + j * SAMPLING_BLOCK_SIZE + tid, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Add the slice's histogram into the row's.
+inline void descent_flush(threadgroup atomic_uint* local, device uint* row_hist, uint tid) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = 0; j < DESCENT_PER_THREAD; j++) {
+        uint b = j * SAMPLING_BLOCK_SIZE + tid;
+        uint n = atomic_load_explicit(local + b, memory_order_relaxed);
+        if (n != 0) {
+            atomic_fetch_add_explicit((device atomic_uint*)(row_hist + b), n,
+                                      memory_order_relaxed);
+        }
     }
 }
 
-SCRATCHY_KERNEL(cast_rows_f16_to_f32, cast_rows<half>)
-SCRATCHY_KERNEL(cast_rows_bf16_to_f32, cast_rows<bfloat>)
-// Identity row-gather for f32 logits — the parity harness's metal side feeds
-// f32 rows directly (the model's own cast is one of the f16/bf16 kernels
-// above; this one exists so the same pipeline can be tested on host data).
-SCRATCHY_KERNEL(cast_rows_f32_to_f32, cast_rows<float>)
+// Pick the round's digit from the row's histogram `h` (thread tid owns digits
+// [tid * DESCENT_PER_THREAD, ...)): the largest d whose suffix count (the
+// round's survivors with digit >= d) plus the survivors above the prefix
+// reaches k — exactly the bit-serial greedy predicate evaluated a digit at a
+// time. The counts are non-increasing in d, so exactly one digit is the
+// largest that reaches k (round 0 counts every element, and each pick leaves
+// the next round's survivors reaching k); its thread publishes it. `prior`
+// and the result are (threshold, survivors above the prefix).
+inline uint2 descent_pick(device const uint* h, uint round, uint k, uint2 prior,
+                          threadgroup uint* warp_buf, threadgroup uint2* pick, uint tid) {
+    uint count[DESCENT_PER_THREAD];
+    uint mine = 0;
+    for (uint j = 0; j < DESCENT_PER_THREAD; j++) {
+        count[j] = h[tid * DESCENT_PER_THREAD + j];
+        mine += count[j];
+    }
+    uint warp_id = tid / WARP_SIZE;
+    uint warp_total = simd_sum(mine);
+    if (tid % WARP_SIZE == 0) warp_buf[warp_id] = warp_total;
+    if (tid == 0) *pick = prior;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint greater = warp_total - simd_prefix_inclusive_sum(mine);
+    for (uint w = warp_id + 1; w < NUM_WARPS; w++) {
+        greater += warp_buf[w];
+    }
+    for (int j = DESCENT_PER_THREAD - 1; j >= 0; j--) {
+        uint at_least = greater + count[j];
+        if ((uint64_t)at_least + prior.y >= (uint64_t)k
+            && (uint64_t)greater + prior.y < (uint64_t)k) {
+            uint digit = tid * DESCENT_PER_THREAD + (uint)j;
+            *pick = uint2(prior.x | (digit << DIGIT_SHIFT[round]), prior.y + greater);
+        }
+        greater = at_least;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint2 result = *pick;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return result;
+}
 
 // ---------------------------------------------------------------------------
-// apply_penalties — repetition / frequency / presence, sliced over the vocab
-// axis. Semantics unchanged from the cuda `apply_penalties_kernel`:
+// sample_softmax_reduce — per (row, slice): gather the row's logits
+// (logits[row_indices[r]], mirrors cuda `cast_to_f32_kernel` with a per-row
+// source index), apply the repetition / frequency / presence penalties
+// (cuda `apply_penalties_kernel`), write the f32 result to the scratch, and
+// reduce the slice's max(logit/T) and partial sum exp(v - slice_max).
+// `sample_softmax_materialize` rescales each partial against the row max, so
+// the row sum equals the single-threadgroup value up to reduction order (the
+// parity harness's robustness margins exist for exactly this class of
+// few-ULP difference). It also zeroes the row's descent histograms.
+// Penalties, unchanged from cuda:
 //   count = occurrences in output_token_ids[row] + prompt_token_ids[row]
 //   if count > 0: logit = logit > 0 ? logit / rep : logit * rep;
 //                 logit -= freq * count + pres
-// Token id == vocab_size is padding (never matches a real vocab index).
+// Token id == vocab_size is padding (never matches a real vocab index); a
+// step without penalties has empty histories (consts[2], consts[3] = 0).
 // ---------------------------------------------------------------------------
 
-#if SCRATCHY_COMPILES(apply_penalties)
-kernel void apply_penalties(
-    device       float* logits            [[buffer(0)]],
-    device const int*   output_token_ids  [[buffer(1)]],
-    device const int*   prompt_token_ids  [[buffer(2)]],
-    device const float* rep_penalties     [[buffer(3)]],
-    device const float* freq_penalties    [[buffer(4)]],
-    device const float* pres_penalties    [[buffer(5)]],
-    constant     uint*  consts            [[buffer(6)]],
+template <typename T>
+[[kernel]] void sample_softmax_reduce(
+    device       float* scratch           [[buffer(0)]],
+    device const T*     logits            [[buffer(1)]],
+    device const uint*  row_indices       [[buffer(2)]],
+    device const int*   output_token_ids  [[buffer(3)]],
+    device const int*   prompt_token_ids  [[buffer(4)]],
+    device const float* rep_penalties     [[buffer(5)]],
+    device const float* freq_penalties    [[buffer(6)]],
+    device const float* pres_penalties    [[buffer(7)]],
+    device const uint*  row_state         [[buffer(8)]],
+    device       uint*  partials          [[buffer(9)]],
+    constant     uint*  consts            [[buffer(10)]],
+    device       uint*  hist              [[buffer(11)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -272,17 +340,26 @@ kernel void apply_penalties(
     uint max_prompt_len = consts[3];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
-
+    device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
+    device const T* in = logits + (size_t)row_indices[row] * vocab;
+    device float* rowp = scratch + (size_t)row * vocab;
+    device const int* out_ids    = output_token_ids + (size_t)row * max_output_len;
+    device const int* prompt_ids = prompt_token_ids + (size_t)row * max_prompt_len;
     float rep_pen  = rep_penalties[row];
     float freq_pen = freq_penalties[row];
     float pres_pen = pres_penalties[row];
-
-    device float* rowp          = logits + (size_t)row * vocab;
-    device const int* out_ids    = output_token_ids + (size_t)row * max_output_len;
-    device const int* prompt_ids = prompt_token_ids + (size_t)row * max_prompt_len;
-
     uint2 b = slice_bounds(vocab, nslices, slice);
+    for (uint i = slice * SAMPLING_BLOCK_SIZE + tid; i < DESCENT_ROUNDS * DESCENT_BUCKETS;
+         i += nslices * SAMPLING_BLOCK_SIZE) {
+        descent_hist(hist, row, 0)[i] = 0;
+    }
+
+    threadgroup float s_warp_buf[NUM_WARPS];
+    float inv_temp = 1.0f / as_type<float>(state[0]);
+
+    float local_max = -INFINITY;
     for (uint v = b.x + tid; v < b.y; v += SAMPLING_BLOCK_SIZE) {
+        float logit = float(in[v]);
         int count = 0;
         for (uint j = 0; j < max_output_len; j++) {
             if (out_ids[j] == (int)v) count++;
@@ -290,52 +367,16 @@ kernel void apply_penalties(
         for (uint j = 0; j < max_prompt_len; j++) {
             if (prompt_ids[j] == (int)v) count++;
         }
-
         if (count > 0) {
-            float logit = rowp[v];
             if (logit > 0.0f) {
                 logit /= rep_pen;
             } else {
                 logit *= rep_pen;
             }
             logit -= freq_pen * (float)count + pres_pen;
-            rowp[v] = logit;
         }
-    }
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// sample_softmax_reduce — per (row, slice): the slice's max(logit/T) and the
-// partial sum exp(v - slice_max). `sample_stats_pick` rescales each partial
-// against the row max, so the row sum equals the single-threadgroup value up
-// to reduction order (the parity harness's robustness margins exist for
-// exactly this class of few-ULP difference).
-// ---------------------------------------------------------------------------
-
-#if SCRATCHY_COMPILES(sample_softmax_reduce)
-kernel void sample_softmax_reduce(
-    device       float* logits_all [[buffer(0)]],
-    device       uint*  partials   [[buffer(1)]],
-    device const uint*  row_state  [[buffer(2)]],
-    constant     uint*  consts     [[buffer(3)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    uint vocab = SAMPLER_VOCAB;
-    uint nslices = consts[0];
-    uint row = tgp / nslices;
-    uint slice = tgp % nslices;
-    device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
-    device float* rowp = logits_all + (size_t)row * vocab;
-    uint2 b = slice_bounds(vocab, nslices, slice);
-
-    threadgroup float s_warp_buf[NUM_WARPS];
-    float inv_temp = 1.0f / as_type<float>(state[0]);
-
-    float local_max = -INFINITY;
-    for (uint i = b.x + tid; i < b.y; i += SAMPLING_BLOCK_SIZE) {
-        local_max = max(local_max, rowp[i] * inv_temp);
+        rowp[v] = logit;
+        local_max = max(local_max, logit * inv_temp);
     }
     float slice_max = block_reduce_max(local_max, s_warp_buf, tid);
 
@@ -351,66 +392,33 @@ kernel void sample_softmax_reduce(
         p[1] = as_type<uint>(slice_sum);
     }
 }
-#endif
+
+SCRATCHY_KERNEL(sample_softmax_reduce_f16, sample_softmax_reduce<half>)
+SCRATCHY_KERNEL(sample_softmax_reduce_bf16, sample_softmax_reduce<bfloat>)
+// f32 logits — the parity harness's metal side feeds f32 rows directly (the
+// model's own logits are f16/bf16); the same pipeline then runs on host data.
+SCRATCHY_KERNEL(sample_softmax_reduce_f32, sample_softmax_reduce<float>)
 
 // ---------------------------------------------------------------------------
-// sample_stats_pick — ONE threadgroup per row: merge the slice partials into
-// the row's max and sum (rescaling each slice's partial sum by
-// exp(slice_max - row_max)), then reset the descent state. 256 threads ≥
-// nslices in every configuration the host builds; extra threads contribute
-// -inf / 0.
-// ---------------------------------------------------------------------------
-
-#if SCRATCHY_COMPILES(sample_stats_pick)
-kernel void sample_stats_pick(
-    device const uint*  partials  [[buffer(0)]],
-    device       uint*  row_state [[buffer(1)]],
-    constant     uint*  consts    [[buffer(2)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    uint nslices = consts[0];
-    uint nrows = consts[1];
-    uint row = min(tgp, nrows - 1);
-    device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
-    device const uint* p = partials + (size_t)row * nslices * 3;
-
-    float my_max = -INFINITY;
-    float my_sum = 0.0f;
-    if (tid < nslices) {
-        my_max = as_type<float>(p[tid * 3 + 0]);
-        my_sum = as_type<float>(p[tid * 3 + 1]);
-    }
-
-    threadgroup float s_warp_buf[NUM_WARPS];
-    float row_max = block_reduce_max(my_max, s_warp_buf, tid);
-
-    float rescaled = (my_max == -INFINITY) ? 0.0f : my_sum * exp(my_max - row_max);
-    float row_sum = block_reduce_sum(rescaled, s_warp_buf, tid);
-
-    if (tid == 0) {
-        state[1] = as_type<uint>(row_max);
-        state[2] = as_type<uint>(row_sum);
-        state[7] = 0;   // threshold accumulator
-        state[11] = 0;  // round
-        state[13] = 0;  // survivors above the prefix
-    }
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// sample_softmax_materialize — per (row, slice): overwrite the f32 scratch
-// with the softmax PROBABILITY BITS — the exact values the cuda radix loop
-// compared on every one of its 32 passes, computed here once:
+// sample_softmax_materialize — per (row, slice): merge the slice partials into
+// the row's max and sum (each slice's partial sum rescaled by
+// exp(slice_max - row_max); every threadgroup merges them itself — 256
+// threads >= nslices, the extra threads contributing -inf / 0), then
+// overwrite the f32 scratch with the softmax PROBABILITY BITS — the exact
+// values the cuda radix loop compared on every one of its 32 passes,
+// computed here once:
 //   bits(i) = as_uint(exp(v(i) - max) * inv_sum)
+// — and histogram the descent's round-0 digit. Slice 0 records the row's max
+// and sum.
 // ---------------------------------------------------------------------------
 
 #if SCRATCHY_COMPILES(sample_softmax_materialize)
 kernel void sample_softmax_materialize(
     device       float* logits_all [[buffer(0)]],
     device       uint*  partials   [[buffer(1)]],
-    device const uint*  row_state  [[buffer(2)]],
-    constant     uint*  consts     [[buffer(3)]],
+    device       uint*  row_state  [[buffer(2)]],
+    device       uint*  hist       [[buffer(3)]],
+    constant     uint*  consts     [[buffer(4)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -418,14 +426,31 @@ kernel void sample_softmax_materialize(
     uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
-    device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
+    device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device float* rowp = logits_all + (size_t)row * vocab;
+    device const uint* p = partials + (size_t)row * nslices * 3;
     uint2 b = slice_bounds(vocab, nslices, slice);
 
+    float my_max = -INFINITY;
+    float my_sum = 0.0f;
+    if (tid < nslices) {
+        my_max = as_type<float>(p[tid * 3 + 0]);
+        my_sum = as_type<float>(p[tid * 3 + 1]);
+    }
+    threadgroup float s_warp_buf[NUM_WARPS];
+    float max_logit = block_reduce_max(my_max, s_warp_buf, tid);
+    float rescaled = (my_max == -INFINITY) ? 0.0f : my_sum * exp(my_max - max_logit);
+    float sum_exp = block_reduce_sum(rescaled, s_warp_buf, tid);
+    if (slice == 0 && tid == 0) {
+        state[1] = as_type<uint>(max_logit);
+        state[2] = as_type<uint>(sum_exp);
+    }
+
     float inv_temp = 1.0f / as_type<float>(state[0]);
-    float max_logit = as_type<float>(state[1]);
-    float inv_sum_exp = 1.0f / as_type<float>(state[2]);
+    float inv_sum_exp = 1.0f / sum_exp;
     device uint* bits = (device uint*)(rowp);
+    threadgroup atomic_uint local_hist[DESCENT_BUCKETS];
+    descent_clear(local_hist, tid);
 
 #if SAMPLER_TELEMETRY
     // Entropy partial over this slice (merged by sample_finalize).
@@ -435,14 +460,16 @@ kernel void sample_softmax_materialize(
         float val = rowp[i] * inv_temp;
         float prob = exp(val - max_logit) * inv_sum_exp;
         bits[i] = as_type<uint>(prob);
+        atomic_fetch_add_explicit(local_hist + (as_type<uint>(prob) >> DIGIT_SHIFT[0]), 1u,
+                                  memory_order_relaxed);
 #if SAMPLER_TELEMETRY
         if (prob > 0.0f) {
             local_ent -= prob * log(prob);
         }
 #endif
     }
+    descent_flush(local_hist, descent_hist(hist, row, 0), tid);
 #if SAMPLER_TELEMETRY
-    threadgroup float s_warp_buf[NUM_WARPS];
     float ent = block_reduce_sum(local_ent, s_warp_buf, tid);
     if (tid == 0) {
         partials[((size_t)row * nslices + slice) * 3 + 2] = as_type<uint>(ent);
@@ -452,18 +479,18 @@ kernel void sample_softmax_materialize(
 #endif
 
 // ---------------------------------------------------------------------------
-// sample_histogram_pass — per (row, slice): a 256-bucket histogram of byte
-// (3 - round) of the prob bits, over the round's SURVIVORS — elements whose
-// already-fixed high bytes equal the threshold's high bytes so far (round and
-// threshold both live in row_state, so this kernel's bindings never change
-// across the four rounds; only the data does).
+// sample_descent_round_{1,2} — per (row, slice): first the pick of the
+// previous round (`descent_pick`, every threadgroup for itself; slice 0
+// records it for the next pass), then the histogram of round ROUND's digit
+// over its survivors. Round 0's histogram rides `sample_softmax_materialize`,
+// the last round's pick `sample_count_compact`.
 // ---------------------------------------------------------------------------
 
-#if SCRATCHY_COMPILES(sample_histogram_pass)
-kernel void sample_histogram_pass(
+template <uint ROUND>
+[[kernel]] void sample_descent_round(
     device const uint*  prob_bits [[buffer(0)]],
     device       uint*  hist      [[buffer(1)]],
-    device const uint*  row_state [[buffer(2)]],
+    device       uint*  row_state [[buffer(2)]],
     constant     uint*  consts    [[buffer(3)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
@@ -472,131 +499,52 @@ kernel void sample_histogram_pass(
     uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
-    device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
-    uint round = state[11];  // 0..3; byte (3 - round) is histogrammed next
+    device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device const uint* rowp = prob_bits + (size_t)row * vocab;
     uint2 b = slice_bounds(vocab, nslices, slice);
 
-    // The fixed high bytes: `round` bytes above the histogrammed byte are
-    // fixed; the mask keeps them and zeroes the rest.
-    uint shift = (3 - round) * 8;
-    uint mask = (shift + 8 >= 32) ? 0u : (~0u << (shift + 8));
-    uint prefix = state[7] & mask;
-
-    threadgroup atomic_uint local_hist[HIST_BUCKETS];
-    for (uint bk = tid; bk < HIST_BUCKETS; bk += SAMPLING_BLOCK_SIZE) {
-        atomic_store_explicit(local_hist + bk, 0u, memory_order_relaxed);
+    threadgroup uint s_warp_buf[NUM_WARPS];
+    threadgroup uint2 s_pick;
+    uint2 picked = descent_pick(descent_hist(hist, row, ROUND - 1), ROUND - 1, state[8],
+                                descent_state(state, ROUND - 1), s_warp_buf, &s_pick, tid);
+    if (slice == 0 && tid == 0) {
+        state[DESCENT_STATE + 2 * ROUND - 2] = picked.x;
+        state[DESCENT_STATE + 2 * ROUND - 1] = picked.y;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    uint mask = prefix_mask(ROUND);
+    uint prefix = picked.x & mask;
+    threadgroup atomic_uint local_hist[DESCENT_BUCKETS];
+    descent_clear(local_hist, tid);
     for (uint i = b.x + tid; i < b.y; i += SAMPLING_BLOCK_SIZE) {
         uint x = rowp[i];
         if ((x & mask) == prefix) {
-            uint bucket = (x >> shift) & 0xFFu;
-            atomic_fetch_add_explicit(local_hist + bucket, 1u, memory_order_relaxed);
+            uint digit = (x >> DIGIT_SHIFT[ROUND]) & digit_mask(ROUND);
+            atomic_fetch_add_explicit(local_hist + digit, 1u, memory_order_relaxed);
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    device uint* dst = hist + ((size_t)row * nslices + slice) * HIST_BUCKETS;
-    for (uint bk = tid; bk < HIST_BUCKETS; bk += SAMPLING_BLOCK_SIZE) {
-        dst[bk] = atomic_load_explicit(local_hist + bk, memory_order_relaxed);
-    }
-    (void)dst;
+    descent_flush(local_hist, descent_hist(hist, row, ROUND), tid);
 }
-#endif
+
+SCRATCHY_KERNEL(sample_descent_round_1, sample_descent_round<1>)
+SCRATCHY_KERNEL(sample_descent_round_2, sample_descent_round<2>)
 
 // ---------------------------------------------------------------------------
-// sample_threshold_pick — ONE threadgroup per row, dispatched once per byte
-// round (after each histogram pass). Merges the slices' histograms, picks
-// this round's byte — the largest b whose suffix count plus the survivors
-// above the prefix reaches k, exactly the bit-serial greedy predicate
-// evaluated a byte at a time — and advances the round. The fourth round also
-// applies the min-p floor over the completed threshold.
-// ---------------------------------------------------------------------------
-
-#if SCRATCHY_COMPILES(sample_threshold_pick)
-kernel void sample_threshold_pick(
-    device const uint*  hist      [[buffer(0)]],
-    device       uint*  row_state [[buffer(1)]],
-    constant     uint*  consts    [[buffer(2)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    uint nslices = consts[0];
-    uint nrows = consts[1];
-    uint row = min(tgp, nrows - 1);
-    device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
-    device const uint* h = hist + (size_t)row * nslices * HIST_BUCKETS;
-
-    // Merge: thread tid owns bucket tid, sums it across slices.
-    threadgroup uint merged[HIST_BUCKETS];
-    if (tid < HIST_BUCKETS) {
-        uint acc = 0;
-        for (uint s = 0; s < nslices; s++) {
-            acc += h[(size_t)s * HIST_BUCKETS + tid];
-        }
-        merged[tid] = acc;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        uint round = state[11];
-        uint k = state[8];             // effective k (host-written)
-        uint threshold = state[7];
-        uint survived = state[13];
-        uint shift = (3 - round) * 8;
-
-        // Largest byte b such that (elements with byte >= b) + survived >= k.
-        // The loop always breaks: at b = 0 the count is every prefix-matching
-        // element, and the previous round guaranteed that count (plus
-        // survived) reaches k.
-        uint pick = 0;
-        uint suffix = 0;  // count of prefix-matching elements with byte > pick
-        uint run = 0;
-        for (int bb = 255; bb >= 0; bb--) {
-            run += merged[bb];
-            if ((uint64_t)run + survived >= (uint64_t)k) {
-                pick = (uint)bb;
-                suffix = run - merged[bb];
-                break;
-            }
-        }
-        threshold |= pick << shift;
-        survived += suffix;
-        state[7] = threshold;
-        state[13] = survived;
-        state[11] = round + 1;
-
-        if (round == 3) {
-            // The threshold is complete; apply the min-p floor (cuda phase 3b).
-            float threshold_prob = as_type<float>(threshold);
-            float min_p = as_type<float>(state[5]);
-            if (min_p > 0.0f) {
-                float inv_sum_exp = 1.0f / as_type<float>(state[2]);
-                float max_prob = inv_sum_exp;  // exp(0) * inv_sum_exp
-                threshold_prob = max(threshold_prob, min_p * max_prob);
-            }
-            state[7] = as_type<uint>(threshold_prob);
-        }
-    }
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// sample_count_compact — per (row, slice): count this slice's strict
-// (bits > threshold) and tied (bits == threshold) elements exactly, and
-// append the strict candidates to the slice's staging run. The staging cap
-// matches the cuda kernel's `pos < cap` drop.
+// sample_count_compact — per (row, slice): pick the last round (completing
+// the threshold), count this slice's strict (bits > threshold) and tied
+// (bits == threshold) elements exactly, and append the strict and the tied
+// candidates to the slice's two staging runs. The staging cap matches the
+// cuda kernel's `pos < cap` drop.
 // ---------------------------------------------------------------------------
 
 #if SCRATCHY_COMPILES(sample_count_compact)
 kernel void sample_count_compact(
     device const uint*  prob_bits [[buffer(0)]],
-    device       uint*  counts    [[buffer(1)]],
-    device       uint*  staging   [[buffer(2)]],
-    device const uint*  row_state [[buffer(3)]],
-    constant     uint*  consts    [[buffer(4)]],
+    device       uint*  hist      [[buffer(1)]],
+    device       uint*  counts    [[buffer(2)]],
+    device       uint*  staging   [[buffer(3)]],
+    device       uint*  row_state [[buffer(4)]],
+    constant     uint*  consts    [[buffer(5)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -604,18 +552,34 @@ kernel void sample_count_compact(
     uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
-    device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
+    device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device const uint* rowp = prob_bits + (size_t)row * vocab;
     uint2 b = slice_bounds(vocab, nslices, slice);
-    uint threshold = state[7];
+
+    // The threshold is complete after the last round's pick; apply the min-p
+    // floor (cuda phase 3b).
+    constexpr uint last = DESCENT_ROUNDS - 1;
+    threadgroup uint s_warp_buf[NUM_WARPS];
+    threadgroup uint2 s_pick;
+    uint2 picked = descent_pick(descent_hist(hist, row, last), last, state[8],
+                                descent_state(state, last), s_warp_buf, &s_pick, tid);
+    float threshold_prob = as_type<float>(picked.x);
+    float min_p = as_type<float>(state[5]);
+    if (min_p > 0.0f) {
+        float inv_sum_exp = 1.0f / as_type<float>(state[2]);
+        float max_prob = inv_sum_exp;  // exp(0) * inv_sum_exp
+        threshold_prob = max(threshold_prob, min_p * max_prob);
+    }
+    uint threshold = as_type<uint>(threshold_prob);
+    if (slice == 0 && tid == 0) state[7] = threshold;
 
     device uint* c = counts + ((size_t)row * nslices + slice) * 4;
     device uint* stage = staging
-        + ((size_t)row * nslices + slice) * 2 * MAX_CANDIDATES;
+        + ((size_t)row * nslices + slice) * 4 * MAX_CANDIDATES;
+    device uint* stage_tied = stage + 2 * MAX_CANDIDATES;
 
-    threadgroup uint s_warp_buf[NUM_WARPS];
-    threadgroup atomic_uint s_next;
-    if (tid == 0) atomic_store_explicit(&s_next, 0u, memory_order_relaxed);
+    threadgroup atomic_uint s_next[2];
+    if (tid < 2) atomic_store_explicit(s_next + tid, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint my_strict = 0;
@@ -624,13 +588,18 @@ kernel void sample_count_compact(
         uint x = rowp[i];
         if (x > threshold) {
             my_strict++;
-            uint pos = atomic_fetch_add_explicit(&s_next, 1u, memory_order_relaxed);
+            uint pos = atomic_fetch_add_explicit(s_next, 1u, memory_order_relaxed);
             if (pos < MAX_CANDIDATES) {
                 stage[2 * pos + 0] = x;
                 stage[2 * pos + 1] = i;
             }
         } else if (x == threshold) {
             my_tied++;
+            uint pos = atomic_fetch_add_explicit(s_next + 1, 1u, memory_order_relaxed);
+            if (pos < MAX_CANDIDATES) {
+                stage_tied[2 * pos + 0] = x;
+                stage_tied[2 * pos + 1] = i;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -640,116 +609,20 @@ kernel void sample_count_compact(
     if (tid == 0) {
         c[0] = strict_total;
         c[1] = tied_total;
-        c[2] = min(atomic_load_explicit(&s_next, memory_order_relaxed),
-                   (uint)MAX_CANDIDATES);  // this slice's staged strict run
+        // This slice's staged strict and tied runs.
+        c[2] = min(atomic_load_explicit(s_next, memory_order_relaxed), (uint)MAX_CANDIDATES);
+        c[3] = min(atomic_load_explicit(s_next + 1, memory_order_relaxed), (uint)MAX_CANDIDATES);
     }
 }
 #endif
 
 // ---------------------------------------------------------------------------
-// sample_quota_pick — ONE threadgroup per row: total the slices' strict
-// counts, compute each slice's share of the tie slots (slices in index
-// order — the cuda kernel's two-phase fill order), and freeze
-// num_candidates.
-// ---------------------------------------------------------------------------
-
-#if SCRATCHY_COMPILES(sample_quota_pick)
-kernel void sample_quota_pick(
-    device       uint* counts    [[buffer(0)]],
-    device       uint* row_state [[buffer(1)]],
-    constant     uint* consts    [[buffer(2)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    uint nslices = consts[0];
-    uint nrows = consts[1];
-    uint row = min(tgp, nrows - 1);
-    device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
-    device const uint* c = counts + (size_t)row * nslices * 4;
-
-    if (tid == 0) {
-        uint cap = state[8];
-        uint strict_total = 0;
-        uint tied_total = 0;
-        for (uint s = 0; s < nslices; s++) {
-            strict_total += c[s * 4 + 0];
-            tied_total += c[s * 4 + 1];
-        }
-        uint strict_kept = min(strict_total, cap);
-        uint tie_slots = cap - strict_kept;
-        uint tied_avail = min(tied_total, tie_slots);
-
-        // Per-slice tie quotas, slices in index order (counts[s, 3]).
-        uint remaining = tied_avail;
-        for (uint s = 0; s < nslices; s++) {
-            uint take = min(c[s * 4 + 1], remaining);
-            counts[(size_t)row * nslices * 4 + s * 4 + 3] = take;
-            remaining -= take;
-        }
-        state[9] = strict_kept;
-        state[10] = tied_avail;
-        state[12] = strict_kept + tied_avail;
-    }
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// sample_compact_tied — per (row, slice): append this slice's tied
-// candidates after its strict run, up to the slice's quota.
-// ---------------------------------------------------------------------------
-
-#if SCRATCHY_COMPILES(sample_compact_tied)
-kernel void sample_compact_tied(
-    device const uint*  prob_bits [[buffer(0)]],
-    device       uint*  counts    [[buffer(1)]],
-    device       uint*  staging   [[buffer(2)]],
-    device const uint*  row_state [[buffer(3)]],
-    constant     uint*  consts    [[buffer(4)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    uint vocab = SAMPLER_VOCAB;
-    uint nslices = consts[0];
-    uint row = tgp / nslices;
-    uint slice = tgp % nslices;
-    device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
-    device const uint* rowp = prob_bits + (size_t)row * vocab;
-    uint2 b = slice_bounds(vocab, nslices, slice);
-    uint threshold = state[7];
-
-    device uint* c = counts + ((size_t)row * nslices + slice) * 4;
-    device uint* stage = staging
-        + ((size_t)row * nslices + slice) * 2 * MAX_CANDIDATES;
-    uint strict_staged = c[2];
-    uint quota = c[3];
-
-    threadgroup atomic_uint s_next;
-    if (tid == 0) atomic_store_explicit(&s_next, 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint i = b.x + tid; i < b.y; i += SAMPLING_BLOCK_SIZE) {
-        if (rowp[i] == threshold) {
-            uint pos = atomic_fetch_add_explicit(&s_next, 1u, memory_order_relaxed);
-            if (pos < quota) {
-                stage[2 * (strict_staged + pos) + 0] = threshold;
-                stage[2 * (strict_staged + pos) + 1] = i;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        uint taken = min(atomic_load_explicit(&s_next, memory_order_relaxed), quota);
-        c[2] = strict_staged + taken;  // the slice's full staging run length
-    }
-}
-#endif
-
-// ---------------------------------------------------------------------------
-// sample_finalize — ONE threadgroup per row: gather the slices' staging runs
-// (strict pairs then tied pairs, slices in order — the cuda kernel's
-// two-phase fill), then the cuda tail: bitonic sort descending by prob,
-// top-p cutoff, renormalize, categorical draw.
+// sample_finalize — ONE threadgroup per row: each slice's share of the tie
+// slots, then gather the slices' staging runs (strict pairs then the
+// quota's tied pairs, slices in order — the cuda kernel's two-phase fill),
+// then the cuda tail: bitonic sort descending by prob, top-p cutoff,
+// renormalize, categorical draw. The token lands over the step's argmax
+// for the row (`tokens[row_indices[row]]`), where the next step reads it.
 //
 // num_candidates >= 1 always: the threshold is at most the largest prob bits
 // value in the row (the min-p floor is min_p * max_prob <= max_prob), so at
@@ -759,19 +632,20 @@ kernel void sample_compact_tied(
 
 #if SCRATCHY_COMPILES(sample_finalize)
 kernel void sample_finalize(
-    device const uint*  staging   [[buffer(0)]],
-    device const uint*  counts    [[buffer(1)]],
-    device const uint*  row_state [[buffer(2)]],
-    device const uint*  prob_bits [[buffer(3)]],
-    device       uint*  output    [[buffer(4)]],
+    device const uint*  staging     [[buffer(0)]],
+    device const uint*  counts      [[buffer(1)]],
+    device const uint*  row_state   [[buffer(2)]],
+    device const uint*  prob_bits   [[buffer(3)]],
+    device const uint*  row_indices [[buffer(4)]],
+    device       uint*  tokens      [[buffer(5)]],
+    constant     uint*  consts      [[buffer(6)]],
 #if SAMPLER_TELEMETRY
-    device const uint*  partials     [[buffer(5)]],
-    device       float* topk_probs   [[buffer(6)]],
-    device       uint*  topk_indices [[buffer(7)]],
-    device       float* stats_out    [[buffer(8)]],
-    constant     uint*  telem_consts [[buffer(9)]],
+    device const uint*  partials     [[buffer(7)]],
+    device       float* topk_probs   [[buffer(8)]],
+    device       uint*  topk_indices [[buffer(9)]],
+    device       float* stats_out    [[buffer(10)]],
+    constant     uint*  telem_consts [[buffer(11)]],
 #endif
-    constant     uint*  consts    [[buffer(10)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -785,19 +659,36 @@ kernel void sample_finalize(
     threadgroup float s_probs[MAX_CANDIDATES];
     threadgroup uint  s_indices[MAX_CANDIDATES];
 
+    // Tie quotas, slices in index order: the greedy fill
+    //   take_s = min(tied_s, remaining); remaining -= take_s
+    // in closed form, take_s = min(tied_s, avail - min(tied before s, avail)).
+    // One lane a slice (the host cuts a row into at most WARP_SIZE slices).
+    threadgroup uint s_quota[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        uint strict = tid < nslices ? c[tid * 4 + 0] : 0u;
+        uint tied = tid < nslices ? c[tid * 4 + 1] : 0u;
+        uint cap = state[8];
+        uint strict_kept = min(simd_sum(strict), cap);
+        uint avail = min(simd_sum(tied), cap - strict_kept);
+        uint before = simd_prefix_exclusive_sum(tied);
+        s_quota[tid] = min(tied, avail - min(before, avail));
+    }
+
     // Gather the slices' runs in order.
     threadgroup atomic_uint s_cursor;
     if (tid == 0) atomic_store_explicit(&s_cursor, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = 0; s < nslices; s++) {
-        uint len = c[s * 4 + 2];
+        uint strict = c[s * 4 + 2];
+        uint len = strict + min(c[s * 4 + 3], s_quota[s]);
         device const uint* stage =
-            staging + ((size_t)row * nslices + s) * 2 * MAX_CANDIDATES;
+            staging + ((size_t)row * nslices + s) * 4 * MAX_CANDIDATES;
         for (uint j = tid; j < len; j += SAMPLING_BLOCK_SIZE) {
+            uint at = j < strict ? j : MAX_CANDIDATES + j - strict;
             uint pos = atomic_fetch_add_explicit(&s_cursor, 1u, memory_order_relaxed);
             if (pos < MAX_CANDIDATES) {
-                s_probs[pos] = as_type<float>(stage[2 * j + 0]);
-                s_indices[pos] = stage[2 * j + 1];
+                s_probs[pos] = as_type<float>(stage[2 * at + 0]);
+                s_indices[pos] = stage[2 * at + 1];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -821,7 +712,7 @@ kernel void sample_finalize(
                     best_idx = i;
                 }
             }
-            output[row] = best_idx;
+            tokens[row_indices[row]] = best_idx;
         }
         return;
     }
@@ -883,7 +774,7 @@ kernel void sample_finalize(
                 break;
             }
         }
-        output[row] = sampled;
+        tokens[row_indices[row]] = sampled;
 
 #if SAMPLER_TELEMETRY
         uint telem_on = telem_consts[0];
