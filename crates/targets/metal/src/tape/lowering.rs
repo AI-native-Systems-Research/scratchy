@@ -3659,7 +3659,14 @@ fn lower_one(
                         function: "causal_softmax_prod_bf16",
                         // SOFT_SPAN_BLOCK = span_ids block size (gather's `bs`).
                         constants: baked(vec![CV::float(1, p.attn_scale), CV::uint(3, bs)]),
-                        dispatch: tg1((lq, 1, 1)),
+                        // One 64-thread threadgroup per row (== the kernel's
+                        // SOFT_T): cooperative row max/sum, not one thread
+                        // streaming kv_len serially ×3 passes.
+                        dispatch: DispatchShape {
+                            threadgroups: (lq, 1, 1),
+                            threads_per_threadgroup: (64, 1, 1),
+                            m_scaling: None,
+                        },
                         bindings: baked(vec![
                             scr(scores_off, 0),
                             rt(RuntimeBindingKind::SeqUsedK, 1),
