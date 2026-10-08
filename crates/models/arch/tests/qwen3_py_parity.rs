@@ -258,6 +258,7 @@ fn qwen3_py_carrier_parity() {
         vision_reverse_indices: None,
         vision_position_ids: None,
         last_token_indices: Some(unsafe { lti_buf.as_view() }),
+        device_inputs: &[],
         deferred: None,
     };
     let _ = null_view; // completeness placeholder, unused fields are None

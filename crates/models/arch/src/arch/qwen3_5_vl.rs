@@ -281,6 +281,7 @@ mod green_gate {
             gdn_is_fresh: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            device_inputs: &[],
             deferred: None,
         };
 

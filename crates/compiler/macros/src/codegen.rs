@@ -7194,18 +7194,27 @@ enum BackboneLayout {
 /// nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
 /// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
-/// logits `width` and `dtype` (`scratchy_target_metal::off_tape`).
+/// logits `width` and `dtype`, and — `head_drafts`, a multi-token-prediction head's drafts a step —
+/// its chain between passes (`scratchy_target_metal::off_tape`).
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    head_drafts: Option<u32>,
 ) -> TokenStream {
     use scratchy_target_metal::off_tape::OffTape;
-    use scratchy_target_metal::tape::ids::{BlockSize, LogitsWidth};
+    use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
+    use scratchy_target_metal::tape::kernel_constants::MtpChainConstants;
     let width = u32::try_from(width).expect("logits width fits u32");
     // The chain advances the full-context group's slots (KV group 0).
     let block_size = BlockSize(mc.global_block_size);
-    let keys = OffTape::keys(LogitsWidth(width), mc.metal_dtype, block_size);
+    let head = head_drafts.map(|drafts| MtpChainConstants {
+        hidden: HiddenSize(u32::try_from(mc.hidden_size).expect("hidden size fits u32")),
+        drafts: NumDrafts(drafts),
+        // An MRoPE head reads a cos/sin row a token in place of its position.
+        rope: RotDim(if mc.mrope { mc.rot_dim } else { 0 }),
+    });
+    let keys = OffTape::keys(LogitsWidth(width), mc.metal_dtype, block_size, head);
     let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
     let OffTape {
         vocab,
@@ -7214,12 +7223,17 @@ fn metal_off_tape_tokens(
         grammar_mask,
         sampler,
         chain_advance,
+        mtp_chain,
     } = ids;
     let vocab = vocab.get();
     let sampler = sampler.iter().map(|row| {
         let row = row.iter();
         quote!([#(#row),*])
     });
+    let mtp_chain = match mtp_chain {
+        Some(k) => quote!(::core::option::Option::Some(#k)),
+        None => quote!(::core::option::Option::None),
+    };
     quote! {
         /// This model's off-tape kernels, baked for its logits.
         #[cfg(feature = "metal")]
@@ -7231,6 +7245,7 @@ fn metal_off_tape_tokens(
                 grammar_mask: #grammar_mask,
                 sampler: [#(#sampler),*],
                 chain_advance: #chain_advance,
+                mtp_chain: #mtp_chain,
             }
         };
     }
@@ -12699,6 +12714,12 @@ pub fn emit_model(
     // non-vision arches (the `vision_*` bounds are absent in text
     // configs). `freqs` is f32 `[total_L, vision_head_dim/2]`; `pixels`
     // is the model dtype (bf16) `[num_tokens, vision_in_features]`.
+    // An MTP head's body reads its target's final hidden rows (`RowsExtern::TargetHidden`).
+    let reads_target_hidden = fuf.nodes.iter().any(|n| {
+        n.op == crate::classified::OpKind::LoadRows(
+            scratchy_forward_compiler::RowsExtern::TargetHidden,
+        )
+    });
     let (
         vision_freqs_bytes_lit,
         vision_pixels_bytes_lit,
@@ -12720,11 +12741,6 @@ pub fn emit_model(
         let posemb_bytes = max_m * vis_embed_dim * 2;
         // target_hidden (MTP heads): model-dtype `[num_tokens, hidden]`, the target's final
         // hidden rows. Zero unless the body reads the extern.
-        let reads_target_hidden = fuf.nodes.iter().any(|n| {
-            n.op == crate::classified::OpKind::LoadRows(
-                scratchy_forward_compiler::RowsExtern::TargetHidden,
-            )
-        });
         let target_hidden_bytes = match reads_target_hidden {
             true => max_m * hidden_size * 2,
             false => 0,
@@ -12841,7 +12857,10 @@ pub fn emit_model(
     // vs broadcast `[n]` positions are disambiguated at runtime by
     // `ctx.positions` numel (the worker uploads `[3, n]` only when image
     // tokens are present).
-    let mrope_runtime_block: proc_macro2::TokenStream = match model.mrope_section {
+    // MRoPE (Qwen3.5-VL): the per-token rotary cos/sin rows a forward reads in place of the
+    // position-indexed cache, built on the host from its positions (`metal_rope_rows`); `None` on
+    // 1D-rope arches, whose rope reads the positions.
+    let metal_rope_rows_fn: proc_macro2::TokenStream = match model.mrope_section {
         Some([t, h, w]) => {
             let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
             let rot_dim_val = model
@@ -12863,37 +12882,57 @@ pub fn emit_model(
             let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
             let rot_dim_lit2 = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
             quote! {
-                let mut __mrope_table_vec: ::std::vec::Vec<u8> = ::std::vec::Vec::new();
-                let mut __mrope_ident_vec: ::std::vec::Vec<u32> = ::std::vec::Vec::new();
-                let (positions, mrope_cos_sin): (&[u32], ::core::option::Option<&[u8]>) =
-                    if !ctx.positions.as_raw().raw_ptr().is_null() {
-                        let __pos_numel = ctx.positions.as_raw().numel();
-                        let __pos_all = ::std::slice::from_raw_parts(
-                            ctx.positions.as_raw().raw_ptr() as *const u32,
-                            __pos_numel,
-                        );
-                        __mrope_table_vec =
-                            ::scratchy_target_metal::interpreter::metal::build_mrope_cos_sin_override(
-                                __pos_all,
-                                n,
-                                #rot_dim_lit2 as usize,
-                                #rope_theta_lit,
-                                [#t_lit, #h_lit, #w_lit],
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE,
-                            );
-                        __mrope_ident_vec.extend(0..n as u32);
-                        (
-                            __mrope_ident_vec.as_slice(),
-                            ::core::option::Option::Some(__mrope_table_vec.as_slice()),
-                        )
-                    } else {
-                        (positions, ::core::option::Option::None)
-                    };
+                /// The rotary cos/sin rows a forward of `n` tokens at `positions` (`[n]`, or MRoPE's
+                /// `[3, n]`) reads in place of the position-indexed cache — its positions then each
+                /// row's own index.
+                #[cfg(feature = "metal")]
+                pub fn metal_rope_rows(
+                    positions: &[u32],
+                    n: usize,
+                ) -> ::core::option::Option<::std::vec::Vec<u8>> {
+                    ::core::option::Option::Some(
+                        ::scratchy_target_metal::interpreter::metal::build_mrope_cos_sin_override(
+                            positions,
+                            n,
+                            #rot_dim_lit2 as usize,
+                            #rope_theta_lit,
+                            [#t_lit, #h_lit, #w_lit],
+                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE,
+                        ),
+                    )
+                }
             }
         }
         None => quote! {
-            let mrope_cos_sin: ::core::option::Option<&[u8]> = ::core::option::Option::None;
+            /// None: this model's rope reads the positions.
+            #[cfg(feature = "metal")]
+            pub fn metal_rope_rows(
+                _positions: &[u32],
+                _n: usize,
+            ) -> ::core::option::Option<::std::vec::Vec<u8>> {
+                ::core::option::Option::None
+            }
         },
+    };
+    let mrope_runtime_block = quote! {
+        let mut __mrope_ident_vec: ::std::vec::Vec<u32> = ::std::vec::Vec::new();
+        let __rope_rows = if !ctx.positions.as_raw().raw_ptr().is_null() {
+            let __pos_all = ::std::slice::from_raw_parts(
+                ctx.positions.as_raw().raw_ptr() as *const u32,
+                ctx.positions.as_raw().numel(),
+            );
+            metal_rope_rows(__pos_all, n)
+        } else {
+            ::core::option::Option::None
+        };
+        let (positions, mrope_cos_sin): (&[u32], ::core::option::Option<&[u8]>) =
+            match &__rope_rows {
+                ::core::option::Option::Some(rows) => {
+                    __mrope_ident_vec.extend(0..n as u32);
+                    (__mrope_ident_vec.as_slice(), ::core::option::Option::Some(rows.as_slice()))
+                }
+                ::core::option::Option::None => (positions, ::core::option::Option::None),
+            };
     };
 
     #[cfg(feature = "metal")]
@@ -12902,7 +12941,13 @@ pub fn emit_model(
     {
         let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
         metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
-        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc));
+        // A multi-token-prediction head (its body reads the target's hidden rows) chains its
+        // passes on the device.
+        let head_drafts = reads_target_hidden.then(|| {
+            let drafts = model.bounds.get("spec_drafts").copied();
+            u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32")
+        });
+        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head_drafts));
     }
     // Its Gated-DeltaNet layers, which hold no KV (empty for a model with none).
     let linear_layer_bits = gdn_linear_layers(fuf, model).unwrap_or_default();
@@ -13359,23 +13404,17 @@ pub fn emit_model(
             unsafe { forward_with_metal_followup(wm, ctx, device, num_tokens, None) }
         }
 
-        /// Same as [`forward`] but takes an optional encoder-tail hook
-        /// that's invoked on the same MTL4 compute encoder used to
-        /// encode the forward, AFTER the bucket dispatches and BEFORE
-        /// `endEncoding`. Lets the caller (the executor's argmax
-        /// dispatch, today) append its own dispatches onto the same
-        /// CB so forward + tail share one commit and one host wait.
+        /// The runtime inputs `ctx` carries for a forward of `num_tokens` tokens, handed to `run`:
+        /// they borrow the host slices `ctx`'s views point at and the rows built here.
+        ///
+        /// # Safety
+        /// Every non-null view in `ctx` points at host-visible memory of its numel.
         #[cfg(feature = "metal")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_with_metal_followup(
-            wm: &Weights,
+        unsafe fn with_forward_inputs<R>(
             ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-        ) -> crate::__gpu::OwnedTensor {
-            let pool = resident_metal_pool(wm, ctx, device);
-
+            run: impl FnOnce(&::scratchy_target_metal::interpreter::metal::ForwardInputs<'_>) -> R,
+        ) -> R {
             // ── Read host-visible input slices off ctx ────────────
             //
             // Under metal, every `TensorView` in `ctx` resolves to a
@@ -13615,8 +13654,32 @@ pub fn emit_model(
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
+                device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
             };
+            run(&inputs)
+        }
+
+        #metal_rope_rows_fn
+
+        /// Same as [`forward`] but takes an optional encoder-tail hook
+        /// that's invoked on the same MTL4 compute encoder used to
+        /// encode the forward, AFTER the bucket dispatches and BEFORE
+        /// `endEncoding`. Lets the caller (the executor's argmax
+        /// dispatch, today) append its own dispatches onto the same
+        /// CB so forward + tail share one commit and one host wait.
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_with_metal_followup(
+            wm: &Weights,
+            ctx: &crate::__gpu::ForwardCtx,
+            device: &mut crate::__gpu::GpuDevice,
+            num_tokens: u64,
+            followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
+        ) -> crate::__gpu::OwnedTensor {
+            let pool = resident_metal_pool(wm, ctx, device);
+            let n = num_tokens as usize;
+
 
             // ── Run forward + copy logits out ─────────────────────
             //
@@ -13645,64 +13708,152 @@ pub fn emit_model(
                     ::scratchy_target_metal::interpreter::metal::ForwardError,
                 > {
                     let spec = &METAL_BUCKETS[bucket_idx];
-                    let logits_buf: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                        dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
-                    > = &worker.arena[spec.terminal_slot as usize];
+                    let logits_buf = &worker.arena[spec.terminal_slot as usize];
+                    let hidden_buf = &worker.arena[spec.backbone_slot as usize];
                     let total_n = n as u32;
                     let vocab = METAL_VOCAB_SIZE as u32;
-                    f(enc, logits_buf, total_n, vocab).map_err(
+                    f(enc, logits_buf, hidden_buf, total_n, vocab).map_err(
                         ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
                     )
                 }
             });
 
-            pool.forward_with_tail(
-                &inputs,
-                |worker, bucket_idx| {
-                    let spec = &METAL_BUCKETS[bucket_idx];
+            with_forward_inputs(ctx, num_tokens, |inputs| {
+                pool.forward_with_tail(
+                    inputs,
+                    |worker, bucket_idx| {
+                        let spec = &METAL_BUCKETS[bucket_idx];
+                        use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
+                        // The caller's rows of the final hidden states (an MTP head's next input),
+                        // before the worker goes back to the pool and its arena is reused.
+                        if let Some(h) = ctx.hidden_out {
+                            let row_bytes =
+                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::HIDDEN_SIZE * 2;
+                            let hidden = worker.arena[spec.backbone_slot as usize].contents();
+                            let mut out = h.out.borrow_mut();
+                            out.clear();
+                            for &row in h.rows {
+                                assert!((row as usize) < n, "hidden row {row} past the forward's {n} rows");
+                                // SAFETY: the backbone slot holds `[n, HIDDEN_SIZE]` 2-byte rows (the
+                                // bucket's arena is sized for at least `n`), and `row < n`.
+                                out.extend_from_slice(unsafe {
+                                    ::std::slice::from_raw_parts(
+                                        (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
+                                        row_bytes,
+                                    )
+                                });
+                            }
+                        }
+                        let buf = worker.arena[spec.terminal_slot as usize].clone();
+                        let vocab = METAL_VOCAB_SIZE as usize;
+                        let shape = [n, vocab];
+                        let bytes = n * vocab * 2; // bf16/f16 — both 2 bytes
+                        let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE {
+                            ::scratchy_target_metal::interpreter::metal::MetalDtype::F16 =>
+                                crate::__gpu::dtype::DType::F16,
+                            ::scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 =>
+                                crate::__gpu::dtype::DType::BF16,
+                            ::scratchy_target_metal::interpreter::metal::MetalDtype::Int4 =>
+                                ::core::unreachable!("Int4 has no logits dtype"),
+                        };
+                        let inner = crate::__gpu::tensor::GpuTensor::new(
+                            buf.contents().as_ptr() as *mut u8,
+                            &shape,
+                            dtype,
+                        );
+                        crate::__gpu::owned_from_metal_buffer(inner, buf, bytes)
+                    },
+                    tail_adapter,
+                )
+            })
+            .expect("MetalWorkerPool::forward")
+        }
+
+        /// One forward encoded onto `encoder` — another model's command buffer, after that model's
+        /// forward, whose outputs `ctx.device_inputs` read — with its input writes at its head
+        /// (`MetalWorkerPool::forward_onto`). Its worker stays out of the pool until the returned
+        /// forward drops, once that command buffer is done.
+        ///
+        /// # Safety
+        /// Same as [`forward`].
+        #[cfg(feature = "metal")]
+        pub unsafe fn forward_onto<'w>(
+            wm: &'w Weights,
+            ctx: &crate::__gpu::ForwardCtx,
+            device: &mut crate::__gpu::GpuDevice,
+            num_tokens: u64,
+            encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+            >,
+        ) -> ::core::result::Result<
+            ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>,
+            ::std::string::String,
+        > {
+            struct Onto<'p>(::scratchy_target_metal::interpreter::metal::Onto<'p, Weights>);
+            impl ::scratchy_forward_compiler::MetalForwardOnto for Onto<'_> {
+                unsafe fn then(
+                    &mut self,
+                    ctx: crate::__gpu::ForwardCtxHandle<'_>,
+                    num_tokens: u64,
+                    encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                        dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                    >,
+                ) -> ::core::result::Result<(), ::std::string::String> {
+                    let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
+                    with_forward_inputs(ctx, num_tokens, |inputs| self.0.then(inputs, encoder))
+                        .map_err(|e| format!("Onto::then: {e}"))
+                }
+
+                fn hidden(
+                    &self,
+                ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
+                > {
+                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
+                    &self.0.worker().arena[spec.backbone_slot as usize]
+                }
+
+                fn logits(
+                    &self,
+                ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
+                > {
+                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
+                    &self.0.worker().arena[spec.terminal_slot as usize]
+                }
+
+                fn vocab(&self) -> u32 {
+                    METAL_VOCAB_SIZE as u32
+                }
+
+                fn hidden_rows(&self, rows: &[u32]) -> ::std::vec::Vec<u8> {
                     use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
-                    // The caller's rows of the final hidden states (an MTP head's next input),
-                    // before the worker goes back to the pool and its arena is reused.
-                    if let Some(h) = ctx.hidden_out {
-                        let row_bytes =
-                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::HIDDEN_SIZE * 2;
-                        let hidden = worker.arena[spec.backbone_slot as usize].contents();
-                        let mut out = h.out.borrow_mut();
-                        out.clear();
-                        for &row in h.rows {
-                            assert!((row as usize) < n, "hidden row {row} past the forward's {n} rows");
-                            // SAFETY: the backbone slot holds `[n, HIDDEN_SIZE]` 2-byte rows (the
-                            // bucket's arena is sized for at least `n`), and `row < n`.
-                            out.extend_from_slice(unsafe {
+                    let spec = &METAL_BUCKETS[self.0.bucket_idx()];
+                    let row_bytes = <Weights as ::scratchy_forward_compiler::CanonicalParams>::HIDDEN_SIZE * 2;
+                    let hidden = self.0.worker().arena[spec.backbone_slot as usize].contents();
+                    let rows_held = spec.bucket_m as usize;
+                    rows.iter()
+                        .flat_map(|&row| {
+                            assert!((row as usize) < rows_held, "hidden row {row} past the bucket's {rows_held}");
+                            // SAFETY: the backbone slot holds `[bucket_m, HIDDEN_SIZE]` 2-byte rows,
+                            // and `row < bucket_m`; the command buffer that wrote them is done.
+                            unsafe {
                                 ::std::slice::from_raw_parts(
                                     (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
                                     row_bytes,
                                 )
-                            });
-                        }
-                    }
-                    let buf = worker.arena[spec.terminal_slot as usize].clone();
-                    let vocab = METAL_VOCAB_SIZE as usize;
-                    let shape = [n, vocab];
-                    let bytes = n * vocab * 2; // bf16/f16 — both 2 bytes
-                    let dtype = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE {
-                        ::scratchy_target_metal::interpreter::metal::MetalDtype::F16 =>
-                            crate::__gpu::dtype::DType::F16,
-                        ::scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 =>
-                            crate::__gpu::dtype::DType::BF16,
-                        ::scratchy_target_metal::interpreter::metal::MetalDtype::Int4 =>
-                            ::core::unreachable!("Int4 has no logits dtype"),
-                    };
-                    let inner = crate::__gpu::tensor::GpuTensor::new(
-                        buf.contents().as_ptr() as *mut u8,
-                        &shape,
-                        dtype,
-                    );
-                    crate::__gpu::owned_from_metal_buffer(inner, buf, bytes)
-                },
-                tail_adapter,
-            )
-            .expect("MetalWorkerPool::forward")
+                            }
+                            .iter()
+                            .copied()
+                        })
+                        .collect()
+                }
+            }
+            let pool = resident_metal_pool(wm, ctx, device);
+            with_forward_inputs(ctx, num_tokens, |inputs| pool.forward_onto(inputs, encoder))
+                .map(|onto| ::std::boxed::Box::new(Onto(onto))
+                    as ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>)
+                .map_err(|e| format!("MetalWorkerPool::forward_onto: {e}"))
         }
 
         /// Phase 6 chain entry point. Opens ONE MTL4 cmdbuf on the
@@ -13728,320 +13879,85 @@ pub fn emit_model(
             body: ::scratchy_forward_compiler::MetalChainBody<'_>,
         ) -> ::core::result::Result<(), ::std::string::String> {
             let pool = resident_metal_pool(wm, ctx, device);
+            with_forward_inputs(ctx, num_tokens, |inputs| {
+                // Pre-pick the bucket from iter-0 num_tokens. The chain
+                // shape is constant across iters so this index is reused.
+                let bucket_idx = pool
+                    .pick_bucket(inputs.num_tokens)
+                    .map_err(|e| format!("MetalWorkerPool::pick_bucket: {e}"))?;
+                let terminal_slot =
+                    METAL_BUCKETS[bucket_idx].terminal_slot as usize;
+                let vocab = METAL_VOCAB_SIZE as u32;
 
-            // Read host-visible iter-0 input slices off ctx (same
-            // pattern as `forward_with_metal_followup`).
-            let n = num_tokens as usize;
-            // Vision towers carry no token ids / positions — the tape
-            // consumes pixels / freqs / cu_seqlens instead, so the macro's
-            // ctx leaves these as `null_view`. `from_raw_parts(null, n)` is
-            // UB even for an unused read (and `write_runtime_inputs` only
-            // copies `len` bytes), so hand the worker an empty slice when
-            // the pointer is null — same null-guard shape as the optional
-            // decoder inputs (slot_mapping / cu_seqlens_q / …) just below.
-            let input_ids: &[u32] = if ctx.input_ids.as_raw().raw_ptr().is_null() {
-                &[]
-            } else {
-                ::std::slice::from_raw_parts(
-                    ctx.input_ids.as_raw().raw_ptr() as *const u32,
-                    n,
-                )
-            };
-            let positions: &[u32] = if ctx.positions.as_raw().raw_ptr().is_null() {
-                &[]
-            } else {
-                ::std::slice::from_raw_parts(
-                    ctx.positions.as_raw().raw_ptr() as *const u32,
-                    n,
-                )
-            };
-            let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
-                    n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            let cu_seqlens_q = if !ctx.cu_seqlens_q.as_raw().raw_ptr().is_null() {
-                let cu_n = ctx.cu_seqlens_q.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.cu_seqlens_q.as_raw().raw_ptr() as *const u32,
-                    cu_n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            let seq_used_k = if !ctx.seqused_k.as_raw().raw_ptr().is_null() {
-                let su_n = ctx.seqused_k.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.seqused_k.as_raw().raw_ptr() as *const u32,
-                    su_n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            let block_table = if !ctx.block_table.as_raw().raw_ptr().is_null() {
-                let bt_n = ctx.block_table.as_raw().numel();
-                ::std::option::Option::Some(::std::slice::from_raw_parts(
-                    ctx.block_table.as_raw().raw_ptr() as *const u32,
-                    bt_n,
-                ))
-            } else {
-                ::std::option::Option::None
-            };
-            // Sliding KV-cache GROUPS (gemma4 SWA): per sliding group, the
-            // per-token slot_mapping + per-block block table. Empty on non-SWA
-            // models. Group `s` here is KV-cache group `s + 1` (group 0 = full).
-            let sliding_slot_mappings: ::std::vec::Vec<&[u32]> = ctx
-                .sliding_slot_mappings
-                .iter()
-                .map(|v| ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, n))
-                .collect();
-            let sliding_block_tables: ::std::vec::Vec<&[u32]> = ctx
-                .sliding_block_tables
-                .iter()
-                .map(|v| {
-                    let sbt_n = v.as_raw().numel();
-                    ::std::slice::from_raw_parts(v.as_raw().raw_ptr() as *const u32, sbt_n)
-                })
-                .collect();
-
-            // Plumb the lm_head sample-row index list from ForwardCtx.
-            // `last_token_indices` is `Option<TensorView>` — present
-            // when the worker built `logits_indices = query_start_loc[1:] - 1`
-            // (any prefill/decode that produces a sampled token), absent
-            // for chunked-prefill intermediate chunks. The metal slice
-            // gathers exactly these rows then runs the lm_head qmv at
-            // M = indices.len().
-            let last_token_indices = ctx.last_token_indices.as_ref().map(|view| {
-                let raw = view.as_raw();
-                ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
-            });
-
-            // GDN per-forward indices (hybrid arches): read from ctx's
-            // host-visible TensorViews (slot id per seq, fresh flag per seq).
-            // `None` for non-hybrid arches (ctx fields are None).
-            let gdn_state_indices = ctx.gdn_state_indices.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const i32,
-                    tv.as_raw().numel(),
-                )
-            });
-            let gdn_is_fresh = ctx.gdn_is_fresh.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u32,
-                    tv.as_raw().numel(),
-                )
-            });
-            // Vision externs (vision towers): raw-byte reads from the
-            // ctx TensorViews. `None` for text arches.
-            let vision_rope_freqs = ctx.vision_rope_freqs.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let pixels = ctx.pixels.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let pos_embeds = ctx.pos_embeds.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let target_hidden = ctx.target_hidden.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            // Qwen2.5-VL windowed-attention externs (i32/u32 byte
-            // views; `None` on non-windowed towers and text bodies).
-            let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_cu_seqlens_window = ctx.vision_cu_seqlens_window.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_window_index = ctx.vision_window_index.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_reverse_indices = ctx.vision_reverse_indices.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            let vision_position_ids = ctx.vision_position_ids.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            // Multimodal splice: vision embeddings (bytes) + a per-source-
-            // row destination map built from `embed_patches`. Text-only
-            // batches leave `embed_patches` empty → both `None` (no-op).
-            let mm_embeds = ctx.mm_embeds.map(|tv| {
-                ::std::slice::from_raw_parts(
-                    tv.as_raw().raw_ptr() as *const u8,
-                    tv.as_raw().size_bytes(),
-                )
-            });
-            // ALWAYS materialized (all-`u32::MAX` for text-only batches):
-            // the splice command sits in every decoder tape, so the kernel
-            // must read `MAX` (= skip) for non-image rows — an unwritten
-            // placeholder buffer would scatter garbage into the residual.
-            let __mm_dst_rows_vec: ::std::vec::Vec<u32> = {
-                let mut __v = ::std::vec![u32::MAX; n];
-                let mut __src: usize = 0;
-                for __p in ctx.embed_patches {
-                    for __k in 0..(__p.length as usize) {
-                        if __src < __v.len() {
-                            __v[__src] = __p.token_offset + __k as u32;
+                pool.with_chain_encoder(
+                    inputs,
+                    |worker, runtime, enc| {
+                        // Concrete adapter that satisfies the non-generic
+                        // `ChainStepHandle` trait. Holds the worker
+                        // borrow + the bucket_idx; calls
+                        // `worker.run_bucket_mtl4` to encode one iter onto
+                        // the encoder.
+                        struct Adapter<'a, W: ::scratchy_forward_compiler::CanonicalParams> {
+                            worker: &'a ::scratchy_target_metal::interpreter::metal::MetalWorker<W>,
+                            bucket_idx: usize,
+                            terminal_slot: usize,
+                            vocab: u32,
                         }
-                        __src += 1;
-                    }
-                }
-                __v
-            };
-            let mm_dst_rows = ::core::option::Option::Some(__mm_dst_rows_vec.as_slice());
-            // MRoPE (Qwen3.5-VL) only: build the per-token cos/sin override
-            // table + identity positions (shadows `positions`); a no-op
-            // `let mrope_cos_sin = None;` on 1D-rope arches.
-            #mrope_runtime_block
-            let inputs = ::scratchy_target_metal::interpreter::metal::ForwardInputs {
-                num_tokens: num_tokens as u32,
-                input_ids,
-                positions,
-                // Per-KV-cache-group slot_mappings / block tables (vLLM hybrid
-                // layout): group 0 = full, then the sliding group(s). On non-SWA
-                // models `sliding_*` are `None`, so this is a single-element vec
-                // == the pre-hybrid single table (byte-identical). Stage 6
-                // widens `ForwardCtx` to carry all N sliding groups.
-                slot_mappings: slot_mapping
-                    .into_iter()
-                    .chain(sliding_slot_mappings)
-                    .collect(),
-                cu_seqlens_q,
-                seq_used_k,
-                // Block-diagonal span labels — wired from the request's block
-                // annotations via ForwardCtx; `None` until that path is
-                // populated (buffer stays zeroed ⇒ span mask inert).
-                span_ids: ctx.span_ids.as_deref(),
-                block_tables: block_table
-                    .into_iter()
-                    .chain(sliding_block_tables)
-                    .collect(),
-                has_spec_tokens: ctx.has_spec_tokens,
-                last_token_indices,
-                gdn_state_indices,
-                gdn_is_fresh,
-                vision_rope_freqs,
-                pixels,
-                pos_embeds,
-                target_hidden,
-                vision_cu_seqlens_full,
-                vision_cu_seqlens_window,
-                vision_window_index,
-                vision_reverse_indices,
-                vision_position_ids,
-                mm_embeds,
-                mm_dst_rows,
-                mrope_cos_sin,
-                deferred: ::core::option::Option::None,
-            };
+                        impl<W: ::scratchy_forward_compiler::CanonicalParams>
+                            ::scratchy_forward_compiler::ChainStepHandle for Adapter<'_, W>
+                        {
+                            fn run_forward_step(
+                                &self,
+                                encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                                >,
+                                num_tokens: u32,
+                                num_seqs: u32,
+                                has_spec_tokens: bool,
+                            ) -> ::core::result::Result<(), ::std::string::String> {
+                                self.worker
+                                    .run_bucket_mtl4(
+                                        self.bucket_idx,
+                                        num_tokens,
+                                        num_seqs,
+                                        has_spec_tokens,
+                                        encoder,
+                                    )
+                                    .map_err(|e| format!("run_bucket_mtl4: {e:?}"))
+                            }
 
-            // Pre-pick the bucket from iter-0 num_tokens. The chain
-            // shape is constant across iters so this index is reused.
-            let bucket_idx = pool
-                .pick_bucket(inputs.num_tokens)
-                .map_err(|e| format!("MetalWorkerPool::pick_bucket: {e}"))?;
-            let terminal_slot =
-                METAL_BUCKETS[bucket_idx].terminal_slot as usize;
-            let vocab = METAL_VOCAB_SIZE as u32;
+                            fn logits_buf(
+                                &self,
+                            ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
+                            > {
+                                &self.worker.arena[self.terminal_slot]
+                            }
 
-            pool.with_chain_encoder(
-                &inputs,
-                |worker, runtime, enc| {
-                    // Concrete adapter that satisfies the non-generic
-                    // `ChainStepHandle` trait. Holds the worker
-                    // borrow + the bucket_idx; calls
-                    // `worker.run_bucket_mtl4` to encode one iter onto
-                    // the encoder.
-                    struct Adapter<'a, W: ::scratchy_forward_compiler::CanonicalParams> {
-                        worker: &'a ::scratchy_target_metal::interpreter::metal::MetalWorker<W>,
-                        bucket_idx: usize,
-                        terminal_slot: usize,
-                        vocab: u32,
-                    }
-                    impl<W: ::scratchy_forward_compiler::CanonicalParams>
-                        ::scratchy_forward_compiler::ChainStepHandle for Adapter<'_, W>
-                    {
-                        fn run_forward_step(
-                            &self,
-                            encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
-                            >,
-                            num_tokens: u32,
-                            num_seqs: u32,
-                            has_spec_tokens: bool,
-                        ) -> ::core::result::Result<(), ::std::string::String> {
-                            self.worker
-                                .run_bucket_mtl4(
-                                    self.bucket_idx,
-                                    num_tokens,
-                                    num_seqs,
-                                    has_spec_tokens,
-                                    encoder,
-                                )
-                                .map_err(|e| format!("run_bucket_mtl4: {e:?}"))
+                            fn vocab(&self) -> u32 { self.vocab }
                         }
-
-                        fn logits_buf(
-                            &self,
-                        ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                            dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
-                        > {
-                            &self.worker.arena[self.terminal_slot]
-                        }
-
-                        fn vocab(&self) -> u32 { self.vocab }
-                    }
-                    let adapter = Adapter {
-                        worker,
-                        bucket_idx,
-                        terminal_slot,
-                        vocab,
-                    };
-                    // Erase the metal-typed `&RuntimeBindings` behind the
-                    // neutral handle so `MetalChainBody` (defined in the
-                    // target-free compiler) names no metal-target type; the
-                    // worker's body closure recovers `&RuntimeBindings`.
-                    body(
-                        &adapter,
-                        ::scratchy_forward_compiler::MetalRuntimeHandle::new(runtime),
-                        enc,
-                    )
-                    .map_err(
-                        ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
-                    )
-                },
-            )
-            .map_err(|e| format!("MetalWorkerPool::with_chain_encoder: {e}"))
+                        let adapter = Adapter {
+                            worker,
+                            bucket_idx,
+                            terminal_slot,
+                            vocab,
+                        };
+                        // Erase the metal-typed `&RuntimeBindings` behind the
+                        // neutral handle so `MetalChainBody` (defined in the
+                        // target-free compiler) names no metal-target type; the
+                        // worker's body closure recovers `&RuntimeBindings`.
+                        body(
+                            &adapter,
+                            ::scratchy_forward_compiler::MetalRuntimeHandle::new(runtime),
+                            enc,
+                        )
+                        .map_err(
+                            ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
+                        )
+                    },
+                )
+                .map_err(|e| format!("MetalWorkerPool::with_chain_encoder: {e}"))
+            })
         }
     };
 
@@ -14284,7 +14200,8 @@ fn emit_shim_model(
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{
-            forward, forward_chain_with_encoder, forward_with_metal_followup,
+            forward, forward_chain_with_encoder, forward_onto, forward_with_metal_followup,
+            metal_rope_rows,
             METAL_ARENA_PEAK_BYTES, METAL_BUCKET_ARENA_COSTS, METAL_BUCKETS, METAL_OFF_TAPE, METAL_RUNGS,
             metal_pool,
         };

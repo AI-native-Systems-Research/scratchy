@@ -511,6 +511,7 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
         has_spec_tokens: false,
         last_token_indices: Some(view(&s.last_token_indices, &[1], u32t)),
+        device_inputs: &[],
         deferred: None,
     };
     let out = match path {

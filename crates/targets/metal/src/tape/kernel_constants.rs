@@ -1358,6 +1358,25 @@ impl From<SamplerConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `mtp_chain.metal`: slot 0 a multi-token-prediction head's hidden width, slot 1 its drafts a
+/// step, slot 2 the width of its rotary cos/sin rows (0: its rope reads positions).
+#[derive(Clone, Copy)]
+pub struct MtpChainConstants {
+    pub hidden: HiddenSize,
+    pub drafts: crate::tape::ids::NumDrafts,
+    pub rope: crate::tape::ids::RotDim,
+}
+
+impl From<MtpChainConstants> for Vec<ConstantValue> {
+    fn from(c: MtpChainConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.hidden.get()),
+            ConstantValue::uint(ConstSlot(1), c.drafts.get()),
+            ConstantValue::uint(ConstSlot(2), c.rope.get()),
+        ]
+    }
+}
+
 /// `chain_advance.metal` slot 0: the model's KV block size.
 pub struct ChainAdvanceConstants {
     pub block_size: BlockSize,

@@ -219,25 +219,30 @@ impl WrittenExtents {
         padding: Padding,
         writes: &mut InputWrites,
     ) -> Result<(), usize> {
-        let len = buffer.length();
-        if src.len() > len {
-            return Err(src.len());
-        }
-        let mut written = self.0.lock().expect("written extents");
-        let stale = written
-            .insert(buffer.gpuAddress(), src.len())
-            .unwrap_or(len);
+        self.cover(buffer, src.len(), padding, writes)?;
         if !src.is_empty() {
             writes.stage(buffer, src);
         }
-        if stale > src.len() {
-            let range = src.len()..stale;
-            let byte = padding.byte();
-            writes.ops.push(InputWrite::Fill {
-                to: buffer.clone(),
-                range,
-                byte,
-            });
+        Ok(())
+    }
+
+    /// Record the head `len` bytes of `buffer` as this forward's — written by the caller — and
+    /// every byte past them the `padding`. `Err`: `len`, more than the buffer holds.
+    pub fn cover(
+        &self,
+        buffer: &Buffer,
+        len: usize,
+        padding: Padding,
+        writes: &mut InputWrites,
+    ) -> Result<(), usize> {
+        if len > buffer.length() {
+            return Err(len);
+        }
+        let mut written = self.0.lock().expect("written extents");
+        let stale = (written.insert(buffer.gpuAddress(), len)).unwrap_or(buffer.length());
+        if stale > len {
+            let (to, range, byte) = (buffer.clone(), len..stale, padding.byte());
+            writes.ops.push(InputWrite::Fill { to, range, byte });
         }
         Ok(())
     }
@@ -273,12 +278,13 @@ pub(super) enum InputWrite {
         range: std::ops::Range<usize>,
         byte: u8,
     },
-    /// The `u32` `offset` bytes into `src`, which an earlier command buffer wrote, to `to` at `at`.
+    /// `len` bytes `offset` into `src`, which an earlier forward wrote, to `to` at `at`.
     Device {
         src: Buffer,
         offset: usize,
         to: Buffer,
         at: usize,
+        len: usize,
     },
 }
 

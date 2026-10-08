@@ -307,9 +307,9 @@ pub struct MetalWorker {
     /// grows it only when the step has more rows.
     argmax_slots: Vec<Arc<ArgmaxSlot>>,
     /// This step's [`Deferral`], set by `execute_model` for
-    /// `forward_argmax_blocking` to commit the target forward under; `None`
-    /// for a step the host waits for.
-    deferral: Option<Deferral>,
+    /// `forward_argmax_blocking` to commit the target forward under, with the
+    /// input tokens still on the device; `None` for a step the host waits for.
+    deferral: Option<(Deferral, Vec<DeviceInput>)>,
     /// The deferred forward `forward_argmax_blocking` committed, back for
     /// `execute_model`.
     committed: Option<(InFlight, Arc<ArgmaxSlot>)>,
@@ -347,6 +347,10 @@ pub struct MetalWorker {
     chain_advance_kernel: Option<scratchy_target_metal::chain_advance::ChainAdvanceKernel>,
     /// The chain advance baked for the draft model's KV block size.
     draft_chain_advance_kernel: Option<scratchy_target_metal::chain_advance::ChainAdvanceKernel>,
+    /// An MTP head's chain between its passes, and the buffer its inputs and outputs live in
+    /// ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)).
+    mtp_chain_kernel: Option<scratchy_target_metal::mtp_chain::MtpChainKernel>,
+    mtp_chain_buffer: Option<scratchy_target_metal::residency::Pinned>,
     /// Second `MTLCommandQueue` on the same device, dedicated to the
     /// draft chain. Metal device-level parallelism: dispatches on
     /// distinct queues run concurrently on Apple Silicon when they
@@ -903,6 +907,8 @@ impl MetalWorker {
             grammar_buf_rows: None,
             chain_advance_kernel: None,
             draft_chain_advance_kernel: None,
+            mtp_chain_kernel: None,
+            mtp_chain_buffer: None,
             draft_queue: None,
             target_tensor_refs: None,
             target_kv_layers: Vec::new(),
@@ -1575,6 +1581,11 @@ impl MetalWorker {
                 ExecutorError::WorkerInit(format!("draft chain_advance compile: {e:?}"))
             })?,
         );
+        self.mtp_chain_kernel = scratchy_target_metal::mtp_chain::MtpChainKernel::new(
+            &gpu_device.device,
+            draft_off_tape,
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("MTP chain compile: {e:?}")))?;
         self.draft_model = Some(draft_model);
         self.draft_model_dir = Some(draft_dir);
         self.draft_hf_config = Some(draft_hf_config);
@@ -1992,7 +2003,7 @@ impl MetalWorker {
             |id| self.input_batch.num_generated(id),
             vocab,
         );
-        let record = self.deferral.as_mut().map(|d| &mut d.host_writes);
+        let record = self.deferral.as_mut().map(|(d, _)| &mut d.host_writes);
         Ok(arena.prepare_step(&params, jobs.len() as u32, record))
     }
 }
@@ -2177,6 +2188,7 @@ fn metal_chain_dispatch(
         gdn_is_fresh: None,
         has_spec_tokens: false,
         last_token_indices: None,
+        device_inputs: &[],
         deferred: None,
     };
 
@@ -2293,8 +2305,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             .map(|(argmax, _)| argmax)
     }
 
-    /// The forward behind [`Self::forward_argmax_blocking`]; `hidden_rows` empty copies no
-    /// hidden rows out.
     fn forward_argmax_hidden_blocking(
         &mut self,
         model: ::scratchy_serving_engine::spec_decode::ModelHandle,
@@ -2302,6 +2312,185 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
         hidden_rows: &[u32],
     ) -> Result<(Vec<u32>, Vec<u8>), ::scratchy_serving_engine::spec_decode::BackendError> {
+        let out = self.forward_argmax_then(model, kv_pool, req, hidden_rows, None)?;
+        Ok((out.tokens, out.hidden))
+    }
+
+    /// Phase 6: K-step draft chain in ONE MTL4 command buffer. Forward,
+    /// argmax_dual_write, and chain_advance (advances positions /
+    /// slot_mapping / seqused_k in-place on the GPU between iters)
+    /// for K iters share one CB, one commit, and one host wait. Per
+    /// iter we spend ~kernel-time only — no host roundtrip, no per-
+    /// iter allocator reset.
+    ///
+    /// Thin wrapper that resolves handles → refs and delegates to the
+    /// free [`metal_chain_dispatch`] helper. The free fn is shared
+    /// with the Phase 9 speculative path (worker's lockstep thread),
+    /// which can't borrow `&self` while the main thread is mid-
+    /// `forward_argmax_blocking` for target verify.
+    fn forward_chain_k(
+        &mut self,
+        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
+        kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
+        req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
+        _block_size: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<u32>>, ::scratchy_serving_engine::spec_decode::BackendError> {
+        use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Resolve target model + KV pool (handle 1 = draft, 0 = target).
+        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
+            ModelHandle::TARGET => self
+                .model
+                .as_deref()
+                .ok_or_else(|| BackendError::Backend("target model not loaded".into()))?,
+            ModelHandle(1) => self
+                .draft_model
+                .as_deref()
+                .ok_or_else(|| BackendError::Backend("draft model not loaded".into()))?,
+            _ => return Err(BackendError::UnknownHandle("ModelHandle")),
+        };
+        let kv_cache_ref: &KvCachePool =
+            match kv_pool {
+                KvPoolHandle::TARGET => self.kv_cache.as_ref().ok_or_else(|| {
+                    BackendError::Backend("target kv_cache not initialized".into())
+                })?,
+                KvPoolHandle(1) => self.draft_kv_cache.as_ref().ok_or_else(|| {
+                    BackendError::Backend("draft kv_cache not initialized".into())
+                })?,
+                _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
+            };
+
+        let argmax_kernels = match model {
+            ModelHandle::TARGET => &self.argmax_kernels,
+            _ => &self.draft_argmax_kernels,
+        }
+        .as_ref()
+        .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
+        let chain_kernel = match model {
+            ModelHandle::TARGET => &self.chain_advance_kernel,
+            _ => &self.draft_chain_advance_kernel,
+        }
+        .as_ref()
+        .ok_or_else(|| BackendError::Backend("chain_advance_kernel not built".into()))?;
+
+        // Phase 8 routing: a draft chain runs on the draft's shadow
+        // device (`draft_device`), so target verify and draft chain stay
+        // disjoint when there is a draft queue.
+        let mut shadow_draft_device: Option<GpuDevice> = match model {
+            ModelHandle(1) => Some(self.draft_device()?),
+            _ => None,
+        };
+        let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
+            shadow
+        } else {
+            self.gpu_device
+                .as_mut()
+                .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?
+        };
+
+        metal_chain_dispatch(
+            model_ref,
+            kv_cache_ref,
+            device_mut,
+            argmax_kernels,
+            chain_kernel,
+            req,
+            k,
+        )
+        .map_err(BackendError::Backend)
+    }
+
+    // (legacy body folded into the free fn `metal_chain_dispatch` below)
+
+    fn load_secondary_model(
+        &mut self,
+        _path: &::std::path::Path,
+        _dtype: Option<&str>,
+    ) -> Result<
+        ::scratchy_serving_engine::spec_decode::ModelHandle,
+        ::scratchy_serving_engine::spec_decode::BackendError,
+    > {
+        // Thin wrapper: delegate to the existing helper which pulls
+        // path + dtype from `self.config`. Phase 5.4 will tighten this
+        // when `DraftModelProposer` takes ownership of the lifecycle and
+        // pushes the path/dtype through the trait surface directly.
+        self.load_draft_model_metal().map_err(|e| {
+            ::scratchy_serving_engine::spec_decode::BackendError::Backend(e.to_string())
+        })?;
+        Ok(::scratchy_serving_engine::spec_decode::ModelHandle(1))
+    }
+
+    fn allocate_kv_pool(
+        &mut self,
+        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
+        num_blocks: usize,
+    ) -> Result<
+        ::scratchy_serving_engine::spec_decode::KvPoolHandle,
+        ::scratchy_serving_engine::spec_decode::BackendError,
+    > {
+        if model != ::scratchy_serving_engine::spec_decode::ModelHandle(1) {
+            return Err(
+                ::scratchy_serving_engine::spec_decode::BackendError::UnknownHandle(
+                    "ModelHandle (only the draft handle 1 supports allocate_kv_pool today)",
+                ),
+            );
+        }
+        self.initialize_draft_cache_metal(num_blocks).map_err(|e| {
+            ::scratchy_serving_engine::spec_decode::BackendError::Backend(e.to_string())
+        })?;
+        Ok(::scratchy_serving_engine::spec_decode::KvPoolHandle(1))
+    }
+
+    fn kv_per_block_bytes(
+        &self,
+        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
+    ) -> Result<usize, ::scratchy_serving_engine::spec_decode::BackendError> {
+        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
+            ::scratchy_serving_engine::spec_decode::ModelHandle::TARGET => {
+                self.model.as_deref().ok_or_else(|| {
+                    ::scratchy_serving_engine::spec_decode::BackendError::Backend(
+                        "target model not loaded".into(),
+                    )
+                })?
+            }
+            ::scratchy_serving_engine::spec_decode::ModelHandle(1) => {
+                self.draft_model.as_deref().ok_or_else(|| {
+                    ::scratchy_serving_engine::spec_decode::BackendError::Backend(
+                        "draft model not loaded".into(),
+                    )
+                })?
+            }
+            _ => {
+                return Err(
+                    ::scratchy_serving_engine::spec_decode::BackendError::UnknownHandle(
+                        "ModelHandle",
+                    ),
+                );
+            }
+        };
+        Ok(kv_per_block_bytes(model_ref, self.config.block_size))
+    }
+}
+
+#[cfg(feature = "metal")]
+impl MetalWorker {
+    /// The forward behind `SpecDecodeBackend::forward_argmax_blocking`; `hidden_rows` empty copies
+    /// no hidden rows out. `then`: an MTP head's passes over the step, run in this forward's
+    /// command buffer after it, and the drafts they picked, `k` a drafting sequence (none without
+    /// a chain).
+    fn forward_argmax_then(
+        &mut self,
+        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
+        kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
+        req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
+        hidden_rows: &[u32],
+        then: Option<&::scratchy_serving_engine::spec_decode::HeadPasses>,
+    ) -> Result<Forwarded, ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
 
         // Resolve handles. 0 → target, 1 → draft; everything else is
@@ -2467,6 +2656,9 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             ModelHandle(1) => Some(self.draft_device()?),
             _ => None,
         };
+        // An MTP head's passes, on a device of their own like any head forward — taken while the
+        // target's worker is still in its pool, to lend the head its activation.
+        let head_device = then.map(|_| self.draft_device()).transpose()?;
         let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
             shadow
         } else {
@@ -2553,10 +2745,14 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
 
         // A step `execute_model` defers: the target forward is committed
         // without waiting for it.
-        let mut deferral = if matches!(model, ModelHandle::TARGET) {
-            self.deferral.take()
-        } else {
-            None
+        let (mut deferral, device_inputs) = match self.deferral.take() {
+            Some((deferral, inputs)) if matches!(model, ModelHandle::TARGET) => {
+                (Some(deferral), inputs)
+            }
+            taken => {
+                self.deferral = taken;
+                (None, Vec::new())
+            }
         };
         // An MTP head's input hidden rows (host bytes; the forward copies them into its runtime
         // buffer) and the rows of this forward's own final hidden states the caller wants back.
@@ -2611,6 +2807,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             gdn_is_fresh: view_gdn_is_fresh,
             has_spec_tokens: req.has_spec_tokens,
             last_token_indices: view_last_token_indices,
+            device_inputs: &device_inputs,
             deferred: deferral.as_ref(),
         };
 
@@ -2628,6 +2825,49 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         );
         let argmax_out = (*argmax.out).clone();
         let consts_buf = (*argmax.consts).clone();
+        let head = match (then, head_device) {
+            (Some(passes), Some(device)) => {
+                let model = (self.draft_model.as_deref())
+                    .ok_or_else(|| BackendError::Backend("MTP head not loaded".into()))?;
+                // An MRoPE head reads a rotary cos/sin row a token in place of its position.
+                let rope_bytes = model.metal_rope_rows(&[0]).map_or(0, |row| row.len());
+                let layout = ChainLayout::of(passes, model.hidden_size() as usize, rope_bytes);
+                let buffer = match &passes.chain {
+                    Some(chain) => {
+                        let slot = &mut self.mtp_chain_buffer;
+                        if reserve_pinned(slot, &mtl_device, &residency, layout.bytes) {
+                            residency.commit();
+                        }
+                        let buffer = (self.mtp_chain_buffer.as_ref()).expect("reserved above");
+                        layout.write(chain, buffer, |positions| model.metal_rope_rows(positions));
+                        Some(&**buffer)
+                    }
+                    None => None,
+                };
+                Some(HeadPassesEncoder {
+                    passes,
+                    model,
+                    kv_cache: (self.draft_kv_cache.as_ref())
+                        .ok_or_else(|| BackendError::Backend("MTP head kv_cache missing".into()))?,
+                    argmax_kernels: (self.draft_argmax_kernels.as_ref()).ok_or_else(|| {
+                        BackendError::Backend("draft argmax_kernels not built".into())
+                    })?,
+                    chain_kernel: self.mtp_chain_kernel.as_ref(),
+                    buffer,
+                    layout,
+                    device,
+                })
+            }
+            _ => None,
+        };
+        assert!(
+            head.is_none() || deferral.is_none(),
+            "a step with a head's pass is waited for"
+        );
+        let head = std::cell::RefCell::new(head);
+        let head_onto: std::cell::RefCell<
+            Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + '_>>,
+        > = std::cell::RefCell::new(None);
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -2729,18 +2969,17 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             .sampler_kernels
             .as_ref()
             .map(|k| k as *const scratchy_target_metal::sampling::SamplerKernels as usize);
+        let (head_cell, head_onto_cell) = (&head, &head_onto);
         let followup: scratchy_forward_compiler::MetalForwardFollowup<'_> = Box::new(
-            move |enc, logits_buf, total_n_actual, vocab_actual| -> Result<(), String> {
+            move |enc,
+                  logits_buf,
+                  hidden_buf,
+                  total_n_actual,
+                  vocab_actual|
+                  -> Result<(), String> {
                 // Retain a clone of the logits buffer for the post-forward
                 // sampler (see `logits_capture` above).
-                let logits_retained: scratchy_target_metal::mtl4_dispatch::Buffer = unsafe {
-                    ::objc2::rc::Retained::retain(
-                        logits_buf as *const _
-                            as *mut ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
-                    )
-                }
-                .expect("retain logits buffer");
-                *logits_capture_cl.borrow_mut() = Some((logits_retained, vocab_actual));
+                *logits_capture_cl.borrow_mut() = Some((retained(logits_buf), vocab_actual));
                 // Update consts buffer in-place (StorageModeShared).
                 let consts_ptr = consts_for_closure.contents().as_ptr() as *mut u32;
                 unsafe {
@@ -2806,6 +3045,12 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                     };
                     ps.encode_into(enc, logits_addr, &argmax_out_for_closure, kernels_ref);
                 }
+                // The MTP head's passes, reading the tokens just picked and the hidden states.
+                if let Some(h) = head_cell.borrow_mut().as_mut() {
+                    let hidden = retained(hidden_buf);
+                    let onto = h.encode(enc, &argmax_out_for_closure, &hidden)?;
+                    *head_onto_cell.borrow_mut() = Some(onto);
+                }
                 Ok(())
             },
         );
@@ -2823,7 +3068,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 BackendError::Backend("a deferred forward returned uncommitted".into())
             })?;
             self.committed = Some((in_flight, argmax));
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Forwarded::default());
         }
 
         // ── 5. Read host-visible argmax buffer + return. ─────────────────
@@ -2875,168 +3120,430 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             });
         }
         self.sampler_logits = logits_capture.borrow_mut().take();
-        Ok((out, hidden_capture.into_inner()))
+        // The drafts, once the command buffer is done; then the head's worker goes back.
+        let drafts = (head.into_inner()).map_or_else(Vec::new, |h| h.drafts());
+        drop(head_onto);
+        Ok(Forwarded {
+            tokens: out,
+            hidden: hidden_capture.into_inner(),
+            drafts,
+        })
     }
+}
 
-    /// Phase 6: K-step draft chain in ONE MTL4 command buffer. Forward,
-    /// argmax_dual_write, and chain_advance (advances positions /
-    /// slot_mapping / seqused_k in-place on the GPU between iters)
-    /// for K iters share one CB, one commit, and one host wait. Per
-    /// iter we spend ~kernel-time only — no host roundtrip, no per-
-    /// iter allocator reset.
-    ///
-    /// Thin wrapper that resolves handles → refs and delegates to the
-    /// free [`metal_chain_dispatch`] helper. The free fn is shared
-    /// with the Phase 9 speculative path (worker's lockstep thread),
-    /// which can't borrow `&self` while the main thread is mid-
-    /// `forward_argmax_blocking` for target verify.
-    fn forward_chain_k(
-        &mut self,
-        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
-        kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
-        req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
-        _block_size: usize,
-        k: usize,
-    ) -> Result<Vec<Vec<u32>>, ::scratchy_serving_engine::spec_decode::BackendError> {
-        use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
+/// What [`MetalWorker::forward_argmax_then`] hands back: each row's token, the final hidden rows
+/// asked for, and an MTP head's drafts, `k` a drafting sequence.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct Forwarded {
+    tokens: Vec<u32>,
+    hidden: Vec<u8>,
+    drafts: Vec<u32>,
+}
 
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Resolve target model + KV pool (handle 1 = draft, 0 = target).
-        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
-            ModelHandle::TARGET => self
-                .model
-                .as_deref()
-                .ok_or_else(|| BackendError::Backend("target model not loaded".into()))?,
-            ModelHandle(1) => self
-                .draft_model
-                .as_deref()
-                .ok_or_else(|| BackendError::Backend("draft model not loaded".into()))?,
-            _ => return Err(BackendError::UnknownHandle("ModelHandle")),
-        };
-        let kv_cache_ref: &KvCachePool =
-            match kv_pool {
-                KvPoolHandle::TARGET => self.kv_cache.as_ref().ok_or_else(|| {
-                    BackendError::Backend("target kv_cache not initialized".into())
-                })?,
-                KvPoolHandle(1) => self.draft_kv_cache.as_ref().ok_or_else(|| {
-                    BackendError::Backend("draft kv_cache not initialized".into())
-                })?,
-                _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
-            };
-
-        let argmax_kernels = match model {
-            ModelHandle::TARGET => &self.argmax_kernels,
-            _ => &self.draft_argmax_kernels,
-        }
-        .as_ref()
-        .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
-        let chain_kernel = match model {
-            ModelHandle::TARGET => &self.chain_advance_kernel,
-            _ => &self.draft_chain_advance_kernel,
-        }
-        .as_ref()
-        .ok_or_else(|| BackendError::Backend("chain_advance_kernel not built".into()))?;
-
-        // Phase 8 routing: a draft chain runs on the draft's shadow
-        // device (`draft_device`), so target verify and draft chain stay
-        // disjoint when there is a draft queue.
-        let mut shadow_draft_device: Option<GpuDevice> = match model {
-            ModelHandle(1) => Some(self.draft_device()?),
-            _ => None,
-        };
-        let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
-            shadow
-        } else {
-            self.gpu_device
-                .as_mut()
-                .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?
-        };
-
-        metal_chain_dispatch(
-            model_ref,
-            kv_cache_ref,
-            device_mut,
-            argmax_kernels,
-            chain_kernel,
-            req,
-            k,
+/// A buffer an encoder hook was handed, kept past the hook.
+#[cfg(feature = "metal")]
+fn retained(
+    buffer: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+) -> scratchy_target_metal::mtl4_dispatch::Buffer {
+    // SAFETY: `buffer` is a live MTLBuffer; retaining it adds a reference.
+    unsafe {
+        ::objc2::rc::Retained::retain(
+            buffer as *const _
+                as *mut ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
         )
-        .map_err(BackendError::Backend)
+    }
+    .expect("retain a live buffer")
+}
+
+/// Where an MTP head's chain ([`Chain`](::scratchy_serving_engine::spec_decode::Chain)) keeps
+/// what it reads and writes, in one pinned buffer: the host's tables, then the device's.
+#[cfg(feature = "metal")]
+struct ChainLayout {
+    /// Drafting sequences.
+    n: usize,
+    /// Drafts each.
+    k: usize,
+    hidden_bytes: usize,
+    /// An MRoPE head's rotary cos/sin row (0: its rope reads positions).
+    rope_bytes: usize,
+    /// Pass 1's rows its argmax runs: its first token row through its last.
+    window: std::ops::Range<u32>,
+    /// Byte offsets: `[seqs, drafted, next, consts, picked, accepted, ids, positions, slots,
+    /// used, hidden, drafts, rope, next_rope]`.
+    at: [usize; 14],
+    bytes: usize,
+}
+
+#[cfg(feature = "metal")]
+impl ChainLayout {
+    const SEQS: usize = 0;
+    const DRAFTED: usize = 1;
+    const NEXT: usize = 2;
+    /// Per argmax `batch`, then per chain pass its depth, then pass 1's window start.
+    const CONSTS: usize = 3;
+    const PICKED: usize = 4;
+    const ACCEPTED: usize = 5;
+    const IDS: usize = 6;
+    const POSITIONS: usize = 7;
+    const SLOTS: usize = 8;
+    const USED: usize = 9;
+    const HIDDEN: usize = 10;
+    const DRAFTS: usize = 11;
+    /// After each pass, per drafting sequence and accepted count, the next pass's rope row.
+    const ROPE: usize = 12;
+    const NEXT_ROPE: usize = 13;
+
+    fn of(
+        passes: &::scratchy_serving_engine::spec_decode::HeadPasses,
+        hidden: usize,
+        rope_bytes: usize,
+    ) -> Self {
+        let rows = passes.one.token_rows.iter().map(|&(row, _)| row);
+        let window = rows.clone().min().unwrap_or(0)..rows.max().map_or(0, |r| r + 1);
+        let (n, drafted, k) = match &passes.chain {
+            Some(c) => (c.num_seqs(), c.drafted.len(), c.next.len()),
+            None => (0, 0, 0),
+        };
+        let hidden_bytes = hidden * 2;
+        let u32s = |count: usize| count * size_of::<u32>();
+        let sizes = [
+            u32s(3 * n),
+            u32s(drafted),
+            u32s(k * n * (k + 1) * 3),
+            u32s(2 * k + 1),
+            u32s((window.len()).max(n)),
+            u32s(n),
+            u32s(n),
+            u32s(n),
+            u32s(n),
+            u32s(n),
+            n * hidden_bytes,
+            u32s(n * k),
+            k * n * (k + 1) * rope_bytes,
+            n * rope_bytes,
+        ];
+        let mut at = [0; 14];
+        let mut bytes = 0;
+        for (at, size) in at.iter_mut().zip(sizes) {
+            *at = bytes;
+            bytes = (bytes + size).next_multiple_of(256);
+        }
+        Self {
+            n,
+            k,
+            hidden_bytes,
+            rope_bytes,
+            window,
+            at,
+            bytes,
+        }
     }
 
-    // (legacy body folded into the free fn `metal_chain_dispatch` below)
-
-    fn load_secondary_model(
-        &mut self,
-        _path: &::std::path::Path,
-        _dtype: Option<&str>,
-    ) -> Result<
-        ::scratchy_serving_engine::spec_decode::ModelHandle,
-        ::scratchy_serving_engine::spec_decode::BackendError,
-    > {
-        // Thin wrapper: delegate to the existing helper which pulls
-        // path + dtype from `self.config`. Phase 5.4 will tighten this
-        // when `DraftModelProposer` takes ownership of the lifecycle and
-        // pushes the path/dtype through the trait surface directly.
-        self.load_draft_model_metal().map_err(|e| {
-            ::scratchy_serving_engine::spec_decode::BackendError::Backend(e.to_string())
-        })?;
-        Ok(::scratchy_serving_engine::spec_decode::ModelHandle(1))
+    /// The host's tables: the chain's sequences, drafted tokens and next-pass tables — with an
+    /// MRoPE head's rope rows at each next pass's positions (`rope_rows`) — and the constants each
+    /// dispatch reads.
+    fn write(
+        &self,
+        chain: &::scratchy_serving_engine::spec_decode::Chain,
+        buffer: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        rope_rows: impl Fn(&[u32]) -> Option<Vec<u8>>,
+    ) {
+        let put_bytes = |at: usize, bytes: &[u8]| {
+            // SAFETY: the buffer holds `self.bytes`, every section sized for what it holds; no
+            // command buffer reads it: the last that did was waited for.
+            unsafe {
+                let dst = buffer.contents().as_ptr().cast::<u8>().add(at);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            }
+        };
+        let put = |section: usize, words: &[u32]| {
+            let bytes = words
+                .iter()
+                .flat_map(|w| w.to_ne_bytes())
+                .collect::<Vec<u8>>();
+            put_bytes(self.at[section], &bytes);
+        };
+        put(Self::SEQS, chain.seqs.as_flattened());
+        put(Self::DRAFTED, &chain.drafted);
+        put(Self::NEXT, &chain.next.concat());
+        if self.rope_bytes > 0 {
+            let table = self.n * (self.k + 1) * self.rope_bytes;
+            for (d, next) in chain.next.iter().enumerate() {
+                let positions: Vec<u32> = next.chunks(3).map(|c| c[0]).collect();
+                let rows = rope_rows(&positions).expect("an MRoPE head's rope rows");
+                put_bytes(self.at[Self::ROPE] + d * table, &rows);
+            }
+        }
+        let batches =
+            std::iter::once(self.window.len() as u32).chain((1..self.k).map(|_| self.n as u32));
+        let depths = 1..=self.k as u32;
+        let consts: Vec<u32> = batches.chain(depths).chain([self.window.start]).collect();
+        put(Self::CONSTS, &consts);
     }
 
-    fn allocate_kv_pool(
+    fn address(
+        &self,
+        buffer: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        section: usize,
+    ) -> u64 {
+        buffer.gpuAddress() + self.at[section] as u64
+    }
+
+    /// Bytes `section`'s first `len` hold, as a pass's device input to the head of `into`.
+    fn input(
+        &self,
+        buffer: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        section: usize,
+        len: usize,
+        into: scratchy_target_metal::interpreter::metal::DeviceInputInto,
+    ) -> DeviceInput {
+        DeviceInput::head(buffer.clone(), self.at[section], len, into)
+    }
+}
+
+/// An MTP head's passes over a step ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)),
+/// encoded in its target's command buffer after the target's forward and argmax: pass 1, then each
+/// chained pass behind the device's pick of its inputs.
+#[cfg(feature = "metal")]
+struct HeadPassesEncoder<'a> {
+    passes: &'a ::scratchy_serving_engine::spec_decode::HeadPasses,
+    model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    kv_cache: &'a KvCachePool,
+    argmax_kernels: &'a scratchy_target_metal::argmax::ArgmaxKernels,
+    chain_kernel: Option<&'a scratchy_target_metal::mtp_chain::MtpChainKernel>,
+    /// The buffer the chain's [`ChainLayout`] lays out; `None` without a chain.
+    buffer: Option<&'a scratchy_target_metal::mtl4_dispatch::Buffer>,
+    layout: ChainLayout,
+    device: GpuDevice,
+}
+
+#[cfg(feature = "metal")]
+impl<'a> HeadPassesEncoder<'a> {
+    /// Encode the passes onto `enc` after the target's forward, which picked its tokens into
+    /// `tokens` (one `u32` a row) and left its final hidden states in `hidden`.
+    fn encode(
         &mut self,
-        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
-        num_blocks: usize,
-    ) -> Result<
-        ::scratchy_serving_engine::spec_decode::KvPoolHandle,
-        ::scratchy_serving_engine::spec_decode::BackendError,
-    > {
-        if model != ::scratchy_serving_engine::spec_decode::ModelHandle(1) {
-            return Err(
-                ::scratchy_serving_engine::spec_decode::BackendError::UnknownHandle(
-                    "ModelHandle (only the draft handle 1 supports allocate_kv_pool today)",
-                ),
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        hidden: &scratchy_target_metal::mtl4_dispatch::Buffer,
+    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+        use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
+        let one = &self.passes.one;
+        let row_bytes = self.layout.hidden_bytes;
+        let token_inputs = (one.token_rows.iter()).map(|&(row, step_row)| {
+            DeviceInput::token(
+                tokens.clone(),
+                step_row as usize * size_of::<u32>(),
+                row as usize,
+            )
+        });
+        let hidden_inputs = (one.hidden_rows.iter()).map(|&(row, step_row, rows)| {
+            let (row, step_row, rows) = (row as usize, step_row as usize, rows as usize);
+            DeviceInput::hidden_rows(hidden.clone(), step_row, row, rows, row_bytes)
+        });
+        let device_inputs: Vec<DeviceInput> = token_inputs.chain(hidden_inputs).collect();
+        let req = one.request();
+        let ctx = head_ctx(self.kv_cache, &req, &device_inputs, one.has_spec_tokens);
+        let n = req.num_tokens as u64;
+        // SAFETY: every view points at the passes' vectors, alive for the call; the forward is
+        // encoded onto `enc`, which the target's command buffer outlives.
+        let mut onto = unsafe {
+            self.model.metal_forward_onto(
+                scratchy_target_metal::ForwardCtxHandle::new(&ctx),
+                scratchy_target_metal::ForwardDeviceHandle::new(&mut self.device),
+                n,
+                enc,
+            )
+        }?;
+        let (Some(chain), Some(buffer)) = (&self.passes.chain, self.buffer) else {
+            return Ok(onto);
+        };
+        let kernel = self
+            .chain_kernel
+            .ok_or("an MTP head without its chain kernel")?;
+        let layout = &self.layout;
+        let creq = chain.request();
+        let n = layout.n;
+        // An MRoPE head reads its rope rows in place of positions, which index them.
+        let position = match layout.rope_bytes {
+            0 => layout.input(buffer, ChainLayout::POSITIONS, n * 4, Into::Positions),
+            rope => layout.input(buffer, ChainLayout::NEXT_ROPE, n * rope, Into::RopeRows),
+        };
+        let inputs = [
+            layout.input(buffer, ChainLayout::IDS, n * 4, Into::InputIds),
+            position,
+            layout.input(buffer, ChainLayout::SLOTS, n * 4, Into::SlotMapping),
+            layout.input(buffer, ChainLayout::USED, n * 4, Into::SeqUsedK),
+            layout.input(
+                buffer,
+                ChainLayout::HIDDEN,
+                n * row_bytes,
+                Into::TargetHidden,
+            ),
+        ];
+        for depth in 1..=layout.k {
+            if depth > 1 {
+                let ctx = head_ctx(self.kv_cache, &creq, &inputs, false);
+                // SAFETY: as pass 1's.
+                unsafe {
+                    onto.then(
+                        scratchy_target_metal::ForwardCtxHandle::new(&ctx),
+                        n as u64,
+                        enc,
+                    )
+                }?;
+            }
+            // The pass's argmax: pass 1's over its window of rows, a later one's over its rows.
+            let first = if depth == 1 { layout.window.start } else { 0 };
+            let logits =
+                onto.logits().gpuAddress() + u64::from(first) * u64::from(onto.vocab()) * 2;
+            let batch = if depth == 1 { layout.window.len() } else { n };
+            let consts = |i: usize| layout.address(buffer, ChainLayout::CONSTS) + (i * 4) as u64;
+            let picked = layout.address(buffer, ChainLayout::PICKED);
+            let argmax_table = argument_table(&self.device, &[logits, picked, consts(depth - 1)])?;
+            scratchy_target_metal::argmax::encode_argmax_into_mtl4(
+                self.argmax_kernels,
+                enc,
+                &argmax_table,
+                batch as u32,
+            )
+            .map_err(|e| format!("encode head argmax: {e:?}"))?;
+            let at = |section| layout.address(buffer, section);
+            let table = (depth - 1) * n * (layout.k + 1);
+            let next = at(ChainLayout::NEXT) + (table * 3 * 4) as u64;
+            let rope = at(ChainLayout::ROPE) + (table * layout.rope_bytes) as u64;
+            let bindings = [
+                picked,
+                onto.hidden().gpuAddress(),
+                tokens.gpuAddress(),
+                at(ChainLayout::DRAFTED),
+                at(ChainLayout::SEQS),
+                at(ChainLayout::ACCEPTED),
+                next,
+                at(ChainLayout::IDS),
+                at(ChainLayout::POSITIONS),
+                at(ChainLayout::SLOTS),
+                at(ChainLayout::USED),
+                at(ChainLayout::HIDDEN),
+                at(ChainLayout::DRAFTS),
+                consts(layout.k + depth - 1),
+                consts(2 * layout.k),
+                rope,
+                at(ChainLayout::NEXT_ROPE),
+            ];
+            let chain_table = argument_table(&self.device, &bindings)?;
+            let n = n as u32;
+            scratchy_target_metal::mtp_chain::encode_mtp_chain_into_mtl4(
+                kernel,
+                enc,
+                &chain_table,
+                n,
             );
         }
-        self.initialize_draft_cache_metal(num_blocks).map_err(|e| {
-            ::scratchy_serving_engine::spec_decode::BackendError::Backend(e.to_string())
-        })?;
-        Ok(::scratchy_serving_engine::spec_decode::KvPoolHandle(1))
+        Ok(onto)
     }
 
-    fn kv_per_block_bytes(
-        &self,
-        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
-    ) -> Result<usize, ::scratchy_serving_engine::spec_decode::BackendError> {
-        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
-            ::scratchy_serving_engine::spec_decode::ModelHandle::TARGET => {
-                self.model.as_deref().ok_or_else(|| {
-                    ::scratchy_serving_engine::spec_decode::BackendError::Backend(
-                        "target model not loaded".into(),
-                    )
-                })?
-            }
-            ::scratchy_serving_engine::spec_decode::ModelHandle(1) => {
-                self.draft_model.as_deref().ok_or_else(|| {
-                    ::scratchy_serving_engine::spec_decode::BackendError::Backend(
-                        "draft model not loaded".into(),
-                    )
-                })?
-            }
-            _ => {
-                return Err(
-                    ::scratchy_serving_engine::spec_decode::BackendError::UnknownHandle(
-                        "ModelHandle",
-                    ),
-                );
-            }
+    /// The drafts the passes picked, `k` a drafting sequence, once the command buffer they ran in
+    /// is done.
+    fn drafts(&self) -> Vec<u32> {
+        let Some(buffer) = self.buffer else {
+            return Vec::new();
         };
-        Ok(kv_per_block_bytes(model_ref, self.config.block_size))
+        let (at, len) = (
+            self.layout.at[ChainLayout::DRAFTS],
+            self.layout.n * self.layout.k,
+        );
+        // SAFETY: the drafts section holds `n * k` words, and the command buffer that wrote them
+        // is done.
+        unsafe {
+            let words = buffer
+                .contents()
+                .as_ptr()
+                .cast::<u8>()
+                .add(at)
+                .cast::<u32>();
+            std::slice::from_raw_parts(words, len).to_vec()
+        }
     }
+}
+
+/// An MTP head forward's context over `req` on its KV cache, its `device_inputs` landing over the
+/// host's.
+#[cfg(feature = "metal")]
+fn head_ctx<'c>(
+    kv_cache: &'c KvCachePool,
+    req: &'c ::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'c>,
+    device_inputs: &'c [DeviceInput],
+    has_spec_tokens: bool,
+) -> scratchy_target_metal::ForwardCtx<'c> {
+    let view = |s: &[u32], shape: &[usize]| unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            s.as_ptr() as *mut u8,
+            shape,
+            scratchy_target_metal::dtype::DType::U32,
+        ))
+    };
+    let (n, num_seqs) = (req.num_tokens, req.seqused_k.len());
+    scratchy_target_metal::ForwardCtx {
+        input_ids: view(req.input_ids, &[n]),
+        positions: view(req.positions, &[n]),
+        slot_mapping: view(req.slot_mapping, &[n]),
+        cu_seqlens_q: view(req.cu_seqlens_q, &[num_seqs + 1]),
+        seqused_k: view(req.seqused_k, &[num_seqs]),
+        span_ids: None,
+        block_table: view(req.block_table, &[num_seqs, req.block_table_stride]),
+        sliding_slot_mappings: Vec::new(),
+        sliding_block_tables: Vec::new(),
+        max_seqlen_q: req.max_seqlen_q,
+        max_seqlen_k: req.max_seqlen_k,
+        kv_cache,
+        mm_embeds: None,
+        embed_patches: &[],
+        vision_rope_cos: None,
+        vision_rope_sin: None,
+        vision_rope_freqs: None,
+        pixels: None,
+        pos_embeds: None,
+        target_hidden: None,
+        hidden_out: None,
+        vision_cu_seqlens_full: None,
+        vision_cu_seqlens_window: None,
+        vision_max_seqlen_full: None,
+        vision_max_seqlen_window: None,
+        vision_window_index: None,
+        vision_reverse_indices: None,
+        vision_position_ids: None,
+        gdn_state: None,
+        gdn_state_indices: None,
+        gdn_is_fresh: None,
+        has_spec_tokens,
+        last_token_indices: req.last_token_indices.map(|r| view(r, &[r.len()])),
+        device_inputs,
+        deferred: None,
+    }
+}
+
+/// An argument table binding `addresses`, in order.
+#[cfg(feature = "metal")]
+fn argument_table(
+    device: &GpuDevice,
+    addresses: &[u64],
+) -> Result<
+    ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ArgumentTable>>,
+    String,
+> {
+    use ::objc2_metal::{MTL4ArgumentTable, MTL4ArgumentTableDescriptor};
+    let desc = MTL4ArgumentTableDescriptor::new();
+    desc.setMaxBufferBindCount(addresses.len());
+    let table = (device.device)
+        .newArgumentTableWithDescriptor_error(&desc)
+        .map_err(|e| format!("argument table: {e:?}"))?;
+    for (i, &address) in addresses.iter().enumerate() {
+        // SAFETY: each address is inside a resident buffer the command buffer outlives.
+        unsafe { table.setAddress_atIndex(address, i) };
+    }
+    Ok(table)
 }
 
 /// Guarantee the one-time aligned-sidecar build survives process exit
@@ -3153,7 +3660,7 @@ fn sampled(
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "metal")]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -4438,28 +4945,22 @@ impl Worker for MetalWorker {
         // A deferred step reads each token still on the device from the step
         // that samples it, the newest one in flight.
         self.deferral = deferrable.then(|| {
-            Deferral::new(
-                prepared
-                    .pending
-                    .iter()
-                    .map(|input| {
-                        let step = self
-                            .in_flight
-                            .back()
-                            .expect("an in-flight token has a step");
-                        let (_, row) = step
-                            .rows
-                            .iter()
-                            .find(|(req_id, _)| *req_id == input.req_id)
-                            .expect("an in-flight token is its request's row in the newest step");
-                        DeviceInput {
-                            src: (*step.argmax.out).clone(),
-                            offset: row * size_of::<u32>(),
-                            flat_index: input.flat_index,
-                        }
-                    })
-                    .collect(),
-            )
+            let inputs = (prepared.pending.iter())
+                .map(|input| {
+                    let step = self
+                        .in_flight
+                        .back()
+                        .expect("an in-flight token has a step");
+                    let (_, row) = step
+                        .rows
+                        .iter()
+                        .find(|(req_id, _)| *req_id == input.req_id)
+                        .expect("an in-flight token is its request's row in the newest step");
+                    let src = (*step.argmax.out).clone();
+                    DeviceInput::token(src, row * size_of::<u32>(), input.flat_index)
+                })
+                .collect();
+            (Deferral::default(), inputs)
         });
         assert!(
             deferrable || prepared.pending.is_empty(),
@@ -4881,15 +5382,35 @@ impl Worker for MetalWorker {
         // target-KV, lockstep writes draft-KV — separate KV pools, no
         // contention. Saves ~15-20 ms / step on the draft chain
         // critical path.
-        // A multi-token-prediction head drafts from this step's hidden rows, so it runs after the
-        // target (in the proposer) — it has no lockstep prefill to overlap.
+        // A multi-token-prediction head drafts from this step's rows: its pass 1 runs in the step's
+        // command buffer, after the target — it has no lockstep prefill to overlap.
         let draft_is_head = self.draft_is_head();
-        let target_hidden_rows: Vec<u32> =
-            match draft_is_head && !scheduler_output.draft_req_ids.is_empty() {
-                true => (0..num_tokens as u32).collect(),
-                false => Vec::new(),
-            };
-        let mut target_hidden: Vec<u8> = Vec::new();
+        let block_ids_u32: Vec<Vec<u32>> = (attn.block_ids.iter())
+            .map(|v| v.iter().map(|&b| b as u32).collect())
+            .collect();
+        let step_rows = ::scratchy_serving_engine::spec_decode::StepRows {
+            req_ids: &req_ids_in_order,
+            input_ids: &input_ids_u32,
+            positions: &positions_u32,
+            slot_mapping: &slot_mapping_u32,
+            cu_seqlens_q: &cu_seqlens_u32,
+            seqused_k: &seqused_k_u32,
+            block_table: &block_table_u32,
+            block_table_stride: max_blocks_eff,
+            block_ids: &block_ids_u32,
+            block_size,
+        };
+        let head_passes = match self.mtp_drafter {
+            Some(drafter) if !scheduler_output.draft_req_ids.is_empty() => {
+                let history = |r: &str| {
+                    let (prompt, generated) = self.input_batch.history(r);
+                    Some([prompt, generated].concat())
+                };
+                drafter.passes(&step_rows, &history, &scheduler_output.draft_req_ids)
+            }
+            _ => None,
+        };
+        let mut picked_drafts: Vec<u32> = Vec::new();
         let phase8_parallel_lockstep = self.draft_model.is_some()
             && !draft_is_head
             && self.draft_kv_cache.is_some()
@@ -5165,6 +5686,7 @@ impl Worker for MetalWorker {
                             gdn_is_fresh: None,
                             has_spec_tokens: false,
                             last_token_indices: None,
+                            device_inputs: &[],
                             deferred: None,
                         };
                         let logits = unsafe {
@@ -5344,18 +5866,19 @@ impl Worker for MetalWorker {
                 spec9_drafts_final = spec9_drafts_out;
                 v
             } else {
-                let (argmax, hidden) = self
-                    .forward_argmax_hidden_blocking(
+                let out = self
+                    .forward_argmax_then(
                         ModelHandle::TARGET,
                         KvPoolHandle::TARGET,
                         &req,
-                        &target_hidden_rows,
+                        &[],
+                        head_passes.as_ref(),
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
                     })?;
-                target_hidden = hidden;
-                argmax
+                picked_drafts = out.drafts;
+                out.tokens
             }
         };
         // A deferred step: its tokens stay on the device until the engine, and
@@ -5565,53 +6088,6 @@ impl Worker for MetalWorker {
             }
         }
 
-        // ── 6.7. Draft seed bundle ──────────────────────────────
-        //
-        // Pre-5.4 the worker ran the lockstep prefill + K autoregressive
-        // draft decode chain inline here against `self.draft_model` +
-        // `self.draft_kv_cache`. As of phase 5.4 the chain lives in
-        // `scratchy_serving_engine::spec_decode::DraftModelProposer::propose_for_step`
-        // (host-side) and reaches the same GPU paths via the
-        // `SpecDecodeBackend` trait. The worker just pre-packages the
-        // owned-data the proposer needs into `draft_seed_inputs`; the
-        // engine pulls `executor.spec_decode_backend()` and drives the
-        // chain in `finalize_step`.
-        let draft_seed_inputs: Option<::scratchy_serving_engine::spec_decode::DraftSeedInputs> =
-            if self.draft_model.is_some() && self.draft_kv_cache.is_some() {
-                Some(::scratchy_serving_engine::spec_decode::DraftSeedInputs {
-                    input_ids: input_ids_u32,
-                    positions: positions_u32,
-                    slot_mapping: slot_mapping_u32,
-                    cu_seqlens_q: cu_seqlens_u32,
-                    seqused_k: seqused_k_u32,
-                    block_table: block_table_u32,
-                    block_table_stride: max_blocks_eff,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    num_tokens,
-                    req_ids: req_ids_in_order.clone(),
-                    block_ids: attn
-                        .block_ids
-                        .iter()
-                        .map(|v| v.iter().map(|&b| b as u32).collect())
-                        .collect(),
-                    tokens_before: attn.tokens_before.clone(),
-                    q_lens: q_lens.clone(),
-                    was_spec_decode: was_spec_decode.clone(),
-                    block_size,
-                    // Phase 8: when target verify ran in parallel
-                    // with lockstep prefill on draft_queue (above),
-                    // the worker has already waited for both — the
-                    // proposer skips its in-proposer lockstep call.
-                    async_lockstep_done,
-                    speculative_seeds: spec9_seeds_final.clone(),
-                    speculative_chain_drafts: spec9_drafts_final.clone(),
-                    target_hidden,
-                })
-            } else {
-                None
-            };
-
         // ── 7. Commit per-request state ─────────────────────────
         // Appends this step's emitted tokens to the history the next step's
         // chunk and the on-GPU sampler's penalties read; appending AFTER
@@ -5624,14 +6100,15 @@ impl Worker for MetalWorker {
         }
 
         // ── 8. The head's drafts ────────────────────────────────
-        // For the requests the engine planned, from this step's rows and the tokens just
-        // committed; the engine schedules them into the next step.
+        // For the requests the engine planned, picked by the head's passes in the step's command
+        // buffer, each from its newest row by the tokens just committed; the engine schedules them
+        // into the next step.
         // TODO: the step's tokens wait for these passes, so a prompt's first token waits for the
         // head's pass over every prompt row (`spec_decode::mtp`'s module docs).
-        let plan = &scheduler_output.draft_req_ids;
-        let draft_token_ids = match (self.mtp_drafter, draft_seed_inputs.as_ref()) {
-            (Some(drafter), Some(seed)) if !plan.is_empty() => {
-                let history: std::collections::HashMap<String, Vec<u32>> = plan
+        let draft_token_ids = match (self.mtp_drafter, head_passes.as_ref()) {
+            (Some(drafter), Some(passes)) => {
+                let history: std::collections::HashMap<String, Vec<u32>> = (scheduler_output)
+                    .draft_req_ids
                     .iter()
                     .map(|r| {
                         let (prompt, generated) = self.input_batch.history(r);
@@ -5639,15 +6116,59 @@ impl Worker for MetalWorker {
                     })
                     .collect();
                 let history = |r: &str| history.get(r).cloned();
-                let drafts = drafter
-                    .draft(seed, &sampled_token_ids, &history, self, plan)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("MTP drafts: {e}")))?;
-                Some(drafts)
+                let drafts = (passes.chain.as_ref()).map(|chain| {
+                    let picked = &picked_drafts;
+                    drafter.drafts(chain, picked, &step_rows, &sampled_token_ids, &history)
+                });
+                Some(drafts.unwrap_or_default())
             }
             _ => None,
         };
-        // A head's seed went to its drafts; a draft model's proposer reads it.
-        let draft_seed_inputs = draft_seed_inputs.filter(|_| self.mtp_drafter.is_none());
+
+        // ── 9. Draft seed bundle ──────────────────────────────
+        //
+        // Pre-5.4 the worker ran the lockstep prefill + K autoregressive
+        // draft decode chain inline here against `self.draft_model` +
+        // `self.draft_kv_cache`. As of phase 5.4 the chain lives in
+        // `scratchy_serving_engine::spec_decode::DraftModelProposer::propose_for_step`
+        // (host-side) and reaches the same GPU paths via the
+        // `SpecDecodeBackend` trait. The worker just pre-packages the
+        // owned-data the proposer needs into `draft_seed_inputs`; the
+        // engine pulls `executor.spec_decode_backend()` and drives the
+        // chain in `finalize_step`.
+        let draft_seed_inputs: Option<::scratchy_serving_engine::spec_decode::DraftSeedInputs> =
+            if self.mtp_drafter.is_none()
+                && self.draft_model.is_some()
+                && self.draft_kv_cache.is_some()
+            {
+                Some(::scratchy_serving_engine::spec_decode::DraftSeedInputs {
+                    input_ids: input_ids_u32,
+                    positions: positions_u32,
+                    slot_mapping: slot_mapping_u32,
+                    cu_seqlens_q: cu_seqlens_u32,
+                    seqused_k: seqused_k_u32,
+                    block_table: block_table_u32,
+                    block_table_stride: max_blocks_eff,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    num_tokens,
+                    req_ids: req_ids_in_order.clone(),
+                    block_ids: block_ids_u32,
+                    tokens_before: attn.tokens_before.clone(),
+                    q_lens: q_lens.clone(),
+                    was_spec_decode: was_spec_decode.clone(),
+                    block_size,
+                    // Phase 8: when target verify ran in parallel
+                    // with lockstep prefill on draft_queue (above),
+                    // the worker has already waited for both — the
+                    // proposer skips its in-proposer lockstep call.
+                    async_lockstep_done,
+                    speculative_seeds: spec9_seeds_final.clone(),
+                    speculative_chain_drafts: spec9_drafts_final.clone(),
+                })
+            } else {
+                None
+            };
 
         Ok(ModelRunnerOutput {
             req_ids: req_ids_in_order,

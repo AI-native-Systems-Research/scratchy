@@ -400,6 +400,28 @@ pub trait ScratchyWeights: Send + Sync {
         unsafe { self.forward(ctx, device, num_tokens) }
     }
 
+    /// The rotary cos/sin rows a forward at `positions` (one a token) reads in place of a
+    /// position-indexed cache — an MRoPE model's, its positions then each row's own index; `None`
+    /// for a model whose rope reads positions.
+    #[cfg(feature = "metal")]
+    fn metal_rope_rows(&self, positions: &[u32]) -> Option<Vec<u8>>;
+
+    /// Encode a forward onto `encoder` — another model's command buffer, after that model's forward,
+    /// whose outputs the context's device inputs read — rather than into a command buffer of its
+    /// own. The returned forward holds the worker the command buffer reads and writes until it
+    /// drops, which must wait until that command buffer is done.
+    ///
+    /// # Safety
+    /// Same as [`Self::forward`].
+    #[cfg(feature = "metal")]
+    unsafe fn metal_forward_onto<'w>(
+        &'w self,
+        ctx: ForwardCtxHandle<'_>,
+        device: ForwardDeviceHandle<'_>,
+        num_tokens: u64,
+        encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<Box<dyn MetalForwardOnto + 'w>, String>;
+
     /// Phase 6 spec-decode K-step chain entry point. Opens ONE MTL4
     /// command buffer on the pool's MTL4 queue and invokes `body`
     /// with a [`ChainStepHandle`] (callable K times to encode a
@@ -431,11 +453,13 @@ pub trait ScratchyWeights: Send + Sync {
 /// Box for a Metal forward-encoder tail hook. Invoked on the same
 /// MTL4 compute encoder used to encode the forward, AFTER the
 /// forward dispatches and BEFORE `endEncoding`. The callee can
-/// append additional dispatches (e.g. argmax sampling) so they
-/// run inside the same command buffer with one commit and one
-/// host wait. Receives:
+/// append additional dispatches (e.g. argmax sampling, an MTP head's
+/// forward) so they run inside the same command buffer with one
+/// commit and one host wait. Receives:
 ///   - the MTL4 compute encoder to append dispatches onto;
 ///   - the logits MTLBuffer (the bucket's terminal arena slot);
+///   - the final (post-norm) hidden states, `[total_n, hidden]` (the
+///     bucket's backbone slot);
 ///   - `total_n` (logits row count) and `vocab` (column count).
 ///
 /// MTL4 only.
@@ -444,11 +468,42 @@ pub type MetalForwardFollowup<'a> = Box<
     dyn FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
             u32,
             u32,
         ) -> Result<(), String>
         + 'a,
 >;
+
+/// The forwards [`ScratchyWeights::metal_forward_onto`] and [`Self::then`] encoded onto another
+/// model's command buffer, on one worker. Their outputs are read once that command buffer is done;
+/// dropping it returns the worker.
+#[cfg(feature = "metal")]
+pub trait MetalForwardOnto {
+    /// Encode another forward on the same worker onto `encoder`, after what is on it; the outputs
+    /// below are then its.
+    ///
+    /// # Safety
+    /// Same as [`ScratchyWeights::forward`].
+    unsafe fn then(
+        &mut self,
+        ctx: ForwardCtxHandle<'_>,
+        num_tokens: u64,
+        encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<(), String>;
+
+    /// The final (post-norm) hidden states, `[num_tokens, hidden]` (the bucket's backbone slot).
+    fn hidden(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
+
+    /// The lm_head output, `[num_tokens, vocab]` rows (the bucket's terminal arena slot).
+    fn logits(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
+
+    /// The logits' row width.
+    fn vocab(&self) -> u32;
+
+    /// Rows `rows` of the final (post-norm) hidden states, as bytes.
+    fn hidden_rows(&self, rows: &[u32]) -> Vec<u8>;
+}
 
 /// Non-generic view of the macro-emitted MetalWorker for the
 /// spec-decode K-step chain body. The body holds an

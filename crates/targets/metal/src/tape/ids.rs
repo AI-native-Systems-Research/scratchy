@@ -318,6 +318,8 @@ u32_newtype!(
     LogitsWidth,
     /// `u32` words per row of a grammar allow-bitset (one bit per token).
     BitsetWords,
+    /// Drafts a multi-token-prediction head makes a speculative step (its `spec_drafts`).
+    NumDrafts,
 );
 
 impl TqDecodeHeads {

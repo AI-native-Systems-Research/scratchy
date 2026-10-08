@@ -2355,6 +2355,30 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    let metal_rope_rows_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => #model_ident::metal_rope_rows(positions, positions.len()),
+            }
+        })
+        .collect();
+
+    let forward_onto_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::forward_onto(w, ctx, device, num_tokens, encoder)
+                },
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
     // emits this const from the macro's per-canonical metal_emission;
     // shim variants re-export the canonical's. The trait impl below
@@ -2826,6 +2850,29 @@ fn emit_arch_dispatcher(
             }
         }
 
+        /// One forward encoded onto another model's command buffer. See
+        /// `::scratchy_forward_compiler::ScratchyWeights::metal_forward_onto`.
+        ///
+        /// # Safety
+        /// Same as [`forward`].
+        #[cfg(feature = "metal")]
+        pub unsafe fn forward_onto<'w>(
+            w: &'w Weights,
+            ctx: &crate::__gpu::ForwardCtx,
+            device: &mut crate::__gpu::GpuDevice,
+            num_tokens: u64,
+            encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+            >,
+        ) -> ::core::result::Result<
+            ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>,
+            ::std::string::String,
+        > {
+            match w {
+                #(#forward_onto_arms)*
+            }
+        }
+
         /// Phase 6 spec-decode K-step chain dispatcher. One MTL4 CB,
         /// caller drives K bucket forwards + per-iter argmax +
         /// chain_advance from inside `body`. See
@@ -3092,6 +3139,31 @@ fn emit_arch_dispatcher(
                 let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
                 let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
                 unsafe { forward_with_metal_followup(self, ctx, device, num_tokens, followup) }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_rope_rows(&self, positions: &[u32]) -> ::core::option::Option<::std::vec::Vec<u8>> {
+                match self {
+                    #(#metal_rope_rows_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            unsafe fn metal_forward_onto<'w>(
+                &'w self,
+                ctx: crate::__gpu::ForwardCtxHandle<'_>,
+                device: crate::__gpu::ForwardDeviceHandle<'_>,
+                num_tokens: u64,
+                encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
+                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                >,
+            ) -> ::core::result::Result<
+                ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>,
+                ::std::string::String,
+            > {
+                let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
+                let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
+                unsafe { forward_onto(self, ctx, device, num_tokens, encoder) }
             }
 
             #[cfg(feature = "metal")]
