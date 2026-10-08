@@ -153,7 +153,10 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
             // power-of-two-only, matching MLX's `is_power_of_2(bits)`
             // dispatch gate).
             assert!(
-                !matches!(kernel, scratchy_target_metal::quantized::QmvKernel::Quad { .. }),
+                !matches!(
+                    kernel,
+                    scratchy_target_metal::quantized::QmvKernel::Quad { .. }
+                ),
                 "b3 must not route to quad (got {kernel:?})"
             );
             let name = qmv_kernel_name(

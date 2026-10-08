@@ -852,19 +852,13 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
                 )?;
             }
 
-            let gu_w = unsafe {
-                GpuTensor::new(gu_w_ptr, &[two_si, packed_hidden], DType::U32)
-            };
+            let gu_w = unsafe { GpuTensor::new(gu_w_ptr, &[two_si, packed_hidden], DType::U32) };
             let gu_s =
                 unsafe { GpuTensor::new(gu_s_ptr, &[two_si, hidden_size / gs], scales_dtype) };
             let gu_b =
                 unsafe { GpuTensor::new(gu_b_ptr, &[two_si, hidden_size / gs], scales_dtype) };
             let d_w = unsafe {
-                GpuTensor::new(
-                    down_w_ptr,
-                    &[hidden_size, packed_shared_inter],
-                    DType::U32,
-                )
+                GpuTensor::new(down_w_ptr, &[hidden_size, packed_shared_inter], DType::U32)
             };
             let d_s = unsafe {
                 GpuTensor::new(down_s_ptr, &[hidden_size, shared_inter / gs], scales_dtype)
@@ -896,7 +890,9 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
         // reassemble half-pairs as F32 garbage. The cuda loader casts this tensor to F32 for
         // the same reason (`weights_quant.rs`: "vLLM always casts this to F32 before the
         // routing kernel; we match"); every noaux_tc checkpoint ships it F32 on disk.
-        let e_score_correction_bias = match gw.contains(&format!("{prefix}.gate.e_score_correction_bias")) {
+        let e_score_correction_bias = match gw
+            .contains(&format!("{prefix}.gate.e_score_correction_bias"))
+        {
             true => Some(gw.take_keep_dtype(&format!("{prefix}.gate.e_score_correction_bias"))?),
             false => None,
         };

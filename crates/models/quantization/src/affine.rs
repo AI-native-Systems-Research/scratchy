@@ -135,8 +135,7 @@ pub fn affine_dequant_b4_to_dtype(
         let total = n * k;
         let (packs, _rem) = weight_bytes.as_chunks::<3>();
         for (g, chunk) in packs.iter().enumerate() {
-            let triple =
-                (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+            let triple = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
             for j in 0..8 {
                 let oindex = g * 8 + j;
                 if oindex >= total {
@@ -208,18 +207,9 @@ mod tests {
         let bias_f = -1.25f32;
         let scale = half::f16::from_f32(scale_f).to_bits().to_le_bytes();
         let bias = half::f16::from_f32(bias_f).to_bits().to_le_bytes();
-        let out = affine_dequant_b4_to_dtype(
-            &packed,
-            &scale,
-            &bias,
-            n,
-            k,
-            gs,
-            3,
-            DType::F16,
-            DType::F16,
-        )
-        .unwrap();
+        let out =
+            affine_dequant_b4_to_dtype(&packed, &scale, &bias, n, k, gs, 3, DType::F16, DType::F16)
+                .unwrap();
         let out_halves = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u16, n * k) };
         for (i, &c) in codes.iter().enumerate() {
             let want = half::f16::from_f32(scale_f * (c as f32) + bias_f).to_bits();
@@ -237,13 +227,29 @@ mod tests {
         let packed = pack_b3(&codes);
         let n_groups = n * k / gs;
         let scales: Vec<u8> = (0..n_groups)
-            .flat_map(|g| half::f16::from_f32(0.25 * (g as f32) + 0.5).to_bits().to_le_bytes())
+            .flat_map(|g| {
+                half::f16::from_f32(0.25 * (g as f32) + 0.5)
+                    .to_bits()
+                    .to_le_bytes()
+            })
             .collect();
         let biases: Vec<u8> = (0..n_groups)
-            .flat_map(|g| half::f16::from_f32(-0.125 * (g as f32)).to_bits().to_le_bytes())
+            .flat_map(|g| {
+                half::f16::from_f32(-0.125 * (g as f32))
+                    .to_bits()
+                    .to_le_bytes()
+            })
             .collect();
         let out = affine_dequant_b4_to_dtype(
-            &packed, &scales, &biases, n, k, gs as u32, 3, DType::F16, DType::F16,
+            &packed,
+            &scales,
+            &biases,
+            n,
+            k,
+            gs as u32,
+            3,
+            DType::F16,
+            DType::F16,
         )
         .unwrap();
         let out_halves = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u16, n * k) };
@@ -267,12 +273,28 @@ mod tests {
         let scales: Vec<u8> = vec![0x00; n_groups * 2];
         let biases: Vec<u8> = vec![0x00; n_groups * 2];
         let out4 = affine_dequant_b4_to_dtype(
-            &w4, &scales, &biases, n, k, gs as u32, 4, DType::F16, DType::F16,
+            &w4,
+            &scales,
+            &biases,
+            n,
+            k,
+            gs as u32,
+            4,
+            DType::F16,
+            DType::F16,
         )
         .unwrap();
         assert_eq!(out4.len(), n * k * 2);
         let out8 = affine_dequant_b4_to_dtype(
-            &w8, &scales, &biases, n, k, gs as u32, 8, DType::F16, DType::F16,
+            &w8,
+            &scales,
+            &biases,
+            n,
+            k,
+            gs as u32,
+            8,
+            DType::F16,
+            DType::F16,
         )
         .unwrap();
         assert_eq!(out8.len(), n * k * 2);

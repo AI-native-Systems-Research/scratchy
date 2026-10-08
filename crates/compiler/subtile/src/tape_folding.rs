@@ -1108,9 +1108,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             // save it, the routed combine precedes the shared expert: the kernel
             // would add its dot into its own output buffer and the true residual —
             // the routed experts' whole contribution — would never be read.
-            if self.ops.in_op(c, 0).ok().flatten() == Some(cur)
-                && ready(self, c, 1)?
-            {
+            if self.ops.in_op(c, 0).ok().flatten() == Some(cur) && ready(self, c, 1)? {
                 residual = Some((c, self.ops.operand(c, 1)));
                 chain.push(c);
             }
@@ -1297,7 +1295,8 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let Some(g) = g else {
             return Ok(());
         };
-        let pre = logits.filter(|&l| pre.contains(&ops.kind(l)) && self.consumers[l] == 2 && free(l));
+        let pre =
+            logits.filter(|&l| pre.contains(&ops.kind(l)) && self.consumers[l] == 2 && free(l));
         let mut stages = [None; ROUTE_TAIL_STAGES];
         let (mut cur, mut next) = (g, 0);
         while self.consumers[cur] == 1 {

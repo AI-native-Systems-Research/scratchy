@@ -285,7 +285,8 @@ enum RouterFlavor {
 }
 
 /// The expert half of a MoE block, which every router shares.
-struct Experts {    experts: NumExperts,
+struct Experts {
+    experts: NumExperts,
     k: TopK,
     inter: u32,
     hidden: u32,
@@ -1202,9 +1203,10 @@ pub fn lower_decode_to_wavefront(
                     .filter(|_| !matches!(router_flavor, RouterFlavor::Mixtral));
                 let lg = match router_flavor {
                     RouterFlavor::QwenShared => bx.push(SubOp::RouteSoftmax, &[lg]),
-                    RouterFlavor::GlmSigmoid => {
-                        bx.push_op(SubOp::RouteSigmoidBias { router }, vec![InputRef::Op(lg), w])
-                    }
+                    RouterFlavor::GlmSigmoid => bx.push_op(
+                        SubOp::RouteSigmoidBias { router },
+                        vec![InputRef::Op(lg), w],
+                    ),
                     RouterFlavor::Mixtral => lg,
                 };
                 let indices = bx.route_top_k(lg, k);

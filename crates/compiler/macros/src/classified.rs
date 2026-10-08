@@ -666,8 +666,7 @@ impl Program {
     /// the `_<digit>` leaf warning in lib.rs) mirror this — keep them
     /// in lockstep.
     pub fn rename_dotted(&self, dotted: &str) -> String {
-        let mut pairs: Vec<&(String, String)> =
-            self.weight_leaf_renames.iter().collect();
+        let mut pairs: Vec<&(String, String)> = self.weight_leaf_renames.iter().collect();
         pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
         let mut out = dotted.to_string();
         for (dsl_leaf, disk_leaf) in pairs {
@@ -929,10 +928,7 @@ mod tests {
     /// Longest key wins, per the codegen consumers' contract.
     #[test]
     fn rename_dotted_matches_whole_segment_runs() {
-        let p = prog_with_renames(&[
-            ("moe", "mlp"),
-            ("mlp.shared_expert", "mlp.shared_experts"),
-        ]);
+        let p = prog_with_renames(&[("moe", "mlp"), ("mlp.shared_expert", "mlp.shared_experts")]);
         // Mid-path run: the GLM-4.5 shared-expert leaves.
         assert_eq!(
             p.rename_dotted("mlp.shared_expert.down_proj"),
@@ -961,7 +957,10 @@ mod tests {
         let s = prog_with_renames(&[("norm", "renorm")]);
         assert_eq!(s.rename_dotted("input_layernorm"), "input_layernorm");
         assert_eq!(s.rename_dotted("norm"), "renorm");
-        assert_eq!(s.rename_dotted("model.layers.0.norm"), "model.layers.0.renorm");
+        assert_eq!(
+            s.rename_dotted("model.layers.0.norm"),
+            "model.layers.0.renorm"
+        );
         // Leading-segment run (top-level `moe` → `mlp`).
         let m = prog_with_renames(&[("moe", "mlp")]);
         assert_eq!(m.rename_dotted("moe.router"), "mlp.router");

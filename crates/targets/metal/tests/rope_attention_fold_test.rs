@@ -203,8 +203,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     let cos_sin: Vec<u16> = (0..MAX_POS)
         .flat_map(|p| {
             (0..c.rot_dim).map(move |i| {
-                let theta =
-                    p as f32 * c.theta.powf(-((i % half_rot) as f32) / half_rot as f32);
+                let theta = p as f32 * c.theta.powf(-((i % half_rot) as f32) / half_rot as f32);
                 if i < half_rot {
                     theta.cos()
                 } else {
@@ -601,7 +600,10 @@ fn glm45_air_dense() {
     // head_dim 128, partial rope (rot 64, pairs within the first half),
     // theta 1e6, dense KV. The span block's K rides unrotated and the
     // fold re-ropes it (rope_on_read=1 in the production M1 constants).
-    for (ctx, name) in [(41usize, "glm45 air dense"), (129usize, "glm45 air dense, ctx 129")] {
+    for (ctx, name) in [
+        (41usize, "glm45 air dense"),
+        (129usize, "glm45 air dense, ctx 129"),
+    ] {
         check(
             name,
             Case {

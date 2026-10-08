@@ -552,9 +552,7 @@ pub fn compile_carrier(
             let dotted = path.join(".");
             // Does a rename intercept this path? (mirror
             // `Program::rename_dotted`'s whole-segment matching)
-            let handled = classified
-                .rename_dotted(&dotted)
-                != dotted;
+            let handled = classified.rename_dotted(&dotted) != dotted;
             if handled {
                 continue;
             }

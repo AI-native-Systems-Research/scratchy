@@ -585,7 +585,10 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
 fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
     // GLM q_proj (k=4096, n=12288) — Fast; and a small-K case exercising
     // the tail-less k%512==0 requirement at a different aspect.
-    for (k, n, seed) in [(4096usize, 12288usize, 0x5A17u64), (512usize, 1024usize, 0x5A18u64)] {
+    for (k, n, seed) in [
+        (4096usize, 12288usize, 0x5A17u64),
+        (512usize, 1024usize, 0x5A18u64),
+    ] {
         let group_size = 64usize;
         let bits = 3u32;
         let c = Case {
@@ -628,10 +631,7 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
         let packed: Vec<u8> = (0..n * k * 3 / 8).map(|_| rng.next() as u8).collect();
         let groups = n * k / group_size;
         let scales: Vec<bf16> = (0..groups)
-            .map(|_| {
-                c.dtype
-                    .bits(0.0008 + 0.0004 * rng.unit().abs())
-            })
+            .map(|_| c.dtype.bits(0.0008 + 0.0004 * rng.unit().abs()))
             .map(|b| bf16::from_bits(b))
             .collect();
         let biases: Vec<bf16> = (0..groups)
@@ -654,9 +654,7 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
             .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
             .collect();
 
-        let want = affine_qmv_b3_bf16_s_bf16(
-            &packed, &scales, &biases, &xn, 1, n, k, group_size,
-        );
+        let want = affine_qmv_b3_bf16_s_bf16(&packed, &scales, &biases, &xn, 1, n, k, group_size);
 
         // Dispatch with the M1 binding layout: w/scales/biases at 0/1/2,
         // x at 3, y at 4, gain at 15, linear bias at 16.
@@ -682,15 +680,7 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
             (&gb, 15),
             (&lb, 16),
         ];
-        batch.encode(
-            &pso,
-            &binds,
-            &[],
-            &[],
-            &[],
-            size(grid),
-            size(threads),
-        );
+        batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
         batch.commit(true);
 
         // Compare: the reference IS the biased output (the CPU fn has no
@@ -716,9 +706,7 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
             c.dtype.value(got[worst]),
             want[worst].to_f32() + linear_bias[worst].to_f32(),
         );
-        eprintln!(
-            "b3 normed+biased affine_qmv_fast k={k} n={n} max_err={max_err:.3e}"
-        );
+        eprintln!("b3 normed+biased affine_qmv_fast k={k} n={n} max_err={max_err:.3e}");
     }
 }
 
@@ -803,9 +791,7 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
     let xn: Vec<bf16> = (0..k)
         .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
         .collect();
-    let want = affine_qmv_b3_bf16_s_bf16(
-        &packed, &scales, &biases, &xn, 1, n, k, group_size,
-    );
+    let want = affine_qmv_b3_bf16_s_bf16(&packed, &scales, &biases, &xn, 1, n, k, group_size);
 
     let (wb, sb, bb) = (
         shared(&r.device, &packed),
@@ -830,15 +816,7 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
         (&gb, 15),
         (&lb, 16),
     ];
-    batch.encode(
-        &pso,
-        &binds,
-        &[],
-        &[],
-        &[],
-        size(grid),
-        size(threads),
-    );
+    batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
     batch.commit(true);
 
     let got = read_u16(&y, n);
@@ -862,9 +840,7 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
         c.dtype.value(got[worst]),
         residual[worst].to_f32() + want[worst].to_f32() + linear_bias[worst].to_f32(),
     );
-    eprintln!(
-        "b3 normed+residual affine_qmv_fast k={k} n={n} max_err={max_err:.3e}"
-    );
+    eprintln!("b3 normed+residual affine_qmv_fast k={k} n={n} max_err={max_err:.3e}");
 }
 
 /// 3-bit `affine_qmv_gated_fast` — the M1-only dense gated path (GLM's
@@ -878,7 +854,10 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
     // GLM shared expert: k=4096 (hidden), n=1408 (intermediate). Fast (n%8,
     // k%512). Also the layer-0 MLP's down shape k=10944 is covered by the
     // plain-qmv family; here gate/up at (4096, 1408).
-    for (k, n, seed) in [(4096usize, 1408usize, 0x7B03u64), (512usize, 256usize, 0x7B04u64)] {
+    for (k, n, seed) in [
+        (4096usize, 1408usize, 0x7B03u64),
+        (512usize, 256usize, 0x7B04u64),
+    ] {
         let group_size = 64usize;
         let bits = 3u32;
         let c = Case {
@@ -932,8 +911,10 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
         let xn: Vec<bf16> = (0..k)
             .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
             .collect();
-        let g = affine_qmv_b3_bf16_s_bf16(&g_packed, &g_scales, &g_biases, &xn, 1, n, k, group_size);
-        let u = affine_qmv_b3_bf16_s_bf16(&u_packed, &u_scales, &u_biases, &xn, 1, n, k, group_size);
+        let g =
+            affine_qmv_b3_bf16_s_bf16(&g_packed, &g_scales, &g_biases, &xn, 1, n, k, group_size);
+        let u =
+            affine_qmv_b3_bf16_s_bf16(&u_packed, &u_scales, &u_biases, &xn, 1, n, k, group_size);
 
         let (gw, gs, gb) = (
             shared(&r.device, &g_packed),

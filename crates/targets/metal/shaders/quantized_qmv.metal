@@ -1172,7 +1172,7 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
     // 4-bit-only), so the codes read as written.
     for (int i = 0; i < (N / 8); i++) {
       const device uint8_t* wb = w + 3 * i;
-      U* wl = w_local + 8 * i;
+      W wl = w_local + 8 * i;
       wl[0] = static_cast<U>((wb[0] & 0x7) * s + b);
       wl[1] = static_cast<U>(((wb[0] & 0x38) >> 3) * s + b);
       wl[2] = static_cast<U>((((wb[0] & 0xc0) >> 6) + ((wb[1] & 0x1) << 2)) * s + b);

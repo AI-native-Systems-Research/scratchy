@@ -1331,19 +1331,11 @@ fn affine_gather_qmv_gated_b3_routed_glm_decode() {
     routed_gated_b3_case(128, 512, 1408, 8, 0x6D6F_6520_726F_7575);
 }
 
-fn routed_gated_b3_case(
-    num_experts: usize,
-    k: usize,
-    n_out: usize,
-    top_k: usize,
-    seed: u64,
-) {
+fn routed_gated_b3_case(num_experts: usize, k: usize, n_out: usize, top_k: usize, seed: u64) {
     use scratchy_target_metal::tape::constants::ConstantValue;
     use scratchy_target_metal::tape::ids::NumExperts;
     use scratchy_target_metal::tape::kernel_constants::RoutedConstants;
-    use scratchy_target_metal::tape::step::{
-        LayerId, RoutePost, RoutePre, RouteProgram,
-    };
+    use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgram};
 
     // GLM shapes, shrunk for the test: top_k=8, hidden k (Fast: k%512),
     // moe_intermediate n_out=1408 (Fast: n%8), gs=64, b3.
@@ -1390,12 +1382,10 @@ fn routed_gated_b3_case(
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
-    let bytes_of = |v: &[bf16]| unsafe {
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
-    };
-    let bytes_f32 = |v: &[f32]| unsafe {
-        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-    };
+    let bytes_of =
+        |v: &[bf16]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
+    let bytes_f32 =
+        |v: &[f32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
 
     // Device buffers. Scratch layout mirrors MoeScratchLayout::compute's
     // Gathered M1 plan (rhs_indices, scores, gate_y, up_y regions), but
@@ -1411,8 +1401,8 @@ fn routed_gated_b3_case(
 
     // Constants: AffineGatherQmvConstants (K, N, rows) + gated act (3) +
     // RoutedConstants (13-17).
-    let mut constants: Vec<ConstantValue> = gather_constants(k as u32, n_out as u32, top_k as u32)
-        .into();
+    let mut constants: Vec<ConstantValue> =
+        gather_constants(k as u32, n_out as u32, top_k as u32).into();
     constants.push(ConstantValue::int(
         scratchy_target_metal::tape::constants::ConstSlot(3),
         0, // SiLU
@@ -1441,7 +1431,18 @@ fn routed_gated_b3_case(
     let us = buf_from_bytes(&mdev.device, bytes_of(&u_scales));
     let ub = buf_from_bytes(&mdev.device, bytes_of(&u_biases));
     let bufs: [&common::Buffer; 14] = [
-        &gw, &gs, &gb, &xb, &rhs_buf, &gate_y, &uw, &us, &ub, &up_y, &logits_buf, &scores_buf,
+        &gw,
+        &gs,
+        &gb,
+        &xb,
+        &rhs_buf,
+        &gate_y,
+        &uw,
+        &us,
+        &ub,
+        &up_y,
+        &logits_buf,
+        &scores_buf,
         &scores_buf, // buffer(12) expert_scale — unused (EXPERT_SCALE off)
         &bias_buf,
     ];
@@ -1556,7 +1557,5 @@ fn routed_gated_b3_case(
         worst.0,
         worst.1
     );
-    eprintln!(
-        "routed gated b3 E={num_experts} k={k}: picks exact, max_err {max_err:.3e}"
-    );
+    eprintln!("routed gated b3 E={num_experts} k={k}: picks exact, max_err {max_err:.3e}");
 }

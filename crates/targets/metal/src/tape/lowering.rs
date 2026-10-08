@@ -7180,7 +7180,12 @@ fn lower_moe_step(
                 }
                 // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
                 if let super::step::RoutePre::SigmoidBias(l) = program.pre {
-                    bindings.push(source(router()?, WeightTensor::MoeRouterBias, layer(&l), 13));
+                    bindings.push(source(
+                        router()?,
+                        WeightTensor::MoeRouterBias,
+                        layer(&l),
+                        13,
+                    ));
                 }
                 constants.extend(Vec::from(RoutedConstants {
                     experts: b.experts,

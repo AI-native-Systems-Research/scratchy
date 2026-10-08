@@ -638,7 +638,13 @@ impl MetalStep {
                 | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
                 | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, ..),
             ) => Some(l),
-            S::Moe(_, MoeStep::Route(RouteProgram { pre: RoutePre::SigmoidBias(l), .. }))
+            S::Moe(
+                _,
+                MoeStep::Route(RouteProgram {
+                    pre: RoutePre::SigmoidBias(l),
+                    ..
+                }),
+            )
             | S::Moe(
                 _,
                 MoeStep::Route(RouteProgram {
