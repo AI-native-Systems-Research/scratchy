@@ -967,7 +967,8 @@ pub struct ServerInfoParams {
 
 /// Response for `GET /server_info`.
 ///
-/// Mirrors Python vLLM's `/server_info` endpoint with three top-level keys.
+/// Mirrors Python vLLM's `/server_info` endpoint with three top-level keys, plus
+/// `requests_served` — a scratchy addition, not vLLM parity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfoResponse {
     /// The VllmConfig used to initialize the stack.
@@ -977,6 +978,23 @@ pub struct ServerInfoResponse {
     pub vllm_env: serde_json::Value,
     /// Basic system information (OS, version, etc.).
     pub system_env: serde_json::Value,
+    /// Requests this process has served since start, excluding the liveness and
+    /// introspection endpoints (see `server::COUNTED_EXCLUDED_ROUTES`).
+    ///
+    /// Provenance, not observability: it answers "did the client under test
+    /// actually talk to *this* server", which an environment variable cannot be
+    /// trusted to answer. Always compiled — unlike everything in `metrics`,
+    /// which is behind a non-default feature — so a measured build carries no
+    /// instrumentation a user's build wouldn't.
+    ///
+    /// `Option` + `serde(default)` so a client can still read an older server
+    /// that has no such field, and so absence stays distinguishable: `None`
+    /// means "this server cannot say", which is not the same claim as
+    /// `Some(0)`, "nothing arrived". A bare `u64` with `serde(default)` would
+    /// collapse the two, deserializing a silent older server as a definite
+    /// zero — and a definite zero is what marks a run void.
+    #[serde(default)]
+    pub requests_served: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -259,6 +259,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         config: server_config,
         is_pooling,
         scratchy_core_config: Some(scratchy_core_config_snapshot),
+        requests_served: std::sync::atomic::AtomicU64::new(0),
     });
     scratchy_serving_api::server::serve(app_state)
         .await

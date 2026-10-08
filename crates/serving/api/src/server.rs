@@ -15,6 +15,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -90,6 +91,42 @@ pub struct AppState {
     pub is_pooling: bool,
     /// The VllmConfig used to initialize the stack (for `/server_info`).
     pub scratchy_core_config: Option<crate::init::VllmConfig>,
+    /// Requests served since start, excluding [`COUNTED_EXCLUDED_ROUTES`].
+    /// Reported by `/server_info`; see `protocol::ServerInfoResponse`.
+    pub requests_served: AtomicU64,
+}
+
+/// Routes that do **not** count towards [`AppState::requests_served`]: liveness
+/// and introspection, which a supervisor polls on its own schedule and which
+/// therefore prove nothing about who sent the inference traffic. `scr launch
+/// claude` alone polls `/health` every 200 ms while a model loads, and reads
+/// `/server_info` to get the count itself.
+///
+/// A const table rather than scattered conditionals, so what counts is one list
+/// a reviewer can read.
+pub const COUNTED_EXCLUDED_ROUTES: &[&str] = &[
+    "/health",
+    "/version",
+    "/server_info",
+    "/is_sleeping",
+    "/gpu_memory",
+    "/metrics",
+];
+
+/// Count one request unless its path is excluded, then pass it on.
+///
+/// At the HTTP layer rather than at the engine's admission sites on purpose: a
+/// request that arrives and is *rejected* still proves the client reached this
+/// server, which is the question this counter exists to answer.
+async fn count_request(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !COUNTED_EXCLUDED_ROUTES.contains(&request.uri().path()) {
+        state.requests_served.fetch_add(1, Ordering::Relaxed);
+    }
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +160,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     if state.config.metrics_enabled {
         router = router.route("/metrics", get(metrics));
     }
+
+    // Count arrivals before anything else runs, so a request that a handler
+    // later rejects still counts as traffic that reached this server.
+    router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        count_request,
+    ));
 
     let mut router = router.with_state(state.clone());
 
@@ -564,6 +608,7 @@ async fn server_info(
         scratchy_core_config,
         vllm_env,
         system_env,
+        requests_served: Some(state.requests_served.load(Ordering::Relaxed)),
     })
 }
 
@@ -979,6 +1024,7 @@ mod tests {
             config: ServerConfig::default(),
             is_pooling: false,
             scratchy_core_config: None,
+            requests_served: AtomicU64::new(0),
         })
     }
 
@@ -1081,6 +1127,7 @@ mod tests {
                 model: "test-model".to_string(),
                 ..VllmConfig::default()
             }),
+            requests_served: AtomicU64::new(0),
         })
     }
 
@@ -1128,6 +1175,82 @@ mod tests {
         assert_eq!(parsed.scratchy_core_config["model"], "test-model");
         // hf_token should NOT appear (skip_serializing).
         assert!(parsed.scratchy_core_config.get("hf_token").is_none());
+    }
+
+    /// `requests_served` is provenance: it answers "did the client under test
+    /// actually reach *this* server". So it must count real traffic and must not
+    /// count the polling a supervisor does on its own — `scr launch claude`
+    /// hits `/health` every 200 ms while a model loads and reads `/server_info`
+    /// to get the number, and either one inflating the count would make a
+    /// hijacked run look like it served traffic.
+    #[tokio::test]
+    async fn requests_served_counts_traffic_but_not_liveness_polls() {
+        let state = make_test_state();
+        let app = build_router(state.clone());
+
+        let get = |uri: &str| {
+            let app = app.clone();
+            let uri = uri.to_string();
+            async move {
+                let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+                app.oneshot(request).await.unwrap()
+            }
+        };
+
+        // The two a supervisor actually polls: `scr launch claude` hits
+        // `/health` every 200 ms while a model loads, and reads `/server_info`
+        // to get this very number. Either one counting would make a hijacked
+        // run look like it served traffic.
+        //
+        // Only these two are driven over HTTP: the rest of the excluded list is
+        // asserted below instead, because `/is_sleeping` awaits an engine
+        // round-trip that never completes under `NoopExecutor`.
+        for _ in 0..3 {
+            assert_eq!(get("/health").await.status(), StatusCode::OK);
+        }
+        assert_eq!(get("/server_info").await.status(), StatusCode::OK);
+        assert_eq!(
+            state.requests_served.load(Ordering::Relaxed),
+            0,
+            "polling /health and /server_info must not count as traffic"
+        );
+
+        // The rest of the exclusion list, as a list: liveness and introspection
+        // only — nothing that carries a prompt may be added here, or the count
+        // stops meaning "the client under test reached this server".
+        assert_eq!(
+            COUNTED_EXCLUDED_ROUTES,
+            &[
+                "/health",
+                "/version",
+                "/server_info",
+                "/is_sleeping",
+                "/gpu_memory",
+                "/metrics",
+            ]
+        );
+
+        // A real request does count.
+        assert_eq!(get("/v1/models").await.status(), StatusCode::OK);
+        assert_eq!(state.requests_served.load(Ordering::Relaxed), 1);
+
+        // So does one that gets rejected — arriving is what proves the client
+        // talked to this server, which is why the count sits at the HTTP layer
+        // rather than at the engine's admission sites.
+        let rejected = get("/v1/does-not-exist").await;
+        assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+        assert_eq!(state.requests_served.load(Ordering::Relaxed), 2);
+
+        // And `/server_info` reports it without counting its own read.
+        let body = get("/server_info")
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let parsed: protocol::ServerInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.requests_served, Some(2));
     }
 
     #[tokio::test]
@@ -1279,6 +1402,7 @@ mod tests {
             },
             is_pooling: false,
             scratchy_core_config: None,
+            requests_served: AtomicU64::new(0),
         })
     }
 
@@ -1471,6 +1595,7 @@ mod tests {
             },
             is_pooling: false,
             scratchy_core_config: None,
+            requests_served: AtomicU64::new(0),
         })
     }
 
@@ -1650,6 +1775,7 @@ mod tests {
             config: ServerConfig::default(),
             is_pooling: true,
             scratchy_core_config: None,
+            requests_served: AtomicU64::new(0),
         })
     }
 

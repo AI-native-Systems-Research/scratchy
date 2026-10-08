@@ -263,6 +263,60 @@ still appear on every published row:
    `crates/cli/scr/src/args.rs:126-139`). It is a default, not a hard-code —
    raising it is one of phase 4's ablations.
 
+### Proving the engine under test served the traffic
+
+**T0.9.** `scr launch claude` points Claude Code at the local server with
+`ANTHROPIC_BASE_URL` and the model-tier variables. A settings file's `env` block
+*overwrites* the process environment Claude Code inherits, so a developer with
+`ANTHROPIC_BASE_URL` in `~/.claude/settings.json` would measure a different
+endpoint than the one under test — and nothing would fail. Launch now sets those
+values twice: in the environment, and through `claude --settings`, which
+outranks the user and both project files.
+
+The same applies to **provider selection**, which bypasses `ANTHROPIC_BASE_URL`
+rather than competing with it. `CLAUDE_CODE_USE_BEDROCK`, `…_VERTEX`,
+`…_FOUNDRY`, `…_MANTLE` and `…_ANTHROPIC_AWS` each route to a provider with its
+own endpoint variable, so one of them left set in a settings file sends the run
+there and our base URL is never consulted. Claude Code's `/setup-bedrock`
+wizard writes one into `~/.claude/settings.json`, so this is a configuration a
+developer gets by following the documented setup. Launch blanks all five.
+
+**Neither of those is the guarantee.** Managed settings rank above
+`--settings`, and three of the five managed delivery mechanisms are not files at
+all — a macOS configuration profile, the Windows registry, and server-managed
+policy held by Anthropic or a gateway. Launch deliberately does **not** scan the
+settings files to warn about what it cannot override: a scan can only ever see
+the file-based sources, so it would reassure in exactly the cases it cannot
+detect, and the request count below catches all of them without reading anyone's
+configuration. Keys launch does not set — a per-provider
+`ANTHROPIC_BEDROCK_BASE_URL`, an `ANTHROPIC_CUSTOM_HEADERS` — are likewise
+caught by the count rather than by inspection.
+
+What makes a run trustworthy is therefore the server's own count:
+`GET /server_info` reports `requests_served`, incremented once per arriving
+request excluding the liveness and introspection routes
+(`server::COUNTED_EXCLUDED_ROUTES`). Launch reads it before and after a session
+and reports the delta. In `-p`/`--print` mode — how a harness drives this — a
+zero count **fails the command**, because a run given a prompt that served no
+requests sent that prompt somewhere else; a harness therefore learns it from the
+exit status rather than by scraping stderr. Interactively a zero count is only
+warned about, since exiting without sending anything legitimately serves none.
+
+An unreadable count is reported as such and never fails, and is not the same
+claim as zero: `requests_served` is `Option<u64>`, so a server too old to report
+it reads as "cannot say" rather than as a definite zero.
+
+Two properties matter for fairness. The counter is **always compiled**, unlike
+everything behind the non-default `metrics` feature, so a measured build carries
+no instrumentation a user's build would not — and it is **one atomic add per
+request**, nothing per token, so it is not on the decode path. A published
+number needs no disclosure about its own measurement apparatus.
+
+**Request counts only.** Server-side token totals would cross-check the
+client's own accounting, which is what the no-truncation row above needs, but
+they answer a different question from "did the traffic arrive here" and are
+deliberately not part of T0.9. They remain open in the table below.
+
 ## Blocked
 
 Every cell this document could not fill, with what resolves it. Nothing here is
@@ -275,7 +329,8 @@ an estimate.
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
 | no-truncation proof on both sides | **T0.4** + the phase 2 harness | per-turn token accounting in the replay client and the live driver |
 | KV-quant deferral and its layer-coverage evidence | **T0.8** | the [Scope and deferrals](#scope-and-deferrals) section above |
-| server-side proof that the engine under test served the traffic | **T0.9** + phase 2's provenance check | request count and token totals recorded from the server, not from the client |
+| per-run provenance record (which config served how many requests) | phase 2's provenance check | `GET /server_info` carries both `scratchy_core_config` and `requests_served`; **T0.9 landed the count** (see [Proving the engine under test served the traffic](#proving-the-engine-under-test-served-the-traffic)) |
+| server-side **token totals**, as a cross-check on the client's own accounting | still open — **not** delivered by T0.9 | a server-side counter alongside `requests_served`, or the `metrics` feature's `prompt_tokens_total` / `output_tokens_total` if a build is willing to carry it |
 | every number | phase 4 | — |
 
 ## Artifacts
