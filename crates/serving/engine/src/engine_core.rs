@@ -752,6 +752,8 @@ impl EngineCore {
                     new_token_ids: Vec::new(),
                     finish_reason: Some(FinishReason::Stop),
                     stop_reason: None,
+                    // Pooling requests surface no token usage, so a cache count
+                    // here has no consumer.
                     num_cached_tokens: 0,
                     events: None,
                     new_logprobs: None,
@@ -861,13 +863,33 @@ impl EngineCore {
                 continue;
             }
 
+            // Prompt tokens served from the prefix cache. The scheduler resolved
+            // this at admission (`core.rs`, `num_cached_tokens` on the request;
+            // `-1` means "not yet known"), and it is final before any token is
+            // emitted: `get_computed_blocks` runs only on the WAITING->RUNNING
+            // transition, and intermediate prefill chunks emit no output at all
+            // (the skip just above). Until now this was hardcoded `0` here, which
+            // made the whole chain dead — `prompt_tokens_details.cached_tokens`
+            // and the TUI's live `cached_tokens` could never be anything but 0.
+            //
+            // This is the BACKED-OFF count, not the raw prefix match: when the
+            // cache covers the entire prompt the scheduler discards one block so
+            // the model has real tokens to forward, and that block genuinely is
+            // recomputed. It is block-aligned for the same reason (floor to the
+            // block size), so it understates logical reuse slightly and never
+            // overstates it.
+            let num_cached_tokens = self
+                .scheduler
+                .get_request(req_id)
+                .map_or(0, |r| r.num_cached_tokens.max(0) as u32);
+
             // Build the output for this request.
             let output = EngineCoreOutput {
                 request_id: req_id.clone(),
                 new_token_ids: new_token_ids_slice.to_vec(),
                 finish_reason,
                 stop_reason,
-                num_cached_tokens: 0,
+                num_cached_tokens,
                 events: None,
                 new_logprobs,
                 new_prompt_logprobs,
@@ -910,6 +932,10 @@ impl EngineCore {
                         new_token_ids: Vec::new(),
                         finish_reason: Some(FinishReason::Stop),
                         stop_reason: None,
+                        // Abort/finish-only output: carries no tokens, so it never
+                        // backs a usage response. If the request ever produced a
+                        // token, the real count already arrived on that output and
+                        // the API layer keeps it (its `> 0` guard is sticky).
                         num_cached_tokens: 0,
                         events: None,
                         new_logprobs: None,
