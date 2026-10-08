@@ -788,4 +788,25 @@ mod tests {
             .expect("cl is placed");
         assert_eq!(*cl_sz, m as u64 * k as u64 * 2, "cl owns [m, k] fp16 — no widening");
     }
+
+    /// ⭐⭐⭐⭐⭐ THE 26b UP/GATE GEMM: k=2816 (128-ALIGNED) but n=2112 (16.5 fp8 KERNEL sticks).
+    /// The packed fp8 weight is `[n, k]` sticked on `out` (= n) — `view_stick_layout`'s
+    /// `DeviceTileLayout::<Fp8>` guard (emit/mod.rs) refuses a non-128-multiple OUT the same way
+    /// the convert refused a non-128-multiple K. This test REPRODUCES the pod panic locally:
+    /// the phase-2 build died at `matmul_s20` (the 26b gate projection) with exactly this
+    /// geometry, while the DOWN gemm (k=2112, n=2816) — the geometry the K-pad test covers —
+    /// was already fixed by the K-pad commit.
+    #[test]
+    fn the_26b_n2112_packed_kernel_out_stick() {
+        let (m, k, n) = (1u32, 2816, 2112);
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the n=2112 packed-kernel fp8 chain emits (the 26b gate gemm wall is gone)");
+        assert!(
+            !ops.iter().any(|o| o.op_name.ends_with("fq_zfpad_op")),
+            "an aligned k needs no K-pad"
+        );
+        let _ = ops;
+    }
 }
