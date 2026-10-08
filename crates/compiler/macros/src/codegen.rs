@@ -8374,6 +8374,44 @@ fn emit_superdsc_wiring(
     // The VALUE, not a `static` — the caller composes decode + prefill into one
     // `Wirings` const, because a bundle's tensor ids are per-PROGRAM and the
     // prefill program has its own.
+    // ⭐ THE DENSE fp8 K-PADS — same rule, same tape, as the retile's own `fp8_k_pad` (the
+    // worker rebuilds the on-disk `[n, k]` buffer's inner axis to `k_pad` so the staged bytes
+    // match the packed retile). Computed HERE off `gk`/`lwd.input.ops` because the macro is
+    // where the wiring literal is rendered; the orientation (which axis is k) comes from the
+    // CONSUMING op, the same evidence the retile uses.
+    let fp8_k_pads: Vec<(u32, u32)> = {
+        use scratchy_subtile::lower::InputRef;
+        use scratchy_subtile::subtile_ir::SubOp;
+        let mut pads: Vec<(u32, u32)> = Vec::new();
+        for od in &lwd.input.ops {
+            let SubOp::MatmulTile { .. } = od.op else {
+                continue;
+            };
+            if od.inputs.len() != 3 {
+                continue;
+            }
+            let Some(InputRef::Ext(e)) = od.inputs.get(1) else {
+                continue;
+            };
+            let Some(&(rows, _cols)) = gk.tensor_shapes.get(*e) else {
+                continue;
+            };
+            let k_pad = scratchy_target_spyre::lower_subtile_tape_to_superdsc::fp8_k_pad(rows);
+            if k_pad > rows {
+                pads.push((*e as u32, k_pad));
+            }
+        }
+        pads.sort();
+        pads.dedup();
+        pads
+    };
+    let fp8_k_pad_toks = fp8_k_pads
+        .iter()
+        .map(|&(id, k)| {
+            let (id, k) = (u32l(id), u32l(k));
+            quote! { (#id, #k) }
+        })
+        .collect::<Vec<_>>();
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
@@ -8398,6 +8436,7 @@ fn emit_superdsc_wiring(
             attn_class_hds: &[#(#attn_class_hds),*],
             rms_invcols: &[#(#rms_invcols_lits),*],
             scalarmul_scales: &[#(#scalarmul_scale_lits),*],
+            fp8_k_pads: &[#(#fp8_k_pad_toks),*],
         }
     }
 }

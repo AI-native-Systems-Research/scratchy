@@ -163,6 +163,31 @@ pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
     }
 }
 
+/// The contraction-K width of an fp8 W8A8 matmul's ACTIVATION and WEIGHT, rounded to a whole
+/// 128-elem SEN143_FP8 stick. ⭐ THE K-AXIS TWIN OF [`DeviceWidth`]'s N law — and the FIRST fp8
+/// model with a non-legal K is what forced it: gemma-4-26b's dense GeGLU DOWN gemm contracts
+/// `k = 2112 = 16.5 sticks`, which `qfp8ch`'s convert guard refuses (`assert_df_stick_multiple`:
+/// a sub-stick tile is rejected by the dxp scheduler, L3DlOpsScheduler:1040). Every earlier fp8
+/// model was legal by luck (granite 2048/11008, g8b 4096/12800, g12b 3840/15360 — all multiples
+/// of 128).
+///
+/// THE CONTRACT, SAME AS `DeviceWidth`'s: the fp8 quantize chain (`cl`/`afp8`), the packed
+/// RetileDescriptor (`[n/64, k/2, 64, 2]`), the layout's weight `nbytes`, and the worker's
+/// staged buffer ALL take their K from this one function, so the shared contraction k cannot
+/// drift between activation and weight. A no-op for every 128-aligned width — granite and the
+/// 12b are byte-identical under it.
+///
+/// ⛔ THE PAD LANES ARE ZERO BY EMISSION, NOT BY SEGMENT INIT. The chain that reaches the
+/// contraction writes `cl`'s `[m, k]` logical window and the pad window is zero-FILLED by the
+/// chain's own emission (a `sub(448,448)` broadcast) — see `matmul_fp8_descriptors`. Segments
+/// zero-init once at prepare, but intermediates RE-USE bytes across steps: a stale pad lane
+/// (last step's activation, or a NaN from a prior consumer) reaching the clamp would pass
+/// through `maximum/minimum` UNCHANGED (NaN-propagation), then `0 · NaN = NaN` in the
+/// contraction — the zero-fill is a correctness requirement, not belt-and-braces.
+pub fn fp8_k_pad(k: u32) -> u32 {
+    k.next_multiple_of(crate::superdsc_opspec::Df::Fp8.elems_per_stick())
+}
+
 /// ⭐ THE UTIL-FLOOR CORE COUNT — the minimum cores a FLOP-heavy matmul (`macs ≥ 2^20`) may be
 /// split onto. One constant for every reader: `DeviceWidth::for_matmul`'s windowed drop test,
 /// guard #11's refusal in the emitter, and `out_width_the_weight_holds`' floor test in the

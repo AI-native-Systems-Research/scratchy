@@ -846,6 +846,16 @@ pub struct Wiring {
     /// `BundleLayout`; this is the copy the emulator path has, on a program it resolved by fingerprint
     /// rather than through a layout it never asks for.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ THE DENSE fp8 K-PADS — for every arity-3 MatmulTile weight whose contraction k is not a
+    /// whole 128-elem SEN143_FP8 stick: `(source id, k_pad)`. The FIRST fp8 model with a
+    /// non-legal K is gemma-4-26b (dense GeGLU DOWN, k=2112 → 2176): the quantize chain and the
+    /// packed weight both run at `k_pad`, so the worker's staging must WIDEN the on-disk
+    /// `[n, k]` buffer's INNER axis to match the retile — a strided rebuild, not the outer-axis
+    /// `resize` the N-pad uses. Baked here (from the same `ir` the retile reads) because the
+    /// bank/weight orientation is a BAKE fact the worker cannot re-derive from `tensor_shapes`
+    /// alone (a bank's N axis is its ROWS). Empty for every 128-aligned model — granite, g8b
+    /// and g12b stage byte-identically.
+    pub fp8_k_pads: &'static [(u32, u32)],
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
@@ -1718,6 +1728,7 @@ mod constant_tape_tests {
             attn_class_hds: &[],
             rms_invcols: &[],
             scalarmul_scales: &[],
+            fp8_k_pads: &[],
         }
     }
 

@@ -14,7 +14,8 @@
 //! through the KTIR, from facts the KTIR itself states.
 
 use super::{
-    EmittedOp, In, assemble_convert, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rbo,
+    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled,
+    op_func_from_str, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     assemble_reduce_off, assemble_reduce_seeded, reduce_opspec,
@@ -62,8 +63,20 @@ pub(crate) fn matmul_fp8_descriptors(
         // prefill), matching torch-spyre exactly — mirrors rmsnorm's unification (no scratchy-only approx,
         // no diagnostic-sweep scaffolding left in the live path).
         let stk = Fp16::ELEMS_PER_STICK; // 64
-        // The quant chain's typed extents: the activation's `m` is the matmul's token rows, `k`/`n`
-        // its in/out feature columns, and the per-row scale tensors are ONE STICK wide.
+        // ⭐ THE 26b K-PAD — the contraction width rounded to a whole 128-elem SEN143_FP8 stick
+        // (`work::fp8_k_pad`, the K-axis twin of `DeviceWidth`'s N law). gemma-4-26b's dense GeGLU
+        // DOWN gemm contracts k=2112 = 16.5 fp8 sticks — the FIRST fp8 model with a non-legal K
+        // (granite/g8b/g12b are all 128-multiples) — and `qfp8ch`'s convert guard refuses a
+        // sub-stick tile outright. The fp16 READS of this chain stay at the LOGICAL `[m, k]` (the
+        // activation's own reservation is k-wide; reading past it is out-of-footprint); only the
+        // chain's TAIL widens: `cl` (the clamp output) and `afp8` (the convert output) are
+        // reserved and addressed at `[m, k_pad]`, with the pad window ZERO-FILLED by this chain's
+        // own emission. The zero is inert by the chain's own arithmetic — the amax never sees the
+        // pad lanes (it reads `absx` at the logical width), and 0 clamps to 0 and contributes
+        // 0·w to the contraction — but the FILL is not optional: segments zero-init once, while
+        // intermediates RE-USE bytes across steps, so an unwritten pad lane is last step's
+        // activation (or a NaN), and `maximum`/`minimum` pass a NaN through UNCHANGED.
+        let k_pad = crate::work::fp8_k_pad(k);
         let m_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
         let k_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(k);
         let n_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(n);
@@ -107,10 +120,15 @@ pub(crate) fn matmul_fp8_descriptors(
         if let Some(l) = layout {
             // Footprints are `m` query rows (decode m=1 ⇒ byte-identical to the old `[1,·]`; prefill m>1
             // reserves the real multi-row extent so a per-row write can't clobber a neighbor row).
-            for r in [R::FqAbsX, R::FqSc, R::FqChi, R::FqCl] {
+            for r in [R::FqAbsX, R::FqSc, R::FqChi] {
                 l.synth(a_id.synth(r), &[m, k]);
             }
-            l.synth_df(a_id.synth(R::FqAfp8), &[m, k], Df::Fp8); // 1-byte / 128-stick residency (½ fp16)
+            // The chain's tail widens to the PAD: `cl` feeds the convert (whose 128-elem stick law
+            // is the reason the pad exists) and `afp8` is the fp8 contraction operand — both are
+            // reserved at `[m, k_pad]`, the one width the convert, the matmulfp8, and the packed
+            // weight's K rows all share.
+            l.synth(a_id.synth(R::FqCl), &[m, k_pad]);
+            l.synth_df(a_id.synth(R::FqAfp8), &[m, k_pad], Df::Fp8); // 1-byte / 128-stick residency (½ fp16)
             for r in [R::FqAmax, R::FqAmaxFl, R::FqAscale, R::FqInvS] {
                 l.synth(a_id.synth(r), &[m, stk]);
             }
@@ -336,7 +354,40 @@ pub(crate) fn matmul_fp8_descriptors(
                 sym_id_base,
                 layout,
             ));
-            let cl_h = rb(&cl, m, k);
+            let cl_h = rb(&cl, m, k_pad);
+            // ⭐ THE PAD WINDOW'S ZERO FILL. `cl`'s logical `[m, k]` window is written by the
+            // clamp above; the `[k, k_pad)` window is written HERE, unconditionally, every
+            // step — a `sub` of the 448 const with itself is a broadcast ZERO (no new const:
+            // the fp8 consts are width-independent `[1,64]` scalars). `In::scalar` broadcasts
+            // both axes, so the op's reads stay in the const's own footprint while the write
+            // covers `[m, 64]` at `col_of(m, k_pad, k, Fp16)` — the RowBlocked stick-group
+            // law (2112/64 = 33 stick-groups, whole, so the pad window starts at a stick
+            // boundary BY ARITHMETIC; a non-whole k would need the fill re-aimed, which the
+            // door's own 64-stick input guard excludes).
+            if k_pad != k {
+                let zf_h = rb(&cl, m, k_pad);
+                ops.push(assemble_pointwise_broadcast_off(
+                    &opn("fq_zfpad_op"),
+                    "sub",
+                    m_rows,
+                    // ⭐ ONE STICK WIDE (the pad width, not `k_pad`): the write is aimed at the
+                    // pad WINDOW via the output offset, so the op's own width is the window's
+                    // 64 elements — a `[m, k_pad]` op would rewrite the logical window too
+                    // (reading `sc`'s unpad-ded bytes at the pad position).
+                    crate::sdsc_abstract::BlockCols::of_one_stick(
+                        crate::sdsc_abstract::Lanes::FP16,
+                    ),
+                    &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
+                    &zf_h,
+                    // The RowBlocked stick-group law aims the write at the pad window: stick-
+                    // group `k/64` of every row (2112/64 = 33, whole — the door's own 64-stick
+                    // input guard keeps `k` a whole fp16 stick, so the window starts at a stick
+                    // boundary by arithmetic).
+                    crate::addr::col_of(m, k_pad, k, Df::Fp16),
+                    sym_id_base,
+                    layout,
+                ));
+            }
             ops.push(pw2(
                 &opn("fq_cl_op"),
                 "maximum",
@@ -350,14 +401,16 @@ pub(crate) fn matmul_fp8_descriptors(
             ));
             // qfp8ch: f16 clamped act → SEN143_FP8. A dtype CONVERT (input 64-stick, output 128-stick), so it
             // goes through `assemble_convert` (two `primaryDsInfo_`), NOT a same-stick pointwise. The output's
-            // `Df::Fp8` is intrinsic to the op (`convert_dtypes`).
+            // `Df::Fp8` is intrinsic to the op (`convert_dtypes`). ⭐ AT `k_pad`: the convert's own
+            // `assert_df_stick_multiple` (128-elem SEN143_FP8 law) is the guard that refused 2112 — the
+            // pad exists so THIS op sees a whole stick count — and its input reads the zero-filled `cl`.
             ops.push(assemble_convert(
                 &opn("fq_afp8_op"),
                 "qfp8ch",
                 m,
-                k,
-                &rb(&cl, m, k),
-                &rb(&afp8, m, k),
+                k_pad,
+                &rb(&cl, m, k_pad),
+                &rb(&afp8, m, k_pad),
                 sym_id_base,
                 layout,
             ));
@@ -378,7 +431,12 @@ pub(crate) fn matmul_fp8_descriptors(
             let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<Fp16>(
                 crate::sdsc_abstract::MatM::of_token_rows(m),
                 crate::sdsc_abstract::MatN::of_out_features(n),
-                crate::sdsc_abstract::MatK::of_in_features(k),
+                // ⭐ `k_pad`, NOT `k`: the packed fp8 weight is staged with `fp8_k_pad` K rows
+                // (the retile + the worker's staging both take it from the same rule), so the
+                // contraction's K must match the staged weight or the tile walks past the
+                // buffer. The activation operand is `[m, k_pad]` — the quantize chain's own
+                // widened tail. No-op at every 128-aligned k.
+                crate::sdsc_abstract::MatK::of_in_features(k_pad),
                 crate::sdsc_abstract::MatY::unbatched(),
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
@@ -657,5 +715,77 @@ mod tests {
                 .contains_key(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
             "no partial synth may be declared at a fitting geometry"
         );
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE 26b K-PAD (2112 → 2176): gemma-4-26b's dense GeGLU DOWN gemm is the FIRST fp8
+    /// model whose contraction k is not a whole 128-elem SEN143_FP8 stick (2112 = 16.5 sticks —
+    /// the panic that stopped the 26b phase-2 bake at `matmul_s20`). The chain must:
+    ///   · emit at all (the `qfp8ch` convert's `assert_df_stick_multiple` refused the sub-stick
+    ///     width — this test passing IS the wall gone);
+    ///   · reserve `cl` and `afp8` at `[m, k_pad]` (the widened tail the convert and the
+    ///     contraction share);
+    ///   · ZERO-FILL the pad window (one `sub(448,448)` op) — stale pad lanes are last step's
+    ///     activation, and a NaN there passes `maximum`/`minimum` unchanged into the product;
+    ///   · keep the amax at the LOGICAL width (the pad never reaches the activation scale).
+    #[test]
+    fn the_26b_k2112_pads_to_a_whole_fp8_stick() {
+        let (m, k, n) = (1u32, 2112, 2816);
+        let k_pad = crate::work::fp8_k_pad(k);
+        assert_eq!(k_pad, 2176, "2112 rounds up to the next whole 128-elem stick");
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the 2112-wide fp8 chain emits (the 26b wall is gone)");
+        // The zero-fill exists (the `sub(448,448)` broadcast), and only ONE such op.
+        assert_eq!(
+            ops.iter().filter(|o| o.op_name.ends_with("fq_zfpad_op")).count(),
+            1,
+            "exactly one pad-window zero fill"
+        );
+        // The synth reservations for the widened tail: `cl` at [m, k_pad] fp16, `afp8` at
+        // [m, k_pad] fp8 (1 byte/elem — the ½-fp16 residency).
+        let s = l.synth.borrow();
+        let cl_sz = s
+            .sizes
+            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .expect("cl is placed");
+        assert_eq!(*cl_sz, m as u64 * k_pad as u64 * 2, "cl owns [m, k_pad] fp16");
+        let afp8_sz = s
+            .sizes
+            .get(&PlaceId::Act(7).synth(SynthRole::FqAfp8).to_string())
+            .expect("afp8 is placed");
+        assert_eq!(
+            *afp8_sz,
+            m as u64 * k_pad as u64,
+            "afp8 owns [m, k_pad] fp8 (1 B/elem)"
+        );
+        // The amax family is untouched by the pad: `absx` stays at the LOGICAL [m, k].
+        let absx_sz = s
+            .sizes
+            .get(&PlaceId::Act(7).synth(SynthRole::FqAbsX).to_string())
+            .expect("absx is placed");
+        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+    }
+
+    /// ⭐ THE ALIGNED CASE IS BYTE-IDENTICAL: at a 128-aligned k (every earlier fp8 model), no
+    /// zero-fill op exists, no widened reservation exists, and the chain is exactly the ops the
+    /// pre-pad emitter produced. Pins that the pad cannot fire where the width was already legal.
+    #[test]
+    fn an_aligned_k_emits_no_pad_op_and_no_widened_reservation() {
+        let (m, k, n) = (32u32, 2048, 128);
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the aligned-geometry fp8 chain emits");
+        assert!(
+            !ops.iter().any(|o| o.op_name.ends_with("fq_zfpad_op")),
+            "no zero-fill op may exist at an aligned k"
+        );
+        let s = l.synth.borrow();
+        let cl_sz = s
+            .sizes
+            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .expect("cl is placed");
+        assert_eq!(*cl_sz, m as u64 * k as u64 * 2, "cl owns [m, k] fp16 — no widening");
     }
 }

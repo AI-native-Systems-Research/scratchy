@@ -93,7 +93,7 @@ pub use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Fp32, SenInt8};
 pub use ktir_superdsc::work::{
     CORELETS_PER_CORE, CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK, MAX_SPAN_BYTES, MatmulSplit,
     STICK_BYTES, bump_sticks_to_splittable, core_split, core_to_wk_slice, distribute_cores,
-    matmul_cost_split, matmul_split_plan, stick_count,
+    fp8_k_pad, matmul_cost_split, matmul_split_plan, stick_count,
 };
 
 // ── EMIT-TIME CONSTANTS THAT USED TO BE ENVIRONMENT READS ───────────────────
@@ -501,6 +501,25 @@ pub fn compute_bundle_layout<F: RopeForm>(
             _ => None,
         })
         .collect();
+    // ⭐ fp8 W8A8 K-PAD (`work::fp8_k_pad`), PRODUCER-KEYED like `router_out_w` above: the dense
+    // GeGLU DOWN weight of gemma-4-26b contracts k=2112 = 16.5 SEN143_FP8 sticks, so the packed
+    // retile (whose `k` takes the same rule) and the worker's staged buffer both widen to
+    // k_pad=2176 — the placement must reserve the SAME rows or the staging over-binds into the
+    // next tensor's bytes. Keyed by the PRODUCING node (arity-3 MatmulTile's `inputs[1]`), never
+    // by width: a `[2112, ·]` census cannot tell the DOWN weight from an unrelated tensor. The
+    // MoE banks are NOT here: their `rows` is the N axis (`[E·out, in]`) and their k is `cols`,
+    // which the `bump_sticks_to_splittable` below already rounds UP past `fp8_k_pad(in)` —
+    // over-reserved is safe (the retile's exact-equality staging guard reads the WORKER's bytes,
+    // not the placement). A no-op for every 128-aligned k (granite, g8b, g12b).
+    let fp8_k_rows: std::collections::BTreeMap<u32, u32> = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+        .map(|n| {
+            let tid = n.inputs[1].tensor.index() as u32;
+            (tid, fp8_k_pad(ir.tensors[tid as usize].rows))
+        })
+        .collect();
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         // Reserve the DEVICE footprint: a stick-last tensor pads its innermost stick dim up to a whole
@@ -513,7 +532,14 @@ pub fn compute_bundle_layout<F: RopeForm>(
             Df::Fp16
         };
         let cols = router_out_w.get(&tid).copied().unwrap_or(s.cols).max(s.cols);
-        s.rows as u64
+        // The fp8 K-pad above replaces a dense fp8 weight's `rows` with `k_pad` when the logical
+        // k is not a whole 128-elem stick (26b DOWN: 2112 → 2176 rows). Inert at aligned k.
+        let rows = fp8_k_rows
+            .get(&tid)
+            .copied()
+            .unwrap_or(s.rows)
+            .max(s.rows);
+        rows as u64
             * bump_sticks_to_splittable(cols.next_multiple_of(df.elems_per_stick())) as u64
             * df.word_length() as u64
     };

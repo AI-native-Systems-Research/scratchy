@@ -2416,6 +2416,13 @@ pub struct BundleWiring {
     /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
     /// own source binding. This is the one list they read, so they cannot disagree about it.
     pub scalarmul_scales: Vec<f32>,
+    /// ⭐ THE DENSE fp8 K-PADS — `(weight tid, k_pad)` for every arity-3 MatmulTile weight whose
+    /// contraction k is not a whole 128-elem SEN143_FP8 stick (gemma-4-26b's dense GeGLU DOWN,
+    /// 2112 → 2176). The worker's staging rebuilds the on-disk `[n, k]` buffer's INNER axis to
+    /// this width so the staged bytes match the packed retile's `prod(device_size)`; the same
+    /// rule pads the retile, the layout's `nbytes` and the quantize chain, so all four state
+    /// one width. Empty for every 128-aligned model.
+    pub fp8_k_pads: Vec<(u32, u32)>,
     /// ⭐ THE ROPE-P CLASS SET — this tape's DISTINCT rope head dims, sorted descending; index `i`
     /// ↔ `rope_p_class_tid(i)`. The macro bakes this into the `Wiring` so the worker's load-time
     /// bind builds one `[hd,hd]` P table PER CLASS (a hybrid model's single composite P is
@@ -2553,6 +2560,22 @@ pub fn graph_wiring<F: RopeForm>(
         tensor_shapes,
         attn_mask,
         scalarmul_scales: layout.scalarmul_scales.clone(),
+        // ⭐ THE DENSE fp8 K-PADS, read off the SAME `ir` the retile manifest reads (arity-3
+        // MatmulTile weights whose k is not a whole 128-elem fp8 stick). Same rule, same tape,
+        // so the wiring's list and the retile's `k` cannot disagree.
+        fp8_k_pads: ir
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+            .map(|n| n.inputs[1].tensor.index() as u32)
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
+            .map(|tid| {
+                let k = fp8_k_pad(ir.tensors[tid as usize].rows);
+                (tid, k)
+            })
+            .filter(|&(tid, k)| k > ir.tensors[tid as usize].rows)
+            .collect(),
         rope_class_hds: layout.rope_class_hds.clone(),
         attn_class_hds: layout.attn_class_hds.clone(),
     })
@@ -3138,6 +3161,13 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             n.inputs[i].tensor.index() as u32
         })
         .collect();
+    // The DENSE fp8 projections (arity-3 MatmulTile `inputs[1]`) — the K-pad's scope, as above.
+    let dense_fp8_tids: std::collections::HashSet<u32> = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+        .map(|n| n.inputs[1].tensor.index() as u32)
+        .collect();
     for (w_tid, in_k, out_n) in &kernel0 {
         let desc = if fp8_weight_tids.contains(w_tid) {
             // fp8 W8A8 weight = the AIU matmulfp8 PACKED tile. Each 128-byte stick holds 64 N-cols each
@@ -3158,7 +3188,22 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             // CONTIGUOUS at device elements `[e·out·in, (e+1)·out·in)` — no E-outermost axis is
             // needed and none is declared: the slab boundary the MoE gather copy reads (one entry =
             // one expert's whole packed slab) is a row boundary of this very map.
-            let k = *in_k as u64;
+            //
+            // ⭐ THE K-PAD (`work::fp8_k_pad`), DENSE fp8 PROJECTIONS ONLY for now: gemma-4-26b's
+            // dense GeGLU DOWN gemm contracts k=2112 = 16.5 fp8 sticks, so BOTH the activation
+            // quantize and this packed weight widen to k_pad = 2176 (a whole 128-elem stick).
+            // The weight's extra 64 K-rows are ZERO — the worker's staging appends them (a
+            // strided inner-axis rebuild), and the contraction's MatK takes the same `k_pad`
+            // from the same rule, so the tile walk stays inside the staged buffer by
+            // construction. A no-op at every 128-aligned k (granite, g8b, g12b: byte-identical
+            // staging). The EXPERT banks are excluded until the expert door's own `in` pad
+            // lands (its `inn % 128` guard still refuses in=704, so a bank padded here could
+            // not run against any door anyway).
+            let k = if dense_fp8_tids.contains(w_tid) {
+                fp8_k_pad(*in_k) as u64
+            } else {
+                *in_k as u64
+            };
             let n = *out_n as u64;
             if !k.is_multiple_of(2) || !n.is_multiple_of(64) {
                 return Err(SuperDscError(format!(

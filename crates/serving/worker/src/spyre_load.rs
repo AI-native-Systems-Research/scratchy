@@ -424,16 +424,49 @@ pub(crate) fn stage_bound_weights(
                     rows as u32,
                 )
                 .get() as usize;
-            if n_dev != cols {
+            let n_padded = if n_dev != cols {
                 // In `[n, k]` the padded axis `n` is the OUTER one, so widening it is appending
                 // zero rows at the end -- `resize`, not a strided rebuild. (Transposed it was the
                 // inner axis and every row had to be copied to a wider stride.) Same padded bytes,
                 // and the only weight that needs any is lm_head.
                 let mut padded = t;
                 padded.resize(n_dev * rows * elem, 0);
-                (padded, vec![rows, n_dev])
+                padded
             } else {
-                (t, vec![rows, cols])
+                t
+            };
+            // ⭐ THE DENSE fp8 K-PAD (gemma-4-26b's GeGLU DOWN, k=2112 → 2176): the quantize
+            // chain and the packed fp8 retile both run at `fp8_k_pad(k)` — a whole 128-elem
+            // SEN143_FP8 stick, the convert's own law — so the staged buffer's INNER axis (the
+            // contraction k, `rows` in the manifest's `[k, n]` pair) must widen to match
+            // `prod(device_size)` or the retile's staging guard refuses. Unlike the N-pad above,
+            // the K axis is INNER in the on-disk `[n, k]` order: a `resize` would only append
+            // zeros after the LAST row, so this is a STRIDED REBUILD — each of the `n_dev` rows
+            // copies its `k` real elements and zero-fills its `k_pad − k` tail. The pad rows are
+            // ZERO, which the contraction makes inert (0·w contributes nothing); the amax never
+            // sees them (it reads the activation's logical width). Baked in the wiring because
+            // WHICH axis is k is a bake fact (an expert bank's N axis is its ROWS).
+            match wiring.fp8_k_pads.iter().find(|&&(id, _)| id as usize == s_id) {
+                Some(&(_, k_pad)) => {
+                    let k = rows;
+                    if k_pad as usize <= k {
+                        return Err(werr(format!(
+                            "sendnn load_weights: fp8 K-pad for source {s_id} says k_pad={k_pad} \
+                             but the manifest declares k={rows} — the pad must widen, never narrow \
+                             (wiring/manifest desync)."
+                        )));
+                    }
+                    // Post-N-pad the buffer is `[n_dev, k]` row-major (k inner, `rows` = k).
+                    let mut padded = vec![0u8; n_dev * k_pad as usize * elem];
+                    for n_row in 0..n_dev {
+                        let src_off = n_row * k * elem;
+                        let dst_off = n_row * k_pad as usize * elem;
+                        padded[dst_off..dst_off + k * elem]
+                            .copy_from_slice(&n_padded[src_off..src_off + k * elem]);
+                    }
+                    (padded, vec![k_pad as usize, n_dev])
+                }
+                None => (n_padded, vec![rows, n_dev]),
             }
         } else {
             (bytes, vec![rows, cols])
