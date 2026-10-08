@@ -1133,6 +1133,17 @@ template <typename T_act, typename T_scale, int group_size, int bits>
 #define INST_GATHER_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
   SCRATCHY_KERNEL(affine_gather_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, affine_gather_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>)
 
+// INST_GATHER_QMM_T_C: explicit compute-dtype instantiation of the MoE
+// grouped expert GEMM — the gather twin of INST_QMM_T_C. Symbol carries
+// `_c_<compute_tag>` after `_<act_tag>`, b4 only (the mixed-compute W
+// loader is nibble-specialized). Used on Apple7 (M1), where bf16
+// simdgroup MMA is software emulation: the kernel reads bf16 x / writes
+// bf16 y, casts to f16 on threadgroup-tile populate, runs the MMA in
+// f16 (~1.7× faster), casts back on store — the same flip qmm_t got,
+// extended to the grouped expert GEMM that dominates MoE prefill.
+#define INST_GATHER_QMM_T_C(act_tag, act_type, ctag, ctype, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  SCRATCHY_KERNEL(affine_gather_qmm_t_##act_tag##_c_##ctag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, affine_gather_qmm_t_kernel<act_type, ctype, scale_type, gs, 4, aln_val>)
+
 #define INST_QMM_T_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
   SCRATCHY_KERNEL(affine_qmm_t_splitk_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag, affine_qmm_t_splitk_kernel<act_type, act_type, scale_type, gs, 4, aln_val>)
 
@@ -1248,6 +1259,22 @@ INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, bf16, bfloat,  32, true,  true)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, bf16, bfloat,  32, false, false)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, bf16, bfloat, 128, true,  true)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, bf16, bfloat, 128, false, false)
+
+// Apple7 (M1) fast-path for the MoE grouped expert GEMM: bf16 device
+// dtype, f16 compute — the gather twin of the INST_QMM_T_C sets above.
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, true,  true)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, false, false)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, f16, half,  32, true,  true)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, f16, half,  32, false, false)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, f16, half, 128, true,  true)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, f16, half, 128, false, false)
+
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, bf16, bfloat,  64, true,  true)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, bf16, bfloat,  64, false, false)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, bf16, bfloat,  32, true,  true)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, bf16, bfloat,  32, false, false)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, bf16, bfloat, 128, true,  true)
+INST_GATHER_QMM_T_C(bf16, bfloat, f16, half, bf16, bfloat, 128, false, false)
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4_qmm_t — NVFP4 prefill matmul (standard 32×32 tile)

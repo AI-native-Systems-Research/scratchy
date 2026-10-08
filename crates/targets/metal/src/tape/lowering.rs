@@ -4463,6 +4463,8 @@ fn lower_one(
                 bucket_m,
                 layer_offset,
                 is_nax,
+                f16_compute: profile
+                    .is_some_and(|p| crate::targets::bf16_simdgroup_is_slow_path(p.generation)),
                 codes: super::kernel_constants::AffineCodesTarget::of(profile),
             };
             return lower_moe_step(p, block, *step, w, at, moe_scratch_bytes);
@@ -6329,8 +6331,18 @@ fn affine_gather_qmv_kernel(
 
 /// Symbol for the MoE grouped expert GEMM (`affine_gather_qmm_t_kernel`,
 /// quantized_qmm.metallib). Gemma4 ships f16 scales; bf16/f16 activation.
+///
+/// `compute_dtype` is the Apple7 (M1) fast-path seam, mirroring
+/// [`crate::tape::quantized::qmm_t_kernel_static_name_with_compute`]: when it
+/// differs from `dtype` the symbol is the `_c_f16_` mixed-compute
+/// instantiation — the kernel reads bf16 `x` / writes bf16 `y` but runs its
+/// threadgroup tiles and simdgroup MMA in f16 (~1.7× faster than the
+/// emulated bf16 MMA). Mixed-compute is instantiated for bits=4 only (the
+/// W loader is nibble-specialized); any other width or combo falls back to
+/// the same-compute symbol, so a mis-dispatch is structurally impossible.
 fn affine_gather_qmm_t_symbol(
     dtype: DequantDtype,
+    compute_dtype: DequantDtype,
     scale_dtype: ScaleDtype,
     group_size: u32,
     aligned_n: bool,
@@ -6346,6 +6358,13 @@ fn affine_gather_qmm_t_symbol(
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     let aln = if aligned_n { "true" } else { "false" };
+    if bits == 4
+        && matches!((dtype, compute_dtype), (DequantDtype::Bf16, DequantDtype::F16))
+    {
+        return leak_symbol(format!(
+            "affine_gather_qmm_t_{d}_c_f16_s_{s}_gs_{group_size}_b_4_alN_{aln}_batch_0"
+        ));
+    }
     leak_symbol(format!(
         "affine_gather_qmm_t_{d}_s_{s}_gs_{group_size}_b_{bits}_alN_{aln}_batch_0"
     ))
@@ -6413,6 +6432,12 @@ struct MoeBake {
     /// M5 matrix accelerator: a grouped projection takes the NAX GEMM (the dominant prefill
     /// lever; the steel grouped GEMM is ~5-10x slower per call).
     is_nax: bool,
+    /// M1 fast-path: this target's bf16 simdgroup MMA is software emulation
+    /// ([`crate::targets::bf16_simdgroup_is_slow_path`] — Apple7 only), so a
+    /// bf16 model's grouped expert GEMMs run `T_compute=F16` — the same flip
+    /// the qmm_t lowering applies to its Standard kernel, extended to the
+    /// MoE twin that dominates MoE prefill. b4 only; the lowering gates it.
+    f16_compute: bool,
     /// How this target stores the experts' codes.
     codes: super::kernel_constants::AffineCodesTarget,
 }
@@ -7101,7 +7126,22 @@ fn lower_moe_step(
                     )
                 } else {
                     let aligned = n_out.is_multiple_of(32);
-                    let symbol = affine_gather_qmm_t_symbol(dtype, scale_dtype, gs, aligned, bits);
+                    // M1 fast-path: mirror of the qmm_t flip — on Apple7 the
+                    // bf16 simdgroup MMA is software emulation (~1.7× slower
+                    // than f16), so a bf16 model's grouped expert GEMM runs
+                    // T_compute=F16 (reads bf16 rows, casts into the
+                    // threadgroup tile, MMAs in f16, casts back on store).
+                    // b4 only: the mixed-compute W loader is
+                    // nibble-specialized, and the symbol builder falls back
+                    // to same-compute for any other width.
+                    let compute_dtype =
+                        if at.f16_compute && bits == 4 && matches!(dtype, DequantDtype::Bf16) {
+                            DequantDtype::F16
+                        } else {
+                            dtype
+                        };
+                    let symbol =
+                        affine_gather_qmm_t_symbol(dtype, compute_dtype, scale_dtype, gs, aligned, bits);
                     (KernelId::AffineGatherQmmT, "quantized_qmm", symbol, 32)
                 };
                 let mpad = s.l.mpad_max;
@@ -9585,6 +9625,7 @@ mod tests {
                 bucket_m,
                 layer_offset: 0,
                 is_nax: false,
+                f16_compute: false,
                 codes: super::super::kernel_constants::AffineCodesTarget::of(None),
             };
             let lower = |step| {
