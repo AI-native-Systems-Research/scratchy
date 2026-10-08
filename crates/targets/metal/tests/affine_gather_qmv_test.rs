@@ -1311,3 +1311,252 @@ fn affine_gather_qmv_b8_bf16_qwen3_5_optiq_fast() {
         eprintln!("affine_gather_qmv b8 n_out={n_out} k={k} max_err={max_err:.3e}");
     }
 }
+
+/// The FUSED routed MoE gate/up kernel — GLM-4.5-Air's M1-only path
+/// (`MetalFusion::MoeRouted`): `affine_gather_qmv_gated_fast` computes its
+/// routing IN-KERNEL from the router Gemm's logits (ROUTED_EXPERTS at slot
+/// 13, PRE=2 sigmoid+bias at 14, POST=2 renorm at 16), picks its own
+/// experts, stores rhs_indices + scores, then runs the gathered matvecs
+/// and the gated activation. M2+ buckets never fuse (pairs >= 64 or a
+/// separate MoeRoute command): this exact pairing of b3 gather + in-kernel
+/// routing is otherwise untested. The reference is the same CPU b3 qmv per
+/// chosen expert + the routing program of `moe_route_kernel`'s GLM test:
+/// biased-sigmoid top-k, unbiased-sigmoid scores renormalized.
+#[test]
+fn affine_gather_qmv_gated_b3_routed_glm_decode() {
+    // Two geometries: E=16 (PER_LANE=1) and the production E=128
+    // (PER_LANE=4 — route_top_k's ballot is 4 u32 lanes wide, untested
+    // at E=16), both fused (E <= the kernel's 128 threads).
+    routed_gated_b3_case(16, 4096, 1408, 8, 0x6D6F_6520_726F_7574);
+    routed_gated_b3_case(128, 512, 1408, 8, 0x6D6F_6520_726F_7575);
+}
+
+fn routed_gated_b3_case(
+    num_experts: usize,
+    k: usize,
+    n_out: usize,
+    top_k: usize,
+    seed: u64,
+) {
+    use scratchy_target_metal::tape::constants::ConstantValue;
+    use scratchy_target_metal::tape::ids::NumExperts;
+    use scratchy_target_metal::tape::kernel_constants::RoutedConstants;
+    use scratchy_target_metal::tape::step::{
+        LayerId, RoutePost, RoutePre, RouteProgram,
+    };
+
+    // GLM shapes, shrunk for the test: top_k=8, hidden k (Fast: k%512),
+    // moe_intermediate n_out=1408 (Fast: n%8), gs=64, b3.
+    let group_size = 64usize;
+    let num_tokens = 1usize;
+    let bits = 3u32;
+
+    let mut s = seed;
+    // Router logits [tokens, E] and the F32 correction bias [E].
+    let mut logits = vec![bf16::ZERO; num_tokens * num_experts];
+    for v in logits.iter_mut() {
+        *v = bf16::from_f32((splitmix(&mut s) % 2000) as f32 / 1000.0 - 1.0);
+    }
+    let mut bias = vec![0f32; num_experts];
+    for v in bias.iter_mut() {
+        *v = (splitmix(&mut s) % 1000) as f32 / 1000.0 - 0.5;
+    }
+
+    // Gate/up packed slabs per expert.
+    let pack = |s: &mut u64| {
+        let packed = vec![0u8; num_experts * n_out * k * 3 / 8];
+        let mut packed = packed;
+        for b in &mut packed {
+            *b = splitmix(s) as u8;
+        }
+        let mut scales = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+        for v in scales.iter_mut() {
+            *v = bf16::from_f32(0.0008 + 0.0004 * (splitmix(s) % 1000) as f32 / 1000.0);
+        }
+        let mut biases = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+        for v in biases.iter_mut() {
+            *v = bf16::from_f32(-0.1 + 0.02 * (splitmix(s) % 1000) as f32 / 1000.0);
+        }
+        (packed, scales, biases)
+    };
+    let (g_packed, g_scales, g_biases) = pack(&mut s);
+    let (u_packed, u_scales, u_biases) = pack(&mut s);
+    let mut x = vec![bf16::ZERO; num_tokens * k];
+    for v in x.iter_mut() {
+        *v = bf16::from_f32((splitmix(&mut s) % 1000) as f32 / 1000.0 - 0.5);
+    }
+
+    let Some(mdev) = detect_device() else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    let bytes_of = |v: &[bf16]| unsafe {
+        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
+    };
+    let bytes_f32 = |v: &[f32]| unsafe {
+        std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+    };
+
+    // Device buffers. Scratch layout mirrors MoeScratchLayout::compute's
+    // Gathered M1 plan (rhs_indices, scores, gate_y, up_y regions), but
+    // only relative offsets between separately-bound regions matter here:
+    // bind each region as its own buffer.
+    let pairs = num_tokens * top_k;
+    let rhs_buf = zeros_buf(&mdev.device, pairs * 4);
+    let scores_buf = zeros_buf(&mdev.device, pairs * 2);
+    let gate_y = zeros_buf(&mdev.device, pairs * n_out * 2);
+    let up_y = zeros_buf(&mdev.device, pairs * n_out * 2);
+    let logits_buf = buf_from_bytes(&mdev.device, bytes_of(&logits));
+    let bias_buf = buf_from_bytes(&mdev.device, bytes_f32(&bias));
+
+    // Constants: AffineGatherQmvConstants (K, N, rows) + gated act (3) +
+    // RoutedConstants (13-17).
+    let mut constants: Vec<ConstantValue> = gather_constants(k as u32, n_out as u32, top_k as u32)
+        .into();
+    constants.push(ConstantValue::int(
+        scratchy_target_metal::tape::constants::ConstSlot(3),
+        0, // SiLU
+    ));
+    let routed: Vec<ConstantValue> = RoutedConstants {
+        experts: NumExperts(num_experts as u32),
+        program: RouteProgram {
+            pre: RoutePre::SigmoidBias(LayerId(0)),
+            scale: None,
+            post: RoutePost::Renorm,
+            expert_scale: None,
+        },
+    }
+    .into();
+    constants.extend(routed);
+    let name = format!("affine_gather_qmv_gated_fast_bf16_s_bf16_gs_{group_size}_b_{bits}");
+    let pipeline = baked_pipeline(&mdev.device, "quantized_qmv", &name, constants)
+        .expect("routed gated b3 pipeline");
+
+    // Bindings 0-13 per the kernel signature.
+    let gw = buf_from_bytes(&mdev.device, &g_packed);
+    let gs = buf_from_bytes(&mdev.device, bytes_of(&g_scales));
+    let gb = buf_from_bytes(&mdev.device, bytes_of(&g_biases));
+    let xb = buf_from_bytes(&mdev.device, bytes_of(&x));
+    let uw = buf_from_bytes(&mdev.device, &u_packed);
+    let us = buf_from_bytes(&mdev.device, bytes_of(&u_scales));
+    let ub = buf_from_bytes(&mdev.device, bytes_of(&u_biases));
+    let bufs: [&common::Buffer; 14] = [
+        &gw, &gs, &gb, &xb, &rhs_buf, &gate_y, &uw, &us, &ub, &up_y, &logits_buf, &scores_buf,
+        &scores_buf, // buffer(12) expert_scale — unused (EXPERT_SCALE off)
+        &bias_buf,
+    ];
+    // Dispatch (1, n_out/8, pairs) × (32, 4, 1) — DS9's shape.
+    if !common::dispatch_threadgroups(
+        &mdev.device,
+        &pipeline,
+        &bufs,
+        MTLSize {
+            width: 1,
+            height: n_out / 8,
+            depth: pairs,
+        },
+        MTLSize {
+            width: 32,
+            height: 4,
+            depth: 1,
+        },
+    ) {
+        return;
+    }
+
+    // ── Reference ──
+    // Routing: biased F32 sigmoids order the top-k (index-ascending
+    // ties), unbiased sigmoids renormalized (bf16 rounding where the
+    // kernel rounds: score = bf16(sigmoid) then renorm in f32/rounded).
+    let sigmoid = |x: f32| 1.0f32 / (1.0 + (-x).exp());
+    let mut picks_all = Vec::new();
+    let mut scores_all = Vec::new();
+    for n in 0..num_tokens {
+        let row = &logits[n * num_experts..(n + 1) * num_experts];
+        let mut order: Vec<usize> = (0..num_experts).collect();
+        order.sort_by(|&a, &b| {
+            (sigmoid(row[b].to_f32()) + bias[b])
+                .total_cmp(&(sigmoid(row[a].to_f32()) + bias[a]))
+                .then(b.cmp(&a))
+        });
+        let picks: Vec<usize> = order[..top_k].iter().rev().copied().collect();
+        let mut unbiased: Vec<f32> = picks
+            .iter()
+            .map(|&i| bf16::from_f32(sigmoid(row[i].to_f32())).to_f32())
+            .collect();
+        let sum: f32 = unbiased.iter().sum();
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        for u in &mut unbiased {
+            *u *= inv;
+        }
+        picks_all.extend(picks);
+        scores_all.extend(unbiased);
+    }
+
+    // rhs_indices written by the kernel (u32).
+    let got_idx: Vec<u32> = {
+        let ptr = rhs_buf.contents().as_ptr() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, pairs) }.to_vec()
+    };
+    let want_idx: Vec<u32> = picks_all.iter().map(|&i| i as u32).collect();
+    assert_eq!(
+        got_idx, want_idx,
+        "routed picks mismatch: got {got_idx:?} want {want_idx:?}"
+    );
+
+    // gate_y holds act(gate)*up per pair row.
+    let got = read_bf16(&gate_y, pairs * n_out);
+    let w_pe = n_out * k * 3 / 8;
+    let sb_pe = n_out * k / group_size;
+    let mut max_err = 0.0_f32;
+    let mut worst = (0usize, 0usize);
+    for nk in 0..pairs {
+        let e = picks_all[nk];
+        let g = affine_qmv_b3_bf16_s_bf16(
+            &g_packed[e * w_pe..(e + 1) * w_pe],
+            &g_scales[e * sb_pe..(e + 1) * sb_pe],
+            &g_biases[e * sb_pe..(e + 1) * sb_pe],
+            &x[..k],
+            1,
+            n_out,
+            k,
+            group_size,
+        );
+        let u = affine_qmv_b3_bf16_s_bf16(
+            &u_packed[e * w_pe..(e + 1) * w_pe],
+            &u_scales[e * sb_pe..(e + 1) * sb_pe],
+            &u_biases[e * sb_pe..(e + 1) * sb_pe],
+            &x[..k],
+            1,
+            n_out,
+            k,
+            group_size,
+        );
+        for c in 0..n_out {
+            let gv = g[c].to_f32();
+            let uv = u[c].to_f32();
+            let want = (gv / (1.0 + (-gv).exp())) * uv;
+            let have = got[nk * n_out + c].to_f32();
+            let err = (have - want).abs();
+            if err > max_err {
+                max_err = err;
+                worst = (nk, c);
+            }
+        }
+    }
+    eprintln!(
+        "routed gated b3 worst pair={} row={} got={:.4} max_err={max_err:.3e}",
+        worst.0,
+        worst.1,
+        got[worst.0 * n_out + worst.1].to_f32(),
+    );
+    assert!(
+        max_err < 0.3,
+        "routed gated b3: pair {} row {}: max_err {max_err}",
+        worst.0,
+        worst.1
+    );
+    eprintln!(
+        "routed gated b3 E={num_experts} k={k}: picks exact, max_err {max_err:.3e}"
+    );
+}
