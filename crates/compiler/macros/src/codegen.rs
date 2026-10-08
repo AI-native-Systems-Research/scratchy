@@ -3713,12 +3713,12 @@ fn emit_weights_struct(
         quote! {}
     };
 
-    // Stream-free metal counterpart to `rotary_load`. `new_from_gpuweights`
-    // currently covers basic + Llama3 scaling; LongRoPE / Yarn /
-    // partial-rotary models hit a compile_error so the failure mode is
-    // an explicit "unsupported under metal" rather than a hidden
-    // runtime panic. Same scope decision as the per-arch metal feature
-    // gates landed in 5.F.5.
+    // Stream-free metal counterpart to `rotary_load`. The
+    // `*_from_gpuweights` constructors cover every rope family the
+    // cuda path emits — basic, Llama3, LongRoPE, YaRN, partial rotary
+    // (combined with each scaling where the family allows it), and
+    // the Gemma4 proportional-global class handled above — so the
+    // metal match below is exhaustive with no refusal arm.
     //
     // Cache dtype is `BF16` to match the rest of the metal stack:
     // `CanonicalParams::METAL_DTYPE` defaults to bf16, the
@@ -3751,6 +3751,11 @@ fn emit_weights_struct(
             .copied()
             .filter(|&f| (f - 1.0).abs() > 1e-9);
         let scaling = model.rope_scaling.clone();
+        // YaRN (DeepSeek MLA): the rope portion uses `qk_rope_head_dim`
+        // rather than the full `head_dim` — the same override the cuda
+        // arm above applies.
+        let yarn_rope_head_dim: Option<usize> =
+            model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
         // Clamp the rotary cache size to the runtime `max_model_len`
         // rather than the model's compile-time `max_position_embeddings`.
         // For Llama-3.2 (max_position_embeddings = 131072) under chat
@@ -3888,6 +3893,45 @@ fn emit_weights_struct(
                         )?;
                     }
                 }
+                // YaRN (`rope_scaling.type == "yarn"` — gpt-oss,
+                // DeepSeek-V2), full or partial rotary. The host math
+                // is shared with cuda's `new_yarn_from_stream` via
+                // `yarn_cos_sin_table` (scratchy-layers), so the two
+                // backends cannot drift; `qk_rope_head_dim` (MLA
+                // models) overrides the rope dim exactly as the cuda
+                // arm does.
+                (
+                    _,
+                    Some(crate::config::RopeScaling::Yarn {
+                        factor,
+                        beta_fast,
+                        beta_slow,
+                        mscale,
+                        mscale_all_dim,
+                        original_max_position_embeddings,
+                    }),
+                ) => {
+                    let orig = original_max_position_embeddings as usize;
+                    let rope_hd = yarn_rope_head_dim.unwrap_or(head_dim);
+                    quote! {
+                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rotary = crate::__gpu::rotary::RotaryCache::new_yarn_from_gpuweights(
+                            gw,
+                            #rope_hd,
+                            rope_max_pos,
+                            #rope_theta,
+                            &crate::__gpu::rotary::YarnRopeScaling {
+                                factor: #factor,
+                                beta_fast: #beta_fast,
+                                beta_slow: #beta_slow,
+                                mscale: #mscale,
+                                mscale_all_dim: #mscale_all_dim,
+                                original_max_position_embeddings: #orig,
+                            },
+                            crate::__gpu::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
+                        )?;
+                    }
+                }
                 // Partial rotary, no scaling (Qwen3.5 / Qwen3-Next:
                 // partial_rotary_factor 0.25). Builds a `[max_pos, rotary_dim]`
                 // cache; `W::ROT_DIM` (= rotary_dim) drives the kernel so the
@@ -3933,34 +3977,6 @@ fn emit_weights_struct(
                         )?;
                     }
                 }
-                // LongRoPE / YaRN (with or without partial rotary): the
-                // macro can't emit a working metal init yet (no
-                // `*_from_gpuweights` counterpart in `scratchy-target-cuda::rotary`).
-                // Stub to a runtime panic so the build remains green for the
-                // metal-supported subset; arches that hit this won't load
-                // successfully under metal until the proper port lands.
-                //
-                // The panic lives inside a local `fn` whose return type is
-                // `RotaryCache` (not `!`), so `rustc` doesn't propagate the
-                // never type to the outer scope and warn `unreachable_code`
-                // on every line of generated code after the rotary load —
-                // the call-site sees a regular `RotaryCache` value. A plain
-                // fn call rather than an immediately-invoked closure keeps
-                // clippy's `redundant_closure_call` happy.
-                _ => quote! {
-                    let rotary: crate::__gpu::rotary::RotaryCache = {
-                        fn unsupported_rotary_scaling() -> crate::__gpu::rotary::RotaryCache {
-                            ::core::panic!(
-                                "metal: rotary scaling variant not yet supported \
-                                 (LongRoPE / Yarn / partial-rotary). Land a metal \
-                                 counterpart to RotaryCache::new_from_gpuweights for \
-                                 this scaling family before enabling this model \
-                                 under --features metal."
-                            )
-                        }
-                        unsupported_rotary_scaling()
-                    };
-                },
             }
         } // else: !global_proportional
     } else {
