@@ -70,6 +70,7 @@ async fn start_otel_server() -> (u16, String, OtelTestServer) {
         config: server_config,
         is_pooling: false,
         scratchy_core_config: None,
+        requests_served: std::sync::atomic::AtomicU64::new(0),
     });
 
     let server_handle = tokio::spawn(async move {

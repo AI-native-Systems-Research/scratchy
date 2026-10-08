@@ -432,6 +432,7 @@ impl TestServerBuilder {
             config: server_config,
             is_pooling,
             scratchy_core_config: None,
+            requests_served: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Spawn the HTTP server on a background task.
