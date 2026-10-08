@@ -77,14 +77,13 @@ fn chain_ends(n: usize, links: &[(usize, usize)]) -> Vec<usize> {
 /// Nor do data edges order a fold's driver after the steps it absorbed, whose operands its command
 /// reads: each `(step, driver)` of `absorbed` with `step` before `driver` in tape order keeps the
 /// step ahead, and what the step reads, the driver's command reads; a step reading the driver's
-/// output (its scale, before its epilogue) runs in the driver's command, as an epilogue does. And a
-/// fold's epilogue is its
-/// driver's command's own write: each `(epilogue, driver)` of `epilogues` runs at its driver's
-/// level, the two kept together in tape order, and a step reading either runs past them — so the
-/// folds the tape order made fold again in wave order, never split into a command each. An op the
-/// target dispatches nothing for (`free`: a step a fold computes inside another, a view) takes no
-/// level of its own: its readers may run at its level. The result is a permutation of the ops: the
-/// same steps compute the same values.
+/// output (its scale, before its epilogue) runs in the driver's command, as an epilogue does. And
+/// a fold's epilogue is its driver's command's own write: each `(epilogue, driver)` of `epilogues`
+/// runs at its driver's level, the two kept together in tape order, and a step reading either runs
+/// past them — so the folds the tape order made fold again in wave order, never split into a
+/// command each. An op the target dispatches nothing for (`free`: a step a fold computes inside
+/// another, a view) takes no level of its own: its readers may run at its level. The result is a
+/// permutation of the ops: the same steps compute the same values.
 pub fn wave_order(
     l: &LoweredDecode,
     rule: fn(&ArchOp) -> ColourRule,
@@ -459,5 +458,29 @@ mod tests {
         let free = [false, false, true, false, false];
         let w = wave_order(&l, |_| ColourRule::FRESH, &[(2, 1)], &[(3, 1)], &free);
         assert_eq!(tiles(&w), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_step_absorbed_past_an_absorbed_step_runs_in_its_command() {
+        use InputRef::{Ext, Op};
+        // Matvec 1 stores its rows biased (2), then scaled (3), both absorbed, and added into the
+        // residual 0 (the add 4, its epilogue); 5 reads the add. The scale reads only the bias.
+        let l = decode(vec![
+            mul(vec![Ext(0)]),
+            mul(vec![Op(0)]),
+            mul(vec![Op(1)]),
+            mul(vec![Op(2)]),
+            mul(vec![Op(3), Op(0)]),
+            mul(vec![Op(4)]),
+        ]);
+        let free = [false, false, true, true, false, false];
+        let w = wave_order(
+            &l,
+            |_| ColourRule::FRESH,
+            &[(2, 1), (3, 1)],
+            &[(4, 1)],
+            &free,
+        );
+        assert_eq!(tiles(&w), [0, 1, 2, 3, 4, 5]);
     }
 }
