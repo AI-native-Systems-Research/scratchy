@@ -1425,8 +1425,9 @@ INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
 // k_lanes=8 (the affine pick, quantized.cpp:567): 4 output rows per
 // simdgroup × 2 simdgroups = 8 rows per threadgroup. vecs_per_tg in
 // {2,3,4,5} covers the decode buckets (bucket_m 2..8 on one tile, 16
-// on 4×4). bits 4 and 8, gs 64 (the MLX-affine presets), batch_0
-// only — the band is a decode-batch shape, never an MoE weight batch.
+// on 4×4). bits 4 and 8, gs in {32, 64, 128} (every MLX-affine preset
+// group size, as MLX's `instantiate_quantized_groups`), batch_0 only —
+// the band is a decode-batch shape, never an MoE weight batch.
 #define INST_QMV_WIDE(name, act_tag, act_type, scale_tag, scale_type, gs, bits, nv, kl)       \
   SCRATCHY_KERNEL(                                                                        \
       name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_nv_##nv##_kl_##kl##_batch_0, \
@@ -1442,9 +1443,15 @@ INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 4, 8)  \
   INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 5, 8)
 
+INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 32)
 INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 64)
+INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 128)
+INST_QMV_WIDE_ALL(bf16, bfloat, bf16, bfloat, 32)
 INST_QMV_WIDE_ALL(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_WIDE_ALL(bf16, bfloat, bf16, bfloat, 128)
+INST_QMV_WIDE_ALL(f16, half, f16, half, 32)
 INST_QMV_WIDE_ALL(f16, half, f16, half, 64)
+INST_QMV_WIDE_ALL(f16, half, f16, half, 128)
 
 // 3-bit wide rows (GLM-4.5-Air-3bit): same decode band, b_3 packing.
 #define INST_QMV_WIDE_ALL_B3(act_tag, act_type, scale_tag, scale_type, gs)          \

@@ -26,7 +26,8 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, qmv_dispatch_shape, qmv_kernel_name,
+    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, pick_qmv_kernel_wide, qmv_dispatch_shape,
+    qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 use scratchy_target_metal::tape::kernel_constants::AffineCodes;
@@ -41,6 +42,8 @@ type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 /// and the `qmv_dispatch_shape` grid. Returns `false` if the host has no
 /// MTL4 queue. bits is fixed at 4 and B at 1 (decode-only), matching the
 /// original test's `execute(.., 1 /* B */, group_size, 4, ..)` call.
+/// M ≥ 2 picks the small-M band (`qmv_wide`) as an M5 target does, with M
+/// baked at slot 7 (`AffineQmvWideConstants`).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_qmv(
     device: &Device,
@@ -56,7 +59,7 @@ fn dispatch_qmv(
     scale_dtype: ScaleDtype,
     codes: AffineCodes,
 ) -> bool {
-    let kernel = pick_qmv_kernel(n as u32, k as u32, 4);
+    let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, true);
     let kernel_name = qmv_kernel_name(
         kernel,
         DequantDtype::Bf16,
@@ -65,11 +68,13 @@ fn dispatch_qmv(
         4,
         false,
     );
+    let wide_m = matches!(kernel, QmvKernel::Wide { .. }).then(|| ConstantValue::int(7, m as i32));
     let constants: Vec<ConstantValue> = [
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
     ]
     .into_iter()
+    .chain(wide_m)
     .chain(codes.constant())
     .collect();
     let pipeline =
@@ -873,16 +878,71 @@ fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
     }
 }
 
+/// The small-M band kernel (`affine_qmv_wide`, `2 ≤ M < vector_limit`)
+/// matches the CPU reference at every group size an MLX-affine preset
+/// ships: Granite 4.1's mlx-community 4bit checkpoints are g32, and a g32
+/// build failed at bake when only gs 64 was instantiated. Only an M5 picks
+/// this kernel, and an M5 stores 4-bit codes offset-8, so each case also
+/// runs on XOR-0x88 codes under `AffineCodes::Offset8` and must match the
+/// as-written run exactly.
+#[test]
+fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
+    let (n, k) = (64, 512);
+    for group_size in [32usize, 64, 128] {
+        for m in 2..=8 {
+            assert!(
+                matches!(
+                    pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, true),
+                    QmvKernel::Wide { .. }
+                ),
+                "M={m} must pick qmv_wide"
+            );
+            let (packed, scales, biases, x) =
+                make_inputs_bf16(0x51DE ^ (group_size * 16 + m) as u64, n, k, m, group_size);
+            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let run = |packed: &[u8], codes| {
+                run_qmv_bf16_codes(
+                    packed,
+                    &scales,
+                    &biases,
+                    &x,
+                    (m, n, k),
+                    group_size as u32,
+                    codes,
+                )
+            };
+            let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+                eprintln!("skipping: no Metal 4 GPU");
+                return;
+            };
+            assert!(!as_written.is_empty(), "no MTL4 queue");
+            let (idx, mv, ev, abs_err, allowed) =
+                worst_abs_error_vs_noise_floor(&as_written, &expected, k, 0.5);
+            assert!(
+                abs_err <= allowed,
+                "qmv_wide gs={group_size} M={m}: worst abs_err={abs_err:.5} at idx {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+            let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+            assert_eq!(
+                run(&offset8, AffineCodes::Offset8),
+                Some(as_written),
+                "qmv_wide offset-8 gs={group_size} M={m}"
+            );
+        }
+    }
+}
+
 /// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
 /// read under `AFFINE_CODES_OFFSET8` give bit-identical output to the codes
 /// as written, on every qmv kernel.
 #[test]
 fn affine_qmv_b4_offset8_codes_match_as_written() {
-    // qmv_quad, qmv_fast, generic qmv.
-    for (n, k) in [(64, 128), (64, 512), (12, 384)] {
-        let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7 ^ k as u64, n, k, 1, 64);
+    // qmv_quad, qmv_fast, generic qmv, qmv_wide.
+    for (m, n, k) in [(1, 64, 128), (1, 64, 512), (1, 12, 384), (4, 64, 512)] {
+        let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7 ^ k as u64, n, k, m, 64);
         let run = |packed: &[u8], codes| {
-            run_qmv_bf16_codes(packed, &scales, &biases, &x, (1, n, k), 64, codes)
+            run_qmv_bf16_codes(packed, &scales, &biases, &x, (m, n, k), 64, codes)
         };
         let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
             eprintln!("skipping: no Metal 4 GPU");
@@ -897,7 +957,7 @@ fn affine_qmv_b4_offset8_codes_match_as_written() {
         assert_eq!(
             run(&offset8, AffineCodes::Offset8),
             Some(as_written),
-            "n={n} k={k}"
+            "m={m} n={n} k={k}"
         );
     }
 }
