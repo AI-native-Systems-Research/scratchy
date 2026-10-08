@@ -379,6 +379,27 @@ jobs:
           --features e2e,metal,scratchy-models/smollm2-135m
           --test e_prefix_caching test_prefix_cache_reports_cached_tokens_metal -- --ignored --test-threads=1
 
+      # REGRESSION GUARD — `/v1/messages` token accounting (issue #298, epic #158).
+      # The endpoint Claude Code uses reported no cache read at all, and on a
+      # STREAMING request no prompt length either (`message_start` carried a
+      # hardcoded `"input_tokens": 0`). Anthropic's input fields are disjoint, so
+      # `input_tokens + cache_read_input_tokens` must equal the prompt — that
+      # invariant is what makes the benchmark's `reprefill_ratio` comparable with
+      # ollama's, which reports the same field natively.
+      #
+      # FILTERED to these two tests on purpose: the other tests in e_anthropic.rs
+      # boot `TestModels::SMOLLM`, which is MLX 4-bit on metal and cannot load
+      # without a `quant/<preset>` feature this build does not name — they fail
+      # today, independently of this change. Same honest scope as the step above:
+      # on this hosted runner the tests SKIP (no Metal 4) and what CI gains is
+      # compile coverage of a file nothing currently compiles; the assertions run
+      # on a real GPU locally and via scripts/act-local.sh.
+      - name: E2E /v1/messages token accounting (metal, SmolLM2-135M)
+        timeout-minutes: 15
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/smollm2-135m
+          --test e_anthropic cached_tokens -- --ignored --test-threads=1
+
       # Gemma-4 tool-call parser server wiring: boot the server with the `gemma4`
       # parser configured and confirm chat/stream (with and without tools) stay
       # well-formed. SmolLM won't emit Gemma-format calls, so this covers the

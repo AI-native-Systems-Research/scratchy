@@ -196,6 +196,22 @@ struct RequestState {
     pooler_output: Option<EmbeddingData>,
 }
 
+/// Prompt-side token counts for one request, carried on every [`StreamDelta`].
+///
+/// A streaming response has to report usage from the delta stream — it never
+/// sees a `UsageInfo`. `cached_tokens` is the prefix-cache hit, which the
+/// scheduler fixes at admission (before any token is emitted), so the first
+/// delta already carries the final value; a consumer should still take the last
+/// value it sees rather than assume which delta arrives first.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamUsage {
+    /// Total prompt tokens for the request.
+    pub prompt_tokens: u32,
+    /// Prompt tokens served from the prefix cache. Block-aligned, so it
+    /// slightly understates logical reuse and never overstates it.
+    pub cached_tokens: u32,
+}
+
 /// A delta sent to a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamDelta {
@@ -215,6 +231,8 @@ pub struct StreamDelta {
     pub tool_call_deltas: Option<Vec<DeltaToolCall>>,
     /// Reasoning content delta (for streaming reasoning parsing).
     pub reasoning: Option<String>,
+    /// Prompt-side token counts, repeated on every delta — see [`StreamUsage`].
+    pub usage: StreamUsage,
 }
 
 // ---------------------------------------------------------------------------
@@ -2458,6 +2476,16 @@ impl AsyncEngine {
             };
 
             // Send streaming delta if applicable.
+            // Prompt-side counts, stamped on every delta this step emits. Read
+            // once here so the literals below stay uniform: which of them fires
+            // first depends on reasoning/tool-parser state, so there is no single
+            // "first delta" to special-case. `num_cached_tokens` is already set
+            // for this step (above), and the scheduler fixes it at admission.
+            let usage = StreamUsage {
+                prompt_tokens: req_state.num_prompt_tokens,
+                cached_tokens: req_state.num_cached_tokens,
+            };
+
             if let Some(tx) = &req_state.stream_tx {
                 // Track accumulated text and token IDs for reasoning/tool parsing.
                 if let Some(ref text) = delta_text {
@@ -2560,6 +2588,7 @@ impl AsyncEngine {
                                     logprobs: step_logprobs.clone(),
                                     tool_call_deltas: None,
                                     reasoning: reasoning_delta,
+                                    usage,
                                 };
                                 let _ = tx.send(delta);
                             }
@@ -2575,6 +2604,7 @@ impl AsyncEngine {
                                         logprobs: None,
                                         tool_call_deltas: None,
                                         reasoning: Some(reasoning),
+                                        usage,
                                     };
                                     let _ = tx.send(delta);
                                 }
@@ -2603,6 +2633,7 @@ impl AsyncEngine {
                                         logprobs: step_logprobs.clone(),
                                         tool_call_deltas: Some(tool_deltas),
                                         reasoning: None,
+                                        usage,
                                     };
                                     let _ = tx.send(delta);
                                 }
@@ -2619,6 +2650,7 @@ impl AsyncEngine {
                                         logprobs: step_logprobs.clone(),
                                         tool_call_deltas: None,
                                         reasoning: Some(reasoning),
+                                        usage,
                                     };
                                     let _ = tx.send(delta);
                                 }
@@ -2636,6 +2668,7 @@ impl AsyncEngine {
                                 logprobs: None,
                                 tool_call_deltas: None,
                                 reasoning: None,
+                                usage,
                             };
                             let _ = tx.send(finish_delta);
                         }
@@ -2655,6 +2688,7 @@ impl AsyncEngine {
                             logprobs: step_logprobs.clone(),
                             tool_call_deltas: None,
                             reasoning: reasoning_delta,
+                            usage,
                         };
                         let _ = tx.send(delta);
                     } else if reasoning_delta.is_some() {
@@ -2668,6 +2702,7 @@ impl AsyncEngine {
                             logprobs: step_logprobs.clone(),
                             tool_call_deltas: None,
                             reasoning: reasoning_delta,
+                            usage,
                         };
                         let _ = tx.send(delta);
                     }
@@ -2688,6 +2723,7 @@ impl AsyncEngine {
                             logprobs: step_logprobs.clone(),
                             tool_call_deltas: None,
                             reasoning: reasoning_delta,
+                            usage,
                         };
                         let _ = tx.send(delta);
                     }
@@ -2859,6 +2895,16 @@ impl AsyncEngine {
         });
 
         // Send streaming delta if applicable.
+        // Prompt-side counts, stamped on every delta this step emits. Read
+        // once here so the literals below stay uniform: which of them fires
+        // first depends on reasoning/tool-parser state, so there is no single
+        // "first delta" to special-case. `num_cached_tokens` is already set
+        // for this step (above), and the scheduler fixes it at admission.
+        let usage = StreamUsage {
+            prompt_tokens: req_state.num_prompt_tokens,
+            cached_tokens: req_state.num_cached_tokens,
+        };
+
         if let Some(tx) = &req_state.stream_tx {
             // If tool parser state is active, route through it.
             if let Some(ref mut parser_state) = req_state.tool_parser_state {
@@ -2889,6 +2935,7 @@ impl AsyncEngine {
                                 logprobs: step_logprobs.clone(),
                                 tool_call_deltas: None,
                                 reasoning: None,
+                                usage,
                             };
                             let _ = tx.send(delta);
                         }
@@ -2918,6 +2965,7 @@ impl AsyncEngine {
                                     logprobs: step_logprobs.clone(),
                                     tool_call_deltas: Some(tool_deltas),
                                     reasoning: None,
+                                    usage,
                                 };
                                 let _ = tx.send(delta);
                             }
@@ -2938,6 +2986,7 @@ impl AsyncEngine {
                             logprobs: None,
                             tool_call_deltas: None,
                             reasoning: None,
+                            usage,
                         };
                         let _ = tx.send(finish_delta);
                     }
@@ -2957,6 +3006,7 @@ impl AsyncEngine {
                         logprobs: step_logprobs.clone(),
                         tool_call_deltas: None,
                         reasoning: None,
+                        usage,
                     };
                     let _ = tx.send(delta);
                 }
@@ -2971,6 +3021,7 @@ impl AsyncEngine {
                     logprobs: step_logprobs.clone(),
                     tool_call_deltas: None,
                     reasoning: None,
+                    usage,
                 };
                 let _ = tx.send(delta);
             }

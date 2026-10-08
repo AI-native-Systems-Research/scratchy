@@ -48,7 +48,7 @@ async fn test_anthropic_simple_message() {
     assert!(body["content"].is_array());
     assert!(!body["content"].as_array().unwrap().is_empty());
     assert_eq!(body["content"][0]["type"], "text");
-    assert!(body["content"][0]["text"].as_str().unwrap().len() > 0);
+    assert!(!body["content"][0]["text"].as_str().unwrap().is_empty());
     assert!(body["usage"]["input_tokens"].as_u64().unwrap() > 0);
     assert!(body["usage"]["output_tokens"].as_u64().unwrap() > 0);
 }
@@ -325,4 +325,172 @@ async fn test_anthropic_empty_messages() {
 
     // Empty messages should fail at the engine level
     assert!(!resp.status().is_success());
+}
+
+// ===========================================================================
+// Usage: prompt + cached token accounting (issue #298, epic #158)
+//
+// `/v1/messages` is the only endpoint Claude Code uses, and it is the endpoint
+// the benchmark measures. Two things used to be unreportable from it:
+//
+//   - the prefix-cache hit, dropped in the Anthropic conversion; and
+//   - on a STREAMING request, the prompt length at all — `message_start`
+//     emitted a literal `"input_tokens": 0`.
+//
+// Anthropic's input fields are disjoint (`input_tokens` is the UNCACHED
+// remainder, so `input_tokens + cache_read_input_tokens` is the whole prompt),
+// unlike OpenAI's, where `cached_tokens` is a subset of `prompt_tokens`. These
+// tests pin that invariant on both the buffered and streaming paths.
+// ===========================================================================
+
+/// A `/v1/messages` body whose prompt comfortably exceeds one KV block.
+///
+/// The reportable hit is floored to the block size (16), so a short body can
+/// report 0 even on a real hit. Length comes from the text: SmolLM's chat
+/// template never references `tools`, so tool schemas would add nothing.
+#[cfg(target_os = "macos")]
+fn long_messages_body(stream: bool) -> serde_json::Value {
+    let mut prompt = String::new();
+    for i in 0..40 {
+        prompt.push_str(&format!(
+            "Paragraph {i}: the scheduler hashes full blocks of prompt tokens and \
+             reuses any contiguous run it has already computed. "
+        ));
+    }
+    json!({
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": stream,
+        "messages": [{"role": "user", "content": prompt}]
+    })
+}
+
+/// Dense SmolLM2 on metal. `TestModels::SMOLLM` is MLX 4-bit there and will not
+/// load without a `quant/<preset>` feature; this stem matches
+/// `model/smollm2-135m`, which the metal CI job already builds.
+#[cfg(target_os = "macos")]
+async fn start_metal_smollm_dense() -> (TestServer, Client) {
+    let server = TestServer::builder("HuggingFaceTB/SmolLM2-135M-Instruct")
+        .with_device("metal")
+        .start()
+        .await
+        .expect("server should start");
+    let client = Client::new(server.base_url());
+    (server, client)
+}
+
+/// Non-streaming: the repeat must report the hit, and the input side must sum
+/// to the same prompt length on both requests.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_anthropic_usage_reports_cached_tokens_on_repeat() {
+    scratchy_e2e::skip_if_no_gpu!();
+    let (_server, client) = start_metal_smollm_dense().await;
+    let body = long_messages_body(false);
+
+    let read_usage = |v: &serde_json::Value| -> (u64, u64) {
+        (
+            v["usage"]["input_tokens"].as_u64().expect("input_tokens"),
+            v["usage"]["cache_read_input_tokens"]
+                .as_u64()
+                .expect("cache_read_input_tokens must be present, even at 0"),
+        )
+    };
+
+    // Fresh server => empty block pool, so request 1 is the cold arm.
+    let cold: serde_json::Value = client
+        .anthropic_messages_raw(&body)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (cold_in, cold_cached) = read_usage(&cold);
+    assert_eq!(cold_cached, 0, "cold request must report no cache read");
+
+    let warm: serde_json::Value = client
+        .anthropic_messages_raw(&body)
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (warm_in, warm_cached) = read_usage(&warm);
+
+    assert!(
+        warm_cached > 0,
+        "repeat of an identical {cold_in}-token prompt must report a cache read, got 0"
+    );
+    assert!(
+        warm_in < cold_in,
+        "a cache hit must shrink input_tokens: cold={cold_in} warm={warm_in}"
+    );
+    // The invariant that makes the number comparable with ollama's.
+    assert_eq!(
+        cold_in + cold_cached,
+        warm_in + warm_cached,
+        "input_tokens + cache_read_input_tokens must equal the prompt on both"
+    );
+
+    eprintln!(
+        "[/v1/messages] cold: input={cold_in} cache_read={cold_cached} | \
+         warm: input={warm_in} cache_read={warm_cached} | reprefill={:.3}",
+        warm_in as f64 / (warm_in + warm_cached) as f64
+    );
+}
+
+/// Streaming: the path Claude Code actually uses. `message_start` used to carry
+/// a hardcoded `"input_tokens": 0`, which also made #161's no-truncation proof
+/// impossible from the endpoint under test.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_anthropic_streaming_reports_prompt_and_cached_tokens() {
+    scratchy_e2e::skip_if_no_gpu!();
+    let (_server, client) = start_metal_smollm_dense().await;
+    let body = long_messages_body(true);
+
+    let cold = client.anthropic_messages_stream(&body).await.unwrap();
+    let start = &cold[0];
+    assert_eq!(start["type"], "message_start");
+    let cold_in = start["message"]["usage"]["input_tokens"]
+        .as_u64()
+        .expect("input_tokens");
+    assert!(
+        cold_in > 0,
+        "message_start must report the real prompt length, not the 0 it used to hardcode"
+    );
+
+    let warm = client.anthropic_messages_stream(&body).await.unwrap();
+    let warm_start = &warm[0]["message"]["usage"];
+    let warm_in = warm_start["input_tokens"].as_u64().expect("input_tokens");
+    let warm_cached = warm_start["cache_read_input_tokens"]
+        .as_u64()
+        .expect("cache_read_input_tokens");
+
+    assert!(
+        warm_cached > 0,
+        "streaming repeat must report a cache read in message_start, got 0"
+    );
+    assert_eq!(
+        warm_in + warm_cached,
+        cold_in,
+        "the streaming input side must sum to the same prompt length"
+    );
+
+    // ollama reports the cache field on message_delta, so one client must be
+    // able to read it in the same place on both engines.
+    let delta = warm
+        .iter()
+        .find(|e| e["type"] == "message_delta")
+        .expect("message_delta");
+    assert_eq!(delta["usage"]["cache_read_input_tokens"], warm_cached);
+    assert_eq!(delta["usage"]["input_tokens"], warm_in);
+    assert!(delta["usage"]["output_tokens"].as_u64().unwrap() > 0);
+
+    eprintln!(
+        "[/v1/messages stream] cold_input={cold_in} | warm: input={warm_in} \
+         cache_read={warm_cached}"
+    );
 }
