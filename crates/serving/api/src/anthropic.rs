@@ -168,8 +168,51 @@ pub enum ResponseContentBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicUsage {
+    /// Prompt tokens actually computed this request — the *uncached remainder*,
+    /// NOT the whole prompt.
+    ///
+    /// The two protocols disagree here, and conflating them double-counts:
+    ///   - OpenAI: `prompt_tokens` is the whole prompt, and
+    ///     `prompt_tokens_details.cached_tokens` is a **subset** of it.
+    ///   - Anthropic: `input_tokens` **excludes** the cached part, so
+    ///     `input_tokens + cache_read_input_tokens` is the whole prompt.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the prefix cache.
+    ///
+    /// The number epic #158 is built on:
+    /// `reprefill_ratio = input_tokens / (input_tokens + cache_read_input_tokens)`
+    /// — the share of a re-sent agent prompt this turn actually paid to
+    /// recompute. Block-aligned (see `StreamUsage`), so it understates reuse
+    /// slightly and never overstates it.
+    pub cache_read_input_tokens: u32,
+}
+
+impl AnthropicUsage {
+    /// Split an OpenAI-shaped [`protocol::UsageInfo`] into Anthropic's disjoint
+    /// input fields.
+    ///
+    /// Deliberately NOT emitting `cache_creation_input_tokens`: scratchy has no
+    /// cache *write* that is separate from prefilling the prompt (no
+    /// `cache_control` breakpoints, no write premium), so any value there would
+    /// be invented rather than measured.
+    fn from_usage(usage: &protocol::UsageInfo) -> Self {
+        let cached = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0);
+        Self {
+            // `saturating_sub` rather than `-`: unreachable on this endpoint
+            // (`convert_request` pins `n: 1` and `MessagesRequest` has no field
+            // mapping to `n`), but `engine.rs` sums `num_cached_tokens` across
+            // n children against a per-prompt `prompt_tokens`, so the invariant
+            // is a property of the caller, not of this function.
+            input_tokens: usage.prompt_tokens.saturating_sub(cached),
+            output_tokens: usage.completion_tokens.unwrap_or(0),
+            cache_read_input_tokens: cached,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,10 +459,7 @@ fn convert_response(resp: protocol::ChatCompletionResponse) -> MessagesResponse 
         model: resp.model,
         stop_reason,
         stop_sequence: None,
-        usage: AnthropicUsage {
-            input_tokens: resp.usage.prompt_tokens,
-            output_tokens: resp.usage.completion_tokens.unwrap_or(0),
-        },
+        usage: AnthropicUsage::from_usage(&resp.usage),
     }
 }
 
@@ -652,10 +692,7 @@ fn completion_to_messages_response(
         model: resp.model,
         stop_reason: Some(stop_reason),
         stop_sequence: None,
-        usage: AnthropicUsage {
-            input_tokens: resp.usage.prompt_tokens,
-            output_tokens: resp.usage.completion_tokens.unwrap_or(0),
-        },
+        usage: AnthropicUsage::from_usage(&resp.usage),
     }
 }
 
@@ -680,7 +717,11 @@ fn stream_buffered_messages_response(
                 "model": msg.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": { "input_tokens": msg.usage.input_tokens, "output_tokens": 0 }
+                "usage": {
+                    "input_tokens": msg.usage.input_tokens,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": msg.usage.cache_read_input_tokens
+                }
             }
         }),
     ));
@@ -849,6 +890,10 @@ struct AnthropicSseEncoder {
     request_id: String,
     started: bool,
     output_tokens: u32,
+    /// Uncached prompt tokens (Anthropic `input_tokens`) — see [`AnthropicUsage`].
+    input_tokens: u32,
+    /// Prompt tokens served from the prefix cache.
+    cache_read_input_tokens: u32,
     saw_tool_use: bool,
     open: Option<OpenBlock>,
     next_index: usize,
@@ -862,6 +907,8 @@ impl AnthropicSseEncoder {
             request_id,
             started: false,
             output_tokens: 0,
+            input_tokens: 0,
+            cache_read_input_tokens: 0,
             saw_tool_use: false,
             open: None,
             next_index: 0,
@@ -883,6 +930,17 @@ impl AnthropicSseEncoder {
         let mut events = Vec::new();
         self.output_tokens += delta.new_token_ids.len() as u32;
 
+        // Prompt-side usage, refreshed from every delta (last write wins) so a
+        // cache count that lands a step late still corrects itself. Split here
+        // rather than passed in, because `message_start` below is emitted on
+        // the first delta and must already carry the real numbers — this is the
+        // only path Claude Code exercises, and it reported a literal 0.
+        self.cache_read_input_tokens = delta.usage.cached_tokens;
+        self.input_tokens = delta
+            .usage
+            .prompt_tokens
+            .saturating_sub(delta.usage.cached_tokens);
+
         if !self.started {
             self.started = true;
             events.push((
@@ -897,7 +955,11 @@ impl AnthropicSseEncoder {
                         "model": self.model,
                         "stop_reason": null,
                         "stop_sequence": null,
-                        "usage": { "input_tokens": 0, "output_tokens": 0 }
+                        "usage": {
+                            "input_tokens": self.input_tokens,
+                            "output_tokens": 0,
+                            "cache_read_input_tokens": self.cache_read_input_tokens
+                        }
                     }
                 }),
             ));
@@ -996,7 +1058,17 @@ impl AnthropicSseEncoder {
                 serde_json::json!({
                     "type": "message_delta",
                     "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                    "usage": { "output_tokens": self.output_tokens }
+                    // Input-side fields repeated here as well as in
+                    // `message_start`: this is where ollama reports them, so one
+                    // client reads the same place on both engines. Anthropic's
+                    // `message_delta.usage` is cumulative-final, not additive,
+                    // so restating the same values is a no-op for a conforming
+                    // client.
+                    "usage": {
+                        "output_tokens": self.output_tokens,
+                        "input_tokens": self.input_tokens,
+                        "cache_read_input_tokens": self.cache_read_input_tokens
+                    }
                 }),
             ));
             events.push((
@@ -1515,6 +1587,7 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_input_tokens: 0,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1544,6 +1617,7 @@ mod tests {
     // Streaming encoder (AnthropicSseEncoder)
     // -----------------------------------------------------------------------
 
+    use crate::engine::StreamUsage;
     use crate::tool_parser::DeltaToolCall;
     use scratchy_core_common::FinishReason;
 
@@ -1551,6 +1625,16 @@ mod tests {
         text: Option<&str>,
         tools: Option<Vec<DeltaToolCall>>,
         finish: Option<FinishReason>,
+    ) -> StreamDelta {
+        mk_delta_usage(text, tools, finish, StreamUsage::default())
+    }
+
+    /// Same, with explicit prompt-side counts for the usage assertions.
+    fn mk_delta_usage(
+        text: Option<&str>,
+        tools: Option<Vec<DeltaToolCall>>,
+        finish: Option<FinishReason>,
+        usage: StreamUsage,
     ) -> StreamDelta {
         StreamDelta {
             index: 0,
@@ -1561,6 +1645,7 @@ mod tests {
             logprobs: None,
             tool_call_deltas: tools,
             reasoning: None,
+            usage,
         }
     }
 
@@ -1723,5 +1808,104 @@ mod tests {
             vec!["message_start", "ping", "message_delta", "message_stop"]
         );
         assert_eq!(events[2].1["delta"]["stop_reason"], "max_tokens");
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage: the OpenAI -> Anthropic input-side split
+    // -----------------------------------------------------------------------
+
+    fn usage_with_cache(prompt: u32, cached: Option<u32>) -> protocol::UsageInfo {
+        protocol::UsageInfo {
+            prompt_tokens: prompt,
+            total_tokens: prompt,
+            completion_tokens: Some(0),
+            prompt_tokens_details: cached.map(|c| protocol::PromptTokenUsageInfo {
+                cached_tokens: Some(c),
+            }),
+        }
+    }
+
+    /// The headline case, with the numbers measured on ollama 0.40.0 for the
+    /// same request sent twice (issue #298): 167 prompt tokens, 166 of them
+    /// served from cache on the repeat. Both engines must put the same split in
+    /// the same fields, or the benchmark compares different quantities.
+    #[test]
+    fn test_usage_splits_cached_prefix_like_ollama() {
+        let u = AnthropicUsage::from_usage(&usage_with_cache(167, Some(166)));
+        assert_eq!(u.input_tokens, 1);
+        assert_eq!(u.cache_read_input_tokens, 166);
+        // Anthropic's invariant: the input side sums to the whole prompt.
+        assert_eq!(u.input_tokens + u.cache_read_input_tokens, 167);
+
+        // And the metric that split exists to serve.
+        let reprefill = u.input_tokens as f64 / (u.input_tokens + u.cache_read_input_tokens) as f64;
+        assert!(
+            reprefill < 0.01,
+            "a 166/167 cache hit must read as near-zero reprefill, got {reprefill}"
+        );
+    }
+
+    /// A cache miss must leave `input_tokens` exactly as it was before this
+    /// change — the whole prompt — so nothing regresses when the cache is cold.
+    #[test]
+    fn test_usage_cache_miss_leaves_input_tokens_whole() {
+        let u = AnthropicUsage::from_usage(&usage_with_cache(167, None));
+        assert_eq!(u.input_tokens, 167);
+        assert_eq!(u.cache_read_input_tokens, 0);
+    }
+
+    /// `engine.rs` sums `num_cached_tokens` across n children against a
+    /// per-prompt `prompt_tokens`, so cached > prompt is representable upstream.
+    /// Unreachable via `/v1/messages` (`convert_request` pins `n: 1`), but the
+    /// split must not wrap if it ever becomes reachable.
+    #[test]
+    fn test_usage_cached_exceeding_prompt_does_not_wrap() {
+        let u = AnthropicUsage::from_usage(&usage_with_cache(200, Some(300)));
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 300);
+    }
+
+    /// The regression guard for the path Claude Code actually uses: a streaming
+    /// request used to report a literal `"input_tokens": 0` in `message_start`
+    /// and nothing at all about the cache.
+    #[test]
+    fn test_stream_reports_prompt_and_cached_tokens() {
+        let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
+        let usage = StreamUsage {
+            prompt_tokens: 1000,
+            cached_tokens: 960,
+        };
+        let mut events = Vec::new();
+        events.extend(enc.push(&mk_delta_usage(Some("hi"), None, None, usage)));
+        events.extend(enc.push(&mk_delta_usage(None, None, Some(FinishReason::Stop), usage)));
+
+        let start = &events[0].1["message"]["usage"];
+        assert_eq!(start["input_tokens"], 40, "1000 prompt - 960 cached");
+        assert_eq!(start["cache_read_input_tokens"], 960);
+
+        // Also on message_delta, where ollama reports it.
+        let delta = &events
+            .iter()
+            .find(|(n, _)| *n == "message_delta")
+            .expect("message_delta")
+            .1["usage"];
+        assert_eq!(delta["input_tokens"], 40);
+        assert_eq!(delta["cache_read_input_tokens"], 960);
+        assert_eq!(delta["output_tokens"], 2);
+    }
+
+    /// A stream with no cache hit still reports the real prompt length, rather
+    /// than the 0 the encoder used to hardcode.
+    #[test]
+    fn test_stream_reports_prompt_tokens_without_cache_hit() {
+        let mut enc = AnthropicSseEncoder::new("r".into(), "m".into());
+        let usage = StreamUsage {
+            prompt_tokens: 512,
+            cached_tokens: 0,
+        };
+        let events = enc.push(&mk_delta_usage(Some("hi"), None, None, usage));
+        let start = &events[0].1["message"]["usage"];
+        assert_eq!(start["input_tokens"], 512);
+        assert_eq!(start["cache_read_input_tokens"], 0);
     }
 }
