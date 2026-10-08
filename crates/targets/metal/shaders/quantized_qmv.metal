@@ -1841,6 +1841,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 //   buffer(5)   = gate y                     buffer(11)  = scores [N, top_k], routed
 //                 [N, top_k, out_vec]        buffer(12)  = per-expert scales, routed and scaled
 //                                             buffer(13) = F32 e_score_correction_bias, routed
+//                                            buffer(15)  = the norm's gain, normed
 // Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
 // gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
 // activation to the block's rows. Every gate row is written raw only by the threadgroup that
@@ -1864,6 +1865,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     device T_act*          scores      [[buffer(11)]],
     const device T_act*    expert_scale [[buffer(12)]],
     const device float*    router_bias [[buffer(13)]],
+    const device T_scale*  gain        [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
