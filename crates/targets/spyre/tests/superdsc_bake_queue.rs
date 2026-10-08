@@ -14,28 +14,32 @@ use scratchy_target_spyre::superdsc_bake::{
 /// different resources, so collapsing them back into one is a regression this pins.
 #[test]
 fn the_disk_bound_is_not_the_compile_width() {
-    // Bytes vs processes — not even the same unit, which is the point.
-    assert!(
-        MAX_STAGED_BYTES >= 64 * 1024 * 1024,
-        "too small to hold a wide group"
-    );
-    assert!(
-        MAX_STAGED_BYTES <= 4 * 1024 * 1024 * 1024,
-        "a bound this large is not a bound"
-    );
-    assert!(
-        COMPILE_WIDTH > 1,
-        "serial compiles are what this queue exists to avoid"
-    );
-    assert!(
-        COMPILE_WIDTH <= 128,
-        "one dxp process per group; do not fork hundreds"
-    );
-    // The channel only has to outrun the workers so a finished one never waits on the producer.
-    assert!(
-        IN_FLIGHT >= COMPILE_WIDTH,
-        "channel shallower than the worker pool starves it"
-    );
+    // Const-evaluated: the bounds are compile-time facts of the queue, so a violation is a
+    // compile error, not a runtime failure. Bytes vs processes — not even the same unit,
+    // which is the point.
+    const {
+        assert!(
+            MAX_STAGED_BYTES >= 64 * 1024 * 1024,
+            "too small to hold a wide group"
+        );
+        assert!(
+            MAX_STAGED_BYTES <= 4 * 1024 * 1024 * 1024,
+            "a bound this large is not a bound"
+        );
+        assert!(
+            COMPILE_WIDTH > 1,
+            "serial compiles are what this queue exists to avoid"
+        );
+        assert!(
+            COMPILE_WIDTH <= 128,
+            "one dxp process per group; do not fork hundreds"
+        );
+        // The channel only has to outrun the workers so a finished one never waits on the producer.
+        assert!(
+            IN_FLIGHT >= COMPILE_WIDTH,
+            "channel shallower than the worker pool starves it"
+        );
+    }
 }
 
 /// ⭐ THE STAGING ROOT IS LOCAL AND OVERRIDABLE, AND IT IS NOT A CACHE.

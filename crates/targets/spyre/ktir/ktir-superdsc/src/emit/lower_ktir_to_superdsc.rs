@@ -96,7 +96,7 @@ pub struct Region {
     /// The buffer's own declared `[rows, cols]` extent — the parameter's
     /// `ktdp.construct_memory_view` `Shape`.
     ///
-    /// ⭐ NOT ALWAYS THE TENSOR'S SHAPE, AND THAT IS THE POINT. `KtirFunc::rope` views `x` as
+    /// ⭐ NOT ALWAYS THE TENSOR'S SHAPE, AND THAT IS THE POINT. The rope program views `x` as
     /// `[rows·heads, hd]`, so this states the HEAD DIM directly.
     ///
     /// ⛔ `v_rows` USED TO BE DROPPED, AND THAT COST THE FIRST GENERATED TOKEN. The prefill lm-head
@@ -110,7 +110,7 @@ pub struct Region {
     /// whole view when the program reads all of it.
     ///
     /// ⛔⛔⛔ `r_start` USED TO BE DISCARDED INTO `_r_start`, AND THAT WAS THE DEFECT. The mq>1
-    /// prefill lm-head tail states its row in the KTIR — `KtirFunc::matmul` puts
+    /// prefill lm-head tail states its row in the KTIR — the matmul puts
     /// `selector_lastrow_col(mq)` on its activation access tile as an `arith.constant` — and this
     /// walk threw it away, so `matmul` built `rb(&a.name(), m, k)` at the BUFFER BASE and the
     /// vocab-wide tail read the wrong `hidden` bytes. MEASURED, granite-3.1-2b fp8, prompt `hi`
@@ -140,7 +140,7 @@ pub struct Region {
     pub is_out: bool,
     /// This parameter's view declares `Fp8E4m3` elements — one byte each.
     ///
-    /// ⭐ THE fp8-NESS IS A VIEW FACT, not an arity guess: `KtirFunc::matmul_fp8` builds its weight
+    /// ⭐ THE fp8-NESS IS A VIEW FACT, not an arity guess: the fp8 matmul builds its weight
     /// through `view_fp8`, which writes `Dtype = Fp8E4m3` on the `ktdp.construct_memory_view`.
     pub is_fp8: bool,
 }
@@ -446,7 +446,7 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
 ///
 /// `rb(name, rows, cols)` — every operand spelling below — names a tensor, not an offset into one, so
 /// the only row a base-addressed descriptor can read is row 0. A KTIR program CAN state a row
-/// (`KtirFunc::matmul` puts `selector_lastrow_col(mq)` on its activation access tile), and for the
+/// (the matmul puts `selector_lastrow_col(mq)` on its activation access tile), and for the
 /// two years' worth of programs here the corner is 0 — except the prefill lm-head tail, whose corner
 /// this walk discarded, producing a wrong first generated token with a fluent continuation behind it.
 ///
@@ -471,10 +471,10 @@ fn base_addressed(name: &str, r: &Region, role: &str) -> Result<(), Error> {
 /// ⛔⛔⛔ THE NODE'S ROW COUNT, WHICH IS NOT ITS FIRST WINDOW'S HEIGHT.
 ///
 /// main's pointwise bodies (`lower_elementwise_node`, `lower_silumul_node`, `lower_rmsnorm_node`,
-/// `lower_scalarmul_node`) are each called ONCE per node with `node.output.region.rows.len` and emit
+/// `lower_scalarmul_node`) were each called ONCE per node with `node.output.region.rows.len` and emit
 /// descriptors spanning all of it. The KTIR side states that same number on
 /// [`KtirNode::out_shape`] — and it has to, because a producer arm may ROW-BLOCK its region so the
-/// emulator's per-core LX holds the live tile set (`KtirFunc::silu_mul` always does; elementwise and
+/// emulator's per-core LX holds the live tile set (silu_mul always does; elementwise and
 /// scalarmul do above `EW_LX_ELEMS`), which makes the program `ceil(m / blk)` windows rather than one.
 /// Reading `Region::r_len` there yields the BLOCK HEIGHT, and a descriptor cut to the block height
 /// leaves every later block's rows unwritten on the card — MEASURED as `mb_=16` beside `mb_=31` in
@@ -608,9 +608,9 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
         // tile four times the width of the one the program states — well-formed, and wrong.
         //
         // ⭐ INERT FOR A STRAIGHT-LINE PRODUCER, WHICH IS EVERY PROGRAM THIS CRATE HAS SEEN. Neither
-        // this crate nor `KtirFunc` mentions `scf.for` anywhere (`grep -rn ScfFor` is empty in both),
-        // so the guard fires only for a program shape that has never reached here — a Triton front
-        // end's K-blocked MLP, whose windows all live in the loop body. It changes nothing for a
+        // this crate nor the producer mentions `scf.for` anywhere (`grep -rn ScfFor` is empty in
+        // both), so the guard fires only for a program shape that has never reached here — a Triton
+        // front end's K-blocked MLP, whose windows all live in the loop body. It changes nothing for a
         // program whose tiles are at the top level, and nothing for one with no tiles at all.
         // ⛔ AND IT IS `deep > top`, NOT `top == 0`. A parameter loaded whole ABOVE a loop and
         // re-blocked INSIDE it has a top-level tile, so a "no window at the top level" test passes it
@@ -637,7 +637,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             ));
         }
         // ⛔⛔⛔ EVERY access tile's ROW SPAN, because "the FIRST" is not "the program's". A producer
-        // arm that ROW-BLOCKS its region for the emulator's LX (`KtirFunc::silu_mul`,
+        // arm that ROW-BLOCKS its region for the emulator's LX (silu_mul; main's
         // `lower_elementwise_node_rows`, `lower_scalarmul_node`'s `by_row`) states one access tile per
         // block, and the field above keeps only block 0 — so a ported body reading its row count off
         // it emitted main's descriptors over the BLOCK HEIGHT and every later block's rows were never
@@ -647,7 +647,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
         // [`node_rows`] can prove the blocks tile the node before a body spans them with one
         // descriptor.
         //
-        // ⛔ AND IT IS EVERY VIEW OF THE PARAMETER, NOT THE ONE FOUND ABOVE. `KtirFunc::view_of` mints
+        // ⛔ AND IT IS EVERY VIEW OF THE PARAMETER, NOT THE ONE FOUND ABOVE. The producer mints
         // a FRESH `ktdp.construct_memory_view` per call and `store_region` calls it once per block, so
         // a row-blocked program states `ceil(m / blk)` views of the same pointer — the `find` above
         // reaches block 0's alone. Collecting only its tiles reported `rows 0..16` for a 31-row node
@@ -1349,7 +1349,7 @@ pub fn rmsnorm(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // x, gamma and the output — the parameters `KtirFunc::rmsnorm` mints. Its constants are
+    // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
     let (tensors, out) = split_out(name, r, layout, 2)?;
     // ⭐⭐⭐ THE EPSILON COMES FROM THE PROGRAM. It was `KtirNode::rmsnorm_eps_idx`, a slot the producer
@@ -1360,7 +1360,7 @@ pub fn rmsnorm(
     // slot is then looked up BY THAT VALUE, exactly as the attention body looks up its multiplier.
     let eps = program_rmsnorm_eps(&k.func).ok_or_else(|| Error {
         message: format!(
-            "RmsNorm {name}: the program states no epsilon. `KtirFunc::rms_norm` splats it into the \
+            "RmsNorm {name}: the program states no epsilon. The rmsnorm program splats it into the \
              `arith.addf` that feeds its one root op — `math.sqrt` there, `math.rsqrt` in a producer \
              that spells `1/sqrt` as one op (`1/sqrt(mean + eps)`) — and the descriptor's `[1,1]` \
              const is resolved from that value, so a program without it cannot be lowered."
@@ -1703,7 +1703,7 @@ pub struct AttnAt<'a> {
     ///
     /// ⛔ THE ONE FACT WITH NO STATEMENT ANYWHERE IN THE PROGRAM, and it cannot have one: it decides
     /// the DEVICE's row/slot laws (`attn_bundle_rows`' pad, rope's head-major collapse), which the
-    /// emulator does not model at all — the producer's `KtirFunc::attn`/`::rope` never receive it and
+    /// emulator does not model at all — the attention/rope programs never receive it and
     /// emit the same ops either way.
     pub rows_are_requests: bool,
     pub sym_id_base: &'a mut i64,
@@ -1714,7 +1714,7 @@ pub struct AttnAt<'a> {
 /// STATES THEM — the seven fields `AttnFacts` used to carry from the producer.
 ///
 /// Every one is a positional join on [`KtirNode::args`], which is the join [`regions`] already
-/// performs: the producer's `KtirFunc::attn` mints its parameters in first-use order — `q`, `out`,
+/// performs: the attention program mints its parameters in first-use order — `q`, `out`,
 /// then (when this node emits the runtime length mask) the mask, then EVERY segment's K view followed
 /// by EVERY segment's V view — and `crate::place::act_name(tid)` is the operand spelling every proven
 /// builder agrees on.
@@ -1758,7 +1758,7 @@ pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
     geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
 ) -> Result<AttnOperands, Error> {
     let (q_width, kv_width) = (geom.nqh() * geom.hd(), geom.nkvh() * geom.hd());
-    // `q`, then `out`: `KtirFunc::attn`'s first two `arg_for` calls, in that order.
+    // `q`, then `out`: the attention program's first two parameter mints, in that order.
     let (q, out) = match (r.first(), r.get(1)) {
         (Some(q), Some(o)) => (q, o),
         _ => {
@@ -1795,14 +1795,14 @@ pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
         return err(format!(
             "{name}: parameter 0 (t{}, read as `q`) is {}written by a `ktdp.store` and parameter 1 \
              (t{}, taken as `out`) is {}— `q` is the read operand and `out` the written one, so this \
-             program's parameters are not the order `KtirFunc::attn` mints them in",
+             program's parameters are not the order the attention program mints them in",
             q.tid,
             if q.is_out { "" } else { "not " },
             out.tid,
             if out.is_out { "" } else { "not " },
         ));
     }
-    // ⭐ THE HEAD DIM, FROM THE PROGRAM'S OWN PER-HEAD WINDOW. `KtirFunc::attn` reads head `h` as
+    // ⭐ THE HEAD DIM, FROM THE PROGRAM'S OWN PER-HEAD WINDOW. The attention program reads head `h` as
     // `tile(q_view, ·, h·hd, ·, hd)`, so the first access tile over the `q` view is `hd` wide — the
     // one place the program states the head dim rather than a product with it.
     //
@@ -1954,11 +1954,11 @@ fn param_tiles_deep(f: &IRFunction<'static>, ptr: &Ssa) -> usize {
 /// the `arith.mulf` that scales a `linalg.matmul`'s scores.
 ///
 /// ⭐ ONE SITE, RECOGNISED BY ITS OPERANDS, not by elimination among the func's float constants —
-/// `KtirFunc::attn` also states `-1e38` and `0.0`, and telling them apart by value would be a
+/// the attention program also states `-1e38` and `0.0`, and telling them apart by value would be a
 /// convention rather than a reading.
 /// The RMSNORM epsilon THE PROGRAM STATES, read structurally.
 ///
-/// ⭐ RECOGNISED BY ITS SHAPE, NOT ITS VALUE. `KtirFunc::rms_norm` computes `1/sqrt(mean + eps)`, so
+/// ⭐ RECOGNISED BY ITS SHAPE, NOT ITS VALUE. The rmsnorm program computes `1/sqrt(mean + eps)`, so
 /// the epsilon is the splat operand of the `arith.addf` that feeds the one `math.sqrt`. The same body
 /// also splats `0.0` (the reduce seed), `1.0` (the reciprocal's numerator) and the reciprocal row
 /// count, so picking a float out by value would be a convention rather than a reading — the same
@@ -1968,7 +1968,7 @@ fn param_tiles_deep(f: &IRFunction<'static>, ptr: &Ssa) -> usize {
 /// operand.
 ///
 /// ⭐ AND THE ROOT IS EITHER `math.sqrt` OR `math.rsqrt`, because a third-party producer states
-/// `1/sqrt(x)` as ONE op. `KtirFunc::rms_norm` spells it `math.sqrt` then `arith.divf(1.0, ·)`; a
+/// `1/sqrt(x)` as ONE op. The builder's `KtirFunc::rms_norm` spells it `math.sqrt` then `arith.divf(1.0, ·)`; a
 /// Triton front end spells the same value `math.rsqrt`, which `OpKind::MathRsqrt` already admits and
 /// which this crate already emits on card as a first-class pointwise (`Elementwise::Rsqrt =>
 /// ("rsqrt", 1)`). The epsilon is the SAME fact under both spellings — the splat into the add that
@@ -1979,7 +1979,7 @@ fn param_tiles_deep(f: &IRFunction<'static>, ptr: &Ssa) -> usize {
 /// [`assemble_rmsnorm`] is
 /// `pw1("rmrsqrt_…", "rsqrt", …)`, and its own comment says "ONE native `rsqrt` (torch.rsqrt), NOT
 /// sqrt+reciprocal". So a program that states `math.rsqrt` matches what this crate EMITS more
-/// closely than `KtirFunc`'s `math.sqrt` + `arith.divf` does, and the reader was the only thing in
+/// closely than the builder's `math.sqrt` + `arith.divf` does, and the reader was the only thing in
 /// the path narrower than both. (Step 2 lines up the same way: it is one native `mean` reduce that
 /// "folds 1/N into the reduce scale", which is exactly a producer that multiplies by a splatted
 /// `1/cols` rather than dividing — see the mean's operand below.)
@@ -2043,7 +2043,7 @@ pub fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
 
 /// The SCALARMUL multiplier the program states, read structurally.
 ///
-/// ⭐ EVERY `arith.mulf` IN THE PROGRAM, AND THEY MUST AGREE. `KtirFunc`'s scalarmul arm splats the
+/// ⭐ EVERY `arith.mulf` IN THE PROGRAM, AND THEY MUST AGREE. The scalarmul arm splats the
 /// scale and multiplies, once for the whole region or once per row block when the region is too wide
 /// for the LX — so a program states the same multiplier one or many times, never two different ones.
 /// Reading all of them and requiring agreement is what makes the many-block form safe to lower from
@@ -2093,9 +2093,27 @@ pub fn program_scalarmul_scale(f: &IRFunction<'static>) -> Option<f32> {
 /// so the slot is the one thing that has to be looked up rather than read.
 fn scale_slot(layout: Option<&BundleLayout>, value: f32) -> Option<usize> {
     layout.and_then(|l| {
+        // ⭐ EXACT BITS FIRST, THEN THE f16 IMAGE — and the fallback is not a tolerance.
+        //
+        // `compute_bundle_layout` registers the tape's f32 constant, and the worker binds ONE
+        // fp16 per slot (`SCALE_BYTES = 2`), so the value the descriptor reads is the f16 image
+        // of the registry entry either way. A Triton producer's program states its epsilon as
+        // the f16 image directly: `LegalizeTypes::step_2b_island_constants` ROUNDS the splat
+        // value (`f.to_f16()`) when it feeds an op with an f16 operand — MEASURED, the
+        // triton-spyre layout docs record `1e-5` arriving as `0.00001001358`. Matching that
+        // against the f32 registry by bits alone refused the CORRECT descriptor, so the f16
+        // image is the second query — exact equality of the bound value, not an approximation.
+        // The builder path's program keeps its f32 constant, so it still matches on the first
+        // query and this changes nothing for it.
         l.scalarmul_scales
             .iter()
             .position(|s| s.to_bits() == value.to_bits())
+            .or_else(|| {
+                let v16 = half::f16::from_f32(value);
+                l.scalarmul_scales
+                    .iter()
+                    .position(|s| half::f16::from_f32(*s) == v16)
+            })
     })
 }
 
@@ -2896,7 +2914,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // ── PAGED-ATTENTION COMPUTE EXTENT, READ OFF THE PROGRAM ──
     //
     // ⭐⭐⭐ IT WAS `AttnAt::active_cap`, THE RUNG, RESOLVED HERE. The rung is a PRODUCER input: it
-    // decides how many rows of the resident cache `KtirFunc::attn` takes an access tile of, so the
+    // decides how many rows of the resident cache the attention program takes an access tile of, so the
     // program already carries the swept extent and the lowering can read it back. `param_read_rows`
     // is that reading — the widest row extent any `ktdp.construct_access_tile` over the cache
     // parameter takes, and 0 when the program takes none (`ActiveCap::NONE`'s zero-length segment).
@@ -2915,7 +2933,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // that is the one place the two consumers could compute different things and neither would fault.
     // `ActiveCap::NONE` means `nb == 0` here — the new-token block alone seeds and finalizes the
     // softmax — and the producer says the same thing by taking NO access tile of the resident cache
-    // (the tensor is still named, so its identity survives; see `KtirFunc::attn`'s zero-length
+    // (the tensor is still named, so its identity survives; see the attention program's zero-length
     // segment). A rung that swept nothing against a program that reads the prefix — or the reverse —
     // is an emulator that cannot be an oracle for this node, so it is a build error naming both.
     // The swept extent cannot exceed the buffer it sweeps: the cache parameter's own view states
@@ -2928,8 +2946,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             ops_in.out_id,
         ));
     }
-    // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, AND IT IS THE ONLY READING OF IT. `KtirFunc::attn`
-    // states `attention_multiplier` inline (`self.scalar(f64::from(scale))`) because the emulator
+    // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, AND IT IS THE ONLY READING OF IT. The attention
+    // program states `attention_multiplier` inline (`self.scalar(f64::from(scale))`) because the emulator
     // interprets these ops and the three attention optimizers recognise the scale by pattern; the
     // DEVICE reads it as a bound `[1,1]` const, whose slot is resolved below FROM THIS VALUE.
     //
@@ -2941,7 +2959,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // no multiplier is a build error naming it.
     let scale_val = program_score_scale(&k.func).ok_or_else(|| Error {
         message: format!(
-            "AttnDecode t{}: the program states no score multiplier. `KtirFunc::attn` scales its \
+            "AttnDecode t{}: the program states no score multiplier. The attention program scales its \
              scores with an `arith.mulf` against an `arith.constant`, and the descriptor's `[1,1]` \
              scale const is resolved from that value, so a program without one cannot be lowered.",
             ops_in.out_id,
@@ -3641,7 +3659,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
 /// ⛔⛔⛔ THIS IS THE OP THE PORT DROPPED, AND ITS ABSENCE WAS A WRONG FIRST TOKEN ON EVERY PROMPT.
 /// The KTIR arm replaced these copies with a one-line row slice on the matmul's activation region,
 /// on the reasoning that "a KTIR view STATES its start address … so row `mq-1` of `[mq, hidden]` is an
-/// address this target can simply name". The KTIR can name it — `KtirFunc::matmul` emits the corner as
+/// address this target can simply name". The KTIR can name it — the matmul emits the corner as
 /// an `arith.constant` — but [`regions`] discarded it and `assemble_matmul_seeded` has nowhere to put
 /// it, so the tail read the buffer base. MEASURED against main on the same card, same ladder rung,
 /// same `PREFILL_PATH` line (`m_used=14 prefill_m=15 rung=2/21`): ours `yun! How can`, main
@@ -3869,7 +3887,7 @@ pub fn matmul_oriented(
     rcol(&a, "activation (A)")?;
     rcol(&out, "output")?;
     // ⭐ THE PRECISION IS THE WEIGHT VIEW'S ELEMENT TYPE, and arity agrees with it by construction:
-    // `KtirFunc::matmul_fp8` is the only builder that views a weight through `view_fp8`, and it is
+    // `KtirFunc::matmul_fp8` was the only builder that viewed a weight through `view_fp8`, and it is
     // the only one that binds a third input (the checkpoint's per-column `w_scale`). Disagreement
     // between the two is a malformed program and says so rather than picking one.
     if w.is_fp8 != (ins.len() == 3) {
@@ -3910,7 +3928,7 @@ pub fn matmul_oriented(
     //
     // ⛔ THE WEIGHT'S VIEW IS `[n, k]`, WHICH IS THE SAME STATEMENT AS main's `[k, n]` REGION. main
     // checked `w.region.rows.len != k` and `w.region.cols.len != n` against the SubtileIR region;
-    // `KtirFunc::matmul` views the same buffer as its natural `[n, k]`, so the two checks swap sides
+    // `KtirFunc::matmul` viewed the same buffer as its natural `[n, k]`, so the two checks swap sides
     // and nothing else about them changes.
     // ⛔ WHICH OF W'S TWO EXTENTS IS K IS A PROVEN FACT, NOT A CONVENTION. The check above reads the
     // weight as `[n, k]` (transpose-B). A plain-B weight is `[k, n]`, and at `k == n` — granite's
@@ -4932,7 +4950,7 @@ pub fn rmsnorm_at(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // x, gamma and the output — the parameters `KtirFunc::rmsnorm` mints. Its constants are
+    // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
     let (tensors, out) = split_out(name, r, layout, 2)?;
     let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
@@ -4968,7 +4986,7 @@ pub fn rmsnorm_at(
 ///
 /// ⭐ WHY THE SPLIT EXISTS. [`program_scalarmul_scale`] reads EVERY `arith.mulf` in the function and
 /// requires them all to agree — exact for a function that IS one scalarmul node, which is what
-/// `KtirFunc` emits. A whole-kernel function is a different shape: one decoder layer holds 21
+/// the producer emits. A whole-kernel function is a different shape: one decoder layer holds 21
 /// `arith.mulf`, most with no splat at all and the splatted ones carrying FOUR different constants
 /// (`INV_D`, `QK_SCALE`, and `RM` twice). The whole-function reader necessarily returns `None` there,
 /// so a per-op caller must state the scale it PROVED for THAT op. The proving stays with the caller

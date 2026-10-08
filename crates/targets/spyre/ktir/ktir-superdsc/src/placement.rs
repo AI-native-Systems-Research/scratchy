@@ -198,7 +198,7 @@ pub struct BundleLayout {
     pub kernel_weights: std::collections::BTreeMap<u32, RetileDescriptor>,
     /// Distinct granite ScalarMul scale VALUES (embedding/residual/attn/logits multipliers), in a stable
     /// order. Index `i` ↔ reserved const TID `scalarmul_scale_tid(i)` (a worker-bound `[1,1]` const,
-    /// exactly the ATTN_SCALE mechanism). The emitter (`lower_scalarmul_node`) looks up its scale's index
+    /// exactly the ATTN_SCALE mechanism). The emitter (the door's scalarmul lowering) looks up its scale's index
     /// here → the const TID it multiplies by; the WORKER reads this list (serde) and binds each
     /// `t{tid} = [scale]`. So the emitter and worker agree on scale↔TID by construction (no reward-hack
     /// fold, no host-route — the op is a real on-device pointwise `mul`).

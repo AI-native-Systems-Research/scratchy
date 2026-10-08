@@ -327,6 +327,13 @@ pub struct MatmulLoopInfo {
     /// reads A from `base + m_row_off * k` elements; default 0 leaves every other
     /// GEMM's full-M reconstruction (read from the stick base) untouched.
     pub m_row_off: i64,
+    /// ⭐ THE B VIEW'S OWN ELEMENT TYPE — `Fp8E4m3` for an fp8-packed weight (one
+    /// byte per element, widened on read), `F16` for every dense weight. The B
+    /// resolvers charge bytes and decode elements at THIS size: reading an fp8
+    /// weight at the F16 default would read `count * 2` bytes (half of them the
+    /// NEXT stick's) and decode garbage — the fp8 splice's weight view is what
+    /// states the truth, so the offload reads it rather than assuming.
+    pub b_dtype: DType,
 }
 
 /// How an op participates in scheduling.
@@ -934,35 +941,29 @@ pub fn run_matmul_loop_gpu(
         // runners) the engine has no f16 pipeline, so stay f32 — never produce an
         // f16 buffer the kernel can't consume (that was the metal.rs unwrap panic).
         let want_b_f16 = use_nax && f16_weights_enabled() && engine.has_f16_b_pipelines();
-        let _t_res = std::time::Instant::now();
-        let ua = resolve_gemm_operand_unified_off(
-            info.a_root,
-            m,
-            k,
-            info.m_row_off as usize,
+        let gemm = GemmResolveCtx {
             ctx,
             engine,
-            false, // A (activation) is always f32 in
-        )?;
+            want_b_f16,
+        };
+        let gemm_a = GemmResolveCtx {
+            ctx,
+            engine,
+            want_b_f16: false, // A (activation) is always f32 in
+        };
+        let _t_res = std::time::Instant::now();
+        let ua =
+            resolve_gemm_operand_unified_off(info.a_root, m, k, info.m_row_off as usize, &gemm_a)?;
         // B operand, resolved VERBATIM (no transpose, no gather):
         //   * transpose-B: the [n,k] weight, or its CONTIGUOUS row-slice for an
         //     N-tile (rows [n_off, n_off+n) — a contiguous block, not a gather).
         //   * plain: the [k,n] weight (contiguous) or a strided column slice.
         let ub = if info.transpose_b {
-            resolve_gemm_bt_operand(info.b_root, n, k, info.n_off, ctx, engine, want_b_f16)?
+            resolve_gemm_bt_operand(info.b_root, n, k, info.n_off, info.b_dtype, &gemm)?
         } else if info.n_off == 0 && info.b_stride == info.n {
-            resolve_gemm_operand_unified(info.b_root, k, n, ctx, engine, want_b_f16)?
+            resolve_gemm_operand_unified(info.b_root, k, n, &gemm)?
         } else {
-            resolve_gemm_weight_slice(
-                info.b_root,
-                k,
-                n,
-                info.n_off,
-                info.b_stride,
-                ctx,
-                engine,
-                want_b_f16,
-            )?
+            resolve_gemm_weight_slice(info.b_root, k, n, info.n_off, info.b_stride, &gemm)?
         };
         GEMM_RESOLVE_NS.fetch_add(
             _t_res.elapsed().as_nanos() as u64,
@@ -1067,6 +1068,18 @@ pub fn run_matmul_loop_gpu(
     Ok(())
 }
 
+/// The GEMM weight resolvers' shared facts — the bundle that keeps every
+/// `resolve_gemm_*` signature under the arity lint (a resolver states its OWN
+/// shape facts, and everything ambient rides here).
+#[cfg(metal)]
+pub(crate) struct GemmResolveCtx<'a> {
+    pub ctx: &'a crate::context::CoreContext,
+    pub engine: &'a NaxGemm,
+    /// f16 B only on the NAX GPU path (the flag AND f16 pipelines); every other
+    /// path keeps f32 B — see the `want_b_f16` derivation at the call site.
+    pub want_b_f16: bool,
+}
+
 /// Resolve a GEMM operand to a resident [`UnifiedBuffer`].
 ///
 ///   * A resident `Tile` (a forwarded activation) is uploaded to a FRESH buffer
@@ -1081,11 +1094,9 @@ fn resolve_gemm_operand_unified(
     root: Ssa,
     rows: usize,
     cols: usize,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
-    resolve_gemm_operand_unified_off(root, rows, cols, 0, ctx, engine, want_f16)
+    resolve_gemm_operand_unified_off(root, rows, cols, 0, gemm)
 }
 
 /// [`resolve_gemm_operand_unified`] with a leading ROW offset: read the `rows×cols`
@@ -1098,12 +1109,13 @@ fn resolve_gemm_operand_unified_off(
     rows: usize,
     cols: usize,
     row_off: usize,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    // f16 applies only to a WEIGHT (HBM pointer); a forwarded activation TILE is
-    // always f32 (it is the A operand, kept f32 in).
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let GemmResolveCtx {
+        ctx,
+        engine,
+        want_b_f16,
+    } = *gemm;
     let n = rows * cols;
     let elem_off = row_off * cols;
     match ctx.get_value(root)? {
@@ -1133,10 +1145,10 @@ fn resolve_gemm_operand_unified_off(
             // is elem*bytes_per_elem (f16 weight), NOT elem*STICK_BYTES.
             let addr = (elem + elem_off as i64) * DType::F16.bytes_per_elem() as i64;
             // Build the resident weight buffer: f16 (raw HBM bytes, no f32 expansion,
-            // half the streamed bytes) when `want_f16`, else f32 (decoded).
+            // half the streamed bytes) when `want_b_f16`, else f32 (decoded).
             let build = || -> Result<UnifiedBuffer, String> {
                 let hbm = ctx.hbm.borrow();
-                if want_f16 {
+                if want_b_f16 {
                     let raw = hbm.read_bytes(addr, n * DType::F16.bytes_per_elem());
                     engine.unified_f16_from_raw(&raw)
                 } else {
@@ -1157,7 +1169,7 @@ fn resolve_gemm_operand_unified_off(
                 len: n,
                 fingerprint,
                 col_off: 0,
-                f16: want_f16,
+                f16: want_b_f16,
             };
             // Fast path: a hit returns the cached buffer with no further HBM work.
             if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
@@ -1197,17 +1209,19 @@ fn resolve_gemm_operand_unified_off(
 /// elements at `col_off`) and cached by [`WeightKey`] including `col_off`, so the 8
 /// tiles of one weight cache independently and are decoded+uploaded at most once.
 #[cfg(metal)]
-#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_weight_slice(
     root: Ssa,
     k: usize,
     n: usize,
     col_off: i64,
     b_stride: i64,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let GemmResolveCtx {
+        ctx,
+        engine,
+        want_b_f16,
+    } = *gemm;
     let elem = match ctx.get_value(root)? {
         crate::ir::Value::Index(s) => *s,
         other => {
@@ -1224,7 +1238,7 @@ fn resolve_gemm_weight_slice(
     // f32 expansion). f32: decode each strided row to f32.
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
-        if want_f16 {
+        if want_b_f16 {
             let mut raw = Vec::with_capacity(k * n * bpe as usize);
             for r in 0..k as i64 {
                 let row_addr = base + (r * b_stride + col_off) * bpe;
@@ -1253,7 +1267,7 @@ fn resolve_gemm_weight_slice(
         len: k * n,
         fingerprint,
         col_off,
-        f16: want_f16,
+        f16: want_b_f16,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1283,10 +1297,14 @@ fn resolve_gemm_bt_operand(
     n: usize,
     k: usize,
     n_off: i64,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    want_f16: bool,
+    b_dtype: DType,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let GemmResolveCtx {
+        ctx,
+        engine,
+        want_b_f16,
+    } = *gemm;
     let elem = match ctx.get_value(root)? {
         crate::ir::Value::Index(s) => *s,
         other => {
@@ -1296,20 +1314,21 @@ fn resolve_gemm_bt_operand(
             ));
         }
     };
-    let bpe = DType::F16.bytes_per_elem() as i64;
+    let bpe = b_dtype.bytes_per_elem() as i64;
     // Contiguous [n,k] block: the N-tile is just rows [n_off, n_off+n) on disk.
     let elem_off = n_off * k as i64;
     // The pointer SSA value is an ELEMENT index (RFC #110): byte addr = elem*bpe.
     let addr = (elem + elem_off) * bpe;
     let count = n * k;
-    // f16: copy the contiguous raw f16 block verbatim (half the bytes). f32: decode.
+    // f16: copy the contiguous raw f16 block verbatim (half the bytes). f32: decode
+    // at the view's own element type — an fp8 weight decodes one BYTE per element.
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
-        if want_f16 {
+        if want_b_f16 && b_dtype == DType::F16 {
             let raw = hbm.read_bytes(addr, count * bpe as usize);
             engine.unified_f16_from_raw(&raw)
         } else {
-            let decoded = hbm.read_decoded(addr, count, DType::F16);
+            let decoded = hbm.read_decoded(addr, count, b_dtype);
             engine.unified_from(&decoded)
         }
     };
@@ -1318,7 +1337,7 @@ fn resolve_gemm_bt_operand(
     }
     let fingerprint = {
         let hbm = ctx.hbm.borrow();
-        weight_fingerprint(hbm, addr, count, DType::F16)
+        weight_fingerprint(hbm, addr, count, b_dtype)
     };
     let key = WeightKey {
         // The TENSOR's base, not this tile's `addr` — `col_off` is what separates the tiles, and
@@ -1327,7 +1346,7 @@ fn resolve_gemm_bt_operand(
         len: count,
         fingerprint,
         col_off: n_off,
-        f16: want_f16,
+        f16: want_b_f16,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1936,8 +1955,8 @@ fn recognize_matmul_loop(
         return None;
     }
     // A = ins[0], B = ins[1]; resolve each to its FULL tensor + resident root.
-    let (a_root, a_shape) = matmul_operand_full(*mm.operands.first()?, defs)?;
-    let (b_root, b_shape) = matmul_operand_full(*mm.operands.get(1)?, defs)?;
+    let (a_root, a_shape, _) = matmul_operand_full(*mm.operands.first()?, defs)?;
+    let (b_root, b_shape, b_dtype) = matmul_operand_full(*mm.operands.get(1)?, defs)?;
     // Contraction axis: plain `matmul` is A[m,k]·B[k,n] (B's FIRST axis = k);
     // transpose-B is A[m,k]·B[n,k]ᵀ (B's LAST axis = k, FIRST axis = n).
     if a_shape.len() != 2 || b_shape.len() != 2 {
@@ -2013,6 +2032,7 @@ fn recognize_matmul_loop(
         b_stride,
         transpose_b,
         m_row_off,
+        b_dtype,
     })
 }
 
@@ -2078,13 +2098,16 @@ fn matmul_b_axis_offset(name: Ssa, defs: &HashMap<Ssa, &Operation>, last: bool) 
 /// tensor; a weight is `ktdp.load` of an access tile -> its memory view's full
 /// shape. The per-iteration tile (the [1,64] slice) is intentionally ignored —
 /// we reconstruct the whole GEMM.
-fn matmul_operand_full(name: Ssa, defs: &HashMap<Ssa, &Operation>) -> Option<(Ssa, Vec<i64>)> {
+fn matmul_operand_full(
+    name: Ssa,
+    defs: &HashMap<Ssa, &Operation>,
+) -> Option<(Ssa, Vec<i64>, DType)> {
     let d = defs.get(&name)?;
     match d.op_type {
         OpKind::TensorExtractSlice => {
             let src = *d.operands.first()?;
             let shape = shape_attr_vec(defs.get(&src).copied())?;
-            Some((src, shape))
+            Some((src, shape, DType::F16))
         }
         OpKind::KtdpLoad => {
             let tile = d.operands.first()?;
@@ -2092,7 +2115,16 @@ fn matmul_operand_full(name: Ssa, defs: &HashMap<Ssa, &Operation>) -> Option<(Ss
             let vd = defs.get(view)?;
             let root = *vd.operands.first()?;
             let shape = shape_attr_vec(Some(vd))?;
-            Some((root, shape))
+            // The view's own element type (an fp8-packed weight's view states
+            // `Fp8E4m3`); F16 when the view does not state one.
+            let dt = vd
+                .attr(AttrKey::Dtype)
+                .and_then(|a| match a {
+                    crate::ir::Attr::Dtype(dt) => Some(*dt),
+                    _ => None,
+                })
+                .unwrap_or(DType::F16);
+            Some((root, shape, dt))
         }
         _ => None,
     }
@@ -6277,6 +6309,7 @@ kernel void mpp_probe(
                 b_stride: 576,
                 transpose_b: false,
                 m_row_off: 0,
+                b_dtype: DType::F16,
             })],
             "prefill K-loop must collapse to a single [8,576]@[576,576] GEMM"
         );
@@ -6303,6 +6336,7 @@ kernel void mpp_probe(
                 b_stride: 576,
                 transpose_b: false,
                 m_row_off: 0,
+                b_dtype: DType::F16,
             })]
         );
     }
@@ -6331,6 +6365,7 @@ kernel void mpp_probe(
                 b_stride: n,
                 transpose_b: true,
                 m_row_off: 0,
+                b_dtype: DType::F16,
             })],
             "transpose-B K-loop must be recognized with transpose_b=true and [n,k] B"
         );

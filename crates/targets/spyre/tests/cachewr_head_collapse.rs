@@ -49,7 +49,7 @@ fn dst_nest(hd: u32) -> Nest {
     Nest::new(&["slot", "feat"], &[PLANE_SLOTS, hd], Df::Fp16)
 }
 
-/// The cache write EXACTLY as `lower_attn_node` emits it: one op per (request, slab, tensor), `y`
+/// The cache write EXACTLY as main's `lower_attn_node` emits it: one op per (request, slab, tensor), `y`
 /// over this slab's kv heads, one-stick identity contraction, head-outermost walk.
 fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> emit::EmittedOp {
     let (src, dst) = (src_nest(mq, hd), dst_nest(hd));

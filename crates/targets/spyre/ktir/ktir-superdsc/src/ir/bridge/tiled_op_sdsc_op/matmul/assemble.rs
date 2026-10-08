@@ -136,7 +136,7 @@ fn out_width_the_weight_holds(
     let Some(p) = l.placements.get(&tid) else {
         return n;
     };
-    // The weight buffer is the `out`-major `[n, k]` one this door's `KtirFunc::matmul` views (the
+    // The weight buffer is the `out`-major `[n, k]` one the producer's matmul views (the
     // transposed-weight `indexing_maps`), and a placement is sized by `synth_footprint_bytes`: the
     // INNER axis stick-rounded, the outer multiplied. So one `out` row costs a stick-rounded `k`.
     let row_bytes = k.next_multiple_of(FP16_ELEMS_PER_STICK) as u64 * 2; // fp16 kernel

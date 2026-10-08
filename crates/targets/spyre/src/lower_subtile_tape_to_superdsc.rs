@@ -588,7 +588,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         bank_weight_segment(&mut placements, &mut seg_bytes, per_layer_ext)?
     };
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
-    // any RopeRotate/RopeAppend, `lower_rope_node` emits `rot = matmul(x, P)` (the
+    // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
     // a FIXED permutation-sign matrix the worker synthesizes + binds (it is NOT a
     // model/safetensors weight, so it gets the reserved id ROPE_P_TID). Place it in
@@ -690,7 +690,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // lived at that byte range — potentially large magnitude, not bounded "stale K-vector" data. The
         // causal mask (mask_neg, a moderate ~-32752 fp16 constant) only reliably neutralizes BOUNDED
         // garbage; it does not guarantee correctness against arbitrary aliased memory. Placed here
-        // (unconditional, any mq with attention) so `lower_attn_node` can emit a real zero-copy into the
+        // (unconditional, any mq with attention) so main's `lower_attn_node` can emit a real zero-copy into the
         // padding rows before GQA-replicate ever reads them, instead of relying on masking alone.
         // SIZE IS `mq_pad`, NOT ONE STICK (2026-07-29). The worker binds this as `[mq_pad, hd]` zeros
         // (`vec![0.0f32; mq_pad*hd]`, narrowed to 2-byte f16), and `mq_pad = mq.div_ceil(64)*64` — so a
@@ -920,7 +920,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // THE SAME DOOR AS THE EMIT — `PaddedMq::of_bundle`, the one parse boundary from a
             // bundle's runtime width to the pad law, so the placements and the ops they hold cannot
             // be sized by different pads (a decode width must be a baked ladder rung here exactly as
-            // it must be in `lower_attn_node`). The placements below spend it in TWO roles and each
+            // it must be in main's `lower_attn_node`). The placements below spend it in TWO roles and each
             // names its own: the staging tensors' ROW extent and the causal mask's SCORE width.
             let mq_pad = scratchy_subtile::sdsc_abstract::PaddedMq::of_bundle(
                 mq32,
@@ -1303,7 +1303,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     seg_bytes[a] = align128(bioff + bibytes);
                 }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
-                // [mq_pad, nkvh·hd]. lower_attn_node copies layer-0 new_v here; the worker reads it to split
+                // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split
                 // the structural inf (matmul vs selector). Never reused ⇒ survives to post-prefill readback.
                 if mq > 1 {
                     let npoff = seg_bytes[a];
@@ -1363,8 +1363,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
 
     // ── granite ScalarMul scale constants ── collect the DISTINCT scale values (embedding / residual /
     //    attention / logits multipliers) and place a `[1,1]` worker-bound const per scale in seg0
-    //    (ACTIVATION, exactly like ATTN_SCALE). `lower_scalarmul_node` reads the index here → the const TID
-    //    the pointwise `mul` multiplies by; the worker binds each `t{tid}=[scale]`. NO weight-fold, NO
+    //    (ACTIVATION, exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index
+    //    here → the const TID it multiplies by; the worker binds each `t{tid}=[scale]`. NO weight-fold, NO
     //    host-route — a real on-device pointwise multiply (the ATTN_SCALE mechanism).
     let mut scalarmul_scales: Vec<f32> = Vec::new();
     let push_scale = |scale: f32, scalarmul_scales: &mut Vec<f32>| {
@@ -1381,7 +1381,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // (`SCALARMUL_SCALE_BASE - i`). Two algebraic identities (`0.0`, `1.0`) were once pushed FIRST
     // for the KTIR construction's `linalg.*` `outs` seeds, which shifted every model scale by two
     // slots and so changed the address every constant reaches the card at. Those seeds are
-    // immediates in the KTIR now (`KtirFunc::splat_zero`/`splat_one`) and never reach a descriptor,
+    // immediates in the KTIR now and never reach a descriptor,
     // because the ported bodies fold the accumulator seed into the contraction exactly as
     // `subtile→superdsc` does.
     for node in &ir.nodes {
@@ -3747,1072 +3747,6 @@ pub fn unroll_layers(rolled: &RolledSuperDsc) -> Vec<EmittedOp> {
     ops
 }
 
-// NOTE — STILL TO MIRROR FROM THE FIXTURE (the dsc tile-schedule internals, the
-// hard tail of the emitter): the per-`dscs_` entry fields T_/Tel_/P_/Pel_/B_/
-// ChipD_/CoreD_/CoreletD_/loopOrder_/loopProperties_/dataStageParam_/
-// scheduleTree_ (per-core HBM start addresses via affine folds)/primaryDsInfo_/
-// labeledDs_ (memOrg_ hbm/lx/l0)/computeOp_/pdsRelation_/pcfg_/target_. These
-// come from torch-spyre scheduler.py + scratchpad planning; emitted next,
-// matmul-first (mirror sdsc_bmm_autoBuffer.json), then add/mul/silu/rmsnorm/
-// softmax, then the SubtileIR walk. Each on-card dxp failure during the in-
-// scratchy AoT bake becomes a build-time guard (guard_superdsc_crash_patterns).
-
-#[cfg(test)]
-mod tests {
-    // `KernelTag` names a WEIGHT-tile stick layout, which only the SuperDSC assemblers take — and
-    // after the retarget those assemblers are reached from tests alone, so the import belongs here
-    // rather than in the lowering's own prelude.
-    use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
-    // ⭐ SAME REASON, WIDER: the whole SuperDSC EMITTER is now `ktir_superdsc::emit`, so every name
-    // below is reached from these tests alone and none of them belongs in the lowering's prelude.
-    // The tests stayed here deliberately — they pin laws of the emitter as this crate CALLS it (the
-    // bundle layout it hands in, the folds it asks for), and moving them would have moved two test
-    // rosters at once.
-    use ktir_superdsc::emit::{emit_sdsc, rb, scaling_factor_const_fp32, sen169_bits};
-    use scratchy_subtile::superdsc_opspec::{
-        ItDim, MaxCores, OpFunc, OpInfo, Scale, SdscFoldSet, StickExtent, WorkPlan,
-    };
-
-    /// ⭐⭐⭐ AN INDEX PAST ITS REGION IS A REFUSAL, NOT AN ALIAS. Every reserved tid used to be
-    /// raw `u32` subtraction from a base — `SCALARMUL_SCALE_BASE - idx`, unchecked — so the 100th
-    /// scale silently took `ksplit_block_tid(0)`'s slot. Two tensors, one tid, one placement: the
-    /// second producer overwrites the first's bytes and the first's consumer reads them. On a
-    /// device with no stack to attach to that is wrong output or a hang, reported by nothing.
-    #[test]
-    #[should_panic(expected = "reserved tid region overflow")]
-    fn an_index_past_its_region_refuses_instead_of_aliasing_the_next_one() {
-        // The 101st scale is past scalarmul's floor. Asked BY NAME — see
-        // `the_declared_bases_are_the_regions_bases` for what a positional index cost here.
-        let _ = scalarmul_scale_tid(reserved_region("scalarmul_scale").slots as usize);
-    }
-
-    /// ⛔⛔⛔ EVERY DECLARED BASE IS ITS OWN **NAMED** REGION'S BASE — and this test previously
-    /// asserted the opposite, which is why the defect it now catches was invisible.
-    ///
-    /// It read `assert_eq!(KCT_RESIDENT_BASE, RESERVED_REGIONS[2].base)`. Both sides were the same
-    /// POSITION, so inserting the `kv_block_index` region at 2 moved the constant AND the expectation
-    /// together and the test stayed green — while `kct_resident_tid(0)` had begun answering
-    /// `KV_BLOCK_INDEX_TID`, i.e. layer 0's resident Kᵗ kernel and the gather's index table sharing one
-    /// placement. A test whose expectation is derived the same wrong way as the code cannot see the
-    /// code being wrong (`a-green-test-can-pin-a-port-divergence-as-correct`).
-    ///
-    /// The bake DID fail — `slots: 1` made `k_id >= 1` overflow — so nothing was silently shipped. That
-    /// was luck, not this test.
-    #[test]
-    fn the_declared_bases_are_the_regions_bases() {
-        assert_eq!(
-            SCALARMUL_SCALE_BASE,
-            reserved_region("scalarmul_scale").base
-        );
-        assert_eq!(KCT_RESIDENT_BASE, reserved_region("kct_resident").base);
-        // ⭐ AND THE TWO DOORS THAT SHARE A NEIGHBOURHOOD MUST NOT MEET. This is the assertion the
-        // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
-        // constant against its own definition.
-        assert_ne!(
-            kct_resident_tid(0),
-            KV_BLOCK_INDEX_TID,
-            "the resident Kᵗ kernel of layer 0 and the gather's index tensor are ONE tid"
-        );
-        // Each region sits strictly below the one before it. They need NOT abut: the K-split
-        // regions were removed and their span is deliberately left as a hole, because a reserved
-        // id is a number that has been baked into artifacts and sliding one up to close a gap
-        // would silently repoint it.
-        for w in RESERVED_REGIONS.windows(2) {
-            assert!(
-                w[1].base < w[0].floor(),
-                "{} overlaps {} or sits above it",
-                w[1].name,
-                w[0].name
-            );
-        }
-    }
-
-    /// The last slot of each region is still ITS OWN, and the first slot of the next is not.
-    #[test]
-    fn a_regions_last_slot_belongs_to_it_and_the_next_tid_does_not() {
-        for r in RESERVED_REGIONS {
-            assert_eq!(r.at(r.slots - 1), r.floor(), "{}", r.name);
-        }
-        assert_eq!(scalarmul_scale_tid(99), RESERVED_REGIONS[1].floor());
-    }
-
-    /// ⭐⭐⭐ THE ARGUMENT ORDER OF `for_output` IS LOAD-BEARING, AND THIS IS THE MODEL THAT PROVES
-    /// IT. granite-3.x-2b: lm_head is `[n=49155, k=2048]` on disk. Padding the OUTPUT axis `n` is
-    /// the whole point — 49155 rounds to 769 sticks, which is PRIME, so the full-occupancy bump
-    /// takes it to 800 sticks = 51200. Padding `k` instead is a NO-OP, because 2048 is already 32
-    /// sticks and fills the machine.
-    ///
-    /// So a caller that passes `(k, n)` where `(n, k)` is meant gets a PLAUSIBLE answer — the
-    /// weight's own contraction width, unpadded — and stages 49155 columns into a placement sized
-    /// for 51200. The executor catches it as
-    /// `host size 201338880 B != prod(device_size)*word_length (209715200 B)`, which is exactly
-    /// `2048 * 49155 * 2` against `2048 * 51200 * 2`. That is a real failure this repo shipped:
-    /// the staged `[rows, cols]` pair moved from a JSON manifest (which recorded the LOGICAL
-    /// `[k, n]`) to `BoundWeight::staged_shape` (which returned the ON-DISK `[n, k]`) under the
-    /// same field names, so every downstream use read `n` where it meant `k`.
-    #[test]
-    fn the_output_axis_is_what_gets_padded_and_swapping_k_and_n_is_silent() {
-        const N: u32 = 49155; // granite vocab
-        const K: u32 = 2048; // granite hidden
-        let right = DeviceWidth::for_output(1, N, K).get();
-        assert_eq!(right, 51200, "the output axis pads to full occupancy");
-        assert_eq!(right % 64, 0);
-        assert_eq!(
-            right / 64 % MAX_CORES,
-            0,
-            "800 sticks = 25 per core on 32 cores"
-        );
-
-        // The swapped call is not an ERROR — it is a different, plausible number.
-        let swapped = DeviceWidth::for_output(1, K, N).get();
-        assert_eq!(
-            swapped, K,
-            "k is already core-splittable, so padding it is a no-op"
-        );
-        assert_ne!(swapped, right);
-
-        // And the byte sizes are the two in the failure message: the host staged the weight
-        // UNPADDED (`n * k`, because the no-op bump left the width alone) into a placement the
-        // emitter had sized at the padded width (`k * n_dev`).
-        assert_eq!(
-            N as usize * K as usize * 2,
-            201_338_880,
-            "what the host staged"
-        );
-        assert_eq!(
-            K as usize * right as usize * 2,
-            209_715_200,
-            "what the device wanted"
-        );
-    }
-    use super::*;
-    use scratchy_subtile::lower::GemmWeight;
-    // ⛔ THIS WHOLE MODULE WAS DEAD. `matmul_opspec`/`matmul_dims`/`matmul_split_map`/
-    // `reduce_opspec_df` moved out of this file into `ir::bridge::tiled_op_sdsc_op::{matmul,reduce}`
-    // and the `use super::*` no longer reached them, so `cargo test -p scratchy-subtile --lib` failed
-    // to COMPILE — which means every assertion below has been reporting nothing, including the three
-    // fused-epilogue tests, while two epilogue fusions were built on that mechanism.
-    //
-    // ⭐ AN UNCOMPILABLE TEST TARGET IS INDISTINGUISHABLE FROM A PASSING ONE unless you read past the
-    // integration-test results, and this crate's `tests/` directory is green — so `cargo test -p …`
-    // printed dozens of `ok` lines with this target's `error:` above them. Same shape as the
-    // `#![cfg(kani)]` proofs that were vacuous for ~100 commits.
-    use crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::{matmul_dims, matmul_split_map};
-    use crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec;
-    use crate::ir::bridge::tiled_op_sdsc_op::reduce::reduce_opspec_df;
-
-    /// Guard the SEN169_FP16 (1-6-9) encoding the reduce `scaling_factor` const needs.
-    /// The bit patterns are pinned against the SFP-constant table (`plus1=0x3E00`,
-    /// `minus1=0xBE00`, `fastSigmoidConst=0x3C00`=0.5) — those are SEN169, NOT IEEE f16.
-    /// A regression here re-introduces the silent reduce mis-scale (mean 4600× too small,
-    /// sum halved) that produced inf attention scores / garbage output on-card.
-    #[test]
-    fn sen169_encoding_pinned_to_sfp_table() {
-        assert_eq!(sen169_bits(1.0), 0x3E00, "SEN169 1.0 (cf. SFP plus1)");
-        assert_eq!(sen169_bits(-1.0), 0xBE00, "SEN169 -1.0 (cf. SFP minus1)");
-        assert_eq!(
-            sen169_bits(0.5),
-            0x3C00,
-            "SEN169 0.5 (cf. SFP fastSigmoidConst)"
-        );
-        assert_eq!(sen169_bits(0.0), 0x0000, "SEN169 +0");
-        // The reduce scale that was the bug: must NOT equal the IEEE f16 bits.
-        let inv576 = 1.0f32 / 576.0;
-        assert_ne!(
-            sen169_bits(inv576),
-            half::f16::from_f32(inv576).to_bits(),
-            "1/576 SEN169 must differ from IEEE f16 (the on-card mis-read)"
-        );
-        // Decode-round-trip within fp16 precision (1-6-9, bias 31).
-        for v in [1.0f32 / 576.0, 1.0 / 9.0, 1.0 / 256.0, 1.0 / 2048.0] {
-            let b = sen169_bits(v);
-            let exp = ((b >> 9) & 0x3F) as i32 - 31;
-            let mant = (b & 0x1FF) as f32 / 512.0;
-            let decoded = (1.0 + mant) * 2f32.powi(exp);
-            assert!(
-                (decoded - v).abs() / v < 0.005,
-                "SEN169 round-trip {v} → {decoded}"
-            );
-        }
-    }
-
-    /// The fp32 reduce (mq>1 rmsnorm mean(x²)) must encode its `scaling_factor`
-    /// external const in the OP's data_format — IEEE_FP32 with the RAW f32 bits,
-    /// NOT a SEN169_FP16 word. A fp16 const feeding an fp32 op is a mixed
-    /// [fp16,fp32] op → DD2 "Unsupported result precision conversion"
-    /// (SentientToProgIR/Utils.cpp:34). Mirrors torch-spyre `encodeConstant` →
-    /// `BinaryConvert<uint32_t>(float)` for IEEE_FP32 (module.cpp:126). The fp16
-    /// reduce path (`sen169_encoding_pinned_to_sfp_table`) is unchanged.
-    #[test]
-    fn fp32_reduce_scale_const_is_ieee_fp32() {
-        // fp32 reduce → ReduceScalingFp32 with raw f32 bits of 1/N.
-        let f32_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp32)
-            .expect("fp32 mean reduce opspec");
-        assert_eq!(
-            f32_spec.op_info,
-            OpInfo::ReduceScalingFp32((1.0f32 / 576.0).to_bits()),
-            "fp32 reduce const must be raw IEEE f32 bits of 1/N"
-        );
-        // The serialized const carries dataFormat_ = IEEE_FP32 and the 32-bit word.
-        let ci = scaling_factor_const_fp32((1.0f32 / 576.0).to_bits());
-        assert_eq!(ci["0"]["dataFormat_"], "IEEE_FP32");
-        let got = ci["0"]["data_"][0].as_u64().unwrap();
-        assert_eq!(got, (1.0f32 / 576.0).to_bits() as u64);
-        assert!(
-            got > 0xFFFF,
-            "a true fp32 word exceeds 16 bits; got {got:#x}"
-        );
-
-        // fp16 reduce path is untouched: still SEN169_FP16, 16-bit word.
-        let f16_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp16)
-            .expect("fp16 mean reduce opspec");
-        assert_eq!(
-            f16_spec.op_info,
-            OpInfo::ReduceScaling(sen169_bits(1.0f32 / 576.0) as u32),
-            "fp16 reduce const must stay SEN169_FP16"
-        );
-    }
-
-    #[test]
-    fn core_split_matches_fixture() {
-        assert_eq!(core_split(384, 32), 32); // 384=2^7·3 → 32 (÷12)
-        assert_eq!(core_split(320, 32), 32); // 320=2^6·5 → 32 (÷10)
-        assert_eq!(core_split(64, 32), 32);
-        assert_eq!(core_split(320, 9), 8); // not ÷9; largest divisor ≤9 is 8
-        assert_eq!(core_split(48, 32), 24); // not ÷32; 48=16·3, largest ≤32 is 24
-        assert_eq!(core_split(7, 32), 7); // prime ≤ max
-        assert_eq!(core_split(13, 32), 13);
-    }
-
-    #[test]
-    fn distribute_beats_single_core() {
-        // The bmm case: out=384, mb=384 (outputs), in=64 (reduction).
-        let dims = vec![
-            ItDim {
-                name: "mb",
-                size: 384,
-                is_reduction: false,
-                is_stick: false,
-                df: Df::Fp16,
-            },
-            ItDim {
-                name: "out",
-                size: 384,
-                is_reduction: false,
-                is_stick: true,
-                df: Df::Fp16,
-            },
-            ItDim {
-                name: "in",
-                size: 64,
-                is_reduction: true,
-                is_stick: true,
-                df: Df::Fp16,
-            },
-        ];
-        let splits = distribute_cores(&dims, MAX_CORES);
-        let cores: u32 = splits.values().product::<u32>().max(1);
-        // Must use all 32 cores — the entire point (sengraph auto-split wastes 31).
-        assert_eq!(
-            cores, 32,
-            "work-division must fill all 32 cores: {splits:?}"
-        );
-        // And the validated WorkPlan accepts it (≤32 by type).
-        let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores).unwrap();
-        assert_eq!(plan.cores_used().get(), 32);
-    }
-
-    #[test]
-    fn bundle_layout_roles_and_packing() {
-        // GLOBAL layout (task #55): weight source → seg1, activation source → seg0,
-        // result → seg4 (logits), all 128 B aligned. A two-op chain produces one
-        // seg3 intermediate; with a third op consuming nothing of the first, the
-        // freed slot is REUSED (lifetime coloring).
-        use scratchy_subtile::subtile_ir::{
-            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
-        };
-        let tensors = vec![
-            TensorShape { rows: 4, cols: 8 },  // t0 = activation source
-            TensorShape { rows: 8, cols: 16 }, // t1 = weight source
-            TensorShape { rows: 4, cols: 16 }, // t2 = result (logits)
-        ];
-        let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
-            tensor: TensorId::from_index(t as usize),
-            region: ts[t].whole(),
-        };
-        let nodes = vec![SubtileNode {
-            id: SubtileId::from_index(0),
-            op: SubOp::MatmulTile {
-                n: 16,
-                weight: GemmWeight::Dense,
-            },
-            inputs: vec![whole(0, &tensors), whole(1, &tensors)],
-            output: whole(2, &tensors),
-        }];
-        let ir: SubtileIR = SubtileIR {
-            tensors,
-            num_sources: 2,
-            nodes,
-            result: TensorId::from_index(2),
-            // Hand-authored fixture: there is no source op list to be the
-            // provenance of, so the map is empty.
-            op_output: Vec::new(),
-        };
-        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
-            .expect("a layout for a plain matmul bundle");
-
-        // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
-        // `(Activation, seg 0, off 0, 64 B)` and both of those had since changed BY DESIGN, silently,
-        // because the target would not compile:
-        //   · seg 0 → 3: the dated `Activation = 3` / `Intermediate = 0` diagnostic swap (see `SegRole`),
-        //     so a segment INDEX literal here restates a decision that already moved once.
-        //   · 64 B → 4096 B: `nbytes` reserves the DEVICE footprint, and
-        //     `bump_sticks_to_splittable` pads a 1-stick width up to 8 sticks so the work division can
-        //     split it — 4 rows x 512 elems x 2 B.
-        // So the segment comes from the role itself, and the size is checked against the invariants the
-        // rule guarantees (at least the flat footprint, a whole number of sticks) rather than one
-        // padding policy's current output. A role mix-up or an aliasing regression still fails; a
-        // deliberate re-tune of the padding no longer reports a defect that is not there.
-        let flat = |rows: u64, cols: u64| rows * cols * 2;
-        for (tid, role, rows, cols) in [
-            (0u32, SegRole::Activation, 4u64, 8u64),
-            (1, SegRole::Weight, 8, 16),
-            (2, SegRole::Logits, 4, 16),
-        ] {
-            let p = layout.placements[&tid];
-            assert_eq!(p.role, role, "t{tid}'s role");
-            assert_eq!(
-                p.segment,
-                role.segment(),
-                "t{tid} lands in ITS ROLE's segment"
-            );
-            assert_eq!(
-                p.offset, 0,
-                "t{tid} is the only tensor in that segment, so it packs at 0"
-            );
-            assert!(
-                p.size >= flat(rows, cols),
-                "t{tid}'s reservation ({}) covers its flat footprint ({})",
-                p.size,
-                flat(rows, cols)
-            );
-            assert_eq!(
-                p.size % (64 * 2),
-                0,
-                "t{tid}'s reservation is whole 64-elem fp16 sticks"
-            );
-            assert_eq!(
-                layout.segment_bytes[p.segment],
-                align128(p.offset + p.size),
-                "segment {} is sized to its packed contents, 128 B aligned",
-                p.segment
-            );
-        }
-        // No intermediates in a single-op bundle — whichever segment that role currently owns.
-        assert_eq!(layout.segment_bytes[SegRole::Intermediate.segment()], 0);
-
-        // No two placements in the SAME segment overlap (build-time safety twin).
-        let mut by_seg: std::collections::BTreeMap<usize, Vec<(u64, u64)>> = Default::default();
-        for p in layout.placements.values() {
-            by_seg
-                .entry(p.segment)
-                .or_default()
-                .push((p.offset, p.size));
-        }
-        for ranges in by_seg.values() {
-            for (i, &(o1, s1)) in ranges.iter().enumerate() {
-                for &(o2, s2) in &ranges[i + 1..] {
-                    assert!(
-                        o1 + s1 <= o2 || o2 + s2 <= o1,
-                        "segment alias {o1}+{s1} vs {o2}+{s2}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn emit_sdsc_matmul_minimal_fields() {
-        // The matmul OpSpec lowers to the frontend-minimal field set.
-        let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
-        let j = serde_json::to_string(&sdsc).unwrap();
-        // Frontend-minimal memOrg: hbm+lx only, NO register file.
-        assert!(j.contains("\"memOrg_\":{\"hbm\":{\"isPresent\":1},\"lx\":{\"isPresent\":1}}"));
-        assert!(!j.contains("pelrf") && !j.contains("ptxrf"));
-        // startAddr data keys carry SPACES "[c, 0, 0]".
-        assert!(j.contains("[0, 0, 0]"));
-        // Dropped scheduler fields are absent.
-        assert!(!j.contains("gtrIdsUsed_") && !j.contains("pdsRelation_"));
-        assert!(!j.contains("hbmStartAddress_") && !j.contains("lxBufferSize_"));
-        assert!(!j.contains("stickRepl_") && !j.contains("unpadN_"));
-        // exUnit is pt (sealed from OpFunc), and the fold factors agree.
-        assert_eq!(sdsc.dscs_[0]["MatMul_0"].computeOp_[0].exUnit, "pt");
-        assert_eq!(sdsc.coreFoldProp_.factor_, 32);
-        assert_eq!(sdsc.coreletFoldProp_.factor_, 1);
-    }
-
-    #[test]
-    fn emit_sdsc_matmul_fused_epilogue_broadcast_batch_scale_correct() {
-        // The bug this test exists to pin: the pmask fusion's FIRST landing marked only "mb"
-        // broadcast and forgot "y" (the GQA-group batch axis a batched score matmul ALSO needs
-        // broadcast for a head-independent mask) — `set_scale_for_dim` silently no-op'd on the
-        // missing marker at the time, so the emitter built a plausible-looking WRONG SdscOp with no
-        // signal, and garbled generation on the card was the first anyone noticed. `broadcast_batch`
-        // exists so the CALLER never has to name "y" (or re-derive whether it exists) at all — this
-        // asserts a batched (`batch>1`, so `batch_dim_name()` returns `Some("y")`) matmul's fused
-        // epilogue operand shows RedNonStick on BOTH "mb" and "y", Active on "out".
-        let mut op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
-        assert_eq!(op.time(), 1);
-        assert_eq!(
-            op.batch_dim_name(),
-            Some("y"),
-            "a batch=16 matmul must carry a real y dim"
-        );
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
-            scratchy_subtile::superdsc_opspec::EpilogueSpec {
-                operand_name: "mask".to_string(),
-                offset_elems: 0,
-                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
-                broadcast_batch: true,
-            },
-        ));
-        // The epilogue operand is the one inserted BEFORE the real output (see
-        // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
-        let epi_idx = 2;
-        let view = op.args[epi_idx].view();
-        // ⭐ ASSERTED BY DIM NAME, NOT BY POSITION. This test asserted `layout == ["mb","out","y"]` and
-        // a scale array indexed against it; the emitter's order is `["mb","y","out"]` (the
-        // on-hardware-proven batch-inner walk `batched_decode_walk_order.rs` pins), so the positional
-        // form went stale the moment the walk work landed — and, because this whole test target failed
-        // to COMPILE, said nothing about it for as long as it was wrong. The SUBJECT is which dims are
-        // broadcast, which does not depend on their order, so it is now stated that way.
-        let scale_of = |d: &str| {
-            view.layout
-                .iter()
-                .position(|&l| l == d)
-                .map(|i| view.scale[i])
-                .unwrap_or_else(|| panic!("epilogue operand has no `{d}` dim: {:?}", view.layout))
-        };
-        assert_eq!(scale_of("mb"), Scale::RedNonStick, "mb must be broadcast");
-        assert_eq!(
-            scale_of("y"),
-            Scale::RedNonStick,
-            "the GQA-group batch axis must be broadcast too"
-        );
-        assert_eq!(scale_of("out"), Scale::Active, "out must stay Active");
-
-        // And the FULL emit succeeds (would have panicked pre-fix if "y" were absent from this
-        // shape's layout, or produced a silently-wrong scale_ if the marker were dropped).
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
-        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
-        let mask_lds = labeled
-            .iter()
-            .find(|l| l.dsName_ == format!("Tensor{epi_idx}"))
-            .expect("mask labeledDs_ entry");
-        // Wire `scale_` is parallel to the operand's own layout, so it is read the same way: -1 for a
-        // broadcast dim, 1 for an active one. Two broadcast dims and one active, whatever the order.
-        let wire = |d: &str| {
-            view.layout
-                .iter()
-                .position(|&l| l == d)
-                .map(|i| mask_lds.scale_[i])
-                .expect("dim")
-        };
-        assert_eq!(wire("mb"), -1, "wire scale_ mb: {:?}", mask_lds.scale_);
-        assert_eq!(wire("y"), -1, "wire scale_ y: {:?}", mask_lds.scale_);
-        assert_eq!(wire("out"), 1, "wire scale_ out: {:?}", mask_lds.scale_);
-    }
-
-    #[test]
-    fn emit_sdsc_matmul_fused_epilogue_broadcast_batch_is_noop_when_unbatched() {
-        // The other half of the SAME fix: `broadcast_batch=true` on an UNBATCHED (batch==1) matmul
-        // must be a genuine no-op, never a panic — `matmul_dims` omits "y" entirely at batch==1, and
-        // `batch_dim_name()` reporting `None` there is exactly what lets `attach_fused_epilogue` skip
-        // marking it instead of reaching for a dim that does not exist (the caller-side bug class
-        // this mechanism replaces: attn.rs no longer computes "is this op batched" itself to decide
-        // whether "y" is safe to name).
-        let mut op = matmul_opspec(384, 384, 64, 1, "Tensor0", "Tensor1", "Tensor2").unwrap();
-        assert_eq!(
-            op.batch_dim_name(),
-            None,
-            "a batch=1 matmul must carry no y dim at all"
-        );
-        // broadcast_batch: true must NOT panic despite there being no "y" to mark.
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
-            scratchy_subtile::superdsc_opspec::EpilogueSpec {
-                operand_name: "mask".to_string(),
-                offset_elems: 0,
-                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
-                broadcast_batch: true,
-            },
-        ));
-        let epi_idx = 2;
-        let view = op.args[epi_idx].view();
-        assert_eq!(
-            view.layout,
-            ["mb", "out"],
-            "unbatched output stays rank-2: {:?}",
-            view.layout
-        );
-        assert_eq!(view.scale, [Scale::RedNonStick, Scale::Active]);
-    }
-
-    #[test]
-    fn emit_sdsc_matmul_fused_epilogue_matches_golden_shape() {
-        // Mirrors `ddc/ddl_templates/test/sdsc_bmm_lxopt.json`'s `MatMul_122`: computeOp_ is a
-        // 2-element array — the matmul (unchanged inputLabeledDs, no mention of the epilogue operand),
-        // then a second entry whose inputLabeledDs/outputLabeledDs both alias the MATMUL'S OWN output
-        // by name (in place), with the epilogue's extra tensor as its second input.
-        let mut op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
-        assert_eq!(
-            op.time(),
-            1,
-            "test assumes an untiled matmul (attach_fused_epilogue's precondition)"
-        );
-        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
-            scratchy_subtile::superdsc_opspec::EpilogueSpec {
-                operand_name: "mask".to_string(),
-                offset_elems: 0,
-                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                broadcast_dims: &[],
-                broadcast_batch: false,
-            },
-        ));
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
-        let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
-        assert_eq!(
-            ops.len(),
-            2,
-            "fused epilogue must add exactly one computeOp_ entry: {ops:?}"
-        );
-
-        // computeOp_[0]: the matmul itself, UNCHANGED — no trace of the mask operand.
-        assert_eq!(ops[0].opFuncName, "batchmatmul");
-        assert_eq!(ops[0].inputLabeledDs, vec!["Tensor0-idx0", "Tensor1-idx1"]);
-        assert_eq!(ops[0].outputLabeledDs, vec!["Tensor3-idx3"]);
-
-        // computeOp_[1]: the epilogue, reading+writing the MATMUL'S OWN output in place, plus the
-        // mask as its second input — exactly the golden's `biasadd` shape.
-        assert_eq!(ops[1].exUnit, "sfp");
-        assert_eq!(ops[1].opFuncName, "stridedadd");
-        assert_eq!(ops[1].inputLabeledDs, vec!["Tensor3-idx3", "Tensor2-idx2"]);
-        assert_eq!(ops[1].outputLabeledDs, vec!["Tensor3-idx3"]);
-
-        // The mask tensor still gets its OWN labeledDs_ entry (the on-card walk must address it), typed
-        // OUTPUT to match `bmm.ddl`'s bias/bnA/bnB/resadd convention (same layout bucket as the real
-        // output, not INPUT).
-        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
-        assert_eq!(
-            labeled.len(),
-            4,
-            "activation, kernel, mask, output: {labeled:?}"
-        );
-        let mask_lds = labeled
-            .iter()
-            .find(|l| l.dsName_ == "Tensor2")
-            .expect("mask labeledDs_ entry");
-        assert_eq!(mask_lds.dsType_, "OUTPUT");
-    }
-
-    #[test]
-    fn sub_stick_matmul_is_rejected() {
-        // N=65 is not a multiple of the 64-fp16 stick → builder Err (witness a).
-        assert!(matmul_opspec(384, 65, 64, 1, "a", "w", "o").is_err());
-    }
-
-    #[test]
-    fn prefill_m_gt_1_lm_head_folds_to_m1_decode_unchanged() {
-        // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m>1 (it time-tiles, and
-        // per-row time-tiling is design-risk-4). It runs it at m=1 over the LAST prompt row instead,
-        // which is what lets prefill produce the first generated token's logits itself. This guards
-        // both halves of the fold: the per-stick extraction copies, and the m=1 re-lowering. The m=1
-        // DECODE bundle must stay a single bare matmul — no copies, no extra ops.
-        //
-        // ⛔ THROUGH THE WHOLE LOWERING, BECAUSE THE COPIES ARE DESCRIPTORS. The counted ops are
-        // SuperDSC descriptors — `hidden/64` `lmlast{j}_o2` copies + `matmul_o2`, main's own names —
-        // and after the SubtileIR → KTIR → SuperDSC split the producer emits ONE `lmlast_s0`
-        // PROGRAM whose consumer arm (`lower_ktir_to_superdsc::lmlast`) materializes those copies.
-        // Asking `lower_one_node` alone (which is what this used to do) counts programs, so a
-        // one-program-two-copies fold reads as "one op short" while the emission is exactly main's.
-        use scratchy_subtile::subtile_ir::{
-            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
-        };
-        // hidden[m, H] @ W_lmhead[H, vocab] -> logits[m, vocab] (t2 = the result). Stick-aligned
-        // H=128, vocab=256 so the m=1 path is a clean single matmul (no time-tile).
-        let (h, vocab) = (128u32, 256u32);
-        let build = |m: u32| {
-            let tensors = vec![
-                TensorShape { rows: m, cols: h }, // t0 = hidden (activation source)
-                TensorShape {
-                    rows: h,
-                    cols: vocab,
-                }, // t1 = lm_head weight source
-                TensorShape {
-                    rows: m,
-                    cols: vocab,
-                }, // t2 = logits (result)
-            ];
-            let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
-                tensor: TensorId::from_index(t as usize),
-                region: ts[t].whole(),
-            };
-            let node = SubtileNode {
-                id: SubtileId::from_index(0),
-                op: SubOp::MatmulTile {
-                    n: vocab,
-                    weight: GemmWeight::Dense,
-                },
-                inputs: vec![whole(0, &tensors), whole(1, &tensors)],
-                output: whole(2, &tensors),
-            };
-            let ir: SubtileIR = SubtileIR {
-                tensors,
-                num_sources: 2,
-                nodes: vec![node.clone()],
-                result: TensorId::from_index(2),
-                // Hand-authored fixture: there is no source op list to be the
-                // provenance of, so the map is empty.
-                op_output: Vec::new(),
-            };
-            (node, ir)
-        };
-        let lower = |m: u32| {
-            let (_, ir) = build(m);
-            // t1 is the lm_head weight; t0 is the activation source.
-            let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-                .unwrap_or_else(|e| panic!("lm_head at m={m} unexpectedly refused: {}", e.0))
-                .0
-                .into_iter()
-                .map(|e| e.op_name)
-                .collect::<Vec<_>>()
-        };
-        // m>1 (prefill): H/64 extraction copies, THEN the matmul re-lowered at m=1.
-        let mq = 8u32;
-        let names = lower(mq);
-        let copies = (h / Fp16::ELEMS_PER_STICK) as usize;
-        assert_eq!(
-            names.len(),
-            copies + 1,
-            "prefill (m>1) lm_head must fold to {copies} extraction copies + 1 matmul, got {names:?}"
-        );
-        for (j, name) in names.iter().take(copies).enumerate() {
-            assert_eq!(
-                name,
-                &format!("lmlast{j}_o2"),
-                "copy {j} misnamed in {names:?}"
-            );
-        }
-        assert_eq!(
-            names[copies], "matmul_o2",
-            "the folded tail must end in the lm_head matmul"
-        );
-        // m==1 (decode): the SAME node lowers to exactly one bare matmul — the fold never fires, so
-        // the decode bundle is byte-identical to the pre-fold emitter.
-        assert_eq!(lower(1), vec!["matmul_o2".to_string()]);
-
-        // ⛔ NEGATIVE CONTROL FOR THE NAME'S OWN FACT. `lmlast` names its copies from
-        // `KtirNode::node_out_tid`, and a MISSING one must REFUSE — not fall back to the program's own
-        // output, which is the reserved `LAST_HIDDEN_TID` and is exactly the wrong name this test
-        // pins. Strip the fact off the extraction program and the lowering must Err naming it.
-        let (_, ir) = build(mq);
-        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let (mut programs, layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
-            .expect("KTIR for the tail");
-        let extract = programs
-            .iter_mut()
-            .find(|e| e.op_name.starts_with("lmlast"))
-            .expect("the tail emits an extraction program");
-        extract.ktir.as_mut().expect("its KTIR").node_out_tid = None;
-        let mut sym = 0i64;
-        let mut fp8q = std::collections::HashSet::new();
-        let stripped = crate::ktir_superdsc_door::lower(
-            extract.ktir.as_ref().unwrap(),
-            &mut sym,
-            Some(&layout),
-            &mut fp8q,
-            None,
-        );
-        let why = stripped
-            .err()
-            .expect("a nameless extraction must refuse")
-            .message;
-        assert!(
-            why.contains("node_out_tid"),
-            "the refusal must name the missing fact, got {why:?}"
-        );
-    }
-
-    #[test]
-    fn fp8_shared_activation_quantizes_once() {
-        // granite decode emits q/k/v = gemm(normed, ·) — THREE arity-3 fp8 matmuls reading the SAME
-        // activation (and gate/up = gemm(normed2, ·) — two more). The per-token activation quantize
-        // (square→amax→scale→clamp→qfp8ch) is a PURE function of the activation, independent of the weight,
-        // so it must be emitted ONCE and shared — not re-run per matmul. Lock that: two arity-3 fp8 matmuls
-        // sharing t0 emit exactly ONE `fq_afp8_op` (qfp8ch) yet still TWO `fq_mm` (per-matmul matmulfp8).
-        use scratchy_subtile::subtile_ir::{
-            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
-        };
-        // ⛔ `n` WAS 64, WHICH IS SUB-STICK FOR fp8. An fp8 stick is 128 elems (fp16's is 64), and the
-        // dxp scheduler rejects a sub-stick tile — a guard this crate enforces by construction, so the
-        // lowering `Err`s before it can emit anything and this test asserted nothing about its actual
-        // subject. That guard landed after the test was written, and the dead target hid it. The subject
-        // — ONE shared activation quantize across two matmuls — does not depend on `n`, so `n` becomes a
-        // legal fp8 width and the test measures what it is named for.
-        let (k, n) = (128u32, 128u32);
-        let tensors = vec![
-            TensorShape { rows: 1, cols: k }, // t0 = activation (m=1 decode)
-            TensorShape { rows: k, cols: n }, // t1 = W1 (fp8)
-            TensorShape { rows: 1, cols: n }, // t2 = w_scale1
-            TensorShape { rows: k, cols: n }, // t3 = W2 (fp8)
-            TensorShape { rows: 1, cols: n }, // t4 = w_scale2
-            TensorShape { rows: 1, cols: n }, // t5 = out1
-            TensorShape { rows: 1, cols: n }, // t6 = out2
-        ];
-        let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
-            tensor: TensorId::from_index(t as usize),
-            region: ts[t].whole(),
-        };
-        let nodes = vec![
-            SubtileNode {
-                id: SubtileId::from_index(0),
-                op: SubOp::MatmulTile {
-                    n,
-                    weight: GemmWeight::Fp8Dynamic,
-                },
-                inputs: vec![whole(0, &tensors), whole(1, &tensors), whole(2, &tensors)],
-                output: whole(5, &tensors),
-            },
-            SubtileNode {
-                id: SubtileId::from_index(1),
-                op: SubOp::MatmulTile {
-                    n,
-                    weight: GemmWeight::Fp8Dynamic,
-                },
-                // SAME activation t0, DIFFERENT weight/scale/out → the quantize of t0 must be reused.
-                inputs: vec![whole(0, &tensors), whole(3, &tensors), whole(4, &tensors)],
-                output: whole(6, &tensors),
-            },
-        ];
-        let ir: SubtileIR = SubtileIR {
-            tensors,
-            num_sources: 5, // t0 activation + t1..t4 (weights + w_scales)
-            nodes,
-            result: TensorId::from_index(6),
-            // Hand-authored fixture: there is no source op list to be the
-            // provenance of, so the map is empty.
-            op_output: Vec::new(),
-        };
-        let weight_ids: std::collections::HashSet<u32> = [1u32, 3u32].into_iter().collect();
-        let (ops, _layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-            .expect("two-fp8-matmul lowering");
-        let quantizes = ops
-            .iter()
-            .filter(|o| o.op_name.ends_with("fq_afp8_op"))
-            .count();
-        assert_eq!(
-            quantizes, 1,
-            "two matmuls sharing an activation must quantize it ONCE (shared), got {quantizes}"
-        );
-        let matmuls = ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
-        assert_eq!(
-            matmuls, 2,
-            "each fp8 matmul still emits its OWN matmulfp8 (weight differs), got {matmuls}"
-        );
-        // The FIRST chain op is likewise shared: one, not two. It is `abs` (`fq_absx_op`), not the
-        // `square` (`fq_sq_op`) this test named — the quantize chain became abs→max, and no op by the
-        // old name has existed for as long as this target failed to compile, so the assert was looking
-        // for zero of something and would have passed only by finding nothing.
-        let first_chain_op = ops
-            .iter()
-            .filter(|o| o.op_name.ends_with("fq_absx_op"))
-            .count();
-        assert_eq!(
-            first_chain_op, 1,
-            "the activation |x| must be shared too, got {first_chain_op}"
-        );
-    }
-
-    #[test]
-    fn matmul_cost_split_fills_cores() {
-        // sdsc_bmm_autoBuffer.json: M=384, N=384, K=64, batch=16 → must use 32 cores.
-        let s = matmul_cost_split(16, 384, 384, 64, 32);
-        assert_eq!(s.cores(), 32, "matmul split must fill 32 cores: {s:?}");
-        // and the iteration space maps M→mb, N→out, K→in, batch→x.
-        let it = matmul_iter_space(384, 384, 64, 16);
-        assert_eq!((it.mb_, it.out_, it.in_, it.x_), (384, 384, 64, 16));
-    }
-
-    #[test]
-    fn assemble_matmul_serializes_and_fills_cores() {
-        // bmm 384×384×64 batch16 fits LX (576 KiB < 1.6 MiB) → time=1 EmittedOp.
-        let emitted = assemble_matmul(
-            "MatMul_0",
-            384,
-            384,
-            64,
-            16,
-            &rb("act", 384, 64),
-            &Stk::<KernelTag>::kernel(64, 384, "wt"),
-            &rb("out", 384, 384),
-            None,
-        );
-        assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
-        let op = emitted.dsc();
-        // numWkSlices product = 32 cores.
-        let prod: u32 = op.numWkSlicesPerDim_.values().product();
-        assert_eq!(
-            prod, 32,
-            "matmul must use 32 cores: {:?}",
-            op.numWkSlicesPerDim_
-        );
-        // serializes to JSON with the mandatory trailing-underscore keys.
-        let j = serde_json::to_string(op).expect("SuperDSC serializes");
-        assert!(j.contains("\"coreFoldProp_\""), "coreFoldProp_ present");
-        assert!(j.contains("\"numWkSlicesPerDim_\""));
-        assert!(j.contains("\"batchmatmul\""), "batch>1 → batchmatmul");
-        assert!(j.contains("\"SEN169_FP16\""));
-        // time=1 op is NOT symbolic — no isStartAddrSymbolic_, addresses concrete.
-        assert!(
-            !j.contains("isStartAddrSymbolic_"),
-            "time=1 op stays concrete-addr"
-        );
-        // per-core stage dims = full / split.
-        let dsc = &op.dscs_[0]["MatMul_0"];
-        assert_eq!(dsc.numCoresUsed_, 32);
-        assert_eq!(dsc.computeOp_[0].exUnit, "pt");
-    }
-
-    #[test]
-    fn bundle_mlir_emits_execute() {
-        // The flat (all-time=1) bundle.mlir is byte-identical to the historical form.
-        let b = bundle_mlir(&["sdsc_0.json".to_string()]);
-        assert!(b.contains("func.func @sdsc_bundle()"));
-        assert!(b.contains("sdscbundle.sdsc_execute () {sdsc_filename=\"sdsc_0.json\"}"));
-        // A time=1 EmittedOp routes through emit_bundle_mlir → the SAME flat body.
-        let emitted = assemble_matmul(
-            "MatMul_0",
-            384,
-            384,
-            64,
-            16,
-            &rb("act", 384, 64),
-            &Stk::<KernelTag>::kernel(64, 384, "wt"),
-            &rb("out", 384, 384),
-            None,
-        );
-        let via_emitted = emit_bundle_mlir(&[emitted]);
-        assert_eq!(
-            via_emitted,
-            bundle_mlir(&["sdsc_0.json".to_string()]),
-            "an all-time=1 bundle.mlir must be byte-identical to the historical flat form"
-        );
-        assert!(!via_emitted.contains("scf.for"));
-    }
-
-    #[test]
-    fn tiled_matmul_concrete_unrolls() {
-        // 64×16384×2048 batch1 overflows LX (2.42 MiB > 1.68 MiB) → time-tiled.
-        // The A term is only 256 KiB so out-tiling brings it under LX (a wide-K
-        // shape would Err instead); the cost split fills 32 cores via out×32.
-        let emitted = assemble_matmul(
-            "matmul_o7",
-            64,
-            16384,
-            2048,
-            1,
-            &rb("a", 64, 2048),
-            &Stk::<KernelTag>::kernel(2048, 16384, "w"),
-            &rb("o", 64, 16384),
-            None,
-        );
-        let n = emitted.time;
-        assert!(n > 1, "this matmul must time-tile, got time={n}");
-        // (ii) the divided per-time `out` shows up in N_ / ss_ (per-core out_per_time).
-        let dsc = &emitted.dsc().dscs_[0]["matmul_o7"];
-        let split_out = emitted
-            .dsc()
-            .numWkSlicesPerDim_
-            .get("out")
-            .copied()
-            .unwrap_or(1);
-        let per_core_out_per_time = (dsc.N_.out_ as u32) / split_out;
-        assert_eq!(
-            per_core_out_per_time % 64,
-            0,
-            "per-time per-core out must be 64-aligned"
-        );
-        // (iv) CONCRETE-UNROLL: bundle.mlir has N flat executes, NO scf.for / symbols;
-        //      the SdscOp JSON is concrete (NOT isStartAddrSymbolic_), and trips differ.
-        let mlir = emit_bundle_mlir(&[emitted.shallow_copy()]);
-        assert!(
-            !mlir.contains("scf.for"),
-            "concrete-unroll has no scf.for:\n{mlir}"
-        );
-        assert!(
-            !mlir.contains("affine.apply"),
-            "concrete-unroll has no affine.apply"
-        );
-        assert!(
-            !mlir.contains("symbol_ids"),
-            "concrete-unroll has no symbol_ids"
-        );
-        assert_eq!(
-            mlir.matches("sdscbundle.sdsc_execute").count() as u32,
-            n,
-            "one flat execute per trip"
-        );
-        let trips = concrete_trips(&emitted);
-        assert_eq!(trips.len() as u32, n);
-        let j0 = serde_json::to_string(&trips[0]).unwrap();
-        assert!(
-            !j0.contains("isStartAddrSymbolic_"),
-            "trip json is concrete, not symbolic"
-        );
-        assert!(
-            j0.contains("{\"factor_\":1,\"label_\":\"time\"}"),
-            "sdscFoldProps_ time stays 1"
-        );
-        assert_ne!(
-            j0,
-            serde_json::to_string(&trips[1]).unwrap(),
-            "trips differ (bumped addrs)"
-        );
-    }
-
-    #[test]
-    fn stick_count_ceils() {
-        assert_eq!(stick_count(64), 1);
-        assert_eq!(stick_count(65), 2);
-        assert_eq!(stick_count(384), 6);
-    }
-
-    // ── RUNG-2 LOCK: the matmul work-division is df-aware. An fp8 (128-lane) matmul
-    // MUST split its N/K by the 128-stick basis, NOT fp16's 64 — a 64-granular split
-    // hands a core a sub-128 slice, the exact `L3DlOpsScheduler:1070 multiple-of-stick`
-    // DtException the fp8 bake used to hit. This guard is fail-first: reverting
-    // `stick_basis`/`matmul_split_map` to a hardcoded 64 makes it RED. ──
-    #[test]
-    fn matmul_split_is_df_aware_fp8_128() {
-        // N=512: fp16 ⇒ 512/64 = 8 sticks (can split ≤8 ways); fp8 ⇒ 512/128 = 4 sticks.
-        // The fp8 split must therefore be COARSER (≤4), never the fp16 8. The `::<Fp8>` type
-        // param — not a runtime flag — is what sources the 128 basis onto the dims.
-        let dims_f16 = matmul_dims::<Fp16>(
-            1,
-            &StickExtent::<Fp16>::new(512).unwrap(),
-            &StickExtent::<Fp16>::new(256).unwrap(),
-            1,
-        );
-        let dims_f8 = matmul_dims::<Fp8>(
-            1,
-            &StickExtent::<Fp8>::new(512).unwrap(),
-            &StickExtent::<Fp8>::new(256).unwrap(),
-            1,
-        );
-        let s_f16 = matmul_split_map(&dims_f16, MAX_CORES);
-        let s_f8 = matmul_split_map(&dims_f8, MAX_CORES);
-        let out16 = s_f16.get("out").copied().unwrap_or(1);
-        let out8 = s_f8.get("out").copied().unwrap_or(1);
-        assert!(
-            out16 <= 8,
-            "fp16 out split bounded by 8 sticks, got {out16}"
-        );
-        assert!(
-            out8 <= 4,
-            "fp8 out split MUST be bounded by 4 (128-)sticks, got {out8}"
-        );
-        // The fp8 per-core `out` extent is a whole 128-stick multiple (never sub-stick).
-        assert_eq!(
-            512u32 / out8.max(1) % 128,
-            0,
-            "fp8 per-core out must be 128-aligned"
-        );
-    }
-
-    #[test]
-    fn workplan_rejects_substick_fp8_split() {
-        // A hand-crafted over-split of an fp8 stick dim (2 sticks, split 4 ways) must be a
-        // typed `Err` at emit (WorkPlan::divide stick clause, stick_basis=128), NOT an
-        // on-card DtException. The SAME split of a fp16 dim (more 64-sticks) is legal.
-        let over = |name: &'static str, _: u32| {
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(name, 4u32);
-            m
-        };
-        let fp8_dim = vec![ItDim {
-            name: "out",
-            size: 256,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp8,
-        }];
-        let err = WorkPlan::divide(&fp8_dim, MaxCores::<MAX_CORES>, |d, c| over(d[0].name, c));
-        assert!(
-            err.is_err(),
-            "fp8 256 (=2×128 sticks) split 4 ways must be Err (sub-stick), got {err:?}"
-        );
-        // fp16 256 = 4×64 sticks ⇒ split 4 ways is exactly 1 stick/core ⇒ Ok.
-        let fp16_dim = vec![ItDim {
-            name: "out",
-            size: 256,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        }];
-        let ok = WorkPlan::divide(&fp16_dim, MaxCores::<MAX_CORES>, |d, c| over(d[0].name, c));
-        assert!(
-            ok.is_ok(),
-            "fp16 256 (=4×64 sticks) split 4 ways is 1 stick/core, must be Ok, got {ok:?}"
-        );
-    }
-
-    #[test]
-    fn matmul_split_fp16_byte_identical_to_stick_count() {
-        // The dense (fp16) path must be UNCHANGED by the df-aware refactor: for any N the
-        // `out` split equals the pre-refactor `stick_count`(÷64)-based split. (Inert-at-fp16
-        // is the rung invariant — only fp8 emission changes.)
-        for &n in &[64u32, 128, 256, 384, 512, 2048, 5504] {
-            let dims = matmul_dims::<Fp16>(
-                1,
-                &StickExtent::<Fp16>::new(n).unwrap(),
-                &StickExtent::<Fp16>::new(64).unwrap(),
-                1,
-            );
-            let split = matmul_split_map(&dims, MAX_CORES)
-                .get("out")
-                .copied()
-                .unwrap_or(1);
-            let expected = core_split(stick_count(n), MAX_CORES);
-            assert_eq!(
-                split, expected,
-                "fp16 out split for N={n} must match stick_count-based split"
-            );
-        }
-    }
-
-    // SEN169_FP16 (1-6-9, bias 31) encode — the device's NATIVE fp16, NOT IEEE (1-5-10). Feeding IEEE
-    // bits is silently mis-read by the device (1.0→IEEE 0x3C00→SEN169 0.5; 1/576→SEN169 ≈1e-6) — the
-    // ~14× rmsnorm scale bug. Anchored to the SFP const table's ground truth (plus1=0x3E00,
-    // minus1=0xBE00) + the exp-field/bias/packing points that were wrong in that bug. Concrete
-    // machine-check (the float encoder is the ALU leaf; Kani/CBMC over-approximates its libm log2).
-    #[test]
-    fn sen169_encode_anchors() {
-        assert_eq!(sen169_bits(1.0), 0x3E00); // 2^0 ⇒ exp field 31 (bias-31), mantissa 0
-        assert_eq!(sen169_bits(-1.0), 0xBE00); // sign bit + plus1
-        assert_eq!(sen169_bits(2.0), 0x4000); // 2^1 ⇒ exp field 32
-        assert_eq!(sen169_bits(0.5), 0x3C00); // 2^-1 ⇒ exp field 30
-        assert_eq!(sen169_bits(0.0), 0); // zero
-        assert_ne!(sen169_bits(1.0), 0x3C00); // NOT IEEE-f16 1.0 (0x3C00) — the mismatch that WAS the bug
-    }
-}
-
 /// ⭐⭐⭐ THIS BUNDLE'S LAUNCH GROUPS: ITS PROGRAMS, IN LAUNCH ORDER.
 ///
 /// One node is one program and one program is one launch. Nothing here partitions by trip kind or
@@ -5207,4 +4141,1086 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         active_cap,
         rows_are_requests,
     )
+}
+
+// NOTE — STILL TO MIRROR FROM THE FIXTURE (the dsc tile-schedule internals, the
+// hard tail of the emitter): the per-`dscs_` entry fields T_/Tel_/P_/Pel_/B_/
+// ChipD_/CoreD_/CoreletD_/loopOrder_/loopProperties_/dataStageParam_/
+// scheduleTree_ (per-core HBM start addresses via affine folds)/primaryDsInfo_/
+// labeledDs_ (memOrg_ hbm/lx/l0)/computeOp_/pdsRelation_/pcfg_/target_. These
+// come from torch-spyre scheduler.py + scratchpad planning; emitted next,
+// matmul-first (mirror sdsc_bmm_autoBuffer.json), then add/mul/silu/rmsnorm/
+// softmax, then the SubtileIR walk. Each on-card dxp failure during the in-
+// scratchy AoT bake becomes a build-time guard (guard_superdsc_crash_patterns).
+
+#[cfg(test)]
+mod tests {
+    // `KernelTag` names a WEIGHT-tile stick layout, which only the SuperDSC assemblers take — and
+    // after the retarget those assemblers are reached from tests alone, so the import belongs here
+    // rather than in the lowering's own prelude.
+    use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+    // ⭐ SAME REASON, WIDER: the whole SuperDSC EMITTER is now `ktir_superdsc::emit`, so every name
+    // below is reached from these tests alone and none of them belongs in the lowering's prelude.
+    // The tests stayed here deliberately — they pin laws of the emitter as this crate CALLS it (the
+    // bundle layout it hands in, the folds it asks for), and moving them would have moved two test
+    // rosters at once.
+    use ktir_superdsc::emit::{emit_sdsc, rb, scaling_factor_const_fp32, sen169_bits};
+    use scratchy_subtile::superdsc_opspec::{
+        ItDim, MaxCores, OpFunc, OpInfo, Scale, SdscFoldSet, StickExtent, WorkPlan,
+    };
+
+    /// ⭐⭐⭐ AN INDEX PAST ITS REGION IS A REFUSAL, NOT AN ALIAS. Every reserved tid used to be
+    /// raw `u32` subtraction from a base — `SCALARMUL_SCALE_BASE - idx`, unchecked — so the 100th
+    /// scale silently took `ksplit_block_tid(0)`'s slot. Two tensors, one tid, one placement: the
+    /// second producer overwrites the first's bytes and the first's consumer reads them. On a
+    /// device with no stack to attach to that is wrong output or a hang, reported by nothing.
+    #[test]
+    #[should_panic(expected = "reserved tid region overflow")]
+    fn an_index_past_its_region_refuses_instead_of_aliasing_the_next_one() {
+        // The 101st scale is past scalarmul's floor. Asked BY NAME — see
+        // `the_declared_bases_are_the_regions_bases` for what a positional index cost here.
+        let _ = scalarmul_scale_tid(reserved_region("scalarmul_scale").slots as usize);
+    }
+
+    /// ⛔⛔⛔ EVERY DECLARED BASE IS ITS OWN **NAMED** REGION'S BASE — and this test previously
+    /// asserted the opposite, which is why the defect it now catches was invisible.
+    ///
+    /// It read `assert_eq!(KCT_RESIDENT_BASE, RESERVED_REGIONS[2].base)`. Both sides were the same
+    /// POSITION, so inserting the `kv_block_index` region at 2 moved the constant AND the expectation
+    /// together and the test stayed green — while `kct_resident_tid(0)` had begun answering
+    /// `KV_BLOCK_INDEX_TID`, i.e. layer 0's resident Kᵗ kernel and the gather's index table sharing one
+    /// placement. A test whose expectation is derived the same wrong way as the code cannot see the
+    /// code being wrong (`a-green-test-can-pin-a-port-divergence-as-correct`).
+    ///
+    /// The bake DID fail — `slots: 1` made `k_id >= 1` overflow — so nothing was silently shipped. That
+    /// was luck, not this test.
+    #[test]
+    fn the_declared_bases_are_the_regions_bases() {
+        assert_eq!(
+            SCALARMUL_SCALE_BASE,
+            reserved_region("scalarmul_scale").base
+        );
+        assert_eq!(KCT_RESIDENT_BASE, reserved_region("kct_resident").base);
+        // ⭐ AND THE TWO DOORS THAT SHARE A NEIGHBOURHOOD MUST NOT MEET. This is the assertion the
+        // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
+        // constant against its own definition.
+        assert_ne!(
+            kct_resident_tid(0),
+            KV_BLOCK_INDEX_TID,
+            "the resident Kᵗ kernel of layer 0 and the gather's index tensor are ONE tid"
+        );
+        // Each region sits strictly below the one before it. They need NOT abut: the K-split
+        // regions were removed and their span is deliberately left as a hole, because a reserved
+        // id is a number that has been baked into artifacts and sliding one up to close a gap
+        // would silently repoint it.
+        for w in RESERVED_REGIONS.windows(2) {
+            assert!(
+                w[1].base < w[0].floor(),
+                "{} overlaps {} or sits above it",
+                w[1].name,
+                w[0].name
+            );
+        }
+    }
+
+    /// The last slot of each region is still ITS OWN, and the first slot of the next is not.
+    #[test]
+    fn a_regions_last_slot_belongs_to_it_and_the_next_tid_does_not() {
+        for r in RESERVED_REGIONS {
+            assert_eq!(r.at(r.slots - 1), r.floor(), "{}", r.name);
+        }
+        assert_eq!(scalarmul_scale_tid(99), RESERVED_REGIONS[1].floor());
+    }
+
+    /// ⭐⭐⭐ THE ARGUMENT ORDER OF `for_output` IS LOAD-BEARING, AND THIS IS THE MODEL THAT PROVES
+    /// IT. granite-3.x-2b: lm_head is `[n=49155, k=2048]` on disk. Padding the OUTPUT axis `n` is
+    /// the whole point — 49155 rounds to 769 sticks, which is PRIME, so the full-occupancy bump
+    /// takes it to 800 sticks = 51200. Padding `k` instead is a NO-OP, because 2048 is already 32
+    /// sticks and fills the machine.
+    ///
+    /// So a caller that passes `(k, n)` where `(n, k)` is meant gets a PLAUSIBLE answer — the
+    /// weight's own contraction width, unpadded — and stages 49155 columns into a placement sized
+    /// for 51200. The executor catches it as
+    /// `host size 201338880 B != prod(device_size)*word_length (209715200 B)`, which is exactly
+    /// `2048 * 49155 * 2` against `2048 * 51200 * 2`. That is a real failure this repo shipped:
+    /// the staged `[rows, cols]` pair moved from a JSON manifest (which recorded the LOGICAL
+    /// `[k, n]`) to `BoundWeight::staged_shape` (which returned the ON-DISK `[n, k]`) under the
+    /// same field names, so every downstream use read `n` where it meant `k`.
+    #[test]
+    fn the_output_axis_is_what_gets_padded_and_swapping_k_and_n_is_silent() {
+        const N: u32 = 49155; // granite vocab
+        const K: u32 = 2048; // granite hidden
+        let right = DeviceWidth::for_output(1, N, K).get();
+        assert_eq!(right, 51200, "the output axis pads to full occupancy");
+        assert_eq!(right % 64, 0);
+        assert_eq!(
+            right / 64 % MAX_CORES,
+            0,
+            "800 sticks = 25 per core on 32 cores"
+        );
+
+        // The swapped call is not an ERROR — it is a different, plausible number.
+        let swapped = DeviceWidth::for_output(1, K, N).get();
+        assert_eq!(
+            swapped, K,
+            "k is already core-splittable, so padding it is a no-op"
+        );
+        assert_ne!(swapped, right);
+
+        // And the byte sizes are the two in the failure message: the host staged the weight
+        // UNPADDED (`n * k`, because the no-op bump left the width alone) into a placement the
+        // emitter had sized at the padded width (`k * n_dev`).
+        assert_eq!(
+            N as usize * K as usize * 2,
+            201_338_880,
+            "what the host staged"
+        );
+        assert_eq!(
+            K as usize * right as usize * 2,
+            209_715_200,
+            "what the device wanted"
+        );
+    }
+    use super::*;
+    use scratchy_subtile::lower::GemmWeight;
+    // ⛔ THIS WHOLE MODULE WAS DEAD. `matmul_opspec`/`matmul_dims`/`matmul_split_map`/
+    // `reduce_opspec_df` moved out of this file into `ir::bridge::tiled_op_sdsc_op::{matmul,reduce}`
+    // and the `use super::*` no longer reached them, so `cargo test -p scratchy-subtile --lib` failed
+    // to COMPILE — which means every assertion below has been reporting nothing, including the three
+    // fused-epilogue tests, while two epilogue fusions were built on that mechanism.
+    //
+    // ⭐ AN UNCOMPILABLE TEST TARGET IS INDISTINGUISHABLE FROM A PASSING ONE unless you read past the
+    // integration-test results, and this crate's `tests/` directory is green — so `cargo test -p …`
+    // printed dozens of `ok` lines with this target's `error:` above them. Same shape as the
+    // `#![cfg(kani)]` proofs that were vacuous for ~100 commits.
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::{matmul_dims, matmul_split_map};
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul::opspec::matmul_opspec;
+    use crate::ir::bridge::tiled_op_sdsc_op::reduce::reduce_opspec_df;
+
+    /// Guard the SEN169_FP16 (1-6-9) encoding the reduce `scaling_factor` const needs.
+    /// The bit patterns are pinned against the SFP-constant table (`plus1=0x3E00`,
+    /// `minus1=0xBE00`, `fastSigmoidConst=0x3C00`=0.5) — those are SEN169, NOT IEEE f16.
+    /// A regression here re-introduces the silent reduce mis-scale (mean 4600× too small,
+    /// sum halved) that produced inf attention scores / garbage output on-card.
+    #[test]
+    fn sen169_encoding_pinned_to_sfp_table() {
+        assert_eq!(sen169_bits(1.0), 0x3E00, "SEN169 1.0 (cf. SFP plus1)");
+        assert_eq!(sen169_bits(-1.0), 0xBE00, "SEN169 -1.0 (cf. SFP minus1)");
+        assert_eq!(
+            sen169_bits(0.5),
+            0x3C00,
+            "SEN169 0.5 (cf. SFP fastSigmoidConst)"
+        );
+        assert_eq!(sen169_bits(0.0), 0x0000, "SEN169 +0");
+        // The reduce scale that was the bug: must NOT equal the IEEE f16 bits.
+        let inv576 = 1.0f32 / 576.0;
+        assert_ne!(
+            sen169_bits(inv576),
+            half::f16::from_f32(inv576).to_bits(),
+            "1/576 SEN169 must differ from IEEE f16 (the on-card mis-read)"
+        );
+        // Decode-round-trip within fp16 precision (1-6-9, bias 31).
+        for v in [1.0f32 / 576.0, 1.0 / 9.0, 1.0 / 256.0, 1.0 / 2048.0] {
+            let b = sen169_bits(v);
+            let exp = ((b >> 9) & 0x3F) as i32 - 31;
+            let mant = (b & 0x1FF) as f32 / 512.0;
+            let decoded = (1.0 + mant) * 2f32.powi(exp);
+            assert!(
+                (decoded - v).abs() / v < 0.005,
+                "SEN169 round-trip {v} → {decoded}"
+            );
+        }
+    }
+
+    /// The fp32 reduce (mq>1 rmsnorm mean(x²)) must encode its `scaling_factor`
+    /// external const in the OP's data_format — IEEE_FP32 with the RAW f32 bits,
+    /// NOT a SEN169_FP16 word. A fp16 const feeding an fp32 op is a mixed
+    /// [fp16,fp32] op → DD2 "Unsupported result precision conversion"
+    /// (SentientToProgIR/Utils.cpp:34). Mirrors torch-spyre `encodeConstant` →
+    /// `BinaryConvert<uint32_t>(float)` for IEEE_FP32 (module.cpp:126). The fp16
+    /// reduce path (`sen169_encoding_pinned_to_sfp_table`) is unchanged.
+    #[test]
+    fn fp32_reduce_scale_const_is_ieee_fp32() {
+        // fp32 reduce → ReduceScalingFp32 with raw f32 bits of 1/N.
+        let f32_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp32)
+            .expect("fp32 mean reduce opspec");
+        assert_eq!(
+            f32_spec.op_info,
+            OpInfo::ReduceScalingFp32((1.0f32 / 576.0).to_bits()),
+            "fp32 reduce const must be raw IEEE f32 bits of 1/N"
+        );
+        // The serialized const carries dataFormat_ = IEEE_FP32 and the 32-bit word.
+        // ⛔ #197 MOVED THE WORD INSIDE THE FOLD MANAGER: `data_` is now
+        // `fold_manager_const(bits, folds)` — an object whose value lands at
+        // `["[0, 0, 0]"][0]` as a DECIMAL STRING (the FoldManager deque dtype), not
+        // the bare array this test read before. The call site below missed that
+        // change (#197 updated the emitter, not this test), which is why this
+        // module had not compiled since.
+        let folds = SdscFoldSet::new(f32_spec.iter.cores_used());
+        let ci = scaling_factor_const_fp32((1.0f32 / 576.0).to_bits(), &folds);
+        assert_eq!(ci["0"]["dataFormat_"], "IEEE_FP32");
+        let got = ci["0"]["data_"]["data_"]["[0, 0, 0]"][0]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("the fold manager holds the word as a decimal string");
+        assert_eq!(got, (1.0f32 / 576.0).to_bits() as u64);
+        assert!(
+            got > 0xFFFF,
+            "a true fp32 word exceeds 16 bits; got {got:#x}"
+        );
+
+        // fp16 reduce path is untouched: still SEN169_FP16, 16-bit word.
+        let f16_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp16)
+            .expect("fp16 mean reduce opspec");
+        assert_eq!(
+            f16_spec.op_info,
+            OpInfo::ReduceScaling(sen169_bits(1.0f32 / 576.0) as u32),
+            "fp16 reduce const must stay SEN169_FP16"
+        );
+    }
+
+    #[test]
+    fn core_split_matches_fixture() {
+        assert_eq!(core_split(384, 32), 32); // 384=2^7·3 → 32 (÷12)
+        assert_eq!(core_split(320, 32), 32); // 320=2^6·5 → 32 (÷10)
+        assert_eq!(core_split(64, 32), 32);
+        assert_eq!(core_split(320, 9), 8); // not ÷9; largest divisor ≤9 is 8
+        assert_eq!(core_split(48, 32), 24); // not ÷32; 48=16·3, largest ≤32 is 24
+        assert_eq!(core_split(7, 32), 7); // prime ≤ max
+        assert_eq!(core_split(13, 32), 13);
+    }
+
+    #[test]
+    fn distribute_beats_single_core() {
+        // The bmm case: out=384, mb=384 (outputs), in=64 (reduction).
+        let dims = vec![
+            ItDim {
+                name: "mb",
+                size: 384,
+                is_reduction: false,
+                is_stick: false,
+                df: Df::Fp16,
+            },
+            ItDim {
+                name: "out",
+                size: 384,
+                is_reduction: false,
+                is_stick: true,
+                df: Df::Fp16,
+            },
+            ItDim {
+                name: "in",
+                size: 64,
+                is_reduction: true,
+                is_stick: true,
+                df: Df::Fp16,
+            },
+        ];
+        let splits = distribute_cores(&dims, MAX_CORES);
+        let cores: u32 = splits.values().product::<u32>().max(1);
+        // Must use all 32 cores — the entire point (sengraph auto-split wastes 31).
+        assert_eq!(
+            cores, 32,
+            "work-division must fill all 32 cores: {splits:?}"
+        );
+        // And the validated WorkPlan accepts it (≤32 by type).
+        let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores).unwrap();
+        assert_eq!(plan.cores_used().get(), 32);
+    }
+
+    #[test]
+    fn bundle_layout_roles_and_packing() {
+        // GLOBAL layout (task #55): weight source → seg1, activation source → seg0,
+        // result → seg4 (logits), all 128 B aligned. A two-op chain produces one
+        // seg3 intermediate; with a third op consuming nothing of the first, the
+        // freed slot is REUSED (lifetime coloring).
+        use scratchy_subtile::subtile_ir::{
+            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+        };
+        let tensors = vec![
+            TensorShape { rows: 4, cols: 8 },  // t0 = activation source
+            TensorShape { rows: 8, cols: 16 }, // t1 = weight source
+            TensorShape { rows: 4, cols: 16 }, // t2 = result (logits)
+        ];
+        let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: ts[t].whole(),
+        };
+        let nodes = vec![SubtileNode {
+            id: SubtileId::from_index(0),
+            op: SubOp::MatmulTile {
+                n: 16,
+                weight: GemmWeight::Dense,
+            },
+            inputs: vec![whole(0, &tensors), whole(1, &tensors)],
+            output: whole(2, &tensors),
+        }];
+        let ir: SubtileIR = SubtileIR {
+            tensors,
+            num_sources: 2,
+            nodes,
+            result: TensorId::from_index(2),
+            // Hand-authored fixture: there is no source op list to be the
+            // provenance of, so the map is empty.
+            op_output: Vec::new(),
+        };
+        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+            .expect("a layout for a plain matmul bundle");
+
+        // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
+        // `(Activation, seg 0, off 0, 64 B)` and both of those had since changed BY DESIGN, silently,
+        // because the target would not compile:
+        //   · seg 0 → 3: the dated `Activation = 3` / `Intermediate = 0` diagnostic swap (see `SegRole`),
+        //     so a segment INDEX literal here restates a decision that already moved once.
+        //   · 64 B → 4096 B: `nbytes` reserves the DEVICE footprint, and
+        //     `bump_sticks_to_splittable` pads a 1-stick width up to 8 sticks so the work division can
+        //     split it — 4 rows x 512 elems x 2 B.
+        // So the segment comes from the role itself, and the size is checked against the invariants the
+        // rule guarantees (at least the flat footprint, a whole number of sticks) rather than one
+        // padding policy's current output. A role mix-up or an aliasing regression still fails; a
+        // deliberate re-tune of the padding no longer reports a defect that is not there.
+        let flat = |rows: u64, cols: u64| rows * cols * 2;
+        for (tid, role, rows, cols) in [
+            (0u32, SegRole::Activation, 4u64, 8u64),
+            (1, SegRole::Weight, 8, 16),
+            (2, SegRole::Logits, 4, 16),
+        ] {
+            let p = layout.placements[&tid];
+            assert_eq!(p.role, role, "t{tid}'s role");
+            assert_eq!(
+                p.segment,
+                role.segment(),
+                "t{tid} lands in ITS ROLE's segment"
+            );
+            assert_eq!(
+                p.offset, 0,
+                "t{tid} is the only tensor in that segment, so it packs at 0"
+            );
+            assert!(
+                p.size >= flat(rows, cols),
+                "t{tid}'s reservation ({}) covers its flat footprint ({})",
+                p.size,
+                flat(rows, cols)
+            );
+            assert_eq!(
+                p.size % (64 * 2),
+                0,
+                "t{tid}'s reservation is whole 64-elem fp16 sticks"
+            );
+            assert_eq!(
+                layout.segment_bytes[p.segment],
+                align128(p.offset + p.size),
+                "segment {} is sized to its packed contents, 128 B aligned",
+                p.segment
+            );
+        }
+        // No intermediates in a single-op bundle — whichever segment that role currently owns.
+        assert_eq!(layout.segment_bytes[SegRole::Intermediate.segment()], 0);
+
+        // No two placements in the SAME segment overlap (build-time safety twin).
+        let mut by_seg: std::collections::BTreeMap<usize, Vec<(u64, u64)>> = Default::default();
+        for p in layout.placements.values() {
+            by_seg
+                .entry(p.segment)
+                .or_default()
+                .push((p.offset, p.size));
+        }
+        for ranges in by_seg.values() {
+            for (i, &(o1, s1)) in ranges.iter().enumerate() {
+                for &(o2, s2) in &ranges[i + 1..] {
+                    assert!(
+                        o1 + s1 <= o2 || o2 + s2 <= o1,
+                        "segment alias {o1}+{s1} vs {o2}+{s2}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emit_sdsc_matmul_minimal_fields() {
+        // The matmul OpSpec lowers to the frontend-minimal field set.
+        let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let j = serde_json::to_string(&sdsc).unwrap();
+        // Frontend-minimal memOrg: hbm+lx only, NO register file.
+        assert!(j.contains("\"memOrg_\":{\"hbm\":{\"isPresent\":1},\"lx\":{\"isPresent\":1}}"));
+        assert!(!j.contains("pelrf") && !j.contains("ptxrf"));
+        // startAddr data keys carry SPACES "[c, 0, 0]".
+        assert!(j.contains("[0, 0, 0]"));
+        // Dropped scheduler fields are absent.
+        assert!(!j.contains("gtrIdsUsed_") && !j.contains("pdsRelation_"));
+        assert!(!j.contains("hbmStartAddress_") && !j.contains("lxBufferSize_"));
+        assert!(!j.contains("stickRepl_") && !j.contains("unpadN_"));
+        // exUnit is pt (sealed from OpFunc), and the fold factors agree.
+        assert_eq!(sdsc.dscs_[0]["MatMul_0"].computeOp_[0].exUnit, "pt");
+        assert_eq!(sdsc.coreFoldProp_.factor_, 32);
+        assert_eq!(sdsc.coreletFoldProp_.factor_, 1);
+    }
+
+    #[test]
+    fn emit_sdsc_matmul_fused_epilogue_broadcast_batch_scale_correct() {
+        // The bug this test exists to pin: the pmask fusion's FIRST landing marked only "mb"
+        // broadcast and forgot "y" (the GQA-group batch axis a batched score matmul ALSO needs
+        // broadcast for a head-independent mask) — `set_scale_for_dim` silently no-op'd on the
+        // missing marker at the time, so the emitter built a plausible-looking WRONG SdscOp with no
+        // signal, and garbled generation on the card was the first anyone noticed. `broadcast_batch`
+        // exists so the CALLER never has to name "y" (or re-derive whether it exists) at all — this
+        // asserts a batched (`batch>1`, so `batch_dim_name()` returns `Some("y")`) matmul's fused
+        // epilogue operand shows RedNonStick on BOTH "mb" and "y", Active on "out".
+        let mut op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
+        assert_eq!(op.time(), 1);
+        assert_eq!(
+            op.batch_dim_name(),
+            Some("y"),
+            "a batch=16 matmul must carry a real y dim"
+        );
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
+            scratchy_subtile::superdsc_opspec::EpilogueSpec {
+                operand_name: "mask".to_string(),
+                offset_elems: 0,
+                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
+                broadcast_batch: true,
+            },
+        ));
+        // The epilogue operand is the one inserted BEFORE the real output (see
+        // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
+        let epi_idx = 2;
+        let view = op.args[epi_idx].view();
+        // ⭐ ASSERTED BY DIM NAME, NOT BY POSITION. This test asserted `layout == ["mb","out","y"]` and
+        // a scale array indexed against it; the emitter's order is `["mb","y","out"]` (the
+        // on-hardware-proven batch-inner walk `batched_decode_walk_order.rs` pins), so the positional
+        // form went stale the moment the walk work landed — and, because this whole test target failed
+        // to COMPILE, said nothing about it for as long as it was wrong. The SUBJECT is which dims are
+        // broadcast, which does not depend on their order, so it is now stated that way.
+        let scale_of = |d: &str| {
+            view.layout
+                .iter()
+                .position(|&l| l == d)
+                .map(|i| view.scale[i])
+                .unwrap_or_else(|| panic!("epilogue operand has no `{d}` dim: {:?}", view.layout))
+        };
+        assert_eq!(scale_of("mb"), Scale::RedNonStick, "mb must be broadcast");
+        assert_eq!(
+            scale_of("y"),
+            Scale::RedNonStick,
+            "the GQA-group batch axis must be broadcast too"
+        );
+        assert_eq!(scale_of("out"), Scale::Active, "out must stay Active");
+
+        // And the FULL emit succeeds (would have panicked pre-fix if "y" were absent from this
+        // shape's layout, or produced a silently-wrong scale_ if the marker were dropped).
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
+        let mask_lds = labeled
+            .iter()
+            .find(|l| l.dsName_ == format!("Tensor{epi_idx}"))
+            .expect("mask labeledDs_ entry");
+        // Wire `scale_` is parallel to the operand's own layout, so it is read the same way: -1 for a
+        // broadcast dim, 1 for an active one. Two broadcast dims and one active, whatever the order.
+        let wire = |d: &str| {
+            view.layout
+                .iter()
+                .position(|&l| l == d)
+                .map(|i| mask_lds.scale_[i])
+                .expect("dim")
+        };
+        assert_eq!(wire("mb"), -1, "wire scale_ mb: {:?}", mask_lds.scale_);
+        assert_eq!(wire("y"), -1, "wire scale_ y: {:?}", mask_lds.scale_);
+        assert_eq!(wire("out"), 1, "wire scale_ out: {:?}", mask_lds.scale_);
+    }
+
+    #[test]
+    fn emit_sdsc_matmul_fused_epilogue_broadcast_batch_is_noop_when_unbatched() {
+        // The other half of the SAME fix: `broadcast_batch=true` on an UNBATCHED (batch==1) matmul
+        // must be a genuine no-op, never a panic — `matmul_dims` omits "y" entirely at batch==1, and
+        // `batch_dim_name()` reporting `None` there is exactly what lets `attach_fused_epilogue` skip
+        // marking it instead of reaching for a dim that does not exist (the caller-side bug class
+        // this mechanism replaces: attn.rs no longer computes "is this op batched" itself to decide
+        // whether "y" is safe to name).
+        let mut op = matmul_opspec(384, 384, 64, 1, "Tensor0", "Tensor1", "Tensor2").unwrap();
+        assert_eq!(
+            op.batch_dim_name(),
+            None,
+            "a batch=1 matmul must carry no y dim at all"
+        );
+        // broadcast_batch: true must NOT panic despite there being no "y" to mark.
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
+            scratchy_subtile::superdsc_opspec::EpilogueSpec {
+                operand_name: "mask".to_string(),
+                offset_elems: 0,
+                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
+                broadcast_batch: true,
+            },
+        ));
+        let epi_idx = 2;
+        let view = op.args[epi_idx].view();
+        assert_eq!(
+            view.layout,
+            ["mb", "out"],
+            "unbatched output stays rank-2: {:?}",
+            view.layout
+        );
+        assert_eq!(view.scale, [Scale::RedNonStick, Scale::Active]);
+    }
+
+    #[test]
+    fn emit_sdsc_matmul_fused_epilogue_matches_golden_shape() {
+        // Mirrors `ddc/ddl_templates/test/sdsc_bmm_lxopt.json`'s `MatMul_122`: computeOp_ is a
+        // 2-element array — the matmul (unchanged inputLabeledDs, no mention of the epilogue operand),
+        // then a second entry whose inputLabeledDs/outputLabeledDs both alias the MATMUL'S OWN output
+        // by name (in place), with the epilogue's extra tensor as its second input.
+        let mut op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
+        assert_eq!(
+            op.time(),
+            1,
+            "test assumes an untiled matmul (attach_fused_epilogue's precondition)"
+        );
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs::One(
+            scratchy_subtile::superdsc_opspec::EpilogueSpec {
+                operand_name: "mask".to_string(),
+                offset_elems: 0,
+                op_func: scratchy_subtile::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[],
+                broadcast_batch: false,
+            },
+        ));
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
+        assert_eq!(
+            ops.len(),
+            2,
+            "fused epilogue must add exactly one computeOp_ entry: {ops:?}"
+        );
+
+        // computeOp_[0]: the matmul itself, UNCHANGED — no trace of the mask operand.
+        assert_eq!(ops[0].opFuncName, "batchmatmul");
+        assert_eq!(ops[0].inputLabeledDs, vec!["Tensor0-idx0", "Tensor1-idx1"]);
+        assert_eq!(ops[0].outputLabeledDs, vec!["Tensor3-idx3"]);
+
+        // computeOp_[1]: the epilogue, reading+writing the MATMUL'S OWN output in place, plus the
+        // mask as its second input — exactly the golden's `biasadd` shape.
+        assert_eq!(ops[1].exUnit, "sfp");
+        assert_eq!(ops[1].opFuncName, "stridedadd");
+        assert_eq!(ops[1].inputLabeledDs, vec!["Tensor3-idx3", "Tensor2-idx2"]);
+        assert_eq!(ops[1].outputLabeledDs, vec!["Tensor3-idx3"]);
+
+        // The mask tensor still gets its OWN labeledDs_ entry (the on-card walk must address it), typed
+        // OUTPUT to match `bmm.ddl`'s bias/bnA/bnB/resadd convention (same layout bucket as the real
+        // output, not INPUT).
+        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
+        assert_eq!(
+            labeled.len(),
+            4,
+            "activation, kernel, mask, output: {labeled:?}"
+        );
+        let mask_lds = labeled
+            .iter()
+            .find(|l| l.dsName_ == "Tensor2")
+            .expect("mask labeledDs_ entry");
+        assert_eq!(mask_lds.dsType_, "OUTPUT");
+    }
+
+    #[test]
+    fn sub_stick_matmul_is_rejected() {
+        // N=65 is not a multiple of the 64-fp16 stick → builder Err (witness a).
+        assert!(matmul_opspec(384, 65, 64, 1, "a", "w", "o").is_err());
+    }
+
+    #[test]
+    fn prefill_m_gt_1_lm_head_folds_to_m1_decode_unchanged() {
+        // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m>1 (it time-tiles, and
+        // per-row time-tiling is design-risk-4). It runs it at m=1 over the LAST prompt row instead,
+        // which is what lets prefill produce the first generated token's logits itself.
+        //
+        // ⭐ THE PRODUCER HALF IS THE SPLICE'S, AND IT HAS LANDED: `lower_all` routes an m>1
+        // vocab-wide MatmulTile through the Triton `lmlast.py` extraction + the re-lowered m=1
+        // matmul. This test pins three things: (1) the m>1 tail LOWERS to the fold's two programs
+        // (an extraction named `lmlast_s{id}` and the m=1 matmul after it — never a silent m>1
+        // lowering of a vocab-wide matmul); (2) the m=1 DECODE bundle stays a single bare matmul —
+        // the fold never fires at m=1; (3) the CONSUMER half of the fold
+        // (`lower_ktir_to_superdsc::lmlast`, main's copy loop verbatim) still refuses a nameless
+        // extraction — pinned through the splice's own fold program below.
+        use scratchy_subtile::subtile_ir::{
+            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+        };
+        // hidden[m, H] @ W_lmhead[H, vocab] -> logits[m, vocab] (t2 = the result). Stick-aligned
+        // H=128, vocab=256 so the m=1 path is a clean single matmul (no time-tile).
+        let (h, vocab) = (128u32, 256u32);
+        let build = |m: u32| {
+            let tensors = vec![
+                TensorShape { rows: m, cols: h }, // t0 = hidden (activation source)
+                TensorShape {
+                    rows: h,
+                    cols: vocab,
+                }, // t1 = lm_head weight source
+                TensorShape {
+                    rows: m,
+                    cols: vocab,
+                }, // t2 = logits (result)
+            ];
+            let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
+                tensor: TensorId::from_index(t),
+                region: ts[t].whole(),
+            };
+            let node = SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n: vocab,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(0, &tensors), whole(1, &tensors)],
+                output: whole(2, &tensors),
+            };
+            let ir: SubtileIR = SubtileIR {
+                tensors,
+                num_sources: 2,
+                nodes: vec![node.clone()],
+                result: TensorId::from_index(2),
+                // Hand-authored fixture: there is no source op list to be the
+                // provenance of, so the map is empty.
+                op_output: Vec::new(),
+            };
+            (node, ir)
+        };
+        let lower = |m: u32| {
+            let (_, ir) = build(m);
+            // t1 is the lm_head weight; t0 is the activation source.
+            let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+                .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
+        };
+        // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
+        // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul, never a
+        // silent m>1 lowering of a vocab-wide matmul (the wrong-token defect the fold exists to
+        // prevent). Through the door the extraction is `hidden/64` per-stick copies named after
+        // the tail's own output tid (`lmlast{j}_o2`), then the m=1 matmul `matmul_o2`.
+        let mq = 8u32;
+        let names = lower(mq).expect("the m>1 lm-head tail folds to m=1");
+        assert_eq!(
+            names.len() as u32,
+            h / 64 + 1,
+            "the fold is the per-stick copies plus the m=1 matmul: {names:?}"
+        );
+        for (j, name) in names.iter().take(h as usize / 64).enumerate() {
+            assert_eq!(
+                name,
+                &format!("lmlast{j}_o2"),
+                "copy {j} is named after the tail's own output tid"
+            );
+        }
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("matmul_o2"),
+            "the fold's last program is the m=1 matmul"
+        );
+        // m==1 (decode): the SAME node lowers to exactly one bare matmul — the fold never fires, so
+        // the decode bundle is byte-identical to the pre-fold emitter.
+        assert_eq!(
+            lower(1).expect("the m=1 decode lm_head lowers"),
+            vec!["matmul_o2".to_string()]
+        );
+
+        // ⛔ NEGATIVE CONTROL FOR THE NAME'S OWN FACT, through the splice's own fold.
+        // `lmlast` names its copies from `KtirNode::node_out_tid`, and a MISSING one must
+        // REFUSE — not fall back to the program's own output, which is the reserved
+        // `LAST_HIDDEN_TID` and is exactly the wrong name this test pins. Strip the fact off
+        // the extraction program and the door must Err naming it.
+        let (node, ir) = build(mq);
+        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+            .expect("the tail's layout mints");
+        let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
+            .expect("the splice's fold mints the tail");
+        let extract = programs
+            .iter_mut()
+            .find(|e| e.op_name.starts_with("lmlast"))
+            .expect("the tail emits an extraction program");
+        extract.ktir.as_mut().expect("its KTIR").node_out_tid = None;
+        let mut sym = 0i64;
+        let mut fp8q = std::collections::HashSet::new();
+        let stripped = crate::ktir_superdsc_door::lower(
+            extract.ktir.as_ref().unwrap(),
+            &mut sym,
+            Some(&layout),
+            &mut fp8q,
+            None,
+        );
+        let why = match stripped {
+            Err(e) => e.message,
+            Ok(_) => panic!("a nameless extraction must refuse"),
+        };
+        assert!(
+            why.contains("node_out_tid"),
+            "the refusal must name the missing fact, got {why:?}"
+        );
+    }
+
+    #[test]
+    fn fp8_shared_activation_quantizes_once() {
+        // granite decode emits q/k/v = gemm(normed, ·) — THREE arity-3 fp8 matmuls reading the SAME
+        // activation (and gate/up = gemm(normed2, ·) — two more). The per-token activation quantize
+        // (square→amax→scale→clamp→qfp8ch) is a PURE function of the activation, independent of the weight,
+        // so it must be emitted ONCE and shared — not re-run per matmul. Lock that: two arity-3 fp8 matmuls
+        // sharing t0 emit exactly ONE `fq_afp8_op` (qfp8ch) yet still TWO `fq_mm` (per-matmul matmulfp8).
+        use scratchy_subtile::subtile_ir::{
+            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+        };
+        // ⛔ `n` WAS 64, WHICH IS SUB-STICK FOR fp8. An fp8 stick is 128 elems (fp16's is 64), and the
+        // dxp scheduler rejects a sub-stick tile — a guard this crate enforces by construction, so the
+        // lowering `Err`s before it can emit anything and this test asserted nothing about its actual
+        // subject. That guard landed after the test was written, and the dead target hid it. The subject
+        // — ONE shared activation quantize across two matmuls — does not depend on `n`, so `n` becomes a
+        // legal fp8 width and the test measures what it is named for.
+        let (k, n) = (128u32, 128u32);
+        let tensors = vec![
+            TensorShape { rows: 1, cols: k }, // t0 = activation (m=1 decode)
+            TensorShape { rows: k, cols: n }, // t1 = W1 (fp8)
+            TensorShape { rows: 1, cols: n }, // t2 = w_scale1
+            TensorShape { rows: k, cols: n }, // t3 = W2 (fp8)
+            TensorShape { rows: 1, cols: n }, // t4 = w_scale2
+            TensorShape { rows: 1, cols: n }, // t5 = out1
+            TensorShape { rows: 1, cols: n }, // t6 = out2
+        ];
+        let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: ts[t].whole(),
+        };
+        let nodes = vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n,
+                    weight: GemmWeight::Fp8Dynamic,
+                },
+                inputs: vec![whole(0, &tensors), whole(1, &tensors), whole(2, &tensors)],
+                output: whole(5, &tensors),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::MatmulTile {
+                    n,
+                    weight: GemmWeight::Fp8Dynamic,
+                },
+                // SAME activation t0, DIFFERENT weight/scale/out → the quantize of t0 must be reused.
+                inputs: vec![whole(0, &tensors), whole(3, &tensors), whole(4, &tensors)],
+                output: whole(6, &tensors),
+            },
+        ];
+        let ir: SubtileIR = SubtileIR {
+            tensors,
+            num_sources: 5, // t0 activation + t1..t4 (weights + w_scales)
+            nodes,
+            result: TensorId::from_index(6),
+            // Hand-authored fixture: there is no source op list to be the
+            // provenance of, so the map is empty.
+            op_output: Vec::new(),
+        };
+        let weight_ids: std::collections::HashSet<u32> = [1u32, 3u32].into_iter().collect();
+        let (ops, _layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+            .expect("two-fp8-matmul lowering");
+        let quantizes = ops
+            .iter()
+            .filter(|o| o.op_name.ends_with("fq_afp8_op"))
+            .count();
+        assert_eq!(
+            quantizes, 1,
+            "two matmuls sharing an activation must quantize it ONCE (shared), got {quantizes}"
+        );
+        let matmuls = ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
+        assert_eq!(
+            matmuls, 2,
+            "each fp8 matmul still emits its OWN matmulfp8 (weight differs), got {matmuls}"
+        );
+        // The FIRST chain op is likewise shared: one, not two. It is `abs` (`fq_absx_op`), not the
+        // `square` (`fq_sq_op`) this test named — the quantize chain became abs→max, and no op by the
+        // old name has existed for as long as this target failed to compile, so the assert was looking
+        // for zero of something and would have passed only by finding nothing.
+        let first_chain_op = ops
+            .iter()
+            .filter(|o| o.op_name.ends_with("fq_absx_op"))
+            .count();
+        assert_eq!(
+            first_chain_op, 1,
+            "the activation |x| must be shared too, got {first_chain_op}"
+        );
+    }
+
+    #[test]
+    fn matmul_cost_split_fills_cores() {
+        // sdsc_bmm_autoBuffer.json: M=384, N=384, K=64, batch=16 → must use 32 cores.
+        let s = matmul_cost_split(16, 384, 384, 64, 32);
+        assert_eq!(s.cores(), 32, "matmul split must fill 32 cores: {s:?}");
+        // and the iteration space maps M→mb, N→out, K→in, batch→x.
+        let it = matmul_iter_space(384, 384, 64, 16);
+        assert_eq!((it.mb_, it.out_, it.in_, it.x_), (384, 384, 64, 16));
+    }
+
+    #[test]
+    fn assemble_matmul_serializes_and_fills_cores() {
+        // bmm 384×384×64 batch16 fits LX (576 KiB < 1.6 MiB) → time=1 EmittedOp.
+        let emitted = assemble_matmul(
+            "MatMul_0",
+            384,
+            384,
+            64,
+            16,
+            &rb("act", 384, 64),
+            &Stk::<KernelTag>::kernel(64, 384, "wt"),
+            &rb("out", 384, 384),
+            None,
+        );
+        assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
+        let op = emitted.dsc();
+        // numWkSlices product = 32 cores.
+        let prod: u32 = op.numWkSlicesPerDim_.values().product();
+        assert_eq!(
+            prod, 32,
+            "matmul must use 32 cores: {:?}",
+            op.numWkSlicesPerDim_
+        );
+        // serializes to JSON with the mandatory trailing-underscore keys.
+        let j = serde_json::to_string(op).expect("SuperDSC serializes");
+        assert!(j.contains("\"coreFoldProp_\""), "coreFoldProp_ present");
+        assert!(j.contains("\"numWkSlicesPerDim_\""));
+        assert!(j.contains("\"batchmatmul\""), "batch>1 → batchmatmul");
+        assert!(j.contains("\"SEN169_FP16\""));
+        // time=1 op is NOT symbolic — no isStartAddrSymbolic_, addresses concrete.
+        assert!(
+            !j.contains("isStartAddrSymbolic_"),
+            "time=1 op stays concrete-addr"
+        );
+        // per-core stage dims = full / split.
+        let dsc = &op.dscs_[0]["MatMul_0"];
+        assert_eq!(dsc.numCoresUsed_, 32);
+        assert_eq!(dsc.computeOp_[0].exUnit, "pt");
+    }
+
+    #[test]
+    fn bundle_mlir_emits_execute() {
+        // The flat (all-time=1) bundle.mlir is byte-identical to the historical form.
+        let b = bundle_mlir(&["sdsc_0.json".to_string()]);
+        assert!(b.contains("func.func @sdsc_bundle()"));
+        assert!(b.contains("sdscbundle.sdsc_execute () {sdsc_filename=\"sdsc_0.json\"}"));
+        // A time=1 EmittedOp routes through emit_bundle_mlir → the SAME flat body.
+        let emitted = assemble_matmul(
+            "MatMul_0",
+            384,
+            384,
+            64,
+            16,
+            &rb("act", 384, 64),
+            &Stk::<KernelTag>::kernel(64, 384, "wt"),
+            &rb("out", 384, 384),
+            None,
+        );
+        let via_emitted = emit_bundle_mlir(&[emitted]);
+        assert_eq!(
+            via_emitted,
+            bundle_mlir(&["sdsc_0.json".to_string()]),
+            "an all-time=1 bundle.mlir must be byte-identical to the historical flat form"
+        );
+        assert!(!via_emitted.contains("scf.for"));
+    }
+
+    #[test]
+    fn tiled_matmul_concrete_unrolls() {
+        // 64×16384×2048 batch1 overflows LX (2.42 MiB > 1.68 MiB) → time-tiled.
+        // The A term is only 256 KiB so out-tiling brings it under LX (a wide-K
+        // shape would Err instead); the cost split fills 32 cores via out×32.
+        let emitted = assemble_matmul(
+            "matmul_o7",
+            64,
+            16384,
+            2048,
+            1,
+            &rb("a", 64, 2048),
+            &Stk::<KernelTag>::kernel(2048, 16384, "w"),
+            &rb("o", 64, 16384),
+            None,
+        );
+        let n = emitted.time;
+        assert!(n > 1, "this matmul must time-tile, got time={n}");
+        // (ii) the divided per-time `out` shows up in N_ / ss_ (per-core out_per_time).
+        let dsc = &emitted.dsc().dscs_[0]["matmul_o7"];
+        let split_out = emitted
+            .dsc()
+            .numWkSlicesPerDim_
+            .get("out")
+            .copied()
+            .unwrap_or(1);
+        let per_core_out_per_time = (dsc.N_.out_ as u32) / split_out;
+        assert_eq!(
+            per_core_out_per_time % 64,
+            0,
+            "per-time per-core out must be 64-aligned"
+        );
+        // (iv) CONCRETE-UNROLL: bundle.mlir has N flat executes, NO scf.for / symbols;
+        //      the SdscOp JSON is concrete (NOT isStartAddrSymbolic_), and trips differ.
+        let mlir = emit_bundle_mlir(&[emitted.shallow_copy()]);
+        assert!(
+            !mlir.contains("scf.for"),
+            "concrete-unroll has no scf.for:\n{mlir}"
+        );
+        assert!(
+            !mlir.contains("affine.apply"),
+            "concrete-unroll has no affine.apply"
+        );
+        assert!(
+            !mlir.contains("symbol_ids"),
+            "concrete-unroll has no symbol_ids"
+        );
+        assert_eq!(
+            mlir.matches("sdscbundle.sdsc_execute").count() as u32,
+            n,
+            "one flat execute per trip"
+        );
+        let trips = concrete_trips(&emitted);
+        assert_eq!(trips.len() as u32, n);
+        let j0 = serde_json::to_string(&trips[0]).unwrap();
+        assert!(
+            !j0.contains("isStartAddrSymbolic_"),
+            "trip json is concrete, not symbolic"
+        );
+        assert!(
+            j0.contains("{\"factor_\":1,\"label_\":\"time\"}"),
+            "sdscFoldProps_ time stays 1"
+        );
+        assert_ne!(
+            j0,
+            serde_json::to_string(&trips[1]).unwrap(),
+            "trips differ (bumped addrs)"
+        );
+    }
+
+    #[test]
+    fn stick_count_ceils() {
+        assert_eq!(stick_count(64), 1);
+        assert_eq!(stick_count(65), 2);
+        assert_eq!(stick_count(384), 6);
+    }
+
+    // ── RUNG-2 LOCK: the matmul work-division is df-aware. An fp8 (128-lane) matmul
+    // MUST split its N/K by the 128-stick basis, NOT fp16's 64 — a 64-granular split
+    // hands a core a sub-128 slice, the exact `L3DlOpsScheduler:1070 multiple-of-stick`
+    // DtException the fp8 bake used to hit. This guard is fail-first: reverting
+    // `stick_basis`/`matmul_split_map` to a hardcoded 64 makes it RED. ──
+    #[test]
+    fn matmul_split_is_df_aware_fp8_128() {
+        // N=512: fp16 ⇒ 512/64 = 8 sticks (can split ≤8 ways); fp8 ⇒ 512/128 = 4 sticks.
+        // The fp8 split must therefore be COARSER (≤4), never the fp16 8. The `::<Fp8>` type
+        // param — not a runtime flag — is what sources the 128 basis onto the dims.
+        let dims_f16 = matmul_dims::<Fp16>(
+            1,
+            &StickExtent::<Fp16>::new(512).unwrap(),
+            &StickExtent::<Fp16>::new(256).unwrap(),
+            1,
+        );
+        let dims_f8 = matmul_dims::<Fp8>(
+            1,
+            &StickExtent::<Fp8>::new(512).unwrap(),
+            &StickExtent::<Fp8>::new(256).unwrap(),
+            1,
+        );
+        let s_f16 = matmul_split_map(&dims_f16, MAX_CORES);
+        let s_f8 = matmul_split_map(&dims_f8, MAX_CORES);
+        let out16 = s_f16.get("out").copied().unwrap_or(1);
+        let out8 = s_f8.get("out").copied().unwrap_or(1);
+        assert!(
+            out16 <= 8,
+            "fp16 out split bounded by 8 sticks, got {out16}"
+        );
+        assert!(
+            out8 <= 4,
+            "fp8 out split MUST be bounded by 4 (128-)sticks, got {out8}"
+        );
+        // The fp8 per-core `out` extent is a whole 128-stick multiple (never sub-stick).
+        assert_eq!(
+            512u32 / out8.max(1) % 128,
+            0,
+            "fp8 per-core out must be 128-aligned"
+        );
+    }
+
+    #[test]
+    fn workplan_rejects_substick_fp8_split() {
+        // A hand-crafted over-split of an fp8 stick dim (2 sticks, split 4 ways) must be a
+        // typed `Err` at emit (WorkPlan::divide stick clause, stick_basis=128), NOT an
+        // on-card DtException. The SAME split of a fp16 dim (more 64-sticks) is legal.
+        let over = |name: &'static str, _: u32| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(name, 4u32);
+            m
+        };
+        let fp8_dim = vec![ItDim {
+            name: "out",
+            size: 256,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp8,
+        }];
+        let err = WorkPlan::divide(&fp8_dim, MaxCores::<MAX_CORES>, |d, c| over(d[0].name, c));
+        assert!(
+            err.is_err(),
+            "fp8 256 (=2×128 sticks) split 4 ways must be Err (sub-stick), got {err:?}"
+        );
+        // fp16 256 = 4×64 sticks ⇒ split 4 ways is exactly 1 stick/core ⇒ Ok.
+        let fp16_dim = vec![ItDim {
+            name: "out",
+            size: 256,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        }];
+        let ok = WorkPlan::divide(&fp16_dim, MaxCores::<MAX_CORES>, |d, c| over(d[0].name, c));
+        assert!(
+            ok.is_ok(),
+            "fp16 256 (=4×64 sticks) split 4 ways is 1 stick/core, must be Ok, got {ok:?}"
+        );
+    }
+
+    #[test]
+    fn matmul_split_fp16_byte_identical_to_stick_count() {
+        // The dense (fp16) path must be UNCHANGED by the df-aware refactor: for any N the
+        // `out` split equals the pre-refactor `stick_count`(÷64)-based split. (Inert-at-fp16
+        // is the rung invariant — only fp8 emission changes.)
+        for &n in &[64u32, 128, 256, 384, 512, 2048, 5504] {
+            let dims = matmul_dims::<Fp16>(
+                1,
+                &StickExtent::<Fp16>::new(n).unwrap(),
+                &StickExtent::<Fp16>::new(64).unwrap(),
+                1,
+            );
+            let split = matmul_split_map(&dims, MAX_CORES)
+                .get("out")
+                .copied()
+                .unwrap_or(1);
+            let expected = core_split(stick_count(n), MAX_CORES);
+            assert_eq!(
+                split, expected,
+                "fp16 out split for N={n} must match stick_count-based split"
+            );
+        }
+    }
+
+    // SEN169_FP16 (1-6-9, bias 31) encode — the device's NATIVE fp16, NOT IEEE (1-5-10). Feeding IEEE
+    // bits is silently mis-read by the device (1.0→IEEE 0x3C00→SEN169 0.5; 1/576→SEN169 ≈1e-6) — the
+    // ~14× rmsnorm scale bug. Anchored to the SFP const table's ground truth (plus1=0x3E00,
+    // minus1=0xBE00) + the exp-field/bias/packing points that were wrong in that bug. Concrete
+    // machine-check (the float encoder is the ALU leaf; Kani/CBMC over-approximates its libm log2).
+    #[test]
+    fn sen169_encode_anchors() {
+        assert_eq!(sen169_bits(1.0), 0x3E00); // 2^0 ⇒ exp field 31 (bias-31), mantissa 0
+        assert_eq!(sen169_bits(-1.0), 0xBE00); // sign bit + plus1
+        assert_eq!(sen169_bits(2.0), 0x4000); // 2^1 ⇒ exp field 32
+        assert_eq!(sen169_bits(0.5), 0x3C00); // 2^-1 ⇒ exp field 30
+        assert_eq!(sen169_bits(0.0), 0); // zero
+        assert_ne!(sen169_bits(1.0), 0x3C00); // NOT IEEE-f16 1.0 (0x3C00) — the mismatch that WAS the bug
+    }
 }

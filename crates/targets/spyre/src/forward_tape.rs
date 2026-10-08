@@ -1014,7 +1014,7 @@ mod tests {
         let got = stick_scatter(rows, width, &src);
         assert_ne!(got, src, "two rows must interleave");
         // Row 1, column 64 → stick 1, so (1)*(2*64) + 1*64 + 0 = 192.
-        assert_eq!(got[192], src[1 * width + 64]);
+        assert_eq!(got[192], src[width + 64]);
         // Every element still appears exactly once.
         let mut a = got.clone();
         let mut b = src.clone();

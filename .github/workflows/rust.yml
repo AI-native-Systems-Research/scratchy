@@ -432,6 +432,50 @@ jobs:
       - name: Test (openblas-system)
         run: cargo test -p ktir-emulator --no-default-features --features optimizer,openblas-system --lib --tests
 
+  # ⭐ THE TRITON SPLICE'S OWN GATE. The splice is now the ONLY producer for the
+  # spliced op kinds (unconditional in `lower_one_node`), so every job that builds
+  # the spyre target compiles it — this job remains the one that runs the splice's
+  # OWN tests at `-D warnings`: the splice golden
+  # (`tests/triton_splice_golden.rs`, which lowers every registered op through
+  # the splice and pins each row's op name, attention mask slot, and the
+  # emulator numeric checks) plus the spyre-emu-gated execution tests.
+  # `--lib --tests`, not bare `cargo test`: the crate's two
+  # `examples/` need `spyre-hw` (a card host), same exclusion the macOS job
+  # documents for ktir-emulator.
+  # Ubuntu (not macOS): `spyre-emu` pulls openblas, which the distro provides; the
+  # macOS build would collide with Accelerate in the same way the linux-spyre-emu
+  # job documents.
+  #
+  # The re-hosted triton crates (frontend, ktir, ktir-superdsc, numeric, splice)
+  # are pure Rust — no hardware — but the linux-cuda job's workspace clippy has
+  # no `--all-targets`, so nothing else in CI compiled their tests or examples:
+  # the 141 ktir tests, the stale-golden pins PROVENANCE.md leans on, and the
+  # splice's own cache-probe example were all local-only until this step. A
+  # bare `cargo test` is right here (their examples need no card, unlike the
+  # spyre target's), so the examples' compile errors are caught too.
+  linux-spyre-triton:
+    name: linux-amd64 (spyre triton splice)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenBLAS
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-spyre-triton
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (spyre triton)
+        run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
+      - name: Test (spyre triton golden + emu execution)
+        run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
+      - name: Clippy (triton re-host crates, all targets)
+        run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
+      - name: Test (triton re-host crates)
+        run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

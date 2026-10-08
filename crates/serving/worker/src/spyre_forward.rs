@@ -1522,7 +1522,7 @@ pub(crate) fn forward_chunk(
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
         // The embedding is this chunk's rows of the hidden state.
         dynamic.push((b.embed_src as u64, emb, vec![n, sh.hidden]));
-        // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. `KtirFunc::splat_scale` reads each
+        // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. The programs read each
         // model constant (a ScalarMul multiplier, an RMSNorm epsilon or divisor) and the algebraic
         // identities `0`/`1` from a bound `[1,1]` tile rather than a KTIR immediate, so that ONE
         // program serves both consumers: `dxp_standalone` has no immediate operand, and an
@@ -1609,8 +1609,8 @@ pub(crate) fn forward_chunk(
         //
         // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s
         // `is_prefill_lm_head_tail` arm folds it to the m=1 tail it really is
-        // (`lower_prefill_lm_head_at_m1`): the activation is sliced to the LAST prompt row and the
-        // output is narrowed by `node_at_one_row` to `Range::new(rows.start, 1)` — row 0. Only that
+        // (main's `lower_prefill_lm_head_at_m1`): the activation is sliced to the LAST prompt row
+        // and the output is narrowed to row 0. Only that
         // row's logits are ever read, and computing all `mq` rows of a 128k-column output would be
         // `mq`× the work for one row of answer.
         //

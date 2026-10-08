@@ -1,0 +1,89 @@
+{
+  "config": "swiglu_mlp_granite_tiled_k",
+  "fixture": "swiglu_mlp",
+  "kernel": "swiglu_mlp_fwd",
+  "inputs_fn": "_swiglu_inputs",
+  "reference_fn": "_swiglu_reference",
+  "seed": 0,
+  "torch": "2.11.0+cpu",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "M": 64,
+    "D_MODEL": 4096,
+    "D_FF": 12800,
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "BLOCK_K": 2048
+  },
+  "grid": [
+    1
+  ],
+  "inputs": [
+    {
+      "arg": "desc_x",
+      "file": "in_desc_x.bin",
+      "shape": [
+        64,
+        4096
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wg",
+      "file": "in_desc_wg.bin",
+      "shape": [
+        12800,
+        4096
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wu",
+      "file": "in_desc_wu.bin",
+      "shape": [
+        12800,
+        4096
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wd",
+      "file": "in_desc_wd.bin",
+      "shape": [
+        4096,
+        12800
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        64,
+        4096
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      64,
+      4096
+    ],
+    "dtype": "f16"
+  },
+  "reference_note": "AUTHORED HERE, not ported. swiglu_mlp.py ships constexprs() only -- no inputs(), no reference() -- and test/pod's SwiGLU apparatus (swiglu_case.py, swiglu_oracle.py, verify_swiglu.py, gen_swiglu_artifact.py) covers the ELEMENTWISE silu(g)*u ONLY: it hands the device g and u as two HBM activation planes (swiglu-stage=3) and never forms x@Wg, x@Wu or h@Wd, so there is nothing there to port for the three-matmul MLP. WHICH PART IS PORTED AND WHICH IS NEW: ported is the ACTIVATION's form -- swiglu_oracle.py:151 true_swiglu computes (g*sigmoid(g))*u, and _swiglu_reference's `(gate * torch.sigmoid(gate)) * up` matches THAT form term for term (it is also swiglu_mlp.py's delta 8, silu(gate)*up, not upstream's s*(up+1)). NEW here are the three matmuls around it -- x@Wg.T, x@Wu.T, h@Wd.T -- and the stimulus, because nothing in the tree had either. The stimulus follows decoder_block.py:500 layer_weights -- torch.randn * (1/sqrt(d_model)), one seeded generator, drawn x, wg, wu, wd -- and the weights are drawn DIRECTLY in the kernel's own buffer orientation (wg/wu [D_FF, D_MODEL], wd [D_MODEL, D_FF]) so no host transpose can go wrong. Compute is f32 with one .to(f16) at the end, as every reference() in test/fixtures is.",
+  "oversized": true,
+  "staging": "THE BYTES ARE NOT IN THE TREE -- this configuration's inputs exceed 8388608 B even at their stored size, and unlike the embedding table and the RoPE angle tables there is nothing sparse or replicated about them to exploit: every weight element is read. Staged on the pod `nickm-7db9667cdd-z2jc6` at `/tmp/numout/swiglu_mlp_granite_tiled_k/`. Reproduce anywhere torch 2.11.0+cpu is available with `python3 test/numeric/gen_numeric_data.py swiglu_mlp_granite_tiled_k <dir>`; the sha256 map in this file is what a regenerated set must match. A harness must be POINTED at a staged directory and must report MISSING when it has not been -- an absent directory is not a pass.",
+  "sha256": {
+    "in_desc_o.bin": "07854d2fef297a06ba81685e660c332de36d5d18d546927d30daad6d7fda1541",
+    "in_desc_wd.bin": "71ffff730942b3f7fa6eba3ad3756df89df068be597b523591e937dea2c653ef",
+    "in_desc_wg.bin": "32ecf68c355373ce63a93705b8881dc83e4e33d2f492eaec4bc541d80ffa45a1",
+    "in_desc_wu.bin": "bd0ebfd300eae8674eec0ca6f367924a84daacce1e2804259667e4768f1a1b2d",
+    "in_desc_x.bin": "b99e0f87d99d2100d083607bc3ebab6e3dd124fb1082aa3ecdfa65943de687e0",
+    "ref_out.bin": "dec3527ac6dafa0435475868dc33d3b8229c6e577180f50fa1570d4a3c2e4090"
+  }
+}

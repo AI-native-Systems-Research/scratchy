@@ -29,6 +29,13 @@ description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR targ
 spyre = []
 spyre-hw = ["spyre", "dep:flex-rs"]
 spyre-emu = ["spyre", "dep:ktir-emulator"]
+# ⭐ THE TRITON SPLICE IS THE ONLY PRODUCER — UNCONDITIONAL. `lower_one_node` routes
+# every spliced op kind (`MatmulTile`, `Elementwise`, `SiluMul`, `RmsNorm`,
+# `RopeRotate`/`RopeAppend`, `ScalarMul`) through `scratchy_triton_splice::lower`;
+# there is no builder arm behind it, so the dependency cannot be optional. The old
+# "pod must keep a path without the parser" concern is retired by the owned parser
+# (3088ede28): the whole ladder is dependency-free offline
+# (`crates/triton/PROVENANCE.md`, copy rule 2).
 
 [dependencies]
 # ⭐ THE BAKED BUNDLE ITSELF — re-exported from this crate's root as `bundle_code`, which is the path
@@ -37,6 +44,10 @@ spyre-emu = ["spyre", "dep:ktir-emulator"]
 # `spyre-hw`, so a gate here would make them fail to resolve in a build that has the target but not
 # the card runtime.
 scratchy-spyre-bundle = { path = "bundle" }
+# ⭐ THE TRITON SPLICE — the registry + ladder driver that compiles a Triton kernel
+# for a SubtileNode. UNCONDITIONAL (see [features]): it is the only producer for the
+# spliced op kinds, and the ladder is dependency-free offline.
+scratchy-triton-splice = { path = "../../triton/splice" }
 scratchy-tensors = { path = "../../tensors" }
 # `kill(-pid, SIGKILL)` on a `dxp_standalone` process group — see `superdsc_bake`'s worker pool.
 libc = { workspace = true }
@@ -68,7 +79,12 @@ ktir-core = { path = "ktir/ktir-core" }
 # path OTHER than a `scratchy-subtile` re-export, this crate must name it directly. Feature-free and
 # unconditional, like `ktir-core`: the lowering is not a device.
 ktir-superdsc = { path = "ktir/ktir-superdsc" }
-ktir-emulator = { path = "ktir/ktir-emulator", optional = true, features = ["metal"] }
+# No `metal` feature forced here: the emulator's build.rs enables its Metal/NAX
+# backend automatically on macOS (`cfg(metal)` from `CARGO_CFG_TARGET_OS`), so the
+# feature would only ever force `objc2` (Apple-only) onto a Linux build — which
+# cannot compile it. macOS keeps the backend; Linux falls back to the naive
+# sgemm parity oracle in the emulator's `blas.rs`.
+ktir-emulator = { path = "ktir/ktir-emulator", optional = true }
 # The sdsc session laws (`sdsc_abstract`): `PrefixMaskShape` / `FoldPages` /
 # `MaskBlocks` / `FoldRowRegime` — the only mints for the values the card's
 # session setters accept. Optional: only the `spyre-hw` run path binds a session.

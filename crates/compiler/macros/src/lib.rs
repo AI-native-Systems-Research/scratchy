@@ -764,6 +764,14 @@ pub fn compile_carrier(
     if quantizations_path.exists() {
         tracked_paths.insert(quantizations_path);
     }
+    // The Triton splice's kernels need NO entry here: the splice
+    // `include_str!`s every `.py` it compiles (its registry rows),
+    // which is cargo's own dependency edge — editing a kernel
+    // rebuilds the splice and every caller, on spyre builds only,
+    // with a missing kernel a compile error rather than a silent
+    // fs miss. (The read_dir block this replaces tracked the
+    // directory for EVERY backend and could silently track nothing
+    // on a read error — the stale-bake bug it existed to prevent.)
     // De-dupe before emitting; multiple variants share preset /
     // override paths. Target profile is no longer a separate file —
     // it's compiled into scratchy-target-cuda, so cargo's normal

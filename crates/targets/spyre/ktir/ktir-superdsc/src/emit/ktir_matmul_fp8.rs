@@ -6,7 +6,7 @@
 //! (fp8×fp8→fp16), then dequant by `a_scale`(per row) · `w_scale`(per channel). Only its DOOR changed:
 //! it takes [`Fp8Facts`] recovered from the KTIR program instead of a `&SubtileNode`.
 //!
-//! ⛔ AND THAT CHAIN IS WHY fp8 NEEDS THIS. `KtirFunc::matmul_fp8` computes **fp16 activation × fp8
+//! ⛔ AND THAT CHAIN IS WHY fp8 NEEDS THIS. The builder's `KtirFunc::matmul_fp8` computed **fp16 activation × fp8
 //! weight** — its own doc says outright that it does not quantize the activation — while this device's
 //! fp8 is fp8×fp8. Lowering the KTIR op-for-op therefore cannot produce `matmulfp8` at all, and it
 //! also addressed the weight as fp16: a `[2048, 2048]` fp8 weight is placed 4 MB and was being read
@@ -23,7 +23,8 @@ use crate::superdsc_opspec::{DataFormat, Df, Fp16, Role, SdscFoldSet};
 
 /// What the KTIR states about one fp8 W8A8 contraction, recovered from its shapes and parameters.
 ///
-/// ⛔ EVERY FIELD IS READ OUT OF THE KTIR. The fp8-ness itself is too: `KtirFunc::matmul_fp8` builds
+/// ⛔ EVERY FIELD IS READ OUT OF THE KTIR. The fp8-ness itself is too: the builder's
+/// `KtirFunc::matmul_fp8` built
 /// its weight view through `view_fp8`, which writes `Dtype = Fp8E4m3` on the
 /// `ktdp.construct_memory_view` — so the recogniser asks the view what its element type is rather than
 /// guessing from arity.

@@ -206,11 +206,12 @@ fn rope(
     attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let (ins, out) = split_out(name, r, layout, 3)?;
-    // `KtirFunc::rope` views `x` as `[rows·heads, hd]`, so the view's COLUMN extent is the head dim.
+    // The rope program views `x` as `[rows·heads, hd]`, so the view's COLUMN extent is the head dim.
     let hd = ins[0].v_cols;
     // ⭐⭐⭐ ROWS AND WIDTH, BOTH READ OFF THE PROGRAM — AND THE READING IS THE TILE, NOT A VIEW.
-    // `KtirFunc::rope` views `x` as `[rows·heads, hd]` and takes `self.tile(x_view, ri·heads, 0,
-    // heads, half)` once per position, so the ACCESS TILE's row extent IS `heads` — the fact the two
+    // The rope program views `x` as `[rows·heads, hd]` and takes one access tile
+    // `(ri·heads, 0, heads, half)` per position, so the ACCESS TILE's row extent IS `heads` — the
+    // fact the two
     // view extents multiply together and neither states alone. `regions()` already records it as
     // `Region::r_len`. With `heads` known the view's own row count divides into the positions, and the
     // node's real width is `heads · hd`.
@@ -232,7 +233,7 @@ fn rope(
     if ins[0].v_rows % heads != 0 {
         return err(format!(
             "{name}: the `x` view states {} row(s) over an access tile of {heads} head(s), which does \
-             not divide — `KtirFunc::rope` views `x` as `rows·heads` by `hd`, so the head count must \
+             not divide — the rope program views `x` as `rows·heads` by `hd`, so the head count must \
              tile its rows exactly",
             ins[0].v_rows,
         ));
@@ -248,7 +249,7 @@ fn rope(
     let total = heads * hd;
     // ⛔ THE ROW KIND, AS A PARAMETER — main's `LowerRope::rows_are_requests`, which main also took as
     // a parameter and for the reason its own comment gives. It decides whether the head-major collapse
-    // may span the query rows, which is a DEVICE law: `KtirFunc::rope` never receives the fact and
+    // may span the query rows, which is a DEVICE law: the rope program never receives the fact and
     // emits the same ops either way, so no program can state it. A rope in a bundle with no attention
     // node has no requests to have rows of, which is main's own `false` at that call site.
     let rows_are_requests = attn_params.is_some_and(|p| p.rows_are_requests);

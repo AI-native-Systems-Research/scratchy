@@ -88,6 +88,41 @@ pub const USABLE_LX_BYTES: u64 = 1_677_721;
 /// this alias documents the residency-byte arithmetic in [`WorkPlan::time_tile_for_lx`].
 pub const FP16_BYTES: u64 = 2;
 
+/// f16 ELEMENT budget for one whole-region pointwise live set — the pointwise row-block
+/// guards read this (the builder's elementwise/silumul arms and the Triton splice's
+/// fallthroughs, which must agree about which of them takes a node). `EW_LX_ELEMS` f16
+/// elements ≈ 2 MB = `LX_CAPACITY_BYTES`; the SAME reasoning as a per-core tile fit,
+/// applied to the tiles a pointwise program holds resident together.
+pub const EW_LX_ELEMS: u64 = 1024 * 1024;
+
+/// How many `[rows, cols]` tiles of one elementwise lowering are LIVE AT ONCE — what
+/// `EW_LX_ELEMS` is divided by. Silu's decomposition is the worst case (`x`, `neg`,
+/// `exp`, the splat `1.0`, the denominator, the result); a binary op holds three.
+/// ⛔ THE BUDGET IS THE LIVE SET, NOT ONE TILE: sizing a block so a single tile fits is
+/// what produced `ArithMulf: LX capacity exceeded` on a `[64, 8192]` block (each tile
+/// 1 MB, three resident).
+pub const EW_SILU_LIVE_TILES: u32 = 6;
+/// The binary-op live set (two operands and the result).
+pub const EW_BINARY_LIVE_TILES: u32 = 3;
+/// The silu-mul live set: gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles,
+/// the widest live set in the model.
+pub const SILU_MUL_LIVE_TILES: u32 = 8;
+
+/// How many ROWS of a `cols`-wide region keep `live` tiles inside [`EW_LX_ELEMS`] —
+/// ONE LAW, shared by the deleted builder's row-block arms (`lower_elementwise_node_rows`,
+/// `lower_scalarmul_node`'s `by_row`, `KtirFunc::silu_mul`) and the Triton splice's
+/// pointwise constexprs, so the two paths cannot disagree about a block height and
+/// emit windows that overlap or leave a gap.
+///
+/// ⛔ NOT ONE ROW. A row at a time is correct and fits trivially, but it emits `m`
+/// copies of every op, and a forward's cost is dominated by PER-OP work: at the m=96
+/// prefill rung that put 3.7 s of a 5.6 s forward outside the GEMMs entirely. Blocking
+/// at the widest height that still fits is what keeps both the LX bound and the op
+/// count.
+pub fn rows_per_block(cols: u32, live: u32) -> u32 {
+    ((EW_LX_ELEMS / live.max(1) as u64 / cols.max(1) as u64) as u32).max(1)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // (a) DataFormat + StickExtent — the fp16-stick / multiple-of-stick witness.
 // ───────────────────────────────────────────────────────────────────────────
@@ -233,7 +268,7 @@ pub enum Df {
     SenInt8,
     /// BF16E — 2-byte / 64-stick (fp16 geometry, wider exponent). DORMANT: no emitter site creates a
     /// bf16 dataspace today (the score path stays SEN169_FP16; bf16-output matmul is dxp-rejected). Kept
-    /// representable for the `lower_attn_node` bf16-operand check.
+    /// representable for main's `lower_attn_node` bf16-operand check.
     Bf16,
     /// ⭐ SENUINT32 — 4-byte / 32-stick. A GATHER'S INDEX TENSOR AND NOTHING ELSE. See [`SenUint32`]
     /// for why it cannot be the value operand's format.

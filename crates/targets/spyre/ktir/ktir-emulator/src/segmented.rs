@@ -40,6 +40,11 @@ use crate::opkind::OpKind;
 use ktir_optimizer::fusion::{ProgramSpec, Segment, plan_segments_budgeted};
 use std::collections::HashMap;
 
+/// `tensor_id -> element-shape`, as [`derive_shapes`] builds.
+pub(crate) type ShapeMap = HashMap<u64, Vec<usize>>;
+/// `tensor_id -> view dtype`, as [`derive_shapes_and_dtypes`] builds.
+pub(crate) type DTypeMap = HashMap<u64, DType>;
+
 /// The integer element-shape attribute on a `construct_memory_view` op.
 fn view_shape_of(op: &Operation) -> Option<Vec<usize>> {
     match op.attr(AttrKey::Shape) {
@@ -67,6 +72,65 @@ pub(crate) fn derive_shapes(
         collect_view_shapes(func.operations, &arg_to_tensor, &mut shapes);
     }
     Ok(shapes)
+}
+
+/// As [`derive_shapes`], but ALSO collecting each tensor's VIEW dtype (the
+/// `dtype:` attribute of its `construct_memory_view` ops) — `F16` for every
+/// tensor a normal model touches, `Fp8E4m3` for an fp8-packed weight, whose
+/// views read one byte per element. The resident executor needs it to bind
+/// pointers at the view's own element size (RFC #110) and to keep packed source
+/// bytes verbatim. A tensor viewed at more than one dtype is a malformed
+/// program — refused loudly rather than guessed.
+pub(crate) fn derive_shapes_and_dtypes(
+    module: &IRModule,
+    spec: &ProgramSpec,
+) -> Result<(ShapeMap, DTypeMap), String> {
+    let mut shapes: ShapeMap = HashMap::new();
+    let mut dtypes: DTypeMap = HashMap::new();
+    for node in &spec.nodes {
+        let func = module.get_function(&node.func)?;
+        let arg_to_tensor: HashMap<Ssa, u64> =
+            node.bindings.iter().map(|b| (b.arg, b.tensor)).collect();
+        collect_view_shapes(func.operations, &arg_to_tensor, &mut shapes);
+        collect_view_dtypes(func.operations, &arg_to_tensor, &mut dtypes)?;
+    }
+    Ok((shapes, dtypes))
+}
+
+/// Walk ops (recursing into regions) recording the dtype of every memory view
+/// whose pointer operand is a known node arg → tensor id, refusing a tensor
+/// viewed at two different dtypes.
+pub(crate) fn collect_view_dtypes(
+    ops: &[Operation],
+    arg_to_tensor: &HashMap<Ssa, u64>,
+    dtypes: &mut HashMap<u64, DType>,
+) -> Result<(), String> {
+    for op in ops {
+        if op.op_type == OpKind::KtdpConstructMemoryView
+            && let Some(ptr) = op.operands.first()
+            && let Some(&tid) = arg_to_tensor.get(ptr)
+            && let Some(dt) = op.attr(AttrKey::Dtype).and_then(|a| match a {
+                Attr::Dtype(d) => Some(*d),
+                _ => None,
+            })
+        {
+            match dtypes.get(&tid) {
+                Some(&prev) if prev != dt => {
+                    return Err(format!(
+                        "tensor t{tid} is viewed at both {prev:?} and {dt:?} — one tensor, \
+                         one element size"
+                    ));
+                }
+                _ => {
+                    dtypes.insert(tid, dt);
+                }
+            }
+        }
+        for rg in op.regions {
+            collect_view_dtypes(rg, arg_to_tensor, dtypes)?;
+        }
+    }
+    Ok(())
 }
 
 /// Walk ops (recursing into regions) recording the shape of every memory view
@@ -146,7 +210,7 @@ pub(crate) fn apply_attention_rewrites<'a>(a: &'a Arena, module: &mut IRModule<'
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(crate::memory::lx_fusion_budget);
-    // ⭐ MATMUL LX-FIT TILING FIRST. `KtirFunc` emits ONE untiled `linalg.matmul` per contraction,
+    // ⭐ MATMUL LX-FIT TILING FIRST. The producer emits ONE untiled `linalg.matmul` per contraction,
     // because the tiling is a property of the device that runs it — the card DECLARES its work
     // division (`WorkPlan::divide` / `time_tile_for_lx`) and never wants a loop nest. This emulator
     // executes the ops against a real 2 MB LX and cannot hold `W[2048, 2048]` fp16 (8 MB) whole, so

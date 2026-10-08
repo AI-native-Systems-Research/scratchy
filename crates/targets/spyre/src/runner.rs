@@ -103,6 +103,18 @@ fn weight_arg(data: Vec<u8>, dt: SDType, shape: Vec<usize>) -> Arg {
             shape,
             dtype: DType::F16,
         },
+        // ⭐ fp8 STAYS 1-BYTE-PACKED, exactly as `spyre_load.rs` stages it (the
+        // "do NOT narrow" law): an fp8 weight VIEW widens on read (`ktdp.load`
+        // over an `Fp8E4m3` memref decodes each byte through `e4m3_to_f32`), so
+        // the bytes must land in HBM verbatim and the VIEW's dtype — carried by
+        // the program, mirrored here — is what makes the executor read them as
+        // one element per byte. Routing this through the `other` arm's F32 would
+        // mislabel the bytes (4× the elements, decoded as garbage).
+        SDType::Fp8E4m3 => Arg::TensorBytes {
+            data,
+            shape,
+            dtype: DType::Fp8E4m3,
+        },
         _ => Arg::TensorBytes {
             data,
             shape,
@@ -261,10 +273,9 @@ impl SpyreSession {
 mod tests {
     use super::*;
     use crate::manifest::attn_mask_fill;
-    use crate::manifest::{alloc_buffers, argmax};
 
     /// Semantics lock for the attention runtime length-mask the emitter emits
-    /// (`KtirFunc::attn`): the prefix scores `addf` a shared
+    /// (the attention program): the prefix scores `addf` a shared
     /// `[1, capacity]` mask tile the host fills via [`attn_mask_fill`] — 0 on
     /// valid columns, large-negative past `decode_position`. This drives the
     /// exact emitted op (`ktdp.load` the mask + `arith.addf`) through ktir_emulator
@@ -280,7 +291,7 @@ mod tests {
     const OUT: u64 = 2;
 
     /// A `[1, 4]` HBM view over parameter `ptr`, its whole-tile access window, and the loaded tile —
-    /// the same three ops `KtirFunc::view_of` / `tile` / `load_tile` emit, built here directly so
+    /// the same three ops a program's `view_of` / `tile` / `load_tile` emit, built here directly so
     /// the test drives CONSTRUCTED IR rather than a second, parsed copy of it.
     fn view_load(
         a: &'static ktir_core::arena::Arena,
@@ -331,7 +342,7 @@ mod tests {
     }
 
     /// Semantics lock for the attention runtime length-mask the emitter emits
-    /// (`KtirFunc::attn`): the prefix scores `addf` a shared `[1, capacity]` mask tile the host
+    /// (the attention program): the prefix scores `addf` a shared `[1, capacity]` mask tile the host
     /// fills via [`attn_mask_fill`] — 0 on valid columns, large-negative past the decode position.
     /// This drives the exact emitted ops (`ktdp.load` the mask + `arith.addf`) through the REAL
     /// launch path — `SpyreSession::new_multi` / `run_step`, keyed by tensor id — and asserts
@@ -369,9 +380,9 @@ mod tests {
         });
         ops.push(add);
 
-        // The store's own view + window over the output parameter.
+        // The store's own view + window over the output parameter. (`next` stops here: the
+        // two SSAs minted below are the program's last.)
         let (oview, oacc) = (Ssa(next), Ssa(next + 1));
-        next += 2;
         let mut vop = Operation::new(a, Some(oview), OpKind::KtdpConstructMemoryView, &[out_p])
             .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())))
             .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(vec![4, 1])))

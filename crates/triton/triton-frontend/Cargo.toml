@@ -1,0 +1,31 @@
+[package]
+name = "triton-frontend"
+description = "Python -> TTIR, in Rust: bridge one of Triton -> KTIR -> SuperDSC, with no Python at runtime"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+# Re-hosted from triton-spyre's third_party/spyre/rust/triton-frontend (see
+# crates/triton/PROVENANCE.md). No [workspace] table: this is a member of scratchy's
+# workspace, not its own.
+
+[features]
+# THE PARSER IS OWNED AND UNCONDITIONAL. `src/py/parser.rs` is a hand-rolled lexer and
+# recursive-descent parser for the Python subset the census bounds -- the same approach
+# as the torch carriers' `crates/compiler/macros/src/parse_python.rs`, with no
+# dependencies, so every build (including the offline pod) parses real `.py` source.
+# It REPLACED `ruff_python_parser`, which pulled 44 lockfile versions for a parse step
+# whose grammar the census bounds anyway: a parser that accepts exactly the census
+# grammar gives the same scope control -- every refusal names the construct and its
+# line:col -- with no third-party code behind a feature that was on everywhere that
+# mattered anyway. Host code (a fixture's `dict(...)`s, f-strings, asserts) is skipped
+# structurally, not parsed, exactly as the ruff adapter ignored it.
+default = []
+
+# THROWAWAY PROBE (zz_attn_probe.rs) — remove with the probe. triton-ktir depends on
+# THIS crate, so the reverse edge lives in dev-dependencies where it cannot cycle.
+[dev-dependencies]
+triton-ktir = { path = "../triton-ktir" }
+
+[dependencies]

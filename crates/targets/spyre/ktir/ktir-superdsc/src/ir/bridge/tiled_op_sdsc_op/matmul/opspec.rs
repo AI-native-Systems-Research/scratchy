@@ -296,7 +296,7 @@ where
     // ⭐⭐⭐ THE REDUCTION'S STICK BASIS IS THE **OPERAND'S**, PER AXIS — and this line is the whole
     // difference between "N and K share one format" and what the machine actually does.
     //
-    // The fp8 path calls this with `DF = Fp16` ON PURPOSE (see `lower_matmul_node`'s fq_mm site): the
+    // The fp8 path calls this with `DF = Fp16` ON PURPOSE (see main's `lower_matmul_node` fq_mm site): the
     // OUTPUT is fp16 and the packed fp8 KERNEL's N-stick is 64, so the `out` work-division must split on
     // the 64 basis. But the fp8 ACTIVATION's K-stick is 128, and `stick_basis` — which is what
     // `WorkPlan::divide`'s stick clause and the split search both measure against — reads the DIM's `df`.
