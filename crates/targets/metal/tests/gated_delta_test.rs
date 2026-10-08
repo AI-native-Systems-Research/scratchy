@@ -424,6 +424,72 @@ fn gdn_rms_norm_gated_matches_reference() {
     }
 }
 
+/// `gdn_rms_norm_gated_f32` at the lowering's threadgroup — the smallest power of two covering
+/// head_v — sums in the 256-thread order bit for bit (the larger tree's extra levels add zeros),
+/// at head_v 128 and 16; a quarter-width threadgroup (four squares a thread, summed in turn) does
+/// not.
+#[test]
+fn gdn_rms_norm_gated_sums_alike_at_every_covering_threadgroup() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+    for (d, threads, narrower) in [(128usize, [128usize, 512], 32usize), (16, [16, 32], 4)] {
+        let rows = 512usize;
+        let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
+        let (x, z, weight) = (shifted(rows * d, 7), shifted(rows * d, 3), shifted(d, 5));
+        let key = PipelineKey::new(
+            "gdn_rms_norm_gated",
+            "gdn_rms_norm_gated_f32",
+            vec![
+                ConstantValue::uint(0, d as u32),
+                ConstantValue::uint(1, rows as u32),
+                ConstantValue::float(2, 1e-6),
+            ],
+        );
+        let pipeline = baked_build(&cache, &key).expect("gdn_rms_norm_gated pipeline");
+        let (x_buf, z_buf, w_buf) = (
+            buf_f32(&device, &x),
+            buf_f32(&device, &z),
+            buf_f32(&device, &weight),
+        );
+        let run = |width: usize| {
+            let out = buf_zero_f32(&device, rows * d);
+            let tg = MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            };
+            let grid = MTLSize {
+                width: rows,
+                height: 1,
+                depth: 1,
+            };
+            let bufs = [&out, &x_buf, &z_buf, &w_buf];
+            common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, tg).then(|| {
+                read_f32(&out, rows * d)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let Some(want) = run(256) else {
+            return;
+        };
+        for width in threads {
+            assert_eq!(
+                run(width),
+                Some(want.clone()),
+                "head_v {d}, {width} threads"
+            );
+        }
+        assert_ne!(run(narrower), Some(want), "head_v {d}, {narrower} threads");
+    }
+}
+
 /// `gdn_conv1d_varlen_f32`, single fresh sequence (is_fresh=1, zero left-pad):
 /// must match `cpu_golden::gdn_causal_conv1d`. Config conv_dim=32, kernel=4.
 #[test]
@@ -886,7 +952,8 @@ fn gdn_scan_simd_is_the_gating_then_scan() {
 }
 
 /// `gdn_scan_pipelined_f32` — the prefill scan (gdn_scan_pipelined.metal, omlx Kernel P's
-/// 8-lanes-per-row staging under this crate's contracts) — against the gating→scan chain over
+/// 8-lanes-per-row staging under this crate's contracts, two rows a thread, 32 a threadgroup)
+/// — against the gating→scan chain over
 /// the same inputs and state: outputs and state left behind must agree to f32 rounding (the
 /// butterfly's summation order is simd_sum's). Mixed continued/fresh varlen batches including a
 /// decode-shaped 1-token continuation; block-tail lengths exercise the partial block.
@@ -1006,7 +1073,7 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
             &alog_buf,
             &dt_buf,
         ];
-        let grid = size(value_dim / 16, 1, seqs);
+        let grid = size(value_dim / 32, 1, seqs);
         if !common::dispatch_threadgroups(&device, &pipe, &bufs, grid, size(128, 1, 1)) {
             return;
         }

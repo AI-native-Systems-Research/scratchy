@@ -14,15 +14,26 @@
 // butterfly over the row's 8 lanes, the summation order simd_sum builds, so
 // the two kernels agree to f32 rounding (the parity test pins this).
 //
-// Mapping (Kernel P): 8 lanes own one value row, each holding head_k/8 state
+// Mapping (Kernel P): 8 lanes own a value row, each holding head_k/8 state
 // channels in four float4 granules at columns seg, seg+8, seg+16, seg+24; a
-// 128-thread threadgroup covers 16 value rows, so value_dim/16 threadgroups
-// spread evenly over the cores (the decode kernel's 4-simdgroup groups
-// under-fill them at prefill). The block's k/q rows (the key head's head_k
-// channels), the 16-row v slice and the raw a/b scalars are staged
+// thread owns two rows, rg and rg+16 of its threadgroup's 32, so a 128-thread
+// threadgroup covers 32 value rows and every k/q fragment a lane reads serves
+// both (value_dim/32 threadgroups). The block's k/q rows (the key head's
+// head_k channels), the 32-row v slice and the raw a/b scalars are staged
 // cooperatively into threadgroup memory and prefetched into registers one
 // block ahead, so the recurrence's per-token reads hit registers or
-// threadgroup memory, never device memory.
+// threadgroup memory, never device memory. Once per block, a token's norms
+// (each lane's k_inv, and q scaled by its q_inv in place) and its gating
+// (decay, 1 + exp(-b)) are formed once for the threadgroup rather than by
+// every lane of every row.
+//
+// Every value is formed by the expression, and in the statement order, a
+// thread owning one row and forming its own norms and gating uses, so the
+// outputs do not depend on the mapping, bit for bit. The order is load-bearing
+// — under fast math the shader compiler contracts by it (k_inv read after the
+// k/q fragments; delta·k_inv as ((v - p)·k_inv)/(1 + exp(-b))) — and a row's 8
+// lanes need not agree on a butterfly total to the last bit, so each lane keeps
+// the norms its own butterfly formed.
 //
 // `conv_out` and `o` are f32; `a`/`b`/`dt_bias` are `T`; `ssm_state` is f32
 // with the cuda-symmetric layout [num_slots, HV, head_v, head_k].
@@ -31,9 +42,9 @@
 //   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
 //   GDN_PIPE_HEAD_K (K), GDN_PIPE_HEAD_V (head_v), GDN_PIPE_SCALE,
 //   GDN_PIPE_TB (tokens per block; multiple of 4).
-// Requires K == 128 (8 lanes × four float4s) and head_v % 16 == 0.
+// Requires K == 128 (8 lanes × four float4s) and head_v % 32 == 0.
 //
-// Dispatch: grid (head_v*HV/16, 1, num_seqs); threads (128, 1, 1). The
+// Dispatch: grid (head_v*HV/32, 1, num_seqs); threads (128, 1, 1). The
 // lowering routes PREFILL here and keeps decode on `gdn_scan_simd` (whose
 // 4-simdgroup groups are the right shape for one token).
 
@@ -67,7 +78,8 @@ template <typename T>
   constexpr uint TB = GDN_PIPE_TB;
   constexpr uint NT = 128;
   constexpr uint KR = 8;   // lanes per value row (head_k == 8*KR channels)
-  constexpr uint DB = 16;  // value rows per threadgroup
+  constexpr uint RS = NT / KR;  // a thread's second row sits RS rows below its first
+  constexpr uint DB = 2 * RS;   // value rows per threadgroup
   const uint H = GDN_PIPE_NUM_K_HEADS;
   const uint HV = GDN_PIPE_NUM_V_HEADS;
   const uint K = GDN_PIPE_HEAD_K;
@@ -78,10 +90,10 @@ template <typename T>
 
   const uint row0 = tgid.x * DB;
   const uint tid = tpig.x;
-  const uint rg = tid / KR;   // value row within the threadgroup
+  const uint rg = tid / KR;   // first value row within the threadgroup
   const uint seg = tid % KR;  // lane within the row
   const uint i_n = tgid.z;    // sequence
-  const uint vr = row0 + rg;  // global value row = i_hv*Vd + i_v
+  const uint vr = row0 + rg;  // global value row = i_hv*Vd + i_v (the second: vr + RS)
   const uint i_hv = vr / Vd;
   const uint i_v = vr % Vd;
   const uint i_h = i_hv / (HV / H);
@@ -103,27 +115,35 @@ template <typename T>
   const float dtb = float(dt_bias[i_hv]);
   const float scale = GDN_PIPE_SCALE;
 
-  device float* state_row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
-  // State fragment in registers: channels 4*(seg + 8*i) .. +3, i = 0..3.
-  float4 st[4];
+  device float* state_row0 = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
+  device float* state_row1 = state_row0 + RS * K;
+  // State fragments in registers, a row each: channels 4*(seg + 8*i) .. +3, i = 0..3.
+  float4 st0[4], st1[4];
   {
-    const device float4* S_in = (const device float4*)(state_row + 4u * seg);
+    const device float4* S0 = (const device float4*)(state_row0 + 4u * seg);
+    const device float4* S1 = (const device float4*)(state_row1 + 4u * seg);
     for (uint i = 0; i < 4; i++) {
-      st[i] = fresh ? 0.0f : S_in[8u * i];
+      st0[i] = fresh ? 0.0f : S0[8u * i];
+    }
+    for (uint i = 0; i < 4; i++) {
+      st1[i] = fresh ? 0.0f : S1[8u * i];
     }
   }
 
   // ── Block staging ──────────────────────────────────────────────────
   // k/q: this key head's head_k channels per token (4 float4s per lane).
-  // v: the threadgroup's 16 value rows. a/b: per token, RAW — the softplus
-  // and sigmoid are applied at the use site, never staged. The row's 8
+  // v: the threadgroup's 32 value rows. a/b: per token, RAW. The row's 8
   // lanes sit in one simdgroup (rg*KR+seg stays within a 32-thread
   // boundary), so the butterflies never cross simdgroups.
   threadgroup float4 k_s[TB][KR][4];
-  threadgroup float4 q_s[TB][KR][4];
+  threadgroup float4 q_s[TB][KR][4];  // raw q, then q·q_inv (the block's prep)
   threadgroup float v_s[TB][DB];
   threadgroup float g_s[TB];
-  threadgroup float b_s[TB];   // RAW b input — sigmoid applied at the use site
+  threadgroup float b_s[TB];
+  // The block's prep: per token each lane's k_inv, decay and 1 + exp(-b).
+  threadgroup float kinv_s[TB][KR];
+  threadgroup float dec_s[TB];
+  threadgroup float den_s[TB];
 
   const device float* qk_base = conv_out + uint(bos) * conv_dim;
   const uint qk_off = i_h * K;  // q's offset in the row; k's is +key_dim
@@ -219,21 +239,15 @@ template <typename T>
       GDN_PIPE_FETCH(tn, seq_len - tn)
     }
 
-    // ── The steps. Each lane reads its own k/q fragments (threadgroup
-    // memory; lane seg touches columns 4*seg..4*seg+3 only), computes the
-    // norms' partials, and runs the recurrence. The butterflies reduce
-    // across the row's 8 lanes (xor 4, 2, 1).
-    for (uint t = 0; t < tt; t++) {
-      const float av = g_s[t] + dtb;
-      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
-      const float decay = exp(neg_a * sp);
-      const float beta = 1.0f / (1.0f + exp(-b_s[t]));
-
+    // ── The block's prep: a token's norms by 8 lanes (the channel split and
+    // butterfly the rows' lanes would use), q scaled in place, and its gating.
+    for (uint w = tid; w < tt * KR; w += NT) {
+      const uint t = w / KR, l = w % KR;
       float4 kc[4], qc[4];
       _Pragma("unroll")
       for (uint i = 0; i < 4; i++) {
-        kc[i] = k_s[t][seg][i];
-        qc[i] = q_s[t][seg][i];
+        kc[i] = k_s[t][l][i];
+        qc[i] = q_s[t][l][i];
       }
       float q_sq = 0.0f, k_sq = 0.0f;
       _Pragma("unroll")
@@ -249,36 +263,91 @@ template <typename T>
       }
       const float q_inv = rsqrt(qs + 1e-6f) * scale;
       const float k_inv = rsqrt(ks + 1e-6f);
-
-      // Decay, then the S·k partial dot.
-      float2 a2 = 0.0f;
       _Pragma("unroll")
       for (uint i = 0; i < 4; i++) {
-        st[i] = st[i] * decay;
-        a2 += float2(dot(st[i].xy, kc[i].xy * k_inv), dot(st[i].zw, kc[i].zw * k_inv));
+        q_s[t][l][i] = qc[i] * q_inv;
       }
-      float p = a2.x + a2.y;
+      kinv_s[t][l] = k_inv;
+    }
+    if (tid < tt) {
+      const float av = g_s[tid] + dtb;
+      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+      dec_s[tid] = exp(sp * neg_a);
+      den_s[tid] = exp(-b_s[tid]) + 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── The steps. Each lane reads its own k/q fragments (threadgroup
+    // memory; lane seg touches columns 4*seg..4*seg+3 only) and runs both
+    // rows' recurrences. The butterflies reduce across a row's 8 lanes
+    // (xor 4, 2, 1).
+    for (uint t = 0; t < tt; t++) {
+      const float decay = dec_s[t];
+      const float den = den_s[t];
+      float4 kc[4], qn[4];
+      _Pragma("unroll")
+      for (uint i = 0; i < 4; i++) {
+        kc[i] = k_s[t][seg][i];
+        qn[i] = q_s[t][seg][i];
+      }
+      const float k_inv = kinv_s[t][seg];
+
+      // Decay, then the S·k partial dots.
+      float p0, p1;
+      {
+        float2 a2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st0[i] = st0[i] * decay;
+          a2 += float2(dot(st0[i].xy, kc[i].xy * k_inv), dot(st0[i].zw, kc[i].zw * k_inv));
+        }
+        p0 = a2.x + a2.y;
+      }
+      {
+        float2 a2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st1[i] = st1[i] * decay;
+          a2 += float2(dot(st1[i].xy, kc[i].xy * k_inv), dot(st1[i].zw, kc[i].zw * k_inv));
+        }
+        p1 = a2.x + a2.y;
+      }
       _Pragma("unroll")
       for (uint m = 4; m >= 1; m /= 2) {
-        p += simd_shuffle_xor(p, m);
+        p0 += simd_shuffle_xor(p0, m);
+        p1 += simd_shuffle_xor(p1, m);
       }
-      const float v_t = v_s[t][rg];
-      const float delta = (v_t - p) * beta;
 
       // S += k·delta; o partial = S·q.
-      float2 o2 = 0.0f;
-      _Pragma("unroll")
-      for (uint i = 0; i < 4; i++) {
-        st[i] = fma(kc[i], float4(delta * k_inv), st[i]);
-        o2 += float2(dot(st[i].xy, qc[i].xy * q_inv), dot(st[i].zw, qc[i].zw * q_inv));
+      float out0, out1;
+      {
+        const float dk = ((v_s[t][rg] - p0) * k_inv) / den;
+        float2 o2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st0[i] = fma(kc[i], float4(dk), st0[i]);
+          o2 += float2(dot(st0[i].xy, qn[i].xy), dot(st0[i].zw, qn[i].zw));
+        }
+        out0 = o2.x + o2.y;
       }
-      float out = o2.x + o2.y;
+      {
+        const float dk = ((v_s[t][rg + RS] - p1) * k_inv) / den;
+        float2 o2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st1[i] = fma(kc[i], float4(dk), st1[i]);
+          o2 += float2(dot(st1[i].xy, qn[i].xy), dot(st1[i].zw, qn[i].zw));
+        }
+        out1 = o2.x + o2.y;
+      }
       _Pragma("unroll")
       for (uint m = 4; m >= 1; m /= 2) {
-        out += simd_shuffle_xor(out, m);
+        out0 += simd_shuffle_xor(out0, m);
+        out1 += simd_shuffle_xor(out1, m);
       }
       if (seg == 0u) {
-        o[(uint(bos) + t0 + t) * value_dim + vr] = out;
+        o[(uint(bos) + t0 + t) * value_dim + vr] = out0;
+        o[(uint(bos) + t0 + t) * value_dim + vr + RS] = out1;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -287,9 +356,13 @@ template <typename T>
 #undef GDN_PIPE_FETCH
 
   {
-    device float4* S_out = (device float4*)(state_row + 4u * seg);
+    device float4* S0 = (device float4*)(state_row0 + 4u * seg);
+    device float4* S1 = (device float4*)(state_row1 + 4u * seg);
     for (uint i = 0; i < 4; i++) {
-      S_out[8u * i] = st[i];
+      S0[8u * i] = st0[i];
+    }
+    for (uint i = 0; i < 4; i++) {
+      S1[8u * i] = st1[i];
     }
   }
 }

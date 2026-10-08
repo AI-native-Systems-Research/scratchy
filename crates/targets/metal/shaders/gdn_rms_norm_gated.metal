@@ -21,7 +21,9 @@
 //   GDN_RMS_ROWS — total_rows (= num_tokens * num_v_heads)
 //   GDN_RMS_EPS  — rms_norm_eps
 //
-// Dispatch: one threadgroup per row; threadgroup reduction over d.
+// Dispatch: one threadgroup per row, a power of two of threads; threadgroup
+// reduction over d. Every power of two ≥ d sums in the same order (its extra
+// tree levels add zeros), so the lowering dispatches the smallest, at most 256.
 
 #include <metal_stdlib>
 #include "baked.h"

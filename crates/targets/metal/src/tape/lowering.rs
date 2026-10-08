@@ -955,9 +955,10 @@ fn route_small_m(
 /// one-command decode (`gdn_decode`) where `lower_one` emitted one ahead of the conv, scan and
 /// norm: it under `OnlyIfDecodeStep`, they under `UnlessDecodeStep`. On the steps they serve, a
 /// geometry the block-staged pipelined scan covers (`gdn_scan_pipelined`: head_k 128 — 8 lanes
-/// own 16 state channels each in four float4 granules — and head_v a multiple of 16) runs it in
-/// place of the simd scan, with the SAME bindings and its own dispatch (grid (value_dim/16, 1, 1)
-/// scaled by num_seqs on Z, threads (128,1,1)); with no decode command, the simd scan stays
+/// own 16 state channels each in four float4 granules — and head_v a multiple of its
+/// [`GDN_PIPE_ROWS`]-row threadgroups) runs it in place of the simd scan, with the SAME bindings
+/// and its own dispatch (grid (value_dim/[`GDN_PIPE_ROWS`], 1, 1) scaled by num_seqs on Z,
+/// threads (128,1,1)); with no decode command, the simd scan stays
 /// under `OnlyIfDecodeStep` as its twin. The norm that follows reads the scan's `o` scratch, so
 /// the scan sits between the two.
 fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
@@ -973,7 +974,7 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
         return cmds;
     }
     let hv = p.gdn_head_v_dim;
-    let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(16);
+    let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
     let pipelined = |scan: &LoweredCommand| LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
@@ -987,7 +988,7 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
                 .collect(),
         ),
         dispatch: DispatchShape {
-            threadgroups: (p.gdn_num_v_heads * hv / 16, 1, 1),
+            threadgroups: (p.gdn_num_v_heads * hv / GDN_PIPE_ROWS, 1, 1),
             threads_per_threadgroup: (128, 1, 1),
             m_scaling: Some(MScaling {
                 axis: MScaleAxis::Z,
@@ -4754,7 +4755,8 @@ fn lower_one(
             }
 
             // 4. Gated RMSNorm → core (model-dtype arena out_slot).
-            //    One threadgroup per row [num_tokens · nv]; scales X.
+            //    One threadgroup per row [num_tokens · nv], the power of two covering head_v
+            //    (any power of two ≥ head_v sums in the same order); scales X.
             cmds.push(LoweredCommand {
                 kernel: KernelId::GatedDeltaNet,
                 library: "gdn_rms_norm_gated",
@@ -4766,7 +4768,7 @@ fn lower_one(
                 ]),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m * nv, 1, 1),
-                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    threads_per_threadgroup: (hv.next_power_of_two().min(THREADS_PER_GROUP), 1, 1),
                     m_scaling: Some(MScaling {
                         axis: MScaleAxis::X,
                         bucket_m: BucketM(bucket_m),
@@ -5532,6 +5534,10 @@ fn gdn_scan_simd_static_name(dtype: DequantDtype) -> &'static str {
 /// default; the TB sweep on qwen3.6-27b (T ∈ {1024, 2048, 4096}) put every
 /// TB ∈ {8, 12, 16, 24} within run-to-run variance of each other.
 const GDN_PIPE_TB: u32 = 12;
+
+/// Value rows a threadgroup of the pipelined GDN prefill scan owns: 128 threads, 8 lanes a row,
+/// two rows a thread.
+const GDN_PIPE_ROWS: u32 = 32;
 
 fn gdn_scan_pipelined_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
@@ -7648,8 +7654,10 @@ mod tests {
         let d = &q27[2].command.dispatch;
         assert_eq!(
             (d.threadgroups, d.threads_per_threadgroup),
-            ((48 * 128 / 16, 1, 1), (128, 1, 1))
+            ((48 * 128 / 32, 1, 1), (128, 1, 1))
         );
+        let d = &q27[3].command.dispatch;
+        assert_eq!(d.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(shape(&lowered((16, 48, 128, 128), 1)), [(decode, None)]);
         // head_k 64: the decode command, then the chain with its simd scan.
         let want = [
@@ -7659,14 +7667,17 @@ mod tests {
             (norm, unless),
         ];
         assert_eq!(shape(&lowered((2, 6, 64, 128), 64)), want);
-        // head_v 48 (not a multiple of 32): no decode command; the scan's twins, sharing the simd
-        // command's bindings — only the dispatch shape differs.
-        let twins = lowered((2, 4, 128, 48), 64);
+        // Eight value heads a key head (past the decode command's 1024 threads): no decode
+        // command; the scan's twins, sharing the simd command's bindings — only the dispatch
+        // shape differs.
+        let twins = lowered((1, 8, 128, 128), 64);
         let want = [(conv, None), (simd, only), (pipe, unless), (norm, None)];
         assert_eq!(shape(&twins), want);
         assert_eq!(twins[1].command.bindings, twins[2].command.bindings);
-        // Neither kernel covers head_k 64 with head_v 48.
+        // head_v 48: no decode command, and not a whole number of the pipelined scan's 32-row
+        // threadgroups — the simd scan alone; neither kernel covers head_k 64 either.
         let want = [(conv, None), (simd, None), (norm, None)];
+        assert_eq!(shape(&lowered((2, 4, 128, 48), 64)), want);
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
     }
 
