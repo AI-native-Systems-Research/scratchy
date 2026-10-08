@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The NAX MLX-affine 4-bit GEMMs that feed the matrix unit the offset-8
 //! codes directly — `affine_qmm_small_m_*` (decode batches) and the
-//! `affine_w4a8_quant_*` + `affine_qmm_w4a8_*` pair (int8 activations) —
-//! against a host f32 reference of `y = x · (s·q + b)ᵀ`, launched as the
+//! `affine_w4a8_quant_*` + `affine_qmm_w4a8_*` pair (int8 activations), and
+//! its MoE grouped twin — against a host f32 reference of `y = x · (s·q + b)ᵀ`, launched as the
 //! tape launches them (M baked at the bucket, the grid scaled to the live
 //! rows), for every activation / scale dtype and group size the lowering
 //! routes to them.
@@ -16,8 +16,9 @@ use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::quantized::{
-    DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile,
-    qmm_w4a8_static_name, small_m_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
+    DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_GROUPED_TILE, W4A8_TILE_ROWS,
+    W4a8Rows, W4a8Tile, qmm_w4a8_static_name, small_m_kernel_static_name, w4a8_quant_static_name,
+    w4a8_scratch_bytes,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -401,4 +402,143 @@ fn w4a8_across_dtypes_group_sizes_and_tiles() {
             }
         }
     });
+}
+
+/// The MoE grouped W4A8 pair (`affine_gather_w4a8_quant_*` + `affine_gather_qmm_w4a8_*`) at the
+/// grouped tile, over the sort's layout: each expert's run padded to 64 rows, the dead rows
+/// sentinel and holding garbage. Runs end inside a tile's first half (a 16-row tile), past it,
+/// and in a second tile; one expert has none. Every real row against its expert's reference.
+#[test]
+fn w4a8_grouped_expert_runs() {
+    with_nax(|device, cache| {
+        for (act, scale) in [(Dtype::Bf16, Dtype::Bf16), (Dtype::F16, Dtype::Bf16)] {
+            for group_size in [64, 128] {
+                run_grouped(device, cache, act, scale, group_size, &[5, 16, 17, 40, 0]);
+            }
+        }
+    });
+}
+
+fn run_grouped(
+    device: &Device,
+    cache: &SpecializedPipelineCache,
+    act: Dtype,
+    scale: Dtype,
+    gs: usize,
+    counts: &[usize],
+) {
+    let (n, k, experts, run) = (192, 512, counts.len(), 64);
+    let m = experts * run;
+    let mut rng = Rng(0x9e0 ^ gs as u64);
+    let codes: Vec<u8> = (0..experts * n * k)
+        .map(|_| (rng.next() & 0xf) as u8)
+        .collect();
+    let packed: Vec<u32> = codes
+        .chunks(8)
+        .map(|c| {
+            c.iter()
+                .enumerate()
+                .fold(0u32, |w, (i, &q)| w | ((q ^ 8) as u32) << (4 * i))
+        })
+        .collect();
+    let groups = experts * n * k / gs;
+    let scales: Vec<u16> = (0..groups)
+        .map(|_| scale.bits(0.01 + 0.04 * rng.unit()))
+        .collect();
+    let biases: Vec<u16> = (0..groups).map(|_| scale.bits(rng.unit() - 0.5)).collect();
+    let x: Vec<u16> = (0..m * k)
+        .map(|_| act.bits(2.0 * rng.unit() - 1.0))
+        .collect();
+    let indices: Vec<u32> = (0..m)
+        .map(|r| match r % run < counts[r / run] {
+            true => (r / run) as u32,
+            false => experts as u32,
+        })
+        .collect();
+    let consts = vec![
+        ConstantValue::int(0, k as i32),
+        ConstantValue::int(1, n as i32),
+        ConstantValue::int(2, m as i32),
+        ConstantValue::int(4, experts as i32),
+    ];
+    let pipeline = |name: &'static str| {
+        let key = PipelineKey::new("quantized_qmm_nax", name, consts.clone());
+        baked_build(cache, &key).expect("pipeline")
+    };
+    let size = |width: usize, height: usize| MTLSize {
+        width,
+        height,
+        depth: 1,
+    };
+    let scratch_bytes = w4a8_scratch_bytes(m as u32, k as u32) as usize;
+    let (w_buf, s_buf, b_buf) = (
+        shared(device, &packed),
+        shared(device, &scales),
+        shared(device, &biases),
+    );
+    let (x_buf, i_buf) = (shared(device, &x), shared(device, &indices));
+    let scratch = shared(device, &vec![0xffu8; scratch_bytes]);
+    let y_buf = shared(device, &vec![0u16; m * n]);
+    let tile = W4A8_GROUPED_TILE;
+    let name = qmm_w4a8_static_name(W4a8Rows::Grouped, act.act(), scale.scale(), gs as u32, tile);
+    let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
+    batch.encode(
+        &pipeline(w4a8_quant_static_name(W4a8Rows::Grouped, act.act())),
+        &[(&x_buf, 0), (&scratch, 1), (&i_buf, 2)],
+        &[],
+        &[],
+        &[],
+        size((k / 64).div_ceil(16), m),
+        size(128, 1),
+    );
+    batch.barrier();
+    batch.encode(
+        &pipeline(name),
+        &[
+            (&w_buf, 0),
+            (&s_buf, 1),
+            (&b_buf, 2),
+            (&scratch, 3),
+            (&y_buf, 4),
+            (&i_buf, 5),
+        ],
+        &[],
+        &[],
+        &[],
+        size(n / tile.cols() as usize, m / W4A8_TILE_ROWS as usize),
+        size(32 * tile.simdgroups() as usize, 1),
+    );
+    batch.commit(true);
+    let got: Vec<u16> =
+        unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, m * n) }
+            .to_vec();
+    let x_used = int8_chunks(&x.iter().map(|&b| act.value(b)).collect::<Vec<_>>());
+    for (r, &e) in indices
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| (**e as usize) < experts)
+    {
+        let e = e as usize;
+        let want: Vec<f32> = (0..n)
+            .map(|c| {
+                let row = (e * n + c) * k;
+                let acc = (0..k).fold(0f64, |acc, kk| {
+                    let g = (row + kk) / gs;
+                    let w =
+                        scale.value(scales[g]) * codes[row + kk] as f32 + scale.value(biases[g]);
+                    acc + (x_used[r * k + kk] * w) as f64
+                });
+                acc as f32
+            })
+            .collect();
+        let peak = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let tol = peak * act.eps() + 1e-3 * peak;
+        for (c, w) in want.iter().enumerate() {
+            let g = act.value(got[r * n + c]);
+            assert!(
+                (g - w).abs() <= tol,
+                "{name} expert {e} row {r} col {c}: got {g}, want {w} (tol {tol})"
+            );
+        }
+    }
 }

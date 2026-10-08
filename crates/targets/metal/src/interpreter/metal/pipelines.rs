@@ -68,6 +68,11 @@ use crate::tape::constants::{TapeVariant, UnboundConstant};
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
 pub const GEMV_ROWS: u32 = 4;
 
+/// Rows from which a bf16 GEMM runs blocked (`gemm_bf16_blocked`): 2.1-2.2x the 8×8-tile GEMM at
+/// a 2048-row MoE router on base M5 (128 × 2816, 256 × 2048), ahead from 256 rows; under them
+/// its few threadgroups lose.
+pub const GEMM_BLOCKED_ROWS: u32 = 256;
+
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
 // `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`)
@@ -163,38 +168,35 @@ impl SpecializedPipelines {
 /// A dense GEMM's pipeline key at `dtype` and its dispatch, keyed on its `(M, N, K)` (constants
 /// 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at least
 /// [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV (`gemv_{f16,bf16}_specialized`),
-/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. Otherwise the 8×8-tile GEMM
-/// (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one simdgroup per tile. Bindings for
-/// both: output 0, input 1, weight 2.
+/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. A bf16 GEMM of at least
+/// [`GEMM_BLOCKED_ROWS`] rows takes the blocked body (`gemm_bf16_blocked`): 32×32 output tiles
+/// over 4 simdgroups sharing their A/B tiles, the 8×8-tile GEMM's MMAs in its order — the same
+/// bits. Otherwise the 8×8-tile GEMM (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one
+/// simdgroup per tile. Bindings for all: output 0, input 1, weight 2.
 pub fn gemm_pipeline(
     dtype: MetalDtype,
     dims: GemmDims,
 ) -> Result<(PipelineKey, DispatchShape), PipelineLookupError> {
     let GemmDims { m, n, k } = dims;
-    let gemv = m == 1 && n >= GEMV_ROWS;
-    let function = match (dtype, gemv) {
-        (MetalDtype::F16, false) => "gemm_f16_specialized",
-        (MetalDtype::Bf16, false) => "gemm_bf16_specialized",
-        (MetalDtype::F16, true) => "gemv_f16_specialized",
-        (MetalDtype::Bf16, true) => "gemv_bf16_specialized",
-        (MetalDtype::Int4, _) => {
+    let (gemv, blocked) = (m == 1 && n >= GEMV_ROWS, m >= GEMM_BLOCKED_ROWS);
+    // The kernel, the outputs a threadgroup covers along N (and M), and its threads.
+    let (function, tile, threads) = match (dtype, gemv, blocked) {
+        (MetalDtype::F16, false, _) => ("gemm_f16_specialized", 8, 32),
+        (MetalDtype::Bf16, false, false) => ("gemm_bf16_specialized", 8, 32),
+        (MetalDtype::Bf16, false, true) => ("gemm_bf16_blocked", 32, 128),
+        (MetalDtype::F16, true, _) => ("gemv_f16_specialized", GEMV_ROWS, 256),
+        (MetalDtype::Bf16, true, _) => ("gemv_bf16_specialized", GEMV_ROWS, 256),
+        (MetalDtype::Int4, ..) => {
             return Err(PipelineLookupError::DtypeNotYetWired(
                 KernelId::Gemm,
                 MetalDtype::Int4,
             ));
         }
     };
-    let dispatch = match gemv {
-        true => DispatchShape {
-            threadgroups: (n.div_ceil(GEMV_ROWS), 1, 1),
-            threads_per_threadgroup: (256, 1, 1),
-            m_scaling: None,
-        },
-        false => DispatchShape {
-            threadgroups: (n.div_ceil(8), m.div_ceil(8), 1),
-            threads_per_threadgroup: (32, 1, 1),
-            m_scaling: None,
-        },
+    let dispatch = DispatchShape {
+        threadgroups: (n.div_ceil(tile), if gemv { 1 } else { m.div_ceil(tile) }, 1),
+        threads_per_threadgroup: (threads, 1, 1),
+        m_scaling: None,
     };
     let constants = vec![
         ConstantValue::uint(0, m),
@@ -423,7 +425,6 @@ mod tests {
             | KernelId::MoeGroupInit
             | KernelId::MoeGroupScatter
             | KernelId::MoeGroupScatterQ8
-            | KernelId::MoeGroupGather
             | KernelId::MoeWeightedSum
             | KernelId::MoePerExpertScale
             | KernelId::VisionLayerNorm
@@ -587,7 +588,6 @@ mod tests {
             | KernelId::MoeGroupInit
             | KernelId::MoeGroupScatter
             | KernelId::MoeGroupScatterQ8
-            | KernelId::MoeGroupGather
             | KernelId::MoeWeightedSum
             | KernelId::MoePerExpertScale
             | KernelId::VisionLayerNorm

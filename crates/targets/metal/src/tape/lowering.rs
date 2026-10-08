@@ -41,10 +41,10 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
     if chunked { crate::BLOCKS_PER_CHUNK } else { 0 }
 }
 use crate::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS,
-    W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
-    qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
-    qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
+    DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
+    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide,
+    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
+    qmm_w4a8_static_name, qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
     splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
@@ -6339,15 +6339,6 @@ fn moe_group_scatter_symbol(dtype: MetalDtype) -> &'static str {
     }
 }
 
-/// Symbol for `moe_group_gather_<dtype>` (moe_group.metallib).
-fn moe_group_gather_symbol(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "moe_group_gather_float16",
-        MetalDtype::Bf16 => "moe_group_gather_bfloat16",
-        _ => "moe_group_gather_float32",
-    }
-}
-
 /// Build a `LoweredCommand` for one of the new MoE kernels with the
 /// usual fields filled in. Callers populate `bindings` + `dispatch` +
 /// `constants` then pass through.
@@ -6394,10 +6385,8 @@ fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
             at.codes.for_bits(w.0) == super::kernel_constants::AffineCodes::Offset8
         })
         && matches!(b.quant.group_size.0, 64 | 128)
-        && hidden.is_multiple_of(64)
-        && inter.is_multiple_of(64)
-        && W4a8Tile::for_n(hidden).is_some()
-        && W4a8Tile::for_n(inter).is_some()
+        && hidden.is_multiple_of(64.max(W4A8_GROUPED_TILE.cols()))
+        && inter.is_multiple_of(64.max(W4A8_GROUPED_TILE.cols()))
         && s.l.mpad_max.is_multiple_of(W4A8_TILE_ROWS)
 }
 
@@ -6501,7 +6490,6 @@ impl MoeScratch {
             R::ExpertGate => sorted(l.gate_out, l.grp_gate_pad),
             R::ExpertUp => sorted(l.up_out, l.grp_up_pad),
             R::ExpertDown => sorted(l.down_out, l.grp_down_pad),
-            R::TokenRows => l.down_out,
         };
         scratch_at(binding_index, byte_offset)
     }
@@ -6992,7 +6980,7 @@ fn lower_moe_step(
                 .into_iter()
                 .chain(codes.constant())
                 .collect();
-            let w4a8_tile = W4a8Tile::for_n(n_out).filter(|_| moe_w4a8(b, at, &s));
+            let w4a8_tile = moe_w4a8(b, at, &s).then_some(W4A8_GROUPED_TILE);
             if let Some(tile) = w4a8_tile {
                 // y[Mpad, n_out] = gather_qmm_w4a8(x_pad as int8 rows + scales, W, indices_pad):
                 // gate and up read the token rows the sort scattered as int8; down quantizes its
@@ -7232,23 +7220,9 @@ fn lower_moe_step(
                 bindings,
             )]
         }
-        S::Unsort if s.grouping != MoeGrouping::Gathered => {
-            let symbol = moe_group_gather_symbol(p.metal_dtype);
-            let (from, pos) = (s.at(0, R::ExpertDown), scratch_at(1, s.l.grp_pos));
-            let bindings = vec![from, pos, s.at(2, R::TokenRows)];
-            let shape = grid((1, pairs, 1), (hidden.min(256), 1, 1), ms(A::Y));
-            let kernel = KernelId::MoeGroupGather;
-            vec![cmd(
-                kernel,
-                "moe_group",
-                symbol,
-                vec![C::int(5, hidden as i32)],
-                shape,
-                bindings,
-            )]
-        }
         S::Unsort => vec![],
-        // `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]`.
+        // `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]`; a sorted bake's pair rows read where
+        // the sort put them, through `pos`.
         S::Combine(Slot(out)) => {
             let threads = hidden.min(64);
             let shape = grid(
@@ -7256,9 +7230,13 @@ fn lower_moe_step(
                 (threads, 1, 1),
                 ms(A::Y),
             );
-            let (rows, scores) = (s.at(0, R::TokenRows), s.at(1, R::TopKScores));
-            let bindings = vec![rows, scores, arena_at(2, out)];
-            let constants = vec![C::int(0, k as i32), C::int(1, hidden as i32)];
+            let (rows, scores) = (s.at(0, R::ExpertDown), s.at(1, R::TopKScores));
+            let mut bindings = vec![rows, scores, arena_at(2, out)];
+            let mut constants = vec![C::int(0, k as i32), C::int(1, hidden as i32)];
+            if s.grouping != MoeGrouping::Gathered {
+                bindings.push(scratch_at(3, s.l.grp_pos));
+                constants.push(C::boolean(2, true));
+            }
             let symbol = moe_weighted_sum_symbol(p);
             let kernel = KernelId::MoeWeightedSum;
             vec![cmd(

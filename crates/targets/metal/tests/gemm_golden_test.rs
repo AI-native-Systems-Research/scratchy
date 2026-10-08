@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Dense GEMM goldens on the production MTL4 dispatch path, the kernel and dispatch the worker
 //! picks (`pipeline_for_gemm`: one row runs MLX's GEMV, `gemv_{f16,bf16}_specialized`; more rows
-//! the MMA GEMM, `gemm_{f16,bf16}_specialized`) vs the CPU reference across Llama
-//! Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192) and Gemma-4's MoE
-//! router. M/N/K are compiled into the kernel, so the only bindings are
+//! the MMA GEMM, `gemm_{f16,bf16}_specialized`, `gemm_bf16_blocked` from 256 rows) vs the CPU
+//! reference across Llama Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192)
+//! and the MoE routers. M/N/K are compiled into the kernel, so the only bindings are
 //! output(0), input(1), weight(2).
 
 mod common;
 
 use half::{bf16, f16};
 use objc2_metal::MTLSize;
-use scratchy_target_metal::aot::baked_kernels;
+use scratchy_target_metal::aot::{baked_build, baked_kernels};
 use scratchy_target_metal::cpu_golden;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::interpreter::metal::__re::ComputePipelineState;
 use scratchy_target_metal::interpreter::metal::pipelines::gemm_pipeline;
 use scratchy_target_metal::interpreter::metal::{GemmDims, MetalDtype, SpecializedPipelines};
-use scratchy_target_metal::specialized_pipeline_cache::SpecializedPipelineCache;
+use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
 
 const SHAPES: &[(usize, usize, usize)] = &[
     (64, 2048, 2048),  // TinyLlama Q/K/V/O K-side
@@ -33,7 +33,60 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (1, 2048, 2048),   // Llama-3.2-1B Q/O decode
     (1, 8192, 2048),   // Llama-3.2-1B gate/up decode
     (1, 128, 2816),    // Gemma-4-26B-A4B MoE router decode
+    (2048, 128, 2816), // Gemma-4-26B-A4B MoE router prefill (bf16: blocked)
+    (256, 256, 2048),  // Qwen3.6-35B-A3B MoE router, the first blocked bucket
 ];
+
+/// The blocked bf16 GEMM runs the 8×8-tile GEMM's MMAs in its order: the same bits, at the MoE
+/// routers' prefill shapes and at M/N/K tails (K = 16q + 8).
+#[test]
+fn gemm_bf16_blocked_is_the_tile8_gemm_bit_for_bit() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device;
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    for (m, n, k) in [(2048, 128, 2816), (256, 256, 2048), (300, 100, 1032)] {
+        let dims = GemmDims { m, n, k };
+        let (blocked, shape) = gemm_pipeline(MetalDtype::Bf16, dims).expect("gemm key");
+        assert_eq!(blocked.kernel_name, "gemm_bf16_blocked");
+        let tile8 = PipelineKey::new("gemm", "gemm_bf16_specialized", blocked.constants.clone());
+        let (m, n, k) = (m as usize, n as usize, k as usize);
+        let bf = |len: usize, f: fn(f32) -> f32| -> Vec<bf16> {
+            (0..len)
+                .map(|i| bf16::from_f32(f(i as f32) * 0.3))
+                .collect()
+        };
+        let input = common::shared_slice(&device, &bf(m * k, |i| (i * 0.013).sin()));
+        let weight = common::shared_slice(&device, &bf(n * k, |i| (i * 0.019).cos()));
+        let run = |key: &PipelineKey, grid: (u32, u32), threads: u32| -> Vec<u16> {
+            let pso = baked_build(&cache, key).expect("pipeline");
+            let out = common::shared_zeroed(&device, m * n * 2);
+            let size = |w: u32, h: u32| MTLSize {
+                width: w as usize,
+                height: h as usize,
+                depth: 1,
+            };
+            let bufs = [&out, &input, &weight];
+            assert!(common::dispatch_threadgroups(
+                &device,
+                &pso,
+                &bufs,
+                size(grid.0, grid.1),
+                size(threads, 1)
+            ));
+            common::read_slice(&out, m * n)
+        };
+        let (g, t) = (shape.threadgroups, shape.threads_per_threadgroup.0);
+        let got = run(&blocked, (g.0, g.1), t);
+        let want = run(&tile8, ((n as u32).div_ceil(8), (m as u32).div_ceil(8)), 32);
+        assert!(
+            got == want,
+            "m={m} n={n} k={k}: the blocked GEMM's bits differ"
+        );
+    }
+}
 
 /// The pipeline the worker plays a dense GEMM of `(m, n, k)` with, and its dispatch as MTL sizes.
 fn gemm(

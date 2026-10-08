@@ -20,7 +20,7 @@
 //                          indices_pad[pos], and the gathered x_pad row.
 //   ... the grouped GEMMs (gate/up/down) over the padded layout, or the
 //       gathered matvecs over the sorted rows ...
-//   4. take_along_axis(pos) unsorts the down output back to token order.
+//   4. moe_weighted_sum reads each pair's down row through pos.
 //
 // All index buffers are u32. `MG_M` = number of (token,expert) pairs
 // (= bucket_m * top_k).
@@ -44,7 +44,7 @@ SCRATCHY_CONSTANT_OPTIONAL(int, MG_NUM_EXPERTS, 1);
 // m-tile (also a multiple of the steel grouped GEMM's BM=32, so the same
 // padded layout drives either kernel); 1 = no padding, the layout the
 // gathered matvec path reads sorted (same-expert pairs adjacent, so their
-// repeat slab reads hit cache). Slot 6/7 — 5 is MG_W's (moe_group_gather).
+// repeat slab reads hit cache).
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_BM, 6);
 // What `moe_group_init` sentinel-fills the dead rows of `indices_pad` with:
 // the grouped GEMMs skip a tile whose expert is `MG_NUM_EXPERTS`; the
@@ -208,36 +208,3 @@ kernel void moe_group_scatter_q8(
   }
 }
 #endif
-
-// ── moe_group_gather (un-scatter) ──────────────────────────────────
-// Restores token order after the grouped GEMM:
-//   out[i, :] = src[pos[i], :]   for i in [0, MG_M)
-// (src = the padded down-projection [Mpad, MG_W]; out = down_out
-// [bucket_m*top_k, MG_W] = the matvec path's layout, so the existing
-// moe_weighted_sum reduces it unchanged). One threadgroup row-block per
-// pair (grid.y = MG_M, m-scaled to actual pairs); threads cover MG_W.
-SCRATCHY_CONSTANT_OPTIONAL(int, MG_W, 5);
-
-template <typename T>
-kernel void moe_group_gather(
-    const device T*    src [[buffer(0)]],
-    const device uint* pos [[buffer(1)]],
-    device T*          out [[buffer(2)]],
-    uint2 tid  [[thread_position_in_threadgroup]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint2 tgsz [[threads_per_threadgroup]]) {
-  const uint i = tgid.y;
-  const uint p = pos[i];
-  const device T* src_row = src + size_t(p) * uint(MG_W);
-  device T* out_row = out + size_t(i) * uint(MG_W);
-  for (uint d = tid.x; d < uint(MG_W); d += tgsz.x) {
-    out_row[d] = src_row[d];
-  }
-}
-
-#define INST_MG_GATHER(tag, type) \
-  SCRATCHY_KERNEL(moe_group_gather_##tag, moe_group_gather<type>)
-
-INST_MG_GATHER(float16, half)
-INST_MG_GATHER(bfloat16, bfloat)
-INST_MG_GATHER(float32, float)

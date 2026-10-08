@@ -250,14 +250,14 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
         | L::RouteScale { .. }
         | L::RouteRenorm
         | L::RouteExpertScale { .. }
-        | L::ExpertGatedAct { .. } => W::OverOperand(OperandIx(0)),
+        | L::ExpertGatedAct { .. }
+        | L::ExpertUnsort => W::OverOperand(OperandIx(0)),
         L::ExpertSort { .. } => W::Region(R::SortedRows),
         L::ExpertMatmul { proj, .. } => W::Region(match proj {
             ExpertProj::Gate => R::ExpertGate,
             ExpertProj::Up => R::ExpertUp,
             ExpertProj::Down => R::ExpertDown,
         }),
-        L::ExpertUnsort => W::Region(R::TokenRows),
         L::ExpertCombine { .. } => W::Arena,
         _ => return None,
     })
@@ -286,8 +286,8 @@ pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 /// 98 ms).
 pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 
-/// The steps whose commands a bake may drop: a gathered block's sort and unsort, and an unsliced
-/// bake's sampled rows around its matmul.
+/// The steps whose commands a bake may drop: a gathered block's sort, the unsort (the combine
+/// reads through it), and an unsliced bake's sampled rows around its matmul.
 pub const METAL_ELIDABLE: &[SubOpKind] = &[
     SubOpKind::ExpertSort,
     SubOpKind::ExpertUnsort,

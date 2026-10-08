@@ -374,7 +374,8 @@ pub enum KernelId {
     MoeRoute,
     /// `out[n, d] = Σ_k expert[n, k, d] * scores[n, k]` — the final
     /// MoE reduction. Function-constant specialization on top_k
-    /// (constant 0) and hidden (constant 1). Bindings:
+    /// (constant 0) and hidden (constant 1); a sorted bake reads pair
+    /// rows through the sort's `pos @ 3` (constant 2). Bindings:
     /// `(expert_out @ 0, scores @ 1, out @ 2)`. Dispatch:
     /// `(ceil(hidden/tg_x), num_tokens, 1)` × `(min(64, hidden), 1, 1)`.
     /// Symbol: `moe_weighted_sum_{float16,bfloat16}` in
@@ -403,11 +404,6 @@ pub enum KernelId {
     /// into the padded layout. Also `MG_MPAD_MAX` (2). Symbol
     /// `moe_group_scatter_q8`.
     MoeGroupScatterQ8,
-    /// MoE grouped-GEMM prefill: un-scatter the padded down output back
-    /// to token order — `out[i,:] = src[pos[i],:]`. Function constant
-    /// `MG_W` (5). Bindings `(src @ 0, pos @ 1, out @ 2)`. Symbol
-    /// `moe_group_gather_{float16,bfloat16}`.
-    MoeGroupGather,
     /// Gemma-4 per-expert score scale (the `gemma_moe` op): in place,
     /// `topk_scores[m, j] *= per_expert_scale[topk_inds[m, j]]` over the
     /// `[M, top_k]` gathered top-k scores. Bindings: `(topk_scores @ 0
@@ -566,7 +562,6 @@ impl KernelId {
             | Self::MoeGroupInit
             | Self::MoeGroupScatter
             | Self::MoeGroupScatterQ8
-            | Self::MoeGroupGather
             | Self::MoePerExpertScale
             | Self::VisionLayerNorm
             | Self::VisionRope

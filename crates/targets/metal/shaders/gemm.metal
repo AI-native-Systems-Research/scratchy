@@ -272,7 +272,7 @@ kernel void gemm_f16_specialized(
 }
 #endif
 
-// ── Blocked simdgroup GEMM for the hd512 unfused attention (pre-M5) ──────────
+// ── Blocked simdgroup GEMM: the hd512 unfused attention (pre-M5), bf16 dense ─
 // C = A[M,K] @ B[N,K]^T. 32×32 output tile, 4 simdgroups (WM=WN=2), BK=16,
 // register-cached 8×8 frags, shared A/B — a single-output adaptation of the MoE
 // steel GEMM (`fused_gate_up_silu_mul_gemm_steel`). Far higher reuse than the
@@ -447,6 +447,24 @@ kernel void gemm_bf16_pv(
     threadgroup bfloat Bs[ATTN_BN * ATTN_LD];
     threadgroup float  c_scratch[ATTN_BM * ATTN_BN];
     gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, seq_used[0], GEMM_PV_W_LD,
+                        As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
+}
+#endif
+
+// Dense bf16 from `GEMM_BLOCKED_ROWS` rows: `gemm_bf16_specialized`'s MMAs in its order, its bits.
+#if SCRATCHY_COMPILES(gemm_bf16_blocked)
+kernel void gemm_bf16_blocked(
+    device       bfloat* output   [[buffer(0)]],
+    device const bfloat* input    [[buffer(1)]],
+    device const bfloat* weight   [[buffer(2)]],
+    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint  simd_lane_id  [[thread_index_in_simdgroup]],
+    uint3 tgid          [[threadgroup_position_in_grid]])
+{
+    threadgroup bfloat As[ATTN_BM * ATTN_LD];
+    threadgroup bfloat Bs[ATTN_BN * ATTN_LD];
+    threadgroup float  c_scratch[ATTN_BM * ATTN_BN];
+    gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, GEMM_K, GEMM_K,
                         As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
 }
 #endif

@@ -9,6 +9,8 @@
 //   expert_out  [N, top_k, hidden]   T_act (bf16/f16/f32)
 //   scores      [N, top_k]           T_act
 //   out         [N, hidden]          T_act
+// A sorted bake (`MWS_SORTED`) reads pair (n, k)'s row where the sort put
+// it, `expert_out[pos[n * top_k + k]]` (`moe_group.metal`'s `pos`).
 //
 // `MWS_TOP_K` and `MWS_HIDDEN` are baked constants so
 // the inner-loop bound is a compile-time constant the optimizer
@@ -22,12 +24,14 @@ using namespace metal;
 
 SCRATCHY_CONSTANT(int, MWS_TOP_K, 0);
 SCRATCHY_CONSTANT(int, MWS_HIDDEN, 1);
+SCRATCHY_CONSTANT_OPTIONAL(bool, MWS_SORTED, 2);
 
 template <typename T>
 [[kernel]] void moe_weighted_sum(
     const device T* expert_out [[buffer(0)]],
     const device T* scores     [[buffer(1)]],
     device T*       out        [[buffer(2)]],
+    const device uint* pos     [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
   uint d = gid.x;
@@ -35,9 +39,9 @@ template <typename T>
   if (d >= uint(MWS_HIDDEN) || n >= grid.y) return;
   float acc = 0.0f;
   device const T* row_scores = scores + n * uint(MWS_TOP_K);
-  device const T* row_expert = expert_out + n * uint(MWS_TOP_K) * uint(MWS_HIDDEN);
   for (int k = 0; k < MWS_TOP_K; ++k) {
-    acc = fma(float(row_expert[uint(k) * uint(MWS_HIDDEN) + d]),
+    const uint pair = n * uint(MWS_TOP_K) + uint(k), row = MWS_SORTED ? pos[pair] : pair;
+    acc = fma(float(expert_out[size_t(row) * uint(MWS_HIDDEN) + d]),
               float(row_scores[k]),
               acc);
   }
