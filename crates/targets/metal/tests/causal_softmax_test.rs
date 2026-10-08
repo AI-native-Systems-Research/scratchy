@@ -142,7 +142,8 @@ fn causal_softmax_prod_handles_bucket_larger_than_kv() {
     let cu_buf = common::shared_slice(&device, &[0u32, LQ_ACTUAL]); // single-seq: lq_actual = cu[1]-cu[0]
 
     // buffer(0)=scores (in-place), buffer(1)=seq_used, buffer(2)=cu_seqlens;
-    // dispatch the FULL bucket (more rows than KVP) — the crash shape.
+    // dispatch the FULL bucket (more rows than KVP) — the crash shape. One
+    // 64-thread threadgroup per row (the kernel's SOFT_T).
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -153,7 +154,7 @@ fn causal_softmax_prod_handles_bucket_larger_than_kv() {
             depth: 1,
         },
         MTLSize {
-            width: 1,
+            width: 64,
             height: 1,
             depth: 1,
         },
@@ -188,6 +189,114 @@ fn causal_softmax_prod_handles_bucket_larger_than_kv() {
         for j in 0..(KVP as usize) {
             let got = bf16::from_bits(out[base + j]).to_f32();
             let want = if j < valid { exps[j] / sum } else { 0.0 };
+            assert!(
+                (got - want).abs() <= 1e-2 + 1e-2 * want.abs(),
+                "i={i} j={j}: got {got} want {want}"
+            );
+        }
+    }
+}
+
+/// The cooperative row reduce on rows longer than one stride sweep (KVP > 64
+/// so threads run multiple strided iterations and the simdgroup/threadgroup
+/// reduces see partial participation), WITH the block-diagonal span bound the
+/// production lowering always bakes (SOFT_SPAN_BLOCK ≠ 0, span_ids bound):
+/// one row span-bounded mid-row, one unlabelled (full causal range), one
+/// bounded to 0, one bounded just before its causal end. Padding rows zeroed.
+#[test]
+fn causal_softmax_prod_strided_rows_and_span() {
+    const BUCKET_ROWS: u32 = 6;
+    const LQ_ACTUAL: u32 = 4;
+    const KVP: u32 = 300; // > SOFT_T: multi-iteration strided scan
+    const SCALE: f32 = 0.7;
+    const CHUNK_START: u32 = KVP - LQ_ACTUAL;
+
+    let Some(__dev) = detect_device() else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    let device = __dev.device;
+
+    let pipeline = baked_pipeline(
+        &device,
+        "attention_causal_softmax",
+        "causal_softmax_prod_bf16",
+        vec![
+            ConstantValue::float(1, SCALE),
+            ConstantValue::uint(3, 128), // SOFT_SPAN_BLOCK: any nonzero enables
+        ],
+    )
+    .expect("causal_softmax_prod_bf16");
+
+    // span_ids[kv position] = label; label-1 = the span's first token. Label
+    // the query positions only (what the kernel reads); 0 = no span.
+    let mut span_ids = vec![0u32; KVP as usize];
+    span_ids[CHUNK_START as usize] = 41; // row 0: span_lo = 40
+    span_ids[(CHUNK_START + 1) as usize] = 0; // row 1: full causal range
+    span_ids[(CHUNK_START + 2) as usize] = 1; // row 2: span_lo = 0
+    span_ids[(CHUNK_START + 3) as usize] = CHUNK_START - 1; // row 3: span_lo = 295
+
+    let n = (BUCKET_ROWS * KVP) as usize;
+    let mut raw = vec![0f32; n];
+    for (idx, v) in raw.iter_mut().enumerate() {
+        // fp32 values, varied; bf16-round the input so reads are exact.
+        *v = ((idx as f32 * 0.37) % 8.0) - 4.0;
+    }
+    let scores: Vec<u16> = raw.iter().map(|&x| bf16::from_f32(x).to_bits()).collect();
+    let scores_buf = common::shared_slice(&device, &scores);
+    let seq_used_buf = common::shared_slice(&device, &[KVP]);
+    let cu_buf = common::shared_slice(&device, &[0u32, LQ_ACTUAL]);
+    let span_buf = common::shared_slice(&device, &span_ids);
+
+    if !common::dispatch_threadgroups(
+        &device,
+        &pipeline,
+        &[&scores_buf, &seq_used_buf, &cu_buf, &span_buf],
+        MTLSize {
+            width: BUCKET_ROWS as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    ) {
+        return;
+    }
+
+    let out: Vec<u16> = common::read_slice(&scores_buf, n);
+    let span_lo = |i: u32| match span_ids[(CHUNK_START + i) as usize] {
+        0 => 0,
+        sf => sf - 1,
+    };
+    for i in 0..BUCKET_ROWS {
+        let base = (i * KVP) as usize;
+        let valid = (CHUNK_START + i + 1) as usize;
+        let lo = if i < LQ_ACTUAL {
+            span_lo(i) as usize
+        } else {
+            0
+        };
+        if i >= LQ_ACTUAL {
+            for j in 0..(KVP as usize) {
+                let got = bf16::from_bits(out[base + j]).to_f32();
+                assert!(got.abs() <= 1e-2, "padding row i={i} j={j}: got {got}");
+            }
+            continue;
+        }
+        let scaled: Vec<f32> = (lo..valid).map(|j| raw[base + j] * SCALE).collect();
+        let m = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scaled.iter().map(|&s| (s - m).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for j in 0..(KVP as usize) {
+            let got = bf16::from_bits(out[base + j]).to_f32();
+            let want = if j >= lo && j < valid {
+                exps[j - lo] / sum
+            } else {
+                0.0
+            };
             assert!(
                 (got - want).abs() <= 1e-2 + 1e-2 * want.abs(),
                 "i={i} j={j}: got {got} want {want}"
