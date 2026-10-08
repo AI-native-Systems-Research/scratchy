@@ -113,9 +113,9 @@ impl AffineInt4 {
         if group_size == 0 || k == 0 || !k.is_multiple_of(group_size) {
             return None;
         }
-        // Membership mirrors the metal qmv kernel families (b_3, b_4, b_8);
+        // Membership mirrors the metal qmv kernel families (b_2, b_3, b_4, b_8);
         // a const fn cannot iterate a table, so state it directly.
-        if !matches!(bits, 3 | 4 | 8) {
+        if !matches!(bits, 2 | 3 | 4 | 8) {
             return None;
         }
         Some(Self {

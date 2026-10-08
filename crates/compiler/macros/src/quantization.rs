@@ -503,10 +503,10 @@ fn parse_affine_no_method(
             field: "group_size",
             reason: "missing or not a u64",
         })? as u32;
-    if !matches!(bits, 3 | 4 | 8) {
+    if !matches!(bits, 2 | 3 | 4 | 8) {
         return Err(ParseError::BadField {
             field: "bits",
-            reason: "MLX-affine scratchy path handles a 3-bit, 4-bit or 8-bit default",
+            reason: "MLX-affine scratchy path handles a 2-bit, 3-bit, 4-bit or 8-bit default",
         });
     }
     if !matches!(group_size, 32 | 64 | 128) {
@@ -589,10 +589,10 @@ fn parse_affine_no_method(
             .get("group_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(group_size as u64) as u32;
-        if !matches!(mb, 3 | 4 | 8) {
+        if !matches!(mb, 2 | 3 | 4 | 8) {
             return Err(ParseError::BadField {
                 field: "quantization.<module>.bits",
-                reason: "per-module MLX-affine bits must be 3, 4 or 8",
+                reason: "per-module MLX-affine bits must be 2, 3, 4 or 8",
             });
         }
         if !matches!(mg, 32 | 64 | 128) {

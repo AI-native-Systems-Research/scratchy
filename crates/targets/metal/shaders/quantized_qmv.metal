@@ -1142,21 +1142,40 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 
 // ─────────────────────────────────────────────────────────────────
 // dequantize — quantized.h:482-556. Decode one quantized block
-// (scale * q + bias) into w_local. Bits 3, 4 and 8 (the wide kernel's
-// instantiations); the other branches dropped rather than kept dead —
-// this copy exists solely for qmv_wide_impl.
+// (scale * q + bias) into w_local. Bits 2, 3, 4 and 8 (the wide
+// kernel's instantiations); the other branches dropped rather than
+// kept dead — this copy exists solely for qmv_wide_impl.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
-      bits == 3 || bits == 4 || bits == 8,
-      "dequantize: scratchy instantiates bits 3, 4 and 8 only");
+      bits == 2 || bits == 3 || bits == 4 || bits == 8,
+      "dequantize: scratchy instantiates bits 2, 3, 4 and 8 only");
 
   const float s = float(scale);
   const float b = float(bias);
 
-  if (bits == 3) {
+  if (bits == 2) {
+    // Continuous LSB-first bitstream: element i's 2 code bits live at bit
+    // offset 2*i of the (little-endian) byte array — 4 codes per byte,
+    // none straddling (2 divides 8). Verbatim MLX `qdot` bits==2 law
+    // (quantized_loader.h:50-62): the masks stay in place (0x0c is 4·q,
+    // 0x30 is 16·q, 0xc0 is 64·q) and the scale divides instead — exact
+    // in f32, power-of-two scalings. No XOR path exists for 2-bit codes
+    // (`AffineCodes::Offset8` is 4-bit-only), so the codes read as
+    // written.
+    float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
+    for (int i = 0; i < (N / 4); i++) {
+      const uint8_t wb = w[i];
+      w_local[4 * i] = static_cast<U>(sc[0] * (wb & 0x03) + b);
+      w_local[4 * i + 1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
+      w_local[4 * i + 2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
+      w_local[4 * i + 3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
+    }
+  }
+
+  else if (bits == 3) {
     // Continuous LSB-first bitstream, byte-anchored every 8 elements
     // (group_size is a multiple of 8): 8 codes span exactly 3 bytes.
     // Verbatim MLX `qdot` bits==3 shifts (quantized_loader.h:64-77) —
@@ -1449,6 +1468,29 @@ INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
 INST_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
 
+// 2-bit instantiations (gpt-oss-120b-mlx-2Bit: 2-bit g64). The template
+// bodies carry the MLX bits==2 packing (a continuous LSB-first bitstream —
+// 4 codes per byte, so packed cols are K/16). Unlike b3, the QUAD rows
+// exist: qmv_quad_impl's `pack_factor = 32 / bits` index math is exact at
+// power-of-two bits, and `pick_qmv_kernel_wide` selects Quad for pow2 bits
+// at K∈{64,128} — the 120b itself never hits it (every affine K is
+// 2880/4096) but a parity-tiny config can shrink K into the quad band.
+// bf16/bf16 = the gpt-oss production combo; f16/f16 for unit tests.
+// batch_0 + batch_1 for the fast/plain qmv (attention projections decode
+// at both).
+#define INST_QMV_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs)                       \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 0) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 1) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,0) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,1)
+
+INST_QMV_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_ALL_B2(f16,  half,   f16,  half,   64)
+
 // qmv_wide instantiations — the small-M band (2 ≤ M < vector_limit).
 // k_lanes=8 (the affine pick, quantized.cpp:567): 4 output rows per
 // simdgroup × 2 simdgroups = 8 rows per threadgroup. vecs_per_tg in
@@ -1490,6 +1532,16 @@ INST_QMV_WIDE_ALL(f16, half, f16, half, 128)
 
 INST_QMV_WIDE_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_WIDE_ALL_B3(f16, half, f16, half, 64)
+
+// 2-bit wide rows (gpt-oss-120b-mlx-2Bit): same decode band, b_2 packing.
+#define INST_QMV_WIDE_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs)          \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 2, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 3, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 4, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 5, 8)
+
+INST_QMV_WIDE_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_WIDE_ALL_B2(f16, half, f16, half, 64)
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
@@ -2065,3 +2117,16 @@ INST_GATHER_QMV_ALL_B3(f16,  half,   f16, half,    64)
 INST_GATHER_QMV_ALL_B3(bf16, bfloat, f16, half,    64)
 INST_GATHER_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_GATHER_QMV_ALL_B3(f16,  half,   bf16, bfloat, 64)
+
+// 2-bit gather-qmv (gpt-oss-120b-mlx-2Bit MoE decode). Same story: the
+// bodies carry the MLX bits==2 packing (4 codes per byte), only entry
+// points were missing.
+#define INST_GATHER_QMV_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs) \
+  INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 2) \
+  INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 2) \
+  INST_GATHER_QMV(affine_qmv_gated,          act_tag, act_type, scale_tag, scale_type, gs, 2) \
+  INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 2)
+INST_GATHER_QMV_ALL_B2(f16,  half,   f16, half,    64)
+INST_GATHER_QMV_ALL_B2(bf16, bfloat, f16, half,    64)
+INST_GATHER_QMV_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
+INST_GATHER_QMV_ALL_B2(f16,  half,   bf16, bfloat, 64)

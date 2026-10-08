@@ -39,9 +39,10 @@ use crate::weights::GpuWeights;
 /// mmap read) — one extra small copy at load, correctness-preserving.
 /// Number of u32 columns MLX-affine packing produces for `k` elements at
 /// `bits` width: a continuous LSB-first bitstream, `ceil(k * bits / 32)`
-/// columns. bits=3 packs 8 elements per 3 bytes (24 bits) — the group is
-/// byte-anchored since group_size ∈ {32, 64, 128} is a multiple of 8; bits=4
-/// and bits=8 give the familiar `k / (32 / bits)` exact division.
+/// columns. bits=2 packs 4 codes per byte; bits=3 packs 8 elements per 3
+/// bytes (24 bits) — the group is byte-anchored since group_size ∈
+/// {32, 64, 128} is a multiple of 8; bits=4 and bits=8 give the familiar
+/// `k / (32 / bits)` exact division.
 pub(crate) const fn affine_packed_cols(k: usize, bits: u32) -> usize {
     (k * bits as usize).div_ceil(32)
 }
@@ -54,8 +55,8 @@ fn affine_dequant_b4_bytes<W: WeightSource + ?Sized>(
     dtype_out: DType,
 ) -> Result<(Vec<u8>, usize, usize)> {
     anyhow::ensure!(
-        matches!(bits, 3 | 4 | 8),
-        "affine_dequant_b4: only bits=3, bits=4 or bits=8 supported, got bits={bits}"
+        matches!(bits, 2 | 3 | 4 | 8),
+        "affine_dequant_b4: only bits=2, bits=3, bits=4 or bits=8 supported, got bits={bits}"
     );
     anyhow::ensure!(
         matches!(dtype_out, DType::F16 | DType::BF16),

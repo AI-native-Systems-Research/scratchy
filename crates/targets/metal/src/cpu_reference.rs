@@ -339,6 +339,93 @@ pub fn affine_qmm_t_b3_bf16_s_bf16(
 pub use affine_qmm_t_b3_bf16_s_bf16 as affine_qmv_b3_bf16_s_bf16;
 pub use affine_qmm_t_b3_f16 as affine_qmv_b3_f16;
 
+/// 2-bit sibling of [`affine_qmm_t_b3`]: `W` is `[N, K]` in MLX's
+/// continuous LSB-first 2-bit bitstream — element i of a row occupies
+/// bits `[2i, 2i+2)` — so a row packs `k/4` bytes and each 4-element
+/// run is byte-anchored (group_size is a multiple of 4). Also serves
+/// as the reference for the 2-bit qmv kernels. gpt-oss-mlx-2Bit ships
+/// every linear in this layout (2-bit g64).
+fn affine_qmm_t_b2<TAct: HalfF, TScale: HalfF>(
+    packed: &[u8],
+    scales: &[TScale],
+    biases: &[TScale],
+    x: &[TAct],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<TAct> {
+    assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
+    assert_eq!(k % 4, 0, "K must be a multiple of 4 for the 2-bit packs");
+    assert_eq!(packed.len(), n * k / 4);
+    assert_eq!(scales.len(), n * k / group_size);
+    assert_eq!(biases.len(), n * k / group_size);
+    assert_eq!(x.len(), m * k);
+
+    let groups_per_row = k / group_size;
+    let packs_per_row = k / 4;
+    let mut w = vec![TAct::ZERO; n * k];
+    for j in 0..n {
+        for p in 0..packs_per_row {
+            let byte = packed[j * packs_per_row + p];
+            let codes = [
+                byte & 0x03,
+                (byte & 0x0c) >> 2,
+                (byte & 0x30) >> 4,
+                (byte & 0xc0) >> 6,
+            ];
+            for (c, &code) in codes.iter().enumerate() {
+                let kk = p * 4 + c;
+                let group_idx = j * groups_per_row + kk / group_size;
+                // Match the kernel's in-register TScale → TAct cast.
+                let scale = TAct::from_f32(scales[group_idx].to_f32()).to_f32();
+                let bias = TAct::from_f32(biases[group_idx].to_f32()).to_f32();
+                w[j * k + kk] = TAct::from_f32(scale * code as f32 + bias);
+            }
+        }
+    }
+    let mut y = vec![TAct::ZERO; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc: f32 = 0.0;
+            for kk in 0..k {
+                acc += x[i * k + kk].to_f32() * w[j * k + kk].to_f32();
+            }
+            y[i * n + j] = TAct::from_f32(acc);
+        }
+    }
+    y
+}
+
+pub fn affine_qmm_t_b2_f16(
+    packed: &[u8],
+    scales: &[half::f16],
+    biases: &[half::f16],
+    x: &[half::f16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<half::f16> {
+    affine_qmm_t_b2::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+}
+
+pub fn affine_qmm_t_b2_bf16_s_bf16(
+    packed: &[u8],
+    scales: &[half::bf16],
+    biases: &[half::bf16],
+    x: &[half::bf16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<half::bf16> {
+    affine_qmm_t_b2::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+}
+
+pub use affine_qmm_t_b2_bf16_s_bf16 as affine_qmv_b2_bf16_s_bf16;
+pub use affine_qmm_t_b2_f16 as affine_qmv_b2_f16;
+
 pub fn affine_dequantize_b4_f16(
     packed: &[u8],
     scales: &[half::f16],

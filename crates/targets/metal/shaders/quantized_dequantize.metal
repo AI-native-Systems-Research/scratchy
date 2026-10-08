@@ -317,3 +317,68 @@ template <typename T_act, typename T_scale, const int group_size>
 // GLM-4.5-Air-3bit ships bf16 activations + bf16 scales, gs=64.
 DEFINE_AFFINE_EMBED_B3(bf16, bfloat, bf16, bfloat, 64)
 DEFINE_AFFINE_EMBED_B3(f16,  half,   f16,  half,   64)
+
+// affine_embed_b2_kernel — 2-bit sibling (gpt-oss-120b-mlx-2Bit ships a
+// quantized embed at bits=2). MLX's 2-bit packing is a continuous
+// LSB-first bitstream where element i's 2 code bits live at bit offset
+// 2*i of the byte array — 4 codes per byte, none straddling (2 divides
+// 8), every 4-code run byte-anchored (group_size is a multiple of 4) —
+// so each thread owns one byte and writes 4 output elements. Codes are
+// MLX's own `qdot` bits==2 masks, shifted down (the same real product
+// as MLX's scale-division spelling); no XOR path (Offset8 is 4-bit
+// only), codes read as written.
+//
+// 2D grid:
+//   index.x = 4-element pack within a token row  ∈ [0, hidden_size / 4)
+//   index.y = output token row                   ∈ [0, num_tokens)
+// Bindings match affine_embed_b4: w [vocab, hidden_size / 4] u8-viewed,
+// scales/biases [vocab, hidden / group_size], indices, out.
+template <typename T_act, typename T_scale, const int group_size>
+inline void affine_embed_b2_kernel(
+    const device uint8_t* w,
+    const device T_scale* scales,
+    const device T_scale* biases,
+    const device uint* indices,
+    device T_act* out,
+    uint hidden_size,
+    uint2 index) {
+    if (index.x * 4 >= hidden_size) return;
+    uint vocab_idx = indices[index.y];
+    size_t bytes_per_row  = size_t(hidden_size) / 4;
+    size_t groups_per_row = size_t(hidden_size) / group_size;
+
+    size_t w_offset    = size_t(vocab_idx) * bytes_per_row + size_t(index.x);
+    size_t out_col     = size_t(index.x) * 4;
+    size_t gindex      = size_t(vocab_idx) * groups_per_row + (out_col / group_size);
+    size_t out_offset  = size_t(index.y) * size_t(hidden_size) + out_col;
+
+    // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7).
+    T_act scale = static_cast<T_act>(scales[gindex]);
+    T_act bias  = static_cast<T_act>(biases[gindex]);
+    const uint8_t val = w[w_offset];
+
+    out[out_offset + 0] = scale * T_act(val & 0x03)        + bias;
+    out[out_offset + 1] = scale * T_act((val & 0x0c) >> 2) + bias;
+    out[out_offset + 2] = scale * T_act((val & 0x30) >> 4) + bias;
+    out[out_offset + 3] = scale * T_act((val & 0xc0) >> 6) + bias;
+}
+
+template <typename T_act, typename T_scale, const int group_size>
+[[kernel]] void affine_embed_b2(
+    const device uint8_t* w        [[buffer(0)]],
+    const device T_scale* scales   [[buffer(1)]],
+    const device T_scale* biases   [[buffer(2)]],
+    const device uint*    indices  [[buffer(3)]],
+    device T_act* out              [[buffer(4)]],
+    uint2 index    [[thread_position_in_grid]]) {
+    affine_embed_b2_kernel<T_act, T_scale, group_size>(
+        w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);
+}
+
+#define DEFINE_AFFINE_EMBED_B2(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_2,    \
+                  affine_embed_b2<act_type, scale_type, gs>)
+
+// gpt-oss-120b-mlx-2Bit ships bf16 activations + bf16 scales, gs=64.
+DEFINE_AFFINE_EMBED_B2(bf16, bfloat, bf16, bfloat, 64)
+DEFINE_AFFINE_EMBED_B2(f16,  half,   f16,  half,   64)

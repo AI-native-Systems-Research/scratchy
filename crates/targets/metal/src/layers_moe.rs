@@ -130,8 +130,8 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         use crate::dtype::DType;
 
         anyhow::ensure!(
-            bits == 3 || bits == 4 || bits == 8,
-            "AffineFusedMoELayer: only bits ∈ {{3, 4, 8}} supported (got {bits})"
+            bits == 2 || bits == 3 || bits == 4 || bits == 8,
+            "AffineFusedMoELayer: only bits ∈ {{2, 3, 4, 8}} supported (got {bits})"
         );
         anyhow::ensure!(
             hidden_size.is_multiple_of(group_size as usize),
@@ -739,8 +739,8 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             shared_expert_gate,
         ) = if shared_expert_intermediate_size > 0 {
             anyhow::ensure!(
-                matches!(bits, 3 | 4 | 8),
-                "AffineSharedFusedMoELayer: only bits ∈ {{3, 4, 8}} supported (got {bits})"
+                matches!(bits, 2 | 3 | 4 | 8),
+                "AffineSharedFusedMoELayer: only bits ∈ {{2, 3, 4, 8}} supported (got {bits})"
             );
             let shared_inter = shared_expert_intermediate_size;
             // Two cases for shared gate+up: either fused on-disk

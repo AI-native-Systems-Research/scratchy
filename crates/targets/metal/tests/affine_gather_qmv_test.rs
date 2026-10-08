@@ -12,8 +12,8 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{
-    affine_qmm_t_b8_bf16_s_bf16, affine_qmv_b3_bf16_s_bf16, affine_qmv_b4_bf16,
-    affine_qmv_b4_bf16_s_bf16,
+    affine_qmm_t_b8_bf16_s_bf16, affine_qmv_b2_bf16_s_bf16, affine_qmv_b3_bf16_s_bf16,
+    affine_qmv_b4_bf16, affine_qmv_b4_bf16_s_bf16,
 };
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
@@ -1186,6 +1186,128 @@ fn affine_gather_qmv_b3_bf16_glm_4_5_air_decode() {
             }
         }
         eprintln!("affine_gather_qmv b3 n_out={n_out} k={k} max_err={max_err:.3e}");
+    }
+}
+
+/// 2-bit gather parity — gpt-oss-120b-mlx-2Bit's MoE decode path
+/// (`affine_gather_qmv{,_fast}` at `b_2`, the compute core the routed
+/// gated/combine kernels share via `gather_qmv_pair`). The 2-bit law:
+/// element i at bits `[2i, 2i+2)` — 4 codes per byte, expert stride
+/// `IN_VEC_SIZE * bits / 32` u32. gpt-oss shapes: every routed-expert
+/// matvec is (n_out=2880, k=2880) — Generic, since 2880 % 512 ≠ 0; the
+/// second case uses a %512 K so the Fast variant is covered too
+/// (top_k=4 and E=128 in production; 16 experts / top_k=4 here for
+/// speed).
+#[test]
+fn affine_gather_qmv_b2_bf16_gpt_oss_decode() {
+    for (n_out, k, seed) in [
+        (2880usize, 2880usize, 0x2B17_4D5A_3B1D_F00Du64),
+        (1408usize, 4096usize, 0xD1A6_0F1E_5EED_B02Bu64),
+    ] {
+        let num_experts = 16usize;
+        let group_size = 64usize;
+        let top_k = 4usize;
+        let num_tokens = 1usize;
+        let bits = 2u32;
+
+        let mut s = seed;
+        // 2-bit: 4 codes per byte → n*k/4 bytes per expert slab.
+        let mut packed = vec![0u8; num_experts * n_out * k / 4];
+        for b in &mut packed {
+            *b = splitmix(&mut s) as u8;
+        }
+        // Realistic 2-bit scales/biases: codes span 0..3, so scale ≈
+        // range/3 keeps dequant weights near ±0.1.
+        let mut scales = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+        for v in &mut scales {
+            *v = bf16::from_f32(0.01 + 0.006 * ((splitmix(&mut s) % 1000) as f32 / 1000.0));
+        }
+        let mut biases = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+        for v in &mut biases {
+            *v = bf16::from_f32(-0.08 + 0.015 * ((splitmix(&mut s) % 1000) as f32 / 1000.0));
+        }
+        let mut x = vec![bf16::ZERO; num_tokens * k];
+        for v in &mut x {
+            *v = bf16::from_f32(((splitmix(&mut s) % 1000) as f32 / 1000.0 - 0.5) * 2.0);
+        }
+        // top_k distinct experts across the 16-expert range.
+        let indices: Vec<u32> = vec![0, 3, 5, 7];
+
+        let Some(mdev) = detect_device() else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let bytes_of = |v: &[bf16]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
+        };
+        let bytes_u32 =
+            |v: &[u32]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        let w_buf = buf_from_bytes(&mdev.device, &packed);
+        let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales));
+        let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases));
+        let x_buf = buf_from_bytes(&mdev.device, bytes_of(&x));
+        let idx_buf = buf_from_bytes(&mdev.device, bytes_u32(&indices));
+        let y_buf = zeros_buf(&mdev.device, num_tokens * top_k * n_out * 2);
+
+        let kernel = if (n_out as u32).is_multiple_of(8) && (k as u32).is_multiple_of(512) {
+            "affine_gather_qmv_fast"
+        } else {
+            "affine_gather_qmv"
+        };
+        let name = format!("{kernel}_bf16_s_bf16_gs_{group_size}_b_{bits}");
+        let constants = gather_constants(k as u32, n_out as u32, top_k as u32).into();
+        let pipeline = baked_pipeline(&mdev.device, "quantized_qmv", &name, constants)
+            .expect("b2 gather pipeline");
+        let bn: u32 = 8;
+        if !common::dispatch_threadgroups(
+            &mdev.device,
+            &pipeline,
+            &[&w_buf, &s_buf, &b_buf, &x_buf, &idx_buf, &y_buf],
+            MTLSize {
+                width: 1,
+                height: n_out.div_ceil(bn as usize),
+                depth: num_tokens * top_k,
+            },
+            MTLSize {
+                width: 32,
+                height: 2,
+                depth: 1,
+            },
+        ) {
+            return;
+        }
+
+        let got = read_bf16(&y_buf, num_tokens * top_k * n_out);
+        let w_pe = n_out * k / 4; // 2-bit bytes per expert
+        let sb_pe = n_out * k / group_size;
+        let mut max_err = 0.0_f32;
+        for n in 0..num_tokens {
+            for slot in 0..top_k {
+                let e = indices[n * top_k + slot] as usize;
+                let want = affine_qmv_b2_bf16_s_bf16(
+                    &packed[e * w_pe..(e + 1) * w_pe],
+                    &scales[e * sb_pe..(e + 1) * sb_pe],
+                    &biases[e * sb_pe..(e + 1) * sb_pe],
+                    &x[n * k..(n + 1) * k],
+                    1,
+                    n_out,
+                    k,
+                    group_size,
+                );
+                let base = (n * top_k + slot) * n_out;
+                for c in 0..n_out {
+                    let g = got[base + c].to_f32();
+                    let w = want[c].to_f32();
+                    let err = (g - w).abs();
+                    max_err = max_err.max(err);
+                    assert!(
+                        err < 0.3 || err / w.abs().max(1e-3) < 0.2,
+                        "b2-gather n_out={n_out} k={k} slot={slot} e={e} c={c} got={g} want={w} err={err}",
+                    );
+                }
+            }
+        }
+        eprintln!("affine_gather_qmv b2 n_out={n_out} k={k} max_err={max_err:.3e}");
     }
 }
 
