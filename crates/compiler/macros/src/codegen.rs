@@ -74,18 +74,18 @@ fn safetensors_prefix(
         .iter()
         .map(|seg| translate_digit_suffix(seg))
         .collect();
-    let mut joined = segs.join(".");
     // DSL-leaf → disk-leaf rename (Gemma4: `self_attn.q_proj_global`
     // shares the on-disk leaf `self_attn.q_proj` with the sliding
     // class at a different shape; LocateAnything: the projector's
     // `linear_1`/`linear_2` disk leaves can't be named in the DSL —
     // a trailing `_<digit>` reads as a layer index — so
-    // `mm.proj_in`/`mm.proj_out` rename here). Longest-suffix match
-    // on the dotted DSL path, applied BEFORE the vision subtree
+    // `mm.proj_in`/`mm.proj_out` rename here; GLM-4.5: the mid-path
+    // `mlp.shared_expert → mlp.shared_experts`). Whole-segment,
+    // longest-key-wins matching on the dotted DSL path
+    // (`Program::rename_dotted`), applied BEFORE the vision subtree
     // resolution below so renamed segments flow into subtree paths.
-    let mut segs = segs;
-    joined = program.rename_dotted(&joined);
-    segs = joined.split('.').map(str::to_string).collect();
+    let joined = program.rename_dotted(&segs.join("."));
+    let segs: Vec<String> = joined.split('.').map(str::to_string).collect();
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     if is_vision {
         // The per-arch vision layout is a REQUIRED declaration

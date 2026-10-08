@@ -1155,7 +1155,6 @@ pub fn lower_decode_to_wavefront(
                 } else {
                     return Err(BridgeError::MissingBound { key: "num_experts" });
                 };
-                let qwen_shared = matches!(router_flavor, RouterFlavor::QwenShared);
                 let top_k =
                     b.get("num_experts_per_tok")
                         .copied()

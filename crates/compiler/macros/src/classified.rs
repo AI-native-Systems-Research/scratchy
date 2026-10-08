@@ -677,11 +677,11 @@ impl Program {
             // suffix arm; a leading segment run falls out of the
             // prefix arm; interior occurrences go through the
             // `.<leaf>.` replace loop.
-            if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str()) {
-                if stripped.is_empty() || stripped.ends_with('.') {
-                    out = format!("{stripped}{disk_leaf}");
-                    continue;
-                }
+            if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str())
+                && (stripped.is_empty() || stripped.ends_with('.'))
+            {
+                out = format!("{stripped}{disk_leaf}");
+                continue;
             }
             let pat = format!(".{dsl_leaf}.");
             let rep = format!(".{disk_leaf}.");
