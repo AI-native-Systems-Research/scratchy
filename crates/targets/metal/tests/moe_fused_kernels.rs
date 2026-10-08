@@ -767,6 +767,73 @@ fn moe_group_offsets_count_every_expert_at_256() {
     assert_eq!(common::read_slice::<u32>(&total, 1), vec![acc]);
 }
 
+/// A grouped bake's act (`SILU_MUL_ROW` / `SILU_MUL_EXPERTS` set, the sort's `indices_pad` at
+/// buffer 3) runs only the rows an expert holds: they keep the plain act's bits — every gate bit
+/// pattern against 16 up values, both acts, both dtypes — and the sentinel rows stay unwritten.
+#[test]
+fn grouped_act_skips_the_sentinel_rows_and_keeps_the_bits() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    const ROW: usize = 512;
+    let n = 65536 * 16;
+    let experts = 4u32;
+    let row_expert: Vec<u32> = (0..(n / ROW) as u32)
+        .map(|r| if r % 7 == 3 { experts } else { r % experts })
+        .collect();
+    let indices = common::shared_slice(&device, &row_expert);
+    let gate = common::shared_slice(&device, &(0..n).map(|i| i as u16).collect::<Vec<_>>());
+    let mut rng = Lcg(11);
+    for dtype in ["bf16", "f16"] {
+        let ups: Vec<u16> = (0..16)
+            .map(|_| {
+                let u = 8.0 * rng.next() - 4.0;
+                match dtype {
+                    "bf16" => bf16::from_f32(u).to_bits(),
+                    _ => half::f16::from_f32(u).to_bits(),
+                }
+            })
+            .collect();
+        let up = common::shared_slice(&device, &(0..n).map(|i| ups[i >> 16]).collect::<Vec<_>>());
+        for act in ["silu", "gelu"] {
+            let run_act = |grouped: bool| {
+                let mut consts = vec![ConstantValue::uint(ConstSlot(0), n as u32)];
+                if grouped {
+                    consts.push(ConstantValue::uint(ConstSlot(1), ROW as u32));
+                    consts.push(ConstantValue::uint(ConstSlot(2), experts));
+                }
+                let pso =
+                    baked_pipeline(&device, "silu_mul", &format!("{act}_mul_{dtype}"), consts)
+                        .expect("act");
+                let out = common::shared_slice(&device, &vec![0xaaaau16; n]);
+                run(&device, 1, 1, |_| {
+                    vec![Dispatch {
+                        pso: &pso,
+                        buffers: vec![(&out, 0), (&gate, 1), (&up, 2), (&indices, 3)],
+                        groups: size(n / 256, 1, 1),
+                        threads: size(256, 1, 1),
+                    }]
+                });
+                bits(&out, n)
+            };
+            let (plain, grouped) = (run_act(false), run_act(true));
+            for (r, rows) in plain.chunks(ROW).zip(grouped.chunks(ROW)).enumerate() {
+                if row_expert[r] < experts {
+                    assert_eq!(rows.0, rows.1, "{act} {dtype}: row {r}");
+                } else {
+                    assert!(
+                        rows.0.iter().any(|&v| v != 0xaaaa),
+                        "{act} {dtype}: row {r}"
+                    );
+                    assert!(
+                        rows.1.iter().all(|&v| v == 0xaaaa),
+                        "{act} {dtype}: row {r}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `n_out` rows over `k_in` of a plain (dense, not gathered) 4-bit matvec, read from DRAM:
 /// 16 distinct weight matrices, cycled, so no dispatch finds its weights in cache.
 fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {

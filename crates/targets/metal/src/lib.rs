@@ -28,10 +28,10 @@ pub mod steel_paged {
 
     /// The NAX (matrix-accelerator) paged attention instantiated for a (dtype, head_dim, page
     /// size), in `attention_steel_nax_paged.metal`; `None` sends the dispatcher to the simdgroup
-    /// `steel_paged_symbol` / SDPA path. Warps are WM Q-row blocks × WN head-dim slices:
-    /// head_dims 64 / 128 one warp a 16-row Q block (BQ 64), 256 two (BQ 64), 512 four with two
-    /// Q-row blocks a threadgroup (BQ 32) over 32-token pages (Gemma 4's global layers, on
-    /// `attention_nax_paged_wide`, whose Q @ K^T / P @ V are whole-page `matmul2d`s).
+    /// `steel_paged_symbol` / SDPA path. Warps are WM Q-row blocks × WN head-dim slices, four
+    /// blocks a threadgroup (BQ 64): head_dims 64 / 128 one warp a block, 256 two, 512 four over
+    /// 32-token pages (Gemma 4's global layers); 256 and 512 on `attention_nax_paged_wide`, whose
+    /// Q @ K^T / P @ V are whole-page `matmul2d`s.
     pub fn nax_paged_kernel(
         dtype_tag: &str,
         head_dim: u32,
@@ -76,14 +76,14 @@ pub mod steel_paged {
                 64,
             ),
             ("f16", 512, 32) => at(
-                "attention_steel_nax_paged_f16_bq32_bk32_bd512_wm2_wn4_bs32",
-                256,
-                32,
+                "attention_steel_nax_paged_f16_bq64_bk32_bd512_wm4_wn4_bs32",
+                512,
+                64,
             ),
             ("bf16", 512, 32) => at(
-                "attention_steel_nax_paged_bf16_bq32_bk32_bd512_wm2_wn4_bs32",
-                256,
-                32,
+                "attention_steel_nax_paged_bf16_bq64_bk32_bd512_wm4_wn4_bs32",
+                512,
+                64,
             ),
             _ => None,
         }
