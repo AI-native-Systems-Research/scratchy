@@ -132,7 +132,8 @@ pub fn lower(
         Program::RouteSoftmax => route_softmax(name, &r, sym_id_base, layout),
         Program::RouteRenorm => route_renorm(name, &r, sym_id_base, layout),
         // The expert MLP's gated activation — silumul's body with the act's own
-        // device primitive (`silu`/`gelufwd`), over the pair rows the sort laid out.
+        // device primitive (key `"silu"`/`"gelu"`, the wire `gelufwd` coming from
+        // the OpFunc), over the pair rows the sort laid out.
         Program::ExpertGatedAct(act) => lk::gated_act(name, act, &r, sym_id_base, layout),
         Program::ScalarWeightMul => lk::scalarweightmul(name, &r, sym_id_base, layout),
         Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
@@ -185,14 +186,12 @@ pub fn lower(
         // accumulating into one scratch (in place, the softmax's own
         // destination-reuse law) and the final add writing the output.
         Program::ExpertCombine => lk::expert_combine(name, &r, sym_id_base, layout),
-        Program::ExpertMatmul => Err(Error {
-            message: format!(
-                "{name}: ExpertMatmul (one projection of each pair's expert, over the stacked \
-                 `[E·out, in]` weight bank) has no SuperDSC lowering yet: the contraction itself \
-                 is the dense W8A8 body's, but the weight ROW each pair reads is selected by its \
-                 expert index — an indexed operand the dense matmul's fixed region does not state"
-            ),
-        }),
+        // One projection of each pair's expert over the stacked `[E·out, in]`
+        // fp8 bank — the gathered W8A8 body: the index converted to u32, the
+        // expert slabs and scales gathered into pair-indexed scratch, then the
+        // dense body's own per-pair `matmulfp8` + dequant at baked offsets.
+        // See the door's own doc for the five legs and the gather laws.
+        Program::ExpertMatmul => lk::expert_matmul(name, &r, sym_id_base, layout, quantized),
     }
 }
 

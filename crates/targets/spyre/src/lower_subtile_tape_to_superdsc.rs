@@ -472,6 +472,35 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
         .map(|n| n.inputs[1].tensor.index() as u32)
         .collect();
+    // ⛔ THE ROUTER-CHAIN NARROW OUTPUTS RESERVE AT W, NOT pad(k). The router
+    // doors write every `[m, k]` routing tensor at the PADDED EXPERT WIDTH
+    // `W = pad64(E)` (the narrow-tensor law: a sub-stick output is read at a
+    // whole-stick window, and the argsort's full-stick compares sweep W), so
+    // the reserved footprint must be `m·W`, not the graph width's own pad.
+    // At 26b (E=128, k=8): W=128 against pad64(8)=64 — a silent 2× under-
+    // reservation that clobbers the next intermediate; inert on tiny26 only
+    // because E=8 ⇒ W=64 == pad64(k). Identified by the tensor's PRODUCING
+    // node, never by width (a width census cannot tell a `[m,8]` routing
+    // output from an unrelated `[m,8]` feature tensor).
+    let router_out_w: std::collections::BTreeMap<u32, u32> = ir
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            SubOp::RouteTopK { .. }
+            | SubOp::RouteGatherScores
+            | SubOp::RouteExpertScale { .. } => {
+                // E is the widest INPUT width of the chain (the scores/logits
+                // row); W = pad64(E).
+                let e = node
+                    .inputs
+                    .iter()
+                    .map(|i| ir.tensors[i.tensor.index()].cols)
+                    .max()?;
+                Some((node.output.tensor.index() as u32, e.next_multiple_of(64)))
+            }
+            _ => None,
+        })
+        .collect();
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         // Reserve the DEVICE footprint: a stick-last tensor pads its innermost stick dim up to a whole
@@ -483,8 +512,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
         } else {
             Df::Fp16
         };
+        let cols = router_out_w.get(&tid).copied().unwrap_or(s.cols).max(s.cols);
         s.rows as u64
-            * bump_sticks_to_splittable(s.cols.next_multiple_of(df.elems_per_stick())) as u64
+            * bump_sticks_to_splittable(cols.next_multiple_of(df.elems_per_stick())) as u64
             * df.word_length() as u64
     };
     // ── Liveness: first def (output of node i) and last use (input of node j). A
@@ -898,13 +928,16 @@ pub fn compute_bundle_layout<F: RopeForm>(
 
     // ── fp8 W8A8 activation-quant consts [1,stick] (seg0, worker-bound like RMS_HALF) ── E4M3 clamp
     // bounds ±448 + 1/448 for `qfp8ch` (per-token amax → a_scale). Placed iff the tape has an fp8
-    // (arity-3) MatmulTile. Unplaced (and thus value-0) was the "clamp consts default 0 → wrong quant"
-    // gap; placing them here + binding in the worker gives the real E4M3 bounds.
-    if ir
-        .nodes
-        .iter()
-        .any(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-    {
+    // quantize CONSUMER: an arity-3 MatmulTile (the dense W8A8 gemm) OR an ExpertMatmul over an
+    // fp8 expert bank (the gathered W8A8 body runs the SAME quantize chain — tiny26 is the case:
+    // dense projections fp16, experts fp8, so the arity-3 census alone found nothing and the
+    // expert door's `quantized` thread hit the undeclared-synthetic refusal). Unplaced (and thus
+    // value-0) was the "clamp consts default 0 → wrong quant" gap; placing them here + binding in
+    // the worker gives the real E4M3 bounds.
+    if ir.nodes.iter().any(|n| {
+        matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3
+            || matches!(n.op, SubOp::ExpertMatmul { .. })
+    }) {
         let a = SegRole::Activation.segment();
         let sz = Fp16::ELEMS_PER_STICK as u64 * 2; // [1, stick] fp16
         for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
