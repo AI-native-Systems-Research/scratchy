@@ -183,10 +183,11 @@ pub(crate) fn matmul_fp8_descriptors(
                 sym_id_base,
                 layout,
             ));
-            // The three tensors the fused op subsumes, plus the `1/448` it used to take as a scalar
-            // operand — it now reaches its own `mulConst`/`clipMin`/`clipMax` through
-            // `ddl.get_external_constant` BY NAME out of the descriptor's `constantInfo_`.
-            let _ = (&absx, &amax, &amaxfl, &inv448);
+            // The three tensors the two fused ops subsume, plus the `1/448` and ±448 they used to take as
+            // scalar tensor operands — the constants now reach their own `mulConst`/`clipMin`/`clipMax`
+            // through `ddl.get_external_constant` BY NAME out of the descriptor's `constantInfo_`.
+            // (`chi` joins them: materialised by nothing, its reservation held for allocator stability.)
+            let _ = (&absx, &amax, &amaxfl, &chi, &inv448, &pos448, &neg448);
             // REVERTED (2026-07-28): a multi-stage blocked-reduce experiment lived here (three
             // iterations, all confirmed on real hardware to make ZERO difference to the actual bug —
             // the K-cache inf this was meant to fix turned out to be caused by cachewr's matmul
@@ -222,26 +223,28 @@ pub(crate) fn matmul_fp8_descriptors(
                 sym_id_base,
                 layout,
             ));
-            let chi_h = rb(&chi, m, k);
-            ops.push(pw2(
-                &opn("fq_chi_op"),
-                "minimum",
+            // ⭐⭐⭐⭐⭐ THE CLAMP IS THE DEVICE'S OWN `clip` OP — ONE input, computing
+            // `FMIN(FMAX(x, clipMin), clipMax)` (`unary_pipeline.ddl:370-377` PE stage, `:472-479` SFP
+            // stage) — the same min/max pair the two ops it replaces encoded, so the swap is
+            // value-preserving by construction. The ±448 E4M3 bounds arrive as the external constants
+            // `clipMin`/`clipMax` out of the descriptor's `constantInfo_` ([`OpFunc::op_consts`]),
+            // NOT as the `[1, stick]` H2D tensor operands `fq_chi`/`fq_cl` read through
+            // `In::scalar(&pos448)`/`In::scalar(&neg448)` — the constants dxp folds before the
+            // constant tables, per the same contract as `quantscalepertokenfp8`'s three. 2 ops → 1,
+            // ×4 activations ×40 layers = 40 more ops off a granite-2b fp8 decode step, and the
+            // `FP8_POS448`/`FP8_NEG448` binds lose their last reader.
+            //
+            // ⛔ `chi` IS NO LONGER MATERIALISED. Its `synth` reservation stays for the same reason
+            // `absx`/`amax`/`amaxfl`'s do above: `BundleLayout::synth` is a bump allocator, so
+            // dropping entries would shift every later tensor and confound a coherence comparison
+            // with the baseline.
+            let cl_h = rb(&cl, m, k);
+            ops.push(pw1(
+                &opn("fq_clip_op"),
+                "clip",
                 m_rows,
                 k_cols,
                 In::full(&sc_h),
-                In::scalar(&pos448),
-                &chi_h,
-                sym_id_base,
-                layout,
-            ));
-            let cl_h = rb(&cl, m, k);
-            ops.push(pw2(
-                &opn("fq_cl_op"),
-                "maximum",
-                m_rows,
-                k_cols,
-                In::full(&chi_h),
-                In::scalar(&neg448),
                 &cl_h,
                 sym_id_base,
                 layout,

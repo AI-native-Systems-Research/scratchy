@@ -4970,6 +4970,25 @@ mod tests {
             replaced, 0,
             "the 4 ops `quantscalepertokenfp8` subsumes must no longer be emitted, got {replaced}"
         );
+        // ⭐ SAME LAW FOR THE CLAMP TAIL: the fused `clip` is likewise shared (one per distinct
+        // activation), and the `minimum`/`maximum` pair it subsumes must be gone — the same
+        // vacuous-green trap, so a silent revert to the 2-op clamp cannot leave this green either.
+        let clip = ops
+            .iter()
+            .filter(|o| o.op_name.ends_with("fq_clip_op"))
+            .count();
+        assert_eq!(
+            clip, 1,
+            "the fused ±448 clamp must be shared too, got {clip}"
+        );
+        let clamp_pair = ops
+            .iter()
+            .filter(|o| o.op_name.ends_with("fq_chi_op") || o.op_name.ends_with("fq_cl_op"))
+            .count();
+        assert_eq!(
+            clamp_pair, 0,
+            "the 2 ops `clip` subsumes must no longer be emitted, got {clamp_pair}"
+        );
     }
 
     #[test]

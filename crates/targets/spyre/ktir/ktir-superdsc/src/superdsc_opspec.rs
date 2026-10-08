@@ -1375,6 +1375,14 @@ pub enum OpFunc {
     /// `minimum` — elementwise min of TWO tensors (sfp unit; the min twin of [`Maximum`]). Used with
     /// `Maximum` to CLAMP the fp8 activation into `[-448, 448]` before [`Qfp8ch`]: `min(max(x,-448),448)`.
     Minimum,
+    /// ⭐ `clip` — the device's OWN clamp, ONE input: `FMIN(FMAX(x, clipMin), clipMax)` with both
+    /// bounds arriving as the external constants `clipMin`/`clipMax`
+    /// (`unary_pipeline.ddl:32-33`, fp16 binding `:16` — the SAME min/max pair [`Minimum`]/[`Maximum`]
+    /// encoded, so the swap is value-preserving by construction). Registered on dd2
+    /// (`sentient_dd2_sysconfig.json` PE supportedOps/5/OpfuncNames/15). It REPLACES the two-op
+    /// `maximum`+`minimum` pair the fp8 chain used to clamp the scaled activation, folding the
+    /// ±448 quant constants into the descriptor instead of binding them as `[1, stick]` H2D tensors.
+    Clip,
     /// `qfp8ch` — cast/quantize fp16 → SEN143_FP8 (E4M3), the fp8 W8A8 activation quantizer (SFP unit;
     /// DDL `quantization_*.ddl` opFuncName "qfp8ch", IBM PR #2401). The input MUST be CLAMPED to [-448, 448]
     /// FIRST (`mul-by-1/scale → clamp±448 → qfp8ch`, mirroring IBM's `quantize_fp8_with_scale`): the
@@ -1473,6 +1481,7 @@ impl OpFunc {
             OpFunc::Identity => "identity",
             OpFunc::Maximum => "maximum",
             OpFunc::Minimum => "minimum",
+            OpFunc::Clip => "clip",
             OpFunc::Qfp8ch => "qfp8ch",
             OpFunc::QuantScalePerTokenFp8 => "quantscalepertokenfp8",
         }
@@ -1547,6 +1556,13 @@ impl OpFunc {
                 ("clipMax", 448.0),
                 ("mulConst", 1.0 / 448.0),
             ],
+            // ⭐ THE fp8 E4M3 CLAMP BOUNDS, the same ±448 the `fq_chi`/`fq_cl` pair used to read as
+            // `[1, stick]` H2D tensor operands. `unary_pipeline.ddl`'s clip body is
+            // `FMAX(x, clipMin)` in PE (`:370-377`) then `FMIN(·, clipMax)` on the SFP (`:472-479`) —
+            // the min/max pair encoded, in the same order-independent clamp form. The bounds are the
+            // E4M3 finite range, so they are quant-format constants, not model constants: they belong
+            // to the op, which is why they live in this table.
+            OpFunc::Clip => &[("clipMin", -448.0), ("clipMax", 448.0)],
             _ => &[],
         }
     }
@@ -1575,6 +1591,11 @@ impl OpFunc {
     pub fn ddl_input_arity(self) -> Option<usize> {
         match self {
             OpFunc::QuantScalePerTokenFp8 => Some(1),
+            // `unary_pipeline.ddl:16` binds clip as `([%type_fp16], [%inptensor], [%outtensor])` —
+            // ONE input. Both bounds are external constants, so unlike the seeded reduces there is no
+            // second operand to get wrong; the row exists so the emitter's build-time arity check
+            // covers this op too.
+            OpFunc::Clip => Some(1),
             _ => None,
         }
     }

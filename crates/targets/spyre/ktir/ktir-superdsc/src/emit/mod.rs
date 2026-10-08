@@ -4888,6 +4888,7 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "identity" => OpFunc::Identity,
         "maximum" => OpFunc::Maximum,
         "minimum" => OpFunc::Minimum,
+        "clip" => OpFunc::Clip,
         "qfp8ch" => OpFunc::Qfp8ch,
         "quantscalepertokenfp8" => OpFunc::QuantScalePerTokenFp8,
         other => panic!(
