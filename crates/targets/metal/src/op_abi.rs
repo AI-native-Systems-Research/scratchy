@@ -74,9 +74,10 @@ pub fn rope_append_bias_slots(o: KvOffsets) -> [Option<(BiasStorage, u32)>; 2] {
 
 /// Metal's colouring facts: the per-op rule table, and the embedded hidden as colour 0 (the
 /// step records' head emits the embed at slot 0).
-/// The widest bucket metal lays out in wave order (`wave_schedule::wave_order`): a one-row tape,
-/// whose steps are latency-bound — a wider bucket would hold more rows' buffers live at once.
-pub const METAL_WAVE_ORDER_ROWS: u64 = 1;
+/// The widest bucket metal lays out in wave order (`wave_schedule::wave_order`): a decode-shaped
+/// tape — the one-row bucket and the verify-sized ones ([`METAL_VERIFY_ROWS`]) — whose steps are
+/// latency-bound; a wider bucket would hold more rows' buffers live at once.
+pub const METAL_WAVE_ORDER_ROWS: u64 = METAL_VERIFY_ROWS as u64;
 
 pub const METAL_COLOUR_FACTS: ColourFacts = ColourFacts {
     rule: metal_colour_rule,
