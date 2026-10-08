@@ -74,8 +74,6 @@ pub enum MoeRegion {
     ExpertGate,
     ExpertUp,
     ExpertDown,
-    /// The projected pair rows in token order.
-    TokenRows,
 }
 
 /// The scores a MoE softmax normalizes: every expert's, or the chosen top-k's.
@@ -475,7 +473,8 @@ pub enum MoeStep {
     ExpertMatmul(ExpertMatmul),
     /// `act(gate) * up`, in place on the gate rows.
     GatedAct(GatedAct),
-    /// The pair rows back in token order — no command when the bake gathers.
+    /// The pair rows back in token order — no command: the combine reads each pair's row where
+    /// the projection wrote it, through the sort's `pos` when the bake sorted.
     Unsort,
     /// `(out)`: each token's pair rows summed by its scores.
     Combine(Slot),

@@ -973,7 +973,8 @@ INST_QMM_SMALL_M_GS(bf16, bfloat, bf16, bfloat)
 // padded row bound, indices[5] (quant: [2]) holds each padded row's expert
 // (QMM_NUM_EXPERTS = sentinel), every expert's run starts on a 64-row
 // boundary, so each 32-row tile reads one expert's weight slab. Sentinel
-// rows are not quantized and sentinel tiles do not run.
+// rows are not quantized, sentinel tiles do not run, and a tile whose last
+// 16 rows are sentinel runs its first 16 alone.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T, bool gather>
@@ -1024,13 +1025,12 @@ template <typename T>
     w4a8_quant_impl<T, true>(x, scratch, indices, tgid, sgid, lid);
 }
 
-template <typename T, typename S, int G, int TN, int NSG>
+template <typename T, typename S, int G, int TM, int TN, int NSG>
 METAL_FUNC void qmm_w4a8_impl(
     const device uchar* w, const device S* scales, const device S* biases,
     const device uchar* scratch, device T* y, uint2 tgid) {
     using namespace mpp::tensor_ops;
     using Ext = dextents<int32_t, 2>;
-    constexpr int TM = 32;
     const int K = QMM_K, N = QMM_N, M = QMM_M, KG = K / G, KC = K / 64;
     using XA = tensor<device int8_t, Ext, tensor_inline>;
     using XB = tensor<device int4b_format, Ext, tensor_inline>;
@@ -1078,7 +1078,7 @@ template <typename T, typename S, int G, int TN, int NSG>
     const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
     const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
     device T* y [[buffer(4)]], uint2 tgid [[threadgroup_position_in_grid]]) {
-    qmm_w4a8_impl<T, S, G, TN, NSG>(w, scales, biases, scratch, y, tgid);
+    qmm_w4a8_impl<T, S, G, 32, TN, NSG>(w, scales, biases, scratch, y, tgid);
 }
 
 template <typename T, typename S, int G, int TN, int NSG>
@@ -1090,9 +1090,14 @@ template <typename T, typename S, int G, int TN, int NSG>
     const uint expert = indices[tgid.y * 32];
     if (expert >= uint(QMM_NUM_EXPERTS)) return;  // sentinel tile
     const size_t K = size_t(QMM_K), N = size_t(QMM_N);
-    qmm_w4a8_impl<T, S, G, TN, NSG>(
-        w + size_t(expert) * N * K / 2, scales + size_t(expert) * N * (K / G),
-        biases + size_t(expert) * N * (K / G), scratch, y, tgid);
+    w += size_t(expert) * N * K / 2;
+    scales += size_t(expert) * N * (K / G);
+    biases += size_t(expert) * N * (K / G);
+    if (indices[tgid.y * 32 + 16] >= uint(QMM_NUM_EXPERTS)) {  // the run ends in the first half
+        qmm_w4a8_impl<T, S, G, 16, TN, NSG>(w, scales, biases, scratch, y, tgid * uint2(1, 2));
+    } else {
+        qmm_w4a8_impl<T, S, G, 32, TN, NSG>(w, scales, biases, scratch, y, tgid);
+    }
 }
 
 SCRATCHY_KERNEL(affine_w4a8_quant_bf16, affine_w4a8_quant<bfloat>)

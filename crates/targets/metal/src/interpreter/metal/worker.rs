@@ -977,7 +977,6 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::MoeGroupInit
         | K::MoeGroupScatter
         | K::MoeGroupScatterQ8
-        | K::MoeGroupGather
         | K::MoePerExpertScale
         | K::GateApply
         | K::GateScale
@@ -1056,7 +1055,7 @@ fn bake_bucket<W: CanonicalParams>(
                 sources,
                 runtime,
             )?;
-            // One row: MLX's GEMV; otherwise the 8×8-tile MMA GEMM (`pipeline_for_gemm`). Both are
+            // One row: MLX's GEMV; otherwise an MMA GEMM (`pipeline_for_gemm`). All are
             // custom kernels on the same per-step dispatch plumbing as every other compute
             // kernel — no MPS (it rejects BFloat16), no classic command buffer.
             let (pipeline, shape) = pipelines

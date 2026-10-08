@@ -625,6 +625,12 @@ pub fn small_m_kernel_static_name(
 /// 64+ rows collapse on the int8 lane (measured 4-6 TOPS vs ~17).
 pub const W4A8_TILE_ROWS: u32 = 32;
 
+/// The grouped (MoE) W4A8 GEMM's tile at every width. Each expert's slab
+/// streams from DRAM for only its few rows a chunk; the narrower tile keeps
+/// twice the threadgroups in flight to hide it (Qwen3.6, 64 rows an expert:
+/// 3.3-3.5% faster a projection; Gemma-4's down, 128 rows: within 1%).
+pub const W4A8_GROUPED_TILE: W4a8Tile = W4a8Tile::Cols64;
+
 /// Columns of one W4A8 GEMM threadgroup: 128 over 4 simdgroups where N
 /// allows it, else 64 over 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

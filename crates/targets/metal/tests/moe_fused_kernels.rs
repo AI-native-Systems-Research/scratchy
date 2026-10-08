@@ -383,9 +383,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
         let (fill, pos) = (u32_buf(experts), u32_buf(pairs));
         let indices_pad = u32_buf(pairs);
         let x_pad = e_buf(pairs * HIDDEN);
-        // The unsorted row buffer the down output gathers back into.
         let sorted_down_y = e_buf(pairs * HIDDEN);
-        let token_rows = e_buf(pairs * HIDDEN);
 
         let int = |slot: u16, v: i32| ConstantValue::int(ConstSlot(slot), v);
         let offsets_pso = baked_pipeline(
@@ -423,17 +421,22 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
             ],
         )
         .expect("scatter");
-        let gather_pso = baked_pipeline(
+        // The weighted sum reading each pair's row through `pos` (`MWS_SORTED`): the unsort.
+        let sorted_sum_pso = baked_pipeline(
             &device,
-            "moe_group",
-            "moe_group_gather_bfloat16",
-            vec![int(5, HIDDEN as i32)],
+            "moe_weighted_sum",
+            "moe_weighted_sum_bfloat16",
+            vec![
+                int(0, TOP_K as i32),
+                int(1, HIDDEN as i32),
+                ConstantValue::boolean(ConstSlot(2), true),
+            ],
         )
-        .expect("gather");
+        .expect("sorted weighted sum");
 
         // The sorted chain: gated over the sorted rows (its own output buffers), then the
         // plain down gather-qmv (GatherRows::Pairs) over the sorted act rows, then the
-        // unsort and the weighted sum over the token-order rows.
+        // weighted sum over the sorted rows through `pos`.
         let rows = GatherRows::Pairs;
         let act_code = int(3, i32::from(gelu));
         let mut gated_constants = block.gate.constants(rows);
@@ -513,22 +516,21 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                     threads: size(32, 2, 1),
                 },
                 Dispatch {
-                    pso: &gather_pso,
-                    buffers: vec![(&sorted_down_y, 0), (&pos, 1), (&token_rows, 2)],
-                    groups: size(1, live_pairs, 1),
-                    threads: size(HIDDEN.min(256), 1, 1),
-                },
-                Dispatch {
-                    pso: &block.weighted_sum,
-                    buffers: vec![(&token_rows, 0), (&block.scores, 1), (&sorted_out, 2)],
+                    pso: &sorted_sum_pso,
+                    buffers: vec![
+                        (&sorted_down_y, 0),
+                        (&block.scores, 1),
+                        (&sorted_out, 2),
+                        (&pos, 3),
+                    ],
                     groups: size(HIDDEN.div_ceil(64), live, 1),
                     threads: size(64, 1, 1),
                 },
             ]
         });
         let what = format!("sorted gelu={gelu} experts={experts} live={live}/{tokens}");
-        // The unsort restores token order, so the act rows compare after applying pos, and
-        // the combined output compares directly.
+        // The sum reads through pos, so the act rows compare after applying pos, and the
+        // combined output compares directly.
         let pos_v = common::read_slice::<u32>(&pos, live_pairs);
         let act_ref = bits(&block.fused_gate_y, pairs * INTER);
         let act_sorted = bits(&sorted_gate_y, pairs * INTER);
