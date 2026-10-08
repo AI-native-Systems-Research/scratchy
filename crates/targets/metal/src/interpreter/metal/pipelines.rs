@@ -4143,4 +4143,163 @@ mod tests {
         }
         eprintln!("fused_mlp_steel m={m} dtype={dtype:?} max_abs_diff={max_diff}");
     }
+
+    /// `gemv_normed_rows_bf16_s_bf16` — the multi-row normed router gemv the m≥2 decode
+    /// buckets dispatch (`KernelId::NormedGemv`, one threadgroup of 256 threads per
+    /// (N-block, row)). Each row is rmsnorm(gain)-then-gemv; the CPU golden mirrors the
+    /// per-row sum-of-squares reduce the kernel rides in the threadgroup buffer's spare
+    /// word. Catches a row-axis wiring or reduce bug the one-row kernel can't show.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemv_normed_rows_bf16_matches_cpu_golden() {
+        use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey};
+
+        let Some(device_info) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let cache = std::sync::Arc::new(
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders"),
+        );
+
+        // GLM-4.5-Air's router shape: N = 128 experts, K = 4096 hidden.
+        let (n, k) = (128usize, 4096usize);
+        for m in [1usize, 2, 5] {
+            let key = PipelineKey::new(
+                "gemm",
+                "gemv_normed_rows_bf16_s_bf16",
+                vec![
+                    ConstantValue::uint(0, m as u32), // GEMM_M (unused by the rows kernel)
+                    ConstantValue::uint(1, n as u32), // GEMM_N
+                    ConstantValue::uint(2, k as u32), // GEMM_K
+                    ConstantValue::float(5, 1e-5),    // GEMV_NORM_EPS
+                    ConstantValue::float(6, 0.0),     // GEMV_NORM_W_OFFSET
+                ],
+            );
+            let pipeline = crate::aot::baked_build(&cache, &key).expect("rows gemv pipeline");
+
+            let input_data: Vec<f32> = (0..m * k)
+                .map(|i| ((i as f32) * 0.011).sin() * 0.5 + (i % 7) as f32 * 0.001)
+                .collect();
+            let gain_data: Vec<f32> = (0..k)
+                .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
+                .collect();
+            let weight_data: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32) * 0.019).cos() * 0.3)
+                .collect();
+
+            use crate::interpreter::metal::__re::{
+                Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+            };
+            fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+                let bf16_data: Vec<half::bf16> =
+                    data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                let bytes = std::mem::size_of_val(bf16_data.as_slice());
+                let buf = device
+                    .newBufferWithLength_options(
+                        bytes.max(1) as u64 as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .expect("newBuffer");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bf16_data.as_ptr() as *const u8,
+                        buf.contents().as_ptr() as *mut u8,
+                        bytes,
+                    );
+                }
+                buf
+            }
+            fn alloc_zero_bf16(device: &Device, n_elems: usize) -> Buffer {
+                let bytes = (n_elems * std::mem::size_of::<half::bf16>()).max(1);
+                let buf = device
+                    .newBufferWithLength_options(
+                        bytes as u64 as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .expect("newBuffer");
+                unsafe {
+                    std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
+                }
+                buf
+            }
+
+            let input_buf = alloc_bf16(&device, &input_data);
+            let weight_buf = alloc_bf16(&device, &weight_data);
+            let gain_buf = alloc_bf16(&device, &gain_data);
+            let output_buf = alloc_zero_bf16(&device, m * n);
+
+            // The lowering's dispatch: (ceil(N/4), M, 1) × (256, 1, 1).
+            use crate::interpreter::metal::__re::MTLSize;
+            if !crate::mtl4_dispatch::dispatch_threadgroups(
+                &device,
+                &pipeline,
+                &[&output_buf, &input_buf, &weight_buf, &gain_buf],
+                MTLSize {
+                    width: n.div_ceil(4),
+                    height: m,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            ) {
+                return;
+            }
+
+            // CPU reference: per row, rmsnorm(x, gain) @ W^T, all bf16-round-tripped.
+            let rt = |v: f32| half::bf16::from_f32(v).to_f32();
+            let input_rt: Vec<f32> = input_data.iter().map(|&v| rt(v)).collect();
+            let gain_rt: Vec<f32> = gain_data.iter().map(|&v| rt(v)).collect();
+            let weight_rt: Vec<f32> = weight_data.iter().map(|&v| rt(v)).collect();
+            let eps = 1e-5_f32;
+            let mut normed = vec![0.0_f32; m * k];
+            for row in 0..m {
+                crate::cpu_golden::rmsnorm(
+                    &input_rt[row * k..(row + 1) * k],
+                    &gain_rt,
+                    &mut normed[row * k..(row + 1) * k],
+                    eps,
+                );
+            }
+            let mut output_cpu = vec![0.0_f32; m * n];
+            crate::cpu_golden::gemm(&normed, &weight_rt, &mut output_cpu, m, k, n);
+
+            let output_metal: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(
+                    output_buf.contents().as_ptr() as *const half::bf16,
+                    output_cpu.len(),
+                )
+            }
+            .iter()
+            .map(|&v| v.to_f32())
+            .collect();
+
+            // K=4096 reduction, bf16 inputs, f32 accumulate, and a bf16 final store: compare
+            // against the CPU reference round-tripped through the same store.
+            let output_cpu_stored: Vec<f32> = output_cpu.iter().map(|&v| rt(v)).collect();
+            let tol: f32 = 5e-2;
+            let mut max_diff = 0.0_f32;
+            for i in 0..output_cpu.len() {
+                let diff = (output_metal[i] - output_cpu_stored[i]).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+                assert!(
+                    diff < tol,
+                    "gemv_normed_rows m={m} [{i}] (row {} col {}) metal={} cpu={} diff={}",
+                    i / n,
+                    i % n,
+                    output_metal[i],
+                    output_cpu[i],
+                    diff
+                );
+            }
+            eprintln!("gemv_normed_rows m={m} max_abs_diff={max_diff}");
+        }
+    }
 }

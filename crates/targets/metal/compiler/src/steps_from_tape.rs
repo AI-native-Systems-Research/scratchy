@@ -9,7 +9,7 @@
 //! lowering: which kernel a step or fold becomes, which slots it binds, which weights it reads.
 //!
 //! [`assemble`] then lays the records out along a walk of the tape's items — rolled, unrolled or
-//! peeled — with the layer loops the shared re-roll found, and [`hazard_flags`] fences the result.
+//! peeled — with the layer loops the shared re-roll found, and [`hazard_fences`] fences the result.
 //! [`proves`] is the check that a rolled layout is the unrolled program.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -33,7 +33,7 @@ use scratchy_target_metal::op_abi::{
     METAL_ELIDABLE, METAL_GUARD_GATES, MetalFusion, MoeWrite, metal_colour_rule, moe_write,
     rope_append_weight_site,
 };
-use scratchy_target_metal::tape::lowered::RuntimeGate;
+use scratchy_target_metal::tape::lowered::{Fence, RuntimeGate};
 use scratchy_target_metal::tape::step::{
     self as st, AffineBits as Bits, AffineGroupSize as Gs, ArenaSlotIdx as Slot, HiddenSize as W,
     IntermediateSize as Inter, LayerId, MetalStep, MoeRegion, MoeRows, MoeStep,
@@ -2148,10 +2148,10 @@ pub struct Assembled {
 }
 
 impl Assembled {
-    /// The barrier flags of the backbone and the lm_head, walked as ONE stream: the lm_head's
+    /// The fences of the backbone and the lm_head, walked as ONE stream: the lm_head's
     /// first row fences against what the backbone left pending.
-    pub fn flags(&self) -> (Vec<bool>, Vec<bool>) {
-        let mut all = hazard_flags(self.sigs.iter().chain(&self.lm_sigs));
+    pub fn flags(&self) -> (Vec<Fence>, Vec<Fence>) {
+        let mut all = hazard_fences(self.sigs.iter().chain(&self.lm_sigs));
         let lm = all.split_off(self.sigs.len());
         (all, lm)
     }
@@ -2226,32 +2226,46 @@ pub fn assemble(
     Ok(out)
 }
 
-/// THE MTL4 barrier flags: a row fences when it reads a buffer pending a write (RAW), writes one
+/// THE MTL4 fences: a row fences when it reads a buffer pending a write (RAW), writes one
 /// pending a write or read (WAW/WAR), or touches a KV layer or the op scratch pending a
 /// conflicting access. The first dispatch never fences; a fence clears everything pending;
 /// metadata rows are invisible. The rows one construct expanded to (`HazardSig::group`) fence as
 /// ONE: the first on the union of their accesses, every later one unconditionally.
-pub fn hazard_flags<'a>(sigs: impl Iterator<Item = &'a HazardSig>) -> Vec<bool> {
+///
+/// The fence carries its hazard CLASS: RAW is [`Fence::Coherent`] (the reader must observe the
+/// prior write through the caches), WAR/WAW are [`Fence::Ordered`] (ordering suffices — no one
+/// reads what these order).
+pub fn hazard_fences<'a>(sigs: impl Iterator<Item = &'a HazardSig>) -> Vec<Fence> {
     let sigs: Vec<&HazardSig> = sigs.collect();
     let mut pending = Pending::default();
     let (mut flags, mut first, mut i) = (Vec::with_capacity(sigs.len()), true, 0);
     while i < sigs.len() {
         if sigs[i].metadata {
-            flags.push(false);
+            flags.push(Fence::None);
             i += 1;
             continue;
         }
         let g = sigs[i].group;
         let rest = sigs[i + 1..].iter();
         let end = i + 1 + rest.take_while(|s| g.is_some() && s.group == g).count();
-        let need = !first && sigs[i..end].iter().any(|s| pending.conflicts(s));
-        if need {
+        let need = (!first)
+            .then(|| {
+                sigs[i..end]
+                    .iter()
+                    .filter_map(|s| pending.conflicts(s))
+                    .max()
+            })
+            .flatten();
+        if need.is_some() {
             pending = Pending::default();
         }
         sigs[i..end].iter().for_each(|s| pending.add(s));
         first = false;
-        flags.push(need);
-        flags.extend(std::iter::repeat_n(true, end - i - 1));
+        flags.push(need.unwrap_or(Fence::None));
+        // Intra-group later rows: the construct's own sub-commands (e.g. a
+        // SplitK partial-writer → reduce pair) read what an earlier row of
+        // the same construct wrote — RAW, so Coherent.
+        flags.extend(std::iter::repeat_n(Fence::Coherent, end - i - 1));
         i = end;
     }
     flags
@@ -2269,22 +2283,37 @@ struct Pending {
 }
 
 impl Pending {
-    fn conflicts(&self, s: &HazardSig) -> bool {
-        let arena = s.reads.iter().any(|x| self.w.contains(x))
-            || s.writes
-                .iter()
-                .any(|x| self.w.contains(x) || self.r.contains(x));
-        let kv = s.kv_r.is_some_and(|l| self.kv_w.contains(&l))
+    /// The fence class this row needs against what is pending, if any:
+    /// `Some(Coherent)` when it READS a pending write (RAW — it must
+    /// observe the write through the caches), `Some(Ordered)` when it
+    /// only writes over pending state (WAW/WAR — ordering suffices).
+    fn conflicts(&self, s: &HazardSig) -> Option<Fence> {
+        // RAW: every read conflict needs the write visible.
+        let raw = s.reads.iter().any(|x| self.w.contains(x))
+            || s.kv_r.is_some_and(|l| self.kv_w.contains(&l))
+            || (s.op_scratch == Access::Read && self.op_scratch == Access::Write)
+            || (s.codec_staging == Access::Read && self.codec_staging == Access::Write);
+        if raw {
+            return Some(Fence::Coherent);
+        }
+        // WAW/WAR: writes over pending state, or a KV/scratch write over a
+        // pending read or write. A scratch `Write` over a pending `Write` is
+        // Coherent, not Ordered: `Access::Write` is "written (and read)" —
+        // the row may read what the pending write left there.
+        if s.op_scratch == Access::Write && self.op_scratch == Access::Write
+            || s.codec_staging == Access::Write && self.codec_staging == Access::Write
+        {
+            return Some(Fence::Coherent);
+        }
+        let waw_war = s
+            .writes
+            .iter()
+            .any(|x| self.w.contains(x) || self.r.contains(x))
             || s.kv_w
-                .is_some_and(|l| self.kv_w.contains(&l) || self.kv_r.contains(&l));
-        let one = |access: Access, pending: Access| match access {
-            Access::Untouched => false,
-            Access::Read => pending == Access::Write,
-            Access::Write => pending != Access::Untouched,
-        };
-        let scratch = one(s.op_scratch, self.op_scratch);
-        let staging = one(s.codec_staging, self.codec_staging);
-        arena || kv || scratch || staging
+                .is_some_and(|l| self.kv_w.contains(&l) || self.kv_r.contains(&l))
+            || (s.op_scratch == Access::Write && self.op_scratch == Access::Read)
+            || (s.codec_staging == Access::Write && self.codec_staging == Access::Read);
+        waw_war.then_some(Fence::Ordered)
     }
 
     fn add(&mut self, s: &HazardSig) {
@@ -2298,13 +2327,13 @@ impl Pending {
 }
 
 /// THE ROLL PROOF: `candidate` with every loop expanded — a body row `i·stride` layers on per
-/// iteration, nesting summed — must be exactly `unrolled`: rows, barrier flags, and weight sites
+/// iteration, nesting summed — must be exactly `unrolled`: rows, fences, and weight sites
 /// (a rolled body binds the same source families every iteration; only the layer advances).
 pub fn proves(
     candidate: &Assembled,
-    flags: &[bool],
+    flags: &[Fence],
     unrolled: &Assembled,
-    unrolled_flags: &[bool],
+    unrolled_flags: &[Fence],
 ) -> Result<(), String> {
     fn expand(rows: &[StepRow], at: usize, base: u32, out: &mut Vec<(StepRow, usize)>) {
         let mut k = 0;
@@ -2345,7 +2374,7 @@ pub fn proves(
     for (i, ((_, k), b)) in expanded.iter().zip(unrolled_flags).enumerate() {
         if flags[*k] != *b {
             return Err(format!(
-                "barrier row {i}: original={b} expanded={}",
+                "fence row {i}: original={b:?} expanded={:?}",
                 flags[*k]
             ));
         }
@@ -2375,29 +2404,53 @@ mod tests {
     /// A construct's rows fence as ONE: the first on every member's accesses, the rest always.
     #[test]
     fn a_constructs_rows_fence_as_one() {
+        use Fence::{Coherent, None as No, Ordered};
         // Alone, row 1 has nothing pending to fence on; row 2 reads row 0's write.
         let alone = [
             sig(&[], &[1], None),
             sig(&[2], &[], None),
             sig(&[1], &[3], None),
         ];
-        assert_eq!(hazard_flags(alone.iter()), [false, false, true]);
+        assert_eq!(hazard_fences(alone.iter()), [No, No, Coherent]);
         let one = [
             sig(&[], &[1], None),
             sig(&[2], &[], Some(0)),
             sig(&[1], &[3], Some(0)),
         ];
-        assert_eq!(hazard_flags(one.iter()), [false, true, true]);
+        // The group's first row fences Coherent (row 2's RAW is the union's
+        // strongest conflict); the group's later rows read what the first
+        // wrote — Coherent.
+        assert_eq!(hazard_fences(one.iter()), [No, Coherent, Coherent]);
     }
 
     /// The op scratch is one location: a write fences on any pending access, a read on a write.
     #[test]
     fn the_op_scratch_is_one_location() {
+        use Fence::{Coherent, None as No};
         let scratch = |op_scratch| HazardSig {
             op_scratch,
             ..HazardSig::default()
         };
         let rows = [Access::Read, Access::Read, Access::Write, Access::Read].map(scratch);
-        assert_eq!(hazard_flags(rows.iter()), [false, false, true, true]);
+        // Write-after-read = Ordered; the read after that write = RAW = Coherent.
+        assert_eq!(
+            hazard_fences(rows.iter()),
+            [No, No, Fence::Ordered, Coherent]
+        );
+    }
+
+    /// The class is the point: a WAW fence orders (Ordered), a RAW fence must
+    /// observe the write through the caches (Coherent). Issue #295 — the
+    /// m≥2 router NormedGemv read a just-written hidden state through an
+    /// Ordered fence and saw stale bytes ~50% of runs.
+    #[test]
+    fn raw_fences_coherent_and_waw_orders() {
+        use Fence::{Coherent, None as No, Ordered};
+        let rows = [
+            sig(&[], &[1], None), // writes slot 1
+            sig(&[], &[1], None), // WAW on slot 1 → Ordered
+            sig(&[1], &[], None), // RAW on slot 1 → Coherent
+        ];
+        assert_eq!(hazard_fences(rows.iter()), [No, Ordered, Coherent]);
     }
 }

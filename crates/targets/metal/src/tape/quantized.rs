@@ -273,6 +273,13 @@ pub fn qmv_kernel_static_name(
 // branch) and `Instruction::Gemm`-equivalent (matmul branch).
 // ─────────────────────────────────────────────────────────────────
 
+/// The smallest `vector_limit` [`get_qmv_batch_limit`] returns over every `(K, N, arch_gen)` — the
+/// matvec band's floor. Every bucket of at most this many minus one rows is in the matvec band for
+/// every shape and every gen class, whatever it lowers: the shared fold pass may fold a matmul's
+/// ends there ([`ModelFoldFacts::matvec_ends`]) and the bucket folding must not merge buckets
+/// across the boundary (the Sorted/Grouped MoE groupings of a bigger bucket cannot take them).
+pub const QMV_MATVEC_BAND_ROWS: u32 = 5;
+
 /// Vector-vs-matrix limit for a given `(K, N, arch_gen)`. M < limit
 /// routes to `qmv*`; M >= limit routes to `qmm*` (P4).
 ///

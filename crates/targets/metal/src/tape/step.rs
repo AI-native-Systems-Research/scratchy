@@ -24,7 +24,7 @@ pub use scratchy_subtile::subtile_ir::{
 pub use super::lowered::ActivationWidth;
 
 use super::ids::ArenaSlotIdx as Slot;
-use super::lowered::RuntimeGate;
+use super::lowered::{Fence, RuntimeGate};
 
 /// Where a KV writer puts the step's new K and V rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,14 +718,14 @@ impl RotaryTables {
     }
 }
 
-/// One bucket's step tape: the backbone and the lm_head halves, each with one barrier flag and
+/// One bucket's step tape: the backbone and the lm_head halves, each with one fence and
 /// one weight site per row. The default is the empty tape a refused canonical bakes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetalStepTape {
     pub backbone: Vec<StepRow>,
-    pub backbone_barriers: Vec<bool>,
+    pub backbone_barriers: Vec<Fence>,
     pub backbone_sources: Vec<Vec<RowSource>>,
     pub lm_head: Vec<StepRow>,
-    pub lm_head_barriers: Vec<bool>,
+    pub lm_head_barriers: Vec<Fence>,
     pub lm_head_sources: Vec<Vec<RowSource>>,
 }

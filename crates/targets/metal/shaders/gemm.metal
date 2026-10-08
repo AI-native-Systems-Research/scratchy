@@ -500,17 +500,16 @@ SCRATCHY_CONSTANT_OPTIONAL(float, GEMV_NORM_W_OFFSET, 6);
 constant constexpr bool GEMV_NORMED = GEMV_NORM_EPS_SET;
 
 template <typename T, typename G>
-[[kernel]] void gemv_specialized(
-    device       T* output [[buffer(0)]],
-    device const T* input  [[buffer(1)]],
-    device const T* weight [[buffer(2)]],
-    device const G* gain   [[buffer(3)]],
-    uint3 tid      [[threadgroup_position_in_grid]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
+METAL_FUNC void gemv_specialized_impl(
+    device       T*       output,
+    device const T*       input,
+    device const T*       weight,
+    device const G*       gain,
+    threadgroup float*    tgp,
+    uint                   tid_x,
+    uint                   simd_gid,
+    uint                   simd_lid)
 {
-    if (GEMM_M != 1u) return;
-
     constexpr int BN = 8;              // simdgroups per threadgroup, all along K
     constexpr int SN = 32;             // threads per simdgroup, all along K
     constexpr int TM = 4;              // outputs per thread
@@ -529,7 +528,7 @@ template <typename T, typename G>
     const int sgN = int(simd_gid) % BN;
     int bn = (SN * sgN + int(simd_lid)) * TN;
 
-    int out_row = int(tid.x) * blockM;
+    int out_row = int(tid_x) * blockM;
     if (out_row >= N) return;
     out_row = out_row + TM <= N ? out_row : N - TM;
     device const T* mat = weight + uint(out_row) * uint(K);
@@ -591,7 +590,6 @@ template <typename T, typename G>
 
     // A simdgroup's sum of squares rides in its slot's spare word.
     sum_sq = GEMV_NORMED ? simd_sum(sum_sq) : 0.0f;
-    threadgroup float tgp[BN * (blockM + TM)];
     if (simd_lid == 0) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
@@ -618,6 +616,52 @@ template <typename T, typename G>
     }
 }
 
+// One row (GEMM_M == 1): the gemv above, on the GEMM's buffers.
+template <typename T, typename G>
+[[kernel]] void gemv_specialized(
+    device       T* output [[buffer(0)]],
+    device const T* input  [[buffer(1)]],
+    device const T* weight [[buffer(2)]],
+    device const G* gain   [[buffer(3)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    if (GEMM_M != 1u) return;
+    constexpr int BN = 8;   // simdgroups per threadgroup, all along K
+    constexpr int TM = 4;   // outputs per thread
+    threadgroup float tgp[BN * (TM + TM)];
+    gemv_specialized_impl(output, input, weight, gain, tgp, tid.x, simd_gid, simd_lid);
+}
+
+// `gemv_normed_rows_*`: the normed gemv over EVERY row of an M-row batch — a router's pre-norm
+// (`MetalFusion::NormedRouter`) on the multi-row buckets, where the plain Gemm path cannot take
+// the fold. Dispatch (ceil(N/4), M, 1): tid.y picks the row; the threadgroup's 256 threads all
+// collaborate on that one row, so the sum-of-squares reduce is the one-row kernel's own.
+template <typename T, typename G>
+[[kernel]] void gemv_specialized_rows(
+    device       T* output [[buffer(0)]],
+    device const T* input  [[buffer(1)]],
+    device const T* weight [[buffer(2)]],
+    device const G* gain   [[buffer(3)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 8;   // simdgroups per threadgroup, all along K
+    constexpr int TM = 4;   // outputs per thread
+    threadgroup float tgp[BN * (TM + TM)];
+    gemv_specialized_impl<T, G>(
+        output + size_t(tid.y) * uint(GEMM_N),
+        input + size_t(tid.y) * uint(GEMM_K),
+        weight,
+        gain,
+        tgp,
+        tid.x,
+        simd_gid,
+        simd_lid);
+}
+
 #define INST_GEMV(tag, T) \
   SCRATCHY_KERNEL(gemv_##tag##_specialized, gemv_specialized<T, T>)
 
@@ -631,3 +675,11 @@ INST_GEMV_NORMED(f16, half, f16, half)
 INST_GEMV_NORMED(bf16, bfloat, f16, half)
 INST_GEMV_NORMED(bf16, bfloat, bf16, bfloat)
 INST_GEMV_NORMED(f16, half, bf16, bfloat)
+
+#define INST_GEMV_NORMED_ROWS(act_tag, T, gain_tag, G) \
+  SCRATCHY_KERNEL(gemv_normed_rows_##act_tag##_s_##gain_tag, gemv_specialized_rows<T, G>)
+
+INST_GEMV_NORMED_ROWS(f16, half, f16, half)
+INST_GEMV_NORMED_ROWS(bf16, bfloat, f16, half)
+INST_GEMV_NORMED_ROWS(bf16, bfloat, bf16, bfloat)
+INST_GEMV_NORMED_ROWS(f16, half, bf16, bfloat)

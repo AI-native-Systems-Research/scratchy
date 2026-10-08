@@ -26,6 +26,7 @@ use scratchy_target_metal::op_abi::{
     metal_colour_rule,
 };
 use scratchy_target_metal::tape::ids::SourceIx;
+use scratchy_target_metal::tape::lowered::Fence;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{
     AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
@@ -224,7 +225,7 @@ impl std::fmt::Display for CanonicalRefusal {
 
 /// The barriers a decode step of `m` sequences runs on the unrolled tape `t` (flags `flags`): the
 /// fenced rows whose runtime gate lets them run on it.
-fn decode_barriers(t: &Assembled, flags: &[bool], m: u64) -> usize {
+fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
     use scratchy_target_metal::interpreter::metal::worker::{StepFacts, gate_matches};
     use scratchy_target_metal::tape::step::StepRow;
     let rows = m as u32;
@@ -236,7 +237,7 @@ fn decode_barriers(t: &Assembled, flags: &[bool], m: u64) -> usize {
     };
     let runs = |r: &StepRow| matches!(r, StepRow::Step(_, g) if gate_matches(*g, decode));
     (t.rows.iter().zip(flags))
-        .filter(|&(r, &f)| f && runs(r))
+        .filter(|&(r, f)| *f != Fence::None && runs(r))
         .count()
 }
 
@@ -265,10 +266,13 @@ pub fn lower_canonical(
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
     let fold_projections = facts.mlp == MlpForm::Packed || m == 1;
-    // The one-row bucket's affine matvecs normalize their input and add into the residual.
+    // The affine matvecs normalize their input and add into the residual on every bucket in the
+    // matvec band: its floor is `QMV_MATVEC_BAND_ROWS` (the qmv batch limit's minimum, so no
+    // shape or gen class crosses below it) — the fold can never ask the matmul band (qmm_t,
+    // which takes no ends) to lower one.
     let model = ModelFoldFacts {
         fold_projections,
-        matvec_ends: m == 1,
+        matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         row_programs: m == 1,
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
@@ -329,7 +333,7 @@ pub fn lower_canonical(
     let (rolled_flags, lm_head_barriers) = rolled.flags();
     let (unrolled_flags, _) = unrolled.flags();
     let barriers = decode_barriers(&unrolled, &unrolled_flags, m);
-    let proof = |b: &Assembled, flags: &[bool]| proves(b, flags, &unrolled, &unrolled_flags);
+    let proof = |b: &Assembled, flags: &[Fence]| proves(b, flags, &unrolled, &unrolled_flags);
 
     // ⭐ THE ROLL IS KEPT ONLY IF IT IS PROVABLY THE SAME PROGRAM, AND THE CUT IS MOVED UNTIL IT
     // IS. A body drawn from layer 0 lowers layer 0's unfused norm for every layer (metal folds a

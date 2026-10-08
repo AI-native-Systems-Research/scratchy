@@ -1285,6 +1285,38 @@ pub fn baked<T>(v: Vec<T>) -> &'static [T] {
     Box::leak(v.into_boxed_slice())
 }
 
+/// The fence one dispatch needs before it runs, from the compile-time
+/// hazard class of what it touches against what is pending since the last
+/// fence. All three order dispatches; they differ in MEMORY visibility:
+///
+/// ⛔ `None` (ordering alone) does NOT make a prior dispatch's store
+/// observable to a reader on every GPU — the store may still live in a
+/// cache the reading dispatch's loads don't snoop. Verified on M5 Max
+/// (GLM-4.5-Air m≥2, issue #295): the router's NormedGemv read the
+/// hidden state a same-encoder dispatch had just written and saw stale
+/// bytes ~50% of runs; forcing every barrier with `None` visibility did
+/// NOT fix it (bisect H), `Device` did (bisect J/K, 10/10 clean). The
+/// failing read was RAW — read-after-write on an arena slot.
+///
+/// So: RAW fences get `Device` (cache-coherent); WAR/WAW fences get
+/// `Ordered` — ordering is all they need, and the flush `Device` forces
+/// costs real decode time where it isn't needed (measured −30 ms TTFT
+/// @ 2048-tok on M4 Llama-3.2-3B-4bit, gemma-4-26b conc decode ~5-10%).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub enum Fence {
+    /// No fence.
+    #[default]
+    None,
+    /// Ordering only (WAR/WAW): no later dispatch may start before the
+    /// prior one's dispatch stage completes. Emitted as a
+    /// `Dispatch→Dispatch` barrier with `MTL4VisibilityOptions::None`.
+    Ordered,
+    /// RAW: a reader must OBSERVE a prior dispatch's write. Emitted as a
+    /// `Dispatch→Dispatch` barrier with `MTL4VisibilityOptions::Device`
+    /// (memory-coherent).
+    Coherent,
+}
+
 /// A tape's commands: positions in a command table. The tapes a model bakes share one table
 /// (each distinct command once), so a command every rung runs is stored once and each rung pays
 /// two bytes for it. Compared and hashed by the commands it lists, whatever table holds them.
@@ -1746,13 +1778,13 @@ impl LoweredMetalTape {
     /// `barrier_before`, expanded in lockstep with [`Self::commands_expanded`].
     ///
     /// The body is byte-equivalent across iterations apart from the layer, so every iteration
-    /// fences exactly as the baked one does — the same walk, reading the flag at each baked
+    /// fences exactly as the baked one does — the same walk, reading the fence at each baked
     /// position instead of the command.
-    pub fn barriers_expanded(&self) -> Vec<bool> {
+    pub fn barriers_expanded(&self) -> Vec<Fence> {
         let mut out = Vec::with_capacity(self.barrier_before.len());
         let flags = self.barrier_before;
         Self::walk(self.loops, 0..self.commands.len(), 0, &mut |pos, _| {
-            out.push(flags.get(pos).copied().unwrap_or(true))
+            out.push(flags.get(pos).copied().unwrap_or(Fence::Coherent))
         });
         out
     }
@@ -1801,17 +1833,17 @@ pub struct LoweredMetalTape {
     /// The tape's commands, positions in a command table ([`baked_commands`]; a baked model's tapes
     /// share one).
     pub commands: TapeCommands,
-    /// MTL4 encoder barrier-before flag per command, mirroring
-    /// `commands.len()`. Sourced from the macro-emitted
-    /// `MetalBucketSpec::{backbone,lm_head}_barriers` slice (one
-    /// bool per `Instruction`) and expanded through loop
+    /// The fence before each command (`None`/`Ordered`/`Coherent` — see
+    /// [`Fence`]), mirroring `commands.len()`. Sourced from the macro-emitted
+    /// `MetalBucketSpec::{backbone,lm_head}_barriers` slice (one fence per
+    /// `Instruction`) and expanded through loop
     /// unrolling — the macro's loop-compression body has the same
-    /// barrier pattern across iterations (byte-equivalence is the
+    /// hazard pattern across iterations (byte-equivalence is the
     /// compression precondition), so iteration N's body row i
-    /// reuses iteration 0's flag at the same position. The bake
+    /// reuses iteration 0's fence at the same position. The bake
     /// pass propagates this into `Mtl4Step.barrier_before`; the
     /// runtime never re-derives the analysis.
-    pub barrier_before: &'static [bool],
+    pub barrier_before: &'static [Fence],
     /// The layer loops the bake kept ROLLED, OUTERMOST FIRST: `commands[start..start+period]`
     /// is one body copy that runs `iters` times, iteration `i` being that body with every
     /// `LayerId` advanced by `i * layer_stride` ([`Binding::bump_layer`]). Empty = straight-line.
@@ -1896,7 +1928,7 @@ pub enum LoweringError {
     /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
     /// runs only on a TurboQuant model.
     CodecStepOnDenseModel,
-    /// A one-row fold — a gated matvec, a matvec's ends, a router's pre-norm, a decode attention
+    /// A one-row fold — a gated matvec, a matmul's ends in the matmul band, a decode attention
     /// running its KV writer — in a bucket of `bucket_m` rows: its kernel computes one row, and
     /// the fold applies to that bucket only.
     OneRowFold { bucket_m: u32 },
@@ -1909,7 +1941,7 @@ pub enum LoweringError {
     /// computes them.
     CombineEndsUngathered,
     /// Rows a MoE step normalizes as it loads them (`MoeRows::Normed`) where its command cannot:
-    /// only the gathered expert matvecs and the one-row router's logits normalize their rows.
+    /// only the gathered expert matvecs and the router's logits normalize their rows.
     NormedRowsUnread,
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.

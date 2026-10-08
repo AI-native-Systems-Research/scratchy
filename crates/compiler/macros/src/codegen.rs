@@ -11223,8 +11223,21 @@ pub fn emit_model(
                             // verbatim. Normalizing to one sentinel
                             // collapsed m=1 with m=2 — the drift gate
                             // caught it against the solve's folding.
+                            // The metal fold pass folds matvec ends on
+                            // every bucket in the qmv matvec band (its
+                            // floor: `QMV_MATVEC_BAND_ROWS`) and not
+                            // above, so the classes split there too —
+                            // a shared canonical would bake one band's
+                            // steps at the other's bucket.
+                            let band = scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS;
                             let mm = if od.m == m {
-                                if m == 1 { u32::MAX } else { u32::MAX - 1 }
+                                if m == 1 {
+                                    u32::MAX
+                                } else if m <= band {
+                                    u32::MAX - 1
+                                } else {
+                                    u32::MAX - 2
+                                }
                             } else {
                                 od.m
                             };

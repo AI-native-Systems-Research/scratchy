@@ -1213,6 +1213,11 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
 // matrix per row. `k_lanes` lanes reduce K per output row;
 // 32/k_lanes rows per simdgroup; the partials fold with a shuffle
 // ladder (simd_sum would mix the rows a simdgroup spans).
+//
+// Ends (`qmv_fast_impl`'s): QMV_NORMED normalizes each input vector as
+// it loads — x ⊙ (gain + offset), its sum of squares folded through the
+// same ladder the dot rides, the rows scaled by 1/rms at the store — and
+// `qmv_store` adds the row's bias and adds into the residual.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T_act, typename T_scale, int group_size, int bits, int vecs_per_tg, int k_lanes>
@@ -1225,7 +1230,9 @@ METAL_FUNC void qmv_wide_impl(
     int M,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const device T_scale* gain = nullptr,
+    const device T_act* bias = nullptr) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
@@ -1255,25 +1262,36 @@ METAL_FUNC void qmv_wide_impl(
   }
 
   U result[vecs_per_tg] = {0};
+  U sum_sq[vecs_per_tg] = {0};
 
   // Each lane reduces a strided subset of the row's groups: decode the group
   // in 8-value sub-chunks and reuse each chunk across the streamed vectors.
   for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
     U scale = srow[g];
-    U bias = brow[g];
+    U b = brow[g];
 #pragma unroll
     for (int sc = 0; sc < group_size / sub; sc++) {
       const int k0 = g * group_size + sc * sub;
       const device uint8_t* wc = wrow + k0 * bits / 8;
       U w_dq[sub];
-      dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+      dequantize<U, sub, bits>(wc, scale, b, w_dq);
 #pragma unroll
       for (int v = 0; v < vecs_per_tg; v++) {
         const device T_act* xc = xv[v] + k0;
         U acc = 0;
 #pragma unroll
         for (int i = 0; i < sub; i++) {
-          acc += static_cast<U>(xc[i]) * w_dq[i];
+          // QMV_NORMED: the gain folds into x as it loads (qmv_normalize's
+          // row), its squares riding a parallel accumulator.
+          U xg;
+          if (QMV_NORMED) {
+            const U xv_i = static_cast<U>(xc[i]);
+            sum_sq[v] += xv_i * xv_i;
+            xg = xv_i * (static_cast<U>(gain[k0 + i]) + QMV_GAIN_OFFSET);
+          } else {
+            xg = static_cast<U>(xc[i]);
+          }
+          acc += xg * w_dq[i];
         }
         result[v] += acc;
       }
@@ -1282,28 +1300,39 @@ METAL_FUNC void qmv_wide_impl(
 
   // Reduce each vector's partial over its k_lanes with a shuffle ladder:
   // simd_sum would mix the results_per_simdgroup rows a simdgroup spans.
+  // The norm's squares ride their own ladder — same lanes, same rows.
   for (int v = 0; v < vecs_per_tg; v++) {
     if constexpr (k_lanes >= 32) {
       result[v] += simd_shuffle_down(result[v], 16);
+      sum_sq[v] += simd_shuffle_down(sum_sq[v], 16);
     }
     if constexpr (k_lanes >= 16) {
       result[v] += simd_shuffle_down(result[v], 8);
+      sum_sq[v] += simd_shuffle_down(sum_sq[v], 8);
     }
     if constexpr (k_lanes >= 8) {
       result[v] += simd_shuffle_down(result[v], 4);
+      sum_sq[v] += simd_shuffle_down(sum_sq[v], 4);
     }
     if constexpr (k_lanes >= 4) {
       result[v] += simd_shuffle_down(result[v], 2);
+      sum_sq[v] += simd_shuffle_down(sum_sq[v], 2);
     }
     if constexpr (k_lanes >= 2) {
       result[v] += simd_shuffle_down(result[v], 1);
+      sum_sq[v] += simd_shuffle_down(sum_sq[v], 1);
     }
   }
 
   if (k_lane == 0 && out_row < OUT_VEC_SIZE) {
     for (int v = 0; v < vecs_per_tg; v++) {
       if (vec0 + v < M) {
-        y[(vec0 + v) * OUT_VEC_SIZE + out_row] = static_cast<T_act>(result[v]);
+        const U row_scale = qmv_row_scale(QMV_NORMED ? sum_sq[v] : 0, IN_VEC_SIZE);
+        qmv_store<T_act>(
+            y + (vec0 + v) * OUT_VEC_SIZE + out_row,
+            result[v] * row_scale,
+            bias,
+            out_row);
       }
     }
   }
@@ -1313,6 +1342,9 @@ METAL_FUNC void qmv_wide_impl(
 // affine_qmv_wide — quantized.h:1723-1775. Non-batched only: the
 // small-M band is a decode-batch shape, never an MoE weight batch.
 // M is the bucket's, baked like K/N (slot 7, set only for this kernel).
+// The ends buffers (15: a folded norm's gain, 16: the row's bias) bind
+// only when the fold took them; the kernel reads them under its
+// QMV_NORMED / QMV_BIASED constants alone.
 // ─────────────────────────────────────────────────────────────────
 
 SCRATCHY_CONSTANT_OPTIONAL(int, QMV_WIDE_M, 7);
@@ -1330,6 +1362,8 @@ template <
     const device T_scale* biases [[buffer(2)]],
     const device T_act* x [[buffer(3)]],
     device T_act* y [[buffer(4)]],
+    const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1342,7 +1376,9 @@ template <
       QMV_WIDE_M,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      gain,
+      bias);
 }
 
 // ─────────────────────────────────────────────────────────────────

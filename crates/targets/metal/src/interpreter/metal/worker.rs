@@ -26,7 +26,7 @@ use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 
 use super::ids::LayerId;
-use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, WeightTensor};
+use super::lowered::{Binding, Fence, KernelId, LoweredCommand, LoweredMetalTape, WeightTensor};
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
@@ -72,10 +72,10 @@ pub enum BucketStep {
         /// shrinking the grid to the actual M instead of paying
         /// the `bucket_m`-shaped over-dispatch cost.
         direct_m_scaling: Vec<Option<super::lowered::MScaling>>,
-        /// Per-sub-dispatch barrier-before flag, sourced from the
+        /// Per-sub-dispatch fence (hazard class), sourced from the
         /// compile-time DAG hazard analysis in `LoweredMetalTape`.
         /// Consumed by the MTL4 path via `Mtl4Step.barrier_before`.
-        barrier_before: Vec<bool>,
+        barrier_before: Vec<Fence>,
         /// Per-sub-dispatch runtime gate, mirroring
         /// [`LoweredMetalTape::runtime_gate`]. `None` (the common
         /// case) means always dispatch; `Some(OnlyIfSingleSeq)` /
@@ -754,7 +754,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 #[cfg(feature = "forward-telemetry")]
                 let compiler_barrier = *need_barrier;
                 // In range mode: skip dispatches outside the segment,
-                // and suppress the barrier on the segment's FIRST
+                // and suppress the fence on the segment's FIRST
                 // dispatch — its predecessor ran in a previous command
                 // buffer (commit + host wait = stronger ordering), and
                 // a leading barrier on an empty encoder is something
@@ -765,7 +765,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         continue;
                     }
                     if this_idx == r.start {
-                        need_barrier = false;
+                        need_barrier = Fence::None;
                     }
                 }
                 if !gate_matches(*gate, facts) {
@@ -777,20 +777,16 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // doesn't run with stale per-dispatch state.
                     continue;
                 }
-                if need_barrier {
-                    // Default to `None` visibility — measured -30 ms
-                    // TTFT @ 1024-tok / -89 ms @ 2048-tok on M4
-                    // Llama-3.2-3B-4bit, coherent on the standard probes
-                    // (short prompts, 80-tok Apollo recall, haiku
-                    // composition, Llama-3.2-1B math). Within a single
-                    // MTL4 compute encoder, dispatch-to-dispatch
-                    // sync is sufficient for correctness — full
-                    // device-coherent visibility is over-conservative
-                    // for back-to-back dispatches that aren't writing
-                    // to memory other dispatches in the SAME encoder
-                    // need cache-coherent reads of. The final cmdbuf
-                    // commit point flushes everything before the next
-                    // encoder runs.
+                if need_barrier != Fence::None {
+                    // Visibility from the hazard class: RAW fences are
+                    // `Device` (memory-coherent — the reader must observe
+                    // the prior write; ordering alone left the m≥2 router
+                    // NormedGemv reading stale bytes ~50% of runs, issue
+                    // #295), WAR/WAW fences are `None` (ordering only —
+                    // `Device`'s flush costs real time where nothing reads
+                    // through the caches: measured -30 ms TTFT @ 2048-tok
+                    // on M4 Llama-3.2-3B-4bit, gemma-4-26b conc decode
+                    // ~5-10%).
                     //
                     // ⛔ NOT a fence pair: `updateFence`/`waitForFence`
                     // between two dispatches of ONE MTL4 compute encoder
@@ -799,14 +795,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // across encoder boundaries, not within one —
                     // the stage barrier is the only in-encoder
                     // producer→consumer mechanism.
-                    // ⛔ `None` beats `Device` on M5 decode too: A/B on
-                    // gemma-4-26b (conc 1/2/4): None 9.8/14.7/19.0 vs
-                    // Device 10.1/15.6/20.9 ms TPOT — the flush costs
-                    // more than it saves at back-to-back dispatch scale.
+                    let visibility = match need_barrier {
+                        Fence::Coherent => MTL4VisibilityOptions::Device,
+                        Fence::Ordered => MTL4VisibilityOptions::None,
+                        Fence::None => unreachable!("guarded above"),
+                    };
                     enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                         MTLStages::Dispatch,
                         MTLStages::Dispatch,
-                        MTL4VisibilityOptions::None,
+                        visibility,
                     );
                 }
                 let tg_scaled = scale_tg_for_num_tokens(
@@ -885,7 +882,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 if tape_enabled {
                     tape.push(TapeEntry {
                         kind: kernel_kind(step.kernel),
-                        barrier: compiler_barrier,
+                        barrier: compiler_barrier != Fence::None,
                         fused: is_fused(step.kernel),
                     });
                 }
@@ -1076,7 +1073,10 @@ fn bake_bucket<W: CanonicalParams>(
                 size(shape.threadgroups),
                 size(shape.threads_per_threadgroup),
             );
-            let cmd_barrier = expanded_barriers.get(cmd_idx).copied().unwrap_or(true);
+            let cmd_barrier = expanded_barriers
+                .get(cmd_idx)
+                .copied()
+                .unwrap_or(Fence::Coherent);
             // Dense GEMM: M is the height axis but the bake here is for a dense linear that
             // always dispatches at the actual M (no bucket_m baking), so leave m_scaling as None.
             match steps.last_mut() {
@@ -1158,7 +1158,10 @@ fn bake_bucket<W: CanonicalParams>(
                 depth: (tpt.depth),
             },
         );
-        let cmd_barrier = expanded_barriers.get(cmd_idx).copied().unwrap_or(true);
+        let cmd_barrier = expanded_barriers
+            .get(cmd_idx)
+            .copied()
+            .unwrap_or(Fence::Coherent);
         let cmd_gate = gated.gate;
         let cmd_m_scaling = cmd.dispatch.m_scaling;
         // Coalesce only when the gate matches too — a `OnlyIfSingleSeq`

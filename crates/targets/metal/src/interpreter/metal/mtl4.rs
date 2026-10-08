@@ -17,6 +17,7 @@ use ::objc2::runtime::ProtocolObject;
 use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
 
 use super::__re::{ComputePipelineState, Device, MTL4ArgumentTableDescriptor, MTLDevice, MTLSize};
+use super::lowered::Fence;
 use super::worker::BucketStep;
 
 /// MTL4 argument-table buffer-binding slot cap. The Metal runtime
@@ -47,12 +48,12 @@ pub struct Mtl4Step {
     /// the `bucket_m`-baked baseline down to the actual M of this
     /// forward.
     pub m_scaling: Vec<Option<super::lowered::MScaling>>,
-    /// One barrier-before flag per sub-dispatch (parallel to
-    /// `tables` / `dispatches`). Sourced from the macro-emitted
-    /// `LoweredMetalTape::barrier_before` — no runtime analysis.
-    /// `true` means the runtime must emit a `Dispatch→Dispatch`
-    /// MTL4 encoder barrier before this sub-dispatch.
-    pub barrier_before: Vec<bool>,
+    /// The fence before each sub-dispatch (parallel to `tables` /
+    /// `dispatches`). Sourced from the macro-emitted
+    /// `LoweredMetalTape::barrier_before` — no runtime analysis. The
+    /// hazard class picks the MTL4 barrier's visibility: `Coherent`
+    /// (RAW) → `Device`, `Ordered` (WAR/WAW) → `None`.
+    pub barrier_before: Vec<Fence>,
     /// One runtime-gate flag per sub-dispatch (parallel to
     /// `tables` / `dispatches`). `None` (the common case) =
     /// always dispatch. `Some(OnlyIfSingleSeq)` /
