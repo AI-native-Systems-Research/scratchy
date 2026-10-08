@@ -83,23 +83,28 @@ server gets:
 ```bash
 # the dense control — the model the harness is built against
 cargo build --release -p scratchy-cli \
-  --features metal,serve,model/gemma-4-12b-it,quant/mlx-affine-b4-g64
+  --features metal,claude,model/gemma-4-12b-it,quant/mlx-affine-b4-g64
 scr launch claude -m mlx-community/gemma-4-12B-it-4bit --device metal
 
 # the MoE carrying the prefix-cache and tool-span headline
 cargo build --release -p scratchy-cli \
-  --features metal,serve,model/gemma-4-26b-a4b-it,quant/mlx-affine-b4-g64
+  --features metal,claude,model/gemma-4-26b-a4b-it,quant/mlx-affine-b4-g64
 scr launch claude -m mlx-community/gemma-4-26b-a4b-it-4bit --device metal
 
 # MoE + GDN: prefix caching is off by design, so this one measures the cost
 cargo build --release -p scratchy-cli \
-  --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
+  --features metal,claude,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
 scr launch claude -m mlx-community/Qwen3.6-35B-A3B-4bit --device metal
 ```
 
 One model per binary on purpose: naming `model/all` forward-expands every config
 in scope ([`BUILD.md`](BUILD.md)), which is minutes-to-hours and an OOM risk on a
 laptop.
+
+`claude`, not `serve`, is the feature these builds need: `scr launch claude` is
+gated on `claude` (`crates/cli/scr/src/main.rs:106`), and `claude = ["serve"]`
+is one-directional — a `serve` build has the server but not the subcommand that
+drives it.
 
 **ollama — T0.4.** The tags are named per rung below; the environment that must
 accompany them (`OLLAMA_CONTEXT_LENGTH`, `OLLAMA_NUM_PARALLEL`,
