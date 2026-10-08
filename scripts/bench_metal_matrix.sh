@@ -43,6 +43,9 @@
 # prefill bucket, the same as any user gets.
 # --cell-timeout-s bounds each scaling cell; a timed-out cell skips the rest of
 # that server's cells, since a hung server would hang them all.
+# --fail-fast stops at the first scratchy build failure instead of measuring
+# the comparison engines alone. Either way, a model with no scratchy numbers
+# fails the run (exit 1).
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -88,6 +91,7 @@ OUTPUT_LEN=32
 WARM_REQUESTS=20
 OFFLINE=0
 SKIP_BUILD=0
+FAIL_FAST=0
 OUT_DIR=""
 KV_CACHE_DTYPE=""
 EVICT=""                 # --exec picks purge on macOS by itself
@@ -149,6 +153,7 @@ while [[ $# -gt 0 ]]; do
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
         --offline)           OFFLINE=1; shift ;;
         --skip-build)        SKIP_BUILD=1; shift ;;
+        --fail-fast)         FAIL_FAST=1; shift ;;
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
         -h|--help)           awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
@@ -179,11 +184,13 @@ chip="$(sysctl -n machdep.cpu.brand_string)"
 slug="$(echo "${chip}" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9-]//g')"
 : "${OUT_DIR:="${ROOT}/bench_results/metal_matrix"}"
 RAW="${OUT_DIR}/${slug}"
-# Named <machine>-<date>-<sha8>.json, the name site/build_metal.py requires, so
-# a finished run drops straight into site/data/metal/. One timestamp feeds both
-# the name and generated_utc, so the two can never disagree.
+# Named <machine>-<start time>-<sha8>.json, the name site/build_metal.py
+# requires, so a finished run drops straight into site/data/metal/ and a second
+# run of one commit on one day never overwrites the first. One timestamp feeds
+# both the name and generated_utc, so the two can never disagree.
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-JSON="${OUT_DIR}/${slug}-${STARTED_UTC:0:10}-$(git -C "${ROOT}" rev-parse HEAD | cut -c1-8).json"
+stamp="${STARTED_UTC//:/}"
+JSON="${OUT_DIR}/${slug}-${stamp}-$(git -C "${ROOT}" rev-parse HEAD | cut -c1-8).json"
 mkdir -p "${RAW}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -258,7 +265,9 @@ json.dump({
 PY
 
 # ---- servers ----------------------------------------------------------------
-# One server at a time on ${PORT}; the exit trap stops it on failure or Ctrl-C.
+# One server at a time on ${PORT}; the exit trap stops it, and anything else
+# this run started (a `scr bench` and the server it launched), on failure,
+# Ctrl-C or kill. A kill takes effect once the current step's command returns.
 srv=""
 serve_up() { # log ready_path cmd...
     local log="$1" path="$2"; shift 2
@@ -283,7 +292,16 @@ serve_down() {
     } 2>/dev/null
     srv=""
 }
-trap serve_down EXIT
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "${c}"; done; kill -TERM "$1" 2>/dev/null || true; }
+cleanup() {
+    serve_down
+    local c; for c in $(pgrep -P $$); do kill_tree "${c}"; done
+    # A killed subshell orphans its children, so also stop whatever is on this run's port.
+    pkill -TERM -f "bench (startup|serve) .*(--port ${PORT}|127\.0\.0\.1:${PORT})" 2>/dev/null || true
+    lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | xargs kill -TERM 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 ollama_env() { echo env OLLAMA_HOST="127.0.0.1:${PORT}" OLLAMA_KEEP_ALIVE=-1 OLLAMA_MAX_LOADED_MODELS=1 "$@"; }
 ollama_up() { serve_up "${RAW}/serve-ollama-${stem}.log" /api/version $(ollama_env "$@") "${OLLAMA_BIN}" serve; }
 
@@ -443,6 +461,7 @@ for entry in "${MODELS[@]}"; do
             built=0
             echo "    BUILD FAILED — ${RAW}/build-${stem}.log" >&2
             tail -3 "${RAW}/build-${stem}.log" | sed 's/^/    /' >&2
+            (( FAIL_FAST )) && die "--fail-fast: stopping at ${stem}'s build failure"
         fi
     fi
     # The next build overwrites ${BIN}, so each model keeps its own copy.
