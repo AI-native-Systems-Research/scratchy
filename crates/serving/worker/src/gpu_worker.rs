@@ -2529,15 +2529,15 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 )
                 .map_err(|e| format!("encode_argmax: {e:?}"))?;
                 // Fused sampler: encode cast → [penalties] → sample onto THIS
-                // encoder, after argmax, reading the (grammar-masked) logits.
+                // encoder, after argmax, reading the (grammar-masked) logits;
+                // each sampled token overwrites its row's argmax.
                 if let Some(ps) = sampler
                     && let Some(addr) = sampler_kernels_addr
                 {
                     let kernels_ref = unsafe {
                         &*(addr as *const scratchy_target_metal::sampling::SamplerKernels)
                     };
-                    ps.encode_into(enc, logits_addr, kernels_ref);
-                    ps.copy_tokens_into(enc, &argmax_out_for_closure);
+                    ps.encode_into(enc, logits_addr, &argmax_out_for_closure, kernels_ref);
                 }
                 Ok(())
             },
