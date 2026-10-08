@@ -50,7 +50,7 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DispatchShape, GatedCommand, GemmDims, IntoBaked, KernelId, LoweredCommand,
+    Binding, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId, LoweredCommand,
     LoweredMetalTape, LoweringError, MetalDtype, RuntimeBindingKind, WeightTensor, baked,
     baked_commands,
 };
@@ -1219,7 +1219,7 @@ fn advance_shape(rows: &[StepRow], times: u32, m_divisor: &mut u32) {
 fn lower(
     p: &MetalModelConsts,
     rows: &[StepRow],
-    barriers_in: &[bool],
+    barriers_in: &[Fence],
     sources: &[Vec<RowSource>],
     at: &BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
@@ -1232,7 +1232,7 @@ fn lower(
         ..
     } = *at;
     let mut commands: Vec<GatedCommand> = Vec::with_capacity(rows.len());
-    let mut barrier_before: Vec<bool> = Vec::with_capacity(rows.len());
+    let mut barrier_before: Vec<Fence> = Vec::with_capacity(rows.len());
     // The layer loop, if this tape has one. Set by the `StepRow::Loop` arm below,
     // which records the body instead of unrolling it.
     let mut loops: Vec<super::lowered::TapeLoop> = Vec::new();
@@ -1250,16 +1250,17 @@ fn lower(
     // `rows_div = 1`), so this is inert outside vision towers.
     let mut m_divisor: u32 = 1;
     let mut i = 0usize;
-    // One barrier flag per row, rolled: the loop body's flags serve every
+    // One fence per row, rolled: the loop body's fences serve every
     // iteration (body equivalence is what let the loop roll, so each
     // iteration has the same hazard signature). A row that emits no command —
     // a view, or a step its bake elides (a gathered MoE's sort) — passes its
     // fence on to the next command: the fence orders what came before against
     // what comes after, whichever row dispatches. A step that lowers to several
     // commands (the SplitK matmul pair) gives its flag to the first; the rest get
-    // `true` (intra-step scratch RAW).
-    let flag_for = |idx: usize| -> bool { barriers_in.get(idx).copied().unwrap_or(true) };
-    let mut carried = false;
+    // `Coherent` (intra-step scratch RAW).
+    let flag_for =
+        |idx: usize| -> Fence { barriers_in.get(idx).copied().unwrap_or(Fence::Coherent) };
+    let mut carried = Fence::None;
 
     while i < rows.len() {
         let closed = loops.len();
@@ -1273,10 +1274,10 @@ fn lower(
         );
         // A fence a body's last rows carry past every command reaches the next
         // iteration's first command too.
-        if carried {
+        if carried != Fence::None {
             for l in &loops[closed..] {
                 if let Some(b) = barrier_before.get_mut(l.start as usize) {
-                    *b = true;
+                    *b = carried.max(*b);
                 }
             }
         }
@@ -1341,7 +1342,7 @@ fn lower(
                 let cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(step, &mut m_divisor);
                 let n_cmds = cmds.len();
-                // The hazard flags track arena slots, not the shared scratch: a command that
+                // The hazard fences track arena slots, not the shared scratch: a command that
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
                 let writes_scratch = cmds.first().is_some_and(|c| {
                     c.command
@@ -1349,13 +1350,20 @@ fn lower(
                         .iter()
                         .any(|b| matches!(b, Binding::Scratch { .. }))
                 });
+                let writes_scratch = if writes_scratch {
+                    Fence::Ordered
+                } else {
+                    Fence::None
+                };
                 commands.extend(cmds);
                 if n_cmds >= 1 {
-                    barrier_before.push(flag_for(i) || writes_scratch || carried);
-                    barrier_before.extend(std::iter::repeat_n(true, n_cmds - 1));
-                    carried = false;
+                    barrier_before.push(flag_for(i).max(writes_scratch).max(carried));
+                    // A step's later commands (a SplitK partial-writer → reduce
+                    // pair) read what its first wrote: RAW, Coherent.
+                    barrier_before.extend(std::iter::repeat_n(Fence::Coherent, n_cmds - 1));
+                    carried = Fence::None;
                 } else {
-                    carried |= flag_for(i);
+                    carried = carried.max(flag_for(i));
                 }
                 i += 1;
             }
@@ -2263,9 +2271,9 @@ fn lower_one(
                 // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
                 let wide_ok =
                     profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
-                if g.ends != QmvEnds::default() && bucket_m != 1 {
-                    return Err(LoweringError::OneRowFold { bucket_m });
-                }
+                // Every matvec-band kernel takes the folded ends (`qmv_fast_impl`,
+                // `qmv_impl` and `qmv_quad_impl` since #242, `qmv_wide_impl` since the
+                // wide gained them) — at any row count the bucket dispatches it.
                 affine_qmv_command(
                     p,
                     g,
@@ -2277,6 +2285,10 @@ fn lower_one(
                     wide_ok,
                     qmv_end_weights(g, w, layer_offset)?,
                 )
+            // The matmul band takes no ends: the qmm_t kernels have no norm / bias /
+            // residual fold, so the shared fold pass only folds a matmul's ends while its
+            // bucket sits in the matvec band (every m ≤ 5: the qmv batch limit's floor
+            // is 6, so no shape crosses at those buckets).
             } else if g.ends != QmvEnds::default() {
                 return Err(LoweringError::OneRowFold { bucket_m });
             } else {
@@ -5935,15 +5947,24 @@ fn fused_add_rmsnorm_kernel_static_name(
     }
 }
 
-/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype.
-fn normed_gemv_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype) -> &'static str {
+/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype. `rows`: the
+/// multi-row variant (`gemv_normed_rows_*`), one threadgroup per (row block, token).
+fn normed_gemv_kernel_static_name(
+    p: &MetalModelConsts,
+    scale_dtype: ScaleDtype,
+    rows: bool,
+) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype) {
-        (MetalDtype::F16, S::F16) => "gemv_normed_f16_s_f16",
-        (MetalDtype::Bf16, S::F16) => "gemv_normed_bf16_s_f16",
-        (MetalDtype::F16, S::Bf16) => "gemv_normed_f16_s_bf16",
-        (MetalDtype::Bf16, S::Bf16) => "gemv_normed_bf16_s_bf16",
-        (dt, sdt) => {
+    match (p.metal_dtype, scale_dtype, rows) {
+        (MetalDtype::F16, S::F16, false) => "gemv_normed_f16_s_f16",
+        (MetalDtype::Bf16, S::F16, false) => "gemv_normed_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16, false) => "gemv_normed_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16, false) => "gemv_normed_bf16_s_bf16",
+        (MetalDtype::F16, S::F16, true) => "gemv_normed_rows_f16_s_f16",
+        (MetalDtype::Bf16, S::F16, true) => "gemv_normed_rows_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16, true) => "gemv_normed_rows_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16, true) => "gemv_normed_rows_bf16_s_bf16",
+        (dt, sdt, _) => {
             unreachable!("gemv_normed: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
         }
     }
@@ -6684,10 +6705,10 @@ fn lower_moe_step(
         }],
         // One row, a norm folded in: its own pre-norm, the router scale binding as the norm's
         // gain, or the RMSNorm whose rows it reads, that norm's gain (its row's `RmsNorm` weight).
+        // m > 1: the same fold on `gemv_normed_rows` — one threadgroup per (row block, token),
+        // its 256 threads collaborating on that token's row, so the norm's sum-of-squares reduce
+        // is the one-row kernel's own.
         S::RouterLogits(rows, l, norm) if norm.is_some() || matches!(rows, MoeRows::Normed(..)) => {
-            if bucket_m != 1 {
-                return Err(LoweringError::OneRowFold { bucket_m });
-            }
             let (x, eps, offset, gain) = match (rows, norm) {
                 (MoeRows::Normed(Slot(slot), n), None) => {
                     let gain = (w.of(WeightKind::RmsNorm, 0)?, WeightTensor::Weight, n.layer);
@@ -6699,10 +6720,11 @@ fn lower_moe_step(
                 }
                 (_, None) => return Err(LoweringError::NormedRowsUnread),
             };
+            let one_row = bucket_m == 1;
             vec![LoweredCommand {
                 kernel: KernelId::NormedGemv,
                 library: "gemm",
-                function: normed_gemv_kernel_static_name(p, scale_dtype),
+                function: normed_gemv_kernel_static_name(p, scale_dtype, one_row),
                 constants: super::kernel_constants::NormedGemvConstants {
                     n: super::ids::NDim(e),
                     k: super::ids::KDim(hidden),
@@ -6710,7 +6732,11 @@ fn lower_moe_step(
                     offset,
                 }
                 .into_baked(),
-                dispatch: grid((e.div_ceil(4), 1, 1), (256, 1, 1), None),
+                dispatch: grid(
+                    (e.div_ceil(4), if one_row { 1 } else { bucket_m }, 1),
+                    (256, 1, 1),
+                    if one_row { None } else { ms(A::Y) },
+                ),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
                     x,
@@ -7442,7 +7468,7 @@ mod tests {
     /// `rows` as a step tape: every row fenced, every row's site [`TEST_SITE`], no lm_head.
     fn row_tape(rows: Vec<StepRow>) -> MetalStepTape {
         MetalStepTape {
-            backbone_barriers: vec![true; rows.len()],
+            backbone_barriers: vec![Fence::Coherent; rows.len()],
             backbone_sources: vec![TEST_SITE.clone(); rows.len()],
             backbone: rows,
             ..MetalStepTape::default()
@@ -7566,7 +7592,7 @@ mod tests {
             }));
             let tape = MetalStepTape {
                 backbone: plain(&[fused]),
-                backbone_barriers: vec![true],
+                backbone_barriers: vec![Fence::Coherent],
                 backbone_sources: vec![[TEST_SITE.clone(), TEST_SITE.clone()].concat()],
                 ..MetalStepTape::default()
             };
@@ -8046,7 +8072,7 @@ mod tests {
         }));
         let folded = MetalStepTape {
             backbone: plain(&[fused]),
-            backbone_barriers: vec![true],
+            backbone_barriers: vec![Fence::Coherent],
             backbone_sources: vec![[TEST_SITE.clone(), TEST_SITE.clone()].concat()],
             ..MetalStepTape::default()
         };
@@ -8325,7 +8351,7 @@ mod tests {
 
     /// The lm_head half a sample-rows construct over [`q_proj`] lowers from: its four rows, each
     /// with its `flags` entry.
-    fn sampled_rows(flags: [bool; 4]) -> MetalStepTape {
+    fn sampled_rows(flags: [Fence; 4]) -> MetalStepTape {
         use SampleRowsStep::{AllRows, Gather, Matmul, Scatter};
         let row = |s| StepRow::Step(MetalStep::SampleRows(q_proj(), s), None);
         MetalStepTape {
@@ -8348,9 +8374,10 @@ mod tests {
     /// Each row's flag rides its command.
     #[test]
     fn sampled_rows_slice_where_the_matmul_is_one_qmm_t() {
+        use crate::tape::lowered::Fence as F;
         use crate::tape::lowered::MScaleAxis;
         use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
-        let rows = sampled_rows([true, false, true, false]);
+        let rows = sampled_rows([F::Coherent, F::None, F::Coherent, F::None]);
         let at = bake_point(512, None);
         let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
         assert_eq!(
@@ -8362,7 +8389,10 @@ mod tests {
                 (KernelId::AffineQmmT, Some(OnlyIfSpec)),
             ]
         );
-        assert_eq!(tape.barrier_before, [true, false, true, false]);
+        assert_eq!(
+            tape.barrier_before,
+            [F::Coherent, F::None, F::Coherent, F::None]
+        );
         // The all-rows command IS the plain matmul's.
         let plain = plain_q_proj(at);
         assert!(plain.commands.len() == 1 && tape.commands[3].command == plain.commands[0].command);
@@ -8393,6 +8423,7 @@ mod tests {
     /// device). It runs under its own row's flag and the fence its elided gather carried.
     #[test]
     fn sampled_rows_run_plain_where_the_matmul_does_not_slice() {
+        use crate::tape::lowered::Fence as F;
         use KernelId as K;
         let m5 = Some(&crate::targets::M5_10CORE);
         let cases = [
@@ -8401,11 +8432,11 @@ mod tests {
             (64, None, K::SplitKReduceSum),
             (64, m5, K::AffineQmmSmallM),
         ];
-        for (gather_fences, (bucket_m, profile, last)) in [false, true]
+        for (gather_fences, (bucket_m, profile, last)) in [F::None, F::Coherent]
             .into_iter()
             .flat_map(|g| cases.map(|c| (g, c)))
         {
-            let rows = sampled_rows([gather_fences, false, true, true]);
+            let rows = sampled_rows([gather_fences, F::None, F::Coherent, F::Coherent]);
             let at = bake_point(bucket_m, profile);
             let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
             let plain = plain_q_proj(at);
@@ -8419,12 +8450,24 @@ mod tests {
                     .iter()
                     .any(|b| matches!(b, Binding::Scratch { .. }))
             });
-            let flags: Vec<bool> = (0..tape.commands.len())
-                .map(|c| c > 0 || writes_scratch || gather_fences)
+            let flags: Vec<F> = (0..tape.commands.len())
+                .map(|c| {
+                    if c == 0 && writes_scratch {
+                        // A scratch write fences Ordered on its own; the
+                        // elided gather's carried fence maxes with it.
+                        F::Ordered.max(gather_fences)
+                    } else if c > 0 {
+                        // The step's later commands (the SplitK reduce, the
+                        // W4A8 GEMM) read what the first wrote: RAW.
+                        F::Coherent
+                    } else {
+                        gather_fences
+                    }
+                })
                 .collect();
             assert_eq!(
                 tape.barrier_before, flags,
-                "bucket {bucket_m}, {gather_fences}"
+                "bucket {bucket_m}, {gather_fences:?}"
             );
             assert_eq!(tape.splitk_scratch_bytes, plain.splitk_scratch_bytes);
         }
@@ -8505,7 +8548,7 @@ mod tests {
         );
         assert!(tape.splitk_scratch_bytes >= w4a8_scratch_bytes(512, 8192));
         assert!(
-            tape.barrier_before[0],
+            tape.barrier_before[0] != Fence::None,
             "the pre-pass waits out the scratch's last reader"
         );
         assert_eq!(codes(&tape), [AffineCodes::Offset8; 2]);
@@ -8534,7 +8577,7 @@ mod tests {
         let row = |s| StepRow::Step(MetalStep::SampleRows(gemm(64, 4), s), None);
         let sampled = MetalStepTape {
             lm_head: [Gather, Matmul, Scatter, AllRows].map(row).to_vec(),
-            lm_head_barriers: vec![true; 4],
+            lm_head_barriers: vec![Fence::Coherent; 4],
             lm_head_sources: vec![TEST_SITE.clone(); 4],
             ..MetalStepTape::default()
         };
