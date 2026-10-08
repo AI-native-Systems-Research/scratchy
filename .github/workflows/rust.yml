@@ -357,6 +357,28 @@ jobs:
           --features e2e,metal,scratchy-models/smollm2-135m
           --test e1_basic_serving test_t1_smollm -- --ignored --test-threads=1
 
+      # REGRESSION GUARD — the engine must REPORT how much prefix it reused, not
+      # merely reuse it. `EngineCoreOutput.num_cached_tokens` was hardcoded 0 at
+      # every production site, so the scheduler's correctly-computed hit never
+      # reached the API: `prompt_tokens_details.cached_tokens` was always absent
+      # and the TUI's live cached-token readout was stuck at 0. Nothing caught it,
+      # because the sibling prefix-cache tests compare generated TEXT only — which
+      # is identical whether or not the hit is reported. Epic #158 measures
+      # `reprefill_ratio`, so the reported number is itself a deliverable.
+      #
+      # HONEST SCOPE: on this hosted runner the test SKIPS (paravirtual GPU, no
+      # Metal 4 — `skip_if_no_gpu!`). What this step buys in CI is COMPILE
+      # coverage of e_prefix_caching.rs, which no other step provides. The
+      # assertions run on a real GPU locally and via scripts/act-local.sh.
+      # Downloads SmolLM2-135M dense (~260 MB, not in the cache key below); the
+      # MLX 4-bit constant cannot be used here — it needs a quant/<preset>
+      # feature that this build does not name.
+      - name: E2E prefix-cache hit reporting (metal, SmolLM2-135M)
+        timeout-minutes: 15
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/smollm2-135m
+          --test e_prefix_caching test_prefix_cache_reports_cached_tokens_metal -- --ignored --test-threads=1
+
       # Gemma-4 tool-call parser server wiring: boot the server with the `gemma4`
       # parser configured and confirm chat/stream (with and without tools) stay
       # well-formed. SmolLM won't emit Gemma-format calls, so this covers the
