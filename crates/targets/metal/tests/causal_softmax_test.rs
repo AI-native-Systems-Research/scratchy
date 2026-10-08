@@ -274,7 +274,11 @@ fn causal_softmax_prod_strided_rows_and_span() {
     for i in 0..BUCKET_ROWS {
         let base = (i * KVP) as usize;
         let valid = (CHUNK_START + i + 1) as usize;
-        let lo = if i < LQ_ACTUAL { span_lo(i) as usize } else { 0 };
+        let lo = if i < LQ_ACTUAL {
+            span_lo(i) as usize
+        } else {
+            0
+        };
         if i >= LQ_ACTUAL {
             for j in 0..(KVP as usize) {
                 let got = bf16::from_bits(out[base + j]).to_f32();
@@ -288,7 +292,11 @@ fn causal_softmax_prod_strided_rows_and_span() {
         let sum: f32 = exps.iter().sum();
         for j in 0..(KVP as usize) {
             let got = bf16::from_bits(out[base + j]).to_f32();
-            let want = if j >= lo && j < valid { exps[j - lo] / sum } else { 0.0 };
+            let want = if j >= lo && j < valid {
+                exps[j - lo] / sum
+            } else {
+                0.0
+            };
             assert!(
                 (got - want).abs() <= 1e-2 + 1e-2 * want.abs(),
                 "i={i} j={j}: got {got} want {want}"

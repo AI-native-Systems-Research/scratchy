@@ -6366,7 +6366,10 @@ fn affine_gather_qmm_t_symbol(
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     let aln = if aligned_n { "true" } else { "false" };
     if bits == 4
-        && matches!((dtype, compute_dtype), (DequantDtype::Bf16, DequantDtype::F16))
+        && matches!(
+            (dtype, compute_dtype),
+            (DequantDtype::Bf16, DequantDtype::F16)
+        )
     {
         return leak_symbol(format!(
             "affine_gather_qmm_t_{d}_c_f16_s_{s}_gs_{group_size}_b_4_alN_{aln}_batch_0"
@@ -7147,8 +7150,14 @@ fn lower_moe_step(
                         } else {
                             dtype
                         };
-                    let symbol =
-                        affine_gather_qmm_t_symbol(dtype, compute_dtype, scale_dtype, gs, aligned, bits);
+                    let symbol = affine_gather_qmm_t_symbol(
+                        dtype,
+                        compute_dtype,
+                        scale_dtype,
+                        gs,
+                        aligned,
+                        bits,
+                    );
                     (KernelId::AffineGatherQmmT, "quantized_qmm", symbol, 32)
                 };
                 let mpad = s.l.mpad_max;
