@@ -17,8 +17,9 @@
 //! compile here (E0004) until its arm exists.
 
 use crate::tape::ids::ArenaSlotIdx as Slot;
-use crate::tape::ids::SourceIx;
+use crate::tape::ids::{QSize, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
+use crate::tape::kernel_constants::norm_threads;
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
@@ -255,6 +256,53 @@ fn sample_rows(
             .map(|c| GatedCommand::gated(c.command, OnlyIfSpec))
             .collect(),
     })
+}
+
+/// The logit soft cap at a multi-row bake point, from its plain lowering `plain` (every row): a step
+/// that samples — no speculative tokens — caps only the rows it samples, one a sequence, as the
+/// sampler reads no other (and a sliced lm_head computed no other); a speculative verify reads
+/// every row, so there `plain` runs.
+fn sampled_soft_cap(
+    p: &MetalModelConsts,
+    step: &MetalStep,
+    plain: Vec<GatedCommand>,
+    bucket_m: u32,
+) -> Vec<GatedCommand> {
+    use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let (MetalStep::TanhSoftCap(.., width), [all]) = (step, plain.as_slice()) else {
+        return plain;
+    };
+    if bucket_m == 1 {
+        return plain;
+    }
+    let width = width.get();
+    let mut sampled = all.command;
+    sampled.function = pick_specialized_symbol(
+        "tanh_soft_cap_sampled_f16",
+        "tanh_soft_cap_sampled_bf16",
+        p.metal_dtype,
+    );
+    let constants = all.command.constants.iter().copied();
+    sampled.constants = baked(constants.chain([ConstantValue::uint(6, width)]).collect());
+    let rows = Binding::Runtime {
+        kind: RuntimeBindingKind::CuSeqlensQ,
+        binding_index: 2,
+    };
+    sampled.bindings = baked(all.command.bindings.iter().copied().chain([rows]).collect());
+    sampled.dispatch = DispatchShape {
+        threadgroups: (width.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
+        threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+        m_scaling: Some(MScaling {
+            axis: MScaleAxis::Y,
+            bucket_m: super::ids::BucketM(bucket_m),
+            seq_axis: Some(MScaleAxis::Y),
+        }),
+    };
+    vec![
+        GatedCommand::gated(all.command, OnlyIfSpec),
+        GatedCommand::gated(sampled, OnlyIfNoSpec),
+    ]
 }
 
 /// Whether the sampled rows slice at this bake point: a multi-row bucket whose matmul lowers to
@@ -1261,6 +1309,10 @@ fn lower(
     let flag_for =
         |idx: usize| -> Fence { barriers_in.get(idx).copied().unwrap_or(Fence::Coherent) };
     let mut carried = Fence::None;
+    // The W4A8 pre-pass whose quantization the shared scratch holds: the last command row's, a
+    // pre-pass and the GEMMs reading it. A next row whose pre-pass is the same command (the same
+    // activation, rows and gate) reads the scratch as it is. Never across a loop's edge.
+    let mut quantized: Option<GatedCommand> = None;
 
     while i < rows.len() {
         let closed = loops.len();
@@ -1272,6 +1324,9 @@ fn lower(
             rows,
             &mut m_divisor,
         );
+        if loops.len() > closed || matches!(rows[i], StepRow::Loop { .. }) {
+            quantized = None;
+        }
         // A fence a body's last rows carry past every command reaches the next
         // iteration's first command too.
         if carried != Fence::None {
@@ -1338,19 +1393,35 @@ fn lower(
                 let cmds = route_gdn(p, step, cmds);
                 let cmds = decode_attention_per_kv_head(p, step, cmds, at, &mut moe_scratch_bytes);
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
+                let cmds = sampled_soft_cap(p, step, cmds, bucket_m);
                 let cmds = row_gate(cmds, *gate, i)?;
-                let cmds = route_by_sequence_count(i, cmds)?;
+                let mut cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(step, &mut m_divisor);
+                let reuses = cmds.first().is_some_and(|c| Some(*c) == quantized);
+                if reuses {
+                    cmds.remove(0);
+                } else if !cmds.is_empty() {
+                    let gemm = |c: &GatedCommand| {
+                        matches!(
+                            c.command.kernel,
+                            KernelId::AffineQmmW4a8 | KernelId::AffineQmmSmallM
+                        )
+                    };
+                    quantized = cmds.split_first().and_then(|(first, rest)| {
+                        (first.command.kernel == KernelId::AffineW4a8Quant && rest.iter().all(gemm))
+                            .then_some(*first)
+                    });
+                }
                 let n_cmds = cmds.len();
                 // The hazard fences track arena slots, not the shared scratch: a command that
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
-                let writes_scratch = cmds.first().is_some_and(|c| {
-                    c.command
-                        .bindings
-                        .iter()
-                        .any(|b| matches!(b, Binding::Scratch { .. }))
-                });
-                let writes_scratch = if writes_scratch {
+                let writes_scratch = if !reuses
+                    && cmds.first().is_some_and(|c| {
+                        c.command
+                            .bindings
+                            .iter()
+                            .any(|b| matches!(b, Binding::Scratch { .. }))
+                    }) {
                     Fence::Ordered
                 } else {
                     Fence::None
@@ -1777,7 +1848,7 @@ fn lower_one(
             // m_mult` — exactly the per-head row count we need.
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1829,7 +1900,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1885,7 +1956,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1972,7 +2043,7 @@ fn lower_one(
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                    threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -2025,7 +2096,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                threads_per_threadgroup: (norm_threads(QSize(p.hidden_size as u32)), 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -2073,7 +2144,7 @@ fn lower_one(
                 constants: constants.into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                    threads_per_threadgroup: (norm_threads(QSize(*hidden)), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -2116,7 +2187,7 @@ fn lower_one(
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                    threads_per_threadgroup: (norm_threads(QSize(*hidden_size)), 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -2391,7 +2462,16 @@ fn lower_one(
                         kernel: KernelId::AffineW4a8Quant,
                         library: "quantized_qmm_nax",
                         function: w4a8_quant_static_name(W4a8Rows::Dense, dtype),
-                        constants: constants(),
+                        // No N: the matmuls of one activation share its pre-pass.
+                        constants: baked(
+                            [
+                                ConstantValue::int(0, k_v as i32),
+                                ConstantValue::int(2, bucket_m as i32),
+                            ]
+                            .into_iter()
+                            .chain(codes.constant())
+                            .collect(),
+                        ),
                         dispatch: DispatchShape {
                             threadgroups: ((k_v / 64).div_ceil(16), bucket_m, 1),
                             threads_per_threadgroup: (128, 1, 1),
@@ -6693,7 +6773,7 @@ fn lower_moe_step(
             .into_baked(),
             dispatch: grid(
                 (bucket_m, 1, 1),
-                (super::kernel_constants::NORM_THREADS, 1, 1),
+                (norm_threads(QSize(hidden)), 1, 1),
                 ms(A::X),
             ),
             bindings: baked(vec![
@@ -8587,6 +8667,107 @@ mod tests {
             (KernelId::AffineW4a8Quant, Some(OnlyIfSpec)),
             (KernelId::AffineQmmW4a8, Some(OnlyIfSpec)),
         ]));
+    }
+
+    /// W4A8 matmuls of one activation in a row share its pre-pass, whatever their widths: the
+    /// next one's GEMM reads the scratch as the first left it, behind no barrier of its own
+    /// (nothing it reads is in flight). A matmul of another activation quantizes its own, and so
+    /// does the first matmul inside a loop: its previous command is another iteration's.
+    #[test]
+    fn w4a8_matmuls_of_one_activation_share_its_pre_pass() {
+        use crate::tape::ids::{BodyLen, LayerStride, LoopIters};
+        use KernelId::{AffineQmmW4a8 as Gemm, AffineW4a8Quant as Quant};
+        let m5 = Some(&crate::targets::M5_10CORE);
+        let gemm = |input, output, n| {
+            StepRow::Step(
+                MetalStep::AffineQmm(AffineMatmul {
+                    input: Slot(input),
+                    output: Slot(output),
+                    layer: LayerId(0),
+                    n: NDim(n),
+                    k: KDim(2048),
+                    group_size: AffineGroupSize(64),
+                    bits: AffineBits(4),
+                    vector_limit: QmvBatchLimit(10),
+                    ends: QmvEnds::default(),
+                }),
+                None,
+            )
+        };
+        let looped = StepRow::Loop {
+            iters: LoopIters(2),
+            body: BodyLen(1),
+            stride: LayerStride(1),
+        };
+        // q, k and v of slot 0, the output projection of slot 4, then a loop over slot 0's.
+        let rows = vec![
+            gemm(0, 1, 4096),
+            gemm(0, 2, 512),
+            gemm(0, 3, 512),
+            gemm(4, 5, 2048),
+            looped,
+            gemm(0, 6, 512),
+        ];
+        let mut tape = row_tape(rows);
+        tape.backbone_barriers = vec![Fence::None; 6];
+        let tape = lower_subtile_tape_to_metal(&tape, &tp(), bake_point(512, m5)).expect("lowers");
+        let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+        assert_eq!(kinds, [Quant, Gemm, Gemm, Gemm, Quant, Gemm, Quant, Gemm]);
+        assert_eq!(
+            tape.barrier_before,
+            [
+                Fence::Ordered,
+                Fence::Coherent,
+                Fence::None,
+                Fence::None,
+                Fence::Ordered,
+                Fence::Coherent,
+                Fence::Ordered,
+                Fence::Coherent,
+            ]
+        );
+    }
+
+    /// The logit soft cap of a multi-row bucket caps every row on a speculative verify and only
+    /// the sampled rows — one a sequence, read through `cu_seqlens_q` — on any other step: the
+    /// same in-place command, its grid one row of threadgroups a live sequence.
+    #[test]
+    fn soft_cap_caps_the_sampled_rows_off_speculative_steps() {
+        use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+        use crate::tape::lowered::{ActivationWidth, MScaleAxis};
+        let mut p = tp();
+        p.final_logit_softcapping = 30.0;
+        let cap = MetalStep::TanhSoftCap(Slot(2), Slot(2), ActivationWidth::of_cols(1000));
+        let at = |bucket_m| {
+            let tape = row_tape(plain(&[cap.clone()]));
+            lower_subtile_tape_to_metal(&tape, &p, bake_point(bucket_m, None)).expect("lowers")
+        };
+        let one = at(1);
+        assert_eq!(gated_steps(&one), [(KernelId::TanhSoftCap, None)]);
+        let tape = at(512);
+        assert_eq!(
+            gated_steps(&tape),
+            [
+                (KernelId::TanhSoftCap, Some(OnlyIfSpec)),
+                (KernelId::TanhSoftCap, Some(OnlyIfNoSpec)),
+            ]
+        );
+        let (every, sampled) = (&tape.commands[0].command, &tape.commands[1].command);
+        assert_eq!(every.function, "tanh_soft_cap_bf16_specialized");
+        assert_eq!(sampled.function, "tanh_soft_cap_sampled_bf16");
+        assert_eq!(&sampled.bindings[..2], every.bindings);
+        assert_eq!(
+            sampled.bindings[2],
+            Binding::Runtime {
+                kind: RuntimeBindingKind::CuSeqlensQ,
+                binding_index: 2
+            }
+        );
+        assert_eq!(&sampled.constants[..1], every.constants);
+        assert_eq!(sampled.constants[1], ConstantValue::uint(6, 1000));
+        assert_eq!(sampled.dispatch.threadgroups, (4, 512, 1));
+        let scaling = sampled.dispatch.m_scaling.expect("seq-scaled");
+        assert_eq!(scaling.seq_axis, Some(MScaleAxis::Y));
     }
 
     /// A multi-token tape runs its own attention off decode steps, in the

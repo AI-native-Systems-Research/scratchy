@@ -24,7 +24,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 };
 use scratchy_target_metal::tape::ids::{BucketM, KDimI32, LayerId, NDimI32, QSize, RmsNormEps};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, NORM_THREADS, RmsNormConstants,
+    AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, RmsNormConstants, norm_threads,
 };
 use scratchy_target_metal::tape::quantized::{
     DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, qmv_dispatch_shape,
@@ -335,7 +335,7 @@ fn matvec(r: &Rig, c: &Case, w: &Weights, rows: &Rows<'_>, y0: &[u16], how: How)
                 &[],
                 &[],
                 size(one),
-                size((NORM_THREADS, 1, 1)),
+                size((norm_threads(QSize(c.k as u32)), 1, 1)),
             );
             batch.barrier();
             qmv(&mut batch, &r.plain, &normed_row);
@@ -541,7 +541,7 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
                 &[],
                 &[],
                 size((1, 1, 1)),
-                size((NORM_THREADS, 1, 1)),
+                size((norm_threads(QSize(c.k as u32)), 1, 1)),
             );
             batch.barrier();
         }

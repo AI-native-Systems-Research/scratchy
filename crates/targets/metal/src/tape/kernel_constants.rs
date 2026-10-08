@@ -84,10 +84,18 @@ pub struct RmsNormConstants {
     pub weight_offset: f32,
 }
 
-/// The threads of an RMSNorm row's threadgroup: every norm command dispatches this many, and its
-/// kernel takes it compiled in (slot 4), so each thread's share of the row is a count the compiler
-/// knows.
+/// The most threads an RMSNorm row's threadgroup runs: a row program's, and a norm's over rows at
+/// least this wide.
 pub const NORM_THREADS: u32 = 1024;
+
+/// The threads of an RMSNorm row's threadgroup over `width`-wide rows: the power of two covering a
+/// row, up to [`NORM_THREADS`]. Its kernel takes them compiled in (slot 4), so each thread's share
+/// of the row is a count the compiler knows. Over a row no wider than them, any covering count sums
+/// in the same order (a thread holds at most one element; `row_sum`'s extra levels add zeros): a
+/// per-head norm's 256-wide rows run 256 threads, the same bits as 1024.
+pub fn norm_threads(width: QSize) -> u32 {
+    width.get().next_power_of_two().clamp(32, NORM_THREADS)
+}
 
 impl From<RmsNormConstants> for Vec<ConstantValue> {
     fn from(c: RmsNormConstants) -> Self {
@@ -96,7 +104,7 @@ impl From<RmsNormConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(1), c.q_size.get()),
             ConstantValue::float(ConstSlot(2), c.rms_norm_eps.get()),
             ConstantValue::float(ConstSlot(3), c.weight_offset),
-            ConstantValue::uint(ConstSlot(4), NORM_THREADS),
+            ConstantValue::uint(ConstSlot(4), norm_threads(c.q_size)),
         ]
     }
 }
