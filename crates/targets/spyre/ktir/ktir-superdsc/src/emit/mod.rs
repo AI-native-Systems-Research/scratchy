@@ -3032,6 +3032,19 @@ pub fn emit_sdsc(
                         <Fp8 as DataFormat>::NAME
                     } else if views.get(out_idx).is_some_and(|o| matches!(o.df, Df::Bf16)) {
                         "BF16E"
+                    } else if matches!(op.op, OpFunc::Fp32ToInt32) {
+                        // The value-cast converts are bound in fp32 MODE ONLY
+                        // (unary_parallel.ddl:47-50 — int32tofp32/fp32toint32 are
+                        // `operation_bind([%type_fp32], ...)`; the DDL comment:
+                        // "the conversion is carried out in fp32 mode, ICVT
+                        // imm=8"). The input TENSOR may be fp16 (`%inptensor`
+                        // carries both types — the vendor fp32toint32 fixture's
+                        // inputLabeledDs is IEEE_FP32 but the bind admits fp16),
+                        // but the OP's mode marker is IEEE_FP32, not the input's
+                        // format. An SEN169_FP16 marker here is dxp's
+                        // "Scheduler failed to find a suitable op mapping"
+                        // (SchedulerStages.cpp:40) — no fp16-mode bind exists.
+                        Df::Fp32.dataformat()
                     } else if views.first().is_some_and(|v| matches!(v.df, Df::Fp32)) {
                         // torch-spyre sets the computeOp data_format from args[0]
                         // (superdsc.py:882 `data_format=args[0].data_format`). The fp32 rmsnorm
@@ -3314,14 +3327,22 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         OpFunc::Fp32ToDl16 => (Df::Fp32, Df::Fp16),
         // qfp8ch: f16 activation → SEN143_FP8 (E4M3). The DDL `matmulfp8` then consumes the fp8 stick.
         OpFunc::Qfp8ch => (Df::Fp16, Df::Fp8),
-        // fp32toint32: fp16/fp32 value → SENUINT32 index. The DDL binds the cast itself in fp32 mode
-        // (ICVT imm=8) while `%inptensor` carries `[%type_fp16, %type_fp32]` (unary_parallel.ddl:20,50),
-        // so the fp16 top-k output converts in ONE op — and the OUTPUT's type list is
-        // `[%type_uint32, %type_int32]` (line 22), the two spellings of "32-bit integer" that let the
-        // same op name the gather's `SENUINT32` index dataspace. Each arg's own df drives its
-        // `stickSize_` (input 64, output 32) — the two distinct `primaryDsInfo_` entries a convert
-        // needs, exactly the KERNEL_IDX stick [32] vs value stick [64] split of the gather fixtures.
-        OpFunc::Fp32ToInt32 => (Df::Fp16, Df::SenUint32),
+        // fp32toint32: IEEE_FP32 value → SENUINT32 index. ⛔ THE INPUT TENSOR
+        // MUST BE FP32 (stick 32, wordLength 4), NOT fp16: the DDL's slice
+        // constraint (unary_parallel.ddl:59) requires the input and output
+        // SLICE sizes equal, and `getStickSizes` measures the slice in
+        // ELEMENTS (elemInSlice = stickSize/8) — an fp16 input's 64-elem stick
+        // yields slice 8 against the u32 output's 32-elem stick slice 4, NEVER
+        // equal, so the direct fp16→u32 convert is dxp-refused at bake
+        // ("slice size does not match", ddl_conversion.cpp:2728). The `%type_fp16`
+        // entry on `%inptensor`'s type list (:20) serves the OTHER ops bound to
+        // that tensor; the cast's own bind (:50) is fp32-mode and its vendor
+        // fixture (`test/sdsc_fp32toint32.json`) states the legal form: an
+        // IEEE_FP32 wordLength-4 input. Callers stage the fp16 routing buffer
+        // through `dl16tofp32` FIRST — the expert door's own two-leg chain
+        // (`dl16tofp32` → `fp32toint32`), the widening convert carrying no
+        // slice constraint of its own (quantization_double_pad.ddl:58).
+        OpFunc::Fp32ToInt32 => (Df::Fp32, Df::SenUint32),
         _ => (Df::Fp16, Df::Fp16),
     }
 }
@@ -5647,11 +5668,12 @@ mod fp32toint32_convert_law {
             .expect("an output arg")
     }
 
-    /// ⭐ THE OUTPUT IS SENUINT32 AT 4 BYTES — the two numbers the gather's DT_CHECKs read. The
-    /// input stays fp16/2 (the DDL binds the cast in fp32 MODE; the input TENSOR may be fp16), so
-    /// the pair (2, 4) is also the control that the two operands were not collapsed onto one df.
+    /// ⭐ THE OUTPUT IS SENUINT32 AT 4 BYTES and the INPUT IS FP32 AT 4 BYTES — the numbers the
+    /// gather's DT_CHECKs read, and the slice-equality law (unary_parallel.ddl:59): both operands'
+    /// sticks are 32-elem (slice 4 each, the match), and the pair (4, 4) is also the control that
+    /// the two operands were not collapsed onto one df.
     #[test]
-    fn the_output_is_senuint32_at_four_bytes_and_the_input_stays_fp16() {
+    fn the_output_is_senuint32_and_the_input_is_fp32_both_four_bytes() {
         let o = op(2);
         let out = out_arg(&o);
         assert_eq!(out.view().df, Df::SenUint32, "the gather's index format");
@@ -5661,32 +5683,30 @@ mod fp32toint32_convert_law {
             .iter()
             .find(|a| a.view().is_input)
             .expect("an input arg");
-        assert_eq!(inp.view().df, Df::Fp16, "the top-k output's own format");
-        assert_eq!(inp.view().df.word_length(), 2, "the input stays 2-byte");
+        assert_eq!(inp.view().df, Df::Fp32, "the fp32 staging leg's format");
+        assert_eq!(inp.view().df.word_length(), 4, "the input is 4-byte fp32");
     }
 
-    /// ⭐ THE TWO STICKS DIFFER — input 64 (fp16), output 32 (u32) — the two `primaryDsInfo_`
-    /// entries a convert needs, and the exact `KERNEL_IDX stickSize_ [32]` vs value-stick `[64]`
-    /// split of every vendor gather fixture.
+    /// ⭐ THE TWO STICKS MATCH AT 32 — the slice-equality constraint's arithmetic
+    /// (unary_parallel.ddl:59: slice = stickSize/8 elements, must be EQUAL): both 32-elem
+    /// sticks yield slice 4, the vendor `sdsc_fp32toint32.json` fixture's own geometry. An
+    /// fp16 input here (stick 64, slice 8) is the dxp "slice size does not match" bake
+    /// refusal (ddl_conversion.cpp:2728).
     #[test]
-    fn each_operand_carries_its_own_formats_stick() {
+    fn both_operands_sticks_yield_the_same_slice() {
         let o = op(2);
         let inp = o
             .args
             .iter()
             .find(|a| a.view().is_input)
             .expect("an input arg");
-        assert_eq!(
-            inp.view().df.elems_per_stick(),
-            64,
-            "the fp16 input's stick"
-        );
         let out = out_arg(&o);
         assert_eq!(
+            inp.view().df.elems_per_stick(),
             out.view().df.elems_per_stick(),
-            32,
-            "the u32 output's stick"
+            "the slice-equality law: equal element counts per stick"
         );
+        assert_eq!(out.view().df.elems_per_stick(), 32, "the u32 output's stick");
     }
 
     /// ⭐ THE NARROWING CONVERT STAYS RANK-3 — the `y` dim dxp's buffer walk indexes (the rank-2
