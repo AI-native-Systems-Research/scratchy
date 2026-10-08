@@ -107,3 +107,17 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 ## Commits & PR titles
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for
 both, scoped to the crate or area touched (`fix(metal): ...`).
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on upstream `AI-native-Systems-Research/scratchy` (via `gh -R`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/` (created lazily). See `docs/agents/domain.md`.
