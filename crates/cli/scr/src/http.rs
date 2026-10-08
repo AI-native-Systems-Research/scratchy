@@ -27,8 +27,20 @@ pub(crate) struct RemoteClient {
     api_key: String,
 }
 
+/// Generation can legitimately take a very long time, so the chat/completion
+/// clients get an hour. A short read (`/server_info`) wants its own budget —
+/// see [`RemoteClient::with_timeout`].
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(3600);
+
 impl RemoteClient {
     pub(crate) fn new(api_key: &str) -> Self {
+        Self::with_timeout(api_key, GENERATION_TIMEOUT)
+    }
+
+    /// A client with a caller-chosen deadline, for requests that are not
+    /// generation and must not inherit an hour-long budget: a metadata GET
+    /// against a wedged server would otherwise hang the CLI rather than fail.
+    pub(crate) fn with_timeout(api_key: &str, timeout: Duration) -> Self {
         Self {
             // `http_status_as_error(false)` so a 4xx/5xx comes back as a
             // response we can read the body of and report, rather than a bare
@@ -36,7 +48,7 @@ impl RemoteClient {
             // status at all, which meant a rejected request streamed its error
             // body through the SSE parser and printed nothing.
             agent: ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(3600)))
+                .timeout_global(Some(timeout))
                 .http_status_as_error(false)
                 .build()
                 .into(),

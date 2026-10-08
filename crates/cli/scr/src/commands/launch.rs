@@ -25,6 +25,168 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// before falling back to SIGKILL. Generous so a large model always drains.
 const SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// How long to wait on the `/server_info` read that proves where the traffic
+/// went. Short on purpose: it runs after Claude Code has exited, so a wedged
+/// server must not hold the CLI open.
+const PROVENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The variables that point Claude Code at the server under test.
+///
+/// One list, consumed twice — written into the child's process environment *and*
+/// rendered into the `claude --settings` payload. Both are needed, and keeping
+/// them derived from the same source is what makes it impossible for one to
+/// drift from the other:
+///
+/// - the **process environment** reaches subprocesses, and covers the sessions
+///   where Claude Code keeps an inherited value;
+/// - **`--settings`** outranks `~/.claude/settings.json` and both project
+///   files, whose `env` block would otherwise overwrite the environment we just
+///   set. Verified against `claude` 2.1.292: with a marker variable in
+///   `.claude/settings.local.json`, the file wins over an exported value, and
+///   `--settings` wins over the file.
+fn launch_env(base_url: &str, auth_token: &str, model: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("ANTHROPIC_BASE_URL", base_url.to_string()),
+        ("ANTHROPIC_AUTH_TOKEN", auth_token.to_string()),
+        // Blank the API key so Claude Code can't fall back to a real Anthropic
+        // account when our base URL is set. An empty value in an `env` block
+        // reads as unset for provider selection, which is the intent.
+        ("ANTHROPIC_API_KEY", String::new()),
+        // Fan the single model out to every tier (opus/sonnet/haiku/subagent),
+        // matching `ollama launch`. The haiku tier matters: Claude Code makes
+        // separate background calls under it.
+        ("ANTHROPIC_MODEL", model.to_string()),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_string()),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_string()),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
+    ]
+    .into_iter()
+    .chain(
+        // Provider selection, blanked. These do not go through
+        // `ANTHROPIC_BASE_URL` at all: each provider has its own endpoint
+        // (`ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`, …), so
+        // one of these left set in a settings file sends the run to that
+        // provider and our base URL is simply not consulted. Claude Code's own
+        // `/setup-bedrock` wizard writes `CLAUDE_CODE_USE_BEDROCK` into
+        // `~/.claude/settings.json`, so this is a configuration a developer
+        // gets by following the documented setup, not an exotic one.
+        //
+        // The empty string is the documented way to turn one off from an `env`
+        // block, which is the only lever available: a settings file can set a
+        // variable but not remove one, and Claude Code "treats the empty value
+        // as unset for provider selection".
+        //
+        // Only the five provider-selection members of `CLAUDE_CODE_USE_*`
+        // belong here. `CLAUDE_CODE_USE_NATIVE_FILE_SEARCH` and
+        // `CLAUDE_CODE_USE_POWERSHELL_TOOL` share the prefix and have nothing
+        // to do with routing — blanking those would change behaviour launch has
+        // no business touching.
+        PROVIDER_SELECTION_VARS.iter().map(|k| (*k, String::new())),
+    )
+    .collect()
+}
+
+/// The variables that choose a provider other than the plain Anthropic API.
+/// Set, they bypass `ANTHROPIC_BASE_URL` entirely.
+const PROVIDER_SELECTION_VARS: &[&str] = &[
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+];
+
+/// [`launch_env`] as a `claude --settings` payload.
+fn claude_settings_json(env: &[(&'static str, String)]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), serde_json::Value::String(v.clone())))
+        .collect();
+    serde_json::json!({ "env": map }).to_string()
+}
+
+/// Whether the forwarded `-- …` args already carry `--settings`.
+fn settings_flag_in_args(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+}
+
+/// `requests_served` from `GET /server_info`, or `None` when this server cannot
+/// say — an older build without the field, or a read that failed.
+///
+/// `None` and `Some(0)` are different claims and are reported differently:
+/// "cannot confirm" is not "nothing arrived".
+fn requests_served(base_url: &str, auth_token: &str) -> Option<u64> {
+    let client = crate::http::RemoteClient::with_timeout(auth_token, PROVENANCE_TIMEOUT);
+    let info = client.get_json(&format!("{base_url}/server_info")).ok()?;
+    info.get("requests_served")?.as_u64()
+}
+
+/// Whether the forwarded `-- …` args put Claude Code in non-interactive mode.
+///
+/// This is the difference between "served nothing" being innocent and being a
+/// failure. An interactive session can legitimately serve zero requests — you
+/// start it, read the banner, press Ctrl-C. A `-p`/`--print` run cannot: it was
+/// given a prompt and exists to answer it, so zero requests means the prompt
+/// went somewhere else. A harness drives this mode, so that is the case that
+/// has to fail by exit status rather than by a line on stderr.
+fn is_print_mode(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "-p" || a == "--print" || a == "--output-format" || a.starts_with("--print="))
+}
+
+/// What the request count proves about where the session's traffic went, and
+/// whether that should fail the command.
+///
+/// Split out and pure so each case is unit-testable without a server: this is
+/// the one check in `launch claude` that a benchmark relies on, and a
+/// provenance claim that reads the wrong way is worse than none.
+fn provenance_report(before: Option<u64>, after: Option<u64>, print_mode: bool) -> (String, bool) {
+    match (before, after) {
+        (Some(b), Some(a)) if a > b => (
+            format!(
+                "scratchy: the server under test served {} request(s) this session.",
+                a - b
+            ),
+            false,
+        ),
+        // Zero. In print mode this is never innocent, so it is an error and the
+        // exit status carries it — a harness must not have to scrape stderr to
+        // learn that its measurement is void. Interactively it usually means
+        // the user exited without sending anything, so it escalates in wording
+        // only: a hard failure on every Ctrl-C would teach people to ignore the
+        // one case that matters.
+        (Some(_), Some(_)) if print_mode => (
+            "the server under test served 0 requests, but this was a non-interactive run with \
+             a prompt — so Claude Code sent it to a different endpoint. Check for \
+             ANTHROPIC_BASE_URL or a CLAUDE_CODE_USE_* provider variable in your settings \
+             files or managed policy. This run measured nothing and must not be published."
+                .to_string(),
+            true,
+        ),
+        (Some(_), Some(_)) => (
+            "scratchy: the server under test served 0 requests this session — expected if you \
+             exited without sending a prompt. If you did send one, Claude Code was talking to \
+             a different endpoint: check for ANTHROPIC_BASE_URL or a CLAUDE_CODE_USE_* \
+             provider variable in your settings files or managed policy, and do not publish \
+             measurements from this run."
+                .to_string(),
+            false,
+        ),
+        // Could not ask. Not an error even in print mode: the run may have been
+        // served perfectly well by a server too old to report a count, and
+        // failing here would break `--server-url` against one.
+        _ => (
+            "Note: could not read a request count from the server, so this run carries no \
+             server-side proof that it served the traffic. (An older server does not report \
+             `requests_served`.)"
+                .to_string(),
+            false,
+        ),
+    }
+}
+
 /// How launch resolved the Claude Code session id and what to add to the
 /// `claude` command line for it (the store is keyed by the id in every case).
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +225,20 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         .clone()
         .or_else(|| args.model.clone())
         .context("a model is required: `scr launch claude <MODEL>`")?;
+
+    // Launch owns `--settings`: it is how the server under test is made to
+    // outrank the user's own settings files, so a second occurrence could put
+    // an `ANTHROPIC_BASE_URL` back and silently redirect the run. Refused up
+    // front, before a model loads, in the same spirit as `serve_argv`'s refusal
+    // of `--serve-arg --host/--port`.
+    if settings_flag_in_args(&args.claude_args) {
+        bail!(
+            "`--settings` is not supported in the passed-through claude args: launch uses it to \
+             point Claude Code at the server under test, and a second occurrence could redirect \
+             the run. Put non-`env` settings in `.claude/settings.json`, or start `claude` \
+             yourself against `scr serve`."
+        );
+    }
 
     // Warn early if this build has no GPU backend: the server will run on CPU,
     // and a multi-billion-parameter model prefilling Claude Code's large prompt
@@ -142,20 +318,20 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         }
     };
 
-    // Point Claude Code at our server and fan the single model out to every
-    // tier (opus/sonnet/haiku/subagent), matching `ollama launch`. The haiku
-    // tier matters: Claude Code makes separate background calls under it.
+    // Where the session's traffic should go, read before it starts so the count
+    // afterwards is a delta: with --server-url the server may already have
+    // served requests that are none of our business.
+    let served_before = requests_served(&base_url, &args.auth_token);
+
+    // Point Claude Code at our server, twice over: in the process environment,
+    // and again through `--settings`, which outranks the settings files whose
+    // `env` block would otherwise overwrite it. See `launch_env`.
+    let env = launch_env(&base_url, &args.auth_token, &model);
     let mut cmd = std::process::Command::new(&args.claude_bin);
-    cmd.env("ANTHROPIC_BASE_URL", &base_url)
-        .env("ANTHROPIC_AUTH_TOKEN", &args.auth_token)
-        // Blank the API key so Claude Code can't fall back to a real Anthropic
-        // account when our base URL is set.
-        .env("ANTHROPIC_API_KEY", "")
-        .env("ANTHROPIC_MODEL", &model)
-        .env("ANTHROPIC_DEFAULT_OPUS_MODEL", &model)
-        .env("ANTHROPIC_DEFAULT_SONNET_MODEL", &model)
-        .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &model)
-        .env("CLAUDE_CODE_SUBAGENT_MODEL", &model);
+    for (key, value) in &env {
+        cmd.env(key, value);
+    }
+    cmd.arg("--settings").arg(claude_settings_json(&env));
     // Note: we deliberately leave prompt caching ON. The server ignores the
     // `cache_control` markers Claude Code sends (serde drops the unknown field),
     // and its own automatic KV prefix caching speeds up requests regardless —
@@ -186,6 +362,10 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         )
     })?;
 
+    // Ask the server what it served, while it is still alive to answer — the one
+    // check here that does not depend on trusting the environment.
+    let served_after = requests_served(&base_url, &args.auth_token);
+
     // Tell the user how to resume THIS session. We print the WRAPPED command (so
     // they don't copy claude's bare `claude --resume <id>`, which would bypass the
     // local server). Only for a startable (non-resume) session; printed even on
@@ -200,12 +380,31 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // Tear the server down (kills the child we spawned), releasing GPU residency.
     drop(server);
 
+    // Last, so the verdict on where the traffic went is what the user is left
+    // looking at.
+    let (report, void) = provenance_report(
+        served_before,
+        served_after,
+        is_print_mode(&args.claude_args),
+    );
+
+    // Claude Code's own failure is reported first: if it exited non-zero, that
+    // is the more specific explanation of why nothing was served.
     if !status.success() {
+        eprintln!("{report}");
         if let Some(code) = status.code() {
             bail!("`{}` exited with status {code}", args.claude_bin);
         }
         bail!("`{}` terminated by signal", args.claude_bin);
     }
+
+    // A non-interactive run that served nothing fails the command even though
+    // `claude` exited 0, so a harness learns it from the exit status instead of
+    // having to scrape stderr.
+    if void {
+        bail!("{report}");
+    }
+    eprintln!("{report}");
     Ok(())
 }
 
@@ -562,8 +761,9 @@ fn gen_uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LaunchClaudeArgs, SessionInject, gen_uuid_v4, ignored_with_server_url,
-        resolve_session_inject, serve_argv, session_id_from_args,
+        LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject, claude_settings_json,
+        gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env, provenance_report,
+        resolve_session_inject, serve_argv, session_id_from_args, settings_flag_in_args,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -813,6 +1013,149 @@ mod tests {
         assert_eq!(session_id_from_args(&s(&["--resume"])), None);
         assert_eq!(session_id_from_args(&s(&["--resume", "--verbose"])), None);
         assert_eq!(session_id_from_args(&s(&["-p", "hello"])), None);
+    }
+
+    /// The `--settings` payload and the process environment have to carry the
+    /// same keys — a key in one and not the other is a key a settings file can
+    /// still overwrite. They are built from one list, so this asserts the
+    /// rendering rather than guarding against drift.
+    #[test]
+    fn settings_payload_carries_every_launch_env_key() {
+        let env = launch_env("http://127.0.0.1:8000", "tok", "my-model");
+        let json: serde_json::Value =
+            serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
+        let block = json["env"].as_object().expect("an env object");
+
+        assert_eq!(block.len(), env.len());
+        for (key, value) in &env {
+            assert_eq!(block[*key].as_str(), Some(value.as_str()), "{key}");
+        }
+        // The three that decide which engine gets measured.
+        assert_eq!(
+            block["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(block["ANTHROPIC_MODEL"].as_str(), Some("my-model"));
+        // Blanked, not absent: an absent key is one a settings file can set.
+        assert_eq!(block["ANTHROPIC_API_KEY"].as_str(), Some(""));
+    }
+
+    /// Every tier gets the model, or Claude Code's background haiku calls go
+    /// somewhere else entirely.
+    #[test]
+    fn launch_env_fans_the_model_out_to_every_tier() {
+        let env = launch_env("http://x", "tok", "m");
+        for key in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            let got = env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str());
+            assert_eq!(got, Some("m"), "{key}");
+        }
+    }
+
+    #[test]
+    fn settings_flag_is_detected_in_either_spelling() {
+        assert!(settings_flag_in_args(&s(&["--settings", "x.json"])));
+        assert!(settings_flag_in_args(&s(&["--settings={}"])));
+        assert!(settings_flag_in_args(&s(&["-p", "hi", "--settings", "{}"])));
+        assert!(!settings_flag_in_args(&s(&["-p", "hi"])));
+        // Not a prefix match on an unrelated flag.
+        assert!(!settings_flag_in_args(&s(&["--settings-foo"])));
+    }
+
+    /// A provider variable left set in a settings file sends the run to that
+    /// provider and `ANTHROPIC_BASE_URL` is never consulted — so each one must
+    /// be blanked, and the blank must reach the `--settings` payload too.
+    #[test]
+    fn provider_selection_is_blanked_everywhere() {
+        let env = launch_env("http://127.0.0.1:8000", "tok", "m");
+        let json: serde_json::Value =
+            serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
+        let block = json["env"].as_object().expect("an env object");
+
+        for key in PROVIDER_SELECTION_VARS {
+            let in_env = env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+            assert_eq!(in_env, Some(""), "{key} must be blanked in the environment");
+            assert_eq!(
+                block[*key].as_str(),
+                Some(""),
+                "{key} must be blanked in --settings too"
+            );
+        }
+
+        // Prefix-sharing variables that have nothing to do with routing are
+        // launch's business to leave alone.
+        for key in [
+            "CLAUDE_CODE_USE_NATIVE_FILE_SEARCH",
+            "CLAUDE_CODE_USE_POWERSHELL_TOOL",
+        ] {
+            assert!(!env.iter().any(|(k, _)| *k == key), "{key} must be left be");
+        }
+    }
+
+    #[test]
+    fn print_mode_is_detected_from_the_forwarded_args() {
+        assert!(is_print_mode(&s(&["-p", "hi"])));
+        assert!(is_print_mode(&s(&["--print", "hi"])));
+        assert!(is_print_mode(&s(&["--output-format", "json"])));
+        assert!(!is_print_mode(&s(&["--resume", "abc"])));
+        assert!(!is_print_mode(&s(&[])));
+    }
+
+    /// The one check a benchmark leans on, so each case has to read correctly.
+    #[test]
+    fn provenance_distinguishes_zero_from_cannot_say() {
+        // Traffic arrived — never a failure, in either mode.
+        for print_mode in [false, true] {
+            let (ok, void) = provenance_report(Some(0), Some(7), print_mode);
+            assert!(ok.contains("served 7 request"), "{ok}");
+            assert!(!void, "traffic arriving must never fail the command");
+        }
+
+        // A delta, not an absolute — --server-url may have prior traffic.
+        let (delta, _) = provenance_report(Some(100), Some(103), false);
+        assert!(delta.contains("served 3 request"), "{delta}");
+
+        // Nothing arrived, interactively: names the likely innocent cause AND
+        // the one that invalidates a measurement, and does NOT fail — a hard
+        // error on every Ctrl-C would teach people to ignore it.
+        let (zero, void) = provenance_report(Some(4), Some(4), false);
+        assert!(zero.contains("0 requests"), "{zero}");
+        assert!(zero.contains("without sending a prompt"), "{zero}");
+        assert!(zero.contains("ANTHROPIC_BASE_URL"), "{zero}");
+        assert!(zero.contains("do not publish"), "{zero}");
+        assert!(
+            !void,
+            "an interactive exit without a prompt is not an error"
+        );
+
+        // Nothing arrived in print mode: there WAS a prompt, so this is void
+        // and the exit status has to carry it. A harness must not need to
+        // scrape stderr to find out its measurement is worthless.
+        let (void_msg, void) = provenance_report(Some(4), Some(4), true);
+        assert!(void, "a non-interactive run that served nothing must fail");
+        assert!(void_msg.contains("0 requests"), "{void_msg}");
+        assert!(void_msg.contains("must not be published"), "{void_msg}");
+        assert!(void_msg.contains("CLAUDE_CODE_USE_"), "{void_msg}");
+        // No innocent explanation offered — there isn't one here.
+        assert!(!void_msg.contains("without sending a prompt"), "{void_msg}");
+
+        // Could not ask is NOT the same claim as zero: it must not accuse, must
+        // not reassure, and must not fail even in print mode — the run may have
+        // been served fine by a server too old to report a count.
+        for print_mode in [false, true] {
+            for (before, after) in [(None, Some(3)), (Some(3), None), (None, None)] {
+                let (report, void) = provenance_report(before, after, print_mode);
+                assert!(report.contains("could not read"), "{report}");
+                assert!(!report.contains("must not be published"), "{report}");
+                assert!(!report.contains("served 3 request"), "{report}");
+                assert!(!void, "an unreadable count must not fail the command");
+            }
+        }
     }
 
     #[test]
