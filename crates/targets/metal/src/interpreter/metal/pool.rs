@@ -21,12 +21,13 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer};
 use objc2_metal::{
-    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
+    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue,
+    MTL4ComputeCommandEncoder, MTLDevice,
 };
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
-use super::forward::{Deferral, ForwardError, ForwardInputs, InFlight};
+use super::forward::{Deferral, DeviceInputInto, ForwardError, ForwardInputs, InFlight};
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
@@ -228,6 +229,9 @@ impl RuntimeFactory {
 pub struct PooledWorker<W: CanonicalParams> {
     pub worker: MetalWorker<W>,
     pub runtime: RuntimeBindings,
+    /// What a forward played in another pool's command buffer ([`MetalWorkerPool::forward_onto`])
+    /// stages its input writes in: its worker is out until that command buffer is done.
+    staging: Option<crate::residency::Pinned>,
 }
 
 /// RAII guard returned by [`MetalWorkerPool::checkout`]. Returns the
@@ -1035,9 +1039,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<R, ForwardError>,
     ) -> Result<(R, Committed), ForwardError> {
         use objc2::runtime::AnyObject;
-        use objc2_metal::{
-            MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLSharedEvent, MTLStages,
-        };
+        use objc2_metal::MTLSharedEvent;
         use std::ptr::NonNull;
         let t_pre = std::time::Instant::now();
         let cb = self
@@ -1056,25 +1058,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
             ring.allocator.reset();
             cb.beginCommandBufferWithAllocator(&ring.allocator);
-            let staged = writes.map_or(&[][..], |w| &w.staged[..]);
-            if !staged.is_empty() {
-                if ring
-                    .staging
-                    .as_ref()
-                    .is_none_or(|b| b.length() < staged.len())
-                {
-                    let buffer = crate::mtl4_dispatch::shared_zeroed(&self.device, staged.len());
-                    ring.staging = Some(self.allocator.residency().pin(buffer));
-                    self.allocator.residency().commit();
-                }
-                let staging = ring.staging.as_ref().expect("sized above");
-                // SAFETY: `staging` is shared storage of at least `staged.len()` bytes, and no
-                // command buffer reads it: the last one that did is done.
-                unsafe {
-                    let dst = staging.contents().as_ptr().cast::<u8>();
-                    std::ptr::copy_nonoverlapping(staged.as_ptr(), dst, staged.len());
-                }
-            }
+            // No command buffer reads the slot's staging, nor a buffer it replaces: the last one
+            // that did is done.
+            self.stage(
+                &mut ring.staging,
+                0,
+                writes.map_or(&[][..], |w| &w.staged[..]),
+            );
             // Residency: MTL4 cmdbufs declare per-cmdbuf.
             // Reuse the same set as the pool (weights + arenas + KV cache).
             let cb_ptr: *mut AnyObject =
@@ -1095,51 +1085,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 .computeCommandEncoder()
                 .expect("MTL4 computeCommandEncoder returned nil");
             let ops = writes.map_or(&[][..], |w| &w.ops[..]);
-            let barrier = |before| {
-                enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                    MTLStages::Blit,
-                    before,
-                    MTL4VisibilityOptions::Device,
-                )
-            };
-            let mut earlier_writes = true;
-            for op in ops {
-                // SAFETY: every range is inside its buffers, checked when it was recorded.
-                unsafe {
-                    match op {
-                        InputWrite::Staged { to, at, len } => {
-                            let staging = ring.staging.as_ref().expect("filled above");
-                            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                                staging, *at, to, 0, *len,
-                            );
-                        }
-                        InputWrite::Fill { to, range, byte } => {
-                            enc.fillBuffer_range_value(to, (*range).clone().into(), *byte);
-                        }
-                        InputWrite::Device {
-                            src,
-                            offset,
-                            to,
-                            at,
-                        } => {
-                            // It overwrites the placeholder a staged write put there.
-                            if std::mem::take(&mut earlier_writes) {
-                                barrier(MTLStages::Blit);
-                            }
-                            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                                src,
-                                *offset,
-                                to,
-                                *at,
-                                size_of::<u32>(),
-                            );
-                        }
-                    }
-                }
-            }
-            if !ops.is_empty() {
-                barrier(MTLStages::Dispatch);
-            }
+            encode_input_writes(&enc, ring.staging.as_deref(), 0, ops);
             let encoded = encode(&enc);
             enc.endEncoding();
             cb.endCommandBuffer();
@@ -1251,19 +1197,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     {
         self.ensure_mtl4();
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
-
-        if !self
-            .residency_attached
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.allocator.residency().commit();
-            // Commit the weights set too. When it is a distinct un-wired set
-            // (default), its inserts — including weight-memcpy arenas added at
-            // load — take effect only on commit; without this the un-wired
-            // weight buffers are not resident and the GPU reads garbage.
-            // No-op when it aliases the wired set (WeightResidency::Wired).
-            self.allocator.weights_residency().commit();
-        }
+        self.attach_residency();
 
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
@@ -1324,44 +1258,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<(), ForwardError>,
     {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
-        // num_seqs = number of sequences packed into this forward.
-        // Computed once here from the staged `cu_seqlens_q` slice
-        // (`batch + 1` entries) and threaded through the dispatch
-        // path so the per-sub-dispatch `RuntimeGate` checks can
-        // pick the lm_head slice (single-seq) vs the full
-        // M=bucket_m fallback (multi-seq). Defaults to 1 when
-        // `cu_seqlens_q` is absent — those are the
-        // `Instruction::AttentionViaCache` decode buckets that
-        // always run a single-token forward, never the slice.
-        let num_seqs: u32 = inputs
-            .cu_seqlens_q
-            .map(|cu| (cu.len().saturating_sub(1)).max(1) as u32)
-            .unwrap_or(1);
+        let num_seqs = num_seqs(inputs);
         let has_spec_tokens = inputs.has_spec_tokens;
-
-        // Lazily commit the allocator's residency set on the first
-        // forward — gated with an atomic bool so the one-time commit
-        // isn't repeated across thousands of forwards. MTL4 command
-        // buffers declare the set per-CB via `useResidencySet:`.
-        //
-        // commit() applies any inserts queued by `register_mmap` /
-        // arena push / `gpu_worker::initialize_cache`'s KV-cache
-        // wiring (~125ms on Llama-3.2-3B's 4.7 GB KV pool). Done
-        // here rather than in init_cache so it overlaps with the
-        // pool build / first-dispatch encoding instead of blocking
-        // the engine init path.
-        if !self
-            .residency_attached
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.allocator.residency().commit();
-            // Commit the weights set too. When it is a distinct un-wired set
-            // (default), its inserts — including weight-memcpy arenas added at
-            // load — take effect only on commit; without this the un-wired
-            // weight buffers are not resident and the GPU reads garbage.
-            // No-op when it aliases the wired set (WeightResidency::Wired).
-            self.allocator.weights_residency().commit();
-        }
+        self.attach_residency();
 
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
@@ -1437,6 +1336,83 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(with_output(&guard.worker, bucket_idx))
     }
 
+    /// Encode one forward onto `enc` — another pool's command buffer, after what is already on it:
+    /// typically that pool's forward, whose outputs [`ForwardInputs::device_inputs`] read — with its
+    /// input writes at its head; [`Onto::then`] encodes more on the same worker. The worker stays
+    /// out of the pool until the returned [`Onto`] drops, which must wait until that command buffer
+    /// is done: the command buffer reads and writes the worker's buffers.
+    pub fn forward_onto(
+        &self,
+        inputs: &ForwardInputs<'_>,
+        enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    ) -> Result<Onto<'_, W>, ForwardError> {
+        self.attach_residency();
+        let mut onto = Onto {
+            guard: self.checkout()?,
+            bucket_idx: 0,
+            staged: 0,
+            retired: Vec::new(),
+        };
+        onto.then(inputs, enc)?;
+        Ok(onto)
+    }
+
+    /// Lazily commit the allocator's residency sets on the pool's first forward — gated with an
+    /// atomic bool so the one-time commit isn't repeated across thousands of forwards. MTL4
+    /// command buffers declare the sets per-CB via `useResidencySet:`.
+    ///
+    /// commit() applies any inserts queued by `register_mmap` / arena push /
+    /// `gpu_worker::initialize_cache`'s KV-cache wiring (~125ms on Llama-3.2-3B's 4.7 GB KV pool).
+    /// Done here rather than in init_cache so it overlaps with the pool build / first-dispatch
+    /// encoding instead of blocking the engine init path. The weights set too: when it is a
+    /// distinct un-wired set (default), its inserts — including weight-memcpy arenas added at load
+    /// — take effect only on commit; without this the un-wired weight buffers are not resident and
+    /// the GPU reads garbage. No-op when it aliases the wired set (WeightResidency::Wired).
+    fn attach_residency(&self) {
+        use std::sync::atomic::Ordering::AcqRel;
+        if !self.residency_attached.swap(true, AcqRel) {
+            self.allocator.residency().commit();
+            self.allocator.weights_residency().commit();
+        }
+    }
+
+    /// Copy `staged` into `staging` past its first `used` bytes — which only command buffers not
+    /// yet committed read — returning where it starts. A buffer too small is replaced by one that
+    /// holds it from the start, and handed back for the caller to keep while command buffers read
+    /// it.
+    fn stage(
+        &self,
+        staging: &mut Option<crate::residency::Pinned>,
+        used: usize,
+        staged: &[u8],
+    ) -> (usize, Option<crate::residency::Pinned>) {
+        let mut at = used.next_multiple_of(4);
+        if staged.is_empty() {
+            return (at, None);
+        }
+        let mut replaced = None;
+        if staging
+            .as_ref()
+            .is_none_or(|b| b.length() < at + staged.len())
+        {
+            let len = staged
+                .len()
+                .max(staging.as_ref().map_or(0, |b| 2 * b.length()));
+            let buffer = crate::mtl4_dispatch::shared_zeroed(&self.device, len);
+            replaced = staging.replace(self.allocator.residency().pin(buffer));
+            self.allocator.residency().commit();
+            at = 0;
+        }
+        let staging = staging.as_ref().expect("sized above");
+        // SAFETY: `staging` is shared storage of at least `at + staged.len()` bytes, and no command
+        // buffer reads them: the ones that read what is before `used` are not committed.
+        unsafe {
+            let dst = staging.contents().as_ptr().cast::<u8>().add(at);
+            std::ptr::copy_nonoverlapping(staged.as_ptr(), dst, staged.len());
+        }
+        (at, replaced)
+    }
+
     fn spawn_worker(&self, lent: &LentActivation) -> Result<PooledWorker<W>, WorkerError> {
         let runtime = self.runtime_factory.build(&self.device, lent);
         let worker = MetalWorker::<W>::new_with_residency(
@@ -1449,7 +1425,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             Some(self.allocator.residency()),
             lent,
         )?;
-        Ok(PooledWorker { worker, runtime })
+        Ok(PooledWorker {
+            worker,
+            runtime,
+            staging: None,
+        })
     }
 
     /// An idle worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose forwards
@@ -1468,6 +1448,148 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // Wake exactly one waiter — at most one of them can claim
         // this worker, the others stay blocked.
         self.cv.notify_one();
+    }
+}
+
+/// num_seqs = number of sequences packed into this forward, from the staged `cu_seqlens_q` slice
+/// (`batch + 1` entries), threaded through the dispatch path so the per-sub-dispatch `RuntimeGate`
+/// checks can pick the lm_head slice (single-seq) vs the full M=bucket_m fallback (multi-seq).
+/// Defaults to 1 when `cu_seqlens_q` is absent — those are the `Instruction::AttentionViaCache`
+/// decode buckets that always run a single-token forward, never the slice.
+fn num_seqs(inputs: &ForwardInputs<'_>) -> u32 {
+    (inputs.cu_seqlens_q).map_or(1, |cu| (cu.len().saturating_sub(1)).max(1) as u32)
+}
+
+/// Encode a forward's input writes `ops` onto `enc` — `Staged` bytes copied from `staging`, from
+/// `base` on — then a barrier before the dispatches that read them.
+fn encode_input_writes(
+    enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    staging: Option<&Buffer>,
+    base: usize,
+    ops: &[InputWrite],
+) {
+    use objc2_metal::{MTL4VisibilityOptions, MTLStages};
+    let barrier = |before| {
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Blit,
+            before,
+            MTL4VisibilityOptions::Device,
+        )
+    };
+    let mut earlier_writes = true;
+    for op in ops {
+        // SAFETY: every range is inside its buffers, checked when it was recorded.
+        unsafe {
+            match op {
+                InputWrite::Staged { to, at, len } => {
+                    let staging = staging.expect("staged bytes have a staging buffer");
+                    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        staging,
+                        base + *at,
+                        to,
+                        0,
+                        *len,
+                    );
+                }
+                InputWrite::Fill { to, range, byte } => {
+                    enc.fillBuffer_range_value(to, (*range).clone().into(), *byte);
+                }
+                InputWrite::Device {
+                    src,
+                    offset,
+                    to,
+                    at,
+                    len,
+                } => {
+                    // It overwrites what a staged write or fill put there.
+                    if std::mem::take(&mut earlier_writes) {
+                        barrier(MTLStages::Blit);
+                    }
+                    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        src, *offset, to, *at, *len,
+                    );
+                }
+            }
+        }
+    }
+    if !ops.is_empty() {
+        barrier(MTLStages::Dispatch);
+    }
+}
+
+/// The forwards [`MetalWorkerPool::forward_onto`] and [`Self::then`] encoded onto another pool's
+/// command buffer, and the worker they run on, out of its pool until this drops.
+pub struct Onto<'p, W: CanonicalParams> {
+    guard: WorkerGuard<'p, W>,
+    /// The bucket the last forward ran.
+    bucket_idx: usize,
+    /// The bytes of the worker's staging the forwards' input writes take.
+    staged: usize,
+    /// Staging buffers the forwards' input writes read that a larger one replaced.
+    retired: Vec<crate::residency::Pinned>,
+}
+
+impl<W: CanonicalParams> Onto<'_, W> {
+    /// Encode another forward on the same worker onto `enc`, after what is on it — the forwards
+    /// before it among that — with its input writes at its head.
+    pub fn then(
+        &mut self,
+        inputs: &ForwardInputs<'_>,
+        enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    ) -> Result<(), ForwardError> {
+        use objc2_metal::{MTL4VisibilityOptions, MTLStages};
+        assert!(
+            inputs.deferred.is_none(),
+            "a forward played in another's command buffer is waited for with it"
+        );
+        let pool = self.guard.pool;
+        let bucket_idx = pool.pick_bucket(inputs.num_tokens)?;
+        assert!(
+            !self.guard.worker.bucket_has_avg_pool_2d(bucket_idx),
+            "a serialized forward runs in command buffers of its own"
+        );
+        let writes = begin_step(&self.guard, inputs, pool.block_table_stride)?;
+        let pooled = &mut *self.guard;
+        let (at, replaced) = pool.stage(&mut pooled.staging, self.staged, &writes.staged);
+        self.retired.extend(replaced);
+        self.staged = at + writes.staged.len();
+        // After everything on the encoder so far: it wrote what the device inputs read, and may
+        // read this worker's runtime inputs or share its activation (an arena lent to it).
+        let all = MTLStages::Dispatch | MTLStages::Blit;
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            all,
+            all,
+            MTL4VisibilityOptions::Device,
+        );
+        encode_input_writes(enc, pooled.staging.as_deref(), at, &writes.ops);
+        (pooled.worker)
+            .run_bucket_mtl4(
+                bucket_idx,
+                inputs.num_tokens,
+                num_seqs(inputs),
+                inputs.has_spec_tokens,
+                enc,
+            )
+            .map_err(ForwardError::Worker)?;
+        if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
+            let dispatches = pooled.worker.count_dispatches(bucket_idx);
+            eprintln!(
+                "[forward-onto bucket={bucket_idx} num_tokens={} mtl4 dispatches={dispatches}]",
+                inputs.num_tokens
+            );
+        }
+        self.bucket_idx = bucket_idx;
+        Ok(())
+    }
+
+    /// The worker whose arena holds the last forward's outputs once the command buffer is done.
+    pub fn worker(&self) -> &MetalWorker<W> {
+        &self.guard.worker
+    }
+
+    /// The bucket the last forward ran.
+    pub fn bucket_idx(&self) -> usize {
+        self.bucket_idx
     }
 }
 
@@ -1534,8 +1656,8 @@ fn commit_options(
 /// Returns 0 when there is no block table (decode-via-cache buckets etc.) — the
 /// dispatch then falls back to the baked const.
 /// Record the step's writes — into the worker's runtime buffers, its deferral's other buffers,
-/// then the tokens an earlier forward wrote on the device — and set the per-step values its
-/// dispatch reads.
+/// then the bytes earlier forwards wrote on the device — and set the per-step values its dispatch
+/// reads.
 fn begin_step<W: CanonicalParams>(
     worker: &PooledWorker<W>,
     inputs: &ForwardInputs<'_>,
@@ -1543,16 +1665,40 @@ fn begin_step<W: CanonicalParams>(
 ) -> Result<InputWrites, ForwardError> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut writes = InputWrites::default();
-    write_runtime_inputs(&worker.runtime, inputs, block_table_stride, &mut writes)?;
+    let runtime = &worker.runtime;
+    write_runtime_inputs(runtime, inputs, block_table_stride, &mut writes)?;
     for (to, bytes) in inputs.deferred.iter().flat_map(|d| &d.host_writes) {
         writes.stage(to, bytes);
     }
-    for input in inputs.deferred.iter().flat_map(|d| &d.device_inputs) {
+    let device_hidden = (inputs.device_inputs.iter())
+        .filter(|d| d.into == DeviceInputInto::TargetHidden)
+        .map(|d| d.at + d.len)
+        .max();
+    if let (None, Some(len)) = (inputs.target_hidden, device_hidden) {
+        let hidden = &runtime.target_hidden;
+        (runtime.written)
+            .cover(hidden, len, Padding::Zero, &mut writes)
+            .map_err(|bytes_needed| ForwardError::BufferTooSmall {
+                kind: "target_hidden",
+                bytes_needed,
+                bytes_available: hidden.length(),
+            })?;
+    }
+    for input in inputs.device_inputs {
+        let to = match input.into {
+            DeviceInputInto::InputIds => &runtime.input_ids,
+            DeviceInputInto::TargetHidden => &runtime.target_hidden,
+            DeviceInputInto::Positions => &runtime.positions,
+            DeviceInputInto::SlotMapping => &runtime.slot_mappings[0],
+            DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
+            DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
+        };
         writes.ops.push(InputWrite::Device {
             src: input.src.clone(),
             offset: input.offset,
-            to: worker.runtime.input_ids.clone(),
-            at: input.flat_index * size_of::<u32>(),
+            to: to.clone(),
+            at: input.at,
+            len: input.len,
         });
     }
     worker
@@ -2403,6 +2549,7 @@ mod tests {
                 mm_embeds: None,
                 mm_dst_rows: None,
                 mrope_cos_sin: None,
+                device_inputs: &[],
                 deferred: None,
             };
             step_has_unrotated_blocks(&inputs, 16)
@@ -2445,6 +2592,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         // Closure runs *while* the worker is checked out — assertion
@@ -2513,9 +2661,9 @@ mod tests {
         pool.allocator.residency().commit();
         let guard = pool.checkout().expect("a worker");
         let input_ids = || crate::mtl4_dispatch::read_slice::<u32>(&guard.runtime.input_ids, 4);
-        let run = |ids: &[u32], device_inputs| {
+        let run = |ids: &[u32], device_inputs: &[crate::interpreter::metal::DeviceInput]| {
             let positions: Vec<u32> = (0..ids.len() as u32).collect();
-            let deferral = Deferral::new(device_inputs);
+            let deferral = Deferral::default();
             let inputs = ForwardInputs {
                 span_ids: None,
                 num_tokens: ids.len() as u32,
@@ -2541,6 +2689,7 @@ mod tests {
                 mm_dst_rows: None,
                 mrope_cos_sin: None,
                 target_hidden: None,
+                device_inputs,
                 deferred: Some(&deferral),
             };
             let before = input_ids();
@@ -2554,13 +2703,107 @@ mod tests {
             committed.in_flight.wait().expect("runs");
             input_ids()
         };
-        let device_input = crate::interpreter::metal::DeviceInput {
-            src: (*sampled).clone(),
-            offset: size_of::<u32>(),
-            flat_index: 1,
+        let device_input =
+            crate::interpreter::metal::DeviceInput::token((*sampled).clone(), size_of::<u32>(), 1);
+        assert_eq!(run(&[5, 0, 9], &[device_input]), [5, 42, 9, 0]);
+        assert_eq!(run(&[8], &[]), [8, 0, 0, 0]);
+    }
+
+    /// Two forwards played onto one command buffer, on one worker: each reads its own inputs — its
+    /// host bytes staged past the first's, its device inputs over the host's placeholders, and
+    /// target hidden rows the host gave none of, padded past them.
+    #[test]
+    fn forwards_onto_one_command_buffer_read_their_own_inputs() {
+        use crate::interpreter::metal::{DeviceInput, DeviceInputInto};
+        use objc2_metal::{MTL4VisibilityOptions, MTLStages};
+        let Some(pool) = build_multi_bucket_pool(&[4], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
         };
-        assert_eq!(run(&[5, 0, 9], vec![device_input]), [5, 42, 9, 0]);
-        assert_eq!(run(&[8], Vec::new()), [8, 0, 0, 0]);
+        pool.ensure_mtl4();
+        let pin = |buffer| pool.allocator.residency().pin(buffer);
+        let src = pin(crate::mtl4_dispatch::shared_bytes(
+            &pool.device,
+            bytes_of(&[10, 11, 12, 13, 20, 21, 22, 23]),
+        ));
+        let seen = pin(crate::mtl4_dispatch::shared_zeroed(&pool.device, 96));
+        pool.allocator.residency().commit();
+        let inputs = |ids, positions, device_inputs| ForwardInputs {
+            span_ids: None,
+            num_tokens: <[u32]>::len(ids) as u32,
+            input_ids: ids,
+            positions,
+            slot_mappings: Vec::new(),
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_tables: Vec::new(),
+            has_spec_tokens: false,
+            last_token_indices: None,
+            gdn_state_indices: None,
+            gdn_is_fresh: None,
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            target_hidden: None,
+            device_inputs,
+            deferred: None,
+        };
+        let first = [
+            DeviceInput::head((*src).clone(), 0, 8, DeviceInputInto::Positions),
+            DeviceInput::hidden_rows((*src).clone(), 1, 0, 2, 4),
+        ];
+        let second = [
+            DeviceInput::head((*src).clone(), 16, 4, DeviceInputInto::Positions),
+            DeviceInput::head((*src).clone(), 20, 4, DeviceInputInto::TargetHidden),
+        ];
+        // What each forward's tape read: its input ids, positions and target hidden rows.
+        let record = |enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+                      runtime: &RuntimeBindings,
+                      at: usize| {
+            let all = MTLStages::Dispatch | MTLStages::Blit;
+            let device = MTL4VisibilityOptions::Device;
+            enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(all, all, device);
+            let from = [&runtime.input_ids, &runtime.positions, &runtime.target_hidden];
+            for (i, from) in from.into_iter().enumerate() {
+                // SAFETY: every buffer holds 16 bytes; `seen` holds 96.
+                unsafe {
+                    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        from,
+                        0,
+                        &seen,
+                        at + 16 * i,
+                        16,
+                    );
+                }
+            }
+            enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(all, all, device);
+        };
+        let ((), committed) = pool
+            .commit(None, |enc| {
+                let mut onto = pool.forward_onto(&inputs(&[1, 2], &[100, 101], &first), enc)?;
+                record(enc, &onto.guard.runtime, 0);
+                onto.then(&inputs(&[3], &[200], &second), enc)?;
+                record(enc, &onto.guard.runtime, 48);
+                Ok(())
+            })
+            .expect("commits");
+        committed.in_flight.wait().expect("runs");
+        let seen = crate::mtl4_dispatch::read_slice::<u32>(&seen, 24);
+        let read = |forward: usize, input: usize| &seen[12 * forward + 4 * input..][..4];
+        assert_eq!(read(0, 0), [1, 2, 0, 0], "the first forward's tokens");
+        assert_eq!(read(0, 1), [10, 11, 0, 0], "the first forward's device positions");
+        assert_eq!(read(0, 2), [11, 12, 0, 0], "the first forward's device hidden rows");
+        assert_eq!(read(1, 0), [3, 0, 0, 0], "the second forward's tokens");
+        assert_eq!(read(1, 1), [20, 0, 0, 0], "the second forward's device positions");
+        assert_eq!(read(1, 2), [21, 0, 0, 0], "the second forward's row, the first's padded");
     }
 
     #[test]
@@ -2594,6 +2837,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         let err = pool
@@ -2636,6 +2880,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         match pool.forward(&inputs, |_, _| ()) {
@@ -2688,6 +2933,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         let err = pool

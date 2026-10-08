@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The kernels a model runs outside its tape — greedy argmax, the grammar mask and the sampler on
-//! the logits its forward leaves, and the spec-decode chain advance — baked like the tape's
-//! kernels ([`crate::aot::bake`]) with the model's logits width, dtype and KV block size compiled
-//! in. The `#[forward]` macro emits one [`OffTapeKernels`] per model
+//! the logits its forward leaves, the spec-decode chain advance, and a multi-token-prediction
+//! head's chain between its passes — baked like the tape's kernels ([`crate::aot::bake`]) with the
+//! model's logits width, dtype, KV block size and hidden width compiled in. The `#[forward]` macro emits one [`OffTapeKernels`] per model
 //! (`ScratchyWeights::metal_off_tape`); the worker builds
 //! [`ArgmaxKernels`](crate::argmax::ArgmaxKernels),
 //! [`GrammarMaskKernels`](crate::grammar_mask::GrammarMaskKernels),
-//! [`SamplerKernels`](crate::sampling::SamplerKernels) and
-//! [`ChainAdvanceKernel`](crate::chain_advance::ChainAdvanceKernel) from it.
+//! [`SamplerKernels`](crate::sampling::SamplerKernels),
+//! [`ChainAdvanceKernel`](crate::chain_advance::ChainAdvanceKernel) and
+//! [`MtpChainKernel`](crate::mtp_chain::MtpChainKernel) from it.
 
 use objc2_foundation::NSString;
 use objc2_metal::{MTLDevice as _, MTLLibrary as _};
@@ -17,7 +18,9 @@ use crate::shader_cache::{ComputePipelineState, Device, Library, load_library_fr
 use crate::specialized_pipeline_cache::PipelineKey;
 use crate::stream::MetalStreamError;
 use crate::tape::ids::{BitsetWords, BlockSize, LogitsWidth};
-use crate::tape::kernel_constants::{ArgmaxConstants, ChainAdvanceConstants, GrammarMaskConstants};
+use crate::tape::kernel_constants::{
+    ArgmaxConstants, ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants,
+};
 use crate::tape::lowered::{BakedKernel, MetalDtype};
 
 /// One model's off-tape kernels: each a [`PipelineKey`] at expansion, a [`BakedKernel`] in the
@@ -34,14 +37,21 @@ pub struct OffTape<K> {
     pub sampler: [[K; SamplerStage::COUNT]; 2],
     /// The spec-decode chain advance, the model's KV block size compiled in.
     pub chain_advance: K,
+    /// A multi-token-prediction head's chain between its passes; `None` for any other model.
+    pub mtp_chain: Option<K>,
 }
 
 pub type OffTapeKernels = OffTape<BakedKernel>;
 
 impl OffTape<PipelineKey> {
     /// The keys of the off-tape kernels reading logits `vocab` wide, of activation `dtype`, over a
-    /// KV cache paged in blocks of `block_size`.
-    pub fn keys(vocab: LogitsWidth, dtype: MetalDtype, block_size: BlockSize) -> Self {
+    /// KV cache paged in blocks of `block_size`; `head`: a multi-token-prediction head's chain.
+    pub fn keys(
+        vocab: LogitsWidth,
+        dtype: MetalDtype,
+        block_size: BlockSize,
+        head: Option<MtpChainConstants>,
+    ) -> Self {
         let (argmax, dual_write, grammar_mask, cast) = match dtype {
             MetalDtype::F16 => (
                 "argmax_f16",
@@ -74,6 +84,7 @@ impl OffTape<PipelineKey> {
                 "chain_advance",
                 ChainAdvanceConstants { block_size }.into(),
             ),
+            mtp_chain: head.map(|c| PipelineKey::new("mtp_chain", "mtp_chain", c.into())),
         }
     }
 }
@@ -87,6 +98,7 @@ impl<K> OffTape<K> {
             grammar_mask: f(self.grammar_mask),
             sampler: self.sampler.map(|row| row.map(&mut f)),
             chain_advance: f(self.chain_advance),
+            mtp_chain: self.mtp_chain.map(f),
         }
     }
 }

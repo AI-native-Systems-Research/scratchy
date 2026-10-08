@@ -115,6 +115,7 @@ pub mod steel_paged {
 pub mod allocator;
 pub mod argmax;
 pub mod chain_advance;
+pub mod mtp_chain;
 pub mod cpu_reference;
 pub mod device;
 /// Metal lowered from the SHARED `SubtileTape` — the same artifact spyre lowers. Lives here,

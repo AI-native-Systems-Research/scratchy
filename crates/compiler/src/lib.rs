@@ -281,7 +281,7 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
 mod dispatcher;
 
 #[cfg(feature = "metal")]
-pub use dispatcher::{ChainStepHandle, MetalChainBody, MetalForwardFollowup};
+pub use dispatcher::{ChainStepHandle, MetalChainBody, MetalForwardFollowup, MetalForwardOnto};
 // Backend-neutral contracts — the `ScratchyWeights` trait (its device-runtime
 // forward methods take the neutral `ForwardCtxHandle` / `ForwardDeviceHandle`)
 // and the pure-config `HfFingerprint` carry no cuda/metal coupling, so they're
