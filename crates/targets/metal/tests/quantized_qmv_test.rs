@@ -26,7 +26,8 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, qmv_dispatch_shape, qmv_kernel_name,
+    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, pick_qmv_kernel_wide, qmv_dispatch_shape,
+    qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 use scratchy_target_metal::tape::kernel_constants::AffineCodes;
@@ -870,6 +871,75 @@ fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
             "qmv generic s_bf16 gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
              (allowed {allowed:.5}; metal={mv}, cpu={ev})"
         );
+    }
+}
+
+/// The small-M band kernel (`affine_qmv_wide`, `2 ≤ M < vector_limit`)
+/// matches the CPU reference at every group size an MLX-affine preset
+/// ships: Granite 4.1's mlx-community 4bit checkpoints are g32, and a g32
+/// build failed at bake when only gs 64 was instantiated.
+#[test]
+fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
+    let (n, k) = (64, 512);
+    for group_size in [32usize, 64, 128] {
+        for m in 2..=8 {
+            let (packed, scales, biases, x) =
+                make_inputs_bf16(0x51DE ^ (group_size * 16 + m) as u64, n, k, m, group_size);
+            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let Some(device) = detect_device().map(|d| d.device) else {
+                eprintln!("skipping: no Metal 4 GPU");
+                return;
+            };
+            let QmvKernel::Wide { nv } =
+                pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, true)
+            else {
+                panic!("M={m} must pick qmv_wide");
+            };
+            let name = qmv_kernel_name(
+                QmvKernel::Wide { nv },
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                group_size as u32,
+                4,
+                false,
+            );
+            let constants = vec![
+                ConstantValue::int(0, k as i32),
+                ConstantValue::int(1, n as i32),
+                ConstantValue::int(7, m as i32),
+            ];
+            let pipeline = baked_pipeline(&device, "quantized_qmv", &name, constants)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let as_bytes =
+                |s: &[half::f16]| -> Vec<u8> { s.iter().flat_map(|v| v.to_le_bytes()).collect() };
+            let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bufs = [
+                buffer_from_bytes(&device, &packed),
+                buffer_from_bytes(&device, &as_bytes(&scales)),
+                buffer_from_bytes(&device, &as_bytes(&biases)),
+                buffer_from_bytes(&device, &x_bytes),
+                zeroed_buffer(&device, m * n * std::mem::size_of::<half::bf16>()),
+            ];
+            let (tg, tpg) = qmv_dispatch_shape(QmvKernel::Wide { nv }, m as u32, n as u32, 1);
+            let size = |(width, height, depth): (u32, u32, u32)| MTLSize {
+                width: width as usize,
+                height: height as usize,
+                depth: depth as usize,
+            };
+            let refs: Vec<&Buffer> = bufs.iter().collect();
+            assert!(
+                common::dispatch_threadgroups(&device, &pipeline, &refs, size(tg), size(tpg)),
+                "no MTL4 queue"
+            );
+            let metal = read_buffer_bf16(&bufs[4], m * n);
+            let (idx, mv, ev, abs_err, allowed) =
+                worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+            assert!(
+                abs_err <= allowed,
+                "qmv_wide gs={group_size} M={m} nv={nv}: worst abs_err={abs_err:.5} at idx {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+        }
     }
 }
 
