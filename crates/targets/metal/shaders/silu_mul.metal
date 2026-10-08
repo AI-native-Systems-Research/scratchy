@@ -16,6 +16,10 @@
 //
 // Baked constants:
 //   SILU_MUL_N — total output element count (= M * intermediate_size)
+//   SILU_MUL_ROW, SILU_MUL_EXPERTS — set by a grouped MoE bake: its padded
+//     rows of SILU_MUL_ROW elements, a row whose expert in `row_expert` is
+//     not below SILU_MUL_EXPERTS (the sort's sentinel) holding no pair and
+//     skipped
 //
 // Dispatch: 1 thread per output element. Float accumulator on the
 // silu so denormalized half/bfloat exp() doesn't flush to zero on
@@ -28,15 +32,23 @@
 using namespace metal;
 
 SCRATCHY_CONSTANT(uint, SILU_MUL_N, 0);
+SCRATCHY_CONSTANT_OPTIONAL(uint, SILU_MUL_ROW, 1);
+SCRATCHY_CONSTANT_OPTIONAL(uint, SILU_MUL_EXPERTS, 2);
+
+inline bool silu_mul_skips(const device uint* row_expert, uint gid) {
+  return gid >= SILU_MUL_N ||
+      (SILU_MUL_ROW_SET && row_expert[gid / max(SILU_MUL_ROW, 1u)] >= SILU_MUL_EXPERTS);
+}
 
 template <typename T>
 [[kernel]] void silu_mul(
     device       T* out  [[buffer(0)]],
     const device T* gate [[buffer(1)]],
     const device T* up   [[buffer(2)]],
+    const device uint* row_expert [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= SILU_MUL_N) {
+  if (silu_mul_skips(row_expert, gid)) {
     return;
   }
   out[gid] = static_cast<T>(silu_mul_f(float(gate[gid]), float(up[gid])));
@@ -57,9 +69,10 @@ template <typename T>
     device       T* out  [[buffer(0)]],
     const device T* gate [[buffer(1)]],
     const device T* up   [[buffer(2)]],
+    const device uint* row_expert [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= SILU_MUL_N) {
+  if (silu_mul_skips(row_expert, gid)) {
     return;
   }
   out[gid] = static_cast<T>(gelu_mul_f(float(gate[gid]), float(up[gid])));

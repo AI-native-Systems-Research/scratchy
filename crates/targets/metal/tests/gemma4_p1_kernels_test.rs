@@ -1171,19 +1171,21 @@ fn rope_on_read_nax_qwen36_hd256() {
 
 /// Gemma 4's global layers: head_dim 512 over four warps a Q-row block, 32-token pages (two NAX
 /// fragments a page), proportional rope (128 rotary dims, pairs 256 apart), 8 query heads a KV
-/// head.
+/// head; one partial step of K-tiles, and two whole steps and a partial one.
 #[test]
 fn rope_on_read_nax_gemma4_global_hd512() {
-    run_rope_on_read_nax_case(NaxRopeCase {
-        name: "gemma4-global-hd512",
-        head_dim: 512,
-        rot_dim: 128,
-        pair_off: 256,
-        num_q_heads: 16,
-        num_kv_heads: 2,
-        kv_len: 70,
-        block_size: 32,
-    });
+    for kv_len in [70, 300] {
+        run_rope_on_read_nax_case(NaxRopeCase {
+            name: "gemma4-global-hd512",
+            head_dim: 512,
+            rot_dim: 128,
+            pair_off: 256,
+            num_q_heads: 16,
+            num_kv_heads: 2,
+            kv_len,
+            block_size: 32,
+        });
+    }
 }
 
 #[test]

@@ -7344,7 +7344,8 @@ fn lower_moe_step(
             )]
         }
         // `out = act(gate) * up`, written over the gate rows; a bake that sorted runs every
-        // padded row (the sort's static grid covered them).
+        // padded row (the sort's static grid covered them), a grouped one skipping the rows the
+        // sort's init left sentinel.
         S::GatedAct(act) => {
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
@@ -7357,15 +7358,13 @@ fn lower_moe_step(
             let n = rows * inter;
             let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
             let gate = |i| s.at(i, R::ExpertGate);
-            let bindings = vec![gate(0), gate(1), s.at(2, R::ExpertUp)];
-            vec![cmd(
-                kernel,
-                "silu_mul",
-                symbol,
-                vec![C::uint(0, n)],
-                shape,
-                bindings,
-            )]
+            let mut bindings = vec![gate(0), gate(1), s.at(2, R::ExpertUp)];
+            let mut constants = vec![C::uint(0, n)];
+            if s.grouping == MoeGrouping::Grouped {
+                bindings.push(scratch_at(3, s.l.grp_indices_pad));
+                constants.extend([C::uint(1, inter), C::uint(2, e)]);
+            }
+            vec![cmd(kernel, "silu_mul", symbol, constants, shape, bindings)]
         }
         S::Unsort => vec![],
         // `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]`; a sorted bake's pair rows read where
@@ -8188,7 +8187,7 @@ mod tests {
         assert!(nax_paged_kernel("bf16", 512, 16).is_none());
         let wide = |hd, bs| nax_paged_kernel("f16", hd, bs).map(|k| (k.threads, k.bq));
         assert_eq!(wide(256, 16), Some((256, 64)));
-        assert_eq!(wide(512, 32), Some((256, 32)));
+        assert_eq!(wide(512, 32), Some((512, 64)));
     }
 
     /// The sliding class's paged prefill lowers through the global class's arm with its own
