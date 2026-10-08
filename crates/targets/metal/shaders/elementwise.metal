@@ -165,7 +165,28 @@ template <typename T>
     float x = float(input[gid]);
     out[gid] = T(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
 }
+
+// The same over the rows a step samples, one per sequence (its last: `cu_seqlens_q[s + 1] - 1`),
+// rows `TANH_SOFTCAP_WIDTH` wide (slot 6): grid (ceil(width / 256), sequences).
+#ifdef SCRATCHY_CONSTANT_6
+SCRATCHY_CONSTANT(uint, TANH_SOFTCAP_WIDTH, 6);
+
+template <typename T>
+[[kernel]] void tanh_soft_cap_sampled(
+    device const T* input [[buffer(0)]],
+    device T* out [[buffer(1)]],
+    device const uint* cu_seqlens_q [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= TANH_SOFTCAP_WIDTH) return;
+    const ulong i = ulong(cu_seqlens_q[gid.y + 1] - 1) * TANH_SOFTCAP_WIDTH + gid.x;
+    float x = float(input[i]);
+    out[i] = T(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
+}
+#endif
 #endif
 
 SCRATCHY_KERNEL(tanh_soft_cap_f16_specialized, tanh_soft_cap<half>)
 SCRATCHY_KERNEL(tanh_soft_cap_bf16_specialized, tanh_soft_cap<bfloat>)
+SCRATCHY_KERNEL(tanh_soft_cap_sampled_f16, tanh_soft_cap_sampled<half>)
+SCRATCHY_KERNEL(tanh_soft_cap_sampled_bf16, tanh_soft_cap_sampled<bfloat>)

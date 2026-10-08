@@ -213,6 +213,143 @@ fn tanh_soft_cap_f16_specialized_matches_cpu() {
     assert!(max_err < 0.05, "tanh_soft_cap max_err {max_err}");
 }
 
+/// The soft cap of a step that samples caps each sequence's last row — in place, as the tape runs
+/// it — to the bits the every-row cap gives that row, and leaves every other row as it was.
+#[test]
+fn tanh_soft_cap_sampled_caps_each_sequences_last_row_alone() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    // Three sequences of 5, 1 and 6 rows; a width no multiple of the threadgroup's 256.
+    let (width, cu) = (1000usize, [0u32, 5, 6, 12]);
+    let rows = cu[3] as usize;
+    let padded = (rows * width).next_multiple_of(256);
+    let cap = 30.0f32;
+    let x = pseudo(17, padded, 80.0);
+    let constants = vec![ConstantValue::float(1, cap)];
+    let all = baked_pipeline(
+        &device,
+        "elementwise",
+        "tanh_soft_cap_f16_specialized",
+        constants,
+    )
+    .expect("tanh_soft_cap pipeline");
+    let constants = vec![
+        ConstantValue::float(1, cap),
+        ConstantValue::uint(6, width as u32),
+    ];
+    let sampled = baked_pipeline(
+        &device,
+        "elementwise",
+        "tanh_soft_cap_sampled_f16",
+        constants,
+    )
+    .expect("tanh_soft_cap_sampled pipeline");
+    let (every, some) = (buf_f16(&device, &x), buf_f16(&device, &x));
+    dispatch_1d(&device, &all, &[&every, &every], padded);
+    let size = |width| MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let mut groups = size(width.div_ceil(256));
+    groups.height = cu.len() - 1;
+    let cu_buf = buf_u32(&device, &cu);
+    if !common::dispatch_threadgroups(
+        &device,
+        &sampled,
+        &[&some, &some, &cu_buf],
+        groups,
+        size(256),
+    ) {
+        return;
+    }
+    let bits = |b: &Buffer| {
+        read_f16(b, rows * width)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let (every, some): (Vec<u32>, Vec<u32>) = (bits(&every), bits(&some));
+    let input: Vec<u32> = x[..rows * width]
+        .iter()
+        .map(|&v| f16::from_f32(v).to_f32().to_bits())
+        .collect();
+    for r in 0..rows {
+        let row = r * width..(r + 1) * width;
+        let want = match cu[1..].contains(&(r as u32 + 1)) {
+            true => &every[row.clone()],
+            false => &input[row.clone()],
+        };
+        assert_eq!(&some[row], want, "row {r}");
+    }
+}
+
+/// The two soft cap kernels compile apart, and a backend may lower one function's fast math
+/// differently in two kernels: over every input of the activation type — all 65536 16-bit
+/// patterns, one sampled row each — the sampled-rows cap gives the every-row cap's bits.
+#[test]
+fn tanh_soft_cap_sampled_is_the_every_row_cap_at_every_input() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let (width, rows) = (1024usize, 64usize);
+    let patterns: Vec<u16> = (0..=u16::MAX).collect();
+    let cu: Vec<u32> = (0..=rows as u32).collect();
+    let cu_buf = buf_u32(&device, &cu);
+    let raw = |data: &[u16]| {
+        let buf = device
+            .newBufferWithLength_options(data.len() * 2, MTLResourceOptions::StorageModeShared)
+            .expect("newBuffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                buf.contents().as_ptr() as *mut u8,
+                data.len() * 2,
+            )
+        };
+        buf
+    };
+    let read = |buf: &Buffer| unsafe {
+        std::slice::from_raw_parts(buf.contents().as_ptr() as *const u16, rows * width).to_vec()
+    };
+    for (act, nan) in [("f16", 0x7c00u16), ("bf16", 0x7f80)] {
+        let cap = vec![ConstantValue::float(1, 30.0)];
+        let every_row = format!("tanh_soft_cap_{act}_specialized");
+        let all = baked_pipeline(&device, "elementwise", &every_row, cap.clone()).expect(act);
+        let sampled = [cap, vec![ConstantValue::uint(6, width as u32)]].concat();
+        let symbol = format!("tanh_soft_cap_sampled_{act}");
+        let sampled = baked_pipeline(&device, "elementwise", &symbol, sampled).expect(act);
+        let (every, some) = (raw(&patterns), raw(&patterns));
+        dispatch_1d(&device, &all, &[&every, &every], rows * width);
+        let groups = MTLSize {
+            width: width / 256,
+            height: rows,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        };
+        let buffers = [&some, &some, &cu_buf];
+        if !common::dispatch_threadgroups(&device, &sampled, &buffers, groups, threads) {
+            return;
+        }
+        let (every, some) = (read(&every), read(&some));
+        // NaN inputs (all-ones exponent, nonzero mantissa) map to a NaN either way.
+        let finite = |p: u16| p & nan != nan || p & !(nan | 0x8000) == 0;
+        let differ = (0..rows * width)
+            .filter(|&i| finite(patterns[i]) && every[i] != some[i])
+            .count();
+        assert_eq!(differ, 0, "{act}: {differ} inputs cap differently");
+    }
+}
+
 // ── Sliding-window attention parity ─────────────────────────────────
 
 struct AttnCase {
@@ -1431,7 +1568,8 @@ fn rmsnorm_unit_f16_matches_cpu() {
             depth: 1,
         },
         MTLSize {
-            width: scratchy_target_metal::tape::kernel_constants::NORM_THREADS as usize,
+            width: scratchy_target_metal::tape::kernel_constants::norm_threads(QSize(width as u32))
+                as usize,
             height: 1,
             depth: 1,
         },
@@ -1453,6 +1591,102 @@ fn rmsnorm_unit_f16_matches_cpu() {
         }
     }
     assert!(max_err < 5e-3, "rmsnorm_unit max_err {max_err}");
+}
+
+/// A per-head norm's rows, narrower than [`NORM_THREADS`], run on `norm_threads(width)` threads:
+/// every count covering the row sums it in the same order (a thread holds at most one element,
+/// the extra tree levels add zeros), so the outputs are the 1024-thread ones bit for bit, in both
+/// activation types — and a quarter of that count (up to four elements a thread, summed in a row)
+/// is shown not to be.
+#[test]
+fn rmsnorm_narrow_rows_sum_alike_at_every_covering_threadgroup() {
+    use scratchy_target_metal::tape::kernel_constants::{NORM_THREADS, norm_threads};
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let raw = |data: &[u16]| {
+        let buf = device
+            .newBufferWithLength_options(data.len() * 2, MTLResourceOptions::StorageModeShared)
+            .expect("newBuffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                buf.contents().as_ptr() as *mut u8,
+                data.len() * 2,
+            )
+        };
+        buf
+    };
+    let f16_bits = |v: f32| f16::from_f32(v).to_bits();
+    let bf16_bits = |v: f32| half::bf16::from_f32(v).to_bits();
+    for (act, bits) in [
+        ("f16", &f16_bits as &dyn Fn(f32) -> u16),
+        ("bf16", &bf16_bits),
+    ] {
+        for width in [256usize, 128, 80] {
+            // Enough rows that a different sum order shows through the outputs' rounding.
+            let rows = 4096;
+            let x: Vec<u16> = pseudo(43 + width as u64, rows * width, 3.0)
+                .into_iter()
+                .map(bits)
+                .collect();
+            let gain: Vec<u16> = pseudo(47, width, 0.5).into_iter().map(bits).collect();
+            let (in_buf, gain_buf) = (raw(&x), raw(&gain));
+            let run = |symbol: &str, threads: u32| {
+                let constants = RmsNormConstants {
+                    bucket_m: BucketM(rows as u32),
+                    q_size: QSize(width as u32),
+                    rms_norm_eps: RmsNormEps(1e-6),
+                    weight_offset: 1.0,
+                };
+                let mut constants: Vec<ConstantValue> = constants.into();
+                constants.retain(|c| c.index != 4);
+                constants.push(ConstantValue::uint(4, threads));
+                let pipeline = baked_pipeline(&device, "rmsnorm", symbol, constants).expect(symbol);
+                let out_buf = buf_zero(&device, rows * width * 2);
+                let size = |width| MTLSize {
+                    width,
+                    height: 1,
+                    depth: 1,
+                };
+                let buffers = [&out_buf, &in_buf, &gain_buf];
+                let ran = common::dispatch_threadgroups(
+                    &device,
+                    &pipeline,
+                    &buffers,
+                    size(rows),
+                    size(threads as usize),
+                );
+                let out = out_buf.contents().as_ptr() as *const u16;
+                ran.then(|| unsafe { std::slice::from_raw_parts(out, rows * width) }.to_vec())
+            };
+            let symbols = [
+                format!("rmsnorm_{act}_s_{act}_specialized"),
+                format!("rmsnorm_unit_{act}_specialized"),
+            ];
+            for symbol in &symbols {
+                let Some(want) = run(symbol, NORM_THREADS) else {
+                    return;
+                };
+                let covering = norm_threads(QSize(width as u32));
+                for threads in [covering, 2 * covering, 512] {
+                    let got = run(symbol, threads).expect("ran");
+                    assert_eq!(got, want, "{symbol} width {width} at {threads} threads");
+                }
+                // f16's 10 mantissa bits show a reordered sum; bf16's 7 hide nearly all of it.
+                if act == "f16" {
+                    let quarter = run(symbol, covering / 4).expect("ran");
+                    let differ = quarter.iter().zip(&want).filter(|(a, b)| a != b).count();
+                    assert!(
+                        differ > 0,
+                        "{symbol} width {width}: up to four elements a thread changed nothing"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
