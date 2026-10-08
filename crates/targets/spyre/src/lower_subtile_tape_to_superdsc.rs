@@ -4938,17 +4938,37 @@ mod tests {
             matmuls, 2,
             "each fp8 matmul still emits its OWN matmulfp8 (weight differs), got {matmuls}"
         );
-        // The FIRST chain op is likewise shared: one, not two. It is `abs` (`fq_absx_op`), not the
-        // `square` (`fq_sq_op`) this test named — the quantize chain became abs→max, and no op by the
-        // old name has existed for as long as this target failed to compile, so the assert was looking
-        // for zero of something and would have passed only by finding nothing.
+        // The FIRST chain op is likewise shared: one, not two. It is now the fused per-token scale
+        // (`fq_qspt_op` — `quantscalepertokenfp8`), which subsumed the `abs` (`fq_absx_op`) that
+        // subsumed the `square` (`fq_sq_op`) this test originally named.
+        //
+        // ⛔ THE NAME IS THE ONLY THING THAT MOVES HERE, AND AN OUT-OF-DATE NAME MAKES THIS ASSERT
+        // VACUOUS IN THE PASSING DIRECTION — it would be counting zero of something that no longer
+        // exists, which is exactly how the `fq_sq_op` spelling survived. So it is pinned to the op the
+        // chain ACTUALLY starts with, and the count stays exactly 1 (shared, not per-matmul).
         let first_chain_op = ops
             .iter()
-            .filter(|o| o.op_name.ends_with("fq_absx_op"))
+            .filter(|o| o.op_name.ends_with("fq_qspt_op"))
             .count();
         assert_eq!(
             first_chain_op, 1,
-            "the activation |x| must be shared too, got {first_chain_op}"
+            "the fused per-token activation scale must be shared too, got {first_chain_op}"
+        );
+        // ⭐ AND THE OP IT REPLACED MUST BE GONE, so a silent revert to the 4-op chain cannot leave this
+        // test green: `fq_absx_op` counting 1 and `fq_qspt_op` counting 1 would both hold if BOTH were
+        // emitted, and the assert above cannot see that.
+        let replaced = ops
+            .iter()
+            .filter(|o| {
+                o.op_name.ends_with("fq_absx_op")
+                    || o.op_name.ends_with("fq_amax_op")
+                    || o.op_name.ends_with("fq_amaxfl_op")
+                    || o.op_name.ends_with("fq_ascale_op")
+            })
+            .count();
+        assert_eq!(
+            replaced, 0,
+            "the 4 ops `quantscalepertokenfp8` subsumes must no longer be emitted, got {replaced}"
         );
     }
 
