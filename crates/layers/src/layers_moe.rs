@@ -97,13 +97,14 @@ pub struct DenseFusedMoELayer {
 /// * `expert_{gate,up}_{w,scales,biases}` — stacked per-expert affine
 ///   tensors with `out_features = intermediate_size`,
 ///   `in_features = hidden_size`. `w` is packed U32
-///   `[E, intermediate, hidden / pack_factor]`; `scales` and `biases`
+///   `[E, intermediate, ceil(hidden*bits/32)]`; `scales` and `biases`
 ///   are F16 `[E, intermediate, hidden / group_size]`.
 /// * `expert_down_{w,scales,biases}` — same triple but with
 ///   `out_features = hidden_size`, `in_features = intermediate_size`.
 ///
-/// `pack_factor = 32 / bits = 8` for bits=4 (the only configuration
-/// we ship). Reading order in `affine_gather_qmv` shaders is `[E, N, K]`
+/// The packed width follows the ceil law (bits=3 packs 8 elements per
+/// 3 bytes — a continuous bitstream, not `K / (32 / bits)`). Reading
+/// order in `affine_gather_qmv` shaders is `[E, N, K]`
 /// — matches the per-expert flatten the loader produces.
 pub struct AffineFusedMoELayer {
     /// Dense router projection `[num_experts, hidden_size]`,
@@ -290,6 +291,13 @@ pub struct AffineSharedFusedMoELayer {
     /// Shared expert sigmoid gate `[1, hidden]` dense F16/BF16.
     /// `MoeSharedExpertGate`.
     pub shared_expert_gate: Option<GpuTensor>,
+
+    /// `[num_experts]` F32 `e_score_correction_bias` for sigmoid routing
+    /// (GLM-4 / DeepSeek-V3 `noaux_tc` at `n_group = 1`): the BIASED
+    /// sigmoids order the top-k picks, the UNBIASED sigmoids are the
+    /// scores the experts scale by. `None` on every softmax-routed MoE
+    /// (Qwen, Mixtral).
+    pub e_score_correction_bias: Option<GpuTensor>,
 
     pub shared_intermediate_size: usize,
 }

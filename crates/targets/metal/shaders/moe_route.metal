@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // A MoE block's routing from its router logits, one threadgroup per token, in one command: the
-// program `moe_route.h` spells, over device rows — the softmax over the experts in place over the
-// logits.
+// program `moe_route.h` spells, over device rows — the softmax over the experts in place over
+// the logits.
 //
-// Bindings: logits @ 0 (in place under ROUTE_PRE), top-k indices @ 1, top-k scores @ 2,
-// per-expert scales @ 3 (bound under ROUTE_EXPERT_SCALE only). Dispatch (1, tokens, 1) ×
-// (BN, 1, 1).
+// Bindings: logits @ 0 (in place under ROUTE_PRE 1), top-k indices @ 1, top-k scores @ 2,
+// per-expert scales @ 3 (bound under ROUTE_EXPERT_SCALE only), the F32 e_score_correction_bias
+// @ 4 (bound under ROUTE_PRE 2 only). Dispatch (1, tokens, 1) × (BN, 1, 1).
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -17,6 +17,7 @@ using namespace metal;
 // `MoeRouteConstants`, compiled in.
 SCRATCHY_CONSTANT(int, ROUTE_EXPERTS, 0);
 SCRATCHY_CONSTANT(int, ROUTE_TOP_K, 1);
+// 0: none, 1: softmax, 2: F32 sigmoid + correction bias.
 SCRATCHY_CONSTANT(int, ROUTE_PRE, 2);
 SCRATCHY_CONSTANT_OPTIONAL(float, ROUTE_SCALE, 3);
 // 0: none, 1: softmax, 2: renorm.
@@ -29,6 +30,7 @@ template <typename T, short BN>
     device uint*    inds         [[buffer(1)]],
     device T*       scores       [[buffer(2)]],
     const device T* expert_scale [[buffer(3)]],
+    const device float* bias     [[buffer(4)]],
     uint3 tid           [[threadgroup_position_in_grid]],
     uint3 lid           [[thread_position_in_threadgroup]],
     uint  simd_lane_id  [[thread_index_in_simdgroup]],
@@ -41,9 +43,10 @@ template <typename T, short BN>
   device T* row_logits = logits + size_t(row) * E;
   device T* row_scores = scores + size_t(row) * K;
   device uint* row_inds = inds + size_t(row) * K;
-  route_top_k<T, E, K, ROUTE_PRE != 0>(
-      row_logits, row_logits, row_inds, lid.x, simd_lane_id, simd_group_id, local_a, local_b);
-  route_scores<T, K, ROUTE_PRE != 0, ROUTE_SCALE_SET, ROUTE_POST, ROUTE_EXPERT_SCALE != 0>(
+  route_top_k<T, E, K, ROUTE_PRE>(
+      row_logits, row_logits, row_inds, bias, lid.x, simd_lane_id, simd_group_id, local_a,
+      local_b);
+  route_scores<T, K, ROUTE_PRE, ROUTE_SCALE_SET, ROUTE_POST, ROUTE_EXPERT_SCALE != 0>(
       row_logits, row_logits, row_inds, row_scores, expert_scale, ROUTE_SCALE, lid.x,
       simd_lane_id, simd_group_id, local_a, local_b);
 }

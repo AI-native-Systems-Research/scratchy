@@ -494,14 +494,38 @@ pub enum MoeStep {
 /// the router says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RouteProgram {
-    /// A softmax over every expert before the sort (Qwen's shared-expert router).
-    pub pre_softmax: bool,
+    /// What the logits go through before the sort.
+    pub pre: RoutePre,
     /// The top-k scores times a constant (Gemma's `hidden^-0.5`).
     pub scale: Option<Scale>,
     /// What the top-k scores go through next.
     pub post: RoutePost,
     /// Each score times its expert's learned scale, from layer `l`'s router (Gemma).
     pub expert_scale: Option<LayerId>,
+}
+
+/// What a routing's logits go through before the sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutePre {
+    /// Nothing — sorted raw (Mixtral's).
+    None,
+    /// A softmax over every expert (Qwen's shared-expert router).
+    Softmax,
+    /// A sigmoid in F32, each expert's plus its F32 `e_score_correction_bias` ordering the
+    /// top-k picks and the UNBIASED sigmoids read back as the scores (GLM-4 / DeepSeek-V3
+    /// `noaux_tc` at `n_group = 1`). The bias, layer `l`'s router bundle's F32 tensor, is
+    /// read back by the route command like the router gate.
+    SigmoidBias(LayerId),
+}
+
+impl RoutePre {
+    /// The layer whose router bundle holds the pre's weight, if it reads one.
+    pub fn layer(&self) -> Option<LayerId> {
+        match *self {
+            Self::None | Self::Softmax => None,
+            Self::SigmoidBias(l) => Some(l),
+        }
+    }
 }
 
 /// The top-k scores' last row-wide step.
@@ -611,8 +635,18 @@ impl MetalStep {
                 | MoeStep::ExpertScale(l)
                 | MoeStep::ExpertMatmul(ExpertMatmul { layer: l, .. })
                 | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
-                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, ..)
-                | MoeStep::Route(RouteProgram {
+                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, ..),
+            ) => Some(l),
+            S::Moe(
+                _,
+                MoeStep::Route(RouteProgram {
+                    pre: RoutePre::SigmoidBias(l),
+                    ..
+                }),
+            )
+            | S::Moe(
+                _,
+                MoeStep::Route(RouteProgram {
                     expert_scale: Some(l),
                     ..
                 }),

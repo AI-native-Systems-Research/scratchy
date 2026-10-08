@@ -143,7 +143,7 @@ pub enum FoldPattern<K: 'static> {
     Route {
         top_k: SubOpKind,
         sort: SubOpKind,
-        pre: SubOpKind,
+        pre: &'static [SubOpKind],
         gather: SubOpKind,
         tail: &'static [&'static [SubOpKind]; ROUTE_TAIL_STAGES],
         kernel: K,
@@ -817,7 +817,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 tail,
                 kernel,
                 ..
-            } => self.route(i, [sort, pre, gather], tail, kernel),
+            } => self.route(i, sort, pre, gather, tail, kernel),
             FoldPattern::Encoded { encode, kernel, .. } => {
                 self.encoded(i, encode, kernel);
                 Ok(())
@@ -1098,11 +1098,18 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             && self.ops.kind(c) == add
             && free(self, c)
         {
-            let at = (0..2u8).find(|&k| self.ops.in_op(c, k).ok().flatten() == Some(cur));
-            if let Some(k) = at
-                && ready(self, c, 1 - k)?
-            {
-                residual = Some((c, self.ops.operand(c, 1 - k)));
+            // The add writes over its operand 1 — the colour rule's accumulator —
+            // and the epilogue's kernel adds its dot into THAT buffer, reading the
+            // residual from it. So the chain must be the delta at operand 0, with
+            // the residual the accumulator at operand 1: then the add's output
+            // colour (operand 1's) IS the residual's, by construction. A chain in
+            // the accumulator position (GLM's `routed + shared`, where the shared
+            // matvec's rows are operand 1) must NOT absorb — `ready` alone does not
+            // save it, the routed combine precedes the shared expert: the kernel
+            // would add its dot into its own output buffer and the true residual —
+            // the routed experts' whole contribution — would never be read.
+            if self.ops.in_op(c, 0).ok().flatten() == Some(cur) && ready(self, c, 1)? {
+                residual = Some((c, self.ops.operand(c, 1)));
                 chain.push(c);
             }
         }
@@ -1263,7 +1270,9 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
     fn route(
         &mut self,
         i: usize,
-        [sort, pre, gather]: [SubOpKind; 3],
+        sort: SubOpKind,
+        pre: &'static [SubOpKind],
+        gather: SubOpKind,
         tail: &[&[SubOpKind]; ROUTE_TAIL_STAGES],
         kernel: K,
     ) -> Result<(), FoldError> {
@@ -1286,7 +1295,8 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let Some(g) = g else {
             return Ok(());
         };
-        let pre = logits.filter(|&l| ops.kind(l) == pre && self.consumers[l] == 2 && free(l));
+        let pre =
+            logits.filter(|&l| pre.contains(&ops.kind(l)) && self.consumers[l] == 2 && free(l));
         let mut stages = [None; ROUTE_TAIL_STAGES];
         let (mut cur, mut next) = (g, 0);
         while self.consumers[cur] == 1 {
@@ -1756,7 +1766,7 @@ mod tests {
                 FoldPattern::Route {
                     top_k: K::RouteTopK,
                     sort: K::RouteArgsort,
-                    pre: K::RouteSoftmax,
+                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias],
                     gather: K::RouteGatherScores,
                     tail: &[
                         &[K::RouteScale],
@@ -2188,12 +2198,15 @@ mod tests {
         let bias = || SubOp::Elementwise(EwKind::BiasAdd);
         let scale = || SubOp::ScalarMul { scale: 0.25 };
         let src = [(1, 64), (64, 64), (1, 64)];
-        // gemm → bias → scale → add(residual, ·) → norm: every step after the gemm is its chain.
+        // gemm → bias → scale → add(delta, residual) → norm: every step after the gemm is its
+        // chain. The chain MUST be the delta at operand 0: the epilogue's kernel adds its dot
+        // into y reading the residual from y, so the add's output colour (operand 1's, the
+        // accumulator) has to BE the residual's — which only the delta-at-0 spelling gives.
         let ops = vec![
             gemm(64, vec![Ext(0), Ext(1)]),
             op(bias(), 1, vec![Op(0), Ext(1)]),
             op(scale(), 1, vec![Op(1)]),
-            op(ADD, 1, vec![Ext(0), Op(2)]),
+            op(ADD, 1, vec![Op(2), Ext(0)]),
             norm(vec![Op(3), Ext(2)]),
         ];
         let (s, f) = fold(&src, weights(3), ops.clone(), &[], &TABLE, ENDS);
@@ -2210,7 +2223,7 @@ mod tests {
                     s[3],
                     StepOperand {
                         step: s[3],
-                        operand: OperandIx(0),
+                        operand: OperandIx(1),
                     },
                 )),
             },
@@ -2222,6 +2235,32 @@ mod tests {
         let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, SPLIT);
         assert_eq!(f.role(s[3]), StepRole::Absorbed { into: s[4] });
         assert!(f.driven(s[0]).is_empty());
+
+        // The accumulator spelling — `add(residual, delta)`, the chain at operand 1 — must NOT
+        // fold: the kernel would add its dot into its own output buffer and the true residual
+        // (operand 0) would never be read. GLM-4.5's moe sum (`routed + shared`) is spelled
+        // this way; folding it dropped every routed expert's contribution at M1.
+        let ops = vec![
+            gemm(64, vec![Ext(0), Ext(1)]),
+            op(bias(), 1, vec![Op(0), Ext(1)]),
+            op(scale(), 1, vec![Op(1)]),
+            op(ADD, 1, vec![Ext(0), Op(2)]),
+            norm(vec![Op(3), Ext(2)]),
+        ];
+        let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[1]), StepRole::Absorbed { into: s[0] });
+        // The chain now ends at the scale: a bias+scale epilogue, no residual add. The add
+        // itself still folds into the norm that reads it (the ResidualNorm pattern).
+        assert_eq!(f.role(s[2]), StepRole::Epilogue { of: s[0] });
+        assert_eq!(f.role(s[3]), StepRole::Absorbed { into: s[4] });
+        let shape = f.driven(s[0]);
+        assert!(matches!(
+            &shape[..],
+            [Fusion {
+                shape: FusedShape::MatvecEpilogue { add: None, .. },
+                ..
+            }]
+        ));
 
         // A bias alone, read by a step no gated fold takes: its epilogue. Read by a gated
         // activation, it stays: the gated folds take the matmul whole.

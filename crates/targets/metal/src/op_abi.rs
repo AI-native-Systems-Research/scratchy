@@ -144,6 +144,7 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         L::RouterNorm { .. }
         | L::RouterLogits { .. }
         | L::RouteSoftmax
+        | L::RouteSigmoidBias { .. }
         | L::RouteArgsort
         | L::RouteTopK { .. }
         | L::RouteGatherScores
@@ -246,6 +247,10 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
         L::RouteArgsort => W::Region(R::SortedExperts),
         L::RouteTopK { .. } => W::Region(R::TopKIndices),
         L::RouteGatherScores => W::Region(R::TopKScores),
+        // Fold-only pre: no command of its own (the biased keys and the unbiased scores cannot
+        // share a buffer), but it colours with the logits it rewrites, like the softmax it
+        // generalizes.
+        L::RouteSigmoidBias { .. } => W::OverOperand(OperandIx(0)),
         L::RouteSoftmax
         | L::RouteScale { .. }
         | L::RouteRenorm
@@ -467,12 +472,13 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     matmul: K::ExpertMatmul,
                     kernel: F::MoeDownCombine,
                 },
-                // `moe_route.metal`'s program: a softmax over every expert first, then the scores
+                // `moe_route.metal`'s program: a softmax over every expert first (Qwen) or the
+                // F32 sigmoid + correction bias GLM-4's noaux_tc routes by, then the scores
                 // scaled, softmaxed or renormalized, and scaled per expert.
                 FoldPattern::Route {
                     top_k: K::RouteTopK,
                     sort: K::RouteArgsort,
-                    pre: K::RouteSoftmax,
+                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias],
                     gather: K::RouteGatherScores,
                     tail: &[
                         &[K::RouteScale],

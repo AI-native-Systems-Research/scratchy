@@ -16,6 +16,7 @@
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
+use scratchy_target_metal::cpu_reference::affine_qmv_b3_bf16_s_bf16;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -569,4 +570,423 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
     };
     within(&c, &run(&plain, false), &want).expect("the norm then gated matvec");
     within(&c, &run(&normed, true), &want).expect("the normalizing gated matvec");
+}
+
+/// 3-bit normed+biased `affine_qmv_fast` — GLM-4.5-Air-3bit's M1 decode
+/// shape exactly: every q/k/v projection runs `affine_qmv_fast` with
+/// `QmvEnds { norm, bias }` (slots 8/9/11 set, gain at buffer 15, the
+/// projection's linear bias at 16), k=4096 n=12288 bf16/bf16 gs=64 b3.
+/// The b4 tests above never cover this: the M1 tape is the only place
+/// norm and bias fold together, and the b3 pack law (8 codes / 3 bytes)
+/// is new. CPU reference is `affine_qmv_b3_bf16_s_bf16` (the same
+/// `cpu_reference::affine_qmm_t_b3` the gather parity test uses) on the
+/// explicitly normed row, plus the bias.
+#[test]
+fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
+    // GLM q_proj (k=4096, n=12288) — Fast; and a small-K case exercising
+    // the tail-less k%512==0 requirement at a different aspect.
+    for (k, n, seed) in [
+        (4096usize, 12288usize, 0x5A17u64),
+        (512usize, 1024usize, 0x5A18u64),
+    ] {
+        let group_size = 64usize;
+        let bits = 3u32;
+        let c = Case {
+            dtype: Dtype::Bf16,
+            group_size,
+            k,
+            n,
+            offset: 0.0,
+        };
+        let Some(r) = rig(&c) else { return };
+
+        // The b3 pipeline: same constants path as the b4 rig, but the b3
+        // kernel name. `pick_qmv_kernel` picks Fast for both shapes.
+        let cache = SpecializedPipelineCache::new(r.device.clone(), &[]).expect("shaders");
+        let name = qmv_kernel_static_name(
+            c.kernel(),
+            c.dtype.dequant(),
+            c.dtype.scale(),
+            bits,
+            group_size as u32,
+        );
+        assert!(
+            name.contains("affine_qmv_fast") && name.contains("b_3"),
+            "picked {name}"
+        );
+        let mut v: Vec<ConstantValue> = AffineQmvConstants {
+            k: KDimI32(c.k as i32),
+            n: NDimI32(c.n as i32),
+            codes: AffineCodes::AsWritten,
+        }
+        .into();
+        // norm + bias, the M1 q/k/v ends: eps at 8, offset at 9, bias flag
+        // at 11 — `QmvEnds { norm, bias }` via the lowering's own From.
+        v.extend(Vec::<ConstantValue>::from(normed(&c)));
+        v.extend(Vec::<ConstantValue>::from(ending(false)));
+        let pso = baked_build(&cache, &PipelineKey::new("quantized_qmv", name, v)).expect(name);
+
+        // b3 weights: n*k*3/8 random bytes, realistic bf16 scales/biases.
+        let mut rng = Lcg(seed);
+        let packed: Vec<u8> = (0..n * k * 3 / 8).map(|_| rng.next() as u8).collect();
+        let groups = n * k / group_size;
+        let scales: Vec<bf16> = (0..groups)
+            .map(|_| c.dtype.bits(0.0008 + 0.0004 * rng.unit().abs()))
+            .map(|b| bf16::from_bits(b))
+            .collect();
+        let biases: Vec<bf16> = (0..groups)
+            .map(|_| c.dtype.bits(-0.1 + 0.02 * rng.unit()))
+            .map(|b| bf16::from_bits(b))
+            .collect();
+        let (x, gain) = inputs(&c, &mut rng);
+        let linear_bias: Vec<bf16> = (0..n)
+            .map(|_| c.dtype.bits(0.25 * rng.unit()))
+            .map(|b| bf16::from_bits(b))
+            .collect();
+
+        // The exact row: rmsnorm(x, gain) in f64, rounded to bf16 per
+        // element (the kernel loads it as T_act), then the b3 reference.
+        let xf: Vec<f32> = x.iter().map(|&b| c.dtype.value(b)).collect();
+        let gainf: Vec<f32> = gain.iter().map(|&b| c.dtype.value(b)).collect();
+        let ms = xf.iter().map(|v| v * v).sum::<f32>() / k as f32;
+        let inv = 1.0 / (ms + EPS).sqrt();
+        let xn: Vec<bf16> = (0..k)
+            .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
+            .collect();
+
+        let want = affine_qmv_b3_bf16_s_bf16(&packed, &scales, &biases, &xn, 1, n, k, group_size);
+
+        // Dispatch with the M1 binding layout: w/scales/biases at 0/1/2,
+        // x at 3, y at 4, gain at 15, linear bias at 16.
+        let (wb, sb, bb) = (
+            shared(&r.device, &packed),
+            shared(&r.device, &scales),
+            shared(&r.device, &biases),
+        );
+        let (xb, gb, lb) = (
+            shared(&r.device, &x),
+            shared(&r.device, &gain),
+            shared(&r.device, &linear_bias),
+        );
+        let y = shared(&r.device, &vec![0u16; n]);
+        let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
+        let (grid, threads) = qmv_dispatch_shape(c.kernel(), 1, n as u32, 1);
+        let binds = [
+            (&wb, 0),
+            (&sb, 1),
+            (&bb, 2),
+            (&xb, 3),
+            (&y, 4),
+            (&gb, 15),
+            (&lb, 16),
+        ];
+        batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+        batch.commit(true);
+
+        // Compare: the reference IS the biased output (the CPU fn has no
+        // epilogue), so add the linear bias to it here.
+        let got = read_u16(&y, n);
+        let mut max_err = 0.0_f32;
+        let mut worst = 0usize;
+        for i in 0..n {
+            let g = c.dtype.value(got[i]);
+            let w = want[i].to_f32() + linear_bias[i].to_f32();
+            let err = (g - w).abs();
+            if err > max_err {
+                max_err = err;
+                worst = i;
+            }
+        }
+        // b3 codes span ±7·scale; with k=4096 and bf16 x, the dot's
+        // magnitude is O(1); 3% absolute covers bf16 rounding at both
+        // the xn round and the output.
+        assert!(
+            max_err < 3e-2 || max_err / want[worst].to_f32().abs().max(1e-3) < 0.2,
+            "b3 normed+biased k={k} n={n}: row {worst} got {} want {} max_err {max_err}",
+            c.dtype.value(got[worst]),
+            want[worst].to_f32() + linear_bias[worst].to_f32(),
+        );
+        eprintln!("b3 normed+biased affine_qmv_fast k={k} n={n} max_err={max_err:.3e}");
+    }
+}
+
+/// The o-projection's M1 end at GLM: NORM + bias + RESIDUAL (slot 10) —
+/// the epilogue fused with the residual add, no scale. The b4 rig's
+/// `ending(true)` covers scale+residual but not this norm+residual pairing,
+/// and no b3 test has covered slot 10 at all.
+#[test]
+fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
+    use scratchy_target_metal::cpu_reference::affine_qmv_b3_bf16_s_bf16;
+
+    // The o-proj shape: k=4096 (attn output), n=4096 (hidden).
+    let (k, n, seed) = (4096usize, 4096usize, 0x5A19u64);
+    let group_size = 64usize;
+    let bits = 3u32;
+    let c = Case {
+        dtype: Dtype::Bf16,
+        group_size,
+        k,
+        n,
+        offset: 0.0,
+    };
+    let Some(r) = rig(&c) else { return };
+    let cache = SpecializedPipelineCache::new(r.device.clone(), &[]).expect("shaders");
+    let name = qmv_kernel_static_name(
+        c.kernel(),
+        c.dtype.dequant(),
+        c.dtype.scale(),
+        bits,
+        group_size as u32,
+    );
+    assert!(
+        name.contains("affine_qmv_fast") && name.contains("b_3"),
+        "picked {name}"
+    );
+    // norm (8/9) + bias (11) + residual (10): the o-proj's M1 end.
+    let mut v: Vec<ConstantValue> = AffineQmvConstants {
+        k: KDimI32(c.k as i32),
+        n: NDimI32(c.n as i32),
+        codes: AffineCodes::AsWritten,
+    }
+    .into();
+    v.extend(Vec::<ConstantValue>::from(normed(&c)));
+    v.extend(Vec::<ConstantValue>::from(QmvEnds {
+        bias: Some(BiasStorage::Affine),
+        scale: None,
+        residual: true,
+        ..QmvEnds::default()
+    }));
+    let pso = baked_build(&cache, &PipelineKey::new("quantized_qmv", name, v)).expect(name);
+
+    // b3 weights + inputs, same recipe as the q/k/v test.
+    let mut rng = Lcg(seed);
+    let packed: Vec<u8> = (0..n * k * 3 / 8).map(|_| rng.next() as u8).collect();
+    let groups = n * k / group_size;
+    let scales: Vec<bf16> = (0..groups)
+        .map(|_| c.dtype.bits(0.0008 + 0.0004 * rng.unit().abs()))
+        .map(|b| bf16::from_bits(b))
+        .collect();
+    let biases: Vec<bf16> = (0..groups)
+        .map(|_| c.dtype.bits(-0.1 + 0.02 * rng.unit()))
+        .map(|b| bf16::from_bits(b))
+        .collect();
+    let (x, gain) = inputs(&c, &mut rng);
+    let linear_bias: Vec<bf16> = (0..n)
+        .map(|_| c.dtype.bits(0.25 * rng.unit()))
+        .map(|b| bf16::from_bits(b))
+        .collect();
+    // The residual row already in y: QMV_ADDS adds into it.
+    let residual: Vec<bf16> = (0..n)
+        .map(|_| c.dtype.bits(4.0 * rng.unit()))
+        .map(|b| bf16::from_bits(b))
+        .collect();
+
+    // The exact row: rmsnorm(x, gain) rounded to bf16, b3 reference;
+    // the kernel adds bias in f32 then adds into the residual row —
+    // `qmv_store`: one rounding of the sum.
+    let xf: Vec<f32> = x.iter().map(|&b| c.dtype.value(b)).collect();
+    let gainf: Vec<f32> = gain.iter().map(|&b| c.dtype.value(b)).collect();
+    let ms = xf.iter().map(|v| v * v).sum::<f32>() / k as f32;
+    let inv = 1.0 / (ms + EPS).sqrt();
+    let xn: Vec<bf16> = (0..k)
+        .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
+        .collect();
+    let want = affine_qmv_b3_bf16_s_bf16(&packed, &scales, &biases, &xn, 1, n, k, group_size);
+
+    let (wb, sb, bb) = (
+        shared(&r.device, &packed),
+        shared(&r.device, &scales),
+        shared(&r.device, &biases),
+    );
+    let (xb, gb, lb) = (
+        shared(&r.device, &x),
+        shared(&r.device, &gain),
+        shared(&r.device, &linear_bias),
+    );
+    // y starts as the residual row.
+    let y = shared(&r.device, &residual);
+    let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
+    let (grid, threads) = qmv_dispatch_shape(c.kernel(), 1, n as u32, 1);
+    let binds = [
+        (&wb, 0),
+        (&sb, 1),
+        (&bb, 2),
+        (&xb, 3),
+        (&y, 4),
+        (&gb, 15),
+        (&lb, 16),
+    ];
+    batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+    batch.commit(true);
+
+    let got = read_u16(&y, n);
+    let mut max_err = 0.0_f32;
+    let mut worst = 0usize;
+    for i in 0..n {
+        let g = c.dtype.value(got[i]);
+        // The kernel: T(bf16(f32(*y) + (dot + bias))) — the sum of the
+        // stored residual and the biased dot, one bf16 rounding.
+        let r = residual[i].to_f32() + want[i].to_f32() + linear_bias[i].to_f32();
+        let err = (g - r).abs();
+        if err > max_err {
+            max_err = err;
+            worst = i;
+        }
+    }
+    assert!(
+        max_err < 5e-2
+            || max_err / (want[worst].to_f32().abs() + residual[worst].to_f32()).max(1e-3) < 0.2,
+        "b3 normed+residual o-proj: row {worst} got {} want {} max_err {max_err}",
+        c.dtype.value(got[worst]),
+        residual[worst].to_f32() + want[worst].to_f32() + linear_bias[worst].to_f32(),
+    );
+    eprintln!("b3 normed+residual affine_qmv_fast k={k} n={n} max_err={max_err:.3e}");
+}
+
+/// 3-bit `affine_qmv_gated_fast` — the M1-only dense gated path (GLM's
+/// layer-0 MLP + 45 shared experts, 46 dispatches in the M1 tape): gate and
+/// up matvecs write into THREADGROUP memory (`rows[2][8]`) and lanes 0-7 of
+/// simdgroup 0 apply silu(g)·u. M2+ buckets never emit this kernel. The
+/// b3 pack law inside the threadgroup-output path is the new surface; the
+/// reference is `affine_qmv_b3_bf16_s_bf16` per projection, then silu-mul.
+#[test]
+fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
+    // GLM shared expert: k=4096 (hidden), n=1408 (intermediate). Fast (n%8,
+    // k%512). Also the layer-0 MLP's down shape k=10944 is covered by the
+    // plain-qmv family; here gate/up at (4096, 1408).
+    for (k, n, seed) in [
+        (4096usize, 1408usize, 0x7B03u64),
+        (512usize, 256usize, 0x7B04u64),
+    ] {
+        let group_size = 64usize;
+        let bits = 3u32;
+        let c = Case {
+            dtype: Dtype::Bf16,
+            group_size,
+            k,
+            n,
+            offset: 0.0,
+        };
+        let Some(r) = rig(&c) else { return };
+        let cache = SpecializedPipelineCache::new(r.device.clone(), &[]).expect("shaders");
+        let name: &'static str = Box::leak(
+            format!("affine_qmv_gated_fast_bf16_s_bf16_gs_{group_size}_b_{bits}").into_boxed_str(),
+        );
+        let mut v: Vec<ConstantValue> = AffineGatedQmvConstants {
+            qmv: AffineQmvConstants {
+                k: KDimI32(c.k as i32),
+                n: NDimI32(c.n as i32),
+                codes: AffineCodes::AsWritten,
+            },
+            act: GatedAct::Silu,
+        }
+        .into();
+        // The M1 dense gated carries the norm (input is the post-attention
+        // norm's row) but no bias — matches C8's CS7 (slots 8/9 only).
+        v.extend(Vec::<ConstantValue>::from(normed(&c)));
+        let pso = baked_build(&cache, &PipelineKey::new("quantized_qmv", name, v)).expect(name);
+
+        let mut rng = Lcg(seed);
+        let mut pack = || -> (Vec<u8>, Vec<bf16>, Vec<bf16>) {
+            let packed: Vec<u8> = (0..n * k * 3 / 8).map(|_| rng.next() as u8).collect();
+            let groups = n * k / group_size;
+            let scales: Vec<bf16> = (0..groups)
+                .map(|_| bf16::from_bits(c.dtype.bits(0.0008 + 0.0004 * rng.unit().abs())))
+                .collect();
+            let biases: Vec<bf16> = (0..groups)
+                .map(|_| bf16::from_bits(c.dtype.bits(-0.1 + 0.02 * rng.unit())))
+                .collect();
+            (packed, scales, biases)
+        };
+        let (g_packed, g_scales, g_biases) = pack();
+        let (u_packed, u_scales, u_biases) = pack();
+        let (x, gain) = inputs(&c, &mut rng);
+
+        // Exact: rmsnorm(x, gain) rounded to bf16, then each projection's
+        // b3 reference, then silu(g)·u in f32.
+        let xf: Vec<f32> = x.iter().map(|&b| c.dtype.value(b)).collect();
+        let gainf: Vec<f32> = gain.iter().map(|&b| c.dtype.value(b)).collect();
+        let ms = xf.iter().map(|v| v * v).sum::<f32>() / k as f32;
+        let inv = 1.0 / (ms + EPS).sqrt();
+        let xn: Vec<bf16> = (0..k)
+            .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
+            .collect();
+        let g =
+            affine_qmv_b3_bf16_s_bf16(&g_packed, &g_scales, &g_biases, &xn, 1, n, k, group_size);
+        let u =
+            affine_qmv_b3_bf16_s_bf16(&u_packed, &u_scales, &u_biases, &xn, 1, n, k, group_size);
+
+        let (gw, gs, gb) = (
+            shared(&r.device, &g_packed),
+            shared(&r.device, &g_scales),
+            shared(&r.device, &g_biases),
+        );
+        let (uw, us, ub) = (
+            shared(&r.device, &u_packed),
+            shared(&r.device, &u_scales),
+            shared(&r.device, &u_biases),
+        );
+        let (xb, gb2) = (shared(&r.device, &x), shared(&r.device, &gain));
+        let y = shared(&r.device, &vec![0u16; n]);
+        let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
+        // Dispatch (1, ceil(n/8), 1) x (32, 4, 1) — the gated kernel's own
+        // shape (4 simdgroups: 0-1 gate, 2-3 up).
+        let binds = [
+            (&gw, 0),
+            (&gs, 1),
+            (&gb, 2),
+            (&xb, 3),
+            (&y, 4),
+            (&uw, 5),
+            (&us, 6),
+            (&ub, 7),
+            (&gb2, 15),
+        ];
+        batch.encode(
+            &pso,
+            &binds,
+            &[],
+            &[],
+            &[],
+            size((1, n as u32 / 8, 1)),
+            size((32, 4, 1)),
+        );
+        batch.commit(true);
+
+        let got = read_u16(&y, n);
+        let mut max_err = 0.0_f32;
+        let mut worst = 0usize;
+        for i in 0..n {
+            let gv = g[i].to_f32();
+            let uv = u[i].to_f32();
+            let want = (gv / (1.0 + (-gv).exp())) * uv;
+            let have = c.dtype.value(got[i]);
+            let err = (have - want).abs();
+            if err > max_err {
+                max_err = err;
+                worst = i;
+            }
+        }
+        assert!(
+            max_err < 3e-2 || max_err / g[worst].to_f32().abs().max(1e-3) < 0.2,
+            "b3 gated k={k} n={n}: row {worst} got {} want {} max_err {max_err}",
+            c.dtype.value(got[worst]),
+            g[worst].to_f32(),
+        );
+        // Discrimination dump: the error structure across rows (is it
+        // proportional to |g| — a missing/mis-scaled term — or noise?).
+        let mut errs = Vec::new();
+        for i in 0..n {
+            let gv = g[i].to_f32();
+            let uv = u[i].to_f32();
+            let want = (gv / (1.0 + (-gv).exp())) * uv;
+            let have = c.dtype.value(got[i]);
+            errs.push(((have - want).abs(), want, gv, uv, have));
+        }
+        errs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        eprintln!("b3 gated affine_qmv_gated_fast k={k} n={n} max_err={max_err:.3e}");
+        for &(e, w, gv, uv, have) in errs.iter().take(5) {
+            eprintln!("  err={e:.4} want={w:.4} g={gv:.4} u={uv:.4} got={have:.4}");
+        }
+    }
 }

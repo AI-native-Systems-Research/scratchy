@@ -69,6 +69,10 @@ pub mod gemma4;
 #[path = "arch/gemma4_moe.rs"]
 pub mod gemma4_moe;
 
+#[cfg(all(feature = "arch-glm4-moe", feature = "metal"))]
+#[path = "arch/glm4_moe.rs"]
+pub mod glm4_moe;
+
 #[cfg(all(
     feature = "arch-granite",
     any(feature = "cuda", feature = "metal", feature = "spyre")

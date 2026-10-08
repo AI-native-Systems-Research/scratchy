@@ -247,3 +247,73 @@ DEFINE_AFFINE_EMBED_B8(bf16, bfloat, bf16, bfloat, 128)
 DEFINE_AFFINE_EMBED_B8(f16,  half,   bf16, bfloat, 32)
 DEFINE_AFFINE_EMBED_B8(f16,  half,   bf16, bfloat, 64)
 DEFINE_AFFINE_EMBED_B8(f16,  half,   bf16, bfloat, 128)
+
+// affine_embed_b3_kernel — 3-bit sibling (GLM-4.5-Air-3bit ships a
+// quantized embed at bits=3). MLX's 3-bit packing is a continuous
+// LSB-first bitstream where 8 codes span exactly 3 bytes — and since
+// group_size is a multiple of 8, every 8-code run is byte-anchored —
+// so each thread owns one 3-byte pack and writes 8 output elements.
+// Code shifts are MLX's own `qdot` bits==3 branch
+// (mlx_quantized/quantized_loader.h:64-77); no XOR path (Offset8 is
+// 4-bit-only), codes read as written.
+//
+// 2D grid:
+//   index.x = 8-element pack within a token row  ∈ [0, hidden_size / 8)
+//   index.y = output token row                   ∈ [0, num_tokens)
+// Bindings match affine_embed_b4: w [vocab, ceil(hidden*3/32)] u8-viewed,
+// scales/biases [vocab, hidden / group_size], indices, out.
+template <typename T_act, typename T_scale, const int group_size>
+inline void affine_embed_b3_kernel(
+    const device uint8_t* w,
+    const device T_scale* scales,
+    const device T_scale* biases,
+    const device uint* indices,
+    device T_act* out,
+    uint hidden_size,
+    uint2 index) {
+    if (index.x * 8 >= hidden_size) return;
+    uint vocab_idx = indices[index.y];
+    size_t bytes_per_row  = size_t(hidden_size) / 8 * 3;
+    size_t groups_per_row = size_t(hidden_size) / group_size;
+
+    size_t w_offset    = size_t(vocab_idx) * bytes_per_row + size_t(index.x) * 3;
+    size_t out_col     = size_t(index.x) * 8;
+    size_t gindex      = size_t(vocab_idx) * groups_per_row + (out_col / group_size);
+    size_t out_offset  = size_t(index.y) * size_t(hidden_size) + out_col;
+
+    // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7).
+    T_act scale = static_cast<T_act>(scales[gindex]);
+    T_act bias  = static_cast<T_act>(biases[gindex]);
+    const uint8_t b0 = w[w_offset + 0];
+    const uint8_t b1 = w[w_offset + 1];
+    const uint8_t b2 = w[w_offset + 2];
+
+    out[out_offset + 0] = scale * T_act(b0 & 0x7)               + bias;
+    out[out_offset + 1] = scale * T_act((b0 & 0x38) >> 3)       + bias;
+    out[out_offset + 2] = scale * T_act(((b0 & 0xc0) >> 6) + ((b1 & 0x1) << 2)) + bias;
+    out[out_offset + 3] = scale * T_act((b1 & 0xe) >> 1)        + bias;
+    out[out_offset + 4] = scale * T_act((b1 & 0x70) >> 4)       + bias;
+    out[out_offset + 5] = scale * T_act(((b1 & 0x80) >> 7) + ((b2 & 0x3) << 1)) + bias;
+    out[out_offset + 6] = scale * T_act((b2 & 0x1c) >> 2)       + bias;
+    out[out_offset + 7] = scale * T_act((b2 & 0xe0) >> 5)       + bias;
+}
+
+template <typename T_act, typename T_scale, const int group_size>
+[[kernel]] void affine_embed_b3(
+    const device uint8_t* w        [[buffer(0)]],
+    const device T_scale* scales   [[buffer(1)]],
+    const device T_scale* biases   [[buffer(2)]],
+    const device uint*    indices  [[buffer(3)]],
+    device T_act* out              [[buffer(4)]],
+    uint2 index    [[thread_position_in_grid]]) {
+    affine_embed_b3_kernel<T_act, T_scale, group_size>(
+        w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);
+}
+
+#define DEFINE_AFFINE_EMBED_B3(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_3,    \
+                  affine_embed_b3<act_type, scale_type, gs>)
+
+// GLM-4.5-Air-3bit ships bf16 activations + bf16 scales, gs=64.
+DEFINE_AFFINE_EMBED_B3(bf16, bfloat, bf16, bfloat, 64)
+DEFINE_AFFINE_EMBED_B3(f16,  half,   f16,  half,   64)

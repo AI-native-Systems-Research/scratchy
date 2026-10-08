@@ -243,7 +243,7 @@ pub enum QuantMethod {
     ///     `mlx-community/Meta-Llama-3-8B-Instruct-4bit`.
     ///   * `true` (`mlx-affine-b<bits>-g<gs>-qembed` preset) —
     ///     newer convert behavior: `embed_tokens` is also quantized
-    ///     to the full affine triple `[vocab, hidden / pack_factor]`
+    ///     to the full affine triple `[vocab, ceil(hidden*bits/32)]`
     ///     U32 + `.scales`/`.biases` F16. Verified against
     ///     `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`.
     ///
@@ -503,10 +503,10 @@ fn parse_affine_no_method(
             field: "group_size",
             reason: "missing or not a u64",
         })? as u32;
-    if !matches!(bits, 4 | 8) {
+    if !matches!(bits, 3 | 4 | 8) {
         return Err(ParseError::BadField {
             field: "bits",
-            reason: "MLX-affine scratchy path handles a 4-bit or 8-bit default",
+            reason: "MLX-affine scratchy path handles a 3-bit, 4-bit or 8-bit default",
         });
     }
     if !matches!(group_size, 32 | 64 | 128) {
@@ -589,10 +589,10 @@ fn parse_affine_no_method(
             .get("group_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(group_size as u64) as u32;
-        if !matches!(mb, 4 | 8) {
+        if !matches!(mb, 3 | 4 | 8) {
             return Err(ParseError::BadField {
                 field: "quantization.<module>.bits",
-                reason: "per-module MLX-affine bits must be 4 or 8",
+                reason: "per-module MLX-affine bits must be 3, 4 or 8",
             });
         }
         if !matches!(mg, 32 | 64 | 128) {
@@ -1049,20 +1049,13 @@ fn parse_fp8(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMe
 /// Apply the arch's DSL-leaf → disk-leaf renames to a dotted role path
 /// so it matches the on-disk safetensors key (Gemma4:
 /// `self_attn.q_proj_global` → `self_attn.q_proj`). Mirrors the rename
-/// step of `codegen::safetensors_prefix` (first exact-or-suffix match
-/// wins). Quantized MoE/attention roles carry no `_<digit>` submodule
+/// step of `codegen::safetensors_prefix` (both delegate to
+/// `Program::rename_dotted`: whole-segment match, longest key wins).
+/// Quantized MoE/attention roles carry no `_<digit>` submodule
 /// suffixes, so the digit-suffix translation `safetensors_prefix` also
 /// does is a no-op here and is omitted.
 fn disk_role_dotted(program: &Program, dotted: &str) -> String {
-    for (dsl_leaf, disk_leaf) in &program.weight_leaf_renames {
-        if dotted == dsl_leaf.as_str() {
-            return disk_leaf.clone();
-        }
-        if let Some(head) = dotted.strip_suffix(&format!(".{dsl_leaf}")) {
-            return format!("{head}.{disk_leaf}");
-        }
-    }
-    dotted.to_string()
+    program.rename_dotted(dotted)
 }
 
 /// Look a weight up in the MLX-native per-module quant map. The map is

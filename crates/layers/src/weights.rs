@@ -2463,12 +2463,14 @@ fn affine_pattern_matches(pattern: &str, name: &str) -> bool {
 /// re-derivation that could drift from it.
 ///
 /// `mlx_lm.convert` ships each quantized linear as a `.{weight,scales,biases}`
-/// triple where the U32 `.weight` is `[.., K / (32 / bits)]` and `.scales` is
-/// `[.., K / group_size]`. Both encode the same `K`, so for every listed weight
+/// triple where the U32 `.weight` is `[.., ceil(K*bits/32)]` and `.scales` is
+/// `[.., K / group_size]`. (bits=3 packs a continuous LSB-first bitstream,
+/// 8 elements per 3 bytes, so `K / (32 / bits)` is not the law — the ceil form
+/// covers every width.) Both encode the same `K`, so for every listed weight
 /// whose `.scales` sibling exists:
 ///
 /// ```text
-/// weight.last() * (32 / bits) == scales.last() * group_size
+/// weight.last() * 32 == scales.last() * group_size * bits
 /// ```
 ///
 /// That is exactly the invariant `affine_dequant_b4_bytes` asserts at load time,
@@ -2518,7 +2520,7 @@ where
         let Some(role) = name.strip_suffix(".weight") else {
             continue;
         };
-        if bits == 0 || !32_u32.is_multiple_of(bits) || group_size == 0 {
+        if !matches!(bits, 3 | 4 | 8) || group_size == 0 {
             continue;
         }
         let Some(scales) = shape_of(&format!("{role}.scales")) else {
@@ -2530,7 +2532,11 @@ where
         let (Some(&packed), Some(&groups)) = (weight.last(), scales.last()) else {
             continue;
         };
-        if packed * (32 / bits) as usize != groups * group_size as usize {
+        // MLX packs a continuous LSB-first bitstream: packed cols =
+        // ceil(K*bits/32), exact since K is a multiple of group_size (≥32).
+        // Cross-multiply so bits=3 (8 elements per 3 bytes, 3∤32) needs no
+        // integer division.
+        if packed as u64 * 32 != groups as u64 * group_size as u64 * bits as u64 {
             tracing::debug!(
                 tensor = name,
                 resolved_bits = bits,
@@ -2734,5 +2740,45 @@ mod affine_width_tests {
             vec![256, 32],
         );
         assert!(check(&m, V3_5));
+    }
+
+    /// ⛔ THE 3-BIT LAW. bits=3 packs a continuous LSB-first bitstream —
+    /// 8 elements per 3 bytes — so `32 / bits` is NOT an integer and the old
+    /// `packed * (32/bits) == groups * group_size` equation could not be
+    /// written. The cross-multiplied form must accept a real b3 checkpoint
+    /// (hidden 4096, gs 64: packed 384 = 4096*3/32, scales 64) and still
+    /// reject its b4 twin (packed 512) — the packed width is the only
+    /// discriminator between a 3-bit and 4-bit checkpoint of the same
+    /// arch+group_size, since their `.scales` shapes are identical.
+    #[test]
+    fn a_b3_row_selects_its_own_checkpoint_and_rejects_its_b4_twin() {
+        let widths_b3: &[(&str, u32, u32)] = &[(
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            3,
+            64,
+        )];
+        let widths_b4: &[(&str, u32, u32)] = &[(
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            4,
+            64,
+        )];
+
+        // GLM-4.5-Air shapes: hidden 4096, gs 64 → b3 packs 384 cols,
+        // b4 packs 512 cols; scales are [N, 64] in BOTH.
+        let ckpt_b3 = ckpt(&[("self_attn.q_proj", 384, 64)]);
+        let ckpt_b4 = ckpt(&[("self_attn.q_proj", 512, 64)]);
+
+        assert!(check(&ckpt_b3, widths_b3), "b3 variant accepts b3");
+        assert!(
+            !check(&ckpt_b4, widths_b3),
+            "b3 variant REJECTS b4 — else the loader derives K=512*32/3 and \
+             mis-rejects at scales-shape, or worse, dequantizes garbage"
+        );
+        assert!(check(&ckpt_b4, widths_b4), "b4 variant accepts b4");
+        assert!(
+            !check(&ckpt_b3, widths_b4),
+            "b4 variant REJECTS b3 — the b4 loader would derive K=384*8 and \
+             silently dequantize with the wrong width"
+        );
     }
 }

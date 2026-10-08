@@ -270,6 +270,20 @@ struct Builder<'a> {
     expansions: u32,
 }
 
+/// Which config key names the routed experts, and which routing math orders the top-k — the
+/// discriminator `moe_block`'s expansion reads off the model bounds. Mirrors the ISel impls'
+/// `applies_to` gates (Mixtral / Qwen / GLM-4), so bridge and solver can never disagree on the
+/// family a config belongs to.
+enum RouterFlavor {
+    /// `num_local_experts` — top-k then softmax over the chosen (Mixtral).
+    Mixtral,
+    /// `num_experts` — softmax over every expert, then top-k (Qwen; renorm per config).
+    QwenShared,
+    /// `n_routed_experts` — sigmoid + e_score_correction_bias keys pick the top-k, the unbiased
+    /// sigmoids gathered as scores (GLM-4 / DeepSeek-V3 `noaux_tc` at `n_group = 1`).
+    GlmSigmoid,
+}
+
 /// The expert half of a MoE block, which every router shares.
 struct Experts {
     experts: NumExperts,
@@ -1130,11 +1144,15 @@ pub fn lower_decode_to_wavefront(
                 let b = &bx.bounds;
                 // Variant discriminators mirror the metal impls'
                 // applies_to: Mixtral = num_local_experts; Qwen-shared =
-                // num_experts (neither on deepseek's n_routed_experts).
-                let (qwen_shared, num_experts) = if let Some(&n) = b.get("num_local_experts") {
-                    (false, n as u32)
+                // num_experts; GLM-4 = n_routed_experts with Qwen-style
+                // on-disk naming (switch_mlp + shared_experts), routed
+                // sigmoid+bias (DeepSeek's noaux_tc at n_group=1).
+                let (router_flavor, num_experts) = if let Some(&n) = b.get("num_local_experts") {
+                    (RouterFlavor::Mixtral, n as u32)
+                } else if let Some(&n) = b.get("n_routed_experts") {
+                    (RouterFlavor::GlmSigmoid, n as u32)
                 } else if let Some(&n) = b.get("num_experts") {
-                    (true, n as u32)
+                    (RouterFlavor::QwenShared, n as u32)
                 } else {
                     return Err(BridgeError::MissingBound { key: "num_experts" });
                 };
@@ -1170,24 +1188,40 @@ pub fn lower_decode_to_wavefront(
                 };
                 let (experts, k) = moe_counts(tile, num_experts, top_k)?;
                 // Qwen order: softmax over every expert, then top-k (renormalised when the
-                // config says so); Mixtral: top-k, then softmax over the chosen.
-                let (router, bundle) = match qwen_shared {
-                    true => (RouterBundle::SharedFused, ExpertBundle::SharedFused),
-                    false => (RouterBundle::Fused, ExpertBundle::Fused),
+                // config says so); Mixtral: top-k, then softmax over the chosen; GLM-4:
+                // sigmoid+bias keys pick the top-k, the UNBIASED sigmoids gathered and
+                // renormalised (routed_scaling_factor 1.0 — no score scale).
+                let (router, bundle) = match router_flavor {
+                    RouterFlavor::QwenShared | RouterFlavor::GlmSigmoid => {
+                        (RouterBundle::SharedFused, ExpertBundle::SharedFused)
+                    }
+                    RouterFlavor::Mixtral => (RouterBundle::Fused, ExpertBundle::Fused),
                 };
-                let shared = std::num::NonZeroU32::new(shared_inter).filter(|_| qwen_shared);
                 bx.expand();
                 let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
-                let lg = match qwen_shared {
-                    true => bx.push(SubOp::RouteSoftmax, &[lg]),
-                    false => lg,
+                let shared = std::num::NonZeroU32::new(shared_inter)
+                    .filter(|_| !matches!(router_flavor, RouterFlavor::Mixtral));
+                let lg = match router_flavor {
+                    RouterFlavor::QwenShared => bx.push(SubOp::RouteSoftmax, &[lg]),
+                    RouterFlavor::GlmSigmoid => bx.push_op(
+                        SubOp::RouteSigmoidBias { router },
+                        vec![InputRef::Op(lg), w],
+                    ),
+                    RouterFlavor::Mixtral => lg,
                 };
                 let indices = bx.route_top_k(lg, k);
                 let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
-                let scores = match (qwen_shared, norm_topk) {
-                    (true, true) => bx.push(SubOp::RouteRenorm, &[scores]),
-                    (true, false) => scores,
-                    (false, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
+                let scores = match (router_flavor, norm_topk) {
+                    (RouterFlavor::QwenShared, true) => bx.push(SubOp::RouteRenorm, &[scores]),
+                    (RouterFlavor::QwenShared, false) => scores,
+                    (RouterFlavor::GlmSigmoid, norm) => {
+                        if norm {
+                            bx.push(SubOp::RouteRenorm, &[scores])
+                        } else {
+                            scores
+                        }
+                    }
+                    (RouterFlavor::Mixtral, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
                 };
                 let hidden = bx.out_cols(tile, 0, "moe_block output")?;
                 let experts = Experts {

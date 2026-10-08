@@ -130,8 +130,8 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         use crate::dtype::DType;
 
         anyhow::ensure!(
-            bits == 4 || bits == 8,
-            "AffineFusedMoELayer: only bits ∈ {{4, 8}} supported (got {bits})"
+            bits == 3 || bits == 4 || bits == 8,
+            "AffineFusedMoELayer: only bits ∈ {{3, 4, 8}} supported (got {bits})"
         );
         anyhow::ensure!(
             hidden_size.is_multiple_of(group_size as usize),
@@ -149,6 +149,12 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         // tensor so the routing Gemm step in `lower_moe_step`
         // (Step 1) reads it as a normal `[E, hidden]` BF16/F16
         // weight — same shape contract as the cuda Dense path.
+        // GLM-4.5 keeps its router DENSE (`{prefix}.gate.weight` bf16,
+        // no scales/biases) — taken as-is. The discriminator is the
+        // SCALES SIBLING, not the weight key: a quantized router ALSO
+        // carries `{prefix}.gate.weight` (the packed bitstream), so
+        // probing the weight alone would hand the routing gemm raw
+        // nibbles as logits.
         // Choose dequant dtype from the model's target_dtype (BF16
         // on every metal build path today).
         let router_dtype = gw.target_dtype().unwrap_or(DType::BF16);
@@ -156,12 +162,17 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
             matches!(router_dtype, DType::BF16 | DType::F16),
             "AffineFusedMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        let router_gate = gw.take_affine_dequant_b4(
-            &format!("{prefix}.gate"),
-            group_size,
-            gate_bits,
-            router_dtype,
-        )?;
+        let router_is_dense = !gw.contains(&format!("{prefix}.gate.scales"));
+        let router_gate = if router_is_dense {
+            gw.take(&format!("{prefix}.gate.weight"))?
+        } else {
+            gw.take_affine_dequant_b4(
+                &format!("{prefix}.gate"),
+                group_size,
+                gate_bits,
+                router_dtype,
+            )?
+        };
 
         // Probe for the switch_mlp pre-stacked layout. Qwen3-MoE-4bit
         // and newer mlx-community repos ship one stacked tensor per
@@ -275,7 +286,6 @@ fn load_stacked_experts(
     use crate::dtype::DType;
     use crate::tensor::GpuTensor;
 
-    let pack_factor = (32 / bits) as usize;
     let gs = group_size as usize;
 
     // Build the pre-stacked tensor name `{prefix}[.{infix}].{proj}.{kind}`.
@@ -322,11 +332,14 @@ fn load_stacked_experts(
     // Per-expert path: stack into pre-allocated MTLBuffers.
     let elem_w = DType::U32.size_bytes();
     let elem_sb = scales_dtype.size_bytes();
-    // gate_proj / up_proj: out=intermediate, in=hidden.
-    let per_gate_w = intermediate_size * (hidden_size / pack_factor);
+    // gate_proj / up_proj: out=intermediate, in=hidden. Packed cols follow
+    // the ceil(in*bits/32) law (exact: in is a multiple of group_size).
+    let packed_hidden = crate::layers_quant::affine_packed_cols(hidden_size, bits);
+    let packed_inter = crate::layers_quant::affine_packed_cols(intermediate_size, bits);
+    let per_gate_w = intermediate_size * packed_hidden;
     let per_gate_sb = intermediate_size * (hidden_size / gs);
     // down_proj: out=hidden, in=intermediate.
-    let per_down_w = hidden_size * (intermediate_size / pack_factor);
+    let per_down_w = hidden_size * packed_inter;
     let per_down_sb = hidden_size * (intermediate_size / gs);
 
     // Experts are WEIGHTS: the weight pool, not the wired activation
@@ -398,37 +411,22 @@ fn load_stacked_experts(
         }
     }
 
-    let mk = |ptr, n_out: usize, n_in: usize, div: usize, dt: DType| unsafe {
-        GpuTensor::new(ptr, &[num_experts, n_out, n_in / div], dt)
+    let mk_w = |ptr: *mut u8, n_out: usize, packed_in: usize, dt: DType| unsafe {
+        GpuTensor::new(ptr, &[num_experts, n_out, packed_in], dt)
+    };
+    let mk_sb = |ptr: *mut u8, n_out: usize, n_in: usize, dt: DType| unsafe {
+        GpuTensor::new(ptr, &[num_experts, n_out, n_in / gs], dt)
     };
     Ok((
-        mk(
-            gate_w_ptr,
-            intermediate_size,
-            hidden_size,
-            pack_factor,
-            DType::U32,
-        ),
-        mk(gate_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(gate_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(
-            up_w_ptr,
-            intermediate_size,
-            hidden_size,
-            pack_factor,
-            DType::U32,
-        ),
-        mk(up_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(up_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-        mk(
-            down_w_ptr,
-            hidden_size,
-            intermediate_size,
-            pack_factor,
-            DType::U32,
-        ),
-        mk(down_s_ptr, hidden_size, intermediate_size, gs, scales_dtype),
-        mk(down_b_ptr, hidden_size, intermediate_size, gs, scales_dtype),
+        mk_w(gate_w_ptr, intermediate_size, packed_hidden, DType::U32),
+        mk_sb(gate_s_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_sb(gate_b_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_w(up_w_ptr, intermediate_size, packed_hidden, DType::U32),
+        mk_sb(up_s_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_sb(up_b_ptr, intermediate_size, hidden_size, scales_dtype),
+        mk_w(down_w_ptr, hidden_size, packed_inter, DType::U32),
+        mk_sb(down_s_ptr, hidden_size, intermediate_size, scales_dtype),
+        mk_sb(down_b_ptr, hidden_size, intermediate_size, scales_dtype),
     ))
 }
 
@@ -741,16 +739,15 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             shared_expert_gate,
         ) = if shared_expert_intermediate_size > 0 {
             anyhow::ensure!(
-                bits == 4 || bits == 8,
-                "AffineSharedFusedMoELayer: only bits ∈ {{4, 8}} supported (got {bits})"
+                matches!(bits, 3 | 4 | 8),
+                "AffineSharedFusedMoELayer: only bits ∈ {{3, 4, 8}} supported (got {bits})"
             );
-            let pack_factor = (32 / bits) as usize;
             let shared_inter = shared_expert_intermediate_size;
             // Two cases for shared gate+up: either fused on-disk
             // (`shared_expert.gate_up_proj`) or split (the more common
             // Qwen-MoE shape with separate gate_proj/up_proj). The
             // affine_gather_qmv lowering wants a single packed
-            // `[2*shared_inter, hidden / pack_factor]` triple, so we
+            // `[2*shared_inter, ceil(hidden*bits/32)]` triple, so we
             // stack split-on-disk variants by allocating and copying
             // gate then up into adjacent halves.
             let has_fused = gw.contains(&format!("{prefix}.shared_expert.gate_up_proj.weight"));
@@ -768,11 +765,14 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             let elem_sb = scales_dtype.size_bytes();
             let gs = group_size as usize;
 
-            // Allocate destination buffers.
+            // Allocate destination buffers. Packed cols follow the
+            // ceil(in*bits/32) law (exact: in is a multiple of group_size).
+            let packed_hidden = crate::layers_quant::affine_packed_cols(hidden_size, bits);
+            let packed_shared_inter = crate::layers_quant::affine_packed_cols(shared_inter, bits);
             let two_si = 2 * shared_inter;
-            let gu_w_bytes = two_si * (hidden_size / pack_factor) * elem_w;
+            let gu_w_bytes = two_si * packed_hidden * elem_w;
             let gu_sb_bytes = two_si * (hidden_size / gs) * elem_sb;
-            let down_w_bytes = hidden_size * (shared_inter / pack_factor) * elem_w;
+            let down_w_bytes = hidden_size * packed_shared_inter * elem_w;
             let down_sb_bytes = hidden_size * (shared_inter / gs) * elem_sb;
 
             // Shared-expert weights: same pool rule as the routed
@@ -807,7 +807,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
                 }
             } else {
                 // Split → stack into [gate_half | up_half].
-                let half_w_bytes = shared_inter * (hidden_size / pack_factor) * elem_w;
+                let half_w_bytes = shared_inter * packed_hidden * elem_w;
                 let half_sb_bytes = shared_inter * (hidden_size / gs) * elem_sb;
                 unsafe {
                     let _ = gw.take_into_metal(
@@ -852,19 +852,13 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
                 )?;
             }
 
-            let gu_w = unsafe {
-                GpuTensor::new(gu_w_ptr, &[two_si, hidden_size / pack_factor], DType::U32)
-            };
+            let gu_w = unsafe { GpuTensor::new(gu_w_ptr, &[two_si, packed_hidden], DType::U32) };
             let gu_s =
                 unsafe { GpuTensor::new(gu_s_ptr, &[two_si, hidden_size / gs], scales_dtype) };
             let gu_b =
                 unsafe { GpuTensor::new(gu_b_ptr, &[two_si, hidden_size / gs], scales_dtype) };
             let d_w = unsafe {
-                GpuTensor::new(
-                    down_w_ptr,
-                    &[hidden_size, shared_inter / pack_factor],
-                    DType::U32,
-                )
+                GpuTensor::new(down_w_ptr, &[hidden_size, packed_shared_inter], DType::U32)
             };
             let d_s = unsafe {
                 GpuTensor::new(down_s_ptr, &[hidden_size, shared_inter / gs], scales_dtype)
@@ -887,6 +881,22 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             (None, None, None, None, None, None, None)
         };
 
+        // GLM-4.5's F32 `e_score_correction_bias` (`{prefix}.gate.e_score_correction_bias`) —
+        // present on every sigmoid-routed MoE (noaux_tc), absent on every softmax-routed one
+        // (Qwen, Mixtral). Probed, never assumed. `take_keep_dtype`, NOT `take`: the routing
+        // kernels read it as `const device float*` (`moe_route.metal` buffer 4,
+        // `quantized_qmv.metal` buffer 13), so the F32 bytes must reach the device un-cast —
+        // `take` would truncate them to the model's target dtype (BF16) and the kernels would
+        // reassemble half-pairs as F32 garbage. The cuda loader casts this tensor to F32 for
+        // the same reason (`weights_quant.rs`: "vLLM always casts this to F32 before the
+        // routing kernel; we match"); every noaux_tc checkpoint ships it F32 on disk.
+        let e_score_correction_bias = match gw
+            .contains(&format!("{prefix}.gate.e_score_correction_bias"))
+        {
+            true => Some(gw.take_keep_dtype(&format!("{prefix}.gate.e_score_correction_bias"))?),
+            false => None,
+        };
+
         Ok(AffineSharedFusedMoELayer {
             routed,
             shared_gate_up_w,
@@ -896,6 +906,7 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
             shared_down_scales,
             shared_down_biases,
             shared_expert_gate,
+            e_score_correction_bias,
             shared_intermediate_size: shared_expert_intermediate_size,
         })
     }

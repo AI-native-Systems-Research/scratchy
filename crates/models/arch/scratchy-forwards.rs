@@ -202,6 +202,11 @@ const CUDA_ONLY: &[&str] = &[
     "deepseek-v3-flat",
     "gemma3-mm",
 ];
+/// Arches whose emit only compiles under metal (no cuda surface — no ISel
+/// claims for their ops). Under a cuda build we must NOT run their pipeline
+/// (the solver would find tile claims missing and panic). Kept in sync with
+/// src/lib.rs gates.
+const METAL_ONLY: &[&str] = &["glm4-moe"];
 /// Arches that additionally support the spyre (KTIR) backend.
 ///
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
@@ -275,6 +280,8 @@ fn main() {
             // never run the pipeline for an arch whose mod won't be compiled.
             let supported = if CUDA_ONLY.contains(&arch.as_str()) {
                 cuda
+            } else if METAL_ONLY.contains(&arch.as_str()) {
+                metal
             } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
                 cuda || metal || spyre
             } else {

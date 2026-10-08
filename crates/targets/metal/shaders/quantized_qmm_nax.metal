@@ -150,9 +150,12 @@ METAL_FUNC void qmm_t_nax_impl(
     uint  simd_lid,
     uint3 tgid)
 {
-    static_assert(bits == 4 || bits == 8,
-                  "qmm_t_nax_impl: bits in {4, 8} (8-bit = byte-per-element "
-                  "dequant in the W-loader; the NAX MMA runs on dequantized "
+    static_assert(bits == 3 || bits == 4 || bits == 8,
+                  "qmm_t_nax_impl: bits in {3, 4, 8} (the affine path rides "
+                  "the MLX QuantizedBlockLoader, whose index math is "
+                  "bits=3-exact: pack_factor 8, bytes_per_pack 3, and K is a "
+                  "multiple of group_size so K*3/8 is exact; 8-bit = "
+                  "byte-per-element dequant; the NAX MMA runs on dequantized "
                   "T_act values either way)");
     static_assert(!nvfp4 || bits == 4, "NVFP4 is 4-bit by definition");
     // Affine NAX requires gs ∈ {64,128} (gs ≥ BK=64, one scale per
@@ -180,18 +183,24 @@ METAL_FUNC void qmm_t_nax_impl(
     // BK_padded: pad for bank-conflict avoidance (BK + 16/sizeof(T) = 64+8=72)
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
 
-    // bits=4: pack_factor=2 (2 int4 per byte); bits=8: pack_factor=1
-    // (1 int8 per byte). bytes_per_pack=1 either way.
-    constexpr int pack_factor    = (bits == 4) ? 2 : 1;
-    constexpr int bytes_per_pack = 1;
+    // Packing law (matches the vendored QuantizedBlockLoader's
+    // get_pack_factor/get_bytes_per_pack): bits=4 → pack_factor=2,
+    // bytes_per_pack=1 (2 nibbles per byte); bits=8 → pack_factor=1,
+    // bytes_per_pack=1 (1 code per byte); bits=3 → pack_factor=8,
+    // bytes_per_pack=3 (8 codes per 3 bytes, byte-anchored every
+    // group since group_size is a multiple of 8). K is a multiple of
+    // group_size (≥64), so K*bytes_per_pack/pack_factor is exact.
+    constexpr int pack_factor    = (bits == 3) ? 8 : ((bits == 4) ? 2 : 1);
+    constexpr int bytes_per_pack = (bits == 3) ? 3 : 1;
 
     // W-loader tile layout
     //   bits=4: BCOLS_PACKED = 64/2 = 32, N_READS = (32×64)/128 = 16
     //   bits=8: BCOLS_PACKED = 64/1 = 64, N_READS = (64×64)/128 = 32
+    //   bits=3: BCOLS_PACKED = 64*3/8 = 24, N_READS = (24×64)/128 = 12
     // Per-thread dequant element count is N_READS × pack_factor = 32
-    // in both cases; only the byte count read per thread doubles for
-    // bits=8 (8-bit weights are inherently 2× the bytes).
-    constexpr int BCOLS_PACKED = BK / pack_factor;
+    // (bits 4/8) or 96 (bits=3, three 3-byte packs); the byte count
+    // per thread scales with the width.
+    constexpr int BCOLS_PACKED = (BK * bytes_per_pack) / pack_factor;
     constexpr int N_READS      = (BCOLS_PACKED * BN) / TGP;
 
     // ── Per-simdgroup M/N offsets within the 64×64 tile ────────────
@@ -531,6 +540,31 @@ INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64, 8)
 INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128, 8)
 INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64, 8)
 INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 8)
+
+// 3-bit rows (GLM-4.5-Air-3bit: bf16×bf16 gs=64 in production; f16×f16
+// and gs=128 + cross-dtype rows for symmetry so no (model-dtype, gs)
+// combo hits a nil computeFunction). The loader's index math is
+// bits=3-exact (pack_factor 8, bytes_per_pack 3 — see the static_assert
+// note in qmm_t_nax_impl); the dequantize bits==3 branch is MLX's own
+// qdot shifts, vendored into metal_nax.h.
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 3)
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 3)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64, 3)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,   128, 3)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64, 3)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128, 3)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64, 3)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 3)
+
+// 3-bit gather rows (GLM-4.5-Air-3bit routed experts).
+INST_GATHER_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 3)
+INST_GATHER_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 3)
+INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64, 3)
+INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,   128, 3)
+INST_GATHER_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64, 3)
+INST_GATHER_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128, 3)
+INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64, 3)
+INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 3)
 
 // ─────────────────────────────────────────────────────────────────
 // Buffer-dims variant: K/N/M as `const constant int&` buffer args

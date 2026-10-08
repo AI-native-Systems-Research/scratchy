@@ -77,6 +77,8 @@ struct Case {
     blocks_per_chunk: usize,
     /// `attention_decode_gqa_tq` over this many threadgroups a KV head.
     gqa: Option<usize>,
+    /// RoPE base (theta). GLM-4.5 uses 1e6, not the 10000 default.
+    theta: f32,
 }
 
 struct Lcg(u64);
@@ -167,8 +169,10 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
     let (hd, nq, nkv) = (c.head_dim, c.num_q_heads, c.num_kv_heads);
     let max_blocks = c.ctx.div_ceil(BLOCK_SIZE);
-    // Logical block l of the sequence lives in physical block (3l + 1) mod N_BLOCKS.
-    let phys = |l: usize| (3 * l + 1) % N_BLOCKS;
+    // Logical block l of the sequence lives in physical block (5l + 1) mod N_BLOCKS
+    // (stride 5 coprime to 12 → injective for any ctx the pool holds: the fold's
+    // tail-slot write must never clobber a live block).
+    let phys = |l: usize| (5 * l + 1) % N_BLOCKS;
     let tail_block = (c.ctx - 1) / BLOCK_SIZE;
     let span = |l: usize| {
         if c.spans && l == tail_block {
@@ -199,7 +203,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     let cos_sin: Vec<u16> = (0..MAX_POS)
         .flat_map(|p| {
             (0..c.rot_dim).map(move |i| {
-                let theta = p as f32 * 10000f32.powf(-((i % half_rot) as f32) / half_rot as f32);
+                let theta = p as f32 * c.theta.powf(-((i % half_rot) as f32) / half_rot as f32);
                 if i < half_rot {
                     theta.cos()
                 } else {
@@ -471,6 +475,7 @@ fn llama(dtype: Dtype, bits: Option<u32>, heads: usize) -> Case {
         ctx: 41,
         blocks_per_chunk: 4,
         gqa: None,
+        theta: 10000.0,
     }
 }
 
@@ -585,6 +590,49 @@ fn partial_rope_at_a_block_edge() {
             pair_off: 32,
             ctx: 33,
             ..llama(Dtype::Bf16, Some(4), 3)
+        },
+    );
+}
+
+#[test]
+fn glm45_air_dense() {
+    // GLM-4.5-Air decode: 96 query heads over 8 KV heads (GQA 12:1),
+    // head_dim 128, partial rope (rot 64, pairs within the first half),
+    // theta 1e6, dense KV. The span block's K rides unrotated and the
+    // fold re-ropes it (rope_on_read=1 in the production M1 constants).
+    for (ctx, name) in [
+        (41usize, "glm45 air dense"),
+        (129usize, "glm45 air dense, ctx 129"),
+    ] {
+        check(
+            name,
+            Case {
+                num_q_heads: 96,
+                num_kv_heads: 8,
+                rot_dim: 64,
+                pair_off: 32,
+                theta: 1e6,
+                spans: true,
+                ctx,
+                ..llama(Dtype::Bf16, None, 1)
+            },
+        );
+    }
+}
+
+#[test]
+fn glm45_air_dense_unbiased_no_spans() {
+    // The same geometry with the plain write-roped cache (spans off),
+    // isolating the rope-on-read leg from the GQA ratio.
+    check(
+        "glm45 air plain",
+        Case {
+            num_q_heads: 96,
+            num_kv_heads: 8,
+            rot_dim: 64,
+            pair_off: 32,
+            theta: 1e6,
+            ..llama(Dtype::Bf16, None, 1)
         },
     );
 }

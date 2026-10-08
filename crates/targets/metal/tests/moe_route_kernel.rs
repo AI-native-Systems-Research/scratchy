@@ -15,7 +15,7 @@ use scratchy_target_metal::tape::kernel_constants::{
     ArgsortConstants, MoeRouteConstants, MoeTopKConstants, ScalarMulConstants, ScoresRow,
     SoftmaxConstants,
 };
-use scratchy_target_metal::tape::step::{LayerId, RoutePost, RouteProgram, Scale};
+use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgram, Scale};
 
 fn size(w: usize, h: usize, d: usize) -> MTLSize {
     MTLSize {
@@ -90,6 +90,8 @@ struct Routing {
     // Each way's buffers: logits, sorted experts, top-k indices, top-k scores.
     split: [common::Buffer; 4],
     fused: [common::Buffer; 4],
+    // The F32 e_score_correction_bias (GLM's noaux_tc), when the pre reads one.
+    bias: Option<common::Buffer>,
 }
 
 /// What one of today's kernels runs over.
@@ -132,7 +134,7 @@ impl Routing {
         let top_k_consts = || MoeTopKConstants { experts, top_k }.into();
         let softmax = |row| SoftmaxConstants { row }.into();
         let mut chain = Vec::new();
-        if program.pre_softmax {
+        if matches!(program.pre, RoutePre::Softmax | RoutePre::SigmoidBias(_)) {
             let c = softmax(ScoresRow::Experts(experts));
             let p = pipe("softmax", "block_softmax_precise_bfloat16", c);
             chain.push((p, Stage::SoftmaxLogits));
@@ -181,6 +183,13 @@ impl Routing {
             program,
         };
         let sym = format!("moe_route_bfloat16_bn{bn}");
+        let bias = match program.pre {
+            RoutePre::SigmoidBias(_) => {
+                let b: Vec<f32> = (0..e).map(|_| -0.5 + rng.next()).collect();
+                Some(common::shared_slice(device, &b))
+            }
+            _ => None,
+        };
         let buffers = || {
             [
                 common::shared_slice(device, &logits),
@@ -199,6 +208,7 @@ impl Routing {
             expert_scale: common::shared_slice(device, &rng.bf16s(e, 0.5, 1.5)),
             split: buffers(),
             fused: buffers(),
+            bias,
         }
     }
 
@@ -243,6 +253,9 @@ impl Routing {
         if self.program.expert_scale.is_some() {
             buffers.push((&self.expert_scale, 3));
         }
+        if let Some(bias) = &self.bias {
+            buffers.push((bias, 4));
+        }
         vec![Dispatch {
             pso: &self.route,
             buffers,
@@ -262,27 +275,35 @@ impl Routing {
 }
 
 const GEMMA: RouteProgram = RouteProgram {
-    pre_softmax: false,
+    pre: RoutePre::None,
     scale: Some(Scale(0.018_844_6)),
     post: RoutePost::Softmax,
     expert_scale: Some(LayerId(0)),
 };
 const TOP_K_SOFTMAX: RouteProgram = RouteProgram {
-    pre_softmax: false,
+    pre: RoutePre::None,
     scale: None,
     post: RoutePost::Softmax,
     expert_scale: None,
 };
 const SHARED: RouteProgram = RouteProgram {
-    pre_softmax: true,
+    pre: RoutePre::Softmax,
     scale: None,
     post: RoutePost::Renorm,
     expert_scale: None,
 };
 const SHARED_UNNORMED: RouteProgram = RouteProgram {
-    pre_softmax: true,
+    pre: RoutePre::Softmax,
     scale: None,
     post: RoutePost::None,
+    expert_scale: None,
+};
+/// GLM-4.5's noaux_tc: F32 sigmoid + correction bias ordering the picks, the UNBIASED sigmoids
+/// renormalized as the scores.
+const GLM: RouteProgram = RouteProgram {
+    pre: RoutePre::SigmoidBias(LayerId(0)),
+    scale: None,
+    post: RoutePost::Renorm,
     expert_scale: None,
 };
 
@@ -309,6 +330,62 @@ fn the_routing_kernel_matches_the_kernels_it_replaces() {
             assert_eq!(split.0, fused.0, "{what}: top-k indices");
             assert_eq!(split.1, fused.1, "{what}: top-k scores");
         }
+    }
+}
+
+/// GLM-4.5's noaux_tc routing against a CPU reference: the picks order on each expert's F32
+/// sigmoid plus its F32 correction bias (ties by index ascending, the stable sort's order), and
+/// the scores are the picks' UNBIASED sigmoids renormalized to sum to one — mlx-lm's
+/// `group_expert_select` at `n_group = 1`.
+#[test]
+fn glm_sigmoid_bias_routing_matches_the_reference() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    let (e, k, n) = (160, 8, 3);
+    let r = Routing::new(&device, GLM, (e, k, n), false);
+    let bias = r.bias.as_ref().expect("the GLM pre reads a bias");
+    let bias: Vec<f32> = common::read_slice(bias, e);
+    let logits: Vec<bf16> = common::read_slice(&r.fused[0], e * n);
+    run(&device, 1, 1, || r.fused());
+    let (inds, scores) = r.outputs(&r.fused);
+    for row in 0..n {
+        // The reference: biased F32 sigmoids order the picks (index-ascending ties), the
+        // unbiased F32 sigmoids of the picks renormalize into the scores.
+        let (row_logits, row_inds) = (
+            &logits[row * e..(row + 1) * e],
+            &inds[row * k..(row + 1) * k],
+        );
+        let sigmoid = |x: bf16| 1.0f32 / (1.0 + (-x.to_f32()).exp());
+        let mut order: Vec<usize> = (0..e).collect();
+        order.sort_by(|&a, &b| {
+            (sigmoid(row_logits[b]) + bias[b])
+                .total_cmp(&(sigmoid(row_logits[a]) + bias[a]))
+                .then(b.cmp(&a))
+        });
+        let want_inds: Vec<u32> = order[..k].iter().rev().map(|&i| i as u32).collect();
+        let what = format!("row {row}");
+        assert_eq!(&row_inds[..], &want_inds[..], "{what}: picks");
+        let picks = order[..k].iter().rev();
+        // The kernel's chain: the F32 sigmoid rounds to bf16 at the gather, then `renorm_row`
+        // loads it back to F32, sums, and multiplies by the reciprocal.
+        let mut unbiased: Vec<f32> = picks
+            .clone()
+            .map(|&i| bf16::from_f32(sigmoid(row_logits[i])).to_f32())
+            .collect();
+        // The renorm's own convention (`renorm_row`): multiply by the reciprocal, not divide.
+        let sum: f32 = unbiased.iter().sum();
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        for u in &mut unbiased {
+            *u *= inv;
+        }
+        let got: Vec<bf16> = scores[row * k..(row + 1) * k]
+            .iter()
+            .map(|&b| bf16::from_bits(b))
+            .collect();
+        let want: Vec<bf16> = unbiased.iter().map(|&f| bf16::from_f32(f)).collect();
+        // The kernel renorms in bf16 (the softmax row's precision); the reference in f32 —
+        // compare as the rounded reference, the same bits mlx's bf16 scores hold.
+        assert_eq!(got, want, "{what}: scores");
     }
 }
 

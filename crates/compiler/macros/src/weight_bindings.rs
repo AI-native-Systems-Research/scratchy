@@ -234,7 +234,8 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         // A MoE block's steps bind their router's or their experts' bundle — the bundle table.
         L::RouterNorm { router, .. }
         | L::RouterLogits { router, .. }
-        | L::RouteExpertScale { router } => router.weight_kind(),
+        | L::RouteExpertScale { router }
+        | L::RouteSigmoidBias { router } => router.weight_kind(),
         L::ExpertMatmul { bundle, .. } => bundle.weight_kind(),
         L::RopeRotate { .. } | L::RopeAppend { .. } => WeightKind::CosSin,
         // A standalone (unfused) per-layer scalar parameter — granite's

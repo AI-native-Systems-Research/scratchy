@@ -31,6 +31,7 @@ arch-gemma3 = []
 arch-gemma3-mm = ["arch-gemma3", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-gemma4 = []
 arch-gemma4-moe = []
+arch-glm4-moe = []
 arch-granite = []
 arch-llama = []
 arch-locateanything = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
@@ -63,6 +64,7 @@ all-arches = [
     "arch-gemma3-mm",
     "arch-gemma4",
     "arch-gemma4-moe",
+    "arch-glm4-moe",
     "arch-granite",
     "arch-llama",
     "arch-locateanything",
@@ -152,6 +154,10 @@ all-arches = [
 # gemma4-moe (1 configs)
 "gemma-4-26b-a4b-it" = ["arch-gemma4-moe"]
 "gemma-4-26b-a4b-it-parity-tiny" = ["arch-gemma4-moe"]
+
+# glm4-moe (1 configs)
+"glm-4.5-air" = ["arch-glm4-moe"]
+"glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
 
 # granite (21 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
@@ -340,6 +346,10 @@ all-arches = [
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",
 ]
+"glm4-moe" = [
+    "glm-4.5-air",
+    "glm-4.5-air-parity-tiny",
+]
 "granite" = [
     "granite-3.0-2b-base",
     "granite-3.0-2b-base-parity-tiny",
@@ -510,6 +520,8 @@ all = [
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",
+    "glm-4.5-air",
+    "glm-4.5-air-parity-tiny",
     "granite-3.0-2b-base",
     "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",

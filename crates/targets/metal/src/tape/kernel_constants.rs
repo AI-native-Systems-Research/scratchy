@@ -901,9 +901,10 @@ impl From<MoeTopKConstants> for Vec<ConstantValue> {
 }
 
 /// `KernelId::MoeRoute` (`moe_route_<T>_bn<bn>`, `moe_route.metal`): the experts a router scores
-/// (slot 0), the top-k it keeps (slot 1), and its program — a softmax first (slot 2), the scores'
-/// scale (slot 3, set only when they scale), what follows (slot 4: 0 nothing, 1 softmax,
-/// 2 renorm), and the per-expert scale (slot 5).
+/// (slot 0), the top-k it keeps (slot 1), and its program — the pre over the experts (slot 2:
+/// 0 none, 1 softmax, 2 F32 sigmoid + correction bias), the scores' scale (slot 3, set only when
+/// they scale), what follows (slot 4: 0 nothing, 1 softmax, 2 renorm), and the per-expert scale
+/// (slot 5).
 pub struct MoeRouteConstants {
     pub experts: NumExperts,
     pub top_k: TopK,
@@ -912,8 +913,13 @@ pub struct MoeRouteConstants {
 
 impl From<MoeRouteConstants> for Vec<ConstantValue> {
     fn from(c: MoeRouteConstants) -> Self {
-        use crate::tape::step::RoutePost;
+        use crate::tape::step::{RoutePost, RoutePre};
         let p = c.program;
+        let pre = match p.pre {
+            RoutePre::None => 0,
+            RoutePre::Softmax => 1,
+            RoutePre::SigmoidBias(_) => 2,
+        };
         let post = match p.post {
             RoutePost::None => 0,
             RoutePost::Softmax => 1,
@@ -922,7 +928,7 @@ impl From<MoeRouteConstants> for Vec<ConstantValue> {
         let mut v = vec![
             ConstantValue::int(ConstSlot(0), c.experts.get() as i32),
             ConstantValue::int(ConstSlot(1), c.top_k.get() as i32),
-            ConstantValue::int(ConstSlot(2), i32::from(p.pre_softmax)),
+            ConstantValue::int(ConstSlot(2), pre),
         ];
         v.extend(p.scale.map(|s| ConstantValue::float(ConstSlot(3), s.0)));
         v.push(ConstantValue::int(ConstSlot(4), post));
@@ -935,8 +941,9 @@ impl From<MoeRouteConstants> for Vec<ConstantValue> {
 }
 
 /// A routed expert kernel's routing (`MetalFusion::MoeRouted`, `quantized_qmv.metal` slots
-/// 13-17): the experts, and the [`MoeRouteConstants`] program — a softmax over the experts
-/// first, the scores' scale, their last step, the per-expert scale.
+/// 13-17): the experts, and the [`MoeRouteConstants`] program — the pre over the experts (0
+/// none, 1 softmax, 2 F32 sigmoid + correction bias), the scores' scale, their last step, the
+/// per-expert scale.
 pub struct RoutedConstants {
     pub experts: NumExperts,
     pub program: crate::tape::step::RouteProgram,
@@ -944,8 +951,13 @@ pub struct RoutedConstants {
 
 impl From<RoutedConstants> for Vec<ConstantValue> {
     fn from(c: RoutedConstants) -> Self {
-        use crate::tape::step::RoutePost;
+        use crate::tape::step::{RoutePost, RoutePre};
         let p = c.program;
+        let pre = match p.pre {
+            RoutePre::None => 0,
+            RoutePre::Softmax => 1,
+            RoutePre::SigmoidBias(_) => 2,
+        };
         let post = match p.post {
             RoutePost::None => 0,
             RoutePost::Softmax => 1,
@@ -953,7 +965,7 @@ impl From<RoutedConstants> for Vec<ConstantValue> {
         };
         let mut v = vec![
             ConstantValue::int(ConstSlot(13), c.experts.get() as i32),
-            ConstantValue::boolean(ConstSlot(14), p.pre_softmax),
+            ConstantValue::int(ConstSlot(14), pre),
         ];
         v.extend(p.scale.map(|s| ConstantValue::float(ConstSlot(15), s.0)));
         v.push(ConstantValue::int(ConstSlot(16), post));

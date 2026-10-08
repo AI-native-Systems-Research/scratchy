@@ -550,10 +550,9 @@ pub fn compile_carrier(
                 continue;
             }
             let dotted = path.join(".");
-            // Does a rename intercept this exact path? (mirror codegen.rs)
-            let handled = classified.weight_leaf_renames.iter().any(|(dsl_leaf, _)| {
-                dotted == *dsl_leaf || dotted.ends_with(&format!(".{dsl_leaf}"))
-            });
+            // Does a rename intercept this path? (mirror
+            // `Program::rename_dotted`'s whole-segment matching)
+            let handled = classified.rename_dotted(&dotted) != dotted;
             if handled {
                 continue;
             }
