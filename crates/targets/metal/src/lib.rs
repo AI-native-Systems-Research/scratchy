@@ -30,7 +30,8 @@ pub mod steel_paged {
     /// size), in `attention_steel_nax_paged.metal`; `None` sends the dispatcher to the simdgroup
     /// `steel_paged_symbol` / SDPA path. Warps are WM Q-row blocks × WN head-dim slices:
     /// head_dims 64 / 128 one warp a 16-row Q block (BQ 64), 256 two (BQ 64), 512 four with two
-    /// Q-row blocks a threadgroup (BQ 32) over 32-token pages (Gemma 4's global layers).
+    /// Q-row blocks a threadgroup (BQ 32) over 32-token pages (Gemma 4's global layers, on
+    /// `attention_nax_paged_wide`, whose Q @ K^T / P @ V are whole-page `matmul2d`s).
     pub fn nax_paged_kernel(
         dtype_tag: &str,
         head_dim: u32,

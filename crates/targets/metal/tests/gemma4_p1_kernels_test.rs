@@ -3402,3 +3402,109 @@ fn steel_nax_paged_bd256_matches_ref_and_vs_steel() {
         );
     }
 }
+
+/// The NAX paged attention bounds every page it reads by the keys present, at head_dim 256 (the
+/// fragment kernel) and 512 (`attention_nax_paged_wide`, whose `matmul2d`s read pages whole): K
+/// and V rows past the last key hold NaN here, and the output must still match the CPU reference
+/// (one P @ V reading such a row unbounded turns its rows NaN). 70 keys end mid-page and
+/// mid-K-tile; the 70 query rows end mid Q-tile.
+#[test]
+fn steel_nax_paged_ignores_rows_past_kv_len() {
+    let Some(di) = detect_nax_device() else {
+        return;
+    };
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+    for (head_dim, block_size) in [(256usize, 16usize), (512, 32)] {
+        let case = AttnCase {
+            num_q_heads: 16,
+            num_kv_heads: 2,
+            head_dim,
+            kv_len: 70,
+            window: 0,
+        };
+        let num_blocks = case.kv_len.div_ceil(block_size);
+        let page = case.num_kv_heads * block_size * head_dim;
+        // Layout [page][kv head][row][head dim]: element i's key is its page's first + its row.
+        let poison_past_kv_len = |mut x: Vec<f32>| {
+            for (i, v) in x.iter_mut().enumerate() {
+                if (i / page) * block_size + (i / head_dim) % block_size >= case.kv_len {
+                    *v = f32::NAN;
+                }
+            }
+            x
+        };
+        let k_host = poison_past_kv_len(pseudo(101, num_blocks * page, 1.0));
+        let v_host = poison_past_kv_len(pseudo(103, num_blocks * page, 1.0));
+        let (k_buf, v_buf) = (buf_f16(&device, &k_host), buf_f16(&device, &v_host));
+        let k_tab = buf_u64(&device, &[k_buf.gpuAddress()]);
+        let v_tab = buf_u64(&device, &[v_buf.gpuAddress()]);
+        let bt_buf = buf_u32(&device, &(0..num_blocks as u32).collect::<Vec<_>>());
+        let total_q = case.kv_len;
+        let q_host = pseudo(109, total_q * case.num_q_heads * head_dim, 1.0);
+        let q_buf = buf_f16(&device, &q_host);
+        let out_buf = buf_zero(&device, total_q * case.num_q_heads * head_dim * 2);
+        let cu_seqlens = buf_u32(&device, &[0, total_q as u32, 0, 0]);
+        let seq_used = buf_u32(&device, &[case.kv_len as u32]);
+        let mut consts = attn_constants(&case, block_size, num_blocks);
+        consts[6] = ConstantValue::uint(6, num_blocks.next_power_of_two() as u32);
+        let nax = scratchy_target_metal::steel_paged::nax_paged_kernel(
+            "f16",
+            head_dim as u32,
+            block_size as u32,
+        )
+        .expect("NAX instance");
+        let key = PipelineKey::new("attention_steel_nax_paged", nax.symbol, consts);
+        let pipeline = baked_build(&cache, &key).expect("NAX pipeline");
+        assert!(common::dispatch_threadgroups(
+            &device,
+            &pipeline,
+            &[
+                &out_buf,
+                &q_buf,
+                &cu_seqlens,
+                &seq_used,
+                &bt_buf,
+                &k_tab,
+                &v_tab,
+                &k_buf,
+                &v_buf,
+            ],
+            MTLSize {
+                width: total_q.div_ceil(nax.bq as usize),
+                height: case.num_q_heads,
+                depth: 1,
+            },
+            MTLSize {
+                width: nax.threads as usize,
+                height: 1,
+                depth: 1,
+            },
+        ));
+        let r = |h: &[f32]| {
+            (h.iter())
+                .map(|&x| f16::from_f32(x).to_f32())
+                .collect::<Vec<_>>()
+        };
+        let positions: Vec<usize> = (0..total_q).collect();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let want = attn_ref(
+            &r(&q_host),
+            &r(&k_host),
+            &r(&v_host),
+            &case,
+            block_size,
+            &positions,
+            scale,
+        );
+        let got = read_f16(&out_buf, total_q * case.num_q_heads * head_dim);
+        let max_err = (got.iter().zip(&want))
+            .map(|(g, w)| (g - w).abs())
+            .fold(
+                0f32,
+                |m, e| if e.is_nan() { f32::INFINITY } else { m.max(e) },
+            );
+        eprintln!("steel nax paged hd{head_dim}, NaN past kv_len: max_err {max_err}");
+        assert!(max_err < 2e-2, "hd{head_dim} max_err {max_err}");
+    }
+}

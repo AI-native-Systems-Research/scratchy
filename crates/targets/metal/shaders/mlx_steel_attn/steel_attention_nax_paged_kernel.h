@@ -37,7 +37,7 @@
 // dispatched, and the attention reads K directly from the cache exactly as
 // before (non-spans path byte-identical).
 //
-// Two kernels live in this header:
+// Three kernels live in this header:
 //   1. `rope_once_nax` — reads unrotated K from the paged cache (block_table
 //      bit 31 flags "unrotated"), ropes each row to its absolute position
 //      using the cos_sin TABLE (the sincos is done ONCE per key here, not per
@@ -47,6 +47,9 @@
 //   2. `attention_nax_paged` — the FA-2 attention. When ROPE_ON_READ it reads
 //      K from the scratch (buffer 7 = scratch base pointer) via the dense
 //      logical-block resolve; otherwise reads K from the cache (buffer 5).
+//   3. `attention_nax_paged_wide` — the same attention, its arithmetic in the
+//      same order, with each warp's Q @ K^T / P @ V a whole-page `matmul2d`
+//      reading the page's rows from device itself (head_dim 512).
 //
 // attention_nax_paged bindings (mirror `attention_steel_paged`):
 //   buffer(0) O             [total_q, num_q_heads, head_dim]
@@ -700,6 +703,293 @@ void attention_nax_paged(
     rcp[i] = 1.f / sum_score[i];
   }
   Otile.template row_bin_op<NMulOp>(rcp);
+
+  if (lim_rows_q < BQ) {
+    if (lim_rows_q <= 0) return;
+    Otile.store_rows(O, Q_stride_tok, lim_rows_q);
+  } else {
+    Otile.store(O, Q_stride_tok);
+  }
+}
+
+// The attention of `attention_nax_paged` (same bindings, constants, masks and spans) and its
+// arithmetic in the same order, for head_dim 512: WN warps a 16-row Q block, each holding O and
+// its partial S over BD / WN head dims, the partial S met in threadgroup memory every K-tile. Each
+// warp's Q @ K^T and P @ V of a page is ONE `matmul2d` reading the page's K or V rows from device
+// itself, S and O stay in the ops' cooperative tensors, and P is converted to P @ V's left input
+// in registers: the matrix unit runs uninterrupted by per-fragment loads and copies.
+// clang-format off
+template <
+    typename T,
+    int BQ,
+    int BK,
+    int BD,
+    int WM,
+    int WN,
+    int BLOCK_SIZE_,
+    typename AccumType = float>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
+void attention_nax_paged_wide(
+    device T*          O            [[buffer(0)]],
+    const device T*    Q            [[buffer(1)]],
+    const device uint* cu_seqlens_q [[buffer(2)]],
+    const device uint* seq_used_k   [[buffer(3)]],
+    const device uint* block_table  [[buffer(4)]],
+    const device uint64_t* k_cache  [[buffer(5)]],
+    const device uint64_t* v_cache  [[buffer(6)]],
+    const device T*    k_scratch    [[buffer(7)]],
+    const device uint* span_ids     [[buffer(8)]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]]) { // clang-format on
+  using namespace mpp::tensor_ops;
+  using Ext = dextents<int32_t, 2>;
+
+  const uint seq_idx    = tid.z;
+  const uint q_head_idx = tid.y;
+  const uint gqa_factor = NAXP_NUM_Q_HEADS / NAXP_NUM_KV_HEADS;
+  const uint kv_head_idx = q_head_idx / gqa_factor;
+
+  const uint seq_start     = cu_seqlens_q[seq_idx];
+  const uint seq_end       = cu_seqlens_q[seq_idx + 1];
+  const uint new_q_for_seq = seq_end - seq_start;
+  const uint kv_len        = seq_used_k[seq_idx];
+  const uint prefix_len    = kv_len - new_q_for_seq;
+  const uint q_block_base  = tid.x * uint(BQ);
+  const uint global_q_base = seq_start + q_block_base;
+
+  if (q_block_base >= new_q_for_seq) {
+    return;
+  }
+  const uint q_tile_rows = min(uint(BQ), new_q_for_seq - q_block_base);
+
+  const int Q_stride_tok = int(NAXP_NUM_Q_HEADS) * BD;
+  Q += int(global_q_base) * Q_stride_tok + int(q_head_idx) * BD;
+  O += int(global_q_base) * Q_stride_tok + int(q_head_idx) * BD;
+
+  const int kv_blk_stride  = int(NAXP_NUM_KV_HEADS) * BLOCK_SIZE_ * BD;
+  const int kv_head_off    = int(kv_head_idx) * (BLOCK_SIZE_ * BD);
+  const device uint* row_block_table =
+      block_table + seq_idx * NAXP_MAX_BLOCKS_PER_SEQ;
+  const int num_pages = int((kv_len + uint(BLOCK_SIZE_) - 1u) / uint(BLOCK_SIZE_));
+
+  const float scale2 = NAXP_SCALE * NAX_M_LOG2E;
+
+  // ----- warp geometry -----------------------------------------------------
+  constexpr short kU = 16;
+  constexpr int DW = BD / WN;
+  // Keys one op takes: one page, at most 32.
+  constexpr int KQ = BLOCK_SIZE_ < 32 ? BLOCK_SIZE_ : 32;
+  constexpr short TK = BK / kU;
+  static_assert(BQ == WM * kU && WN > 1, "one 16-row Q block a warp, WN warps a block");
+  static_assert(BK % KQ == 0 && BLOCK_SIZE_ % KQ == 0 && KQ % kU == 0, "whole ops a K-tile");
+  static_assert(DW % kU == 0, "whole 16-dim fragments a warp");
+
+  using otile_t = NAXTile<AccumType, 1, DW / kU>;
+  using stile_t = NAXTile<AccumType, 1, TK>;
+
+  const short rb = short(simd_group_id / WN);
+  const short wn = short(simd_group_id % WN);
+  const short tm = kU * rb;
+  const short lim_rows_q = short(int(q_tile_rows) - int(tm));
+  // A warp past the tile's rows still runs its ops (its block meets every K-tile): it reads the
+  // tile's first rows and stores nothing.
+  const device T* Qw = Q + (lim_rows_q > 0 ? int(tm) : 0) * Q_stride_tok + wn * DW;
+  O += tm * Q_stride_tok + wn * DW;
+
+  const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
+  const short sm = simd_coord.y;
+  const short sn = simd_coord.x;
+
+  constexpr short kRowsPT = otile_t::kRowsPerThread;
+  metal::vec<AccumType, kRowsPT> max_score;
+  metal::vec<AccumType, kRowsPT> sum_score{0};
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    max_score[i] = NaxLimits<AccumType>::finite_min;
+  }
+
+  // Causal/window iteration bounds (absolute K-axis coords), shared by the threadgroup (its warps
+  // meet every K-tile): the Q tile rows are [prefix_len + q_block_base, ... + q_tile_rows).
+  const int abs_q_min = int(prefix_len) + int(q_block_base) + int(tm);
+  const int abs_q_first = int(prefix_len) + int(q_block_base);
+  const int abs_q_max_excl = abs_q_first + int(q_tile_rows);
+  const int kv_tiles_total = int((kv_len + uint(BK) - 1u) / uint(BK));
+  int kb_lim = (abs_q_max_excl + BK - 1) / BK;
+  if (kb_lim > kv_tiles_total) kb_lim = kv_tiles_total;
+  int kb_start = 0;
+  if (NAXP_WINDOW > 0) {
+    const int first_k = abs_q_first - NAXP_WINDOW + 1;
+    if (first_k > 0) kb_start = first_k / BK;
+  }
+  // Block-diagonal span attention, as in `attention_nax_paged`: a span-uniform Q tile starts at
+  // its span's first K-tile.
+  if (NAXP_ROR != 0u) {
+    const uint sf = span_ids[uint(abs_q_first)];
+    const uint sl = span_ids[uint(abs_q_max_excl - 1)];
+    if (sf != 0u && sf == sl) {
+      const int span_kb = (int(sf) - 1) / int(BK);
+      if (span_kb > kb_start) { kb_start = span_kb; }
+    }
+  }
+
+  // The first row of the `KQ`-key group `g`'s page, for K (pre-roped scratch for spans, else the
+  // cache: one path per pipeline, on the baked ROR) and V (always the cache, never roped).
+  auto resolve_k = [&](int g) -> const device T* {
+    const int lb = g / (BLOCK_SIZE_ / KQ);
+    const int rows = (g % (BLOCK_SIZE_ / KQ)) * KQ * BD;
+    if (NAXP_ROR != 0u) {
+      return nax_resolve_scratch<T>(
+          k_scratch, lb, num_pages, kv_blk_stride, kv_head_off) + rows;
+    }
+    return nax_resolve_block<T>(
+        k_cache, row_block_table, lb, num_pages,
+        int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off) + rows;
+  };
+  auto resolve_v = [&](int g) -> const device T* {
+    return nax_resolve_block<T>(
+        v_cache, row_block_table, g / (BLOCK_SIZE_ / KQ), num_pages,
+        int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off)
+        + (g % (BLOCK_SIZE_ / KQ)) * KQ * BD;
+  };
+
+  constexpr auto qk_desc = matmul2d_descriptor(
+      16, KQ, DW, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<qk_desc, execution_simdgroup> qk_op;
+  constexpr auto pv_desc = matmul2d_descriptor(
+      16, DW, KQ, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<pv_desc, execution_simdgroup> pv_op;
+
+  // Tensor extents bound the rows the ops read: Q past the tile's rows and V past kv_len read as 0.
+  tensor<device T, Ext, tensor_inline> q_rows(
+      (device T*)Qw, Ext(Q_stride_tok, max(min(int(lim_rows_q), int(kU)), 1)));
+  auto sQ = q_rows.template slice<DW, dynamic_extent>(0, 0);
+  auto k_slice = [&](int g) {
+    tensor<device T, Ext, tensor_inline> k((device T*)(resolve_k(g) + wn * DW), Ext(BD, KQ));
+    return k.template slice<DW, KQ>(0, 0);
+  };
+  auto v_slice = [&](int g, int rows) {
+    tensor<device T, Ext, tensor_inline> v((device T*)(resolve_v(g) + wn * DW), Ext(BD, rows));
+    return v.template slice<DW, dynamic_extent>(0, 0);
+  };
+  using sk_t = decltype(k_slice(0));
+  using sv_t = decltype(v_slice(0, 1));
+  using pin_t = typename decltype(pv_op)::template cooperative_tensor_left_input_t<
+      AccumType, T, AccumType>;
+  auto Oc = pv_op.template get_destination_cooperative_tensor<pin_t, sv_t, AccumType>();
+  STEEL_PRAGMA_UNROLL
+  for (uint16_t i = 0; i < Oc.get_capacity(); ++i) Oc[i] = 0;
+
+  // The block's partial S, lane by lane, a buffer a K-tile parity: a warp writing tile kb + 2's
+  // part has met its block at tile kb + 1, after everyone read tile kb's.
+  constexpr int kPart = 32 * stile_t::kElemsPerTile;
+  threadgroup AccumType sx[2 * WM * WN * kPart];
+  constexpr auto neg_inf = NaxLimits<AccumType>::finite_min;
+
+  // ----- KV loop -----------------------------------------------------------
+  for (int kb = kb_start; kb < kb_lim; kb++) {
+    const int key0 = kb * BK;
+    // This warp's partial S over its head dims, a page group at a time.
+    stile_t Sp;
+    STEEL_PRAGMA_UNROLL
+    for (short q = 0; q < BK / KQ; q++) {
+      const int g = kb * (BK / KQ) + q;
+      auto c = qk_op.template get_destination_cooperative_tensor<decltype(sQ), sk_t, AccumType>();
+      STEEL_PRAGMA_UNROLL
+      for (uint16_t i = 0; i < c.get_capacity(); ++i) c[i] = 0;
+      if (g * KQ < int(kv_len)) {
+        auto sK = k_slice(g);
+        qk_op.run(sQ, sK, c);
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < KQ / 2; i++) Sp.elems()[q * (KQ / 2) + i] = c[i];
+    }
+    threadgroup AccumType* part = sx + (kb & 1) * (WM * WN * kPart);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < stile_t::kElemsPerTile; i++) {
+      part[(simd_group_id * stile_t::kElemsPerTile + i) * 32 + simd_lane_id] = Sp.elems()[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stile_t Stile;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < stile_t::kElemsPerTile; i++) {
+      AccumType s = 0;
+      STEEL_PRAGMA_UNROLL
+      for (short w = 0; w < WN; w++) {
+        s += part[((rb * WN + w) * stile_t::kElemsPerTile + i) * 32 + simd_lane_id];
+      }
+      Stile.elems()[i] = s;
+    }
+
+    // Scale, then mask the partial tail, the causal diagonal and keys past the window.
+    STEEL_PRAGMA_UNROLL
+    for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+      Stile.elems()[ii] *= scale2;
+    }
+    const bool tail = key0 + BK > int(kv_len);
+    const bool causal = key0 + BK - 1 > abs_q_min;
+    const bool window = NAXP_WINDOW > 0 && (abs_q_max_excl - 1 - key0) >= NAXP_WINDOW;
+    if (tail || causal || window) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        thread auto& fg = Stile.frag_at(0, ik);
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+            const int r = abs_q_min + sm + ii * stile_t::kFragRowsJump;
+            const int c = key0 + ik * kU + sn + jj;
+            const auto loc = ii * stile_t::kFragThrCols + jj;
+            const bool dead = c >= int(kv_len) || r < c ||
+                (NAXP_WINDOW > 0 && (r - c) >= NAXP_WINDOW);
+            fg[loc] = dead ? neg_inf : fg[loc];
+          }
+        }
+      }
+    }
+
+    // Online softmax: (max, sum, O) from the masked S; S becomes P.
+    metal::vec<AccumType, kRowsPT> new_max;
+    metal::vec<AccumType, kRowsPT> factor;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) new_max[i] = max_score[i];
+    Stile.template row_reduce<NMaxOp>(new_max);
+    Stile.template row_bin_op<NExpSubOp>(new_max);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      factor[i] = fast::exp2(max_score[i] - new_max[i]);
+      max_score[i] = new_max[i];
+      sum_score[i] = sum_score[i] * factor[i];
+    }
+    Stile.template row_reduce<NSumOp>(sum_score);
+    // O's elements lie as S's: fragments of 16 columns, a lane's 4 of row sm then 4 of row sm + 8.
+    STEEL_PRAGMA_UNROLL
+    for (uint16_t i = 0; i < Oc.get_capacity(); ++i) Oc[i] *= factor[(i % 8) / 4];
+
+    // O += P @ V a page group at a time, P converted in registers to the op's left input.
+    STEEL_PRAGMA_UNROLL
+    for (short g = 0; g < BK / KQ; g++) {
+      const int rows = min(int(kv_len) - (key0 + g * KQ), KQ);
+      if (rows > 0) {
+        auto p = qk_op.template get_destination_cooperative_tensor<decltype(sQ), sk_t, AccumType>();
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < KQ / 2; i++) p[i] = Stile.elems()[g * (KQ / 2) + i];
+        auto P = pv_op.template get_left_input_cooperative_tensor<AccumType, T, AccumType>(p);
+        auto sV = v_slice(kb * (BK / KQ) + g, rows);
+        pv_op.run(P, sV, Oc);
+      }
+    }
+  }
+
+  // ----- normalize + store -------------------------------------------------
+  metal::vec<AccumType, kRowsPT> rcp;
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    rcp[i] = 1.f / sum_score[i];
+  }
+  otile_t Otile;
+  STEEL_PRAGMA_UNROLL
+  for (uint16_t i = 0; i < Oc.get_capacity(); ++i) Otile.elems()[i] = Oc[i] * rcp[(i % 8) / 4];
 
   if (lim_rows_q < BQ) {
     if (lim_rows_q <= 0) return;
