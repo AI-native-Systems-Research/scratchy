@@ -5909,9 +5909,10 @@ pub fn tanhsoftcap(
 ///
 /// `silumul`'s body verbatim (same handles, same synth, same column-block
 /// offsets), with the act's OWN device primitive in place of `"silu"`: `silu` for
-/// [`GatedAct::Silu`], `gelufwd` for [`GatedAct::Gelu`] — both real DDL
-/// primitives (`elementwise_op_func`), so the two-op form `act(gate) → tmp`,
-/// `multiply(tmp, up) → out` holds for either.
+/// [`GatedAct::Silu`], `gelu` for [`GatedAct::Gelu`] (the `op_func_from_str`
+/// keys; the dxp wire spelling `gelufwd` comes from the `OpFunc` itself) — both
+/// real DDL primitives (`elementwise_op_func`), so the two-op form
+/// `act(gate) → tmp`, `multiply(tmp, up) → out` holds for either.
 pub fn gated_act(
     name: &str,
     act: crate::ktir_node::GatedAct,
@@ -5919,9 +5920,15 @@ pub fn gated_act(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
+    // ⛔ THE `op_func_from_str` KEY, NOT THE WIRE SPELLING. `"gelufwd"` is
+    // `OpFunc::name()`'s dxp spelling — a different string with a different
+    // job (it reaches the descriptor via the `OpFunc`, never via this key);
+    // the key is `"gelu"`, the `elementwise_op_func` law. Passing the wire
+    // spelling here was a PANIC at the door's first execution (tiny26's
+    // GeGLU pairs), never caught locally because the emu bypasses the door.
     let act_func = match act {
         crate::ktir_node::GatedAct::Silu => "silu",
-        crate::ktir_node::GatedAct::Gelu => "gelufwd",
+        crate::ktir_node::GatedAct::Gelu => "gelu",
     };
     let (ins, o) = split_out(name, r, layout, 2)?;
     let (gate_r, up_r) = (ins[0], ins[1]);
@@ -6370,6 +6377,610 @@ pub fn expert_combine(
             ));
         }
     }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertMatmul`] —
+/// one projection of each `(token, slot)` pair's expert over the stacked
+/// `[E·out, in]` fp8 weight bank, the gathered form of the dense W8A8 body.
+///
+/// The program's parameters, in `KtirFunc::expert_matmul` mint order:
+/// `rows [m, k·in]`, `idx [m, k]` (the SORT's index input, bound by the
+/// producer), `w [E·out, in]` (the packed fp8 bank), `s [E·out, 1]` (the
+/// bf16 per-channel scale bank) + `out [m, k·out]`. Every extent derives
+/// from the views: `k = idx.v_cols`, `in = rows.v_cols/k`,
+/// `out = out.v_cols/k`, `E = w.v_rows/out`.
+///
+/// ⭐ THE PAIR LOOP IS OVER PAIRS, NOT TOKENS — the emu's own enumeration
+/// (`for p in 0..m·k`, `(n_tok, slot) = (p/k, p%k)`), stated here as
+/// emit-time constants because `m` and `k` are graph constants. Five legs:
+///
+/// 1. **INDEX** — one `fp32toint32` convert of the whole `[m, W]` routing
+///    output to SENUINT32 (`OpFunc::Fp32ToInt32`, the vendor
+///    unary_parallel.ddl bind whose input list accepts fp16 and whose output
+///    list accepts uint32). Lane `j` of row `i` holds pair `(i, j)`'s expert
+///    id; the pad lanes past `k` are zero, which names expert 0 — the same
+///    slab every out-of-range pair reads, inert because no matmul leg reads
+///    past pair `m·k`.
+/// 2. **WEIGHT GATHER** — a kernel-less identity copy of the pair's expert
+///    slab from the retiled fp8 bank into a pair-indexed scratch. One entry
+///    per pair, `page = out·in/128` one-stick fp8 rows (the slab's whole
+///    height at the 128-elem fp8 stick), `cols = 128` (ONE fp8 stick — the
+///    gather's one-stick law, at the copied format's own width). The entry
+///    value is the RAW expert id: the bank's expert `e` slab is
+///    device-contiguous at elements `[e·out·in, (e+1)·out·in)` (the
+///    stage-weight test pins it), so `idx·skip_addr` with
+///    `skip_addr = page·128 = out·in` elements lands exactly on the slab.
+/// 3. **SCALE GATHER** — the same index tensor, the bf16 bank viewed `[E·out]`
+///    flat at fp16 geometry: `page = out/64` rows, `cols = 64` (one fp16
+///    stick), producing pair `p`'s `[out]` scale window at scratch offset
+///    `p·out`.
+/// 4. **MATMUL** — per pair, the dense W8A8 body's own `matmulfp8` at baked
+///    offsets: `A` = the quantized activation row `p/k` at
+///    `a_off = (p/k)·(k·in) + (p%k)·in` into `[m, k·in]` rows, `W` = the
+///    pair's fp8 scratch slab at `w_off = p·(out·in)`, `out` at
+///    `o_off = (p/k)·(k·out) + (p%k)·out` into the `[m, k·out]` pair rows.
+///    The activation quantize chain is the dense body's own, SHARED per
+///    distinct activation through `quantized` exactly as `matmul`'s door
+///    threads it — the pair rows are one activation from the quantizer's
+///    point of view, quantized once at `[m, k·in]`.
+/// 5. **DEQUANT** — `raw · s_scratch` (per-pair window) `· a_scale` (the
+///    per-row lane-0 broadcast, `In::col`): the pair-major `[m·k, out]`
+///    flattening of the output IS the token-major `[m, k·out]` the emu
+///    stores (`store_region` at `(n_tok, slot·out + c)`), so the dequant
+///    legs write the output tile directly at the same `o_off` windows the
+///    matmul wrote its raw product into — no unsort inside the door.
+///
+/// ⛔ THE GATHERS SIT ON THE COPIES, NOT THE MATMUL — the card-measured law
+/// (`emit/mod.rs`'s kernel-bearing refusal): a gather may not ride an op
+/// whose `primaryDsInfo_` carries a KERNEL. The copy feeds the matmul a
+/// regular scratch; the matmul is the dense body's own descriptor.
+///
+/// ⛔ THE INDEX IS ONE CONVERT PER ROUTER, NOT PER PROJECTION — the convert
+/// is keyed off the INDEX tensor's own tid (`rows`' sibling, resolved by
+/// extent), so gate/up/down each re-emit it against the same input buffer.
+/// The convert is idempotent on the wire (same input tensor, same output
+/// synth), so the three projections' converts land on the same scratch and
+/// the later ones merely re-write the bytes the first wrote. Wasted ops, no
+/// wrong bytes — the shared-convert refinement (a `quantized`-style dedup
+/// keyed on the index tid) is a worklist item, not this door's blocker.
+///
+/// ⛔ A PAIR COUNT ABOVE ONE INDEX STICK (m·k > 32) SPLITS THE GATHERS into
+/// one op per 32 entries, the `GatherScratch::copies` cut: the IBR is
+/// loaded one stick at a time and each core's read offset is taken modulo
+/// it, so entries past the first 32 WRAP silently (rung 8's corruption).
+/// The destination advances by the entries covered (`dest_entry`), the index
+/// base by whole sticks (`EntryBase::of_sticks`), the two numbers the
+/// `GatherCopy` law separates.
+pub fn expert_matmul(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    quantized: &mut std::collections::HashSet<String>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The four compute inputs + the output. ⭐ MINT ORDER, NOT CALL ORDER —
+    // and the mint order is NOT the call order: `KtirFunc::expert_matmul`
+    // mints `w` and `s` FIRST (their `arg_for`s open the bank views), then
+    // `idx` (`load_region`), then `rows` (the pair loop's first block load),
+    // so the parameters arrive as `[w, s, idx, rows]` and NO position in the
+    // list names an operand. Each is resolved by its extent law:
+    //   · the BANK PAIR `w`/`s` — the two inputs that share a row count
+    //     (the stacked `[E·out, in]` codes and `[E·out, 1]` scales have the
+    //     same bank rows), `s` the rank-1 one;
+    //   · `idx` — of the two `m`-rowed inputs left, the NARROW `[m, k]`
+    //     routing; `rows` the wide `[m, k·in]` pair rows (the wide one is
+    //     never ambiguous: `in` is a whole 64-stick, `k` is the top-k).
+    // ⛔ AND `k` IS THE ROUTING TENSOR'S OWN WIDTH, NOT A RATIO. An earlier
+    // version computed `k = rows.v_cols / idx.v_cols` — which is `in`, the
+    // per-pair width, not `k` — and then derived `in = rows.v_cols / k`, so
+    // the two facts traded places and every downstream extent (the bank's
+    // `in`, the output's `n`) was checked against the wrong one.
+    let (tensors, out) = split_out(name, r, layout, 4)?;
+    let rows = node_rows(name, &out)?;
+    // ⛔ THE SCALE BANK IS THE UNIQUE RANK-1-VIEWED INPUT — and the RANK is
+    // read off the VIEW's dimensionality, not off `v_rows/v_cols`. The
+    // builder mints the scale bank's view as ONE-DIM `[E·out]` with stride 1
+    // (`view_of(s_ptr, [bank_rows], [1])`), and `shape_2d` surfaces a rank-1
+    // view as `(1, E·out)` — a `[1, 1024]` REGION, not `[1024, 1]`. So the
+    // discriminator is `v_rows == 1 ∧ v_cols > 1` (one flat row), and `w` is
+    // the input whose ROW count is the scale bank's LENGTH. Two earlier
+    // drafts got this wrong in complementary ways: "two inputs sharing a row
+    // count" matched rows/idx at decode m=1 (t204 [1,256]/t199 [1,2], the
+    // round-8 retry refusal), and "the input with `v_cols == 1`" found
+    // nothing at all (the scale bank is `[1, E·out]`, not `[E·out, 1]` — the
+    // next refusal). The pair rows and the routing are always m-rowed with
+    // `m ≥ 1` and widths > 1, and a weight bank of one ROW would mean
+    // `E·out = 1` — a single expert with a one-channel projection, refused
+    // by the stick guards below.
+    let s_r = tensors
+        .iter()
+        .copied()
+        .find(|t| t.v_rows == 1 && t.v_cols > 1)
+        .ok_or_else(|| Error {
+            message: format!(
+                "ExpertMatmul {name}: no input is the rank-1 scale bank — the builder views the \
+                 stacked [E·out] scales as ONE flat row, and exactly one of the four inputs has \
+                 that shape",
+            ),
+        })?;
+    let w_r = tensors
+        .iter()
+        .copied()
+        .find(|t| t.tid != s_r.tid && t.v_rows == s_r.v_cols)
+        .ok_or_else(|| Error {
+            message: format!(
+                "ExpertMatmul {name}: no input carries the scale bank t{}'s {} rows — the \
+                 stacked [E·out, in] codes have the same bank row count as their scales",
+                s_r.tid, s_r.v_cols
+            ),
+        })?;
+    let (rows_r, idx_r) = {
+        let rest: Vec<Region> = tensors
+            .iter()
+            .copied()
+            .filter(|t| t.tid != w_r.tid && t.tid != s_r.tid)
+            .collect();
+        let [a, b] = rest[..] else {
+            return err(format!(
+                "ExpertMatmul {name}: {} input(s) remain after the bank pair — the pair rows and \
+                 the routing are exactly two",
+                rest.len()
+            ));
+        };
+        let (rows_r, idx_r) = if a.v_cols >= b.v_cols { (a, b) } else { (b, a) };
+        if idx_r.v_cols == 0 || rows_r.v_cols % idx_r.v_cols != 0 || rows_r.v_rows != idx_r.v_rows
+        {
+            return err(format!(
+                "ExpertMatmul {name}: the pair rows t{} [{}, {}] and the routing t{} [{}, {}] — \
+                 the routing's width must be the top-k and divide the pair rows' k·in, at the same \
+                 row count",
+                rows_r.tid, rows_r.v_rows, rows_r.v_cols, idx_r.tid, idx_r.v_rows, idx_r.v_cols
+            ));
+        }
+        (rows_r, idx_r)
+    };
+    let k = idx_r.v_cols;
+    if k == 0 || out.v_cols % k != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: the routing t{} states k={k} but the output t{}'s width is \
+             {} — the pair output is [m, k·out], so k must divide it",
+            idx_r.tid,
+            out.tid,
+            out.v_cols
+        ));
+    }
+    let inn = rows_r.v_cols / k;
+    let n = out.v_cols / k;
+    let bank_rows = w_r.v_rows;
+    if bank_rows % n != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: the weight bank t{} is [{}, {}] but the projection's out width \
+             is {n} — the stacked bank is [E·out, in], so out must divide its rows",
+            w_r.tid, w_r.v_rows, w_r.v_cols
+        ));
+    }
+    let e_count = bank_rows / n;
+    if w_r.v_cols != inn {
+        return err(format!(
+            "ExpertMatmul {name}: the weight bank t{} contracts {} columns but the rows t{} \
+             carry {} per pair — the bank's `in` must match the activation's",
+            w_r.tid, w_r.v_cols, rows_r.tid, inn
+        ));
+    }
+    // The stick guards: `in` must be a whole fp16 64-stick for the activation
+    // quantize (the dense body's own guard) and a whole 128-elem fp8 stick for
+    // the gathered slab copy; `out` must be a whole 64-stick for the scale
+    // gather's fp16 page and the dequant window; `n % 64 == 0` also keeps the
+    // bank's own retile law (each expert slab a whole number of n-sticks).
+    let stk16 = crate::work::FP16_ELEMS_PER_STICK;
+    let stk8 = Df::Fp8.elems_per_stick();
+    if inn % stk16 != 0 || inn % stk8 != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: in={inn} is not a whole {stk16}-fp16 / {stk8}-fp8 stick — the \
+             activation quantize and the gathered slab copy both address whole sticks"
+        ));
+    }
+    if n % stk16 != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: out={n} is not a whole {stk16}-fp16 stick — the scale gather's \
+             page and the dequant window both address whole sticks"
+        ));
+    }
+    let out_tid = out.tid;
+    let idx_tid = idx_r.tid;
+    let rows_s = rows_r.name();
+    let w_s = w_r.name();
+    let s_s = s_r.name();
+    let out_s = out.name();
+    let idx_s = idx_r.name();
+    // The padded expert width W — the width the router chain's doors WRITE
+    // the routing buffer at (`w = next_multiple_of(64, E)`, the top-k door's
+    // own padded-width law). ⛔ IT IS NOT THE ROUTING TENSOR'S VIEW WIDTH:
+    // the view declares the graph shape `[m, k]` (sub-stick, the
+    // narrow-tensor law), while every router door reads and writes the
+    // buffer at W — so the convert's `cols` must be W, and W comes from the
+    // BANK's own expert count `E = bank_rows / n`, the one input that states
+    // it. The placement's `nbytes` pads the routing tensor's graph width to
+    // a stick, which for k ≤ 64 under-reserves the routing buffer relative
+    // to the doors' own writes — the top-k door's `out` handle is W wide and
+    // the router consts are placed at W, so the reserved `[m, k_pad]` buffer
+    // and the written `[m, W]` window only agree because the router chain's
+    // tensors share the segment; the convert reads W and the door's own
+    // scratch is sized W, keeping the two consistent here.
+    let w_pad = e_count.next_multiple_of(stk16);
+    if w_pad == 0 || e_count == 0 {
+        return err(format!(
+            "ExpertMatmul {name}: the bank t{} states E={e_count} — the padded expert width \
+             next_multiple_of(64, E) must be a nonzero stick",
+            w_r.tid
+        ));
+    }
+    // ── The scratch reservations, all keyed off the OUTPUT's tid (the
+    // per-matmul law the dense body states; the index convert keyed off the
+    // IDX tensor's own tid so the three projections share one scratch).
+    let out_id = PlaceId::Act(out_tid);
+    let idx_id = PlaceId::Act(idx_tid);
+    use crate::place::SynthRole as R;
+    let xf32_s = crate::placement::syn(layout, idx_id.synth(R::XF32));
+    let xidx_s = crate::placement::syn(layout, idx_id.synth(R::XIdx));
+    let xw_s = crate::placement::syn(layout, out_id.synth(R::XWScratch));
+    let xs_s = crate::placement::syn(layout, out_id.synth(R::XSScratch));
+    let xraw_s = crate::placement::syn(layout, out_id.synth(R::XRaw));
+    let xdqa_s = crate::placement::syn(layout, out_id.synth(R::XDqA));
+    if let Some(l) = layout {
+        // The fp32 staging leg of the index convert chain — same shape, same
+        // 4-byte word as the u32 index (the slice-equality law above), so the
+        // footprint is identical to the converted index's own reservation.
+        l.synth_like(idx_id.synth(R::XF32), idx_tid, &[rows, w_pad], Df::Fp32);
+        // The converted index: `[m, W]` u32 — the fp16 top-k output's padded
+        // width at 4 bytes. `synth_like` off the IDX tensor's own placement so
+        // the footprint follows the routing buffer's real (padded) extent.
+        l.synth_like(idx_id.synth(R::XIdx), idx_tid, &[rows, w_pad], Df::SenUint32);
+        // The fp8 pair scratch — `[pairs·page_w, 128]` one-stick sub-rows,
+        // the gathered copy's destination law. ⛔ `page_w = n·in/128` sub-rows
+        // per pair (the slab's whole height at the 128-elem fp8 stick), not
+        // `n/64`: the door previously reserved `pairs·(n/64)` — short by the
+        // `in/128` factor (2× at in=256, 22× at 26b's in=2816), under-
+        // reserving the scratch the gather writes.
+        l.synth_df(
+            out_id.synth(R::XWScratch),
+            &[rows * k * (n * inn / stk8), stk8],
+            Df::Fp8,
+        );
+        // The scale scratch: `[m·k, out]` fp16 — pair p's `[out]` window at
+        // `p·out` (the gathered scale copy's destination, row-major).
+        l.synth_df(out_id.synth(R::XSScratch), &[rows * k, n], Df::Fp16);
+        // The raw product and its a_scale-folded intermediate: the dense
+        // body's FqRaw/FqDqA at the pair-major flattening `[m·k, out]`.
+        l.synth_df(out_id.synth(R::XRaw), &[rows * k, n], Df::Fp16);
+        l.synth_df(out_id.synth(R::XDqA), &[rows * k, n], Df::Fp16);
+    }
+    let mut ops: Vec<EmittedOp> = Vec::new();
+    // ⛔ THE m=1 (DECODE) REGIME ONLY, AND THIS IS A REFUSAL, NOT A LIMIT THE
+    // FIRST RUN CAN DISCOVER. The door's legs below are decode-correct by
+    // construction and prefill-INEXPRESSIBLE in the current vocabulary, each
+    // for a stated reason:
+    //   · the per-pair matmuls write 1-row `[1, n]` windows into the
+    //     `[m, k·n]` output — a rank-2 walk derives its stick-group stride
+    //     from the SWEPT mb (1), so at m>1 the pairs of tokens past the
+    //     first address the wrong stick groups (the output's own
+    //     `with_device_extent` covers the OUTPUT, but the A operand's
+    //     per-pair `[in]` windows into the stick-major `[m, k·in]`
+    //     activation have no input-side expression at all);
+    //   · the fp32toint32 convert of a W>64-wide buffer ROW-MIXES at m>1
+    //     (rank-3 flat, the narrowing law) — and W = pad64(E) is 128 for
+    //     every real gemma-4 MoE;
+    //   · the dequant legs are whole-tensor `[pairs, n]` pointwise ops
+    //     (correct at any m — the pair-major flattening IS the token-major
+    //     one) but their INPUTS are the per-pair matmul legs' outputs.
+    // A prefill bucket carrying an ExpertMatmul therefore refuses HERE,
+    // naming the row count, instead of baking a descriptor whose first
+    // token is right and every later one reads another pair's window. The
+    // prefill design (one expert-batch op per expert, or the gathered
+    // matmul's per-token y-batch on the copy) is a worklist item that
+    // starts from this refusal's text.
+    if rows > 1 {
+        return err(format!(
+            "ExpertMatmul {name}: {rows} token rows — the door is the DECODE (m=1) regime. At \
+             m>1 the per-pair matmul windows into the [m, k·in] activation and the [m, k·out] \
+             pair rows are not expressible as rank-2 1-row sweeps (the stick-group stride comes \
+             from the swept mb, not the buffer's), and the W>64 index convert row-mixes in the \
+             rank-3 flat form the narrowing law requires. Prefill MoE needs the per-expert \
+             batch form — a stated design task, not a silent wrong bake",
+        ));
+    }
+    // ── 1. THE INDEX CONVERT — TWO LEGS, NOT ONE ─────────────────────────
+    // `[m, W]` fp16 → fp32 → SENUINT32. ⛔ `fp32toint32`'s DDL bind
+    // (unary_parallel.ddl:59) constrains the input and output SLICE sizes
+    // EQUAL, and `getStickSizes` measures the slice in ELEMENTS
+    // (designSpaceConfig.cpp: elemInSlice = stickSize/8): an fp16 input's
+    // 64-elem stick yields slice 8 against the u32 output's 32-elem stick
+    // slice 4 — NEVER equal, so the direct fp16→u32 convert is dxp-refused
+    // ("slice size does not match", ddl_conversion.cpp:2728). The `%type_fp16`
+    // entry on `%inptensor`'s type list (line 20) is for the OTHER ops on
+    // that tensor; the CAST's own bind (:50) is fp32-mode, and the vendor
+    // `sdsc_fp32toint32.json` fixture states the legal form: an IEEE_FP32
+    // wordLength-4 input (stick 32, slice 4 — the match). `dl16tofp32`
+    // (quantization_double_pad.ddl:58) carries NO slice-equality constraint,
+    // so the fp16→fp32 widening is unconstrained and stages the routing
+    // buffer at the geometry the narrowing convert demands. Both converts
+    // read the buffer at its own padded width W — the same tiles every
+    // router door wrote.
+    ops.push(crate::emit::assemble_convert(
+        &format!("emxf_o{idx_tid}"),
+        "dl16tofp32",
+        rows,
+        w_pad,
+        &rb(&idx_s, rows, w_pad),
+        &rb(&xf32_s, rows, w_pad),
+        sym_id_base,
+        layout,
+    ));
+    ops.push(crate::emit::assemble_convert(
+        &format!("emidx_o{idx_tid}"),
+        "fp32toint32",
+        rows,
+        w_pad,
+        &rb(&xf32_s, rows, w_pad),
+        &rb(&xidx_s, rows, w_pad),
+        sym_id_base,
+        layout,
+    ));
+    // ── 2. THE WEIGHT GATHER ─────────────────────────────────────────────
+    // Per 32-entry stick of the flat pair index: one kernel-less fp8 copy of
+    // the indexed expert slabs into the pair scratch. `mb` is the copy's
+    // one-stick sub-rows; `page` is the slab's whole height in sub-rows.
+    let pairs = rows * k;
+    let slab_elems = n * inn; // one expert's whole packed slab, fp8 elements
+    let page_w = slab_elems / stk8; // one-stick sub-rows per slab
+    if slab_elems % stk8 != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: one expert slab is {slab_elems} fp8 elements, not a whole \
+             {stk8}-elem stick tall — the gathered copy's page must be whole sub-rows"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    for (stick, first) in (0..pairs).step_by(cap as usize).enumerate() {
+        let entries = cap.min(pairs - first);
+        let _ = stick;
+        ops.push(
+            crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                &w_s,
+                &xw_s,
+                entries * page_w, // `mb`: the run's one-stick sub-rows
+                stk8,             // `out`: ONE fp8 stick
+                Df::Fp8,
+                crate::superdsc_opspec::GatherIndex {
+                    name: xidx_s.clone(),
+                    entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                    page: crate::superdsc_opspec::PageExtent::of_positions(page_w),
+                    per_position: None,
+                    first_entry: crate::superdsc_opspec::EntryBase::of_sticks(stick as u32),
+                },
+                crate::superdsc_opspec::DestEntry::of_entries(first),
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: the expert weight gather: {e}"),
+            })
+            .and_then(|op| {
+                let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+                crate::emit::emit_sdsc_tiled(
+                    &format!("emwg_s{stick}_o{out_tid}"),
+                    &op,
+                    &folds,
+                    sym_id_base,
+                    layout,
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: the expert weight gather emit: {}", e.0),
+                })
+            })?,
+        );
+    }
+    // ── 3. THE SCALE GATHER ──────────────────────────────────────────────
+    // The same index, the bf16 bank at fp16 geometry: one entry covers the
+    // pair's `out` scales = `out/64` one-stick sub-rows, `cols` one fp16
+    // stick. The bank is viewed `[E·out, 1]` row-major, so `skip_addr` at
+    // `page·64 = out` fp16 elements steps exactly one bank row — the same
+    // arithmetic the weight gather states at its own format.
+    let page_s = n / stk16;
+    for (stick, first) in (0..pairs).step_by(cap as usize).enumerate() {
+        let entries = cap.min(pairs - first);
+        let _ = stick;
+        ops.push(
+            crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                &s_s,
+                &xs_s,
+                entries * page_s,
+                stk16,
+                Df::Fp16,
+                crate::superdsc_opspec::GatherIndex {
+                    name: xidx_s.clone(),
+                    entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                    page: crate::superdsc_opspec::PageExtent::of_positions(page_s),
+                    per_position: None,
+                    first_entry: crate::superdsc_opspec::EntryBase::of_sticks(stick as u32),
+                },
+                crate::superdsc_opspec::DestEntry::of_entries(first),
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: the expert scale gather: {e}"),
+            })
+            .and_then(|op| {
+                let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+                crate::emit::emit_sdsc_tiled(
+                    &format!("emsg_s{stick}_o{out_tid}"),
+                    &op,
+                    &folds,
+                    sym_id_base,
+                    layout,
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: the expert scale gather emit: {}", e.0),
+                })
+            })?,
+        );
+    }
+    // ── 4. THE SHARED ACTIVATION QUANTIZE + PER-PAIR MATMULS + DEQUANT ──
+    // The dense W8A8 chain over the whole `[m, k·in]` pair rows, quantized
+    // once per distinct activation (`quantized`, the dense door's own dedup).
+    // The pair rows ARE one activation from the quantizer's point of view:
+    // `fq_absx`/`fq_amax`/… run at `[rows, k·in]` and the per-row a_scale is
+    // one scale per TOKEN-PAIR row — exactly what leg 5's `In::col` broadcast
+    // reads.
+    let fq = super::ktir_matmul_fp8::matmul_fp8_descriptors(
+        &super::ktir_matmul_fp8::Fp8Facts {
+            a_tid: rows_r.tid,
+            a_name: rows_s.clone(),
+            w_name: xw_s.clone(),
+            ws_name: xs_s.clone(),
+            out_tid,
+        },
+        // ⭐ THE WHOLE-TENSOR SHAPE, NOT PER-PAIR: the quantize chain runs over
+        // the full `[rows, k·in]` activation and the dequant over the full
+        // `[rows, k·out]` output; only the MATMUL is per-pair, and it is
+        // re-emitted below at per-pair offsets. So the facts handed to the
+        // dense body state the whole node, and the per-pair matmul is spliced
+        // in place of the body's single whole-tensor `matmulfp8`.
+        rows,
+        inn,
+        k * n,
+        sym_id_base,
+        layout,
+        quantized,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: the expert activation quantize: {}", e.0)
+    })?;
+    // The dense body emitted its own whole-tensor `matmulfp8` + dequant pair;
+    // the per-pair door REPLACES those legs (the quantize chain is kept). The
+    // body's `fq_mm` op is the one whose op name ends `_fq_mm`; the two
+    // dequant legs are `_fq_dqa_op`/`_fq_dqw_op`. Split them off by name —
+    // the body's own `opn` law (`{out}_{suffix}`) makes the names derivable.
+    let opn = |s: &str| format!("{out_s}_{s}");
+    let mm_name = opn("fq_mm");
+    let dqa_name = opn("fq_dqa_op");
+    let dqw_name = opn("fq_dqw_op");
+    for op in fq {
+        let is_mm = op.op_name.ends_with(&mm_name);
+        let is_dqa = op.op_name.ends_with(&dqa_name);
+        let is_dqw = op.op_name.ends_with(&dqw_name);
+        if !is_mm && !is_dqa && !is_dqw {
+            ops.push(op);
+        }
+    }
+    // The per-pair matmuls and dequant legs, at the pair offsets.
+    // ⛔ THE DEQUANT HANDLES ARE 1-ROW FLAT, NOT `[pairs, n]`. The matmuls and
+    // both gathers wrote the scratches FLAT at pair-major offsets (`p·n`), and
+    // a `[pairs, n]` pointwise op at pairs>1 ∧ n>64 classifies STICK-MAJOR
+    // (rows>1 ∧ cols>64 ∧ block-aligned) — a rank-2 read of a flat-written
+    // buffer, scrambled for every geometry but `n == 64 ∧ pairs < 2`. At the
+    // door's m=1 the pair-major `[pairs, n]` flattening IS one flat row
+    // `[1, pairs·n]` (the token-major law), so the dequant legs below run
+    // 1-row — rank-3 flat (rows=1 never classifies stick-major), the dense
+    // body's own decode shape.
+    let xraw = rb(&xraw_s, 1, pairs * n);
+    let xdqa = rb(&xdqa_s, 1, pairs * n);
+    let out_h = rb(&out_s, rows, k * n);
+    let xsscale = rb(&xs_s, 1, pairs * n);
+    let flat_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(pairs * n);
+    for p in 0..pairs {
+        let (n_tok, slot) = (p / k, p % k);
+        // A's window: token `n_tok`'s slot-`slot` `[in]` block of the
+        // quantized pair rows; O's window: the same pair's `[n]` block of the
+        // output row. Both are plain flat offsets at the 1-row swept m —
+        // RowBlocked collapses to row-major at m=1.
+        let a_off = n_tok * (k * inn) + slot * inn;
+        let o_off = n_tok * (k * n) + slot * n;
+        let _ = o_off;
+        // matmulfp8 at the pair window: the dense body's own spec call, with
+        // per-operand element offsets into the quantized activation and the
+        // pair scratch. `w_off` is the compile-time slab offset `p·slab_elems`
+        // — the scratch's pair-major law.
+        let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<
+            crate::superdsc_opspec::Fp16,
+        >(
+            crate::sdsc_abstract::MatM::of_token_rows(1),
+            crate::sdsc_abstract::MatN::of_out_features(n),
+            crate::sdsc_abstract::MatK::of_in_features(inn),
+            crate::sdsc_abstract::MatY::unbatched(),
+            crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
+                super::bmm_site::TapeLoweringSite::witness(),
+            ),
+            &rows_s,
+            &xw_s,
+            &xraw_s,
+            a_off,
+            p * slab_elems,
+            p * n,
+            Df::Fp8,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: pair {p}'s matmulfp8: {e}")
+        })?;
+        for arg in &mut spec.args {
+            if !matches!(arg.view().role, crate::superdsc_opspec::Role::Output) {
+                arg.set_df(Df::Fp8);
+            }
+        }
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(spec.iter.cores_used());
+        ops.push(
+            crate::emit::emit_sdsc_tiled(
+                &format!("emmm_p{p}_o{out_tid}"),
+                &spec,
+                &folds,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: pair {p}'s matmulfp8 emit: {}", e.0)
+            })?,
+        );
+    }
+    // ── 5. THE DEQUANT, ONE FLAT ROW ─────────────────────────────────────
+    // ⛔ NOT `[pairs, n]` — and this replaces legs that had never executed
+    // and were wrong two ways:
+    //   · a `[pairs, n]` pointwise op at pairs>1 ∧ n>64 classifies
+    //     STICK-MAJOR (rows>1 ∧ cols>64 ∧ block-aligned) — a rank-2 read of
+    //     buffers the matmul and the gathers wrote FLAT at `p·n`: scrambled
+    //     for every geometry but `n == 64 ∧ pairs < 2`;
+    //   · leg 2's a_scale read demanded `pairs` rows out of the quantize's
+    //     one `[1, stk]` scale row (`In::col` per-row, then `In::mb` whose
+    //     materialized extent the synth guard prices at the op's rows) —
+    //     both refused or out-of-footprint.
+    // At the door's m=1 the pair-major `[pairs, n]` flattening IS one flat
+    // row `[1, pairs·n]` (the token-major law), so both legs run 1-ROW:
+    // rank-3 flat (rows=1 never classifies stick-major), reading the same
+    // flat bytes the matmul/gather wrote — the dense body's own decode
+    // shape (`fq_dqa_op` at m=1). The a_scale is the quantize's ONE scale
+    // row (every pair's token IS token 0 at m=1), read `In::col` over the
+    // `[1, stk]` footprint — one row, in-footprint, the dense body's own
+    // `ascale_h` idiom.
+    let ascale_s = crate::placement::syn(layout, PlaceId::Act(rows_r.tid).synth(R::FqAscale));
+    let ascale = rb(&ascale_s, rows, stk16);
+    ops.push(crate::emit::pw2(
+        &format!("ems_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        flat_cols,
+        In::full(&xraw),
+        In::full(&xsscale),
+        &xdqa,
+        sym_id_base,
+        layout,
+    ));
+    ops.push(crate::emit::pw2(
+        &format!("emo_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        flat_cols,
+        In::full(&xdqa),
+        In::col(&ascale),
+        &out_h,
+        sym_id_base,
+        layout,
+    ));
     Ok(ops)
 }
 
@@ -7072,17 +7683,27 @@ pub fn route_expert_scale(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
-    // The scores [m, k], the indices [m, k], the [E] scale row, and the
-    // [m, k] output — the parameters `KtirFunc::route_expert_scale` mints.
+    // The [E] scale row, the indices [m, k], the scores [m, k], and the
+    // [m, k] output — the parameters `KtirFunc::route_expert_scale` mints,
+    // IN MINT ORDER (arg_for(scale) and arg_for(idx) open their views before
+    // load_region(scores) — first use, not call order; the same law the
+    // ExpertMatmul door learned the hard way). ⛔ THE OLD DOOR READ THEM AS
+    // `[scores, idx, scale]` — tensors[0] IS THE SCALE ROW, so the "scores"
+    // operand of every leg named the [1, E] scale buffer: the col_at lane
+    // read materialized `m` rows out of a ONE-ROW tensor, which the placement
+    // guard refused at m=8 (2B + 1024B > 1024B) after passing at m≤4 only
+    // because the mis-read FIT the bumped [1, 512·2B] footprint — and every
+    // descriptor the m=1 bake shipped computed the WRONG function (the score
+    // rode the scale row's lanes).
     let (tensors, out) = split_out(name, r, layout, 3)?;
     let rows = node_rows(name, &out)?;
     let k = out.v_cols;
-    let e = tensors[2].v_cols;
+    let e = tensors[0].v_cols;
     let w = e.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
     if w == 0 || e == 0 || k == 0 {
         return err(format!(
-            "RouteExpertScale {name}: the scores t{} [{}, {}], the indices t{} [{}, {}], the \
-             scale row t{} [{}, {}], and the output t{} [{rows}, {k}] — the widths must be \
+            "RouteExpertScale {name}: the scale row t{} [{}, {}], the indices t{} [{}, {}], the \
+             scores t{} [{}, {}], and the output t{} [{rows}, {k}] — the widths must be \
              positive and E's padded width a whole 64-stick (got {w})",
             tensors[0].tid,
             tensors[0].v_rows,
@@ -7098,9 +7719,9 @@ pub fn route_expert_scale(
     }
     check_pointwise_cols(w, "RouteExpertScale", out.tid)?;
     let out_tid = out.tid;
-    let scores_s = tensors[0].name();
+    let scale_s = tensors[0].name();
     let idx_s = tensors[1].name();
-    let scale_s = tensors[2].name();
+    let scores_s = tensors[2].name();
     let out_s = out.name();
     // The consts the select reads — the iota row and the identity table.
     let iota = rb(
@@ -7172,6 +7793,9 @@ pub fn route_expert_scale(
             layout,
         ));
         // 3. prod_j = sel_j · scores[:,j] — the score rides the same lane.
+        //    Written to the MATCH buffer: `m_` is dead from step 2 of this j
+        //    until step 1 of j+1 rewrites it, so the slot recycles (the
+        //    gather door's own single-assignment chain, one buffer per stage).
         ops.push(pw2(
             &format!("reprd_j{j}_o{out_tid}"),
             "multiply",
@@ -7179,17 +7803,18 @@ pub fn route_expert_scale(
             f_cols,
             In::full(&sel),
             In::col_at(&scores, lane),
-            &sel,
+            &m_,
             sym_id_base,
             layout,
         ));
-        // 4. val_j = Σ_h prod_j — the native cols reduce, [m, stick].
+        // 4. val_j = Σ_h prod_j — the native cols reduce, [m, stick], off the
+        //    product in the recycled match buffer.
         ops.push(assemble_reduce_off(
             &format!("reval_j{j}_o{out_tid}"),
             "sum",
             t_rows,
             f_cols,
-            &sel,
+            &m_,
             crate::addr::DevOff::ZERO,
             &val,
             crate::addr::DevOff::ZERO,
