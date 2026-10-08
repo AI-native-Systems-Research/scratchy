@@ -8648,6 +8648,15 @@ fn synth_role_tokens(
         R::AMatch => quote! { #b::AMatch },
         R::ASel => quote! { #b::ASel },
         R::AIdx => quote! { #b::AIdx },
+        // The expert-matmul scratch: the fp32 index-staging leg, the SENUINT32 index, the
+        // pair-indexed fp8 weight and bf16 scale gathers, and the raw / a_scale-folded
+        // products ([`lk::expert_matmul`]'s own synths — all unit, so plain idents).
+        R::XF32 => quote! { #b::XF32 },
+        R::XIdx => quote! { #b::XIdx },
+        R::XWScratch => quote! { #b::XWScratch },
+        R::XSScratch => quote! { #b::XSScratch },
+        R::XRaw => quote! { #b::XRaw },
+        R::XDqA => quote! { #b::XDqA },
     }
 }
 
@@ -9906,12 +9915,38 @@ fn dump_wavefront_mega(
                                         ),
                                     }
                                 }
-                                Err(e) => panic!(
-                                    "[spyre-superdsc] {base}: RE-ROLL NOT YET LOWERABLE — {e}. \
-                                 (Next worklist item for the re-rolled SuperDSC emitter — this failure was \
-                                 previously swallowed by an eprintln, leaving superdsc_fp unset and shipping \
-                                 a ZERO-group bundle that only crashed at pod load.)"
-                                ),
+                                Err(e) => {
+                                    // ⭐ THE RUNG CONTRACT: "a rung that fails to lower is logged and
+                                    // SKIPPED; that batch runs on a narrower rung, in more than one
+                                    // forward, which is slower and never wrong" (the decode batch
+                                    // ladder's own law, and the prefill rung handler's own promise
+                                    // at the wavefront level — `prefill ladder rung m={pl} NOT
+                                    // LOWERED … (SKIPPED; a narrower rung still covers this width)`).
+                                    // A BATCH rung (`decode_rows > 1`) or a PREFILL rung
+                                    // (`prefill_mq.is_some()`) is exactly that case: its callers
+                                    // already treat a missing rung as a fall-to-narrower, never as
+                                    // a build stop. Only the PRIMARY bodies (`decode_rows <= 1`,
+                                    // decode) have no narrower rung to fall to — for them the panic
+                                    // stands (a failed primary bake left `superdsc_fp` unset and
+                                    // shipped a ZERO-group bundle that only crashed at pod load —
+                                    // the swallow this panic replaced).
+                                    if decode_rows > 1 || prefill_mq.is_some() {
+                                        eprintln!(
+                                            "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
+                                             decode_rows={decode_rows} prefill_mq={prefill_mq:?} — \
+                                             {e} (SKIPPED per the rung contract; a narrower rung \
+                                             still covers this width)"
+                                        );
+                                    } else {
+                                        panic!(
+                                            "[spyre-superdsc] {base}: RE-ROLL NOT YET LOWERABLE — \
+                                         {e}. (Next worklist item for the re-rolled SuperDSC emitter — \
+                                         this failure was previously swallowed by an eprintln, leaving \
+                                         superdsc_fp unset and shipping a ZERO-group bundle that only \
+                                         crashed at pod load.)"
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

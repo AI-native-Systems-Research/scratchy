@@ -110,6 +110,36 @@ pub enum SynthRole {
     ASel,
     /// The top-k per-slot reduce accum `[m, stick]` (the expert index at lane 0).
     AIdx,
+    // ── expert-matmul scratch (the gathered expert projection) ──
+    // One per PAIR p = n_tok·k + slot, which is a COMPILE-TIME CONSTANT at
+    // this door (m and k are graph constants), so the per-pair windows are
+    // baked offsets into per-NODE buffers rather than indexed operands — the
+    // whole reason the door needs no `y`-batch and no runtime index.
+    /// The router indices staged in fp32 — the MIDDLE leg of the index
+    /// convert chain (`dl16tofp32` → `fp32toint32`), `[m, W]` at 4-byte/32-stick.
+    /// ⛔ `fp32toint32`'s DDL bind (`unary_parallel.ddl:59`) constrains the
+    /// input and output SLICE sizes equal, and the slice is measured in
+    /// ELEMENTS: an fp16 input's 64-elem stick yields slice 8 against the
+    /// u32 output's 32-elem stick slice 4 — NEVER equal, so the direct
+    /// fp16→u32 convert is dxp-refused by constraint (ddl_conversion.cpp:2728
+    /// "slice size does not match"). The fp32 input's 32-elem stick carries
+    /// slice 4, the match the vendor `sdsc_fp32toint32.json` fixture states.
+    XF32,
+    /// The router indices `fp32toint32`-converted to SENUINT32 — the gather's
+    /// index tensor, `[m, W]` at 4-byte/32-stick (W = the padded expert width).
+    XIdx,
+    /// The pair-indexed fp8 WEIGHT scratch — expert slab of pair p at flat
+    /// elements `[p·(n·in), (p+1)·(n·in))`, `[m·k·(n·64), 128]` fp8.
+    XWScratch,
+    /// The pair-indexed SCALE scratch — expert scales of pair p at `[p·n,
+    /// (p+1)·n)` bf16, the bank's `[E·n]` row sequence gathered per pair.
+    XSScratch,
+    /// The per-pair RAW matmul product `[m·k·n]` fp16 (the dense body's FqRaw
+    /// at the pair-major flattening), before the dequant multiplies.
+    XRaw,
+    /// The `a_scale`-folded intermediate `[m·k·n]` fp16 (the dense body's
+    /// FqDqA), before the per-channel w_scale multiply.
+    XDqA,
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -193,6 +223,12 @@ impl fmt::Display for SynthRole {
             Self::AMatch => f.write_str("amatch"),
             Self::ASel => f.write_str("asel"),
             Self::AIdx => f.write_str("aidx"),
+            Self::XIdx => f.write_str("xidx"),
+            Self::XF32 => f.write_str("xf32"),
+            Self::XWScratch => f.write_str("xwscratch"),
+            Self::XSScratch => f.write_str("xsscratch"),
+            Self::XRaw => f.write_str("xraw"),
+            Self::XDqA => f.write_str("xdqa"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),
