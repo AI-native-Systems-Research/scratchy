@@ -2030,11 +2030,17 @@ fn extract_rope_scaling(json: &serde_json::Value) -> Option<RopeScaling> {
             let factor = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let beta_fast = rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0);
             let beta_slow = rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            // HF signature parity: `YarnRotaryEmbedding.__init__(mscale=1.0,
+            // mscale_all_dim=1.0)`. gpt-oss omits the pair — with the 1.0/1.0
+            // defaults the mscale ratio is 1.0 (plain interpolation, no
+            // attention temperature), which is what mlx-lm/vLLM compute for
+            // it. Every in-tree yarn config carries an explicit pair, so this
+            // default is dead code for them.
             let mscale = rs.get("mscale").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let mscale_all_dim = rs
                 .get("mscale_all_dim")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                .unwrap_or(1.0);
             let original_max_position_embeddings = rs
                 .get("original_max_position_embeddings")
                 .and_then(|v| v.as_u64())
@@ -2762,6 +2768,44 @@ mod tests {
             )],
         );
         assert_eq!(extract_scalars(&normed2).get("rope_theta"), Some(&5.0));
+    }
+
+    /// A yarn `rope_scaling` block that omits the mscale pair (gpt-oss)
+    /// parses to HF's signature defaults 1.0/1.0 — with that pair the
+    /// cos/sin mscale ratio is exactly 1.0 (plain interpolation, no
+    /// attention temperature), which is what mlx-lm/vLLM compute for
+    /// gpt-oss. The pre-fix default (`mscale_all_dim` 0.0) made the
+    /// ratio `0.1·ln(factor)+1 ≈ 1.3466` at factor 32 — a wrong
+    /// attention temperature folded into the cache.
+    #[test]
+    fn yarn_config_without_mscale_pair_parses_to_hf_defaults() {
+        let json = serde_json::json!({
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 32.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "original_max_position_embeddings": 4096
+            }
+        });
+        match extract_rope_scaling(&json) {
+            Some(RopeScaling::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                mscale,
+                mscale_all_dim,
+                original_max_position_embeddings,
+            }) => {
+                assert_eq!(factor, 32.0);
+                assert_eq!(beta_fast, 32.0);
+                assert_eq!(beta_slow, 1.0);
+                assert_eq!(mscale, 1.0);
+                assert_eq!(mscale_all_dim, 1.0);
+                assert_eq!(original_max_position_embeddings, 4096);
+            }
+            other => panic!("expected Yarn scaling, got {other:?}"),
+        }
     }
 
     /// Spec mirroring the gemma4 `#[forward]` carrier-mod declarations
