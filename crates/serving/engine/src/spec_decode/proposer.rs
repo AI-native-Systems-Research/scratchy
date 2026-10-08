@@ -92,11 +92,6 @@ pub struct DraftSeedInputs {
     /// speculative chain (CUDA, the in-proposer pre-Phase-9 path).
     pub speculative_seeds: Vec<u32>,
     pub speculative_chain_drafts: Vec<Vec<u32>>,
-
-    /// The target's final (post-norm) hidden states for every row of the step, `[num_tokens,
-    /// hidden]` row-major in the model dtype, when the draft is a multi-token-prediction head
-    /// (which reads them, [`super::mtp`]). Empty for a draft model.
-    pub target_hidden: Vec<u8>,
 }
 
 /// Per-step context handed to [`Proposer::propose_for_step`]. Carries

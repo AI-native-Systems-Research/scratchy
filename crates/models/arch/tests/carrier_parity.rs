@@ -562,6 +562,7 @@ mod imp {
                 vision_reverse_indices: None,
                 vision_position_ids: None,
                 last_token_indices: Some(host_view(&lti, &[1], u32t)),
+                device_inputs: &[],
                 deferred: None,
             };
 

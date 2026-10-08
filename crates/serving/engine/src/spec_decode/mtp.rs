@@ -4,18 +4,24 @@
 //! (Qwen3.5/3.6 `mtp.*`; an MLX drafter repo carries it alone) and reads the target's final
 //! (post-norm) hidden states.
 //!
-//! Per step, after the target ran (prefill, decode or verify) and its tokens were appended:
+//! Per step (prefill, decode or verify):
 //!
-//! 1. **Pass 1 over the step's rows**, through each sequence's newest. Row `r`, at position `p`,
-//!    feeds the head the target's hidden state at `r` and the token at `p + 1` — read from the
-//!    request's history, so a prompt row gets the next prompt token, an accepted draft its
-//!    successor, and the newest row the token the target just produced. The rows past it held
-//!    rejected drafts: they keep no token and do not run (the head's KV at their positions is
-//!    rewritten when they next do), so the newest row is its sequence's last — the row the lm_head
-//!    samples. Every row writes the head's KV at the target's slot for `p`, so the head attends
-//!    the whole history. The newest row's argmax is draft 1.
-//! 2. **Passes 2..=k**, one row per drafting sequence: the previous draft at the next position,
-//!    with the head's own final hidden state from the pass before.
+//! 1. **Pass 1 over the step's rows** ([`PassOne`]), in the step's own command buffer after its
+//!    target. Row `r`, at position `p`, feeds the head the target's hidden state at `r` and the
+//!    token at `p + 1`: the request's history where the host has it (a prompt row gets the next
+//!    prompt token), else the target's token at `r`, copied on the device — the step's new tokens,
+//!    so an accepted draft's row gets its successor and the newest row the token the target just
+//!    produced. Rows past the newest held rejected drafts; they run too, on causal attention that
+//!    leaves the rows before them alone, and the head's KV at their positions is rewritten before
+//!    it is read. So every row of a verify step can be the newest: the lm_head runs every row, and
+//!    the host reads back each new token's row and picks the newest's argmax, draft 1. Every row
+//!    writes the head's KV at the target's slot for `p`, so the head attends the whole history.
+//! 2. **Passes 2..=k** ([`Chain`]), one row per drafting sequence: the previous draft at the next
+//!    position, with the head's own final hidden state from the pass before. They run in the same
+//!    command buffer: which row is a sequence's newest depends on the drafts the target accepted,
+//!    so the device picks each pass's inputs — the token and hidden state at that row, and the
+//!    position, slot and used KV length the host laid out for each accepted count. The host reads
+//!    back the drafts alone.
 //!
 //! The head's KV pool has the target's blocks, so it shares the target's block table. Only a
 //! sequence that produced a token this step drafts; an intermediate prefill chunk still runs its
@@ -96,10 +102,11 @@
 //!   bit-exactness (the varlen scan's replay 1 ULP off), the compiler contracting each copy apart.
 //!   Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`, `GDN_CONV_DRAFTS` 0).
 //! - TODO: time to first token pays the head's pass over the prompt (about 0.19 s on a 5.4k-token
-//!   prompt, base M5): the worker returns a step's tokens with its drafts, so the first token waits
-//!   for pass 1 over every prompt row. The next step needs the drafts, the client does not: return
-//!   the step's tokens before the head runs, or run the head inside the target's submission (#240:
-//!   a speculative step as one compiled tape).
+//!   prompt, base M5): pass 1 runs in the prompt step's command buffer, so its first token waits
+//!   for the head's pass over every prompt row. The next step needs the drafts, the client does
+//!   not: return the step's tokens before the head runs.
+//! - TODO: the next step is scheduled once the host has read this one's tokens and drafts (#240:
+//!   pipelined cycles). Its inputs are on the device already.
 //! - TODO: choose `k` per bucket. `spec_drafts` (2) is one constant for every bucket, because the
 //!   target's verify rows a sequence and its Gated-DeltaNet record areas are baked from it; a
 //!   bucket-specific `k` needs both sized to the largest. Greedy tokens a verify step at
@@ -130,10 +137,8 @@ use std::collections::{HashMap, HashSet};
 
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
-use super::backend::{
-    BackendError, ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend,
-};
-use super::proposer::{DraftSeedInputs, Proposer, ProposerStepCtx};
+use super::backend::ForwardArgmaxRequest;
+use super::proposer::{Proposer, ProposerStepCtx};
 
 /// Configuration for the MTP proposer, held by [`super::ProposerConfig::Mtp`].
 #[derive(Debug, Clone)]
@@ -147,10 +152,6 @@ pub struct MtpProposerConfig {
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
 }
-
-/// The head is the backend's secondary model, with the secondary KV pool.
-const HEAD: ModelHandle = ModelHandle(1);
-const HEAD_KV: KvPoolHandle = KvPoolHandle(1);
 
 /// The MTP proposer (module docs).
 #[derive(Debug)]
@@ -182,177 +183,323 @@ pub struct MtpDrafter {
     pub max_model_len: usize,
 }
 
+/// A step's rows as its target runs them, in sequence order: what the head's passes read.
+#[derive(Clone, Copy, Debug)]
+pub struct StepRows<'a> {
+    pub req_ids: &'a [String],
+    pub input_ids: &'a [u32],
+    pub positions: &'a [u32],
+    pub slot_mapping: &'a [u32],
+    pub cu_seqlens_q: &'a [u32],
+    pub seqused_k: &'a [u32],
+    /// Each sequence's row of `block_table_stride` blocks.
+    pub block_table: &'a [u32],
+    pub block_table_stride: usize,
+    /// Each sequence's blocks.
+    pub block_ids: &'a [Vec<u32>],
+    pub block_size: usize,
+}
+
+impl StepRows<'_> {
+    /// Rows `is` of the step's block table.
+    fn block_rows(&self, is: &[usize]) -> Vec<u32> {
+        let stride = self.block_table_stride;
+        (is.iter())
+            .flat_map(|&i| &self.block_table[i * stride..(i + 1) * stride])
+            .copied()
+            .collect()
+    }
+
+    /// Sequence `i`'s KV slot for position `p`; `u32::MAX` (no write) past its blocks.
+    fn slot(&self, i: usize, p: usize) -> u32 {
+        let bs = self.block_size;
+        (self.block_ids[i].get(p / bs)).map_or(u32::MAX, |&b| (b as usize * bs + p % bs) as u32)
+    }
+}
+
+/// The head's passes over a step (module docs), run in the step's command buffer after its target.
+#[derive(Debug, PartialEq)]
+pub struct HeadPasses {
+    pub one: PassOne,
+    /// `None` when no planned sequence gets a token from the step (prefill chunks short of their
+    /// prompt's end): pass 1 primes their head KV, and nothing drafts.
+    pub chain: Option<Chain>,
+}
+
+/// The head's pass 1 over a step: the rows' host inputs, and what the device copies from the
+/// target.
+#[derive(Debug, PartialEq)]
+pub struct PassOne {
+    /// Each planned sequence's rows of the step, in order. A row's input token is the one after its
+    /// position: the host's, or a placeholder the target's overwrites ([`Self::token_rows`]).
+    pub input_ids: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub slot_mapping: Vec<u32>,
+    pub cu_seqlens_q: Vec<u32>,
+    pub seqused_k: Vec<u32>,
+    pub block_table: Vec<u32>,
+    pub block_table_stride: usize,
+    /// Each sequence's last row: the row the lm_head samples on a step without speculative rows.
+    pub last_rows: Vec<u32>,
+    /// Some sequence has more than one row that can be its newest: the lm_head runs every row.
+    pub has_spec_tokens: bool,
+    /// `(row, step row)` of each row whose input is the target's token at its step row — one the
+    /// host does not have yet. One of a sequence's is its newest; their argmax runs on the device.
+    pub token_rows: Vec<(u32, u32)>,
+    /// `(row, step row, rows)`: each sequence's rows, reading the target's final hidden states at
+    /// its rows of the step.
+    pub hidden_rows: Vec<(u32, u32, u32)>,
+}
+
+/// Passes 2..=k, one row per drafting sequence — one the step gives a token — chained on the
+/// device after pass 1 (module docs): their host inputs, and the tables the device picks the rest
+/// from by the number of drafts the target accepted.
+#[derive(Debug, PartialEq)]
+pub struct Chain {
+    /// Per drafting sequence: its first token row in the step, its token rows, and its first token
+    /// row in pass 1's rows.
+    pub seqs: Vec<[u32; 3]>,
+    /// Per step row, the token the row after it reads — the draft it verifies within a sequence.
+    pub drafted: Vec<u32>,
+    /// After each pass 1..=k: per drafting sequence and accepted count `0..=k`, the next pass's
+    /// position, slot and used KV length (zeros after the last pass, which has none).
+    pub next: Vec<Vec<u32>>,
+    /// Each chained pass's host inputs, one row per drafting sequence. The token, position, slot
+    /// and used KV length are placeholders the device overwrites: the position and used length the
+    /// largest the last pass takes, the slot none.
+    pub input_ids: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub slot_mapping: Vec<u32>,
+    pub cu_seqlens_q: Vec<u32>,
+    pub seqused_k: Vec<u32>,
+    pub block_table: Vec<u32>,
+    pub block_table_stride: usize,
+    pub last_rows: Vec<u32>,
+    /// Each drafting sequence's index in the step.
+    steps: Vec<usize>,
+}
+
+impl PassOne {
+    /// The forward's host-side request (its target hidden states come from the device).
+    pub fn request(&self) -> ForwardArgmaxRequest<'_> {
+        request(
+            [&self.input_ids, &self.positions, &self.slot_mapping],
+            [&self.cu_seqlens_q, &self.seqused_k, &self.block_table],
+            self.block_table_stride,
+            &self.last_rows,
+            self.has_spec_tokens,
+        )
+    }
+}
+
+impl Chain {
+    /// A chained pass's host-side request (its target hidden states come from the device).
+    pub fn request(&self) -> ForwardArgmaxRequest<'_> {
+        request(
+            [&self.input_ids, &self.positions, &self.slot_mapping],
+            [&self.cu_seqlens_q, &self.seqused_k, &self.block_table],
+            self.block_table_stride,
+            &self.last_rows,
+            false,
+        )
+    }
+
+    /// The drafting sequences.
+    pub fn num_seqs(&self) -> usize {
+        self.steps.len()
+    }
+}
+
+/// A head forward's request over `rows` (its tokens, positions and slots) and `seqs` (its
+/// cumulative sequence lengths, used KV lengths and block table rows).
+fn request<'a>(
+    [input_ids, positions, slot_mapping]: [&'a [u32]; 3],
+    [cu_seqlens_q, seqused_k, block_table]: [&'a [u32]; 3],
+    block_table_stride: usize,
+    last_rows: &'a [u32],
+    has_spec_tokens: bool,
+) -> ForwardArgmaxRequest<'a> {
+    ForwardArgmaxRequest {
+        input_ids,
+        positions,
+        slot_mapping,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        span_ids: None,
+        sliding_slot_mappings: &[],
+        sliding_block_tables: &[],
+        block_table_stride,
+        max_seqlen_q: (cu_seqlens_q.windows(2))
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .unwrap_or(0),
+        max_seqlen_k: seqused_k.iter().copied().max().unwrap_or(0) as usize,
+        num_tokens: input_ids.len(),
+        has_spec_tokens,
+        last_token_indices: Some(last_rows),
+        target_hidden: None,
+    }
+}
+
 impl MtpDrafter {
-    /// The drafts of the step `seed` describes for the requests in `plan`, which produced
-    /// `produced` (per request, in `seed` order) and whose token histories `history` reads.
-    pub fn draft(
+    /// The head's passes over the rows of `step` that the requests in `plan` run, before the step:
+    /// `history` reads each request's tokens so far. `None` when none is planned.
+    pub fn passes(
         &self,
-        seed: &DraftSeedInputs,
+        step: &StepRows<'_>,
+        history: &dyn Fn(&str) -> Option<Vec<u32>>,
+        plan: &HashSet<String>,
+    ) -> Option<HeadPasses> {
+        let mut one = PassOne {
+            input_ids: Vec::new(),
+            positions: Vec::new(),
+            slot_mapping: Vec::new(),
+            cu_seqlens_q: vec![0],
+            seqused_k: Vec::new(),
+            block_table: Vec::new(),
+            block_table_stride: step.block_table_stride,
+            last_rows: Vec::new(),
+            has_spec_tokens: false,
+            token_rows: Vec::new(),
+            hidden_rows: Vec::new(),
+        };
+        // Per drafting sequence: its index in the step, its token rows' span of `token_rows`.
+        let mut drafting: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+        let included: Vec<usize> = (0..step.req_ids.len())
+            .filter(|&i| plan.contains(&step.req_ids[i]))
+            .collect();
+        for &i in &included {
+            let tokens = history(&step.req_ids[i]).unwrap_or_default();
+            let rows = step.cu_seqlens_q[i] as usize..step.cu_seqlens_q[i + 1] as usize;
+            let (start, first_token) = (one.input_ids.len(), one.token_rows.len());
+            for r in rows.clone() {
+                let p = step.positions[r] as usize;
+                let row = one.input_ids.len() as u32;
+                let token = tokens.get(p + 1).copied().unwrap_or_else(|| {
+                    one.token_rows.push((row, r as u32));
+                    0
+                });
+                one.input_ids.push(token);
+                one.positions.push(step.positions[r]);
+                one.slot_mapping.push(step.slot_mapping[r]);
+            }
+            let (row, step_row) = (start as u32, rows.start as u32);
+            one.hidden_rows.push((row, step_row, rows.len() as u32));
+            one.cu_seqlens_q.push(one.input_ids.len() as u32);
+            one.seqused_k.push(step.seqused_k[i]);
+            one.last_rows.push(one.input_ids.len() as u32 - 1);
+            if one.token_rows.len() > first_token {
+                drafting.push((i, first_token..one.token_rows.len()));
+            }
+        }
+        if included.is_empty() {
+            return None;
+        }
+        one.has_spec_tokens = drafting.iter().any(|(_, tokens)| tokens.len() > 1);
+        one.block_table = step.block_rows(&included);
+        let chain = (!drafting.is_empty()).then(|| self.chain(step, &one, &drafting));
+        Some(HeadPasses { one, chain })
+    }
+
+    /// Passes 2..=k after `one` for the `drafting` sequences (each its index in the step and its
+    /// span of `one`'s token rows).
+    fn chain(
+        &self,
+        step: &StepRows<'_>,
+        one: &PassOne,
+        drafting: &[(usize, std::ops::Range<usize>)],
+    ) -> Chain {
+        let k = self.drafts;
+        let n = drafting.len();
+        let steps: Vec<usize> = drafting.iter().map(|&(i, _)| i).collect();
+        let seqs: Vec<[u32; 3]> = (drafting.iter())
+            .map(|(_, tokens)| {
+                let (row, step_row) = one.token_rows[tokens.start];
+                [step_row, tokens.len() as u32, row]
+            })
+            .collect();
+        // The step's next-row tokens: within a sequence, the draft each row verifies.
+        let mut drafted = step.input_ids[1..].to_vec();
+        drafted.push(0);
+        // After pass `d`, the next pass's row at accepted count `a` sits at `first + a + d`, the
+        // newest row's position plus `d`.
+        let next = (1..=k)
+            .map(|d| {
+                (drafting.iter().zip(&seqs))
+                    .flat_map(|(&(i, _), &[step_row, ..])| {
+                        let first = step.positions[step_row as usize] as usize;
+                        (0..=k).flat_map(move |a| match d < k {
+                            true => {
+                                let p = first + a + d;
+                                [p as u32, step.slot(i, p), p as u32 + 1]
+                            }
+                            false => [0; 3],
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        // Placeholders: the last pass's position at the most drafts accepted.
+        let last: Vec<u32> = (seqs.iter())
+            .map(|&[step_row, rows, _]| step.positions[step_row as usize] + rows - 1 + k as u32 - 1)
+            .collect();
+        Chain {
+            seqs,
+            drafted,
+            next,
+            input_ids: vec![0; n],
+            seqused_k: last.iter().map(|&p| p + 1).collect(),
+            positions: last,
+            slot_mapping: vec![u32::MAX; n],
+            cu_seqlens_q: (0..=n as u32).collect(),
+            block_table: step.block_rows(&steps),
+            block_table_stride: step.block_table_stride,
+            last_rows: (0..n as u32).collect(),
+            steps,
+        }
+    }
+
+    /// The drafts after `chain` ran: `picked`, its `k` drafts per drafting sequence, read back,
+    /// for the requests of `step` that produced `produced` (per request, in step order) and whose
+    /// token histories `history` reads, the step's tokens appended. No draft lands past the
+    /// maximum model length.
+    pub fn drafts(
+        &self,
+        chain: &Chain,
+        picked: &[u32],
+        step: &StepRows<'_>,
         produced: &[Vec<u32>],
         history: &dyn Fn(&str) -> Option<Vec<u32>>,
-        backend: &mut dyn SpecDecodeBackend,
-        plan: &HashSet<String>,
-    ) -> Result<HashMap<String, Vec<u32>>, BackendError> {
-        let num_reqs = seed.req_ids.len();
-        let row_bytes = seed.target_hidden.len() / seed.num_tokens.max(1);
-        let included: Vec<usize> = (0..num_reqs)
-            .filter(|&i| plan.contains(&seed.req_ids[i]))
+    ) -> HashMap<String, Vec<u32>> {
+        let k = self.drafts;
+        // Each sequence's newest row: the position before its newest token.
+        let newest: Vec<Option<usize>> = (chain.steps.iter())
+            .map(|&i| {
+                let tokens = history(&step.req_ids[i]).unwrap_or_default().len();
+                tokens.checked_sub(2).filter(|_| !produced[i].is_empty())
+            })
             .collect();
-        if included.is_empty() {
-            return Ok(HashMap::new());
-        }
-        // Rows `is` of the step's block table.
-        let stride = seed.block_table_stride;
-        let block_rows = |is: &[usize]| -> Vec<u32> {
-            is.iter()
-                .flat_map(|&i| {
-                    seed.block_table[i * stride..(i + 1) * stride]
-                        .iter()
-                        .copied()
-                })
-                .collect()
-        };
-
-        // Pass 1: each sequence's rows through its newest, each row with its successor, and the
-        // position of each drafting sequence's newest row.
-        let mut input_ids = Vec::with_capacity(seed.num_tokens);
-        let mut positions = Vec::with_capacity(seed.num_tokens);
-        let mut slot_mapping = Vec::with_capacity(seed.num_tokens);
-        let mut target_hidden = Vec::with_capacity(seed.target_hidden.len());
-        let (mut cu_seqlens_q, mut seqused_k) = (vec![0u32], Vec::with_capacity(num_reqs));
-        let mut newest: Vec<Option<usize>> = vec![None; num_reqs];
-        for &i in &included {
-            let req_id = &seed.req_ids[i];
-            let tokens = history(req_id).unwrap_or_default();
-            let rows = seed.cu_seqlens_q[i] as usize..seed.cu_seqlens_q[i + 1] as usize;
-            // The newest token sits at `tokens.len() - 1`, produced by the row at the position
-            // before it.
-            let newest_pos = tokens
-                .len()
-                .checked_sub(2)
-                .filter(|_| !produced[i].is_empty());
-            let found = rows
-                .clone()
-                .find(|&r| Some(seed.positions[r] as usize) == newest_pos);
-            newest[i] = found.and(newest_pos);
-            let end = found.map_or(rows.end, |r| r + 1);
-            for row in rows.start..end {
-                let p = seed.positions[row] as usize;
-                input_ids.push(tokens.get(p + 1).copied().unwrap_or(0));
-                positions.push(seed.positions[row]);
-                slot_mapping.push(seed.slot_mapping[row]);
-                target_hidden
-                    .extend_from_slice(&seed.target_hidden[row * row_bytes..][..row_bytes]);
-            }
-            cu_seqlens_q.push(input_ids.len() as u32);
-            seqused_k.push(seed.seqused_k[i] - (rows.end - end) as u32);
-        }
-        // Each included sequence's last row, in `included` order.
-        let lm_rows: Vec<u32> = cu_seqlens_q[1..].iter().map(|&end| end - 1).collect();
-        let drafting: Vec<usize> = included
-            .iter()
-            .copied()
-            .filter(|&i| newest[i].is_some())
-            .collect();
-        let hidden_rows: Vec<u32> = (included.iter().zip(&lm_rows))
-            .filter(|&(&i, _)| newest[i].is_some())
-            .map(|(_, &r)| r)
-            .collect();
-        let pass1_blocks = block_rows(&included);
-        let pass1 = ForwardArgmaxRequest {
-            input_ids: &input_ids,
-            positions: &positions,
-            slot_mapping: &slot_mapping,
-            cu_seqlens_q: &cu_seqlens_q,
-            seqused_k: &seqused_k,
-            block_table: &pass1_blocks,
-            span_ids: None,
-            sliding_slot_mappings: &[],
-            sliding_block_tables: &[],
-            block_table_stride: seed.block_table_stride,
-            max_seqlen_q: cu_seqlens_q
-                .windows(2)
-                .map(|w| (w[1] - w[0]) as usize)
-                .max()
-                .unwrap_or(0),
-            max_seqlen_k: seqused_k.iter().copied().max().unwrap_or(0) as usize,
-            num_tokens: input_ids.len(),
-            has_spec_tokens: false,
-            last_token_indices: Some(&lm_rows),
-            target_hidden: Some(&target_hidden),
-        };
-        let (argmax, mut hidden) =
-            backend.forward_argmax_hidden_blocking(HEAD, HEAD_KV, &pass1, &hidden_rows)?;
-        let mut drafts: Vec<Vec<u32>> = hidden_rows
-            .iter()
-            .map(|&r| vec![argmax[r as usize]])
-            .collect();
-
-        // Passes 2..=k: one row per drafting sequence, at the position after the last.
-        let n = drafting.len();
-        let rows: Vec<u32> = (0..n as u32).collect();
-        let cu_seqlens: Vec<u32> = (0..=n as u32).collect();
-        let block_table = block_rows(&drafting);
-        for depth in 1..self.drafts {
-            let positions: Vec<usize> = drafting
+        // Pass `d + 1` runs at the newest position plus `d`, and its draft lands one past it.
+        let fits = |d: usize| {
+            newest
                 .iter()
-                .map(|&i| newest[i].expect("drafting sequences have a newest row") + depth)
-                .collect();
-            // The draft this pass makes lands at `position + 2`.
-            if n == 0 || positions.iter().any(|&p| p + 2 >= self.max_model_len) {
-                break;
-            }
-            let slot_mapping: Vec<u32> = drafting
-                .iter()
-                .zip(&positions)
-                .map(|(&i, &p)| {
-                    seed.block_ids[i]
-                        .get(p / seed.block_size)
-                        .map_or(u32::MAX, |&b| {
-                            (b as usize * seed.block_size + p % seed.block_size) as u32
-                        })
-                })
-                .collect();
-            let seqused_k: Vec<u32> = positions.iter().map(|&p| p as u32 + 1).collect();
-            let positions: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
-            let input_ids: Vec<u32> = drafts.iter().map(|d| *d.last().expect("draft 1")).collect();
-            let req = ForwardArgmaxRequest {
-                input_ids: &input_ids,
-                positions: &positions,
-                slot_mapping: &slot_mapping,
-                cu_seqlens_q: &cu_seqlens,
-                seqused_k: &seqused_k,
-                block_table: &block_table,
-                span_ids: None,
-                sliding_slot_mappings: &[],
-                sliding_block_tables: &[],
-                block_table_stride: stride,
-                max_seqlen_q: 1,
-                max_seqlen_k: seqused_k.iter().copied().max().unwrap_or(0) as usize,
-                num_tokens: n,
-                has_spec_tokens: false,
-                last_token_indices: Some(&rows),
-                target_hidden: Some(&hidden),
-            };
-            let (argmax, next_hidden) =
-                backend.forward_argmax_hidden_blocking(HEAD, HEAD_KV, &req, &rows)?;
-            for (draft, &token) in drafts.iter_mut().zip(&argmax) {
-                draft.push(token);
-            }
-            hidden = next_hidden;
-        }
-        Ok(drafting
-            .iter()
-            .zip(drafts)
-            .map(|(&i, d)| {
+                .flatten()
+                .all(|&p| p + d + 2 < self.max_model_len)
+        };
+        let depth = 1 + (1..k).take_while(|&d| fits(d)).count();
+        (chain.steps.iter().zip(&newest).enumerate())
+            .filter_map(|(s, (&i, newest))| {
+                let d = picked[s * k..][..depth].to_vec();
+                let newest = (*newest)?;
                 tracing::debug!(
                     "MTP drafts for {} after position {}: {d:?}",
-                    seed.req_ids[i],
-                    newest[i].map_or(0, |p| p + 1)
+                    step.req_ids[i],
+                    newest + 1
                 );
-                (seed.req_ids[i].clone(), d)
+                Some((step.req_ids[i].clone(), d))
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -400,120 +547,59 @@ impl Proposer for MtpProposer {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
-    /// One forward the proposer issued: its rows and the hidden rows it asked for.
-    #[derive(Debug, PartialEq)]
-    struct Forward {
-        input_ids: Vec<u32>,
-        positions: Vec<u32>,
-        slot_mapping: Vec<u32>,
-        cu_seqlens_q: Vec<u32>,
-        seqused_k: Vec<u32>,
-        block_table: Vec<u32>,
-        last_token_indices: Vec<u32>,
-        target_hidden: Vec<u8>,
-        hidden_rows: Vec<u32>,
+    /// A step of two sequences: `a` verifies three drafts at positions 10..=13 (its history holds
+    /// 11 tokens, `500..511`; the drafts `21..=23`); `b` runs an intermediate prefill chunk, 0..=2
+    /// of an 8-token prompt.
+    struct TwoSequences {
+        req_ids: Vec<String>,
+        block_ids: Vec<Vec<u32>>,
+        history_a: Vec<u32>,
+        history_b: Vec<u32>,
     }
 
-    /// Records every head forward; forward `c` argmaxes row `r` to `1000 * (c + 1) + r` and
-    /// returns hidden rows of bytes `c + 100`.
-    #[derive(Default)]
-    struct Recorder {
-        forwards: Vec<Forward>,
-    }
-
-    const ROW_BYTES: usize = 4;
-
-    impl SpecDecodeBackend for Recorder {
-        fn forward_argmax_blocking(
-            &mut self,
-            _: ModelHandle,
-            _: KvPoolHandle,
-            _: &ForwardArgmaxRequest<'_>,
-        ) -> Result<Vec<u32>, BackendError> {
-            Err(BackendError::NotImplemented("argmax without hidden rows"))
+    impl TwoSequences {
+        fn new() -> Self {
+            Self {
+                req_ids: vec!["a".into(), "b".into()],
+                block_ids: vec![vec![3], vec![5]],
+                history_a: (500..511).collect(),
+                history_b: (700..708).collect(),
+            }
         }
 
-        fn forward_argmax_hidden_blocking(
-            &mut self,
-            model: ModelHandle,
-            kv_pool: KvPoolHandle,
-            req: &ForwardArgmaxRequest<'_>,
-            hidden_rows: &[u32],
-        ) -> Result<(Vec<u32>, Vec<u8>), BackendError> {
-            assert_eq!((model, kv_pool), (HEAD, HEAD_KV));
-            assert_eq!(req.num_tokens, req.input_ids.len());
-            let c = self.forwards.len() as u32;
-            self.forwards.push(Forward {
-                input_ids: req.input_ids.to_vec(),
-                positions: req.positions.to_vec(),
-                slot_mapping: req.slot_mapping.to_vec(),
-                cu_seqlens_q: req.cu_seqlens_q.to_vec(),
-                seqused_k: req.seqused_k.to_vec(),
-                block_table: req.block_table.to_vec(),
-                last_token_indices: req.last_token_indices.unwrap_or_default().to_vec(),
-                target_hidden: req.target_hidden.unwrap_or_default().to_vec(),
-                hidden_rows: hidden_rows.to_vec(),
-            });
-            let argmax = (0..req.num_tokens as u32).map(|r| 1000 * (c + 1) + r);
-            let hidden = vec![c as u8 + 100; hidden_rows.len() * ROW_BYTES];
-            Ok((argmax.collect(), hidden))
+        fn rows(&self) -> StepRows<'_> {
+            StepRows {
+                req_ids: &self.req_ids,
+                input_ids: &[510, 21, 22, 23, 700, 701, 702],
+                positions: &[10, 11, 12, 13, 0, 1, 2],
+                slot_mapping: &[58, 59, 60, 61, 80, 81, 82],
+                cu_seqlens_q: &[0, 4, 7],
+                seqused_k: &[14, 3],
+                block_table: &[3, 0, 5, 0],
+                block_table_stride: 2,
+                block_ids: &self.block_ids,
+                block_size: 16,
+            }
         }
 
-        fn load_secondary_model(
-            &mut self,
-            _: &Path,
-            _: Option<&str>,
-        ) -> Result<ModelHandle, BackendError> {
-            Err(BackendError::NotImplemented("load_secondary_model"))
+        /// The histories before the step.
+        fn before(&self) -> impl Fn(&str) -> Option<Vec<u32>> + '_ {
+            |id| match id {
+                "a" => Some(self.history_a.clone()),
+                "b" => Some(self.history_b.clone()),
+                _ => None,
+            }
         }
 
-        fn allocate_kv_pool(
-            &mut self,
-            _: ModelHandle,
-            _: usize,
-        ) -> Result<KvPoolHandle, BackendError> {
-            Err(BackendError::NotImplemented("allocate_kv_pool"))
+        /// The histories after it: `a` kept `kept` drafts and took its bonus token.
+        fn after(&self, kept: u32) -> impl Fn(&str) -> Option<Vec<u32>> + '_ {
+            move |id| match id {
+                "a" => Some((500..512 + kept).collect()),
+                _ => self.before()(id),
+            }
         }
-
-        fn kv_per_block_bytes(&self, _: ModelHandle) -> Result<usize, BackendError> {
-            Err(BackendError::NotImplemented("kv_per_block_bytes"))
-        }
-    }
-
-    /// A step of two sequences: `a` verified three drafts at positions 10..=13 and kept one (its
-    /// newest token, the bonus, sits at 12, produced by the row at 11); `b` ran an intermediate
-    /// prefill chunk, 0..=2 of an 8-token prompt. Its seed, the tokens it produced, and the
-    /// requests' histories.
-    fn two_sequence_step() -> (DraftSeedInputs, Vec<Vec<u32>>, Vec<u32>, Vec<u32>) {
-        let seed = DraftSeedInputs {
-            input_ids: Vec::new(),
-            positions: vec![10, 11, 12, 13, 0, 1, 2],
-            slot_mapping: vec![58, 59, 60, 61, 80, 81, 82],
-            cu_seqlens_q: vec![0, 4, 7],
-            seqused_k: vec![14, 3],
-            block_table: vec![3, 0, 5, 0],
-            block_table_stride: 2,
-            max_seqlen_q: 4,
-            max_seqlen_k: 14,
-            num_tokens: 7,
-            req_ids: vec!["a".into(), "b".into()],
-            block_ids: vec![vec![3], vec![5]],
-            tokens_before: vec![10, 0],
-            q_lens: vec![4, 3],
-            was_spec_decode: vec![true, false],
-            block_size: 16,
-            async_lockstep_done: false,
-            speculative_seeds: Vec::new(),
-            speculative_chain_drafts: Vec::new(),
-            // Row `r`'s hidden state is `ROW_BYTES` bytes of `r`.
-            target_hidden: (0..7u8).flat_map(|r| [r; ROW_BYTES]).collect(),
-        };
-        let produced = vec![vec![511, 512], Vec::new()];
-        (seed, produced, (500..513).collect(), (700..708).collect())
     }
 
     fn proposer(max_seqs: usize) -> MtpProposer {
@@ -534,103 +620,105 @@ mod tests {
         of.iter().map(|&id| id.to_string()).collect()
     }
 
-    fn hidden_of(rows: &[u8]) -> Vec<u8> {
-        rows.iter().flat_map(|&r| [r; ROW_BYTES]).collect()
-    }
-
-    /// Chained forward `c` of `a`: the draft before it at `p`, block 3, the hidden rows forward
-    /// `c - 1` returned.
-    fn chain(c: u8, input: u32, p: u32) -> Forward {
-        Forward {
-            input_ids: vec![input],
-            positions: vec![p],
-            slot_mapping: vec![3 * 16 + p],
-            cu_seqlens_q: vec![0, 1],
-            seqused_k: vec![p + 1],
-            block_table: vec![3, 0],
-            last_token_indices: vec![0],
-            target_hidden: vec![c - 1 + 100; ROW_BYTES],
-            hidden_rows: vec![0],
-        }
-    }
-
-    /// [`two_sequence_step`], both planned: pass 1 runs `a` through its newest row and all of `b`;
-    /// `a` alone drafts, chaining at 12 and 13.
+    /// Pass 1 runs every row of each planned sequence: the host's tokens where its history has
+    /// them (`b`'s prompt), the target's where it does not (`a`'s verify rows); each sequence's
+    /// rows read the target's hidden states at its own rows of the step. Only `a` gets a token, so
+    /// only `a` chains; `b` alone primes its prompt, and nothing planned runs nothing.
     #[test]
-    fn pass_one_runs_each_sequence_through_its_newest_row() {
-        let (seed, produced, history_a, history_b) = two_sequence_step();
-        let history = |id: &str| match id {
-            "a" => Some(history_a.clone()),
-            "b" => Some(history_b.clone()),
-            _ => None,
+    fn pass_one_runs_every_row_of_the_planned_sequences() {
+        let step = TwoSequences::new();
+        let history = step.before();
+        let passes = |plan: &[&str]| DRAFTER.passes(&step.rows(), &history, &ids(plan));
+        let both = passes(&["a", "b"]).expect("passes");
+        let one = PassOne {
+            input_ids: vec![0, 0, 0, 0, 701, 702, 703],
+            positions: vec![10, 11, 12, 13, 0, 1, 2],
+            slot_mapping: vec![58, 59, 60, 61, 80, 81, 82],
+            cu_seqlens_q: vec![0, 4, 7],
+            seqused_k: vec![14, 3],
+            block_table: vec![3, 0, 5, 0],
+            block_table_stride: 2,
+            last_rows: vec![3, 6],
+            has_spec_tokens: true,
+            token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
+            hidden_rows: vec![(0, 0, 4), (4, 4, 3)],
         };
-        let mut backend = Recorder::default();
-        let drafts = DRAFTER
-            .draft(&seed, &produced, &history, &mut backend, &ids(&["a", "b"]))
-            .expect("drafts");
-        let want = [
-            Forward {
-                input_ids: vec![history_a[11], history_a[12], 701, 702, 703],
-                positions: vec![10, 11, 0, 1, 2],
-                slot_mapping: vec![58, 59, 80, 81, 82],
-                cu_seqlens_q: vec![0, 2, 5],
-                seqused_k: vec![12, 3],
-                block_table: vec![3, 0, 5, 0],
-                last_token_indices: vec![1, 4],
-                target_hidden: hidden_of(&[0, 1, 4, 5, 6]),
-                hidden_rows: vec![1],
-            },
-            chain(1, 1001, 12),
-            chain(2, 2000, 13),
-        ];
-        assert_eq!(backend.forwards, want);
-        let want_drafts = HashMap::from([("a".to_string(), vec![1001, 2000, 3000])]);
-        assert_eq!(drafts, want_drafts);
+        assert_eq!(both.one, one);
+        let chain = both.chain.expect("a chains");
+        assert_eq!(chain.seqs, [[0, 4, 0]]);
+        assert_eq!(chain.num_seqs(), 1);
+
+        let b = passes(&["b"]).expect("passes");
+        assert_eq!(b.one.input_ids, [701, 702, 703]);
+        assert_eq!((b.one.token_rows.len(), b.one.has_spec_tokens), (0, false));
+        assert_eq!(b.chain, None);
+        assert_eq!(passes(&[]), None);
     }
 
-    /// The head runs for the planned requests alone: `a` without `b` drafts as before from rows
-    /// of its own; `b` alone only primes its prompt; nothing planned, nothing runs.
+    /// After pass `d`, the next pass's row at accepted count `a` is at the newest position, `10 +
+    /// a`, plus `d`: its slot in `a`'s block 3, its used length one past it. The placeholders are
+    /// the last pass's at the most accepted; the device compares each row's target token with the
+    /// draft the row after it reads.
     #[test]
-    fn pass_one_runs_only_the_planned_requests() {
-        let (seed, produced, history_a, history_b) = two_sequence_step();
-        let history = |id: &str| match id {
-            "a" => Some(history_a.clone()),
-            "b" => Some(history_b.clone()),
-            _ => None,
+    fn the_chain_lays_out_every_accepted_count() {
+        let step = TwoSequences::new();
+        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]));
+        let chain = passes.expect("passes").chain.expect("a chains");
+        let at = |d: u32| -> Vec<u32> {
+            (0..=3)
+                .flat_map(|a| [10 + a + d, 3 * 16 + 10 + a + d, 11 + a + d])
+                .collect()
         };
-        let run = |plan: &[&str]| {
-            let mut backend = Recorder::default();
-            let drafts = DRAFTER
-                .draft(&seed, &produced, &history, &mut backend, &ids(plan))
-                .expect("drafts");
-            (backend.forwards, drafts)
-        };
-
-        let (forwards, drafts) = run(&["a"]);
-        let pass1 = Forward {
-            input_ids: vec![history_a[11], history_a[12]],
-            positions: vec![10, 11],
-            slot_mapping: vec![58, 59],
-            cu_seqlens_q: vec![0, 2],
-            seqused_k: vec![12],
-            block_table: vec![3, 0],
-            last_token_indices: vec![1],
-            target_hidden: hidden_of(&[0, 1]),
-            hidden_rows: vec![1],
-        };
-        assert_eq!(forwards, [pass1, chain(1, 1001, 12), chain(2, 2000, 13)]);
+        assert_eq!(chain.next, [at(1), at(2), vec![0; 12]]);
+        assert_eq!(chain.drafted, [21, 22, 23, 700, 701, 702, 0]);
         assert_eq!(
-            drafts,
-            HashMap::from([("a".to_string(), vec![1001, 2000, 3000])])
+            (chain.input_ids, chain.positions, chain.seqused_k),
+            (vec![0], vec![15], vec![16])
         );
+        assert_eq!(chain.slot_mapping, [u32::MAX]);
+        assert_eq!(chain.cu_seqlens_q, [0, 1]);
+        assert_eq!((chain.block_table, chain.last_rows), (vec![3, 0], vec![0]));
+    }
 
-        let (forwards, drafts) = run(&["b"]);
-        assert_eq!(forwards.len(), 1, "pass 1 primes b's prompt");
-        assert_eq!(forwards[0].positions, [0, 1, 2]);
-        assert!(drafts.is_empty());
-
-        let (forwards, drafts) = run(&[]);
-        assert!(forwards.is_empty() && drafts.is_empty());
+    /// The drafts the device picked, each drafting sequence's `k`, from its newest row: the host
+    /// knows it from the tokens the step committed, and logs it. Near the maximum model length the
+    /// drafts that would land past it go — for every sequence, as one chained pass runs them all.
+    #[test]
+    fn drafts_are_the_device_s_up_to_the_model_length() {
+        let step = TwoSequences::new();
+        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]));
+        let chain = passes.expect("passes").chain.expect("a chains");
+        let picked = [901, 1000, 2000];
+        for kept in 0..4u32 {
+            let produced = vec![(0..=kept).collect(), Vec::new()];
+            let drafts =
+                DRAFTER.drafts(&chain, &picked, &step.rows(), &produced, &step.after(kept));
+            assert_eq!(
+                drafts,
+                HashMap::from([("a".into(), picked.to_vec())]),
+                "kept {kept}"
+            );
+        }
+        // Kept all three: the newest row is at 13, so pass 2 runs at 14 and its draft lands at 16.
+        let near = |max_model_len| MtpDrafter {
+            drafts: 3,
+            max_model_len,
+        };
+        let produced = vec![vec![0, 1, 2, 3], Vec::new()];
+        let drafts = |max_model_len| {
+            let d = near(max_model_len).drafts(
+                &chain,
+                &picked,
+                &step.rows(),
+                &produced,
+                &step.after(3),
+            );
+            d["a"].clone()
+        };
+        assert_eq!(drafts(18), picked);
+        assert_eq!(drafts(17), picked[..2]);
+        assert_eq!(drafts(16), picked[..1]);
+        assert_eq!(drafts(15), picked[..1], "draft 1 is pass 1's, never cut");
     }
 
     /// A scheduled step of `(request, num_computed_tokens)`: one at 0 runs from its first position.

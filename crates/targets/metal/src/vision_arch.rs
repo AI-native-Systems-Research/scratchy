@@ -367,6 +367,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             // The vision tape is text-/GDN-free, so the decoder-specific slots
             // are inert.
             has_spec_tokens: false,
+            device_inputs: &[],
             deferred: None,
         };
 
