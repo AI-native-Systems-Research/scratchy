@@ -3340,7 +3340,9 @@ fn rope_append_store_unrotated_then_read_roundtrip() {
 // times the SAME kernel (attention_via_cache_v2) ROR-off vs ROR-on with
 // an ALL-ZERO flag buffer (the non-span case) on the real device and
 // asserts the rope-on-read specialization does not regress the hot path.
-// Prints the ratio; fails on a gross (>15%) regression — the bar.
+// Each side's time is the median GPU time per dispatch over interleaved
+// command buffers of 100 dispatches. Prints the ratio; fails on a gross
+// (>15%) regression — the bar.
 #[test]
 fn rope_on_read_decode_parity_bench() {
     let Some(di) = detect_device() else {
@@ -3415,79 +3417,68 @@ fn rope_on_read_decode_parity_bench() {
     )
     .expect("ROR-on pipeline");
 
-    let run = |pipeline: &common::Pipeline, ror: bool, bt: &Buffer, iters: usize| -> bool {
-        // ROR-on binds cos_sin at slot 6 (the flag rides in block_table bit
-        // 31). K/V are reached via raw gpuAddress → ride in the slice for
-        // residency.
-        for _ in 0..iters {
-            let ok = if ror {
-                common::dispatch_threadgroups(
-                    &device,
-                    pipeline,
-                    &[
-                        &out_buf, &q_buf, &seq_used, bt, &k_tab, &v_tab, &cos_sin, &k_buf, &v_buf,
-                    ],
-                    MTLSize {
-                        width: 1,
-                        height: num_heads,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 1024,
-                        height: 1,
-                        depth: 1,
-                    },
-                )
-            } else {
-                common::dispatch_threadgroups(
-                    &device,
-                    pipeline,
-                    &[
-                        &out_buf, &q_buf, &seq_used, bt, &k_tab, &v_tab, &k_buf, &v_buf,
-                    ],
-                    MTLSize {
-                        width: 1,
-                        height: num_heads,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 1024,
-                        height: 1,
-                        depth: 1,
-                    },
-                )
-            };
-            if !ok {
-                return false;
-            }
+    // One sample: PER_CB dispatches of one side in ONE command buffer, a barrier after each, timed
+    // to completion — the kernel's GPU time. A command buffer per dispatch would add a new queue,
+    // a wired residency set and an event wait to every sample: host costs larger and noisier than
+    // the kernel. ROR-on binds cos_sin at slot 6 (the flag rides in block_table bit 31); K/V are
+    // reached via raw gpuAddress → resident, not bound.
+    const PER_CB: usize = 100;
+    let sample = |pipeline: &common::Pipeline, rope: Option<&Buffer>, bt: &Buffer| -> Option<f64> {
+        let mut binds = vec![
+            (&out_buf, 0),
+            (&q_buf, 1),
+            (&seq_used, 2),
+            (bt, 3),
+            (&k_tab, 4),
+            (&v_tab, 5),
+        ];
+        binds.extend(rope.map(|cos_sin| (cos_sin, 6)));
+        let grid = MTLSize {
+            width: 1,
+            height: num_heads,
+            depth: 1,
+        };
+        let threads = MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        };
+        let mut batch = common::Mtl4DispatchBatch::begin(&device)?;
+        for _ in 0..PER_CB {
+            batch.encode(pipeline, &binds, &[], &[], &[&k_buf, &v_buf], grid, threads);
+            batch.barrier();
         }
-        true
+        let t = std::time::Instant::now();
+        batch.commit(true);
+        Some(t.elapsed().as_secs_f64() * 1000.0 / PER_CB as f64)
     };
-
-    let iters = 200usize;
-    // Warm up + interleave to average out thermal/scheduling drift.
-    if !run(&off_pipe, false, &bt_buf, 5) {
-        return;
+    let sides = [
+        (&off_pipe, None, &bt_buf),
+        (&on_pipe, Some(&cos_sin), &bt_buf),
+        (&on_pipe, Some(&cos_sin), &bt_buf_flagged),
+    ];
+    // Warm up every side, then rounds in rotating side order so clock ramps and drift land on all
+    // three alike; each side's median sample.
+    for (pipeline, rope, bt) in sides {
+        if sample(pipeline, rope, bt).is_none() {
+            return;
+        }
     }
-    run(&on_pipe, true, &bt_buf, 5);
-    run(&on_pipe, true, &bt_buf_flagged, 5);
-    let mut off_secs = 0f64;
-    let mut on_secs = 0f64;
-    let mut rot_secs = 0f64;
-    for _ in 0..3 {
-        let t = std::time::Instant::now();
-        run(&off_pipe, false, &bt_buf, iters);
-        off_secs += t.elapsed().as_secs_f64();
-        let t = std::time::Instant::now();
-        run(&on_pipe, true, &bt_buf, iters);
-        on_secs += t.elapsed().as_secs_f64();
-        let t = std::time::Instant::now();
-        run(&on_pipe, true, &bt_buf_flagged, iters);
-        rot_secs += t.elapsed().as_secs_f64();
-    }
-    let off_ms = off_secs * 1000.0 / (3 * iters) as f64;
-    let on_ms = on_secs * 1000.0 / (3 * iters) as f64;
-    let rot_ms = rot_secs * 1000.0 / (3 * iters) as f64;
+    const ROUNDS: usize = 9;
+    let rounds: [[f64; 3]; ROUNDS] = std::array::from_fn(|round| {
+        let mut ms = [0f64; 3];
+        for k in 0..sides.len() {
+            let s = (round + k) % sides.len();
+            let (pipeline, rope, bt) = sides[s];
+            ms[s] = sample(pipeline, rope, bt).expect("MTL4 queue");
+        }
+        ms
+    });
+    let [off_ms, on_ms, rot_ms]: [f64; 3] = std::array::from_fn(|s| {
+        let mut ms = rounds.map(|round| round[s]);
+        ms.sort_by(f64::total_cmp);
+        ms[ROUNDS / 2]
+    });
     let ratio = on_ms / off_ms;
     let rot_ratio = rot_ms / off_ms;
     eprintln!(
