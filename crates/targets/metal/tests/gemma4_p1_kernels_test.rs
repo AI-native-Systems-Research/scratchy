@@ -1204,6 +1204,263 @@ fn rope_on_read_nax_gqa4_hd128() {
     });
 }
 
+/// Correctness probe for the simdgroup WIDE paged prefill kernel — the
+/// pre-NAX port of `attention_nax_paged_wide` — at Gemma 4's global-layer
+/// shape (head_dim 512, gqa 4, 32-token pages, BQ=64/BK=32/WM=4/WN=4,
+/// 512 threads). kv_len 300 exercises two whole 128-key steps plus a
+/// partial one, a 12-of-32-key tail page, a 44-of-64-row last Q block
+/// (one 16-row warp-block fully past the tile's rows) — vs the CPU
+/// reference. Also runs the rope-on-read source swap (K from the dense
+/// pre-roped scratch, span_ids all zero) and requires it to reproduce the
+/// cache-source run exactly.
+#[test]
+fn steel_wide_paged_bd512_matches_ref() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+
+    let case = AttnCase {
+        num_q_heads: 8,
+        num_kv_heads: 2,
+        head_dim: 512,
+        kv_len: 300,
+        window: 0,
+    };
+    let block_size = 32usize;
+    let num_blocks = case.kv_len.div_ceil(block_size);
+    let kv_elems = num_blocks * case.num_kv_heads * block_size * case.head_dim;
+
+    let k_host = pseudo(101, kv_elems, 1.0);
+    let v_host = pseudo(103, kv_elems, 1.0);
+    let k_buf = buf_f16(&device, &k_host);
+    let v_buf = buf_f16(&device, &v_host);
+    let k_r: Vec<f32> = k_host.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let v_r: Vec<f32> = v_host.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let k_tab = buf_u64(&device, &[k_buf.gpuAddress()]);
+    let v_tab = buf_u64(&device, &[v_buf.gpuAddress()]);
+    let block_table: Vec<u32> = (0..num_blocks as u32).collect();
+    let bt_buf = buf_u32(&device, &block_table);
+    let scale = 1.0 / (case.head_dim as f32).sqrt();
+
+    let total_q = case.kv_len;
+    let q_host = pseudo(109, total_q * case.num_q_heads * case.head_dim, 1.0);
+    let q_buf = buf_f16(&device, &q_host);
+    let q_r: Vec<f32> = q_host.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+    let out_buf = buf_zero(&device, total_q * case.num_q_heads * case.head_dim * 2);
+    let cu_seqlens = buf_u32(&device, &[0, total_q as u32, 0, 0]);
+    let seq_used = buf_u32(&device, &[case.kv_len as u32]);
+
+    let mut consts = attn_constants(&case, block_size, num_blocks);
+    consts[6] = ConstantValue::uint(6, 128); // BPC: keep every block in chunk 0
+    consts.push(ConstantValue::uint(99, 0)); // DEBUG_MODE (classic header's slot)
+
+    let ror_consts = {
+        let mut c = consts.clone();
+        c.push(ConstantValue::uint(8, 512)); // ATTN_ROT_DIM (rope twin's)
+        c.push(ConstantValue::uint(9, 256)); // ATTN_PAIR_OFF
+        c.push(ConstantValue::uint(10, 1)); // ATTN_ROPE_ON_READ: K from scratch
+        c
+    };
+
+    let run = |consts: Vec<ConstantValue>, extra: &[&Buffer]| -> Option<Vec<f32>> {
+        let key = PipelineKey::new(
+            "attention_steel_wide_paged",
+            "attention_steel_wide_paged_f16_bq32_bk32_bd512_wm2_wn8_bs32",
+            consts,
+        );
+        let pipeline = baked_build(&cache, &key).expect("steel wide paged pipeline");
+        let nq_blocks = total_q.div_ceil(32);
+        let mut bufs = vec![
+            &out_buf,
+            &q_buf,
+            &cu_seqlens,
+            &seq_used,
+            &bt_buf,
+            &k_tab,
+            &v_tab,
+        ];
+        bufs.extend_from_slice(extra);
+        if !common::dispatch_threadgroups(
+            &device,
+            &pipeline,
+            &bufs,
+            MTLSize {
+                width: nq_blocks,
+                height: case.num_q_heads,
+                depth: 1,
+            },
+            MTLSize {
+                width: 512,
+                height: 1,
+                depth: 1,
+            },
+        ) {
+            return None;
+        }
+        Some(read_f16(
+            &out_buf,
+            total_q * case.num_q_heads * case.head_dim,
+        ))
+    };
+
+    // Cache-source run.
+    let Some(got) = run(consts, &[&k_buf, &v_buf]) else {
+        return;
+    };
+    let positions: Vec<usize> = (0..total_q).collect();
+    let want = attn_ref(&q_r, &k_r, &v_r, &case, block_size, &positions, scale);
+    let mut max_err = 0f32;
+    let mut worst = 0usize;
+    for i in 0..got.len() {
+        let e = (got[i] - want[i]).abs();
+        if e > max_err {
+            max_err = e;
+            worst = i;
+        }
+    }
+    let hd = case.head_dim;
+    let nqh = case.num_q_heads;
+    eprintln!(
+        "steel wide bd512: max_err={max_err} at idx={worst} (q={}, h={}, d={}) got={} want={}",
+        worst / (nqh * hd),
+        (worst / hd) % nqh,
+        worst % hd,
+        got[worst],
+        want[worst]
+    );
+    assert!(max_err < 2e-2, "steel wide bd512 max_err {max_err}");
+
+    // Rope-on-read source swap: the scratch holds the same K in the same
+    // dense logical-block layout, span_ids all zero (no spans) — the run
+    // must reproduce the cache-source run exactly (same loads, same math).
+    let k_scratch = buf_f16(&device, &k_host);
+    let span_ids = buf_u32(&device, &vec![0u32; case.kv_len]);
+    let Some(got_ror) = run(ror_consts, &[&k_scratch, &span_ids, &k_buf, &v_buf]) else {
+        return;
+    };
+    let ror_err = got_ror
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert_eq!(ror_err, 0.0, "ROR source swap must be bit-identical");
+}
+
+/// Limiter probe for the simdgroup WIDE paged prefill kernel at Gemma 4's
+/// global-layer shape (8 q / 2 kv heads, head_dim 512, m=4096, 32-token
+/// pages). Prints achieved TFLOP/s plus the pipeline's occupancy facts —
+/// the shape the unfused per-head path ran at ~0.55 TFLOP/s on M1 Max and
+/// the hd256 classic steel kernel at ~3.
+#[test]
+fn steel_wide_paged_limiter_bench() {
+    let Some(detected) = detect_device() else {
+        eprintln!("skip steel_wide_paged_limiter_bench: no metal device");
+        return;
+    };
+    let device = detected.device.clone();
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("cache");
+
+    let case = AttnCase {
+        num_q_heads: 8,
+        num_kv_heads: 2,
+        head_dim: 512,
+        kv_len: 4096,
+        window: 0,
+    };
+    let block_size = 32usize;
+    let num_blocks = case.kv_len.div_ceil(block_size);
+    let kv_elems = num_blocks * case.num_kv_heads * block_size * case.head_dim;
+    let k_buf = buf_f16(&device, &pseudo(101, kv_elems, 1.0));
+    let v_buf = buf_f16(&device, &pseudo(103, kv_elems, 1.0));
+    let k_tab = buf_u64(&device, &[k_buf.gpuAddress()]);
+    let v_tab = buf_u64(&device, &[v_buf.gpuAddress()]);
+    let block_table: Vec<u32> = (0..num_blocks as u32).collect();
+    let bt_buf = buf_u32(&device, &block_table);
+    let total_q = case.kv_len;
+    let q_buf = buf_f16(
+        &device,
+        &pseudo(109, total_q * case.num_q_heads * case.head_dim, 1.0),
+    );
+    let out_buf = buf_zero(&device, total_q * case.num_q_heads * case.head_dim * 2);
+    let cu_seqlens = buf_u32(&device, &[0, total_q as u32, 0, 0]);
+    let seq_used = buf_u32(&device, &[case.kv_len as u32]);
+
+    let mut consts = attn_constants(&case, block_size, num_blocks);
+    consts[6] = ConstantValue::uint(6, 128);
+    consts.push(ConstantValue::uint(99, 0));
+    let key = PipelineKey::new(
+        "attention_steel_wide_paged",
+        "attention_steel_wide_paged_f16_bq32_bk32_bd512_wm2_wn8_bs32",
+        consts,
+    );
+    let pipeline = baked_build(&cache, &key).expect("pipeline");
+
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let tew = pipeline.threadExecutionWidth();
+    let smem = pipeline.staticThreadgroupMemoryLength();
+    eprintln!(
+        "OCCUPANCY: maxTotalThreadsPerThreadgroup={max_threads} threadExecutionWidth={tew} \
+         staticThreadgroupMemoryLength={smem}B (kernel launches 512 threads / 16 simdgroups)"
+    );
+
+    let nq_blocks = total_q.div_ceil(32);
+    let run = |iters: usize| -> bool {
+        for _ in 0..iters {
+            if !common::dispatch_threadgroups(
+                &device,
+                &pipeline,
+                &[
+                    &out_buf,
+                    &q_buf,
+                    &cu_seqlens,
+                    &seq_used,
+                    &bt_buf,
+                    &k_tab,
+                    &v_tab,
+                    &k_buf,
+                    &v_buf,
+                ],
+                MTLSize {
+                    width: nq_blocks,
+                    height: case.num_q_heads,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 512,
+                    height: 1,
+                    depth: 1,
+                },
+            ) {
+                return false;
+            }
+        }
+        true
+    };
+
+    if !run(3) {
+        return;
+    } // warmup
+    let iters = 20usize;
+    let t = std::time::Instant::now();
+    run(iters);
+    let secs = t.elapsed().as_secs_f64();
+
+    // causal self-attention, one layer, all heads:
+    // QK^T and A·V each do (m*m/2) causal pairs * head_dim MACs; 2 matmuls, 2 flop/MAC.
+    let m = case.kv_len as f64;
+    let flop_per_call = 2.0 * 2.0 * (m * m / 2.0) * case.head_dim as f64 * case.num_q_heads as f64;
+    let tflops = flop_per_call * iters as f64 / secs / 1e12;
+    let ms = secs * 1000.0 / iters as f64;
+    eprintln!(
+        "BENCH steel wide bd512 m={} {}q/{}kv: {ms:.3} ms/call, {tflops:.2} TFLOP/s  \
+         [unfused hd512 path ~0.55, classic steel paged 0.81 at hd128 on M1 Max]",
+        case.kv_len, case.num_q_heads, case.num_kv_heads
+    );
+}
+
 /// Limiter probe for the steel paged prefill kernel at a realistic Llama-3.2-3B
 /// shape (24 q / 8 kv heads, head_dim 128, m=4096). Prints achieved TFLOP/s
 /// (vs the ~9 the 4-bit GEMM gets on the same GPU) plus the compiled pipeline's
