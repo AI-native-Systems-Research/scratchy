@@ -17,6 +17,7 @@ use scratchy_target_metal::tape::ids::{HiddenSize, KDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, SiluMulConstants,
 };
+use scratchy_target_metal::tape::quantized::{QmvKernel, qmv_dispatch_shape};
 use scratchy_target_metal::tape::step::GatedAct;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
@@ -193,6 +194,12 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
     );
 
     let mut batch = Mtl4DispatchBatch::begin(&device)?;
+    let kernel = if c.fast() {
+        QmvKernel::Fast
+    } else {
+        QmvKernel::Generic
+    };
+    let ((_, groups, _), (lanes, simdgroups, _)) = qmv_dispatch_shape(kernel, 1, c.n as u32, 1);
     for (wt, y) in [(&gate, &gate_y), (&up, &up_y)] {
         let binds = [
             (&wt.w, 0),
@@ -201,7 +208,11 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
             (&x, 3),
             (y, 4),
         ];
-        batch.encode(&matvec, &binds, &[], &[], &[], tg(1, c.n / 8), tg(32, 2));
+        let (grid, threads) = (
+            tg(1, groups as usize),
+            tg(lanes as usize, simdgroups as usize),
+        );
+        batch.encode(&matvec, &binds, &[], &[], &[], grid, threads);
     }
     batch.barrier();
     let binds = [(&unfused, 0), (&gate_y, 1), (&up_y, 2)];

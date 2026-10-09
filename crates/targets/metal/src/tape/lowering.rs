@@ -8544,7 +8544,7 @@ mod tests {
         // The qmv: one row baked, the live sequence count at dispatch; the matmul's weight and
         // slots.
         assert_eq!(qmv.function, "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0");
-        assert_eq!(qmv.dispatch.threadgroups, (1, 2048 / 8, 1));
+        assert_eq!(qmv.dispatch.threadgroups, (1, 2048 / 4, 1));
         let ms = qmv.dispatch.m_scaling.expect("scales with the sequences");
         assert_eq!(ms.seq_axis, Some(MScaleAxis::X));
         let bindings = affine_qmm_bindings(7, 11, LayerId(3), src(WeightKind::Linear, 0));
@@ -9333,8 +9333,8 @@ mod tests {
             cmd.constants,
             vec![ConstantValue::int(0, 2048), ConstantValue::int(1, 2048)],
         );
-        // qmv_fast grid: (M, ceil(N/8), B); group: (32, 2, 1).
-        assert_eq!(cmd.dispatch.threadgroups, (1, 2048 / 8, 1));
+        // qmv_fast grid: (M, ceil(N/4), B); group: (32, 2, 1).
+        assert_eq!(cmd.dispatch.threadgroups, (1, 2048 / 4, 1));
         assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 1));
         // 5 bindings: weight (idx 0), scales (1), biases (2), in (3), out (4).
         assert_eq!(cmd.bindings.len(), 5);
