@@ -376,7 +376,7 @@ impl Block {
         Dispatch {
             pso,
             buffers,
-            groups: size(1, INTER.div_ceil(8), self.tokens * TOP_K),
+            groups: size(self.tokens * TOP_K, INTER.div_ceil(8), 1),
             threads: size(32, 4, 1),
         }
     }
@@ -398,7 +398,7 @@ impl Block {
         Dispatch {
             pso: &self.combine,
             buffers,
-            groups: size(1, HIDDEN.div_ceil(4), self.tokens),
+            groups: size(self.tokens, HIDDEN.div_ceil(4), 1),
             threads: size(32, TOP_K, 1),
         }
     }
