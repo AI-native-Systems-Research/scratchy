@@ -80,6 +80,23 @@ ollama_tag() {
     esac
 }
 
+# Extra --chat-template-config for the parity gate's mlx-lm side, per stem;
+# empty = mlx-lm's defaults already render the checkpoint's chat template the
+# way `scr chat` does. mlx_lm.generate forces `enable_thinking` on for any
+# vocab with think tokens, but gemma-4's own template defaults it OFF (it
+# prefills an empty thought channel), so without this pin the gate compares
+# two different prompts and its 12/40-token budgets die inside mlx-lm's
+# thought before any answer exists to agree on. Qwen3.5's template defaults
+# thinking on, matching mlx-lm's injection, so it needs nothing here.
+# The single quotes ride along into --parity-cmd, whose shell-words split
+# would otherwise strip the JSON's double quotes and crash the child on
+# json.loads — with stderr nulled, that masquerades as a parity mismatch.
+mlx_parity_config() {
+    case "$1" in
+        gemma-4-*) echo "'{\"enable_thinking\":false}'" ;;
+    esac
+}
+
 MODELS=()
 SCENARIOS="frozen,cold,warm"
 REPS=3
@@ -558,10 +575,14 @@ PY
     parity_ok=1
     if (( built )) && [[ -n "${MLX_PYTHON}" ]]; then
         echo "--- parity gate vs mlx-lm (blocking)"
+        # The gate only means "same load path" if both sides render the SAME
+        # prompt; see mlx_parity_config for where mlx-lm's defaults diverge
+        # from the checkpoint template `scr chat` renders.
+        pconfig="$(mlx_parity_config "${stem}")"
         if "${BIN}" bench startup --model "${id}" --exec --mode cli --scenarios warm --port "${PORT}" \
                 --child-cmd "${model_bin} chat -m ${id} --device metal -q {prompt} --max-tokens {output_len} --temperature 0" \
                 --backend scratchy \
-                --parity-cmd "${MLX_PYTHON} -m mlx_lm.generate --model ${id} --prompt {prompt} --max-tokens {output_len} --temp 0" \
+                --parity-cmd "${MLX_PYTHON} -m mlx_lm.generate --model ${id} --prompt {prompt} --max-tokens {output_len} --temp 0${pconfig:+ --chat-template-config ${pconfig}}" \
                 --parity-backend mlx-lm \
                 --output-json "${RAW}/parity-${stem}.json" >"${RAW}/parity-${stem}.log" 2>&1; then
             grep -E "^ +(capital|arith|count) |PARITY OK" "${RAW}/parity-${stem}.log" | sed 's/^/    /'
