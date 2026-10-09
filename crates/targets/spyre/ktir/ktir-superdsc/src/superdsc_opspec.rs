@@ -1375,6 +1375,14 @@ pub enum OpFunc {
     /// `minimum` — elementwise min of TWO tensors (sfp unit; the min twin of [`Maximum`]). Used with
     /// `Maximum` to CLAMP the fp8 activation into `[-448, 448]` before [`Qfp8ch`]: `min(max(x,-448),448)`.
     Minimum,
+    /// ⭐ `clip` — the device's OWN clamp, ONE input: `FMIN(FMAX(x, clipMin), clipMax)` with both
+    /// bounds arriving as the external constants `clipMin`/`clipMax`
+    /// (`unary_pipeline.ddl:32-33`, fp16 binding `:16` — the SAME min/max pair [`Minimum`]/[`Maximum`]
+    /// encoded, so the swap is value-preserving by construction). Registered on dd2
+    /// (`sentient_dd2_sysconfig.json` PE supportedOps/5/OpfuncNames/15). It REPLACES the two-op
+    /// `maximum`+`minimum` pair the fp8 chain used to clamp the scaled activation, folding the
+    /// ±448 quant constants into the descriptor instead of binding them as `[1, stick]` H2D tensors.
+    Clip,
     /// `qfp8ch` — cast/quantize fp16 → SEN143_FP8 (E4M3), the fp8 W8A8 activation quantizer (SFP unit;
     /// DDL `quantization_*.ddl` opFuncName "qfp8ch", IBM PR #2401). The input MUST be CLAMPED to [-448, 448]
     /// FIRST (`mul-by-1/scale → clamp±448 → qfp8ch`, mirroring IBM's `quantize_fp8_with_scale`): the
@@ -1383,6 +1391,37 @@ pub enum OpFunc {
     /// compute step, not an unproven skip. (If we ever drop the clamp it MUST be gated by a Kani proof of
     /// the fp16 bound.) Output tensor is `_fp8`-named so the residency + `matmulfp8` dispatch activate.
     Qfp8ch,
+    /// ⭐⭐⭐⭐⭐ `quantscalepertoken` — THE HARDWARE'S OWN FUSED PER-TOKEN ACTIVATION SCALE, which
+    /// replaces FIVE ops we currently emit per quantized activation.
+    ///
+    /// `~/git/deeptools/ddc/ddl_templates/quant_scale_per_token.ddl:40` binds it as ONE input, ONE
+    /// output and THREE `ddl.internal_tensor` intermediates (`output_tensor_reduce`,
+    /// `output_tensor_intermediate`, `reciprocal_tensor`) — so the abs, the max-reduce, the floor, the
+    /// scale and the reciprocal all happen INSIDE one op with its partials on-chip. The body is an
+    /// `FABSMAX` tree: chunk absmax in PE (`:178`), the nfwd combine (`:191-197`), `SPLAT` (`:211`),
+    /// `REDUCE mode=10` on the SFP (`:219`) and an FABSMAX psum ring across cores (`:232`). Its
+    /// `1/448` and clamp bounds arrive as the external constants `mulConst` / `clipMin` / `clipMax`
+    /// (`:52-54`).
+    ///
+    /// ⭐ IT IS REGISTERED AND ENABLED ON OUR PART, so this is not a speculative opcode:
+    /// `sys-arch-spec/arch_enums.cpp:455-456` maps `OpFuncs::QUANT_SCALE_PER_TOKEN{,_FP8}`, and
+    /// `perfdsc/.../sysConfigs2.0/multi_sentient_dd2_sysconfig.json:87` lists both for **dd2**.
+    ///
+    /// ⛔ THE OUTPUT IS THE SCALE, NOT THE QUANTIZED TENSOR — `%global_layout_output` drops the reduce
+    /// dim that `%global_layout_input` carries, so it is `[tokens, 1]`. It therefore replaces
+    /// `fq_absx → fq_amax → fq_amaxfl → fq_ascale → fq_invs`; the `fq_sc → fq_chi → fq_cl → fq_afp8`
+    /// tail that produces the `[m,k]` fp8 activation still stands. 5 ops → 1, ×4 activations a layer =
+    /// 16 of the 51 glue ops that are 67% of a bs=1 decode layer.
+    ///
+    /// ⛔ WHY IT WAS NEVER CALLED: [`EpilogueOpFunc`] is sealed to what `bmm.ddl`'s EPILOGUE SLOTS
+    /// expose, and that was read as the machine's whole op menu — the standalone fused templates were
+    /// never opened. A sealed enum in this crate records what we emit, never what the device can do.
+    /// ⛔ THE **FP8** VARIANT IS THE ONE WITH THE CONSTANT CONTRACT. The compiler's own construction
+    /// code supplies `clipMin`/`clipMax`/`mulConst` only for `QUANT_SCALE_PER_TOKEN_FP8`
+    /// (`dsm/translators/sengraphToPerfDsc/sengraphFoldingHelperAuxMethods.cpp:1421-1435`, each guarded
+    /// by a `DT_CHECK` that the attribute is present), so that is the variant to emit — the plain
+    /// `quantscalepertoken` has no such branch and is not what an fp8 activation wants.
+    QuantScalePerTokenFp8,
 }
 
 impl OpFunc {
@@ -1442,7 +1481,9 @@ impl OpFunc {
             OpFunc::Identity => "identity",
             OpFunc::Maximum => "maximum",
             OpFunc::Minimum => "minimum",
+            OpFunc::Clip => "clip",
             OpFunc::Qfp8ch => "qfp8ch",
+            OpFunc::QuantScalePerTokenFp8 => "quantscalepertokenfp8",
         }
     }
 
@@ -1459,6 +1500,104 @@ impl OpFunc {
             _ => "sfp",
         };
         ExUnit(s)
+    }
+
+    /// ⭐ THE NAMED EXTERNAL CONSTANTS THIS OP FUNC REQUIRES — a const table, empty for every op but
+    /// one. They are emitted into the descriptor's **`constantInfo_`**, not `opConsts` (see the
+    /// emission site in [`crate::emit::emit_sdsc`] for the witness and for why `opConsts` is the wrong
+    /// field).
+    ///
+    /// ⛔ REQUIRED, NOT OPTIONAL, AND THE DESCRIPTOR IS REFUSED WITHOUT THEM. `quant_scale_per_token.ddl`
+    /// reaches its bounds through `ddl.get_external_constant` by NAME (`:52-54`), and the compiler's own
+    /// builder `DT_CHECK`s all three before pushing them
+    /// (`sengraphFoldingHelperAuxMethods.cpp:1423-1434`). Omitting them is
+    /// `DtException: Scheduler failed to find a suitable op mapping` at bake — a message that names the
+    /// op and not the missing constants, which is how this cost a build to discover. MEASURED with the
+    /// two-stage `L3DlOpsScheduler_standalone` + `ddc_standalone` oracle: the same descriptor is
+    /// refused carrying only `scaling_factor` and accepted carrying these three.
+    ///
+    /// ⛔ THE VALUES ARE **SEN169** BIT PATTERNS, NOT IEEE fp16. `dsc/dscdefn.h:504` types the field
+    /// `map<string, array<uint32_t,4>>` and `dsc2.cpp:5296`'s `getConstValues` reads those four words as
+    /// a PACKED buffer at the format's bit width, so with the DDL's `num_elements=1` only word 0 is
+    /// read. SEN169_FP16 is 1-6-9 with exponent bias 31 — the DDL's own `%tff = 0x4DFC` decodes to
+    /// exactly 255 in that format and to nothing meaningful in IEEE, which is the check that a
+    /// hand-written IEEE constant would have failed silently. [`crate::emit::sen169_bits`] is the
+    /// encoder, so the value is spelled as the REAL NUMBER here and encoded once.
+    pub fn op_consts(self) -> &'static [(&'static str, f32)] {
+        match self {
+            // ⭐⭐⭐ THE OP COMPUTES `FMIN(FMAX(absmax·mulConst, clipMin), clipMax)`, AND THESE THREE
+            // NUMBERS ARE CHOSEN TO MAKE THAT BIT-FOR-BIT THE CHAIN IT REPLACES — read off the DDL
+            // body, not off the vendor's defaults.
+            //
+            // `quant_scale_per_token.ddl` fp8 branch, in order: `:259` `FMA16(absmax, mulConst, 0)`,
+            // `:283` `FMAX(·, clipMin)`, `:287` `FMIN(·, clipMax)`. What we emit today is
+            // `fq_amaxfl: maximum(amax, 1/448)` then `fq_ascale: mul(·, 1/448)`, i.e.
+            // `max(amax/448, 1/448²)`. So:
+            //
+            // * `mulConst = 1/448` — `fq_ascale`'s multiplier. (The vendor derives it the same way:
+            //   `nodeFissionFusion.cpp:22838` sets `mulConst = 1.0 / constValues.at(0)` from the
+            //   `RealDiv`'s divisor in the `X → AbsMax → RealDiv → Clip` pattern it fuses,
+            //   `utilInfoInit.cpp:5083-5117`.)
+            //
+            // * ⛔ `clipMin = 1/448²`, **NOT the vendor's `-448`** (`nodeFissionFusion.cpp:3916`).
+            //   `FMAX` here clamps the SCALE, and the scale is a magnitude, so a negative bound is
+            //   inert — which would silently DROP `fq_amaxfl`'s floor. That floor is a scratchy padding
+            //   guard, not part of torch-spyre's decomposition: an all-zero (padded) row has
+            //   `amax == 0`, and an unfloored `0` scale makes `fq_invs` `recip(0) = inf` and then
+            //   `0·inf = NaN` for the whole row. `1/448²` is exactly `max(amax, 1/448)·(1/448)`
+            //   evaluated at the floor, so every real row (whose `amax ≫ 1/448`) is untouched.
+            //
+            // * `clipMax = 448` — PROVABLY INERT, kept at the vendor's value only so the upper bound is
+            //   not invented here. The input is fp16, so `amax ≤ 65504` and `amax·(1/448) ≤ 146.2 < 448`
+            //   for every finite activation; `fq_amaxfl`/`fq_ascale` had no upper clamp and this one
+            //   cannot fire.
+            OpFunc::QuantScalePerTokenFp8 => &[
+                ("clipMin", 1.0 / 448.0 / 448.0),
+                ("clipMax", 448.0),
+                ("mulConst", 1.0 / 448.0),
+            ],
+            // ⭐ THE fp8 E4M3 CLAMP BOUNDS, the same ±448 the `fq_chi`/`fq_cl` pair used to read as
+            // `[1, stick]` H2D tensor operands. `unary_pipeline.ddl`'s clip body is
+            // `FMAX(x, clipMin)` in PE (`:370-377`) then `FMIN(·, clipMax)` on the SFP (`:472-479`) —
+            // the min/max pair encoded, in the same order-independent clamp form. The bounds are the
+            // E4M3 finite range, so they are quant-format constants, not model constants: they belong
+            // to the op, which is why they live in this table.
+            OpFunc::Clip => &[("clipMin", -448.0), ("clipMax", 448.0)],
+            _ => &[],
+        }
+    }
+
+    /// ⭐⭐⭐ HOW MANY INPUT TENSORS THIS OP FUNC'S DDL TEMPLATE BINDS — `None` = the template does not
+    /// pin it (every op that shipped before this table existed), `Some(n)` = a hard match criterion.
+    ///
+    /// ⛔ AN INPUT-ARITY MISMATCH IS NOT A DIAGNOSABLE ERROR IN THE COMPILER, IT IS A SILENT
+    /// NON-MATCH. `DdlConversion::matchDdl2Dsc` (`ddc/ddl/ddl_conversion.cpp:2158-2163`) walks the
+    /// template's `ddl.operation_bind`s and, for each, hunts a computeOp with the same op func, the same
+    /// `inputLabeledDs.size()` and the same `outputLabeledDs.size()`. `continue` on any of the three.
+    /// If no computeOp maps, the template is unsuitable, `selectAndParseDdlTemplate` prints
+    /// `[DDC] DDL found but not suitable for op <name>` and `sbf::runDdc` turns that into
+    /// `DtException: Scheduler failed to find a suitable op mapping for sdsc: <op>` — which names the op
+    /// and says nothing about arity.
+    ///
+    /// ⛔ THIS IS WHY THE SEEDED-REDUCE CONVENTION IS NOT UNIVERSAL. Our `sum`/`max`/`mean` reduces pass
+    /// the accumulator as `inputLabeledDs[1]` AND as the sole output, which is exactly what
+    /// `summeanmaxexx2.ddl` binds (two inputs) — so those stay `None`. The machine's FUSED reduces keep
+    /// their accumulator on-chip as a `ddl.internal_tensor` and bind ONE input
+    /// (`quant_scale_per_token.ddl:41`: `[%input_tensor]`, `[%output_tensor]`,
+    /// `[%output_tensor_reduce]`), so passing them a seed operand makes them unmatchable.
+    ///
+    /// ⭐ The emitter turns a violation into a `cargo build` error rather than a bake refusal, so this
+    /// row and the operand list cannot drift apart.
+    pub fn ddl_input_arity(self) -> Option<usize> {
+        match self {
+            OpFunc::QuantScalePerTokenFp8 => Some(1),
+            // `unary_pipeline.ddl:16` binds clip as `([%type_fp16], [%inptensor], [%outtensor])` —
+            // ONE input. Both bounds are external constants, so unlike the seeded reduces there is no
+            // second operand to get wrong; the row exists so the emitter's build-time arity check
+            // covers this op too.
+            OpFunc::Clip => Some(1),
+            _ => None,
+        }
     }
 
     /// True for the transcendental sfp ops that need the SFP polynomial constant

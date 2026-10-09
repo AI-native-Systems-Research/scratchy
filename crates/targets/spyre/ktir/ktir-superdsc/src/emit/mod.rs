@@ -2483,8 +2483,38 @@ pub fn emit_sdsc(
     }
     // A reduction accumulator is BOTH an input AND the output (matches the
     // reduce fixture: accum is inputLabeledDs[1] and the sole outputLabeledDs).
-    if op.is_reduction && views.len() == 2 {
+    //
+    // ⛔⛔⛔ EXCEPT WHEN THE OP FUNC'S OWN DDL BINDS A DIFFERENT INPUT ARITY, WHICH IS A HARD MATCH
+    // CRITERION AND NOT A HINT. `ddl_conversion.cpp:2161-2163` (`DdlConversion::matchDdl2Dsc`) walks
+    // every `ddl.operation_bind` in the selected template and skips any computeOp whose
+    // `inputLabeledDs.size() != opBindInputs.size()` — an arity mismatch is indistinguishable from
+    // "wrong op", so the template is silently declared unsuitable and the whole descriptor is refused
+    // with a message that names only the op. A SEEDED reduce (`sum`/`max`/`mean` →
+    // `summeanmaxexx2.ddl`) binds TWO inputs and is unchanged here; the machine's own FUSED reduces
+    // (`quantscalepertokenfp8` → `quant_scale_per_token.ddl:41`, one `%input_tensor`, one
+    // `%output_tensor`, its accumulator an on-chip `ddl.internal_tensor`) bind ONE.
+    //
+    // ⭐ DRIVEN BY [`OpFunc::ddl_input_arity`], a const table — a target-ABI fact this shared pass
+    // takes as INPUT, never a match arm here.
+    if op.is_reduction && views.len() == 2 && op.op.ddl_input_arity().is_none_or(|n| n == 2) {
         input_refs.push(format!("Tensor{out_idx}-idx{out_idx}"));
+    }
+    // ⭐⭐⭐ THE ARITY REFUSAL, MOVED FROM THE BAKE TO THE BUILD. `emit_sdsc` runs inside `#[forward]`,
+    // so this `Err` is a `cargo build` error naming the contract — not a `DtException: Scheduler failed
+    // to find a suitable op mapping` hours later on a card, which is how the mismatch above was found.
+    if let Some(want) = op.op.ddl_input_arity()
+        && input_refs.len() != want
+    {
+        return Err(SuperDscError(format!(
+            "op '{op_name}' ({}): its DDL template binds exactly {want} input tensor(s), but this \
+             descriptor lists {} ({input_refs:?}). `DdlConversion::matchDdl2Dsc` \
+             (ddl_conversion.cpp:2161) SKIPS a computeOp whose input count differs from the \
+             `ddl.operation_bind`'s, so the template is declared unsuitable and dxp refuses the \
+             whole bundle with a message that names only the op. Fix the operand list, or the \
+             `OpFunc::ddl_input_arity` row if the template really binds a different arity.",
+            op.op.name(),
+            input_refs.len()
+        )));
     }
 
     // ⛔⛔⛔⛔⛔ A GATHER MAY NOT SIT ON AN OP THAT HAS A `KERNEL` — the card's own refusal, moved to
@@ -2860,11 +2890,53 @@ pub fn emit_sdsc(
         });
     }
 
-    let constant_info = match op.op_info {
-        OpInfo::SfpConstTable => sfp_constant_table(folds),
-        OpInfo::ReduceScaling(packed) => scaling_factor_const(packed, folds),
-        OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits, folds),
-        OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
+    // ⭐⭐⭐ AN OP FUNC WHOSE DDL READS NAMED EXTERNAL CONSTANTS SUPPLIES THEM HERE — `constantInfo_`,
+    // NOT `opConsts`, and it REPLACES whatever the generic path would have written.
+    //
+    // `ddc/ddl_templates/test/sdsc_layernormscale.json` is the frontend-stage witness: a fused
+    // reduce-style op carrying its `eps` as `constantInfo_: {"0": {dataFormat_, name_: "eps", data_}}`,
+    // with ONE input, ONE output, no interim operand and `exUnit: sfp`. `opConsts_` in
+    // `sengraphToPerfDsc/sengraphFoldingHelperAuxMethods.cpp:1432` is perfdsc's INTERNAL structure on
+    // the way here, not the descriptor field ddc matches against — emitting the constants there left
+    // `ddc.run_v1` refusing exactly as before.
+    //
+    // ⛔ IT MUST TAKE PRECEDENCE OVER [`OpInfo::ReduceScaling`], WHICH IS WHY IT IS NOT A MATCH ARM.
+    // A fused reduce still arrives through the reduce assembler, so its `op_info` is
+    // `ReduceScaling(1.0)` — the `scaling_factor` that `summeanmaxexx2.ddl` reads and
+    // `quant_scale_per_token.ddl` does not. Written as a guarded arm it lost to `ReduceScaling` and the
+    // three constants never reached the descriptor at all: MEASURED with
+    // `L3DlOpsScheduler_standalone` + `ddc_standalone` on the emitted descriptor, `scaling_factor`
+    // alone is refused and the three named constants are accepted.
+    //
+    // ⛔ THE TABLE IS THE WHOLE CONDITION: `op_consts()` is empty for every other op func, so every
+    // shipped descriptor is byte-identical.
+    let constant_info = if !op.op.op_consts().is_empty() {
+        // ⭐ THE SAME POST-2026-09 CONTRACT THE REDUCE ARMS BELOW WRITE: `data_` is a FoldManager
+        // OBJECT (`fold_manager_const`), one entry per named constant, NO `allocations_` (the
+        // validator's additionalProperties-style rejection killed that field). Each value is ONE
+        // SEN169 word — the DDL reads it per-element out of `dataFormat_`.
+        serde_json::Value::Object(
+            op.op
+                .op_consts()
+                .iter()
+                .map(|&(cname, v)| {
+                    serde_json::json!({
+                        "dataFormat_": "SEN169_FP16",
+                        "name_": cname,
+                        "data_": fold_manager_const(sen169_bits(v) as u32, folds)
+                    })
+                })
+                .enumerate()
+                .map(|(i, entry)| (i.to_string(), entry))
+                .collect(),
+        )
+    } else {
+        match op.op_info {
+            OpInfo::SfpConstTable => sfp_constant_table(folds),
+            OpInfo::ReduceScaling(packed) => scaling_factor_const(packed, folds),
+            OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits, folds),
+            OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
+        }
     };
     // torch-spyre's `generate_constant_info` returns the JSON *string* "{}" for the
     // EMPTY case and a DICT only when populated. VERIFIED on the REAL frontend (compiled
@@ -4816,7 +4888,9 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "identity" => OpFunc::Identity,
         "maximum" => OpFunc::Maximum,
         "minimum" => OpFunc::Minimum,
+        "clip" => OpFunc::Clip,
         "qfp8ch" => OpFunc::Qfp8ch,
+        "quantscalepertokenfp8" => OpFunc::QuantScalePerTokenFp8,
         other => panic!(
             "op_func_from_str: unknown op name {other:?} — would have silently become `add` \
              (wrong op). Add an explicit arm or fix the caller."

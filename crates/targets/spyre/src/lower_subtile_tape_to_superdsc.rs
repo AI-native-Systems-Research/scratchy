@@ -449,6 +449,23 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // ── Liveness: first def (output of node i) and last use (input of node j). A
     //    source has no def (def = 0, live from the start); the result has no use
     //    (use = nodes.len(), live to the end). ──
+    // ⭐ THE SCALARMUL WEIGHT FOLDS COME FIRST — every liveness and placement fact below must
+    //    already know them. A folded ScalarMul emits NO op, so its output tensor is written by
+    //    nobody and every reader of it is re-pointed at the PRODUCER's bytes (the placement
+    //    alias in the intermediate scan). Computing the folds before liveness is what lets the
+    //    producer's bytes stay live for the folded node's readers instead of being reclaimed
+    //    under them.
+    //
+    // ⛔ TWO LISTS, BECAUSE THE TWO FOLD KINDS DIFFER IN WHAT HAPPENS TO THE NODE. The union
+    // (`weight_scale_folds`) is everything the worker applies to staged bytes at load — the
+    // ScalarMul folds AND the attention-scale folds — and it is what the census skips and the
+    // layout carries. The ScalarMul folds ALONE leave the tape: their node is host-routed and
+    // their output placement aliases the producer's bytes, which is why the liveness extension
+    // and the placement alias below key on `scalarmul_folds` and never on the union — an
+    // attention fold's node STAYS (at scale 1.0), its output is a real intermediate, and
+    // aliasing it to the query's bytes would hand every attention consumer the query buffer.
+    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
+    let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let n_nodes = ir.nodes.len();
     let mut first_def: std::collections::BTreeMap<u32, usize> = Default::default();
     let mut last_use: std::collections::BTreeMap<u32, usize> = Default::default();
@@ -457,6 +474,22 @@ pub fn compute_bundle_layout<F: RopeForm>(
         first_def.entry(o).or_insert(i);
         for inp in &node.inputs {
             last_use.insert(inp.tensor.index() as u32, i);
+        }
+    }
+    // ⛔ A FOLDED SCALARMUL'S READERS READ THE PRODUCER'S BYTES. The layout aliases the folded
+    //    node's output placement to its producer's (in the intermediate scan below), so the
+    //    producer's byte range must stay un-reused for as long as the FOLD'S OUTPUT is live —
+    //    the scan would otherwise reclaim those bytes the moment the (now op-less) ScalarMul
+    //    "consumes" the product, and the alias would surface as silent corruption: the fold's
+    //    readers would read a later intermediate that the scan moved into the reclaimed range.
+    for (fold_id, _, _) in &scalarmul_folds {
+        let node = &ir.nodes[fold_id.index()];
+        let producer_out = node.inputs[0].tensor.index() as u32;
+        let fold_out = node.output.tensor.index() as u32;
+        if let Some(&exp) = last_use.get(&fold_out)
+            && exp > *last_use.get(&producer_out).unwrap_or(&0)
+        {
+            last_use.insert(producer_out, exp);
         }
     }
 
@@ -844,10 +877,23 @@ pub fn compute_bundle_layout<F: RopeForm>(
         })
         .flatten()
         .collect();
+    // A FOLDED ScalarMul's output is placed by the ALIAS below, not by this pool — a colored
+    // slot of its own would be a dead hole beside the producer's bytes its readers are
+    // re-pointed at. (An attention-scale fold's node keeps running, so its output is an
+    // ordinary intermediate and colors normally.)
+    let folded_out: std::collections::HashSet<u32> = scalarmul_folds
+        .iter()
+        .map(|(id, _, _)| ir.nodes[id.index()].output.tensor.index() as u32)
+        .collect();
     let mut inter: Vec<u32> = first_def
         .keys()
         .copied()
-        .filter(|&t| t >= ir.num_sources && t != result && !replaced_kv.contains(&t))
+        .filter(|&t| {
+            t >= ir.num_sources
+                && t != result
+                && !replaced_kv.contains(&t)
+                && !folded_out.contains(&t)
+        })
         .collect();
     inter.sort_by_key(|t| (first_def[t], *t));
     // ── SEGMENT COLORING (the multi-op stitching fix): dxp's ModuleStitcher connects
@@ -894,6 +940,23 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 size: nbytes(tid),
             },
         );
+    }
+
+    // ⭐ THE FOLD'S PLACEMENT ALIAS. A folded ScalarMul writes nothing, so its output tensor's
+    //    readers are pointed at the PRODUCER's bytes: same segment, same offset, same size — the
+    //    recognition required the folded node's output region to MIRROR its input, and its input
+    //    IS the producer's whole output, so the window is byte-for-byte the window the matmul
+    //    wrote (which now holds `x·(W·s)` once the worker scales the staged weight). The scan
+    //    above skipped these tids; this is their single placement. Same mechanism as the on-card
+    //    residual threading (`hidden_out` ← `hidden_in`), and safe for the same reason the
+    //    liveness extension above is: the producer's range is not reclaimable while the fold's
+    //    readers live.
+    for (fold_id, _, _) in &scalarmul_folds {
+        let node = &ir.nodes[fold_id.index()];
+        let producer_out = node.inputs[0].tensor.index() as u32;
+        let fold_out = node.output.tensor.index() as u32;
+        let p = placements[&producer_out];
+        placements.insert(fold_out, TensorPlacement { tid: fold_out, ..p });
     }
 
     // ── Attention KV cache (seg2) + scale const (seg1) for in-bundle attention ──
@@ -1361,11 +1424,24 @@ pub fn compute_bundle_layout<F: RopeForm>(
         }
     }
 
-    // ── granite ScalarMul scale constants ── collect the DISTINCT scale values (embedding / residual /
-    //    attention / logits multipliers) and place a `[1,1]` worker-bound const per scale in seg0
-    //    (ACTIVATION, exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index
-    //    here → the const TID it multiplies by; the worker binds each `t{tid}=[scale]`. NO weight-fold, NO
-    //    host-route — a real on-device pointwise multiply (the ATTN_SCALE mechanism).
+    // ── granite ScalarMul scale constants ── collect the DISTINCT scale values (embedding /
+    //    residual / attention / logits multipliers) and place a `[1,1]` worker-bound const per
+    //    scale in seg0 (ACTIVATION, exactly like ATTN_SCALE). The pointwise `mul` the door
+    //    lowers reads the index here → the const TID it multiplies by; the worker binds each
+    //    `t{tid}=[scale]`.
+    //
+    //    ⭐ EXCEPT THE WEIGHT-FOLDED ONES: a multiplier that commutes into its matmul's weight
+    //    ([`scalar_mul_weight_folds`], computed at the top of this function) never becomes a
+    //    device op, so its scale never enters this registry either — the worker applies it to
+    //    the staged weight bytes instead. The skip is by NODE, not by value: the same VALUE
+    //    pushed by an `AttnDecode` or `RmsNorm` below still lands (the registry is
+    //    content-dedup'd, and its consumers look values up BY BITS), so a shared value keeps
+    //    its slot and the registry stays the one list both the bake and the bind read.
+    let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
+        weight_scale_folds
+            .iter()
+            .any(|(fold_id, _, _)| *fold_id == id)
+    };
     let mut scalarmul_scales: Vec<f32> = Vec::new();
     let push_scale = |scale: f32, scalarmul_scales: &mut Vec<f32>| {
         if !scalarmul_scales
@@ -1390,13 +1466,25 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // (`AttnDecode.scale` == config `attention_multiplier`, set by `attention_scale_for`). NO recompute
         // (the worker must never invent `1/sqrt(hd)` — that ignored the model's real attention_multiplier).
         match &node.op {
-            SubOp::ScalarMul { scale } => push_scale(*scale, &mut scalarmul_scales),
+            SubOp::ScalarMul { scale } => {
+                if !folded_node(node.id) {
+                    push_scale(*scale, &mut scalarmul_scales);
+                }
+            }
             // torch-spyre `spyre__sdpa_overrideable`: scaling_factor = sqrt(scale), applied to BOTH q and K
             // (`query * scaling_factor`, `key * scaling_factor`). Register √scale for the prefill split; the
             // un-split `scale` stays for the decode qs.
+            //
+            // ⭐ EXCEPT THE WEIGHT-FOLDED ONES (the same skip the ScalarMul arm takes): an
+            // attention whose √scale commuted into W_q/W_k runs at scale 1.0 and multiplies
+            // NOTHING, so neither it nor its square root may occupy a registry slot — and the
+            // 1.0 itself most of all, which is why the skip is by NODE and not by value (a
+            // pushed identity would shift every scale after it by a slot).
             SubOp::AttnDecode { scale, .. } => {
-                push_scale(*scale, &mut scalarmul_scales);
-                push_scale(scale.sqrt(), &mut scalarmul_scales);
+                if !folded_node(node.id) {
+                    push_scale(*scale, &mut scalarmul_scales);
+                    push_scale(scale.sqrt(), &mut scalarmul_scales);
+                }
             }
             // RMSNorm epsilon (config `rms_norm_eps`) flows through the SAME registry — a `[1,1]`
             // worker-bound const the rmsnorm adds to the mean-of-squares (config value, not dropped).
@@ -1452,6 +1540,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         weight_bank_bytes,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
+        weight_scale_folds: weight_scale_folds
+            .into_iter()
+            .map(|(_, tid, scale)| (tid, scale))
+            .collect(),
         synth,
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
@@ -1880,15 +1972,83 @@ pub fn write_eval_golden<F: RopeForm>(
     let dbg = dir.join("dbg");
     std::fs::create_dir_all(dbg.join("golden"))?;
     let nsrc = ir.num_sources as usize;
-    let src_vals: Vec<Vec<f32>> = (0..nsrc)
+    // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO — BOTH KINDS. A weight-folded ScalarMul has no
+    // device op, so the bundle under test never applies its multiplier as a node — the scale
+    // enters through the staged weight bytes. The golden must model exactly that or every
+    // comparison diverges at the first folded node: pre-scale each fold target's synthetic
+    // source by its multiplier (what `stage_bound_weights` does to the real bytes) and SKIP
+    // the folded nodes in the eval walk (what `lower_one_node`'s HostRouted arm does to the
+    // tape). An attention-scale fold's node is NOT skipped — it still runs, at the scale the
+    // splice's rewrite gave the real program (1.0) — so the golden evaluates it at 1.0 over
+    // the pre-scaled W_q/W_k, which is bit-for-bit the folded bundle's contract.
+    let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
+    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
+    let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
+        scalarmul_folds.iter().any(|(fold_id, _, _)| *fold_id == id)
+    };
+    let mut src_vals: Vec<Vec<f32>> = (0..nsrc)
         .map(|id| {
             let t = ir.tensors[id];
             let n = (t.rows as usize) * (t.cols as usize);
             (0..n).map(|j| dbg_synth_val(id, j)).collect()
         })
         .collect();
+    for (_, tid, scale) in &scalarmul_folds {
+        if let Some(src) = src_vals.get_mut(*tid as usize) {
+            for v in src.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+    for (_, w_q, w_k, sqrt_scale) in &attn_folds {
+        for tid in [w_q, w_k] {
+            if let Some(src) = src_vals.get_mut(*tid as usize) {
+                for v in src.iter_mut() {
+                    *v *= sqrt_scale;
+                }
+            }
+        }
+    }
     let src_refs: Vec<&[f32]> = src_vals.iter().map(|v| v.as_slice()).collect();
-    let bufs = scratchy_subtile::subtile_ir::eval_dag(ir, &src_refs);
+    // eval_dag minus the folded nodes — the same per-node `eval_node`/`scatter` pair it runs,
+    // with the fold's nodes skipped so the golden describes the FOLDED bundle's semantics.
+    let mut bufs: Vec<Vec<f32>> = ir
+        .tensors
+        .iter()
+        .map(|t| vec![0f32; (t.rows * t.cols) as usize])
+        .collect();
+    for (s, src) in src_refs.iter().enumerate() {
+        bufs[s].copy_from_slice(src);
+    }
+    for node in &ir.nodes {
+        if folded_node(node.id) {
+            continue;
+        }
+        // An attention-folded node evaluates at the REWRITTEN scale (1.0): the real program
+        // the golden must track was minted from the rewritten node, and evaluating the
+        // original scale over the pre-scaled sources would double-apply the multiplier.
+        let mut attn_node;
+        let node_ref = if let SubOp::AttnDecode { .. } = &node.op
+            && attn_folds.iter().any(|(id, ..)| *id == node.id)
+        {
+            attn_node = node.clone();
+            if let SubOp::AttnDecode { scale, .. } = &mut attn_node.op {
+                *scale = 1.0;
+            }
+            &attn_node
+        } else {
+            node
+        };
+        let out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
+        let shape = ir.shape(node.output.tensor);
+        scratchy_subtile::subtile_ir::scatter(
+            &mut bufs,
+            node.output.tensor,
+            node.output.region,
+            &out,
+            shape,
+        );
+    }
     let mut order = String::from("[");
     let mut seen = std::collections::HashSet::new();
     for (ni, node) in ir.nodes.iter().enumerate() {
@@ -1933,12 +2093,15 @@ pub fn write_eval_golden<F: RopeForm>(
     let wtj: Vec<String> = wt.iter().map(|w| w.to_string()).collect();
     std::fs::write(dbg.join("weight_tids.json"), format!("[{}]", wtj.join(",")))?;
     // granite ScalarMul scale VALUES (index i ↔ `scalarmul_scale_tid(i)`). SAME first-seen walk order as
-    // `compute_bundle_layout` (both iterate `ir.nodes`, dedup by bits) ⇒ index↔TID consistent. The worker
-    // reads this + binds each `t{scalarmul_scale_tid(i)} = [scale_i]` so the on-device pointwise `mul` gets
-    // the real value (unbound = 0 = wrong). Written alongside source_shapes.json (the run reads both).
+    // `compute_bundle_layout` (both iterate `ir.nodes`, dedup by bits) ⇒ index↔TID consistent — including
+    // the WEIGHT-FOLDED SKIP: a folded multiplier never enters the registry, so it must not enter this
+    // list either, or every scale after it would bind one slot off. The reader binds each
+    // `t{scalarmul_scale_tid(i)} = [scale_i]` so the on-device pointwise `mul` gets the real value
+    // (unbound = 0 = wrong). Written alongside source_shapes.json (the run reads both).
     let mut sm: Vec<f32> = Vec::new();
     for node in &ir.nodes {
         if let SubOp::ScalarMul { scale } = &node.op
+            && !folded_node(node.id)
             && !sm.iter().any(|s| s.to_bits() == scale.to_bits())
         {
             sm.push(*scale);
@@ -3002,6 +3165,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         weight_bank_bytes,
         kernel_weights,
         scalarmul_scales,
+        weight_scale_folds,
         synth,
         // EMIT-ONLY, deliberately not baked: the arrangement authority is the build-time check that a
         // tensor has ONE device layout (`declare_arrangement` returns a build `Err` naming the tensor
@@ -3088,6 +3252,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .collect(),
         ),
         scalarmul_scales: std::borrow::Cow::Owned(scalarmul_scales.clone()),
+        weight_scale_folds: std::borrow::Cow::Owned(weight_scale_folds.clone()),
         kv_request_stride_bytes: *kv_request_stride_bytes,
     }
 }
@@ -4938,17 +5103,178 @@ mod tests {
             matmuls, 2,
             "each fp8 matmul still emits its OWN matmulfp8 (weight differs), got {matmuls}"
         );
-        // The FIRST chain op is likewise shared: one, not two. It is `abs` (`fq_absx_op`), not the
-        // `square` (`fq_sq_op`) this test named — the quantize chain became abs→max, and no op by the
-        // old name has existed for as long as this target failed to compile, so the assert was looking
-        // for zero of something and would have passed only by finding nothing.
+        // The FIRST chain op is likewise shared: one, not two. It is now the fused per-token scale
+        // (`fq_qspt_op` — `quantscalepertokenfp8`), which subsumed the `abs` (`fq_absx_op`) that
+        // subsumed the `square` (`fq_sq_op`) this test originally named.
+        //
+        // ⛔ THE NAME IS THE ONLY THING THAT MOVES HERE, AND AN OUT-OF-DATE NAME MAKES THIS ASSERT
+        // VACUOUS IN THE PASSING DIRECTION — it would be counting zero of something that no longer
+        // exists, which is exactly how the `fq_sq_op` spelling survived. So it is pinned to the op the
+        // chain ACTUALLY starts with, and the count stays exactly 1 (shared, not per-matmul).
         let first_chain_op = ops
             .iter()
-            .filter(|o| o.op_name.ends_with("fq_absx_op"))
+            .filter(|o| o.op_name.ends_with("fq_qspt_op"))
             .count();
         assert_eq!(
             first_chain_op, 1,
-            "the activation |x| must be shared too, got {first_chain_op}"
+            "the fused per-token activation scale must be shared too, got {first_chain_op}"
+        );
+        // ⭐ AND THE OP IT REPLACED MUST BE GONE, so a silent revert to the 4-op chain cannot leave this
+        // test green: `fq_absx_op` counting 1 and `fq_qspt_op` counting 1 would both hold if BOTH were
+        // emitted, and the assert above cannot see that.
+        let replaced = ops
+            .iter()
+            .filter(|o| {
+                o.op_name.ends_with("fq_absx_op")
+                    || o.op_name.ends_with("fq_amax_op")
+                    || o.op_name.ends_with("fq_amaxfl_op")
+                    || o.op_name.ends_with("fq_ascale_op")
+            })
+            .count();
+        assert_eq!(
+            replaced, 0,
+            "the 4 ops `quantscalepertokenfp8` subsumes must no longer be emitted, got {replaced}"
+        );
+        // ⭐ SAME LAW FOR THE CLAMP TAIL: the fused `clip` is likewise shared (one per distinct
+        // activation), and the `minimum`/`maximum` pair it subsumes must be gone — the same
+        // vacuous-green trap, so a silent revert to the 2-op clamp cannot leave this green either.
+        let clip = ops
+            .iter()
+            .filter(|o| o.op_name.ends_with("fq_clip_op"))
+            .count();
+        assert_eq!(
+            clip, 1,
+            "the fused ±448 clamp must be shared too, got {clip}"
+        );
+        let clamp_pair = ops
+            .iter()
+            .filter(|o| o.op_name.ends_with("fq_chi_op") || o.op_name.ends_with("fq_cl_op"))
+            .count();
+        assert_eq!(
+            clamp_pair, 0,
+            "the 2 ops `clip` subsumes must no longer be emitted, got {clamp_pair}"
+        );
+    }
+
+    /// ⭐ THE SCALARMUL WEIGHT FOLD, END TO END through the real walk — granite's own residual
+    /// shape (`add(oproj · residual_multiplier, hidden)`), at the decode dims that shape runs.
+    /// One lowering answers four questions at once:
+    ///   * the ScalarMul is GONE from the tape (no `scalarmul` program, no registry slot);
+    ///   * the fold names the PRODUCER MATMUL'S WEIGHT (t1), the recognition's own target;
+    ///   * the folded node's output placement ALIASES the producer's bytes — the reader of the
+    ///     scaled product reads the matmul's output buffer, which is the whole mechanism by
+    ///     which an op-less node's consumers still find their data;
+    ///   * the two matmuls themselves are untouched (the fold deletes exactly one program).
+    #[test]
+    fn the_residual_scalarmul_folds_into_the_weight_and_off_the_tape() {
+        use scratchy_subtile::lower::GemmWeight;
+        use scratchy_subtile::subtile_ir::{
+            SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+        };
+        // granite-3.1-2b decode: hidden 2048, o_proj [2048, 2048] at m=1.
+        let (m, k, n) = (1u32, 2048u32, 2048u32);
+        let scale = 0.130_417_02f32; // granite's residual_multiplier, as it appears in the dsl
+        // ⛔ SOURCES ARE `0..num_sources` — the caller-filled prefix, so the two weights sit at
+        // t1/t2 and every produced tensor follows them.
+        let tensors = vec![
+            TensorShape { rows: m, cols: k }, // t0 = x (activation source)
+            TensorShape { rows: k, cols: n }, // t1 = W (weight source)
+            TensorShape { rows: k, cols: n }, // t2 = W2 (the consumer's own weight)
+            TensorShape { rows: m, cols: n }, // t3 = x·W
+            TensorShape { rows: m, cols: n }, // t4 = (x·W)·s — the folded node's output
+            TensorShape { rows: m, cols: n }, // t5 = the residual add's output
+        ];
+        let whole = |t: usize, ts: &[TensorShape]| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: ts[t].whole(),
+        };
+        let nodes = vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(0, &tensors), whole(1, &tensors)],
+                output: whole(3, &tensors),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::ScalarMul { scale },
+                inputs: vec![whole(3, &tensors)],
+                output: whole(4, &tensors),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(2),
+                op: SubOp::MatmulTile {
+                    n,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(4, &tensors), whole(2, &tensors)],
+                output: whole(5, &tensors),
+            },
+        ];
+        let ir: SubtileIR = SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes,
+            result: TensorId::from_index(5),
+            // Hand-authored fixture: there is no source op list to be the provenance of.
+            op_output: Vec::new(),
+        };
+        let weight_ids: std::collections::HashSet<u32> = [1u32, 2u32].into_iter().collect();
+        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+            .expect("the folded residual shape lowers");
+
+        // (a) the ScalarMul is GONE — no program carries its name, and the walk emitted the two
+        // matmuls and nothing else. ⛔ THE COUNT IS THE ANTI-VACUOUS HALF: a name filter alone
+        // stays green if the splice renames the op; the total pins that exactly one program was
+        // deleted by the fold.
+        let scalarmul_programs = ops
+            .iter()
+            .filter(|o| o.op_name.contains("scalarmul"))
+            .count();
+        assert_eq!(
+            scalarmul_programs,
+            0,
+            "the folded ScalarMul must not become a device program: {:?}",
+            ops.iter().map(|o| &o.op_name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ops.len(),
+            2,
+            "the fold deletes exactly the ScalarMul's program — two matmuls remain: {:?}",
+            ops.iter().map(|o| &o.op_name).collect::<Vec<_>>()
+        );
+
+        // (b) the fold is in the LAYOUT, naming the producer's weight (t1).
+        assert_eq!(
+            layout.weight_scale_folds,
+            vec![(1u32, scale)],
+            "the fold targets W (t1), the producer matmul's last input"
+        );
+
+        // (c) the folded node's output placement ALIASES the producer's bytes — same segment,
+        // same offset, same size — which is how the consumer of the scaled product reads data
+        // no op wrote. The producer placement itself is what the alias must equal, read from
+        // the layout rather than restated here.
+        let producer = &layout.placements[&3u32];
+        let folded = &layout.placements[&4u32];
+        assert_eq!(
+            (folded.segment, folded.offset, folded.size),
+            (producer.segment, producer.offset, producer.size),
+            "the folded node's output (t3) must read the producer's bytes (t2)"
+        );
+
+        // (d) the folded scale LEFT the registry — no `[1,1]` const bind exists for it, so the
+        // registry this graph's programs read holds nothing for a program that no longer is.
+        assert!(
+            !layout
+                .scalarmul_scales
+                .iter()
+                .any(|s| s.to_bits() == scale.to_bits()),
+            "the folded multiplier must not occupy a registry slot: {:?}",
+            layout.scalarmul_scales
         );
     }
 

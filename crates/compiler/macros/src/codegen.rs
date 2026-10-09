@@ -8493,6 +8493,17 @@ fn emit_superdsc_wiring(
         .iter()
         .map(|v| proc_macro2::Literal::f32_suffixed(*v))
         .collect();
+    // The ScalarMul weight folds, straight off the bake's recognition — the worker scales these
+    // staged weights at load, so the list it reads has to be the one the lowering recognized.
+    let weight_scale_fold_lits: Vec<proc_macro2::TokenStream> = gk
+        .weight_scale_folds
+        .iter()
+        .map(|(tid, scale)| {
+            let tid = proc_macro2::Literal::u32_suffixed(*tid);
+            let scale = proc_macro2::Literal::f32_suffixed(*scale);
+            quote! { (#tid, #scale) }
+        })
+        .collect();
 
     // The VALUE, not a `static` — the caller composes decode + prefill into one
     // `Wirings` const, because a bundle's tensor ids are per-PROGRAM and the
@@ -8520,6 +8531,7 @@ fn emit_superdsc_wiring(
             rope_p: &[#(#rope_p_lits),*],
             rms_invcols: &[#(#rms_invcols_lits),*],
             scalarmul_scales: &[#(#scalarmul_scale_lits),*],
+            weight_scale_folds: &[#(#weight_scale_fold_lits),*],
         }
     }
 }
@@ -8815,6 +8827,7 @@ fn layout_tokens(
         places,
         kernel_weights,
         scalarmul_scales,
+        weight_scale_folds,
         kv_request_stride_bytes,
     } = l;
     let segs = segment_bytes
@@ -8830,6 +8843,12 @@ fn layout_tokens(
     let scales = scalarmul_scales
         .iter()
         .map(|s| proc_macro2::Literal::f32_suffixed(*s));
+    // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
+    let folds = weight_scale_folds.iter().map(|(tid, scale)| {
+        let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
+        let scale = proc_macro2::Literal::f32_suffixed(*scale);
+        quote! { (#tid, #scale) }
+    });
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
@@ -8838,6 +8857,7 @@ fn layout_tokens(
             places: ::std::borrow::Cow::Borrowed(&[#(#places),*]),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
+            weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
             kv_request_stride_bytes: #krs,
         }
     }
@@ -9219,6 +9239,19 @@ fn dump_wavefront_mega(
             Option<proc_macro2::TokenStream>,
             Option<proc_macro2::TokenStream>,
         )> = std::cell::RefCell::new((None, None));
+        // (label, fold set sorted by tid) of the first program that walked — every
+        // later program must reproduce it exactly. See the census doc below.
+        type WeightFoldCensus = Option<(String, Vec<(u32, f32)>)>;
+        // ⛔ CROSS-PROGRAM FOLD CENSUS (guard-every-crash-at-build-time). Every program this
+        // model bakes — decode, each cap bucket, each batch rung, each prefill width — runs
+        // over ONE set of staged weight bytes, and a ScalarMul weight fold rewrites those
+        // bytes at load. So the fold set is not a per-program fact: a program whose
+        // recognition folds a multiplier another program still runs as an op would read
+        // pre-scaled weights and scale them AGAIN (or route the op to the host and never
+        // apply it). The first walk's set is the reference; every later walk must equal it,
+        // sorted by tid, or the build refuses naming both programs.
+        let weight_fold_census: std::cell::RefCell<WeightFoldCensus> =
+            std::cell::RefCell::new(None);
         // SEPARATE fp for the m=N batched-PREFILL reroll bundle ("prefill-all-but-last"). The
         // prefill `emit_bundle` (is_prefill=true; under superdsc its seq_sym is forced to None so
         // the tape is CONCRETE at m=prefill_m) bakes its OWN prefix/body/suffix — with the lm_head
@@ -9833,6 +9866,39 @@ fn dump_wavefront_mega(
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
                 };
+                // The census entry for this program: the fold set the wiring just recognized,
+                // sorted by tid so two walks that found the same folds in a different node
+                // order still compare equal.
+                {
+                    let mut folds = gk.weight_scale_folds.clone();
+                    folds.sort_unstable_by_key(|(tid, _)| *tid);
+                    let mut census = weight_fold_census.borrow_mut();
+                    match &*census {
+                        None => *census = Some((base.clone(), folds)),
+                        Some((ref_label, ref_folds)) if *ref_folds == folds => {}
+                        Some((ref_label, ref_folds)) => {
+                            let show = |f: &[(u32, f32)]| {
+                                f.iter()
+                                    .map(|(t, s)| format!("t{t}×{s}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            panic!(
+                                "[spyre] {base}: its ScalarMul weight folds disagree with \
+                                 {ref_label}'s — every program this model bakes runs over ONE set \
+                                 of staged weight bytes, so a fold one program recognizes and \
+                                 another runs as an op is a double-applied (or never-applied) \
+                                 multiplier. {base} folds [{}]; {ref_label} folds [{}]. The \
+                                 recognition is structural (shared weight, shared producer, \
+                                 sliced read), so a disagreement means the two graphs' producer \
+                                 structure differs around a folded ScalarMul — refuse rather \
+                                 than serve silently-wrong logits.",
+                                show(&folds),
+                                show(ref_folds),
+                            );
+                        }
+                    }
+                }
                 // The programs ride the bundle (`bundle_code::bundle(fp)`), not a per-node text.
                 let nodes: Vec<(String, String)> = Vec::new();
                 let attn_mask_json = match gk.attn_mask {

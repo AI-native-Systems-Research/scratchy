@@ -1706,6 +1706,11 @@ pub struct AttnAt<'a> {
     /// emulator does not model at all — the attention/rope programs never receive it and
     /// emit the same ops either way.
     pub rows_are_requests: bool,
+    /// Whether this bundle's attention scale was folded into `W_q`/`W_k` — the caller-side twin of
+    /// the spyre door's `BundleAttnParams::scale_folded`. The fold removes the score mulf from the
+    /// program, so a folded program states NO multiplier; this fact is what tells the door that
+    /// absence is the fold and not a broken program.
+    pub scale_folded: bool,
     pub sym_id_base: &'a mut i64,
     pub layout: Option<&'a BundleLayout>,
 }
@@ -2898,6 +2903,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         k,
         r,
         rows_are_requests,
+        scale_folded,
         sym_id_base,
         layout,
     } = a;
@@ -2957,14 +2963,43 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // travelling `SubtileIR → params → SuperDSC` past the IR. A third-party producer had to supply a
     // number its own program already states. There is one reading now, and no default: a program with
     // no multiplier is a build error naming it.
-    let scale_val = program_score_scale(&k.func).ok_or_else(|| Error {
-        message: format!(
-            "AttnDecode t{}: the program states no score multiplier. The attention program scales its \
-             scores with an `arith.mulf` against an `arith.constant`, and the descriptor's `[1,1]` \
-             scale const is resolved from that value, so a program without one cannot be lowered.",
-            ops_in.out_id,
-        ),
-    })?;
+    //
+    // ⭐ EXCEPT THE ONE CASE WHERE THE PROGRAM CANNOT STATE IT, WHICH IS THE FOLD. When the bundle's
+    // `√attention_multiplier` was folded into `W_q`/`W_k`, the node's scale was rewritten to 1.0
+    // before the splice minted this program, and the triton→ktir pipeline folds a multiply by 1.0
+    // away entirely — the program TRUTHFULLY states no multiplier, because no device multiply is
+    // left to do (the weights carry `√scale` each). `scale_folded` is the caller's statement that
+    // this is that case; a multiplier-less program without it is still the build error below, and a
+    // program that states a real multiplier WHILE the caller says folded is the half-applied fold —
+    // the multiplies would double-scale pre-scaled weights, so it is refused, not best-efforted.
+    let scale_val = match program_score_scale(&k.func) {
+        None if scale_folded => None,
+        None => {
+            return Err(Error {
+                message: format!(
+                    "AttnDecode t{}: the program states no score multiplier. The attention program \
+                     scales its scores with an `arith.mulf` against an `arith.constant`, and the \
+                     descriptor's `[1,1]` scale const is resolved from that value, so a program \
+                     without one cannot be lowered — unless the bundle folded its √scale into \
+                     W_q/W_k, which the caller must then state in `BundleAttnParams::scale_folded`.",
+                    ops_in.out_id,
+                ),
+            });
+        }
+        Some(v) if scale_folded && v != 1.0 => {
+            return Err(Error {
+                message: format!(
+                    "AttnDecode t{}: the bundle states the attention scale was folded into \
+                     W_q/W_k, but the program still states a score multiplier of {v}. The fold \
+                     rewrites the node's scale to 1.0 before the splice mints the program, so a \
+                     real multiplier here means the fold and the splice disagreed — emitting the \
+                     multiplies would scale weights that already carry √scale.",
+                    ops_in.out_id,
+                ),
+            });
+        }
+        some => some,
+    };
     // SPAN-OVERFLOW GUARD (ported from torch-spyre's span_overflow_hint_analysis.py). Real
     // corrective re-tiling of the resident cache's PHYSICAL STORAGE (not just the compute sweep
     // `active_cap` already bounds) means paging the cache into multiple physical buffers — a
@@ -3033,34 +3068,16 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     let kc = crate::place::act_name(k_id); // natural K cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     let vc = crate::place::act_name(v_id); // natural V cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     let kct = crate::place::act_name(kct_resident_tid(k_id)); // resident Kᵀ scratch [nqh, hd, cap]
-    // attention_multiplier (config) — see the ORIGINAL header doc: NO 1/sqrt(hd) recompute.
-    let scale_idx = layout
-        .and_then(|l| {
-            l.scalarmul_scales
-                .iter()
-                .position(|s| s.to_bits() == scale_val.to_bits())
-        })
-        .ok_or_else(|| Error {
-            message: format!(
-                "AttnDecode t{t}: scale {scale_val} absent from BundleLayout.scalarmul_scales \
-                 (registry desync)"
-            ),
-        })?;
-    let _scale = crate::place::act_name(scalarmul_scale_tid(scale_idx)); // unused directly: torch-spyre splits into sqrt_scale on both Q and K.
-    let sqrt_scale_val = scale_val.sqrt();
-    let sqrt_scale_idx = layout
-        .and_then(|l| {
-            l.scalarmul_scales
-                .iter()
-                .position(|s| s.to_bits() == sqrt_scale_val.to_bits())
-        })
-        .ok_or_else(|| Error {
-            message: format!(
-                "AttnDecode t{t}: √scale {sqrt_scale_val} absent from scalarmul_scales (registry \
-                 desync)"
-            ),
-        })?;
-    let sqrt_scale = crate::place::act_name(scalarmul_scale_tid(sqrt_scale_idx)); // [1,1] = √attention_multiplier
+    // ⭐⭐⭐ A FOLDED ATTENTION STATES NO SCALE AT ALL. The √scale was FOLDED into W_q and W_k (the
+    // producer half's `attn_scale_weight_folds` recognition): the splice minted this program at the
+    // REWRITTEN scale of 1.0, the triton→ktir pipeline folded the `qk · 1.0` multiply away entirely,
+    // and the registry census skipped the node's arm — so `scale_val` above is `None` (a model whose
+    // attention_multiplier genuinely IS 1.0 lands in the same place), and the query and the roped
+    // new-K arrive over the staged weights already carrying √scale each: `(q·√s)·(k·√s)ᵀ` is
+    // `(q·kᵀ)·s` with no device multiply left to do. The skip arm at the multiplies below takes
+    // both: no registry lookups (a folded node pushed no slot, so looking anything up is a desync
+    // error by design), no `qs`/`new_k_scaled` buffers, and the score legs read `q` and the roped
+    // new-K directly.
     let pmask = crate::place::act_name(ATTN_MASK_TID); // [nqh, cap]    prefix validity (worker-tiled, mb-broadcast over mq)
     let cmask = crate::place::act_name(ATTN_CAUSAL_TID); // [mq, mq_pad] causal triu (worker-tiled)
     // [mq, nqh·hd] — the identity; every scratch name below is a rendering of it.
@@ -3260,43 +3277,83 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // scaled (see the cache-write below), so the prefix score needs only qs scaled. new_k_scaled is
     // nkvh-wide now (K dedup, see above) — assemble_attn's "new block" score reads it per-query-head
     // via the SAME gqa-dedup mapping kct_base already uses (matching producer/consumer by construction).
-    let (qs, new_k_scaled) = (n(SynthRole::Qs), n(SynthRole::NewKScaled));
-    if let Some(l) = layout {
-        l.synth(attn_id.synth(SynthRole::Qs), &[mq, nqh * hd]);
-        l.synth(
-            attn_id.synth(SynthRole::NewKScaled),
-            &[mq_pad.row_axis_extent(), nkvh * hd],
-        );
-    }
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_qs_o{t}"),
-        "multiply",
-        // Q is `[mq, nqh*hd]`: the chunk's REAL rows, the full query feature width.
-        crate::sdsc_abstract::RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(
-            mq,
-        )),
-        crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
-        &[In::full(&rbo(&q)).ew(), In::scalar(&rbo(&sqrt_scale)).ew()],
-        &rbo(&qs),
-        crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
-    ));
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_nks_o{t}"),
-        "multiply",
-        // new-K is allocated `[mq_pad, nkvh*hd]`: the scale covers the PADDED rows, zeros included.
-        crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
-        crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
-        &[
-            In::full(&rbo(&new_k_rep)).ew(),
-            In::scalar(&rbo(&sqrt_scale)).ew(),
-        ],
-        &rbo(&new_k_scaled),
-        crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
-    ));
+    //
+    // ⭐ WHEN THE PROGRAM STATES NO MULTIPLIER — OR STATES 1.0 (see the comment beside `scale_val`)
+    // this whole section is SKIPPED: no multiplies, no `[1,1]` consts looked up, no
+    // `qs`/`new_k_scaled` synthetics — the score legs read `q` and the roped new-K (which the fold
+    // already pre-scaled) by their own names.
+    let (qs, new_k_scaled) = match scale_val {
+        None | Some(1.0) => (q.clone(), new_k_rep.clone()),
+        // attention_multiplier (config) — see the ORIGINAL header doc: NO 1/sqrt(hd) recompute.
+        Some(scale_val) => {
+            let scale_idx = layout
+            .and_then(|l| {
+                l.scalarmul_scales
+                    .iter()
+                    .position(|s| s.to_bits() == scale_val.to_bits())
+            })
+            .ok_or_else(|| Error {
+                message: format!(
+                    "AttnDecode t{t}: scale {scale_val} absent from BundleLayout.scalarmul_scales \
+                     (registry desync)"
+                ),
+            })?;
+            // unused directly: torch-spyre splits into sqrt_scale on both Q and K.
+            let _scale = crate::place::act_name(scalarmul_scale_tid(scale_idx));
+            let sqrt_scale_val = scale_val.sqrt();
+            let sqrt_scale_idx = layout
+                .and_then(|l| {
+                    l.scalarmul_scales
+                        .iter()
+                        .position(|s| s.to_bits() == sqrt_scale_val.to_bits())
+                })
+                .ok_or_else(|| Error {
+                    message: format!(
+                        "AttnDecode t{t}: √scale {sqrt_scale_val} absent from scalarmul_scales \
+                     (registry desync)"
+                    ),
+                })?;
+            let sqrt_scale = crate::place::act_name(scalarmul_scale_tid(sqrt_scale_idx)); // [1,1] = √attention_multiplier
+            let (qs, new_k_scaled) = (n(SynthRole::Qs), n(SynthRole::NewKScaled));
+            if let Some(l) = layout {
+                l.synth(attn_id.synth(SynthRole::Qs), &[mq, nqh * hd]);
+                l.synth(
+                    attn_id.synth(SynthRole::NewKScaled),
+                    &[mq_pad.row_axis_extent(), nkvh * hd],
+                );
+            }
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_qs_o{t}"),
+                "multiply",
+                // Q is `[mq, nqh*hd]`: the chunk's REAL rows, the full query feature width.
+                crate::sdsc_abstract::RowCount::of_query_rows(
+                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                ),
+                crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
+                &[In::full(&rbo(&q)).ew(), In::scalar(&rbo(&sqrt_scale)).ew()],
+                &rbo(&qs),
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_nks_o{t}"),
+                "multiply",
+                // new-K is allocated `[mq_pad, nkvh*hd]`: the scale covers the PADDED rows, zeros included.
+                crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
+                crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
+                &[
+                    In::full(&rbo(&new_k_rep)).ew(),
+                    In::scalar(&rbo(&sqrt_scale)).ew(),
+                ],
+                &rbo(&new_k_scaled),
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+            (qs, new_k_scaled)
+        }
+    };
 
     // ⭐ THE GATHER'S INDEX TENSOR, NAMED BY ITS RESERVED TID'S OWN SPELLING — `act_name` is what the
     // placement, the bind and the descriptor all resolve through, so the tensor the descriptor gathers

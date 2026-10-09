@@ -314,6 +314,96 @@ fn spilled_weight_tail_tids(
         .collect()
 }
 
+/// ⭐ THE RUNTIME HALF OF THE SCALARMUL WEIGHT FOLD — scale the fold targets' staged bytes.
+///
+/// `scalar_mul_weight_folds` recognized, at BUILD time, every multiplier that commutes into a
+/// matmul's weight (`(x·W)·s == x·(W·s)`); the wiring carries the `(tensor id, multiplier)` list
+/// and this is the whole of the fold at runtime: one elementwise multiply, at load, over the staged
+/// bytes this model is about to bind — the card's post-narrowing f16, the emulator's source dtype.
+/// The folded `ScalarMul` never becomes a program, so nothing in the run touches the scale again.
+///
+/// ⛔ ONE ROUNDING, IN f32: each element is widened, scaled, and narrowed once — the same discipline
+/// the bf16→f16 narrowing pass follows, so the staged bytes carry `fp16(x)·s` and not a compound of
+/// two roundings. The fold is NOT byte-identical to the un-folded tape (which rounded `x·W` before
+/// scaling); that is the algebra trading rounding ORDER, and it is why the fold's acceptance gate is
+/// token-level agreement, not byte equality.
+///
+/// ⛔ REFUSES WHAT THE RECOGNITION DID NOT PREVENT: a fold naming a tensor the binding did not
+/// stage, or a payload a multiply cannot scale in place (fp8 — that is a requantize; integers).
+/// Either is a wiring↔recognition desync, not an input to interpret.
+fn apply_weight_scale_folds(
+    weights: &mut [(usize, Vec<u8>, SDType, Vec<usize>)],
+    folds: &[(u32, f32)],
+) -> ExecutorResult<()> {
+    use rayon::prelude::*;
+    for (tid, scale) in folds {
+        let (id, bytes, dt, _) = weights
+            .iter_mut()
+            .find(|(id, _, _, _)| *id == *tid as usize)
+            .ok_or_else(|| {
+                werr(format!(
+                    "ScalarMul weight fold names tensor t{tid}, which the generated binding did \
+                     not stage — the wiring and the weight binding disagree about the sources"
+                ))
+            })?;
+        // SAFETY-free elementwise scale: every branch below reinterprets the Vec's own bytes as
+        // the dtype it already declares, so the length check is the whole of the guard.
+        match *dt {
+            SDType::F16 => {
+                if bytes.len() % 2 != 0 {
+                    return Err(werr(format!(
+                        "fold target t{id} holds {} bytes — not a whole number of f16 elements",
+                        bytes.len()
+                    )));
+                }
+                let n = bytes.len() / 2;
+                let elems = unsafe {
+                    std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut half::f16, n)
+                };
+                elems
+                    .par_iter_mut()
+                    .for_each(|e| *e = half::f16::from_f32(e.to_f32() * scale));
+            }
+            SDType::BF16 => {
+                if bytes.len() % 2 != 0 {
+                    return Err(werr(format!(
+                        "fold target t{id} holds {} bytes — not a whole number of bf16 elements",
+                        bytes.len()
+                    )));
+                }
+                let n = bytes.len() / 2;
+                let elems = unsafe {
+                    std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut half::bf16, n)
+                };
+                elems
+                    .par_iter_mut()
+                    .for_each(|e| *e = half::bf16::from_f32(e.to_f32() * scale));
+            }
+            SDType::F32 => {
+                if bytes.len() % 4 != 0 {
+                    return Err(werr(format!(
+                        "fold target t{id} holds {} bytes — not a whole number of f32 elements",
+                        bytes.len()
+                    )));
+                }
+                let n = bytes.len() / 4;
+                let elems =
+                    unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, n) };
+                elems.par_iter_mut().for_each(|e| *e *= scale);
+            }
+            other => {
+                return Err(werr(format!(
+                    "ScalarMul weight fold names t{id}, staged as {other:?} — a fold target must \
+                     be a float payload the multiply can scale in place. The recognition refuses \
+                     fp8 weights at build time, so reaching here means the wiring's fold list and \
+                     the lowering's recognition have desynced"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn stage_bound_weights(
     bound: &[scratchy_forward_compiler::BoundWeight],
     // ⛔ FOR PLACEMENT EXISTENCE ONLY — never for names. The K-split branches
@@ -496,6 +586,11 @@ pub(crate) fn stage_bound_weights(
             _t_cvt.elapsed().as_secs_f64()
         );
     }
+    // ── THE SCALARMUL WEIGHT FOLD'S RUNTIME HALF. Runs AFTER the narrowing on the card (so the
+    //    multiply lands on the final f16 bytes — one rounding) and on the source dtype on the
+    //    emulator; the folded ScalarMul has no program on either tier, so the scale enters the run
+    //    HERE and nowhere else. ──
+    apply_weight_scale_folds(&mut weights, wiring.weight_scale_folds)?;
     tracing::debug!(
         "[timing] load_weights ({} tensors) took {:.2}s (of which take/disk {:.2}s; transpose = remainder)",
         weights.len(),
@@ -2056,5 +2151,122 @@ impl SpyreWorker {
             batched_prefill,
             kv_budget_bytes: kv_budget_bytes_v,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the ScalarMul weight fold's runtime half
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod weight_scale_fold_tests {
+    use super::*;
+
+    /// One staged weight as `stage_bound_weights` shapes them: `(id, bytes, dtype, dims)`.
+    /// The element values go through the SAME one-rounding encode the load path produces
+    /// (`f32 → dtype` once), so the test asserts the multiply's effect, not encoding drift.
+    fn staged(id: usize, dt: SDType, vals: &[f32]) -> (usize, Vec<u8>, SDType, Vec<usize>) {
+        let bytes: Vec<u8> = vals
+            .iter()
+            .flat_map(|v| match dt {
+                SDType::F16 => half::f16::from_f32(*v).to_le_bytes().to_vec(),
+                SDType::BF16 => half::bf16::from_f32(*v).to_le_bytes().to_vec(),
+                SDType::F32 => v.to_le_bytes().to_vec(),
+                _ => panic!("test helper stages float payloads only"),
+            })
+            .collect();
+        let dims = vec![1, vals.len()];
+        (id, bytes, dt, dims)
+    }
+
+    /// Decode staged bytes back to f32 (the payload already narrowed; widen for comparison).
+    fn decoded(dt: SDType, bytes: &[u8]) -> Vec<f32> {
+        match dt {
+            SDType::F16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
+                .collect(),
+            SDType::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c).to_f32())
+                .collect(),
+            SDType::F32 => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
+            _ => panic!("test helper decodes float payloads only"),
+        }
+    }
+
+    /// The multiply is one f32 round-trip per element, on EVERY float payload the load can
+    /// stage, and touches NOTHING but the fold targets: granite's 0.22 over f16 (the card's
+    /// post-narrowing bytes), bf16, and f32, with an un-named neighbor keeping its bytes.
+    #[test]
+    fn scales_every_float_payload_with_one_rounding_and_spares_the_unnamed() {
+        let vals = [2.0f32, -0.5, 3.25];
+        let mut weights = vec![
+            staged(0, SDType::F16, &[7.0, 8.0]), // not a fold target
+            staged(1, SDType::F16, &vals),
+            staged(2, SDType::BF16, &vals),
+            staged(3, SDType::F32, &vals),
+        ];
+        let folds: Vec<(u32, f32)> = [(1u32, 0.22f32), (2, 0.22), (3, 0.22)].to_vec();
+        apply_weight_scale_folds(&mut weights, &folds).expect("float payloads fold");
+        for (id, dt) in [(1usize, SDType::F16), (2, SDType::BF16), (3, SDType::F32)] {
+            let (_, bytes, sdt, _) = &weights[id];
+            assert_eq!(*sdt, dt);
+            // The pinned discipline: `from_f32(widen(x) * s)` — ONE narrowing, in f32. A
+            // fold that instead scaled in the NARROW dtype (or double-rounded) differs in
+            // the last bit somewhere across these values and fails here.
+            let want: Vec<f32> = vals
+                .iter()
+                .map(|v| match dt {
+                    SDType::F16 => half::f16::from_f32(v * 0.22).to_f32(),
+                    SDType::BF16 => half::bf16::from_f32(v * 0.22).to_f32(),
+                    _ => v * 0.22,
+                })
+                .collect();
+            assert_eq!(decoded(dt, bytes), want, "t{id} ({dt:?}) kept one rounding");
+        }
+        let (_, bytes, _, _) = &weights[0];
+        assert_eq!(
+            decoded(SDType::F16, bytes),
+            vec![7.0, 8.0],
+            "a tensor no fold names keeps its staged bytes"
+        );
+    }
+
+    /// A fold naming a tensor the binding did not stage is a wiring↔recognition desync —
+    /// refused with the tid in the message, never silently skipped.
+    #[test]
+    fn refuses_a_fold_naming_an_unstaged_tensor() {
+        let mut weights = vec![staged(1, SDType::F16, &[1.0])];
+        let err = apply_weight_scale_folds(&mut weights, &[(7u32, 2.0)])
+            .expect_err("unstaged fold target");
+        assert!(
+            err.to_string().contains("t7"),
+            "the refusal names the tid: {err}"
+        );
+        // The staged tensor is untouched — a refusal leaves the bytes alone.
+        assert_eq!(decoded(SDType::F16, &weights[0].1), vec![1.0]);
+    }
+
+    /// An fp8 payload is a requantize, not a scale — the recognition refuses fp8 fold targets
+    /// at BUILD time, so an fp8 fold reaching the runtime half can only be a desync. Refused.
+    #[test]
+    fn refuses_an_fp8_fold_target_as_a_desync() {
+        let mut weights = vec![(1usize, vec![0u8; 4], SDType::Fp8E4m3, vec![1, 4])];
+        let err =
+            apply_weight_scale_folds(&mut weights, &[(1u32, 2.0)]).expect_err("fp8 fold target");
+        assert!(
+            err.to_string().contains("desynced"),
+            "the refusal says what reaching here means: {err}"
+        );
     }
 }

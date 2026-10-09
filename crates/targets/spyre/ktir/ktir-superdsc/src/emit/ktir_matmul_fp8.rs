@@ -144,17 +144,50 @@ pub(crate) fn matmul_fp8_descriptors(
             // both this op and the amax reduce on the stick-major rank-2 path, matching how the
             // activation was actually written. At m==1 (decode) `stickmajor` is false in both, so the
             // emission is byte-identical to the previous Flat form.
-            let absx_h = rb(&absx, m, k);
-            ops.push(pw1(
-                &opn("fq_absx_op"),
-                "abs",
-                m_rows,
-                k_cols,
-                In::full(&rb(&a_name, m, k)),
-                &absx_h,
+            // ⭐⭐⭐⭐⭐ ONE HARDWARE OP FOR THE FIRST FOUR STEPS — see [`OpFunc::QuantScalePerTokenFp8`].
+            //
+            // `abs → max-reduce → floor → ·(1/448)` IS `quantscalepertokenfp8`, whose DDL body is the
+            // FABSMAX tree (`quant_scale_per_token.ddl:178-232`) with its partials in
+            // `ddl.internal_tensor`, i.e. on-chip, and whose tail is exactly
+            // `FMIN(FMAX(absmax·mulConst, clipMin), clipMax)` (`:259/:283/:287`) — the three constants
+            // [`OpFunc::op_consts`] supplies are picked to make that identical to `fq_amaxfl` +
+            // `fq_ascale`, floor included. Registered for dd2 (`multi_sentient_dd2_sysconfig.json:87`).
+            //
+            // ⛔ IT IS SHAPED EXACTLY LIKE THE REDUCE IT REPLACES, which is why it goes through the
+            // reduce assembler and not a new one: input `[m, k]`, output `[m, stick]` — the DDL's
+            // `%global_layout_output` drops the reduce dim its `%global_layout_input` carries, so the
+            // output IS the per-token scale. `invs` below still reciprocates it (the DDL keeps its own
+            // reciprocal INTERNAL, so it is not an operand we can read), and `sc/chi/cl/afp8` still
+            // build the `[m,k]` fp8 tensor. 4 ops → 1, ×4 activations a layer = 12 of the 51 glue ops
+            // that are 67% of a bs=1 decode layer.
+            //
+            // ⛔ IT IS AN UNSEEDED REDUCE, so it does NOT take the accumulator as a second input the way
+            // `max`/`sum`/`mean` do — `OpFunc::ddl_input_arity` carries that fact and the emitter makes
+            // a violation a build error. Passing the seed is not a diagnosable error in the compiler: it
+            // is a silent template non-match (MEASURED — the same descriptor with two inputs is
+            // `[DDC] DDL found but not suitable for op quantscalepertokenfp8`, with one input it is
+            // accepted).
+            //
+            // ⛔ `absx`/`amax`/`amaxfl` are no longer materialised. Their `synth` reservations are left
+            // in place deliberately for this first measurement so the bundle's ADDRESS ASSIGNMENT does
+            // not move — `BundleLayout::synth` is a bump allocator, so dropping entries would shift
+            // every later tensor and confound a coherence comparison with the baseline.
+            let ascale_h = rb(&ascale, m, stk);
+            ops.push(assemble_reduce_seeded(
+                &opn("fq_qspt_op"),
+                "quantscalepertokenfp8",
+                m,
+                k,
+                &rb(&a_name, m, k),
+                &ascale_h,
                 sym_id_base,
                 layout,
-            )); // absx = |act|
+            ));
+            // The three tensors the two fused ops subsume, plus the `1/448` and ±448 they used to take as
+            // scalar tensor operands — the constants now reach their own `mulConst`/`clipMin`/`clipMax`
+            // through `ddl.get_external_constant` BY NAME out of the descriptor's `constantInfo_`.
+            // (`chi` joins them: materialised by nothing, its reservation held for allocator stability.)
+            let _ = (&absx, &amax, &amaxfl, &chi, &inv448, &pos448, &neg448);
             // REVERTED (2026-07-28): a multi-stage blocked-reduce experiment lived here (three
             // iterations, all confirmed on real hardware to make ZERO difference to the actual bug —
             // the K-cache inf this was meant to fix turned out to be caused by cachewr's matmul
@@ -166,47 +199,6 @@ pub(crate) fn matmul_fp8_descriptors(
             // premise (fixing K-cache inf) is already fixed elsewhere is unjustified risk with no
             // upside. Reverted to the simple, single unblocked reduce — decode already proves this form
             // works (m=1 always takes this path); prefill (m>1) now takes it too.
-            let amax_h = rb(&amax, m, stk);
-            ops.push(assemble_reduce_seeded(
-                &opn("fq_amax_op"),
-                "max",
-                m,
-                k,
-                &absx_h,
-                &amax_h,
-                sym_id_base,
-                layout,
-            ));
-            // floor: amax = max(amax, 1/448) — a zero-amax (all-zero padded query row) would make
-            // invs=recip(0)=inf → 0·inf=NaN downstream; every real (non-padded) row's amax is always >>
-            // 1/448, so this leaves them byte-identical. A scratchy padding guard, not part of torch-spyre's
-            // decomposition (which never sees a zero-amax row).
-            let amaxfl_h = rb(&amaxfl, m, stk);
-            ops.push(pw2(
-                &opn("fq_amaxfl_op"),
-                "maximum",
-                m_rows,
-                scale_cols,
-                In::full(&amax_h),
-                In::scalar(&inv448),
-                &amaxfl_h,
-                sym_id_base,
-                layout,
-            ));
-            // a_scale = amax·(1/448); invs = reciprocal(a_scale) — torch-spyre's `quantize_fp8_with_scale`
-            // takes `scale` as input and computes `reciprocal(scale)` itself.
-            let ascale_h = rb(&ascale, m, stk);
-            ops.push(pw2(
-                &opn("fq_ascale_op"),
-                "mul",
-                m_rows,
-                scale_cols,
-                In::full(&amaxfl_h),
-                In::scalar(&inv448),
-                &ascale_h,
-                sym_id_base,
-                layout,
-            ));
             let invs_h = rb(&invs, m, stk);
             ops.push(pw1(
                 &opn("fq_invs_op"),
@@ -231,26 +223,28 @@ pub(crate) fn matmul_fp8_descriptors(
                 sym_id_base,
                 layout,
             ));
-            let chi_h = rb(&chi, m, k);
-            ops.push(pw2(
-                &opn("fq_chi_op"),
-                "minimum",
+            // ⭐⭐⭐⭐⭐ THE CLAMP IS THE DEVICE'S OWN `clip` OP — ONE input, computing
+            // `FMIN(FMAX(x, clipMin), clipMax)` (`unary_pipeline.ddl:370-377` PE stage, `:472-479` SFP
+            // stage) — the same min/max pair the two ops it replaces encoded, so the swap is
+            // value-preserving by construction. The ±448 E4M3 bounds arrive as the external constants
+            // `clipMin`/`clipMax` out of the descriptor's `constantInfo_` ([`OpFunc::op_consts`]),
+            // NOT as the `[1, stick]` H2D tensor operands `fq_chi`/`fq_cl` read through
+            // `In::scalar(&pos448)`/`In::scalar(&neg448)` — the constants dxp folds before the
+            // constant tables, per the same contract as `quantscalepertokenfp8`'s three. 2 ops → 1,
+            // ×4 activations ×40 layers = 40 more ops off a granite-2b fp8 decode step, and the
+            // `FP8_POS448`/`FP8_NEG448` binds lose their last reader.
+            //
+            // ⛔ `chi` IS NO LONGER MATERIALISED. Its `synth` reservation stays for the same reason
+            // `absx`/`amax`/`amaxfl`'s do above: `BundleLayout::synth` is a bump allocator, so
+            // dropping entries would shift every later tensor and confound a coherence comparison
+            // with the baseline.
+            let cl_h = rb(&cl, m, k);
+            ops.push(pw1(
+                &opn("fq_clip_op"),
+                "clip",
                 m_rows,
                 k_cols,
                 In::full(&sc_h),
-                In::scalar(&pos448),
-                &chi_h,
-                sym_id_base,
-                layout,
-            ));
-            let cl_h = rb(&cl, m, k);
-            ops.push(pw2(
-                &opn("fq_cl_op"),
-                "maximum",
-                m_rows,
-                k_cols,
-                In::full(&chi_h),
-                In::scalar(&neg448),
                 &cl_h,
                 sym_id_base,
                 layout,

@@ -420,6 +420,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // scalarmul multiplier; a bundle whose ops read none states an empty one, and an empty one is
         // what every current Triton-derived bundle states.
         scalarmul_scales: std::borrow::Cow::Owned(Vec::new()),
+        // No weight folds: the ScalarMul fold multiplies the WORKER's staged weight bytes at load,
+        // and this runner stages inputs from files, not through the worker's binding. An empty list
+        // is also what every Triton-derived bundle's layout states (`layout::for_regions`).
+        weight_scale_folds: std::borrow::Cow::Owned(Vec::new()),
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
     };

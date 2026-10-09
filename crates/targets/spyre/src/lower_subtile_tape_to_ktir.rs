@@ -18,7 +18,7 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
-use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileNode};
+use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
@@ -48,35 +48,292 @@ pub(crate) enum NodeLowering {
     HostRouted(&'static str),
 }
 
+/// ⭐⭐⭐ THE SCALARMUL WEIGHT FOLD — the compile-time multipliers that never need a device op.
+///
+/// A `ScalarMul` whose single input is a MATMUL's whole output multiplies a linear function's
+/// result by a constant, and a constant commutes with linearity: `(x·W)·s == x·(W·s)`. So the
+/// multiplier can leave the runtime tape entirely — the worker stages the fold target's bytes
+/// pre-scaled and the pointwise `mul` + its `[1,1]` const bind disappear. This is the constants
+/// fold the hardware has no descriptor door for (no DDL template takes a `mulConst` outside
+/// `quant_scale_per_token.ddl`): the weight IS the door.
+///
+/// The fold target is the producer's LAST input — the same slot for both arities the emitter
+/// knows: dense `MatmulTile` `[A, W]` folds into `W`; fp8 W8A8 `[A, qW, ws]` folds into the
+/// `ws` dequant row (`(qA·qW)·a[m]·ws[n]·s == (qA·qW)·a[m]·(ws·s)[n]` — the payload and its
+/// quantization are untouched, which is why the fp8 fold is exact algebra, not a requantize).
+///
+/// ⛔ EVERY REFUSAL BELOW IS A CORRECTNESS FACT, NOT TIMIDITY:
+///   * a SLICED read (the input region not EXACTLY one producer's whole output) — the fold
+///     scales every row the matmul wrote, not just the slice read, and two producers writing
+///     disjoint regions of one tensor match no whole-output producer at all;
+///   * the fold target read by any OTHER node — a shared weight cannot absorb a per-consumer
+///     scale (granite ties `lm_head` to the embedding table; a scale folded into a tied table
+///     would scale the logits too);
+///   * the producer's output read by any node other than this `ScalarMul` — that reader needs
+///     the UNSCALED product, and the fold would hand it `x·W·s`;
+///   * a non-matmul producer (granite's `embedding_multiplier` scales a GATHER) — the
+///     multiplier does not commute with a lookup;
+///   * an output region that does not MIRROR the input — the fold re-points every reader of
+///     this node's output at the producer's bytes (the layout aliases the two placements),
+///     which is the same window only because a pointwise map's output region equals its input
+///     region;
+///   * the graph RESULT — the logits ScalarMul is the splice's own lm_head-tail fold
+///     (`lower_all` folds both halves to m=1), and the result's Logits placement is the
+///     worker's readback window, not a window this fold may redirect.
+pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<(SubtileId, u32, f32)> {
+    let mut folds = Vec::new();
+    for node in &ir.nodes {
+        let SubOp::ScalarMul { scale } = &node.op else {
+            continue;
+        };
+        let [input] = node.inputs.as_slice() else {
+            continue;
+        };
+        if node.output.tensor == ir.result || node.output.region != input.region {
+            continue;
+        }
+        let Some(producer) = ir
+            .nodes
+            .iter()
+            .find(|p| p.id != node.id && p.output == *input)
+        else {
+            continue;
+        };
+        if !matches!(producer.op, SubOp::MatmulTile { .. }) || producer.inputs.len() < 2 {
+            continue;
+        }
+        let target = producer.inputs.last().expect("len checked above");
+        // ⛔ AN fp8 WEIGHT CANNOT ABSORB A SCALE — multiplying its mantissa bytes elementwise is
+        // a REQUANTIZE (the product has to re-encode into fp8's own exponent range), not the
+        // exact algebra this fold is. The `ws` dequant row is the fp8 fold's target precisely
+        // because it sits OUTSIDE the quantized payload. The fp8-weight test is the emitter's
+        // own (`input[1]` of an arity-3 `MatmulTile`, `compute_bundle_layout::fp8_weight_tids`),
+        // restated here so a matmul whose input order puts the quantized payload last is refused
+        // at RECOGNITION — a build-time fact, not a load-time dtype check.
+        let is_fp8_weight = |t: TensorId| {
+            ir.nodes.iter().any(|n| {
+                matches!(n.op, SubOp::MatmulTile { .. })
+                    && n.inputs.len() == 3
+                    && n.inputs[1].tensor == t
+            })
+        };
+        if is_fp8_weight(target.tensor) {
+            continue;
+        }
+        let shared = |tid: TensorId, skip: SubtileId| {
+            ir.nodes
+                .iter()
+                .any(|n| n.id != skip && n.inputs.iter().any(|r| r.tensor == tid))
+        };
+        // The weight must be this matmul's alone, and the product must be this ScalarMul's
+        // alone — see the refusals above.
+        if shared(target.tensor, producer.id) || shared(input.tensor, node.id) {
+            continue;
+        }
+        folds.push((node.id, target.tensor.index() as u32, *scale));
+    }
+    folds
+}
+
+/// ⭐⭐⭐ THE ATTENTION SCALE'S OWN WEIGHT FOLD — `(q·√s)·(k·√s)ᵀ == (q·kᵀ)·s`, with each `√s`
+/// commuted into the projection weight that produced its side.
+///
+/// torch-spyre's attention scales the scores by applying `√scale` to BOTH the query and the key
+/// (`query * scaling_factor`, `key * scaling_factor`), and those two multiplies commute into
+/// `W_q` and `W_k` exactly the way a residual multiplier commutes into `o_proj`: the query's
+/// `√s` rides its matmul, the key's rides its matmul **and the KV cache the rope writes** — the
+/// cache then holds pre-scaled K, which is consistent because the score matmul is the only thing
+/// that ever reads it. The rope in between is a rotation (linear), so the scalar passes through
+/// it unchanged; `V` carries no scale and is untouched.
+///
+/// The fold's node-side half is the mirror of the ScalarMul fold's, with ONE structural
+/// difference: **the AttnDecode node STAYS on the tape at `scale = 1.0`.** The two multiplies
+/// this fold removes are not tape nodes at all — they are ops the attention lowering emits
+/// (`qs = Q·√s`, `new_k_scaled = K·√s`) reading the `[1,1]` registry consts — so nothing is
+/// host-routed, nothing is re-pointed, and no placement aliases: the recognition rewrites the
+/// node's scale to 1.0 where the node is lowered, and the lowering emits no multiplies for a
+/// scale of 1.0. The registry entries for both `scale` and `√scale` leave the census with the
+/// node's arm skipped.
+///
+/// The producer walk, and ⛔ EVERY REFUSAL IS A CORRECTNESS FACT:
+///   * `inputs[0]` (Q) must be a rope's WHOLE output — its producer is the `RopeRotate` — and
+///     `inputs[3]` (new K) the `RopeAppend`'s; a pre-populated cache region or any other
+///     producer shape refuses (the walk is granite's chain, stated as a shape and not guessed
+///     at: `matmul → rope → attention`);
+///   * the rope's first input must be a MATMUL's whole output, whose LAST input is the fold
+///     target (`W_q` / `W_k`) — the same slot law the ScalarMul fold uses, so fp8 W8A8 folds
+///     into the `ws` dequant row (exact algebra, never a requantize);
+///   * the fold target read by any OTHER node refuses — a shared weight cannot absorb a
+///     per-consumer scale (a fused-QKV table would refuse here, which is why the fold is
+///     granite's separate-projections shape);
+///   * the MATMUL's output read by any node other than the rope, and the ROPE's output read by
+///     any node other than this attention, both refuse — the fold changes those tensors'
+///     VALUES (that is its whole point), so a second consumer wanting the unscaled value would
+///     read pre-scaled bytes;
+///   * `scale == 1.0` has nothing to fold and is skipped, not refused — it is also the value a
+///     folded node carries afterward, which is what makes the rewrite idempotent.
+///
+/// Returns `(attn node, W_q tid, W_k tid, √scale)` — one entry per foldable attention node.
+pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<(SubtileId, u32, u32, f32)> {
+    /// The projection weight behind one side of an attention: `attn_input` must be the WHOLE
+    /// output of a rope (`RopeRotate` for the query, `RopeAppend` for the key — both linear
+    /// rotations of their first input, which is the algebra the fold rides), and that rope's
+    /// first input must be the WHOLE output of a matmul whose last input is the target.
+    fn projection_weight<F: RopeForm>(
+        ir: &SubtileIR<F>,
+        attn_input: &scratchy_subtile::subtile_ir::TensorRegion,
+        attn_id: SubtileId,
+        is_fp8_weight: &impl Fn(TensorId) -> bool,
+        shared: &impl Fn(TensorId, SubtileId) -> bool,
+    ) -> Option<TensorId> {
+        let rope = ir
+            .nodes
+            .iter()
+            .find(|p| p.id != attn_id && p.output == *attn_input)?;
+        if !matches!(rope.op, SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. })
+            || rope.inputs.is_empty()
+        {
+            return None;
+        }
+        let matmul = ir
+            .nodes
+            .iter()
+            .find(|p| p.id != rope.id && p.output == rope.inputs[0])?;
+        if !matches!(matmul.op, SubOp::MatmulTile { .. }) || matmul.inputs.len() < 2 {
+            return None;
+        }
+        let target = matmul.inputs.last().expect("len checked above");
+        // The fp8-payload and shared-weight refusals, same laws as the ScalarMul fold's —
+        // see that function's doc for why each is a correctness fact and not timidity.
+        if is_fp8_weight(target.tensor) {
+            return None;
+        }
+        if shared(target.tensor, matmul.id) {
+            return None;
+        }
+        // The matmul's product must be the rope's alone, and the rope's output this
+        // attention's alone: the fold changes both tensors' values, and any other reader
+        // needs the unscaled ones.
+        if shared(matmul.output.tensor, rope.id) || shared(rope.output.tensor, attn_id) {
+            return None;
+        }
+        Some(target.tensor)
+    }
+    let is_fp8_weight = |t: TensorId| {
+        ir.nodes.iter().any(|n| {
+            matches!(n.op, SubOp::MatmulTile { .. })
+                && n.inputs.len() == 3
+                && n.inputs[1].tensor == t
+        })
+    };
+    let shared = |tid: TensorId, skip: SubtileId| {
+        ir.nodes
+            .iter()
+            .any(|n| n.id != skip && n.inputs.iter().any(|r| r.tensor == tid))
+    };
+    let mut folds = Vec::new();
+    for node in &ir.nodes {
+        let SubOp::AttnDecode { scale, .. } = &node.op else {
+            continue;
+        };
+        // inputs = [q, prefix_k, prefix_v, new_k, new_v] — the walk is the two live sides.
+        let [q, _prefix_k, _prefix_v, new_k, _new_v] = node.inputs.as_slice() else {
+            continue;
+        };
+        if *scale == 1.0 {
+            continue;
+        }
+        let Some(w_q) = projection_weight(ir, q, node.id, &is_fp8_weight, &shared) else {
+            continue;
+        };
+        let Some(w_k) = projection_weight(ir, new_k, node.id, &is_fp8_weight, &shared) else {
+            continue;
+        };
+        folds.push((
+            node.id,
+            w_q.index() as u32,
+            w_k.index() as u32,
+            scale.sqrt(),
+        ));
+    }
+    folds
+}
+
+/// ⭐ EVERY weight fold this graph admits, in the ONE list every fold consumer reads.
+///
+/// Both kinds are the same contract at load time — the worker multiplies the staged bytes of
+/// each `(tid, multiplier)` pair once, at load — so the runtime list, the layout field, and the
+/// macro's cross-program census take this union:
+///   * the [`scalar_mul_weight_folds`]: `(folded ScalarMul node, weight tid, multiplier)` —
+///     the node LEAVES the tape (host-routed, its output placement aliased to the producer's);
+///   * the [`attn_scale_weight_folds`]: the SAME `(node, tid, multiplier)` shape, twice per
+///     attention node (W_q and W_k at `√scale`) — the node STAYS, at `scale = 1.0`.
+///
+/// ⛔ THE TWO KINDS ARE NOT INTERCHANGEABLE DOWNSTREAM, AND THE DISTINCTION IS THE NODE'S OWN
+/// OP. A consumer that treats a fold's node as gone (the placement alias, the liveness
+/// extension, the golden's eval skip) must ask `scalar_mul_weight_folds` directly — only that
+/// kind leaves the tape. A consumer that applies bytes (the layout field, the runtime, the
+/// census, the golden's source pre-scaling) takes this union. A fold entry keyed on an
+/// AttnDecode reaching the aliasing sites would point the attention's OUTPUT placement at the
+/// query's bytes, so those sites keep their own recognizer rather than filtering this list.
+pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(SubtileId, u32, f32)> {
+    let mut folds = scalar_mul_weight_folds(ir);
+    for (id, w_q, w_k, sqrt_scale) in attn_scale_weight_folds(ir) {
+        folds.push((id, w_q, sqrt_scale));
+        folds.push((id, w_k, sqrt_scale));
+    }
+    folds
+}
+
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
 ///
 /// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `SubOp::AttnDecode`'s
 /// `geom` and `scale` were in its hand and `active_cap` / `rows_are_requests` were its own walk
-/// parameters. This split lowers KTIR → SuperDSC one pass later, per BUNDLE, so the same four facts
-/// are read HERE — off the graph's own `AttnDecode` nodes and off this walk's parameters — and travel
-/// to the door as [`crate::ktir_superdsc_door::BundleAttnParams`], an argument of the call.
+/// parameters. This split lowers KTIR → SuperDSC one pass later, per BUNDLE, so the same facts
+/// are read HERE — off the graph's own `AttnDecode` nodes, off this walk's parameters, and off the
+/// fold recognition's own node set (the `scale` main read became TWO things downstream: the value
+/// the program states when there is one to apply, and the fold fact when the weights carry it) —
+/// and travel to the door as [`crate::ktir_superdsc_door::BundleAttnParams`], an argument of the
+/// call.
 ///
 /// ⛔ THE MODEL FACTS MUST BE THE MODEL'S, SO A DISAGREEMENT IS AN ERROR AND NOT A CHOICE. One
 /// `#[forward]` expansion is one model, so every `AttnDecode` node in one graph carries the same
-/// geometry and the same multiplier. If two ever differed, one value per bundle could not describe
-/// both, and picking the first would silently give one layer another layer's registry slot — so this
-/// refuses instead, naming both.
+/// geometry and the same multiplier, and (the fold being derived from the graph's shape, which is
+/// the same in every layer) the same folded-ness. If two ever differed, one value per bundle could
+/// not describe both, and picking the first would silently give one layer another layer's registry
+/// slot — or its double-scaled scores — so this refuses instead, naming both.
 ///
-/// `None` when the graph has no attention node: there is then nothing for the four to be facts of, and
-/// an attention program arriving at the door without them is that door's own build error.
+/// `None` when the graph has no attention node: there is then nothing for the facts to be facts
+/// of, and an attention program arriving at the door without them is that door's own build error.
 pub(crate) fn attn_bundle_params<F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
+    // The fold's node set, taken once: a node is folded iff the attention-fold recognition named
+    // it (which is also why the door's `scale_folded` is a fact about the program, not a
+    // restatement of one of its values — see `BundleAttnParams::scale_folded`).
+    let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
     let mut found: Option<(ktir_superdsc::head_counts::ModelAttnGeometry, u32)> = None;
+    let mut first_folded: Option<bool> = None;
     for n in &ir.nodes {
         let SubOp::AttnDecode { geom, .. } = &n.op else {
             continue;
         };
         let t = n.output.tensor.index() as u32;
-        match found {
-            None => found = Some((*geom, t)),
-            Some((g0, t0)) => {
+        let n_folded = folded.contains(&n.id);
+        match (found, first_folded) {
+            (None, _) => {
+                found = Some((*geom, t));
+                first_folded = Some(n_folded);
+            }
+            (Some((g0, t0)), Some(f0)) => {
                 if g0 != *geom {
                     return Err(SuperDscError(format!(
                         "AttnDecode t{t0} declares geometry ({g0}) while AttnDecode t{t} declares \
@@ -85,13 +342,30 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
                          give one layer the other's."
                     )));
                 }
+                // The fold fact follows the SAME one-value-per-bundle law: a bundle whose attention
+                // nodes disagree on folded-ness cannot state one `scale_folded` for all of them,
+                // and the door's multiplies would be right for one layer and double-scaling for
+                // another — so it is an error naming both, never a choice.
+                if f0 != n_folded {
+                    return Err(SuperDscError(format!(
+                        "AttnDecode t{t0} {} its attention scale into W_q/W_k while AttnDecode t{t} \
+                         did {}. One bundle is one model, and the door takes ONE fold fact for the \
+                         whole bundle; a graph carrying both would emit score multiplies that are \
+                         right for one layer and double-scaling for the other.",
+                        if f0 { "folded" } else { "did not fold" },
+                        if n_folded { "fold" } else { "not" },
+                    )));
+                }
             }
+            // `found` and `first_folded` are set in the same arm and never apart.
+            (Some(_), None) => unreachable!("first_folded tracks found"),
         }
     }
     Ok(
         found.map(|(geom, _)| crate::ktir_superdsc_door::BundleAttnParams {
             geom,
             rows_are_requests,
+            scale_folded: first_folded.unwrap_or(false),
         }),
     )
 }
@@ -211,7 +485,19 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // tail folds BOTH halves to m=1 (main's `is_prefill_lm_head_tail` covers this
         // arm too), and the fold is the splice's `lower_all` now. Every other
         // ScalarMul is the ordinary one-op pointwise.
+        //
+        // ⭐⭐ EXCEPT THE ONES THAT NEVER NEED A DEVICE OP AT ALL: a multiplier whose product
+        // scales a MATMUL OUTPUT commutes into the matmul's weight (`(x·W)·s == x·(W·s)`), so
+        // [`scalar_mul_weight_folds`] takes it out of the tape and into the staged weight bytes
+        // — the multiplier stops being a per-step `[1,1]` const + a pointwise `mul` and becomes
+        // a load-time fact. See that function for why the recognition refuses shared weights.
         SubOp::ScalarMul { .. } => {
+            if scalar_mul_weight_folds(ir)
+                .iter()
+                .any(|(id, _, _)| *id == node.id)
+            {
+                return HostRouted("ScalarMulWeightFold");
+            }
             match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
@@ -225,7 +511,28 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             // door (`attn_at`: the swept extent, the scale, the span guard, the row laws)
             // or is a constexpr the kernel states from the node's own payload.
             let cap = ir.tensors[kv.cache_tensor().index() as u32 as usize].rows;
-            match scratchy_triton_splice::lower_attn(node, ir, cap, active_cap) {
+            // ⭐⭐⭐ THE SCALE, REWRITTEN TO 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
+            // carrier of the scale (the kernel states it as its `SCALE` constexpr and the door
+            // reads that value back), so rewriting it HERE — at the boundary where the program
+            // is minted — is the single edit that reaches every consumer: the door sees 1.0 and
+            // emits no `qs`/`new_k_scaled` multiplies, the emulator interprets `qk · 1.0` over
+            // the pre-scaled weights the fold staged, and the registry census skips the node's
+            // arm. The REAL multiplier meanwhile rides the fold list into the staged W_q/W_k
+            // bytes, where `(q·√s)·(k·√s)ᵀ` reproduces `(q·kᵀ)·s` exactly.
+            let mut folded_node;
+            let node_ref: &SubtileNode<F> = if attn_scale_weight_folds(ir)
+                .iter()
+                .any(|(id, ..)| *id == node.id)
+            {
+                folded_node = node.clone();
+                if let SubOp::AttnDecode { scale, .. } = &mut folded_node.op {
+                    *scale = 1.0;
+                }
+                &folded_node
+            } else {
+                node
+            };
+            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
@@ -404,6 +711,20 @@ pub struct BundleWiring {
     /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
     /// own source binding. This is the one list they read, so they cannot disagree about it.
     pub scalarmul_scales: Vec<f32>,
+    /// The weight folds this graph admits: `(tensor id, multiplier)` for each matmul weight the
+    /// worker must scale at load instead of the tape applying the multiplier at runtime —
+    /// EITHER a `ScalarMul` fold ([`scalar_mul_weight_folds`], whose refusal set — sliced reads,
+    /// shared fold target, shared producer output, non-matmul producer — is that fold's safety
+    /// envelope) or an attention-scale fold ([`attn_scale_weight_folds`], the same envelope read
+    /// through the rope, `√scale` into `W_q`/`W_k`). The runtime applies both kinds identically:
+    /// one multiply over the staged bytes at load.
+    ///
+    /// ⛔ THE UNROLLED WALK THAT PRODUCES THIS WIRING HOST-ROUTES THE FOLDED SCALARMUL NODES
+    /// TOO: the same recognition gates `lower_one_node`'s ScalarMul arm, so a wiring that ran
+    /// the multiplier as a program while the card path folded it would be a wiring that
+    /// double-applies the scale. (An attention-scale fold's node is NOT host-routed — it still
+    /// runs, at the scale 1.0 the same arm rewrote it to.)
+    pub weight_scale_folds: Vec<(u32, f32)>,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -495,6 +816,7 @@ pub fn graph_wiring<F: RopeForm>(
         tensor_shapes,
         attn_mask,
         scalarmul_scales: layout.scalarmul_scales.clone(),
+        weight_scale_folds: layout.weight_scale_folds.clone(),
     })
 }
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -1166,4 +1488,577 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         suffix_in_tid,
         attn_params,
     })
+}
+
+#[cfg(test)]
+mod scalar_mul_weight_fold_tests {
+    use super::*;
+    use scratchy_subtile::lower::GemmWeight;
+    use scratchy_subtile::subtile_ir::{Region, TensorId, TensorRegion, TensorShape};
+
+    /// granite's residual shape and its refusals, as one fixture with switches: t0 = x
+    /// (activation source), t1 = W (weight source), t2 = the matmul's whole output, t3 = the
+    /// ScalarMul's output, t4 = W2 (the consumer's OWN weight), t5 = the consumer's output,
+    /// t6 = spare. `tied_weight` adds a second reader of W (the tied-table refusal),
+    /// `shared_product` adds a second reader of t2 (the unscaled-product refusal), `sliced`
+    /// makes the ScalarMul read a column slice of t2, and `as_result` makes t3 the graph result.
+    fn graph(
+        scale: f32,
+        tied_weight: bool,
+        shared_product: bool,
+        sliced: bool,
+        as_result: bool,
+    ) -> SubtileIR {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 8 },  // t0 = x
+            TensorShape { rows: 8, cols: 16 }, // t1 = W
+            TensorShape { rows: 1, cols: 16 }, // t2 = x·W
+            TensorShape { rows: 1, cols: 16 }, // t3 = (x·W)·s
+            TensorShape { rows: 16, cols: 4 }, // t4 = W2 (the consumer's own weight)
+            TensorShape { rows: 1, cols: 4 },  // t5 = the consumer's output
+            TensorShape { rows: 1, cols: 16 }, // t6 = spare
+        ];
+        let whole = |t: usize| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: tensors[t].whole(),
+        };
+        let mut nodes = vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(0), whole(1)],
+                output: whole(2),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::ScalarMul { scale },
+                inputs: vec![if sliced {
+                    TensorRegion {
+                        tensor: TensorId::from_index(2),
+                        region: Region {
+                            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                            cols: scratchy_subtile::subtile_ir::Range::new(0, 8),
+                        },
+                    }
+                } else {
+                    whole(2)
+                }],
+                output: whole(3),
+            },
+        ];
+        // The consumer every fold needs: a reader of the SCALED product over its OWN weight, so
+        // the base fixture reads W exactly once (the producer).
+        nodes.push(SubtileNode {
+            id: SubtileId::from_index(2),
+            op: SubOp::MatmulTile {
+                n: 4,
+                weight: GemmWeight::Dense,
+            },
+            inputs: vec![whole(3), whole(4)],
+            output: whole(5),
+        });
+        if tied_weight {
+            // A second reader of W — the tied lm_head/embedding shape: one weight, two matmuls.
+            nodes.push(SubtileNode {
+                id: SubtileId::from_index(3),
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(0), whole(1)],
+                output: whole(6),
+            });
+        }
+        if shared_product {
+            // A second reader of the UNSCALED product t2 beside the ScalarMul — reading a
+            // SLICE, so this reader is not itself a fold candidate and the refusal under test
+            // is the ORIGINAL node's alone.
+            nodes.insert(
+                1,
+                SubtileNode {
+                    id: SubtileId::from_index(4),
+                    op: SubOp::ScalarMul { scale: 2.0 },
+                    inputs: vec![TensorRegion {
+                        tensor: TensorId::from_index(2),
+                        region: Region {
+                            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                            cols: scratchy_subtile::subtile_ir::Range::new(0, 8),
+                        },
+                    }],
+                    output: whole(6),
+                },
+            );
+        }
+        SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes,
+            result: TensorId::from_index(if as_result { 3 } else { 5 }),
+            // Hand-authored fixture: there is no source op list to be the provenance of.
+            op_output: Vec::new(),
+        }
+    }
+
+    /// The fold fires on granite's residual shape, naming the matmul's LAST input.
+    #[test]
+    fn the_residual_multiplier_folds_into_the_matmul_weight() {
+        let ir = graph(0.5, false, false, false, false);
+        let folds = scalar_mul_weight_folds(&ir);
+        assert_eq!(
+            folds,
+            vec![(SubtileId::from_index(1), 1, 0.5f32)],
+            "the ScalarMul folds into W (t1), the producer's last input"
+        );
+    }
+
+    /// The tied lm_head/embedding table is granite's own refusal: a weight another node reads
+    /// cannot absorb a per-consumer scale.
+    #[test]
+    fn a_weight_another_node_reads_refuses_the_fold() {
+        let ir = graph(0.5, true, false, false, false);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "a shared weight must keep its ScalarMul as an op"
+        );
+    }
+
+    /// A second reader of the matmul's output needs the UNSCALED product.
+    #[test]
+    fn a_product_another_node_reads_refuses_the_fold() {
+        let ir = graph(0.5, false, true, false, false);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "a shared product must keep its ScalarMul as an op"
+        );
+    }
+
+    /// A sliced read scales rows the fold would not.
+    #[test]
+    fn a_sliced_read_refuses_the_fold() {
+        let ir = graph(0.5, false, false, true, false);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "a sliced read must keep its ScalarMul as an op"
+        );
+    }
+
+    /// The logits ScalarMul is the splice's own lm-head-tail fold, and the result's Logits
+    /// placement is the worker's readback window — not this fold's to redirect.
+    #[test]
+    fn the_graph_result_refuses_the_fold() {
+        let ir = graph(0.5, false, false, false, true);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "the result ScalarMul belongs to the splice's lm-head-tail fold"
+        );
+    }
+
+    /// The fp8 W8A8 shape folds into the `ws` dequant row — the scale rides the row that is
+    /// already per-column, so the quantized payload is untouched (exact algebra, no requantize).
+    #[test]
+    fn the_fp8_w8a8_multiplier_folds_into_the_dequant_row() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 8 },  // t0 = qA
+            TensorShape { rows: 8, cols: 16 }, // t1 = qW (fp8 payload)
+            TensorShape { rows: 1, cols: 16 }, // t2 = ws (the dequant row)
+            TensorShape { rows: 1, cols: 16 }, // t3 = (qA·qW)·a·ws
+            TensorShape { rows: 1, cols: 16 }, // t4 = scaled
+            TensorShape { rows: 16, cols: 4 }, // t5 = the consumer's own dense weight
+            TensorShape { rows: 1, cols: 4 },  // t6 = consumer output
+        ];
+        let whole = |t: usize| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: tensors[t].whole(),
+        };
+        let nodes = vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Fp8Dynamic,
+                },
+                inputs: vec![whole(0), whole(1), whole(2)],
+                output: whole(3),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::ScalarMul { scale: 0.5 },
+                inputs: vec![whole(3)],
+                output: whole(4),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(2),
+                op: SubOp::MatmulTile {
+                    n: 4,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(4), whole(5)],
+                output: whole(6),
+            },
+        ];
+        let ir: SubtileIR = SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes,
+            result: TensorId::from_index(6),
+            op_output: Vec::new(),
+        };
+        assert_eq!(
+            scalar_mul_weight_folds(&ir),
+            vec![(SubtileId::from_index(1), 2, 0.5f32)],
+            "the fp8 fold targets the ws dequant row (t2), never the quantized payload (t1)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attn_scale_weight_fold_tests {
+    use super::*;
+    use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
+
+    /// granite's decode attention chain and its refusals, as one fixture with switches, built
+    /// through `lower_region` — the ONLY construction that can mint the Tiled stage's
+    /// `KvCacheLayout`/`KvCacheProducer`/`SoftmaxStateId` witnesses, and the SAME one the macro's
+    /// KTIR path builds the real graph with (`fuse_silu_mul` + `lower_region`; the head-tiling
+    /// rewrites are other targets' passes and never run here, so the ropes and the attention are
+    /// WHOLE ops — the shape the recognizer's whole-region matches are pinned to).
+    ///
+    /// The chain under test is `matmul → rope → attention` on both live sides, exactly as
+    /// `to_wavefront` lowers `rope_append(q, k, v, …)`: `x·W_q → rope_rotate`, `x·W_k →
+    /// rope_append` (writing the paged cache), `AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)`
+    /// with v aliased through un-roped. Geometry (2 query heads, 1 kv head, head_dim 8) fixes
+    /// q_width 16 and kv_width 8, so W_q is `[8,16]` and W_k `[8,8]`.
+    ///
+    /// `q_unroped` / `k_unroped` point the attention at the RAW projection product on that side
+    /// (a non-rope producer); `shared_w_q` adds a second matmul over W_q (the fused-QKV table
+    /// shape); `shared_q_product` adds a second consumer of the q projection's product; and
+    /// `shared_roped_q` adds a second consumer of the roped q. The extra consumers read over
+    /// their OWN weight (a third source, `W3`), so they are never fold candidates themselves and
+    /// each refusal under test is the fold's alone.
+    fn attn_graph(
+        scale: f32,
+        q_unroped: bool,
+        k_unroped: bool,
+        shared_w_q: bool,
+        shared_q_product: bool,
+        shared_roped_q: bool,
+    ) -> SubtileIR {
+        // granite's own geometry through the same mint the config path uses, scaled down: the
+        // recognizer reads only `scale`, so the geometry is inert — it just has to exist.
+        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+            ktir_superdsc::head_counts::QueryHeads::new(2),
+            ktir_superdsc::head_counts::KvHeads::new(1),
+            ktir_superdsc::head_counts::HeadDim::new(8),
+        )
+        .expect("2 query heads over 1 kv head, head_dim 8, mints");
+        let hd = ktir_superdsc::head_counts::HeadDim::new(8);
+        let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
+        let sources = vec![
+            shape(1, 8),  // 0: x (hidden 8)
+            shape(8, 16), // 1: W_q [K=q_width rows? no — row-major [K, N] = [8, 16]]
+            shape(8, 8),  // 2: W_k [8, kv_width]
+            shape(1, 8),  // 3: v (the V projection's output, un-roped)
+            shape(32, 8), // 4: prefix_k cache
+            shape(32, 8), // 5: prefix_v cache
+            shape(1, 16), // 6: cos
+            shape(1, 16), // 7: sin
+            shape(16, 4), // 8: W3 (the refusal readers' own weight)
+        ];
+        let q_ref = if q_unroped {
+            InputRef::Op(0)
+        } else {
+            InputRef::Op(1)
+        };
+        let k_ref = if k_unroped {
+            InputRef::Op(2)
+        } else {
+            InputRef::Op(3)
+        };
+        let mut ops = vec![
+            // 0: q = x · W_q
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            // 1: q_rot = rope_rotate(q, cos, sin)
+            OpDesc {
+                op: SubOp::rope_rotate(hd),
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(6), InputRef::Ext(7)],
+            },
+            // 2: k = x · W_k
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 8,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(2)],
+            },
+            // 3: k_rot = rope_append(k, cos, sin, v, prefix_k, prefix_v) — writing the paged cache
+            OpDesc {
+                op: SubOp::rope_append(
+                    hd,
+                    0,
+                    scratchy_subtile::subtile_ir::AttnMask::Causal,
+                    scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
+                ),
+                m: 1,
+                inputs: vec![
+                    InputRef::Op(2),
+                    InputRef::Ext(6),
+                    InputRef::Ext(7),
+                    InputRef::Ext(3),
+                    InputRef::Ext(4),
+                    InputRef::Ext(5),
+                ],
+            },
+            // 4: attn = AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)
+            OpDesc {
+                op: SubOp::attn_decode(
+                    geom,
+                    scale,
+                    33,
+                    scratchy_subtile::subtile_ir::AttnMask::Causal,
+                ),
+                m: 1,
+                inputs: vec![
+                    q_ref,
+                    InputRef::Ext(4),
+                    InputRef::Ext(5),
+                    k_ref,
+                    InputRef::Ext(3),
+                ],
+            },
+        ];
+        if shared_w_q {
+            // A second matmul over W_q — the fused-QKV table: one projection weight, two matmuls.
+            ops.push(OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            });
+        }
+        if shared_q_product {
+            // A second consumer of the UNSCALED q product — over its own weight, so it is not
+            // itself a fold candidate.
+            ops.push(OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 4,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(8)],
+            });
+        }
+        if shared_roped_q {
+            // A second consumer of the ROPED q — what the fold would hand pre-scaled bytes.
+            ops.push(OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 4,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(1), InputRef::Ext(8)],
+            });
+        }
+        let input = LoweringInput {
+            sources,
+            ops,
+            result: 4,
+        };
+        let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
+        scratchy_subtile::subtile_ir::lower_region(&input, nb)
+    }
+
+    /// The fold fires on granite's chain, naming BOTH projection weights at `√scale` — the query's
+    /// and the key's, one entry each, so the runtime list holds two multiplies at load and the
+    /// node's own scale is rewritten to 1.0 where it is lowered.
+    #[test]
+    fn the_attention_scale_folds_into_both_projection_weights() {
+        let ir = attn_graph(1.0 / 64.0, false, false, false, false, false);
+        assert_eq!(
+            attn_scale_weight_folds(&ir),
+            vec![(SubtileId::from_index(4), 1, 2, 0.125f32)],
+            "the fold names W_q (source 1) and W_k (source 2), each at √scale"
+        );
+        assert_eq!(
+            weight_scale_folds(&ir),
+            vec![
+                (SubtileId::from_index(4), 1, 0.125f32),
+                (SubtileId::from_index(4), 2, 0.125f32),
+            ],
+            "the union list the runtime applies carries one (tid, multiplier) pair per side"
+        );
+    }
+
+    /// The fp8 W8A8 shape folds into the `ws` dequant rows — the SAME slot law the ScalarMul fold
+    /// uses, which is the whole point: the scale rides the row that is already per-column, so the
+    /// quantized payloads are untouched (exact algebra, no requantize). granite's fp8 preset
+    /// quantizes every projection, so both sides take it.
+    #[test]
+    fn the_fp8_attention_folds_into_the_dequant_rows() {
+        let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
+        let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+            ktir_superdsc::head_counts::QueryHeads::new(2),
+            ktir_superdsc::head_counts::KvHeads::new(1),
+            ktir_superdsc::head_counts::HeadDim::new(8),
+        )
+        .expect("2 query heads over 1 kv head, head_dim 8, mints");
+        let hd = ktir_superdsc::head_counts::HeadDim::new(8);
+        let input = LoweringInput {
+            sources: vec![
+                shape(1, 8),  // 0: x
+                shape(8, 16), // 1: qW_q — the fp8 PAYLOAD
+                shape(16, 1), // 2: ws_q — the dequant row
+                shape(8, 8),  // 3: qW_k — the fp8 PAYLOAD
+                shape(8, 1),  // 4: ws_k — the dequant row
+                shape(1, 8),  // 5: v
+                shape(32, 8), // 6: prefix_k cache
+                shape(32, 8), // 7: prefix_v cache
+                shape(1, 16), // 8: cos
+                shape(1, 16), // 9: sin
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 16,
+                        weight: GemmWeight::Fp8Dynamic,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
+                },
+                OpDesc {
+                    op: SubOp::rope_rotate(hd),
+                    m: 1,
+                    inputs: vec![InputRef::Op(0), InputRef::Ext(8), InputRef::Ext(9)],
+                },
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 8,
+                        weight: GemmWeight::Fp8Dynamic,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(3), InputRef::Ext(4)],
+                },
+                OpDesc {
+                    op: SubOp::rope_append(
+                        hd,
+                        0,
+                        scratchy_subtile::subtile_ir::AttnMask::Causal,
+                        scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
+                    ),
+                    m: 1,
+                    inputs: vec![
+                        InputRef::Op(2),
+                        InputRef::Ext(8),
+                        InputRef::Ext(9),
+                        InputRef::Ext(5),
+                        InputRef::Ext(6),
+                        InputRef::Ext(7),
+                    ],
+                },
+                OpDesc {
+                    op: SubOp::attn_decode(
+                        geom,
+                        1.0 / 64.0,
+                        33,
+                        scratchy_subtile::subtile_ir::AttnMask::Causal,
+                    ),
+                    m: 1,
+                    inputs: vec![
+                        InputRef::Op(1),
+                        InputRef::Ext(6),
+                        InputRef::Ext(7),
+                        InputRef::Op(3),
+                        InputRef::Ext(5),
+                    ],
+                },
+            ],
+            result: 4,
+        };
+        let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
+        let ir = scratchy_subtile::subtile_ir::lower_region(&input, nb);
+        assert_eq!(
+            attn_scale_weight_folds(&ir),
+            vec![(SubtileId::from_index(4), 2, 4, 0.125f32)],
+            "the fp8 fold targets the ws dequant rows (sources 2 and 4), never the quantized \
+             payloads (1 and 3)"
+        );
+    }
+
+    /// A query that skipped its rope has a MATMUL for a producer — the walk is granite's
+    /// `matmul → rope → attention` chain, stated as a shape, and a non-rope producer is not it.
+    #[test]
+    fn an_unroped_query_refuses_the_fold() {
+        let ir = attn_graph(1.0 / 64.0, true, false, false, false, false);
+        assert!(
+            attn_scale_weight_folds(&ir).is_empty(),
+            "a non-rope producer of q must keep its multiplies as ops"
+        );
+    }
+
+    /// The mirror refusal on the key side: the fold needs BOTH chains clean, never a half-fold —
+    /// scaling only W_q would leave the scores at `q·kᵀ·(s/√s)`.
+    #[test]
+    fn an_unroped_key_refuses_the_whole_fold() {
+        let ir = attn_graph(1.0 / 64.0, false, true, false, false, false);
+        assert!(
+            attn_scale_weight_folds(&ir).is_empty(),
+            "a non-rope producer of new_k must refuse the whole fold, not fold W_q alone"
+        );
+    }
+
+    /// A shared projection table is the fused-QKV shape: one weight, two matmuls, and a
+    /// per-consumer scale cannot ride it.
+    #[test]
+    fn a_shared_projection_table_refuses_the_fold() {
+        let ir = attn_graph(1.0 / 64.0, false, false, true, false, false);
+        assert!(
+            attn_scale_weight_folds(&ir).is_empty(),
+            "a weight another matmul reads must keep its multiplies as ops"
+        );
+    }
+
+    /// A second reader of the projection's product needs the UNSCALED product.
+    #[test]
+    fn a_second_reader_of_the_projection_product_refuses_the_fold() {
+        let ir = attn_graph(1.0 / 64.0, false, false, false, true, false);
+        assert!(
+            attn_scale_weight_folds(&ir).is_empty(),
+            "a shared projection product must keep its multiplies as ops"
+        );
+    }
+
+    /// A second reader of the roped query needs the UNSCALED rotation — the fold changes that
+    /// tensor's value, which is its whole point.
+    #[test]
+    fn a_second_reader_of_the_roped_query_refuses_the_fold() {
+        let ir = attn_graph(1.0 / 64.0, false, false, false, false, true);
+        assert!(
+            attn_scale_weight_folds(&ir).is_empty(),
+            "a shared roped query must keep its multiplies as ops"
+        );
+    }
+
+    /// `scale == 1.0` has nothing to fold — and it is also the value a folded node carries
+    /// afterward, which is what makes the recognition idempotent.
+    #[test]
+    fn a_scale_of_one_folds_nothing() {
+        let ir = attn_graph(1.0, false, false, false, false, false);
+        assert!(
+            attn_scale_weight_folds(&ir).is_empty(),
+            "a scale of 1.0 multiplies nothing and must fold nothing"
+        );
+    }
 }
