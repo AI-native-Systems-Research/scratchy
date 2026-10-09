@@ -93,8 +93,29 @@ pub struct SystemBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicMessage {
-    pub role: String,
+    pub role: AnthropicRole,
     pub content: MessageContent,
+}
+
+/// Who a message of the conversation is from. Claude Code (2.1+) sends `system` messages
+/// inside `messages` too — its environment block after the first user turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicRole {
+    User,
+    Assistant,
+    System,
+}
+
+impl AnthropicRole {
+    /// The chat-completions role.
+    fn chat_role(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::System => "system",
+        }
+    }
 }
 
 /// An Anthropic tool definition.
@@ -222,19 +243,33 @@ impl AnthropicUsage {
 fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
     let mut messages = Vec::new();
 
-    // System message
-    if let Some(sys) = req.system {
-        let text = match sys {
-            SystemParam::Text(t) => t,
-            SystemParam::Blocks(blocks) => blocks
-                .into_iter()
-                .map(|b| b.text)
+    // One system message, first: the `system` parameter, then every `system` message of the
+    // conversation in order. Chat templates take a system message only at the start (Qwen3.5/3.6's
+    // raises "System message must be at the beginning").
+    let in_conversation = (req.messages.iter())
+        .filter(|m| m.role == AnthropicRole::System)
+        .map(|m| match &m.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Blocks(blocks) => (blocks.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
-        };
+        });
+    let system: Vec<String> = match req.system {
+        None => Vec::new(),
+        Some(SystemParam::Text(t)) => vec![t],
+        Some(SystemParam::Blocks(blocks)) => blocks.into_iter().map(|b| b.text).collect(),
+    }
+    .into_iter()
+    .chain(in_conversation)
+    .collect();
+    if !system.is_empty() {
         messages.push(protocol::ChatCompletionMessageParam {
             role: "system".to_string(),
-            content: Some(Value::String(text)),
+            content: Some(Value::String(system.join("\n"))),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -243,10 +278,13 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
 
     // Convert messages
     for msg in req.messages {
+        if msg.role == AnthropicRole::System {
+            continue;
+        }
         match msg.content {
             MessageContent::Text(text) => {
                 messages.push(protocol::ChatCompletionMessageParam {
-                    role: msg.role,
+                    role: msg.role.chat_role().to_string(),
                     content: Some(Value::String(text)),
                     name: None,
                     tool_calls: None,
@@ -317,7 +355,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                         Some(tool_calls)
                     };
                     messages.push(protocol::ChatCompletionMessageParam {
-                        role: msg.role,
+                        role: msg.role.chat_role().to_string(),
                         content,
                         name: None,
                         tool_calls: tc,
@@ -1261,7 +1299,7 @@ mod tests {
         let req = MessagesRequest {
             model: Some("test-model".into()),
             messages: vec![AnthropicMessage {
-                role: "user".into(),
+                role: AnthropicRole::User,
                 content: MessageContent::Text("Hello".into()),
             }],
             system: None,
@@ -1282,12 +1320,37 @@ mod tests {
         assert_eq!(chat.temperature, Some(0.7));
     }
 
+    /// Claude Code 2.1's first request: the `system` blocks, then a user turn and a `system`
+    /// message (its environment block). The chat request carries one system message, first, the
+    /// parameter's text and then the conversation's.
+    #[test]
+    fn test_convert_system_messages_in_the_conversation() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "max_tokens": 50,
+            "system": [{"type": "text", "text": "You are Claude Code."}, {"type": "text", "text": "Be concise."}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Read stack.py."}]},
+                {"role": "system", "content": [{"type": "text", "text": "# Environment"}]}
+            ]
+        }))
+        .expect("parses");
+        let chat = convert_request(req);
+        let roles: Vec<&str> = chat.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user"]);
+        assert_eq!(
+            chat.messages[0].content,
+            Some(Value::String(
+                "You are Claude Code.\nBe concise.\n# Environment".into()
+            ))
+        );
+    }
+
     #[test]
     fn test_convert_system_message() {
         let req = MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
-                role: "user".into(),
+                role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
             }],
             system: Some(SystemParam::Text("Be helpful.".into())),
@@ -1315,7 +1378,7 @@ mod tests {
         let req = MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
-                role: "user".into(),
+                role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
             }],
             system: None,
@@ -1343,7 +1406,7 @@ mod tests {
         let req = MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
-                role: "assistant".into(),
+                role: AnthropicRole::Assistant,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
                     id: "call_1".into(),
                     name: "get_weather".into(),
@@ -1373,7 +1436,7 @@ mod tests {
         let req = MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
-                role: "user".into(),
+                role: AnthropicRole::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: "call_1".into(),
                     content: Some(ToolResultContent::Text("72°F".into())),
@@ -1402,7 +1465,7 @@ mod tests {
         let req = MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
-                role: "user".into(),
+                role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
             }],
             system: None,
@@ -1433,7 +1496,7 @@ mod tests {
         let req = MessagesRequest {
             model: None,
             messages: vec![AnthropicMessage {
-                role: "user".into(),
+                role: AnthropicRole::User,
                 content: MessageContent::Text("Hi".into()),
             }],
             system: None,
