@@ -282,7 +282,7 @@ u32_newtype!(
     AffineGroupSize,
     /// MLX-affine bits per quantized weight.
     AffineBits,
-    /// An MLX-affine GEMM's matvec/matmul boundary (`get_qmv_batch_limit`).
+    /// An MLX-affine GEMM's matvec/matmul boundary on a target (`get_qmv_batch_limit`).
     QmvBatchLimit,
     /// Routed experts of a MoE layer.
     NumExperts,

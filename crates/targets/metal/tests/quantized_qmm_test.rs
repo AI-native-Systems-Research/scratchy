@@ -667,7 +667,7 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
-    let is_nax = scratchy_target_metal::targets::is_nax_capable(dev.profile.generation);
+    let is_nax = dev.profile.has_nax();
     if !is_nax {
         eprintln!(
             "skipping NAX parity test on non-NAX-capable hardware ({:?})",
@@ -826,7 +826,7 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
         QmmTKernel::Standard,
         pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, gs, false),
     ];
-    if scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
+    if dev.profile.has_nax() {
         kernels.push(QmmTKernel::Nax);
     }
     let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7, n, k, m, gs as usize);

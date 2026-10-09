@@ -63,15 +63,23 @@ use scratchy_ir::CanonicalParams;
 
 use super::lowered::{DispatchShape, GemmDims, KernelId, LoweredCommand, MetalDtype};
 use crate::tape::constants::{TapeVariant, UnboundConstant};
+use crate::tape::ids::GpuCores;
 
 /// Outputs one threadgroup of the dense GEMV computes (MLX's `blockM`): the fewest a GEMV
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
 pub const GEMV_ROWS: u32 = 4;
 
-/// Rows from which a bf16 GEMM runs blocked (`gemm_bf16_blocked`): 2.1-2.2x the 8×8-tile GEMM at
-/// a 2048-row MoE router on base M5 (128 × 2816, 256 × 2048), ahead from 256 rows; under them
-/// its few threadgroups lose.
-pub const GEMM_BLOCKED_ROWS: u32 = 256;
+/// Where a bf16 GEMM starts running blocked (`gemm_bf16_blocked`), measured on a base M5's 10 cores:
+/// 2.1-2.2x the 8×8-tile GEMM at a 2048-row MoE router (128 × 2816, 256 × 2048), ahead from 256
+/// rows; under them its few threadgroups lose.
+const GEMM_BLOCKED_MEASURED: (u32, GpuCores) = (256, GpuCores(10));
+
+/// Whether a bf16 GEMM of `m` rows runs blocked on a GPU of `cores` cores. Its threadgroups grow
+/// with the rows, so it needs as many rows a core as it won from on the measured GPU.
+pub fn gemm_runs_blocked(m: u32, cores: GpuCores) -> bool {
+    let (rows, measured) = GEMM_BLOCKED_MEASURED;
+    m * measured.get() >= rows * cores.get()
+}
 
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
@@ -99,12 +107,19 @@ pub struct SpecializedPipelines {
     cache: Arc<SpecializedPipelineCache>,
     /// The tape variant the pool picked: the values its commands' variant-bound constants take.
     variant: TapeVariant,
+    /// The device's GPU cores: the body its dense GEMMs run ([`gemm_runs_blocked`]).
+    gpu_cores: Option<GpuCores>,
 }
 
 impl SpecializedPipelines {
     /// Wrap an already-constructed cache, every baked kernel `variant`'s tapes name registered.
     pub fn new(cache: Arc<SpecializedPipelineCache>, variant: TapeVariant) -> Self {
-        Self { cache, variant }
+        let gpu_cores = crate::device::gpu_cores(cache.device());
+        Self {
+            cache,
+            variant,
+            gpu_cores,
+        }
     }
 
     /// The tape variant the pool picked.
@@ -144,13 +159,15 @@ impl SpecializedPipelines {
             .map_err(PipelineLookupError::Build)
     }
 
-    /// A dense GEMM's pipeline at `dtype` and its dispatch ([`gemm_pipeline`]).
+    /// A dense GEMM's pipeline at `dtype` and its dispatch ([`gemm_pipeline`]), its body the one
+    /// the device's cores call for.
     pub fn pipeline_for_gemm(
         &self,
         dtype: MetalDtype,
         dims: GemmDims,
     ) -> Result<(ComputePipelineState, DispatchShape), PipelineLookupError> {
-        let (key, dispatch) = gemm_pipeline(dtype, dims)?;
+        let cores = self.gpu_cores.ok_or(PipelineLookupError::UnknownGpuCores)?;
+        let (key, dispatch) = gemm_pipeline(dtype, dims, gemm_runs_blocked(dims.m, cores))?;
         let pipeline = self
             .cache
             .get_or_build(&key)
@@ -168,17 +185,18 @@ impl SpecializedPipelines {
 /// A dense GEMM's pipeline key at `dtype` and its dispatch, keyed on its `(M, N, K)` (constants
 /// 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at least
 /// [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV (`gemv_{f16,bf16}_specialized`),
-/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. A bf16 GEMM of at least
-/// [`GEMM_BLOCKED_ROWS`] rows takes the blocked body (`gemm_bf16_blocked`): 32×32 output tiles
+/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. A bf16 GEMM `blocked`
+/// ([`gemm_runs_blocked`]) takes the blocked body (`gemm_bf16_blocked`): 32×32 output tiles
 /// over 4 simdgroups sharing their A/B tiles, the 8×8-tile GEMM's MMAs in its order — the same
 /// bits. Otherwise the 8×8-tile GEMM (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one
 /// simdgroup per tile. Bindings for all: output 0, input 1, weight 2.
 pub fn gemm_pipeline(
     dtype: MetalDtype,
     dims: GemmDims,
+    blocked: bool,
 ) -> Result<(PipelineKey, DispatchShape), PipelineLookupError> {
     let GemmDims { m, n, k } = dims;
-    let (gemv, blocked) = (m == 1 && n >= GEMV_ROWS, m >= GEMM_BLOCKED_ROWS);
+    let gemv = m == 1 && n >= GEMV_ROWS;
     // The kernel, the outputs a threadgroup covers along N (and M), and its threads.
     let (function, tile, threads) = match (dtype, gemv, blocked) {
         (MetalDtype::F16, false, _) => ("gemm_f16_specialized", 8, 32),
@@ -225,6 +243,8 @@ pub enum PipelineLookupError {
     Build(MetalStreamError),
     /// A command's constant is bound to a value the picked tape variant does not carry.
     Unbound(UnboundConstant),
+    /// The device reports no GPU core count, which picks its dense GEMMs' body.
+    UnknownGpuCores,
 }
 
 impl std::fmt::Display for PipelineLookupError {
@@ -244,6 +264,10 @@ impl std::fmt::Display for PipelineLookupError {
             ),
             Self::Build(e) => write!(f, "specialized pipeline build: {e}"),
             Self::Unbound(e) => write!(f, "specialized pipeline lookup: {e}"),
+            Self::UnknownGpuCores => write!(
+                f,
+                "specialized pipeline lookup: the device reports no GPU core count"
+            ),
         }
     }
 }
@@ -254,6 +278,17 @@ impl std::error::Error for PipelineLookupError {}
 mod tests {
     use super::*;
     use scratchy_ir::CanonicalParams;
+
+    /// The blocked GEMM's cutoff is the base M5's 256 rows on its 10 cores, and moves with the core
+    /// count: a 40-core GPU needs 1024 rows for each core to get as many threadgroups.
+    #[test]
+    fn gemm_runs_blocked_from_the_rows_its_cores_call_for() {
+        let cutoff = |cores| (1..=4096).find(|&m| gemm_runs_blocked(m, GpuCores(cores)));
+        assert_eq!(cutoff(10), Some(256));
+        assert_eq!(cutoff(40), Some(1024));
+        assert_eq!(cutoff(8), Some(205));
+        assert_eq!(cutoff(80), Some(2048));
+    }
 
     /// The probes' tape variant: their `MAX_BLOCKS_PER_SEQ`, no TurboQuant decode attention.
     const PROBE_VARIANT: TapeVariant = TapeVariant {

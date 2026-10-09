@@ -25,9 +25,10 @@ use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
     ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
     KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
-    MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput,
-    RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    MoeStep, NDim, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource,
+    RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
+use crate::tape::targets::MetalTarget;
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
 
@@ -43,10 +44,11 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 }
 use crate::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide,
-    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
-    qmm_w4a8_static_name, qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
-    splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
+    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, get_qmv_batch_limit, pick_qmm_t_kernel,
+    pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
+    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
+    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
+    w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -59,7 +61,7 @@ use crate::tape::lowered::{
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
 /// indices, and the runtime inputs the bake varies over.
 #[derive(Clone, Copy)]
-pub struct BakePoint<'a> {
+pub struct BakePoint {
     /// Chunked-addressing attention variant (spec-decode). A PARAMETER,
     /// not process state: the macro bakes both variants from parallel
     /// threads, and a global here was a cross-model probe race.
@@ -75,7 +77,6 @@ pub struct BakePoint<'a> {
     ///
     /// [`ConstantType::KvCap`]: super::constants::ConstantType::KvCap
     pub block_cap: u32,
-    pub profile: Option<&'a crate::targets::MetalTargetProfile>,
 }
 
 /// The weights a row can bind: its site's sources and the model's class rotary tables.
@@ -87,7 +88,7 @@ struct RowSources<'a> {
 }
 
 impl<'a> RowSources<'a> {
-    fn of_row(sites: &'a [Vec<RowSource>], index: usize, at: &BakePoint<'_>) -> Self {
+    fn of_row(sites: &'a [Vec<RowSource>], index: usize, at: &BakePoint) -> Self {
         let site = sites.get(index).map_or(&[][..], Vec::as_slice);
         let rotary = at.rotary;
         Self {
@@ -135,12 +136,12 @@ impl<'a> RowSources<'a> {
 /// boundary the caller needs to manage. Loop bodies never span the two
 /// halves; if one ever did, the malformed-loop check fires inside the
 /// offending half and surfaces the per-half index.
-pub fn lower_subtile_tape_to_metal(
+pub fn lower_subtile_tape_to_metal<T: MetalTarget>(
     steps: &MetalStepTape,
     p: &MetalModelConsts,
-    at: BakePoint<'_>,
+    at: BakePoint,
 ) -> Result<LoweredMetalTape, LoweringError> {
-    let half = |rows, barriers, sources| lower(p, rows, barriers, sources, &at);
+    let half = |rows, barriers, sources| lower::<T>(p, rows, barriers, sources, &at);
     let bb = half(
         &steps.backbone,
         &steps.backbone_barriers,
@@ -216,13 +217,12 @@ pub fn lower_subtile_tape_to_metal(
 /// The two gates never both hold, so the all-rows matmul reads the gathered buffer as the norm
 /// left it. Otherwise the matmul runs plain and the rest emits nothing. Every other step's
 /// commands pass through.
-fn sample_rows(
+fn sample_rows<T: MetalTarget>(
     p: &MetalModelConsts,
     step: &MetalStep,
     plain: Vec<GatedCommand>,
     bucket_m: u32,
     w: RowSources<'_>,
-    profile: Option<&crate::targets::MetalTargetProfile>,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
     use SampleRowsStep as R;
@@ -237,7 +237,7 @@ fn sample_rows(
         (true, R::Matmul) => {
             let x = Some(crate::tape::lowered::MScaleAxis::X);
             let ix = w.of(WeightKind::Linear, 0)?;
-            let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
+            let codes = T::AFFINE_CODES.for_bits(g.bits.get());
             sampled(affine_qmv_command(
                 p,
                 &g,
@@ -920,13 +920,12 @@ fn route_by_sequence_count(
 /// `AffineQmm` in a bucket that can see a `SMALL_M_TOKENS` step: the twin runs
 /// on those steps (`OnlyIfSmallMTokens`) and the instruction's own GEMM on
 /// every other (`UnlessSmallMTokens`).
-fn route_small_m(
+fn route_small_m<T: MetalTarget>(
     p: &MetalModelConsts,
     step: &MetalStep,
     cmds: Vec<GatedCommand>,
     bucket_m: u32,
     w: RowSources<'_>,
-    profile: Option<&crate::targets::MetalTargetProfile>,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
     // A sample-rows step lowered its matmul, twin included.
@@ -947,7 +946,7 @@ fn route_small_m(
         return Ok(cmds);
     };
     // The small-M kernel reads the codes as stored, signed (offset-8).
-    let codes = super::kernel_constants::AffineCodes::of(profile, 4);
+    let codes = T::AFFINE_CODES.for_bits(4);
     let tile = match SmallMTile::for_bucket(bucket_m) {
         Some(tile)
             if codes == super::kernel_constants::AffineCodes::Offset8
@@ -1088,7 +1087,7 @@ fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
     cmds: Vec<GatedCommand>,
-    at: &BakePoint<'_>,
+    at: &BakePoint,
     moe_scratch_bytes: &mut u32,
 ) -> Vec<GatedCommand> {
     let attention = match step {
@@ -1264,19 +1263,18 @@ fn advance_shape(rows: &[StepRow], times: u32, m_divisor: &mut u32) {
 /// `at.num_arena_slots` is the colored slot count; the lowered tape
 /// carries it through verbatim — the worker uses it to size its
 /// per-shape-class arena. `sources` is each row's weight site.
-fn lower(
+fn lower<T: MetalTarget>(
     p: &MetalModelConsts,
     rows: &[StepRow],
     barriers_in: &[Fence],
     sources: &[Vec<RowSource>],
-    at: &BakePoint<'_>,
+    at: &BakePoint,
 ) -> Result<LoweredMetalTape, LoweringError> {
     let BakePoint {
         chunked,
         bucket_m,
         num_arena_slots,
         block_cap,
-        profile,
         ..
     } = *at;
     let mut commands: Vec<GatedCommand> = Vec::with_capacity(rows.len());
@@ -1373,7 +1371,7 @@ fn lower(
             }
             StepRow::Step(step, gate) => {
                 let w = RowSources::of_row(sources, i, at);
-                let own = lower_one(
+                let own = lower_one::<T>(
                     p,
                     chunked,
                     step,
@@ -1385,14 +1383,13 @@ fn lower(
                     &mut roped_k_scratch_bytes,
                     &mut attn_unfused_scratch_bytes,
                     block_cap,
-                    profile,
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
-                let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
+                let cmds = route_small_m::<T>(p, step, own, bucket_m, w)?;
                 let cmds = route_gdn(p, step, cmds);
                 let cmds = decode_attention_per_kv_head(p, step, cmds, at, &mut moe_scratch_bytes);
-                let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
+                let cmds = sample_rows::<T>(p, step, cmds, bucket_m, w)?;
                 let cmds = sampled_soft_cap(p, step, cmds, bucket_m);
                 let cmds = row_gate(cmds, *gate, i)?;
                 let mut cmds = route_by_sequence_count(i, cmds)?;
@@ -1634,7 +1631,7 @@ fn pair_coresident_param(
 /// elem_size_bytes(dtype)` across every `AffineQmm` in this tape that
 /// picked `SplitK`. The worker uses it to size the shared scratch
 /// buffer that `Binding::Scratch` resolves against.
-fn lower_one(
+fn lower_one<T: MetalTarget>(
     p: &MetalModelConsts,
     chunked: bool,
     inst: &MetalStep,
@@ -1650,7 +1647,6 @@ fn lower_one(
     // sites (block-table row stride + scratch bound) and the rope-once
     // `roped_k_scratch` `num_pages` so long context isn't truncated.
     block_cap: u32,
-    profile: Option<&crate::targets::MetalTargetProfile>,
     // The row-count divisor in force, threaded by `lower()` (1 normally;
     // `vision_merge_factor` after the merger reshape) so post-merge ops
     // dispatch over `bucket_m / m_divisor` rows.
@@ -1678,7 +1674,7 @@ fn lower_one(
             }
             let (writer_site, attention_site) = w.site.split_at(f.writer_sources.min(w.site.len()));
             let mut part = |step: &MetalStep, site| {
-                lower_one(
+                lower_one::<T>(
                     p,
                     chunked,
                     step,
@@ -1690,7 +1686,6 @@ fn lower_one(
                     roped_k_scratch_bytes,
                     attn_unfused_scratch_bytes,
                     block_cap,
-                    profile,
                     m_divisor,
                 )
             };
@@ -2297,8 +2292,7 @@ fn lower_one(
         //     SplitK is a sibling of qmm_t Standard for B==1; lands in
         //     C3 alongside its downstream sum-reduce.
         //
-        // `vector_limit` (`QmvBatchLimit`) rides on the step, baked from
-        // `get_qmv_batch_limit(K, N, arch_gen)`.
+        // `vector_limit` is the target's: `get_qmv_batch_limit::<T>(K, N)`.
         //
         // Bindings match the kernel signatures in `quantized_qmv.metal`
         // and `quantized_qmm.metal`:
@@ -2318,7 +2312,6 @@ fn lower_one(
                 k: KDim(k),
                 group_size: AffineGroupSize(group_size),
                 bits: AffineBits(bits),
-                vector_limit: QmvBatchLimit(vector_limit),
                 ends: _,
             } = g;
             let dtype = dequant_dtype_for(p);
@@ -2327,9 +2320,7 @@ fn lower_one(
             let k_v = *k;
             let bits_v = *bits;
             let gs = *group_size;
-            let vl = *vector_limit;
-
-            if bucket_m < vl {
+            if bucket_m < get_qmv_batch_limit::<T>(k_v, n_v).get() {
                 // Matvec branch (decode-shape). The MLX-mirrored shape
                 // heuristic (qmv_fast when N%8==0 && K%512==0, qmv_quad
                 // when K∈{64,128}, else generic) — measured 0.28 ms /
@@ -2337,11 +2328,7 @@ fn lower_one(
                 // single-stream M1 Max (the sweep's per-CB overhead
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
-                // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539); our
-                // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
-                let wide_ok =
-                    profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
+                let codes = T::AFFINE_CODES.for_bits(g.bits.get());
                 // Every matvec-band kernel takes the folded ends (`qmv_fast_impl`,
                 // `qmv_impl` and `qmv_quad_impl` since #242, `qmv_wide_impl` since the
                 // wide gained them) — at any row count the bucket dispatches it.
@@ -2353,7 +2340,7 @@ fn lower_one(
                     layer,
                     w.of(WeightKind::Linear, 0)?,
                     codes,
-                    wide_ok,
+                    T::AFFINE_QMV_WIDE,
                     qmv_end_weights(g, w, layer_offset)?,
                 )
             // The matmul band takes no ends: the qmm_t kernels have no norm / bias /
@@ -2373,12 +2360,9 @@ fn lower_one(
                 //     collapses the `[split_k, M, N]` partial to
                 //     `[M, N]` in the AffineQmm's out slot.
                 // NAX hardware MMA (`affine_qmm_t_nax`, MPP `matmul2d`):
-                // M5+/A19+ only — `is_nax_capable` gates on arch gen ≥ 17
-                // (MLX `mlx/backend/metal/device.cpp:828`). M4 and earlier
-                // lack the unit (M4's `matmul2d` emulates and produces a
-                // wrong layout), so `is_nax_capable` is false there.
-                // ~3× prefill GEMM speedup on M5.
-                let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+                // `MetalTarget::HAS_NAX`, gen 17 on. ~3× prefill GEMM
+                // speedup on M5.
+                let is_nax = T::HAS_NAX;
                 // 8-bit weights (Gemma4 MLP projections): NAX has
                 // `_b_8_` instantiations (byte-per-element W-loader,
                 // same MMA) — the dominant Gemma4 prefill lever (the
@@ -2404,10 +2388,7 @@ fn lower_one(
                 // in f16, casts back to bf16 on store. Output is bf16
                 // so the residual stream is unchanged. M2+ has
                 // hardware bf16 so we keep T_compute=T_act there.
-                use crate::targets::bf16_simdgroup_is_slow_path;
-                let f16_compute_eligible = profile
-                    .map(|p| bf16_simdgroup_is_slow_path(p.generation))
-                    .unwrap_or(false)
+                let f16_compute_eligible = T::BF16_SIMDGROUP_SLOW
                     && matches!(dtype, DequantDtype::Bf16)
                     && !matches!(kernel, QmmTKernel::Nax)
                     // The mixed-compute (`_c_f16_`) qmm_t kernels (INST_QMM_T_C)
@@ -2426,7 +2407,7 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
+                let codes = T::AFFINE_CODES.for_bits(bits_v);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax)
                         && codes == super::kernel_constants::AffineCodes::Offset8
@@ -2542,7 +2523,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                                codes: T::AFFINE_CODES.for_bits(bits_v),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -2582,7 +2563,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                                codes: T::AFFINE_CODES.for_bits(bits_v),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -2649,7 +2630,7 @@ fn lower_one(
                                 k_partition_size: super::ids::KPartitionSizeI32(
                                     k_partition_size as i32,
                                 ),
-                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                                codes: T::AFFINE_CODES.for_bits(bits_v),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3024,7 +3005,7 @@ fn lower_one(
                 function: affine_embed_kernel_static_name(dtype, scale_dtype, gs, bits_v),
                 constants: super::kernel_constants::AffineEmbedConstants {
                     hidden_size: super::ids::HiddenSize(hidden_size),
-                    codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
+                    codes: T::AFFINE_CODES.for_bits(bits_v),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3108,7 +3089,7 @@ fn lower_one(
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
-            let codes = super::kernel_constants::AffineCodes::of(profile, bits);
+            let codes = T::AFFINE_CODES.for_bits(bits);
             let constants = super::kernel_constants::AffineGatedQmvConstants {
                 qmv: super::kernel_constants::AffineQmvConstants {
                     k: super::ids::KDimI32(k as i32),
@@ -3534,7 +3515,7 @@ fn lower_one(
                 crate::tape::lowered::MetalDtype::Bf16 => "bf16",
                 _ => "f16",
             };
-            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+            let is_nax = T::HAS_NAX;
             let nax_kernel = if is_nax {
                 crate::steel_paged::nax_paged_kernel(steel_dtype_tag, head_dim, block_size)
             } else {
@@ -3549,7 +3530,7 @@ fn lower_one(
                 && nax_kernel.is_none();
             let unfused = if hd512_unfused {
                 use crate::specialized_pipeline_cache::ConstantValue as CV;
-                let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+                let is_nax = T::HAS_NAX;
                 let (rd, po, _on, _bind) = rope_on_read_params(p, !sliding);
                 let nh = p.num_q_heads;
                 let nkv = num_kv_heads.max(1);
@@ -3865,8 +3846,8 @@ fn lower_one(
             // instance lookup fails or, worse, links to the wrong
             // `_bd<X>_` symbol — verified on Llama-3.2-1B, HEAD_DIM=64,
             // before the lookup-driven gate landed).
-            // NAX matrix-accelerator paged attention (M5+/A19+ only —
-            // `is_nax_capable` gates on arch gen ≥ 17). The NAX kernel
+            // NAX matrix-accelerator paged attention (M5+ only —
+            // `MetalTarget::HAS_NAX`, gen 17 on). The NAX kernel
             // (`attention_steel_nax_paged`) drives the Apple matrix accelerator via
             // MPP `matmul2d`: ~3.5× the simdgroup steel kernel on the Llama-3B
             // prefill shape (11.8 vs 3.3 TFLOP/s) and on Qwen3.6's head_dim 256
@@ -4525,7 +4506,7 @@ fn lower_one(
                 AttnMask::Causal => I::AttentionViaCache(*q, *out, *layer, *pairing),
                 AttnMask::SlidingWindow => I::SlidingAttentionViaCache(*q, *out, *layer, *pairing),
             };
-            let via_cache = lower_one(
+            let via_cache = lower_one::<T>(
                 p,
                 chunked,
                 &decode,
@@ -4537,7 +4518,6 @@ fn lower_one(
                 roped_k_scratch_bytes,
                 attn_unfused_scratch_bytes,
                 block_cap,
-                profile,
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
@@ -4545,16 +4525,11 @@ fn lower_one(
             return Ok(via_cache.first().map(twin).into_iter().collect());
         }
         I::Moe(block, step) => {
-            let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             let at = MoeBake {
                 bucket_m,
                 layer_offset,
-                is_nax,
-                f16_compute: profile
-                    .is_some_and(|p| crate::targets::bf16_simdgroup_is_slow_path(p.generation)),
-                codes: super::kernel_constants::AffineCodesTarget::of(profile),
             };
-            return lower_moe_step(p, block, *step, w, at, moe_scratch_bytes);
+            return lower_moe_step::<T>(p, block, *step, w, at, moe_scratch_bytes);
         }
 
         // ── Qwen3.5 Gated-DeltaNet: conv1d → gating → scan → gated-RMSNorm ──
@@ -6519,29 +6494,18 @@ fn make_moe_command(
 struct MoeBake {
     bucket_m: u32,
     layer_offset: u32,
-    /// M5 matrix accelerator: a grouped projection takes the NAX GEMM (the dominant prefill
-    /// lever; the steel grouped GEMM is ~5-10x slower per call).
-    is_nax: bool,
-    /// M1 fast-path: this target's bf16 simdgroup MMA is software emulation
-    /// ([`crate::targets::bf16_simdgroup_is_slow_path`] — Apple7 only), so a
-    /// bf16 model's grouped expert GEMMs run `T_compute=F16` — the same flip
-    /// the qmm_t lowering applies to its Standard kernel, extended to the
-    /// MoE twin that dominates MoE prefill. b4 only; the lowering gates it.
-    f16_compute: bool,
-    /// How this target stores the experts' codes.
-    codes: super::kernel_constants::AffineCodesTarget,
 }
 
 /// Whether a grouped bake's expert GEMMs run W4A8 on the matrix unit's int8 lane: the experts'
 /// codes are stored offset-8 and the shapes fit its tiles. Every expert's run starts on a 64-row
 /// boundary, so each 32-row tile is one expert's. A function of the block and the bake only, so
 /// every step of the block agrees.
-fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
+fn moe_w4a8<T: MetalTarget>(b: &MoeBlock, s: &MoeScratch) -> bool {
     let (hidden, inter) = (b.hidden.0, b.inter.0);
     s.grouping == MoeGrouping::Grouped
-        && at.is_nax
+        && T::HAS_NAX
         && b.quant.widths.uniform().is_some_and(|w| {
-            at.codes.for_bits(w.0) == super::kernel_constants::AffineCodes::Offset8
+            T::AFFINE_CODES.for_bits(w.0) == super::kernel_constants::AffineCodes::Offset8
         })
         && matches!(b.quant.group_size.0, 64 | 128)
         && hidden.is_multiple_of(64.max(W4A8_GROUPED_TILE.cols()))
@@ -6670,7 +6634,7 @@ fn arena_at(binding_index: u8, slot: u32) -> Binding {
 
 /// Lower one step of a MoE block: its command(s) at the block's scratch layout for this bake.
 /// A gathered bake's sort and unsort emit none — their readers bind what they view.
-fn lower_moe_step(
+fn lower_moe_step<T: MetalTarget>(
     p: &MetalModelConsts,
     b: &MoeBlock,
     step: MoeStep,
@@ -6789,7 +6753,7 @@ fn lower_moe_step(
     let each_step = |steps: &[MoeStep], bytes: &mut u32| {
         let mut commands = Vec::new();
         for &step in steps {
-            commands.extend(lower_moe_step(p, b, step, w, at, bytes)?);
+            commands.extend(lower_moe_step::<T>(p, b, step, w, at, bytes)?);
         }
         Ok::<_, LoweringError>(commands)
     };
@@ -7050,7 +7014,7 @@ fn lower_moe_step(
             // W4A8: the bucket's token rows are quantized once, into the `down_out` region
             // (unused until the unsort), and scattered as int8 rows + scales into `x_pad` — not
             // once per expert copy.
-            let w4a8 = moe_w4a8(b, at, &s);
+            let w4a8 = moe_w4a8::<T>(b, &s);
             let quant = w4a8.then(|| {
                 cmd(
                     KernelId::AffineW4a8Quant,
@@ -7143,12 +7107,12 @@ fn lower_moe_step(
             };
             let weights = expert_weights(proj, l, 0)?;
             let bits = width.bits().0;
-            let codes = at.codes.for_bits(bits);
+            let codes = T::AFFINE_CODES.for_bits(bits);
             let dims: Vec<ConstantValue> = [C::int(0, k_in as i32), C::int(1, n_out as i32)]
                 .into_iter()
                 .chain(codes.constant())
                 .collect();
-            let w4a8_tile = moe_w4a8(b, at, &s).then_some(W4A8_GROUPED_TILE);
+            let w4a8_tile = moe_w4a8::<T>(b, &s).then_some(W4A8_GROUPED_TILE);
             if let Some(tile) = w4a8_tile {
                 // y[Mpad, n_out] = gather_qmm_w4a8(x_pad as int8 rows + scales, W, indices_pad):
                 // gate and up read the token rows the sort scattered as int8; down quantizes its
@@ -7202,7 +7166,7 @@ fn lower_moe_step(
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
                 // bits=3 rides NAX like 4/8: the loader's index math is
                 // bits=3-exact and metal_nax.h carries the dequantize branch.
-                let use_nax = at.is_nax
+                let use_nax = T::HAS_NAX
                     && n_out.is_multiple_of(64)
                     && matches!(gs, 64 | 128)
                     && matches!(bits, 3 | 4 | 8);
@@ -7224,12 +7188,14 @@ fn lower_moe_step(
                     // b4 only: the mixed-compute W loader is
                     // nibble-specialized, and the symbol builder falls back
                     // to same-compute for any other width.
-                    let compute_dtype =
-                        if at.f16_compute && bits == 4 && matches!(dtype, DequantDtype::Bf16) {
-                            DequantDtype::F16
-                        } else {
-                            dtype
-                        };
+                    let compute_dtype = if T::BF16_SIMDGROUP_SLOW
+                        && bits == 4
+                        && matches!(dtype, DequantDtype::Bf16)
+                    {
+                        DequantDtype::F16
+                    } else {
+                        dtype
+                    };
                     let symbol = affine_gather_qmm_t_symbol(
                         dtype,
                         compute_dtype,
@@ -7322,7 +7288,7 @@ fn lower_moe_step(
             };
             let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
             let gather = AffineGatherQmvConstants {
-                qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
+                qmv: qmv(inter, hidden, T::AFFINE_CODES.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
             let mut constants: Vec<ConstantValue> =
@@ -7384,7 +7350,7 @@ fn lower_moe_step(
             }
             let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
             let constants = AffineCombineQmvConstants {
-                qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
+                qmv: qmv(hidden, inter, T::AFFINE_CODES.for_bits(bits)),
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),
                 residual: ends.residual,
@@ -7465,7 +7431,31 @@ fn moe_per_expert_scale_symbol(p: &MetalModelConsts) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tape::targets::{AppleGpu, MetalTargetProfile, OnTarget, with_target};
     use scratchy_ir::CanonicalParams;
+
+    /// The tests' targets: an M1, M2 and M5 that are not Ultras.
+    type M1 = AppleGpu<13, false>;
+    type M2 = AppleGpu<14, false>;
+    type M5 = AppleGpu<17, false>;
+
+    /// `rows` lowered at `at` on every target, in [`MetalTargetProfile::BAKED`]'s order.
+    fn lower_everywhere(
+        rows: &MetalStepTape,
+        p: &MetalModelConsts,
+        at: BakePoint,
+    ) -> Vec<LoweredMetalTape> {
+        struct Lower<'a>(&'a MetalStepTape, &'a MetalModelConsts, BakePoint);
+        impl OnTarget for Lower<'_> {
+            type Out = LoweredMetalTape;
+            fn on_target<T: MetalTarget>(self) -> LoweredMetalTape {
+                lower_subtile_tape_to_metal::<T>(self.0, self.1, self.2).expect("lowers")
+            }
+        }
+        (MetalTargetProfile::BAKED.iter())
+            .map(|&target| with_target(target, Lower(rows, p, at)).expect("baked"))
+            .collect()
+    }
 
     fn tp() -> MetalModelConsts {
         MetalModelConsts::from_canonical::<TestParams>()
@@ -7619,17 +7609,13 @@ mod tests {
     }
 
     /// The tests' bake point: 8 arena slots, the test rotary tables, block capacity 128.
-    fn bake_point(
-        bucket_m: u32,
-        profile: Option<&crate::targets::MetalTargetProfile>,
-    ) -> BakePoint<'_> {
+    fn bake_point(bucket_m: u32) -> BakePoint {
         BakePoint {
             chunked: false,
             bucket_m,
             num_arena_slots: 8,
             rotary: Some(TEST_ROTARY),
             block_cap: 128,
-            profile,
         }
     }
 
@@ -7693,7 +7679,7 @@ mod tests {
         rows: Vec<StepRow>,
         bucket_m: u32,
     ) -> Result<LoweredMetalTape, LoweringError> {
-        lower_subtile_tape_to_metal(&row_tape(rows), p, bake_point(bucket_m, None))
+        lower_subtile_tape_to_metal::<M2>(&row_tape(rows), p, bake_point(bucket_m))
     }
 
     /// A one-row step's decode attention running its KV writer lowers to ONE command: the
@@ -7731,7 +7717,7 @@ mod tests {
                 backbone_sources: vec![[TEST_SITE.clone(), TEST_SITE.clone()].concat()],
                 ..MetalStepTape::default()
             };
-            let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
+            let lowered = lower_subtile_tape_to_metal::<M2>(&tape, &p, bake_point(1))
                 .expect("a one-row fold lowers");
             assert_eq!(lowered.commands.len(), 1, "one command");
             let one = &lowered.commands[0];
@@ -7756,7 +7742,7 @@ mod tests {
                 assert!(bound(i), "binding {i}");
             }
             assert_eq!((bound(20), bound(22)), (tq, false));
-            let two = lower_subtile_tape_to_metal(&tape, &p, bake_point(2, None));
+            let two = lower_subtile_tape_to_metal::<M2>(&tape, &p, bake_point(2));
             assert!(matches!(
                 two,
                 Err(LoweringError::OneRowFold { bucket_m: 2 })
@@ -7984,27 +7970,21 @@ mod tests {
             tq_writer(0, Causal, LLAMA_KV),
             attention(MetalStep::AttentionViaCache, 0, Interleaved),
         );
-        let find = |profile, k| {
-            let tape = lower_subtile_tape_to_metal(
-                &row_tape(rows.clone()),
-                &p,
-                bake_point(/*bucket_m=*/ 1, Some(profile)),
-            )
-            .expect("lower_subtile_tape_to_metal");
-            tape.commands
-                .iter()
+        let tapes = lower_everywhere(&row_tape(rows), &p, bake_point(/*bucket_m=*/ 1));
+        let find = |tape: &LoweredMetalTape, k| {
+            (tape.commands.iter())
                 .find(|c| c.command.kernel == k)
                 .expect("command")
                 .command
         };
         let (fp16, tq) = (
-            find(&crate::targets::M1_MAX, KernelId::AttentionViaCache),
-            find(&crate::targets::M1_MAX, KernelId::AttentionViaCacheTq),
+            find(&tapes[0], KernelId::AttentionViaCache),
+            find(&tapes[0], KernelId::AttentionViaCacheTq),
         );
-        for class in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
+        for tape in &tapes {
             assert!(
-                find(class, KernelId::AttentionViaCacheTq) == tq,
-                "one tape per class"
+                find(tape, KernelId::AttentionViaCacheTq) == tq,
+                "one tape per target"
             );
         }
         assert_eq!(p.num_q_heads / p.num_kv_heads, 8);
@@ -8211,7 +8191,7 @@ mod tests {
             backbone_sources: vec![[TEST_SITE.clone(), TEST_SITE.clone()].concat()],
             ..MetalStepTape::default()
         };
-        let folded = lower_subtile_tape_to_metal(&folded, &p, bake_point(1, None))
+        let folded = lower_subtile_tape_to_metal::<M2>(&folded, &p, bake_point(1))
             .expect("a folded per-KV-head decode encodes");
         assert_eq!(
             kernels(&folded),
@@ -8262,16 +8242,16 @@ mod tests {
             ..tp()
         };
         let rows = plain(&[attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX)]);
-        let lower = |profile| {
-            lower_subtile_tape_to_metal(&row_tape(rows.clone()), &p, bake_point(64, profile))
+        fn lower<T: MetalTarget>(rows: &[StepRow], p: &MetalModelConsts) -> LoweredMetalTape {
+            lower_subtile_tape_to_metal::<T>(&row_tape(rows.to_vec()), p, bake_point(64))
                 .expect("lower_subtile_tape_to_metal")
-        };
+        }
         let constant = |c: &LoweredCommand, slot: u16| {
             (c.constants.iter())
                 .find(|k| k.index == slot)
                 .map(|k| k.bits)
         };
-        let m5 = lower(Some(&crate::targets::M5_10CORE));
+        let m5 = lower::<M5>(&rows, &p);
         let kernels = |t: &LoweredMetalTape| {
             (t.commands.iter())
                 .map(|c| c.command.kernel)
@@ -8294,7 +8274,7 @@ mod tests {
         assert_eq!(constant(nax, 7), Some(1024));
         assert_eq!((constant(nax, 10), constant(nax, 14)), (Some(1), None));
 
-        let steel = lower(None);
+        let steel = lower::<M2>(&rows, &p);
         assert_eq!(kernels(&steel)[0], KernelId::RopeOnceSteel);
         let attn = &steel.commands[1].command;
         assert_eq!(attn.library, "attention_steel_paged");
@@ -8382,19 +8362,13 @@ mod tests {
                 n: NDim(3072),
                 k: KDim(8192),
                 bits: AffineBits(bits),
-                vector_limit: QmvBatchLimit(10),
                 ..q_proj()
             })
         };
-        let lower_at = |step, bucket_m, profile| {
-            lower_subtile_tape_to_metal(
-                &row_tape(plain(&[step])),
-                &tp(),
-                bake_point(bucket_m, profile),
-            )
-            .expect("lower_subtile_tape_to_metal")
-        };
-        let m5 = Some(&crate::targets::M5_10CORE);
+        fn lower_at<T: MetalTarget>(step: MetalStep, bucket_m: u32) -> LoweredMetalTape {
+            lower_subtile_tape_to_metal::<T>(&row_tape(plain(&[step])), &tp(), bake_point(bucket_m))
+                .expect("lower_subtile_tape_to_metal")
+        }
         for (bucket_m, own, tile) in [
             // The matvec branch's multi-row pick on NAX is the wide
             // kernel (`qmv_wide`, M ≥ 2) — weight groups dequantized
@@ -8406,7 +8380,7 @@ mod tests {
                 SmallMTile::Rows16,
             ),
         ] {
-            let tape = lower_at(gemm(4), bucket_m, m5);
+            let tape = lower_at::<M5>(gemm(4), bucket_m);
             let mut want: Vec<_> = own.iter().map(|&k| (k, Some(UnlessSmallMTokens))).collect();
             want.push((KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)));
             assert_eq!(gated_steps(&tape), want);
@@ -8452,13 +8426,12 @@ mod tests {
                 "same weights and slots"
             );
         }
-        for (instruction, bucket_m, profile) in [
-            (gemm(4), 1, m5),
-            (gemm(4), 512, m5),
-            (gemm(8), 8, m5),
-            (gemm(4), 8, Some(&crate::targets::M1_8CORE)),
+        for (bucket_m, tape) in [
+            (1, lower_at::<M5>(gemm(4), 1)),
+            (512, lower_at::<M5>(gemm(4), 512)),
+            (8, lower_at::<M5>(gemm(8), 8)),
+            (8, lower_at::<M1>(gemm(4), 8)),
         ] {
-            let tape = lower_at(instruction, bucket_m, profile);
             assert!(
                 tape.commands
                     .iter()
@@ -8468,8 +8441,54 @@ mod tests {
         }
     }
 
-    /// Llama-1B's `q_proj` shape (N=K=2048, gs=64, 4-bit, qmv batch limit 18), slot 7 into slot 11
-    /// at layer 3.
+    /// Each target's first command for `g` in the 8-row bucket, in [`MetalTargetProfile::BAKED`]'s
+    /// order: generations 13 to 17, each not an Ultra and an Ultra.
+    fn first_commands_at_bucket_8(g: AffineMatmul) -> Vec<LoweredCommand> {
+        let rows = row_tape(plain(&[MetalStep::AffineQmm(g)]));
+        (lower_everywhere(&rows, &tp(), bake_point(8)).iter())
+            .map(|tape| tape.commands[0].command)
+            .collect()
+    }
+
+    /// MLX's affine `qmv_wide` from gen 15 on: an M1 or M2 runs the 8 rows through `qmv_fast`, a
+    /// threadgroup row a token re-streaming the weight; an M3 on takes the wide kernel, 4 tokens a
+    /// threadgroup sharing each weight group's reads.
+    #[test]
+    fn affine_matvec_rows_share_their_weight_reads_from_gen_15() {
+        use KernelId::{AffineQmvFast as Fast, AffineQmvWide as Wide};
+        let shapes: Vec<_> = (first_commands_at_bucket_8(q_proj()).iter())
+            .map(|c| (c.kernel, c.dispatch.threadgroups))
+            .collect();
+        let (fast, wide) = ((Fast, (8, 2048 / 4, 1)), (Wide, (2, 2048 / 8, 1)));
+        assert_eq!(
+            shapes,
+            [fast, fast, fast, fast, wide, wide, wide, wide, wide, wide]
+        );
+    }
+
+    /// The matvec band ends at the target's qmv batch limit (MLX v0.32.2): a weight wider than
+    /// 4096 leaves it at 6 rows on an M1 or M2 that is not an Ultra, so its 8-row bucket runs the
+    /// split-K matmul, where an Ultra (12) and every later generation (13) still run the matvec.
+    #[test]
+    fn the_matvec_band_ends_at_the_targets_batch_limit() {
+        use KernelId::{AffineQmmTSplitK as SplitK, AffineQmvFast as Fast, AffineQmvWide as Wide};
+        let wide_weight = AffineMatmul {
+            n: NDim(3072),
+            k: KDim(8192),
+            ..q_proj()
+        };
+        let kernels: Vec<_> = (first_commands_at_bucket_8(wide_weight).iter())
+            .map(|c| c.kernel)
+            .collect();
+        assert_eq!(
+            kernels,
+            [
+                SplitK, Fast, SplitK, Fast, Wide, Wide, Wide, Wide, Wide, Wide
+            ]
+        );
+    }
+
+    /// Llama-1B's `q_proj` shape (N=K=2048, gs=64, 4-bit), slot 7 into slot 11 at layer 3.
     fn q_proj() -> AffineMatmul {
         AffineMatmul {
             input: Slot(7),
@@ -8479,7 +8498,6 @@ mod tests {
             k: KDim(2048),
             group_size: AffineGroupSize(64),
             bits: AffineBits(4),
-            vector_limit: QmvBatchLimit(18),
             ends: QmvEnds::default(),
         }
     }
@@ -8498,9 +8516,9 @@ mod tests {
     }
 
     /// [`q_proj`] lowered on its own at `at`.
-    fn plain_q_proj(at: BakePoint<'_>) -> LoweredMetalTape {
+    fn plain_q_proj<T: MetalTarget>(at: BakePoint) -> LoweredMetalTape {
         let rows = row_tape(plain(&[MetalStep::AffineQmm(q_proj())]));
-        lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers")
+        lower_subtile_tape_to_metal::<T>(&rows, &tp(), at).expect("lowers")
     }
 
     /// Where the matmul lowers to one qmm_t command (bucket 512: Standard), the rows slice: the
@@ -8513,8 +8531,8 @@ mod tests {
         use crate::tape::lowered::MScaleAxis;
         use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
         let rows = sampled_rows([F::Coherent, F::None, F::Coherent, F::None]);
-        let at = bake_point(512, None);
-        let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
+        let at = bake_point(512);
+        let tape = lower_subtile_tape_to_metal::<M2>(&rows, &tp(), at).expect("lowers");
         assert_eq!(
             gated_steps(&tape),
             [
@@ -8529,7 +8547,7 @@ mod tests {
             [F::Coherent, F::None, F::Coherent, F::None]
         );
         // The all-rows command IS the plain matmul's.
-        let plain = plain_q_proj(at);
+        let plain = plain_q_proj::<M2>(at);
         assert!(plain.commands.len() == 1 && tape.commands[3].command == plain.commands[0].command);
         // The gather over the matmul's input, `k` wide; the scatter over its output, `n` wide; one
         // thread per column, walking the sequences in order (the rows move in place).
@@ -8560,51 +8578,50 @@ mod tests {
     fn sampled_rows_run_plain_where_the_matmul_does_not_slice() {
         use crate::tape::lowered::Fence as F;
         use KernelId as K;
-        let m5 = Some(&crate::targets::M5_10CORE);
-        let cases = [
-            (1, None, K::AffineQmvFast),
-            (8, None, K::AffineQmvFast),
-            (64, None, K::SplitKReduceSum),
-            (64, m5, K::AffineQmmSmallM),
-        ];
-        for (gather_fences, (bucket_m, profile, last)) in [F::None, F::Coherent]
-            .into_iter()
-            .flat_map(|g| cases.map(|c| (g, c)))
-        {
+        fn lowered<T: MetalTarget>(bucket_m: u32, gather_fences: F) -> [LoweredMetalTape; 2] {
             let rows = sampled_rows([gather_fences, F::None, F::Coherent, F::Coherent]);
-            let at = bake_point(bucket_m, profile);
-            let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
-            let plain = plain_q_proj(at);
-            assert!(tape.commands == plain.commands, "bucket {bucket_m}: plain");
-            assert_eq!(tape.commands.last().map(|c| c.command.kernel), Some(last));
-            // A first command that writes the shared scratch (split-K's partial, a W4A8
-            // pre-pass) waits out its last reader whatever its row's flag.
-            let writes_scratch = tape.commands.first().is_some_and(|c| {
-                c.command
-                    .bindings
-                    .iter()
-                    .any(|b| matches!(b, Binding::Scratch { .. }))
-            });
-            let flags: Vec<F> = (0..tape.commands.len())
-                .map(|c| {
-                    if c == 0 && writes_scratch {
-                        // A scratch write fences Ordered on its own; the
-                        // elided gather's carried fence maxes with it.
-                        F::Ordered.max(gather_fences)
-                    } else if c > 0 {
-                        // The step's later commands (the SplitK reduce, the
-                        // W4A8 GEMM) read what the first wrote: RAW.
-                        F::Coherent
-                    } else {
-                        gather_fences
-                    }
-                })
-                .collect();
-            assert_eq!(
-                tape.barrier_before, flags,
-                "bucket {bucket_m}, {gather_fences:?}"
-            );
-            assert_eq!(tape.splitk_scratch_bytes, plain.splitk_scratch_bytes);
+            let at = bake_point(bucket_m);
+            let tape = lower_subtile_tape_to_metal::<T>(&rows, &tp(), at).expect("lowers");
+            [tape, plain_q_proj::<T>(at)]
+        }
+        for gather_fences in [F::None, F::Coherent] {
+            for (bucket_m, last, [tape, plain]) in [
+                (1, K::AffineQmvFast, lowered::<M2>(1, gather_fences)),
+                (8, K::AffineQmvFast, lowered::<M2>(8, gather_fences)),
+                (64, K::SplitKReduceSum, lowered::<M2>(64, gather_fences)),
+                (64, K::AffineQmmSmallM, lowered::<M5>(64, gather_fences)),
+            ] {
+                assert!(tape.commands == plain.commands, "bucket {bucket_m}: plain");
+                assert_eq!(tape.commands.last().map(|c| c.command.kernel), Some(last));
+                // A first command that writes the shared scratch (split-K's partial, a W4A8
+                // pre-pass) waits out its last reader whatever its row's flag.
+                let writes_scratch = tape.commands.first().is_some_and(|c| {
+                    c.command
+                        .bindings
+                        .iter()
+                        .any(|b| matches!(b, Binding::Scratch { .. }))
+                });
+                let flags: Vec<F> = (0..tape.commands.len())
+                    .map(|c| {
+                        if c == 0 && writes_scratch {
+                            // A scratch write fences Ordered on its own; the
+                            // elided gather's carried fence maxes with it.
+                            F::Ordered.max(gather_fences)
+                        } else if c > 0 {
+                            // The step's later commands (the SplitK reduce, the
+                            // W4A8 GEMM) read what the first wrote: RAW.
+                            F::Coherent
+                        } else {
+                            gather_fences
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    tape.barrier_before, flags,
+                    "bucket {bucket_m}, {gather_fences:?}"
+                );
+                assert_eq!(tape.splitk_scratch_bytes, plain.splitk_scratch_bytes);
+            }
         }
     }
 
@@ -8627,12 +8644,11 @@ mod tests {
             k: KDim(8192),
             group_size: AffineGroupSize(gs),
             bits: AffineBits(bits),
-            vector_limit: QmvBatchLimit(10),
             ends: QmvEnds::default(),
         };
-        let lower_at = |rows: MetalStepTape, profile| {
-            lower_subtile_tape_to_metal(&rows, &tp(), bake_point(512, profile)).expect("lowers")
-        };
+        fn lower_at<T: MetalTarget>(rows: MetalStepTape) -> LoweredMetalTape {
+            lower_subtile_tape_to_metal::<T>(&rows, &tp(), bake_point(512)).expect("lowers")
+        }
         let backbone = |g| row_tape(plain(&[MetalStep::AffineQmm(g)]));
         let codes = |tape: &LoweredMetalTape| -> Vec<AffineCodes> {
             tape.commands
@@ -8640,9 +8656,7 @@ mod tests {
                 .map(|c| AffineCodes::of_constants(c.command.constants))
                 .collect()
         };
-        let m5 = Some(&crate::targets::M5_10CORE);
-
-        let tape = lower_at(backbone(gemm(64, 4)), m5);
+        let tape = lower_at::<M5>(backbone(gemm(64, 4)));
         assert_eq!(
             gated_steps(&tape),
             [
@@ -8688,16 +8702,23 @@ mod tests {
         );
         assert_eq!(codes(&tape), [AffineCodes::Offset8; 2]);
 
-        for (g, profile, want) in [
-            (gemm(64, 8), m5, AffineCodes::AsWritten),
-            (gemm(32, 4), m5, AffineCodes::Offset8),
+        for (g, tape, want) in [
+            (
+                gemm(64, 8),
+                lower_at::<M5>(backbone(gemm(64, 8))),
+                AffineCodes::AsWritten,
+            ),
+            (
+                gemm(32, 4),
+                lower_at::<M5>(backbone(gemm(32, 4))),
+                AffineCodes::Offset8,
+            ),
             (
                 gemm(64, 4),
-                Some(&crate::targets::M1_8CORE),
+                lower_at::<M1>(backbone(gemm(64, 4))),
                 AffineCodes::AsWritten,
             ),
         ] {
-            let tape = lower_at(backbone(g), profile);
             assert!(
                 tape.commands
                     .iter()
@@ -8716,7 +8737,7 @@ mod tests {
             lm_head_sources: vec![TEST_SITE.clone(); 4],
             ..MetalStepTape::default()
         };
-        let steps = gated_steps(&lower_at(sampled, m5));
+        let steps = gated_steps(&lower_at::<M5>(sampled));
         assert!(steps.contains(&(KernelId::GatherLastToken, Some(OnlyIfNoSpec))));
         assert!(steps.ends_with(&[
             (KernelId::AffineW4a8Quant, Some(OnlyIfSpec)),
@@ -8732,7 +8753,6 @@ mod tests {
     fn w4a8_matmuls_of_one_activation_share_its_pre_pass() {
         use crate::tape::ids::{BodyLen, LayerStride, LoopIters};
         use KernelId::{AffineQmmW4a8 as Gemm, AffineW4a8Quant as Quant};
-        let m5 = Some(&crate::targets::M5_10CORE);
         let gemm = |input, output, n| {
             StepRow::Step(
                 MetalStep::AffineQmm(AffineMatmul {
@@ -8743,7 +8763,6 @@ mod tests {
                     k: KDim(2048),
                     group_size: AffineGroupSize(64),
                     bits: AffineBits(4),
-                    vector_limit: QmvBatchLimit(10),
                     ends: QmvEnds::default(),
                 }),
                 None,
@@ -8765,7 +8784,8 @@ mod tests {
         ];
         let mut tape = row_tape(rows);
         tape.backbone_barriers = vec![Fence::None; 6];
-        let tape = lower_subtile_tape_to_metal(&tape, &tp(), bake_point(512, m5)).expect("lowers");
+        let tape =
+            lower_subtile_tape_to_metal::<M5>(&tape, &tp(), bake_point(512)).expect("lowers");
         let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
         assert_eq!(kinds, [Quant, Gemm, Gemm, Gemm, Quant, Gemm, Quant, Gemm]);
         assert_eq!(
@@ -8795,7 +8815,7 @@ mod tests {
         let cap = MetalStep::TanhSoftCap(Slot(2), Slot(2), ActivationWidth::of_cols(1000));
         let at = |bucket_m| {
             let tape = row_tape(plain(&[cap.clone()]));
-            lower_subtile_tape_to_metal(&tape, &p, bake_point(bucket_m, None)).expect("lowers")
+            lower_subtile_tape_to_metal::<M2>(&tape, &p, bake_point(bucket_m)).expect("lowers")
         };
         let one = at(1);
         assert_eq!(gated_steps(&one), [(KernelId::TanhSoftCap, None)]);
@@ -9258,7 +9278,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &scalar_mul,
@@ -9270,7 +9290,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             128,
-            None,
             1,
         )
         .expect("lower scalar_mul");
@@ -9307,7 +9326,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &inst,
@@ -9319,7 +9338,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             /*block_cap=*/ 128,
-            /*profile=*/ None,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -9398,7 +9416,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &inst,
@@ -9410,7 +9428,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             /*block_cap=*/ 128,
-            /*profile=*/ None,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -9451,7 +9468,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &inst,
@@ -9463,7 +9480,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             /*block_cap=*/ 128,
-            /*profile=*/ None,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -9537,7 +9553,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &inst,
@@ -9549,7 +9565,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             /*block_cap=*/ 128,
-            /*profile=*/ None,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -9612,7 +9627,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &inst,
@@ -9624,7 +9639,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             /*block_cap=*/ 128,
-            /*profile=*/ None,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -9654,7 +9668,7 @@ mod tests {
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
         let mut attn_unfused = 0u32;
-        let cmds = lower_one(
+        let cmds = lower_one::<M2>(
             &tp(),
             /*chunked=*/ false,
             &inst,
@@ -9666,7 +9680,6 @@ mod tests {
             &mut roped_k,
             &mut attn_unfused,
             /*block_cap=*/ 128,
-            /*profile=*/ None,
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -9820,12 +9833,10 @@ mod tests {
             let at = MoeBake {
                 bucket_m,
                 layer_offset: 0,
-                is_nax: false,
-                f16_compute: false,
-                codes: super::super::kernel_constants::AffineCodesTarget::of(None),
             };
             let lower = |step| {
-                lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a MoE step lowers")
+                lower_moe_step::<M2>(&p, &block, step, row(), at, &mut 0)
+                    .expect("a MoE step lowers")
             };
             let router = lower(MoeStep::RouterLogits(tokens, LayerId(0), None));
             assert_eq!(

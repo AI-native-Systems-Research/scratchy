@@ -41,7 +41,6 @@ use scratchy_target_metal::tape::ids::{
 use scratchy_target_metal::tape::kernel_constants::{
     TqCompressConstants, TqOffset, TqStagePass, TqWriteback,
 };
-use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -1485,7 +1484,7 @@ fn check_per_row(c: Case, kernel: PerRow) {
         eprintln!("skipping {}: no Metal 4 GPU", c.name);
         return;
     };
-    if matches!(kernel, PerRow::Nax) && !is_nax_capable(di.profile.generation) {
+    if matches!(kernel, PerRow::Nax) && !di.profile.has_nax() {
         eprintln!("skipping {}: no NAX", c.name);
         return;
     }

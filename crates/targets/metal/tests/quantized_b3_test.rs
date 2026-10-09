@@ -309,7 +309,7 @@ fn qmm_t_nax_b3_bf16_prefill_shape() {
         eprintln!("skipping: no Metal device");
         return;
     };
-    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+    if !di.profile.has_nax() {
         eprintln!(
             "skipping NAX b3 parity on non-NAX hardware ({:?})",
             di.profile.generation

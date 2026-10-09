@@ -32,7 +32,7 @@ fn detect_nax_device() -> Option<scratchy_target_metal::MetalDevice> {
         eprintln!("skipping: no Metal 4 device");
         return None;
     };
-    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+    if !di.profile.has_nax() {
         eprintln!("skipping: non-NAX GPU ({:?})", di.profile.generation);
         return None;
     }

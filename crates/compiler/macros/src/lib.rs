@@ -705,15 +705,15 @@ pub fn compile_carrier(
     // for a search that is not compiled in. What still has to happen is the PROBE: it fails the
     // build when no Metal device is present.
     //
-    // Compile-time profile only — does NOT require Metal 4 (unlike the runtime
-    // `detect_device()`), so models build on non-Metal-4 hosts.
+    // Presence only — does NOT require Metal 4 (unlike the runtime `detect_device()`), so models
+    // build on non-Metal-4 hosts; the bake lowers a tape for every target, whatever the host is.
     #[cfg(feature = "metal")]
-    scratchy_target_metal::device::detect_metal_profile().ok_or_else(|| {
-        syn::Error::new(
+    if !scratchy_target_metal::device::metal_device_present() {
+        return Err(syn::Error::new(
             name_span,
             "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
-        )
-    })?;
+        ));
+    }
 
     // Spyre/KTIR is a host backend with no GPU cost model. The solver only
     // needs a profile to cover the FUF with spyre's own claim impls, which the

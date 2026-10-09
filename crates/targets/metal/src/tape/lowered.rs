@@ -196,7 +196,7 @@ pub enum KernelId {
     /// ~5-10x slower per call). BM=64 tile. Maps to
     /// `affine_gather_qmm_t_nax_<dtype>_s_<scale>_gs_<gs>_b_4_alN_<bool>
     /// _batch_0` in `quantized_qmm_nax.metallib`. Same bindings/constants
-    /// as `AffineGatherQmmT`. Dispatched when `is_nax_capable` + N%64==0
+    /// as `AffineGatherQmmT`. Dispatched when `MetalTarget::HAS_NAX` + N%64==0
     /// + gs in {64,128}.
     AffineGatherQmmTNax,
     /// MLX-affine int4 prefill matmul, transpose=true, split-K
@@ -207,10 +207,10 @@ pub enum KernelId {
     /// emitted by the lowering pass (mirroring
     /// `quantized.cpp:861 strided_reduce_general_dispatch`).
     AffineQmmTSplitK,
-    /// NAX (Apple9 / M4+) prefill matmul — 64×64×64 MPP matmul2d tile.
+    /// NAX (gen 17+, M5) prefill matmul — 64×64×64 MPP matmul2d tile.
     /// Maps to `affine_qmm_t_nax_<dtype>_gs_<gs>_b_4_alN_<bool>_batch_0`
     /// in `quantized_qmm_nax.metallib`. Only dispatched when
-    /// `is_nax_capable(profile.generation)` and `K % 64 == 0`.
+    /// `MetalTarget::HAS_NAX` and `K % 64 == 0`.
     AffineQmmTNax,
     /// NAX decode-batch matmul: the 4-bit codes as the MPP `matmul2d`
     /// operand, one threadgroup's rows covering the batch, so each weight is
@@ -241,11 +241,11 @@ pub enum KernelId {
     /// to `nvfp4_qmm_t_<dtype>_s_<scale>_gs_16_b_4_alN_<bool>_batch_0`
     /// in `quantized_qmm.metallib`. Mirrors `AffineQmmT`.
     Nvfp4QmmT,
-    /// NVFP4 int4 prefill matmul on NAX (Apple9 / M4+) — 64×64 MPP
+    /// NVFP4 int4 prefill matmul on NAX (gen 17+, M5) — 64×64 MPP
     /// matmul2d tile. Maps to
     /// `nvfp4_qmm_t_nax_<dtype>_s_<scale>_gs_16_b_4_alN_<bool>_batch_0`
     /// in `quantized_qmm_nax.metallib`. Dispatched (in place of
-    /// `Nvfp4QmmT`) when `is_nax_capable(profile.generation)` and
+    /// `Nvfp4QmmT`) when `MetalTarget::HAS_NAX` and
     /// `K % 64 == 0`. Mirrors `AffineQmmTNax`.
     Nvfp4QmmTNax,
     /// Fused `silu(gate) * up` for the decomposed q-MLP path. The
@@ -2043,40 +2043,8 @@ impl std::error::Error for LoweringError {}
 
 // ── Static-tape classing (macro-baked, load-selected) ───────────────
 
-/// Device-generation class a baked tape variant targets. The lowering's
-/// only device-profile dependence is `AppleSiliconGen` (NAX capability
-/// and the M1 bf16-simdgroup slow path), so three classes cover every
-/// chip; variants that lower identically are deduped at expansion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub enum GenClass {
-    /// M1 family (no NAX, bf16 simdgroup emulated).
-    M1,
-    /// M2/M3/M4 (no NAX, native bf16 simdgroup).
-    Mid,
-    /// M5+ (NAX hardware MMA).
-    M5,
-}
-
-impl GenClass {
-    pub fn of(generation: crate::tape::targets::AppleSiliconGen) -> Self {
-        use crate::tape::targets::AppleSiliconGen as G;
-        match generation {
-            G::M1 => GenClass::M1,
-            G::M2 | G::M3 | G::M4 => GenClass::Mid,
-            G::M5 => GenClass::M5,
-        }
-    }
-
-    /// Whether this class stores MLX-affine 4-bit weight codes XOR 0x88
-    /// (signed q - 8): the matrix unit's int8 x int4 lane reads them as
-    /// stored (the W4A8 GEMM). The weight loader flips them on load and the
-    /// lowering tells every other reader to flip them back
-    /// ([`AffineCodes`](super::kernel_constants::AffineCodes)) — one fact,
-    /// read by both.
-    pub fn stores_affine_b4_offset8(self) -> bool {
-        matches!(self, GenClass::M5)
-    }
-}
+// A baked rung's key, named here too: the baked tape spells it `__tl::MetalTargetProfile`.
+pub use super::targets::MetalTargetProfile;
 
 /// How a tape's KV readers address the paged cache: a workload fact the caller names when it
 /// picks a rung.
@@ -2092,12 +2060,12 @@ pub enum KvAddressing {
 }
 
 /// One baked tape rung: the full [`LoweredMetalTape`] lowered at expansion for a
-/// `(generation class, KV addressing, KV cap, TurboQuant decode heads)` point, every fact of
+/// `(target, KV addressing, KV cap, TurboQuant decode heads)` point, every fact of
 /// it a constant. The pool picks the rung for its device, workload and KV capacity at load —
 /// selection only, no analysis, no substitution.
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ClassedTape {
-    pub gen_class: GenClass,
+    pub target: MetalTargetProfile,
     pub addressing: KvAddressing,
     /// The KV cap rung: the blocks per sequence the tape's block-table stride, scratch sizes and
     /// dispatches are baked for. It serves every capacity up to it.
@@ -2109,11 +2077,11 @@ pub struct ClassedTape {
 }
 
 impl ClassedTape {
-    /// The rung `(gen_class, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
+    /// The rung `(target, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
     /// the roped-K and unfused-attention scratch bytes its cap sizes.
     pub const fn rung(
         body: LoweredMetalTape,
-        gen_class: GenClass,
+        target: MetalTargetProfile,
         addressing: KvAddressing,
         cap: MaxBlocksPerSeq,
         tq_heads: Option<TqDecodeHeads>,
@@ -2125,7 +2093,7 @@ impl ClassedTape {
             ..body
         };
         Self {
-            gen_class,
+            target,
             addressing,
             cap,
             tq_heads,

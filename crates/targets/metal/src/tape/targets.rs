@@ -1,156 +1,131 @@
 // Copyright © 2024 Apple Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Metal target profiles for Apple Silicon devices.
+//! The Metal GPU a tape targets: the constants its architecture name carries.
 //!
-//! Provides device-specific parameters for M1-M5 chips. Kernel
-//! selection is closed-form (see `tape::quantized`); costs, where a
-//! solver still wants them, come from the analytical roofline
-//! (bandwidth/TFLOPS below) — there is no empirical cost table.
+//! `MTLDevice.architecture.name` reads `applegpu_g<GEN><size>` — `applegpu_g17g` is a base M5,
+//! `applegpu_g13d` an M1 Ultra. MLX keys every per-device choice on those two facts
+//! (`device.cpp`: `get_architecture_gen`, `get_architecture().back()`); so does the lowering, which
+//! is generic over an [`AppleGpu<GEN, ULTRA>`](AppleGpu) and reads every setting off its
+//! [`MetalTarget`] consts. One tape is baked per target; the device picks its own at load.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-/// Apple Silicon architecture generation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AppleSiliconGen {
-    M1,
-    M2,
-    M3,
-    M4,
-    /// Apple9 gen 17+ — first generation with the NAX (Neural Accelerator
-    /// eXtension) hardware MMA. See [`is_nax_capable`].
-    M5,
-}
+use super::ids::QmvBatchLimit;
+use super::kernel_constants::AffineCodesTarget;
 
-/// Metal device profile containing hardware specs and cost models
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A Metal target as a value: a device's parsed architecture, or a baked tape's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct MetalTargetProfile {
-    /// Architecture generation (M1/M2/M3/M4)
-    pub generation: AppleSiliconGen,
-
-    /// Peak TFLOPS for FP16 operations
-    pub peak_tflops_fp16: f64,
-
-    /// Memory bandwidth in GB/s
-    pub memory_bandwidth_gbps: f64,
-
-    /// Unified memory size in GB
-    pub unified_memory_gb: u32,
-
-    /// Maximum threadgroup memory in bytes (32KB for all Apple Silicon)
-    pub threadgroup_memory_bytes: u32,
-
-    /// Maximum threads per threadgroup
-    pub max_threads_per_threadgroup: u32,
+    /// The architecture generation: 13 = M1, 14 = M2, 15 = M3, 16 = M4, 17 = M5.
+    pub generation: u32,
+    /// An Ultra (architecture letter `d`), which MLX tunes apart.
+    pub ultra: bool,
 }
 
-/// M1 device profile (base model, 8 GPU cores)
-pub const M1_8CORE: MetalTargetProfile = MetalTargetProfile {
-    generation: AppleSiliconGen::M1,
-    peak_tflops_fp16: 2.6,
-    memory_bandwidth_gbps: 68.25,
-    unified_memory_gb: 16,
-    threadgroup_memory_bytes: 32768,
-    max_threads_per_threadgroup: 1024,
-};
+impl MetalTargetProfile {
+    /// The newest generation a tape is baked for: a later one has all its features.
+    pub const NEWEST_GENERATION: u32 = 17;
 
-/// M1 Max device profile (32 GPU cores)
-pub const M1_MAX: MetalTargetProfile = MetalTargetProfile {
-    generation: AppleSiliconGen::M1,
-    peak_tflops_fp16: 10.4,
-    memory_bandwidth_gbps: 400.0,
-    unified_memory_gb: 64,
-    threadgroup_memory_bytes: 32768,
-    max_threads_per_threadgroup: 1024,
-};
+    /// Every target a tape is baked for: each generation from the M1's, Ultra and not.
+    pub const BAKED: [Self; 10] = {
+        let mut all = [Self {
+            generation: 13,
+            ultra: false,
+        }; 10];
+        let mut i = 0;
+        while i < all.len() {
+            all[i] = Self {
+                generation: 13 + i as u32 / 2,
+                ultra: i % 2 == 1,
+            };
+            i += 1;
+        }
+        all
+    };
 
-/// M2 device profile (10 GPU cores)
-pub const M2_10CORE: MetalTargetProfile = MetalTargetProfile {
-    generation: AppleSiliconGen::M2,
-    peak_tflops_fp16: 3.6,
-    memory_bandwidth_gbps: 100.0,
-    unified_memory_gb: 24,
-    threadgroup_memory_bytes: 32768,
-    max_threads_per_threadgroup: 1024,
-};
+    /// The target of the GPU whose architecture is `name` (`applegpu_g<GEN><size>`); `None` for a
+    /// name of another shape, or a generation before the M1's.
+    pub fn of_architecture(name: &str) -> Option<Self> {
+        let rest = name.strip_prefix("applegpu_g")?;
+        let letter = rest.chars().last()?;
+        let generation: u32 = rest[..rest.len() - letter.len_utf8()].parse().ok()?;
+        (generation >= 13).then_some(Self {
+            generation: generation.min(Self::NEWEST_GENERATION),
+            ultra: letter == 'd',
+        })
+    }
 
-/// M3 device profile (base model, 10 GPU cores)
-pub const M3_10CORE: MetalTargetProfile = MetalTargetProfile {
-    generation: AppleSiliconGen::M3,
-    peak_tflops_fp16: 4.0,
-    memory_bandwidth_gbps: 100.0,
-    unified_memory_gb: 24,
-    threadgroup_memory_bytes: 32768,
-    max_threads_per_threadgroup: 1024,
-};
+    /// The NAX matrix unit: MLX `is_nax_available`, gen ≥ 17. An M4 runs MPP `matmul2d` emulated on
+    /// the simdgroup matmul, with a per-thread layout that is not `BaseNAXFrag`'s.
+    pub const fn has_nax(self) -> bool {
+        self.generation >= 17
+    }
 
-/// M4 device profile (10 GPU cores)
-pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
-    generation: AppleSiliconGen::M4,
-    peak_tflops_fp16: 4.5,
-    memory_bandwidth_gbps: 120.0,
-    unified_memory_gb: 24,
-    threadgroup_memory_bytes: 32768,
-    max_threads_per_threadgroup: 1024,
-};
+    /// Whether an affine matvec over two or more rows takes `qmv_wide`: MLX `use_qmv_wide`
+    /// ("affine qmv_wide only beats qmv on gen-15+").
+    pub const fn affine_qmv_wide(self) -> bool {
+        self.generation >= 15
+    }
 
-/// M5 device profile (base model, 10 GPU cores).
-///
-/// First generation with NAX hardware MMA (gen 17 ≥ 17 — see
-/// [`is_nax_capable`]). Perf figures are estimates pending a cost sweep
-/// on this chip; the empty `cost_table` forces the solver onto the
-/// analytical roofline, so these only affect cost-model scoring, not
-/// correctness.
-pub const M5_10CORE: MetalTargetProfile = MetalTargetProfile {
-    generation: AppleSiliconGen::M5,
-    peak_tflops_fp16: 5.0,
-    memory_bandwidth_gbps: 150.0,
-    unified_memory_gb: 24,
-    threadgroup_memory_bytes: 32768,
-    max_threads_per_threadgroup: 1024,
-};
+    /// Whether bf16 simdgroup MMAs run emulated (the M1s): ~1.7× slower than f16 (4.58 vs 7.74
+    /// TF/s on `affine_qmm_t_*_gs_64_b_4_alN_true_batch_0`, M=1024 N=3072 K=3072), so a bf16
+    /// model's qmm_t computes in f16 — casting inside the kernel only; the residual stream stays
+    /// bf16.
+    pub const fn bf16_simdgroup_slow(self) -> bool {
+        self.generation == 13
+    }
 
-/// Returns `true` if the given generation has the NAX (Neural Accelerator
-/// eXtension) hardware MMA that MLX's `BaseNAXFrag` cooperative-tensor
-/// layout assumes.
-///
-/// NAX is **M5+ / A19+ only** — not M4. MLX's own gate is `arch_gen >= 17`
-/// (M5 is gen 17, M4 is gen 16; see `mlx/backend/metal/device.cpp:828`
-/// `is_nax_available`). `MetalPerformancePrimitives matmul2d` is callable
-/// on M4 but emulates via the standard simdgroup matmul with a
-/// cooperative-tensor per-thread layout that does NOT match
-/// `BaseNAXFrag`'s 2-row × 4-col assumption.
-///
-/// Returns `false` for M1–M4 (gen ≤ 16, no NAX hardware — M4 emulates
-/// `matmul2d` via the standard simdgroup matmul, yielding a
-/// cooperative-tensor layout that does NOT match `BaseNAXFrag`). Returns
-/// `true` for M5+ (gen ≥ 17), validated against the layout probe on an
-/// Apple M5 (MacBook Pro, macOS 26.5): the `ct_c` per-thread coords come
-/// back in the contiguous 2×4 `BaseNAXFrag` pattern, distinct from the
-/// M4 emulation layout.
-pub fn is_nax_capable(g: AppleSiliconGen) -> bool {
-    matches!(g, AppleSiliconGen::M5)
+    /// Whether 4-bit MLX-affine codes are stored XOR 0x88 (signed q - 8): the matrix unit's int8 x
+    /// int4 lane reads them as stored (the W4A8 GEMM). The weight loader flips them on load and the
+    /// lowering tells every other reader to flip them back — one fact, read by both.
+    pub const fn stores_affine_b4_offset8(self) -> bool {
+        self.has_nax()
+    }
 }
 
-/// Returns `true` when the GPU's bf16 simdgroup MMA path is slow
-/// enough that loading bf16 from memory and running the MMA in fp16
-/// is a perf win — the M1 generation only.
-///
-/// On M1 (Apple7), `simdgroup_multiply_accumulate` of
-/// `simdgroup_matrix<bfloat>` runs through a software emulation path
-/// and clocks ~1.7× slower than `simdgroup_matrix<half>` on the same
-/// shapes (validated empirically: 4.58 TF/s bf16 vs 7.74 TF/s f16 on
-/// `affine_qmm_t_*_gs_64_b_4_alN_true_batch_0` at M=1024 N=3072 K=3072).
-/// M2 added partial hardware bf16 support; M3+ has fully accelerated
-/// bf16 plus the NAX matrix unit.
-///
-/// The qmm_t lowering reads this to pick a `T_compute=half`
-/// instantiation when the model's activation dtype is bf16, casting
-/// bf16↔half inside the kernel only — the residual stream stays bf16
-/// so dynamic-range correctness is preserved (full-f16 streams break
-/// Llama-3.x exponent range — see `scratchy-forward-compiler/src/instr.rs:199-202`).
-pub fn bf16_simdgroup_is_slow_path(g: AppleSiliconGen) -> bool {
-    matches!(g, AppleSiliconGen::M1)
+/// An Apple GPU of architecture generation `GEN`, an Ultra or not: the Metal target as a type.
+pub struct AppleGpu<const GEN: u32, const ULTRA: bool>;
+
+/// Every setting a tape is lowered at, a const of its target.
+pub trait MetalTarget {
+    const PROFILE: MetalTargetProfile;
+    const HAS_NAX: bool = Self::PROFILE.has_nax();
+    const AFFINE_QMV_WIDE: bool = Self::PROFILE.affine_qmv_wide();
+    const BF16_SIMDGROUP_SLOW: bool = Self::PROFILE.bf16_simdgroup_slow();
+    const AFFINE_CODES: AffineCodesTarget = AffineCodesTarget::of(Some(Self::PROFILE));
+    const QMV_BATCH_LIMITS: [QmvBatchLimit; 3] = super::quantized::qmv_batch_limits(Self::PROFILE);
+}
+
+impl<const GEN: u32, const ULTRA: bool> MetalTarget for AppleGpu<GEN, ULTRA> {
+    const PROFILE: MetalTargetProfile = MetalTargetProfile {
+        generation: GEN,
+        ultra: ULTRA,
+    };
+}
+
+/// What runs at one target, the target a type: the consumer side of [`with_target`].
+pub trait OnTarget {
+    type Out;
+    fn on_target<T: MetalTarget>(self) -> Self::Out;
+}
+
+/// The one door from a target value to its type. `None` for a target no tape is baked for.
+pub fn with_target<C: OnTarget>(target: MetalTargetProfile, consumer: C) -> Option<C::Out> {
+    fn sized<const GEN: u32, C: OnTarget>(ultra: bool, consumer: C) -> C::Out {
+        match ultra {
+            false => consumer.on_target::<AppleGpu<GEN, false>>(),
+            true => consumer.on_target::<AppleGpu<GEN, true>>(),
+        }
+    }
+    Some(match target.generation {
+        13 => sized::<13, C>(target.ultra, consumer),
+        14 => sized::<14, C>(target.ultra, consumer),
+        15 => sized::<15, C>(target.ultra, consumer),
+        16 => sized::<16, C>(target.ultra, consumer),
+        17 => sized::<17, C>(target.ultra, consumer),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -158,9 +133,30 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::assertions_on_constants)] // deliberate const sanity checks on the profile tables
-    fn test_profile_constants() {
-        assert_eq!(M1_8CORE.generation, AppleSiliconGen::M1);
-        assert!(M3_10CORE.peak_tflops_fp16 > M2_10CORE.peak_tflops_fp16);
+    fn architecture_names_carry_the_target() {
+        let at = |generation, ultra| Some(MetalTargetProfile { generation, ultra });
+        let of = MetalTargetProfile::of_architecture;
+        assert_eq!(of("applegpu_g13s"), at(13, false));
+        assert_eq!(of("applegpu_g13d"), at(13, true));
+        assert_eq!(of("applegpu_g16g"), at(16, false));
+        assert_eq!(of("applegpu_g17g"), at(17, false));
+        assert_eq!(of("applegpu_g18s"), at(17, false));
+        assert_eq!(of("applegpu_g12g"), None);
+        assert_eq!(of("Apple Paravirtual device"), None);
+    }
+
+    /// The door hands every baked target its own type.
+    #[test]
+    fn every_baked_target_has_its_type() {
+        struct Profile;
+        impl OnTarget for Profile {
+            type Out = MetalTargetProfile;
+            fn on_target<T: MetalTarget>(self) -> MetalTargetProfile {
+                T::PROFILE
+            }
+        }
+        for target in MetalTargetProfile::BAKED {
+            assert_eq!(with_target(target, Profile), Some(target));
+        }
     }
 }

@@ -754,7 +754,7 @@ impl MetalAllocator {
 
     /// How this device's kernels read MLX-affine codes.
     fn affine_codes_target(&self) -> AffineCodesTarget {
-        AffineCodesTarget::of(Some(&crate::device::profile_for_device(&self.device)))
+        AffineCodesTarget::of(crate::device::known_profile(&self.device))
     }
 
     /// The buffer binding for the MLX-affine packed codes `ptr..ptr + len`,

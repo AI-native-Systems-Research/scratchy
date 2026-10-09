@@ -21,6 +21,9 @@
 //!
 //! Bits = 4 only; other bits land alongside the qmv/qmm kernels.
 
+use crate::tape::ids::QmvBatchLimit;
+use crate::tape::targets::{MetalTarget, MetalTargetProfile};
+
 /// Activation / output dtype the affine quant kernels read and write —
 /// the kernel template parameter `T_act`.
 /// Picks between the `affine_*_f16_s_*_*` and `affine_*_bf16_s_*_*`
@@ -82,7 +85,7 @@ pub enum QmvKernel {
 
 /// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
 /// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+,
-/// which maps to our `is_nax_capable` boundary — M5), then fast/generic.
+/// [`MetalTarget::AFFINE_QMV_WIDE`]), then fast/generic.
 ///
 /// ```text
 /// if ((K == 128 || K == 64) && is_power_of_2(bits)) → qmv_quad(d=K)
@@ -269,50 +272,58 @@ pub fn qmv_kernel_static_name(
 }
 
 // ─────────────────────────────────────────────────────────────────
-// `get_qmv_batch_limit` — port of `quantized.cpp:84`. Decides where
-// the matvec / matmul boundary sits per arch generation. Used by
-// `lower_one` to choose between `Instruction::AffineQmm` (matvec
-// branch) and `Instruction::Gemm`-equivalent (matmul branch).
+// `get_qmv_batch_limit` — port of MLX v0.32.2 `quantized.cpp:85`.
+// Where the matvec / matmul boundary sits on a target.
 // ─────────────────────────────────────────────────────────────────
 
-/// The smallest `vector_limit` [`get_qmv_batch_limit`] returns over every `(K, N, arch_gen)` — the
-/// matvec band's floor. Every bucket of at most this many minus one rows is in the matvec band for
-/// every shape and every gen class, whatever it lowers: the shared fold pass may fold a matmul's
+/// MLX's qmv batch limits on `target` (`quantized.cpp:85`, v0.32.2): the rows from which a matmul
+/// whose `K` and `N` are both at most 2048, both at most 4096, or either larger takes the matrix
+/// kernel.
+pub const fn qmv_batch_limits(target: MetalTargetProfile) -> [QmvBatchLimit; 3] {
+    let [small, medium, large] = match (target.generation, target.ultra) {
+        (_, true) => [32, 18, 12],
+        (17.., false) => [33, 25, 13],
+        (15 | 16, false) => [13, 15, 13],
+        (_, false) => [14, 10, 6],
+    };
+    [
+        QmvBatchLimit(small),
+        QmvBatchLimit(medium),
+        QmvBatchLimit(large),
+    ]
+}
+
+/// The most rows a bucket can have and still be in the matvec band on every target and shape: one
+/// fewer than the smallest of the [`qmv_batch_limits`]. The shared fold pass may fold a matmul's
 /// ends there ([`ModelFoldFacts::matvec_ends`]) and the bucket folding must not merge buckets
 /// across the boundary (the Sorted/Grouped MoE groupings of a bigger bucket cannot take them).
-pub const QMV_MATVEC_BAND_ROWS: u32 = 5;
+pub const QMV_MATVEC_BAND_ROWS: u32 = {
+    let mut floor = u32::MAX;
+    let mut i = 0;
+    while i < MetalTargetProfile::BAKED.len() {
+        let limits = qmv_batch_limits(MetalTargetProfile::BAKED[i]);
+        let mut j = 0;
+        while j < limits.len() {
+            if limits[j].0 < floor {
+                floor = limits[j].0;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    floor - 1
+};
 
-/// Vector-vs-matrix limit for a given `(K, N, arch_gen)`. M < limit
-/// routes to `qmv*`; M >= limit routes to `qmm*` (P4).
-///
-/// MLX models the `arch_size` ('d' for desktop variants like M3 Ultra
-/// vs. anything else) — scratchy's `MetalTargetProfile` doesn't track
-/// that today, so we conservatively use the non-'d' branch (smaller
-/// limits, more aggressive matvec routing). This matches MacBook Pro
-/// M3/M4 Pro/Max behavior; M3/M4 Ultra would over-route to matvec
-/// versus MLX, which is correct (qmv kernels handle small M fine —
-/// just slightly less efficient than qmm at the high-M boundary).
-pub fn get_qmv_batch_limit(k: u32, n: u32, arch_gen: crate::tape::targets::AppleSiliconGen) -> u32 {
-    use crate::tape::targets::AppleSiliconGen as G;
-    match arch_gen {
-        G::M1 | G::M2 => {
-            if k <= 2048 && n <= 2048 {
-                14
-            } else if k <= 4096 && n <= 4096 {
-                10
-            } else {
-                6
-            }
-        }
-        G::M3 | G::M4 | G::M5 => {
-            if k <= 2048 && n <= 2048 {
-                18
-            } else if k <= 4096 && n <= 4096 {
-                12
-            } else {
-                10
-            }
-        }
+/// The matvec/matmul boundary of a `k × n` weight on target `T`: a bucket of fewer rows takes
+/// `qmv*`, one of at least as many `qmm*`.
+pub fn get_qmv_batch_limit<T: MetalTarget>(k: u32, n: u32) -> QmvBatchLimit {
+    let [small, medium, large] = T::QMV_BATCH_LIMITS;
+    if k <= 2048 && n <= 2048 {
+        small
+    } else if k <= 4096 && n <= 4096 {
+        medium
+    } else {
+        large
     }
 }
 
@@ -335,7 +346,7 @@ pub enum QmmTKernel {
     /// `qmm_splitk` heuristic at `quantized.cpp:788-805` targets
     /// ~512 threadgroups; falls back to `Standard` if split_k ≤ 1).
     SplitK { split_k: u32, k_partition_size: u32 },
-    /// `affine_qmm_t_nax_*_alN_<bool>_batch_0` — NAX (Apple9 / M4+)
+    /// `affine_qmm_t_nax_*_alN_<bool>_batch_0` — NAX (gen 17+, M5)
     /// MMA path using `MetalPerformancePrimitives matmul2d`. Only
     /// selected when `is_nax == true` AND `K % 64 == 0`.
     /// 64×64×64 tile, no split-K (MLX NAX path at `quantized.cpp:695`).
@@ -376,7 +387,7 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
 /// else if transpose:                                qmm (transpose=true)
 /// ```
 ///
-/// `is_nax` should be `crate::tape::targets::is_nax_capable(profile.generation)`.
+/// `is_nax` is the target's [`MetalTarget::HAS_NAX`].
 ///
 /// gs=32 is excluded from NAX dispatch because the BK=64 NAX shader
 /// violates `BCOLS <= group_size` for gs=32; MLX handles that with a
@@ -1108,7 +1119,6 @@ pub fn qvm_kernel_static_name(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tape::targets::AppleSiliconGen;
 
     #[test]
     fn qmv_kernel_pick_follows_mlx_dispatch_qmv() {
@@ -1416,16 +1426,23 @@ mod tests {
     }
 
     #[test]
-    fn qmv_batch_limit_matches_mlx_table() {
-        // M3+ default branch (non-'d'): 18, 12, 10 per (K, N) buckets
-        assert_eq!(get_qmv_batch_limit(2048, 2048, AppleSiliconGen::M3), 18);
-        assert_eq!(get_qmv_batch_limit(4096, 4096, AppleSiliconGen::M3), 12);
-        assert_eq!(get_qmv_batch_limit(8192, 8192, AppleSiliconGen::M3), 10);
-        assert_eq!(get_qmv_batch_limit(2048, 2048, AppleSiliconGen::M4), 18);
-
-        // M1/M2 branch: 14, 10, 6
-        assert_eq!(get_qmv_batch_limit(2048, 2048, AppleSiliconGen::M1), 14);
-        assert_eq!(get_qmv_batch_limit(4096, 4096, AppleSiliconGen::M2), 10);
-        assert_eq!(get_qmv_batch_limit(8192, 8192, AppleSiliconGen::M1), 6);
+    fn qmv_batch_limit_matches_mlx_v0_32_2() {
+        use crate::tape::targets::AppleGpu;
+        fn at<T: MetalTarget>() -> [u32; 3] {
+            [2048, 4096, 8192].map(|kn| get_qmv_batch_limit::<T>(kn, kn).get())
+        }
+        assert_eq!(at::<AppleGpu<13, false>>(), [14, 10, 6]);
+        assert_eq!(at::<AppleGpu<14, false>>(), [14, 10, 6]);
+        assert_eq!(at::<AppleGpu<15, false>>(), [13, 15, 13]);
+        assert_eq!(at::<AppleGpu<16, false>>(), [13, 15, 13]);
+        assert_eq!(at::<AppleGpu<17, false>>(), [33, 25, 13]);
+        assert_eq!(at::<AppleGpu<13, true>>(), [32, 18, 12]);
+        assert_eq!(at::<AppleGpu<17, true>>(), [32, 18, 12]);
+        // A weight is as large as its larger side.
+        assert_eq!(
+            get_qmv_batch_limit::<AppleGpu<13, false>>(2048, 4096).get(),
+            10
+        );
+        assert_eq!(QMV_MATVEC_BAND_ROWS, 5);
     }
 }

@@ -38,69 +38,29 @@ impl MetalDevice {
     }
 }
 
-/// Cost/target profile for a Metal device, chosen by chip name.
-///
-/// Each chip routes to the profile whose embedded cost CSV was swept on that
-/// chip. Costs are analytical (roofline from the profile's bandwidth /
-/// TFLOPS figures) — there is no empirical cost table.
-pub(crate) fn profile_for_device(device: &Device) -> MetalTargetProfile {
-    known_profile(device).unwrap_or_else(|| {
-        // GitHub's hosted "Apple Paravirtual device" legitimately has no cost
-        // profile (it can't run the kernels anyway — see `detect_device`), so
-        // don't spam the build/test log for it; only warn for genuinely
-        // unexpected hardware.
-        let name = device.name().to_string();
-        if !name.contains("Paravirtual") {
-            eprintln!("Warning: Unknown Metal device '{name}', defaulting to M1 profile");
-        }
-        crate::targets::M1_8CORE
-    })
-}
-
-/// The profile of the chip `device`'s name names; `None` for a device no profile was swept on.
+/// The target of `device`'s architecture (`MTLDevice.architecture.name`); `None` for a GPU that is
+/// not Apple silicon.
 pub(crate) fn known_profile(device: &ProtocolObject<dyn MTLDevice>) -> Option<MetalTargetProfile> {
-    let name = device.name().to_string();
-    Some(if name.contains("M1") {
-        if name.contains("Max") {
-            crate::targets::M1_MAX
-        } else {
-            crate::targets::M1_8CORE
-        }
-    } else if name.contains("M2") {
-        crate::targets::M2_10CORE
-    } else if name.contains("M3") {
-        crate::targets::M3_10CORE
-    } else if name.contains("M4") {
-        crate::targets::M4_10CORE
-    } else if name.contains("M5") {
-        crate::targets::M5_10CORE
-    } else {
-        return None;
-    })
+    MetalTargetProfile::of_architecture(&device.architecture().name().to_string())
 }
 
-/// COMPILE-TIME cost profile for the default Metal device, chosen by chip name.
-///
-/// Used by the `#[forward]` proc-macro to pick a cost model at build time.
-/// Deliberately does NOT gate on Metal 4: profile selection only needs the
-/// device name, and the models must build on ANY Metal host — including
-/// non-Metal-4 CI build hosts (GitHub's "Apple Paravirtual device"). Runtime
-/// device acquisition uses [`detect_device`], which DOES gate on Metal 4.
-pub fn detect_metal_profile() -> Option<MetalTargetProfile> {
-    let device = MTLCreateSystemDefaultDevice()?;
-    Some(profile_for_device(&device))
+/// Whether the host has a Metal device: the `#[forward]` proc-macro's probe. The bake lowers a tape
+/// for every target, so it reads nothing off the device, and does NOT gate on Metal 4 — the models
+/// must build on ANY Metal host, including non-Metal-4 CI build hosts (GitHub's "Apple Paravirtual
+/// device"). Runtime device acquisition uses [`detect_device`], which DOES gate on Metal 4.
+pub fn metal_device_present() -> bool {
+    MTLCreateSystemDefaultDevice().is_some()
 }
 
 /// Detect the current Metal device for RUNTIME use.
 ///
-/// Returns `None` when there is no Metal device OR the device does not support
-/// Metal 4. This backend builds every compute pipeline through an `MTL4Compiler`
+/// Returns `None` when there is no Metal device, the device does not support
+/// Metal 4, or its architecture is not Apple silicon. This backend builds every compute pipeline through an `MTL4Compiler`
 /// (`SpecializedPipelineCache` → `newCompilerWithDescriptor`), so a non-Metal-4
 /// device — e.g. GitHub's hosted "Apple Paravirtual device", which is Metal 3
 /// only — is unusable here. Reporting it as absent lets the worker and the GPU
 /// test suite (which guard on `detect_device()`) skip cleanly instead of
-/// panicking at the first pipeline build. Compile-time profile selection uses
-/// [`detect_metal_profile`], which does NOT gate on Metal 4.
+/// panicking at the first pipeline build.
 pub fn detect_device() -> Option<MetalDevice> {
     let device = MTLCreateSystemDefaultDevice()?;
     if device
@@ -114,7 +74,14 @@ pub fn detect_device() -> Option<MetalDevice> {
         );
         return None;
     }
-    let profile = profile_for_device(&device);
+    let Some(profile) = known_profile(&device) else {
+        eprintln!(
+            "Metal device '{}' (architecture '{}') is not Apple silicon; treating as unavailable",
+            device.name(),
+            device.architecture().name()
+        );
+        return None;
+    };
     Some(MetalDevice::new(device, profile))
 }
 
@@ -173,7 +140,8 @@ mod tests {
     fn test_device_detection() {
         if let Some(device) = detect_device() {
             println!("Detected device: {}", device.device.name());
-            println!("Profile: {:?}", device.profile.generation);
+            println!("Architecture: {}", device.device.architecture().name());
+            println!("Profile: {:?}", device.profile);
             let cores = gpu_cores(&device.device);
             println!("GPU cores: {cores:?}");
             assert!(cores.is_some_and(|n| n.get() > 0));

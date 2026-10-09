@@ -50,7 +50,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
         | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightTensor"
         | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
-        | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence" => {
+        | "MetalTargetProfile" | "KvAddressing" | "TapeLoop" | "TapeCommands" | "Fence" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {

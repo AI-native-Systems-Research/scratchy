@@ -76,9 +76,9 @@ pub fn tier_implemented(tier: MatmulTier) -> bool {
     )
 }
 
-/// The matmul tier a Metal device *supports*, parsed from its name (mirrors
-/// scratchy's `detect_device` name-parse → `AppleSiliconGen` → `is_nax_capable`):
-///   * Apple `M5`+  -> Nax (Apple9 gen 17+, first with the Neural Accelerator)
+/// The matmul tier a Metal device *supports*, parsed from its name (the name-based twin of
+/// scratchy-target-metal's `MetalTargetProfile::of_architecture` → `has_nax`):
+///   * Apple `M5`+  -> Nax (gen 17+, first with the Neural Accelerator)
 ///   * any other Apple GPU (M1..M4, Apple7+) -> Simdgroup
 ///   * non-Apple / unknown -> Naive
 pub fn device_matmul_tier(device_name: &str) -> MatmulTier {

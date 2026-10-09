@@ -6,7 +6,7 @@
 //! zero per-op surface.
 //!
 //! Everything that varies is a rung, every fact of it baked; the pool only picks:
-//! - **device generation** → one rung per [`GenClass`];
+//! - **device** → one rung per baked [`MetalTargetProfile`], lowered at its target type;
 //! - **KV block-table capacity** → one rung per cap of the model's [`kv_cap_ladder`];
 //! - **TurboQuant decode heads** (from the device's core count) → one rung per head count the
 //!   geometry admits.
@@ -21,8 +21,8 @@ use scratchy_target_metal::tape::ids::{
     TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    Binding, DispatchShape, GatedCommand, GenClass, KernelId, KvAddressing, LoweredCommand,
-    LoweredMetalTape, LoweringError, MetalDtype, TapeCommands,
+    Binding, DispatchShape, GatedCommand, KernelId, KvAddressing, LoweredCommand, LoweredMetalTape,
+    LoweringError, MetalDtype, TapeCommands,
 };
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
@@ -153,11 +153,12 @@ impl CommandPool {
         variant: TapeVariant,
     ) -> Result<(), BakeDefect> {
         for c in commands.iter() {
-            let key = aot::bake_key(&c.command, dtype, variant)
+            let keys = aot::bake_keys(&c.command, dtype, variant)
                 .map_err(|e| BakeDefect(format!("bake key: {e}")))?;
-            let Some(key) = key else { continue };
-            if self.named_kernels.insert(key.clone()) {
-                self.kernels.push(key);
+            for key in keys {
+                if self.named_kernels.insert(key.clone()) {
+                    self.kernels.push(key);
+                }
             }
         }
         Ok(())
@@ -301,7 +302,9 @@ use scratchy_target_metal::tape::constants::TapeVariant;
 use scratchy_target_metal::tape::lowering as tl;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{MetalStepTape, RotaryTables};
-use scratchy_target_metal::tape::targets::MetalTargetProfile;
+use scratchy_target_metal::tape::targets::{
+    MetalTarget, MetalTargetProfile, OnTarget, with_target,
+};
 
 /// Why a bucket's tape could not bake — a defect; the caller panics with it.
 pub struct BakeDefect(pub String);
@@ -351,15 +354,6 @@ pub fn emit_bucket_barriers_static(static_ident: &syn::Ident, barriers: &[bool])
     }
 }
 
-fn profile_for(class: GenClass) -> MetalTargetProfile {
-    use scratchy_target_metal::tape::targets::{M1_MAX, M4_10CORE, M5_10CORE};
-    match class {
-        GenClass::M1 => M1_MAX,
-        GenClass::Mid => M4_10CORE,
-        GenClass::M5 => M5_10CORE,
-    }
-}
-
 /// `f` over `items` on every core, in order.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -374,30 +368,30 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     })
 }
 
-/// One rung of a bucket's tape: its class, addressing and KV cap.
+/// One rung of a bucket's tape: its addressing and KV cap, lowered at its target.
 struct Rung<'a> {
-    profile: &'a MetalTargetProfile,
+    mc: &'a MetalModelConsts,
+    input: &'a BucketLowerInput<'a>,
     addressing: KvAddressing,
     cap: MaxBlocksPerSeq,
 }
 
-fn run_lower(
-    mc: &MetalModelConsts,
-    input: &BucketLowerInput<'_>,
-    rung: &Rung<'_>,
-) -> Result<LoweredMetalTape, LoweringError> {
-    let at = tl::BakePoint {
-        chunked: rung.addressing == KvAddressing::Chunked,
-        bucket_m: input.bucket_m,
-        num_arena_slots: input.num_arena_slots,
-        rotary: input.rotary,
-        block_cap: rung.cap.get(),
-        profile: Some(rung.profile),
-    };
-    tl::lower_subtile_tape_to_metal(input.steps, mc, at)
+impl OnTarget for Rung<'_> {
+    type Out = Result<LoweredMetalTape, LoweringError>;
+
+    fn on_target<T: MetalTarget>(self) -> Self::Out {
+        let at = tl::BakePoint {
+            chunked: self.addressing == KvAddressing::Chunked,
+            bucket_m: self.input.bucket_m,
+            num_arena_slots: self.input.num_arena_slots,
+            rotary: self.input.rotary,
+            block_cap: self.cap.get(),
+        };
+        tl::lower_subtile_tape_to_metal::<T>(self.input.steps, self.mc, at)
+    }
 }
 
-/// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` variant of one
+/// Bake every `(target × KV addressing × KV cap × TurboQuant decode heads)` variant of one
 /// bucket's tape and emit the `&'static [ClassedTape]` expression. A tape with no TurboQuant decode
 /// attention serves every device (`tq_heads: None`); one with it has a variant per head count its
 /// geometry admits ([`TqDecodeHeads::candidates`]), which the device picks among. A cap rung whose
@@ -406,7 +400,7 @@ fn run_lower(
 ///
 /// A variant's cap and heads reach its commands only as variant-bound constants
 /// ([`ConstantType::KvCap`](scratchy_target_metal::tape::constants::ConstantType::KvCap)), so the
-/// variants of a `(class, addressing)` share one hoisted body and each carries only its cap-sized
+/// variants of a `(target, addressing)` share one hoisted body and each carries only its cap-sized
 /// scratch ([`ClassedTape::rung`]); the kernels its values bake join the model's kernel table.
 ///
 /// [`ClassedTape::rung`]: scratchy_target_metal::tape::lowered::ClassedTape::rung
@@ -415,7 +409,6 @@ pub fn bake_bucket_tapes(
     input: &BucketLowerInput<'_>,
     pool: &mut CommandPool,
 ) -> Result<TokenStream, BakeDefect> {
-    let classes = [GenClass::M1, GenClass::Mid, GenClass::M5];
     let candidates: Vec<TqDecodeHeads> = TqDecodeHeads::candidates(
         HeadDim(mc.global_head_dim),
         NumQHeads(mc.num_q_heads),
@@ -438,27 +431,28 @@ pub fn bake_bucket_tapes(
     let defect = |e: LoweringError| BakeDefect(format!("bucket_m={}: {e}", input.bucket_m));
     // Every rung's tapes, lowered in parallel (each lowering is independent); `None` = the rung
     // cannot exist for this bucket.
-    let points: Vec<(GenClass, KvAddressing, MaxBlocksPerSeq)> = (classes.iter())
-        .flat_map(|&c| [KvAddressing::Direct, KvAddressing::Chunked].map(|a| (c, a)))
-        .flat_map(|(c, a)| input.cap_ladder.iter().map(move |&cap| (c, a, cap)))
-        .collect();
-    let lowered = par_map(&points, |&(class, addressing, cap)| {
-        let profile = profile_for(class);
+    let points: Vec<(MetalTargetProfile, KvAddressing, MaxBlocksPerSeq)> =
+        (MetalTargetProfile::BAKED.iter())
+            .flat_map(|&t| [KvAddressing::Direct, KvAddressing::Chunked].map(|a| (t, a)))
+            .flat_map(|(t, a)| input.cap_ladder.iter().map(move |&cap| (t, a, cap)))
+            .collect();
+    let lowered = par_map(&points, |&(target, addressing, cap)| {
         let rung = Rung {
-            profile: &profile,
+            mc,
+            input,
             addressing,
             cap,
         };
-        match run_lower(mc, input, &rung) {
+        match with_target(target, rung).expect("every baked target has its type") {
             Err(LoweringError::ScratchTooLarge { .. }) => Ok(None),
             tape => tape.map(Some),
         }
     });
-    // The scratch grows with the cap: the first rung of a `(class, addressing)` ladder that cannot
+    // The scratch grows with the cap: the first rung of a `(target, addressing)` ladder that cannot
     // exist ends it (`points` holds each ladder contiguous, ascending).
     let mut ended = None;
-    for (&(class, addressing, cap), tapes) in points.iter().zip(lowered) {
-        if ended == Some((class, addressing)) {
+    for (&(target, addressing, cap), tapes) in points.iter().zip(lowered) {
+        if ended == Some((target, addressing)) {
             continue;
         }
         let Some(tape) = tapes.map_err(defect)? else {
@@ -467,7 +461,7 @@ pub fn bake_bucket_tapes(
                 input.bucket_m,
                 cap.get()
             );
-            ended = Some((class, addressing));
+            ended = Some((target, addressing));
             continue;
         };
         // The cap-sized scratch is the variant's; the rest of the tape is the body.
@@ -515,14 +509,14 @@ pub fn bake_bucket_tapes(
         for tq_heads in heads {
             let variant = TapeVariant { cap, tq_heads };
             pool.name_kernels(tape.commands, mc.metal_dtype, variant)?;
-            let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
+            let target_toks = tok("target", crate::const_tokens::const_tokens(&target))?;
             let addressing_toks =
                 tok("addressing", crate::const_tokens::const_tokens(&addressing))?;
             let cap_toks = tok("cap", crate::const_tokens::const_tokens(&cap))?;
             let tq_toks = tok("tq heads", crate::const_tokens::const_tokens(&tq_heads))?;
             entries.push(quote! {
                 __tl::ClassedTape::rung(
-                    #ident, #class_toks, #addressing_toks, #cap_toks, #tq_toks,
+                    #ident, #target_toks, #addressing_toks, #cap_toks, #tq_toks,
                     [#roped_k, #attn_unfused],
                 ),
             });

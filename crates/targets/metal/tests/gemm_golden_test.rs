@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Dense GEMM goldens on the production MTL4 dispatch path, the kernel and dispatch the worker
 //! picks (`pipeline_for_gemm`: one row runs MLX's GEMV, `gemv_{f16,bf16}_specialized`; more rows
-//! the MMA GEMM, `gemm_{f16,bf16}_specialized`, `gemm_bf16_blocked` from 256 rows) vs the CPU
+//! the MMA GEMM, `gemm_{f16,bf16}_specialized`, `gemm_bf16_blocked` from the rows the device's
+//! cores call for, `gemm_runs_blocked`) vs the CPU
 //! reference across Llama Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192)
 //! and the MoE routers. M/N/K are compiled into the kernel, so the only bindings are
 //! output(0), input(1), weight(2).
@@ -49,7 +50,7 @@ fn gemm_bf16_blocked_is_the_tile8_gemm_bit_for_bit() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     for (m, n, k) in [(2048, 128, 2816), (256, 256, 2048), (300, 100, 1032)] {
         let dims = GemmDims { m, n, k };
-        let (blocked, shape) = gemm_pipeline(MetalDtype::Bf16, dims).expect("gemm key");
+        let (blocked, shape) = gemm_pipeline(MetalDtype::Bf16, dims, true).expect("gemm key");
         assert_eq!(blocked.kernel_name, "gemm_bf16_blocked");
         let tile8 = PipelineKey::new("gemm", "gemm_bf16_specialized", blocked.constants.clone());
         let (m, n, k) = (m as usize, n as usize, k as usize);
@@ -116,16 +117,19 @@ fn gemm(
 fn make_pipelines() -> Option<(common::Device, SpecializedPipelines)> {
     let device = detect_device()?.device;
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let keys: Vec<_> = [MetalDtype::Bf16, MetalDtype::F16]
+    let mut keys: Vec<_> = [MetalDtype::Bf16, MetalDtype::F16]
         .into_iter()
         .flat_map(|dtype| SHAPES.iter().map(move |&(m, n, k)| (dtype, m, n, k)))
-        .map(|(dtype, m, n, k)| {
+        .flat_map(|(dtype, m, n, k)| {
             let (m, n, k) = (m as u32, n as u32, k as u32);
-            gemm_pipeline(dtype, GemmDims { m, n, k })
-                .expect("gemm key")
-                .0
+            [false, true].map(|blocked| {
+                gemm_pipeline(dtype, GemmDims { m, n, k }, blocked)
+                    .expect("gemm key")
+                    .0
+            })
         })
         .collect();
+    keys.dedup();
     cache.register_baked(&baked_kernels(&keys));
     // A GEMM binds no variant-bound constant: any variant serves.
     let variant = scratchy_target_metal::tape::constants::TapeVariant {

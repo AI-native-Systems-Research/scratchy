@@ -124,7 +124,7 @@ pub enum PoolBuildError {
         bucket_m: u32,
         need: MaxBlocksPerSeq,
     },
-    /// The device's name names no chip generation a tape is baked for.
+    /// The device's architecture is no Apple-silicon generation a tape is baked for.
     UnknownDevice(String),
     /// `ScratchyWeights::metal_rungs` handed out something other than [`MetalRungs`].
     NotMetalRungs,
@@ -158,8 +158,8 @@ impl std::fmt::Display for PoolBuildError {
             ),
             Self::UnknownDevice(name) => write!(
                 f,
-                "MetalWorkerPool::for_buckets: device `{name}` is no chip generation a tape is \
-                 baked for"
+                "MetalWorkerPool::for_buckets: device architecture `{name}` is no Apple-silicon \
+                 generation a tape is baked for"
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
             Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
@@ -462,13 +462,12 @@ pub fn pick_rung<'a>(
         buckets.push(smallest);
     }
     let profile = crate::device::known_profile(device)
-        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
-    let gen_class = crate::tape::lowered::GenClass::of(profile.generation);
+        .ok_or_else(|| PoolBuildError::UnknownDevice(device.architecture().name().to_string()))?;
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
     let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
     let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
     let serves = |t: &&ClassedTape| {
-        t.gen_class == gen_class
+        t.target == profile
             && t.addressing == addressing
             && t.tq_heads.is_none_or(|h| h == tq_heads)
     };
@@ -2676,12 +2675,12 @@ mod tests {
 
     /// Baked tape rungs for an empty test bucket — what the macro
     /// would emit for `(empty, empty)` instruction streams: an
-    /// empty-command tape per (gen class × chunked) pair at KV cap 128.
+    /// empty-command tape per (target × chunked) pair at KV cap 128.
     fn test_empty_tapes(
         bucket_m: u32,
         num_arena_slots: u32,
     ) -> &'static [crate::tape::lowered::ClassedTape] {
-        use crate::tape::lowered::{ClassedTape, GenClass, LoweredMetalTape, baked};
+        use crate::tape::lowered::{ClassedTape, LoweredMetalTape, MetalTargetProfile, baked};
         let tape = LoweredMetalTape {
             bucket_m,
             num_arena_slots,
@@ -2695,10 +2694,10 @@ mod tests {
             attn_unfused_scratch_bytes: 0,
         };
         let mut v = Vec::new();
-        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {
+        for target in MetalTargetProfile::BAKED {
             for addressing in [KvAddressing::Direct, KvAddressing::Chunked] {
                 v.push(ClassedTape {
-                    gen_class,
+                    target,
                     addressing,
                     cap: MaxBlocksPerSeq(128),
                     tq_heads: None,

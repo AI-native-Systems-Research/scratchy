@@ -1706,7 +1706,6 @@ impl Recording<'_> {
                 k: kd,
                 group_size: Gs(affine.group().get()),
                 bits: Bits(affine.bits().get()),
-                vector_limit: st::QmvBatchLimit(affine_qmm_vector_limit(k, n)),
                 ends,
             }),
         };
@@ -2117,13 +2116,6 @@ impl Recording<'_> {
 /// The constant a `(1 + w)` gain adds to the stored weight.
 fn offset(gain: GainConvention) -> st::GainOffset {
     st::GainOffset(gain.offset())
-}
-
-/// The MLX qmv batch limit for an affine-quantized matmul, from the target's table — fixed at M4
-/// whatever the generation class the bake targets.
-fn affine_qmm_vector_limit(k: u32, n: u32) -> u32 {
-    use scratchy_target_metal::targets::AppleSiliconGen;
-    scratchy_target_metal::quantized::get_qmv_batch_limit(k, n, AppleSiliconGen::M4)
 }
 
 /// Which MoE bits a layout carries: the repacked per-projection widths, or each op's raw width.

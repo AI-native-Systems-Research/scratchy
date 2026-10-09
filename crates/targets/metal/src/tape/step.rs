@@ -9,8 +9,7 @@
 
 pub use super::ids::{
     AffineBits, AffineGroupSize, ArenaSlotIdx, BodyLen, HiddenSize, IntermediateSize, KDim,
-    LayerId, LayerStride, LoopIters, NDim, NumExperts, QmvBatchLimit, RowsDivisor, RowsPerToken,
-    SourceIx, TopK,
+    LayerId, LayerStride, LoopIters, NDim, NumExperts, RowsDivisor, RowsPerToken, SourceIx, TopK,
 };
 pub use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
 use scratchy_subtile::handoff::WeightKind;
@@ -387,8 +386,7 @@ pub enum RowInstr {
 }
 
 /// An MLX-affine matmul: `input · W` into `output`, `W` the layer's `n × k` weight packed `bits`
-/// wide in groups of `group_size`; `vector_limit` rows or more take the matrix kernel. `ends`:
-/// what its one-row matvec does around the dot.
+/// wide in groups of `group_size`. `ends`: what its one-row matvec does around the dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AffineMatmul {
     pub input: Slot,
@@ -398,7 +396,6 @@ pub struct AffineMatmul {
     pub k: KDim,
     pub group_size: AffineGroupSize,
     pub bits: AffineBits,
-    pub vector_limit: QmvBatchLimit,
     pub ends: QmvEnds,
 }
 

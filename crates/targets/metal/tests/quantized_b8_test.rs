@@ -276,7 +276,7 @@ fn qmm_t_nax_b8_bf16_prefill_shape() {
         eprintln!("skipping: no Metal device");
         return;
     };
-    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+    if !di.profile.has_nax() {
         eprintln!(
             "skipping NAX b8 parity on non-NAX hardware ({:?})",
             di.profile.generation
@@ -403,7 +403,7 @@ fn qwen_gdn_b8_bf16_nax_prefill_shapes() {
         eprintln!("skipping: no Metal device");
         return;
     };
-    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+    if !di.profile.has_nax() {
         eprintln!(
             "skipping NAX b8 GDN on non-NAX hardware ({:?})",
             di.profile.generation

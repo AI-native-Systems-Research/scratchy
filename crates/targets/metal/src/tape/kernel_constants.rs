@@ -581,7 +581,7 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
 // ── MLX-affine code storage ──────────────────────────────────────
 
 /// How the MLX-affine packed codes a command reads are stored. On a
-/// [`GenClass::stores_affine_b4_offset8`](crate::tape::lowered::GenClass::stores_affine_b4_offset8)
+/// [`MetalTargetProfile::stores_affine_b4_offset8`](crate::tape::targets::MetalTargetProfile::stores_affine_b4_offset8)
 /// target every 4-bit weight's codes are stored XOR 0x88; every kernel
 /// that reads them carries this, and on `Offset8` gets `AFFINE_CODES_OFFSET8`
 /// (slot 5) to XOR them back.
@@ -592,10 +592,6 @@ pub enum AffineCodes {
 }
 
 impl AffineCodes {
-    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>, bits: u32) -> Self {
-        AffineCodesTarget::of(profile).for_bits(bits)
-    }
-
     /// Slot 5, set only on `Offset8` so every other pipeline keeps its key.
     pub fn constant(self) -> Option<ConstantValue> {
         match self {
@@ -622,11 +618,13 @@ pub struct AffineCodesTarget {
 }
 
 impl AffineCodesTarget {
-    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>) -> Self {
+    /// The storage on `target`; an unknown device's codes are as written.
+    pub const fn of(target: Option<crate::tape::targets::MetalTargetProfile>) -> Self {
         Self {
-            offset8_b4: profile.is_some_and(|t| {
-                crate::tape::lowered::GenClass::of(t.generation).stores_affine_b4_offset8()
-            }),
+            offset8_b4: match target {
+                Some(t) => t.stores_affine_b4_offset8(),
+                None => false,
+            },
         }
     }
 
