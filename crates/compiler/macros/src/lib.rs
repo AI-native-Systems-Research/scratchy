@@ -1558,6 +1558,20 @@ pub fn compile_carrier(
     let canonical_for: std::collections::HashMap<usize, Ident> =
         compute_canonical_variants(&solved);
 
+    // The affine rows each emitted variant's fingerprint gate carries,
+    // keyed by module name. Populated as canonicals emit and read when
+    // a shim's own accessor set yields no rows (metal: the shim's set
+    // is ISel's, empty there) — the shim's `load` delegates to the
+    // canonical's body, so its fingerprint must gate on the canonical's
+    // widths. Ordering law: `config::load_dir` returns its final list
+    // sorted by source_stem (synthesized fans included), and
+    // `compute_canonical_variants` picks each class's
+    // alphabetically-earliest stem as canonical — so the canonical is
+    // always the FIRST member of its class in `solved` order and its
+    // rows are in the map before any of its shims emit.
+    let mut emitted_affine_rows: std::collections::HashMap<String, Vec<(String, u32, u32)>> =
+        std::collections::HashMap::new();
+
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut arch_dispatch_arms: Vec<DispatchArm> = Vec::new();
 
@@ -1570,8 +1584,15 @@ pub fn compile_carrier(
         } else {
             Some(canonical_ident.clone())
         };
+        let canonical_affine_rows = if is_canonical {
+            None
+        } else {
+            emitted_affine_rows
+                .get(canonical_ident.to_string().as_str())
+                .map(|rows| rows.as_slice())
+        };
 
-        let codegen_items = codegen::emit_model(
+        let (codegen_items, model_affine_rows) = codegen::emit_model(
             &sm.prog,
             sm.model,
             &sm.fuf,
@@ -1583,7 +1604,11 @@ pub fn compile_carrier(
             canonical_override.as_ref(),
             sm.tp_world_size,
             mode.emit_arch_dispatch,
+            canonical_affine_rows,
         );
+        if is_canonical {
+            emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);
+        }
         let stub_items = &sm.stub_items;
         // Vision arch glue: per-variant `VisionArchWeights` impl,
         // `try_load_mm` with d_model fingerprint, inventory submits
