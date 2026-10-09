@@ -1860,14 +1860,7 @@ impl AsyncEngine {
                                 last_progress.elapsed(),
                             );
                             client.abort_running_requests();
-                            let mut reqs = requests.lock().await;
-                            for req_state in reqs.values_mut() {
-                                if req_state.finish_reason.is_none() {
-                                    req_state.finish_reason = Some(FinishReason::Abort);
-                                    req_state.error = Some(err_msg.clone());
-                                }
-                            }
-                            drop(reqs);
+                            Self::fail_requests(&mut *requests.lock().await, &err_msg, |_| true);
                             notify.notify_waiters();
                             last_progress = Instant::now();
                         } else if !model_executed {
@@ -1883,14 +1876,7 @@ impl AsyncEngine {
                         // so abort everything the scheduler currently has.
                         let err_msg = format!("Engine step error: {e}");
                         client.abort_running_requests();
-                        let mut reqs = requests.lock().await;
-                        for req_state in reqs.values_mut() {
-                            if req_state.finish_reason.is_none() {
-                                req_state.finish_reason = Some(FinishReason::Abort);
-                                req_state.error = Some(err_msg.clone());
-                            }
-                        }
-                        drop(reqs);
+                        Self::fail_requests(&mut *requests.lock().await, &err_msg, |_| true);
                         notify.notify_waiters();
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     }
@@ -2057,14 +2043,9 @@ impl AsyncEngine {
                             client
                                 .abort_requests(&req_ids)
                                 .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
-                            let mut reqs = requests.lock().await;
-                            for req_id in &req_ids {
-                                if let Some(req_state) = reqs.get_mut(req_id) {
-                                    req_state.finish_reason = Some(FinishReason::Abort);
-                                    req_state.error = Some(err_msg.clone());
-                                }
-                            }
-                            drop(reqs);
+                            Self::fail_requests(&mut *requests.lock().await, &err_msg, |id| {
+                                req_ids.iter().any(|r| r == id)
+                            });
                             notify.notify_waiters();
                             gpu_in_flight -= 1;
                         }
@@ -2141,14 +2122,7 @@ impl AsyncEngine {
                             last_progress.elapsed(),
                         );
                         client.abort_running_requests();
-                        let mut reqs = requests.lock().await;
-                        for req_state in reqs.values_mut() {
-                            if req_state.finish_reason.is_none() {
-                                req_state.finish_reason = Some(FinishReason::Abort);
-                                req_state.error = Some(err_msg.clone());
-                            }
-                        }
-                        drop(reqs);
+                        Self::fail_requests(&mut *requests.lock().await, &err_msg, |_| true);
                         notify.notify_waiters();
                         last_progress = Instant::now();
                     } else {
@@ -2445,6 +2419,47 @@ impl AsyncEngine {
                 })
             })
             .collect()
+    }
+
+    /// End the requests `pick` selects, which the engine will produce no more output for, with
+    /// `err`. A non-streaming request keeps its entry, now finished, for `poll_until_done` to
+    /// collect. A streaming one has no such consumer: its stream gets a final `Abort` delta and its
+    /// entry goes. Marked and left in place, a stream whose request the engine no longer holds
+    /// hangs its client forever, and its entry keeps `has_requests` true — so the no-progress
+    /// watchdog re-fires every `no_progress_timeout` without ever clearing it.
+    fn fail_requests(
+        requests: &mut HashMap<String, RequestState>,
+        err: &str,
+        pick: impl Fn(&str) -> bool,
+    ) {
+        let mut ended = Vec::new();
+        for (id, req_state) in requests.iter_mut() {
+            if req_state.finish_reason.is_some() || !pick(id) {
+                continue;
+            }
+            req_state.finish_reason = Some(FinishReason::Abort);
+            req_state.error = Some(err.to_string());
+            if let Some(tx) = req_state.stream_tx.take() {
+                let _ = tx.send(StreamDelta {
+                    index: req_state.choice_index,
+                    new_token_ids: Vec::new(),
+                    text: None,
+                    finish_reason: Some(FinishReason::Abort),
+                    stop_reason: None,
+                    logprobs: None,
+                    tool_call_deltas: None,
+                    reasoning: None,
+                    usage: StreamUsage {
+                        prompt_tokens: req_state.num_prompt_tokens,
+                        cached_tokens: req_state.num_cached_tokens,
+                    },
+                });
+                ended.push(id.clone());
+            }
+        }
+        for id in ended {
+            requests.remove(&id);
+        }
     }
 
     /// Phase 3: Under lock — put detokenizers back, apply detok results,
@@ -5352,6 +5367,39 @@ mod tests {
         assert!(
             err_msg.contains("No-progress watchdog") || err_msg.contains("step loop exited"),
             "unexpected error: {err_msg}"
+        );
+    }
+
+    /// A STREAMING request the engine never answers must still end: the watchdog sends its
+    /// stream a final `Abort` delta and drops its entry. Marking the entry alone — which nothing
+    /// streaming reads — left the client waiting forever and the watchdog re-firing every timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_progress_watchdog_ends_streams() {
+        let engine = Arc::new(make_no_progress_engine());
+        engine.spawn_step_loop();
+
+        let (_, _, mut rx) = engine
+            .chat_completion_stream(make_chat_request())
+            .await
+            .expect("stream starts");
+        let last = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut last = None;
+            while let Some(delta) = rx.recv().await {
+                last = Some(delta);
+            }
+            last
+        })
+        .await
+        .expect("the stream never ended — the watchdog did not end it");
+
+        assert_eq!(
+            last.and_then(|d| d.finish_reason),
+            Some(FinishReason::Abort),
+            "the stream's last delta says why it ended"
+        );
+        assert!(
+            engine.requests.lock().await.is_empty(),
+            "the ended stream's entry must go, or the watchdog re-fires forever"
         );
     }
 
