@@ -180,8 +180,7 @@ fn sink_attn_ref(
             let qrow = &q[(qi * num_q_heads + h) * head_dim..][..head_dim];
             let mut scores = Vec::with_capacity(kv_len + 1);
             for t in 0..kv_len {
-                let masked = t > q_abs
-                    || (window > 0 && (q_abs - t) as i64 >= window as i64);
+                let masked = t > q_abs || (window > 0 && (q_abs - t) as i64 >= window as i64);
                 if masked {
                     scores.push(f32::NEG_INFINITY);
                     continue;
@@ -249,10 +248,7 @@ impl Pool {
         // max-seeded-with-sink path, not just the tail term.
         let sinks_host = pseudo(seed + 4, case.num_q_heads, 3.0);
         let sinks_buf = buf_t::<T>(device, &sinks_host);
-        let sinks_r: Vec<f32> = sinks_host
-            .iter()
-            .map(|&x| T::load(T::store(x)))
-            .collect();
+        let sinks_r: Vec<f32> = sinks_host.iter().map(|&x| T::load(T::store(x))).collect();
         Self {
             k_buf,
             v_buf,
@@ -319,9 +315,7 @@ fn decode_case<T: Store>(name: &str, case: Case, sinks: bool) {
     }
     let key = PipelineKey::new(
         "attention",
-        Box::leak(
-            format!("attention_via_cache_v2_{}_specialized", T::tag()).into_boxed_str(),
-        ),
+        Box::leak(format!("attention_via_cache_v2_{}_specialized", T::tag()).into_boxed_str()),
         consts,
     );
     let pipeline = baked_build(&cache, &key).expect("decode pipeline");
@@ -403,11 +397,7 @@ fn prefill_sdpa_case<T: Store>(name: &str, case: Case) {
     let key = PipelineKey::new(
         "attention",
         Box::leak(
-            format!(
-                "attention_prefill_sdpa_v2_paged_{}_specialized",
-                T::tag()
-            )
-            .into_boxed_str(),
+            format!("attention_prefill_sdpa_v2_paged_{}_specialized", T::tag()).into_boxed_str(),
         ),
         consts,
     );
@@ -487,11 +477,7 @@ fn prefill_gqa_shared_case<T: Store>(name: &str, case: Case) {
     let key = PipelineKey::new(
         "attention",
         Box::leak(
-            format!(
-                "attention_prefill_sdpa_gqa_shared_{}_specialized",
-                T::tag()
-            )
-            .into_boxed_str(),
+            format!("attention_prefill_sdpa_gqa_shared_{}_specialized", T::tag()).into_boxed_str(),
         ),
         consts,
     );

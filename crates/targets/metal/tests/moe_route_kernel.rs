@@ -432,7 +432,11 @@ fn gpt_oss_biased_routing_matches_the_reference() {
         let picks = order[..k].iter().rev().copied().collect::<Vec<_>>();
         let want_inds: Vec<u32> = picks.iter().map(|&i| i as u32).collect();
         let what = format!("row {row}");
-        assert_eq!(&inds[row * k..(row + 1) * k], &want_inds[..], "{what}: picks");
+        assert_eq!(
+            &inds[row * k..(row + 1) * k],
+            &want_inds[..],
+            "{what}: picks"
+        );
         biased.extend(
             picks
                 .iter()
@@ -444,8 +448,8 @@ fn gpt_oss_biased_routing_matches_the_reference() {
         row: ScoresRow::TopK(TopK(k as u32)),
     }
     .into();
-    let softmax = baked_pipeline(&device, "softmax", "block_softmax_precise_bfloat16", c)
-        .expect("softmax");
+    let softmax =
+        baked_pipeline(&device, "softmax", "block_softmax_precise_bfloat16", c).expect("softmax");
     let src = common::shared_slice(&device, &biased);
     let want_scores = common::shared_zeroed(&device, n * k * 2);
     let mut batch = common::Mtl4DispatchBatch::begin(&device).expect("an MTL4 queue");

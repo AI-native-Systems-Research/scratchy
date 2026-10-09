@@ -923,7 +923,9 @@ impl SourceRef<'_> {
         match self {
             Self::Linear(scratchy_layers::LinearLayer::AffineQuant(_))
             | Self::AffineQuantEmbedding(_) => which == T::Weight,
-            Self::FusedMoe(_) | Self::SharedFusedMoe(_) | Self::GemmaSwitchGlu(_)
+            Self::FusedMoe(_)
+            | Self::SharedFusedMoe(_)
+            | Self::GemmaSwitchGlu(_)
             | Self::GptOssMoe(_) => matches!(
                 which,
                 T::MoeExpertGateW

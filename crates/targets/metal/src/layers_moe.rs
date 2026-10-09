@@ -1179,18 +1179,14 @@ impl GptOssMoEOps for GptOssMoELayer {
         );
         let esz = g_dt.size_bytes();
         let per_expert = intermediate_size * esz;
-        let mut gate_up_bytes =
-            Vec::with_capacity(num_experts * 2 * intermediate_size * esz);
+        let mut gate_up_bytes = Vec::with_capacity(num_experts * 2 * intermediate_size * esz);
         for e in 0..num_experts {
             let at = e * per_expert;
             gate_up_bytes.extend_from_slice(&g_bytes[at..at + per_expert]);
             gate_up_bytes.extend_from_slice(&u_bytes[at..at + per_expert]);
         }
-        let gate_up_linear_bias = gw.alloc_packed_from_host(
-            &gate_up_bytes,
-            &[num_experts, 2 * intermediate_size],
-            g_dt,
-        )?;
+        let gate_up_linear_bias =
+            gw.alloc_packed_from_host(&gate_up_bytes, &[num_experts, 2 * intermediate_size], g_dt)?;
 
         // Down-proj LINEAR bias → `[E, hidden]`, same bytes expert-major.
         let (d_bytes, d_shape, d_dt) = gw.take_cpu(&format!("{prefix}.experts.down_proj.bias"))?;

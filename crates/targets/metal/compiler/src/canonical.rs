@@ -106,7 +106,7 @@ impl SourceManifest {
                 // carries the `Copy` GpuTensor handle by value (same
                 // deref as the `weight_at` arm in codegen.rs).
                 K::AttnSinks => {
-                    return Ok(quote!(#ix => Some(#r::AttnSinks(*self.#base(layer.get()))),))
+                    return Ok(quote!(#ix => Some(#r::AttnSinks(*self.#base(layer.get()))),));
                 }
                 K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin

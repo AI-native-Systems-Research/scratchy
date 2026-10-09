@@ -306,7 +306,9 @@ impl Fixture {
         // byte-identical for every existing case.
         let sink = c.sinks.map_or(vec![], |scale| {
             let mut rng = Lcg(0x51e5u64 ^ (c.num_q_heads as u64) ^ ((c.head_dim as u64) << 24));
-            (0..c.num_q_heads).map(|_| c.dtype.round(scale * rng.gauss())).collect()
+            (0..c.num_q_heads)
+                .map(|_| c.dtype.round(scale * rng.gauss()))
+                .collect()
         });
         let mut f = Self {
             c: c.clone(),

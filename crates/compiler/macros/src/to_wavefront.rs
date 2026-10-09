@@ -1028,8 +1028,10 @@ pub fn lower_decode_to_wavefront(
                 if bx.scale.is_nan() {
                     return Err(BridgeError::MissingBound { key: "head_dim" });
                 }
-                let is_sink =
-                    matches!(node.op, OpKind::SinkAttention | OpKind::SinkSlidingAttention);
+                let is_sink = matches!(
+                    node.op,
+                    OpKind::SinkAttention | OpKind::SinkSlidingAttention
+                );
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
                 let v = bx.input_at(tile, 2)?;
@@ -1448,12 +1450,12 @@ pub fn lower_decode_to_wavefront(
                         detail: "gptoss_moe without a weight input",
                     })?;
                 let b = &bx.bounds;
-                let num_experts = b
-                    .get("num_local_experts")
-                    .copied()
-                    .ok_or(BridgeError::MissingBound {
-                        key: "num_local_experts",
-                    })? as u32;
+                let num_experts =
+                    b.get("num_local_experts")
+                        .copied()
+                        .ok_or(BridgeError::MissingBound {
+                            key: "num_local_experts",
+                        })? as u32;
                 let top_k =
                     b.get("num_experts_per_tok")
                         .copied()
@@ -1485,16 +1487,13 @@ pub fn lower_decode_to_wavefront(
                 // refused here at build time rather than silently computed
                 // with the wrong clamp. The upgrade path if a second consumer
                 // appears is a `CanonicalParams` scalar.
-                let limit = bx
-                    .model
-                    .scalars
-                    .get("swiglu_limit")
-                    .copied()
-                    .ok_or(BridgeError::MalformedOp {
+                let limit = bx.model.scalars.get("swiglu_limit").copied().ok_or(
+                    BridgeError::MalformedOp {
                         tile,
                         op: OpKind::GptOssMoe,
                         detail: "gptoss_moe requires a `swiglu_limit` config scalar",
-                    })?;
+                    },
+                )?;
                 if limit != 7.0 {
                     return Err(BridgeError::MalformedOp {
                         tile,

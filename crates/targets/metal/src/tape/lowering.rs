@@ -7473,9 +7473,7 @@ fn lower_moe_step(
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
                 GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
-                GatedAct::SwigluOai => {
-                    (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype))
-                }
+                GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
             };
             let (rows, m_scaling) = match s.grouping {
                 MoeGrouping::Gathered => (pairs, ms(A::X)),
@@ -8065,8 +8063,10 @@ mod tests {
             attention(MetalStep::AttentionViaCache, 0, Interleaved),
         ));
         for (row, row_site) in tape.backbone.iter().zip(&mut tape.backbone_sources) {
-            if let StepRow::Step(MetalStep::AttentionViaCache(..) | MetalStep::AttnPackedKv(..), _) =
-                row
+            if let StepRow::Step(
+                MetalStep::AttentionViaCache(..) | MetalStep::AttnPackedKv(..),
+                _,
+            ) = row
             {
                 *row_site = site.clone();
             }

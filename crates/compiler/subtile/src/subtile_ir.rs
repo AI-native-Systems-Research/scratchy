@@ -1762,10 +1762,7 @@ pub fn eval_node<F: RopeForm>(
                 qh_count * hd,
                 "attn Q width is a head multiple"
             );
-            debug_assert!(
-                node.inputs.len() >= 3,
-                "attn needs Q + >=1 (K,V) segment"
-            );
+            debug_assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
             // The gpt-oss trailing sinks weight: the registry's arity
             // closure admits `Q + (K,V) pairs` (odd count) or exactly 6
             // = the 5-input decode form plus ONE trailing weight-source
@@ -1834,9 +1831,7 @@ pub fn eval_node<F: RopeForm>(
                     // participates in the softmax max/denominator, and
                     // is dropped before the ·V accumulation below — it
                     // contributes to normalization only.
-                    let sink_col = sinks
-                        .as_ref()
-                        .map(|s| s[qh_start + hl]);
+                    let sink_col = sinks.as_ref().map(|s| s[qh_start + hl]);
                     if let Some(sink) = sink_col {
                         scores.push(sink);
                     }

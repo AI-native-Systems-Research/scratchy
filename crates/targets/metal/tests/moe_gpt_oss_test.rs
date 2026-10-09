@@ -272,7 +272,10 @@ impl Block {
             LinearBias::gate_up(device, &mut rng, EXPERTS),
             LinearBias::down(device, &mut rng, EXPERTS),
         );
-        let (rows, experts) = (GatherRows::Tokens(TopK(TOP_K as u32)), NumExperts(EXPERTS as u32));
+        let (rows, experts) = (
+            GatherRows::Tokens(TopK(TOP_K as u32)),
+            NumExperts(EXPERTS as u32),
+        );
         let route = MoeRouteConstants {
             experts,
             top_k: TopK(TOP_K as u32),
@@ -287,7 +290,11 @@ impl Block {
         Self {
             route: baked_pipeline(device, "moe_route", "moe_route_bfloat16_bn32", route.into())
                 .expect("route"),
-            gated: gate.pipeline(device, "affine_gather_qmv_gated", gate.gated_constants(rows)),
+            gated: gate.pipeline(
+                device,
+                "affine_gather_qmv_gated",
+                gate.gated_constants(rows),
+            ),
             routed_gated: gate.pipeline(device, "affine_gather_qmv_gated", routed_gated_c),
             combine: down.pipeline(
                 device,
@@ -424,7 +431,11 @@ fn routed_gpt_oss_moe_matches_the_routing_command_then_the_unrouted_chain() {
     let mut distinct = picked.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    assert_eq!(distinct.len(), pairs, "the routing command's picks {picked:?}");
+    assert_eq!(
+        distinct.len(),
+        pairs,
+        "the routing command's picks {picked:?}"
+    );
     assert_eq!(
         picked,
         common::read_slice::<u32>(&block.routed_indices, pairs),
@@ -540,10 +551,7 @@ fn gpt_oss_linear_biases_match_the_reference() {
                 let r = row[col].to_f32() + block.down_bias.host[e * HIDDEN + col].to_f32();
                 acc = f32::mul_add(r, scores[p].to_f32(), acc);
             }
-            let (g, w) = (
-                bf16::from_bits(got_out[n * HIDDEN + col]).to_f32(),
-                acc,
-            );
+            let (g, w) = (bf16::from_bits(got_out[n * HIDDEN + col]).to_f32(), acc);
             let err = (g - w).abs();
             max_out_err = max_out_err.max(err);
             assert!(

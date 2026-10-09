@@ -637,7 +637,12 @@ mod yarn_tests {
     /// gpt-oss context — every freq index, both halves.
     #[test]
     fn yarn_table_matches_reference_at_boundary_positions() {
-        let table = yarn_cos_sin_table(GPT_OSS_HEAD_DIM, GPT_OSS_MAX_POS, GPT_OSS_THETA, &gpt_oss_yarn());
+        let table = yarn_cos_sin_table(
+            GPT_OSS_HEAD_DIM,
+            GPT_OSS_MAX_POS,
+            GPT_OSS_THETA,
+            &gpt_oss_yarn(),
+        );
         let half = GPT_OSS_HEAD_DIM / 2;
         for pos in [0usize, 1, 4095, 4096, 8192, 131_071] {
             for i in 0..half {
@@ -666,7 +671,12 @@ mod yarn_tests {
     /// every value.
     #[test]
     fn yarn_hf_default_mscale_pair_is_plain_interpolation() {
-        let table = yarn_cos_sin_table(GPT_OSS_HEAD_DIM, GPT_OSS_MAX_POS, GPT_OSS_THETA, &gpt_oss_yarn());
+        let table = yarn_cos_sin_table(
+            GPT_OSS_HEAD_DIM,
+            GPT_OSS_MAX_POS,
+            GPT_OSS_THETA,
+            &gpt_oss_yarn(),
+        );
         let half = GPT_OSS_HEAD_DIM / 2;
         for i in 0..GPT_OSS_HEAD_DIM {
             assert_eq!(table[i], if i < half { 1.0 } else { 0.0 });

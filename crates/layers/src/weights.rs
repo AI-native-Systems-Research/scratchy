@@ -2661,12 +2661,18 @@ mod affine_width_tests {
         // Same K=2048, gs=64: 32 scale cols either way; packed 128 (b2) vs 256 (b4).
         let c2 = ckpt(&[("self_attn.q_proj", 128, 32)]);
         let c4 = ckpt(&[("self_attn.q_proj", 256, 32)]);
-        assert!(check(&c2, b2), "the b2 variant must accept the b2 checkpoint");
+        assert!(
+            check(&c2, b2),
+            "the b2 variant must accept the b2 checkpoint"
+        );
         assert!(
             !check(&c4, b2),
             "the b2 variant must REJECT the b4 checkpoint — packed K/8 cannot satisfy a b2 row",
         );
-        assert!(check(&c4, b4), "the b4 variant must accept the b4 checkpoint");
+        assert!(
+            check(&c4, b4),
+            "the b4 variant must accept the b4 checkpoint"
+        );
         assert!(
             !check(&c2, b4),
             "the b4 variant must REJECT the b2 checkpoint — packed K/16 cannot satisfy a b4 row",
