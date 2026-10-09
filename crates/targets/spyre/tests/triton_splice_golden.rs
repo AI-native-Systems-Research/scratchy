@@ -1439,6 +1439,9 @@ fn spliced_rope_lowers_through_the_door() {
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 geom,
                 rows_are_requests,
+                // No fold: this fixture's q/k are Ext sources with no projection matmuls, so the
+                // program states its real scale and the door emits the score multiplies.
+                scale_folded: false,
             };
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
@@ -1890,6 +1893,8 @@ fn spliced_attn_lowers_through_the_door() {
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 geom: attn_geometry(s.geom).expect("granite's geometry mints"),
                 rows_are_requests,
+                // No fold: same as the rope door's fixture — the program states its real scale.
+                scale_folded: false,
             };
             let mut sym = 0i64;
             let mut quantized = HashSet::new();

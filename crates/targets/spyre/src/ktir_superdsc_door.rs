@@ -67,6 +67,19 @@ pub struct BundleAttnParams {
     pub geom: ktir_superdsc::head_counts::ModelAttnGeometry,
     /// main's `lower_one_node(.., rows_are_requests, ..)`.
     pub rows_are_requests: bool,
+    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION SCALE WAS FOLDED INTO `W_q`/`W_k` — and it is here because
+    /// the fold makes the program UNABLE to state the one fact that remains.
+    ///
+    /// The score multiplier was the one thing the program stated and the door read back
+    /// (`program_score_scale`, on the `qk · scale` mulf). The fold rewrites the node's scale to 1.0
+    /// before the splice mints the program, and the triton→ktir pipeline folds a multiply by 1.0
+    /// away entirely — so a folded attention program states NO multiplier, which is the truth (no
+    /// device multiply is left to do: the weights carry `√scale` each) but is indistinguishable, at
+    /// the door, from a broken program. This bool is the caller's statement of which one it is, and
+    /// the door HARD-REFUSES a multiplier-less program without it — a fact about what the program
+    /// cannot say, not a value duplicated from what it does (the caller-stated `f32` this struct
+    /// once carried beside the program's own reading, and lost for exactly that reason).
+    pub scale_folded: bool,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -168,6 +181,7 @@ fn attn(
             k,
             r,
             rows_are_requests: p.rows_are_requests,
+            scale_folded: p.scale_folded,
             sym_id_base,
             layout,
         }),

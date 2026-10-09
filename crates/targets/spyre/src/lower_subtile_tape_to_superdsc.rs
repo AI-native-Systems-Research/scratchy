@@ -455,7 +455,17 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    alias in the intermediate scan). Computing the folds before liveness is what lets the
     //    producer's bytes stay live for the folded node's readers instead of being reclaimed
     //    under them.
-    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
+    //
+    // ⛔ TWO LISTS, BECAUSE THE TWO FOLD KINDS DIFFER IN WHAT HAPPENS TO THE NODE. The union
+    // (`weight_scale_folds`) is everything the worker applies to staged bytes at load — the
+    // ScalarMul folds AND the attention-scale folds — and it is what the census skips and the
+    // layout carries. The ScalarMul folds ALONE leave the tape: their node is host-routed and
+    // their output placement aliases the producer's bytes, which is why the liveness extension
+    // and the placement alias below key on `scalarmul_folds` and never on the union — an
+    // attention fold's node STAYS (at scale 1.0), its output is a real intermediate, and
+    // aliasing it to the query's bytes would hand every attention consumer the query buffer.
+    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::weight_scale_folds(ir);
+    let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let n_nodes = ir.nodes.len();
     let mut first_def: std::collections::BTreeMap<u32, usize> = Default::default();
     let mut last_use: std::collections::BTreeMap<u32, usize> = Default::default();
@@ -472,7 +482,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    the scan would otherwise reclaim those bytes the moment the (now op-less) ScalarMul
     //    "consumes" the product, and the alias would surface as silent corruption: the fold's
     //    readers would read a later intermediate that the scan moved into the reclaimed range.
-    for (fold_id, _, _) in &weight_scale_folds {
+    for (fold_id, _, _) in &scalarmul_folds {
         let node = &ir.nodes[fold_id.index()];
         let producer_out = node.inputs[0].tensor.index() as u32;
         let fold_out = node.output.tensor.index() as u32;
@@ -869,8 +879,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .collect();
     // A FOLDED ScalarMul's output is placed by the ALIAS below, not by this pool — a colored
     // slot of its own would be a dead hole beside the producer's bytes its readers are
-    // re-pointed at.
-    let folded_out: std::collections::HashSet<u32> = weight_scale_folds
+    // re-pointed at. (An attention-scale fold's node keeps running, so its output is an
+    // ordinary intermediate and colors normally.)
+    let folded_out: std::collections::HashSet<u32> = scalarmul_folds
         .iter()
         .map(|(id, _, _)| ir.nodes[id.index()].output.tensor.index() as u32)
         .collect();
@@ -940,7 +951,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    residual threading (`hidden_out` ← `hidden_in`), and safe for the same reason the
     //    liveness extension above is: the producer's range is not reclaimable while the fold's
     //    readers live.
-    for (fold_id, _, _) in &weight_scale_folds {
+    for (fold_id, _, _) in &scalarmul_folds {
         let node = &ir.nodes[fold_id.index()];
         let producer_out = node.inputs[0].tensor.index() as u32;
         let fold_out = node.output.tensor.index() as u32;
@@ -1463,9 +1474,17 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // torch-spyre `spyre__sdpa_overrideable`: scaling_factor = sqrt(scale), applied to BOTH q and K
             // (`query * scaling_factor`, `key * scaling_factor`). Register √scale for the prefill split; the
             // un-split `scale` stays for the decode qs.
+            //
+            // ⭐ EXCEPT THE WEIGHT-FOLDED ONES (the same skip the ScalarMul arm takes): an
+            // attention whose √scale commuted into W_q/W_k runs at scale 1.0 and multiplies
+            // NOTHING, so neither it nor its square root may occupy a registry slot — and the
+            // 1.0 itself most of all, which is why the skip is by NODE and not by value (a
+            // pushed identity would shift every scale after it by a slot).
             SubOp::AttnDecode { scale, .. } => {
-                push_scale(*scale, &mut scalarmul_scales);
-                push_scale(scale.sqrt(), &mut scalarmul_scales);
+                if !folded_node(node.id) {
+                    push_scale(*scale, &mut scalarmul_scales);
+                    push_scale(scale.sqrt(), &mut scalarmul_scales);
+                }
             }
             // RMSNorm epsilon (config `rms_norm_eps`) flows through the SAME registry — a `[1,1]`
             // worker-bound const the rmsnorm adds to the mean-of-squares (config value, not dropped).
@@ -1953,17 +1972,19 @@ pub fn write_eval_golden<F: RopeForm>(
     let dbg = dir.join("dbg");
     std::fs::create_dir_all(dbg.join("golden"))?;
     let nsrc = ir.num_sources as usize;
-    // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO. A weight-folded ScalarMul has no device op, so the
-    // bundle under test never applies its multiplier as a node — the scale enters through the
-    // staged weight bytes. The golden must model exactly that or every comparison diverges at
-    // the first folded node: pre-scale each fold target's synthetic source by its multiplier
-    // (what `stage_bound_weights` does to the real bytes) and SKIP the folded nodes in the eval
-    // walk (what `lower_one_node`'s HostRouted arm does to the tape).
-    let weight_scale_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
+    // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO — BOTH KINDS. A weight-folded ScalarMul has no
+    // device op, so the bundle under test never applies its multiplier as a node — the scale
+    // enters through the staged weight bytes. The golden must model exactly that or every
+    // comparison diverges at the first folded node: pre-scale each fold target's synthetic
+    // source by its multiplier (what `stage_bound_weights` does to the real bytes) and SKIP
+    // the folded nodes in the eval walk (what `lower_one_node`'s HostRouted arm does to the
+    // tape). An attention-scale fold's node is NOT skipped — it still runs, at the scale the
+    // splice's rewrite gave the real program (1.0) — so the golden evaluates it at 1.0 over
+    // the pre-scaled W_q/W_k, which is bit-for-bit the folded bundle's contract.
+    let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
+    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
-        weight_scale_folds
-            .iter()
-            .any(|(fold_id, _, _)| *fold_id == id)
+        scalarmul_folds.iter().any(|(fold_id, _, _)| *fold_id == id)
     };
     let mut src_vals: Vec<Vec<f32>> = (0..nsrc)
         .map(|id| {
@@ -1972,10 +1993,19 @@ pub fn write_eval_golden<F: RopeForm>(
             (0..n).map(|j| dbg_synth_val(id, j)).collect()
         })
         .collect();
-    for (_, tid, scale) in &weight_scale_folds {
+    for (_, tid, scale) in &scalarmul_folds {
         if let Some(src) = src_vals.get_mut(*tid as usize) {
             for v in src.iter_mut() {
                 *v *= scale;
+            }
+        }
+    }
+    for (_, w_q, w_k, sqrt_scale) in &attn_folds {
+        for tid in [w_q, w_k] {
+            if let Some(src) = src_vals.get_mut(*tid as usize) {
+                for v in src.iter_mut() {
+                    *v *= sqrt_scale;
+                }
             }
         }
     }
@@ -1994,7 +2024,22 @@ pub fn write_eval_golden<F: RopeForm>(
         if folded_node(node.id) {
             continue;
         }
-        let out = scratchy_subtile::subtile_ir::eval_node(node, ir, &bufs);
+        // An attention-folded node evaluates at the REWRITTEN scale (1.0): the real program
+        // the golden must track was minted from the rewritten node, and evaluating the
+        // original scale over the pre-scaled sources would double-apply the multiplier.
+        let mut attn_node;
+        let node_ref = if let SubOp::AttnDecode { .. } = &node.op
+            && attn_folds.iter().any(|(id, ..)| *id == node.id)
+        {
+            attn_node = node.clone();
+            if let SubOp::AttnDecode { scale, .. } = &mut attn_node.op {
+                *scale = 1.0;
+            }
+            &attn_node
+        } else {
+            node
+        };
+        let out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
         let shape = ir.shape(node.output.tensor);
         scratchy_subtile::subtile_ir::scatter(
             &mut bufs,

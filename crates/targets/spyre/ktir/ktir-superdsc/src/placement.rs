@@ -204,14 +204,16 @@ pub struct BundleLayout {
     /// fold, no host-route — the op is a real on-device pointwise `mul`).
     #[serde(default)]
     pub scalarmul_scales: Vec<f32>,
-    /// ⭐ THE SCALARMUL WEIGHT FOLDS — `(weight tensor id, multiplier)`, one per `ScalarMul` node
-    /// [`crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds`] recognized (a compile-time
-    /// multiplier scaling a MATMUL's whole, unshared output). The weight's staged bytes are
-    /// multiplied by `multiplier` at load — dense `[A, W]` folds into `W`, fp8 `[A, qW, ws]` into
-    /// the `ws` dequant row — and neither the `[1,1]` const bind nor the pointwise `mul` is
-    /// emitted. EMPTY for every model whose multipliers scale something other than a private
-    /// matmul product (granite's tied-embedding `embedding_multiplier` is exactly that), which is
-    /// what keeps those bundles byte-identical to before this field existed.
+    /// ⭐ THE WEIGHT FOLDS — `(weight tensor id, multiplier)`, one per fold the producer half
+    /// recognized, of EITHER kind: a `ScalarMul` multiplier scaling a MATMUL's whole, unshared
+    /// output (`scalar_mul_weight_folds`), or an attention's `√scale` scaling its `W_q`/`W_k`
+    /// (`attn_scale_weight_folds` — the node stays on the tape at scale 1.0). The weight's
+    /// staged bytes are multiplied by `multiplier` at load — dense `[A, W]` folds into `W`, fp8
+    /// `[A, qW, ws]` into the `ws` dequant row — and neither the `[1,1]` const bind nor the
+    /// pointwise `mul` is emitted. EMPTY for every model whose multipliers scale something
+    /// other than a private matmul product (granite's tied-embedding `embedding_multiplier` is
+    /// exactly that), which is what keeps those bundles byte-identical to before this field
+    /// existed.
     #[serde(default)]
     pub weight_scale_folds: Vec<(u32, f32)>,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
