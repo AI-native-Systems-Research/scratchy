@@ -1013,7 +1013,8 @@ impl MetalWorker {
                 // and rung-summed; the resolver and the OOM guard share it.
                 // The target is still a local here, not `self.model` (see
                 // the helper's parameter doc).
-                let peak = self.metal_peak_activation_estimate(Some(model), Some(gpu_device))?;
+                let peak =
+                    self.metal_peak_activation_estimate(Some(model), Some(gpu_device), None)?;
                 // The sampler arena allocated right AFTER this resolves is
                 // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
                 // the sliced buffers' terms — count its per-row cost so the
@@ -1073,18 +1074,27 @@ impl MetalWorker {
         // (after field assignment) passes `None` and the fields serve.
         model: Option<&dyn scratchy_forward_compiler::ScratchyWeights>,
         gpu_device: Option<&scratchy_target_metal::GpuDevice>,
+        // The budget the internal bucket selection prunes against. `None` =
+        // the raw `working_set × utilization` figure — the load-time
+        // `--max-num-seqs` resolver's view, which wants the conservative
+        // pre-floor estimate. `determine_available_memory` passes its
+        // KV-floored total so the arena returned here matches the bucket
+        // its ladder will actually run (and the KV split subtracts exactly
+        // that arena, not a stale collapsed one).
+        budget: Option<usize>,
     ) -> ExecutorResult<usize> {
         let model = model
             .or(self.model.as_deref())
             .ok_or_else(|| ExecutorError::WorkerInit("peak estimate: model not loaded".into()))?;
-        let total = self
-            .metal_device
-            .as_ref()
-            .map(|dev| {
-                (dev.device.recommendedMaxWorkingSetSize() as f64
-                    * self.config.gpu_memory_utilization) as usize
-            })
-            .unwrap_or(0);
+        let total = budget.unwrap_or_else(|| {
+            self.metal_device
+                .as_ref()
+                .map(|dev| {
+                    (dev.device.recommendedMaxWorkingSetSize() as f64
+                        * self.config.gpu_memory_utilization) as usize
+                })
+                .unwrap_or(0)
+        });
         let weights_and_overhead = self
             .metal_device
             .as_ref()
@@ -3714,7 +3724,8 @@ impl Worker for MetalWorker {
         // gemma-4-26b to 21,984 tokens with no OOM on a 32 GiB M5.
         // `gpu_memory_utilization` (default 0.9) is the headroom knob — lower it
         // for a model that trips `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
-        let total = (working_set as f64 * self.config.gpu_memory_utilization) as usize;
+        let utilization_budget = (working_set as f64 * self.config.gpu_memory_utilization) as usize;
+        let mut total = utilization_budget;
         // Reserve room for the Gated-DeltaNet recurrent-state pool. It is
         // built in `initialize_cache` (which runs AFTER this), so it is
         // NOT yet in `currentAllocatedSize`; fold it into the non-KV
@@ -3742,6 +3753,50 @@ impl Worker for MetalWorker {
             .device
             .currentAllocatedSize()
             .saturating_add(gdn_reserve);
+        // ── The KV floor, as a fixed point with the ladder ────────────────
+        // A model whose resident set fits Apple's recommended working set
+        // but not `util × working_set` (a 48 GiB checkpoint on a 64 GiB box
+        // at the 0.9 default) is KV-starved, not an OOM risk: the
+        // utilization default is a HEADROOM REQUEST, not a ceiling on
+        // weights. Floor the budget at resident + the shared KV floor —
+        // the engine then clamps context to what's left instead of
+        // refusing a model the device can hold — and cap it at the working
+        // set itself, so a model too big for Apple's own recommendation
+        // still trips the guard below unchanged.
+        //
+        // The floor must run BEFORE the ladder selection under it, not
+        // after: the selector prunes the bucket ladder against the budget
+        // it is handed, so flooring late left a model that only fits past
+        // `util × working_set` collapsing its prefill ladder to the m=1
+        // fallback (m=1 prefill steps cost ~15× a decode step — TTFT
+        // linear in prompt length on a device with GiB of headroom).
+        // But the floor needs the peak-activation estimate, and the
+        // estimate internally runs the same selector — resolve the two to
+        // a fixed point: each pass floors the budget with the estimate the
+        // current budget selects, then re-estimates under the floored
+        // budget. Both are monotone in the budget and the result is capped
+        // at the working set, so the sequence rises to its fixed point in
+        // a few passes — and the FIRST pass breaks out unchanged whenever
+        // the floor does not bind (the normal case: `util × working_set`
+        // already covers resident + KV floor), costing exactly the one
+        // estimate this function always ran.
+        let mut peak_activation_estimate =
+            self.metal_peak_activation_estimate(None, None, Some(total))?;
+        for _ in 0..8 {
+            let floored = utilization_budget
+                .max(
+                    weights_and_overhead
+                        .saturating_add(peak_activation_estimate)
+                        .saturating_add(scratchy_serving_engine::gpu_budget::KV_FLOOR_BYTES),
+                )
+                .min(working_set);
+            if floored <= total {
+                break;
+            }
+            total = floored;
+            peak_activation_estimate =
+                self.metal_peak_activation_estimate(None, None, Some(total))?;
+        }
         // ── Target-reactive prefill-bucket selection ─────────────────────
         // The forward macro now compiles a full bucket ladder for every arch
         // (no per-model `workloads` cap). Pick the largest bucket THIS device
@@ -3766,9 +3821,10 @@ impl Worker for MetalWorker {
             // subtracts (64 MiB runtime/staging + 150 MiB redundancy) so the
             // headroom the selector splits equals what is actually left.
             let pad = (64 + 150) * 1024 * 1024u64;
-            // `total` is ALREADY the wireable budget (working_set·util capped
-            // at maxBufferLength), so use it directly — do NOT re-apply
-            // `utilization` here or it would shrink the budget twice.
+            // `total` is ALREADY the final budget (working_set·util,
+            // KV-floored by the fixed point above), so use it directly —
+            // do NOT re-apply `utilization` here or it would shrink the
+            // budget twice.
             let budget = total as u64;
             let fixed = (weights_and_overhead as u64).saturating_add(pad);
             let sel = select_prefill_bucket(budget, fixed, bucket_costs, ARENA_FRACTION);
@@ -3828,26 +3884,14 @@ impl Worker for MetalWorker {
         // `metal_peak_activation_estimate` — the same helper the unset-
         // `--max-num-seqs` resolver budgets against at load. (The
         // arena/rung intermediates above stay only to feed the log line.)
-        let peak_activation_estimate = self.metal_peak_activation_estimate(None, None)?;
-        // A model whose resident set fits Apple's recommended working set
-        // but not `util × working_set` (a 48 GiB checkpoint on a 64 GiB box
-        // at the 0.9 default) is KV-starved, not an OOM risk: the
-        // utilization default is a HEADROOM REQUEST, not a ceiling on
-        // weights. Floor the budget at resident + the shared KV floor —
-        // the engine then clamps context to what's left instead of
-        // refusing a model the device can hold — and cap it at the
-        // working set itself, so a model too big for Apple's own
-        // recommendation still trips the guard below unchanged. Same
-        // shape as the `maxBufferLength`-floor removal above: a default
-        // that starves a model which fits the device is the defect.
-        let resident = weights_and_overhead.saturating_add(peak_activation_estimate);
-        let total = total
-            .max(resident.saturating_add(scratchy_serving_engine::gpu_budget::KV_FLOOR_BYTES))
-            .min(working_set);
-        // `total` already folds in `gpu_memory_utilization` (and the floor
-        // above), so pass util=1.0 here — applying it again would shrink the
-        // KV budget a second time below the headroom the bucket selector
-        // just split.
+        // The estimate itself is the fixed point's last pass above,
+        // computed under the same floored `total` the ladder selection
+        // just ran — so the arena the KV split subtracts below is exactly
+        // the bucket the ladder stashed, never a stale collapsed one.
+        // `total` already folds in `gpu_memory_utilization` (and the KV
+        // floor above), so pass util=1.0 below — applying it again would
+        // shrink the KV budget a second time below the headroom the
+        // bucket selector just split.
         let available =
             compute_available_kv_bytes(total, weights_and_overhead, peak_activation_estimate, 1.0);
         // A uniform TurboQuant pool still reserves one fp16 chunk per layer
