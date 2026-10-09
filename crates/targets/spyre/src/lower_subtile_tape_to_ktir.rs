@@ -18,7 +18,7 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
-use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileNode};
+use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
@@ -46,6 +46,95 @@ pub(crate) enum NodeLowering {
     Unhandled(String),
     /// A recognized data-movement op routed host-side (not a SuperDSC tile).
     HostRouted(&'static str),
+}
+
+/// ⭐⭐⭐ THE SCALARMUL WEIGHT FOLD — the compile-time multipliers that never need a device op.
+///
+/// A `ScalarMul` whose single input is a MATMUL's whole output multiplies a linear function's
+/// result by a constant, and a constant commutes with linearity: `(x·W)·s == x·(W·s)`. So the
+/// multiplier can leave the runtime tape entirely — the worker stages the fold target's bytes
+/// pre-scaled and the pointwise `mul` + its `[1,1]` const bind disappear. This is the constants
+/// fold the hardware has no descriptor door for (no DDL template takes a `mulConst` outside
+/// `quant_scale_per_token.ddl`): the weight IS the door.
+///
+/// The fold target is the producer's LAST input — the same slot for both arities the emitter
+/// knows: dense `MatmulTile` `[A, W]` folds into `W`; fp8 W8A8 `[A, qW, ws]` folds into the
+/// `ws` dequant row (`(qA·qW)·a[m]·ws[n]·s == (qA·qW)·a[m]·(ws·s)[n]` — the payload and its
+/// quantization are untouched, which is why the fp8 fold is exact algebra, not a requantize).
+///
+/// ⛔ EVERY REFUSAL BELOW IS A CORRECTNESS FACT, NOT TIMIDITY:
+///   * a SLICED read (the input region not EXACTLY one producer's whole output) — the fold
+///     scales every row the matmul wrote, not just the slice read, and two producers writing
+///     disjoint regions of one tensor match no whole-output producer at all;
+///   * the fold target read by any OTHER node — a shared weight cannot absorb a per-consumer
+///     scale (granite ties `lm_head` to the embedding table; a scale folded into a tied table
+///     would scale the logits too);
+///   * the producer's output read by any node other than this `ScalarMul` — that reader needs
+///     the UNSCALED product, and the fold would hand it `x·W·s`;
+///   * a non-matmul producer (granite's `embedding_multiplier` scales a GATHER) — the
+///     multiplier does not commute with a lookup;
+///   * an output region that does not MIRROR the input — the fold re-points every reader of
+///     this node's output at the producer's bytes (the layout aliases the two placements),
+///     which is the same window only because a pointwise map's output region equals its input
+///     region;
+///   * the graph RESULT — the logits ScalarMul is the splice's own lm_head-tail fold
+///     (`lower_all` folds both halves to m=1), and the result's Logits placement is the
+///     worker's readback window, not a window this fold may redirect.
+pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<(SubtileId, u32, f32)> {
+    let mut folds = Vec::new();
+    for node in &ir.nodes {
+        let SubOp::ScalarMul { scale } = &node.op else {
+            continue;
+        };
+        let [input] = node.inputs.as_slice() else {
+            continue;
+        };
+        if node.output.tensor == ir.result || node.output.region != input.region {
+            continue;
+        }
+        let Some(producer) = ir
+            .nodes
+            .iter()
+            .find(|p| p.id != node.id && p.output == *input)
+        else {
+            continue;
+        };
+        if !matches!(producer.op, SubOp::MatmulTile { .. }) || producer.inputs.len() < 2 {
+            continue;
+        }
+        let target = producer.inputs.last().expect("len checked above");
+        // ⛔ AN fp8 WEIGHT CANNOT ABSORB A SCALE — multiplying its mantissa bytes elementwise is
+        // a REQUANTIZE (the product has to re-encode into fp8's own exponent range), not the
+        // exact algebra this fold is. The `ws` dequant row is the fp8 fold's target precisely
+        // because it sits OUTSIDE the quantized payload. The fp8-weight test is the emitter's
+        // own (`input[1]` of an arity-3 `MatmulTile`, `compute_bundle_layout::fp8_weight_tids`),
+        // restated here so a matmul whose input order puts the quantized payload last is refused
+        // at RECOGNITION — a build-time fact, not a load-time dtype check.
+        let is_fp8_weight = |t: TensorId| {
+            ir.nodes.iter().any(|n| {
+                matches!(n.op, SubOp::MatmulTile { .. })
+                    && n.inputs.len() == 3
+                    && n.inputs[1].tensor == t
+            })
+        };
+        if is_fp8_weight(target.tensor) {
+            continue;
+        }
+        let shared = |tid: TensorId, skip: SubtileId| {
+            ir.nodes
+                .iter()
+                .any(|n| n.id != skip && n.inputs.iter().any(|r| r.tensor == tid))
+        };
+        // The weight must be this matmul's alone, and the product must be this ScalarMul's
+        // alone — see the refusals above.
+        if shared(target.tensor, producer.id) || shared(input.tensor, node.id) {
+            continue;
+        }
+        folds.push((node.id, target.tensor.index() as u32, *scale));
+    }
+    folds
 }
 
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
@@ -211,7 +300,19 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // tail folds BOTH halves to m=1 (main's `is_prefill_lm_head_tail` covers this
         // arm too), and the fold is the splice's `lower_all` now. Every other
         // ScalarMul is the ordinary one-op pointwise.
+        //
+        // ⭐⭐ EXCEPT THE ONES THAT NEVER NEED A DEVICE OP AT ALL: a multiplier whose product
+        // scales a MATMUL OUTPUT commutes into the matmul's weight (`(x·W)·s == x·(W·s)`), so
+        // [`scalar_mul_weight_folds`] takes it out of the tape and into the staged weight bytes
+        // — the multiplier stops being a per-step `[1,1]` const + a pointwise `mul` and becomes
+        // a load-time fact. See that function for why the recognition refuses shared weights.
         SubOp::ScalarMul { .. } => {
+            if scalar_mul_weight_folds(ir)
+                .iter()
+                .any(|(id, _, _)| *id == node.id)
+            {
+                return HostRouted("ScalarMulWeightFold");
+            }
             match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
@@ -404,6 +505,15 @@ pub struct BundleWiring {
     /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
     /// own source binding. This is the one list they read, so they cannot disagree about it.
     pub scalarmul_scales: Vec<f32>,
+    /// The ScalarMul weight folds this graph admits: `(tensor id, multiplier)` for each matmul
+    /// weight the worker must scale at load instead of the tape running the multiplier as an op —
+    /// the recognition is [`scalar_mul_weight_folds`], whose refusal set (sliced reads, shared
+    /// fold target, shared producer output, non-matmul producer) is the whole safety envelope.
+    ///
+    /// ⛔ THE UNROLLED WALK THAT PRODUCES THIS WIRING HOST-ROUTES THE FOLDED NODES TOO: the same
+    /// recognition gates `lower_one_node`'s ScalarMul arm, so a wiring that ran the multiplier as a
+    /// program while the card path folded it would be a wiring that double-applies the scale.
+    pub weight_scale_folds: Vec<(u32, f32)>,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -495,6 +605,7 @@ pub fn graph_wiring<F: RopeForm>(
         tensor_shapes,
         attn_mask,
         scalarmul_scales: layout.scalarmul_scales.clone(),
+        weight_scale_folds: layout.weight_scale_folds.clone(),
     })
 }
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -1166,4 +1277,228 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         suffix_in_tid,
         attn_params,
     })
+}
+
+#[cfg(test)]
+mod scalar_mul_weight_fold_tests {
+    use super::*;
+    use scratchy_subtile::lower::GemmWeight;
+    use scratchy_subtile::subtile_ir::{Region, TensorId, TensorRegion, TensorShape};
+
+    /// granite's residual shape and its refusals, as one fixture with switches: t0 = x
+    /// (activation source), t1 = W (weight source), t2 = the matmul's whole output, t3 = the
+    /// ScalarMul's output, t4 = W2 (the consumer's OWN weight), t5 = the consumer's output,
+    /// t6 = spare. `tied_weight` adds a second reader of W (the tied-table refusal),
+    /// `shared_product` adds a second reader of t2 (the unscaled-product refusal), `sliced`
+    /// makes the ScalarMul read a column slice of t2, and `as_result` makes t3 the graph result.
+    fn graph(
+        scale: f32,
+        tied_weight: bool,
+        shared_product: bool,
+        sliced: bool,
+        as_result: bool,
+    ) -> SubtileIR {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 8 },  // t0 = x
+            TensorShape { rows: 8, cols: 16 }, // t1 = W
+            TensorShape { rows: 1, cols: 16 }, // t2 = x·W
+            TensorShape { rows: 1, cols: 16 }, // t3 = (x·W)·s
+            TensorShape { rows: 16, cols: 4 }, // t4 = W2 (the consumer's own weight)
+            TensorShape { rows: 1, cols: 4 },  // t5 = the consumer's output
+            TensorShape { rows: 1, cols: 16 }, // t6 = spare
+        ];
+        let whole = |t: usize| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: tensors[t].whole(),
+        };
+        let mut nodes = vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(0), whole(1)],
+                output: whole(2),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::ScalarMul { scale },
+                inputs: vec![if sliced {
+                    TensorRegion {
+                        tensor: TensorId::from_index(2),
+                        region: Region {
+                            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                            cols: scratchy_subtile::subtile_ir::Range::new(0, 8),
+                        },
+                    }
+                } else {
+                    whole(2)
+                }],
+                output: whole(3),
+            },
+        ];
+        // The consumer every fold needs: a reader of the SCALED product over its OWN weight, so
+        // the base fixture reads W exactly once (the producer).
+        nodes.push(SubtileNode {
+            id: SubtileId::from_index(2),
+            op: SubOp::MatmulTile {
+                n: 4,
+                weight: GemmWeight::Dense,
+            },
+            inputs: vec![whole(3), whole(4)],
+            output: whole(5),
+        });
+        if tied_weight {
+            // A second reader of W — the tied lm_head/embedding shape: one weight, two matmuls.
+            nodes.push(SubtileNode {
+                id: SubtileId::from_index(3),
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(0), whole(1)],
+                output: whole(6),
+            });
+        }
+        if shared_product {
+            // A second reader of the UNSCALED product t2 beside the ScalarMul — reading a
+            // SLICE, so this reader is not itself a fold candidate and the refusal under test
+            // is the ORIGINAL node's alone.
+            nodes.insert(
+                1,
+                SubtileNode {
+                    id: SubtileId::from_index(4),
+                    op: SubOp::ScalarMul { scale: 2.0 },
+                    inputs: vec![TensorRegion {
+                        tensor: TensorId::from_index(2),
+                        region: Region {
+                            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                            cols: scratchy_subtile::subtile_ir::Range::new(0, 8),
+                        },
+                    }],
+                    output: whole(6),
+                },
+            );
+        }
+        SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes,
+            result: TensorId::from_index(if as_result { 3 } else { 5 }),
+            // Hand-authored fixture: there is no source op list to be the provenance of.
+            op_output: Vec::new(),
+        }
+    }
+
+    /// The fold fires on granite's residual shape, naming the matmul's LAST input.
+    #[test]
+    fn the_residual_multiplier_folds_into_the_matmul_weight() {
+        let ir = graph(0.5, false, false, false, false);
+        let folds = scalar_mul_weight_folds(&ir);
+        assert_eq!(
+            folds,
+            vec![(SubtileId::from_index(1), 1, 0.5f32)],
+            "the ScalarMul folds into W (t1), the producer's last input"
+        );
+    }
+
+    /// The tied lm_head/embedding table is granite's own refusal: a weight another node reads
+    /// cannot absorb a per-consumer scale.
+    #[test]
+    fn a_weight_another_node_reads_refuses_the_fold() {
+        let ir = graph(0.5, true, false, false, false);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "a shared weight must keep its ScalarMul as an op"
+        );
+    }
+
+    /// A second reader of the matmul's output needs the UNSCALED product.
+    #[test]
+    fn a_product_another_node_reads_refuses_the_fold() {
+        let ir = graph(0.5, false, true, false, false);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "a shared product must keep its ScalarMul as an op"
+        );
+    }
+
+    /// A sliced read scales rows the fold would not.
+    #[test]
+    fn a_sliced_read_refuses_the_fold() {
+        let ir = graph(0.5, false, false, true, false);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "a sliced read must keep its ScalarMul as an op"
+        );
+    }
+
+    /// The logits ScalarMul is the splice's own lm-head-tail fold, and the result's Logits
+    /// placement is the worker's readback window — not this fold's to redirect.
+    #[test]
+    fn the_graph_result_refuses_the_fold() {
+        let ir = graph(0.5, false, false, false, true);
+        assert!(
+            scalar_mul_weight_folds(&ir).is_empty(),
+            "the result ScalarMul belongs to the splice's lm-head-tail fold"
+        );
+    }
+
+    /// The fp8 W8A8 shape folds into the `ws` dequant row — the scale rides the row that is
+    /// already per-column, so the quantized payload is untouched (exact algebra, no requantize).
+    #[test]
+    fn the_fp8_w8a8_multiplier_folds_into_the_dequant_row() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 8 },  // t0 = qA
+            TensorShape { rows: 8, cols: 16 }, // t1 = qW (fp8 payload)
+            TensorShape { rows: 1, cols: 16 }, // t2 = ws (the dequant row)
+            TensorShape { rows: 1, cols: 16 }, // t3 = (qA·qW)·a·ws
+            TensorShape { rows: 1, cols: 16 }, // t4 = scaled
+            TensorShape { rows: 16, cols: 4 }, // t5 = the consumer's own dense weight
+            TensorShape { rows: 1, cols: 4 },  // t6 = consumer output
+        ];
+        let whole = |t: usize| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: tensors[t].whole(),
+        };
+        let nodes = vec![
+            SubtileNode {
+                id: SubtileId::from_index(0),
+                op: SubOp::MatmulTile {
+                    n: 16,
+                    weight: GemmWeight::Fp8Dynamic,
+                },
+                inputs: vec![whole(0), whole(1), whole(2)],
+                output: whole(3),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(1),
+                op: SubOp::ScalarMul { scale: 0.5 },
+                inputs: vec![whole(3)],
+                output: whole(4),
+            },
+            SubtileNode {
+                id: SubtileId::from_index(2),
+                op: SubOp::MatmulTile {
+                    n: 4,
+                    weight: GemmWeight::Dense,
+                },
+                inputs: vec![whole(4), whole(5)],
+                output: whole(6),
+            },
+        ];
+        let ir: SubtileIR = SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes,
+            result: TensorId::from_index(6),
+            op_output: Vec::new(),
+        };
+        assert_eq!(
+            scalar_mul_weight_folds(&ir),
+            vec![(SubtileId::from_index(1), 2, 0.5f32)],
+            "the fp8 fold targets the ws dequant row (t2), never the quantized payload (t1)"
+        );
+    }
 }

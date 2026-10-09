@@ -562,6 +562,15 @@ pub struct Wiring {
     /// `1/hidden` broadcast over one stick — the mq>1 sum-based amax pre-scale. A pure function of
     /// `hidden`, formerly `vec![1.0 / h as f32; 64]` per forward.
     pub rms_invcols: &'static [f32],
+    /// The ScalarMul weight folds the baked programs carry: `(tensor id, multiplier)` for each
+    /// matmul weight the worker must scale at load — `(x·W)·s == x·(W·s)`, so the folded
+    /// multiplier's device op is gone and the scale rides the staged weight bytes instead
+    /// ([`crate::spyre_load`]'s `stage_bound_weights` applies it, the one runtime half of the fold).
+    ///
+    /// ⛔ THE MULTIPLY IS POST-STAGING, PRE-CARD — the same staged fp16 bytes the un-folded bundle
+    /// would have shipped, times the multiplier, once, at load. Not a per-forward cost and not a
+    /// requantize: dense weights scale in place, fp8 dequant rows scale their `ws` row.
+    pub weight_scale_folds: &'static [(u32, f32)],
     /// EVERY compile-time scalar this program's KTIR reads, in registry order: entry `i` is bound at
     /// `lower_subtile_tape_to_superdsc::scalarmul_scale_tid(i)` as a `[1,1]` fp16 — the model's own
     /// multipliers and RMSNorm epsilons, exactly the set and order `subtile→superdsc` registers.

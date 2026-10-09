@@ -501,6 +501,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // Triton kernel therefore stages its weight FLAT, which is what an empty map states.
         kernel_weights: Default::default(),
         scalarmul_scales,
+        // No ScalarMul weight folds: a fold is a SUBTILE-GRAPH fact (a multiplier whose producer
+        // is a matmul), and one Triton kernel's parameter list is not a graph — its scale consts
+        // are the `scalarmul_scales` above, bound per launch.
+        weight_scale_folds: Vec::new(),
         synth,
         // The arrangement authority starts empty and every op declares into it — that is the point:
         // the FIRST op to address a tensor fixes its device layout and a later disagreement is a

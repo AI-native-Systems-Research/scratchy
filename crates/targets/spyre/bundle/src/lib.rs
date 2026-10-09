@@ -216,6 +216,11 @@ pub struct BundleLayout<'a> {
     /// `scalarmul_scale_tid(i)`, which the worker binds as a `[1,1]` const so the on-device
     /// pointwise `mul` gets its real multiplier (unbound = 0 = wrong output).
     pub scalarmul_scales: Cow<'a, [f32]>,
+    /// ⭐ THE SCALARMUL WEIGHT FOLDS — `(weight tensor id, multiplier)`: the compile-time
+    /// multipliers that commuted into their matmul's weight and so never became device ops.
+    /// The worker multiplies each listed weight's STAGED fp16 bytes by its multiplier at load
+    /// (`stage_bound_weights`), which is the whole of the fold's runtime half.
+    pub weight_scale_folds: Cow<'a, [(u32, f32)]>,
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,
