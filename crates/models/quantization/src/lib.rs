@@ -43,7 +43,9 @@ pub fn enabled_presets() -> Vec<&'static str> {
     preset!(v, "ggml");
     preset!(v, "gptq-sym");
     preset!(v, "gptq-sym-desc_act");
+    preset!(v, "mlx-affine-b2-g64-attn4-router8-qembed");
     preset!(v, "mlx-affine-b2-g64-qembed");
+    preset!(v, "mlx-affine-b3-g64-attn4-router8-qembed");
     preset!(v, "mlx-affine-b3-g64-qembed");
     preset!(v, "mlx-affine-b4-g128");
     preset!(v, "mlx-affine-b4-g128-qembed");

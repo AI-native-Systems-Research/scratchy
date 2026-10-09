@@ -36,7 +36,9 @@ gemma4-moe-ct-int4-sym = []
 ggml = []
 gptq-sym = []
 gptq-sym-desc_act = []
+mlx-affine-b2-g64-attn4-router8-qembed = []
 mlx-affine-b2-g64-qembed = []
+mlx-affine-b3-g64-attn4-router8-qembed = []
 mlx-affine-b3-g64-qembed = []
 mlx-affine-b4-g128 = []
 mlx-affine-b4-g128-qembed = []
@@ -56,7 +58,9 @@ nvfp4 = []
 # (`UnsupportedWeight`, "non-affine int4/ggml weight not yet lowered on the
 # SDSC/wavefront path") — not ready to bundle in.
 mlx = [
+    "mlx-affine-b2-g64-attn4-router8-qembed",
     "mlx-affine-b2-g64-qembed",
+    "mlx-affine-b3-g64-attn4-router8-qembed",
     "mlx-affine-b3-g64-qembed",
     "mlx-affine-b4-g32",
     "mlx-affine-b4-g64",

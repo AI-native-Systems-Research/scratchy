@@ -1,7 +1,9 @@
 {
-  "_comment": "Real pairs: 120b x b2 (jesusoctavioas/gpt-oss-120b-mlx-2Bit, uniform 2-bit INCLUDING the router) and 20b x b4 (jesusoctavioas/gpt-oss-20b-mlx-4Bit); the parity-tiny builds under BOTH presets for the kernel/quad goldens. Checkpointless cross pairs: 120b x b4, 20b x b2. mlx-community/gpt-oss-120b-4bit keeps an 8-bit router — it needs a b4-router8 preset variant with `bits_overrides: {\"mlp.router\": 8}` (the parser accepts override value 8 for exactly that case); recipe only, not declared here. Like glm4-moe, a build naming a gpt-oss stem WITHOUT a quant feature fails loudly at expansion (dense MoE has no metal realization).",
+  "_comment": "Real pairs: 120b x b2 (jesusoctavioas/gpt-oss-120b-mlx-2Bit, uniform 2-bit INCLUDING the router — the checkpoint whose chat quality convicted the uniform recipe), 120b x b2-attn4-router8 (the 'proper' 2-bit: experts 2, attn/embed/lm_head 4, router 8), 120b x b3-attn4-router8 (the 'proper' 3-bit), and 20b x b4 (jesusoctavioas/gpt-oss-20b-mlx-4Bit); the parity-tiny builds under EVERY preset for the kernel/quad goldens. The attn4-router8 presets are the recipe the 2026-10-09 ablation derived: attention@2bit alone is fatal while experts@2bit (96% of params) stays coherent, so bits go where the damage is — no off-the-shelf checkpoint ships it (mlx-lm's CLI cannot requant MXFP4 experts), which is why the proper checkpoints are converted locally and destined for the org. Checkpointless cross pairs: 120b x b4, 20b x b2, 20b x b2-attn4-router8/b3-attn4-router8 exist as local conversions. mlx-community/gpt-oss-120b-4bit keeps an 8-bit router — it needs a b4-router8 preset variant with `bits_overrides: {\"mlp.router\": 8}` (the parser accepts any affine width as an override now); recipe only, not declared here. Like glm4-moe, a build naming a gpt-oss stem WITHOUT a quant feature fails loudly at expansion (dense MoE has no metal realization).",
   "quantizations": [
     "mlx-affine-b2-g64-qembed",
+    "mlx-affine-b2-g64-attn4-router8-qembed",
+    "mlx-affine-b3-g64-attn4-router8-qembed",
     "mlx-affine-b4-g64-qembed"
   ]
 }

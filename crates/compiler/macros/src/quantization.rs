@@ -528,8 +528,11 @@ fn parse_affine_no_method(
     }
     // Optional per-path-suffix bit-width overrides (preset-owned shape,
     // `bits_overrides: { "mlp.gate_proj": 8, ... }`). Gemma4-12B ships
-    // 8-bit MLP projections alongside the 4-bit default; only 8 is a
-    // valid override width (4 would be a pointless no-op entry).
+    // 8-bit MLP projections alongside the 4-bit default; gpt-oss's
+    // proper low-bit recipes widen attention/embed/lm_head to 4 and the
+    // router to 8 over a 2/3-bit expert default. Any affine width the
+    // section default takes is a valid override (an entry equal to the
+    // default is a pointless no-op, but harmless).
     let mut bits_overrides: Vec<(String, u32)> = Vec::new();
     if let Some(ov) = obj.get("bits_overrides") {
         let map = ov.as_object().ok_or(ParseError::BadField {
@@ -541,10 +544,10 @@ fn parse_affine_no_method(
                 field: "bits_overrides",
                 reason: "override bits must be a u64",
             })? as u32;
-            if b != 8 {
+            if !matches!(b, 2 | 3 | 4 | 8) {
                 return Err(ParseError::BadField {
                     field: "bits_overrides",
-                    reason: "MLX-affine override bits must be 8",
+                    reason: "MLX-affine override bits must be 2, 3, 4 or 8",
                 });
             }
             bits_overrides.push((k.clone(), b));
@@ -1202,13 +1205,19 @@ pub fn affine_moe_expert_bits(
 /// Effective on-disk bit-width of the quantized `embed_tokens` under an
 /// MLX-affine method: the per-module entry when the checkpoint is
 /// mixed/dynamic (OptiQ ships `embed_tokens` at 8-bit while the section
-/// default is 4-bit), else the section default. `None` for non-affine
-/// methods. Used by the embedding-fingerprint packed-shape gate so a
-/// mixed checkpoint isn't rejected for computing `hidden / 8` when its
-/// embed is actually packed at `hidden / 4`.
+/// default is 4-bit), else a `bits_overrides` entry naming the embed
+/// (gpt-oss's proper low-bit recipes ship it at 4 over a 2/3-bit
+/// default), else the section default. `None` for non-affine methods.
+/// Used by the embedding-fingerprint packed-shape gate so a mixed
+/// checkpoint isn't rejected for computing `hidden / 8` when its
+/// embed is actually packed at `hidden / 4`. Must mirror the untied
+/// `embed_tokens` arm of [`storage_format_for_weight`].
 pub fn affine_embed_bits(method: &QuantMethod) -> Option<u32> {
     if let QuantMethod::Affine {
-        bits, per_module, ..
+        bits,
+        bits_overrides,
+        per_module,
+        ..
     } = method
     {
         Some(
@@ -1216,6 +1225,12 @@ pub fn affine_embed_bits(method: &QuantMethod) -> Option<u32> {
                 .iter()
                 .find(|(k, _)| k.ends_with("embed_tokens"))
                 .map(|&(_, (b, _))| b)
+                .or_else(|| {
+                    bits_overrides
+                        .iter()
+                        .find(|(s, _)| s.ends_with("embed_tokens"))
+                        .map(|&(_, b)| b)
+                })
                 .unwrap_or(*bits),
         )
     } else {
@@ -1266,6 +1281,7 @@ pub fn storage_format_for_weight(
         if let QuantMethod::Affine {
             bits,
             group_size,
+            ref bits_overrides,
             ref per_module,
             ..
         } = qc.method
@@ -1280,6 +1296,19 @@ pub fn storage_format_for_weight(
                         group_size: g,
                     },
                     None => StorageFormat::Dense,
+                };
+            }
+            // A `bits_overrides` entry naming the embed pins the shared
+            // buffer's width the same way (gpt-oss's proper low-bit
+            // recipes put embed/lm_head at 4 over a 2/3-bit default) —
+            // and implies the buffer IS quantized.
+            if let Some(&(_, b)) = bits_overrides
+                .iter()
+                .find(|(s, _)| "embed_tokens".ends_with(s.as_str()))
+            {
+                return StorageFormat::Affine {
+                    bits: b,
+                    group_size,
                 };
             }
             return StorageFormat::Affine { bits, group_size };
@@ -1312,6 +1341,7 @@ pub fn storage_format_for_weight(
             bits,
             group_size,
             quantize_embed,
+            ref bits_overrides,
             ref per_module,
             ..
         } = qc.method
@@ -1326,6 +1356,20 @@ pub fn storage_format_for_weight(
                     group_size: g,
                 },
                 None => StorageFormat::Dense,
+            };
+        }
+        // A `bits_overrides` entry naming the embed wins over the section
+        // default AND implies the embed is quantized (gpt-oss's proper
+        // low-bit recipes: 4-bit embed over a 2/3-bit expert default).
+        // Same precedence as every other affine weight: per-module map,
+        // then the suffix override, then the default.
+        if let Some(&(_, b)) = bits_overrides
+            .iter()
+            .find(|(s, _)| "embed_tokens".ends_with(s.as_str()))
+        {
+            return StorageFormat::Affine {
+                bits: b,
+                group_size,
             };
         }
         return if quantize_embed {
@@ -1743,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn affine_bits_overrides_rejects_non_8() {
+    fn affine_bits_overrides_rejects_unknown_width() {
         let v = json(
             r#"{
                 "quantization_config": {
@@ -1754,6 +1798,89 @@ mod tests {
             }"#,
         );
         assert!(QuantizationConfig::parse(&v).is_err());
+    }
+
+    /// gpt-oss's proper low-bit recipes: a 2/3-bit expert DEFAULT with
+    /// attention/embed/lm_head widened to 4 and the router to 8. The
+    /// override width may sit on EITHER side of the section default —
+    /// the 8-only law predated the first downward-override preset.
+    #[test]
+    fn parses_affine_bits_overrides_below_the_default() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "bits": 2,
+                    "group_size": 64,
+                    "quant_embed": true,
+                    "bits_overrides": {
+                        "embed_tokens": 4,
+                        "lm_head": 4,
+                        "mlp.router": 8,
+                        "self_attn.q_proj": 4
+                    }
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        let QuantMethod::Affine {
+            bits,
+            group_size,
+            quantize_embed,
+            ref bits_overrides,
+            ..
+        } = qc.method
+        else {
+            panic!("expected Affine, got {:?}", qc.method);
+        };
+        assert_eq!((bits, group_size), (2, 64));
+        assert!(quantize_embed);
+        assert_eq!(
+            bits_overrides.as_slice(),
+            [
+                ("embed_tokens".to_string(), 4),
+                ("lm_head".to_string(), 4),
+                ("mlp.router".to_string(), 8),
+                ("self_attn.q_proj".to_string(), 4),
+            ],
+            "overrides arrive sorted (parser sorts for a deterministic signature)",
+        );
+    }
+
+    /// `affine_embed_bits` must mirror the untied `embed_tokens` arm of
+    /// `storage_format_for_weight`: per-module entry first, then a
+    /// `bits_overrides` entry naming the embed, else the section default.
+    /// A drift between the two computes the fingerprint's embed-shape
+    /// literal at a width the loader never reads.
+    #[test]
+    fn affine_embed_bits_honors_the_override_law() {
+        let method = QuantMethod::Affine {
+            bits: 2,
+            group_size: 64,
+            quantize_embed: true,
+            bits_overrides: vec![("embed_tokens".to_string(), 4)],
+            per_module: Vec::new(),
+        };
+        assert_eq!(affine_embed_bits(&method), Some(4));
+
+        // The per-module map outranks the override (OptiQ precedence).
+        let method = QuantMethod::Affine {
+            bits: 2,
+            group_size: 64,
+            quantize_embed: true,
+            bits_overrides: vec![("embed_tokens".to_string(), 4)],
+            per_module: vec![("model.embed_tokens".to_string(), (8, 64))],
+        };
+        assert_eq!(affine_embed_bits(&method), Some(8));
+
+        // No override, no per-module entry: the section default.
+        let method = QuantMethod::Affine {
+            bits: 2,
+            group_size: 64,
+            quantize_embed: true,
+            bits_overrides: Vec::new(),
+            per_module: Vec::new(),
+        };
+        assert_eq!(affine_embed_bits(&method), Some(2));
     }
 
     #[test]

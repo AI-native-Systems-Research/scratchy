@@ -859,9 +859,8 @@ fn plan_field_load(
     // struct and is planted directly by `emit_weights_struct`, never
     // through this walk — so a GpuTensor-typed accessor here is the
     // sinks.
-    let is_attn_sinks = ty.ends_with("::GpuTensor")
-        || ty == "GpuTensor"
-        || ty.ends_with("tensor::GpuTensor");
+    let is_attn_sinks =
+        ty.ends_with("::GpuTensor") || ty == "GpuTensor" || ty.ends_with("tensor::GpuTensor");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
     let is_marlin = ty.ends_with("::MarlinLinear")
@@ -1479,14 +1478,22 @@ fn plan_field_load(
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
             .unwrap_or_else(|| {
-                model.bounds.get("num_local_experts").copied().unwrap_or(128) as usize
+                model
+                    .bounds
+                    .get("num_local_experts")
+                    .copied()
+                    .unwrap_or(128) as usize
             });
         let top_k = v
             .get("num_experts_per_tok")
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
             .unwrap_or_else(|| {
-                model.bounds.get("num_experts_per_tok").copied().unwrap_or(4) as usize
+                model
+                    .bounds
+                    .get("num_experts_per_tok")
+                    .copied()
+                    .unwrap_or(4) as usize
             });
         let intermediate_size = model
             .bounds
@@ -2825,6 +2832,7 @@ fn emit_fingerprint_check(
     let embed_expects_packed: bool = match model.quantization.as_ref().map(|qc| &qc.method) {
         Some(crate::quantization::QuantMethod::Affine {
             quantize_embed,
+            bits_overrides,
             per_module,
             ..
         }) => {
@@ -2835,9 +2843,15 @@ fn emit_fingerprint_check(
             // shape, never matches the real 8-bit-packed embed, and OptiQ is
             // forced onto the preset hybrid variant. `storage_format_for_weight`
             // already quantizes the embed in that case; keep the two in agreement.
+            // A `bits_overrides` entry naming the embed implies packed the same
+            // way (gpt-oss's proper low-bit recipes ship a 4-bit embed over a
+            // 2/3-bit default) — same agreement, same reason.
             model.tie_word_embeddings
                 || *quantize_embed
                 || per_module.iter().any(|(k, _)| k.ends_with("embed_tokens"))
+                || bits_overrides
+                    .iter()
+                    .any(|(s, _)| s.ends_with("embed_tokens"))
         }
         _ => false,
     };
@@ -5468,9 +5482,7 @@ fn field_load_affine_bits(plan: &FieldLoad) -> Option<u32> {
         // per-layer gather (the collapsed layer-0 plan supplies it).
         FieldLoad::FusedMoe { affine, .. }
         | FieldLoad::SharedFusedMoe { affine, .. }
-        | FieldLoad::GptOssMoe { affine, .. } => {
-            affine.map(|(_, b)| b)
-        }
+        | FieldLoad::GptOssMoe { affine, .. } => affine.map(|(_, b)| b),
         _ => None,
     }
 }
@@ -15105,6 +15117,92 @@ mod fingerprint_tests {
             ts.contains("if let Some") && gate.contains("&&"),
             "the theta gate must be an `if let Some(..) = hf.rope_theta && ..` so a `None` \
              from the caller falls through, got:\n{ts}",
+        );
+    }
+
+    /// The embed's packed-width literal the emitted fingerprint gates on,
+    /// parsed back out of the token stream (same discipline as
+    /// [`emitted_rope_theta`]: assert on what the generated code compares,
+    /// not on our intent).
+    fn emitted_embed_packed_width(model: &crate::config::ModelParams, arch: &str) -> Option<usize> {
+        let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
+            .expect("load weights manifest");
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        // `match gw . tensor_shape_any ("model.embed_tokens.weight") { ..
+        // shape [0] == 201088usize && shape [1] == 360usize .. }`
+        // — anchor on `[1]` so the `>= 2usize` rank check can't be
+        // mistaken for the width literal.
+        let tail = ts.split("model.embed_tokens.weight").nth(1)?;
+        let after_idx1 = tail.split("[1]").nth(1)?;
+        let lit: String = after_idx1
+            .chars()
+            .skip_while(|c| *c != '=')
+            .skip_while(|c| *c == '=' || *c == ' ')
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        lit.parse().ok()
+    }
+
+    /// ⛔ gpt-oss's `attn4-router8` presets: the embed's packed width must
+    /// come from the OVERRIDE, not the section default. The b2-attn4 preset
+    /// declares a 2-bit expert default with `embed_tokens: 4`; hidden 2880
+    /// packs to 2880*4/32 = 360 at 4-bit but 2880*2/32 = 180 at the default.
+    /// A regression that ignores the embed override computes the 180 literal
+    /// while the loader dequantizes 4-bit — the fingerprint then
+    /// false-rejects every proper checkpoint (or worse, accepts at the
+    /// wrong width if the shapes happened to agree).
+    #[test]
+    fn gpt_oss_attn4_preset_gates_the_embed_at_the_override_width() {
+        let proper = variant_of(
+            "gpt-oss",
+            "gpt-oss-120b",
+            "mlx-affine-b2-g64-attn4-router8-qembed",
+        );
+        let plain = variant_of("gpt-oss", "gpt-oss-120b", "mlx-affine-b2-g64-qembed");
+
+        // Premise: both variants are the same model at the same group size —
+        // they differ ONLY in the per-role bit map.
+        assert_eq!(
+            proper.bounds.get("hidden_size"),
+            plain.bounds.get("hidden_size"),
+            "premise broken: the two variants disagree on hidden_size",
+        );
+        let proper_m = proper.quantization.as_ref().map(|qc| qc.method.clone());
+        let plain_m = plain.quantization.as_ref().map(|qc| qc.method.clone());
+        let (
+            Some(crate::quantization::QuantMethod::Affine {
+                bits: proper_bits,
+                group_size: proper_gs,
+                bits_overrides: proper_ov,
+                ..
+            }),
+            Some(crate::quantization::QuantMethod::Affine {
+                bits: plain_bits,
+                group_size: plain_gs,
+                bits_overrides: plain_ov,
+                ..
+            }),
+        ) = (proper_m, plain_m)
+        else {
+            panic!("both variants must parse as MLX-affine");
+        };
+        assert_eq!((proper_bits, proper_gs), (plain_bits, plain_gs));
+        assert!(
+            plain_ov.is_empty() && !proper_ov.is_empty(),
+            "premise broken: the presets differ in more than their bit map",
+        );
+
+        let proper_w = emitted_embed_packed_width(&proper, "gpt-oss")
+            .expect("the b2-attn4 variant must gate on the embed shape");
+        let plain_w = emitted_embed_packed_width(&plain, "gpt-oss")
+            .expect("the plain b2 variant must gate on the embed shape");
+        assert_eq!(
+            proper_w, 360,
+            "the 4-bit embed override must pack 2880*4/32 = 360, got {proper_w}",
+        );
+        assert_eq!(
+            plain_w, 180,
+            "the plain b2 default must pack 2880*2/32 = 180, got {plain_w}",
         );
     }
 
