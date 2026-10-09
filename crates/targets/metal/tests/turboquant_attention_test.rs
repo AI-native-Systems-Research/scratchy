@@ -136,6 +136,11 @@ struct Case {
     decode_heads: u32,
     /// A decode by `attention_decode_gqa_tq` over this many threadgroups a KV head.
     gqa: Option<u32>,
+    /// gpt-oss attention sinks: `Some(scale)` gives every query head one
+    /// extra softmax column — a logit drawn at that scale, UNSCALED by
+    /// `attn_scale`, contributing no V, exactly as the arch defines them;
+    /// `None` (every non-sink case) leaves the column off, byte-identical.
+    sinks: Option<f32>,
 }
 
 /// Channels of each KV head that carry the large bias.
@@ -213,6 +218,8 @@ struct Fixture {
     /// K / V projection biases `[kv_head][head_dim]` (zero without `c.bias`).
     kb: Vec<f32>,
     vb: Vec<f32>,
+    /// Per-query-head sink logits, dtype-rounded (empty without `c.sinks`).
+    sink: Vec<f32>,
 }
 
 impl Fixture {
@@ -295,6 +302,12 @@ impl Fixture {
                     .collect()
             }
         };
+        // A second, independent stream: the K/V/Q draws above stay
+        // byte-identical for every existing case.
+        let sink = c.sinks.map_or(vec![], |scale| {
+            let mut rng = Lcg(0x51e5u64 ^ (c.num_q_heads as u64) ^ ((c.head_dim as u64) << 24));
+            (0..c.num_q_heads).map(|_| c.dtype.round(scale * rng.gauss())).collect()
+        });
         let mut f = Self {
             c: c.clone(),
             n_blocks,
@@ -308,6 +321,7 @@ impl Fixture {
             cos_sin,
             kb,
             vb,
+            sink,
         };
         if c.bias.is_some() {
             for (s, &(len, _)) in c.seqs.iter().enumerate() {
@@ -483,9 +497,14 @@ fn ideal_attention(f: &Fixture, kv: impl Fn(usize, usize, usize, bool) -> Vec<f3
                         .push(c.attn_scale * qrow.iter().zip(&k).map(|(a, b)| a * b).sum::<f32>());
                     vals.push(kv(s, t, kvh, true));
                 }
-                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                // The sink column: UNSCALED by attn_scale, no V, one per head.
+                let sink = f.c.sinks.map(|_| f.sink[h]);
+                let mut m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if let Some(sink) = sink {
+                    m = m.max(sink);
+                }
                 let w: Vec<f32> = scores.iter().map(|&x| (x - m).exp()).collect();
-                let l: f32 = w.iter().sum();
+                let l: f32 = w.iter().sum::<f32>() + sink.map_or(0.0, |s| (s - m).exp());
                 let orow = &mut out[(row * nq + h) * hd..][..hd];
                 for (wi, v) in w.iter().zip(&vals) {
                     for d in 0..hd {
@@ -605,6 +624,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         shared(&device, &dt_bits(&f.kb)),
         shared(&device, &dt_bits(&f.vb)),
     );
+    let sinks = shared(&device, &dt_bits(&f.sink));
     let offset_on = restore && c.bias.is_some();
     let src_k = f.pool(&device, &f.k, 0, cached);
     let src_v = f.pool(&device, &f.v, 0, cached);
@@ -702,6 +722,9 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         if offset_on {
             consts.extend([k_bias, v_bias]);
         }
+        if c.sinks.is_some() {
+            consts.push(ConstantValue::uint(21, 1));
+        }
         let mut binds = vec![
             (&out, 0),
             (&q, 1),
@@ -720,6 +743,9 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         ];
         if offset_on {
             binds.extend([(&kb, 14), (&vb, 15)]);
+        }
+        if c.sinks.is_some() {
+            binds.push((&sinks, 16));
         }
         let attention = pso(
             "attention",
@@ -808,27 +834,33 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             tg(32, 1, 1),
         );
         batch.barrier();
+        let mut prefill_consts = f.attn_constants(&[]);
+        let mut prefill_binds = vec![
+            (&out, 0),
+            (&q, 1),
+            (&cu_seqlens, 2),
+            (&seq_used, 3),
+            (&block_table, 4),
+            (&scratch_k.table, 5),
+            (&scratch_v.table, 6),
+            (&cos_sin, 7),
+            (&span_ids, 8),
+        ];
+        if c.sinks.is_some() {
+            prefill_consts.push(ConstantValue::uint(21, 1));
+            prefill_binds.push((&sinks, 9));
+        }
         let attention = pso(
             "attention",
             format!(
                 "attention_prefill_sdpa_v2_paged_{}_specialized",
                 c.dtype.tag()
             ),
-            f.attn_constants(&[]),
+            prefill_consts,
         );
         batch.encode(
             &attention,
-            &[
-                (&out, 0),
-                (&q, 1),
-                (&cu_seqlens, 2),
-                (&seq_used, 3),
-                (&block_table, 4),
-                (&scratch_k.table, 5),
-                (&scratch_v.table, 6),
-                (&cos_sin, 7),
-                (&span_ids, 8),
-            ],
+            &prefill_binds,
             &[],
             &[],
             &resident,
@@ -975,6 +1007,7 @@ fn llama_3b(name: &'static str) -> Case {
         bias: None,
         decode_heads: 1,
         gqa: None,
+        sinks: None,
     }
 }
 
@@ -1132,6 +1165,71 @@ fn decode_gemma4_global_gqa_eight_sequences() {
             (2, 1),
         ],
         ..gemma4_global("decode gemma4 global gqa eight seqs")
+    });
+}
+
+/// gpt-oss-20b: the first attention-sinks arch on a coded cache — head dim
+/// 64 (the smallest the codec takes), GQA 8, 4-bit. Its K/V projections are
+/// biased and stay biased past the gemm (the affine gemm dequantizes the
+/// weight; the linear bias rides in as its own operand), so a coded gpt-oss
+/// cache also carries the KB/VB bias-restore path (consts 14/15) — see
+/// `gpt_oss_biased_rope` for the full composition. `check` runs every head
+/// count a decode threadgroup can serve for the geometry.
+fn gpt_oss(name: &'static str) -> Case {
+    Case {
+        head_dim: 64,
+        num_q_heads: 64,
+        num_kv_heads: 8,
+        bits: 4,
+        attn_scale: 0.125,
+        rope: None,
+        seqs: vec![(1000, 1)],
+        sinks: Some(2.0),
+        ..llama_3b(name)
+    }
+}
+
+#[test]
+fn decode_gpt_oss_sinks() {
+    check(gpt_oss("decode gpt-oss sinks"));
+}
+
+/// The arch's even layers: the 128-token sliding window over a 1000-key
+/// context, sinks on.
+#[test]
+fn decode_gpt_oss_sinks_sliding_window() {
+    check(Case {
+        window: 128,
+        ..gpt_oss("decode gpt-oss sinks window")
+    });
+}
+
+/// gpt-oss's every layer: biased K/V projections restored on read, NeoX
+/// rope-on-read at rot 64 (YaRN lowers to the same table shape), and the
+/// sink column — the full composition a coded gpt-oss cache carries.
+fn gpt_oss_biased_rope(name: &'static str) -> Case {
+    Case {
+        bias: Some(100.0),
+        rope: Some(Rope {
+            rot_dim: 64,
+            pair_off: 32,
+            coresident: true,
+        }),
+        ..gpt_oss(name)
+    }
+}
+
+#[test]
+fn decode_gpt_oss_sinks_biased_rope() {
+    check(gpt_oss_biased_rope("decode gpt-oss sinks biased rope"));
+}
+
+/// The arch's even layers: the same composition in the 128-token window.
+#[test]
+fn decode_gpt_oss_sinks_biased_rope_window() {
+    check(Case {
+        window: 128,
+        ..gpt_oss_biased_rope("decode gpt-oss sinks biased rope window")
     });
 }
 
@@ -1332,6 +1430,22 @@ fn prefill_head_dim_256_sliding_window() {
         rope: None,
         seqs: vec![(700, 40)],
         ..llama_3b("prefill hd256 window")
+    });
+}
+
+/// gpt-oss prefill under the codec: the staged rotated-domain image, the
+/// query rotated in and the output back, sinks on — full attention and the
+/// arch's 128-token window.
+#[test]
+fn prefill_gpt_oss_sinks() {
+    check(Case {
+        seqs: vec![(500, 200)],
+        ..gpt_oss("prefill gpt-oss sinks")
+    });
+    check(Case {
+        seqs: vec![(500, 200)],
+        window: 128,
+        ..gpt_oss("prefill gpt-oss sinks window")
     });
 }
 

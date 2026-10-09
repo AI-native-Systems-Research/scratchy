@@ -1193,10 +1193,27 @@ template <typename T>
     // simdgroup's max was seeded with the sink, so the argument is ≤ 0;
     // simdgroup 0 adds it once so the merged denominator carries exactly one
     // sink column (all lanes of a simdgroup hold identical partials; the
-    // merge reads lane 0's).
+    // merge reads lane 0's). The column's value is ZERO, and under TurboQuant
+    // the merge epilogue adds vb to the whole output — so the sink must
+    // cancel its own share: its "value" enters the codebook accumulator as
+    // −vb (centered like the tail's plain V above), and the epilogue's +vb
+    // then restores exactly the keys' weight sum. Without this a sink that
+    // dominates the softmax (a biased-KV layer's scaled scores can sit far
+    // below an unscaled sink) hands the output a full vb vector.
     if (ATTN_SINKS_ON && simd_gid == 0) {
         for (uint h = 0; h < heads; ++h) {
-            sum_exp_score[h] += metal::fast::exp(U(sinks[q_head_idx + h]) - max_score[h]);
+            const U w = metal::fast::exp(U(sinks[q_head_idx + h]) - max_score[h]);
+            sum_exp_score[h] += w;
+            if (ATTN_TQ != 0u && ATTN_TQ_VB) {
+                U v_loc[16];
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    v_loc[j] = -U(vb[tq_e + j]) * tq_signs[tq_e + j];
+                }
+                tq_wht(v_loc, qk_per_thread, simd_lid);
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    o_reg[h * qk_per_thread + j] += w * v_loc[j];
+                }
+            }
         }
     }
 
