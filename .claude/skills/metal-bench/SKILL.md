@@ -129,7 +129,16 @@ echo "exit ${PIPESTATUS[0]}"
 The script exits 1 when a model got no scratchy numbers. `tee` would hide
 that, which is why `PIPESTATUS[0]` is printed. `--fail-fast` stops at the
 first scratchy build failure, instead of spending hours measuring only the
-other engines.
+other engines. It does **not** stop on a parity-gate failure: the run moves
+on to the next model.
+
+Before timing each model, the script runs a blocking **parity gate**: `scr
+chat` and `mlx_lm.generate`, both greedy, must give exactly the same answer
+to a few short prompts that have one right answer. A model that fails the
+gate isn't timed on any engine, ollama included, because there would be no
+scratchy numbers to compare against. The gate needs mlx-lm, so it runs on
+every full and smoke run. Rules and rationale are in `docs/BENCHMARKING.md`
+(fairness rule 3).
 
 Run the command in the background, so a full run doesn't hit a shell timeout,
 and wait for it to finish. While it runs, watch the log for these lines and
@@ -139,6 +148,11 @@ act on each one as it appears:
   stop the run and go back to step 1.
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
+- `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or
+  `PARITY FAILED — not timing <stem>`. On a failure, tell the user right
+  away: that model will have no numbers, and the run will exit 1. Ask
+  whether to let it finish the other models or stop it (**Stopping a run**
+  below). Then go to **On a parity failure** below.
 - `json -> <path>`: the run has finished writing its JSON.
 
 **On a build failure:** check whether it's a regression on `main` or a
@@ -158,6 +172,35 @@ the failure is a regression on `main` since `$sha`. Tell the user, and point
 them to the build log, the failing commit and the known-good one so they can
 file an issue. If it fails too, the problem is with this Mac's toolchain.
 
+**On a parity failure:** don't retry, loosen the gate or edit the script's
+commands to get it through. A mismatch on these prompts means scratchy and
+mlx-lm computed different things, and timing either of them would compare
+different computations. The gate's full output is in
+`<out-dir>/<machine>/parity-<stem>.log`; the path is on the `PARITY FAILED`
+line. For each prompt it shows `OK` or `FAIL`, then `a:` (scratchy) and `b:`
+(mlx-lm) for every `FAIL`. Report the `FAIL` lines to the user, and say
+which of these the outputs look like:
+
+- **The two sides were given different prompts.** One side starts with a
+  thought or reasoning block, or with template text the other doesn't have,
+  and runs out of tokens before it answers. `scr chat` renders the
+  checkpoint's chat template with its declared defaults, while
+  `mlx_lm.generate` forces `enable_thinking` on for any vocab with think
+  tokens. That was #314 (gemma-4). The fix is a new entry in
+  `mlx_parity_config` in `scripts/bench_metal_matrix.sh`, not a change to
+  scratchy.
+- **A real disagreement.** Both sides answer, and the answers differ, or
+  scratchy's output is garbage. That points at the load path: wrong quant
+  preset, wrong group size, or a broken dequant. Check whether it's a
+  regression on `main` the same way as **On a build failure**: build the
+  same features at the known-good commit. Then rerun the gate on its own
+  with that binary. The command is the `bench startup ... --parity-cmd`
+  call in `scripts/bench_metal_matrix.sh`, run with `--child-cmd` pointing
+  at the known-good build's `scr`.
+
+Either way, the user decides what to file. Point them to the parity log and
+the commit.
+
 **Stopping a run** (only when the user asks, or after a failed check):
 stopping just the script isn't enough. It handles signals only between
 steps, and the `scr bench` and server it started keep running. Stop all of
@@ -171,8 +214,9 @@ lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # the ollama serv
 ```
 
 **Done when:** the header shows real paths for both `mlx-lm  :` and
-`ollama  :`, the log ends with a `json -> <path>` line, and `exit 0` is
-printed.
+`ollama  :`, every model printed `PARITY OK`, the log ends with a
+`json -> <path>` line, and `exit 0` is printed. A parity failure also exits
+1, with `(parity gate failed)` on the final `FAILED:` line.
 
 ## 4. Check the JSON
 
@@ -195,7 +239,8 @@ print("repo   ", d["repo"]["sha"][:8], d["repo"]["branch"], "dirty=" + str(d["re
 print("engines", c["comparison"])
 for m in d["models"]:
     reps = Counter(r["scenario"] for r in m.get("cache_ladder") or [])
-    print("model  ", m["stem"], "built=" + str(m.get("built")), dict(reps))
+    print("model  ", m["stem"], "built=" + str(m.get("built")),
+          "parity=" + str(m.get("parity_mlx_lm")), dict(reps))
 full = (c["scenarios"] == ["frozen", "cold", "warm"] and c["cold_priming_launches"] == 3
         and c["scaling"] is not None and not c["scratchy_serve_args"]
         and all(Counter(r["scenario"] for r in m.get("cache_ladder") or []).get("frozen") == 3
@@ -206,9 +251,12 @@ EOF
 
 **Done when:** you've reported every line to the user. These all have to
 hold for a run to go on the site: `AC Power`, `dirty=False`, both engines
-`True`, and every model `built=True`. If any of them fails, report it and let
-the user decide whether the run is usable. Report the `commit` and `scope`
-lines too, but they don't fail the run on their own; step 5 asks about them.
+`True`, and every model `built=True` and `parity=True`. `parity=False` means
+the model failed the gate and has no numbers. `parity=None` on a built model
+means the gate didn't run, so its numbers were never checked. If any of
+these fails, report it and let the user decide whether the run is usable.
+Report the `commit` and `scope` lines too, but they don't fail the run on
+their own; step 5 asks about them.
 A smoke run ends here.
 
 ## 5. Copy into the site
@@ -218,6 +266,7 @@ Before copying, ask the user to confirm if any of these is true:
 - the run has fewer models than the default three (or fewer than the
   small-RAM pair on a 16/24 GB Mac)
 - `commit` isn't upstream `main`
+- any model's `parity` isn't `True`
 
 Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
