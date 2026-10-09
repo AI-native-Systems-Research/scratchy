@@ -22,11 +22,11 @@ use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::norm_threads;
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
-    AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
-    ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
-    KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
-    MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput,
-    RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
+    ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,
+    KDim, KvOffsets, KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
+    MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
+    RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -5616,6 +5616,15 @@ fn gelu_mul_static_name(dtype: DequantDtype) -> &'static str {
     }
 }
 
+/// `swiglu_oai_mul_<dtype>` sibling (gpt-oss SwiGLU-OAI decomposed tail) —
+/// same `silu_mul.metal` library.
+fn swiglu_oai_mul_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "swiglu_oai_mul_f16",
+        DequantDtype::Bf16 => "swiglu_oai_mul_bf16",
+    }
+}
+
 fn gate_apply_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gate_apply_f16",
@@ -7042,8 +7051,12 @@ fn lower_moe_step(
                 let scale = WeightTensor::GemmaPerExpertScale;
                 bindings.push(source(router()?, scale, layer(&l), 3));
             }
-            // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
-            if let super::step::RoutePre::SigmoidBias(l) = program.pre {
+            // The F32 router bias, when the pre carries one: the sigmoid +
+            // bias correction (GLM) or gpt-oss's plain linear add — both
+            // read the same `const device float*` buffer 4.
+            if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
+                program.pre
+            {
                 bindings.push(source(router()?, WeightTensor::MoeRouterBias, layer(&l), 4));
             }
             let shape = grid((1, bucket_m, 1), (bn, 1, 1), ms(A::Y));
@@ -7369,8 +7382,11 @@ fn lower_moe_step(
                     let scale = WeightTensor::GemmaPerExpertScale;
                     bindings.push(source(router()?, scale, layer(&l), 12));
                 }
-                // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
-                if let super::step::RoutePre::SigmoidBias(l) = program.pre {
+                // The F32 router bias, when the pre reads one: GLM's e_score_correction_bias
+                // (sigmoid + bias) or gpt-oss's linear router bias.
+                if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
+                    program.pre
+                {
                     bindings.push(source(
                         router()?,
                         WeightTensor::MoeRouterBias,
@@ -7382,6 +7398,14 @@ fn lower_moe_step(
                     experts: b.experts,
                     program,
                 }));
+            }
+            // gpt-oss experts carry per-expert LINEAR biases on gate and up — the [E, 2·inter]
+            // concat the loader interleaves — bound at 14, with the kernel's switch at slot 4.
+            // Every other bundle leaves both unset, and the kernel const-folds the adds away.
+            if b.bundle == ExpertBundle::GptOss {
+                let bias = WeightTensor::MoeExpertGateUpLinearBias;
+                bindings.push(source(router()?, bias, layer(&gate.layer), 14));
+                constants.push(C::boolean(4, true));
             }
             commands.push(cmd(
                 kernel,
@@ -7418,13 +7442,21 @@ fn lower_moe_step(
                 bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
             }
             let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
-            let constants = AffineCombineQmvConstants {
+            let mut constants: Vec<ConstantValue> = AffineCombineQmvConstants {
                 qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),
                 residual: ends.residual,
             }
             .into();
+            // gpt-oss experts carry a per-expert LINEAR bias on the down projection too — [E,
+            // hidden] at buffer 10, switch at slot 6. Other bundles leave both unset and the
+            // kernel const-folds the add away.
+            if b.bundle == ExpertBundle::GptOss {
+                let bias = WeightTensor::MoeExpertDownLinearBias;
+                bindings.push(source(router()?, bias, layer(&down.layer), 10));
+                constants.push(C::boolean(6, true));
+            }
             vec![cmd(
                 kernel,
                 "quantized_qmv",
@@ -7441,6 +7473,9 @@ fn lower_moe_step(
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
                 GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
+                GatedAct::SwigluOai => {
+                    (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype))
+                }
             };
             let (rows, m_scaling) = match s.grouping {
                 MoeGrouping::Gathered => (pairs, ms(A::X)),

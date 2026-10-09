@@ -615,6 +615,12 @@ pub enum ExpertProj {
 pub enum GatedAct {
     Silu,
     Gelu,
+    /// gpt-oss's SwiGLU-OAI: `gate = min(g, 7)`, `up = clamp(u, -7, 7)`,
+    /// `y = (up + 1) · gate · sigmoid(1.702 · gate)`. The ±7 clamps are
+    /// the reference's hard limits (transformers `SwiGLUOAI`, mlx
+    /// `SwigluOAI` at `limit` 7.0 — asserted at config parse), part of
+    /// the activation itself, not a softcap.
+    SwigluOai,
 }
 
 /// The weight bundle a router reads.
@@ -626,6 +632,9 @@ pub enum RouterBundle {
     Fused,
     /// The router inside a Qwen-style fused MoE bundle.
     SharedFused,
+    /// gpt-oss's router: a biased linear (the bias orders the top-k picks
+    /// AND is read back as the pre-softmax score) over the experts bundle.
+    GptOss,
 }
 
 /// The weight bundle an expert projection reads.
@@ -635,6 +644,9 @@ pub enum ExpertBundle {
     SwitchGlu,
     Fused,
     SharedFused,
+    /// gpt-oss's SwiGLU-OAI experts: SwitchGLU-shaped stacks plus
+    /// per-expert linear biases on gate/up/down.
+    GptOss,
 }
 
 impl RouterBundle {
@@ -645,6 +657,7 @@ impl RouterBundle {
             Self::Gemma => K::GemmaRouter,
             Self::Fused => K::FusedMoe,
             Self::SharedFused => K::SharedFusedMoe,
+            Self::GptOss => K::GptOssMoe,
         }
     }
 }
@@ -657,6 +670,7 @@ impl ExpertBundle {
             Self::SwitchGlu => K::GemmaSwitchGlu,
             Self::Fused => K::FusedMoe,
             Self::SharedFused => K::SharedFusedMoe,
+            Self::GptOss => K::GptOssMoe,
         }
     }
 }
@@ -784,6 +798,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
             SubOp::RouteSigmoidBias { router } => router.hash(h),
+            SubOp::RouteBias { router } => router.hash(h),
             SubOp::RouteTopK { k } => k.hash(h),
             SubOp::RouteScale { scale } => scale.to_bits().hash(h),
             SubOp::RouteExpertScale { router } => router.hash(h),
@@ -1130,6 +1145,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// buffer keeps the UNBIASED sigmoids, so the standard score gather reads the values mlx
     /// renormalizes. `inputs` = `[logits, router]`.
     RouteSigmoidBias { router: RouterBundle },
+    /// The router's linear bias added to its logits, in place (gpt-oss routing). The BIASED
+    /// values order the top-k picks AND are read back as the gathered scores — a softmax over
+    /// the top-k then normalizes them, so unlike [`Self::RouteSigmoidBias`] the buffer keeps the
+    /// values the picks read. `inputs` = `[logits, router]`.
+    RouteBias { router: RouterBundle },
     /// Each row's indices sorted by ascending score. `inputs` = `[scores]`.
     RouteArgsort,
     /// The last `k` sorted indices of each row — its top-k experts. `inputs` = `[sorted]`.
@@ -1752,7 +1772,7 @@ pub fn eval_node<F: RopeForm>(
             // the per-head `[num_heads]` sinks — read it here and stop
             // the (K,V) walk before it (the pair loop below would
             // otherwise gather past the end).
-            let sinks: Option<Vec<f32>> = if node.inputs.len() % 2 == 0 {
+            let sinks: Option<Vec<f32>> = if node.inputs.len().is_multiple_of(2) {
                 Some(gather(&node.inputs[node.inputs.len() - 1], graph, bufs).0)
             } else {
                 None
@@ -2282,6 +2302,7 @@ pub fn lower_region(
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
             SubOp::RouteSoftmax => SubOp::RouteSoftmax,
             SubOp::RouteSigmoidBias { router } => SubOp::RouteSigmoidBias { router },
+            SubOp::RouteBias { router } => SubOp::RouteBias { router },
             SubOp::RouteArgsort => SubOp::RouteArgsort,
             SubOp::RouteTopK { k } => SubOp::RouteTopK { k },
             SubOp::RouteGatherScores => SubOp::RouteGatherScores,

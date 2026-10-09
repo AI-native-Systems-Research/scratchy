@@ -103,6 +103,7 @@ impl SourceManifest {
                 K::GemmaSwitchGlu => quote!(GemmaSwitchGlu),
                 K::GatedDeltaNet => quote!(GatedDeltaNet),
                 K::AttnSinks => quote!(AttnSinks),
+                K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin
                 | K::Bnb4
                 | K::Fp8

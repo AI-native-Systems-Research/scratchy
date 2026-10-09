@@ -913,6 +913,325 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
+// GptOssMoELayer (gpt-oss 20b/120b: biased router + SwiGLU-OAI experts)
+// ---------------------------------------------------------------------------
+
+/// Metal load extension trait on the neutral [`GptOssMoELayer`].
+pub trait GptOssMoEOps {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        gw: &mut crate::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+        gate_bits: u32,
+    ) -> anyhow::Result<Self>
+    where
+        Self: Sized;
+}
+
+/// The gpt-oss checkpoint ships each pre-stacked expert tensor 2-D
+/// `[(E·N), K/div]` (mlx-lm's converter flattens the expert axis); the
+/// shaders walk `[E, N, K/div]`. Row-major, those are the same bytes — so
+/// the restack is a metadata-only reshape, guarded by a REAL shape assert
+/// (a silent mismatch here is fluent garbage, per the `AffineInt4::mint`
+/// law). A genuinely 3-D checkpoint (the Qwen3-MoE convention) passes
+/// through with its dims verified.
+fn restack_expert_tensor(
+    t: crate::tensor::GpuTensor,
+    name: &str,
+    e: usize,
+    out: usize,
+    packed: usize,
+) -> anyhow::Result<crate::tensor::GpuTensor> {
+    let expected = e * out * packed;
+    anyhow::ensure!(
+        t.numel() == expected,
+        "GptOssMoELayer: `{name}` holds {} elements (expected {e}·{out}·{packed} = {expected})",
+        t.numel(),
+    );
+    if t.ndim() == 3 {
+        anyhow::ensure!(
+            t.dim(0) == e && t.dim(1) == out && t.dim(2) == packed,
+            "GptOssMoELayer: `{name}` shape {:?} (expected [{e}, {out}, {packed}])",
+            t.shape(),
+        );
+        Ok(t)
+    } else {
+        anyhow::ensure!(
+            t.ndim() == 2 && t.dim(0) == e * out && t.dim(1) == packed,
+            "GptOssMoELayer: `{name}` shape {:?} (expected 2-D [{}, {packed}] — the \
+             pre-stacked gpt-oss layout — or 3-D [{e}, {out}, {packed}])",
+            t.shape(),
+            e * out,
+        );
+        Ok(t.reshape(&[e, out, packed]))
+    }
+}
+
+impl GptOssMoEOps for GptOssMoELayer {
+    /// Load the gpt-oss MoE bundle from `{prefix}` (= `...layers.N.mlp`):
+    /// * `{prefix}.router` → dequantized affine `[E, hidden]` dense gate at
+    ///   `gate_bits` — the jesusoctavioas 2-bit checkpoints quantize the
+    ///   router at the preset's own width, so `gate_bits` is the live path.
+    ///   A dense `{prefix}.router.weight` (no scales sibling) is taken as-is.
+    /// * `{prefix}.router.bias` → `[E]`, converted to F32: the routing
+    ///   kernels read `const device float*` (buffer 4 of the route command,
+    ///   buffer 13 of the gathered expert kernels) — the same ABI as GLM's
+    ///   F32 `e_score_correction_bias`, but gpt-oss ships BF16 so the
+    ///   conversion happens here rather than on disk.
+    /// * `{prefix}.experts.{gate,up,down}_proj.*` → the pre-stacked affine
+    ///   experts (Qwen proj names + the `experts` infix), each restacked
+    ///   2-D→3-D by [`restack_expert_tensor`].
+    /// * `{prefix}.experts.{gate,up}_proj.bias` → the per-expert LINEAR
+    ///   biases, interleaved per expert (expert e's `inter` gate rows then
+    ///   its `inter` up rows) into one `[E, 2·inter]` buffer;
+    ///   `{prefix}.experts.down_proj.bias` → `[E, hidden]`.
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        gw: &mut crate::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+        gate_bits: u32,
+    ) -> anyhow::Result<Self> {
+        use crate::dtype::DType;
+
+        anyhow::ensure!(
+            bits == 2 || bits == 3 || bits == 4 || bits == 8,
+            "GptOssMoELayer: only bits ∈ {{2, 3, 4, 8}} supported (got {bits})"
+        );
+        anyhow::ensure!(
+            hidden_size.is_multiple_of(group_size as usize),
+            "GptOssMoELayer: hidden_size={hidden_size} not divisible by group_size={group_size}"
+        );
+        anyhow::ensure!(
+            intermediate_size.is_multiple_of(group_size as usize),
+            "GptOssMoELayer: intermediate_size={intermediate_size} not divisible by \
+             group_size={group_size}"
+        );
+
+        // Router gate: quantized on the 2-bit checkpoints (uniform affine
+        // incl. the router); a dense export (no scales sibling) is taken
+        // as-is. Same scales-sibling discriminator as `AffineFusedMoELayer`
+        // — probing `.weight` alone would hand the routing gemm raw nibbles.
+        let router_dtype = gw.target_dtype().unwrap_or(DType::BF16);
+        anyhow::ensure!(
+            matches!(router_dtype, DType::BF16 | DType::F16),
+            "GptOssMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
+        );
+        let router_is_dense = !gw.contains(&format!("{prefix}.router.scales"));
+        let router_gate = if router_is_dense {
+            gw.take(&format!("{prefix}.router.weight"))?
+        } else {
+            gw.take_affine_dequant_b4(
+                &format!("{prefix}.router"),
+                group_size,
+                gate_bits,
+                router_dtype,
+            )?
+        };
+
+        // Router bias: F32 `[E]` on the device, converted from the
+        // checkpoint's BF16/F16/F32 — `take_to_cpu_f32` handles every
+        // on-disk float width, and `alloc_packed_from_host` re-uploads as
+        // F32. The kernels' `const device float*` ABI is unchanged from
+        // GLM's (see the e_score_correction_bias note above).
+        let router_bias_f32 = gw.take_to_cpu_f32(&format!("{prefix}.router.bias"))?;
+        anyhow::ensure!(
+            router_bias_f32.len() == num_experts,
+            "GptOssMoELayer: `{prefix}.router.bias` holds {} elements (expected {num_experts})",
+            router_bias_f32.len(),
+        );
+        let mut router_bias_bytes = Vec::with_capacity(num_experts * 4);
+        for v in &router_bias_f32 {
+            router_bias_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let router_bias =
+            gw.alloc_packed_from_host(&router_bias_bytes, &[num_experts], DType::F32)?;
+
+        // Experts: the pre-stacked layout under the `experts` infix with
+        // Qwen proj names — exactly `mlp.experts.{gate,up,down}_proj.*`.
+        let (
+            expert_gate_w,
+            expert_gate_scales,
+            expert_gate_biases,
+            expert_up_w,
+            expert_up_scales,
+            expert_up_biases,
+            expert_down_w,
+            expert_down_scales,
+            expert_down_biases,
+        ) = load_stacked_experts(
+            gw,
+            prefix,
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            group_size,
+            bits,
+            MoeExpertNaming::Qwen,
+            Some("experts"),
+        )?;
+        let gs = group_size as usize;
+        let packed_hidden = crate::layers_quant::affine_packed_cols(hidden_size, bits);
+        let packed_inter = crate::layers_quant::affine_packed_cols(intermediate_size, bits);
+        let (expert_gate_w, expert_gate_scales, expert_gate_biases) = (
+            restack_expert_tensor(
+                expert_gate_w,
+                &format!("{prefix}.experts.gate_proj.weight"),
+                num_experts,
+                intermediate_size,
+                packed_hidden,
+            )?,
+            restack_expert_tensor(
+                expert_gate_scales,
+                &format!("{prefix}.experts.gate_proj.scales"),
+                num_experts,
+                intermediate_size,
+                hidden_size / gs,
+            )?,
+            restack_expert_tensor(
+                expert_gate_biases,
+                &format!("{prefix}.experts.gate_proj.biases"),
+                num_experts,
+                intermediate_size,
+                hidden_size / gs,
+            )?,
+        );
+        let (expert_up_w, expert_up_scales, expert_up_biases) = (
+            restack_expert_tensor(
+                expert_up_w,
+                &format!("{prefix}.experts.up_proj.weight"),
+                num_experts,
+                intermediate_size,
+                packed_hidden,
+            )?,
+            restack_expert_tensor(
+                expert_up_scales,
+                &format!("{prefix}.experts.up_proj.scales"),
+                num_experts,
+                intermediate_size,
+                hidden_size / gs,
+            )?,
+            restack_expert_tensor(
+                expert_up_biases,
+                &format!("{prefix}.experts.up_proj.biases"),
+                num_experts,
+                intermediate_size,
+                hidden_size / gs,
+            )?,
+        );
+        let (expert_down_w, expert_down_scales, expert_down_biases) = (
+            restack_expert_tensor(
+                expert_down_w,
+                &format!("{prefix}.experts.down_proj.weight"),
+                num_experts,
+                hidden_size,
+                packed_inter,
+            )?,
+            restack_expert_tensor(
+                expert_down_scales,
+                &format!("{prefix}.experts.down_proj.scales"),
+                num_experts,
+                hidden_size,
+                intermediate_size / gs,
+            )?,
+            restack_expert_tensor(
+                expert_down_biases,
+                &format!("{prefix}.experts.down_proj.biases"),
+                num_experts,
+                hidden_size,
+                intermediate_size / gs,
+            )?,
+        );
+
+        // Per-expert gate/up LINEAR biases → one `[E, 2·inter]` buffer,
+        // expert e's gate rows then its up rows. `take_cpu` hands back
+        // target-dtype bytes (floats only are cast), so the 2-byte element
+        // interleave is dtype-agnostic between F16 and BF16.
+        let (g_bytes, g_shape, g_dt) = gw.take_cpu(&format!("{prefix}.experts.gate_proj.bias"))?;
+        let (u_bytes, u_shape, u_dt) = gw.take_cpu(&format!("{prefix}.experts.up_proj.bias"))?;
+        anyhow::ensure!(
+            g_dt == u_dt && matches!(g_dt, DType::F16 | DType::BF16),
+            "GptOssMoELayer: expert linear biases must be F16/BF16 (got gate {g_dt}, up {u_dt})"
+        );
+        let elems = |shape: &[usize]| shape.iter().product::<usize>();
+        anyhow::ensure!(
+            elems(&g_shape) == num_experts * intermediate_size,
+            "GptOssMoELayer: `{prefix}.experts.gate_proj.bias` holds {} elements (expected \
+             {num_experts}·{intermediate_size})",
+            elems(&g_shape),
+        );
+        anyhow::ensure!(
+            elems(&u_shape) == num_experts * intermediate_size,
+            "GptOssMoELayer: `{prefix}.experts.up_proj.bias` holds {} elements (expected \
+             {num_experts}·{intermediate_size})",
+            elems(&u_shape),
+        );
+        let esz = g_dt.size_bytes();
+        let per_expert = intermediate_size * esz;
+        let mut gate_up_bytes =
+            Vec::with_capacity(num_experts * 2 * intermediate_size * esz);
+        for e in 0..num_experts {
+            let at = e * per_expert;
+            gate_up_bytes.extend_from_slice(&g_bytes[at..at + per_expert]);
+            gate_up_bytes.extend_from_slice(&u_bytes[at..at + per_expert]);
+        }
+        let gate_up_linear_bias = gw.alloc_packed_from_host(
+            &gate_up_bytes,
+            &[num_experts, 2 * intermediate_size],
+            g_dt,
+        )?;
+
+        // Down-proj LINEAR bias → `[E, hidden]`, same bytes expert-major.
+        let (d_bytes, d_shape, d_dt) = gw.take_cpu(&format!("{prefix}.experts.down_proj.bias"))?;
+        anyhow::ensure!(
+            d_dt == g_dt,
+            "GptOssMoELayer: down bias dtype {d_dt} differs from gate/up {g_dt}"
+        );
+        anyhow::ensure!(
+            elems(&d_shape) == num_experts * hidden_size,
+            "GptOssMoELayer: `{prefix}.experts.down_proj.bias` holds {} elements (expected \
+             {num_experts}·{hidden_size})",
+            elems(&d_shape),
+        );
+        let down_linear_bias =
+            gw.alloc_packed_from_host(&d_bytes, &[num_experts, hidden_size], d_dt)?;
+
+        Ok(GptOssMoELayer {
+            router_gate,
+            router_bias,
+            expert_gate_w,
+            expert_gate_scales,
+            expert_gate_biases,
+            expert_up_w,
+            expert_up_scales,
+            expert_up_biases,
+            expert_down_w,
+            expert_down_scales,
+            expert_down_biases,
+            gate_up_linear_bias,
+            down_linear_bias,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            group_size,
+            bits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SharedFusedMoELayer (enum: Affine for metal)
 // ---------------------------------------------------------------------------
 

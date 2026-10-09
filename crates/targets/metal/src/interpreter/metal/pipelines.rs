@@ -394,6 +394,7 @@ mod tests {
                 | KernelId::AffineEmbed
                 | KernelId::SiluMul
                 | KernelId::GeluMul
+                | KernelId::SwigluOaiMul
                 | KernelId::GateApply
                 | KernelId::GateSplit
                 | KernelId::GateScale
@@ -554,6 +555,7 @@ mod tests {
             | KernelId::AffineEmbed
             | KernelId::SiluMul
             | KernelId::GeluMul
+            | KernelId::SwigluOaiMul
             | KernelId::GateApply
             | KernelId::GateSplit
             | KernelId::GateScale

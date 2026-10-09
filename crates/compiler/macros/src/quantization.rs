@@ -1402,6 +1402,7 @@ pub fn storage_format_for_weight(
         let consumer = node.op == OpKind::Gemm
             || node.op == OpKind::Moe
             || node.op == OpKind::GemmaMoe
+            || node.op == OpKind::GptOssMoe
             || (affine_method && node.op == OpKind::Embed);
         if !consumer {
             continue;

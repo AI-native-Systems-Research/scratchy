@@ -96,6 +96,7 @@ macro_rules! for_each_subop {
             RouterLogits [SubOp::RouterLogits { .. }] arity = (|n| n == 2), cols = [nz experts];
             RouteSoftmax [SubOp::RouteSoftmax] arity = (|n| n == 1), cols = [in0];
             RouteSigmoidBias [SubOp::RouteSigmoidBias { .. }] arity = (|n| n == 2), cols = [in0];
+            RouteBias [SubOp::RouteBias { .. }] arity = (|n| n == 2), cols = [in0];
             RouteArgsort [SubOp::RouteArgsort] arity = (|n| n == 1), cols = [in0];
             RouteTopK [SubOp::RouteTopK { .. }] arity = (|n| n == 1), cols = [nz k];
             RouteGatherScores [SubOp::RouteGatherScores] arity = (|n| n == 2), cols = [in1];

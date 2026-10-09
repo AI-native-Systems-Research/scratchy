@@ -460,6 +460,28 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
     },
+    /// gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`). Dispatches
+    /// to `GptOssMoELayer::load` (metal-only). One bundle carries the
+    /// affine router gate at `{prefix}.router` (dequantized at
+    /// `gate_bits` — gpt-oss-2Bit quantizes the router at the preset's
+    /// own width), the F32 router bias, the pre-stacked affine experts,
+    /// and the per-expert SwiGLU-OAI linear biases.
+    GptOssMoe {
+        prefix: String,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        /// `Some((group_size, bits))` when the experts are MLX-affine —
+        /// the only storage with a metal realization. `None` tolerated
+        /// for the dense/verbatim config (never runtime-selected).
+        affine: Option<(u32, u32)>,
+        /// Router `{prefix}.router` dequant bit-width, resolved through
+        /// `affine_role_bits` like every other affine role — see
+        /// [`FieldLoad::FusedMoe::gate_bits`]. The gpt-oss path names the
+        /// gate `router`, not `gate`.
+        gate_bits: Option<u32>,
+    },
 }
 
 /// The MLX-affine `.weight` tensors this field load will read, each paired with
@@ -545,6 +567,16 @@ fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
             bits,
             ..
         } => one(&format!("{prefix}.proj"), *bits, *group_size),
+        // gpt-oss router gate: `gate_bits` is what the load call dequantizes
+        // `{prefix}.router` at. The expert stacks under `{prefix}.experts`
+        // are omitted (see the fn doc) — same accepted residual risk as the
+        // other MoE bundles.
+        FieldLoad::GptOssMoe {
+            prefix,
+            affine: Some((group_size, _)),
+            gate_bits: Some(gate_bits),
+            ..
+        } => one(&format!("{prefix}.router"), *gate_bits, *group_size),
         _ => Vec::new(),
     }
 }
@@ -798,6 +830,9 @@ fn plan_field_load(
     let is_gemma_switch_glu = ty.ends_with("::SwitchGluExpertsLayer")
         || ty == "SwitchGluExpertsLayer"
         || ty.ends_with("layers_moe::SwitchGluExpertsLayer");
+    let is_gpt_oss_moe = ty.ends_with("::GptOssMoELayer")
+        || ty == "GptOssMoELayer"
+        || ty.ends_with("layers_moe::GptOssMoELayer");
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
@@ -1425,6 +1460,82 @@ fn plan_field_load(
             hidden_size,
             group_size,
             bits,
+        };
+    }
+
+    if is_gpt_oss_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "GptOssMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let num_experts = v
+            .get("num_local_experts")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model.bounds.get("num_local_experts").copied().unwrap_or(128) as usize
+            });
+        let top_k = v
+            .get("num_experts_per_tok")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model.bounds.get("num_experts_per_tok").copied().unwrap_or(4) as usize
+            });
+        let intermediate_size = model
+            .bounds
+            .get("intermediate_size")
+            .copied()
+            .unwrap_or(2880) as usize;
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2880) as usize;
+        // Op-keyed arm (the `GptOssMoe` op selects it), so like GemmaSwitchGlu
+        // it MUST tolerate the Dense/verbatim config and default its storage
+        // params rather than panic — that config never becomes the
+        // runtime-selected specialization on metal.
+        let only_src = accessor.source_weights[0].0;
+        let only_idx = accessor.source_weights[0].1;
+        let affine = match crate::quantization::storage_format_for_weight(
+            program, fuf, only_src, only_idx, model,
+        ) {
+            crate::quantization::StorageFormat::Affine { group_size, bits } => {
+                Some((group_size, bits))
+            }
+            _ => None,
+        };
+        // Router gate bit-width at the gpt-oss path `{prefix}.router`
+        // (NOT `.gate`): `affine_role_bits` honors preset `bits_overrides`
+        // and MLX per-module maps alike; falls back to the expert bits
+        // (the jesusoctavioas 2-bit checkpoint quantizes the router at
+        // the preset's own width, so the fallback is the live path).
+        let gate_bits = affine.map(|(_, expert_bits)| {
+            let router_path = format!("{prefix}.router");
+            model
+                .quantization
+                .as_ref()
+                .and_then(|qc| {
+                    crate::quantization::affine_role_bits(
+                        program,
+                        &qc.method,
+                        &router_path,
+                        only_idx,
+                    )
+                })
+                .unwrap_or(expert_bits)
+        });
+        return FieldLoad::GptOssMoe {
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            affine,
+            gate_bits,
         };
     }
 
@@ -4242,6 +4353,7 @@ fn emit_weights_struct(
                 use crate::__gpu::layers_moe::{
                     FusedMoEOps as _, SharedFusedMoEOps as _, DeepSeekV2MoEOps as _,
                     Gemma4RouterOps as _, SwitchGluExpertsOps as _,
+                    GptOssMoEOps as _,
                 };
                 // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
                 // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
@@ -5306,6 +5418,39 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::GptOssMoe {
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            affine,
+            gate_bits,
+        } => {
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let intermediate_size = *intermediate_size;
+            let hidden_size = *hidden_size;
+            // Op-keyed arm: the Dense/verbatim config reaches here too and
+            // must still codegen (it is never the runtime-selected
+            // specialization on metal), so default its storage params —
+            // the GemmaSwitchGlu tolerance.
+            let (group_size, bits) = affine.unwrap_or((64, 4));
+            let gate_bits = gate_bits.unwrap_or(bits);
+            quote! {
+                let #name = crate::__gpu::layers_moe::GptOssMoELayer::load(
+                    gw,
+                    #prefix,
+                    #num_experts,
+                    #top_k,
+                    #intermediate_size,
+                    #hidden_size,
+                    #group_size,
+                    #bits,
+                    #gate_bits,
+                )?;
+            }
+        }
     }
 }
 
@@ -5321,7 +5466,9 @@ fn field_load_affine_bits(plan: &FieldLoad) -> Option<u32> {
         // MoE bundles carry the routed-expert bits in `affine`; the router
         // `gate_bits` is uniform across layers so it stays out of the
         // per-layer gather (the collapsed layer-0 plan supplies it).
-        FieldLoad::FusedMoe { affine, .. } | FieldLoad::SharedFusedMoe { affine, .. } => {
+        FieldLoad::FusedMoe { affine, .. }
+        | FieldLoad::SharedFusedMoe { affine, .. }
+        | FieldLoad::GptOssMoe { affine, .. } => {
             affine.map(|(_, b)| b)
         }
         _ => None,
@@ -6301,6 +6448,54 @@ fn emit_layered_load_body(
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
+        FieldLoad::GptOssMoe {
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            affine,
+            gate_bits,
+        } => {
+            let p = layer_templated_prefix_expr(
+                prefix,
+                vision_zero_prefix_ref,
+                decoder_zero_prefix_ref,
+            );
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let intermediate_size = *intermediate_size;
+            let hidden_size = *hidden_size;
+            // Op-keyed arm — the Dense/verbatim config's storage params
+            // default rather than panic (the unindexed arm's tolerance).
+            let (group_size, bits) = affine.unwrap_or((64, 4));
+            let gate_bits = gate_bits.unwrap_or(bits);
+            // Per-layer expert bits (OptiQ) — same treatment as
+            // GemmaSwitchGlu: index the slice when heterogeneous, else
+            // the single width. `gate_bits` is uniform across layers
+            // (the collapsed layer-0 plan supplies it).
+            let bits_expr: TokenStream = match &per_layer_bits_lit {
+                Some(bits_slice) => quote! { (#bits_slice)[layer as usize] },
+                None => quote! { #bits },
+            };
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        crate::__gpu::layers_moe::GptOssMoELayer::load(
+                            gw,
+                            &#p,
+                            #num_experts,
+                            #top_k,
+                            #intermediate_size,
+                            #hidden_size,
+                            #group_size,
+                            #bits_expr,
+                            #gate_bits,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
     }
 }
 
@@ -6419,6 +6614,7 @@ pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind
         WeightKind::SharedFusedMoe => "shared_fused_moe_at",
         WeightKind::GemmaRouter => "gemma_router_at",
         WeightKind::GemmaSwitchGlu => "gemma_switch_glu_at",
+        WeightKind::GptOssMoe => "gpt_oss_moe_at",
         WeightKind::CosSin => "cos_sin_at",
         WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
         WeightKind::AttnSinks => "sinks_at",

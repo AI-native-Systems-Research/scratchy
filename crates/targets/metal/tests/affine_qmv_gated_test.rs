@@ -170,6 +170,7 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
     let act_name = match c.gated {
         GatedAct::Silu => "silu_mul",
         GatedAct::Gelu => "gelu_mul",
+        GatedAct::SwigluOai => "swiglu_oai_mul",
     };
     let n = HiddenSize(c.n as u32);
     let act = pso(
@@ -318,5 +319,22 @@ fn four_bit_generic_and_eight_bit_fast() {
         k: 1024,
         n: 512,
         ..LLAMA
+    });
+}
+
+/// gpt-oss's expert width: 2-bit g64, hidden 2880 in, intermediate 2880 out, SwiGLU-OAI — the
+/// dense-kernel slice of it (the gather kernels' linear-bias cases live in `moe_fused_kernels`).
+/// Pins the b2 instantiations of all three symbols (both matvecs, the gated kernel, the
+/// standalone `swiglu_oai_mul`) against each other.
+#[test]
+fn gpt_oss_2bit_swiglu_oai() {
+    check(Case {
+        act: Dtype::Bf16,
+        scale: Dtype::Bf16,
+        group_size: 64,
+        bits: 2,
+        k: 2880,
+        n: 2880,
+        gated: GatedAct::SwigluOai,
     });
 }

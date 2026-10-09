@@ -5,8 +5,9 @@
 // the logits.
 //
 // Bindings: logits @ 0 (in place under ROUTE_PRE 1), top-k indices @ 1, top-k scores @ 2,
-// per-expert scales @ 3 (bound under ROUTE_EXPERT_SCALE only), the F32 e_score_correction_bias
-// @ 4 (bound under ROUTE_PRE 2 only). Dispatch (1, tokens, 1) × (BN, 1, 1).
+// per-expert scales @ 3 (bound under ROUTE_EXPERT_SCALE only), the F32 router bias @ 4 (bound
+// under ROUTE_PRE 2 or 3 — the correction bias or the linear one). Dispatch (1, tokens, 1) ×
+// (BN, 1, 1).
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -17,7 +18,7 @@ using namespace metal;
 // `MoeRouteConstants`, compiled in.
 SCRATCHY_CONSTANT(int, ROUTE_EXPERTS, 0);
 SCRATCHY_CONSTANT(int, ROUTE_TOP_K, 1);
-// 0: none, 1: softmax, 2: F32 sigmoid + correction bias.
+// 0: none, 1: softmax, 2: F32 sigmoid + correction bias, 3: F32 logit + linear bias.
 SCRATCHY_CONSTANT(int, ROUTE_PRE, 2);
 SCRATCHY_CONSTANT_OPTIONAL(float, ROUTE_SCALE, 3);
 // 0: none, 1: softmax, 2: renorm.
@@ -47,7 +48,7 @@ template <typename T, short BN>
       row_logits, row_logits, row_inds, bias, lid.x, simd_lane_id, simd_group_id, local_a,
       local_b);
   route_scores<T, K, ROUTE_PRE, ROUTE_SCALE_SET, ROUTE_POST, ROUTE_EXPERT_SCALE != 0>(
-      row_logits, row_logits, row_inds, row_scores, expert_scale, ROUTE_SCALE, lid.x,
+      row_logits, row_logits, row_inds, row_scores, bias, expert_scale, ROUTE_SCALE, lid.x,
       simd_lane_id, simd_group_id, local_a, local_b);
 }
 

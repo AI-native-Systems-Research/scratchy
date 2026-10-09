@@ -1766,7 +1766,7 @@ mod tests {
                 FoldPattern::Route {
                     top_k: K::RouteTopK,
                     sort: K::RouteArgsort,
-                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias],
+                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias, K::RouteBias],
                     gather: K::RouteGatherScores,
                     tail: &[
                         &[K::RouteScale],

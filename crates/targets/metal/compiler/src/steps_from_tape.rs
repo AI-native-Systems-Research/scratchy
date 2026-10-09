@@ -827,7 +827,7 @@ impl Recording<'_> {
         // A Qwen-MoE projection's own width, as the quantization declares it per layer.
         let declared = match bundle {
             ExpertBundle::SharedFused => self.facts.moe_expert_bits,
-            ExpertBundle::SwitchGlu | ExpertBundle::Fused => None,
+            ExpertBundle::SwitchGlu | ExpertBundle::Fused | ExpertBundle::GptOss => None,
         };
         let step = declared.map_or(raw, |w| {
             let widths = w(layer);
@@ -1312,6 +1312,11 @@ impl Recording<'_> {
                 let e = self.source_arg(j, 1)?;
                 weights.push((router.weight_kind(), e));
                 st::RoutePre::SigmoidBias(self.layer(e))
+            }
+            Some((j, &SubOp::RouteBias { router })) => {
+                let e = self.source_arg(j, 1)?;
+                weights.push((router.weight_kind(), e));
+                st::RoutePre::Bias(self.layer(e))
             }
             Some(_) => return Err(self.no(i, Refused::FusionShape)),
         };
@@ -2063,6 +2068,10 @@ impl Recording<'_> {
             // route command (`RouteProgram::pre`). A sigmoid+bias left on its own escaped the
             // Route fold, which nothing lowers.
             L::RouteSigmoidBias { .. } => return Err(self.no(i, Refused::Escaped)),
+            // Fold-only, gpt-oss's: the bias runs inside the route command
+            // (`RouteProgram::pre`), which computes the biased keys on the fly and reads them
+            // back the same way. One left on its own escaped the Route fold.
+            L::RouteBias { .. } => return Err(self.no(i, Refused::Escaped)),
             L::RouteArgsort => self.moe(i, MoeStep::Argsort, &[], &[], None)?,
             L::RouteTopK { .. } => self.moe(i, MoeStep::TopK, &[], &[], None)?,
             L::RouteGatherScores => self.moe(i, MoeStep::GatherScores, &[], &[], None)?,

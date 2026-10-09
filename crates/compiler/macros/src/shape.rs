@@ -469,6 +469,7 @@ pub fn apply_signature_with_geometry(
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
         OpKind::Moe => sig_moe(solver, inputs),
         OpKind::GemmaMoe => sig_gemma_moe(solver, inputs),
+        OpKind::GptOssMoe => sig_gptoss_moe(solver, inputs),
         OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
         OpKind::GateSplit => sig_gate_split(solver, inputs),
         OpKind::GateApply => sig_gate_apply(solver, inputs),
@@ -996,6 +997,17 @@ fn sig_gemma_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeE
     })
 }
 
+/// `gptoss_moe(x: [T, H], mlp_weight)` → `[T, H]`. Two args: one
+/// activation tile and one MoE weight bundle (`GptOssMoELayer` — a
+/// struct, not a tensor, so it contributes an empty shape). Output =
+/// `x` shape.
+fn sig_gptoss_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GptOssMoe, inputs, 2)?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
 /// Elementwise unary ops (silu, gelu, …) preserve shape.
 /// `scalar_weight_mul(x: [...], w: [1])` → `[...]` — multiply by a
 /// loaded one-element weight (Gemma4 `layer_scalar`).
@@ -1119,6 +1131,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // (arg 3) are weight-bundle structs (GemmaRouterLayer /
         // SwitchGluExpertsLayer), not tensors; skip the rank assertion.
         OpKind::GemmaMoe => &[],
+        // GptOssMoe's mlp[layer] is a weight-bundle struct
+        // (GptOssMoELayer), not a tensor; like Moe, skip the assertion.
+        OpKind::GptOssMoe => &[],
         // GatedDeltaNet's linear_attn[layer] is a GatedDeltaNetLayer struct
         // (not a tensor); like Moe, skip the tensor-rank assertion.
         OpKind::GatedDeltaNet => &[],

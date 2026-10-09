@@ -800,7 +800,10 @@ impl From<AffineGatherQmvConstants> for Vec<ConstantValue> {
 /// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`, `Q` =
 /// [`AffineGatherQmvConstants`]) and `KernelId::AffineQmvGated` (`affine_qmv_gated[_fast]_*`,
 /// `Q` = [`AffineQmvConstants`]): the gate projection's matvec constants (the up's are the same)
-/// and the activation (slot 3: 0 SiLU, 1 GELU).
+/// and the activation (slot 3: 0 SiLU, 1 GELU, 2 SwiGLU-OAI). The gather form additionally takes
+/// the gpt-oss gate/up LINEAR biases: the lowering binds them at the kernel's buffer 14 and sets
+/// slot 4 (`GATED_LINEAR_BIAS`), which this struct deliberately does NOT own — it is a MoE-bundle
+/// fact, not a matvec one, and only the gathered command ever carries it.
 pub struct AffineGatedQmvConstants<Q> {
     pub qmv: Q,
     pub act: crate::tape::step::GatedAct,
@@ -812,6 +815,11 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
         let act = match c.act {
             GatedAct::Silu => 0,
             GatedAct::Gelu => 1,
+            // gpt-oss SwiGLU-OAI: `y = (clamp(u, ±7)+1) · min(g,7) ·
+            // sigmoid(1.702·g)` — the ±7 limits are baked into the kernel's
+            // `swiglu_oai_mul_f`, asserted equal to the config's
+            // `swiglu_limit` at the bridge.
+            GatedAct::SwigluOai => 2,
         };
         let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(3), act));
@@ -820,7 +828,9 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
 }
 
 /// `KernelId::MoeDownCombine` (`affine_gather_qmv_combine[_fast]_*`): the down projection's
-/// [`AffineQmvConstants`] and the experts each token chose (slot 2), whose rows it combines.
+/// [`AffineQmvConstants`] and the experts each token chose (slot 2), whose rows it combines. The
+/// gpt-oss down LINEAR biases ride the same rule as the gated kernel's: the lowering binds them
+/// at buffer 10 and sets slot 6 (`COMBINE_LINEAR_BIAS`), outside this struct.
 pub struct AffineCombineQmvConstants {
     pub qmv: AffineQmvConstants,
     pub top_k: TopK,
@@ -930,9 +940,9 @@ impl From<MoeTopKConstants> for Vec<ConstantValue> {
 
 /// `KernelId::MoeRoute` (`moe_route_<T>_bn<bn>`, `moe_route.metal`): the experts a router scores
 /// (slot 0), the top-k it keeps (slot 1), and its program — the pre over the experts (slot 2:
-/// 0 none, 1 softmax, 2 F32 sigmoid + correction bias), the scores' scale (slot 3, set only when
-/// they scale), what follows (slot 4: 0 nothing, 1 softmax, 2 renorm), and the per-expert scale
-/// (slot 5).
+/// 0 none, 1 softmax, 2 F32 sigmoid + correction bias, 3 F32 logit + linear bias), the scores'
+/// scale (slot 3, set only when they scale), what follows (slot 4: 0 nothing, 1 softmax, 2
+/// renorm), and the per-expert scale (slot 5).
 pub struct MoeRouteConstants {
     pub experts: NumExperts,
     pub top_k: TopK,
@@ -947,6 +957,10 @@ impl From<MoeRouteConstants> for Vec<ConstantValue> {
             RoutePre::None => 0,
             RoutePre::Softmax => 1,
             RoutePre::SigmoidBias(_) => 2,
+            // gpt-oss: the F32 linear router bias added on the fly — the
+            // biased values order the top-k picks AND are read back as the
+            // gathered scores.
+            RoutePre::Bias(_) => 3,
         };
         let post = match p.post {
             RoutePost::None => 0,
@@ -970,8 +984,8 @@ impl From<MoeRouteConstants> for Vec<ConstantValue> {
 
 /// A routed expert kernel's routing (`MetalFusion::MoeRouted`, `quantized_qmv.metal` slots
 /// 13-17): the experts, and the [`MoeRouteConstants`] program — the pre over the experts (0
-/// none, 1 softmax, 2 F32 sigmoid + correction bias), the scores' scale, their last step, the
-/// per-expert scale.
+/// none, 1 softmax, 2 F32 sigmoid + correction bias, 3 F32 logit + linear bias), the scores'
+/// scale, their last step, the per-expert scale.
 pub struct RoutedConstants {
     pub experts: NumExperts,
     pub program: crate::tape::step::RouteProgram,
@@ -985,6 +999,8 @@ impl From<RoutedConstants> for Vec<ConstantValue> {
             RoutePre::None => 0,
             RoutePre::Softmax => 1,
             RoutePre::SigmoidBias(_) => 2,
+            // gpt-oss: the F32 linear router bias — see `MoeRouteConstants`.
+            RoutePre::Bias(_) => 3,
         };
         let post = match p.post {
             RoutePost::None => 0,

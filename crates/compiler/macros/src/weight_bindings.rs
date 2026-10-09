@@ -235,7 +235,8 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         L::RouterNorm { router, .. }
         | L::RouterLogits { router, .. }
         | L::RouteExpertScale { router }
-        | L::RouteSigmoidBias { router } => router.weight_kind(),
+        | L::RouteSigmoidBias { router }
+        | L::RouteBias { router } => router.weight_kind(),
         L::ExpertMatmul { bundle, .. } => bundle.weight_kind(),
         L::RopeRotate { .. } | L::RopeAppend { .. } => WeightKind::CosSin,
         // gpt-oss attention sinks: the trailing `[num_heads]` weight

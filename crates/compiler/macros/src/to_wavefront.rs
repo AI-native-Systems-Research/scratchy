@@ -1427,6 +1427,109 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
+            OpKind::GptOssMoe => {
+                let x = bx.input_at(tile, 0)?;
+                // One opaque STRUCT bundle (`mlp[layer]` — router gate +
+                // router bias + experts + expert linear biases under one
+                // base), like `moe_block`.
+                let w = node
+                    .inputs
+                    .iter()
+                    .find_map(|inp| match inp {
+                        FufInput::Weight { id, index, .. } => Some((id.0, *index)),
+                        _ => None,
+                    })
+                    .map(|(id, index)| {
+                        InputRef::Ext(bx.push_source(1, 1, SourceBinding::Weight { id, index }))
+                    })
+                    .ok_or(BridgeError::MalformedOp {
+                        tile,
+                        op: OpKind::GptOssMoe,
+                        detail: "gptoss_moe without a weight input",
+                    })?;
+                let b = &bx.bounds;
+                let num_experts = b
+                    .get("num_local_experts")
+                    .copied()
+                    .ok_or(BridgeError::MissingBound {
+                        key: "num_local_experts",
+                    })? as u32;
+                let top_k =
+                    b.get("num_experts_per_tok")
+                        .copied()
+                        .ok_or(BridgeError::MissingBound {
+                            key: "num_experts_per_tok",
+                        })? as u32;
+                let moe_inter = b
+                    .get("moe_intermediate_size")
+                    .or_else(|| b.get("intermediate_size"))
+                    .copied()
+                    .ok_or(BridgeError::MissingBound {
+                        key: "moe_intermediate_size",
+                    })? as u32;
+                let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
+                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
+                        (*group_size, *bits)
+                    }
+                    _ => {
+                        return Err(BridgeError::NoMetalRealization {
+                            tile,
+                            detail: "gptoss_moe without affine expert storage has no metal \
+                                     realization (dense MoE is unclaimed on metal)",
+                        });
+                    }
+                };
+                // The SwiGLU-OAI limit is BAKED as 7.0 into the kernels
+                // (`swiglu_oai_mul_f`, the GATED_ACT==2 epilogue); gpt-oss is
+                // the only consumer, so a config carrying any other limit is
+                // refused here at build time rather than silently computed
+                // with the wrong clamp. The upgrade path if a second consumer
+                // appears is a `CanonicalParams` scalar.
+                let limit = bx
+                    .model
+                    .scalars
+                    .get("swiglu_limit")
+                    .copied()
+                    .ok_or(BridgeError::MalformedOp {
+                        tile,
+                        op: OpKind::GptOssMoe,
+                        detail: "gptoss_moe requires a `swiglu_limit` config scalar",
+                    })?;
+                if limit != 7.0 {
+                    return Err(BridgeError::MalformedOp {
+                        tile,
+                        op: OpKind::GptOssMoe,
+                        detail: "gptoss_moe kernels bake swiglu_limit = 7.0; this config \
+                                 carries another value",
+                    });
+                }
+                let (experts, k) = moe_counts(tile, num_experts, top_k)?;
+                let router = RouterBundle::GptOss;
+                bx.expand();
+                // gpt-oss order: linear router WITH bias → top-4 over the
+                // biased logits → the biased values read back as the gathered
+                // scores → softmax over the top-4 (no renorm) — the Mixtral
+                // arm's exact post-gather sequence.
+                let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
+                let lg = bx.push_op(SubOp::RouteBias { router }, vec![InputRef::Op(lg), w]);
+                let indices = bx.route_top_k(lg, k);
+                let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
+                let scores = bx.push(SubOp::RouteSoftmax, &[scores]);
+                let hidden = bx.out_cols(tile, 0, "gptoss_moe output")?;
+                let experts = Experts {
+                    experts,
+                    k,
+                    inter: moe_inter,
+                    hidden,
+                    quant: ExpertQuant::declared(group_size, bits),
+                    bundle: ExpertBundle::GptOss,
+                    act: GatedAct::SwigluOai,
+                    shared: SharedExpertBound(None),
+                };
+                let idx = bx.experts(x, indices, scores, w, experts);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
             OpKind::TanhSoftCap => {
                 let x = bx.input_at(tile, 0)?;
                 let idx = bx.push_op(SubOp::TanhSoftCap, vec![x]);
