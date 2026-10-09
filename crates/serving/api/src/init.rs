@@ -277,8 +277,7 @@ fn effective_block_size(configured: usize, device: &str) -> usize {
 /// Prefill-chunk cap (tokens) for sliding-window models, enforced at the
 /// scheduler via `max_num_batched_tokens.min(SWA_PREFILL_CHUNK_CAP)`. Bounds a
 /// sliding group's in-flight KV per step, so its live block set stays ~window +
-/// chunk (the hybrid pool is sized to `window + 2*cap` for eviction lag in
-/// `compute_kv_blocks`). Keeps sliding KV a few hundred MiB at 32k vs ~1 GiB.
+/// chunk. Keeps sliding KV a few hundred MiB at 32k vs ~1 GiB.
 const SWA_PREFILL_CHUNK_CAP: usize = 2048;
 
 /// Resolve the full set of stop-on-generate token IDs the engine
@@ -600,8 +599,7 @@ fn init_cache(
     // kernels can address (hybrid SWA arches: the sliding class's block table
     // is baked at a fixed row stride). Beyond it the kernel would index past
     // the block table; capping here means an over-long prompt is rejected by
-    // the scheduler instead. Also sizes the KV pool to this context, not the
-    // whole memory budget.
+    // the scheduler instead.
     let effective_max_model_len = match worker.kv_max_addressable_tokens() {
         Some(cap) if cap < max_model_len => {
             info!(
@@ -619,17 +617,9 @@ fn init_cache(
         dtype_elem_bytes,
         utilization,
         kv_cache_dtype,
-        effective_max_model_len,
+        worker.kv_block_bytes(block_size),
         worker.supports_hybrid_swa_kv(),
     );
-    // A worker whose uniform pool is not dense rows (a metal model built with
-    // TurboQuant: packed codes) states what one block costs; the budget buys
-    // that many of them instead.
-    if swa_hybrid_kv.is_none()
-        && let Some(bytes_per_block) = worker.kv_block_bytes(block_size)
-    {
-        num_gpu_blocks = blocks_within(kv_cache_bytes, bytes_per_block);
-    }
     // Fixed-size resident KV pool cap (spyre/sendnn PAGED CB): the on-card pool is
     // exactly `nblk` blocks, so the scheduler's block allocator must not exceed it
     // (else it hands out a block id past the pool → silent KV corruption). The
@@ -1651,7 +1641,9 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
             dtype_elem_bytes,
             config.gpu_memory_utilization,
             &config.kv_cache_dtype,
-            max_model_len,
+            workers
+                .first()
+                .and_then(|w| w.kv_block_bytes(config.block_size)),
             supports_hybrid_swa_kv,
         );
 
@@ -2160,7 +2152,7 @@ fn initialize_stack_multinode(
             dtype_elem_bytes,
             config.gpu_memory_utilization,
             &config.kv_cache_dtype,
-            max_model_len,
+            worker.kv_block_bytes(config.block_size),
             worker.supports_hybrid_swa_kv(),
         );
 
@@ -2770,7 +2762,9 @@ fn initialize_stack_tp_pp(
                 dtype_elem_bytes,
                 config.gpu_memory_utilization,
                 &config.kv_cache_dtype,
-                max_model_len,
+                workers
+                    .first()
+                    .and_then(|w| w.kv_block_bytes(config.block_size)),
                 supports_hybrid_swa_kv,
             );
 
@@ -3130,7 +3124,9 @@ fn initialize_stack_tp(
             dtype_elem_bytes,
             config.gpu_memory_utilization,
             &config.kv_cache_dtype,
-            max_model_len,
+            workers
+                .first()
+                .and_then(|w| w.kv_block_bytes(config.block_size)),
             supports_hybrid_swa_kv,
         );
 
@@ -3518,7 +3514,7 @@ fn initialize_stack_external(
             dtype_elem_bytes,
             config.gpu_memory_utilization,
             &config.kv_cache_dtype,
-            max_model_len,
+            worker.kv_block_bytes(config.block_size),
             worker.supports_hybrid_swa_kv(),
         );
 
@@ -3946,8 +3942,15 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
 
 /// Compute the KV-cache block count AND the hybrid SWA layout, if any.
 ///
-/// For uniform (non-SWA) models this is exactly [`compute_num_blocks`] with no
-/// hybrid config. For `is_swa_hybrid` models (gemma4) it computes vLLM's
+/// Both layouts spend the WHOLE KV budget, as vLLM does: the scheduler admits
+/// requests until blocks run out, so a pool smaller than the budget is a
+/// concurrency cap nobody asked for. `block_bytes` is the worker's own cost of
+/// one block ([`Worker::kv_block_bytes`]) when it is not the dense row derived
+/// here — TurboQuant codes, or a hybrid model's shared page plus its TurboQuant
+/// global store — and the budget buys that many blocks.
+///
+/// For uniform (non-SWA) models this is [`compute_num_blocks`] with no hybrid
+/// config. For `is_swa_hybrid` models (gemma4) it computes vLLM's
 /// group-shared layout: the shared-pool `num_blocks`
 /// (`available / page_size / group_size`, the SAME total VA as the uniform pool
 /// but holding `group_size`× more blocks since each physical tensor is shared
@@ -3961,17 +3964,20 @@ fn compute_kv_blocks(
     dtype_elem_bytes: usize,
     utilization: f64,
     kv_cache_dtype: &str,
-    max_model_len: usize,
+    block_bytes: Option<usize>,
     allow_hybrid: bool,
 ) -> (usize, Option<HybridKvConfig>) {
-    let uniform = compute_num_blocks(
-        available_bytes,
-        block_size,
-        hf_config,
-        dtype_elem_bytes,
-        utilization,
-        kv_cache_dtype,
-    );
+    let uniform = match block_bytes {
+        Some(bytes) => blocks_within(available_bytes, bytes),
+        None => compute_num_blocks(
+            available_bytes,
+            block_size,
+            hf_config,
+            dtype_elem_bytes,
+            utilization,
+            kv_cache_dtype,
+        ),
+    };
     // The CUDA decode reads a single block table for every layer (no grouped
     // sliding-window KV); only metal wires the `sliding_groups` decode. A CUDA
     // worker passes `allow_hybrid=false` so gemma4 (and any hybrid-SWA arch)
@@ -4017,61 +4023,28 @@ fn compute_kv_blocks(
         elem_bytes,
     ) {
         Some(layout) => {
-            // Size the shared pool to what `max_model_len` actually needs, not
-            // the whole KV budget. Unlike a uniform pool (which pre-commits all
-            // num_blocks), the hybrid pool is lazy-committed AND the sliding
-            // groups free out-of-window blocks, so the live set is ~the full
-            // group's full-context blocks plus a window's worth per sliding
-            // group. Reserving the full budget of residency-attached VA (gemma4:
-            // 256k → ~5 GiB) just starves the activation arena → OOM, while the
-            // actual KV stays well under 1 GiB. mlx-lm sizes its caches to the
-            // sequence the same way (RotatingKVCache grows to min(ctx, window)).
-            //
-            // Upper bound on the live block-ID set: the full group's
-            // full-context blocks (`mml/full_bs`) plus, generously, one
-            // full-context sliding group's worth (`mml/sliding_bs`) — that
-            // covers all N sliding groups since each is window-bounded well
-            // below a full context. Still clamped to the budget-derived count.
-            let full_bs = layout.full_block_size().max(1);
-            // Each SLIDING group draws from this one shared pool (gemma4-12b: 5,
-            // 26b: 5). The scheduler's SWA eviction (remove_skipped_blocks) frees
-            // out-of-window blocks every step and the prefill chunk is capped at
-            // SWA_PREFILL_CHUNK_CAP, so a sliding group's live block set is bounded
-            // by (window + chunk_cap), NOT the full context. Sizing to mml here
-            // over-reserves ~10x of residency-attached VA and OOMs big models
-            // (gemma-4-26b weights ~24 GB on a 32 GB Mac); measured max_block tops
-            // out at ~(window+cap)/bs * num_sliding + global, matching this.
-            let num_sliding = layout.num_groups().saturating_sub(1).max(1);
-            let sliding_window = geom
-                .iter()
-                .filter(|g| g.is_sliding)
-                .filter_map(|g| g.sliding_window)
-                .max()
-                .unwrap_or(0);
-            // Live sliding set = window + the in-flight prefill chunk, plus a
-            // chunk of eviction lag: the scheduler frees WHOLE out-of-window
-            // blocks at the START of a step, so the prior chunk's blocks can
-            // still be resident when the next chunk's are added. Budget
-            // 2*chunk_cap of headroom over the window. Measured sliding usage at
-            // 24k (~1.1-1.2k blocks across 5 groups) sits inside this and far
-            // under the full-context ~7.7k that sizing to mml would reserve.
-            let sliding_blocks_per_group =
-                ((sliding_window + 2 * SWA_PREFILL_CHUNK_CAP).div_ceil(block_size) + 2)
-                    // A sequence of at most `max_model_len` tokens can never need more
-                    // than its own block count, regardless of the window+lag headroom.
-                    .min(max_model_len.div_ceil(block_size));
-            let need = max_model_len.div_ceil(full_bs) + num_sliding * sliding_blocks_per_group;
-            let num_blocks = layout.config.num_blocks.min(need).max(16);
+            // The WHOLE budget, at what a block really costs. The scheduler admits
+            // requests until blocks run out and recomputes a preempted one from
+            // token 0 (prefix caching is off on this layout), so this pool's size
+            // IS the concurrency the server sustains: a pool of one 32k sequence
+            // preempts 12 requests of 640 tokens and never fits 8 of 4.6k. The
+            // pool commits lazily and the lowest-free-first allocator keeps live
+            // block ids near the working set, so a large pool costs reserved VA;
+            // charging each block its TurboQuant global store (`block_bytes`)
+            // keeps that inside the budget the activation arena was carved from.
+            let num_blocks = block_bytes
+                .map_or(layout.config.num_blocks, |bytes| {
+                    blocks_within(available_bytes, bytes)
+                })
+                .max(16);
             tracing::info!(
-                "Hybrid SWA KV layout: {} shared blocks ({} groups, group_size {}, page {} B; \
-                 sized for max_model_len {} → {} blocks, budget cap {})",
+                "Hybrid SWA KV layout: {} shared blocks ({} groups, group_size {}, page {} B, \
+                 {} B per block)",
                 num_blocks,
                 layout.num_groups(),
                 layout.group_size,
                 layout.page_size_bytes,
-                max_model_len,
-                need,
-                layout.config.num_blocks,
+                block_bytes.unwrap_or(layout.page_size_bytes * layout.group_size),
             );
             (num_blocks, Some((num_blocks, layout.engine_groups())))
         }
@@ -4153,6 +4126,35 @@ mod tests {
         let blocks = compute_num_blocks(1024, 16, &config, 4, 0.9, "auto");
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
+    }
+
+    /// The hybrid (gemma4) pool spends the WHOLE budget at the worker's cost of a
+    /// block, like every other pool. Sized to one `max_model_len` sequence it was
+    /// 2,634 blocks on gemma-4-26b whatever the budget — a concurrency cap that
+    /// preempted 12 concurrent 640-token requests and never fit 8 of 4,608.
+    #[test]
+    fn test_hybrid_pool_spends_the_budget_at_the_workers_block_cost() {
+        let config = HfModelConfig::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../models/arch/configs/gemma4-moe/gemma-4-26b-a4b-it.json"
+        ))
+        .expect("gemma-4-26b config");
+        // gemma-4-26b's sliding page: 16 tokens × 8 KV heads × (256 K + 256 V) × 2 B.
+        let page = 16 * 8 * 512 * 2;
+        let group_size = 5;
+        // ~ what the metal worker reports: the shared pages + the TurboQuant global store.
+        let block_bytes = page * group_size + 297_472;
+        for budget in [3usize << 30, 22 << 30] {
+            let (num_blocks, hybrid) =
+                compute_kv_blocks(budget, 16, &config, 2, 0.9, "auto", Some(block_bytes), true);
+            let (pool, groups) = hybrid.expect("gemma4 takes the hybrid layout");
+            assert_eq!(num_blocks, budget / block_bytes, "budget {budget}");
+            assert_eq!(pool, num_blocks, "scheduler and worker size one pool");
+            assert_eq!(groups.len(), 6, "1 full + 5 sliding groups");
+            // No worker cost: the dense shared pages alone.
+            let (dense, _) = compute_kv_blocks(budget, 16, &config, 2, 0.9, "auto", None, true);
+            assert_eq!(dense, budget / (page * group_size), "budget {budget}");
+        }
     }
 
     #[test]

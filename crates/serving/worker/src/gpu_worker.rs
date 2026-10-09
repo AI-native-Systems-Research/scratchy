@@ -676,7 +676,8 @@ fn hybrid_kv_layout(
 
 /// A uniform model built with TurboQuant: its KV lives in packed codes and the
 /// fp16 pool is a one-chunk seed (`initialize_cache`). A hybrid model's
-/// TurboQuant global layers share a pool sized to its context, not the budget.
+/// TurboQuant global layers keep their codes BESIDE its fp16 pool, which the
+/// sliding layers read ([`target_block_bytes`] charges both).
 #[cfg(feature = "metal")]
 fn uniform_turboquant(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -686,13 +687,37 @@ fn uniform_turboquant(
         && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
 }
 
-/// Bytes one block of the TARGET pool costs: a uniform TurboQuant model's
-/// codes, norms and scratch, every other model's dense rows.
+/// Bytes one block of the TARGET pool costs: a hybrid model's page in each of
+/// its group-shared tensors plus, built with TurboQuant, the global layers'
+/// codes, norms and scratch; a uniform TurboQuant model's codes, norms and
+/// scratch; every other model's dense rows.
 #[cfg(feature = "metal")]
 fn target_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
 ) -> usize {
+    if let Some(layout) = hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES) {
+        let shared_pages = layout.page_size_bytes * layout.group_size;
+        let codec = model.kv_codec();
+        if !codec.is_turboquant() {
+            return shared_pages;
+        }
+        // What `build_tq_provision` allocates per block: the GLOBAL group's
+        // (group 0) layers at the global geometry, `full_block_size` tokens each.
+        let tq = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs())
+            .expect("a metal model's baked rungs are MetalRungs")
+            .tq;
+        let num_global = layout.layer_to_group.iter().filter(|&&g| g == 0).count();
+        return shared_pages
+            + layout.full_block_size()
+                * scratchy_target_metal::turboquant::kv_bytes_per_token(
+                    codec,
+                    num_global,
+                    tq.kv_heads.get() as usize,
+                    tq.head_dim.get() as usize,
+                    METAL_KV_ELEM_BYTES,
+                );
+    }
     if uniform_turboquant(model, block_size) {
         block_size.saturating_mul(pool_bytes_per_token(
             model,
@@ -2968,11 +2993,14 @@ impl Worker for MetalWorker {
     }
 
     fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
-        // A uniform TurboQuant model's blocks are packed codes, not the dense
-        // rows the engine would derive — the same cost the draft split in
-        // `determine_available_memory` divides by.
+        // A uniform TurboQuant model's blocks are packed codes, and a hybrid
+        // model's are group-shared pages plus its TurboQuant global store — not
+        // the dense rows the engine would derive. The same cost the draft split
+        // in `determine_available_memory` divides by.
         let model = self.model.as_deref()?;
-        uniform_turboquant(model, block_size).then(|| target_block_bytes(model, block_size))
+        (uniform_turboquant(model, block_size)
+            || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some())
+        .then(|| target_block_bytes(model, block_size))
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {

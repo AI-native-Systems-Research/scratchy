@@ -2342,9 +2342,19 @@ impl SchedulerInterface for Scheduler {
                     break;
                 }
 
-                // Pop from the waiting queue directly to avoid peek+clone.
+                // The queue decides ORDER; the request admitted is the canonical record. The queue
+                // holds a copy taken when the request was queued, and a request preempted with a
+                // decode step still in flight (async scheduling) receives that step's token AFTER —
+                // on the canonical record (`append_output_tokens`), never on this copy. Admitting the
+                // copy schedules one token short: that step is an intermediate chunk that samples
+                // nothing, then `num_tokens == num_computed` leaves the request unschedulable until
+                // the server's no-progress watchdog aborts it.
                 let mut request = match self.waiting.pop_request() {
-                    Some(r) => r,
+                    Some(queued) => self
+                        .requests
+                        .get(&queued.request_id)
+                        .cloned()
+                        .expect("every queued request has a canonical record"),
                     None => break,
                 };
                 let request_id = request.request_id.clone();
@@ -5547,6 +5557,105 @@ mod tests {
             assert_eq!(
                 inner_hashes[i], outer_hashes[i],
                 "block {i} hash must match between inner and outer"
+            );
+        }
+    }
+
+    /// A request PREEMPTED WITH A DECODE STEP IN FLIGHT must resume and finish. Under async
+    /// scheduling the next step is scheduled before the previous one's tokens arrive, so a request
+    /// preempted at step N+1 still receives step N's token — on the canonical record only. Admitting
+    /// the waiting queue's stale copy scheduled one token short, sampled nothing, and left the request
+    /// unschedulable; the server's 60 s no-progress watchdog then aborted it. gemma-4-26b-shaped: one
+    /// full group (bs 32) + five sliding groups (window 1024, bs 16) over the 2634-block pool its
+    /// server sized, 12 concurrent 512-token prompts × 128 tokens — which overflows near the end, so
+    /// the tail request is preempted mid-decode. The worker is modelled the way `InputBatch` runs: a
+    /// request samples when its chunk reaches the end of the history the WORKER holds.
+    #[test]
+    fn test_hybrid_preempted_mid_decode_resumes_under_async_scheduling() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 2048,
+            max_num_seqs: 16,
+            enable_chunked_prefill: true,
+            async_scheduling: Some(true),
+            ..Default::default()
+        };
+        let pool = 2634usize;
+        let mut tracker = SimpleBlockTracker::new(pool, 16);
+        let mut groups = vec![(false, 0usize, 32usize)];
+        groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
+        tracker.enable_hybrid(pool, groups);
+        let mut sched = Scheduler::new(&cfg, 32768, Box::new(tracker));
+        let (num_reqs, prompt_len, max_tokens) = (12usize, 512u32, 128u32);
+        for i in 0..num_reqs {
+            sched.add_request(Request::new(
+                format!("r{i}"),
+                (0..prompt_len).collect(),
+                SamplingParams {
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+                i as f64,
+                0,
+                0,
+                None,
+            ));
+        }
+
+        // The worker's history length per request: prompt ++ every token sampled, in flight or not.
+        let mut worker_history: HashMap<String, usize> = HashMap::new();
+        let mut in_flight: Vec<String> = Vec::new();
+        let mut preempted_mid_decode = false;
+        for _ in 0..10_000 {
+            let out = sched.schedule();
+            preempted_mid_decode |= out.preempted_req_ids.as_ref().is_some_and(|p| {
+                p.iter().any(|id| {
+                    sched
+                        .get_request(id)
+                        .is_some_and(|r| r.num_output_tokens() > 0)
+                })
+            });
+            let mut sampled = Vec::new();
+            for (id, &n) in &out.num_scheduled_tokens {
+                let r = sched.get_request(id).unwrap();
+                let start = r.num_computed_tokens as usize - n;
+                let history = worker_history
+                    .entry(id.clone())
+                    .or_insert(r.num_prompt_tokens as usize);
+                if start + n >= *history {
+                    *history += 1;
+                    sampled.push(id.clone());
+                }
+            }
+            // One-step lag: the PREVIOUS step's tokens land after this step was scheduled.
+            for id in std::mem::replace(&mut in_flight, sampled) {
+                if sched.get_request(&id).unwrap().status.is_finished() {
+                    continue;
+                }
+                sched.append_output_tokens(&id, &[7]);
+                if sched.get_request(&id).unwrap().num_output_tokens() >= max_tokens as usize {
+                    sched.finish_requests(&[id.as_str()], RequestStatus::FinishedLengthCapped);
+                }
+            }
+            if !sched.has_unfinished_requests() {
+                break;
+            }
+        }
+
+        assert!(
+            preempted_mid_decode,
+            "the pool must overflow mid-decode, or this test does not exercise the resume"
+        );
+        let unfinished = sched.get_unfinished_request_ids();
+        assert!(
+            unfinished.is_empty(),
+            "requests stuck after a mid-decode preemption: {unfinished:?}"
+        );
+        for i in 0..num_reqs {
+            let r = sched.get_request(&format!("r{i}")).unwrap();
+            assert_eq!(
+                r.num_output_tokens(),
+                max_tokens as usize,
+                "r{i} must emit all its tokens"
             );
         }
     }
