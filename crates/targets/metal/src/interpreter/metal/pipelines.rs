@@ -73,6 +73,59 @@ pub const GEMV_ROWS: u32 = 4;
 /// its few threadgroups lose.
 pub const GEMM_BLOCKED_ROWS: u32 = 256;
 
+/// The rows from which a GPU with the NAX matrix unit runs its dense bf16 GEMMs on it: 64, the
+/// ladder's smallest prefill bucket. There the 64×64-tile body takes over the 8×8-tile simdgroup
+/// body's whole range — 1.5-5× at 64 rows across the MoE-router geometries and a wide-N
+/// projection (`gemm_crossover_probe_test`), and the gemma-4-26b router's 64-bucket TTFT in an
+/// interleaved e2e A/B. The decode buckets below 64 stay on the simdgroup bodies: their cells
+/// measure as dispatch noise.
+pub const NAX_GEMM_MIN_M: u32 = 64;
+
+/// The columns from which the NAX body also takes the blocked body's range: a GEMM narrower
+/// than this runs its 256-row-and-up buckets blocked. The NAX grid is `n/64 × m/64`
+/// threadgroups — at the MoE routers' n = 128 that is 2 wide, too few groups to occupy the
+/// GPU once m grows. An interleaved e2e A/B on a 40-core M5 Max measured that under-occupied
+/// grid LOSING to the blocked body at gemma-4-26b's 512- and 1024-row buckets (n = 128,
+/// k = 2816) while WINNING at qwen3.6-35b's 1024-row bucket (n = 256, k = 2048) — the isolated
+/// probe's 3 ms bursts run at un-ramped clocks and cannot see that regime, so this constant is
+/// the e2e table's, not the sweep's.
+pub const NAX_GEMM_WIDE_N: u32 = 256;
+
+/// The body a dense GEMM of `m` rows over `n` columns and `k` contraction runs on a GPU that
+/// has the matrix unit or not. The NAX body steps its contraction by its 64-wide `BK` — the
+/// same gate MLX puts on its NAX qmm (`quantized.cpp:695`) — so a `k` that is not a multiple
+/// of 64 falls to the simdgroup pair's law.
+pub fn gemm_body(m: u32, n: u32, k: u32, has_nax: bool) -> GemmBody {
+    if has_nax
+        && m >= NAX_GEMM_MIN_M
+        && k.is_multiple_of(64)
+        && (m < GEMM_BLOCKED_ROWS || n >= NAX_GEMM_WIDE_N)
+    {
+        GemmBody::Nax
+    } else if m >= GEMM_BLOCKED_ROWS {
+        GemmBody::Blocked
+    } else {
+        GemmBody::Tile
+    }
+}
+
+/// A dense GEMM's body: which kernel its dispatch runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmBody {
+    /// `gemm_{f16,bf16}_specialized`: 8×8 tiles, one simdgroup per tile.
+    Tile,
+    /// `gemm_bf16_blocked`: 32×32 output tiles, 4 simdgroups sharing their A/B tiles.
+    Blocked,
+    /// `gemm_nax_bf16_dense`: 64×64 tiles on the NAX matrix unit (gen ≥ 17).
+    Nax,
+}
+
+impl GemmBody {
+    /// Every body a bake fans a GEMM command over: the device picks one at load
+    /// ([`gemm_body`]).
+    pub const ALL: [Self; 3] = [Self::Tile, Self::Blocked, Self::Nax];
+}
+
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
 // `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`)
@@ -99,12 +152,21 @@ pub struct SpecializedPipelines {
     cache: Arc<SpecializedPipelineCache>,
     /// The tape variant the pool picked: the values its commands' variant-bound constants take.
     variant: TapeVariant,
+    /// Whether the device's target has the NAX matrix unit: the body its dense GEMMs run
+    /// ([`gemm_body`]).
+    has_nax: bool,
 }
 
 impl SpecializedPipelines {
     /// Wrap an already-constructed cache, every baked kernel `variant`'s tapes name registered.
     pub fn new(cache: Arc<SpecializedPipelineCache>, variant: TapeVariant) -> Self {
-        Self { cache, variant }
+        let has_nax = crate::device::known_profile(cache.device())
+            .is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+        Self {
+            cache,
+            variant,
+            has_nax,
+        }
     }
 
     /// The tape variant the pool picked.
@@ -144,13 +206,15 @@ impl SpecializedPipelines {
             .map_err(PipelineLookupError::Build)
     }
 
-    /// A dense GEMM's pipeline at `dtype` and its dispatch ([`gemm_pipeline`]).
+    /// A dense GEMM's pipeline at `dtype` and its dispatch ([`gemm_pipeline`]), its body the one
+    /// the device calls for ([`gemm_body`]).
     pub fn pipeline_for_gemm(
         &self,
         dtype: MetalDtype,
         dims: GemmDims,
     ) -> Result<(ComputePipelineState, DispatchShape), PipelineLookupError> {
-        let (key, dispatch) = gemm_pipeline(dtype, dims)?;
+        let body = gemm_body(dims.m, dims.n, dims.k, self.has_nax);
+        let (key, dispatch) = gemm_pipeline(dtype, dims, body)?;
         let pipeline = self
             .cache
             .get_or_build(&key)
@@ -165,25 +229,55 @@ impl SpecializedPipelines {
     }
 }
 
-/// A dense GEMM's pipeline key at `dtype` and its dispatch, keyed on its `(M, N, K)` (constants
-/// 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at least
-/// [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV (`gemv_{f16,bf16}_specialized`),
-/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. A bf16 GEMM of at least
-/// [`GEMM_BLOCKED_ROWS`] rows takes the blocked body (`gemm_bf16_blocked`): 32×32 output tiles
-/// over 4 simdgroups sharing their A/B tiles, the 8×8-tile GEMM's MMAs in its order — the same
-/// bits. Otherwise the 8×8-tile GEMM (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one
-/// simdgroup per tile. Bindings for all: output 0, input 1, weight 2.
+/// A dense GEMM's pipeline key at `dtype` and `dims` for `body`, keyed on its `(M, N, K)` (the
+/// simdgroup bodies' constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`).
+/// One row of at least [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV
+/// (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per [`GEMV_ROWS`] outputs.
+/// Otherwise the body [`gemm_body`] picked runs: the NAX body (`gemm_nax_bf16_dense`) on the
+/// matrix unit's 64×64 tiles, a bf16 GEMM `blocked` taking the blocked body
+/// (`gemm_bf16_blocked`): 32×32 output tiles over 4 simdgroups sharing their A/B tiles, the
+/// 8×8-tile GEMM's MMAs in its order — the same bits — or the 8×8-tile GEMM
+/// (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one simdgroup per tile. A body the
+/// `(dtype, dims)` cannot serve runs the 8×8-tile body, as every dtype the blocked body does not
+/// already does. Bindings for all: output 0, input 1, weight 2.
 pub fn gemm_pipeline(
     dtype: MetalDtype,
     dims: GemmDims,
+    body: GemmBody,
 ) -> Result<(PipelineKey, DispatchShape), PipelineLookupError> {
     let GemmDims { m, n, k } = dims;
-    let (gemv, blocked) = (m == 1 && n >= GEMV_ROWS, m >= GEMM_BLOCKED_ROWS);
+    let gemv = m == 1 && n >= GEMV_ROWS;
+    // The NAX body's own library and constants: the quantized_qmm_nax kernels read K, N, M as
+    // int slots 0 / 1 / 2 — not the gemm library's M, N, K as uint — and dispatch MLX's 3D
+    // threadgroup (32, 2, 2), which the MPP matmul2d scheduler prefers ~7% over a flat
+    // (128, 1, 1) (`qmm_t_dispatch_shape`).
+    if matches!(
+        (dtype, body, gemv),
+        (MetalDtype::Bf16, GemmBody::Nax, false)
+    ) && k.is_multiple_of(64)
+    {
+        let dispatch = DispatchShape {
+            threadgroups: (n.div_ceil(64), m.div_ceil(64), 1),
+            threads_per_threadgroup: (32, 2, 2),
+            m_scaling: None,
+        };
+        let constants = vec![
+            ConstantValue::int(0, k as i32),
+            ConstantValue::int(1, n as i32),
+            ConstantValue::int(2, m as i32),
+        ];
+        return Ok((
+            PipelineKey::new("quantized_qmm_nax", "gemm_nax_bf16_dense", constants),
+            dispatch,
+        ));
+    }
     // The kernel, the outputs a threadgroup covers along N (and M), and its threads.
-    let (function, tile, threads) = match (dtype, gemv, blocked) {
+    let (function, tile, threads) = match (dtype, gemv, body) {
         (MetalDtype::F16, false, _) => ("gemm_f16_specialized", 8, 32),
-        (MetalDtype::Bf16, false, false) => ("gemm_bf16_specialized", 8, 32),
-        (MetalDtype::Bf16, false, true) => ("gemm_bf16_blocked", 32, 128),
+        (MetalDtype::Bf16, false, GemmBody::Tile | GemmBody::Nax) => {
+            ("gemm_bf16_specialized", 8, 32)
+        }
+        (MetalDtype::Bf16, false, GemmBody::Blocked) => ("gemm_bf16_blocked", 32, 128),
         (MetalDtype::F16, true, _) => ("gemv_f16_specialized", GEMV_ROWS, 256),
         (MetalDtype::Bf16, true, _) => ("gemv_bf16_specialized", GEMV_ROWS, 256),
         (MetalDtype::Int4, ..) => {
@@ -254,6 +348,100 @@ impl std::error::Error for PipelineLookupError {}
 mod tests {
     use super::*;
     use scratchy_ir::CanonicalParams;
+
+    /// The body a GEMM's rows and columns call for on a GPU with the matrix unit and one without.
+    #[test]
+    fn gemm_body_picks_the_nax_body_from_its_measured_rows() {
+        // With the unit: the NAX body from its measured rows — the whole range the 8×8-tile
+        // body serves, and past the blocked body's rows only at the wide columns the NAX grid
+        // occupies the GPU at (qwen3.6-35b's router; the gemma-4-26b router's n = 128 stays
+        // blocked there, its 2-wide grid measured losing e2e at the 512- and 1024-row buckets).
+        assert_eq!(gemm_body(8, 256, 2048, true), GemmBody::Tile);
+        assert_eq!(gemm_body(NAX_GEMM_MIN_M, 256, 2048, true), GemmBody::Nax);
+        assert_eq!(gemm_body(NAX_GEMM_MIN_M, 128, 2816, true), GemmBody::Nax);
+        assert_eq!(gemm_body(4096, 256, 2048, true), GemmBody::Nax);
+        assert_eq!(gemm_body(512, 128, 2816, true), GemmBody::Blocked);
+        assert_eq!(gemm_body(1024, 128, 2816, true), GemmBody::Blocked);
+        // A k the NAX body cannot step falls to the simdgroup pair's law.
+        assert_eq!(gemm_body(4096, 256, 2000, true), GemmBody::Blocked);
+        assert_eq!(gemm_body(64, 256, 2000, true), GemmBody::Tile);
+        // Without the unit: the simdgroup pair's law alone.
+        assert_eq!(gemm_body(4096, 256, 2048, false), GemmBody::Blocked);
+        assert_eq!(gemm_body(64, 256, 2048, false), GemmBody::Tile);
+    }
+
+    /// The NAX body's pipeline names the NAX library's kernel at its own constant slots: K, N, M
+    /// as int 0 / 1 / 2, the gemm library's M, N, K as uint would read the kernel its contraction
+    /// as its row count. Its dispatch is MLX's 3D threadgroup, not the gemm library's flat one.
+    #[test]
+    fn nax_gemm_names_the_nax_librarys_slots() {
+        let (key, shape) = gemm_pipeline(
+            MetalDtype::Bf16,
+            GemmDims {
+                m: 512,
+                n: 256,
+                k: 2048,
+            },
+            GemmBody::Nax,
+        )
+        .expect("gemm key");
+        assert_eq!(key.library_name, "quantized_qmm_nax");
+        assert_eq!(key.kernel_name, "gemm_nax_bf16_dense");
+        assert_eq!(
+            key.constants,
+            vec![
+                ConstantValue::int(0, 2048),
+                ConstantValue::int(1, 256),
+                ConstantValue::int(2, 512)
+            ]
+        );
+        assert_eq!(shape.threadgroups, (4, 8, 1));
+        assert_eq!(shape.threads_per_threadgroup, (32, 2, 2));
+    }
+
+    /// A body the dims cannot serve runs the body that can: the NAX body at one row is the GEMV,
+    /// and at a k it cannot step the 8×8-tile body — the bake fan's keys collapse to what serves,
+    /// so a dispatch never runs a body its dims cannot.
+    #[test]
+    fn nax_gemm_falls_to_the_bodies_the_dims_serve() {
+        let (key, shape) = gemm_pipeline(
+            MetalDtype::Bf16,
+            GemmDims {
+                m: 1,
+                n: 2048,
+                k: 2048,
+            },
+            GemmBody::Nax,
+        )
+        .expect("gemm key");
+        assert_eq!(key.kernel_name, "gemv_bf16_specialized");
+        assert_eq!(shape.threads_per_threadgroup, (256, 1, 1));
+        let (key, _) = gemm_pipeline(
+            MetalDtype::Bf16,
+            GemmDims {
+                m: 512,
+                n: 256,
+                k: 2000,
+            },
+            GemmBody::Nax,
+        )
+        .expect("gemm key");
+        assert_eq!(key.kernel_name, "gemm_bf16_specialized");
+        // F16 has no NAX or blocked body: every body's key is the 8×8-tile GEMM's.
+        for body in GemmBody::ALL {
+            let (key, _) = gemm_pipeline(
+                MetalDtype::F16,
+                GemmDims {
+                    m: 512,
+                    n: 256,
+                    k: 2048,
+                },
+                body,
+            )
+            .expect("gemm key");
+            assert_eq!(key.kernel_name, "gemm_f16_specialized");
+        }
+    }
 
     /// The probes' tape variant: their `MAX_BLOCKS_PER_SEQ`, no TurboQuant decode attention.
     const PROBE_VARIANT: TapeVariant = TapeVariant {

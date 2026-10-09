@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rayon::prelude::*;
 
 use crate::interpreter::metal::SpecializedPipelines;
-use crate::interpreter::metal::pipelines::gemm_pipeline;
+use crate::interpreter::metal::pipelines::{GemmBody, gemm_pipeline};
 use crate::specialized_pipeline_cache::{
     ComputePipelineState, ConstantType, ConstantValue, Device, PipelineKey,
     SpecializedPipelineCache,
@@ -133,25 +133,30 @@ pub fn baked_library(library: &str) -> Option<&'static BakedLibrary> {
     BAKED_LIBRARIES.iter().find(|l| l.name == library)
 }
 
-/// The key [`bake`] compiles `cmd`'s kernel under for tape `variant` at activation `dtype`, when its
-/// library is baked: its variant-bound constants take the variant's values.
-pub fn bake_key(
+/// The keys [`bake`] compiles `cmd`'s kernel under for tape `variant` at activation `dtype`, when
+/// its library is baked: its variant-bound constants take the variant's values. A dense GEMM bakes
+/// every body ([`GemmBody::ALL`]): the device picks one at load
+/// ([`gemm_body`](crate::interpreter::metal::pipelines::gemm_body)).
+pub fn bake_keys(
     cmd: &LoweredCommand,
     dtype: MetalDtype,
     variant: TapeVariant,
-) -> Result<Option<PipelineKey>, UnboundConstant> {
-    let key = match (cmd.kernel, cmd.gemm_dims) {
-        (KernelId::Gemm, Some(dims)) => match gemm_pipeline(dtype, dims) {
-            Ok((key, _)) => key,
-            Err(_) => return Ok(None),
-        },
+) -> Result<Vec<PipelineKey>, UnboundConstant> {
+    let mut keys = match (cmd.kernel, cmd.gemm_dims) {
+        (KernelId::Gemm, Some(dims)) => GemmBody::ALL
+            .into_iter()
+            .filter_map(|body| gemm_pipeline(dtype, dims, body).ok())
+            .map(|(key, _)| key)
+            .collect(),
         _ => {
             let constants = cmd.constants.iter().map(|c| c.resolve(variant));
             let constants = constants.collect::<Result<Vec<_>, _>>()?;
-            PipelineKey::new(cmd.library, cmd.function, constants)
+            vec![PipelineKey::new(cmd.library, cmd.function, constants)]
         }
     };
-    Ok(baked_library(key.library_name).map(|_| key))
+    keys.retain(|key| baked_library(key.library_name).is_some());
+    keys.dedup();
+    Ok(keys)
 }
 
 /// One kernel [`bake`] compiled: the metallib holding it — its batch's — and its name there.
@@ -347,7 +352,7 @@ pub fn tape_pipelines(
     variant: TapeVariant,
 ) -> Result<SpecializedPipelines, MetalStreamError> {
     let commands = tapes.iter().flat_map(|t| t.commands.iter());
-    let keys = commands.map(|c| bake_key(&c.command, dtype, variant));
+    let keys = commands.map(|c| bake_keys(&c.command, dtype, variant));
     let keys: Vec<_> = (keys.collect::<Result<Vec<_>, _>>())
         .map_err(|e| MetalStreamError::ShaderCompilationFailed(e.to_string()))?
         .into_iter()
@@ -451,7 +456,7 @@ fn msl_literal(c: &ConstantValue) -> String {
         }
         ConstantType::Bool => (c.bits != 0).to_string(),
         ConstantType::KvCap | ConstantType::TqHeads => panic!(
-            "bake: constant slot {} is bound to its tape variant; `bake_key` resolves it",
+            "bake: constant slot {} is bound to its tape variant; `bake_keys` resolves it",
             c.index
         ),
     }

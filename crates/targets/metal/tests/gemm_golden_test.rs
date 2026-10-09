@@ -14,9 +14,10 @@ use scratchy_target_metal::aot::{baked_build, baked_kernels};
 use scratchy_target_metal::cpu_golden;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::interpreter::metal::__re::ComputePipelineState;
-use scratchy_target_metal::interpreter::metal::pipelines::gemm_pipeline;
+use scratchy_target_metal::interpreter::metal::pipelines::{GemmBody, gemm_pipeline};
 use scratchy_target_metal::interpreter::metal::{GemmDims, MetalDtype, SpecializedPipelines};
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
+use scratchy_target_metal::targets::is_nax_capable;
 
 const SHAPES: &[(usize, usize, usize)] = &[
     (64, 2048, 2048),  // TinyLlama Q/K/V/O K-side
@@ -34,7 +35,7 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (1, 8192, 2048),   // Llama-3.2-1B gate/up decode
     (1, 128, 2816),    // Gemma-4-26B-A4B MoE router decode
     (2048, 128, 2816), // Gemma-4-26B-A4B MoE router prefill (bf16: blocked)
-    (256, 256, 2048),  // Qwen3.6-35B-A3B MoE router, the first blocked bucket
+    (256, 256, 2048),  // Qwen3.6-35B-A3B MoE router, the first blocked bucket on main (NAX here)
 ];
 
 /// The blocked bf16 GEMM runs the 8×8-tile GEMM's MMAs in its order: the same bits, at the MoE
@@ -49,7 +50,8 @@ fn gemm_bf16_blocked_is_the_tile8_gemm_bit_for_bit() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     for (m, n, k) in [(2048, 128, 2816), (256, 256, 2048), (300, 100, 1032)] {
         let dims = GemmDims { m, n, k };
-        let (blocked, shape) = gemm_pipeline(MetalDtype::Bf16, dims).expect("gemm key");
+        let (blocked, shape) =
+            gemm_pipeline(MetalDtype::Bf16, dims, GemmBody::Blocked).expect("gemm key");
         assert_eq!(blocked.kernel_name, "gemm_bf16_blocked");
         let tile8 = PipelineKey::new("gemm", "gemm_bf16_specialized", blocked.constants.clone());
         let (m, n, k) = (m as usize, n as usize, k as usize);
@@ -121,11 +123,14 @@ fn make_pipelines() -> Option<(common::Device, SpecializedPipelines)> {
         .flat_map(|dtype| SHAPES.iter().map(move |&(m, n, k)| (dtype, m, n, k)))
         .map(|(dtype, m, n, k)| {
             let (m, n, k) = (m as u32, n as u32, k as u32);
-            gemm_pipeline(dtype, GemmDims { m, n, k })
-                .expect("gemm key")
-                .0
+            GemmBody::ALL.map(|body| {
+                gemm_pipeline(dtype, GemmDims { m, n, k }, body)
+                    .expect("gemm key")
+                    .0
+            })
         })
         .collect();
+    let keys: Vec<_> = keys.into_iter().flatten().collect();
     cache.register_baked(&baked_kernels(&keys));
     // A GEMM binds no variant-bound constant: any variant serves.
     let variant = scratchy_target_metal::tape::constants::TapeVariant {
@@ -183,6 +188,73 @@ fn gemm_bf16_matches_cpu_golden() {
             assert!(
                 diff < 5e-2,
                 "gemm_bf16 m={m} n={n} k={k} [{i}] (row {} col {}) metal={} cpu={} diff={}",
+                i / n,
+                i % n,
+                got[i].to_f32(),
+                want[i],
+                diff
+            );
+        }
+    }
+}
+
+/// The NAX body's GEMM (`gemm_nax_bf16_dense`) matches the CPU reference at the MoE-router
+/// shapes it is picked for, and at M/N tails — its contraction steps 64, so a K tail cannot
+/// reach it (`gemm_body` falls those to the simdgroup bodies). Skips on a GPU without the matrix
+/// unit: the kernel's fragment layout is the unit's own, emulated differently on an M4.
+#[test]
+fn gemm_bf16_nax_matches_cpu_golden() {
+    let Some(di) = detect_device().filter(|di| is_nax_capable(di.profile.generation)) else {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    };
+    let device = di.device;
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    for (m, n, k) in [(2048, 128, 2816), (256, 256, 2048), (300, 100, 1024)] {
+        let dims = GemmDims {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        };
+        let (key, shape) = gemm_pipeline(MetalDtype::Bf16, dims, GemmBody::Nax).expect("gemm key");
+        assert_eq!(key.kernel_name, "gemm_nax_bf16_dense");
+        let pso = baked_build(&cache, &key).expect("pipeline");
+
+        let input_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+        let weight_f32: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.3)
+            .collect();
+        let input: Vec<bf16> = input_f32.iter().map(|&v| bf16::from_f32(v)).collect();
+        let weight: Vec<bf16> = weight_f32.iter().map(|&v| bf16::from_f32(v)).collect();
+        let in_buf = common::shared_slice(&device, &input);
+        let w_buf = common::shared_slice(&device, &weight);
+        let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<bf16>());
+
+        let size = |(w, h, d): (u32, u32, u32)| MTLSize {
+            width: w as usize,
+            height: h as usize,
+            depth: d as usize,
+        };
+        assert!(common::dispatch_threadgroups(
+            &device,
+            &pso,
+            &[&out_buf, &in_buf, &w_buf],
+            size(shape.threadgroups),
+            size(shape.threads_per_threadgroup),
+        ));
+
+        let got: Vec<bf16> = common::read_slice(&out_buf, m * n);
+        let inb: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+        let wb: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
+        let mut want = vec![0.0_f32; m * n];
+        cpu_golden::gemm(&inb, &wb, &mut want, m, k, n);
+        for i in 0..want.len() {
+            let diff = (got[i].to_f32() - want[i]).abs();
+            assert!(
+                diff < 5e-2,
+                "gemm_bf16_nax m={m} n={n} k={k} [{i}] (row {} col {}) metal={} cpu={} diff={}",
                 i / n,
                 i % n,
                 got[i].to_f32(),
