@@ -1500,11 +1500,22 @@ impl MetalWorker {
             return;
         };
         let alloc_chunk_counter = std::cell::Cell::new(0usize);
+        // Grow GEOMETRICALLY: a step that needs a block past the allocated chunks
+        // at least doubles the pool, so a filling pool pays a handful of
+        // allocate-and-wire stalls inside serving steps instead of one per chunk,
+        // and its memory stays within 2× of the blocks in use.
+        let allocated = kv.allocated_blocks();
+        let target = if max_block < allocated {
+            max_block
+        } else {
+            max_block.max(2 * allocated - 1)
+        };
+        let t_grow = std::time::Instant::now();
         // Returns Ok(n) where n = number of NEW chunks allocated to reach
-        // `max_block` (Ok(0) = the pool already covered it); Err if a chunk
+        // `target` (Ok(0) = the pool already covered it); Err if a chunk
         // allocation or commit failed.
         let grew_result = kv.grow_to_cover(
-            max_block,
+            target,
             |bytes| {
                 let c = alloc_chunk_counter.get();
                 alloc_chunk_counter.set(c + 1);
@@ -1524,8 +1535,15 @@ impl MetalWorker {
         // committed, so any prompt that crossed a chunk boundary (~128 blocks)
         // could wedge the GPU.
         match &grew_result {
-            Ok(0) => {}                  // nothing grew — already covered, skip the commit
-            Ok(_) => residency.commit(), // wire the newly-allocated chunk pages
+            Ok(0) => {} // nothing grew — already covered, skip the commit
+            Ok(n) => {
+                residency.commit(); // wire the newly-allocated chunk pages
+                info!(
+                    "ScratchyWorker(metal): KV pool grew {n} chunks to {} blocks in {:.1} ms",
+                    kv.allocated_blocks(),
+                    t_grow.elapsed().as_secs_f64() * 1e3,
+                );
+            }
             Err(e) => tracing::error!("KV grow_to_cover failed (max_block={max_block}): {e}"),
         }
     }
