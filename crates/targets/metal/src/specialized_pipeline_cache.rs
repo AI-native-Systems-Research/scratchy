@@ -94,6 +94,12 @@ impl SpecializedPipelineCache {
         })
     }
 
+    /// The device this cache builds on: callers read its profile from it
+    /// ([`crate::device::known_profile`]).
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Make each of `kernels` — of [`crate::aot::baked_library`] libraries — buildable.
     pub fn register_baked<'k>(&self, kernels: impl IntoIterator<Item = &'k BakedKernel>) {
         let by_key = &mut self.baked.lock().unwrap().kernels;

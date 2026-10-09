@@ -767,6 +767,30 @@ METAL_FUNC void gemm_t_nax_impl(
 }
 #endif
 
+// The dense-linear GEMM (`KernelId::Gemm`) on the same body: behind the gemm
+// slot's binding contract — output(0), input(1), weight(2) — so the worker's
+// Gemm dispatch binds it like the simdgroup bodies. Picked from the rows the
+// device calls for (`gemm_body`): the MoE routers and every dense bf16 linear
+// above the measured crossover.
+#if SCRATCHY_COMPILES(gemm_nax_bf16_dense)
+[[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16_dense(
+    device bfloat*       y   [[buffer(0)]],   // C [M, N] = x @ w^T
+    const device bfloat* x   [[buffer(1)]],   // A [M, K]
+    const device bfloat* w   [[buffer(2)]],   // B [N, K]
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint3 tgid     [[threadgroup_position_in_grid]])
+{
+    constexpr int BN = 64;
+    constexpr int BK = 64;
+    constexpr int BK_padded = BK + 16 / int(sizeof(bfloat));
+    threadgroup bfloat Ws[BN * BK_padded];
+    // dense: w row stride == contraction == QMM_K. Full contraction [0, QMM_K].
+    gemm_t_nax_impl<bfloat>(x, w, y, Ws, QMM_K, QMM_N, QMM_M, QMM_K, simd_gid, simd_lid, tgid,
+                            0, QMM_K);
+}
+#endif
+
 // Dynamic-kv_len GEMM wrappers for hd512 unfused attention. kv_len grows per
 // forward but the tape bakes dims, so the changing dim is read from
 // seq_used[0] at runtime (grid baked at the max; tiles with y_col>=N or the

@@ -153,11 +153,12 @@ impl CommandPool {
         variant: TapeVariant,
     ) -> Result<(), BakeDefect> {
         for c in commands.iter() {
-            let key = aot::bake_key(&c.command, dtype, variant)
+            let keys = aot::bake_keys(&c.command, dtype, variant)
                 .map_err(|e| BakeDefect(format!("bake key: {e}")))?;
-            let Some(key) = key else { continue };
-            if self.named_kernels.insert(key.clone()) {
-                self.kernels.push(key);
+            for key in keys {
+                if self.named_kernels.insert(key.clone()) {
+                    self.kernels.push(key);
+                }
             }
         }
         Ok(())
