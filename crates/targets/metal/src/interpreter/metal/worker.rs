@@ -286,15 +286,12 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// sized to `max(attn_unfused_scratch_bytes)`. `None` when no hd512-unfused
     /// attention was lowered.
     pub attn_unfused_scratch: Option<Buffer>,
-    /// Per-forward block-table ROW WIDTH (== the host's `max_blocks_eff`
-    /// stride) for the TurboQuant full-context staging grid. Stashed from
-    /// `inputs.block_tables` before each forward (see the `write_runtime_inputs`
-    /// call sites in `pool.rs`). The `TqStageRotated` dispatch reads this
-    /// for `grid.x` so the staging covers the WHOLE active context. Using the
-    /// static `W::MAX_BLOCKS_PER_SEQ` instead (128 for uniform arches) truncated
-    /// it at 128 blocks / 2048 tokens, leaving the reused fp16 scratch
-    /// tail holding the previous layer's KV → `!!!!` collapse past 2048 tokens.
-    /// `0` until the first forward sets it (dispatch falls back to the const).
+    /// Per-forward count of the blocks the step's longest sequence spans
+    /// (`live_block_width` in `pool.rs`, set before each forward), for the
+    /// `TqStageRotated` and `RopeOnce*` grids: they cover the WHOLE active
+    /// context and no more — the block-table row is the KV cap rung's width,
+    /// which grows with the pool, not the context. `0` until the first
+    /// forward sets it (dispatch falls back to the baked grid).
     pub tq_dequant_max_blocks: std::sync::atomic::AtomicU32,
     /// Whether some sequence of the step about to run has an unrotated
     /// (bit-31, span) block in its block table, set with
@@ -817,28 +814,21 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // num_seqs) — block-table-driven, with early-exit past
                 // seqused_k; grid.z = the live batch's num_seqs.
                 let tg_scaled = if matches!(step.kernel, super::lowered::KernelId::TqStageRotated) {
-                    // grid.x must cover the host block-table ROW WIDTH
-                    // (`max_blocks_eff`) — every block of the longest
-                    // sequence. The static `W::MAX_BLOCKS_PER_SEQ` (128 for
-                    // uniform arches like Llama) truncated the pass at 128
-                    // blocks / 2048 tokens, so the reused fp16 scratch's tail
-                    // kept the PREVIOUS layer's KV → attention collapse to
-                    // `!!!!` past 2048 tokens. The per-forward runtime width is
-                    // stashed from `inputs.block_tables` (== the stride the host
-                    // padded the block_table to); fall back to the baked const
-                    // when unset (0). Floor at the const so we never shrink
-                    // below the host stride for short contexts.
+                    // grid.x must cover every block of the longest sequence
+                    // (`tq_dequant_max_blocks`). The static
+                    // `W::MAX_BLOCKS_PER_SEQ` (128 for uniform arches like
+                    // Llama) truncated the pass at 128 blocks / 2048 tokens, so
+                    // the reused fp16 scratch's tail kept the PREVIOUS layer's
+                    // KV → attention collapse to `!!!!` past 2048 tokens. The
+                    // baked const stands in only while the width is unset (0).
                     let runtime_mb = self
                         .tq_dequant_max_blocks
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let baked =
                         <W as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ;
-                    // Cover the whole active context: the runtime block-table
-                    // width (== the host's padded stride), floored at the baked
-                    // const so short contexts never shrink below it.
-                    let cover = runtime_mb.max(baked) as usize;
+                    let cover = if runtime_mb == 0 { baked } else { runtime_mb };
                     MTLSize {
-                        width: cover,
+                        width: cover as usize,
                         height: tg_scaled.height,
                         depth: (num_seqs as usize).max(1),
                     }
@@ -850,8 +840,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // sequence's roped K (computed prefix + new). The baked grid M-scales by
                 // num_tokens (the NEW tokens only) — too few for a chunked-prefill CONTINUATION,
                 // leaving the prefix blocks past one bucket un-roped → garbage K → `!!!!` past
-                // 4096 tokens. Override grid.y to the step's block-table width
-                // (`tq_dequant_max_blocks`), which is the rung's cap: the scratch holds it.
+                // 4096 tokens. Override grid.y to every block of the sequence
+                // (`tq_dequant_max_blocks`), within the rung's cap: the scratch holds it.
                 // Mirrors the TqStageRotated grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,

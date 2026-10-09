@@ -1497,16 +1497,6 @@ fn commit_options(
     options
 }
 
-/// TurboQuant full-context dequant grid width = the host block-table ROW
-/// STRIDE for this forward. The serving worker flattens the block table to
-/// `[num_reqs * max_blocks_eff]` (gpu_worker.rs), with
-/// `max_blocks_eff = max(W::MAX_BLOCKS_PER_SEQ, runtime_max_blocks)`, so the
-/// stride recovers as `len / num_seqs`. The `TqStageRotated` dispatch must
-/// cover exactly this many blocks so the reused fp16 scratch is filled for the
-/// WHOLE active context (the kernel early-exits past `seqused_k`); the static
-/// `W::MAX_BLOCKS_PER_SEQ` truncated it at 2048 tokens for uniform arches.
-/// Returns 0 when there is no block table (decode-via-cache buckets etc.) — the
-/// dispatch then falls back to the baked const.
 /// Record the step's writes — into the worker's runtime buffers, its deferral's other buffers,
 /// then the tokens an earlier forward wrote on the device — and set the per-step values its
 /// dispatch reads.
@@ -1529,10 +1519,10 @@ fn begin_step<W: CanonicalParams>(
             at: input.flat_index * size_of::<u32>(),
         });
     }
-    worker
-        .worker
-        .tq_dequant_max_blocks
-        .store(tq_dequant_block_width(inputs), Relaxed);
+    worker.worker.tq_dequant_max_blocks.store(
+        live_block_width(inputs, W::BLOCK_SIZE.min(W::GLOBAL_BLOCK_SIZE)),
+        Relaxed,
+    );
     worker.worker.unrotated_blocks.store(
         step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
         Relaxed,
@@ -1543,8 +1533,7 @@ fn begin_step<W: CanonicalParams>(
 /// Whether some sequence of the step has an unrotated (bit-31, span) block
 /// among the blocks it uses, in the full KV group's block table.
 fn step_has_unrotated_blocks(inputs: &ForwardInputs<'_>, block_size: u32) -> bool {
-    let (Some(table), stride) = (inputs.block_tables.first(), tq_dequant_block_width(inputs))
-    else {
+    let (Some(table), stride) = (inputs.block_tables.first(), block_table_stride(inputs)) else {
         return false;
     };
     let stride = stride as usize;
@@ -1561,7 +1550,21 @@ fn step_has_unrotated_blocks(inputs: &ForwardInputs<'_>, block_size: u32) -> boo
     })
 }
 
-fn tq_dequant_block_width(inputs: &ForwardInputs<'_>) -> u32 {
+/// The grid width, in blocks, of the kernels that walk a sequence's block-table row and exit past
+/// its `seq_used_k` (`TqStageRotated`, `RopeOnce*`): the blocks the step's longest sequence spans
+/// at `block_size` (the model's smallest), within the row. The row is the KV cap rung's width,
+/// which follows the pool (16384 blocks for a large Mac's Gemma 4 pool), not the context; every
+/// block past the longest sequence's is one those kernels exit on. 0 without a block table: the
+/// dispatch keeps its baked grid.
+fn live_block_width(inputs: &ForwardInputs<'_>, block_size: u32) -> u32 {
+    let stride = block_table_stride(inputs);
+    let longest = inputs.seq_used_k.and_then(|k| k.iter().max());
+    longest.map_or(stride, |&kv| kv.div_ceil(block_size.max(1)).min(stride))
+}
+
+/// The host block-table ROW STRIDE: the serving worker pads every sequence's row to
+/// `max_blocks_eff` (gpu_worker.rs), so it recovers as `len / num_seqs`.
+fn block_table_stride(inputs: &ForwardInputs<'_>) -> u32 {
     let num_seqs = inputs
         .cu_seqlens_q
         .map(|cu| cu.len().saturating_sub(1).max(1))
@@ -2328,48 +2331,61 @@ mod tests {
         assert_eq!(pool.pick_bucket(9).unwrap(), 0, "9 only fits the 32 bucket");
     }
 
+    /// A step of one query token per sequence, its `used` keys over `table`'s rows.
+    fn step_over<'a>(cu: &'a [u32], used: &'a [u32], table: &'a [u32]) -> ForwardInputs<'a> {
+        ForwardInputs {
+            span_ids: None,
+            num_tokens: 2,
+            input_ids: &[0, 0],
+            positions: &[31, 16],
+            slot_mappings: Vec::new(),
+            cu_seqlens_q: Some(cu),
+            seq_used_k: Some(used),
+            block_tables: vec![table],
+            has_spec_tokens: false,
+            last_token_indices: None,
+            gdn_state_indices: None,
+            gdn_is_fresh: None,
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            deferred: None,
+        }
+    }
+
     /// A step has an unrotated block only if some sequence's USED blocks hold
     /// one: a bit-31 entry past a sequence's `seq_used_k` (stale padding in
     /// its row) does not count, and neither does another group's table.
     #[test]
     fn a_step_has_unrotated_blocks_only_among_the_blocks_it_uses() {
         let flagged = |b: u32| b | crate::UNROTATED_BLOCK_BIT;
-        let cu = [0u32, 1, 2];
-        let used = [32u32, 17];
-        let has = |table: &[u32]| {
-            let inputs = ForwardInputs {
-                span_ids: None,
-                num_tokens: 2,
-                input_ids: &[0, 0],
-                positions: &[31, 16],
-                slot_mappings: Vec::new(),
-                cu_seqlens_q: Some(&cu),
-                seq_used_k: Some(&used),
-                block_tables: vec![table],
-                has_spec_tokens: false,
-                last_token_indices: None,
-                gdn_state_indices: None,
-                gdn_is_fresh: None,
-                vision_rope_freqs: None,
-                vision_cu_seqlens_full: None,
-                vision_cu_seqlens_window: None,
-                vision_window_index: None,
-                vision_reverse_indices: None,
-                vision_position_ids: None,
-                pixels: None,
-                pos_embeds: None,
-                mm_embeds: None,
-                mm_dst_rows: None,
-                mrope_cos_sin: None,
-                deferred: None,
-            };
-            step_has_unrotated_blocks(&inputs, 16)
-        };
+        let has =
+            |table: &[u32]| step_has_unrotated_blocks(&step_over(&[0, 1, 2], &[32, 17], table), 16);
         // Rows of 4 blocks; the first sequence uses 2 blocks, the second 2.
         assert!(!has(&[1, 2, 0, 0, 3, 4, 0, 0]));
         assert!(has(&[1, flagged(2), 0, 0, 3, 4, 0, 0]));
         assert!(has(&[1, 2, 0, 0, 3, flagged(4), 0, 0]));
         assert!(!has(&[1, 2, flagged(9), 0, 3, 4, 0, flagged(9)]));
+    }
+
+    /// The block-walking grids (`TqStageRotated`, `RopeOnce*`) cover the longest sequence's
+    /// blocks, never the row: a large Mac's Gemma 4 pool pads every row to the 16384-block KV cap
+    /// rung, and launching all of it charged every prefill step for the pool, not the prompt.
+    #[test]
+    fn block_walking_grids_cover_the_longest_sequence_not_the_row() {
+        let rows = vec![0u32; 2 * 16384];
+        let width = |used: &[u32]| live_block_width(&step_over(&[0, 1, 2], used, &rows), 16);
+        assert_eq!(width(&[512, 17]), 32, "512 keys span 32 blocks of 16");
+        assert_eq!(width(&[17, 513]), 33, "the longest, wherever it sits");
+        assert_eq!(width(&[16384 * 16, 1]), 16384, "a full row");
     }
 
     #[test]
