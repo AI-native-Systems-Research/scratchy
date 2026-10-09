@@ -1328,9 +1328,11 @@ template <typename T>
     // `qb`'s row stride: a head's row padded by 4 floats, so the 8 rows of a fragment's load and
     // the merge's stores fall in different banks.
     constexpr uint QS = D + 4u;
+    // `xs`: the key groups' S exchange, then the codebook as code-byte pairs; or the writer's encode.
     constexpr uint XS_S = KG * 2u * SG * 64u;
+    constexpr uint XS_C = XS_S + 2u * 256u;
     constexpr uint XS_ENC = tq_encode_floats(2u, D) + 2u * D;
-    constexpr uint XS = XS_S > XS_ENC ? XS_S : XS_ENC;
+    constexpr uint XS = XS_C > XS_ENC ? XS_C : XS_ENC;
     // Checked where this kernel is baked (`sizeof(T)` defers them to its instantiation).
     static_assert(sizeof(T) && ATTN_TQ == 4u, "a packed word holds one 8-wide tile row");
     static_assert(sizeof(T) && ATTN_NUM_Q_HEADS == G * ATTN_NUM_KV_HEADS, "8 query heads a KV head");
@@ -1364,12 +1366,8 @@ template <typename T>
     threadgroup float qb[G * QS];
     threadgroup float xs[XS];
     threadgroup T fold_kv[2u * ATTN_FOLD_DIM];
-    threadgroup float lut[16];
     threadgroup float ml[2u * KG * G];
     threadgroup float own_s[G];
-    if (tid < 16u) {
-        lut[tid] = tq_centroids[tid];
-    }
 
     // The query heads' element `e` as the writer leaves it: roped under the fold, rounded to T.
     const uint fold_pos = ATTN_FOLD ? positions[seq] : 0u;
@@ -1435,6 +1433,12 @@ template <typename T>
                              tq_v_bias, tq_bias_cos_sin, xs, codes);
         }
         return;
+    }
+    // The codebook by code byte: entry `b` holds codes `b & 15` and `b >> 4` (`.x` of entry c < 16:
+    // code c), so a lane decodes the two V elements of a word it holds with one load.
+    threadgroup float2* lut = (threadgroup float2*)(xs + XS_S);
+    for (uint i = tid; i < 256u; i += D) {
+        lut[i] = float2(tq_centroids[i & 15u], tq_centroids[i >> 4u]);
     }
     // q in the codebook domain, `s·H·D·q / D`, a simdgroup a head; its fragments; then the plain
     // query, scaled, for the keys the plain domain scores. With two simdgroups a head, each takes
@@ -1566,8 +1570,8 @@ template <typename T>
             simdgroup_float8x8 S = simdgroup_float8x8(0.0f);
             for (uint t = 0; t < TILES; ++t) {
                 simdgroup_float8x8 Kt;
-                Kt.thread_elements()[0] = lut[(w0[t] >> (fm * 4u)) & 15u] * n0;
-                Kt.thread_elements()[1] = lut[(w1[t] >> (fm * 4u)) & 15u] * n1;
+                Kt.thread_elements()[0] = lut[(w0[t] >> (fm * 4u)) & 15u].x * n0;
+                Kt.thread_elements()[1] = lut[(w1[t] >> (fm * 4u)) & 15u].x * n1;
                 simdgroup_multiply_accumulate(S, Qf[t], Kt, S);
             }
             s0 = S.thread_elements()[0];
@@ -1585,7 +1589,7 @@ template <typename T>
                     const uint r = packed_row(key);
                     float x[QK];
                     for (uint j = 0; j < QK; ++j) {
-                        x[j] = lut[tq_code(tq_packed_k, r * pdim, simd_lid * QK + j)];
+                        x[j] = lut[tq_code(tq_packed_k, r * pdim, simd_lid * QK + j)].x;
                     }
                     tq_wht(x, QK, simd_lid);
                     const float n = tq_norms_k[r] / float(D);
@@ -1642,10 +1646,10 @@ template <typename T>
         const float nv = vv ? tq_norms_v[rv] : 0.0f;
         device const uint* wv = tq_packed_v + rv * pdim + word0;
         for (uint t = 0; t < TILES; ++t) {
-            const uint w = wv[t];
+            const float2 c = lut[(wv[t] >> (fn * 4u)) & 255u];
             simdgroup_float8x8 Vt;
-            Vt.thread_elements()[0] = lut[(w >> (fn * 4u)) & 15u] * nv;
-            Vt.thread_elements()[1] = lut[(w >> (fn * 4u + 4u)) & 15u] * nv;
+            Vt.thread_elements()[0] = c.x * nv;
+            Vt.thread_elements()[1] = c.y * nv;
             Of[t].thread_elements()[0] *= factor;
             Of[t].thread_elements()[1] *= factor;
             simdgroup_multiply_accumulate(Of[t], P, Vt, Of[t]);
