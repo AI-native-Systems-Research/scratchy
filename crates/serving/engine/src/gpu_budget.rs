@@ -365,7 +365,7 @@ mod max_num_seqs_default_tests {
 
 #[cfg(test)]
 mod bucket_selection_tests {
-    use super::{PrefillBucketSelection, select_prefill_bucket};
+    use super::{KV_FLOOR_BYTES, PrefillBucketSelection, select_prefill_bucket};
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
@@ -466,5 +466,53 @@ mod bucket_selection_tests {
                 kv_bytes: 42 * GIB
             }
         );
+    }
+
+    /// The KV-floor interaction `determine_available_memory` runs: a model
+    /// whose resident set fits Apple's recommended working set but not
+    /// `util × working_set` (the 48 GiB gpt-oss-120b-3bit on a 64 GiB M5
+    /// Max: raw budget 46.8 GiB < weights 48.2 GiB) must not collapse the
+    /// prefill ladder to the fallback — the floor lifts the budget past the
+    /// resident set BEFORE the selector runs, and the selector, handed the
+    /// floored budget, recovers a real bucket.
+    #[test]
+    fn the_kv_floor_reaches_the_ladder_instead_of_collapsing_it() {
+        let working_set = 52 * GIB;
+        let utilization_budget = 46_800 * MIB; // 0.9 × working_set
+        let weights = 48_200 * MIB;
+        let pad = 214 * MIB; // (64 + 150) MiB — the worker's non-arena terms
+        let fixed = weights + pad;
+
+        // The RAW budget: the resident set overflows it entirely — the same
+        // fallback `severely_starved_falls_back_to_smallest` pins, except
+        // here the device holds 3.6 GiB of working set the budget never
+        // saw. THE DEFECT: m=1 prefill steps at ~15× decode cost (TTFT
+        // linear in prompt length) while the box sits on free headroom.
+        let raw = select_prefill_bucket(utilization_budget, fixed, &ladder(), 0.6);
+        assert_eq!(raw.max_bucket_m, 1);
+
+        // One pass of the worker's fixed point: floor the budget at
+        // resident + the raw-budget estimate (the collapsed arena plus its
+        // pads/rung), capped at the working set.
+        let est_raw = raw.arena_bytes + 64 * MIB + 90 * MIB;
+        let floored = utilization_budget
+            .max(weights + est_raw + KV_FLOOR_BYTES as u64)
+            .min(working_set);
+
+        let sel = select_prefill_bucket(floored, fixed, &ladder(), 0.6);
+        assert!(
+            sel.max_bucket_m >= 512,
+            "the floor must recover a real bucket, got {sel:?}"
+        );
+
+        // Monotone — the loop's convergence law: re-estimating under the
+        // floored budget (the bigger arena the recovered ladder actually
+        // runs) and re-flooring only LIFTS the budget, never un-floors it,
+        // so iterating the two reaches a fixed point instead of oscillating.
+        let est_floored = sel.arena_bytes + 64 * MIB + 90 * MIB;
+        let refloored = utilization_budget
+            .max(weights + est_floored + KV_FLOOR_BYTES as u64)
+            .min(working_set);
+        assert!(refloored >= floored);
     }
 }
