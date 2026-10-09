@@ -1459,7 +1459,7 @@ impl MetalWorker {
     /// derefs the chunk-address table. Allocates missing chunks as
     /// StorageModePrivate (residency-inserted) and commits the residency
     /// set once if anything grew. No-op for non-chunked pools.
-    fn grow_metal_kv_to_cover(&mut self, max_block: usize) {
+    fn grow_metal_kv_to_cover(&mut self, max_block: usize) -> ExecutorResult<()> {
         // TurboQuant on a UNIFORM model never reads the fp16 KV pool (every layer
         // uses the packed store + the one-layer fp16 scratch, both provisioned by
         // the RuntimeFactory). Skipping growth keeps the pool at its 1-chunk seed
@@ -1482,10 +1482,10 @@ impl MetalWorker {
             .is_some_and(|m| m.kv_codec().is_turboquant())
             && !self.kv_is_hybrid
         {
-            return;
+            return Ok(());
         }
         let Some(device) = self.gpu_device.as_ref() else {
-            return;
+            return Ok(());
         };
         // Hold the residency set so we can make the chunk(s) that `grow_to_cover`
         // is about to allocate GPU-resident. A freshly-allocated MTLBuffer chunk
@@ -1503,35 +1503,29 @@ impl MetalWorker {
             .map(|kv| kv.num_tensors * 2)
             .unwrap_or(0);
         if n_slots == 0 {
-            return;
+            return Ok(());
         }
         let kv_layers_ref = &mut self.target_kv_layers;
         let Some(kv) = self.kv_cache.as_mut() else {
-            return;
+            return Ok(());
         };
         let alloc_chunk_counter = std::cell::Cell::new(0usize);
-        // Grow GEOMETRICALLY: a step that needs a block past the allocated chunks
-        // at least doubles the pool, so a filling pool pays a handful of
-        // allocate-and-wire stalls inside serving steps instead of one per chunk,
-        // and its memory stays within 2× of the blocks in use.
-        let allocated = kv.allocated_blocks();
-        let target = if max_block < allocated {
-            max_block
-        } else {
-            max_block.max(2 * allocated - 1)
-        };
+        // `grow_to_cover` allocates chunk by chunk, every tensor's K then V in slot
+        // order, from the chunk after the last one the pool holds whole.
+        let bpc = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
+        let first = kv.allocated_blocks().div_ceil(bpc);
         let t_grow = std::time::Instant::now();
-        // Returns Ok(n) where n = number of NEW chunks allocated to reach
-        // `target` (Ok(0) = the pool already covered it); Err if a chunk
-        // allocation or commit failed.
+        // Returns Ok(n) where n = number of NEW chunks allocated (Ok(0) = the pool
+        // already covered it); Err if a chunk's allocation failed, with the pool
+        // holding exactly the chunks it held whole before it.
         let grew_result = kv.grow_to_cover(
-            target,
+            kv.growth_target(max_block),
             |bytes| {
                 let c = alloc_chunk_counter.get();
                 alloc_chunk_counter.set(c + 1);
-                let slot = c % n_slots;
+                let (slot, chunk) = (c % n_slots, first + c / n_slots);
                 kv_layers_ref[slot]
-                    .commit_next(bytes)
+                    .commit_chunk(chunk, bytes)
                     .map_err(|e| anyhow::anyhow!("KV grow slot={slot}: {e}"))
             },
             |m| m.gpu_address(),
@@ -1544,29 +1538,31 @@ impl MetalWorker {
         // previously the grow result was discarded and the new chunk was never
         // committed, so any prompt that crossed a chunk boundary (~128 blocks)
         // could wedge the GPU.
-        match &grew_result {
-            Ok(0) => {} // nothing grew — already covered, skip the commit
-            Ok(n) => {
-                // The new chunks' pages are mapped on the mapper's queue: in place before
-                // the forward reads them, then wired.
-                if let Some(mapper) = self.kv_mapper.as_ref() {
-                    mapper.wait();
-                }
-                residency.commit();
-                info!(
-                    "ScratchyWorker(metal): KV pool grew {n} chunks to {} blocks in {:.1} ms",
-                    kv.allocated_blocks(),
-                    t_grow.elapsed().as_secs_f64() * 1e3,
-                );
+        // A grow that failed fails the step: the forward would read the chunk it
+        // could not build. Chunks it did map stay mapped for the retry.
+        let grew = grew_result.map_err(|e| {
+            ExecutorError::WorkerExecution(format!("KV pool grow to block {max_block}: {e}"))
+        })?;
+        if grew > 0 {
+            // The new chunks' pages are mapped on the mapper's queue: in place before
+            // the forward reads them, then wired.
+            if let Some(mapper) = self.kv_mapper.as_ref() {
+                mapper.wait();
             }
-            Err(e) => tracing::error!("KV grow_to_cover failed (max_block={max_block}): {e}"),
+            residency.commit();
+            info!(
+                "ScratchyWorker(metal): KV pool grew {grew} chunks to {} blocks in {:.1} ms",
+                kv.allocated_blocks(),
+                t_grow.elapsed().as_secs_f64() * 1e3,
+            );
         }
+        Ok(())
     }
 
     /// Reactive KV (2c): when the batch is fully idle (no live blocks), drop
-    /// the per-layer commit-counter back to 1 chunk. The layers keep the chunks'
-    /// buffers (`SparseKvLayer::shrink_to`) and hand them out again on regrowth,
-    /// so memory stays at its high-water mark. Only call when
+    /// the pool back to 1 chunk. The layers keep the dropped chunks mapped
+    /// (`SparseKvLayer::commit_chunk` hands the same ranges back on
+    /// regrowth), so memory stays at its high-water mark. Only call when
     /// `input_batch.num_active() == 0` so no in-flight forward references a
     /// dropped chunk index.
     fn shrink_metal_kv_idle(&mut self) {
@@ -1576,9 +1572,6 @@ impl MetalWorker {
         };
         if freed.is_empty() {
             return;
-        }
-        for layer in self.target_kv_layers.iter_mut() {
-            layer.shrink_to(1);
         }
         let n = freed.len();
         drop(freed);
@@ -1687,7 +1680,7 @@ impl MetalWorker {
                     let layer_idx = c / (2 * chunks_per_layer);
                     let slot = layer_idx * 2 + kv;
                     draft_layers_ref[slot]
-                        .commit_next(bytes)
+                        .commit_chunk((c / 2) % chunks_per_layer, bytes)
                         .map_err(|e| anyhow::anyhow!("draft KV commit slot={slot}: {e}"))
                 },
                 |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
@@ -3558,7 +3551,7 @@ impl Worker for MetalWorker {
                     alloc_chunk_counter.set(c + 1);
                     let slot = c % n_slots;
                     kv_layers_ref[slot]
-                        .commit_next(bytes)
+                        .commit_chunk(c / n_slots, bytes)
                         .map_err(|e| anyhow::anyhow!("KV chunk commit slot={slot}: {e}"))
                 },
                 // Chunk-address table: `StorageModeShared` so the CPU can
@@ -4221,7 +4214,7 @@ impl Worker for MetalWorker {
                 .copied()
                 .max()
                 .unwrap_or(0);
-            self.grow_metal_kv_to_cover(max_block);
+            self.grow_metal_kv_to_cover(max_block)?;
         }
 
         // slot_mapping[t] = block_ids[abs_pos / bs] * bs + (abs_pos % bs)

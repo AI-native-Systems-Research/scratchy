@@ -61,9 +61,8 @@ pub struct SparseKvLayer {
     buffer: Pinned,
     chunk_bytes: usize,
     max_chunks: usize,
-    /// `heaps[i]` backs chunk `i`, pinned for the layer's life; the first `committed` are in use.
+    /// `heaps[i]` backs chunk `i`, mapped and pinned for the layer's life.
     heaps: Vec<Pinned<ProtocolObject<dyn MTLHeap>>>,
-    committed: usize,
 }
 
 impl SparseKvLayer {
@@ -95,18 +94,22 @@ impl SparseKvLayer {
             chunk_bytes,
             max_chunks,
             heaps: Vec::new(),
-            committed: 0,
         })
     }
 
-    /// The pool's next chunk, `bytes` of it: one a shrink released, else a new heap's pages mapped
-    /// into the chunk's range (only queued — [`KvMapper::wait`] before a forward reads it).
-    pub fn commit_next(&mut self, bytes: usize) -> Result<MetalMem, String> {
-        if self.committed == self.max_chunks {
-            return Err(format!("all {} chunks committed", self.max_chunks));
+    /// Chunk `chunk`, `bytes` of it, mapping a new heap into its range the first time (only
+    /// queued — [`KvMapper::wait`] before a forward reads it) and handing back the same range after:
+    /// a grow the pool retries after a failure, or regrows after a shrink, maps nothing twice.
+    pub fn commit_chunk(&mut self, chunk: usize, bytes: usize) -> Result<MetalMem, String> {
+        if chunk >= self.max_chunks || chunk > self.heaps.len() {
+            let mapped = self.heaps.len();
+            return Err(format!(
+                "chunk {chunk} of {}: {mapped} mapped",
+                self.max_chunks
+            ));
         }
-        let offset = self.committed * self.chunk_bytes;
-        if self.committed == self.heaps.len() {
+        let offset = chunk * self.chunk_bytes;
+        if chunk == self.heaps.len() {
             let desc = MTLHeapDescriptor::new();
             desc.setType(MTLHeapType::Placement);
             desc.setStorageMode(MTLStorageMode::Private);
@@ -135,15 +138,8 @@ impl SparseKvLayer {
             };
             self.heaps.push(self.residency.pin(heap));
         }
-        self.committed += 1;
         let buffer = (*self.buffer).clone();
         Ok(MetalMem::from_buffer_with_offset(buffer, offset, bytes))
-    }
-
-    /// Hand back every chunk past the first `keep`; their pages stay mapped (an MTL4 command buffer
-    /// does not retain what it binds) and `commit_next` reuses them.
-    pub fn shrink_to(&mut self, keep: usize) {
-        self.committed = self.committed.min(keep);
     }
 }
 

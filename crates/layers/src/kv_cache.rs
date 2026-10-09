@@ -830,6 +830,19 @@ impl<M: PoolMemory> KvCachePool<M> {
         freed
     }
 
+    /// The block a grow should cover to serve `block_id`: at least double the
+    /// allocated chunks, so a filling pool grows in a handful of steps — each
+    /// allocates and wires memory inside a serving step — while staying within
+    /// 2× of the blocks in use.
+    pub fn growth_target(&self, block_id: usize) -> usize {
+        let allocated = self.allocated_blocks();
+        if block_id < allocated {
+            block_id
+        } else {
+            block_id.max((2 * allocated).saturating_sub(1))
+        }
+    }
+
     /// Grow the pool until `block_id` is backed by an allocated chunk.
     /// Allocates each missing chunk's K+V buffers for every layer (via
     /// `alloc_chunk`, which must return resident memory) and writes their
@@ -837,7 +850,8 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// Returns the number of chunks newly allocated (0 = already
     /// covered); the caller must `residency.commit()` once if > 0 before
     /// dispatching, so the new chunk pages are wired for the bindless
-    /// deref. No-op for non-chunked (cuda / single-buffer) pools.
+    /// deref. On Err the pool holds exactly the chunks it held whole before
+    /// the failing one. No-op for non-chunked (cuda / single-buffer) pools.
     pub fn grow_to_cover(
         &mut self,
         block_id: usize,
@@ -861,6 +875,10 @@ impl<M: PoolMemory> KvCachePool<M> {
             let blocks_here = self
                 .blocks_per_chunk
                 .min(self.num_blocks - next * self.blocks_per_chunk);
+            // Allocate chunk `next` for EVERY tensor before the pool records any of
+            // it: a failure partway leaves the pool as it was (no tensor holds the
+            // chunk, no table entry changed), so the next grow retries it whole.
+            let mut fresh = Vec::with_capacity(self.num_tensors);
             for tensor in 0..self.num_tensors {
                 // Per-tensor block size for hybrid-geometry models
                 // (Gemma4, page-unified → uniform); uniform fallback otherwise.
@@ -869,8 +887,9 @@ impl<M: PoolMemory> KvCachePool<M> {
                     .as_ref()
                     .map_or(per_block_elems, |v| v[tensor]);
                 let bytes = blocks_here * lbe * elem;
-                let kc = alloc_chunk(bytes)?;
-                let vc = alloc_chunk(bytes)?;
+                fresh.push((alloc_chunk(bytes)?, alloc_chunk(bytes)?));
+            }
+            for (tensor, (kc, vc)) in fresh.into_iter().enumerate() {
                 let ka = gpu_addr(&kc);
                 let va = gpu_addr(&vc);
                 // Write the chunk gpuAddresses into the (already-bound)
@@ -1098,5 +1117,49 @@ mod group_shared_tests {
             pool.k_chunks[1].len(),
             "both shared tensors grow in lockstep"
         );
+    }
+
+    #[test]
+    fn growth_target_at_least_doubles_the_pool() {
+        let pool = build(3, None); // 1 chunk of 16 blocks, 64 blocks in all
+        assert_eq!(pool.growth_target(10), 10, "already covered: no growth");
+        assert_eq!(
+            pool.growth_target(16),
+            31,
+            "first block past the pool: double it"
+        );
+        assert_eq!(
+            pool.growth_target(40),
+            40,
+            "past double: cover the block itself"
+        );
+    }
+
+    #[test]
+    fn a_grow_that_fails_partway_leaves_the_pool_whole() {
+        // 2 shared tensors → 4 allocations per chunk; the 3rd (tensor 1's K) fails.
+        let mut pool = build(5, Some(vec![0, 1, 0, 1, 0]));
+        let table = pool.k_chunk_table_mem(0).ptr() as *const u64;
+        let calls = std::cell::Cell::new(0);
+        let failing = |b| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err(anyhow::anyhow!("allocation failed"))
+            } else {
+                Ok(MockMem::alloc(b))
+            }
+        };
+        assert!(pool.grow_to_cover(20, failing, |m| m.ptr() as u64).is_err());
+        assert_eq!(
+            pool.allocated_blocks(),
+            16,
+            "the half-built chunk is not counted"
+        );
+        assert_eq!((pool.k_chunks[0].len(), pool.k_chunks[1].len()), (1, 1));
+        assert_eq!(unsafe { *table.add(1) }, 0, "no table entry written for it");
+        // The next grow retries the chunk whole.
+        let grew = pool.grow_to_cover(20, |b| Ok(MockMem::alloc(b)), |m| m.ptr() as u64);
+        assert_eq!(grew.unwrap(), 1);
+        assert_eq!((pool.k_chunks[0].len(), pool.k_chunks[1].len()), (2, 2));
     }
 }

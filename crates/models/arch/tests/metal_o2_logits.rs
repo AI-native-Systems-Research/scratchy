@@ -276,7 +276,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 let c = calls.get();
                 calls.set(c + 1);
                 layers_ref[c % n_slots]
-                    .commit_next(bytes)
+                    .commit_chunk(c / n_slots, bytes)
                     .map_err(|e| anyhow::anyhow!("KV chunk commit: {e}"))
             },
             |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
