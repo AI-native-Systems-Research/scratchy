@@ -663,4 +663,10 @@ o2_cases! {
     // dense-router (no scales sibling) + sigmoid-bias (noaux_tc) MoE, first
     // q/k/v attention biases on the affine stack.
     "glm-4.5-air" => o2_glm_4_5_air_mlx("mlx-community/GLM-4.5-Air-3bit", Sampled);
+    // gpt-oss: 120b is the first 2-bit checkpoint (mlx-affine-b2-g64-qembed,
+    // uniform 2-bit INCLUDING the router); 20b rides b4-qembed as the quality
+    // sanity anchor for the same arch (YaRN rope, attention sinks, biased
+    // router, SwiGLU-OAI experts with per-expert linear biases).
+    "gpt-oss-120b" => o2_gpt_oss_120b_mlx("jesusoctavioas/gpt-oss-120b-mlx-2Bit", Sampled);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled);
 }

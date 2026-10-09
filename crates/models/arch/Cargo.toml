@@ -32,6 +32,7 @@ arch-gemma3-mm = ["arch-gemma3", "vision", "dep:scratchy-vision", "dep:half", "s
 arch-gemma4 = []
 arch-gemma4-moe = []
 arch-glm4-moe = []
+arch-gpt-oss = []
 arch-granite = []
 arch-llama = []
 arch-locateanything = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
@@ -65,6 +66,7 @@ all-arches = [
     "arch-gemma4",
     "arch-gemma4-moe",
     "arch-glm4-moe",
+    "arch-gpt-oss",
     "arch-granite",
     "arch-llama",
     "arch-locateanything",
@@ -158,6 +160,11 @@ all-arches = [
 # glm4-moe (1 configs)
 "glm-4.5-air" = ["arch-glm4-moe"]
 "glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
+
+# gpt-oss (2 configs)
+"gpt-oss-120b" = ["arch-gpt-oss"]
+"gpt-oss-120b-parity-tiny" = ["arch-gpt-oss"]
+"gpt-oss-20b" = ["arch-gpt-oss"]
 
 # granite (21 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
@@ -350,6 +357,11 @@ all-arches = [
     "glm-4.5-air",
     "glm-4.5-air-parity-tiny",
 ]
+"gpt-oss" = [
+    "gpt-oss-120b",
+    "gpt-oss-120b-parity-tiny",
+    "gpt-oss-20b",
+]
 "granite" = [
     "granite-3.0-2b-base",
     "granite-3.0-2b-base-parity-tiny",
@@ -522,6 +534,9 @@ all = [
     "gemma-4-26b-a4b-it-parity-tiny",
     "glm-4.5-air",
     "glm-4.5-air-parity-tiny",
+    "gpt-oss-120b",
+    "gpt-oss-120b-parity-tiny",
+    "gpt-oss-20b",
     "granite-3.0-2b-base",
     "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",

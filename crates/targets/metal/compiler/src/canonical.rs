@@ -102,7 +102,12 @@ impl SourceManifest {
                 K::GemmaRouter => quote!(GemmaRouter),
                 K::GemmaSwitchGlu => quote!(GemmaSwitchGlu),
                 K::GatedDeltaNet => quote!(GatedDeltaNet),
-                K::AttnSinks => quote!(AttnSinks),
+                // The layered sinks accessor borrows; the SourceRef
+                // carries the `Copy` GpuTensor handle by value (same
+                // deref as the `weight_at` arm in codegen.rs).
+                K::AttnSinks => {
+                    return Ok(quote!(#ix => Some(#r::AttnSinks(*self.#base(layer.get()))),))
+                }
                 K::GptOssMoe => quote!(GptOssMoe),
                 K::Marlin
                 | K::Bnb4

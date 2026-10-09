@@ -1,0 +1,7 @@
+{
+  "_comment": "Real pairs: 120b x b2 (jesusoctavioas/gpt-oss-120b-mlx-2Bit, uniform 2-bit INCLUDING the router) and 20b x b4 (jesusoctavioas/gpt-oss-20b-mlx-4Bit); the parity-tiny builds under BOTH presets for the kernel/quad goldens. Checkpointless cross pairs: 120b x b4, 20b x b2. mlx-community/gpt-oss-120b-4bit keeps an 8-bit router — it needs a b4-router8 preset variant with `bits_overrides: {\"mlp.router\": 8}` (the parser accepts override value 8 for exactly that case); recipe only, not declared here. Like glm4-moe, a build naming a gpt-oss stem WITHOUT a quant feature fails loudly at expansion (dense MoE has no metal realization).",
+  "quantizations": [
+    "mlx-affine-b2-g64-qembed",
+    "mlx-affine-b4-g64-qembed"
+  ]
+}
