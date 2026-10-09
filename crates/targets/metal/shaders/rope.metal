@@ -15,6 +15,7 @@
 #include <metal_stdlib>
 #include "baked.h"
 #include "kv_writer.h"
+#include "row_sum.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -412,10 +413,10 @@ kernel void rope_append_bf16_specialized(
 // Dispatch: threadgroups (M, NUM_Q_HEADS, 1) x (HEAD_DIM, 1, 1).
 // ---------------------------------------------------------------------------
 
-/// 256-thread-replica per-head RMS: exact clone of the standalone
-/// `rmsnorm_specialized_impl` reduction (tg_size = 256), regardless of
-/// this kernel's actual threadgroup width. ALL threads of the TG must
-/// call this (threadgroup barriers inside).
+/// 256-thread-replica per-head RMS: the standalone `rmsnorm_specialized_impl`
+/// reduction at tg_size = 256 (`row_sum`), regardless of this kernel's actual
+/// threadgroup width; threads past 256 add nothing. ALL threads of the TG must
+/// call this (threadgroup barriers inside); `scratch` holds one float a thread.
 template <typename T_act>
 inline float rope_norm_rms_256(
     device const T_act* row,
@@ -430,7 +431,6 @@ inline float rope_norm_rms_256(
             float val = float(row[i]);
             local_sum += val * val;
         }
-        scratch[d] = local_sum;
         // The standalone 256-thread kernel writes shared_sum[tid] = 0
         // for every tid >= n (its strided loop is empty), so its tree
         // reduction sums exact zeros in the tail lanes. This kernel
@@ -445,14 +445,7 @@ inline float rope_norm_rms_256(
             scratch[s] = 0.0f;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (d < stride) {
-            scratch[d] += scratch[d + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return sqrt(scratch[0] / float(n) + eps);
+    return sqrt(row_sum(local_sum, d, 256u, scratch) / float(n) + eps);
 }
 
 template <typename T_act, typename T_scale>
@@ -496,7 +489,7 @@ template <typename T_act, typename T_scale>
 
     // 512 = max head_dim this kernel serves (Gemma4 global). The
     // lowering asserts head_dim <= 512.
-    threadgroup float scratch[256];
+    threadgroup float scratch[ROPE_HEAD_DIM > 256u ? ROPE_HEAD_DIM : 256u];
     threadgroup T_act q_tg[512];
     threadgroup T_act k_tg[512];
     threadgroup float tq_scratch[ROPE_TQ_FLOATS];

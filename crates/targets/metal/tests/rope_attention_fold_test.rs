@@ -395,15 +395,16 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     }
     match c.gqa {
         Some(splits) => {
+            // Running its writer, one threadgroup past the splits writes and encodes the row.
             let grid = MTLSize {
                 width: 1,
                 height: nkv,
-                depth: splits,
+                depth: splits + usize::from(how == Run::Fold),
             };
             batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1));
             batch.barrier();
             let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
-            batch.encode(&combine, &binds, &[], &[], &[], tg(1, nq), tg(32, 1));
+            batch.encode(&combine, &binds, &[], &[], &[], tg(1, nq), tg(128, 1));
         }
         None => batch.encode(
             &attention,
