@@ -110,6 +110,77 @@ const LONG_PROMPTS: &[&str] = &[
 #[cfg(feature = "llama-3.2-3b")]
 const LONG_BUCKET_CAP: u32 = 512;
 
+/// gpt-oss's sliding-window boundary probe: ~170 tokens, past the arch's 128-token window on the
+/// even (sliding) layers — the one e2e check that the windowed KV layout and the full layers'
+/// paged cache agree on what the model attends to once the window actually clips. Compiled with
+/// the one case that reads it.
+#[cfg(feature = "gpt-oss-20b")]
+const GPT_OSS_LONG_PROMPTS: &[&str] = &[
+    "The old observatory on the hill above the fishing village has been staffed by three \
+     generations of the same family, and each of them has kept the same leather-bound logbook \
+     open on the desk beneath the great brass telescope. Every clear night the duty astronomer \
+     records the seeing conditions, the temperature, the humidity, and every meteor, satellite, \
+     and aircraft that crosses the field of view, along with the times of first and last light. \
+     Last autumn a wildfire threatened the hill, the power failed for nine days, and the family \
+     kept the dome turning with a diesel generator and handwritten star charts. Write the \
+     logbook entry for the first night after the power was restored, describing what the \
+     astronomer observes, what was nearly lost, and what the family decides must change before \
+     the next season.",
+];
+
+/// The ladder cap of [`GPT_OSS_LONG_PROMPTS`] (keeps bucket 512, drops 1024+).
+#[cfg(feature = "gpt-oss-20b")]
+const GPT_OSS_LONG_BUCKET_CAP: u32 = 512;
+
+/// gpt-oss's sliding-window boundary pair, bracketing the arch's 128-token window from both
+/// sides: the first (99 tokens) still fits entirely inside it — no layer ever clips — while the
+/// second (146 tokens) pushes the pool's opening sentences out of the even (sliding) layers'
+/// reach, leaving only the odd (full-attention) layers attending to them. Both prefill in the
+/// same bucket (512), so the pair differs in window clipping alone; a first-token mlx agreement
+/// that holds under the window but breaks past it indicts the windowed KV layout rather than
+/// length-scaling accumulation noise.
+#[cfg(feature = "gpt-oss-20b")]
+const GPT_OSS_WINDOW_PROMPTS: &[&str] = &[
+    "The stone bridge at the edge of the market town has nine arches, and the middle one is \
+     carved with the date the river last froze. Every morning the miller opens the sluice \
+     gate, the baker lights the ovens, and the ferryman poles his flat boat to the far bank. \
+     On market days the square fills with stalls selling wool, apples, and honey, and the \
+     innkeeper chalks the day's prices on a slate. Describe the mood of this town at dusk in \
+     one sentence.",
+    "The stone bridge at the edge of the market town has nine arches, and the middle one is \
+     carved with the date the river last froze. Every morning the miller opens the sluice \
+     gate, the baker lights the ovens, and the ferryman poles his flat boat to the far bank. \
+     On market days the square fills with stalls selling wool, apples, and honey, and the \
+     innkeeper chalks the day's prices on a slate. Children race paper boats under the \
+     arches while the blacksmith re-shoes cart horses in the forge's orange light. The \
+     clockmaker adjusts the church tower's mechanism every Friday, and the schoolmaster \
+     rings the bell for lessons at eight. Describe the mood of this town at dusk in one \
+     sentence.",
+];
+
+/// The ladder cap of [`GPT_OSS_WINDOW_PROMPTS`] (keeps bucket 512, drops 1024+).
+#[cfg(feature = "gpt-oss-20b")]
+const GPT_OSS_WINDOW_BUCKET_CAP: u32 = 512;
+
+/// gpt-oss's harmony chat framing, pinned verbatim (the render `scr chat` builds
+/// for one user turn — same string mlx-lm's `apply_chat_template` emits). The only
+/// e2e case whose prefill carries the arch's special tokens (`<|start|>`/
+/// `<|message|>`/`<|end|>`, ids ≥ 200000) through the quantized embedding: raw-text
+/// prompts never exercise those embed rows. Greedy must reason here — mlx-lm
+/// continues `We need to answer: "The capital of France is". The answer: "Paris".`;
+/// echoing the user turn instead would indict the special-token path, not the model.
+#[cfg(feature = "gpt-oss-20b")]
+const GPT_OSS_HARMONY_PROMPTS: &[&str] = &[
+    "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n\
+     Knowledge cutoff: 2024-06\nCurrent date: 2026-10-09\n\nReasoning: medium\n\n\
+     # Valid channels: analysis, commentary, final. Channel must be included for every \
+     message.<|end|><|start|>user<|message|>The capital of France is<|end|><|start|>assistant",
+];
+
+/// The ladder cap of [`GPT_OSS_HARMONY_PROMPTS`] (keeps bucket 512, drops 1024+).
+#[cfg(feature = "gpt-oss-20b")]
+const GPT_OSS_HARMONY_BUCKET_CAP: u32 = 512;
+
 /// Greedy decode steps after each prefill (decoders only).
 const DECODE_STEPS: usize = 16;
 
@@ -669,4 +740,7 @@ o2_cases! {
     // router, SwiGLU-OAI experts with per-expert linear biases).
     "gpt-oss-120b" => o2_gpt_oss_120b_mlx("jesusoctavioas/gpt-oss-120b-mlx-2Bit", Sampled);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);
+    "gpt-oss-20b" => o2_gpt_oss_20b_mlx_harmony("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_HARMONY_PROMPTS @ GPT_OSS_HARMONY_BUCKET_CAP);
 }
