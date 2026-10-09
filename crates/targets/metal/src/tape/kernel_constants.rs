@@ -320,6 +320,14 @@ pub struct AttentionViaCacheConstants {
     /// `None` (every non-spans dispatch) → byte-identical emitted Vec and the
     /// shader keeps the contiguous-slice + shuffle path.
     pub pair_coresident: Option<u32>,
+    /// gpt-oss attention sinks (slot 21, `ATTN_SINKS`): the layer's
+    /// per-head sink logits are an extra softmax column, added UNSCALED
+    /// after qk·sm_scale and dropped before ·V. `Some(1)` binds the
+    /// `[num_heads]` tensor (buffer 16) and turns the kernel's sink math
+    /// on; `None` on every non-sink dispatch → the emitted Vec is
+    /// byte-identical (no slot 21) and the shader const-folds the column
+    /// away.
+    pub sinks: Option<u32>,
 }
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
@@ -337,6 +345,9 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
         push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
         if let Some(pc) = c.pair_coresident {
             v.push(ConstantValue::uint(ConstSlot(12), pc));
+        }
+        if let Some(sinks) = c.sinks {
+            v.push(ConstantValue::uint(ConstSlot(21), sinks));
         }
         v
     }
@@ -538,6 +549,12 @@ pub struct AttentionPrefillPagedConstants {
     /// with `rope_on_read: None` (ROR=0), which had silently gated the seek
     /// off. `None` → slot 14 unset → byte-identical (the seek folds away).
     pub self_only: Option<u32>,
+    /// gpt-oss attention sinks (slot 21): `Some(1)` binds the layer's
+    /// `[num_heads]` sink-logit tensor (buffer 9) and turns the sink math
+    /// on in every kernel of this family (sdpa-paged, gqa_shared, steel,
+    /// NAX — each reads the slot under its own `ATTN_PAGED_SINKS` /
+    /// `NAXP_SINKS` name). `None` → no slot 21, byte-identical.
+    pub sinks: Option<u32>,
     /// Resolved KV geometry — the compile-time continuation/span witness. Its
     /// type is only constructible via
     /// [`KvGeometry::resolve`](crate::tape::continuation_witness::KvGeometry::resolve),
@@ -565,6 +582,9 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
         }
         if let Some(so) = c.self_only {
             v.push(ConstantValue::uint(ConstSlot(14), so));
+        }
+        if let Some(sinks) = c.sinks {
+            v.push(ConstantValue::uint(ConstSlot(21), sinks));
         }
         // Per-token `span_ids` index divisor from the KV-geometry witness
         // (slot 13). `== 1` = the per-token contract. Emitted for every

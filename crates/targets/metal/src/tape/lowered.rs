@@ -890,6 +890,10 @@ pub enum SourceRef<'w> {
     Linear(&'w scratchy_layers::LinearLayer),
     /// A RoPE table's packed cos/sin cache (layer-independent).
     CosSin(scratchy_tensors::tensor::GpuTensor),
+    /// gpt-oss attention sinks: the per-layer `[num_attention_heads]`
+    /// plain dense sink-logit tensor (the single tensor of its bundle,
+    /// read through [`WeightTensor::Weight`] like [`Self::CosSin`]).
+    AttnSinks(scratchy_tensors::tensor::GpuTensor),
     /// Mixtral-style MoE: dense router + packed per-expert slabs.
     FusedMoe(&'w scratchy_layers::layers_moe::FusedMoELayer),
     /// Qwen-style MoE with an optional shared expert.
@@ -950,6 +954,7 @@ impl SourceRef<'_> {
             (Self::LayerNorm(n), T::Weight) => Some(n.weight),
             (Self::LayerNorm(n), T::Bias) => n.bias,
             (Self::CosSin(t), T::Weight) => Some(t),
+            (Self::AttnSinks(t), T::Weight) => Some(t),
             (Self::Linear(l @ L::Dense(_)), T::Weight) => Some(l.dense_weight()),
             (Self::Linear(l @ L::Dense(_)), T::Bias) => l.dense_bias(),
             (Self::Linear(l @ L::AffineQuant(_)), T::Weight) => Some(l.affine_weight()),

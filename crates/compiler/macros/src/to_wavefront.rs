@@ -1021,15 +1021,45 @@ pub fn lower_decode_to_wavefront(
             // attention(q', k', v, kv_cache, block_table): AttnDecode
             // reading Q_rot, prefix-cache Source segments, then the new
             // token's (K_rot, V) as Sub edges.
-            OpKind::Attention | OpKind::SlidingAttention => {
+            OpKind::Attention
+            | OpKind::SlidingAttention
+            | OpKind::SinkAttention
+            | OpKind::SinkSlidingAttention => {
                 if bx.scale.is_nan() {
                     return Err(BridgeError::MissingBound { key: "head_dim" });
                 }
+                let is_sink =
+                    matches!(node.op, OpKind::SinkAttention | OpKind::SinkSlidingAttention);
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
                 let v = bx.input_at(tile, 2)?;
+                // gpt-oss attention sinks: the per-layer `[num_heads]`
+                // weight at arg 3 rides to the kernel as a TRAILING
+                // weight-source input — an extra softmax column, never
+                // a (K, V) segment pair.
+                let sinks = if is_sink {
+                    let inp = node
+                        .inputs
+                        .get(3)
+                        .cloned()
+                        .ok_or(BridgeError::MalformedOp {
+                            tile,
+                            op: node.op,
+                            detail: "sink_attention without a sinks weight input",
+                        })?;
+                    Some(bx.resolve(tile, &inp)?)
+                } else {
+                    None
+                };
                 let Some(layer) = kv_cache_index(node) else {
                     // Cache-less encoder form: attention(q, k, v).
+                    if is_sink {
+                        return Err(BridgeError::MalformedOp {
+                            tile,
+                            op: node.op,
+                            detail: "sink attention requires a kv_cache — decoder-only op",
+                        });
+                    }
                     if bx.scale.is_nan() {
                         return Err(BridgeError::MissingBound { key: "head_dim" });
                     }
@@ -1058,7 +1088,9 @@ pub fn lower_decode_to_wavefront(
                 // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
                 let mask = match node.op {
-                    OpKind::SlidingAttention => AttnMask::SlidingWindow,
+                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention => {
+                        AttnMask::SlidingWindow
+                    }
                     _ => AttnMask::Causal,
                 };
                 let base_geom = bx
@@ -1077,9 +1109,13 @@ pub fn lower_decode_to_wavefront(
                         *attn = AttnMask::SlidingWindow;
                     }
                 }
+                let mut attn_inputs = vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v];
+                if let Some(s) = sinks {
+                    attn_inputs.push(s);
+                }
                 let idx = bx.push_op(
                     SubOp::attn_decode(geom, scale, valid_len, mask),
-                    vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v],
+                    attn_inputs,
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);

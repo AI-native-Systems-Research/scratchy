@@ -124,6 +124,13 @@ impl<'a> RowSources<'a> {
     fn rotary(self, class: Option<bool>) -> Result<Option<SourceIx>, LoweringError> {
         class.map(|g| self.table(g)).transpose()
     }
+
+    /// The row's attention-sink source (gpt-oss), when its site binds
+    /// one. Additive-optional: `None` on every non-sink model, so the
+    /// sinks-off dispatch is byte-identical to the pre-sinks ABI.
+    fn sinks(self) -> Option<SourceIx> {
+        self.of(WeightKind::AttnSinks, 0).ok()
+    }
 }
 
 /// Lower one bucket's step tape, `backbone ++ lm_head`.
@@ -1108,6 +1115,13 @@ fn decode_attention_per_kv_head(
     let takes = |c: &LoweredCommand| {
         c.kernel == KernelId::AttentionViaCacheTq
             && !c.constants.iter().any(|k| matches!(k.index, 14 | 15))
+            // A sinks dispatch stays on its one-pass twin: the split pair
+            // (`attention_decode_gqa_tq` + combine) has no sink math, and the
+            // combine keeps only buffers 0/11/15 — the sink column would be
+            // silently dropped. Unreachable for gpt-oss (head_dim 64 fails the
+            // geometry below) but guarded for any future hd≥128 + TQ + sinks
+            // model: refusing the split keeps the correct kernel.
+            && !c.bindings.iter().any(|b| b.index() == 16)
             && lane_stride(c)
     };
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
@@ -3431,6 +3445,9 @@ fn lower_one(
                         ror_on,
                         p.global_head_dim,
                     ),
+                    // gpt-oss sinks: the const mirrors the binding's presence
+                    // (the 0/1 master switch the shader gates its column on).
+                    sinks: w.sinks().map(|_| 1),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3450,6 +3467,7 @@ fn lower_one(
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
+                    sinks: w.sinks(),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -3969,6 +3987,11 @@ fn lower_one(
                 // Slot 11: gqa_shared reads pre-roped K from the scratch.
                 k_scratch: if gqa_shared_spans { Some(1) } else { None },
                 self_only: if sliding_steel_spans { Some(1) } else { None },
+                // gpt-oss sinks: the const mirrors the binding's presence —
+                // one field the whole family (steel/NAX/gqa_shared/sdpa and
+                // their per-row twins, via the `..constants` spreads below)
+                // inherits.
+                sinks: w.sinks().map(|_| 1),
             };
             // Spans (rope-once-to-scratch): when a steel-family kernel (NAX
             // matrix-accel OR simdgroup steel) OR the GQA-cooperative shared
@@ -3996,6 +4019,7 @@ fn lower_one(
             // the cache, with cos_sin to re-rope unrotated span blocks when
             // `reropes`.
             let rotary = w.rotary(ror_bind)?;
+            let sinks = w.sinks();
             let bindings_for = |scratch: bool, reropes: bool| {
                 super::kernel_bindings::AttentionPrefillPagedBindingSet {
                     output: super::ids::ArenaSlotIdx(*out_slot),
@@ -4003,6 +4027,7 @@ fn lower_one(
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: if reropes { rotary } else { None },
                     nax_roped_k_scratch: scratch,
+                    sinks,
                 }
             };
             let bindings = bindings_for(roped_k_scratch, !roped_k_scratch);
@@ -4272,6 +4297,8 @@ fn lower_one(
                     pair_off: ror_po,
                     rope_on_read: ror_on,
                     pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, p.head_dim),
+                    // gpt-oss sinks: the const mirrors the binding's presence.
+                    sinks: w.sinks().map(|_| 1),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -4288,6 +4315,7 @@ fn lower_one(
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
+                    sinks: w.sinks(),
                 }
                 .into_baked(),
                 gemm_dims: None,

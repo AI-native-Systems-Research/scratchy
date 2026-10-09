@@ -102,6 +102,7 @@ impl SourceManifest {
                 K::GemmaRouter => quote!(GemmaRouter),
                 K::GemmaSwitchGlu => quote!(GemmaSwitchGlu),
                 K::GatedDeltaNet => quote!(GatedDeltaNet),
+                K::AttnSinks => quote!(AttnSinks),
                 K::Marlin
                 | K::Bnb4
                 | K::Fp8

@@ -1825,6 +1825,24 @@ impl Recording<'_> {
                     ),
                     (false, Causal) => (S::AttentionViaCache(q, out, layer, pairing), rotary()),
                 };
+                // gpt-oss attention sinks: the 6-input form's TRAILING
+                // weight input (arg 5) binds the per-layer
+                // `[num_heads]` sink vector. The registry admits
+                // exactly 6 for the even form, so a present 6th
+                // operand that is not a weight source is a malformed
+                // tape — refuse rather than silently drop the sinks.
+                let sites = match self.arg(i, 5) {
+                    Ok(InputRef::Ext(e)) => {
+                        if !matches!(self.l.bindings[e], SourceBinding::Weight { .. }) {
+                            return Err(self.no(i, Refused::NotAWeight(e)));
+                        }
+                        let mut sites = sites;
+                        sites.extend(self.site(i, WeightKind::AttnSinks, e)?);
+                        sites
+                    }
+                    Ok(InputRef::Op(_)) => return Err(self.no(i, Refused::NotASource(5))),
+                    Err(_) => sites,
+                };
                 let v = match self.arg(i, 4) {
                     Ok(InputRef::Op(v)) => self.colour(v).ok(),
                     _ => None,

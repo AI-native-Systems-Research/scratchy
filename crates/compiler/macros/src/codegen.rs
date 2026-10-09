@@ -282,6 +282,12 @@ enum FieldLoad {
     /// only; fused-concat raw-linear isn't a real PyTorch shape and would
     /// be a manifest authoring error.
     RawLinear(String),
+    /// gpt-oss attention sinks: the per-layer `[num_attention_heads]`
+    /// plain dense GpuTensor, read verbatim via `gw.take` (the
+    /// on-disk key is `<prefix>` itself — an `nn.Parameter`, like
+    /// [`Self::RawLinear`]). Layered by construction (one per layer);
+    /// never quantized, so [`affine_tensors_of`] lists no row for it.
+    AttnSinks(String),
     /// The model has `tie_word_embeddings: true`: `lm_head` shares
     /// its weight with `embed_tokens`. No safetensors read — build
     /// the `LinearLayer` from the already-loaded embedding field
@@ -813,6 +819,14 @@ fn plan_field_load(
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_layer_norm =
         ty.ends_with("::LayerNorm") || ty == "LayerNorm" || ty.ends_with("layers::LayerNorm");
+    // gpt-oss attention sinks: a bare `GpuTensor` field. The rotary
+    // (`WeightKind::CosSin`) is the only other GpuTensor on a Weights
+    // struct and is planted directly by `emit_weights_struct`, never
+    // through this walk — so a GpuTensor-typed accessor here is the
+    // sinks.
+    let is_attn_sinks = ty.ends_with("::GpuTensor")
+        || ty == "GpuTensor"
+        || ty.ends_with("tensor::GpuTensor");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
     let is_marlin = ty.ends_with("::MarlinLinear")
@@ -1521,6 +1535,17 @@ fn plan_field_load(
             prefixes.len(),
         );
         return FieldLoad::GatedDeltaNet(prefixes.into_iter().next().unwrap());
+    }
+
+    if is_attn_sinks {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "AttnSinks accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        return FieldLoad::AttnSinks(prefixes.into_iter().next().unwrap());
     }
 
     if is_embedding || is_affine_quant_embedding {
@@ -4756,6 +4781,10 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // gemm op via `dense_weight()`.
             let #name = crate::__gpu::layers::LinearLayer::load_raw(gw, #key)?;
         },
+        FieldLoad::AttnSinks(_) => panic!(
+            "codegen: AttnSinks is per-layer by construction (one sink vector per \
+             attention layer) — should never appear in an unindexed group"
+        ),
         FieldLoad::LinearAffine {
             prefix,
             group_size,
@@ -5957,6 +5986,20 @@ fn emit_layered_load_body(
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
+        FieldLoad::AttnSinks(prefix) => {
+            let p = layer_templated_prefix_expr(
+                prefix,
+                vision_zero_prefix_ref,
+                decoder_zero_prefix_ref,
+            );
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        gw.take(&#p)
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
         FieldLoad::DeepSeekV2Fp8BlockMoe {
             prefix,
             n_routed_experts,
@@ -6378,6 +6421,7 @@ pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind
         WeightKind::GemmaSwitchGlu => "gemma_switch_glu_at",
         WeightKind::CosSin => "cos_sin_at",
         WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
+        WeightKind::AttnSinks => "sinks_at",
     }
 }
 
@@ -6473,6 +6517,10 @@ fn emit_weight_accessors_impl(
                     // `.clone()` needed (it would just be a redundant copy).
                     let arm_body = match slot.kind {
                         WeightKind::CosSin => quote! { self.#base.cos_sin_cache },
+                        // The layered sinks accessor hands back a
+                        // borrow; the trait hands the `Copy` handle
+                        // by value.
+                        WeightKind::AttnSinks => quote! { *self.#base(layer) },
                         _ => quote! { self.#base(layer) },
                     };
                     by_kind.entry(key).or_default().push(quote! {
@@ -6677,6 +6725,7 @@ fn emit_weight_accessors_impl(
     let gemma_router = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaRouter);
     let gemma_switch_glu = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaSwitchGlu);
     let cos_sin = method_emit_kind(&crate::weight_vocab::WeightKind::CosSin);
+    let attn_sinks = method_emit_kind(&crate::weight_vocab::WeightKind::AttnSinks);
     // `affine_quant_embedding_at` is gated `#[cfg(feature = "metal")]`
     // on the trait so we must emit the cfg attribute together with the
     // method body, or skip both when the arch never resolves an
@@ -6753,6 +6802,7 @@ fn emit_weight_accessors_impl(
             #gemma_router
             #gemma_switch_glu
             #cos_sin
+            #attn_sinks
             #affine_quant_embedding
         }
     }

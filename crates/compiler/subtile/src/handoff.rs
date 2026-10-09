@@ -70,6 +70,11 @@ pub enum WeightKind {
     /// Metal-only: MLX-affine int4 quantized embedding. Resolves to
     /// `WeightAccessors::affine_quant_embedding_at`.
     AffineQuantEmbedding,
+    /// Per-layer attention-sink logits (`[num_attention_heads]`,
+    /// dense, never quantized — gpt-oss). An extra softmax column
+    /// added unscaled after qk·sm_scale; the sink column is dropped
+    /// before the ·V accumulation.
+    AttnSinks,
 }
 
 /// Compile-time mapping from `(TileId, output_slot)` → flat slot
@@ -267,6 +272,9 @@ impl WeightKind {
             // NOTE: no leading `&` — this one is passed by value.
             Self::CosSin => "crate::__gpu::tensor::GpuTensor",
             Self::AffineQuantEmbedding => "&crate::__gpu::layers::AffineQuantEmbedding",
+            // NOTE: no leading `&` — a per-layer plain dense
+            // `[num_heads]` GpuTensor, taken verbatim at load.
+            Self::AttnSinks => "crate::__gpu::tensor::GpuTensor",
         }
     }
 }

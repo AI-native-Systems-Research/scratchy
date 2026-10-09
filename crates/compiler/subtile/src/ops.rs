@@ -64,8 +64,10 @@ macro_rules! for_each_subop {
             // — the caches are per-layer PrefixK / PrefixV sources used
             // as TMA-store destinations for the new decode token's K/V.
             RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0];
-            // `[Q, (K_seg, V_seg)...]`.
-            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| n >= 3 && n % 2 == 1),
+            // `[Q, (K_seg, V_seg)...]`, optionally with a trailing
+            // `[num_heads]` sinks weight source (gpt-oss attention
+            // sinks — a 6th input read as a weight, not a K/V pair).
+            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| (n >= 3 && n % 2 == 1) || n == 6),
                 cols = [q_width geom];
             TanhSoftCap [SubOp::TanhSoftCap] arity = (|n| n == 1), cols = [in0];
             RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0];

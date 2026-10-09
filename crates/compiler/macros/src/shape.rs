@@ -397,6 +397,12 @@ pub fn apply_signature_with_geometry(
         // in the picked kernel (window-masked vs. dense), not in
         // the type signature.
         OpKind::SlidingAttention => sig_attention(solver, inputs, op, hybrid_attention_geometry),
+        // Sink attention: q/k/v constraints + the rank-1 sinks weight.
+        // See `sig_sink_attention`.
+        OpKind::SinkAttention => sig_sink_attention(solver, inputs, op, hybrid_attention_geometry),
+        OpKind::SinkSlidingAttention => {
+            sig_sink_attention(solver, inputs, op, hybrid_attention_geometry)
+        }
         // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
         // No heads-layout anchoring — vision shapes are pinned at
         // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
@@ -720,6 +726,39 @@ fn sig_attention(
         solver.unify(v.last().unwrap(), &kv_heads)?;
     }
     Ok(OpSig { output: q.clone() })
+}
+
+/// `sink_attention(q, k, v, sinks, kv_cache, block_table)` (6-arg,
+/// decoder) → `[.., num_attention_heads * head_dim]`. gpt-oss attention
+/// with per-head learned sink logits: arg 3 is the dense per-layer
+/// `[num_attention_heads]` weight (unified with the query-head count —
+/// one sink per head), args 4/5 are the same opaque KV-side externs as
+/// `attention`'s 5-arg form. q/k/v constraints are exactly
+/// [`sig_attention`]'s — delegated with the plain attention op of the
+/// same class so the shared per-class head-geometry anchors apply.
+fn sig_sink_attention(
+    solver: &mut Solver,
+    inputs: &[Shape],
+    op: OpKind,
+    hybrid_attention_geometry: bool,
+) -> Result<OpSig, ShapeError> {
+    expect_args(op, inputs, 6)?;
+    let sinks = &inputs[3];
+    if sinks.len() != 1 {
+        return Err(ShapeError::BadArgs {
+            op,
+            reason: format!("sinks weight must have rank 1, got {}", sinks.len()),
+        });
+    }
+    solver.unify(
+        sinks.last().unwrap(),
+        &Dim::Bound("num_attention_heads".into()),
+    )?;
+    let class = match op {
+        OpKind::SinkSlidingAttention => OpKind::SlidingAttention,
+        _ => OpKind::Attention,
+    };
+    sig_attention(solver, &inputs[..3], class, hybrid_attention_geometry)
 }
 
 /// `varlen_attention(q, k, v, cu_seqlens, max_seqlen)` →
@@ -1046,6 +1085,10 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::RopeAppendInterleaved => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
+        // Sink attention: arg 3 is the per-layer `[num_attention_heads]`
+        // sinks weight (dense tensor — the sig unifies its dim).
+        OpKind::SinkAttention => &[(3, 1)],
+        OpKind::SinkSlidingAttention => &[(3, 1)],
         OpKind::VarlenAttention => &[],
         OpKind::Silu => &[],
         OpKind::Gelu => &[],

@@ -238,6 +238,10 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         | L::RouteSigmoidBias { router } => router.weight_kind(),
         L::ExpertMatmul { bundle, .. } => bundle.weight_kind(),
         L::RopeRotate { .. } | L::RopeAppend { .. } => WeightKind::CosSin,
+        // gpt-oss attention sinks: the trailing `[num_heads]` weight
+        // input on the decode op (a plain AttnDecode binds no weight,
+        // so this arm only fires on the 6-input sinks form).
+        L::AttnDecode { .. } => WeightKind::AttnSinks,
         // A standalone (unfused) per-layer scalar parameter — granite's
         // `layer_scalar` class — reads through the norm accessor. Unlike
         // `BiasAdd` (skipped before this is ever called; see `from_tape`'s

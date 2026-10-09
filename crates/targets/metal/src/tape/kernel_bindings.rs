@@ -88,6 +88,10 @@ pub struct AttentionPrefillPagedBindingSet {
     /// attention reads pre-roped K and does no per-tile rotation. Mutually
     /// exclusive with the cos_sin slot-7 binding (only one writes slot 7).
     pub nax_roped_k_scratch: bool,
+    /// gpt-oss attention sinks: `Some(ix)` binds the layer's
+    /// `[num_heads]` sink-logit tensor (slot 9, after the SpanIds slot
+    /// 8); `None` → sinks-off, byte-identical to the pre-sinks ABI.
+    pub sinks: Option<SourceIx>,
 }
 
 impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
@@ -137,6 +141,9 @@ impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
                 kind: RuntimeBindingKind::SpanIds,
                 binding_index: 8,
             });
+        }
+        if let Some(sinks) = s.sinks {
+            v.push(source(sinks, WeightTensor::Weight, s.kv_layer, 9));
         }
         v
     }
@@ -191,6 +198,13 @@ pub struct AttentionViaCacheBindingSet {
     /// table (slot 6); `None` (every non-spans dispatch) → the 6-binding
     /// ABI, exactly as before.
     pub rope_on_read: Option<SourceIx>,
+    /// gpt-oss attention sinks: `Some(ix)` binds the layer's
+    /// `[num_heads]` sink-logit tensor (slot 16 — free between the TQ
+    /// projection biases 14/15 and the fold buffers 17..22, so a
+    /// TurboQuant dispatch carrying sinks can't collide with
+    /// `TqAttentionBindingSet`'s slots 7..=13); `None` → sinks-off,
+    /// byte-identical to the pre-sinks ABI.
+    pub sinks: Option<SourceIx>,
 }
 
 impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
@@ -224,6 +238,9 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
         ];
         if let Some(table) = s.rope_on_read {
             push_rope_on_read_bindings(&mut v, s.kv_layer, table, 6);
+        }
+        if let Some(sinks) = s.sinks {
+            v.push(source(sinks, WeightTensor::Weight, s.kv_layer, 16));
         }
         v
     }

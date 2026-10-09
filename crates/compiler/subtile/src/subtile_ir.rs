@@ -1741,8 +1741,28 @@ pub fn eval_node<F: RopeForm>(
                 qh_count * hd,
                 "attn Q width is a head multiple"
             );
-            debug_assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
-            debug_assert_eq!(node.inputs.len() % 2, 1, "attn inputs = Q + (K,V) pairs");
+            debug_assert!(
+                node.inputs.len() >= 3,
+                "attn needs Q + >=1 (K,V) segment"
+            );
+            // The gpt-oss trailing sinks weight: the registry's arity
+            // closure admits `Q + (K,V) pairs` (odd count) or exactly 6
+            // = the 5-input decode form plus ONE trailing weight-source
+            // input. An even count therefore marks the LAST input as
+            // the per-head `[num_heads]` sinks — read it here and stop
+            // the (K,V) walk before it (the pair loop below would
+            // otherwise gather past the end).
+            let sinks: Option<Vec<f32>> = if node.inputs.len() % 2 == 0 {
+                Some(gather(&node.inputs[node.inputs.len() - 1], graph, bufs).0)
+            } else {
+                None
+            };
+            let attn_len = node.inputs.len() - sinks.is_some() as usize;
+            debug_assert_eq!(
+                attn_len % 2,
+                1,
+                "attn inputs = Q + (K,V) pairs (+ optional trailing sinks)"
+            );
             // kv-head offset of this block (from the first K segment's column slice).
             let kvh_start = node.inputs[1].region.cols.start as usize / hd;
             // Concatenate K/V segments along sequence; each segment spans this
@@ -1751,7 +1771,7 @@ pub fn eval_node<F: RopeForm>(
             let mut v_all: Vec<f32> = Vec::new();
             let mut kv_count = 0usize;
             let mut i = 1;
-            while i < node.inputs.len() {
+            while i < attn_len {
                 let (k, kr, kc) = gather(&node.inputs[i], graph, bufs);
                 let (v, vr, vc) = gather(&node.inputs[i + 1], graph, bufs);
                 debug_assert_eq!((vr, vc), (kr, kc), "attn V seg shape");
@@ -1788,6 +1808,17 @@ pub fn eval_node<F: RopeForm>(
                         }
                         *score = dot * scale;
                     }
+                    // The sink column: appended after qk·scale, UNSCALED
+                    // (sink logits are never multiplied by sm_scale),
+                    // participates in the softmax max/denominator, and
+                    // is dropped before the ·V accumulation below — it
+                    // contributes to normalization only.
+                    let sink_col = sinks
+                        .as_ref()
+                        .map(|s| s[qh_start + hl]);
+                    if let Some(sink) = sink_col {
+                        scores.push(sink);
+                    }
                     let maxs = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut sum = 0f32;
                     for sc in scores.iter_mut() {
@@ -1796,6 +1827,9 @@ pub fn eval_node<F: RopeForm>(
                     }
                     for sc in scores.iter_mut() {
                         *sc /= sum;
+                    }
+                    if sink_col.is_some() {
+                        scores.pop();
                     }
                     for d in 0..hd {
                         let mut val = 0f32;

@@ -312,6 +312,17 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_FOLD_PAIR_OFF, 20);
 constant constexpr bool ATTN_FOLD = ATTN_FOLD_ROT_DIM_SET;
 constant constexpr uint ATTN_FOLD_DIM = ATTN_FOLD ? ATTN_HEAD_DIM : 1u;
 
+// 21  ATTN_SINKS — gpt-oss attention sinks: the layer's per-head sink logits
+//     (bound at the kernel family's sinks buffer) are an extra softmax column,
+//     added UNSCALED (never multiplied by sm_scale — HF gpt_oss appends the raw
+//     sink logit after the scaled qk) and dropped before ·V (the sink
+//     contributes weight to the denominator only). Online softmax seeds the
+//     row max with the sink so the running rescale accounts for it, and the
+//     denominator gains exp(sink − rowmax). Unset: the column folds away and
+//     the kernel is byte-identical (the sinks buffer is never dereferenced).
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_SINKS, 21);
+constant bool ATTN_SINKS_ON = ATTN_SINKS_SET;
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -714,6 +725,11 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
 //                [head_dim], centroids [2^bits], slot_mapping [batch].
 //   buffer(14/15) (ATTN_TQ_K_BIAS / ATTN_TQ_V_BIAS) = K / V projection bias
 //                [num_kv_heads * head_dim].
+//   buffer(16) (ATTN_SINKS) = the layer's sink logits [num_q_heads], the
+//                model dtype (gpt-oss ships bf16). Free between the TQ biases
+//                (14/15) and the fold buffers (17..22) so a TurboQuant
+//                dispatch carrying sinks can't collide with the TQ slots
+//                7..=13.
 //
 // Dispatch: threadgroups (batch, num_q_heads, 1), threads (1024, 1, 1)
 // = 32 simdgroups × 32 lanes. HEAD_DIM must be a multiple of 32.
@@ -752,6 +768,10 @@ template <typename T>
     device const uint*  slot_mapping [[buffer(13)]],
     device const T*     tq_k_bias    [[buffer(14)]],
     device const T*     tq_v_bias    [[buffer(15)]],
+    // gpt-oss attention sinks (ATTN_SINKS): the layer's [num_q_heads] sink
+    // logits, model dtype. Only dereferenced when ATTN_SINKS; unbound
+    // otherwise (the cos_sin slot-6 pattern).
+    device const T*     sinks        [[buffer(16)]],
     device const T*     fold_k        [[buffer(17)]],
     device const T*     fold_v        [[buffer(18)]],
     device const uint*  positions     [[buffer(19)]],
@@ -959,10 +979,13 @@ template <typename T>
     // Initialize per-thread max with finite minimum (MLX uses
     // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
     // fast::exp doesn't handle -INFINITY safely so we avoid it.
+    // Attention sinks: every simdgroup seeds its max with the UNSCALED sink
+    // logit instead, so the merge's global max is ≥ the sink and the
+    // denominator term simdgroup 0 adds below can't overflow.
     U max_score[8];
     U sum_exp_score[8];
     for (uint h = 0; h < heads; ++h) {
-        max_score[h] = -FLT_MAX;
+        max_score[h] = ATTN_SINKS_ON ? U(sinks[q_head_idx + h]) : -FLT_MAX;
         sum_exp_score[h] = 0;
     }
 
@@ -1162,6 +1185,18 @@ template <typename T>
                 o_reg[h * qk_per_thread + j] =
                     o_reg[h * qk_per_thread + j] * factor[h] + exp_score[h] * v_loc[j];
             }
+        }
+    }
+
+    // Attention sinks: the denominator gains exp(sink − rowmax) — the extra
+    // softmax column, UNSCALED by sm_scale, contributing no V. Every
+    // simdgroup's max was seeded with the sink, so the argument is ≤ 0;
+    // simdgroup 0 adds it once so the merged denominator carries exactly one
+    // sink column (all lanes of a simdgroup hold identical partials; the
+    // merge reads lane 0's).
+    if (ATTN_SINKS_ON && simd_gid == 0) {
+        for (uint h = 0; h < heads; ++h) {
+            sum_exp_score[h] += metal::fast::exp(U(sinks[q_head_idx + h]) - max_score[h]);
         }
     }
 
@@ -1750,6 +1785,9 @@ SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_t
     // Block-diagonal span attention: per-logical-block span label. Bound only
     // when ATTN_ROR; read only under ATTN_ROR (const-folded away otherwise).
     device const uint*     span_ids              [[buffer(8)]],
+    // gpt-oss attention sinks (ATTN_SINKS): the layer's [num_q_heads] sink
+    // logits, model dtype. Only dereferenced when ATTN_SINKS.
+    device const half*     sinks                 [[buffer(9)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -1835,7 +1873,9 @@ SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_t
         o_reg[i] = 0;
     }
 
-    U max_score = -FLT_MAX;
+    // Attention sinks: seed the max with the UNSCALED sink logit (see
+    // attention_via_cache_v2) so the merged global max is ≥ the sink.
+    U max_score = ATTN_SINKS_ON ? U(sinks[q_head_idx]) : -FLT_MAX;
     U sum_exp_score = 0;
 
     // Block-diagonal span attention. span_ids holds (the span's first block + 1),
@@ -1951,6 +1991,13 @@ SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_t
     U global_max = simd_max(other_max);
     U factor = metal::fast::exp(other_max - global_max);
     U global_sum = simd_sum(tg_sum[simd_lid] * factor);
+    // Attention sinks: the denominator gains the extra column's weight,
+    // exp(sink − global_max) — every simdgroup computes this merge copy
+    // redundantly, so each copy's divide stays consistent. The seed makes
+    // global_max ≥ sink, so the argument is ≤ 0.
+    if (ATTN_SINKS_ON) {
+        global_sum += metal::fast::exp(U(sinks[q_head_idx]) - global_max);
+    }
 
     for (uint j = 0; j < qk_per_thread; ++j) {
         tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
@@ -1993,6 +2040,9 @@ SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_t
     device const bfloat*   cos_sin               [[buffer(7)]],
     // Block-diagonal span attention: per-logical-block span label (slot 8).
     device const uint*     span_ids              [[buffer(8)]],
+    // gpt-oss attention sinks (ATTN_SINKS): the layer's [num_q_heads] sink
+    // logits, model dtype. Only dereferenced when ATTN_SINKS.
+    device const bfloat*   sinks                 [[buffer(9)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -2067,7 +2117,9 @@ SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_t
         o_reg[i] = 0;
     }
 
-    U max_score = -FLT_MAX;
+    // Attention sinks: seed the max with the UNSCALED sink logit (see
+    // attention_via_cache_v2) so the merged global max is ≥ the sink.
+    U max_score = ATTN_SINKS_ON ? U(sinks[q_head_idx]) : -FLT_MAX;
     U sum_exp_score = 0;
 
     // Block-diagonal span attention. span_ids holds (the span's first block + 1),
@@ -2176,6 +2228,11 @@ SCRATCHY_KERNEL(attention_decode_gqa_tq_bf16_specialized, attention_decode_gqa_t
     U global_max = simd_max(other_max);
     U factor = metal::fast::exp(other_max - global_max);
     U global_sum = simd_sum(tg_sum[simd_lid] * factor);
+    // Attention sinks: the denominator gains the extra column's weight,
+    // exp(sink − global_max). The seed makes global_max ≥ sink.
+    if (ATTN_SINKS_ON) {
+        global_sum += metal::fast::exp(U(sinks[q_head_idx]) - global_max);
+    }
 
     for (uint j = 0; j < qk_per_thread; ++j) {
         tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
@@ -2399,6 +2456,10 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
     //     redundancy the scratch path replaces).
     // The unrotated flag rides in block_table bit 31 (no flag buffer).
     device const half*     cos_sin               [[buffer(7)]],
+    // gpt-oss attention sinks (ATTN_SINKS): the layer's [num_q_heads] sink
+    // logits, model dtype. Only dereferenced when ATTN_SINKS. Slot 9 — the
+    // binding set's SpanIds rides 8.
+    device const half*     sinks                [[buffer(9)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -2475,7 +2536,10 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
         o_reg[i] = 0;
     }
 
-    U run_max = -FLT_MAX;
+    // Attention sinks: seed the max with the UNSCALED sink logit (see
+    // attention_via_cache_v2). Each simdgroup owns one head's full key
+    // range (no cross-simdgroup merge), so the seed doubles as the row max.
+    U run_max = ATTN_SINKS_ON ? U(sinks[q_head_idx]) : -FLT_MAX;
     U sum_exp = 0;
 
     // Key range for THIS query: causal cap at q_abs_pos, window floor
@@ -2633,6 +2697,11 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
     }
 
     // ── Store: lanes own disjoint dim slices; normalize by sum ──────
+    // Attention sinks: the denominator gains the extra column's weight,
+    // exp(sink − run_max) ≤ 1 by the seed, contributing no V.
+    if (ATTN_SINKS_ON) {
+        sum_exp += metal::fast::exp(U(sinks[q_head_idx]) - run_max);
+    }
     device half* o_ptr = o_row + simd_lid * qk_per_thread;
     const U inv = (sum_exp != 0) ? (U(1) / sum_exp) : U(0);
     for (uint j = 0; j < qk_per_thread; ++j) {
@@ -2675,6 +2744,8 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
     // Spans, slot 7 = cos_sin (in-kernel rope) OR the pre-roped K scratch
     // (ATTN_K_SCRATCH). See the f16 sibling. Unrotated flag rides in bit 31.
     device const bfloat*   cos_sin               [[buffer(7)]],
+    // gpt-oss attention sinks (ATTN_SINKS): see the f16 sibling (slot 9).
+    device const bfloat*   sinks                [[buffer(9)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -2751,7 +2822,10 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
         o_reg[i] = 0;
     }
 
-    U run_max = -FLT_MAX;
+    // Attention sinks: seed the max with the UNSCALED sink logit (see
+    // attention_via_cache_v2). Each simdgroup owns one head's full key
+    // range (no cross-simdgroup merge), so the seed doubles as the row max.
+    U run_max = ATTN_SINKS_ON ? U(sinks[q_head_idx]) : -FLT_MAX;
     U sum_exp = 0;
 
     // Key range for THIS query: causal cap at q_abs_pos, window floor
@@ -2903,6 +2977,11 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
     }
 
     // ── Store: lanes own disjoint dim slices; normalize by sum ──────
+    // Attention sinks: the denominator gains the extra column's weight,
+    // exp(sink − run_max) ≤ 1 by the seed, contributing no V.
+    if (ATTN_SINKS_ON) {
+        sum_exp += metal::fast::exp(U(sinks[q_head_idx]) - run_max);
+    }
     device bfloat* o_ptr = o_row + simd_lid * qk_per_thread;
     const U inv = (sum_exp != 0) ? (U(1) / sum_exp) : U(0);
     for (uint j = 0; j < qk_per_thread; ++j) {

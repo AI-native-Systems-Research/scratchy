@@ -223,6 +223,22 @@ pub enum OpKind {
     /// through the FUF so the solver can match distinct Impls
     /// (dense flash-attn vs. window-masked flash-attn).
     SlidingAttention,
+    /// Full attention with per-head learned sink logits (gpt-oss).
+    /// `sink_attention(q, k, v, sinks, kv_cache, block_table)`: same
+    /// q/k/v geometry as `Attention`, plus a rank-1 weight
+    /// `[num_attention_heads]`. The sink rides to the kernel as a
+    /// trailing weight-source input on the shared attention sub-op and
+    /// enters the online softmax as one extra column, added UNSCALED
+    /// after qk·sm_scale (never multiplied by it) and dropped before
+    /// the ·V accumulation. Distinct OpKind (rather than a flag on
+    /// `Attention`) so the no-sink kernels compile bit-identically to
+    /// the pre-change binaries.
+    SinkAttention,
+    /// `SinkSlidingAttention`: [`Self::SinkAttention`] at a
+    /// sliding-window layer — the same kernel with the window baked,
+    /// exactly as [`Self::SlidingAttention`] relates to
+    /// [`Self::Attention`].
+    SinkSlidingAttention,
     /// Variable-length attention used by vision encoders (Qwen2-VL,
     /// Qwen2.5-VL, ViT-style towers). Same q/k/v shape as `Attention`
     /// but with a `cu_seqlens` ragged-batch index instead of a paged
@@ -516,6 +532,8 @@ impl OpKind {
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
+            "sink_attention" => Some(Self::SinkAttention),
+            "sink_sliding_attention" => Some(Self::SinkSlidingAttention),
             // Vision-tower ops. Unambiguous names: the four below are
             // unused on the decoder side, so the lookup is shared with
             // the decoder prelude — a `#[forward]` body that wrote
@@ -566,6 +584,8 @@ impl OpKind {
             Self::RopeAppendInterleaved => "rope_append_interleaved",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
+            Self::SinkAttention => "sink_attention",
+            Self::SinkSlidingAttention => "sink_sliding_attention",
             Self::VarlenAttention => "varlen_attention",
             Self::Silu => "silu",
             Self::Gelu => "gelu",

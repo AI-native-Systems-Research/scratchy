@@ -905,6 +905,87 @@ def sliding_attention(q, k, v, layer_cache, block_table):
     return out.reshape(n, qh * hd)
 
 
+def _sink_column(scores, sinks, h):
+    """gpt-oss attention sinks: the extra softmax column = the RAW per-head
+    sink logit, appended UNSCALED after qk·scale (HF gpt_oss never multiplies
+    it by sm_scale) and dropped before ·V — it contributes denominator
+    weight only. `scores` is 1-D here; the sink becomes its last entry."""
+    return torch.cat([scores, sinks[h:h + 1]])
+
+
+def sink_attention(q, k, v, sinks, layer_cache=None, block_table=None):
+    """attention.metal (ATTN_SINKS): attention plus the per-head sink column
+    (see `_sink_column`)."""
+    if layer_cache is None:
+        n = q.shape[0]
+        st = STATE["attn"][0]
+        qh, kvh, hd, scale = st["q_heads"], st["kv_heads"], st["head_dim"], st["scale"]
+        qv = q.view(n, qh, hd)
+        kv = k.view(n, kvh, hd).transpose(0, 1)  # [kvh, n, hd]
+        vv = v.view(n, kvh, hd).transpose(0, 1)
+        if kvh != qh:
+            kv = kv.repeat_interleave(qh // kvh, dim=0)
+            vv = vv.repeat_interleave(qh // kvh, dim=0)
+        scores = torch.einsum("ihd,hjd->hij", qv, kv) * scale
+        # Bidirectional: one sink column per head, broadcast over queries.
+        scores = torch.cat([scores, sinks.view(qh, 1, 1).expand(qh, n, 1)], dim=-1)
+        probs = torch.softmax(scores, dim=-1)  # bidirectional: no mask
+        return torch.einsum("hij,hjd->ihd", probs[..., :-1], vv).reshape(n, qh * hd)
+    layer = STATE["layer_of"][id(layer_cache)]
+    st = STATE["attn"][layer]
+    qh, kvh, hd, scale = st["q_heads"], st["kv_heads"], st["head_dim"], st["scale"]
+    kcache, vcache = layer_cache
+    n = q.shape[0]
+    qv = q.view(n, qh, hd)
+    out = torch.empty_like(qv)
+    bt = STATE["block_table"]
+    for t in range(n):
+        pos = STATE["positions"][t]
+        attend = pos + 1
+        ks = torch.empty(attend, kvh, hd)
+        vs = torch.empty_like(ks)
+        for j in range(attend):
+            blk, off = j // BLOCK_SIZE, j % BLOCK_SIZE
+            pb = bt[blk]
+            ks[j] = kcache[pb, :, off, :]
+            vs[j] = vcache[pb, :, off, :]
+        for h in range(qh):
+            kv_h = h // (qh // kvh)
+            scores = _sink_column((ks[:, kv_h, :] @ qv[t, h]) * scale, sinks, h)
+            probs = torch.softmax(scores, dim=0)
+            out[t, h] = probs[:-1] @ vs[:, kv_h, :]
+    return out.reshape(n, qh * hd)
+
+
+def sink_sliding_attention(q, k, v, sinks, layer_cache, block_table):
+    """attention.metal (ATTN_SINKS + ATTN_WINDOW): sliding_attention plus
+    the per-head sink column (see `_sink_column`)."""
+    layer = STATE["layer_of"][id(layer_cache)]
+    st = STATE["attn"][layer]
+    qh, kvh, hd, scale, window = st["q_heads"], st["kv_heads"], st["head_dim"], st["scale"], st["window"]
+    kcache, vcache = layer_cache
+    n = q.shape[0]
+    qv = q.view(n, qh, hd)
+    out = torch.empty_like(qv)
+    bt = STATE["block_table"]
+    for t in range(n):
+        pos = STATE["positions"][t]
+        lo = max(0, pos - window + 1)
+        ks = torch.empty(pos - lo + 1, kvh, hd)
+        vs = torch.empty_like(ks)
+        for jj, j in enumerate(range(lo, pos + 1)):
+            blk, off = j // BLOCK_SIZE, j % BLOCK_SIZE
+            pb = bt[blk]
+            ks[jj] = kcache[pb, :, off, :]
+            vs[jj] = vcache[pb, :, off, :]
+        for h in range(qh):
+            kv_h = h // (qh // kvh)
+            scores = _sink_column((ks[:, kv_h, :] @ qv[t, h]) * scale, sinks, h)
+            probs = torch.softmax(scores, dim=0)
+            out[t, h] = probs[:-1] @ vs[:, kv_h, :]
+    return out.reshape(n, qh * hd)
+
+
 def varlen_attention(q, k, v, cu_seqlens, max_seqlen):
     """vision_varlen_attn.metal: cacheless, NON-causal, per-segment SDPA,
     scale = head_dim**-0.5, MHA (no GQA)."""
