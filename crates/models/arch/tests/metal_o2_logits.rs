@@ -744,8 +744,10 @@ o2_cases! {
     // recipe the uniform-2-bit ablation convicted. The 2-bit-experts leg of
     // this same recipe is coherent at 20b (32 experts) but token soup at 120b
     // (128-expert pool), so 3 is the expert floor at this scale; the mlx-lm
-    // control generates clean harmony reasoning from this checkpoint.
-    "gpt-oss-120b" => o2_gpt_oss_120b_3bit_mlx("scratchery/gpt-oss-120b-3bit", Sampled);
+    // control generates clean harmony reasoning from this checkpoint. The
+    // stem's own config carries the recipe (the qwen2.5-vl-3b-mlx
+    // convention), so no quant feature is needed to build this case.
+    "gpt-oss-120b-3bit" => o2_gpt_oss_120b_3bit_mlx("scratchery/gpt-oss-120b-3bit", Sampled);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);

@@ -161,8 +161,9 @@ all-arches = [
 "glm-4.5-air" = ["arch-glm4-moe"]
 "glm-4.5-air-parity-tiny" = ["arch-glm4-moe"]
 
-# gpt-oss (2 configs)
+# gpt-oss (4 configs)
 "gpt-oss-120b" = ["arch-gpt-oss"]
+"gpt-oss-120b-3bit" = ["arch-gpt-oss"]
 "gpt-oss-120b-parity-tiny" = ["arch-gpt-oss"]
 "gpt-oss-20b" = ["arch-gpt-oss"]
 
@@ -359,6 +360,7 @@ all-arches = [
 ]
 "gpt-oss" = [
     "gpt-oss-120b",
+    "gpt-oss-120b-3bit",
     "gpt-oss-120b-parity-tiny",
     "gpt-oss-20b",
 ]
@@ -535,6 +537,7 @@ all = [
     "glm-4.5-air",
     "glm-4.5-air-parity-tiny",
     "gpt-oss-120b",
+    "gpt-oss-120b-3bit",
     "gpt-oss-120b-parity-tiny",
     "gpt-oss-20b",
     "granite-3.0-2b-base",
