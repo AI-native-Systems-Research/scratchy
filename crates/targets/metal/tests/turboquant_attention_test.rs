@@ -692,7 +692,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         );
         let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
         let grid = tg(n_seqs, c.num_q_heads, 1);
-        batch.encode(&combine, &binds, &[], &[], &[], grid, tg(32, 1, 1));
+        batch.encode(&combine, &binds, &[], &[], &[], grid, tg(128, 1, 1));
     } else if decode {
         let heads = c.decode_heads;
         let mut consts = f.attn_constants(&[bits, ConstantValue::uint(16, heads)]);
@@ -1266,7 +1266,7 @@ fn gemma4_global_decode_timing() {
             eprintln!(
                 "{kv_len:>6} keys  per-KV-head kernel, {splits:>2} splits: {:8.1} us, + combine {:8.1} us",
                 time(&[attention]),
-                time(&[attention, (&combine, tg(1, nq, 1), tg(32, 1, 1))])
+                time(&[attention, (&combine, tg(1, nq, 1), tg(128, 1, 1))])
             );
         }
     }

@@ -1075,6 +1075,10 @@ const ATTN_MAX_SPLITS: u32 = 16;
 /// The query heads `attention_decode_gqa_tq` serves a KV head.
 const GQA_HEADS: u32 = 8;
 
+/// The threads of `attention_via_cache_v2_combine`'s threadgroup: its `ATTN_COMBINE_GROUPS`
+/// simdgroups.
+const COMBINE_THREADS: u32 = 4 * 32;
+
 /// A one-row bucket's TurboQuant decode attention (the codec's packed twin, or it running its KV
 /// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
 /// head_dim a multiple of 128 up to 512, KV blocks of whole 8-key blocks, no projection bias, a
@@ -1136,6 +1140,8 @@ fn decode_attention_per_kv_head(
             .copied()
             .collect();
         constants.push(ConstantValue::uint(18, splits));
+        // Running its KV writer, one threadgroup past the splits writes and encodes the row.
+        let writer = u32::from(constants.iter().any(|k| k.index == ATTN_FOLD.0));
         let (x, _, _) = command.dispatch.threadgroups;
         let attention = LoweredCommand {
             kernel: KernelId::AttentionDecodeGqaTq,
@@ -1145,7 +1151,7 @@ fn decode_attention_per_kv_head(
             ),
             constants: baked(constants.clone()),
             dispatch: DispatchShape {
-                threadgroups: (x, p.num_global_kv_heads, splits),
+                threadgroups: (x, p.num_global_kv_heads, splits + writer),
                 threads_per_threadgroup: (hd, 1, 1),
                 ..command.dispatch
             },
@@ -1170,7 +1176,7 @@ fn decode_attention_per_kv_head(
             constants: baked(constants),
             dispatch: DispatchShape {
                 threadgroups: (x, p.num_q_heads, 1),
-                threads_per_threadgroup: (32, 1, 1),
+                threads_per_threadgroup: (COMBINE_THREADS, 1, 1),
                 ..command.dispatch
             },
             bindings: baked(kept.chain([partials]).collect()),
@@ -8163,7 +8169,7 @@ mod tests {
                 (1, p.num_q_heads, 1)
             )
         );
-        assert_eq!(combine.dispatch.threads_per_threadgroup, (32, 1, 1));
+        assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(combine.constants, gqa.constants);
         let out_and_signs = (twin.bindings.iter()).filter(|b| matches!(b.index(), 0 | 11));
         assert_eq!(
@@ -8222,6 +8228,14 @@ mod tests {
         );
         let fold = &folded.commands[0].command;
         assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
+        // Its splits and the writer's threadgroup.
+        let fold_splits = (fold.constants.iter())
+            .find(|k| k.index == 18)
+            .map(|k| k.bits);
+        assert_eq!(
+            Some(fold.dispatch.threadgroups),
+            fold_splits.map(|s| (1, 4, s + 1))
+        );
     }
 
     /// The NAX paged attention is instantiated for the pages it reads: 16-token pages at head_dims

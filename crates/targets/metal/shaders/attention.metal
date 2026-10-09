@@ -297,8 +297,10 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_STAGE_PASS, 17);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_SPLITS_FC, 18);
 constant constexpr uint ATTN_SPLITS = ATTN_SPLITS_FC_SET ? ATTN_SPLITS_FC : 1u;
 // The decode merge's output slices per barrier round (`attn_decode_merge`): its scratch holds
-// this many 32 x 32 transposes.
+// this many 32 x 32 transposes, each row padded to 33 floats so a simdgroup's transposed stores
+// (a lane a row) land in 32 different banks.
 constant constexpr uint ATTN_MERGE_SLICES = 4u;
+constant constexpr uint ATTN_MERGE_STRIDE = 33u;
 
 // 19 / 20  ATTN_FOLD_ROT_DIM / ATTN_FOLD_PAIR_OFF — set: a one-row step's decode attention runs
 //     its KV writer (`MetalFusion::RopedAttention`), roping as the writer would — NeoX pairs
@@ -623,13 +625,13 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
         for (uint j0 = 0; j0 < qk_per_thread; j0 += ATTN_MERGE_SLICES) {
             const uint nj = min(ATTN_MERGE_SLICES, qk_per_thread - j0);
             for (uint jj = 0; jj < nj; ++jj) {
-                tg_outputs[(jj * BD + simd_lid) * BD + simd_gid] = o_reg[h * qk_per_thread + j0 + jj];
+                tg_outputs[(jj * BD + simd_lid) * ATTN_MERGE_STRIDE + simd_gid] = o_reg[h * qk_per_thread + j0 + jj];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint jj = 0; jj < nj; ++jj) {
                 // Each simdgroup reads its column from tg_outputs and sums
                 // across the BD partials, weighted by per-simdgroup factor.
-                U val = tg_outputs[(jj * BD + simd_gid) * BD + simd_lid] * factor;
+                U val = tg_outputs[(jj * BD + simd_gid) * ATTN_MERGE_STRIDE + simd_lid] * factor;
                 U combined = simd_sum(val);
                 if (global_sum != 0) {
                     combined = combined / global_sum;
@@ -796,8 +798,12 @@ template <typename T>
     thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim <= 512)
     thread U o_reg[32];                 // [h * qk_per_thread + j], <= 32 (ATTN_TQ_HEADS)
 
-    // Threadgroup scratch for per-simdgroup max + sum_exp combine.
-    threadgroup U tg_outputs[ATTN_MERGE_SLICES * BN * BD];
+    // Threadgroup scratch for per-simdgroup max + sum_exp combine; first, under the TurboQuant
+    // fold, the KV row encode's scratch and codes.
+    constexpr uint MERGE_FLOATS = ATTN_MERGE_SLICES * uint(BN) * ATTN_MERGE_STRIDE;
+    constexpr uint ENCODE_FLOATS =
+        ATTN_TQ_BITS_SET && ATTN_FOLD ? tq_encode_floats(2u, ATTN_HEAD_DIM) + 2u * ATTN_HEAD_DIM : 0u;
+    threadgroup U tg_outputs[MERGE_FLOATS > ENCODE_FLOATS ? MERGE_FLOATS : ENCODE_FLOATS];
     threadgroup U tg_max[BN * 8];       // [head][simdgroup], heads <= 8
     threadgroup U tg_sum[BN * 8];
 
@@ -1176,14 +1182,19 @@ SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<
 // threadgroup per query head merges the partials its KV head's ATTN_SPLITS threadgroups stored
 // (buffer 16, `[batch, num_q_heads, ATTN_SPLITS, 2 + head_dim]`: max, sum, unnormalized output in
 // the codebook domain) and writes the head's output as `attention_via_cache_v2`'s merge does.
-// Dispatch: threadgroups (batch, num_q_heads, 1), threads (32, 1, 1).
+// Its ATTN_COMBINE_GROUPS simdgroups each sum their share of every lane's elements over the
+// splits; the first divides and rotates them. Dispatch: threadgroups (batch, num_q_heads, 1), threads
+// (32 · ATTN_COMBINE_GROUPS, 1, 1).
+constant constexpr uint ATTN_COMBINE_GROUPS = 4u;
 template <typename T>
-[[kernel, max_total_threads_per_threadgroup(32)]] void attention_via_cache_v2_combine(
+[[kernel, max_total_threads_per_threadgroup(32 * ATTN_COMBINE_GROUPS)]] void
+attention_via_cache_v2_combine(
     device       T*     output        [[buffer(0)]],
     device const float* tq_signs      [[buffer(11)]],
     device const T*     tq_v_bias     [[buffer(15)]],
     device const float* attn_partials [[buffer(16)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
     typedef float U;
@@ -1199,19 +1210,38 @@ template <typename T>
     for (uint s = 0; s < ATTN_SPLITS; ++s) {
         global_max = max(global_max, U(p[s * row]));
     }
-    // Lane l the elements l·qk_per_thread + j: the codebook domain's lane slices under TurboQuant.
+    // Lane l the elements l·qk_per_thread + j: the codebook domain's lane slices under TurboQuant;
+    // this simdgroup QG of them from `j0`, through `sums` (a lane's row padded by one).
+    // Another kernel's bake may set a head dim this one cannot take: its arrays need a size all
+    // the same (the assert refuses baking this kernel with one).
+    constexpr bool D_OK = ATTN_HEAD_DIM % (32u * ATTN_COMBINE_GROUPS) == 0u && ATTN_HEAD_DIM != 0u;
+    static_assert(sizeof(T) && D_OK, "head_dim a multiple of 32 lanes x the combine's groups");
+    constexpr uint QG = D_OK ? ATTN_HEAD_DIM / 32u / ATTN_COMBINE_GROUPS : 1u;
+    threadgroup U sums[32u * (QG * ATTN_COMBINE_GROUPS + 1u)];
     const uint e0 = simd_lid * qk_per_thread;
+    const uint j0 = simd_gid * QG;
     U global_sum = 0;
-    U o_loc[16];
-    for (uint j = 0; j < qk_per_thread; ++j) {
-        o_loc[j] = 0;
+    U part[QG];
+    for (uint j = 0; j < QG; ++j) {
+        part[j] = 0;
     }
     for (uint s = 0; s < ATTN_SPLITS; ++s) {
         const U factor = metal::fast::exp(U(p[s * row]) - global_max);
         global_sum += U(p[s * row + 1u]) * factor;
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_loc[j] += U(p[s * row + 2u + e0 + j]) * factor;
+        for (uint j = 0; j < QG; ++j) {
+            part[j] += U(p[s * row + 2u + e0 + j0 + j]) * factor;
         }
+    }
+    for (uint j = 0; j < QG; ++j) {
+        sums[simd_lid * (qk_per_thread + 1u) + j0 + j] = part[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid != 0u) {
+        return;
+    }
+    U o_loc[16];
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        o_loc[j] = sums[simd_lid * (qk_per_thread + 1u) + j];
     }
     for (uint j = 0; j < qk_per_thread; ++j) {
         o_loc[j] = global_sum != 0 ? o_loc[j] / global_sum : o_loc[j];
@@ -1248,10 +1278,10 @@ SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_c
 // keys' blocks and stores its heads' partials for `attention_via_cache_v2_combine` (one head a
 // threadgroup); the last also takes the step's own key when its writer left it in the cache, or
 // under the fold (`ATTN_FOLD`) built it here, exactly as `attention_via_cache_v2` does. Under the
-// fold each threadgroup ropes the query heads and builds the KV row in threadgroup memory, never
-// writing the query back, and split 0 writes the row to the cache and encodes it. Bindings:
-// `attention_via_cache_v2`'s, buffer 0 unread. Dispatch: threadgroups (batch, num_kv_heads,
-// ATTN_SPLITS), threads (head_dim, 1, 1).
+// fold each split ropes the query heads, never writing the query back, the last builds the KV row
+// in threadgroup memory, and one threadgroup more (z = ATTN_SPLITS) builds it, writes it to the
+// cache and encodes it. Bindings: `attention_via_cache_v2`'s, buffer 0 unread. Dispatch:
+// threadgroups (batch, num_kv_heads, ATTN_SPLITS + the fold's writer), threads (head_dim, 1, 1).
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(ATTN_HEAD_DIM)]] void attention_decode_gqa_tq(
     device const T*     q             [[buffer(1)]],
@@ -1295,6 +1325,9 @@ template <typename T>
     constexpr uint DS = D / SG;
     constexpr uint TILES = DS / 8u;
     constexpr uint QK = D / 32u;
+    // `qb`'s row stride: a head's row padded by 4 floats, so the 8 rows of a fragment's load and
+    // the merge's stores fall in different banks.
+    constexpr uint QS = D + 4u;
     constexpr uint XS_S = KG * 2u * SG * 64u;
     constexpr uint XS_ENC = tq_encode_floats(2u, D) + 2u * D;
     constexpr uint XS = XS_S > XS_ENC ? XS_S : XS_ENC;
@@ -1328,7 +1361,7 @@ template <typename T>
     const bool own_key = slot != 0xFFFFFFFFu;
     const uint n_packed = kv_len - (own_key ? 1u : 0u);
 
-    threadgroup float qb[G * D];
+    threadgroup float qb[G * QS];
     threadgroup float xs[XS];
     threadgroup T fold_kv[2u * ATTN_FOLD_DIM];
     threadgroup float lut[16];
@@ -1359,32 +1392,8 @@ template <typename T>
         }
         return float(qh[e]);
     };
-    // q in the codebook domain, `s·H·D·q / D`, a simdgroup a head; its fragments; then the plain
-    // query, scaled, for the keys the plain domain scores.
-    for (uint h = simd_gid; h < G; h += NSG) {
-        float x[QK];
-        for (uint j = 0; j < QK; ++j) {
-            const uint e = simd_lid * QK + j;
-            x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_signs[e];
-        }
-        tq_wht(x, QK, simd_lid);
-        for (uint j = 0; j < QK; ++j) {
-            qb[h * D + simd_lid * QK + j] = x[j] / float(D);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_float8x8 Qf[TILES];
-    for (uint t = 0; t < TILES; ++t) {
-        simdgroup_load(Qf[t], qb + sg * DS + t * 8u, D);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < G * D; i += D) {
-        qb[i] = ATTN_SCALE_FC * q_plain(i / D, i % D);
-    }
-
-    // Fold: the KV row in `fold_kv` (K, then V), K roped unless its block is a span's; split 0
-    // writes it to the cache and encodes it, as `attention_via_cache_v2`'s fold does.
-    if (ATTN_FOLD) {
+    // The fold's KV row in `fold_kv` (K, then V), K roped unless its block is a span's.
+    auto build_row = [&]() {
         threadgroup T* fk = fold_kv;
         threadgroup T* fv = fold_kv + ATTN_FOLD_DIM;
         const uint row = (seq * num_kv + kvh) * D;
@@ -1402,22 +1411,86 @@ template <typename T>
             fk[off + tid] = T(r.y);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-        if (z == 0u && own_key) {
+    };
+    // Under the fold the threadgroup past the splits is the writer's: it builds the row, writes it
+    // to the cache and encodes it into the packed store, as `attention_via_cache_v2`'s fold does,
+    // off the splits' path.
+    if (ATTN_FOLD && z == ATTN_SPLITS) {
+        build_row();
+        if (own_key) {
             const uint phys = (ATTN_ROR != 0u) ? (slot & 0x7FFFFFFFu) : slot;
             const uint block = phys / bs;
             const uint chunk = (ATTN_BLOCKS_PER_CHUNK == 0u) ? 0u : block / ATTN_BLOCKS_PER_CHUNK;
             const uint blk_in_chunk =
                 (ATTN_BLOCKS_PER_CHUNK == 0u) ? block : block % ATTN_BLOCKS_PER_CHUNK;
             const uint at = blk_in_chunk * kv_blk_stride + kvh * kv_head_stride + (phys % bs) * D;
-            ((device T*)k_cache[chunk])[at + tid] = fk[tid];
-            ((device T*)v_cache[chunk])[at + tid] = fv[tid];
+            ((device T*)k_cache[chunk])[at + tid] = fold_kv[tid];
+            ((device T*)v_cache[chunk])[at + tid] = fold_kv[ATTN_FOLD_DIM + tid];
             const uint vpw = 32u / ATTN_TQ;
             threadgroup uint* codes = (threadgroup uint*)(xs + tq_encode_floats(2u, D));
-            kv_row_encode<T>(float(fk[tid]), float(fv[tid]), tid, D, num_kv, kvh, slot, fold_pos,
-                             ATTN_TQ, vpw, pdim, 0u, 0u, ATTN_FOLD_ROT_DIM, off, tq_signs,
-                             tq_boundaries, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
-                             tq_k_bias, tq_v_bias, tq_bias_cos_sin, xs, codes);
+            kv_row_encode<T>(float(fold_kv[tid]), float(fold_kv[ATTN_FOLD_DIM + tid]), tid, D,
+                             num_kv, kvh, slot, fold_pos, ATTN_TQ, vpw, pdim, 0u, 0u,
+                             ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, tq_signs, tq_boundaries,
+                             tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias,
+                             tq_v_bias, tq_bias_cos_sin, xs, codes);
         }
+        return;
+    }
+    // q in the codebook domain, `s·H·D·q / D`, a simdgroup a head; its fragments; then the plain
+    // query, scaled, for the keys the plain domain scores. With two simdgroups a head, each takes
+    // half its dims (the index's top bit) and the transform's stages run in the same order: the
+    // low bits in a lane, the lane bits by shuffles, the top bit across the pair through `qb`.
+    if (NSG == 2u * G) {
+        constexpr uint HQ = QK / 2u;
+        const uint h = simd_gid % G;
+        const uint hi = simd_gid / G;
+        const uint own = h * QS + hi * (D / 2u) + simd_lid * HQ;
+        float x[HQ];
+        for (uint j = 0; j < HQ; ++j) {
+            const uint e = hi * (D / 2u) + simd_lid * HQ + j;
+            x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_signs[e];
+        }
+        tq_wht(x, HQ, simd_lid);
+        for (uint j = 0; j < HQ; ++j) {
+            qb[own + j] = x[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint pair = h * QS + (1u - hi) * (D / 2u) + simd_lid * HQ;
+        for (uint j = 0; j < HQ; ++j) {
+            const float o = qb[pair + j];
+            x[j] = hi != 0u ? (o - x[j]) : (x[j] + o);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < HQ; ++j) {
+            qb[own + j] = x[j] / float(D);
+        }
+    } else {
+        for (uint h = simd_gid; h < G; h += NSG) {
+            float x[QK];
+            for (uint j = 0; j < QK; ++j) {
+                const uint e = simd_lid * QK + j;
+                x[j] = ATTN_SCALE_FC * q_plain(h, e) * tq_signs[e];
+            }
+            tq_wht(x, QK, simd_lid);
+            for (uint j = 0; j < QK; ++j) {
+                qb[h * QS + simd_lid * QK + j] = x[j] / float(D);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Qf[TILES];
+    for (uint t = 0; t < TILES; ++t) {
+        simdgroup_load(Qf[t], qb + sg * DS + t * 8u, QS);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < G * D; i += D) {
+        qb[i / D * QS + i % D] = ATTN_SCALE_FC * q_plain(i / D, i % D);
+    }
+
+    // Fold: the last split builds the KV row in `fold_kv` (K, then V), K roped unless its block is
+    // a span's, for the step's own key; the writer's threadgroup (above) built it too.
+    if (ATTN_FOLD && z == ATTN_SPLITS - 1u) {
+        build_row();
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1445,7 +1518,7 @@ template <typename T>
         for (uint h = 0; h < G; ++h) {
             float acc = 0.0f;
             for (uint j = 0; j < QK; ++j) {
-                acc += qb[h * D + simd_lid * QK + j] * x[j];
+                acc += qb[h * QS + simd_lid * QK + j] * x[j];
             }
             s[h] = simd_sum(acc);
         }
@@ -1630,7 +1703,7 @@ template <typename T>
     for (uint g = 0; g < KG; ++g) {
         if (g == kg) {
             for (uint t = 0; t < TILES; ++t) {
-                const uint e = fm * D + sg * DS + t * 8u + fn;
+                const uint e = fm * QS + sg * DS + t * 8u + fn;
                 const float o0 = Of[t].thread_elements()[0] * to_gm;
                 const float o1 = Of[t].thread_elements()[1] * to_gm;
                 qb[e] = g == 0u ? o0 : qb[e] + o0;
@@ -1652,7 +1725,7 @@ template <typename T>
         for (uint g = 0; g < KG; ++g) {
             hl += ml[KG * G + g * G + h] * metal::fast::exp(ml[g * G + h] - hm);
         }
-        float o = qb[i];
+        float o = qb[h * QS + i % D];
         if (takes_own) {
             const float s = own_s[h];
             const float new_m = max(hm, s);
