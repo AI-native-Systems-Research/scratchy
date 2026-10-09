@@ -183,6 +183,10 @@ struct RequestState {
     /// Accumulated generated text so far (for streaming tool parsing).
     accumulated_text: String,
 
+    /// The generated text past the reasoning so far: what the streaming tool parser reads when a
+    /// reasoning parser routes text first.
+    accumulated_content: String,
+
     /// Accumulated generated token IDs (for streaming reasoning parsing).
     accumulated_token_ids: Vec<u32>,
 
@@ -2240,6 +2244,7 @@ impl AsyncEngine {
                     reasoning_ended: false,
                     include_reasoning,
                     accumulated_text: String::new(),
+                    accumulated_content: String::new(),
                     accumulated_token_ids: Vec::new(),
                     tool_calls_emitted: false,
                     forced_function_name,
@@ -2584,11 +2589,13 @@ impl AsyncEngine {
                 // Phase 2: Tool parsing on content portion (only after reasoning ends).
                 if let Some(ref mut parser_state) = req_state.tool_parser_state {
                     if let Some(ref content_text) = content_text_for_tools {
-                        // Build previous/current text for tool parser (content portion only).
-                        let previous_text_for_tools = req_state.accumulated_text.clone(); // approximation
+                        // The tool parser reads the content alone: past the reasoning, which
+                        // it would otherwise emit as content (`</think>` included).
+                        let previous_len = req_state.accumulated_content.len();
+                        req_state.accumulated_content.push_str(content_text);
                         let parser_result = parser_state.process_delta(
-                            &previous_text_for_tools,
-                            &req_state.accumulated_text,
+                            &req_state.accumulated_content[..previous_len],
+                            &req_state.accumulated_content,
                             content_text,
                         );
 
@@ -4056,6 +4063,7 @@ mod tests {
             reasoning_ended: false,
             include_reasoning: true,
             accumulated_text: String::new(),
+            accumulated_content: String::new(),
             accumulated_token_ids: Vec::new(),
             tool_calls_emitted: false,
             forced_function_name: None,
@@ -5730,6 +5738,62 @@ mod tests {
             "content done",
             "content should be everything after </think>"
         );
+    }
+
+    /// Qwen3.6 behind Claude Code: the template opens `<think>`, so the output starts in
+    /// reasoning, closes it, then calls a tool. The tool parser reads only the text past the
+    /// reasoning — no reasoning and no `</think>` stream as content — and the call goes out
+    /// whole, its arguments included.
+    #[test]
+    fn test_streaming_reasoning_then_qwen3_coder_tool_call() {
+        use crate::reasoning_parser::Qwen3ReasoningParser;
+        let parser = Qwen3ReasoningParser::new(&reasoning_test_vocab()).unwrap();
+        let tools = crate::tool_parser::get_tool_parser("qwen3_coder").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state = Some(parser.create_streaming_state());
+        state.tool_parser_state = Some(tools.create_streaming_state());
+        state.include_reasoning = true;
+        requests.insert("req-1".to_string(), state);
+        let pieces: [(&[u32], &str); 5] = [
+            (&[10], "I will run ls."),
+            (&[101, 11], "\n</think>\n\n"),
+            (&[12], "<tool_call>\n<function=Bash>\n"),
+            (&[13], "<parameter=command>\nls\n</parameter>\n"),
+            (&[14], "</function>\n</tool_call>"),
+        ];
+        for (i, (ids, text)) in pieces.iter().enumerate() {
+            let output = EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: ids.to_vec(),
+                finish_reason: (i + 1 == pieces.len()).then_some(FinishReason::Stop),
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            };
+            let detok = Some((None, Some(text.to_string())));
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        }
+        let (mut content, mut reasoning, mut calls) = (String::new(), String::new(), Vec::new());
+        while let Ok(delta) = rx.try_recv() {
+            content.push_str(delta.text.as_deref().unwrap_or(""));
+            reasoning.push_str(delta.reasoning.as_deref().unwrap_or(""));
+            calls.extend(delta.tool_call_deltas.unwrap_or_default());
+        }
+        assert_eq!(content.trim(), "", "content: {content:?}");
+        assert!(
+            reasoning.contains("I will run ls."),
+            "reasoning: {reasoning:?}"
+        );
+        assert_eq!(calls.len(), 1, "one call: {calls:?}");
+        assert_eq!(calls[0].function_name.as_deref(), Some("Bash"));
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0].function_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["command"], "ls");
     }
 
     #[test]

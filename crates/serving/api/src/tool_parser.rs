@@ -2763,6 +2763,7 @@ impl StreamingToolParserState for Gemma4StreamingState {
 
 const QWEN_TC_OPEN: &str = "<tool_call>";
 const QWEN_TC_CLOSE: &str = "</tool_call>";
+const QWEN_FN_CLOSE: &str = "</function>";
 
 /// Tool parser for the Qwen3-Coder / Qwen3.6 XML call format:
 /// `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>`.
@@ -2926,7 +2927,14 @@ impl StreamingToolParserState for Qwen3CoderStreamingState {
                 return ToolParserDelta::Content(new);
             }
         }
-        let extracted = qwen3_coder_extract(current_text);
+        // Only calls whose close has arrived: `qwen3_coder_extract` takes an unclosed last call to
+        // the end of its text, so a call still streaming would go out before its parameters.
+        let closed = [QWEN_TC_CLOSE, QWEN_FN_CLOSE]
+            .iter()
+            .filter_map(|close| current_text.rfind(close).map(|at| at + close.len()))
+            .max()
+            .unwrap_or(0);
+        let extracted = qwen3_coder_extract(&current_text[..closed]);
         if extracted.tool_calls.len() > self.calls_emitted {
             let deltas = extracted.tool_calls[self.calls_emitted..]
                 .iter()
@@ -4525,6 +4533,39 @@ mod qwen3_coder_tests {
         let args: serde_json::Value =
             serde_json::from_str(&e.tool_calls[0].function.arguments).unwrap();
         assert_eq!(args["path"], "/some/path");
+    }
+
+    /// Streamed piece by piece, as Qwen3.6 generates it, a call goes out once — whole, its
+    /// parameters included — when its close arrives, after the content before it.
+    #[test]
+    fn streams_a_call_once_its_close_arrives() {
+        let pieces = [
+            "I'll list them.\n",
+            "<tool_call>\n",
+            "<function=Bash>\n",
+            "<parameter=command>\n",
+            "ls\n",
+            "</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ];
+        let mut state = Qwen3CoderToolParser::new().create_streaming_state();
+        let (mut text, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+        for piece in pieces {
+            let previous = text.clone();
+            text.push_str(piece);
+            match state.process_delta(&previous, &text, piece) {
+                ToolParserDelta::Content(c) => content.push_str(&c),
+                ToolParserDelta::ToolCalls(d) => calls.extend(d),
+                ToolParserDelta::None => {}
+            }
+        }
+        assert_eq!(content, "I'll list them.\n");
+        assert_eq!(calls.len(), 1, "one call, emitted once");
+        assert_eq!(calls[0].function_name.as_deref(), Some("Bash"));
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0].function_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["command"], "ls");
     }
 
     #[test]
