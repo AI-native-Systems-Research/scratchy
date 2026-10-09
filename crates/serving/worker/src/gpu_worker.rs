@@ -3801,10 +3801,25 @@ impl Worker for MetalWorker {
         // `--max-num-seqs` resolver budgets against at load. (The
         // arena/rung intermediates above stay only to feed the log line.)
         let peak_activation_estimate = self.metal_peak_activation_estimate(None, None)?;
-        // `total` already folds in `gpu_memory_utilization` and is capped at
-        // the wireable `maxBufferLength`, so pass util=1.0 here — applying it
-        // again would shrink the KV budget a second time below the headroom
-        // the bucket selector just split.
+        // A model whose resident set fits Apple's recommended working set
+        // but not `util × working_set` (a 48 GiB checkpoint on a 64 GiB box
+        // at the 0.9 default) is KV-starved, not an OOM risk: the
+        // utilization default is a HEADROOM REQUEST, not a ceiling on
+        // weights. Floor the budget at resident + the shared KV floor —
+        // the engine then clamps context to what's left instead of
+        // refusing a model the device can hold — and cap it at the
+        // working set itself, so a model too big for Apple's own
+        // recommendation still trips the guard below unchanged. Same
+        // shape as the `maxBufferLength`-floor removal above: a default
+        // that starves a model which fits the device is the defect.
+        let resident = weights_and_overhead.saturating_add(peak_activation_estimate);
+        let total = total
+            .max(resident.saturating_add(scratchy_serving_engine::gpu_budget::KV_FLOOR_BYTES))
+            .min(working_set);
+        // `total` already folds in `gpu_memory_utilization` (and the floor
+        // above), so pass util=1.0 here — applying it again would shrink the
+        // KV budget a second time below the headroom the bucket selector
+        // just split.
         let available =
             compute_available_kv_bytes(total, weights_and_overhead, peak_activation_estimate, 1.0);
         // A uniform TurboQuant pool still reserves one fp16 chunk per layer
