@@ -433,7 +433,17 @@ impl Expander<'_> {
                     let rows = RotatedRows::Output;
                     (SubOp::RotateRows { rows }, vec![InputRef::Op(out)])
                 }
-                After::PackedTwin => (SubOp::AttnPackedKv, vec![q, InputRef::Op(out), pk, pv]),
+                After::PackedTwin => {
+                    // The twin IS the attention under the codec, so the attention's trailing
+                    // weight inputs (gpt-oss sinks — operand 5, past the cached form's
+                    // positional q/prefix_k/prefix_v/new_k/v prefix) ride along. Without them
+                    // the twin's weight row loses their sites and the lowered decode dispatch
+                    // silently drops the sinks column its dense twin still carries.
+                    let mut inputs = vec![q, InputRef::Op(out), pk, pv];
+                    let trailing = self.l.input.ops[i].inputs.iter().skip(5).copied();
+                    inputs.extend(trailing.map(|r| self.input(r)));
+                    (SubOp::AttnPackedKv, inputs)
+                }
             };
             out = self.push(op, m, inputs, self.tiles[out], expansion);
         }
@@ -502,6 +512,35 @@ mod tests {
         assert_eq!(l.op_tiles[9], l.op_tiles[8]);
         assert_eq!((l.op_tiles[6], l.op_tiles[7]), (None, None));
         assert_eq!(l.input.ops.len(), layer(64, 1).input.ops.len() + 3);
+    }
+
+    /// A sinks attention (gpt-oss: a 6th, trailing `[num_heads]` weight operand) twins with its
+    /// sinks weight: the twin carries it as its 5th operand, and the encodes do NOT take it (it
+    /// is the attention's, not a projection's bias). Without the carry the twin's weight row
+    /// loses the sink site and the lowered decode dispatch silently drops the sink column its
+    /// dense twin still carries — decode diverges from prefill and the model echoes.
+    #[test]
+    fn a_sinks_attention_twins_with_its_trailing_weight() {
+        let mut input = one_layer_input_shaped(256, 64, 512, 64);
+        input.ops.iter_mut().for_each(|od| od.m = 1);
+        let sinks = input.sources.len();
+        input.sources.push(SourceShape { rows: 1, cols: 4 });
+        input.ops[6].inputs.push(InputRef::Ext(sinks));
+        let x = expand_kv_codec(&lowered(input), &FACTS).expect("expands");
+        use InputRef::{Ext, Op};
+        // The dense anchor keeps all six of its inputs under `UnlessCodecDecode`…
+        assert_eq!(
+            x.input.ops[8].inputs,
+            [Op(4), Ext(7), Ext(8), Op(5), Op(3), Ext(sinks)]
+        );
+        // …and the twin carries the trailing sinks weight as its 5th operand.
+        assert_eq!(
+            x.input.ops[9].inputs,
+            [Op(4), Op(8), Op(6), Op(7), Ext(sinks)]
+        );
+        // The encodes stay untouched: the sink column is not a projection bias.
+        assert_eq!(x.input.ops[6].inputs, [Ext(7), Ext(5)]);
+        assert_eq!(x.input.ops[7].inputs, [Ext(8), Ext(5)]);
     }
 
     /// Every other form: the layer's K and V staged and the query rotated in ahead of the

@@ -8040,6 +8040,65 @@ mod tests {
         );
     }
 
+    /// A sinks attention's TurboQuant twin keeps the dense command's sink column: both the
+    /// `AttentionViaCache` dispatch and its `AttentionViaCacheTq` twin carry the sink const
+    /// (slot 21) and the sinks weight binding (slot 16 — free between the TQ projection
+    /// biases and the fold buffers, so the twin's TQ slots 7..=13 cannot collide with it).
+    /// The codec expansion used to build the twin without the attention's trailing sinks
+    /// operand, so the twin's row had no sink site and every TurboQuant decode of a
+    /// sink-attention arch (gpt-oss) silently dropped the column its dense twin still
+    /// carried — decode diverged from prefill and the model echoed.
+    #[test]
+    fn decode_turboquant_twin_keeps_the_attention_sinks() {
+        use crate::tape::ids::LayerId;
+        use crate::tape::lowered::{Binding, WeightTensor};
+        // The attention rows' site, plus the attention's trailing sinks weight — what a
+        // gpt-oss attention's rows look like once the codec carries the operand.
+        let sinks = SourceIx(500);
+        let mut site = TEST_SITE.clone();
+        site.push(RowSource {
+            kind: WeightKind::AttnSinks,
+            ix: sinks,
+        });
+        let mut tape = row_tape(coded(
+            tq_writer(0, Causal, LLAMA_KV),
+            attention(MetalStep::AttentionViaCache, 0, Interleaved),
+        ));
+        for (row, row_site) in tape.backbone.iter().zip(&mut tape.backbone_sources) {
+            if let StepRow::Step(MetalStep::AttentionViaCache(..) | MetalStep::AttnPackedKv(..), _) =
+                row
+            {
+                *row_site = site.clone();
+            }
+        }
+        let tape = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(1, None))
+            .expect("lower_subtile_tape_to_metal");
+        let find = |k| {
+            tape.commands
+                .iter()
+                .map(|c| &c.command)
+                .find(|c| c.kernel == k)
+                .expect("the command")
+        };
+        let (fp16, tq) = (
+            find(KernelId::AttentionViaCache),
+            find(KernelId::AttentionViaCacheTq),
+        );
+        // The twin copies the dense command's constants wholesale — sinks included —
+        // then extends with the TQ pair.
+        assert_eq!(fp16.constants.last(), Some(&ConstantValue::uint(21, 1)));
+        assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
+        // Both bind the layer's `[num_heads]` sink tensor at slot 16.
+        let sink_binding = Binding::Source {
+            ix: sinks,
+            which: WeightTensor::Weight,
+            layer: LayerId(0),
+            binding_index: 16,
+        };
+        assert!(fp16.bindings.contains(&sink_binding));
+        assert!(tq.bindings.contains(&sink_binding));
+    }
+
     /// The TurboQuant decode twin's query heads per threadgroup turn on the
     /// device's GPU core count, which no baked class knows: every class's
     /// profile lowers it at one head, and the pool serves the device's count

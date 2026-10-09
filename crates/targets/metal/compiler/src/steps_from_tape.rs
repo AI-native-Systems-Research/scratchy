@@ -1881,9 +1881,25 @@ impl Recording<'_> {
             }
             L::AttnPackedKv => {
                 // The layer's decode attention: its writer's layer and pairing.
-                let (layer, pairing, class, offsets, sites) =
+                let (layer, pairing, class, offsets, mut sites) =
                     self.codec_writer(i, self.step_arg(i, 2)?)?;
                 let (q, out) = (self.read(i, 0)?, out()?);
+                // gpt-oss attention sinks: the twin's TRAILING weight input (arg 4 —
+                // the attention's 6th operand, carried by the codec expansion) binds the
+                // per-layer `[num_heads]` sink vector, exactly as the dense form's. The
+                // registry admits exactly 5 for the trailing form, so a present 5th
+                // operand that is not a weight source is a malformed tape — refuse
+                // rather than silently drop the sinks.
+                match self.arg(i, 4) {
+                    Ok(InputRef::Ext(e)) => {
+                        if !matches!(self.l.bindings[e], SourceBinding::Weight { .. }) {
+                            return Err(self.no(i, Refused::NotAWeight(e)));
+                        }
+                        sites.extend(self.site(i, WeightKind::AttnSinks, e)?);
+                    }
+                    Ok(InputRef::Op(_)) => return Err(self.no(i, Refused::NotASource(4))),
+                    Err(_) => {}
+                }
                 let step = S::AttnPackedKv(q, out, layer, pairing, class, offsets);
                 let mut e = em(step, &[q, out], &[out], sites);
                 e.sig.kv_r = Some(layer);

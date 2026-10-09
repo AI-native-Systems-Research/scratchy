@@ -91,7 +91,10 @@ macro_rules! for_each_subop {
             KvEncode [SubOp::KvEncode { .. }] arity = (|n| n == 2 || n == 3), cols = [one];
             KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one];
             RotateRows [SubOp::RotateRows { .. }] arity = (|n| n == 1), cols = [in0];
-            AttnPackedKv [SubOp::AttnPackedKv] arity = (|n| n == 4), cols = [in1];
+            // `[q, out, packed_k, packed_v]`, optionally with the attention's
+            // trailing `[num_heads]` sinks weight source (gpt-oss attention
+            // sinks — the 5th input read as a weight, as the dense form's 6th).
+            AttnPackedKv [SubOp::AttnPackedKv] arity = (|n| n == 4 || n == 5), cols = [in1];
             RouterNorm [SubOp::RouterNorm { .. }] arity = (|n| n == 2), cols = [in0];
             RouterLogits [SubOp::RouterLogits { .. }] arity = (|n| n == 2), cols = [nz experts];
             RouteSoftmax [SubOp::RouteSoftmax] arity = (|n| n == 1), cols = [in0];

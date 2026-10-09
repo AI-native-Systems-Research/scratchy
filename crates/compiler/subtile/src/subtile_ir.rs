@@ -1198,7 +1198,8 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `rows` turned into or out of the codebook's domain, in place. `inputs` = `[x]`.
     RotateRows { rows: RotatedRows },
     /// An attention read straight off the packed store: its query, the output it replaces, and
-    /// the store's two halves. `inputs` = `[q, out, packed_k, packed_v]`.
+    /// the store's two halves. `inputs` = `[q, out, packed_k, packed_v]`, optionally with the
+    /// attention's trailing `[num_heads]` sinks weight source (the dense form's 6th operand).
     AttnPackedKv,
 
     // ── The sampled rows of a result matmul (see `sample_rows`) ───
@@ -3264,7 +3265,7 @@ mod tests {
         // Smallest fixture that exercises a RopeAppend → AttnDecode
         // chain. Uses 1 KV head, head_dim 4.
         let (m, hq, hkv, hd, l) = (1u32, 1u32, 1u32, 4u32, 3u32);
-        let (qdim, kvdim) = (hq * hd, hkv * hd); // both = 4
+        let kvdim = hkv * hd; // = qdim (hq * hd) = 4
         let scale = 0.5f32;
         let input = crate::lower::LoweringInput {
             sources: vec![
