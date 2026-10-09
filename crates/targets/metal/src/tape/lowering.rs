@@ -927,7 +927,9 @@ fn route_by_sequence_count(
 /// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
 /// `AffineQmm` in a bucket that can see a `SMALL_M_TOKENS` step: the twin runs
 /// on those steps (`OnlyIfSmallMTokens`) and the instruction's own GEMM on
-/// every other (`UnlessSmallMTokens`).
+/// every other (`UnlessSmallMTokens`). The twin computes the bare product, so a
+/// matmul whose ends were folded into it (its input's norm, its bias, scale or
+/// residual add) has none: its own matvec runs on every step.
 fn route_small_m(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -949,6 +951,13 @@ fn route_small_m(
         k: KDim(k),
         group_size: AffineGroupSize(group_size),
         bits: AffineBits(4),
+        ends:
+            QmvEnds {
+                norm: None,
+                bias: None,
+                scale: None,
+                residual: false,
+            },
         ..
     } = g
     else {
@@ -8657,6 +8666,38 @@ mod tests {
                     .iter()
                     .all(|c| c.gate.is_none() && c.command.kernel != KernelId::AffineQmmSmallM),
                 "bucket {bucket_m}: no small-M twin"
+            );
+        }
+        // A matvec whose input's norm and residual add were folded into it has no twin to take
+        // a 4–16-token step: the twin's bare product would skip both. Its matvec runs on every
+        // step, ends and all.
+        let ends = QmvEnds {
+            norm: Some(crate::tape::step::RowNorm {
+                layer: LayerId(0),
+                eps: crate::tape::step::Eps(1e-6),
+                offset: crate::tape::step::GainOffset(0.0),
+            }),
+            residual: true,
+            ..QmvEnds::default()
+        };
+        for bucket_m in [4, 8] {
+            let folded = MetalStep::AffineQmm(AffineMatmul {
+                ends,
+                ..(match gemm(4) {
+                    MetalStep::AffineQmm(g) => g,
+                    _ => unreachable!("gemm is an AffineQmm"),
+                })
+            });
+            let tape = lower_at(folded, bucket_m, m5);
+            assert_eq!(
+                gated_steps(&tape),
+                [(KernelId::AffineQmvWide, None)],
+                "bucket {bucket_m}"
+            );
+            let constants = tape.commands[0].command.constants;
+            assert!(
+                constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
+                "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
             );
         }
     }
