@@ -164,7 +164,14 @@ bimodal ITL distribution in this repo for a week
    gate on drift deep inside open-ended generations: greedy argmax legitimately
    splits at near-ties between two kernel stacks. For real numerical fidelity
    work use the golden-reference tooling (`scripts/generate_mlx_goldens.py`,
-   `tools/vision_parity/`) instead.
+   `tools/vision_parity/`) instead. The gate only means "same load path" if
+   both sides render the *same* prompt: `scr chat` follows the checkpoint
+   template's declared defaults, while `mlx_lm.generate` forces
+   `enable_thinking` on for any vocab with think tokens — gemma-4's template
+   defaults it off and prefills an empty thought channel — so the matrix gives
+   the mlx-lm side a per-model `--chat-template-config`
+   (`mlx_parity_config` in `scripts/bench_metal_matrix.sh`) wherever the two
+   disagree.
 4. **Same weights, matching preset.** scratchy must be built with the preset
    matching the checkpoint's `config.json`.
 5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
@@ -237,7 +244,10 @@ scr bench startup --exec -m "$MODEL" \
     --child-cmd "target/release/scr serve $MODEL --device metal --port 8731 --no-prefix-caching" \
     --scenarios frozen,cold --reps 2 --evict purge
 
-# CLI mode needs {prompt}; add a blocking parity gate against mlx-lm
+# CLI mode needs {prompt}; add a blocking parity gate against mlx-lm.
+# Thinking models: pin mlx-lm to the checkpoint template's own default
+# (scr chat renders it; mlx_lm.generate turns thinking on) — e.g. gemma-4
+# needs --chat-template-config '{"enable_thinking":false}'.
 sudo -v
 scr bench startup --exec -m "$MODEL" --mode cli \
     --child-cmd "target/release/scr chat -m $MODEL --device metal -q {prompt} --max-tokens {output_len}" \
