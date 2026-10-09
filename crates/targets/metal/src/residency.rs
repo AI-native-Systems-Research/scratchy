@@ -14,7 +14,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
-use objc2::{class, msg_send, sel};
+use objc2::{Message, class, msg_send, sel};
 use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLDevice};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -141,8 +141,8 @@ impl MetalResidencySet {
     /// Hold `buffer` in this set until the returned [`Pinned`] drops. The only
     /// way into a set, so no member can outlive its owner. Commit the set
     /// before the command buffer that reads it is committed.
-    pub fn pin(&self, buffer: Buffer) -> Pinned {
-        self.update(&buffer, true);
+    pub fn pin<A: Message>(&self, buffer: Retained<A>) -> Pinned<A> {
+        self.update(&*buffer, true);
         Pinned {
             buffer,
             set: self.clone(),
@@ -150,13 +150,12 @@ impl MetalResidencySet {
     }
 
     /// Count one pin of `buffer` in or out; the set holds it while any are live.
-    fn update(&self, buffer: &Buffer, add: bool) {
+    fn update<A: Message>(&self, buffer: &A, add: bool) {
         let mut inner = self.inner.lock().expect("residency set mutex");
         if inner.set_ptr.is_null() || inner.ended {
             return;
         }
-        let buf_ptr: *mut AnyObject =
-            Retained::as_ptr(buffer) as *const AnyObject as *mut AnyObject;
+        let buf_ptr: *mut AnyObject = buffer as *const A as *const AnyObject as *mut AnyObject;
         let pins = inner.pins.entry(buf_ptr as usize).or_default();
         *pins = if add { *pins + 1 } else { *pins - 1 };
         match (add, *pins) {
@@ -202,27 +201,28 @@ impl MetalResidencySet {
     }
 }
 
-/// A buffer held in a [`MetalResidencySet`] for exactly as long as this value
-/// lives: dropping it takes the buffer back out (applied at the set's next
-/// commit). MTL4 keeps resident only what a command buffer's sets hold, so a
-/// buffer the GPU reaches by address must be owned through one of these by
-/// something that outlives the command buffer.
-#[must_use = "dropping a Pinned unpins its buffer"]
-pub struct Pinned {
-    buffer: Buffer,
+/// An allocation (a buffer unless named — a sparse buffer's backing heap is the
+/// other) held in a [`MetalResidencySet`] for exactly as long as this value
+/// lives: dropping it takes it back out (applied at the set's next commit).
+/// MTL4 keeps resident only what a command buffer's sets hold, so memory the
+/// GPU reaches by address must be owned through one of these by something that
+/// outlives the command buffer.
+#[must_use = "dropping a Pinned unpins its allocation"]
+pub struct Pinned<A: Message = ProtocolObject<dyn MTLBuffer>> {
+    buffer: Retained<A>,
     set: MetalResidencySet,
 }
 
-impl std::ops::Deref for Pinned {
-    type Target = Buffer;
-    fn deref(&self) -> &Buffer {
+impl<A: Message> std::ops::Deref for Pinned<A> {
+    type Target = Retained<A>;
+    fn deref(&self) -> &Retained<A> {
         &self.buffer
     }
 }
 
-impl Drop for Pinned {
+impl<A: Message> Drop for Pinned<A> {
     fn drop(&mut self) {
-        self.set.update(&self.buffer, false);
+        self.set.update(&*self.buffer, false);
     }
 }
 

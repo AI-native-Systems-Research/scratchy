@@ -60,8 +60,10 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLDevice",
     "MTLEvent",
     "MTLFunctionConstantValues",
+    "MTLHeap",
     "MTLLibrary",
     "MTLResource",
+    "MTLResourceStateCommandEncoder",
     "MTLTypes",
     # MTL4 surfaces for the migration off MTLCommandBuffer + ICB.
     # Runtime-probed via
@@ -83,7 +85,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTL4PipelineState",
     "MTL4SpecializedFunctionDescriptor",
 ] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSRange", "NSString"] }
 # `device::gpu_cores` reads the GPU core count from the IO registry.
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFNumber", "CFString"] }
 dispatch2 = "0.3"

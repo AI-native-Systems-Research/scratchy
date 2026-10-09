@@ -26,8 +26,8 @@ pub struct GpuDevice {
     /// ladder so the activation arena matches the KV budget. `None` = keep all
     /// compiled buckets (no pruning).
     pub metal_bucket_max_m: Option<u32>,
-    /// The KV addressing the workload's tapes run, which the lazy `MetalWorkerPool::for_buckets`
-    /// picks its rung by: chunked, as every KV pool is one buffer per chunk (`chunked_kv`).
+    /// The KV addressing the workload's tapes run (spec-decode: chunked), which the lazy
+    /// `MetalWorkerPool::for_buckets` picks its rung by.
     pub kv_addressing: crate::tape::lowered::KvAddressing,
 }
 
@@ -41,7 +41,7 @@ impl GpuDevice {
             queue,
             allocator,
             metal_bucket_max_m: None,
-            kv_addressing: crate::tape::lowered::KvAddressing::Chunked,
+            kv_addressing: Default::default(),
         }
     }
 
