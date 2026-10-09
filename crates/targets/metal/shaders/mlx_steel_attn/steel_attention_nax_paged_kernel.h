@@ -81,6 +81,7 @@
 #include <metal_stdlib>
 
 #include "metal_nax.h"  // NAXTile + BaseNAXFrag + tile_matmad_nax
+#include "paged_resolve.h"  // paged_resolve_block / paged_resolve_scratch
 
 using namespace metal;
 using namespace mlx::steel;
@@ -132,57 +133,6 @@ struct NExpSubOp {
 struct NDivOp {
   template <typename T> METAL_FUNC static constexpr T apply(T x, T y) { return x / y; }
 };
-
-// Resolve the device base pointer for paged block `logical_block` of the
-// current sequence: indirect through the per-seq block table, then through
-// the per-layer chunk-address table, then add the kv-head offset.
-//   chunk_table[ physical / blocks_per_chunk ]
-//     + (physical % blocks_per_chunk) * kv_blk_stride
-//     + kv_head_off
-// Mirrors `PagedBlockLoaderT::resolve` (paged_loader.h).
-//
-// Spans: block_table bit 31 carries the rope-on-read unrotated flag; mask
-// it off for addressing (identity for non-spans — the worker only ever
-// sets bit 31 when ROPE_ON_READ, so this is a free ALU op there). This
-// mirrors `paged_loader.h`'s `& 0x7FFFFFFFu` in all three resolve paths.
-template <typename T>
-METAL_FUNC const device T* nax_resolve_block(
-    const device uint64_t* chunk_table,
-    const device uint* block_table_row,
-    int logical_block,
-    int num_pages,
-    int blocks_per_chunk,
-    int kv_blk_stride,
-    int kv_head_off) {
-  int lb = logical_block;
-  if (lb >= num_pages) {
-    lb = num_pages - 1;
-  }
-  const uint physical = uint(block_table_row[lb]) & 0x7FFFFFFFu;
-  const uint chunk = physical / uint(blocks_per_chunk);
-  const uint bic = physical % uint(blocks_per_chunk);
-  return (const device T*)chunk_table[chunk] + int(bic) * kv_blk_stride + kv_head_off;
-}
-
-// Resolve the base pointer for LOGICAL block `logical_block` of the roped-K
-// SCRATCH (rope-on-read spans). The scratch is a single dense contiguous
-// buffer written by `rope_once_nax`, indexed by LOGICAL block (no block_table
-// indirection, no chunk table) with the SAME per-block strides as the cache:
-//   scratch + logical_block * kv_blk_stride + kv_head_off
-// so attention can reuse the cache's `do_qk_direct` load math verbatim.
-template <typename T>
-METAL_FUNC const device T* nax_resolve_scratch(
-    const device T* scratch,
-    int logical_block,
-    int num_pages,
-    int kv_blk_stride,
-    int kv_head_off) {
-  int lb = logical_block;
-  if (lb >= num_pages) {
-    lb = num_pages - 1;
-  }
-  return scratch + lb * kv_blk_stride + kv_head_off;
-}
 
 // ── rope-once kernel ──────────────────────────────────────────────────────
 //
@@ -243,7 +193,7 @@ void rope_once_nax_kernel(
       block_table + seq_idx * NAXP_MAX_BLOCKS_PER_SEQ;
 
   // Source row (cache, possibly unrotated) and dest row (scratch, dense).
-  const device T* k_blk = nax_resolve_block<T>(
+  const device T* k_blk = paged_resolve_block<T>(
       k_cache, row_block_table, int(logical_block), int(num_pages),
       int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off);
   device T* dst_blk = k_scratch + int(logical_block) * kv_blk_stride + kv_head_off;
@@ -446,10 +396,10 @@ void attention_nax_paged(
   // so the compiler keeps only one path per pipeline variant.
   auto resolve_k = [&](int lb) -> const device T* {
     if (NAXP_ROR != 0u) {
-      return nax_resolve_scratch<T>(
+      return paged_resolve_scratch<T>(
           k_scratch, lb, num_pages, kv_blk_stride, kv_head_off);
     }
-    return nax_resolve_block<T>(
+    return paged_resolve_block<T>(
         k_cache, row_block_table, lb, num_pages,
         int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off);
   };
@@ -621,7 +571,7 @@ void attention_nax_paged(
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
           const int lb = kb_ * TK + ik;
-          const device T* Vp = nax_resolve_block<T>(
+          const device T* Vp = paged_resolve_block<T>(
               v_cache, row_block_table, lb, num_pages,
               int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off);
           const short vlim = short(lim_rows_k - ik * kU);
@@ -812,15 +762,15 @@ void attention_nax_paged_wide(
     const int lb = g / (BLOCK_SIZE_ / KQ);
     const int rows = (g % (BLOCK_SIZE_ / KQ)) * KQ * BD;
     if (NAXP_ROR != 0u) {
-      return nax_resolve_scratch<T>(
+      return paged_resolve_scratch<T>(
           k_scratch, lb, num_pages, kv_blk_stride, kv_head_off) + rows;
     }
-    return nax_resolve_block<T>(
+    return paged_resolve_block<T>(
         k_cache, row_block_table, lb, num_pages,
         int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off) + rows;
   };
   auto resolve_v = [&](int g) -> const device T* {
-    return nax_resolve_block<T>(
+    return paged_resolve_block<T>(
         v_cache, row_block_table, g / (BLOCK_SIZE_ / KQ), num_pages,
         int(NAXP_BLOCKS_PER_CHUNK), kv_blk_stride, kv_head_off)
         + (g % (BLOCK_SIZE_ / KQ)) * KQ * BD;

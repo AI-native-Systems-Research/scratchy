@@ -3546,13 +3546,24 @@ fn lower_one(
             } else {
                 None
             };
-            // The fused NAX kernel takes the hd512 global class where it has an instantiation.
+            // The simdgroup WIDE paged kernel — the pre-NAX steel port of the
+            // NAX wide kernel (WN head-dim-slice warps, S exchanged once a
+            // step) — takes the head_dims the classic steel kernel cannot
+            // (one warp's whole-head O does not fit): head_dim 512 over
+            // 32-token pages, Gemma 4's global layers on M1-M4. Unconditional
+            // lookup: on M5+ the NAX kernel above keeps the class (`use_nax`
+            // prefers it); earlier GPUs run this one.
+            let steel_wide_kernel =
+                crate::steel_paged::steel_wide_paged_kernel(steel_dtype_tag, head_dim, block_size);
+            // The fused NAX or wide-steel kernel takes the hd512 global class
+            // where it has an instantiation.
             #[allow(clippy::overly_complex_bool_expr)]
             let hd512_unfused = HD512_UNFUSED_CONTINUATION_OK
                 && !sliding
                 && head_dim > 256
                 && p.rope_on_read
-                && nax_kernel.is_none();
+                && nax_kernel.is_none()
+                && steel_wide_kernel.is_none();
             let unfused = if hd512_unfused {
                 use crate::specialized_pipeline_cache::ConstantValue as CV;
                 let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
@@ -3879,8 +3890,11 @@ fn lower_one(
             // (8.5 vs 2.5). Instantiated for head_dims 64 / 128 / 256 over 16-token
             // pages (`nax_paged_kernel`); everything else falls through to the
             // simdgroup steel path below.
-            // Class head_dim: 512 has no steel instantiation, so
-            // Gemma4 global prefill auto-falls-back to SDPA-paged.
+            // Class head_dim: 512 has no CLASSIC steel instantiation (one
+            // warp's whole-head O does not fit); the WIDE steel kernel covers
+            // it over 32-token pages, so Gemma4 global prefill runs it (and
+            // anything else the wide table misses still falls back to
+            // SDPA-paged).
             let steel_symbol = steel_paged_symbol(steel_dtype_tag, head_dim);
             // Chunked-prefill long-context correctness (the launch-claude bug):
             // the steel/NAX/gqa_shared paged prefill reads pre-roped K from the
@@ -3894,21 +3908,30 @@ fn lower_one(
             // block-table width in the worker (worker.rs, the `tq_dequant_max_blocks`
             // pattern). Steel stays ON (the fast kernel).
             let use_steel =
-                (steel_symbol.is_some() || nax_kernel.is_some()) && bucket_m >= BQ_STEEL;
+                (steel_symbol.is_some() || nax_kernel.is_some() || steel_wide_kernel.is_some())
+                    && bucket_m >= BQ_STEEL;
             // Prefer the NAX kernel when its symbol is present AND steel is
             // selected. Its grid uses BQ=64 (vs steel's BQ=32); both kernels
             // share the same bindings/constants and a per-(BQ-block, q_head)
             // grid with seq on Z.
             let use_nax = use_steel && nax_kernel.is_some();
+            // The wide steel kernel is the non-NAX hd512 arm: same bindings and
+            // constants as the classic steel kernel, its own library/symbol and
+            // 512-thread grid (its BQ is 32, the classic's).
+            let use_steel_wide = use_steel && !use_nax && steel_wide_kernel.is_some();
             let bq_steel = match nax_kernel.filter(|_| use_nax) {
                 Some(nax) => nax.bq,
-                None => BQ_STEEL,
+                None => match steel_wide_kernel.filter(|_| use_steel_wide) {
+                    Some(wide) => wide.bq,
+                    None => BQ_STEEL,
+                },
             };
             // GQA-cooperative fallback selection (see the longer comment at the
             // dispatch site below). Computed early so `constants.k_scratch` (slot
             // 11) can be set when the gqa_shared kernel reads pre-roped K from
-            // the rope-once scratch. head_dim 512 (gemma4 global) has no steel
-            // instantiation → use_steel is false → this path is taken.
+            // the rope-once scratch. Taken only where no steel-family kernel has
+            // an instantiation (head_dim 512 over pages other than 32, or
+            // buckets below BQ_STEEL).
             let gqa = p.num_q_heads / num_kv_heads.max(1);
             let use_gqa_shared = !sliding
                 && !use_steel
@@ -4047,15 +4070,19 @@ fn lower_one(
                 // NAX (matrix-accelerator) wins when it has an instantiation
                 // (M5+, `nax_paged_kernel`); it shares the simdgroup steel
                 // kernel's bindings/constants and swaps the library/function
-                // pair and the thread count. Falls back to the simdgroup
+                // pair and the thread count. The WIDE steel kernel is next
+                // (pre-NAX hd512). Falls back to the simdgroup
                 // `attention_steel_paged` symbol otherwise.
                 let (library, function, threads) = match nax_kernel.filter(|_| use_nax) {
                     Some(nax) => ("attention_steel_nax_paged", nax.symbol, nax.threads),
-                    None => (
-                        "attention_steel_paged",
-                        steel_symbol.expect("steel_symbol is Some when use_steel is true"),
-                        128,
-                    ),
+                    None => match steel_wide_kernel.filter(|_| use_steel_wide) {
+                        Some(wide) => ("attention_steel_wide_paged", wide.symbol, wide.threads),
+                        None => (
+                            "attention_steel_paged",
+                            steel_symbol.expect("steel_symbol is Some when use_steel is true"),
+                            128,
+                        ),
+                    },
                 };
                 let attn_cmd = LoweredCommand {
                     kernel: KernelId::AttentionPrefillSdpaPaged,
@@ -4072,8 +4099,12 @@ fn lower_one(
                     // steel/NAX attention reads pre-roped K from the scratch;
                     // (3) its sdpa-paged twin for steps with several sequences.
                     // Pick the rope-once kernel matching the selected attention
-                    // kernel: NAX → `rope_once_nax`; simdgroup steel (hd
-                    // 64/96/128/256, incl. SmolLM hd64) → `rope_once_steel`.
+                    // kernel: NAX → `rope_once_nax`; the wide steel kernel (hd
+                    // 512, 32-token pages) → its bs32 `rope_once_steel` twin
+                    // (the classic library's is bs16 — the page sizes must
+                    // match, the scratch layout is [pages, heads, PAGE, bd]);
+                    // classic simdgroup steel (hd 64/96/128/256, incl. SmolLM
+                    // hd64) → `rope_once_steel`.
                     let (rope_kernel, rope_library, rope_sym) = if use_nax {
                         (
                             KernelId::RopeOnceNax,
@@ -4084,6 +4115,19 @@ fn lower_one(
                                 block_size,
                             )
                             .expect("rope_once_nax_symbol is Some when use_nax is true"),
+                        )
+                    } else if use_steel_wide {
+                        (
+                            KernelId::RopeOnceSteel,
+                            "attention_steel_wide_paged",
+                            crate::steel_paged::rope_once_steel_wide_symbol(
+                                steel_dtype_tag,
+                                head_dim,
+                                block_size,
+                            )
+                            .expect(
+                                "rope_once_steel_wide_symbol is Some when use_steel_wide is true",
+                            ),
                         )
                     } else {
                         (
@@ -8981,10 +9025,93 @@ mod tests {
         }
     }
 
-    /// Gemma-4's hd512 global prefill runs the unfused attention, whose kernels
-    /// read sequence 0 only, on single-sequence steps, and on the rest a paged
-    /// attention re-roping span blocks as it reads: gqa_shared at a GQA ratio it
-    /// takes, sdpa-paged otherwise. Neither needs a rope-once pair or scratch.
+    /// Gemma-4's hd512 global prefill over 32-token pages runs the simdgroup
+    /// WIDE steel kernel (the pre-NAX port of the NAX wide kernel) with its
+    /// rope-once twin at the wide kernel's page size: single-sequence steps
+    /// rope K once into the shared scratch, run the wide attention off it, and
+    /// carry a plain twin of the same kernel for multi-sequence steps without
+    /// unrotated blocks; steps holding unrotated span blocks run the sdpa-paged
+    /// kernel re-roping them (cos_sin). Both codecs keep their decode gate.
+    #[test]
+    fn hd512_global_prefill_runs_the_wide_steel_kernel() {
+        use crate::tape::lowered::RuntimeGate::{
+            OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+        };
+        use crate::tape::lowered::SeqScope;
+        for (codec, step_gate) in [
+            (KvCodec::Dense, None),
+            (KvCodec::TurboQuant(TQ_BITS), Some(UnlessDecodeStep)),
+        ]
+        .into_iter()
+        {
+            let one = RuntimeGate::and(step_gate, &[OnlyIfOneSequence]);
+            let plain_gate =
+                RuntimeGate::and(step_gate, &[UnlessOneSequence, UnlessUnrotatedBlocks]);
+            let reroping = RuntimeGate::and(step_gate, &[UnlessOneSequence, OnlyIfUnrotatedBlocks]);
+            let p = MetalModelConsts {
+                rope_on_read: true,
+                global_head_dim: 512,
+                num_global_kv_heads: 2,
+                global_block_size: 32,
+                global_rot_dim: 128,
+                kv_codec: codec,
+                ..tp()
+            };
+            let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
+            let writer = tq_writer(0, Causal, LLAMA_KV);
+            // A dense model's tape carries the layer as written; a coded one's, as the codec
+            // pass expands it.
+            let rows = match codec {
+                KvCodec::Dense => plain(&[writer, attention]),
+                KvCodec::TurboQuant(_) => coded(writer, attention),
+            };
+            let tape = lower_tq(&p, rows, 64);
+            let gated = |g: RuntimeGate| {
+                tape.commands
+                    .iter()
+                    .filter(move |c| c.gate == Some(g))
+                    .map(|c| c.command)
+            };
+            let own: Vec<_> = gated(one).collect();
+            assert_eq!(
+                own.iter().map(|c| c.kernel).collect::<Vec<_>>(),
+                [KernelId::RopeOnceSteel, KernelId::AttentionPrefillSdpaPaged],
+                "{codec:?}"
+            );
+            assert_eq!(own[0].library, "attention_steel_wide_paged");
+            assert_eq!(own[0].function, "rope_once_steel_bf16_bd512_bs32");
+            assert_eq!(own[1].library, "attention_steel_wide_paged");
+            assert_eq!(
+                own[1].function,
+                "attention_steel_wide_paged_bf16_bq32_bk32_bd512_wm2_wn8_bs32"
+            );
+            assert_eq!(own[1].dispatch.threads_per_threadgroup, (512, 1, 1));
+            assert_eq!(own[1].dispatch.threadgroups.0, 2, "bucket_m 64 / BQ 32");
+            assert!(own.iter().all(|c| c.seq_scope() == SeqScope::RowZero));
+            // The plain twin is the same wide kernel, reading the cache's
+            // roped K (no scratch).
+            assert_eq!(
+                gated(plain_gate).map(|c| c.function).collect::<Vec<_>>(),
+                [own[1].function],
+                "{codec:?}"
+            );
+            assert_eq!(
+                gated(reroping).map(|c| c.function).collect::<Vec<_>>(),
+                ["attention_prefill_sdpa_v2_paged_bf16_specialized"],
+                "{codec:?}"
+            );
+            // The rope-once scratch is sized (per-sequence block capacity),
+            // not zero: the wide path reads pre-roped K from it.
+            assert!(tape.roped_k_scratch_bytes > 0);
+        }
+    }
+
+    /// head_dim 512 over pages the wide kernel is NOT instantiated for (16)
+    /// keeps the unfused attention fallback: its kernels read sequence 0 only,
+    /// on single-sequence steps, and on the rest a paged attention re-roping
+    /// span blocks as it reads: gqa_shared at a GQA ratio it takes, sdpa-paged
+    /// otherwise. Neither needs a rope-once pair or scratch.
     #[test]
     fn hd512_unfused_prefill_runs_only_for_one_sequence() {
         use crate::tape::lowered::RuntimeGate::{
@@ -9009,7 +9136,7 @@ mod tests {
                 rope_on_read: true,
                 global_head_dim: 512,
                 num_global_kv_heads: kv_heads,
-                global_block_size: 32,
+                global_block_size: 16,
                 global_rot_dim: 128,
                 kv_codec: codec,
                 ..tp()

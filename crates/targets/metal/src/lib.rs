@@ -98,6 +98,56 @@ pub mod steel_paged {
         pub bq: u32,
     }
 
+    /// The simdgroup (pre-NAX) WIDE paged attention instantiated for a (dtype, head_dim, page
+    /// size), in `attention_steel_wide_paged.metal` — the steel port of `attention_nax_paged_wide`
+    /// (WN head-dim-slice warps a 16-row Q block, S exchanged once a step, Q/K/V fragments straight
+    /// from device) for head_dims one warp's whole-head O cannot hold on GPUs without the matrix
+    /// accelerator: head_dim 512 over 32-token pages (Gemma 4's global layers on M1-M4). `None`
+    /// sends the dispatcher to the unfused / SDPA path.
+    pub fn steel_wide_paged_kernel(
+        dtype_tag: &str,
+        head_dim: u32,
+        block_size: u32,
+    ) -> Option<NaxPagedKernel> {
+        let at = |symbol, threads, bq| {
+            Some(NaxPagedKernel {
+                symbol,
+                threads,
+                bq,
+            })
+        };
+        match (dtype_tag, head_dim, block_size) {
+            ("f16", 512, 32) => at(
+                "attention_steel_wide_paged_f16_bq32_bk32_bd512_wm2_wn8_bs32",
+                512,
+                32,
+            ),
+            ("bf16", 512, 32) => at(
+                "attention_steel_wide_paged_bf16_bq32_bk32_bd512_wm2_wn8_bs32",
+                512,
+                32,
+            ),
+            _ => None,
+        }
+    }
+
+    /// MSL symbol for the spans rope-once kernel at the WIDE steel kernel's page size
+    /// (`rope_once_steel` at bs32, from `attention_steel_wide_paged.metal`). The
+    /// `rope_once_steel_symbol` rows are bs16 (the classic kernel's 16-token pages); the
+    /// wide kernel runs on 32-token pages, so its rope twin is instantiated separately at
+    /// the same (dtype, head_dim, page) combos as `steel_wide_paged_kernel`.
+    pub fn rope_once_steel_wide_symbol(
+        dtype_tag: &str,
+        head_dim: u32,
+        block_size: u32,
+    ) -> Option<&'static str> {
+        match (dtype_tag, head_dim, block_size) {
+            ("f16", 512, 32) => Some("rope_once_steel_f16_bd512_bs32"),
+            ("bf16", 512, 32) => Some("rope_once_steel_bf16_bd512_bs32"),
+            _ => None,
+        }
+    }
+
     /// MSL symbol for the spans rope-once kernel (`rope_once_nax`), which
     /// ropes a request's K ONCE into the dense scratch so the NAX attention
     /// reads pre-roped K with no per-tile rotation. Lives in the same
