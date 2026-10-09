@@ -123,14 +123,18 @@ pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
     pick_qmv_kernel_wide(n, k, bits, 1, false)
 }
 
+/// The rows an `affine_qmv_fast` threadgroup takes: its 2 simdgroups × the shader's
+/// `QMV_FAST_ROWS` (2; MLX's tile is 8).
+pub const QMV_FAST_TILE_ROWS: u32 = 4;
+
 /// Threadgroup grid + threads-per-group for a picked qmv variant.
 ///
 /// `qmv_quad`: `bn = quads_per_simd * results_per_quadgroup = 8 * 8 = 64`
 /// (`quantized.cpp:193-198`); group is one simdgroup
 /// (`(simdgroup_size=32, 1, 1)`).
 ///
-/// `qmv` / `qmv_fast`: `bn = 8`, `bk = 32`, group `(bk=32, 2, 1)` —
-/// 2 simdgroups (`quantized.cpp:251-254`).
+/// `qmv`: `bn = 8`, `bk = 32`, group `(bk=32, 2, 1)` — 2 simdgroups (`quantized.cpp:251-254`);
+/// `qmv_fast` the same group over [`QMV_FAST_TILE_ROWS`].
 pub fn qmv_dispatch_shape(
     kernel: QmvKernel,
     m: u32,
@@ -142,10 +146,8 @@ pub fn qmv_dispatch_shape(
             let bn: u32 = 64;
             ((m, n.div_ceil(bn), b), (32, 1, 1))
         }
-        QmvKernel::Fast | QmvKernel::Generic => {
-            let bn: u32 = 8;
-            ((m, n.div_ceil(bn), b), (32, 2, 1))
-        }
+        QmvKernel::Fast => ((m, n.div_ceil(QMV_FAST_TILE_ROWS), b), (32, 2, 1)),
+        QmvKernel::Generic => ((m, n.div_ceil(8), b), (32, 2, 1)),
         QmvKernel::Wide { nv } => {
             // quantized.cpp:559-571: rows_per_tg = (32 / k_lanes=8) × 2
             // simdgroups = 8; group (32, 2, 1); grid
@@ -1147,12 +1149,12 @@ mod tests {
         assert_eq!((tx, ty, tz), (1, 2048u32.div_ceil(64), 1));
         assert_eq!((gx, gy, gz), (32, 1, 1));
 
-        // qmv_fast: bn = 8
+        // qmv_fast: 4-row threadgroups of 2 simdgroups
         let ((tx, ty, tz), (gx, gy, gz)) = qmv_dispatch_shape(QmvKernel::Fast, 1, 2048, 1);
-        assert_eq!((tx, ty, tz), (1, 2048u32.div_ceil(8), 1));
+        assert_eq!((tx, ty, tz), (1, 2048 / 4, 1));
         assert_eq!((gx, gy, gz), (32, 2, 1));
 
-        // qmv_generic shares qmv_fast's grid
+        // qmv_generic: bn = 8
         let ((tx, ty, tz), _) = qmv_dispatch_shape(QmvKernel::Generic, 1, 2049, 1);
         assert_eq!((tx, ty, tz), (1, 2049u32.div_ceil(8), 1));
     }

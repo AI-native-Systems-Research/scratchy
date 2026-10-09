@@ -38,6 +38,9 @@ using namespace metal;
 
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
+// Rows a simdgroup of the one-row `affine_qmv_fast` (MLX's 4): its 4-row threadgroups
+// (`QMV_FAST_TILE_ROWS`) put twice MLX's simdgroups on each matrix's weight stream.
+MLX_MTL_CONST int QMV_FAST_ROWS = 2;
 
 // ─────────────────────────────────────────────────────────────────
 // `AffineQmvConstants`, compiled in: the K/N dims MLX passes as
@@ -675,11 +678,12 @@ METAL_FUNC void qmv_quad_impl(
 }
 
 // ─────────────────────────────────────────────────────────────────
-// qmv_fast_impl — quantized.h:749-814
+// qmv_fast_impl — quantized.h:749-814, `results_per_simdgroup` rows a simdgroup (MLX's 4): a row
+// takes the same bits at 4 and 2 (`QMV_FAST_ROWS`); at 1 the compiler rounds some rows apart.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T_act, typename T_scale, int group_size, int bits,
-          typename Y = device T_act*>
+          typename Y = device T_act*, int results_per_simdgroup = 4>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T_scale* scales,
@@ -695,7 +699,6 @@ METAL_FUNC void qmv_fast_impl(
     const device T_act* bias = nullptr) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
@@ -1073,19 +1076,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
         b_strides,
         tid);
   }
-  qmv_fast_impl<T_act, T_scale, group_size, bits>(
-      w,
-      scales,
-      biases,
-      x,
-      y,
-      IN_VEC_SIZE,
-      OUT_VEC_SIZE,
-      tid,
-      simd_gid,
-      simd_lid,
-      gain,
-      bias);
+  qmv_fast_impl<T_act, T_scale, group_size, bits, device T_act*, QMV_FAST_ROWS>(
+      w, scales, biases, x, y, IN_VEC_SIZE, OUT_VEC_SIZE, tid, simd_gid, simd_lid, gain, bias);
 }
 
 // ─────────────────────────────────────────────────────────────────

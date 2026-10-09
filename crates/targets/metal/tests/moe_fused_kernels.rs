@@ -853,7 +853,15 @@ fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
         .collect();
     let x = common::shared_slice(device, &rng.bf16s(k_in, -1.0, 1.0));
     let y = common::shared_zeroed(device, n_out * 2);
-    let fast = scratchy_target_metal::tape::quantized::qmv_fast_covers(n_out as u32, k_in as u32);
+    use scratchy_target_metal::tape::quantized::{QmvKernel, qmv_dispatch_shape, qmv_fast_covers};
+    let fast = qmv_fast_covers(n_out as u32, k_in as u32);
+    let kernel = if fast {
+        QmvKernel::Fast
+    } else {
+        QmvKernel::Generic
+    };
+    let ((_, row_groups, _), (lanes, simdgroups, _)) =
+        qmv_dispatch_shape(kernel, 1, n_out as u32, 1);
     let fast = if fast { "_fast" } else { "" };
     let name = format!("affine_qmv{fast}_bf16_s_bf16_gs_64_b_4_batch_0");
     let constants = AffineQmvConstants {
@@ -867,8 +875,8 @@ fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
         vec![Dispatch {
             pso: &pso,
             buffers: vec![(w, 0), (s, 1), (b, 2), (&x, 3), (&y, 4)],
-            groups: size(1, n_out.div_ceil(8), 1),
-            threads: size(32, 2, 1),
+            groups: size(1, row_groups as usize, 1),
+            threads: size(lanes as usize, simdgroups as usize, 1),
         }]
     })
 }
