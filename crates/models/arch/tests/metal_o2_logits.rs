@@ -739,6 +739,13 @@ o2_cases! {
     // sanity anchor for the same arch (YaRN rope, attention sinks, biased
     // router, SwiGLU-OAI experts with per-expert linear biases).
     "gpt-oss-120b" => o2_gpt_oss_120b_mlx("jesusoctavioas/gpt-oss-120b-mlx-2Bit", Sampled);
+    // gpt-oss 120b "proper" 3-bit (scratchery/gpt-oss-120b-3bit): experts at
+    // b3/g64 with attention 4, router 8, embed/lm_head 4 — the mixed-width
+    // recipe the uniform-2-bit ablation convicted. The 2-bit-experts leg of
+    // this same recipe is coherent at 20b (32 experts) but token soup at 120b
+    // (128-expert pool), so 3 is the expert floor at this scale; the mlx-lm
+    // control generates clean harmony reasoning from this checkpoint.
+    "gpt-oss-120b" => o2_gpt_oss_120b_3bit_mlx("scratchery/gpt-oss-120b-3bit", Sampled);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx_long("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_LONG_PROMPTS @ GPT_OSS_LONG_BUCKET_CAP);
     "gpt-oss-20b" => o2_gpt_oss_20b_mlx_window("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Sampled, GPT_OSS_WINDOW_PROMPTS @ GPT_OSS_WINDOW_BUCKET_CAP);
