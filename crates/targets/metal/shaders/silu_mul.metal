@@ -83,3 +83,29 @@ template <typename T>
 
 INST_GELU_MUL(f16,  half)
 INST_GELU_MUL(bf16, bfloat)
+
+// gpt-oss SwiGLU-OAI sibling (`swiglu_oai_mul_f` in gated_act.h): the
+// clamped affine activation OpenAI ships instead of SiLU. Same three
+// instructions as the SwiGLU decomposition, with the OAI act as the
+// elementwise tail — the decomposed fallback of a bake whose gate/up fold
+// did not fuse (the fused path is `affine_gather_qmv_gated`'s
+// GATED_ACT == 2 epilogue).
+template <typename T>
+[[kernel]] void swiglu_oai_mul(
+    device       T* out  [[buffer(0)]],
+    const device T* gate [[buffer(1)]],
+    const device T* up   [[buffer(2)]],
+    const device uint* row_expert [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (silu_mul_skips(row_expert, gid)) {
+    return;
+  }
+  out[gid] = static_cast<T>(swiglu_oai_mul_f(float(gate[gid]), float(up[gid])));
+}
+
+#define INST_SWIGLU_OAI_MUL(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(swiglu_oai_mul_##dtype_tag, swiglu_oai_mul<mtl_type>)
+
+INST_SWIGLU_OAI_MUL(f16,  half)
+INST_SWIGLU_OAI_MUL(bf16, bfloat)

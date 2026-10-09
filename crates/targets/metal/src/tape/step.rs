@@ -516,6 +516,11 @@ pub enum RoutePre {
     /// `noaux_tc` at `n_group = 1`). The bias, layer `l`'s router bundle's F32 tensor, is
     /// read back by the route command like the router gate.
     SigmoidBias(LayerId),
+    /// The router's linear bias added to its logits in F32 (gpt-oss): the biased values order
+    /// the top-k picks AND are read back as the scores — a softmax over the top-k then
+    /// normalizes them. The bias, layer `l`'s router bundle's F32 tensor (converted from the
+    /// checkpoint's BF16 at load), is read back by the route command like the router gate.
+    Bias(LayerId),
 }
 
 impl RoutePre {
@@ -523,7 +528,7 @@ impl RoutePre {
     pub fn layer(&self) -> Option<LayerId> {
         match *self {
             Self::None | Self::Softmax => None,
-            Self::SigmoidBias(l) => Some(l),
+            Self::SigmoidBias(l) | Self::Bias(l) => Some(l),
         }
     }
 }

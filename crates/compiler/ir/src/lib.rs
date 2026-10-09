@@ -233,6 +233,29 @@ pub trait WeightAccessors {
     ) -> &::scratchy_quantizations::AffineQuantEmbedding {
         unreachable!("affine_quant_embedding_at not implemented for this arch")
     }
+    /// gpt-oss attention sinks: the per-layer
+    /// `[num_attention_heads]` plain dense sink-logit tensor.
+    fn sinks_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> ::scratchy_tensors::tensor::GpuTensor {
+        unreachable!("sinks_at not implemented for this arch")
+    }
+    /// Metal-only: gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`) —
+    /// affine router gate + F32 router bias + pre-stacked affine experts +
+    /// per-expert SwiGLU-OAI linear biases under one layer struct.
+    fn gpt_oss_moe_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::scratchy_layers::layers_moe::GptOssMoELayer {
+        unreachable!("gpt_oss_moe_at not implemented for this arch")
+    }
 }
 
 /// Universal opcode set. Tuple variants throughout — keeps each

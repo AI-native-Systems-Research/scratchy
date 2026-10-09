@@ -994,9 +994,31 @@ inline constexpr short get_bytes_per_pack() {
 template <typename Tdst, typename Tsc, int N, int bits, bool offset8 = false>
 inline void
 dequantize(const device uint8_t* w, Tdst scale, Tdst bias, threadgroup Tdst* w_local) {
-  static_assert(bits == 3 || bits == 4 || bits == 8, "NAX dequantize: bits in {3,4,8}");
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 8,
+      "NAX dequantize: bits in {2,3,4,8}");
 
-  if (bits == 3) {
+  if (bits == 2) {
+    // Continuous LSB-first bitstream: element i's 2 code bits live at bit
+    // offset 2*i of the (little-endian) byte array — 4 codes per byte,
+    // none straddling (2 divides 8), every 4-code run byte-anchored.
+    // Verbatim MLX `qdot` bits==2 law (quantized_loader.h:50-62): the
+    // masks stay in place (0x0c is 4·q, 0x30 is 16·q, 0xc0 is 64·q) and
+    // the scale divides instead. No XOR path — offset8 is 4-bit-only.
+    Tdst s[4] = {
+        scale,
+        scale / static_cast<Tdst>(4.0f),
+        scale / static_cast<Tdst>(16.0f),
+        scale / static_cast<Tdst>(64.0f)};
+    for (int i = 0; i < (N / 4); i++) {
+      w_local[4 * i] = s[0] * (w[i] & 0x03) + bias;
+      w_local[4 * i + 1] = s[1] * (w[i] & 0x0c) + bias;
+      w_local[4 * i + 2] = s[2] * (w[i] & 0x30) + bias;
+      w_local[4 * i + 3] = s[3] * (w[i] & 0xc0) + bias;
+    }
+  }
+
+  else if (bits == 3) {
     // Continuous LSB-first bitstream: 8 codes span exactly 3 bytes, and
     // every 8-code run is byte-anchored (group_size is a multiple of 8).
     // Shifts are MLX's own `qdot` bits==3 branch (quantized.h:47-76); no
@@ -1150,7 +1172,9 @@ struct QuantizedBlockLoader {
   static_assert(
       group_size % BCOLS == 0,
       "The group size should be divisible by the columns");
-  static_assert(bits == 3 || bits == 4 || bits == 8, "NAX loader: bits in {3,4,8}");
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 8,
+      "NAX loader: bits in {2,3,4,8}");
 
   STEEL_CONST short pack_factor = get_pack_factor<bits, 8>();
   STEEL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();

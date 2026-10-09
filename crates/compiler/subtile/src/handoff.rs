@@ -63,6 +63,12 @@ pub enum WeightKind {
     /// Gemma-4 SwitchGLU experts bundle (`ExpertBundle::SwitchGlu`) — resolves to
     /// `WeightAccessors::gemma_switch_glu_at` → `&SwitchGluExpertsLayer`.
     GemmaSwitchGlu,
+    /// gpt-oss's whole MoE bundle (`RouterBundle::GptOss` /
+    /// `ExpertBundle::GptOss`): the biased router, the SwiGLU-OAI
+    /// expert stacks and their per-expert linear biases under one
+    /// `mlp[layer]` base — resolves to
+    /// `WeightAccessors::gpt_oss_moe_at` → `&GptOssMoELayer`.
+    GptOssMoe,
     /// Gated-DeltaNet per-layer weight bundle — resolves to
     /// `WeightAccessors::gated_delta_net_at`.
     GatedDeltaNet,
@@ -70,6 +76,11 @@ pub enum WeightKind {
     /// Metal-only: MLX-affine int4 quantized embedding. Resolves to
     /// `WeightAccessors::affine_quant_embedding_at`.
     AffineQuantEmbedding,
+    /// Per-layer attention-sink logits (`[num_attention_heads]`,
+    /// dense, never quantized — gpt-oss). An extra softmax column
+    /// added unscaled after qk·sm_scale; the sink column is dropped
+    /// before the ·V accumulation.
+    AttnSinks,
 }
 
 /// Compile-time mapping from `(TileId, output_slot)` → flat slot
@@ -264,9 +275,13 @@ impl WeightKind {
             Self::SharedFusedMoe => "&crate::__gpu::layers_moe::SharedFusedMoELayer",
             Self::GemmaRouter => "&crate::__gpu::layers_moe::GemmaRouterLayer",
             Self::GemmaSwitchGlu => "&crate::__gpu::layers_moe::SwitchGluExpertsLayer",
+            Self::GptOssMoe => "&crate::__gpu::layers_moe::GptOssMoELayer",
             // NOTE: no leading `&` — this one is passed by value.
             Self::CosSin => "crate::__gpu::tensor::GpuTensor",
             Self::AffineQuantEmbedding => "&crate::__gpu::layers::AffineQuantEmbedding",
+            // NOTE: no leading `&` — a per-layer plain dense
+            // `[num_heads]` GpuTensor, taken verbatim at load.
+            Self::AttnSinks => "crate::__gpu::tensor::GpuTensor",
         }
     }
 }

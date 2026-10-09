@@ -257,6 +257,11 @@ pub enum KernelId {
     /// decomposed GeGLU q-MLP path (Gemma2/3/4). Maps to
     /// `gelu_mul_<dtype>` in `silu_mul.metallib`.
     GeluMul,
+    /// gpt-oss SwiGLU-OAI sibling of [`KernelId::SiluMul`] for the
+    /// decomposed gpt-oss MoE expert tail (the fused path is
+    /// `MoeGateUpAct`'s `GATED_ACT == 2` epilogue). Maps to
+    /// `swiglu_oai_mul_<dtype>` in `silu_mul.metallib`.
+    SwigluOaiMul,
     /// Qwen3.5 attention output gate `out = attn * sigmoid(gate)`. Maps
     /// to `gate_apply_<dtype>` in `gate_apply.metallib`.
     GateApply,
@@ -540,6 +545,7 @@ impl KernelId {
             | Self::Nvfp4QmmTNax
             | Self::SiluMul
             | Self::GeluMul
+            | Self::SwigluOaiMul
             | Self::GateApply
             | Self::GateScale
             | Self::GateSplit
@@ -890,6 +896,10 @@ pub enum SourceRef<'w> {
     Linear(&'w scratchy_layers::LinearLayer),
     /// A RoPE table's packed cos/sin cache (layer-independent).
     CosSin(scratchy_tensors::tensor::GpuTensor),
+    /// gpt-oss attention sinks: the per-layer `[num_attention_heads]`
+    /// plain dense sink-logit tensor (the single tensor of its bundle,
+    /// read through [`WeightTensor::Weight`] like [`Self::CosSin`]).
+    AttnSinks(scratchy_tensors::tensor::GpuTensor),
     /// Mixtral-style MoE: dense router + packed per-expert slabs.
     FusedMoe(&'w scratchy_layers::layers_moe::FusedMoELayer),
     /// Qwen-style MoE with an optional shared expert.
@@ -898,6 +908,9 @@ pub enum SourceRef<'w> {
     GemmaRouter(&'w scratchy_layers::layers_moe::GemmaRouterLayer),
     /// Gemma-4 SwitchGLU experts (router-less).
     GemmaSwitchGlu(&'w scratchy_layers::layers_moe::SwitchGluExpertsLayer),
+    /// gpt-oss MoE (biased router + SwiGLU-OAI experts with per-expert
+    /// linear biases).
+    GptOssMoe(&'w scratchy_layers::layers_moe::GptOssMoELayer),
     /// Qwen3.5 Gated-DeltaNet per-layer weights.
     GatedDeltaNet(&'w scratchy_layers::GatedDeltaNetLayer),
 }
@@ -910,7 +923,10 @@ impl SourceRef<'_> {
         match self {
             Self::Linear(scratchy_layers::LinearLayer::AffineQuant(_))
             | Self::AffineQuantEmbedding(_) => which == T::Weight,
-            Self::FusedMoe(_) | Self::SharedFusedMoe(_) | Self::GemmaSwitchGlu(_) => matches!(
+            Self::FusedMoe(_)
+            | Self::SharedFusedMoe(_)
+            | Self::GemmaSwitchGlu(_)
+            | Self::GptOssMoe(_) => matches!(
                 which,
                 T::MoeExpertGateW
                     | T::MoeExpertUpW
@@ -950,6 +966,7 @@ impl SourceRef<'_> {
             (Self::LayerNorm(n), T::Weight) => Some(n.weight),
             (Self::LayerNorm(n), T::Bias) => n.bias,
             (Self::CosSin(t), T::Weight) => Some(t),
+            (Self::AttnSinks(t), T::Weight) => Some(t),
             (Self::Linear(l @ L::Dense(_)), T::Weight) => Some(l.dense_weight()),
             (Self::Linear(l @ L::Dense(_)), T::Bias) => l.dense_bias(),
             (Self::Linear(l @ L::AffineQuant(_)), T::Weight) => Some(l.affine_weight()),
@@ -975,6 +992,22 @@ impl SourceRef<'_> {
             (Self::GemmaSwitchGlu(e), T::MoeExpertDownS) => Some(e.expert_down_scales),
             (Self::GemmaSwitchGlu(e), T::MoeExpertDownB) => Some(e.expert_down_biases),
             (Self::FusedMoe(F::Affine(a)), _) => routed(a),
+            (Self::GptOssMoe(g), _) => match which {
+                T::MoeRouterGate => Some(g.router_gate),
+                T::MoeRouterBias => Some(g.router_bias),
+                T::MoeExpertGateW => Some(g.expert_gate_w),
+                T::MoeExpertGateS => Some(g.expert_gate_scales),
+                T::MoeExpertGateB => Some(g.expert_gate_biases),
+                T::MoeExpertUpW => Some(g.expert_up_w),
+                T::MoeExpertUpS => Some(g.expert_up_scales),
+                T::MoeExpertUpB => Some(g.expert_up_biases),
+                T::MoeExpertDownW => Some(g.expert_down_w),
+                T::MoeExpertDownS => Some(g.expert_down_scales),
+                T::MoeExpertDownB => Some(g.expert_down_biases),
+                T::MoeExpertGateUpLinearBias => Some(g.gate_up_linear_bias),
+                T::MoeExpertDownLinearBias => Some(g.down_linear_bias),
+                _ => None,
+            },
             (Self::SharedFusedMoe(Sh::Affine(s)), _) => match which {
                 T::MoeSharedGateUpW => s.shared_gate_up_w,
                 T::MoeSharedGateUpS => s.shared_gate_up_scales,
@@ -1097,8 +1130,20 @@ pub enum WeightTensor {
     /// `[num_experts]` F32 `e_score_correction_bias` on a sigmoid-routed
     /// MoE (GLM-4 / DeepSeek-V3 `noaux_tc`). Valid against the
     /// `SourceRef::SharedFusedMoe` bundle; the route command reads it as
-    /// its 4th buffer (the gathered expert kernels' 13th).
+    /// its 4th buffer (the gathered expert kernels' 13th). Also the
+    /// gpt-oss router's linear bias (BF16→F32 at load, read as the
+    /// route command's 4th buffer and the gathered kernels' 13th).
     MoeRouterBias,
+    /// gpt-oss experts: dense `[E, 2*intermediate]` per-expert gate/up
+    /// LINEAR biases (gate rows then up rows), added by the gate/up
+    /// gather kernel (`affine_gather_qmv_gated`'s buffer 14). Valid only
+    /// against the `SourceRef::GptOssMoe` bundle.
+    MoeExpertGateUpLinearBias,
+    /// gpt-oss experts: dense `[E, hidden]` per-expert down-proj LINEAR
+    /// biases, added by the down/combine gather kernel
+    /// (`affine_gather_qmv_combine`'s buffer 10). Valid only against the
+    /// `SourceRef::GptOssMoe` bundle.
+    MoeExpertDownLinearBias,
     // ── Gated-DeltaNet bundle tensors ───────────────────────────────
     //
     // Valid only against the `SourceRef::GatedDeltaNet` bundle.

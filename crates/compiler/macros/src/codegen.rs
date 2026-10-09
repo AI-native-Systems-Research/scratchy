@@ -282,6 +282,12 @@ enum FieldLoad {
     /// only; fused-concat raw-linear isn't a real PyTorch shape and would
     /// be a manifest authoring error.
     RawLinear(String),
+    /// gpt-oss attention sinks: the per-layer `[num_attention_heads]`
+    /// plain dense GpuTensor, read verbatim via `gw.take` (the
+    /// on-disk key is `<prefix>` itself — an `nn.Parameter`, like
+    /// [`Self::RawLinear`]). Layered by construction (one per layer);
+    /// never quantized, so [`affine_tensors_of`] lists no row for it.
+    AttnSinks(String),
     /// The model has `tie_word_embeddings: true`: `lm_head` shares
     /// its weight with `embed_tokens`. No safetensors read — build
     /// the `LinearLayer` from the already-loaded embedding field
@@ -454,6 +460,28 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
     },
+    /// gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`). Dispatches
+    /// to `GptOssMoELayer::load` (metal-only). One bundle carries the
+    /// affine router gate at `{prefix}.router` (dequantized at
+    /// `gate_bits` — gpt-oss-2Bit quantizes the router at the preset's
+    /// own width), the F32 router bias, the pre-stacked affine experts,
+    /// and the per-expert SwiGLU-OAI linear biases.
+    GptOssMoe {
+        prefix: String,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        /// `Some((group_size, bits))` when the experts are MLX-affine —
+        /// the only storage with a metal realization. `None` tolerated
+        /// for the dense/verbatim config (never runtime-selected).
+        affine: Option<(u32, u32)>,
+        /// Router `{prefix}.router` dequant bit-width, resolved through
+        /// `affine_role_bits` like every other affine role — see
+        /// [`FieldLoad::FusedMoe::gate_bits`]. The gpt-oss path names the
+        /// gate `router`, not `gate`.
+        gate_bits: Option<u32>,
+    },
 }
 
 /// The MLX-affine `.weight` tensors this field load will read, each paired with
@@ -474,19 +502,20 @@ enum FieldLoad {
 /// Only tensors whose width this function can state are listed. Unlisted
 /// tensors are simply not checked.
 ///
-/// ⚠️ ACCEPTED RESIDUAL RISK: the routed-expert stacks are NOT listed.
-/// `switch_mlp.{gate,up,down}_proj`, Mixtral's `w1/w2/w3` and
-/// `GemmaSwitchGlu`'s sub-leaves are named inside the backend loaders, not
-/// here, so this function cannot state their on-disk paths without duplicating
-/// that naming — which is the duplication the whole design exists to remove.
-/// The consequence is explicit: the expert-bit axis has NO fingerprint
-/// coverage, so a #202-class divergence in EXPERT widths (rather than the
-/// router gates') would still mis-select and surface down in the dequant path,
-/// and `load_stacked_experts`' pre-stacked `take()` validates no width against
-/// expected geometry either. No in-tree checkpoint diverges that way today —
-/// the two qwen3.5/3.6 checkpoints agree on expert bits and differ only in the
-/// gates. Closing it means teaching the macro those per-arch leaf names (or
-/// having the loaders report them), which is a design call of its own.
+/// ⚠️ RESIDUAL RISK, now scoped: the routed-expert stacks of the SHARED MoE
+/// bundles are NOT listed. `switch_mlp.{gate,up,down}_proj`, Mixtral's
+/// `w1/w2/w3` and `GemmaSwitchGlu`'s sub-leaves are named inside the backend
+/// loaders, not here, so this function cannot state their on-disk paths
+/// without duplicating that naming — which is the duplication the whole
+/// design exists to remove. The consequence is explicit: for those bundles
+/// the expert-bit axis has NO fingerprint coverage, so a #202-class
+/// divergence in EXPERT widths (rather than the router gates') would still
+/// mis-select and surface down in the dequant path. No in-tree pair of
+/// presets for those arches agrees on every listed width while differing in
+/// expert bits, so the omission cannot bite today. `GptOssMoe` DOES list its
+/// expert stacks (the macro states those leaf names — see the arm): its
+/// b2-attn4/b3-attn4 preset pair agrees on attention, router and embed
+/// widths and differs ONLY in expert bits, so the rows are load-bearing.
 fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
     let one = |p: &str, bits: u32, gs: u32| vec![(format!("{p}.weight"), bits, gs)];
     match fl {
@@ -539,6 +568,32 @@ fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
             bits,
             ..
         } => one(&format!("{prefix}.proj"), *bits, *group_size),
+        // gpt-oss router gate: `gate_bits` is what the load call dequantizes
+        // `{prefix}.router` at. The expert stacks under `{prefix}.experts`
+        // ARE listed — unlike the other MoE bundles, the macro states their
+        // on-disk leaf names here because it constructs the very load call
+        // that reads them. They are not optional: the b2-attn4 and b3-attn4
+        // presets agree on every OTHER fingerprinted width (attention 4,
+        // router 8, embed/lm_head 4), so the expert bits are the only row
+        // that separates the two variants — without it whichever variant is
+        // consulted first claims the other's checkpoint and dies in the
+        // loader's packed-width assert (#316).
+        FieldLoad::GptOssMoe {
+            prefix,
+            affine: Some((group_size, expert_bits)),
+            gate_bits: Some(gate_bits),
+            ..
+        } => {
+            let mut rows = one(&format!("{prefix}.router"), *gate_bits, *group_size);
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                rows.push((
+                    format!("{prefix}.experts.{proj}.weight"),
+                    *expert_bits,
+                    *group_size,
+                ));
+            }
+            rows
+        }
         _ => Vec::new(),
     }
 }
@@ -792,6 +847,9 @@ fn plan_field_load(
     let is_gemma_switch_glu = ty.ends_with("::SwitchGluExpertsLayer")
         || ty == "SwitchGluExpertsLayer"
         || ty.ends_with("layers_moe::SwitchGluExpertsLayer");
+    let is_gpt_oss_moe = ty.ends_with("::GptOssMoELayer")
+        || ty == "GptOssMoELayer"
+        || ty.ends_with("layers_moe::GptOssMoELayer");
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
@@ -813,6 +871,13 @@ fn plan_field_load(
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_layer_norm =
         ty.ends_with("::LayerNorm") || ty == "LayerNorm" || ty.ends_with("layers::LayerNorm");
+    // gpt-oss attention sinks: a bare `GpuTensor` field. The rotary
+    // (`WeightKind::CosSin`) is the only other GpuTensor on a Weights
+    // struct and is planted directly by `emit_weights_struct`, never
+    // through this walk — so a GpuTensor-typed accessor here is the
+    // sinks.
+    let is_attn_sinks =
+        ty.ends_with("::GpuTensor") || ty == "GpuTensor" || ty.ends_with("tensor::GpuTensor");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
     let is_marlin = ty.ends_with("::MarlinLinear")
@@ -1414,6 +1479,90 @@ fn plan_field_load(
         };
     }
 
+    if is_gpt_oss_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "GptOssMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let num_experts = v
+            .get("num_local_experts")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("num_local_experts")
+                    .copied()
+                    .unwrap_or(128) as usize
+            });
+        let top_k = v
+            .get("num_experts_per_tok")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("num_experts_per_tok")
+                    .copied()
+                    .unwrap_or(4) as usize
+            });
+        let intermediate_size = model
+            .bounds
+            .get("intermediate_size")
+            .copied()
+            .unwrap_or(2880) as usize;
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2880) as usize;
+        // Op-keyed arm (the `GptOssMoe` op selects it), so like GemmaSwitchGlu
+        // it MUST tolerate the Dense/verbatim config and default its storage
+        // params rather than panic — that config never becomes the
+        // runtime-selected specialization on metal.
+        let only_src = accessor.source_weights[0].0;
+        let only_idx = accessor.source_weights[0].1;
+        let affine = match crate::quantization::storage_format_for_weight(
+            program, fuf, only_src, only_idx, model,
+        ) {
+            crate::quantization::StorageFormat::Affine { group_size, bits } => {
+                Some((group_size, bits))
+            }
+            _ => None,
+        };
+        // Router gate bit-width at the gpt-oss path `{prefix}.router`
+        // (NOT `.gate`): `affine_role_bits` honors preset `bits_overrides`
+        // and MLX per-module maps alike; falls back to the expert bits
+        // (the jesusoctavioas 2-bit checkpoint quantizes the router at
+        // the preset's own width, so the fallback is the live path).
+        let gate_bits = affine.map(|(_, expert_bits)| {
+            let router_path = format!("{prefix}.router");
+            model
+                .quantization
+                .as_ref()
+                .and_then(|qc| {
+                    crate::quantization::affine_role_bits(
+                        program,
+                        &qc.method,
+                        &router_path,
+                        only_idx,
+                    )
+                })
+                .unwrap_or(expert_bits)
+        });
+        return FieldLoad::GptOssMoe {
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            affine,
+            gate_bits,
+        };
+    }
+
     if is_deepseek_v2_moe {
         assert_eq!(
             prefixes.len(),
@@ -1521,6 +1670,17 @@ fn plan_field_load(
             prefixes.len(),
         );
         return FieldLoad::GatedDeltaNet(prefixes.into_iter().next().unwrap());
+    }
+
+    if is_attn_sinks {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "AttnSinks accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        return FieldLoad::AttnSinks(prefixes.into_iter().next().unwrap());
     }
 
     if is_embedding || is_affine_quant_embedding {
@@ -2689,6 +2849,7 @@ fn emit_fingerprint_check(
     let embed_expects_packed: bool = match model.quantization.as_ref().map(|qc| &qc.method) {
         Some(crate::quantization::QuantMethod::Affine {
             quantize_embed,
+            bits_overrides,
             per_module,
             ..
         }) => {
@@ -2699,9 +2860,15 @@ fn emit_fingerprint_check(
             // shape, never matches the real 8-bit-packed embed, and OptiQ is
             // forced onto the preset hybrid variant. `storage_format_for_weight`
             // already quantizes the embed in that case; keep the two in agreement.
+            // A `bits_overrides` entry naming the embed implies packed the same
+            // way (gpt-oss's proper low-bit recipes ship a 4-bit embed over a
+            // 2/3-bit default) — same agreement, same reason.
             model.tie_word_embeddings
                 || *quantize_embed
                 || per_module.iter().any(|(k, _)| k.ends_with("embed_tokens"))
+                || bits_overrides
+                    .iter()
+                    .any(|(s, _)| s.ends_with("embed_tokens"))
         }
         _ => false,
     };
@@ -2800,8 +2967,29 @@ pub(crate) enum WeightsEmitMode<'a> {
     Shim { canonical: &'a Ident },
 }
 
+/// The affine rows a variant's fingerprint gate should carry. A shim's
+/// `load` delegates to its canonical's body, where the affine
+/// bit-widths are baked in — and on metal the shim's own accessor set
+/// is ISel's, which is empty there, so a rowless shim would otherwise
+/// gate on nothing and select anything. A shim with no rows of its own
+/// inherits its canonical's; own rows always win when present (cuda
+/// runs ISel, so the shim's own recipe is what its load reads there).
+fn effective_fingerprint_rows<'a>(
+    mode: &WeightsEmitMode<'_>,
+    own: &'a [(String, u32, u32)],
+    canonical: Option<&'a [(String, u32, u32)]>,
+) -> &'a [(String, u32, u32)] {
+    match (mode, own.is_empty()) {
+        (WeightsEmitMode::Shim { .. }, true) => canonical.unwrap_or(&[]),
+        _ => own,
+    }
+}
+
 /// Emit the `Weights` struct definition (or alias) + its `load` +
-/// `fingerprint_matches` free fns.
+/// `fingerprint_matches` free fns. Returns the tokens alongside the
+/// affine rows its fingerprint gate actually carries (the canonical's,
+/// for a rowless shim) so the caller can hand them to that variant's
+/// future shims.
 #[allow(clippy::too_many_arguments)]
 fn emit_weights_struct(
     program: &Program,
@@ -2818,10 +3006,11 @@ fn emit_weights_struct(
     mode: WeightsEmitMode<'_>,
     tp_world_size: u8,
     emit_fingerprint: bool,
-) -> TokenStream {
+    canonical_affine_rows: Option<&[(String, u32, u32)]>,
+) -> (TokenStream, Vec<(String, u32, u32)>) {
     let isel_accessors = match collect_accessors(program, fuf, sfufs, lib, model) {
         Ok(a) => a,
-        Err(err) => return err,
+        Err(err) => return (err, Vec::new()),
     };
     let accessors = match tape_accessors {
         Some(tape) => {
@@ -2988,7 +3177,7 @@ fn emit_weights_struct(
                     stem = model.source_stem,
                     name = a.name,
                 );
-                return quote! { compile_error!(#msg); };
+                return (quote! { compile_error!(#msg); }, Vec::new());
             }
         }
     }
@@ -3059,6 +3248,8 @@ fn emit_weights_struct(
     // `FieldLoad`s they are emitted from, then collapsed per role. This is what
     // the fingerprint's bit table is built from — see `affine_tensors_of`.
     let affine_rows = compress_affine_rows(plans.iter().flat_map(affine_tensors_of).collect());
+    let fingerprint_rows =
+        effective_fingerprint_rows(&mode, &affine_rows, canonical_affine_rows).to_vec();
     // Per-arch decoder root for embed_tokens probes etc. `model` for
     // text-only and Qwen-style VL, `<prefix>.model` for arches whose
     // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
@@ -3337,7 +3528,7 @@ fn emit_weights_struct(
     // `hidden_size` / `vocab_size` panics in `emit_fingerprint_check`
     // — vision configs (`vision_*` + `d_model` only) lack those keys.
     let fingerprint_method = if emit_fingerprint {
-        emit_fingerprint_check(model, manifest, tp_world_size, &affine_rows)
+        emit_fingerprint_check(model, manifest, tp_world_size, &fingerprint_rows)
     } else {
         TokenStream::new()
     };
@@ -3713,12 +3904,12 @@ fn emit_weights_struct(
         quote! {}
     };
 
-    // Stream-free metal counterpart to `rotary_load`. `new_from_gpuweights`
-    // currently covers basic + Llama3 scaling; LongRoPE / Yarn /
-    // partial-rotary models hit a compile_error so the failure mode is
-    // an explicit "unsupported under metal" rather than a hidden
-    // runtime panic. Same scope decision as the per-arch metal feature
-    // gates landed in 5.F.5.
+    // Stream-free metal counterpart to `rotary_load`. The
+    // `*_from_gpuweights` constructors cover every rope family the
+    // cuda path emits — basic, Llama3, LongRoPE, YaRN, partial rotary
+    // (combined with each scaling where the family allows it), and
+    // the Gemma4 proportional-global class handled above — so the
+    // metal match below is exhaustive with no refusal arm.
     //
     // Cache dtype is `BF16` to match the rest of the metal stack:
     // `CanonicalParams::METAL_DTYPE` defaults to bf16, the
@@ -3751,6 +3942,11 @@ fn emit_weights_struct(
             .copied()
             .filter(|&f| (f - 1.0).abs() > 1e-9);
         let scaling = model.rope_scaling.clone();
+        // YaRN (DeepSeek MLA): the rope portion uses `qk_rope_head_dim`
+        // rather than the full `head_dim` — the same override the cuda
+        // arm above applies.
+        let yarn_rope_head_dim: Option<usize> =
+            model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
         // Clamp the rotary cache size to the runtime `max_model_len`
         // rather than the model's compile-time `max_position_embeddings`.
         // For Llama-3.2 (max_position_embeddings = 131072) under chat
@@ -3888,6 +4084,45 @@ fn emit_weights_struct(
                         )?;
                     }
                 }
+                // YaRN (`rope_scaling.type == "yarn"` — gpt-oss,
+                // DeepSeek-V2), full or partial rotary. The host math
+                // is shared with cuda's `new_yarn_from_stream` via
+                // `yarn_cos_sin_table` (scratchy-layers), so the two
+                // backends cannot drift; `qk_rope_head_dim` (MLA
+                // models) overrides the rope dim exactly as the cuda
+                // arm does.
+                (
+                    _,
+                    Some(crate::config::RopeScaling::Yarn {
+                        factor,
+                        beta_fast,
+                        beta_slow,
+                        mscale,
+                        mscale_all_dim,
+                        original_max_position_embeddings,
+                    }),
+                ) => {
+                    let orig = original_max_position_embeddings as usize;
+                    let rope_hd = yarn_rope_head_dim.unwrap_or(head_dim);
+                    quote! {
+                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rotary = crate::__gpu::rotary::RotaryCache::new_yarn_from_gpuweights(
+                            gw,
+                            #rope_hd,
+                            rope_max_pos,
+                            #rope_theta,
+                            &crate::__gpu::rotary::YarnRopeScaling {
+                                factor: #factor,
+                                beta_fast: #beta_fast,
+                                beta_slow: #beta_slow,
+                                mscale: #mscale,
+                                mscale_all_dim: #mscale_all_dim,
+                                original_max_position_embeddings: #orig,
+                            },
+                            crate::__gpu::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
+                        )?;
+                    }
+                }
                 // Partial rotary, no scaling (Qwen3.5 / Qwen3-Next:
                 // partial_rotary_factor 0.25). Builds a `[max_pos, rotary_dim]`
                 // cache; `W::ROT_DIM` (= rotary_dim) drives the kernel so the
@@ -3933,34 +4168,6 @@ fn emit_weights_struct(
                         )?;
                     }
                 }
-                // LongRoPE / YaRN (with or without partial rotary): the
-                // macro can't emit a working metal init yet (no
-                // `*_from_gpuweights` counterpart in `scratchy-target-cuda::rotary`).
-                // Stub to a runtime panic so the build remains green for the
-                // metal-supported subset; arches that hit this won't load
-                // successfully under metal until the proper port lands.
-                //
-                // The panic lives inside a local `fn` whose return type is
-                // `RotaryCache` (not `!`), so `rustc` doesn't propagate the
-                // never type to the outer scope and warn `unreachable_code`
-                // on every line of generated code after the rotary load —
-                // the call-site sees a regular `RotaryCache` value. A plain
-                // fn call rather than an immediately-invoked closure keeps
-                // clippy's `redundant_closure_call` happy.
-                _ => quote! {
-                    let rotary: crate::__gpu::rotary::RotaryCache = {
-                        fn unsupported_rotary_scaling() -> crate::__gpu::rotary::RotaryCache {
-                            ::core::panic!(
-                                "metal: rotary scaling variant not yet supported \
-                                 (LongRoPE / Yarn / partial-rotary). Land a metal \
-                                 counterpart to RotaryCache::new_from_gpuweights for \
-                                 this scaling family before enabling this model \
-                                 under --features metal."
-                            )
-                        }
-                        unsupported_rotary_scaling()
-                    };
-                },
             }
         } // else: !global_proportional
     } else {
@@ -4095,7 +4302,7 @@ fn emit_weights_struct(
     // shim's one-line delegation body, so the expensive load
     // compile work (N_layers × N_accessors lines) runs ONCE per
     // equivalence class.
-    match &mode {
+    let tokens = match &mode {
         WeightsEmitMode::Canonical => quote! {
             #weights_def
 
@@ -4201,6 +4408,7 @@ fn emit_weights_struct(
                 use crate::__gpu::layers_moe::{
                     FusedMoEOps as _, SharedFusedMoEOps as _, DeepSeekV2MoEOps as _,
                     Gemma4RouterOps as _, SwitchGluExpertsOps as _,
+                    GptOssMoEOps as _,
                 };
                 // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
                 // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
@@ -4321,7 +4529,8 @@ fn emit_weights_struct(
                 super::#canonical::load(gw, stream, max_model_len, tp_rank)
             }
         },
-    }
+    };
+    (tokens, fingerprint_rows)
 }
 
 /// Split a Weights field name into `(base, layer)` where `layer`
@@ -4740,6 +4949,10 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // gemm op via `dense_weight()`.
             let #name = crate::__gpu::layers::LinearLayer::load_raw(gw, #key)?;
         },
+        FieldLoad::AttnSinks(_) => panic!(
+            "codegen: AttnSinks is per-layer by construction (one sink vector per \
+             attention layer) — should never appear in an unindexed group"
+        ),
         FieldLoad::LinearAffine {
             prefix,
             group_size,
@@ -5261,6 +5474,39 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::GptOssMoe {
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            affine,
+            gate_bits,
+        } => {
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let intermediate_size = *intermediate_size;
+            let hidden_size = *hidden_size;
+            // Op-keyed arm: the Dense/verbatim config reaches here too and
+            // must still codegen (it is never the runtime-selected
+            // specialization on metal), so default its storage params —
+            // the GemmaSwitchGlu tolerance.
+            let (group_size, bits) = affine.unwrap_or((64, 4));
+            let gate_bits = gate_bits.unwrap_or(bits);
+            quote! {
+                let #name = crate::__gpu::layers_moe::GptOssMoELayer::load(
+                    gw,
+                    #prefix,
+                    #num_experts,
+                    #top_k,
+                    #intermediate_size,
+                    #hidden_size,
+                    #group_size,
+                    #bits,
+                    #gate_bits,
+                )?;
+            }
+        }
     }
 }
 
@@ -5276,9 +5522,9 @@ fn field_load_affine_bits(plan: &FieldLoad) -> Option<u32> {
         // MoE bundles carry the routed-expert bits in `affine`; the router
         // `gate_bits` is uniform across layers so it stays out of the
         // per-layer gather (the collapsed layer-0 plan supplies it).
-        FieldLoad::FusedMoe { affine, .. } | FieldLoad::SharedFusedMoe { affine, .. } => {
-            affine.map(|(_, b)| b)
-        }
+        FieldLoad::FusedMoe { affine, .. }
+        | FieldLoad::SharedFusedMoe { affine, .. }
+        | FieldLoad::GptOssMoe { affine, .. } => affine.map(|(_, b)| b),
         _ => None,
     }
 }
@@ -5941,6 +6187,20 @@ fn emit_layered_load_body(
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
+        FieldLoad::AttnSinks(prefix) => {
+            let p = layer_templated_prefix_expr(
+                prefix,
+                vision_zero_prefix_ref,
+                decoder_zero_prefix_ref,
+            );
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        gw.take(&#p)
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
         FieldLoad::DeepSeekV2Fp8BlockMoe {
             prefix,
             n_routed_experts,
@@ -6242,6 +6502,54 @@ fn emit_layered_load_body(
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
+        FieldLoad::GptOssMoe {
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            affine,
+            gate_bits,
+        } => {
+            let p = layer_templated_prefix_expr(
+                prefix,
+                vision_zero_prefix_ref,
+                decoder_zero_prefix_ref,
+            );
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let intermediate_size = *intermediate_size;
+            let hidden_size = *hidden_size;
+            // Op-keyed arm — the Dense/verbatim config's storage params
+            // default rather than panic (the unindexed arm's tolerance).
+            let (group_size, bits) = affine.unwrap_or((64, 4));
+            let gate_bits = gate_bits.unwrap_or(bits);
+            // Per-layer expert bits (OptiQ) — same treatment as
+            // GemmaSwitchGlu: index the slice when heterogeneous, else
+            // the single width. `gate_bits` is uniform across layers
+            // (the collapsed layer-0 plan supplies it).
+            let bits_expr: TokenStream = match &per_layer_bits_lit {
+                Some(bits_slice) => quote! { (#bits_slice)[layer as usize] },
+                None => quote! { #bits },
+            };
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        crate::__gpu::layers_moe::GptOssMoELayer::load(
+                            gw,
+                            &#p,
+                            #num_experts,
+                            #top_k,
+                            #intermediate_size,
+                            #hidden_size,
+                            #group_size,
+                            #bits_expr,
+                            #gate_bits,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
     }
 }
 
@@ -6360,8 +6668,10 @@ pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind
         WeightKind::SharedFusedMoe => "shared_fused_moe_at",
         WeightKind::GemmaRouter => "gemma_router_at",
         WeightKind::GemmaSwitchGlu => "gemma_switch_glu_at",
+        WeightKind::GptOssMoe => "gpt_oss_moe_at",
         WeightKind::CosSin => "cos_sin_at",
         WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
+        WeightKind::AttnSinks => "sinks_at",
     }
 }
 
@@ -6457,6 +6767,10 @@ fn emit_weight_accessors_impl(
                     // `.clone()` needed (it would just be a redundant copy).
                     let arm_body = match slot.kind {
                         WeightKind::CosSin => quote! { self.#base.cos_sin_cache },
+                        // The layered sinks accessor hands back a
+                        // borrow; the trait hands the `Copy` handle
+                        // by value.
+                        WeightKind::AttnSinks => quote! { *self.#base(layer) },
                         _ => quote! { self.#base(layer) },
                     };
                     by_kind.entry(key).or_default().push(quote! {
@@ -6661,6 +6975,7 @@ fn emit_weight_accessors_impl(
     let gemma_router = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaRouter);
     let gemma_switch_glu = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaSwitchGlu);
     let cos_sin = method_emit_kind(&crate::weight_vocab::WeightKind::CosSin);
+    let attn_sinks = method_emit_kind(&crate::weight_vocab::WeightKind::AttnSinks);
     // `affine_quant_embedding_at` is gated `#[cfg(feature = "metal")]`
     // on the trait so we must emit the cfg attribute together with the
     // method body, or skip both when the arch never resolves an
@@ -6737,6 +7052,7 @@ fn emit_weight_accessors_impl(
             #gemma_router
             #gemma_switch_glu
             #cos_sin
+            #attn_sinks
             #affine_quant_embedding
         }
     }
@@ -11077,7 +11393,12 @@ pub fn emit_model(
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
     emit_fingerprint: bool,
-) -> TokenStream {
+    // The canonical's affine rows, for a shim whose own accessor set
+    // yields none (metal: the shim's set is ISel's, empty there) — its
+    // delegated load reads the canonical's widths, so its fingerprint
+    // gate must too. `None` for canonicals themselves.
+    canonical_affine_rows: Option<&[(String, u32, u32)]>,
+) -> (TokenStream, Vec<(String, u32, u32)>) {
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
     // (which already covers text-side encoders like ModernBERT)
@@ -11101,11 +11422,15 @@ pub fn emit_model(
             canonical,
             tp_world_size,
             emit_fingerprint,
+            canonical_affine_rows,
         );
     }
     // The struct emitter, callable twice: once with instruction
     // selection's accessors and — for a tape-scheduled arch, after
     // the front-end swap has produced them — once with the tape's.
+    // Returns the emitted tokens alongside the affine rows its
+    // fingerprint gate carries (the tape call's rows are what survive
+    // — `weights_affine_rows` is overwritten alongside `weights`).
     let emit_struct = |tape_accs: Option<&[WeightAccessor]>| {
         emit_weights_struct(
             program,
@@ -11118,12 +11443,13 @@ pub fn emit_model(
             WeightsEmitMode::Canonical,
             tp_world_size,
             emit_fingerprint,
+            None,
         )
     };
     #[cfg(feature = "metal")]
     let mut tape_accessors_for_struct: Option<Vec<WeightAccessor>> = None;
     #[cfg(feature = "metal")]
-    let mut weights = emit_struct(None);
+    let (mut weights, mut weights_affine_rows) = emit_struct(None);
     // THE MODEL'S WEIGHT BINDING, from the tape both backends lower.
     //
     // Instruction selection (cuda's solver) and metal's instruction-stream
@@ -11139,7 +11465,7 @@ pub fn emit_model(
     // the per-target alias), so the same fields compile and load on any
     // backend.
     #[cfg(all(feature = "spyre", not(feature = "metal")))]
-    let weights = {
+    let (weights, weights_affine_rows) = {
         let lowered = sfufs
             .per_workload
             .keys()
@@ -11194,7 +11520,8 @@ pub fn emit_model(
             model.source_stem,
             tw.as_ref().map(|t| t.accessors.len()).unwrap_or(0),
         );
-        let struct_tokens = emit_struct(tw.as_ref().map(|t| t.accessors.as_slice()));
+        let (struct_tokens, struct_affine_rows) =
+            emit_struct(tw.as_ref().map(|t| t.accessors.as_slice()));
         // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
         // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
         // worker's `"{disk}.weight"` lookup is replaced by; only generated code
@@ -11223,10 +11550,10 @@ pub fn emit_model(
                 }
             }
         };
-        quote! { #struct_tokens #bindings }
+        (quote! { #struct_tokens #bindings }, struct_affine_rows)
     };
     #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let weights = emit_struct(None);
+    let (weights, weights_affine_rows) = emit_struct(None);
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
     // Buckets with identical impl picks produce byte-identical fn
@@ -11931,7 +12258,9 @@ pub fn emit_model(
     // front-end swap has lowered the canonical.
     #[cfg(feature = "metal")]
     if let Some(tape_accs) = tape_accessors_for_struct.as_ref() {
-        weights = emit_struct(Some(tape_accs));
+        let (w, r) = emit_struct(Some(tape_accs));
+        weights = w;
+        weights_affine_rows = r;
     }
 
     if cfg!(feature = "spyre") {
@@ -13626,7 +13955,7 @@ pub fn emit_model(
             (quote! {}, quote! {}, quote! {}, quote! {})
         };
 
-    quote! {
+    let tokens = quote! {
         #weights
 
         #ktir_bundle_const
@@ -13706,7 +14035,8 @@ pub fn emit_model(
                 })
                 .collect()
         }
-    }
+    };
+    (tokens, weights_affine_rows)
 }
 
 /// Unused — consumers used to reach this by name from tests.
@@ -13727,7 +14057,11 @@ fn _unused(_: OpKind) {}
 /// - `pub fn fingerprint_matches` — VARIANT-specific. The
 ///   tensor-suffix gate (e.g. dense `.weight` vs AWQ `.qweight` vs
 ///   CT `.weight_packed` vs BNB4 `.weight.absmax`) differs per
-///   variant, so each ships its own sniff.
+///   variant, so each ships its own sniff. The affine bit-map gate
+///   inherits the CANONICAL's rows when the shim's own accessor set
+///   yields none (metal: that set is ISel's, empty there) — the
+///   shim's `load` delegates to the canonical's body, so the
+///   canonical's widths are what a selected shim actually reads.
 /// - `pub fn load` — VARIANT-specific. The loader calls
 ///   `MarlinLinear::load_awq` vs `load_gptq` vs
 ///   `Bnb4bitLinear::load` etc. depending on the variant's
@@ -13750,8 +14084,11 @@ fn emit_shim_model(
     canonical: &Ident,
     tp_world_size: u8,
     emit_fingerprint: bool,
-) -> TokenStream {
-    let weights = emit_weights_struct(
+    // The canonical's affine rows — the fallback for this shim's
+    // fingerprint gate when its own accessor set yields none.
+    canonical_affine_rows: Option<&[(String, u32, u32)]>,
+) -> (TokenStream, Vec<(String, u32, u32)>) {
+    let (weights, shim_affine_rows) = emit_weights_struct(
         program,
         fuf,
         sfufs,
@@ -13762,6 +14099,7 @@ fn emit_shim_model(
         WeightsEmitMode::Shim { canonical },
         tp_world_size,
         emit_fingerprint,
+        canonical_affine_rows,
     );
 
     // Per-tape_index fn surfaces are gone — dispatch lives on the
@@ -13771,7 +14109,7 @@ fn emit_shim_model(
     // — variant-specific differences (quant format, fingerprint) are
     // load-time only; static tape_index plans are byte-identical.
     let _ = sfufs;
-    quote! {
+    let tokens = quote! {
         #weights
 
         // Spyre: shim variants share the canonical's solve, so the
@@ -13799,7 +14137,8 @@ fn emit_shim_model(
             METAL_ARENA_PEAK_BYTES, METAL_BUCKET_ARENA_COSTS, METAL_BUCKETS, METAL_OFF_TAPE, METAL_RUNGS,
             metal_pool,
         };
-    }
+    };
+    (tokens, shim_affine_rows)
 }
 
 #[cfg(test)]
@@ -14468,6 +14807,48 @@ mod fingerprint_tests {
             .join(arch)
     }
 
+    /// A shim's `load` delegates to its canonical's body — the affine
+    /// bit-widths are baked into THAT body, and on metal the shim's own
+    /// accessor set is ISel's, which is empty there. So a rowless shim
+    /// must inherit its canonical's rows or its fingerprint gate is
+    /// vacuous and it selects any affine-compatible checkpoint (the
+    /// gpt-oss b2/b3-attn4 collision: the b2 shim passed selection and
+    /// its delegated bits-2 load died in the element-count assert).
+    /// Own rows win when present; canonicals never inherit.
+    #[test]
+    fn a_rowless_shim_inherits_its_canonicals_affine_rows() {
+        let canonical_rows = vec![
+            (
+                "model.layers.*.mlp.experts.gate_proj.weight".to_string(),
+                2,
+                64,
+            ),
+            ("model.layers.*.mlp.router".to_string(), 8, 64),
+        ];
+        let empty: Vec<(String, u32, u32)> = Vec::new();
+        let canonical_mod = Ident::new("canonical_mod", proc_macro2::Span::call_site());
+        let shim = WeightsEmitMode::Shim {
+            canonical: &canonical_mod,
+        };
+
+        // Rowless shim → the canonical's rows.
+        assert_eq!(
+            effective_fingerprint_rows(&shim, &empty, Some(&canonical_rows)),
+            canonical_rows.as_slice()
+        );
+        // Shim with its own rows (cuda: ISel runs) keeps them.
+        let own = vec![("model.layers.*.mlp.router".to_string(), 2, 64)];
+        assert_eq!(
+            effective_fingerprint_rows(&shim, &own, Some(&canonical_rows)),
+            own.as_slice()
+        );
+        // A canonical never inherits.
+        assert_eq!(
+            effective_fingerprint_rows(&WeightsEmitMode::Canonical, &empty, Some(&canonical_rows)),
+            empty.as_slice()
+        );
+    }
+
     /// MLA archs (DeepSeek V3 / Kimi K2) ship `q_a_proj` rather than
     /// `q_proj`, so the FP8-block disambiguation tensor names must
     /// follow the same `fp_leaf` selection the rest of the
@@ -14808,6 +15189,47 @@ mod fingerprint_tests {
             vec![("model.layers.0.self_attn.q_proj.weight".to_string(), 4, 64)],
         );
 
+        // gpt-oss lists its expert stacks at the EXPERT width. The
+        // b2-attn4/b3-attn4 preset pair agrees on every other fingerprinted
+        // width (attention 4, router 8, embed/lm_head 4), so these rows are
+        // the only discriminator between the two variants — without them the
+        // pair fingerprints identically and the first-consulted variant
+        // claims the other's checkpoint (#316: the b2 variant's 180 packed
+        // cols vs the b3 checkpoint's 270).
+        let gptoss = FieldLoad::GptOssMoe {
+            prefix: "model.layers.0.mlp".to_string(),
+            num_experts: 128,
+            top_k: 4,
+            intermediate_size: 2880,
+            hidden_size: 2880,
+            affine: Some((64, 3)),
+            gate_bits: Some(8),
+        };
+        assert_eq!(
+            affine_tensors_of(&gptoss),
+            vec![
+                ("model.layers.0.mlp.router.weight".to_string(), 8, 64),
+                (
+                    "model.layers.0.mlp.experts.gate_proj.weight".to_string(),
+                    3,
+                    64
+                ),
+                (
+                    "model.layers.0.mlp.experts.up_proj.weight".to_string(),
+                    3,
+                    64
+                ),
+                (
+                    "model.layers.0.mlp.experts.down_proj.weight".to_string(),
+                    3,
+                    64
+                ),
+            ],
+            "the expert stacks must be listed at the expert width (`affine`'s \
+             bits), NOT the router's — they are the only width separating the \
+             attn4-router8 presets from each other",
+        );
+
         // Nothing is claimed for a dense load.
         assert!(affine_tensors_of(&FieldLoad::LinearDense("x".into())).is_empty());
 
@@ -14815,7 +15237,7 @@ mod fingerprint_tests {
         // matcher compares patterns against full tensor names, so a row that
         // stopped at the role would match nothing and the gate would go silently
         // dead — it fails open, so no test of the widths themselves would notice.
-        for fl in [&moe, &router, &leaf] {
+        for fl in [&moe, &router, &leaf, &gptoss] {
             for (name, _, _) in affine_tensors_of(fl) {
                 assert!(
                     name.ends_with(".weight"),
@@ -14909,6 +15331,92 @@ mod fingerprint_tests {
             ts.contains("if let Some") && gate.contains("&&"),
             "the theta gate must be an `if let Some(..) = hf.rope_theta && ..` so a `None` \
              from the caller falls through, got:\n{ts}",
+        );
+    }
+
+    /// The embed's packed-width literal the emitted fingerprint gates on,
+    /// parsed back out of the token stream (same discipline as
+    /// [`emitted_rope_theta`]: assert on what the generated code compares,
+    /// not on our intent).
+    fn emitted_embed_packed_width(model: &crate::config::ModelParams, arch: &str) -> Option<usize> {
+        let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
+            .expect("load weights manifest");
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        // `match gw . tensor_shape_any ("model.embed_tokens.weight") { ..
+        // shape [0] == 201088usize && shape [1] == 360usize .. }`
+        // — anchor on `[1]` so the `>= 2usize` rank check can't be
+        // mistaken for the width literal.
+        let tail = ts.split("model.embed_tokens.weight").nth(1)?;
+        let after_idx1 = tail.split("[1]").nth(1)?;
+        let lit: String = after_idx1
+            .chars()
+            .skip_while(|c| *c != '=')
+            .skip_while(|c| *c == '=' || *c == ' ')
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        lit.parse().ok()
+    }
+
+    /// ⛔ gpt-oss's `attn4-router8` presets: the embed's packed width must
+    /// come from the OVERRIDE, not the section default. The b2-attn4 preset
+    /// declares a 2-bit expert default with `embed_tokens: 4`; hidden 2880
+    /// packs to 2880*4/32 = 360 at 4-bit but 2880*2/32 = 180 at the default.
+    /// A regression that ignores the embed override computes the 180 literal
+    /// while the loader dequantizes 4-bit — the fingerprint then
+    /// false-rejects every proper checkpoint (or worse, accepts at the
+    /// wrong width if the shapes happened to agree).
+    #[test]
+    fn gpt_oss_attn4_preset_gates_the_embed_at_the_override_width() {
+        let proper = variant_of(
+            "gpt-oss",
+            "gpt-oss-120b",
+            "mlx-affine-b2-g64-attn4-router8-qembed",
+        );
+        let plain = variant_of("gpt-oss", "gpt-oss-120b", "mlx-affine-b2-g64-qembed");
+
+        // Premise: both variants are the same model at the same group size —
+        // they differ ONLY in the per-role bit map.
+        assert_eq!(
+            proper.bounds.get("hidden_size"),
+            plain.bounds.get("hidden_size"),
+            "premise broken: the two variants disagree on hidden_size",
+        );
+        let proper_m = proper.quantization.as_ref().map(|qc| qc.method.clone());
+        let plain_m = plain.quantization.as_ref().map(|qc| qc.method.clone());
+        let (
+            Some(crate::quantization::QuantMethod::Affine {
+                bits: proper_bits,
+                group_size: proper_gs,
+                bits_overrides: proper_ov,
+                ..
+            }),
+            Some(crate::quantization::QuantMethod::Affine {
+                bits: plain_bits,
+                group_size: plain_gs,
+                bits_overrides: plain_ov,
+                ..
+            }),
+        ) = (proper_m, plain_m)
+        else {
+            panic!("both variants must parse as MLX-affine");
+        };
+        assert_eq!((proper_bits, proper_gs), (plain_bits, plain_gs));
+        assert!(
+            plain_ov.is_empty() && !proper_ov.is_empty(),
+            "premise broken: the presets differ in more than their bit map",
+        );
+
+        let proper_w = emitted_embed_packed_width(&proper, "gpt-oss")
+            .expect("the b2-attn4 variant must gate on the embed shape");
+        let plain_w = emitted_embed_packed_width(&plain, "gpt-oss")
+            .expect("the plain b2 variant must gate on the embed shape");
+        assert_eq!(
+            proper_w, 360,
+            "the 4-bit embed override must pack 2880*4/32 = 360, got {proper_w}",
+        );
+        assert_eq!(
+            plain_w, 180,
+            "the plain b2 default must pack 2880*2/32 = 180, got {plain_w}",
         );
     }
 

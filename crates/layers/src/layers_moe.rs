@@ -207,6 +207,67 @@ pub struct SwitchGluExpertsLayer {
 }
 
 // ---------------------------------------------------------------------------
+// GptOssMoELayer (gptoss_moe op): biased router + SwiGLU-OAI experts with
+// per-expert LINEAR biases
+// ---------------------------------------------------------------------------
+
+/// gpt-oss (20b / 120b) fused MoE weight bundle (base `mlp`, Metal-only at
+/// runtime).
+///
+/// Distinct from [`AffineFusedMoELayer`] — which it otherwise mirrors in its
+/// expert storage — in three ways the gpt-oss forward needs:
+/// * the router is linear WITH bias: `router_gate` `[E, hidden]` (dequantized
+///   from the affine `{prefix}.router` at load, at the router's own bit width)
+///   plus `router_bias` F32 `[E]` added to the logits before top-k, with the
+///   BIASED values read back as the gathered scores;
+/// * the experts are SwiGLU-OAI (`y = (clamp(u, ±7) + 1) · min(g, 7) ·
+///   sigmoid(1.702 · g)`) with per-expert LINEAR biases — the checkpoint ships
+///   dense `mlp.experts.{gate,up,down}_proj.bias`, concatenated here into
+///   `gate_up_linear_bias` `[E, 2*inter]` (gate rows then up rows) and
+///   `down_linear_bias` `[E, hidden]`, added inside the gather kernels;
+/// * the expert stacks arrive as SINGLE pre-stacked 2-D tensors
+///   `[(E·N), K/div]` on disk, which the loader restacks (zero-copy view)
+///   into the `[E, N, K/div]` reading order the shaders walk.
+///
+/// `top_k` picks; the post-gather normalizer is a softmax over the top-4
+/// (no renorm), matching HF's `GptOssSparseMoeBlock`.
+pub struct GptOssMoELayer {
+    /// Dense router projection `[num_experts, hidden_size]`, dequantized
+    /// from the affine `{prefix}.router` at load.
+    pub router_gate: GpuTensor,
+    /// F32 `[num_experts]` router linear bias (converted from the
+    /// checkpoint's BF16 at load). Added to the logits before top-k AND
+    /// read back as the gathered score.
+    pub router_bias: GpuTensor,
+
+    pub expert_gate_w: GpuTensor,
+    pub expert_gate_scales: GpuTensor,
+    pub expert_gate_biases: GpuTensor,
+
+    pub expert_up_w: GpuTensor,
+    pub expert_up_scales: GpuTensor,
+    pub expert_up_biases: GpuTensor,
+
+    pub expert_down_w: GpuTensor,
+    pub expert_down_scales: GpuTensor,
+    pub expert_down_biases: GpuTensor,
+
+    /// Dense `[E, 2*intermediate_size]` per-expert gate/up LINEAR biases,
+    /// gate rows then up rows — added by the gate/up gather kernel.
+    pub gate_up_linear_bias: GpuTensor,
+    /// Dense `[E, hidden_size]` per-expert down-proj LINEAR biases — added
+    /// by the down/combine gather kernel.
+    pub down_linear_bias: GpuTensor,
+
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+    pub group_size: u32,
+    pub bits: u32,
+}
+
+// ---------------------------------------------------------------------------
 // FusedMoELayer (enum: Dense for cuda, Affine for metal)
 // ---------------------------------------------------------------------------
 

@@ -44,3 +44,8 @@ Today's presets:
 - `gptq-sym-desc_act` — as above but desc_act=true (activation ordering).
 - `ct-int4-sym` — compressed-tensors INT4 symmetric, group_size=128.
 - `bnb-nf4-dq` — bitsandbytes NF4, double quantization.
+- `mlx-affine-b<2|3>-g64-attn4-router8-qembed` — gpt-oss's "proper"
+  low-bit recipes: experts at the 2/3-bit default, attention/embed/
+  lm_head widened to 4 and the router to 8 via `bits_overrides` (the
+  first presets whose overrides sit BELOW and ABOVE the default at
+  once; override width may be any of 2/3/4/8).

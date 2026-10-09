@@ -223,6 +223,22 @@ pub enum OpKind {
     /// through the FUF so the solver can match distinct Impls
     /// (dense flash-attn vs. window-masked flash-attn).
     SlidingAttention,
+    /// Full attention with per-head learned sink logits (gpt-oss).
+    /// `sink_attention(q, k, v, sinks, kv_cache, block_table)`: same
+    /// q/k/v geometry as `Attention`, plus a rank-1 weight
+    /// `[num_attention_heads]`. The sink rides to the kernel as a
+    /// trailing weight-source input on the shared attention sub-op and
+    /// enters the online softmax as one extra column, added UNSCALED
+    /// after qk·sm_scale (never multiplied by it) and dropped before
+    /// the ·V accumulation. Distinct OpKind (rather than a flag on
+    /// `Attention`) so the no-sink kernels compile bit-identically to
+    /// the pre-change binaries.
+    SinkAttention,
+    /// `SinkSlidingAttention`: [`Self::SinkAttention`] at a
+    /// sliding-window layer — the same kernel with the window baked,
+    /// exactly as [`Self::SlidingAttention`] relates to
+    /// [`Self::Attention`].
+    SinkSlidingAttention,
     /// Variable-length attention used by vision encoders (Qwen2-VL,
     /// Qwen2.5-VL, ViT-style towers). Same q/k/v shape as `Attention`
     /// but with a `cu_seqlens` ragged-batch index instead of a paged
@@ -399,6 +415,17 @@ pub enum OpKind {
     /// GeGLU (not SiLU). No shared expert. Output = `expert_in` shape.
     /// Metal-only; claimed by `MetalGemmaMoeImpl`.
     GemmaMoe,
+    /// gpt-oss fused MoE block (`GptOssForCausalLM`, 20b / 120b). DSL
+    /// form: `h = gptoss_moe(x, mlp[layer])` — like [`OpKind::Moe`] it
+    /// takes ONE activation input and ONE weight bundle, but the router
+    /// is linear WITH bias (a dense F32 `[E]` added to the logits before
+    /// top-k and read back as the gathered score), the post-gather
+    /// normalizer is a softmax over the top-4 (no renorm), and the
+    /// experts are SwiGLU-OAI (`y = (clamp(u,±7)+1)·min(g,7)·
+    /// sigmoid(1.702·g)`) with per-expert LINEAR biases on gate/up/down.
+    /// Resolves to a `GptOssMoELayer` at base `mlp`. Shape-preserving.
+    /// Metal-only; claimed by `MetalGptOssMoeImpl`.
+    GptOssMoe,
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). One coarse op
     /// orchestrating the surviving `gdn_*` kernels: causal conv1d(+SiLU) →
     /// split q/k/v → input-dependent gating → recurrent delta-rule scan →
@@ -516,6 +543,8 @@ impl OpKind {
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
+            "sink_attention" => Some(Self::SinkAttention),
+            "sink_sliding_attention" => Some(Self::SinkSlidingAttention),
             // Vision-tower ops. Unambiguous names: the four below are
             // unused on the decoder side, so the lookup is shared with
             // the decoder prelude — a `#[forward]` body that wrote
@@ -545,6 +574,7 @@ impl OpKind {
             "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
             "gemma_moe" => Some(Self::GemmaMoe),
+            "gptoss_moe" => Some(Self::GptOssMoe),
             "gated_delta_net" => Some(Self::GatedDeltaNet),
             "gate_split" => Some(Self::GateSplit),
             "gate_apply" => Some(Self::GateApply),
@@ -566,6 +596,8 @@ impl OpKind {
             Self::RopeAppendInterleaved => "rope_append_interleaved",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
+            Self::SinkAttention => "sink_attention",
+            Self::SinkSlidingAttention => "sink_sliding_attention",
             Self::VarlenAttention => "varlen_attention",
             Self::Silu => "silu",
             Self::Gelu => "gelu",
@@ -585,6 +617,7 @@ impl OpKind {
             Self::MlaAttention => "mla_attention",
             Self::Moe => "moe_block",
             Self::GemmaMoe => "gemma_moe",
+            Self::GptOssMoe => "gptoss_moe",
             Self::GatedDeltaNet => "gated_delta_net",
             Self::GateSplit => "gate_split",
             Self::GateApply => "gate_apply",

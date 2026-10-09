@@ -215,9 +215,11 @@ METAL_FUNC void qmm_t_impl_inline(
   // for the same-compute symbol family (Gemma4 8-bit MLP, bf16/bf16).
   // bits=3 likewise: the MLX loader carries the full bits==3 branch
   // (8 codes per 3 bytes), and 3-bit is only instantiated
-  // same-compute (GLM-4.5-Air-3bit, bf16/bf16).
-  static_assert(bits == 3 || bits == 4 || bits == 8,
-                "qmm_t_impl_inline only instantiated for bits in {3, 4, 8}");
+  // same-compute (GLM-4.5-Air-3bit, bf16/bf16). bits=2 the same: the
+  // loader's bits==2 branch decodes 4 codes per byte (gpt-oss-120b
+  // 2-bit, bf16/bf16), same-compute only.
+  static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 8,
+                "qmm_t_impl_inline only instantiated for bits in {2, 3, 4, 8}");
   static_assert(group_size == 16 || group_size == 32 || group_size == 64 ||
                     group_size == 128,
                 "qmm_t_impl_inline expects group_size in {16, 32, 64, 128}");
@@ -1233,6 +1235,28 @@ INST_GATHER_QMM_T_B3(bf16, bfloat, bf16, bfloat, 64, true,  true)
 INST_GATHER_QMM_T_B3(bf16, bfloat, bf16, bfloat, 64, false, false)
 INST_GATHER_QMM_T_B3(f16,  half,   f16,  half,   64, true,  true)
 INST_GATHER_QMM_T_B3(f16,  half,   f16,  half,   64, false, false)
+
+// 2-bit Standard qmm_t + MoE grouped expert GEMM (gpt-oss-120b-mlx-2Bit:
+// 2-bit g64 with bf16 activations + bf16 scales; f16/f16 for unit
+// tests). Same-kernel-family story as b3/b8: the bodies are bits-generic
+// (the MLX bits==2 packing — 4 codes per byte, so packed cols are K/16),
+// only entry points were missing. Standard + gather only, no SplitK (the
+// splitk family is b4-only; the lowering downgrades 2-bit SplitK to
+// Standard) and no qmm_n / mixed-compute (both nibble-specialized).
+#define INST_QMM_T_B2(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  SCRATCHY_KERNEL(affine_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_2_alN_##aln_tag##_batch_0, affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 2, aln_val>)
+
+#define INST_GATHER_QMM_T_B2(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  SCRATCHY_KERNEL(affine_gather_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_2_alN_##aln_tag##_batch_0, affine_gather_qmm_t_kernel<act_type, act_type, scale_type, gs, 2, aln_val>)
+
+INST_QMM_T_B2(bf16, bfloat, bf16, bfloat, 64, true,  true)
+INST_QMM_T_B2(bf16, bfloat, bf16, bfloat, 64, false, false)
+INST_QMM_T_B2(f16,  half,   f16,  half,   64, true,  true)
+INST_QMM_T_B2(f16,  half,   f16,  half,   64, false, false)
+INST_GATHER_QMM_T_B2(bf16, bfloat, bf16, bfloat, 64, true,  true)
+INST_GATHER_QMM_T_B2(bf16, bfloat, bf16, bfloat, 64, false, false)
+INST_GATHER_QMM_T_B2(f16,  half,   f16,  half,   64, true,  true)
+INST_GATHER_QMM_T_B2(f16,  half,   f16,  half,   64, false, false)
 
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, true,  true)
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, false, false)

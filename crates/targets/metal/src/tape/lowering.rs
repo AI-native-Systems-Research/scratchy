@@ -22,11 +22,11 @@ use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::kernel_constants::norm_threads;
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
-    AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
-    ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
-    KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
-    MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput,
-    RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
+    ExpertMatmul, ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize,
+    KDim, KvOffsets, KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
+    MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
+    RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -123,6 +123,13 @@ impl<'a> RowSources<'a> {
     /// [`Self::table`] of `class` (`is_global`), when rope-on-read is on (`Some`).
     fn rotary(self, class: Option<bool>) -> Result<Option<SourceIx>, LoweringError> {
         class.map(|g| self.table(g)).transpose()
+    }
+
+    /// The row's attention-sink source (gpt-oss), when its site binds
+    /// one. Additive-optional: `None` on every non-sink model, so the
+    /// sinks-off dispatch is byte-identical to the pre-sinks ABI.
+    fn sinks(self) -> Option<SourceIx> {
+        self.of(WeightKind::AttnSinks, 0).ok()
     }
 }
 
@@ -1112,6 +1119,13 @@ fn decode_attention_per_kv_head(
     let takes = |c: &LoweredCommand| {
         c.kernel == KernelId::AttentionViaCacheTq
             && !c.constants.iter().any(|k| matches!(k.index, 14 | 15))
+            // A sinks dispatch stays on its one-pass twin: the split pair
+            // (`attention_decode_gqa_tq` + combine) has no sink math, and the
+            // combine keeps only buffers 0/11/15 — the sink column would be
+            // silently dropped. Unreachable for gpt-oss (head_dim 64 fails the
+            // geometry below) but guarded for any future hd≥128 + TQ + sinks
+            // model: refusing the split keeps the correct kernel.
+            && !c.bindings.iter().any(|b| b.index() == 16)
             && lane_stride(c)
     };
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
@@ -2392,8 +2406,10 @@ fn lower_one(
                 // kernel). 3-bit has `_b_3_` instantiations too (the
                 // QuantizedBlockLoader's index math is bits=3-exact;
                 // MLX's own qdot bits==3 shifts are vendored into
-                // metal_nax.h's dequantize). SplitK stays b4-only, so
-                // any non-b4 SplitK pick downgrades to Standard.
+                // metal_nax.h's dequantize), and 2-bit likewise
+                // (`_b_2_`: 4 codes per byte, none straddling).
+                // SplitK stays b4-only, so any non-b4 SplitK pick
+                // downgrades to Standard.
                 let kernel = match pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs, is_nax) {
                     QmmTKernel::SplitK { .. } if *bits != 4 => QmmTKernel::Standard,
                     k => k,
@@ -2422,7 +2438,7 @@ fn lower_one(
                     // (the with-compute name builder omits `bits`) and decode
                     // 8-bit as 4-bit → silent garbage (OptiQ on M1). 8-bit
                     // keeps same-compute bf16 → the existing b8 kernel; 3-bit
-                    // likewise has no `_c_f16_` instantiation.
+                    // and 2-bit likewise have no `_c_f16_` instantiation.
                     && bits_v == 4;
                 let compute_dtype = if f16_compute_eligible {
                     DequantDtype::F16
@@ -2438,8 +2454,8 @@ fn lower_one(
                         && codes == super::kernel_constants::AffineCodes::Offset8
                         // Offset8 already implies b4 (`for_bits`), but state
                         // it: the W4A8 GEMM multiplies int4 codes on the
-                        // matrix unit's int8 lane — a 3-bit bitstream would
-                        // misalign there.
+                        // matrix unit's int8 lane — a 3-bit or 2-bit
+                        // bitstream would misalign there.
                         && bits_v == 4
                         && matches!(gs, 64 | 128)
                         && k_v.is_multiple_of(64)
@@ -2993,11 +3009,12 @@ fn lower_one(
             let bits_v = *bits;
             let gs = *group_size;
             assert!(
-                matches!(bits_v, 3 | 4 | 8),
-                "AffineEmbed: only bits ∈ {{3, 4, 8}} is wired (4-bit default; \
+                matches!(bits_v, 2 | 3 | 4 | 8),
+                "AffineEmbed: only bits ∈ {{2, 3, 4, 8}} is wired (4-bit default; \
                  8-bit for MLX-native mixed/dynamic quant like OptiQ whose \
                  embed_tokens is 8-bit; 3-bit for GLM-4.5-Air-3bit's quantized \
-                 embed); got bits={bits_v}"
+                 embed; 2-bit for gpt-oss-mlx-2Bit's quantized embed); got \
+                 bits={bits_v}"
             );
             assert!(
                 matches!(gs, 32 | 64 | 128),
@@ -3017,7 +3034,9 @@ fn lower_one(
             // packs 1 code/byte (hidden threads) — one thread per packed
             // byte. bits=3 packs 8 codes per 3 bytes — one thread per
             // 8-element pack (hidden/8 threads), since the group is
-            // byte-anchored (group_size is a multiple of 8).
+            // byte-anchored (group_size is a multiple of 8). bits=2 packs
+            // 4 codes/byte (hidden/4 threads) — the else arm's
+            // hidden*bits/8.
             let packs_per_row = if bits_v == 3 {
                 hidden_size / 8
             } else {
@@ -3432,6 +3451,9 @@ fn lower_one(
                         ror_on,
                         p.global_head_dim,
                     ),
+                    // gpt-oss sinks: the const mirrors the binding's presence
+                    // (the 0/1 master switch the shader gates its column on).
+                    sinks: w.sinks().map(|_| 1),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3451,6 +3473,7 @@ fn lower_one(
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
+                    sinks: w.sinks(),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -3993,6 +4016,11 @@ fn lower_one(
                 // Slot 11: gqa_shared reads pre-roped K from the scratch.
                 k_scratch: if gqa_shared_spans { Some(1) } else { None },
                 self_only: if sliding_steel_spans { Some(1) } else { None },
+                // gpt-oss sinks: the const mirrors the binding's presence —
+                // one field the whole family (steel/NAX/gqa_shared/sdpa and
+                // their per-row twins, via the `..constants` spreads below)
+                // inherits.
+                sinks: w.sinks().map(|_| 1),
             };
             // Spans (rope-once-to-scratch): when a steel-family kernel (NAX
             // matrix-accel OR simdgroup steel) OR the GQA-cooperative shared
@@ -4020,6 +4048,7 @@ fn lower_one(
             // the cache, with cos_sin to re-rope unrotated span blocks when
             // `reropes`.
             let rotary = w.rotary(ror_bind)?;
+            let sinks = w.sinks();
             let bindings_for = |scratch: bool, reropes: bool| {
                 super::kernel_bindings::AttentionPrefillPagedBindingSet {
                     output: super::ids::ArenaSlotIdx(*out_slot),
@@ -4027,6 +4056,7 @@ fn lower_one(
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: if reropes { rotary } else { None },
                     nax_roped_k_scratch: scratch,
+                    sinks,
                 }
             };
             let bindings = bindings_for(roped_k_scratch, !roped_k_scratch);
@@ -4317,6 +4347,8 @@ fn lower_one(
                     pair_off: ror_po,
                     rope_on_read: ror_on,
                     pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, p.head_dim),
+                    // gpt-oss sinks: the const mirrors the binding's presence.
+                    sinks: w.sinks().map(|_| 1),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -4333,6 +4365,7 @@ fn lower_one(
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
+                    sinks: w.sinks(),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -5633,6 +5666,15 @@ fn gelu_mul_static_name(dtype: DequantDtype) -> &'static str {
     }
 }
 
+/// `swiglu_oai_mul_<dtype>` sibling (gpt-oss SwiGLU-OAI decomposed tail) —
+/// same `silu_mul.metal` library.
+fn swiglu_oai_mul_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "swiglu_oai_mul_f16",
+        DequantDtype::Bf16 => "swiglu_oai_mul_bf16",
+    }
+}
+
 fn gate_apply_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gate_apply_f16",
@@ -6162,11 +6204,12 @@ fn rope_append_normed_kernel_static_name(
 }
 
 /// Format the kernel symbol name for an `AffineEmbed` lowering.
-/// Matches the `DEFINE_AFFINE_EMBED_B{3,4,8}` macro invocations in
+/// Matches the `DEFINE_AFFINE_EMBED_B{2,3,4,8}` macro invocations in
 /// `shaders/quantized_dequantize.metal`
 /// (`affine_embed_<dtype>_s_<scale_dtype>_gs_<gs>_b_<bits>`). bits=8 is
 /// for MLX-native mixed/dynamic quant (OptiQ) 8-bit embeddings; bits=3
-/// for GLM-4.5-Air-3bit's quantized embed.
+/// for GLM-4.5-Air-3bit's quantized embed; bits=2 for
+/// gpt-oss-mlx-2Bit's quantized embed.
 fn affine_embed_kernel_static_name(
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
@@ -6178,8 +6221,8 @@ fn affine_embed_kernel_static_name(
         "affine_embed_kernel_static_name: unsupported group_size={group_size} — only 32/64/128"
     );
     assert!(
-        matches!(bits, 3 | 4 | 8),
-        "affine_embed_kernel_static_name: unsupported bits={bits} — only 3/4/8 instantiated"
+        matches!(bits, 2 | 3 | 4 | 8),
+        "affine_embed_kernel_static_name: unsupported bits={bits} — only 2/3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     leak_symbol(format!("affine_embed_{d}_s_{s}_gs_{group_size}_b_{bits}"))
@@ -6447,8 +6490,8 @@ fn affine_gather_qmv_kernel(
         "affine_gather_qmv_kernel: unsupported group_size={group_size} — only 32/64/128 instantiated"
     );
     assert!(
-        matches!(bits, 3 | 4 | 8),
-        "affine_gather_qmv_kernel: unsupported bits={bits} — only 3/4/8 instantiated"
+        matches!(bits, 2 | 3 | 4 | 8),
+        "affine_gather_qmv_kernel: unsupported bits={bits} — only 2/3/4/8 instantiated"
     );
     // MLX-native mixed/dynamic quant (OptiQ) ships 8-bit experts on the
     // sensitive edge layers; the `_b_{bits}` suffix selects the matching
@@ -6490,8 +6533,8 @@ fn affine_gather_qmm_t_symbol(
         "affine_gather_qmm_t_symbol: unsupported group_size={group_size} — only 32/64/128"
     );
     assert!(
-        matches!(bits, 3 | 4 | 8),
-        "affine_gather_qmm_t_symbol: unsupported bits={bits} — only 3/4/8 instantiated"
+        matches!(bits, 2 | 3 | 4 | 8),
+        "affine_gather_qmm_t_symbol: unsupported bits={bits} — only 2/3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     let aln = if aligned_n { "true" } else { "false" };
@@ -6524,8 +6567,8 @@ fn affine_gather_qmm_t_nax_symbol(
         "affine_gather_qmm_t_nax_symbol: unsupported group_size={group_size} — NAX gather is gs 64/128 only"
     );
     assert!(
-        matches!(bits, 3 | 4 | 8),
-        "affine_gather_qmm_t_nax_symbol: unsupported bits={bits} — only 3/4/8 instantiated"
+        matches!(bits, 2 | 3 | 4 | 8),
+        "affine_gather_qmm_t_nax_symbol: unsupported bits={bits} — only 2/3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
     leak_symbol(format!(
@@ -7058,8 +7101,12 @@ fn lower_moe_step(
                 let scale = WeightTensor::GemmaPerExpertScale;
                 bindings.push(source(router()?, scale, layer(&l), 3));
             }
-            // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
-            if let super::step::RoutePre::SigmoidBias(l) = program.pre {
+            // The F32 router bias, when the pre carries one: the sigmoid +
+            // bias correction (GLM) or gpt-oss's plain linear add — both
+            // read the same `const device float*` buffer 4.
+            if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
+                program.pre
+            {
                 bindings.push(source(router()?, WeightTensor::MoeRouterBias, layer(&l), 4));
             }
             let shape = grid((1, bucket_m, 1), (bn, 1, 1), ms(A::Y));
@@ -7251,11 +7298,12 @@ fn lower_moe_step(
             if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
                 // bits=3 rides NAX like 4/8: the loader's index math is
-                // bits=3-exact and metal_nax.h carries the dequantize branch.
+                // bits=3-exact and metal_nax.h carries the dequantize
+                // branch; bits=2 likewise (4 codes per byte).
                 let use_nax = at.is_nax
                     && n_out.is_multiple_of(64)
                     && matches!(gs, 64 | 128)
-                    && matches!(bits, 3 | 4 | 8);
+                    && matches!(bits, 2 | 3 | 4 | 8);
                 let (kernel, library, symbol, tile) = if use_nax {
                     let symbol = affine_gather_qmm_t_nax_symbol(dtype, scale_dtype, gs, bits);
                     (
@@ -7384,8 +7432,11 @@ fn lower_moe_step(
                     let scale = WeightTensor::GemmaPerExpertScale;
                     bindings.push(source(router()?, scale, layer(&l), 12));
                 }
-                // The F32 e_score_correction_bias, when the pre is the sigmoid + bias.
-                if let super::step::RoutePre::SigmoidBias(l) = program.pre {
+                // The F32 router bias, when the pre reads one: GLM's e_score_correction_bias
+                // (sigmoid + bias) or gpt-oss's linear router bias.
+                if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
+                    program.pre
+                {
                     bindings.push(source(
                         router()?,
                         WeightTensor::MoeRouterBias,
@@ -7397,6 +7448,14 @@ fn lower_moe_step(
                     experts: b.experts,
                     program,
                 }));
+            }
+            // gpt-oss experts carry per-expert LINEAR biases on gate and up — the [E, 2·inter]
+            // concat the loader interleaves — bound at 14, with the kernel's switch at slot 4.
+            // Every other bundle leaves both unset, and the kernel const-folds the adds away.
+            if b.bundle == ExpertBundle::GptOss {
+                let bias = WeightTensor::MoeExpertGateUpLinearBias;
+                bindings.push(source(router()?, bias, layer(&gate.layer), 14));
+                constants.push(C::boolean(4, true));
             }
             commands.push(cmd(
                 kernel,
@@ -7433,13 +7492,21 @@ fn lower_moe_step(
                 bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
             }
             let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
-            let constants = AffineCombineQmvConstants {
+            let mut constants: Vec<ConstantValue> = AffineCombineQmvConstants {
                 qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),
                 residual: ends.residual,
             }
             .into();
+            // gpt-oss experts carry a per-expert LINEAR bias on the down projection too — [E,
+            // hidden] at buffer 10, switch at slot 6. Other bundles leave both unset and the
+            // kernel const-folds the add away.
+            if b.bundle == ExpertBundle::GptOss {
+                let bias = WeightTensor::MoeExpertDownLinearBias;
+                bindings.push(source(router()?, bias, layer(&down.layer), 10));
+                constants.push(C::boolean(6, true));
+            }
             vec![cmd(
                 kernel,
                 "quantized_qmv",
@@ -7456,6 +7523,7 @@ fn lower_moe_step(
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
                 GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
+                GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
             };
             let (rows, m_scaling) = match s.grouping {
                 MoeGrouping::Gathered => (pairs, ms(A::X)),
@@ -8018,6 +8086,67 @@ mod tests {
                 (13, RuntimeBindingKind::SlotMapping { layer }),
             ]
         );
+    }
+
+    /// A sinks attention's TurboQuant twin keeps the dense command's sink column: both the
+    /// `AttentionViaCache` dispatch and its `AttentionViaCacheTq` twin carry the sink const
+    /// (slot 21) and the sinks weight binding (slot 16 — free between the TQ projection
+    /// biases and the fold buffers, so the twin's TQ slots 7..=13 cannot collide with it).
+    /// The codec expansion used to build the twin without the attention's trailing sinks
+    /// operand, so the twin's row had no sink site and every TurboQuant decode of a
+    /// sink-attention arch (gpt-oss) silently dropped the column its dense twin still
+    /// carried — decode diverged from prefill and the model echoed.
+    #[test]
+    fn decode_turboquant_twin_keeps_the_attention_sinks() {
+        use crate::tape::ids::LayerId;
+        use crate::tape::lowered::{Binding, WeightTensor};
+        // The attention rows' site, plus the attention's trailing sinks weight — what a
+        // gpt-oss attention's rows look like once the codec carries the operand.
+        let sinks = SourceIx(500);
+        let mut site = TEST_SITE.clone();
+        site.push(RowSource {
+            kind: WeightKind::AttnSinks,
+            ix: sinks,
+        });
+        let mut tape = row_tape(coded(
+            tq_writer(0, Causal, LLAMA_KV),
+            attention(MetalStep::AttentionViaCache, 0, Interleaved),
+        ));
+        for (row, row_site) in tape.backbone.iter().zip(&mut tape.backbone_sources) {
+            if let StepRow::Step(
+                MetalStep::AttentionViaCache(..) | MetalStep::AttnPackedKv(..),
+                _,
+            ) = row
+            {
+                *row_site = site.clone();
+            }
+        }
+        let tape = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(1, None))
+            .expect("lower_subtile_tape_to_metal");
+        let find = |k| {
+            tape.commands
+                .iter()
+                .map(|c| &c.command)
+                .find(|c| c.kernel == k)
+                .expect("the command")
+        };
+        let (fp16, tq) = (
+            find(KernelId::AttentionViaCache),
+            find(KernelId::AttentionViaCacheTq),
+        );
+        // The twin copies the dense command's constants wholesale — sinks included —
+        // then extends with the TQ pair.
+        assert_eq!(fp16.constants.last(), Some(&ConstantValue::uint(21, 1)));
+        assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
+        // Both bind the layer's `[num_heads]` sink tensor at slot 16.
+        let sink_binding = Binding::Source {
+            ix: sinks,
+            which: WeightTensor::Weight,
+            layer: LayerId(0),
+            binding_index: 16,
+        };
+        assert!(fp16.bindings.contains(&sink_binding));
+        assert!(tq.bindings.contains(&sink_binding));
     }
 
     /// The TurboQuant decode twin's query heads per threadgroup turn on the

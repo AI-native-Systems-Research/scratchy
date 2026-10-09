@@ -64,8 +64,10 @@ macro_rules! for_each_subop {
             // — the caches are per-layer PrefixK / PrefixV sources used
             // as TMA-store destinations for the new decode token's K/V.
             RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0];
-            // `[Q, (K_seg, V_seg)...]`.
-            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| n >= 3 && n % 2 == 1),
+            // `[Q, (K_seg, V_seg)...]`, optionally with a trailing
+            // `[num_heads]` sinks weight source (gpt-oss attention
+            // sinks — a 6th input read as a weight, not a K/V pair).
+            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| (n >= 3 && n % 2 == 1) || n == 6),
                 cols = [q_width geom];
             TanhSoftCap [SubOp::TanhSoftCap] arity = (|n| n == 1), cols = [in0];
             RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0];
@@ -89,11 +91,15 @@ macro_rules! for_each_subop {
             KvEncode [SubOp::KvEncode { .. }] arity = (|n| n == 2 || n == 3), cols = [one];
             KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one];
             RotateRows [SubOp::RotateRows { .. }] arity = (|n| n == 1), cols = [in0];
-            AttnPackedKv [SubOp::AttnPackedKv] arity = (|n| n == 4), cols = [in1];
+            // `[q, out, packed_k, packed_v]`, optionally with the attention's
+            // trailing `[num_heads]` sinks weight source (gpt-oss attention
+            // sinks — the 5th input read as a weight, as the dense form's 6th).
+            AttnPackedKv [SubOp::AttnPackedKv] arity = (|n| n == 4 || n == 5), cols = [in1];
             RouterNorm [SubOp::RouterNorm { .. }] arity = (|n| n == 2), cols = [in0];
             RouterLogits [SubOp::RouterLogits { .. }] arity = (|n| n == 2), cols = [nz experts];
             RouteSoftmax [SubOp::RouteSoftmax] arity = (|n| n == 1), cols = [in0];
             RouteSigmoidBias [SubOp::RouteSigmoidBias { .. }] arity = (|n| n == 2), cols = [in0];
+            RouteBias [SubOp::RouteBias { .. }] arity = (|n| n == 2), cols = [in0];
             RouteArgsort [SubOp::RouteArgsort] arity = (|n| n == 1), cols = [in0];
             RouteTopK [SubOp::RouteTopK { .. }] arity = (|n| n == 1), cols = [nz k];
             RouteGatherScores [SubOp::RouteGatherScores] arity = (|n| n == 2), cols = [in1];

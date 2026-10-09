@@ -2520,7 +2520,7 @@ where
         let Some(role) = name.strip_suffix(".weight") else {
             continue;
         };
-        if !matches!(bits, 3 | 4 | 8) || group_size == 0 {
+        if !matches!(bits, 2 | 3 | 4 | 8) || group_size == 0 {
             continue;
         }
         let Some(scales) = shape_of(&format!("{role}.scales")) else {
@@ -2636,6 +2636,46 @@ mod affine_width_tests {
             !check(&c3_5, V3_6),
             "3.6's variant must REJECT 3.5 — accepting it is the originally reported \
              `[256, 32] != [256, 16]`",
+        );
+    }
+
+    /// The b2/b4 twin: at the same K and group size the ONLY discriminator
+    /// between a 2-bit and a 4-bit checkpoint is the packed-column count
+    /// (K/16 vs K/8). Each variant's row must accept its own and reject its
+    /// sibling's, or a b2 build dequantizes a b4 checkpoint (or vice versa)
+    /// with the wrong stride. Before b2 was a member of the gate's bit set,
+    /// a 2-bit row silently `continue`d — permissive — so this also pins
+    /// that the gate now FIRES at bits=2.
+    #[test]
+    fn the_two_affine_bit_widths_select_different_variants() {
+        let b2: &[(&str, u32, u32)] = &[(
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            2,
+            64,
+        )];
+        let b4: &[(&str, u32, u32)] = &[(
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            4,
+            64,
+        )];
+        // Same K=2048, gs=64: 32 scale cols either way; packed 128 (b2) vs 256 (b4).
+        let c2 = ckpt(&[("self_attn.q_proj", 128, 32)]);
+        let c4 = ckpt(&[("self_attn.q_proj", 256, 32)]);
+        assert!(
+            check(&c2, b2),
+            "the b2 variant must accept the b2 checkpoint"
+        );
+        assert!(
+            !check(&c4, b2),
+            "the b2 variant must REJECT the b4 checkpoint — packed K/8 cannot satisfy a b2 row",
+        );
+        assert!(
+            check(&c4, b4),
+            "the b4 variant must accept the b4 checkpoint"
+        );
+        assert!(
+            !check(&c2, b4),
+            "the b4 variant must REJECT the b2 checkpoint — packed K/16 cannot satisfy a b4 row",
         );
     }
 

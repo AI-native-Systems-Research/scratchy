@@ -90,7 +90,8 @@ struct Routing {
     // Each way's buffers: logits, sorted experts, top-k indices, top-k scores.
     split: [common::Buffer; 4],
     fused: [common::Buffer; 4],
-    // The F32 e_score_correction_bias (GLM's noaux_tc), when the pre reads one.
+    // The F32 router bias (GLM's e_score_correction_bias, gpt-oss's linear one), when the pre
+    // reads one.
     bias: Option<common::Buffer>,
 }
 
@@ -184,7 +185,7 @@ impl Routing {
         };
         let sym = format!("moe_route_bfloat16_bn{bn}");
         let bias = match program.pre {
-            RoutePre::SigmoidBias(_) => {
+            RoutePre::SigmoidBias(_) | RoutePre::Bias(_) => {
                 let b: Vec<f32> = (0..e).map(|_| -0.5 + rng.next()).collect();
                 Some(common::shared_slice(device, &b))
             }
@@ -306,6 +307,14 @@ const GLM: RouteProgram = RouteProgram {
     post: RoutePost::Renorm,
     expert_scale: None,
 };
+/// gpt-oss's biased router: the F32 linear bias added to each logit orders the top-4 picks, and
+/// the BIASED values are read back as the scores, softmaxed over the top-4.
+const GPT_OSS: RouteProgram = RouteProgram {
+    pre: RoutePre::Bias(LayerId(0)),
+    scale: None,
+    post: RoutePost::Softmax,
+    expert_scale: None,
+};
 
 #[test]
 fn the_routing_kernel_matches_the_kernels_it_replaces() {
@@ -386,6 +395,78 @@ fn glm_sigmoid_bias_routing_matches_the_reference() {
         // The kernel renorms in bf16 (the softmax row's precision); the reference in f32 —
         // compare as the rounded reference, the same bits mlx's bf16 scores hold.
         assert_eq!(got, want, "{what}: scores");
+    }
+}
+
+/// gpt-oss's biased routing against its reference: the picks order on each expert's F32 logit
+/// plus its F32 linear bias (ties by index ascending, the stable sort's order), and the scores
+/// are the softmax over the picks' BIASED values — the deliberate divergence from GLM's PRE 2,
+/// which reads back the unbiased sigmoid; gpt-oss's top-4 softmax normalizes the biased logits
+/// themselves. The softmax is pinned by running `block_softmax_precise` — the same `softmax_row`
+/// the routing kernel calls — over the reconstructed biased picks, so the scores compare bit for
+/// bit.
+#[test]
+fn gpt_oss_biased_routing_matches_the_reference() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    // gpt-oss's router: 128 experts, top 4.
+    let (e, k, n) = (128, 4, 3);
+    let r = Routing::new(&device, GPT_OSS, (e, k, n), false);
+    let bias = r.bias.as_ref().expect("the gpt-oss pre reads a bias");
+    let bias: Vec<f32> = common::read_slice(bias, e);
+    let logits: Vec<bf16> = common::read_slice(&r.fused[0], e * n);
+    run(&device, 1, 1, || r.fused());
+    let (inds, scores) = r.outputs(&r.fused);
+    // Every row's picks' biased values, as the kernel rounds them for the gather — the softmax's
+    // input, reconstructed on the host (an exact f32 add, then the bf16 round).
+    let mut biased: Vec<bf16> = Vec::with_capacity(n * k);
+    for row in 0..n {
+        let row_logits = &logits[row * e..(row + 1) * e];
+        // The reference: biased F32 logits order the picks (index-ascending ties).
+        let mut order: Vec<usize> = (0..e).collect();
+        order.sort_by(|&a, &b| {
+            (row_logits[b].to_f32() + bias[b])
+                .total_cmp(&(row_logits[a].to_f32() + bias[a]))
+                .then(b.cmp(&a))
+        });
+        let picks = order[..k].iter().rev().copied().collect::<Vec<_>>();
+        let want_inds: Vec<u32> = picks.iter().map(|&i| i as u32).collect();
+        let what = format!("row {row}");
+        assert_eq!(
+            &inds[row * k..(row + 1) * k],
+            &want_inds[..],
+            "{what}: picks"
+        );
+        biased.extend(
+            picks
+                .iter()
+                .map(|&i| bf16::from_f32(row_logits[i].to_f32() + bias[i])),
+        );
+    }
+    // The softmax over those rows, by the standalone kernel the routing kernel's row op shares.
+    let c = SoftmaxConstants {
+        row: ScoresRow::TopK(TopK(k as u32)),
+    }
+    .into();
+    let softmax =
+        baked_pipeline(&device, "softmax", "block_softmax_precise_bfloat16", c).expect("softmax");
+    let src = common::shared_slice(&device, &biased);
+    let want_scores = common::shared_zeroed(&device, n * k * 2);
+    let mut batch = common::Mtl4DispatchBatch::begin(&device).expect("an MTL4 queue");
+    batch.encode(
+        &softmax,
+        &[(&src, 0), (&want_scores, 1)],
+        &[],
+        &[],
+        &[],
+        size(n, 1, 1),
+        size(256, 1, 1),
+    );
+    batch.commit(true);
+    let want: Vec<u16> = common::read_slice(&want_scores, n * k);
+    for row in 0..n {
+        let got: Vec<u16> = scores[row * k..(row + 1) * k].to_vec();
+        assert_eq!(got, want[row * k..(row + 1) * k], "row {row}: scores");
     }
 }
 

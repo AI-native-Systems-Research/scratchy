@@ -1021,15 +1021,47 @@ pub fn lower_decode_to_wavefront(
             // attention(q', k', v, kv_cache, block_table): AttnDecode
             // reading Q_rot, prefix-cache Source segments, then the new
             // token's (K_rot, V) as Sub edges.
-            OpKind::Attention | OpKind::SlidingAttention => {
+            OpKind::Attention
+            | OpKind::SlidingAttention
+            | OpKind::SinkAttention
+            | OpKind::SinkSlidingAttention => {
                 if bx.scale.is_nan() {
                     return Err(BridgeError::MissingBound { key: "head_dim" });
                 }
+                let is_sink = matches!(
+                    node.op,
+                    OpKind::SinkAttention | OpKind::SinkSlidingAttention
+                );
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
                 let v = bx.input_at(tile, 2)?;
+                // gpt-oss attention sinks: the per-layer `[num_heads]`
+                // weight at arg 3 rides to the kernel as a TRAILING
+                // weight-source input — an extra softmax column, never
+                // a (K, V) segment pair.
+                let sinks = if is_sink {
+                    let inp = node
+                        .inputs
+                        .get(3)
+                        .cloned()
+                        .ok_or(BridgeError::MalformedOp {
+                            tile,
+                            op: node.op,
+                            detail: "sink_attention without a sinks weight input",
+                        })?;
+                    Some(bx.resolve(tile, &inp)?)
+                } else {
+                    None
+                };
                 let Some(layer) = kv_cache_index(node) else {
                     // Cache-less encoder form: attention(q, k, v).
+                    if is_sink {
+                        return Err(BridgeError::MalformedOp {
+                            tile,
+                            op: node.op,
+                            detail: "sink attention requires a kv_cache — decoder-only op",
+                        });
+                    }
                     if bx.scale.is_nan() {
                         return Err(BridgeError::MissingBound { key: "head_dim" });
                     }
@@ -1058,7 +1090,9 @@ pub fn lower_decode_to_wavefront(
                 // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
                 let mask = match node.op {
-                    OpKind::SlidingAttention => AttnMask::SlidingWindow,
+                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention => {
+                        AttnMask::SlidingWindow
+                    }
                     _ => AttnMask::Causal,
                 };
                 let base_geom = bx
@@ -1077,9 +1111,13 @@ pub fn lower_decode_to_wavefront(
                         *attn = AttnMask::SlidingWindow;
                     }
                 }
+                let mut attn_inputs = vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v];
+                if let Some(s) = sinks {
+                    attn_inputs.push(s);
+                }
                 let idx = bx.push_op(
                     SubOp::attn_decode(geom, scale, valid_len, mask),
-                    vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v],
+                    attn_inputs,
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
@@ -1388,6 +1426,106 @@ pub fn lower_decode_to_wavefront(
                     shared: SharedExpertBound(None),
                 };
                 let idx = bx.experts(expert_in, indices, scores, bank, experts);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            OpKind::GptOssMoe => {
+                let x = bx.input_at(tile, 0)?;
+                // One opaque STRUCT bundle (`mlp[layer]` — router gate +
+                // router bias + experts + expert linear biases under one
+                // base), like `moe_block`.
+                let w = node
+                    .inputs
+                    .iter()
+                    .find_map(|inp| match inp {
+                        FufInput::Weight { id, index, .. } => Some((id.0, *index)),
+                        _ => None,
+                    })
+                    .map(|(id, index)| {
+                        InputRef::Ext(bx.push_source(1, 1, SourceBinding::Weight { id, index }))
+                    })
+                    .ok_or(BridgeError::MalformedOp {
+                        tile,
+                        op: OpKind::GptOssMoe,
+                        detail: "gptoss_moe without a weight input",
+                    })?;
+                let b = &bx.bounds;
+                let num_experts =
+                    b.get("num_local_experts")
+                        .copied()
+                        .ok_or(BridgeError::MissingBound {
+                            key: "num_local_experts",
+                        })? as u32;
+                let top_k =
+                    b.get("num_experts_per_tok")
+                        .copied()
+                        .ok_or(BridgeError::MissingBound {
+                            key: "num_experts_per_tok",
+                        })? as u32;
+                let moe_inter = b
+                    .get("moe_intermediate_size")
+                    .or_else(|| b.get("intermediate_size"))
+                    .copied()
+                    .ok_or(BridgeError::MissingBound {
+                        key: "moe_intermediate_size",
+                    })? as u32;
+                let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
+                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
+                        (*group_size, *bits)
+                    }
+                    _ => {
+                        return Err(BridgeError::NoMetalRealization {
+                            tile,
+                            detail: "gptoss_moe without affine expert storage has no metal \
+                                     realization (dense MoE is unclaimed on metal)",
+                        });
+                    }
+                };
+                // The SwiGLU-OAI limit is BAKED as 7.0 into the kernels
+                // (`swiglu_oai_mul_f`, the GATED_ACT==2 epilogue); gpt-oss is
+                // the only consumer, so a config carrying any other limit is
+                // refused here at build time rather than silently computed
+                // with the wrong clamp. The upgrade path if a second consumer
+                // appears is a `CanonicalParams` scalar.
+                let limit = bx.model.scalars.get("swiglu_limit").copied().ok_or(
+                    BridgeError::MalformedOp {
+                        tile,
+                        op: OpKind::GptOssMoe,
+                        detail: "gptoss_moe requires a `swiglu_limit` config scalar",
+                    },
+                )?;
+                if limit != 7.0 {
+                    return Err(BridgeError::MalformedOp {
+                        tile,
+                        op: OpKind::GptOssMoe,
+                        detail: "gptoss_moe kernels bake swiglu_limit = 7.0; this config \
+                                 carries another value",
+                    });
+                }
+                let (experts, k) = moe_counts(tile, num_experts, top_k)?;
+                let router = RouterBundle::GptOss;
+                bx.expand();
+                // gpt-oss order: linear router WITH bias → top-4 over the
+                // biased logits → the biased values read back as the gathered
+                // scores → softmax over the top-4 (no renorm) — the Mixtral
+                // arm's exact post-gather sequence.
+                let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
+                let lg = bx.push_op(SubOp::RouteBias { router }, vec![InputRef::Op(lg), w]);
+                let indices = bx.route_top_k(lg, k);
+                let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
+                let scores = bx.push(SubOp::RouteSoftmax, &[scores]);
+                let hidden = bx.out_cols(tile, 0, "gptoss_moe output")?;
+                let experts = Experts {
+                    experts,
+                    k,
+                    inter: moe_inter,
+                    hidden,
+                    quant: ExpertQuant::declared(group_size, bits),
+                    bundle: ExpertBundle::GptOss,
+                    act: GatedAct::SwigluOai,
+                    shared: SharedExpertBound(None),
+                };
+                let idx = bx.experts(x, indices, scores, w, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

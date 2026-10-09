@@ -1,0 +1,4 @@
+{
+  "_comment": "gpt-oss ships BF16 scales on every affine tensor (verified against the jesusoctavioas safetensors headers: `*.scales` BF16 everywhere). No renames and no aliases: the DSL names match the checkpoint's `model.layers.N.*` layout verbatim, and `rope_scaling` sits flat at the config's top level.",
+  "scale_dtype": "bf16"
+}

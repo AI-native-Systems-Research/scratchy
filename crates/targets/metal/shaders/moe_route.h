@@ -9,6 +9,12 @@
 //                                       its F32 correction bias orders the picks; the UNBIASED
 //                                       sigmoids are read back as the scores. The sort's order
 //                                       runs in F32 — a 16-bit key cannot order these.
+//   [logit + bias in F32]               PRE 3 (gpt-oss's biased router): each expert's F32 logit
+//                                       plus its F32 linear bias orders the picks; the BIASED
+//                                       logits are read back as the scores — the softmax over the
+//                                       top-k that follows normalizes them (a deliberate
+//                                       divergence from PRE 2, which reads back the unbiased
+//                                       value). Same F32 sort as PRE 2.
 //   the top-k experts, ascending        as the argsort kernel's (`argpartition.metal`) stable
 //                                       ascending sort and `slice_trailing_cols`' last k
 //   their scores                        as `take_along_axis`
@@ -20,15 +26,15 @@
 // times. The key is the score's 16 bits mapped to an unsigned order (`LessThan`'s: every NaN
 // above everything, -0 equal to +0) over the expert's index, so equal scores rank by index — the
 // order a stable ascending sort leaves them in — and the k picks, read back to front, are the
-// sort's last k. PRE 2 picks on the biased F32 scores instead, ties by index the same way.
-// Every other step runs the code of the kernel named beside it, over the same rows, so the
+// sort's last k. PRE 2 and PRE 3 pick on the biased F32 scores instead, ties by index the same
+// way. Every other step runs the code of the kernel named beside it, over the same rows, so the
 // routing gives the same bits as those kernels in sequence. A softmax or renorm row's
 // threads past its scores hold the reduction's identity, so any threadgroup of at least E / 4
 // threads gives the bits of the 256-thread kernel too.
 //
 // The rows are pointers of any address space: the routing command's are device memory (the
-// softmax in place over the logits), an expert kernel's its threadgroup memory. PRE 2's bias is
-// the router bundle's own F32 tensor, one value per expert.
+// softmax in place over the logits), an expert kernel's its threadgroup memory. PRE 2's and
+// PRE 3's bias is the router bundle's own F32 tensor, one value per expert.
 
 #pragma once
 
@@ -61,9 +67,9 @@ METAL_FUNC void route_barrier() {
 }
 
 // The top-k of E experts' scores into `inds`: `logits`, under PRE 1 softmaxed into `soft` first;
-// PRE 2 picks on each expert's F32 sigmoid plus its F32 `bias` — computed on the fly, nothing
-// written back (the logits stay raw for the gather). Thread `lid` of the threadgroup; every
-// thread returns with the picks in `inds`.
+// PRE 2 picks on each expert's F32 sigmoid plus its F32 `bias`, PRE 3 on its F32 logit plus the
+// bias — both computed on the fly, nothing written back (the logits stay raw for the gather).
+// Thread `lid` of the threadgroup; every thread returns with the picks in `inds`.
 template <typename T, int E, int K, int PRE, typename PL, typename PS, typename PI, typename PB>
 METAL_FUNC void route_top_k(
     PL logits,
@@ -82,15 +88,14 @@ METAL_FUNC void route_top_k(
     route_barrier();
   }
   if (simd_group_id == 0) {
-    if (PRE == 2) {
+    if (PRE == 2 || PRE == 3) {
       // The picks order on the biased F32 scores — a 16-bit key cannot hold them. Ties rank by
       // index ascending, the packed-key order: each round takes the max score's LOWEST index.
       float keys[PER_LANE];
       for (int j = 0; j < PER_LANE; ++j) {
         uint e = simd_lane_id + 32 * uint(j);
-        keys[j] = e < uint(E)
-            ? 1.0f / (1.0f + exp(-float(logits[e]))) + bias[e]
-            : -INFINITY;
+        float v = PRE == 2 ? 1.0f / (1.0f + exp(-float(logits[e]))) : float(logits[e]);
+        keys[j] = e < uint(E) ? v + bias[e] : -INFINITY;
       }
       for (int r = 0; r < K; ++r) {
         float m = -INFINITY;
@@ -141,16 +146,18 @@ METAL_FUNC void route_top_k(
 }
 
 // The top-k picks' scores into `scores`, from the scores `route_top_k` picked from (`soft` under
-// PRE 1, else `logits` — under PRE 2 the UNBIASED F32 sigmoid of the raw logit): each [× scale],
-// [softmaxed | renormed over the k], [× its expert's scale]. Thread `lid` of the threadgroup;
-// every thread returns with the scores in `scores`.
+// PRE 1, else `logits` — under PRE 2 the UNBIASED F32 sigmoid of the raw logit, under PRE 3 the
+// logit plus its F32 `bias`, the value the picks ordered on): each [× scale], [softmaxed |
+// renormed over the k], [× its expert's scale]. Thread `lid` of the threadgroup; every thread
+// returns with the scores in `scores`.
 template <typename T, int K, int PRE, bool SCALED, int POST, bool EXPERT_SCALED, typename PL,
-          typename PS, typename PI, typename PO>
+          typename PS, typename PI, typename PO, typename PB>
 METAL_FUNC void route_scores(
     PL logits,
     PS soft,
     PI inds,
     PO scores,
+    PB bias,
     const device T* expert_scale,
     float scale,
     uint lid,
@@ -161,7 +168,9 @@ METAL_FUNC void route_scores(
   if (lid < uint(K)) {
     T s = PRE == 2
         ? T(1.0f / (1.0f + exp(-float(logits[inds[lid]]))))
-        : (PRE == 1 ? T(soft[inds[lid]]) : T(logits[inds[lid]]));
+        : (PRE == 3
+               ? T(float(logits[inds[lid]]) + float(bias[inds[lid]]))
+               : (PRE == 1 ? T(soft[inds[lid]]) : T(logits[inds[lid]])));
     if (SCALED) {
       s = T(float(s) * scale);
     }

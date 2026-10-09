@@ -145,6 +145,7 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::RouterLogits { .. }
         | L::RouteSoftmax
         | L::RouteSigmoidBias { .. }
+        | L::RouteBias { .. }
         | L::RouteArgsort
         | L::RouteTopK { .. }
         | L::RouteGatherScores
@@ -251,6 +252,10 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
         // share a buffer), but it colours with the logits it rewrites, like the softmax it
         // generalizes.
         L::RouteSigmoidBias { .. } => W::OverOperand(OperandIx(0)),
+        // Fold-only pre, gpt-oss's: the biased keys and the gathered scores CAN share a buffer
+        // (the fold adds the bias on the fly and reads it back the same way), so like the
+        // sigmoid's it runs no command of its own — the routing program's PRE 3 owns its math.
+        L::RouteBias { .. } => W::OverOperand(OperandIx(0)),
         L::RouteSoftmax
         | L::RouteScale { .. }
         | L::RouteRenorm
@@ -305,7 +310,9 @@ pub const METAL_ELIDABLE: &[SubOpKind] = &[
 pub const fn router_gate(router: RouterBundle) -> WeightTensor {
     match router {
         RouterBundle::Gemma => WeightTensor::GemmaRouterGate,
-        RouterBundle::Fused | RouterBundle::SharedFused => WeightTensor::MoeRouterGate,
+        RouterBundle::Fused | RouterBundle::SharedFused | RouterBundle::GptOss => {
+            WeightTensor::MoeRouterGate
+        }
     }
 }
 
@@ -478,7 +485,7 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                 FoldPattern::Route {
                     top_k: K::RouteTopK,
                     sort: K::RouteArgsort,
-                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias],
+                    pre: &[K::RouteSoftmax, K::RouteSigmoidBias, K::RouteBias],
                     gather: K::RouteGatherScores,
                     tail: &[
                         &[K::RouteScale],

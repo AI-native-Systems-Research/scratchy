@@ -1142,21 +1142,40 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 
 // ─────────────────────────────────────────────────────────────────
 // dequantize — quantized.h:482-556. Decode one quantized block
-// (scale * q + bias) into w_local. Bits 3, 4 and 8 (the wide kernel's
-// instantiations); the other branches dropped rather than kept dead —
-// this copy exists solely for qmv_wide_impl.
+// (scale * q + bias) into w_local. Bits 2, 3, 4 and 8 (the wide
+// kernel's instantiations); the other branches dropped rather than
+// kept dead — this copy exists solely for qmv_wide_impl.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
-      bits == 3 || bits == 4 || bits == 8,
-      "dequantize: scratchy instantiates bits 3, 4 and 8 only");
+      bits == 2 || bits == 3 || bits == 4 || bits == 8,
+      "dequantize: scratchy instantiates bits 2, 3, 4 and 8 only");
 
   const float s = float(scale);
   const float b = float(bias);
 
-  if (bits == 3) {
+  if (bits == 2) {
+    // Continuous LSB-first bitstream: element i's 2 code bits live at bit
+    // offset 2*i of the (little-endian) byte array — 4 codes per byte,
+    // none straddling (2 divides 8). Verbatim MLX `qdot` bits==2 law
+    // (quantized_loader.h:50-62): the masks stay in place (0x0c is 4·q,
+    // 0x30 is 16·q, 0xc0 is 64·q) and the scale divides instead — exact
+    // in f32, power-of-two scalings. No XOR path exists for 2-bit codes
+    // (`AffineCodes::Offset8` is 4-bit-only), so the codes read as
+    // written.
+    float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
+    for (int i = 0; i < (N / 4); i++) {
+      const uint8_t wb = w[i];
+      w_local[4 * i] = static_cast<U>(sc[0] * (wb & 0x03) + b);
+      w_local[4 * i + 1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
+      w_local[4 * i + 2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
+      w_local[4 * i + 3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
+    }
+  }
+
+  else if (bits == 3) {
     // Continuous LSB-first bitstream, byte-anchored every 8 elements
     // (group_size is a multiple of 8): 8 codes span exactly 3 bytes.
     // Verbatim MLX `qdot` bits==3 shifts (quantized_loader.h:64-77) —
@@ -1449,6 +1468,29 @@ INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
 INST_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
 
+// 2-bit instantiations (gpt-oss-120b-mlx-2Bit: 2-bit g64). The template
+// bodies carry the MLX bits==2 packing (a continuous LSB-first bitstream —
+// 4 codes per byte, so packed cols are K/16). Unlike b3, the QUAD rows
+// exist: qmv_quad_impl's `pack_factor = 32 / bits` index math is exact at
+// power-of-two bits, and `pick_qmv_kernel_wide` selects Quad for pow2 bits
+// at K∈{64,128} — the 120b itself never hits it (every affine K is
+// 2880/4096) but a parity-tiny config can shrink K into the quad band.
+// bf16/bf16 = the gpt-oss production combo; f16/f16 for unit tests.
+// batch_0 + batch_1 for the fast/plain qmv (attention projections decode
+// at both).
+#define INST_QMV_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs)                       \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 0) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 1) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,0) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,1)
+
+INST_QMV_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_ALL_B2(f16,  half,   f16,  half,   64)
+
 // qmv_wide instantiations — the small-M band (2 ≤ M < vector_limit).
 // k_lanes=8 (the affine pick, quantized.cpp:567): 4 output rows per
 // simdgroup × 2 simdgroups = 8 rows per threadgroup. vecs_per_tg in
@@ -1490,6 +1532,16 @@ INST_QMV_WIDE_ALL(f16, half, f16, half, 128)
 
 INST_QMV_WIDE_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_WIDE_ALL_B3(f16, half, f16, half, 64)
+
+// 2-bit wide rows (gpt-oss-120b-mlx-2Bit): same decode band, b_2 packing.
+#define INST_QMV_WIDE_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs)          \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 2, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 3, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 4, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 2, 5, 8)
+
+INST_QMV_WIDE_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_WIDE_ALL_B2(f16, half, f16, half, 64)
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
@@ -1734,7 +1786,7 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 // ─────────────────────────────────────────────────────────────────
 
 #ifdef SCRATCHY_CONSTANT_3
-// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh).
+// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh), 2 SwiGLU-OAI (gpt-oss's clamped form).
 SCRATCHY_CONSTANT(int, GATED_ACT, 3);
 
 // A dense gated MLP's gate and up projections and its activation, one row:
@@ -1779,7 +1831,10 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   if (simd_gid == 0 && simd_lid < 8) {
     float g = float(rows[0][simd_lid]);
     float u = float(rows[1][simd_lid]);
-    y[row0 + simd_lid] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u) : silu_mul_f(g, u));
+    y[row0 + simd_lid] =
+        static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u)
+                             : GATED_ACT == 2 ? swiglu_oai_mul_f(g, u)
+                             : silu_mul_f(g, u));
   }
 }
 #endif
@@ -1789,10 +1844,10 @@ SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
 
 // 13-18 (`MetalFusion::MoeRouted`): the gated kernel routes its token itself, from the router
 // logits, by `moe_route.h`'s program — the experts (13), the pre over them (14: 1 softmax, 2
-// F32 sigmoid + correction bias), the scores' scale (15), their last step (16: 1 softmax, 2
-// renorm) and the per-expert scale (17) — and stores the picks and scores the later kernels
-// read; the F32 e_score_correction_bias reads buffer(13) under 14's value 2. Unset: they are the
-// routing command's.
+// F32 sigmoid + correction bias, 3 F32 logit + linear bias), the scores' scale (15), their last
+// step (16: 1 softmax, 2 renorm) and the per-expert scale (17) — and stores the picks and scores
+// the later kernels read; the F32 router bias reads buffer(13) under 14's value 2 or 3. Unset:
+// they are the routing command's.
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_EXPERTS, 13);
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_PRE, 14);
 SCRATCHY_CONSTANT_OPTIONAL(float, ROUTED_SCALE, 15);
@@ -1802,6 +1857,12 @@ constant constexpr bool ROUTED = ROUTED_EXPERTS_SET;
 // The experts a routed kernel's top-k reads (a valid shape when unrouted).
 constant constexpr int ROUTED_E = ROUTED ? ROUTED_EXPERTS : 32;
 constant constexpr bool ROUTED_SOFT = ROUTED && ROUTED_PRE == 1;
+
+// 4 (`GATED_LINEAR_BIAS`): the gated kernel's experts carry per-expert LINEAR biases on gate and
+// up — gpt-oss's SwiGLU-OAI — bound at buffer(14) as [E, 2·out_vec], each expert's gate rows then
+// its up rows. Unset (every other model): no buffer(14), and the epilogue's adds const-fold away.
+SCRATCHY_CONSTANT_OPTIONAL(bool, GATED_LINEAR_BIAS_FC, 4);
+constant constexpr bool GATED_LINEAR_BIAS = GATED_LINEAR_BIAS_FC_SET && GATED_LINEAR_BIAS_FC;
 
 // Pair `nk`'s matvec over expert `expert_idx`'s weights: output block `block` (8 rows, 4 per
 // simdgroup) of `y`'s row `nk`, reading `x`'s row `x_row` — normalized by `gain` as it loads,
@@ -1875,8 +1936,9 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 //   buffer(4)   = rhs_indices                buffer(10)  = router logits, routed
 //   buffer(5)   = gate y                     buffer(11)  = scores [N, top_k], routed
 //                 [N, top_k, out_vec]        buffer(12)  = per-expert scales, routed and scaled
-//                                             buffer(13) = F32 e_score_correction_bias, routed
-//                                            buffer(15)  = the norm's gain, normed
+//                                             buffer(13) = F32 router bias, routed (PRE 2 / 3)
+//                                            buffer(14)  = gate/up LINEAR biases, gpt-oss only
+//                                             buffer(15) = the norm's gain, normed
 // Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
 // gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
 // activation to the block's rows. Every gate row is written raw only by the threadgroup that
@@ -1900,6 +1962,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     device T_act*          scores      [[buffer(11)]],
     const device T_act*    expert_scale [[buffer(12)]],
     const device float*    router_bias [[buffer(13)]],
+    const device T_act*    linear_bias [[buffer(14)]],
     const device T_scale*  gain        [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -1922,7 +1985,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     if (tid.y == 0 && nk % uint(GATHER_PER_ROW) == 0) {
       device T_act* row_scores = scores + size_t(n) * GATHER_PER_ROW;
       route_scores<T_act, GATHER_PER_ROW, ROUTED_PRE, ROUTED_SCALE_SET, ROUTED_POST,
-                   ROUTED_EXPERT_SCALE>(row, soft, routed, row_scores, expert_scale,
+                   ROUTED_EXPERT_SCALE>(row, soft, routed, row_scores, router_bias, expert_scale,
                                         ROUTED_SCALE, lid, simd_lid, simd_gid, local_a, local_b);
       if (lid < uint(GATHER_PER_ROW)) {
         rhs_indices[size_t(n) * GATHER_PER_ROW + lid] = routed[lid];
@@ -1941,7 +2004,16 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     size_t at = size_t(nk) * size_t(OUT_VEC_SIZE) + row;
     float g = float(gate_y[at]);
     float u = float(up_y[at]);
-    gate_y[at] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u) : silu_mul_f(g, u));
+    if (GATED_LINEAR_BIAS) {
+      // gpt-oss: the pair's expert adds its gate and up LINEAR biases before the activation —
+      // [E, 2·out_vec], the expert's gate rows then its up rows.
+      const device T_act* b = linear_bias + size_t(expert) * 2 * size_t(OUT_VEC_SIZE);
+      g += float(b[row]);
+      u += float(b[OUT_VEC_SIZE + row]);
+    }
+    gate_y[at] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u)
+                              : GATED_ACT == 2 ? swiglu_oai_mul_f(g, u)
+                              : silu_mul_f(g, u));
   }
 }
 #endif
@@ -1954,12 +2026,20 @@ SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_RESIDUAL_FC, 19);
 constant constexpr bool COMBINE_GATE_SCALE = COMBINE_GATE_SCALE_FC_SET && COMBINE_GATE_SCALE_FC;
 constant constexpr bool COMBINE_RESIDUAL = COMBINE_RESIDUAL_FC_SET && COMBINE_RESIDUAL_FC;
 
+// 6 (`COMBINE_LINEAR_BIAS`): each chosen expert's down projection carries a LINEAR bias (gpt-oss)
+// — buffer(10), [E, out_vec] — added to its row before the score weights it. Unset: no
+// buffer(10), and the add const-folds away.
+SCRATCHY_CONSTANT_OPTIONAL(bool, COMBINE_LINEAR_BIAS_FC, 6);
+constant constexpr bool COMBINE_LINEAR_BIAS = COMBINE_LINEAR_BIAS_FC_SET && COMBINE_LINEAR_BIAS_FC;
+
 // The MoE block's down projection and its weighted combine:
 // `out[n, d] = Σ_k down[n, k, d] · scores[n, k]`, summed in slot order (as `moe_weighted_sum`).
 // Each pair's x row is its own (the gated activation's rows); GATHER_PER_ROW is the top-k.
 //   buffer(0-2) = w / scales / biases   buffer(5) = y      [N, top_k, out_vec]
 //   buffer(3)   = x  [N, top_k, in_vec] buffer(6) = scores [N, top_k]
 //   buffer(4)   = rhs_indices           buffer(7) = out    [N, out_vec]
+//   buffer(8)   = shared rows, gate-scaled   buffer(9) = the gate, gate-scaled
+//   buffer(10)  = down LINEAR biases [E, out_vec], gpt-oss only
 // Dispatch (1, ceil(out_vec / 4), N), threadgroup (32, top_k, 1): simdgroup k runs pair
 // (n, k)'s matvec over the 4-row group tid.y, then lanes 0-3 of simdgroup 0 combine the group's
 // rows. A pair row another threadgroup also writes (qmv_impl redoing a tail) gets the same bits.
@@ -1975,6 +2055,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     device T_act*          out         [[buffer(7)]],
     const device T_act*    shared_y    [[buffer(8)]],
     const device T_act*    gate        [[buffer(9)]],
+    const device T_act*    down_bias   [[buffer(10)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
@@ -1989,9 +2070,13 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act* rows = y + size_t(n) * uint(GATHER_PER_ROW) * size_t(OUT_VEC_SIZE);
     float acc = 0.0f;
     for (int k = 0; k < GATHER_PER_ROW; ++k) {
-      acc = fma(float(rows[size_t(k) * size_t(OUT_VEC_SIZE) + row]),
-                float(scores[n * uint(GATHER_PER_ROW) + uint(k)]),
-                acc);
+      float r = float(rows[size_t(k) * size_t(OUT_VEC_SIZE) + row]);
+      if (COMBINE_LINEAR_BIAS) {
+        // gpt-oss: pair k's expert adds its down LINEAR bias before the score weights it.
+        uint e = rhs_indices[n * uint(GATHER_PER_ROW) + uint(k)];
+        r += float(down_bias[size_t(e) * size_t(OUT_VEC_SIZE) + row]);
+      }
+      acc = fma(r, float(scores[n * uint(GATHER_PER_ROW) + uint(k)]), acc);
     }
     const size_t at = size_t(n) * size_t(OUT_VEC_SIZE) + row;
     T_act v = T_act(acc);
@@ -2065,3 +2150,16 @@ INST_GATHER_QMV_ALL_B3(f16,  half,   f16, half,    64)
 INST_GATHER_QMV_ALL_B3(bf16, bfloat, f16, half,    64)
 INST_GATHER_QMV_ALL_B3(bf16, bfloat, bf16, bfloat, 64)
 INST_GATHER_QMV_ALL_B3(f16,  half,   bf16, bfloat, 64)
+
+// 2-bit gather-qmv (gpt-oss-120b-mlx-2Bit MoE decode). Same story: the
+// bodies carry the MLX bits==2 packing (4 codes per byte), only entry
+// points were missing.
+#define INST_GATHER_QMV_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs) \
+  INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 2) \
+  INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 2) \
+  INST_GATHER_QMV(affine_qmv_gated,          act_tag, act_type, scale_tag, scale_type, gs, 2) \
+  INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 2)
+INST_GATHER_QMV_ALL_B2(f16,  half,   f16, half,    64)
+INST_GATHER_QMV_ALL_B2(bf16, bfloat, f16, half,    64)
+INST_GATHER_QMV_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
+INST_GATHER_QMV_ALL_B2(f16,  half,   bf16, bfloat, 64)

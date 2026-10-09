@@ -615,6 +615,12 @@ pub enum ExpertProj {
 pub enum GatedAct {
     Silu,
     Gelu,
+    /// gpt-oss's SwiGLU-OAI: `gate = min(g, 7)`, `up = clamp(u, -7, 7)`,
+    /// `y = (up + 1) · gate · sigmoid(1.702 · gate)`. The ±7 clamps are
+    /// the reference's hard limits (transformers `SwiGLUOAI`, mlx
+    /// `SwigluOAI` at `limit` 7.0 — asserted at config parse), part of
+    /// the activation itself, not a softcap.
+    SwigluOai,
 }
 
 /// The weight bundle a router reads.
@@ -626,6 +632,9 @@ pub enum RouterBundle {
     Fused,
     /// The router inside a Qwen-style fused MoE bundle.
     SharedFused,
+    /// gpt-oss's router: a biased linear (the bias orders the top-k picks
+    /// AND is read back as the pre-softmax score) over the experts bundle.
+    GptOss,
 }
 
 /// The weight bundle an expert projection reads.
@@ -635,6 +644,9 @@ pub enum ExpertBundle {
     SwitchGlu,
     Fused,
     SharedFused,
+    /// gpt-oss's SwiGLU-OAI experts: SwitchGLU-shaped stacks plus
+    /// per-expert linear biases on gate/up/down.
+    GptOss,
 }
 
 impl RouterBundle {
@@ -645,6 +657,7 @@ impl RouterBundle {
             Self::Gemma => K::GemmaRouter,
             Self::Fused => K::FusedMoe,
             Self::SharedFused => K::SharedFusedMoe,
+            Self::GptOss => K::GptOssMoe,
         }
     }
 }
@@ -657,6 +670,7 @@ impl ExpertBundle {
             Self::SwitchGlu => K::GemmaSwitchGlu,
             Self::Fused => K::FusedMoe,
             Self::SharedFused => K::SharedFusedMoe,
+            Self::GptOss => K::GptOssMoe,
         }
     }
 }
@@ -784,6 +798,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
             SubOp::RouteSigmoidBias { router } => router.hash(h),
+            SubOp::RouteBias { router } => router.hash(h),
             SubOp::RouteTopK { k } => k.hash(h),
             SubOp::RouteScale { scale } => scale.to_bits().hash(h),
             SubOp::RouteExpertScale { router } => router.hash(h),
@@ -1130,6 +1145,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// buffer keeps the UNBIASED sigmoids, so the standard score gather reads the values mlx
     /// renormalizes. `inputs` = `[logits, router]`.
     RouteSigmoidBias { router: RouterBundle },
+    /// The router's linear bias added to its logits, in place (gpt-oss routing). The BIASED
+    /// values order the top-k picks AND are read back as the gathered scores — a softmax over
+    /// the top-k then normalizes them, so unlike [`Self::RouteSigmoidBias`] the buffer keeps the
+    /// values the picks read. `inputs` = `[logits, router]`.
+    RouteBias { router: RouterBundle },
     /// Each row's indices sorted by ascending score. `inputs` = `[scores]`.
     RouteArgsort,
     /// The last `k` sorted indices of each row — its top-k experts. `inputs` = `[sorted]`.
@@ -1178,7 +1198,8 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `rows` turned into or out of the codebook's domain, in place. `inputs` = `[x]`.
     RotateRows { rows: RotatedRows },
     /// An attention read straight off the packed store: its query, the output it replaces, and
-    /// the store's two halves. `inputs` = `[q, out, packed_k, packed_v]`.
+    /// the store's two halves. `inputs` = `[q, out, packed_k, packed_v]`, optionally with the
+    /// attention's trailing `[num_heads]` sinks weight source (the dense form's 6th operand).
     AttnPackedKv,
 
     // ── The sampled rows of a result matmul (see `sample_rows`) ───
@@ -1742,7 +1763,24 @@ pub fn eval_node<F: RopeForm>(
                 "attn Q width is a head multiple"
             );
             debug_assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
-            debug_assert_eq!(node.inputs.len() % 2, 1, "attn inputs = Q + (K,V) pairs");
+            // The gpt-oss trailing sinks weight: the registry's arity
+            // closure admits `Q + (K,V) pairs` (odd count) or exactly 6
+            // = the 5-input decode form plus ONE trailing weight-source
+            // input. An even count therefore marks the LAST input as
+            // the per-head `[num_heads]` sinks — read it here and stop
+            // the (K,V) walk before it (the pair loop below would
+            // otherwise gather past the end).
+            let sinks: Option<Vec<f32>> = if node.inputs.len().is_multiple_of(2) {
+                Some(gather(&node.inputs[node.inputs.len() - 1], graph, bufs).0)
+            } else {
+                None
+            };
+            let attn_len = node.inputs.len() - sinks.is_some() as usize;
+            debug_assert_eq!(
+                attn_len % 2,
+                1,
+                "attn inputs = Q + (K,V) pairs (+ optional trailing sinks)"
+            );
             // kv-head offset of this block (from the first K segment's column slice).
             let kvh_start = node.inputs[1].region.cols.start as usize / hd;
             // Concatenate K/V segments along sequence; each segment spans this
@@ -1751,7 +1789,7 @@ pub fn eval_node<F: RopeForm>(
             let mut v_all: Vec<f32> = Vec::new();
             let mut kv_count = 0usize;
             let mut i = 1;
-            while i < node.inputs.len() {
+            while i < attn_len {
                 let (k, kr, kc) = gather(&node.inputs[i], graph, bufs);
                 let (v, vr, vc) = gather(&node.inputs[i + 1], graph, bufs);
                 debug_assert_eq!((vr, vc), (kr, kc), "attn V seg shape");
@@ -1788,6 +1826,15 @@ pub fn eval_node<F: RopeForm>(
                         }
                         *score = dot * scale;
                     }
+                    // The sink column: appended after qk·scale, UNSCALED
+                    // (sink logits are never multiplied by sm_scale),
+                    // participates in the softmax max/denominator, and
+                    // is dropped before the ·V accumulation below — it
+                    // contributes to normalization only.
+                    let sink_col = sinks.as_ref().map(|s| s[qh_start + hl]);
+                    if let Some(sink) = sink_col {
+                        scores.push(sink);
+                    }
                     let maxs = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut sum = 0f32;
                     for sc in scores.iter_mut() {
@@ -1796,6 +1843,9 @@ pub fn eval_node<F: RopeForm>(
                     }
                     for sc in scores.iter_mut() {
                         *sc /= sum;
+                    }
+                    if sink_col.is_some() {
+                        scores.pop();
                     }
                     for d in 0..hd {
                         let mut val = 0f32;
@@ -2248,6 +2298,7 @@ pub fn lower_region(
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
             SubOp::RouteSoftmax => SubOp::RouteSoftmax,
             SubOp::RouteSigmoidBias { router } => SubOp::RouteSigmoidBias { router },
+            SubOp::RouteBias { router } => SubOp::RouteBias { router },
             SubOp::RouteArgsort => SubOp::RouteArgsort,
             SubOp::RouteTopK { k } => SubOp::RouteTopK { k },
             SubOp::RouteGatherScores => SubOp::RouteGatherScores,
@@ -3209,7 +3260,7 @@ mod tests {
         // Smallest fixture that exercises a RopeAppend → AttnDecode
         // chain. Uses 1 KV head, head_dim 4.
         let (m, hq, hkv, hd, l) = (1u32, 1u32, 1u32, 4u32, 3u32);
-        let (qdim, kvdim) = (hq * hd, hkv * hd); // both = 4
+        let kvdim = hkv * hd; // = qdim (hq * hd) = 4
         let scale = 0.5f32;
         let input = crate::lower::LoweringInput {
             sources: vec![

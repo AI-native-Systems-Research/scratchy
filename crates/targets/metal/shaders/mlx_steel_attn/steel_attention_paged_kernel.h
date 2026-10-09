@@ -121,6 +121,16 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_SELFONLY_RAW, 14);
 constant bool  ATTN_PAGED_SELFONLY_DEF = ATTN_PAGED_SELFONLY_RAW_SET;
 constant uint  ATTN_PAGED_SELFONLY = ATTN_PAGED_SELFONLY_DEF ? ATTN_PAGED_SELFONLY_RAW : 0u;
 
+// 21  ATTN_PAGED_SINKS — gpt-oss attention sinks: the layer's per-head sink
+//     logits (bound at buffer 9) are an extra softmax column, added UNSCALED
+//     by sm_scale (HF gpt_oss appends the raw logit after the scaled qk) and
+//     dropped before ·V. This kernel's scores live in the scaled log2 domain
+//     (scale carries M_LOG2E_F, ExpSubOp is fast::exp2), so the sink enters
+//     the max/denominator as sink·log2(e) — converted, never sm_scale'd.
+//     Unset: the column folds away, non-sink pipelines byte-identical.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_SINKS, 21);
+constant bool  ATTN_PAGED_SINKS_ON = ATTN_PAGED_SINKS_SET;
+
 // ── rope-once kernel (spans rope-on-read, simdgroup steel prefill) ──────────
 //
 // One pass over a request's K for one layer: read the UNROTATED K from the
@@ -298,6 +308,9 @@ void attention_paged(
     // Block-diagonal span attention: per-logical-block span label (slot 8).
     // Bound only when spans/rope-on-read active; read only under ATTN_PAGED_ROR.
     const device uint*  span_ids              [[buffer(8)]],
+    // gpt-oss attention sinks (ATTN_PAGED_SINKS): the layer's
+    // [num_q_heads] sink logits, model dtype. Only dereferenced when set.
+    const device T*     sinks                 [[buffer(9)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -515,10 +528,16 @@ void attention_paged(
   AccumType max_score[kRowsPT];
   AccumType sum_score[kRowsPT] = {0};
 
-  // Init to -Inf
+  // Init to -Inf. Attention sinks (gpt-oss): the max seeds with the sink
+  // column instead (converted into the log2 domain, NOT scaled by
+  // sm_scale — see ATTN_PAGED_SINKS), so the row max is ≥ the sink and the
+  // denominator term added before the divide can't overflow.
+  const AccumType sink_scaled =
+      ATTN_PAGED_SINKS_ON ? AccumType(sinks[q_head_idx]) * AccumType(M_LOG2E_F)
+                          : Limits<AccumType>::finite_min;
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    max_score[i] = Limits<AccumType>::finite_min;
+    max_score[i] = sink_scaled;
   }
 
   // KV-block iteration bounds. The Q tile spans rows [q_block_base,
@@ -857,6 +876,15 @@ void attention_paged(
 
       loader_k.next();
       loader_v.next();
+    }
+  }
+
+  // Attention sinks (gpt-oss): the denominator gains the extra column's
+  // weight, exp2(sink − rowmax) ≤ 1 by the seed, contributing no V.
+  if (ATTN_PAGED_SINKS_ON) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      sum_score[i] += fast::exp2(sink_scaled - max_score[i]);
     }
   }
 

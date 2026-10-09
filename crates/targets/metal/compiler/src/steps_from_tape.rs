@@ -827,7 +827,7 @@ impl Recording<'_> {
         // A Qwen-MoE projection's own width, as the quantization declares it per layer.
         let declared = match bundle {
             ExpertBundle::SharedFused => self.facts.moe_expert_bits,
-            ExpertBundle::SwitchGlu | ExpertBundle::Fused => None,
+            ExpertBundle::SwitchGlu | ExpertBundle::Fused | ExpertBundle::GptOss => None,
         };
         let step = declared.map_or(raw, |w| {
             let widths = w(layer);
@@ -1312,6 +1312,11 @@ impl Recording<'_> {
                 let e = self.source_arg(j, 1)?;
                 weights.push((router.weight_kind(), e));
                 st::RoutePre::SigmoidBias(self.layer(e))
+            }
+            Some((j, &SubOp::RouteBias { router })) => {
+                let e = self.source_arg(j, 1)?;
+                weights.push((router.weight_kind(), e));
+                st::RoutePre::Bias(self.layer(e))
             }
             Some(_) => return Err(self.no(i, Refused::FusionShape)),
         };
@@ -1825,6 +1830,24 @@ impl Recording<'_> {
                     ),
                     (false, Causal) => (S::AttentionViaCache(q, out, layer, pairing), rotary()),
                 };
+                // gpt-oss attention sinks: the 6-input form's TRAILING
+                // weight input (arg 5) binds the per-layer
+                // `[num_heads]` sink vector. The registry admits
+                // exactly 6 for the even form, so a present 6th
+                // operand that is not a weight source is a malformed
+                // tape — refuse rather than silently drop the sinks.
+                let sites = match self.arg(i, 5) {
+                    Ok(InputRef::Ext(e)) => {
+                        if !matches!(self.l.bindings[e], SourceBinding::Weight { .. }) {
+                            return Err(self.no(i, Refused::NotAWeight(e)));
+                        }
+                        let mut sites = sites;
+                        sites.extend(self.site(i, WeightKind::AttnSinks, e)?);
+                        sites
+                    }
+                    Ok(InputRef::Op(_)) => return Err(self.no(i, Refused::NotASource(5))),
+                    Err(_) => sites,
+                };
                 let v = match self.arg(i, 4) {
                     Ok(InputRef::Op(v)) => self.colour(v).ok(),
                     _ => None,
@@ -1858,9 +1881,25 @@ impl Recording<'_> {
             }
             L::AttnPackedKv => {
                 // The layer's decode attention: its writer's layer and pairing.
-                let (layer, pairing, class, offsets, sites) =
+                let (layer, pairing, class, offsets, mut sites) =
                     self.codec_writer(i, self.step_arg(i, 2)?)?;
                 let (q, out) = (self.read(i, 0)?, out()?);
+                // gpt-oss attention sinks: the twin's TRAILING weight input (arg 4 —
+                // the attention's 6th operand, carried by the codec expansion) binds the
+                // per-layer `[num_heads]` sink vector, exactly as the dense form's. The
+                // registry admits exactly 5 for the trailing form, so a present 5th
+                // operand that is not a weight source is a malformed tape — refuse
+                // rather than silently drop the sinks.
+                match self.arg(i, 4) {
+                    Ok(InputRef::Ext(e)) => {
+                        if !matches!(self.l.bindings[e], SourceBinding::Weight { .. }) {
+                            return Err(self.no(i, Refused::NotAWeight(e)));
+                        }
+                        sites.extend(self.site(i, WeightKind::AttnSinks, e)?);
+                    }
+                    Ok(InputRef::Op(_)) => return Err(self.no(i, Refused::NotASource(4))),
+                    Err(_) => {}
+                }
                 let step = S::AttnPackedKv(q, out, layer, pairing, class, offsets);
                 let mut e = em(step, &[q, out], &[out], sites);
                 e.sig.kv_r = Some(layer);
@@ -2045,6 +2084,10 @@ impl Recording<'_> {
             // route command (`RouteProgram::pre`). A sigmoid+bias left on its own escaped the
             // Route fold, which nothing lowers.
             L::RouteSigmoidBias { .. } => return Err(self.no(i, Refused::Escaped)),
+            // Fold-only, gpt-oss's: the bias runs inside the route command
+            // (`RouteProgram::pre`), which computes the biased keys on the fly and reads them
+            // back the same way. One left on its own escaped the Route fold.
+            L::RouteBias { .. } => return Err(self.no(i, Refused::Escaped)),
             L::RouteArgsort => self.moe(i, MoeStep::Argsort, &[], &[], None)?,
             L::RouteTopK { .. } => self.moe(i, MoeStep::TopK, &[], &[], None)?,
             L::RouteGatherScores => self.moe(i, MoeStep::GatherScores, &[], &[], None)?,

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Rotary positional embedding cache — cuda runtime half.
 //!
-//! The neutral [`RotaryCache`] type, the rope-scaling config structs, and the
-//! stream-free `*_from_gpuweights` constructors live in `scratchy-layers`
-//! (re-exported below). This module adds the cuda-only stream-based
-//! constructors (`*_from_stream`, LongRoPE / YaRN host-math) as a
-//! [`CudaRotaryExt`] extension trait so the macro-emitted cuda `load_with`
-//! body can keep calling `RotaryCache::new_from_stream(...)` path-syntax.
+//! The neutral [`RotaryCache`] type, the rope-scaling config structs, the
+//! stream-free `*_from_gpuweights` constructors, and the shared YaRN
+//! host-math (`yarn_cos_sin_table`) live in `scratchy-layers`
+//! (re-exported below). This module adds the cuda-only stream-based upload
+//! constructors (`*_from_stream`) as a [`CudaRotaryExt`] extension trait so
+//! the macro-emitted cuda `load_with` body can keep calling
+//! `RotaryCache::new_from_stream(...)` path-syntax.
 
 pub use scratchy_layers::rotary::*;
 
@@ -18,53 +19,6 @@ use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 #[cfg(feature = "cuda")]
 use anyhow::Result;
-
-#[cfg(feature = "cuda")]
-fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn yarn_find_correction_range(
-    beta_fast: f64,
-    beta_slow: f64,
-    dim: usize,
-    base: f64,
-    original_max_pos: usize,
-) -> (f64, f64) {
-    let n_orig = original_max_pos as f64;
-    let low =
-        (n_orig / (beta_fast * 2.0 * std::f64::consts::PI)).ln() / (2.0 / dim as f64 * base.ln());
-    let high =
-        (n_orig / (beta_slow * 2.0 * std::f64::consts::PI)).ln() / (2.0 / dim as f64 * base.ln());
-    (
-        low.floor().max(0.0),
-        high.ceil().min(dim as f64 / 2.0 - 1.0),
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn yarn_linear_ramp_mask(low: f64, high: f64, dim: usize) -> Vec<f64> {
-    let len = dim / 2;
-    (0..len)
-        .map(|i| {
-            let t = i as f64;
-            if low >= high {
-                if t < low { 0.0 } else { 1.0 }
-            } else if t < low {
-                0.0
-            } else if t > high {
-                1.0
-            } else {
-                (t - low) / (high - low)
-            }
-        })
-        .collect()
-}
 
 /// Allocate + upload a `[max_pos, rotary_dim]` f32 cos|sin cache to
 /// GPU memory in the target dtype. Extracted so variants (standard,
@@ -545,46 +499,10 @@ impl CudaRotaryExt for RotaryCache {
         dtype: DType,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
-        let half = rope_head_dim / 2;
-        let factor = yarn.factor;
-        let (low, high) = yarn_find_correction_range(
-            yarn.beta_fast,
-            yarn.beta_slow,
-            rope_head_dim,
-            rope_theta,
-            yarn.original_max_position_embeddings,
-        );
-        let ramp = yarn_linear_ramp_mask(low, high, rope_head_dim);
-        // Python's DeepseekScalingRotaryEmbedding bakes
-        //   mscale = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
-        // into the cos/sin cache (mscale_all_dim^2 is handled separately in the attention
-        // softmax scale). For DeepSeek V2-Lite mscale==mscale_all_dim so this is 1.0.
-        let mscale_num = yarn_get_mscale(factor, yarn.mscale);
-        let mscale_den = if yarn.mscale_all_dim != 0.0 {
-            yarn_get_mscale(factor, yarn.mscale_all_dim)
-        } else {
-            1.0
-        };
-        let mscale = (mscale_num / mscale_den) as f32;
-
-        let inv_freqs: Vec<f64> = (0..half)
-            .map(|i| {
-                let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rope_head_dim as f64);
-                let freq_inter = freq / factor;
-                // ramp[i]=0 → original (high-freq, small i), ramp[i]=1 → interpolated (low-freq, large i).
-                // Matches Python: inv_freq = interp*ramp + extrap*(1-ramp)
-                freq * (1.0 - ramp[i]) + freq_inter * ramp[i]
-            })
-            .collect();
-
-        let mut cache = vec![0f32; max_pos * rope_head_dim];
-        for pos in 0..max_pos {
-            for i in 0..half {
-                let angle = pos as f64 * inv_freqs[i];
-                cache[pos * rope_head_dim + i] = angle.cos() as f32 * mscale;
-                cache[pos * rope_head_dim + half + i] = angle.sin() as f32 * mscale;
-            }
-        }
+        // Host math shared with the neutral `new_yarn_from_gpuweights`
+        // via `scratchy-layers` — one implementation of the YaRN table,
+        // two upload paths, so the backends cannot drift.
+        let cache = yarn_cos_sin_table(rope_head_dim, max_pos, rope_theta, yarn);
 
         let cos_sin_cache = upload_combined_cos_sin(&cache, max_pos, rope_head_dim, dtype, stream)?;
         let (cos_cache, sin_cache) =

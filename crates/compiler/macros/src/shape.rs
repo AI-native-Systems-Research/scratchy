@@ -397,6 +397,12 @@ pub fn apply_signature_with_geometry(
         // in the picked kernel (window-masked vs. dense), not in
         // the type signature.
         OpKind::SlidingAttention => sig_attention(solver, inputs, op, hybrid_attention_geometry),
+        // Sink attention: q/k/v constraints + the rank-1 sinks weight.
+        // See `sig_sink_attention`.
+        OpKind::SinkAttention => sig_sink_attention(solver, inputs, op, hybrid_attention_geometry),
+        OpKind::SinkSlidingAttention => {
+            sig_sink_attention(solver, inputs, op, hybrid_attention_geometry)
+        }
         // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
         // No heads-layout anchoring — vision shapes are pinned at
         // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
@@ -463,6 +469,7 @@ pub fn apply_signature_with_geometry(
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
         OpKind::Moe => sig_moe(solver, inputs),
         OpKind::GemmaMoe => sig_gemma_moe(solver, inputs),
+        OpKind::GptOssMoe => sig_gptoss_moe(solver, inputs),
         OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
         OpKind::GateSplit => sig_gate_split(solver, inputs),
         OpKind::GateApply => sig_gate_apply(solver, inputs),
@@ -722,6 +729,39 @@ fn sig_attention(
     Ok(OpSig { output: q.clone() })
 }
 
+/// `sink_attention(q, k, v, sinks, kv_cache, block_table)` (6-arg,
+/// decoder) → `[.., num_attention_heads * head_dim]`. gpt-oss attention
+/// with per-head learned sink logits: arg 3 is the dense per-layer
+/// `[num_attention_heads]` weight (unified with the query-head count —
+/// one sink per head), args 4/5 are the same opaque KV-side externs as
+/// `attention`'s 5-arg form. q/k/v constraints are exactly
+/// [`sig_attention`]'s — delegated with the plain attention op of the
+/// same class so the shared per-class head-geometry anchors apply.
+fn sig_sink_attention(
+    solver: &mut Solver,
+    inputs: &[Shape],
+    op: OpKind,
+    hybrid_attention_geometry: bool,
+) -> Result<OpSig, ShapeError> {
+    expect_args(op, inputs, 6)?;
+    let sinks = &inputs[3];
+    if sinks.len() != 1 {
+        return Err(ShapeError::BadArgs {
+            op,
+            reason: format!("sinks weight must have rank 1, got {}", sinks.len()),
+        });
+    }
+    solver.unify(
+        sinks.last().unwrap(),
+        &Dim::Bound("num_attention_heads".into()),
+    )?;
+    let class = match op {
+        OpKind::SinkSlidingAttention => OpKind::SlidingAttention,
+        _ => OpKind::Attention,
+    };
+    sig_attention(solver, &inputs[..3], class, hybrid_attention_geometry)
+}
+
 /// `varlen_attention(q, k, v, cu_seqlens, max_seqlen)` →
 /// `q.shape`. Vision-encoder attention. Inputs: q/k/v all rank-2
 /// `[total_L, num_heads * head_dim]` (vision-side; the heads-layout
@@ -957,6 +997,17 @@ fn sig_gemma_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeE
     })
 }
 
+/// `gptoss_moe(x: [T, H], mlp_weight)` → `[T, H]`. Two args: one
+/// activation tile and one MoE weight bundle (`GptOssMoELayer` — a
+/// struct, not a tensor, so it contributes an empty shape). Output =
+/// `x` shape.
+fn sig_gptoss_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GptOssMoe, inputs, 2)?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
 /// Elementwise unary ops (silu, gelu, …) preserve shape.
 /// `scalar_weight_mul(x: [...], w: [1])` → `[...]` — multiply by a
 /// loaded one-element weight (Gemma4 `layer_scalar`).
@@ -1046,6 +1097,10 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::RopeAppendInterleaved => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
+        // Sink attention: arg 3 is the per-layer `[num_attention_heads]`
+        // sinks weight (dense tensor — the sig unifies its dim).
+        OpKind::SinkAttention => &[(3, 1)],
+        OpKind::SinkSlidingAttention => &[(3, 1)],
         OpKind::VarlenAttention => &[],
         OpKind::Silu => &[],
         OpKind::Gelu => &[],
@@ -1076,6 +1131,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // (arg 3) are weight-bundle structs (GemmaRouterLayer /
         // SwitchGluExpertsLayer), not tensors; skip the rank assertion.
         OpKind::GemmaMoe => &[],
+        // GptOssMoe's mlp[layer] is a weight-bundle struct
+        // (GptOssMoELayer), not a tensor; like Moe, skip the assertion.
+        OpKind::GptOssMoe => &[],
         // GatedDeltaNet's linear_attn[layer] is a GatedDeltaNetLayer struct
         // (not a tensor); like Moe, skip the tensor-rank assertion.
         OpKind::GatedDeltaNet => &[],

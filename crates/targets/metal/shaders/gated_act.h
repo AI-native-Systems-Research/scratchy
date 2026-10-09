@@ -38,3 +38,19 @@ inline float gelu_mul_f(float g, float u) {
   float gelu_g = 0.5f * g * (1.0f + metal::tanh(inner));
   return gelu_g * u;
 }
+
+// gpt-oss SwiGLU-OAI (gpt_oss `SwiGLU(limit=7.0)`): the clamped affine
+// variant OpenAI ships — NOT silu. transformers / vLLM / mlx-lm / llama.cpp
+// agree on
+//   gate = min(g, 7); up = clamp(u, -7, 7);
+//   y = (up + 1) · gate · sigmoid(1.702 · gate).
+// The ±7 limit is gpt-oss's `swiglu_limit` config scalar; it is BAKED here
+// (and asserted equal to 7.0 at the bridge, where the config is read), so a
+// config carrying any other value is a build-time refusal, never a silent
+// mis-clamp.
+inline float swiglu_oai_mul_f(float g, float u) {
+  const float limit = 7.0f;
+  float gate = metal::min(g, limit);
+  float up = metal::clamp(u, -limit, limit);
+  return (up + 1.0f) * gate / (1.0f + metal::exp(-1.702f * gate));
+}
