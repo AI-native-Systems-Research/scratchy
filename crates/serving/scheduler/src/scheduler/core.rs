@@ -209,7 +209,9 @@ pub struct SimpleBlockTracker {
     /// Lowest-free-first allocation order for the hybrid path (a min-heap of
     /// free block IDs). Full groups take the lowest IDs and hold them; sliding
     /// groups recycle their just-freed low IDs immediately, so the **max
-    /// allocated block ID stays ~`full_blocks + Σ window_blocks`**. This is the
+    /// allocated block ID stays ~`full_blocks + Σ window_blocks`** (`2 ×` the
+    /// window with prefix caching on: the prompt's last window is held, see
+    /// `remove_skipped_blocks`). This is the
     /// load-bearing adaptation to scratchy's substrate: lockstep
     /// `grow_to_cover` residency is keyed on the max block ID, so an unbounded
     /// (FIFO, free-to-back) ID would commit the whole pool resident and
@@ -664,29 +666,48 @@ impl SimpleBlockTracker {
     /// already cached BEFORE this step's new tokens). Idempotent — the reverse
     /// scan stops at the first null, so re-calling with a larger skip only frees
     /// the newly-exposed lower-index blocks. No-op for full groups.
+    ///
+    /// With prefix caching on, the blocks covering the PROMPT's last window
+    /// (what a re-sent prompt needs at its largest admissible P, aligned to
+    /// `global_bs`) are held until the request is freed instead (#328). Freed
+    /// here they went straight into the lowest-free-first heap, the reply's own
+    /// new blocks recycled them and evicted their hashes, so after a reply of a
+    /// few hundred tokens the same prompt reused nothing. Costs at most one
+    /// extra window per sliding group per request, whatever the reply length.
     fn remove_skipped_blocks(
         &mut self,
-        request_id: &str,
+        request: &Request,
         g: usize,
         grp: SwaGroup,
-        total_computed: usize,
+        global_bs: usize,
     ) {
         if !grp.is_sliding {
             return; // full attention never frees
         }
         // skipped_tokens = max(0, num_computed - window + 1)
+        let total_computed = request.num_computed_tokens as usize;
         let num_skipped_tokens = (total_computed + 1).saturating_sub(grp.window);
         if num_skipped_tokens == 0 {
             return;
         }
+        let held = if self.enable_caching {
+            let prompt_len = request.num_prompt_tokens as usize;
+            let p_max = prompt_len / global_bs * global_bs;
+            p_max.saturating_sub(grp.window) / grp.block_size..prompt_len / grp.block_size
+        } else {
+            0..0
+        };
         let mut removed: Vec<usize> = Vec::new();
-        if let Some((tables, _)) = self.allocations.get_mut(request_id)
+        if let Some((tables, _)) = self.allocations.get_mut(&request.request_id)
             && let Some(blocks) = tables.get_mut(g)
         {
             // Only WHOLE skipped blocks are freed (// block_size floor); the
             // partial block straddling the window edge is retained.
             let num_skipped_blocks = (num_skipped_tokens / grp.block_size).min(blocks.len());
             for i in (0..num_skipped_blocks).rev() {
+                if held.contains(&i) {
+                    continue;
+                }
                 if blocks[i] == Self::NULL_BLOCK {
                     // Already nulled — usually by a prior call (contiguous
                     // nulled head, could `break`), but spans credits also NULL
@@ -721,8 +742,6 @@ impl SimpleBlockTracker {
         let num_groups = groups.len();
         let total_tokens =
             request.num_computed_tokens as usize + num_new_tokens + num_lookahead_tokens;
-        let total_computed = request.num_computed_tokens as usize;
-
         // Fresh request with cache hits: seed each group's table from the
         // per-group matched ids (cached block ids reused; usize::MAX = miss →
         // alloc fresh; NULL_BLOCK = out-of-window head → null-pad). Reused
@@ -749,8 +768,13 @@ impl SimpleBlockTracker {
 
         // 1. Free out-of-window blocks per sliding group BEFORE the capacity
         //    check (vLLM: "call before allocating to reduce evicted blocks").
+        let global_bs = groups
+            .iter()
+            .find(|g| !g.is_sliding)
+            .unwrap_or(&groups[0])
+            .block_size;
         for (g, grp) in groups.iter().enumerate() {
-            self.remove_skipped_blocks(&request.request_id, g, *grp, total_computed);
+            self.remove_skipped_blocks(request, g, *grp, global_bs);
         }
 
         // 2. New tail blocks needed per group + ONE atomic cross-group check.
@@ -3981,6 +4005,34 @@ mod tests {
         );
     }
 
+    /// Prefill `prompt_len` tokens, decode `reply_len` more one at a time (sealing each step, as
+    /// the engine does), free, then look the same prompt up again. Returns the reusable P.
+    fn hybrid_reuse_after_reply(prompt_len: usize, reply_len: usize) -> u32 {
+        let mut t = caching_hybrid(512, 64);
+        let mut r1 = hybrid_req("r1", prompt_len);
+        t.allocate_slots(&r1, prompt_len, 0, &[]).unwrap();
+        r1.num_computed_tokens = prompt_len as u32;
+        t.seal(&r1);
+        for i in 0..reply_len {
+            r1.append_output_token_ids(&[10_000 + i as u32]);
+            t.allocate_slots(&r1, 1, 0, &[]).unwrap();
+            r1.num_computed_tokens += 1;
+            t.seal(&r1);
+        }
+        t.free("r1");
+        t.get_computed_blocks(&hybrid_req("r2", prompt_len)).0
+    }
+
+    #[test]
+    fn test_hybrid_prompt_window_survives_long_reply() {
+        // #328: the sliding group's blocks covering the prompt's last window slide out of the
+        // window during decode. Freed straight into the lowest-free-first heap, the reply's own
+        // new blocks recycled them (evicting their hashes), so re-sending the same prompt after a
+        // long reply found no admissible P and reused nothing. A short reply never got that far.
+        assert_eq!(hybrid_reuse_after_reply(200, 8), 192, "short reply");
+        assert_eq!(hybrid_reuse_after_reply(200, 300), 192, "long reply");
+    }
+
     #[test]
     fn test_hybrid_caching_refcount_on_shared_hits() {
         // A reused cached block must be ref-counted so freeing one request does
@@ -4056,6 +4108,41 @@ mod tests {
             pool - 1,
             "all data blocks freed (null block 0 held out), no leak/double-free"
         );
+    }
+
+    #[test]
+    fn test_hybrid_held_prompt_window_stays_bounded() {
+        // With caching on, the prompt's last window is held for the request's life (#328) — that
+        // must cost one extra window, not grow with the reply.
+        let bs = 16usize;
+        let window = 64usize;
+        let win_blocks = window.div_ceil(bs);
+        let pool = 4096usize;
+        let mut tracker = SimpleBlockTracker::with_caching(pool, bs);
+        tracker.enable_hybrid(pool, vec![(true, window, bs)]);
+
+        let mut r = hybrid_req("r1", 200);
+        tracker.allocate_slots(&r, 200, 0, &[]).expect("prefill");
+        r.num_computed_tokens = 200;
+        let mut max_seen = 0usize;
+        for i in 0..4000u32 {
+            r.append_output_token_ids(&[10_000 + i]);
+            let groups = tracker.allocate_slots(&r, 1, 0, &[]).expect("decode");
+            r.num_computed_tokens += 1;
+            let live = groups[0].iter().filter(|&&b| b != 0).count();
+            assert!(
+                live <= 2 * win_blocks + 3,
+                "live sliding blocks {live} exceed window + held prompt window at tok {i}",
+            );
+            max_seen = max_seen.max(tracker.max_allocated_block_id());
+        }
+        assert!(
+            max_seen <= 2 * win_blocks + 16,
+            "max allocated block id {max_seen} climbed past two windows + prefill slack"
+        );
+
+        tracker.free("r1");
+        assert_eq!(tracker.num_free_blocks(), pool - 1, "no leak/double-free");
     }
 
     #[test]
@@ -5658,5 +5745,70 @@ mod tests {
                 "r{i} must emit all its tokens"
             );
         }
+    }
+
+    /// #328, through the scheduler: gemma-4-12b-shaped groups (one full group, bs 32, + five
+    /// sliding groups, window 1024, bs 16) with prefix caching. The issue's ~1.4k-token prompt
+    /// with a 300-token reply, then the same prompt again, must reuse the prompt — it reused 0
+    /// once the first reply passed ~150 tokens.
+    #[test]
+    fn test_hybrid_same_prompt_after_long_reply_hits_prefix_cache() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 2048,
+            max_num_seqs: 1,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let pool = 2634usize;
+        let mut tracker = SimpleBlockTracker::with_caching(pool, 16);
+        let mut groups = vec![(false, 0usize, 32usize)];
+        groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
+        tracker.enable_hybrid(pool, groups);
+        let mut sched = Scheduler::new(&cfg, 32768, Box::new(tracker));
+        let (prompt_len, max_tokens) = (1418u32, 300u32);
+        let request = |id: &str| {
+            Request::new(
+                id.into(),
+                (0..prompt_len).collect(),
+                SamplingParams {
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+                0.0,
+                0,
+                0,
+                None,
+            )
+        };
+
+        sched.add_request(request("r1"));
+        for _ in 0..10_000 {
+            let out = sched.schedule();
+            for id in out.num_scheduled_tokens.keys() {
+                let r = sched.get_request(id).unwrap();
+                if r.num_computed_tokens as usize >= r.num_tokens() {
+                    sched.append_output_tokens(id, &[7]);
+                    if sched.get_request(id).unwrap().num_output_tokens() >= max_tokens as usize {
+                        sched.finish_requests(&[id.as_str()], RequestStatus::FinishedLengthCapped);
+                    }
+                }
+            }
+            if !sched.has_unfinished_requests() {
+                break;
+            }
+        }
+        assert_eq!(
+            sched.get_request("r1").unwrap().num_output_tokens(),
+            max_tokens as usize
+        );
+
+        sched.add_request(request("r2"));
+        sched.schedule();
+        let cached = sched.get_request("r2").unwrap().num_cached_tokens;
+        assert_eq!(
+            cached,
+            (prompt_len / 32 * 32) as i32,
+            "the re-sent prompt must reuse every full global block"
+        );
     }
 }
