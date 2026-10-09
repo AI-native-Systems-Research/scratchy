@@ -25,8 +25,15 @@ use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgr
 
 const EXPERTS: usize = 128;
 const TOP_K: usize = 4;
-const HIDDEN: usize = 2880;
-const INTER: usize = 2880;
+// Small, law-true shapes — K a multiple of GS (64) and of the b2 pack (4),
+// N wide enough to carry the linear biases past the ±7 clamps. The 120b's
+// real 2880×2880 expert slabs made this fixture generate ~1G values per
+// build; the b2 kernels' real-width behavior is pinned by quantized_b2_test
+// and affine_gather_qmv_test at N,K ∈ {2880, 4096} — THIS test's pins are
+// the composition: PRE 3 routing, SwiGLU-OAI, the linear-bias slots, and
+// routed-vs-unrouted equality.
+const HIDDEN: usize = 192;
+const INTER: usize = 192;
 const GS: usize = 64;
 /// gpt-oss's routing program: the F32 linear bias orders the top-4, the biased values are read
 /// back as the scores, softmaxed over the top-4.
@@ -95,20 +102,31 @@ impl Experts {
         n_out: usize,
         k_in: usize,
     ) -> Self {
+        // ONE expert's slab, replicated across the pool with a per-expert XOR
+        // of the codes: the fixture costs one expert's generation, not
+        // `experts`' (CI runs this suite in debug), while every expert still
+        // reads distinct bits, so a mis-gathered expert computes the wrong
+        // rows. The XOR is a bijection on the slab's bytes, so the code
+        // histogram — codes spanning the scale's 4 steps — is unchanged.
         // 2-bit codes: 4 per byte, so a row packs k_in / 4 bytes.
-        let codes: Vec<u8> = (0..experts * n_out * k_in / 4)
+        let slab: Vec<u8> = (0..n_out * k_in / 4)
             .map(|_| (rng.next() * 256.0) as u8)
             .collect();
+        let codes: Vec<u8> = (0..experts)
+            .flat_map(|e| slab.iter().map(move |&c| c ^ e as u8))
+            .collect();
         // Centred weights of ~±0.03: codes span 4 steps of the scale, the bias takes off half.
-        let groups = experts * n_out * k_in / GS;
         let steps = 3.0f32;
-        let (scales, biases): (Vec<bf16>, Vec<bf16>) = (0..groups)
+        let groups = n_out * k_in / GS;
+        let (slab_scales, slab_biases): (Vec<bf16>, Vec<bf16>) = (0..groups)
             .map(|_| {
                 let scale = (0.5 + rng.next()) * 0.06 / steps;
                 let bias = -scale * steps / 2.0 * (1.0 + 0.1 * (rng.next() * 2.0 - 1.0));
                 (bf16::from_f32(scale), bf16::from_f32(bias))
             })
             .unzip();
+        let scales = slab_scales.repeat(experts);
+        let biases = slab_biases.repeat(experts);
         Self {
             w: common::shared_slice(device, &codes),
             s: common::shared_slice(device, &scales),
@@ -178,9 +196,10 @@ struct LinearBias {
 
 impl LinearBias {
     /// The gate/up concat `[E, 2·inter]` — expert e's gate rows then its up rows — wide enough
-    /// to push past the ±7 clamps: the reference must catch a mis-clamp, not just a mis-add.
+    /// to push past the ±7 clamps on its own: the reference must catch a mis-clamp, not just a
+    /// mis-add.
     fn gate_up(device: &common::Device, rng: &mut Lcg, experts: usize) -> Self {
-        let host = rng.bf16s(experts * 2 * INTER, -6.0, 6.0);
+        let host = rng.bf16s(experts * 2 * INTER, -9.0, 9.0);
         Self {
             buf: common::shared_slice(device, &host),
             host,
@@ -266,8 +285,21 @@ impl Block {
             .collect();
         let scores_host = rng.bf16s(pairs, 0.05, 0.45);
         let x_host = rng.bf16s(tokens * HIDDEN, -1.0, 1.0);
-        let logits_host = rng.bf16s(tokens * EXPERTS, -3.0, 3.0);
         let router_bias_host: Vec<f32> = (0..EXPERTS).map(|_| -0.5 + rng.next()).collect();
+        // A 4th-vs-5th tie in the BIASED logits is outside the two routers'
+        // contract — the route command and the in-kernel router may order an
+        // exact tie differently — so the fixture re-rolls until it draws
+        // none. The fixture's draw count must not be what decides this.
+        let mut logits_host = rng.bf16s(tokens * EXPERTS, -3.0, 3.0);
+        while (0..tokens).any(|t| {
+            let mut biased: Vec<f32> = (0..EXPERTS)
+                .map(|e| logits_host[t * EXPERTS + e].to_f32() + router_bias_host[e])
+                .collect();
+            biased.sort_by(|a, b| b.total_cmp(a));
+            biased[TOP_K - 1] == biased[TOP_K]
+        }) {
+            logits_host = rng.bf16s(tokens * EXPERTS, -3.0, 3.0);
+        }
         let (gate_up_bias, down_bias) = (
             LinearBias::gate_up(device, &mut rng, EXPERTS),
             LinearBias::down(device, &mut rng, EXPERTS),
