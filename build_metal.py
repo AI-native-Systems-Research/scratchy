@@ -2,7 +2,8 @@
 """Generate site/_site/metal.html from site/data/metal/*.json.
 
 Each data file is one run of scripts/bench_metal_matrix.sh, copied in
-unedited and named <machine>-<YYYY-MM-DD>-<sha8>.json. The page reads them at
+unedited and named <machine>-<YYYY-MM-DDTHHMMSSZ>-<sha8>.json (older runs:
+<machine>-<YYYY-MM-DD>-<sha8>.json). The page reads them at
 site-build time, so it cannot drift from what the runner measured, and a file
 missing what the page needs fails the build rather than rendering a blank.
 
@@ -83,9 +84,12 @@ def load(data_dir):
                     errors.append(f"{f.name}: models[{i}] missing {', '.join(missing)}")
         if len(errors) > before:          # the name check needs the fields above
             continue
-        want = f"{slug(run['machine']['chip'])}-{run['generated_utc'][:10]}-{str(run['repo']['sha'])[:8]}.json"
-        if f.name != want:
-            errors.append(f"{f.name}: name it {want} (<machine>-<date>-<sha8>.json)")
+        # The start time keeps two runs of one commit on one day apart; names
+        # from before it carry only the date.
+        machine, utc, sha8 = slug(run['machine']['chip']), run['generated_utc'], str(run['repo']['sha'])[:8]
+        want = f"{machine}-{utc[:10]}T{utc[11:19].replace(':', '')}Z-{sha8}.json"
+        if f.name not in (want, f"{machine}-{utc[:10]}-{sha8}.json"):
+            errors.append(f"{f.name}: name it {want} (<machine>-<start time>-<sha8>.json)")
         run["_file"] = f
         runs.append(run)
     if errors:
