@@ -11399,7 +11399,7 @@ pub fn emit_model(
     // the per-target alias), so the same fields compile and load on any
     // backend.
     #[cfg(all(feature = "spyre", not(feature = "metal")))]
-    let weights = {
+    let (weights, weights_affine_rows) = {
         let lowered = sfufs
             .per_workload
             .keys()
