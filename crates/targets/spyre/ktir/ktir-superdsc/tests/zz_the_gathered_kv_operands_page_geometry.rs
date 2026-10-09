@@ -147,6 +147,7 @@ fn prefix_score_op(rung: u32, kv_block_index: Option<&str>) -> serde_json::Value
         kv_block_index,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )

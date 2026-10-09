@@ -99,6 +99,7 @@ fn emit_at(mq: u32) -> Vec<OpFields> {
         None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )
@@ -238,6 +239,7 @@ fn the_start_address_extractor_sees_real_values() {
         None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )
@@ -290,6 +292,7 @@ fn dump_the_score_node_for_stride_comparison() {
             None,
             ktir_superdsc::place::PlaceId::Act(900),
             true,
+            false,
             &mut sym,
             None,
         )
@@ -348,6 +351,7 @@ fn what_skip_addr_the_gathered_score_leg_would_get() {
         None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )
@@ -575,6 +579,7 @@ fn doubling_the_rung_doubles_the_per_core_row_fold() {
             None,
             ktir_superdsc::place::PlaceId::Act(900),
             true,
+            false,
             &mut sym,
             None,
         )
@@ -657,6 +662,7 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
         Some("t4294967175"),
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )
@@ -853,6 +859,7 @@ fn every_run_of_the_cut_pass_addresses_its_own_entries_and_rows() {
         Some("t4294967175"),
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )
@@ -976,6 +983,7 @@ fn the_ungathered_shipped_prefix_fold_still_emits() {
         None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )

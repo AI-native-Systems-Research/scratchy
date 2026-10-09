@@ -2197,10 +2197,20 @@ fn emit_one(
                 sym_id_base,
                 layout,
                 &mut q,
-                b,
-                // This door's operands are WINDOWS of the caller's parameters — the fact the
-                // spurious-pad drop in `matmul_oriented` discriminates on.
-                super::lower_ktir_to_superdsc::OperandOrigin::Windowed,
+                super::lower_ktir_to_superdsc::MatmulProof {
+                    b,
+                    // This door's operands are WINDOWS of the caller's parameters — the fact the
+                    // spurious-pad drop in `matmul_oriented` discriminates on.
+                    origin: super::lower_ktir_to_superdsc::OperandOrigin::Windowed,
+                    // ⭐ NO HEAD-MAJOR o_proj HANDOFF HERE, BY CONSTRUCTION. That fact is minted
+                    // from the BUNDLE's attention-output row count (mq == 1 over a multi-slab head
+                    // dim) and lives on the spyre door's `BundleAttnParams`; this whole-function
+                    // door lowers an UNROLLED graph whose per-layer o matmuls key on per-layer
+                    // weight tids the bundle fact's one canonical tid cannot name. The unrolled
+                    // bake therefore keeps the pre-restructure emission — see the codegen's
+                    // headmajor mutation sites.
+                    headmajor: None,
+                },
             )?
         }
         Program::Elementwise(e) => {

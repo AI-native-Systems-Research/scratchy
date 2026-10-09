@@ -219,10 +219,17 @@ fn emit_regions(
                 &mut sym,
                 layout,
                 &mut quantized,
-                b,
-                // The per-`Program` door's operands are whole staged tensors, not windows of the
-                // caller's parameters — the fact the spurious-pad drop discriminates on.
-                emit::lower_ktir_to_superdsc::OperandOrigin::Staged,
+                emit::lower_ktir_to_superdsc::MatmulProof {
+                    b,
+                    // The per-`Program` door's operands are whole staged tensors, not windows of
+                    // the caller's parameters — the fact the spurious-pad drop discriminates on.
+                    origin: emit::lower_ktir_to_superdsc::OperandOrigin::Staged,
+                    // ⭐ NO HEAD-MAJOR o_proj HANDOFF HERE. That fact is minted from a spyre
+                    // BUNDLE's attention-output row count (mq == 1 over a multi-slab head dim) and
+                    // lives on the spyre door's `BundleAttnParams`; this Triton producer states no
+                    // bundle facts, so it keeps the pre-restructure emission.
+                    headmajor: None,
+                },
             )
         }
         // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and

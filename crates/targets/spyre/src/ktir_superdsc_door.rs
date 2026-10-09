@@ -80,6 +80,29 @@ pub struct BundleAttnParams {
     /// cannot say, not a value duplicated from what it does (the caller-stated `f32` this struct
     /// once carried beside the program's own reading, and lost for exactly that reason).
     pub scale_folded: bool,
+    /// ⭐ WHETHER THIS BUNDLE'S o_proj READS THE HEAD-MAJOR COPY — the finalize/weight contract of
+    /// the multi-slab single-row body, and the SECOND fact the program cannot state.
+    ///
+    /// At `nslab > 1` the shipped finalize relayouts `out` to token-stream at `nqh·nslab` ops; at
+    /// `mq == 1` a row IS a head, so the alternative is to leave `out` slab-major (one op per slab)
+    /// and permute o_proj's contraction axis to meet it — a SECOND, k-shuffled copy of each layer's
+    /// o_proj weight under [`crate::reserved_tids::oproj_headmajor_tid`]. The finalize cannot say
+    /// which arrangement its bytes are in, and the o matmul cannot say which copy its B operand
+    /// means — this ONE fact is what both consume, so the restructure cannot be half-applied:
+    /// the door swaps the B operand on exactly the bundles whose finalize went slab-major.
+    ///
+    /// Minted ONLY where fully expressible: the attention output is a single row (`mq == 1`),
+    /// the head dim spans more than one feature slab (`hd > POOL_STICK`), and the o matmul is fp8
+    /// W8A8 (the staging walk the permuted copy is derived for). A wider bundle, a single-slab head
+    /// dim, or a dense o_proj keeps the shipped emission byte-for-byte.
+    pub headmajor_handoff: bool,
+    /// The o matmul's weight tid — the MatmulTile found by DATAFLOW (its A operand is an attention
+    /// output), stated per bundle so the matmul door's swap keys on the OPERAND's identity and
+    /// never on a shape: at `k == n` (granite-3.1-8b's `[4096, 4096]` o_proj) the extents cannot
+    /// tell the o matmul from any other square projection, and a shape-keyed swap would re-point
+    /// every square projection at the permuted copy. `None` when the graph's attention has no
+    /// matmul consumer (nothing to swap; the handoff above is `false` with it).
+    pub oproj_wtid: Option<u32>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -126,7 +149,33 @@ pub fn lower(
         Program::SiluMul => silumul(name, &r, sym_id_base, layout),
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),
-        Program::Matmul => matmul(name, &r, sym_id_base, layout, quantized),
+        Program::Matmul => matmul(
+            name,
+            &r,
+            sym_id_base,
+            layout,
+            quantized,
+            // ⭐ THE HEAD-MAJOR SWAP'S DOOR FACT, from the same `BundleAttnParams` the rope/attn
+            // arms read: the o matmul's weight tid, named per bundle by the dataflow walk. Every
+            // other matmul of the bundle (q/k/v, mlp, lm_head) carries a tid the fact does not
+            // name, so it keeps its own staged weight — the swap is keyed on the operand's
+            // identity, never a shape. ⛔ A handoff without an `oproj_wtid` is a malformed bundle
+            // statement — the handoff is minted only where the walk found the o matmul — and a
+            // slab-major finalize with no weight to meet it is refused here, not emitted.
+            match attn_params {
+                Some(p) if p.headmajor_handoff => Some(lk::HeadmajorOproj {
+                    oproj_wtid: p.oproj_wtid.ok_or_else(|| Error {
+                        message: format!(
+                            "{name}: the bundle states the head-major attention finalize but \
+                             names no o_proj weight tid — the handoff is minted only where the \
+                             dataflow walk found the o matmul, so a handoff without one is a \
+                             malformed bundle statement",
+                        ),
+                    })?,
+                }),
+                _ => None,
+            },
+        ),
         Program::LmLast => lmlast(name, k, &r, sym_id_base, layout),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         Program::Attn => attn(name, k, &r, sym_id_base, layout, attn_params),
@@ -182,6 +231,7 @@ fn attn(
             r,
             rows_are_requests: p.rows_are_requests,
             scale_folded: p.scale_folded,
+            headmajor_handoff: p.headmajor_handoff,
             sym_id_base,
             layout,
         }),

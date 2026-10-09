@@ -221,6 +221,12 @@ pub struct BundleLayout<'a> {
     /// The worker multiplies each listed weight's STAGED fp16 bytes by its multiplier at load
     /// (`stage_bound_weights`), which is the whole of the fold's runtime half.
     pub weight_scale_folds: Cow<'a, [(u32, f32)]>,
+    /// ⭐ THE HEAD-MAJOR o_proj PERMUTED COPIES — `(companion weight id, permuted copy id)`: the
+    /// second, k-shuffled o_proj copies the head-major restructure stages, which the worker
+    /// materializes from their companions' bytes at load (`spyre_load`'s copy pass, the one
+    /// runtime half). See the producer-side `BundleLayout::weight_copies` for the mint's
+    /// bundle-invariance law.
+    pub weight_copies: Cow<'a, [(u32, u32)]>,
     /// Bytes between two requests' KV inside one page+layer, or 0 for an unpaged bundle. The
     /// EMITTER's number, travelling to the runtime rather than being re-derived there.
     pub kv_request_stride_bytes: u64,

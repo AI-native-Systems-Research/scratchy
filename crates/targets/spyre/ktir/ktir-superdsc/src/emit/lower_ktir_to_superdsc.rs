@@ -1711,6 +1711,12 @@ pub struct AttnAt<'a> {
     /// program, so a folded program states NO multiplier; this fact is what tells the door that
     /// absence is the fold and not a broken program.
     pub scale_folded: bool,
+    /// ⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj SLAB-MAJOR — the caller-side twin of the spyre
+    /// door's `BundleAttnParams::headmajor_handoff`, and the SAME fact the matmul door swaps the o
+    /// matmul's B operand on (the permuted `oproj_headmajor_tid` copy): one fact, both halves of the
+    /// restructure, so neither can be emitted without the other. TRUE only for the single-row
+    /// (`mq == 1`) body of a multi-slab head dim with an fp8 W8A8 o matmul.
+    pub headmajor_handoff: bool,
     pub sym_id_base: &'a mut i64,
     pub layout: Option<&'a BundleLayout>,
 }
@@ -2904,6 +2910,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         r,
         rows_are_requests,
         scale_folded,
+        headmajor_handoff,
         sym_id_base,
         layout,
     } = a;
@@ -3493,6 +3500,9 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         kv_block_index.as_deref(),
         attn_id,
         rows_are_requests,
+        // The head-major o_proj handoff — the bundle fact the finalize above and the o matmul's
+        // B-operand swap key on together. See [`AttnAt::headmajor_handoff`].
+        headmajor_handoff,
         sym_id_base,
         layout,
     )?);
@@ -3847,17 +3857,18 @@ pub fn lmlast(
 /// (activation, packed fp8 weight, the checkpoint's per-column `w_scale`) is W8A8 and goes to
 /// [`super::ktir_matmul_fp8`], which IS main's arity-3 branch unchanged.
 /// ⭐ UNCHANGED FOR EVERY EXISTING CALLER, deliberately. `crates/targets/spyre`'s own
-/// `ktir_superdsc_door` calls this with five arguments, and its weights are transpose-B by
-/// construction (main's `[k, n]` SubtileIR region viewed as `[n, k]`) — which is exactly the reading
-/// the guard inside hardcoded before the orientation became a parameter. So this delegates at
-/// `TransposeB` and preserves today's behaviour byte-for-byte; only a producer that CAN prove the
-/// orientation is asked to.
+/// `ktir_superdsc_door` is the caller that states the head-major fact; its weights are transpose-B
+/// by construction (main's `[k, n]` SubtileIR region viewed as `[n, k]`) — which is exactly the
+/// reading the guard inside hardcoded before the orientation became a parameter. So this delegates
+/// at `TransposeB` and preserves today's behaviour byte-for-byte; only a producer that CAN prove
+/// the orientation is asked to.
 pub fn matmul(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
+    headmajor: Option<HeadmajorOproj>,
 ) -> Result<Vec<EmittedOp>, Error> {
     matmul_oriented(
         name,
@@ -3865,8 +3876,11 @@ pub fn matmul(
         sym_id_base,
         layout,
         quantized,
-        super::whole_function::BOrient::TransposeB,
-        OperandOrigin::Staged,
+        MatmulProof {
+            b: super::whole_function::BOrient::TransposeB,
+            origin: OperandOrigin::Staged,
+            headmajor,
+        },
     )
 }
 
@@ -3882,6 +3896,27 @@ pub enum OperandOrigin {
     Windowed,
 }
 
+/// ⭐ THE HEAD-MAJOR o_proj HANDOFF, for the matmul door — the caller-side twin of the spyre
+/// door's `BundleAttnParams` head-major fact, carrying the ONE thing this side keys the B-operand
+/// swap on: the o matmul's weight tid, named by the bundle facts (dataflow-found, see that
+/// struct's own doc), never by a shape. `None` for every producer whose caller states no
+/// handoff — those bake exactly what they baked before this existed.
+#[derive(Clone, Copy)]
+pub struct HeadmajorOproj {
+    /// The o matmul's weight tid, as the bundle's canonical (layer-0) o_proj.
+    pub oproj_wtid: u32,
+}
+
+/// THE CALLER-PROVEN FACTS a matmul emission keys on — everything the door knows that the
+/// program's own tiles cannot state, bundled so the door states each fact exactly once: the weight
+/// orientation ([`super::whole_function::BOrient`]), who the operands are ([`OperandOrigin`]), and
+/// the head-major o_proj handoff ([`HeadmajorOproj`] — `None` wherever no bundle states one).
+pub struct MatmulProof {
+    pub b: super::whole_function::BOrient,
+    pub origin: OperandOrigin,
+    pub headmajor: Option<HeadmajorOproj>,
+}
+
 /// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
 /// [`super::whole_function::matmul_b_orientation`], which reads it off the op's own `indexing_maps`.
 pub fn matmul_oriented(
@@ -3890,8 +3925,7 @@ pub fn matmul_oriented(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
-    b: super::whole_function::BOrient,
-    origin: OperandOrigin,
+    proof: MatmulProof,
 ) -> Result<Vec<EmittedOp>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
@@ -3959,6 +3993,40 @@ pub fn matmul_oriented(
     // `[m, k]`.
     let (m, n) = (out.r_len, out.c_len);
     let k = a.c_len;
+    // ⭐⭐⭐ THE HEAD-MAJOR o_proj SWAP — the matmul half of the restructure whose finalize half lives
+    // in the attention door (`assemble_attn`'s `headmajor_handoff` form). Where the bundle's
+    // attention finalize writes `out` SLAB-MAJOR (one op per feature slab of the head dim), the
+    // contraction axis of THIS matmul arrives permuted — head-major `s·nqh·64 + h·64 + d` — so its
+    // B operand must be the second, k-shuffled o_proj copy staged under `oproj_headmajor_tid`, the
+    // copy whose retile walk enumerates exactly that order. The fact and the copy are minted
+    // together in `compute_bundle_layout`; this door only NAMES the operand, which is why the key
+    // is the WEIGHT TID the bundle facts stated by dataflow (see `HeadmajorOproj`) — never a shape:
+    // at `k == n` (granite-3.1-8b's `[4096, 4096]` o_proj) the extents cannot tell the o matmul
+    // from any other square projection, and a shape-keyed swap would re-point every square
+    // projection at the permuted copy.
+    //
+    // ⛔ AND THE WIDTH AND PRECISION ARE THE HANDOFF'S OWN. The fact was minted from the bundle's
+    // attention-output row count and the fp8 W8A8 o matmul the dataflow walk found; `m` here and
+    // `w.is_fp8` here are that same pair stated by the program. A swap at any other width or
+    // precision reads slab-major bytes against an unpermuted weight (or the reverse) — half a
+    // restructure, fluent and wrong — so a disagreement is refused here rather than baked.
+    let w_name = match proof.headmajor {
+        Some(h) if h.oproj_wtid == w.tid => {
+            if m != 1 || !w.is_fp8 {
+                return err(format!(
+                    "MatmulTile {name}: the bundle states the head-major o_proj handoff for weight \
+                     t{}, but this program states m={m} over an {} weight — the handoff is minted \
+                     for the single-row fp8 W8A8 o matmul (mq == 1 over a multi-slab head dim). \
+                     Half a restructure is a slab-major activation read against an unpermuted \
+                     weight: fix the bundle's statement, not the emission.",
+                    w.tid,
+                    if w.is_fp8 { "fp8" } else { "f16" },
+                ));
+            }
+            crate::place::act_name(crate::reserved_tids::oproj_headmajor_tid(w.tid))
+        }
+        _ => w.name(),
+    };
     // ── fp8 W8A8 (arity-3 [act(fp16 [m,k]), W(fp8 [k,n]), w_scale(f16 [n,1] ≡ [1,n])]): per-token quantize
     //    act → fp8, `matmulfp8` (fp8×fp8→fp16), dequant by `a_scale[m]·w_scale[n]`. fp8-ness is TYPED: the
     //    quantized act (`Df::Fp8` via `synth_df` + the qfp8ch convert's output) and the weight/act matmul
@@ -3969,7 +4037,7 @@ pub fn matmul_oriented(
             &super::ktir_matmul_fp8::Fp8Facts {
                 a_tid: a.tid,
                 a_name: a.name(),
-                w_name: w.name(),
+                w_name,
                 ws_name: ws.name(),
                 out_tid: out.tid,
             },
@@ -3990,9 +4058,9 @@ pub fn matmul_oriented(
     // ⛔ WHICH OF W'S TWO EXTENTS IS K IS A PROVEN FACT, NOT A CONVENTION. The check above reads the
     // weight as `[n, k]` (transpose-B). A plain-B weight is `[k, n]`, and at `k == n` — granite's
     // `[4096, 4096]` output projection — the extents alone cannot tell the two framings apart, so a
-    // hardcoded reading is a silent wrong contraction on one of them. `b` carries the orientation
-    // proved from the op's own `indexing_maps` by `whole_function::matmul_b_orientation`.
-    let (w_k, w_n, framing) = match b {
+    // hardcoded reading is a silent wrong contraction on one of them. `proof.b` carries the
+    // orientation proved from the op's own `indexing_maps` by `whole_function::matmul_b_orientation`.
+    let (w_k, w_n, framing) = match proof.b {
         super::whole_function::BOrient::TransposeB => (w.c_len, w.r_len, "[n, k]"),
         super::whole_function::BOrient::PlainB => (w.r_len, w.c_len, "[k, n]"),
     };
@@ -4042,7 +4110,8 @@ pub fn matmul_oriented(
     // granite tiled_k). `windowed_program` carries whether the padded weight columns would be read
     // from the caller's parameter windows — the one fact the staged-buffer contract of
     // `for_output` does not hold here.
-    let n_dev = DeviceWidth::for_matmul(m, n, k, matches!(origin, OperandOrigin::Windowed)).get();
+    let n_dev =
+        DeviceWidth::for_matmul(m, n, k, matches!(proof.origin, OperandOrigin::Windowed)).get();
     let macs = m as u64 * n_dev as u64 * k as u64;
     // ── GUARD #11 (util floor) computed on the PROVEN partition `CoreSplit::plan` (Kani: disjoint +
     //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
@@ -4104,14 +4173,14 @@ pub fn matmul_oriented(
     // already concluded).
     //
     // The corners, per orientation (the kernel's coords are `[in=k, out=n]`, so which of W's two
-    // view axes is k_start and which is n_start is decided by the PROVEN `b`, not by convention —
-    // at `k == n` the extents cannot tell the two framings apart):
+    // view axes is k_start and which is n_start is decided by the PROVEN `proof.b`, not by
+    // convention — at `k == n` the extents cannot tell the two framings apart):
     //   * A (RowBlocked `[rows, cols]`):      `rc_of(a.v_rows, a.v_cols, a.r_start, a.c_start)`
     //   * W (Kernel `[in, out]`):             `rc_of(k_full, n_full, k_start, n_start)`
     //   * O (RowBlocked `[rows, cols]`):      `col_of(m, out_full_cols, out.c_start)`
     // with `out_full_cols = out.v_cols`.
     let a_off = crate::addr::rc_of(a.v_rows, a.v_cols, a.r_start, a.c_start, Df::Fp16);
-    let (k_start, n_start, k_full, n_full) = match b {
+    let (k_start, n_start, k_full, n_full) = match proof.b {
         super::whole_function::BOrient::TransposeB => {
             // W's view is `[n, k]`: the ROW axis is out (n), the COLUMN axis is in (k).
             (w.c_start, w.r_start, w.v_cols, w.v_rows)
@@ -4153,7 +4222,7 @@ pub fn matmul_oriented(
             k,
             1,
             &rb(&a.name(), m, k),
-            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, w.name()),
+            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
             &rb(&out.name(), m, n_dev),
             sym_id_base,
             layout,
@@ -4190,7 +4259,7 @@ pub fn matmul_oriented(
             MatK::of_in_features(k),
             &rb(&a.name(), m, k),
             a_off,
-            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, w.name()),
+            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
             w_off,
             k_full,
             &rb(&out.name(), m, n_dev),

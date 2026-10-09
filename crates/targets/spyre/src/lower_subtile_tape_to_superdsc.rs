@@ -179,11 +179,11 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
     FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
-    NEW_V_PROBE_TID, ONES_REDUCE_TID, RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT,
-    RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID,
-    ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
-    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, kct_resident_tid, reserved_region,
-    scalarmul_scale_tid,
+    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
+    RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
+    RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
+    SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
+    kct_resident_tid, oproj_headmajor_tid, reserved_region, scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -546,6 +546,28 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .collect();
 
     // Sources first (deterministic id order): weights → seg1, activations → seg3 (Activation role).
+    // ⭐⭐⭐ THE HEAD-MAJOR o_proj PERMUTED COPIES — the layout half of the restructure whose
+    //    emission halves are the attention finalize's slab-major form and the o matmul's B-operand
+    //    swap. Where the head dim is multi-slab and the o matmul is fp8 W8A8, every o_proj weight
+    //    gains a SECOND, k-shuffled copy under `oproj_headmajor_tid(w)` — placed in THIS loop,
+    //    immediately after its companion, so each layer's block grows by exactly one copy and the
+    //    per-layer stride stays UNIFORM at S+E (what the executor's one-base-per-segment advance
+    //    needs; the stride guard proves it). ⛔ MINTED BUNDLE-INVARIANTLY: the gate is the GEOMETRY
+    //    (`OprojEdges::geometry_applies`), never this bundle's row count — every bundle of a model
+    //    shares ONE staged weight segment, so a rows-gated mint would hand the single-row body
+    //    addresses no other bundle staged. Only the door's emission gates on rows
+    //    (`BundleAttnParams::headmajor_handoff`), and a bundle that never states the handoff
+    //    simply never names its permuted copy — staged and unread, like any other resident weight.
+    let oproj = crate::lower_subtile_tape_to_ktir::oproj_edges(ir)?;
+    let oproj_perm_after: std::collections::BTreeMap<u32, u32> = if oproj.geometry_applies {
+        oproj
+            .edges
+            .iter()
+            .map(|e| (e.w, oproj_headmajor_tid(e.w)))
+            .collect()
+    } else {
+        std::collections::BTreeMap::new()
+    };
     for tid in 0..ir.num_sources {
         if prefix_kv_tids.contains(&tid) {
             continue; // re-placed into seg2 (Kv) below — no dead Activation slot / no per-step re-H2D
@@ -556,6 +578,28 @@ pub fn compute_bundle_layout<F: RopeForm>(
             SegRole::Activation
         };
         pack(tid, role, &mut seg_bytes, &mut placements);
+        // The companion insert — see `oproj_perm_after` above. Hand-built (NOT through `pack`,
+        // which would index `ir.tensors[perm]` for a size a reserved tid has no tensor for): same
+        // role, same segment, same BANK, same SIZE as the weight it permutes, one 128-aligned
+        // block later. The companion is COPIED out (it is `Copy`) so the insert below does not
+        // borrow against it.
+        if let Some(&perm) = oproj_perm_after.get(&tid) {
+            let seg = SegRole::Weight.segment();
+            let off = seg_bytes[seg];
+            let companion = placements[&tid];
+            placements.insert(
+                perm,
+                TensorPlacement {
+                    tid: perm,
+                    role: SegRole::Weight,
+                    segment: seg,
+                    bank: companion.bank,
+                    offset: off,
+                    size: companion.size,
+                },
+            );
+            seg_bytes[seg] = align128(off + companion.size);
+        }
     }
     // ── KSPLIT block WEIGHTS (seg1) ── the lm_head split's B block weights `ksplit_block_tid(b)` are added by
     // the `kernel0` loop (RetileDescriptors) + the worker (bytes), but NOT by the source loop above (they are
@@ -602,8 +646,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    ⛔ Do NOT reorder these on the grounds that banking is more general. It is more general and
     //    it does not work yet; the spill is narrower and it is measured. Settle the stitcher question
     //    (`ModuleStitcher` in deeptools) before promoting banking.
-    let per_layer_tids: std::collections::BTreeSet<u32> =
+    let mut per_layer_tids: std::collections::BTreeSet<u32> =
         per_layer_ext.values().flatten().copied().collect();
+    // ⭐ THE PERMUTED COPIES ARE PER-LAYER WEIGHTS TOO. They ride the same per-layer stride as
+    // their companions (the insert placed one after each layer's o_proj), so they must be SPARED
+    // by the tail spill exactly as the companions are — a perm copy moved to a spill segment is a
+    // per-layer WEIGHT outside the strided segment, which the stride guard below exists to refuse.
+    per_layer_tids.extend(oproj_perm_after.values().copied());
     let per_layer_block_end = placements
         .values()
         .filter(|p| {
@@ -1543,6 +1592,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         weight_scale_folds: weight_scale_folds
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
+            .collect(),
+        weight_copies: oproj_perm_after
+            .iter()
+            .map(|(w, perm)| (*w, *perm))
             .collect(),
         synth,
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
@@ -3166,6 +3219,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         kernel_weights,
         scalarmul_scales,
         weight_scale_folds,
+        weight_copies,
         synth,
         // EMIT-ONLY, deliberately not baked: the arrangement authority is the build-time check that a
         // tensor has ONE device layout (`declare_arrangement` returns a build `Err` naming the tensor
@@ -3253,6 +3307,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         ),
         scalarmul_scales: std::borrow::Cow::Owned(scalarmul_scales.clone()),
         weight_scale_folds: std::borrow::Cow::Owned(weight_scale_folds.clone()),
+        weight_copies: std::borrow::Cow::Owned(weight_copies.clone()),
         kv_request_stride_bytes: *kv_request_stride_bytes,
     }
 }
@@ -4298,6 +4353,7 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    one_request_decode: bool,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -4305,6 +4361,7 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         weight_ids,
         active_cap,
         rows_are_requests,
+        one_request_decode,
     )
 }
 

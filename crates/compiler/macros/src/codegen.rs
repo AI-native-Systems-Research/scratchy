@@ -8820,6 +8820,18 @@ fn emit_superdsc_wiring(
             quote! { (#tid, #scale) }
         })
         .collect();
+    // The head-major o_proj permuted copies, straight off the layout's mint — the worker
+    // materializes each `to` tid from its `from` tid's bytes at load, so the list it reads has
+    // to be the one the layout placed.
+    let weight_copy_lits: Vec<proc_macro2::TokenStream> = gk
+        .weight_copies
+        .iter()
+        .map(|(from, to)| {
+            let from = proc_macro2::Literal::u32_suffixed(*from);
+            let to = proc_macro2::Literal::u32_suffixed(*to);
+            quote! { (#from, #to) }
+        })
+        .collect();
 
     // The VALUE, not a `static` — the caller composes decode + prefill into one
     // `Wirings` const, because a bundle's tensor ids are per-PROGRAM and the
@@ -8848,6 +8860,7 @@ fn emit_superdsc_wiring(
             rms_invcols: &[#(#rms_invcols_lits),*],
             scalarmul_scales: &[#(#scalarmul_scale_lits),*],
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
+            weight_copies: &[#(#weight_copy_lits),*],
         }
     }
 }
@@ -9144,6 +9157,7 @@ fn layout_tokens(
         kernel_weights,
         scalarmul_scales,
         weight_scale_folds,
+        weight_copies,
         kv_request_stride_bytes,
     } = l;
     let segs = segment_bytes
@@ -9165,6 +9179,11 @@ fn layout_tokens(
         let scale = proc_macro2::Literal::f32_suffixed(*scale);
         quote! { (#tid, #scale) }
     });
+    let copies = weight_copies.iter().map(|(from, to)| {
+        let from = proc_macro2::Literal::u32_unsuffixed(*from);
+        let to = proc_macro2::Literal::u32_unsuffixed(*to);
+        quote! { (#from, #to) }
+    });
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
@@ -9174,6 +9193,7 @@ fn layout_tokens(
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
+            weight_copies: ::std::borrow::Cow::Borrowed(&[#(#copies),*]),
             kv_request_stride_bytes: #krs,
         }
     }
@@ -9616,6 +9636,14 @@ fn dump_wavefront_mega(
              decode_rows: u32|
              -> (String, Vec<(String, String)>, String, GroupGraphs) {
                 let is_prefill = prefill_mq.is_some();
+                // The decode ladder's ONE-REQUEST rung: a CONCRETE single-row decode. `seq_sym`
+                // must be absent because the symbolic CB batch ALSO passes `decode_rows = 1`,
+                // deliberately, over a 96-row template — naming it here would hand the handoff a
+                // width its own graph contradicts. This is the head-major o_proj handoff's own
+                // fact, and deliberately NOT `rows_are_requests`: that arg stays false at the
+                // one-request rung (it gates the batched-decode emission, and the single-row bake
+                // keeps the shipped values) and is true of rungs the handoff cannot apply to.
+                let one_request = !is_prefill && decode_rows == 1 && seq_sym.is_none();
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
@@ -9739,6 +9767,7 @@ fn dump_wavefront_mega(
                                 // are one token each of the running requests once it is baked wider than
                                 // a single row.
                                 !is_prefill && decode_rows > 1,
+                                one_request,
                             ) {
                                 Ok(rolled) => {
                                     eprintln!(
@@ -9789,6 +9818,19 @@ fn dump_wavefront_mega(
                                     // wants it.
                                     let unrolled = superdsc::unroll_layers(&rolled);
                                     let card = cfg!(feature = "spyre-hw");
+                                    // ⛔ THE UNROLLED TWIN CANNOT STATE THE HEAD-MAJOR HANDOFF. The
+                                    // handoff's matmul half keys on ONE canonical weight tid — the
+                                    // rolled body's layer-0 representative — but the unrolled body's
+                                    // per-layer o matmuls name their OWN per-layer weight tids, so a
+                                    // handoff here would slab-major EVERY layer's finalize while
+                                    // swapping only layer 0's weight: fluent, wrong output. The
+                                    // restructure is a ROLLED-body fact (the executor's per-layer
+                                    // segment advance is what makes one canonical tid reach all 40
+                                    // weights); the emulator keeps the pre-restructure emission.
+                                    let unrolled_params = rolled.attn_params.map(|mut p| {
+                                        p.headmajor_handoff = false;
+                                        p
+                                    });
                                     let pre = if card {
                                         superdsc::emit_bundle(
                                             &rolled.prefix,
@@ -9803,7 +9845,11 @@ fn dump_wavefront_mega(
                                         if card { &rolled.body } else { &unrolled },
                                         Some(&rolled.layout),
                                         superdsc::FoldGrouping::Split,
-                                        rolled.attn_params,
+                                        if card {
+                                            rolled.attn_params
+                                        } else {
+                                            unrolled_params
+                                        },
                                     );
                                     // The SAME body, with the per-page fold fused back into the
                                     // surrounding work instead of standing alone. Splitting the fold
@@ -9899,6 +9945,7 @@ fn dump_wavefront_mega(
                                                     &weight_ids,
                                                     rung,
                                                     !is_prefill && decode_rows > 1,
+                                                    one_request,
                                                 ) {
                                                     // Same device split as the ceiling rung above: the
                                                     // card bakes the ROLLED body, the emulator the
@@ -9910,6 +9957,16 @@ fn dump_wavefront_mega(
                                                         } else {
                                                             superdsc::unroll_layers(&rr)
                                                         };
+                                                        // ⛔ THE UNROLLED TWIN CANNOT STATE THE
+                                                        // HANDOFF — same law as the ceiling rung's
+                                                        // `bod` above, stated at this rung's own
+                                                        // params.
+                                                        let rung_params = rr.attn_params.map(
+                                                            |mut p| {
+                                                                p.headmajor_handoff = false;
+                                                                p
+                                                            },
+                                                        );
                                                         match superdsc::emit_bundle(
                                                         if card { &rr.body } else { &rung_unrolled },
                                                         Some(&rr.layout),
@@ -9917,7 +9974,7 @@ fn dump_wavefront_mega(
                                                         // THIS rung's own params — `rr` was lowered at
                                                         // `rung`, so its swept extent is `rung`'s and
                                                         // not the ceiling bundle's.
-                                                        rr.attn_params,
+                                                        if card { rr.attn_params } else { rung_params },
                                                     ) {
                                                         Ok(rfp) => {
                                                             // Each rung also gets a fold-fused

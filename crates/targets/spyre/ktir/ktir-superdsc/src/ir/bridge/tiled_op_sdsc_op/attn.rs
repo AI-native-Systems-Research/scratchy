@@ -1789,6 +1789,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
     // one resident history, requests each have their own.
     rows_are_requests: bool,
+    // ⭐⭐⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj IN THE SLAB-MAJOR ORDER — the caller-side
+    // statement of the head-major restructure, minted where the bundle's facts are (the spyre door's
+    // `BundleAttnParams::headmajor_handoff`; a triton producer's caller states its own). TRUE only
+    // for the single-row (mq == 1) body of a model whose head dim spans more than one feature slab
+    // and whose o matmul is fp8 W8A8 — the conditions the permuted o_proj copy is staged for. The
+    // matmul half of the contract (the B-operand swap to that copy) keys on the SAME fact at the
+    // matmul door, so neither half can be emitted without the other.
+    headmajor_handoff: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
@@ -2763,6 +2771,21 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         req: 0,
     };
     let nslab = nests.slabs();
+    // ⛔ THE HANDOFF FACT AND THE PROGRAM'S OWN WIDTH MUST AGREE. The fact is minted from the
+    // bundle's attention-output row count — the same count this emission's `width` states — so a
+    // handoff at any other width, or at a single slab (where there is nothing to restructure), is
+    // a caller/program desync in which each side alone emits HALF a restructure: a slab-major
+    // `out` read by an unswapped o_proj weight, or the reverse. Fluent, wrong tokens, nothing
+    // else — refused here so the bundle never bakes.
+    if headmajor_handoff && (mq != 1 || nslab == 1) {
+        return Err(SuperDscError(format!(
+            "AttnDecode t{t}: the bundle states the head-major o_proj handoff, but this program's \
+             width is mq={mq} over {nslab} feature slab(s) — the handoff is minted for the \
+             single-row body of a multi-slab head dim (mq == 1, nslab > 1). Half a restructure is \
+             a slab-major `out` read by an unswapped o_proj weight: fix the caller's statement, \
+             not the emission.",
+        )));
+    }
     if nslab == 1 {
         // ONE OP AT ANY ROW COUNT. The note above works the permutation out: at `nslab == 1`, `hd`
         // IS the stick, so out's `h*mq*hd + s*mq*stk + r*stk` and run_o's `(h*mq+r)*stk` are the same
@@ -2806,6 +2829,41 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     layout,
                 ));
             }
+        }
+    } else if headmajor_handoff {
+        // ⭐⭐⭐ THE HEAD-MAJOR HANDOFF — the single-row body's slab-major finalize, the other half
+        // of the contract whose weight-copy price the route-2 note above works out. At `mq == 1` a
+        // row IS a head, so o_proj's contraction axis can be permuted to meet `out` where the
+        // accumulator already holds it: slab-outer, `s·nqh·64 + h·64 + d` — `run_o`'s own
+        // arrangement. Each op below is ONE STICK WIDE (`nqh` rows × 64 cols), so the stick-blocked
+        // write law (`(c/64)·(R·64) + r·64 + c%64` over one stick of columns) degenerates to a
+        // CONTIGUOUS `nqh·64`-element block at the offset — one op per feature slab, ALL heads at
+        // once, where the per-head loop below pays `nqh·nslab` single-core ops to relayout what it
+        // divides. On granite-3.1-8b that is 64 ops → 2 per layer (2,480 of ~15,400 descriptor
+        // executions per decode step; the baked mq=1 body loses exactly 62 descriptors).
+        //
+        // The read and the write share ONE offset: `head_major(0, s)` is `s·nqh·64` at `mq == 1`,
+        // which is BOTH `run_o`'s slab-s plane base and `out`'s slab-s block base — the handoff
+        // copies each accumulator plane to `out` VERBATIM, no relayout at all. The o matmul reads
+        // the result flat (`[1, nqh·hd]`, one row) against the SECOND, k-shuffled o_proj copy the
+        // same bundle fact swaps in at the matmul door: the copy's staging walk enumerates its
+        // k-axis in exactly this order (`s`, then `h`, then `d`).
+        for s in 0..nslab {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_o_s{s}_o{t}"),
+                "realdiv",
+                // ALL `nqh` head-major rows at once — at `mq == 1` the mask rows ARE the heads.
+                RowCount::of_mask_rows(rows),
+                BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
+                &[
+                    In::sliced(&hm(&bufs.run_o), nests.head_major(0, s)).ew(),
+                    In::col(&hm(&bufs.run_l)).ew(),
+                ],
+                &hm(out),
+                nests.head_major(0, s),
+                sym_id_base,
+                layout,
+            ));
         }
     } else {
         // ⛔⛔⛔⭐⭐⭐ THIS PER-HEAD LOOP CANNOT GO VIA A POINTWISE OP, AND HERE IS THE PROOF — so the next

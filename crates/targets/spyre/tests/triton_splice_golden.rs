@@ -1442,6 +1442,10 @@ fn spliced_rope_lowers_through_the_door() {
                 // No fold: this fixture's q/k are Ext sources with no projection matmuls, so the
                 // program states its real scale and the door emits the score multiplies.
                 scale_folded: false,
+                // No handoff: this fixture's rope program has no o matmul at all, and a stated
+                // handoff without one is the door's own refusal.
+                headmajor_handoff: false,
+                oproj_wtid: None,
             };
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
@@ -1895,6 +1899,11 @@ fn spliced_attn_lowers_through_the_door() {
                 rows_are_requests,
                 // No fold: same as the rope door's fixture — the program states its real scale.
                 scale_folded: false,
+                // No handoff: this fixture's attention output is the graph RESULT (no o matmul
+                // consumes it), so the dataflow the handoff keys on finds no edge — stated here
+                // exactly as `attn_bundle_params` would state it for such a graph.
+                headmajor_handoff: false,
+                oproj_wtid: None,
             };
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
