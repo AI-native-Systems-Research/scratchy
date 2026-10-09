@@ -254,6 +254,7 @@ pub mod layers_quant;
 pub mod loaders;
 pub mod weights_metal;
 pub use weights_metal::MetalWeightsExt;
+pub mod chunked_kv;
 pub mod metal_allocator;
 pub mod metal_mem;
 pub mod mtl4_dispatch;
@@ -263,7 +264,6 @@ pub mod quantized;
 pub mod residency;
 pub mod sampling;
 pub mod shader_cache;
-pub mod chunked_kv;
 pub mod specialized_pipeline_cache;
 pub mod stream;
 /// The pure tape-construction layer (no objc) — shared with the
