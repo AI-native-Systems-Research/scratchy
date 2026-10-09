@@ -263,7 +263,7 @@ pub mod quantized;
 pub mod residency;
 pub mod sampling;
 pub mod shader_cache;
-pub mod single_buffer_kv;
+pub mod chunked_kv;
 pub mod specialized_pipeline_cache;
 pub mod stream;
 /// The pure tape-construction layer (no objc) — shared with the

@@ -34,10 +34,10 @@ use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
 };
+use scratchy_target_metal::chunked_kv::ChunkedKvLayer;
 use scratchy_target_metal::gdn_state::GdnStatePool;
 use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
-use scratchy_target_metal::single_buffer_kv::SingleBufferKvLayer;
 use scratchy_target_metal::weights::GpuWeights;
 use scratchy_target_metal::{
     DType, ForwardCtx, ForwardCtxHandle, ForwardDeviceHandle, GpuDevice, GpuTensor, MetalAllocator,
@@ -136,7 +136,7 @@ struct Loaded {
     gpu: GpuDevice,
     kv: KvCachePool,
     /// Backing buffers of `kv`'s chunks; must outlive the pool.
-    _kv_layers: Vec<SingleBufferKvLayer>,
+    _kv_layers: Vec<ChunkedKvLayer>,
     gdn: Option<GdnStatePool<PoolMem>>,
     /// Group 0 (full attention) block size — page-unified on hybrid layouts.
     full_block_size: usize,
@@ -236,13 +236,13 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let full_block_size = hybrid.as_ref().map_or(BLOCK_SIZE, |h| h.full_block_size());
 
     let residency = gpu.allocator.residency().clone();
-    let mut kv_layers: Vec<SingleBufferKvLayer> = (0..num_tensors * 2)
+    let mut kv_layers: Vec<ChunkedKvLayer> = (0..num_tensors * 2)
         .map(|slot| {
             let bytes = match (&hybrid, &per_layer_block_elems) {
                 (None, Some(v)) => blocks_per_chunk * v[slot / 2] * elem_bytes,
                 _ => chunk_bytes,
             };
-            SingleBufferKvLayer::new(&device, &residency, bytes, 1).expect("SingleBufferKvLayer")
+            ChunkedKvLayer::new(&device, &residency, bytes, 1).expect("ChunkedKvLayer")
         })
         .collect();
     // The block-table width: the model's KV cap rung for the capacity, as the worker sizes it.
@@ -274,16 +274,9 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
             |bytes| {
                 let c = calls.get();
                 calls.set(c + 1);
-                let layer = &mut layers_ref[c % n_slots];
-                let chunk = layer.committed_chunks();
-                layer
-                    .commit_through(chunk + 1)
-                    .map_err(|e| anyhow::anyhow!("KV chunk commit: {e}"))?;
-                Ok(MetalMem::from_buffer_with_offset(
-                    layer.buffer_clone(),
-                    chunk * layer.chunk_bytes(),
-                    bytes,
-                ))
+                layers_ref[c % n_slots]
+                    .commit_next(bytes)
+                    .map_err(|e| anyhow::anyhow!("KV chunk commit: {e}"))
             },
             |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
         )
