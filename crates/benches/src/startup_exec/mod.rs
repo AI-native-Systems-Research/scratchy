@@ -457,6 +457,13 @@ pub(crate) struct Rep {
     pub crash: Option<String>,
 }
 
+/// How much of a CLI child's stderr an error message carries.
+const STDERR_TAIL_BYTES: usize = 2048;
+
+/// How long to wait for a reaped child's stderr to reach EOF. A process the
+/// child started and left running can hold the pipe open indefinitely.
+const STDERR_DRAIN: Duration = Duration::from_secs(2);
+
 /// Spawn a one-shot CLI and stop the clock on its first content byte.
 ///
 /// A line cannot be classified as banner or content until it ends, but the
@@ -464,9 +471,6 @@ pub(crate) struct Rep {
 /// a candidate and the candidate is committed once the line resolves as
 /// content. Stopping on the newline instead would overstate TTFT by a whole
 /// line of tokens.
-/// How much of a CLI child's stderr an error message carries.
-const STDERR_TAIL_BYTES: usize = 2048;
-
 fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
     let t_zero = Instant::now();
     let mut child = Command::new(&argv[0])
@@ -478,12 +482,16 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
 
     // Drained on its own thread so a chatty child never blocks on a full pipe;
     // only the end is kept, which is where a traceback or panic lands.
+    // The reader hands its result over a channel, so the wait for it can be
+    // bounded (STDERR_DRAIN); a reader still blocked then is left to finish
+    // on its own when whoever holds the pipe exits.
     let mut stderr = child.stderr.take().expect("piped");
-    let stderr_tail = std::thread::spawn(move || {
+    let (tail_tx, tail_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut all = Vec::new();
         let _ = stderr.read_to_end(&mut all);
         let tail = &all[all.len().saturating_sub(STDERR_TAIL_BYTES)..];
-        String::from_utf8_lossy(tail).trim().to_string()
+        let _ = tail_tx.send(String::from_utf8_lossy(tail).trim().to_string());
     });
 
     let mut stdout = child.stdout.take().expect("piped");
@@ -520,7 +528,9 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
     }
 
     let usage = wait4_child(&mut child)?;
-    let tail = stderr_tail.join().unwrap_or_default();
+    let tail = tail_rx
+        .recv_timeout(STDERR_DRAIN)
+        .unwrap_or_else(|_| "(stderr still held open by a process the child started)".into());
     let crash = (!usage.ok).then(|| {
         if tail.is_empty() {
             format!("{}, nothing on stderr", usage.status)
@@ -1500,6 +1510,28 @@ mod tests {
 
         let ok = run_cli(&["/bin/echo".into(), "hi".into()], Backend::Scratchy).unwrap();
         assert!(ok.crash.is_none());
+    }
+
+    /// A grandchild that inherits stderr and outlives the child must not hang
+    /// the reap: the wait for stderr is bounded.
+    #[test]
+    fn a_grandchild_holding_stderr_does_not_hang_run_cli() {
+        let t0 = Instant::now();
+        let rep = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "(sleep 30 >/dev/null &) ; echo hi; exit 1".into(),
+            ],
+            Backend::Scratchy,
+        )
+        .expect("the child emitted a token");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "run_cli waited {:?} on an inherited pipe",
+            t0.elapsed()
+        );
+        assert!(rep.crash.expect("exit 1 is a crash").contains("exit 1"));
     }
 
     #[test]

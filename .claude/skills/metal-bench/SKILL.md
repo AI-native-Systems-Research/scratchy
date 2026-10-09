@@ -187,6 +187,12 @@ act on each one as it appears:
   `--engines` left it out. If it's an engine the user meant to run, stop the
   run and go back to step 1.
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
+- `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
+  only the dense ones, since it runs out of memory on MoE GGUFs on Metal.
+- `N FAILED` on a cell, then `requests failed; skipping this server's
+  remaining cells`: that engine ran out of memory (or errored) at that size.
+  The run carries on, and the page marks the cell with ‡. Note which engine
+  and cell for the user; it's a finding, not a broken run.
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
 - `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or

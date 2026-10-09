@@ -32,7 +32,8 @@ struct RequestResult {
     e2el: f64,
     /// Number of output tokens generated.
     output_tokens: usize,
-    /// SSE chunks that carried `choices` (what the timing clocks saw).
+    /// SSE chunks that carried text (what the timing clocks saw); 1 for a
+    /// request whose only chunk was an empty final one (see `is_unstreamed`).
     chunks: usize,
     /// Timestamp (seconds since benchmark start) when request was sent.
     start_time: f64,
@@ -190,11 +191,7 @@ fn send_request(
                         }
                         last_token_time = now;
                     }
-                    // Usage can ride on any chunk: llama.cpp sends it on its
-                    // last one, which also has `choices`.
-                    if let Some(ct) = parsed["usage"]["completion_tokens"].as_u64() {
-                        usage_completion_tokens = Some(ct as usize);
-                    }
+                    usage_completion_tokens = merge_usage(usage_completion_tokens, &parsed);
                 }
             }
         }
@@ -230,6 +227,17 @@ fn send_request(
         chunks,
         start_time,
         success: first_token_time.is_some(),
+    }
+}
+
+/// The completion-token count so far, updated from one chunk. Usage can ride
+/// on any chunk: llama.cpp sends it on its last one, which also has `choices`.
+/// The count only grows within a request, so keep the largest: an interim
+/// `completion_tokens: 0` must not undo the final one.
+fn merge_usage(so_far: Option<usize>, chunk: &serde_json::Value) -> Option<usize> {
+    match chunk["usage"]["completion_tokens"].as_u64() {
+        Some(ct) => Some(so_far.unwrap_or(0).max(ct as usize)),
+        None => so_far,
     }
 }
 
@@ -778,6 +786,9 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     let mut json = serde_json::json!({
         "duration": total_time,
         "completed": num_success,
+        // Requests sent that errored or timed out. Every metric here covers
+        // only the completed ones, so a reader must see when that is a subset.
+        "failed": num_fail,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
         "request_throughput": num_success as f64 / total_time,
@@ -909,6 +920,22 @@ fn compute_peak_concurrent(results: &[&RequestResult]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_keeps_the_largest_count_from_any_chunk() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // llama.cpp: usage on the last chunk, which also has choices.
+        let last = c(r#"{"choices":[{"text":""}],"usage":{"completion_tokens":5}}"#);
+        assert_eq!(merge_usage(None, &last), Some(5));
+        // A later interim zero does not undo it; a chunk without usage keeps it.
+        let zero = c(r#"{"choices":[],"usage":{"completion_tokens":0}}"#);
+        assert_eq!(merge_usage(Some(5), &zero), Some(5));
+        assert_eq!(
+            merge_usage(Some(5), &c(r#"{"choices":[{"text":"x"}]}"#)),
+            Some(5)
+        );
+        assert_eq!(merge_usage(None, &c(r#"{"choices":[{"text":"x"}]}"#)), None);
+    }
 
     #[test]
     fn only_chunks_with_text_are_tokens() {

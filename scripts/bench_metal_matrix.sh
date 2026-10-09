@@ -179,7 +179,7 @@ EVICT_PATH=()
 SETTLE_S=""
 # --exec's 600 s default timed out gemma-4-31b-it (18.4 GB) on this class of machine.
 READY_TIMEOUT_S=1800
-CELL_TIMEOUT_S=3600
+CELL_TIMEOUT_S=1200     # the slowest real cell takes minutes; a hung server, forever
 SERVE_ARGS=""
 SEED=""
 MLX_PYTHON=""
@@ -289,18 +289,28 @@ ENGINE_ROWS=(
     "omlx_tq|oMLX TurboQuant|OMLX_BIN"
     "mistralrs|mistral.rs|MISTRALRS_BIN"
 )
-# --engines: run exactly these (by label), and refuse if one is not installed.
+# --engines: run exactly these (by label or key), and refuse a name that is
+# unknown or not installed. Rows are selected, not their binaries cleared: the
+# two oMLX rows share OMLX_BIN, so clearing it for one would turn off the other.
 lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+ENGINES_ON=""
 if [[ -n "${ENGINES}" ]]; then
-    for row in "${ENGINE_ROWS[@]}"; do
-        IFS='|' read -r key label binvar <<<"${row}"
-        if [[ ",$(lower "${ENGINES}")," == *",$(lower "${label}"),"* || ",$(lower "${ENGINES}")," == *",${key},"* ]]; then
+    IFS=',' read -r -a wanted <<<"$(lower "${ENGINES}")"
+    for w in "${wanted[@]}"; do
+        hit=""
+        for row in "${ENGINE_ROWS[@]}"; do
+            IFS='|' read -r key label binvar <<<"${row}"
+            [[ "${w}" == "$(lower "${label}")" || "${w}" == "${key}" ]] || continue
             [[ -n "${!binvar}" ]] || { echo "--engines names ${label}, which is not installed" >&2; exit 2; }
-        else
-            printf -v "${binvar}" '%s' ""
-        fi
+            hit="${key}"; ENGINES_ON+=",${key}"
+        done
+        [[ -n "${hit}" ]] || { echo "--engines names ${w}, which is not an engine" >&2; exit 2; }
     done
 fi
+engine_on() { # key binvar: does this row run? Installed, and selected when --engines is given.
+    [[ -n "${!2}" ]] || return 1
+    [[ -z "${ENGINES}" || "${ENGINES_ON}," == *",$1,"* ]]
+}
 
 BIN="${ROOT}/target/release/scr"
 chip="$(sysctl -n machdep.cpu.brand_string)"
@@ -336,7 +346,8 @@ engine_version() { # key
         vllm_metal) # the Homebrew formula's version, else the plugin in vllm's own python
                     local v; v="$(brew list --versions vllm-metal 2>/dev/null | awk '{print $2}')"
                     [[ -n "${v}" ]] && echo "${v}" \
-                        || "$(head -1 "${VLLM_BIN}" | sed 's/^#!//')" -c 'import importlib.metadata as m; print(m.version("vllm-metal"))' ;;
+                        || { local -a py; read -r -a py <<<"$(head -1 "${VLLM_BIN}" | sed 's/^#!//')"
+                             "${py[@]}" -c 'import importlib.metadata as m; print(m.version("vllm-metal"))'; } ;;
         omlx)       "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
         mistralrs)  "${MISTRALRS_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
     esac 2>/dev/null || true
@@ -364,10 +375,15 @@ check_pin scratchy "${V_scratchy}"
 known="scratchy"
 for row in "${ENGINE_ROWS[@]}"; do
     IFS='|' read -r key label binvar <<<"${row}"
-    known+=",${label}"
-    [[ -n "${!binvar}" ]] || continue
-    # Both oMLX rows run the one installed oMLX: one version, one pin.
-    if [[ "${key}" == omlx_tq ]]; then printf -v V_omlx_tq '%s' "$(engine_version omlx)"; continue; fi
+    # Both oMLX rows run the one installed oMLX: one version, one pin, named
+    # oMLX. A pin for oMLX TurboQuant is refused as unknown below, not ignored.
+    [[ "${key}" == omlx_tq ]] || known+=",${label}"
+    engine_on "${key}" "${binvar}" || continue
+    if [[ "${key}" == omlx_tq ]]; then
+        printf -v V_omlx_tq '%s' "$(engine_version omlx)"
+        engine_on omlx OMLX_BIN || check_pin oMLX "${V_omlx_tq}"
+        continue
+    fi
     printf -v "V_${key}" '%s' "$(engine_version "${key}")"
     v="V_${key}"; check_pin "${label}" "${!v}"
 done
@@ -387,8 +403,11 @@ echo "scratchy: ${V_scratchy:0:12}"
 for row in "${ENGINE_ROWS[@]}"; do
     IFS='|' read -r key label binvar <<<"${row}"
     v="V_${key}"
-    printf '%-10s: %s\n' "${label}" "${!binvar:+${!binvar} (${!v:-version unknown})}"
-    [[ -n "${!binvar}" ]] || printf '%-10s  skipped (not installed, or left out by --engines)\n' ""
+    if engine_on "${key}" "${binvar}"; then
+        printf '%-10s: %s\n' "${label}" "${!binvar} (${!v:-version unknown})"
+    else
+        printf '%-10s: \n%-10s  skipped (not installed, or left out by --engines)\n' "${label}" ""
+    fi
 done
 (( SCALING )) && echo "scaling : ${SCALE_AXES}"
 echo "output  : ${JSON}"
@@ -403,7 +422,7 @@ for row in "${ENGINE_ROWS[@]}"; do
     IFS='|' read -r key label binvar <<<"${row}"
     v="V_${key}"
     pl="${label}"; [[ "${key}" == omlx_tq ]] && pl=oMLX
-    ENGINE_INFO+=$'\n'"${key}|${label}|$([[ -n "${!binvar}" ]] && echo 1 || echo 0)|${!v:-}|$(pin_for "${pl}")"
+    ENGINE_INFO+=$'\n'"${key}|${label}|$(engine_on "${key}" "${binvar}" && echo 1 || echo 0)|${!v:-}|$(pin_for "${pl}")"
 done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED
@@ -510,8 +529,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
-ollama_env() { echo env OLLAMA_HOST="127.0.0.1:${PORT}" OLLAMA_KEEP_ALIVE=-1 OLLAMA_MAX_LOADED_MODELS=1 "$@"; }
-ollama_up() { serve_up "${RAW}/serve-ollama-${stem}.log" /api/version $(ollama_env "$@") "${OLLAMA_BIN}" serve; }
 
 max_of() { local m=0 x; IFS=',' read -r -a _xs <<<"$1"; for x in "${_xs[@]}"; do (( x > m )) && m=${x}; done; echo "${m}"; }
 
@@ -541,8 +558,10 @@ llama_cpp_cmd() { # -c is the total across slots, so it is PAR x CTX
 llama_cpp_ready() { echo /health; }
 
 vllm_metal_model() { echo "$2"; }
-vllm_metal_cmd() {
-    local x=""; (( $2 )) && x+=" --max-num-seqs $2"; (( $3 )) && x+=" --max-model-len $3"
+vllm_metal_cmd() { # with no CTX (warm-up, ladder) the largest the sweeps need, never
+    # the checkpoint's own context, whose KV may not fit and stop vLLM starting
+    local x="" c=$3; (( c )) || c=$(largest_ctx)
+    (( $2 )) && x+=" --max-num-seqs $2"; (( c )) && x+=" --max-model-len ${c}"
     echo "${VLLM_BIN} serve $1 --host 127.0.0.1 --port ${PORT}${x}"
 }
 vllm_metal_ready() { echo /v1/models; }
@@ -562,8 +581,9 @@ omlx_serve() { # base-dir PAR
     local x=""; (( $2 )) && x=" --max-concurrent-requests $2"
     echo "${OMLX_BIN} serve --base-path $1 --model-dir ${RAW}/omlx-models --host 127.0.0.1 --port ${PORT} --paged-ssd-cache-dir $1/ssd-cache${x}"
 }
-omlx_cmd()    { omlx_serve "${RAW}/omlx-home" "$2"; }
-omlx_tq_cmd() { omlx_serve "${RAW}/omlx-home-tq" "$2"; }
+omlx_home()   { [[ "$1" == omlx_tq ]] && echo "${RAW}/omlx-home-tq" || echo "${RAW}/omlx-home"; }
+omlx_cmd()    { omlx_serve "$(omlx_home omlx)" "$2"; }
+omlx_tq_cmd() { omlx_serve "$(omlx_home omlx_tq)" "$2"; }
 omlx_ready()    { echo /v1/models; }
 omlx_tq_ready() { echo /v1/models; }
 omlx_turboquant() { # model name as oMLX lists it
@@ -575,13 +595,28 @@ json.dump({"version": 1, "models": {sys.argv[2]: {"turboquant_kv_enabled": True,
 PY
 }
 
-mistralrs_model() { gguf_ref "$1"; }
-mistralrs_cmd() { # --max-seq-len defaults to 4096, too short for long prompts
-    local x="" o; (( $2 )) && x+=" --max-seqs $2"; (( $3 )) && x+=" --max-seq-len $3"
+# Not for MoE models: on Metal mistral.rs runs out of memory in its MoE expert
+# path (moe experts forward) on every MoE GGUF here, so its rows could only be
+# failed requests.
+mistralrs_model() { [[ ",${MODELS_MOE}," == *",$1,"* ]] || gguf_ref "$1"; }
+mistralrs_cmd() { # --max-model-len is its context; --max-seq-len only sizes device mapping
+    local x="" o; (( $2 )) && x+=" --max-seqs $2"; (( $3 )) && x+=" --max-model-len $3 --max-seq-len $3"
     o=$(orig_ref "${stem}"); [[ -n "${o}" ]] && x+=" --tok-model-id ${o}"
     echo "${MISTRALRS_BIN} serve -m ${1%%:*} -f ${1#*:} -p ${PORT}${x}"
 }
 mistralrs_ready() { echo /v1/models; }
+
+# The largest context any of this run's sweeps needs (0 without scaling).
+largest_ctx() {
+    local m=0 a par ctx; local -a axs
+    (( SCALING )) || { echo 0; return 0; }
+    IFS=',' read -r -a axs <<<"${SCALE_AXES}"
+    for a in "${axs[@]}"; do
+        read -r par ctx <<<"$(axis_size "${a}")"
+        [[ -n "${ctx}" ]] && (( ctx > m )) && m=${ctx}
+    done
+    echo "${m}"
+}
 
 # Concurrent requests and context one axis needs: "PAR CTX" (+256 tokenizer slack).
 axis_size() { # axis
@@ -618,9 +653,12 @@ PY
 # `footprint` gives the physical footprint in bytes, which counts Metal buffers
 # (plain RSS does not); `top` reports the same figure but in whole GB past 10 GB,
 # too coarse to tell two engines, or oMLX and oMLX TurboQuant, apart.
-tree_pids() { local c; echo "$1"; for c in $(pgrep -P "$1"); do tree_pids "${c}"; done; }
+# The sampler runs at background QoS (taskpolicy -b), which macOS keeps on the
+# efficiency cores: about 20 ms of CPU a process each second, off the
+# performance cores the measured server and client run on.
+tree_pids() { local c; echo "$1"; for c in $(taskpolicy -b pgrep -P "$1"); do tree_pids "${c}"; done; }
 footprint_bytes() { # pid -> bytes, or nothing if it has gone
-    footprint -f bytes -p "$1" 2>/dev/null \
+    taskpolicy -b footprint -f bytes -p "$1" 2>/dev/null \
         | awk '{ for (i = 1; i < NF; i++) if ($i == "Footprint:") { print $(i + 1); exit } }' || true
 }
 mem_sampler() { # pid out
@@ -642,10 +680,11 @@ numbers() { # bench-serve json -> one human line
 import json, sys
 j = json.load(open(sys.argv[1]))
 f = lambda v, spec: "-".rjust(int(spec.split(".")[0])) if v is None else format(v, spec)
-un = j.get("unstreamed_requests") or 0
+un, bad = j.get("unstreamed_requests") or 0, j.get("failed") or 0
 print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {f(j['median_ttft_ms'], '6.0f')} ms"
       f" · TPOT p50 {f(j['median_tpot_ms'], '5.1f')} ms · {j['completed']} ok"
-      + (f" · {un} unstreamed (untimed)" if un else ""))
+      + (f" · {un} unstreamed (untimed)" if un else "")
+      + (f" · {bad} FAILED" if bad else ""))
 PY
 }
 run_cell() { # prefix axis rung input output conc
@@ -679,6 +718,13 @@ PY
         echo "failed (see ${RAW}/cells-${stem}.log)"
     else
         numbers "${out_json}"
+        # A server that dropped requests has usually run out of memory, and the
+        # cells after this one only grow: stop its sweep rather than wait out a
+        # timeout per cell on a server whose generation has died.
+        if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("failed") else 1)' "${out_json}" 2>/dev/null; then
+            cells_hung=1
+            echo "    requests failed; skipping this server's remaining cells (see ${RAW}/cells-${stem}.log)"
+        fi
     fi
 }
 run_scale_cells() { # prefix [axes]
@@ -722,14 +768,19 @@ served_name() { # the first model the running server lists
 }
 engine_prepare() { # key label model -> prints the name requests carry; fails if it cannot serve
     local key="$1" label="$2" model="$3" log="${RAW}/serve-$1-${stem}.log" name="" snap
+    local up; up="$("${key}_cmd" "${model}" 0 0)"
     if [[ "${key}" == omlx || "${key}" == omlx_tq ]]; then
-        rm -rf "${RAW}/omlx-home-tq"     # learn the name with TurboQuant off
+        # Each variant starts from an empty home of its own; the name is learned
+        # in a third, throwaway one, so nothing it writes (SSD cache, registry)
+        # is in either variant's home when that variant is measured.
+        rm -rf "$(omlx_home "${key}")" "${RAW}/omlx-home-probe"
         snap="${HF_HOME:-${HOME}/.cache/huggingface}/hub/models--${model//\//--}"
         [[ -f "${snap}/refs/main" ]] || return 1
         rm -rf "${RAW}/omlx-models" && mkdir -p "${RAW}/omlx-models/${model%%/*}"
         ln -s "${snap}/snapshots/$(cat "${snap}/refs/main")" "${RAW}/omlx-models/${model}"
+        up="$(omlx_serve "${RAW}/omlx-home-probe" 0)"
     fi
-    serve_up "${log}" "$("${key}_ready")" bash -c "exec $("${key}_cmd" "${model}" 0 0)" || { serve_down; return 1; }
+    serve_up "${log}" "$("${key}_ready")" bash -c "exec ${up}" || { serve_down; return 1; }
     case "${key}" in
         mlx_lm|vllm_metal) name="${model}" ;;
         ollama)
@@ -750,6 +801,7 @@ print(next((m["digest"] for m in json.load(sys.stdin)["models"] if m["name"]==t)
         *)  name="$(served_name)" ;;
     esac
     serve_down
+    rm -rf "${RAW}/omlx-home-probe"
     [[ "${key}" == omlx_tq && -n "${name}" ]] && omlx_turboquant "${name}"
     [[ -n "${name}" ]] && echo "${name}"
 }
@@ -776,7 +828,8 @@ run_engine() { # key label
     cell_model="${name}"; cell_tok="${id}"
     IFS=',' read -r -a axes <<<"${SCALE_AXES}"
     for ax in "${axes[@]}"; do
-        read -r par ctx <<<"$(axis_size "${ax}")" || continue
+        par=""; ctx=""; read -r par ctx <<<"$(axis_size "${ax}")"
+        [[ -n "${par}" ]] || { echo "--- scaling sweep, ${label}: no axis called ${ax}, skipped"; continue; }
         echo "--- scaling sweep, ${label} ${ax} (${par} at once, context ${ctx})"
         if serve_up "${RAW}/serve-${key}-${stem}.log" "$("${key}_ready")" bash -c "exec $("${key}_cmd" "${model}" "${par}" "${ctx}")"; then
             run_scale_cells "${RAW}/scale-${key}-${stem}" "${ax}"
@@ -1046,7 +1099,7 @@ PY
     if (( parity_ok )); then
         for row in "${ENGINE_ROWS[@]}"; do
             IFS='|' read -r key label binvar <<<"${row}"
-            [[ -n "${!binvar}" ]] && run_engine "${key}" "${label}"
+            if engine_on "${key}" "${binvar}"; then run_engine "${key}" "${label}"; fi
         done
     fi
 
@@ -1059,7 +1112,7 @@ js, raw, stem, mid, quant, feats, built, secs, size, parity_ok, mlx_python = sys
 env = os.environ
 KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms", "median_itl_ms",
         "p99_itl_ms", "median_e2el_ms", "output_throughput", "request_throughput",
-        "completed", "total_output_tokens", "duration", "unstreamed_requests",
+        "completed", "failed", "total_output_tokens", "duration", "unstreamed_requests",
         "server_mem_peak_mib", "server_mem_median_mib"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?\.json$")
 def load(name):
