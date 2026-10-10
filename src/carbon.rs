@@ -25,17 +25,19 @@ pub enum Module {
     Tag,
     Tile,
     ToggleTip,
+    Tooltip,
     UiShell,
 }
 
 /// Which module defines each `cds-*` tag family: the tag itself and every
 /// `<family>-...` tag.
-const FAMILIES: [(&str, Module); 21] = [
+const FAMILIES: [(&str, Module); 22] = [
     ("cds-accordion", Module::Accordion),
     ("cds-button", Module::Button),
     ("cds-clickable-tile", Module::Tile),
     ("cds-code-snippet", Module::CodeSnippet),
     ("cds-column", Module::Grid),
+    ("cds-definition-tooltip", Module::Tooltip),
     ("cds-grid", Module::Grid),
     ("cds-header", Module::UiShell),
     ("cds-heading", Module::Heading),
@@ -102,6 +104,7 @@ impl Module {
             Module::Tag => "tag",
             Module::Tile => "tile",
             Module::ToggleTip => "toggle-tip",
+            Module::Tooltip => "tooltip",
             Module::UiShell => "ui-shell",
         };
         format!("{}/{file}.min.js", Self::CDN)
@@ -154,6 +157,16 @@ pub fn CodeSnippet(#[props(into)] id: Option<String>, children: Element) -> Elem
 #[derive(Clone, Copy, PartialEq)]
 pub enum Alignment {
     Bottom,
+    Left,
+}
+
+impl Alignment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Alignment::Bottom => "bottom",
+            Alignment::Left => "left",
+        }
+    }
 }
 
 /// A Carbon toggletip: an (i) button opening a short note, so explanations
@@ -170,9 +183,7 @@ pub fn Toggletip(
     alignment: Alignment,
     children: Element,
 ) -> Element {
-    let alignment = match alignment {
-        Alignment::Bottom => "bottom",
-    };
+    let alignment = alignment.as_str();
     let button_label = if label.is_empty() {
         "What this means".to_string()
     } else {
@@ -314,6 +325,22 @@ pub fn Heading(children: Element) -> Element {
 #[component]
 pub fn Layer(level: u8, children: Element) -> Element {
     rsx! { cds-layer { "level": "{level}", {children} } }
+}
+
+/// A `cds-definition-tooltip`: a term, dotted-underlined, whose definition
+/// opens on hover, click or keyboard focus.
+#[component]
+pub fn Definition(
+    #[props(into)] definition: String,
+    alignment: Alignment,
+    children: Element,
+) -> Element {
+    rsx! {
+        cds-definition-tooltip { "open-on-hover": "", "align": alignment.as_str(),
+            {children}
+            span { "slot": "definition", "{definition}" }
+        }
+    }
 }
 
 /// A small `cds-table` with one header row.
