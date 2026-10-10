@@ -2337,6 +2337,11 @@ impl AsyncEngine {
                     debug!("Output for unknown request {}, ignoring", output.request_id);
                     return None;
                 };
+                // Finished here already (a stop string matched; a non-streaming entry waits to be
+                // collected): what the steps still in flight for it produced is not its output.
+                if req_state.finish_reason.is_some() {
+                    return None;
+                }
 
                 // Track output tokens.
                 #[cfg(feature = "metrics")]
@@ -2488,6 +2493,10 @@ impl AsyncEngine {
                 // Already logged in Phase 1.
                 continue;
             };
+            // Finished here already: dropped in Phase 1.
+            if req_state.finish_reason.is_some() {
+                continue;
+            }
 
             // NOTHING TO PUT BACK — the detokenizer never left. This arm used to reinstall it, and
             // when the state had already been removed it `continue`d above and dropped it forever.
@@ -2834,6 +2843,9 @@ impl AsyncEngine {
             debug!("Output for unknown request {}, ignoring", output.request_id);
             return;
         };
+        if req_state.finish_reason.is_some() {
+            return;
+        }
 
         // Track output tokens.
         #[cfg(feature = "metrics")]
@@ -4385,6 +4397,35 @@ mod tests {
         };
         // Should not panic.
         AsyncEngine::process_output(&mut requests, output);
+    }
+
+    /// An output for a request finished here already — a stop string matched, its non-streaming
+    /// entry waiting to be collected — came from a step still in flight for it: every path drops
+    /// it, the request's tokens as they were.
+    #[test]
+    fn an_output_for_a_finished_request_is_dropped() {
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(None);
+        state.generated_token_ids = vec![10, 11];
+        state.finish_reason = Some(FinishReason::Stop);
+        requests.insert("req-1".to_string(), state);
+        let output = || EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let work = AsyncEngine::process_outputs_phase1(&mut requests, &[output()]);
+        assert!(work.iter().all(Option::is_none), "nothing to detokenize");
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output()], results);
+        AsyncEngine::process_output(&mut requests, output());
+        assert_eq!(requests["req-1"].generated_token_ids, [10, 11]);
     }
 
     #[test]
