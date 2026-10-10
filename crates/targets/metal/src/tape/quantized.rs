@@ -164,6 +164,13 @@ pub const QMV_FAST_TILE_ROWS: u32 = 4;
 /// MLX's 4 rows a simdgroup. [`QmvKernel::FastFold`].
 pub const QMV_FAST_FOLD_TILE_ROWS: u32 = 8;
 
+/// The rows a dense `affine_qmv_gated` threadgroup takes: `qmv_fast_impl`'s own sub-tile at
+/// [`QMV_FAST_TILE_ROWS`] — half `qmv_impl`'s fixed 8, so a small gate/up pair (a MoE layer's
+/// shared expert is ~1 MB) gets twice the threadgroups it needs to stream.
+pub const fn gated_tile_rows(fast: bool) -> u32 {
+    if fast { QMV_FAST_TILE_ROWS } else { 8 }
+}
+
 /// Threadgroup grid + threads-per-group for a picked qmv variant.
 ///
 /// `qmv_quad`: `bn = quads_per_simd * results_per_quadgroup = 8 * 8 = 64`

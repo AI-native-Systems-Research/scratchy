@@ -1988,9 +1988,13 @@ SCRATCHY_CONSTANT(int, GATED_ACT, 3);
 // `y = act(gate · x) * (up · x)`, as the two matvecs and `silu_mul` / `gelu_mul` compute it.
 //   buffer(0-2) = gate w / scales / biases   buffer(5-7) = up w / scales / biases
 //   buffer(3)   = x  [in_vec]                buffer(4)   = y  [out_vec]
-// Dispatch (1, out_vec / 8, 1), threadgroup (32, 4, 1): simdgroups 0-1 run the gate matvec over
-// the 8-row block tid.y, 2-3 the up matvec's, each row rounded to T_act as the matvec stores it;
-// then lanes 0-7 of simdgroup 0 apply the activation to the block's rows.
+// Dispatch (1, out_vec / 4, 1) fast — (1, out_vec / 8, 1) otherwise — threadgroup (32, 4, 1):
+// simdgroups 0-1 run the gate matvec over the block tid.y, 2-3 the up matvec's, each row rounded
+// to T_act as the matvec stores it; then lanes 0-(rows-1) of simdgroup 0 apply the activation to
+// the block's rows. The fast path runs `qmv_fast_impl`'s own sub-tile (`QMV_FAST_ROWS` a
+// simdgroup, so 4-row blocks and twice the threadgroups — an 8-row block leaves a shared
+// expert's ~1 MB of gate/up at a third of the machine's streaming rate for want of groups);
+// `qmv_impl` has no row-tile parameter, so the non-fast path keeps its 8-row blocks.
 template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 [[kernel]] void affine_qmv_gated(
     const device uint32_t* gate_w      [[buffer(0)]],
@@ -2005,25 +2009,29 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
-  static_assert(OUT_VEC_SIZE % 8 == 0, "every block holds 8 whole rows");
-  threadgroup T_act rows[2][8];
+  static_assert(OUT_VEC_SIZE % 8 == 0, "the non-fast blocks hold 8 whole rows; fast's 4 divide them");
+  constexpr int BLOCK_ROWS = fast ? 2 * QMV_FAST_ROWS : 8;
+  threadgroup T_act rows[2][BLOCK_ROWS];
   const bool up = simd_gid >= 2;
-  // The block's own rows: the impl then reads rows 0-7 of a matrix that starts at the block.
-  const size_t row0 = size_t(tid.y) * 8;
+  // The block's own rows: the impl then reads rows 0-(BLOCK_ROWS-1) of a matrix that starts at
+  // the block.
+  const size_t row0 = size_t(tid.y) * BLOCK_ROWS;
   const size_t w_offset = row0 * size_t(IN_VEC_SIZE) * bits / 32;
   const size_t sb_offset = row0 * size_t(IN_VEC_SIZE / group_size);
   const device uint32_t* w = (up ? up_w : gate_w) + w_offset;
   const device T_scale* scales = (up ? up_scales : gate_scales) + sb_offset;
   const device T_scale* biases = (up ? up_biases : gate_biases) + sb_offset;
   if (fast) {
-    qmv_fast_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
-        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid, gain);
+    qmv_fast_impl<T_act, T_scale, group_size, bits, threadgroup T_act*, QMV_FAST_ROWS>(
+        w, scales, biases, x, rows[up], IN_VEC_SIZE, BLOCK_ROWS, uint3(0), simd_gid % 2, simd_lid,
+        gain);
   } else {
     qmv_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
-        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid, gain);
+        w, scales, biases, x, rows[up], IN_VEC_SIZE, BLOCK_ROWS, uint3(0), simd_gid % 2, simd_lid,
+        gain);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_gid == 0 && simd_lid < 8) {
+  if (simd_gid == 0 && simd_lid < BLOCK_ROWS) {
     float g = float(rows[0][simd_lid]);
     float u = float(rows[1][simd_lid]);
     y[row0 + simd_lid] =
