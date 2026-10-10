@@ -78,6 +78,15 @@ pub enum QmvKernel {
     FastFold,
     /// `affine_qmv_*` — generic fallback with bounds-checked tail.
     Generic,
+    /// `affine_qmv_tiny_*` — sub-tile N (`N < 8`) at one row, power-of-two
+    /// bits: the generic kernel's guarded path leaves a whole simdgroup
+    /// idle (its lanes map to output rows that don't exist) and walks K in
+    /// `values_per_thread × 32`-value blocks — 16 serial blocks at b8's
+    /// packing, K = 2048. Ours splits K across BOTH simdgroups of one
+    /// threadgroup (64 lanes), combines the partials through threadgroup
+    /// memory. MLX dispatches its `qmv` here; the divergence is the same
+    /// class as #326 — measured faster, same math.
+    Tiny,
     /// `affine_qmv_wide_*_nv_<nv>_kl_8` — the small-M band (`2 ≤ M <
     /// vector_limit`): each weight group is dequantized once and
     /// reused across `nv` input vectors, so weight traffic is
@@ -113,6 +122,13 @@ pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) ->
         QmvKernel::Wide {
             nv: m.div_ceil(n_tiles),
         }
+    } else if m == 1 && n < 8 && matches!(bits, 2 | 4 | 8) && k.is_multiple_of(16) {
+        // Sub-tile N at one row: the generic kernel's guarded path parks a
+        // whole simdgroup and serializes K — the tiny kernel puts both to
+        // work. Power-of-two bits only: the 3/5/6-bit packings' word
+        // indexing doesn't divide by lane; K a whole multiple of the
+        // 16-value lane chunk, so no bounds-checked tail is needed.
+        QmvKernel::Tiny
     } else if qmv_fast_covers(n, k) {
         if m >= 2 {
             QmvKernel::FastFold
@@ -170,6 +186,12 @@ pub fn qmv_dispatch_shape(
         QmvKernel::Fast => ((m, n.div_ceil(QMV_FAST_TILE_ROWS), b), (32, 2, 1)),
         QmvKernel::FastFold => ((m, n.div_ceil(QMV_FAST_FOLD_TILE_ROWS), b), (32, 2, 1)),
         QmvKernel::Generic => ((m, n.div_ceil(8), b), (32, 2, 1)),
+        QmvKernel::Tiny => {
+            // One threadgroup per (row, batch): all of N lives in it, both
+            // simdgroups splitting K (the reduce crosses them through
+            // threadgroup memory).
+            ((m, 1, b), (32, 2, 1))
+        }
         QmvKernel::Wide { nv } => {
             // quantized.cpp:559-571: rows_per_tg = (32 / k_lanes=8) × 2
             // simdgroups = 8; group (32, 2, 1); grid
@@ -211,6 +233,9 @@ pub fn qmv_kernel_name(
         }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+        }
+        QmvKernel::Tiny => {
+            format!("affine_qmv_tiny_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
         }
         QmvKernel::Wide { nv } => {
             format!(
@@ -282,6 +307,9 @@ pub fn qmv_kernel_static_name(
         }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
+        }
+        QmvKernel::Tiny => {
+            format!("affine_qmv_tiny_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::Wide { nv } => {
             if !matches!(nv, 2..=5) {
@@ -1201,6 +1229,60 @@ mod tests {
         assert_eq!(
             pick_qmv_kernel_wide(2049, 2048, 4, 4, false),
             QmvKernel::Generic
+        );
+    }
+
+    #[test]
+    fn qmv_kernel_pick_routes_sub_tile_n_to_tiny() {
+        // Sub-tile N at one row: ours, not MLX's — `dispatch_qmv` sends the
+        // generic kernel here and leaves a whole simdgroup parked (the same
+        // class of measured divergence as the NAX floor, #326).
+        // Qwen3.6's shared-expert gate: N=1, K=2048, 8-bit.
+        assert_eq!(pick_qmv_kernel_wide(1, 2048, 8, 1, false), QmvKernel::Tiny);
+        // odd sub-tile N at 4-bit, whole second K pass
+        assert_eq!(pick_qmv_kernel_wide(7, 2048, 4, 1, false), QmvKernel::Tiny);
+        // partial second pass: K = 1024 + 8 lane chunks
+        assert_eq!(pick_qmv_kernel_wide(1, 1152, 4, 1, false), QmvKernel::Tiny);
+        // the 3-bit packing's word indexing doesn't divide by lane
+        assert_eq!(
+            pick_qmv_kernel_wide(1, 2048, 3, 1, false),
+            QmvKernel::Generic
+        );
+        // K must be a whole multiple of the 16-value lane chunk
+        assert_eq!(
+            pick_qmv_kernel_wide(1, 1023, 4, 1, false),
+            QmvKernel::Generic
+        );
+        // N=8 is fast's whole tile, not sub-tile
+        assert_eq!(pick_qmv_kernel_wide(8, 2048, 4, 1, false), QmvKernel::Fast);
+        // M ≥ 2 keeps the wide band ahead of tiny
+        assert!(matches!(
+            pick_qmv_kernel_wide(1, 2048, 8, 2, true),
+            QmvKernel::Wide { .. }
+        ));
+        // quad still wins its K band first
+        assert_eq!(
+            pick_qmv_kernel_wide(1, 128, 4, 1, false),
+            QmvKernel::Quad { d: 128 }
+        );
+
+        // One threadgroup per (row, batch): all of N lives in it, both
+        // simdgroups splitting K.
+        let ((tx, ty, tz), (gx, gy, gz)) = qmv_dispatch_shape(QmvKernel::Tiny, 1, 7, 3);
+        assert_eq!((tx, ty, tz), (1, 1, 3));
+        assert_eq!((gx, gy, gz), (32, 2, 1));
+
+        // Decoded against the INST_QMV_* rows in shaders/quantized_qmv.metal.
+        assert_eq!(
+            qmv_kernel_name(
+                QmvKernel::Tiny,
+                DequantDtype::Bf16,
+                ScaleDtype::Bf16,
+                64,
+                8,
+                false
+            ),
+            "affine_qmv_tiny_bf16_s_bf16_gs_64_b_8_batch_0"
         );
     }
 
