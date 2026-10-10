@@ -927,7 +927,9 @@ fn route_by_sequence_count(
 /// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
 /// `AffineQmm` in a bucket that can see a `SMALL_M_TOKENS` step: the twin runs
 /// on those steps (`OnlyIfSmallMTokens`) and the instruction's own GEMM on
-/// every other (`UnlessSmallMTokens`).
+/// every other (`UnlessSmallMTokens`). The twin computes the bare product, so a
+/// matmul whose ends were folded into it (its input's norm, its bias, scale or
+/// residual add) has none: its own matvec runs on every step.
 fn route_small_m(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -949,6 +951,13 @@ fn route_small_m(
         k: KDim(k),
         group_size: AffineGroupSize(group_size),
         bits: AffineBits(4),
+        ends:
+            QmvEnds {
+                norm: None,
+                bias: None,
+                scale: None,
+                residual: false,
+            },
         ..
     } = g
     else {
@@ -6129,23 +6138,24 @@ fn fused_add_rmsnorm_kernel_static_name(
     }
 }
 
-/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype. `rows`: the
-/// multi-row variant (`gemv_normed_rows_*`), one threadgroup per (row block, token).
+/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype. A one-row
+/// bucket's is the one-row gemv; a multi-row bucket's the per-row variant (`gemv_normed_rows_*`),
+/// one threadgroup per (row block, token).
 fn normed_gemv_kernel_static_name(
     p: &MetalModelConsts,
     scale_dtype: ScaleDtype,
-    rows: bool,
+    bucket_m: super::ids::BucketM,
 ) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype, rows) {
-        (MetalDtype::F16, S::F16, false) => "gemv_normed_f16_s_f16",
-        (MetalDtype::Bf16, S::F16, false) => "gemv_normed_bf16_s_f16",
-        (MetalDtype::F16, S::Bf16, false) => "gemv_normed_f16_s_bf16",
-        (MetalDtype::Bf16, S::Bf16, false) => "gemv_normed_bf16_s_bf16",
-        (MetalDtype::F16, S::F16, true) => "gemv_normed_rows_f16_s_f16",
-        (MetalDtype::Bf16, S::F16, true) => "gemv_normed_rows_bf16_s_f16",
-        (MetalDtype::F16, S::Bf16, true) => "gemv_normed_rows_f16_s_bf16",
-        (MetalDtype::Bf16, S::Bf16, true) => "gemv_normed_rows_bf16_s_bf16",
+    match (p.metal_dtype, scale_dtype, bucket_m.0 == 1) {
+        (MetalDtype::F16, S::F16, true) => "gemv_normed_f16_s_f16",
+        (MetalDtype::Bf16, S::F16, true) => "gemv_normed_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16, true) => "gemv_normed_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16, true) => "gemv_normed_bf16_s_bf16",
+        (MetalDtype::F16, S::F16, false) => "gemv_normed_rows_f16_s_f16",
+        (MetalDtype::Bf16, S::F16, false) => "gemv_normed_rows_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16, false) => "gemv_normed_rows_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16, false) => "gemv_normed_rows_bf16_s_bf16",
         (dt, sdt, _) => {
             unreachable!("gemv_normed: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
         }
@@ -6933,7 +6943,11 @@ fn lower_moe_step(
             vec![LoweredCommand {
                 kernel: KernelId::NormedGemv,
                 library: "gemm",
-                function: normed_gemv_kernel_static_name(p, scale_dtype, one_row),
+                function: normed_gemv_kernel_static_name(
+                    p,
+                    scale_dtype,
+                    super::ids::BucketM(bucket_m),
+                ),
                 constants: super::kernel_constants::NormedGemvConstants {
                     n: super::ids::NDim(e),
                     k: super::ids::KDim(hidden),
@@ -8654,6 +8668,38 @@ mod tests {
                 "bucket {bucket_m}: no small-M twin"
             );
         }
+        // A matvec whose input's norm and residual add were folded into it has no twin to take
+        // a 4–16-token step: the twin's bare product would skip both. Its matvec runs on every
+        // step, ends and all.
+        let ends = QmvEnds {
+            norm: Some(crate::tape::step::RowNorm {
+                layer: LayerId(0),
+                eps: crate::tape::step::Eps(1e-6),
+                offset: crate::tape::step::GainOffset(0.0),
+            }),
+            residual: true,
+            ..QmvEnds::default()
+        };
+        for bucket_m in [4, 8] {
+            let folded = MetalStep::AffineQmm(AffineMatmul {
+                ends,
+                ..(match gemm(4) {
+                    MetalStep::AffineQmm(g) => g,
+                    _ => unreachable!("gemm is an AffineQmm"),
+                })
+            });
+            let tape = lower_at(folded, bucket_m, m5);
+            assert_eq!(
+                gated_steps(&tape),
+                [(KernelId::AffineQmvWide, None)],
+                "bucket {bucket_m}"
+            );
+            let constants = tape.commands[0].command.constants;
+            assert!(
+                constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
+                "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
+            );
+        }
     }
 
     /// Llama-1B's `q_proj` shape (N=K=2048, gs=64, 4-bit, qmv batch limit 18), slot 7 into slot 11
@@ -10127,5 +10173,44 @@ mod tests {
             sorted_rows(8).0 == MoeGrouping::Sorted,
             "bucket 8 is the sorted bake"
         );
+    }
+
+    /// A router with its block's input norm folded in writes every row's logits: one row runs the
+    /// one-row normed gemv, a multi-row bucket the per-row kernel, a threadgroup row per token.
+    #[test]
+    fn a_normed_router_writes_every_row() {
+        use crate::tape::step::{Eps, GainOffset, MoeRows, MoeStep, RowNorm};
+        let block = qwen_moe_block(256);
+        let p = tp();
+        let norm = RowNorm {
+            layer: LayerId(0),
+            eps: Eps(1e-6),
+            offset: GainOffset(0.0),
+        };
+        let step = MoeStep::RouterLogits(MoeRows::Normed(Slot(1), norm), LayerId(0), None);
+        for bucket_m in [1, 2, 8, 64] {
+            let at = MoeBake {
+                bucket_m,
+                layer_offset: 0,
+                is_nax: false,
+                f16_compute: false,
+                codes: super::super::kernel_constants::AffineCodesTarget::of(None),
+            };
+            let router = lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("lowers");
+            let [c] = router.as_slice() else {
+                panic!(
+                    "bucket {bucket_m}: one router command, got {}",
+                    router.len()
+                );
+            };
+            assert_eq!(c.kernel, KernelId::NormedGemv, "bucket {bucket_m}");
+            assert_eq!(
+                c.function.starts_with("gemv_normed_rows_"),
+                bucket_m > 1,
+                "bucket {bucket_m}: {}",
+                c.function
+            );
+            assert_eq!(c.dispatch.threadgroups, (256 / 4, bucket_m, 1));
+        }
     }
 }
