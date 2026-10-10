@@ -125,6 +125,11 @@ impl Executor for UniProcExecutor {
         self.worker.hybrid_kv_stores()
     }
 
+    /// Straight through to the worker, which allocated them.
+    fn recurrent_state_snapshots(&self) -> usize {
+        self.worker.recurrent_state_snapshots()
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,

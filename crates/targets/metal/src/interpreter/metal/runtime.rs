@@ -136,8 +136,12 @@ pub struct RuntimeBindings {
     /// [`Self::gdn_state_conv`]; empty for a model that drafts nothing (its tapes bind none).
     pub gdn_lanes_conv: Vec<Buffer>,
     pub gdn_lanes_ssm: Vec<Buffer>,
-    /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence.
-    /// Shared storage; the pool overwrites `contents()` each forward.
+    /// `[num_seqs]` [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) — 24 bytes (6 i32s) per
+    /// batched sequence: its state-pool slot, the snapshot a restore reads its start state from,
+    /// the snapshots a save stores into. Shared storage; the pool overwrites `contents()` each
+    /// forward and zeroes the tail past them: an all-zero record is a plain step on slot 0, and a
+    /// padding sequence past them has no rows (`cu_seqlens_q`'s zeroed tail), so no kernel runs
+    /// it.
     pub gdn_state_indices: Buffer,
     /// `[num_seqs]` u32 — per-sequence fresh flag. Shared storage.
     pub gdn_is_fresh: Buffer,

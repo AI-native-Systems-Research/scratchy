@@ -5,7 +5,9 @@
 //!
 //! Sends concurrent HTTP requests to a running vLLM server (OpenAI-compatible
 //! API) and measures per-request latency metrics: TTFT, TPOT, ITL, and
-//! end-to-end latency (E2EL).
+//! end-to-end latency (E2EL). `--dataset-name multi-turn` instead runs
+//! closed-loop conversations against the chat endpoint and reports latency and
+//! prefix-cache reuse per turn.
 
 use std::io::Read;
 use std::path::Path;
@@ -419,7 +421,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         }
     };
 
-    let api_url = format!("{}{}", args.base_url, args.endpoint);
+    let api_url = format!("{}{}", args.base_url, args.endpoint());
     eprintln!("vLLM Rust — serving benchmark");
     eprintln!("Model: {model}");
     eprintln!("API URL: {api_url}");
@@ -456,6 +458,10 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         scratchy_serving_api::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
     };
+
+    if args.is_multi_turn() {
+        return run_multi_turn(&args, agent, api_url, &model, &tokenizer);
+    }
 
     let client = Arc::new(Client {
         agent,
@@ -659,16 +665,21 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         }
     }
 
+    write_results(&args, &model, &json)
+}
+
+/// Write the results JSON where `--output-json` and `--save-result` say.
+fn write_results(args: &BenchServeArgs, model: &str, json: &serde_json::Value) -> Result<()> {
     // --output-json: explicit path.
     if let Some(ref path) = args.output_json {
-        std::fs::write(path, serde_json::to_string_pretty(&json)?)?;
+        std::fs::write(path, serde_json::to_string_pretty(json)?)?;
         eprintln!("Results written to {path}");
     }
 
     // --save-result: auto-generated filename.
     if args.save_result {
         let label = args.label.as_deref().unwrap_or("openai");
-        let model_basename = model.rsplit('/').next().unwrap_or(&model);
+        let model_basename = model.rsplit('/').next().unwrap_or(model);
         let datetime = crate::timestamp_filename_tag("-");
 
         let filename = if let Some(ref name) = args.result_filename {
@@ -685,11 +696,437 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         let dir = args.result_dir.as_deref().unwrap_or(".");
         std::fs::create_dir_all(dir)?;
         let path = std::path::PathBuf::from(dir).join(&filename);
-        std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+        std::fs::write(&path, serde_json::to_string_pretty(json)?)?;
         eprintln!("Results saved to {}", path.display());
     }
 
     Ok(())
+}
+
+/// One `multi-turn` request: how long it took and what the server's `usage`
+/// said about it.
+struct TurnResult {
+    /// 0-based position in its conversation.
+    turn: usize,
+    success: bool,
+    /// Request sent to response body read (seconds). Nothing streams, so this
+    /// is the TTFT only at `--output-len 1`.
+    latency: f64,
+    /// `usage.completion_tokens` (0 when the server sent none).
+    output_tokens: usize,
+    /// `usage.prompt_tokens`, when the server sent it.
+    prompt_tokens: Option<usize>,
+    /// `usage.prompt_tokens_details.cached_tokens`, when the server sent it.
+    cached_tokens: Option<usize>,
+}
+
+/// What every `multi-turn` request shares: where it goes and how it samples.
+struct ChatClient {
+    agent: Agent,
+    api_url: String,
+    api_key: Option<String>,
+    /// Every field of a request body but its `messages`.
+    body: serde_json::Value,
+}
+
+impl ChatClient {
+    fn new(args: &BenchServeArgs, agent: Agent, api_url: String, model: &str) -> Self {
+        let mut body = serde_json::json!({
+            "model": model,
+            "max_tokens": args.output_len,
+            "stream": false,
+        });
+        // As in `send_request`: unset knobs are left out rather than sent as
+        // null, so the server applies its own default.
+        if args.ignore_eos {
+            body["ignore_eos"] = serde_json::json!(true);
+        }
+        if let Some(t) = args.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(p) = args.top_p {
+            body["top_p"] = serde_json::json!(p);
+        }
+        if let Some(k) = args.top_k {
+            body["top_k"] = serde_json::json!(k);
+        }
+        if let Some(kwargs) = &args.chat_template_kwargs {
+            body["chat_template_kwargs"] = serde_json::Value::Object(kwargs.clone());
+        }
+        ChatClient {
+            agent,
+            api_url,
+            api_key: args.api_key.clone(),
+            body,
+        }
+    }
+
+    /// Send one non-streaming chat request, timed to the end of its body.
+    ///
+    /// The server renders the chat template; the client never does, so every
+    /// backend applies its own to the same `messages`.
+    fn send(&self, messages: serde_json::Value, turn: usize, request_id: &str) -> TurnResult {
+        let mut body = self.body.clone();
+        body["messages"] = messages;
+        let mut result = TurnResult {
+            turn,
+            success: false,
+            latency: 0.0,
+            output_tokens: 0,
+            prompt_tokens: None,
+            cached_tokens: None,
+        };
+
+        let request_start = Instant::now();
+        let mut req = self
+            .agent
+            .post(&self.api_url)
+            .header("content-type", "application/json")
+            .header("x-request-id", request_id);
+        if let Some(key) = &self.api_key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = match req.send(body.to_string().as_str()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Request failed: {e}");
+                return result;
+            }
+        };
+        let status = resp.status();
+        let text = match resp.into_body().read_to_string() {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("Reading the response failed: {e}");
+                return result;
+            }
+        };
+        result.latency = request_start.elapsed().as_secs_f64();
+        if !status.is_success() {
+            eprintln!("Request failed with status {status}: {text}");
+            return result;
+        }
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+            eprintln!("Request returned a body that is not JSON: {text}");
+            return result;
+        };
+
+        let count = |v: &serde_json::Value| v.as_u64().map(|n| n as usize);
+        let usage = &parsed["usage"];
+        result.output_tokens = count(&usage["completion_tokens"]).unwrap_or(0);
+        result.prompt_tokens = count(&usage["prompt_tokens"]);
+        result.cached_tokens = count(&usage["prompt_tokens_details"]["cached_tokens"]);
+        result.success = parsed["choices"].as_array().is_some_and(|c| !c.is_empty());
+        result
+    }
+}
+
+/// What a `multi-turn` run measured.
+struct MultiTurnRun {
+    /// Every request sent, conversation by conversation.
+    results: Vec<TurnResult>,
+    /// Requests per conversation.
+    turns: usize,
+    /// Requests the run meant to send: more than `results` when a failed
+    /// turn ended its conversation early.
+    planned: usize,
+    /// Prompt tokens over the successful requests.
+    total_input_tokens: usize,
+    /// Wall time of the measured requests (seconds).
+    total_time: f64,
+}
+
+/// `--dataset-name multi-turn`: conversations sharing one system prompt, run
+/// closed loop — turn k+1 is sent once turn k has answered — with
+/// `--max-concurrency` bounding the conversations in flight.
+fn run_multi_turn(
+    args: &BenchServeArgs,
+    agent: Agent,
+    api_url: String,
+    model: &str,
+    tokenizer: &Tokenizer,
+) -> Result<()> {
+    eprintln!(
+        "multi-turn: {} turns per conversation, system_len: {}, user_len: {}, reply_len: {}",
+        args.multi_turn_turns,
+        args.multi_turn_system_len,
+        args.multi_turn_user_len,
+        args.multi_turn_reply_len
+    );
+    let count_tokens = |text: &str| datasets::token_count(tokenizer, text);
+    let spec = |conversations| datasets::MultiTurnSpec {
+        conversations,
+        turns: args.multi_turn_turns,
+        system_len: args.multi_turn_system_len,
+        user_len: args.multi_turn_user_len,
+        reply_len: args.multi_turn_reply_len,
+    };
+    eprintln!(
+        "Generating {} conversations sharing one ~{}-token system prompt...",
+        args.num_prompts, args.multi_turn_system_len
+    );
+    let dataset = Arc::new(datasets::generate_multi_turn(
+        &count_tokens,
+        &spec(args.num_prompts),
+        args.seed,
+    )?);
+    let turns = dataset.turns();
+    if args.output_len > 1 {
+        eprintln!(
+            "note: multi-turn requests are not streamed, so at --output-len {} the per-turn \
+             latency includes decode; --output-len 1 makes it the TTFT",
+            args.output_len
+        );
+    }
+    let client = Arc::new(ChatClient::new(args, agent, api_url, model));
+
+    // Throwaway conversations come from a disjoint seed, so even their system
+    // prompt is not the measured one. The pre-flight is conversation 0's
+    // first turn; the warmups walk the rest in order, a conversation's turns
+    // back to back as in the run.
+    let throwaway = datasets::generate_multi_turn(
+        &count_tokens,
+        &spec(1 + args.num_warmups.div_ceil(turns)),
+        datasets::throwaway_seed(args.seed),
+    )?;
+    preflight(|| {
+        client
+            .send(throwaway.messages(0, 0), 0, "preflight")
+            .success
+    })?;
+    warm_up(args.num_warmups, |i| {
+        let (conv, turn) = (1 + i / turns, i % turns);
+        client.send(throwaway.messages(conv, turn), turn, &format!("warmup-{i}"));
+    });
+
+    let num_conversations = dataset.num_conversations();
+    let pb = progress_bar(args, num_conversations * turns);
+    let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+    // `--request-rate` paces conversation starts.
+    let cumulative_delays = generate_request_delays(
+        num_conversations,
+        args.request_rate,
+        args.burstiness,
+        args.seed.wrapping_add(42),
+    );
+
+    let benchmark_start = Instant::now();
+    let mut handles = Vec::with_capacity(num_conversations);
+    for (conv, &start_at) in cumulative_delays.iter().enumerate() {
+        wait_until(benchmark_start, start_at);
+
+        let client = client.clone();
+        let dataset = dataset.clone();
+        let pb = pb.clone();
+        // As for single prompts, but the permit is held for the whole
+        // conversation.
+        let permit = semaphore.as_ref().map(|s| s.acquire_owned());
+        handles.push(std::thread::spawn(move || {
+            let _permit = permit;
+            let mut sent = Vec::with_capacity(turns);
+            for turn in 0..turns {
+                let request_id = format!("bench-{conv}-{turn}");
+                let result = client.send(dataset.messages(conv, turn), turn, &request_id);
+                if let Some(ref pb) = pb {
+                    pb.inc(1);
+                }
+                let ok = result.success;
+                sent.push(result);
+                // The next turn would be timed against a cache this one may
+                // never have filled, so a failure ends the conversation.
+                if !ok {
+                    break;
+                }
+            }
+            sent
+        }));
+    }
+
+    let conversations = join_all(handles)?;
+    let total_time = benchmark_start.elapsed().as_secs_f64();
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    // The server's prompt count includes the chat template; the content count
+    // is the floor to fall back on when it sends none.
+    let mut total_input_tokens = 0;
+    for (conv, sent) in conversations.iter().enumerate() {
+        for r in sent.iter().filter(|r| r.success) {
+            total_input_tokens += r
+                .prompt_tokens
+                .unwrap_or_else(|| dataset.content_tokens(conv, r.turn));
+        }
+    }
+    let run = MultiTurnRun {
+        results: conversations.into_iter().flatten().collect(),
+        turns,
+        planned: num_conversations * turns,
+        total_input_tokens,
+        total_time,
+    };
+    report_multi_turn(args, model, &run)
+}
+
+/// Print a `multi-turn` run's summary and per-turn table, and write its JSON.
+fn report_multi_turn(args: &BenchServeArgs, model: &str, run: &MultiTurnRun) -> Result<()> {
+    let num_success = run.results.iter().filter(|r| r.success).count();
+    let num_fail = run.planned - num_success;
+    if num_success == 0 {
+        anyhow::bail!("All {num_fail} requests failed. Check server connectivity and model name.");
+    }
+    let total_output_tokens: usize = run
+        .results
+        .iter()
+        .filter(|r| r.success)
+        .map(|r| r.output_tokens)
+        .sum();
+    let total_time = run.total_time;
+    let total_input_tokens = run.total_input_tokens;
+    let selected_pcts: Vec<f64> = args
+        .metric_percentiles
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let per_turn = turn_stats(&run.results, run.turns);
+
+    println!();
+    println!("{:=^50}", " Serving Benchmark Result ");
+    println!("{:<40} {:<10}", "Successful requests:", num_success);
+    println!("{:<40} {:<10}", "Failed requests:", num_fail);
+    if let Some(mc) = args.max_concurrency {
+        println!("{:<40} {:<10}", "Maximum conversation concurrency:", mc);
+    }
+    if !args.request_rate.is_infinite() {
+        println!(
+            "{:<40} {:<10.2}",
+            "Conversation rate configured (conv/s):", args.request_rate
+        );
+    }
+    println!("{:<40} {:<10.2}", "Benchmark duration (s):", total_time);
+    println!("{:<40} {:<10}", "Total input tokens:", total_input_tokens);
+    println!(
+        "{:<40} {:<10}",
+        "Total generated tokens:", total_output_tokens
+    );
+    println!(
+        "{:<40} {:<10.2}",
+        "Request throughput (req/s):",
+        num_success as f64 / total_time
+    );
+    print_turn_table(&per_turn, &selected_pcts);
+    println!("{:=^50}", "");
+
+    let mut json = serde_json::json!({
+        "duration": total_time,
+        "completed": num_success,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "request_throughput": num_success as f64 / total_time,
+        "output_throughput": total_output_tokens as f64 / total_time,
+        "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
+    });
+    let obj = json.as_object_mut().unwrap();
+    // Per turn, 1-based. "ttft" is the request latency: see `ChatClient::send`.
+    for (k, turn) in per_turn.iter().enumerate().map(|(i, t)| (i + 1, t)) {
+        let ms = |p| (!turn.latencies.is_empty()).then(|| percentile(&turn.latencies, p) * 1000.0);
+        obj.insert(
+            format!("completed_turn{k}"),
+            serde_json::json!(turn.completed),
+        );
+        obj.insert(
+            format!("median_ttft_ms_turn{k}"),
+            serde_json::json!(ms(50.0)),
+        );
+        for &p in &selected_pcts {
+            obj.insert(
+                format!("p{}_ttft_ms_turn{k}", p_word(p)),
+                serde_json::json!(ms(p)),
+            );
+        }
+        obj.insert(
+            format!("mean_prompt_tokens_turn{k}"),
+            serde_json::json!(turn.mean_prompt_tokens),
+        );
+        obj.insert(
+            format!("mean_cached_tokens_turn{k}"),
+            serde_json::json!(turn.mean_cached_tokens),
+        );
+    }
+
+    write_results(args, model, &json)
+}
+
+/// One turn's slice of a `multi-turn` run.
+struct TurnStats {
+    /// Successful requests at this turn.
+    completed: usize,
+    /// Their latencies (seconds), sorted.
+    latencies: Vec<f64>,
+    /// `None` when no request at this turn reported a prompt size.
+    mean_prompt_tokens: Option<f64>,
+    /// `None` when the server reported no cached tokens anywhere in the run.
+    mean_cached_tokens: Option<f64>,
+}
+
+/// Break a `multi-turn` run's successful requests out per turn.
+///
+/// scratchy leaves `prompt_tokens_details` out when nothing was reused, so a
+/// missing cached count reads as 0 once the server has reported one anywhere
+/// in the run. A server that never reports one gets null, not a made-up 0.
+fn turn_stats(results: &[TurnResult], turns: usize) -> Vec<TurnStats> {
+    let ok = || results.iter().filter(|r| r.success);
+    let reports_cached = ok().any(|r| r.cached_tokens.is_some());
+    (0..turns)
+        .map(|turn| {
+            let at: Vec<&TurnResult> = ok().filter(|r| r.turn == turn).collect();
+            let mut latencies: Vec<f64> = at.iter().map(|r| r.latency).collect();
+            latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let prompt: Vec<f64> = at
+                .iter()
+                .filter_map(|r| r.prompt_tokens)
+                .map(|n| n as f64)
+                .collect();
+            let cached: Vec<f64> = at
+                .iter()
+                .map(|r| r.cached_tokens.unwrap_or(0) as f64)
+                .collect();
+            TurnStats {
+                completed: at.len(),
+                latencies,
+                mean_prompt_tokens: (!prompt.is_empty()).then(|| mean(&prompt)),
+                mean_cached_tokens: (reports_cached && !cached.is_empty()).then(|| mean(&cached)),
+            }
+        })
+        .collect()
+}
+
+fn print_turn_table(stats: &[TurnStats], pcts: &[f64]) {
+    let tokens = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.0}"));
+    println!("{:-^50}", "Per-turn Latency (TTFT at --output-len 1)");
+    let mut header = format!("{:<6}{:>6}{:>12}", "Turn", "Done", "Median ms");
+    for &p in pcts {
+        header += &format!("{:>10}", format!("P{} ms", p_word(p)));
+    }
+    println!("{header}{:>12}{:>12}", "Prompt tok", "Cached tok");
+    for (k, turn) in stats.iter().enumerate() {
+        let ms = |p| {
+            if turn.latencies.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:.2}", percentile(&turn.latencies, p) * 1000.0)
+            }
+        };
+        let mut row = format!("{:<6}{:>6}{:>12}", k + 1, turn.completed, ms(50.0));
+        for &p in pcts {
+            row += &format!("{:>10}", ms(p));
+        }
+        println!(
+            "{row}{:>12}{:>12}",
+            tokens(turn.mean_prompt_tokens),
+            tokens(turn.mean_cached_tokens)
+        );
+    }
 }
 
 /// `random` / `sharegpt`: one streamed completion per prompt, open loop.
@@ -741,7 +1178,7 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
         let output_len = p.expected_output_len.min(args.output_len);
         send_request(client, &p.prompt, output_len, request_id, Instant::now())
     };
-    preflight(|| send_throwaway(0, "preflight"))?;
+    preflight(|| send_throwaway(0, "preflight").success)?;
     warm_up(args.num_warmups, |i| {
         send_throwaway(1 + i, &format!("warmup-{i}"));
     });
@@ -813,9 +1250,9 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
 }
 
 /// Send one request to verify connectivity, and fail fast if it does not land.
-fn preflight(send: impl FnOnce() -> RequestResult) -> Result<()> {
+fn preflight(send: impl FnOnce() -> bool) -> Result<()> {
     eprintln!("Sending pre-flight request to verify connectivity...");
-    if !send().success {
+    if !send() {
         anyhow::bail!("Pre-flight request failed. Check server connectivity and model name.");
     }
     eprintln!("Pre-flight request succeeded.");
@@ -1007,5 +1444,43 @@ mod tests {
         assert!(!is_unstreamed(&req(128, 2, 8.0, 10.3)));
         // max_tokens 1: one chunk is all there is to see.
         assert!(!is_unstreamed(&req(1, 1, 0.3, 0.3)));
+    }
+
+    fn turn(turn: usize, latency: f64, cached_tokens: Option<usize>) -> TurnResult {
+        TurnResult {
+            turn,
+            success: true,
+            latency,
+            output_tokens: 1,
+            prompt_tokens: Some(2100 + 400 * turn),
+            cached_tokens,
+        }
+    }
+
+    #[test]
+    fn a_missing_cached_count_is_zero_only_from_a_server_that_reports_one() {
+        // scratchy on a cold turn 1: no `prompt_tokens_details` at all.
+        let stats = turn_stats(&[turn(0, 0.8, None), turn(1, 0.1, Some(2096))], 2);
+        assert_eq!(stats[0].mean_cached_tokens, Some(0.0));
+        assert_eq!(stats[1].mean_cached_tokens, Some(2096.0));
+        assert_eq!(stats[1].mean_prompt_tokens, Some(2500.0));
+        assert_eq!(stats[1].latencies, vec![0.1]);
+
+        let never = turn_stats(&[turn(0, 0.8, None), turn(1, 0.1, None)], 2);
+        assert_eq!(never[1].mean_cached_tokens, None);
+    }
+
+    #[test]
+    fn failed_turns_count_toward_no_turn_stats() {
+        let failed = TurnResult {
+            success: false,
+            ..turn(1, 9.0, Some(2096))
+        };
+        let stats = turn_stats(&[turn(0, 0.8, None), failed], 2);
+        assert_eq!(stats[1].completed, 0);
+        assert!(stats[1].latencies.is_empty());
+        assert_eq!(stats[1].mean_prompt_tokens, None);
+        // Its cached count came from a request that failed: not a report.
+        assert_eq!(stats[0].mean_cached_tokens, None);
     }
 }

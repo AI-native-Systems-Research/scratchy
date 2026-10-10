@@ -2047,8 +2047,8 @@ fn write_runtime_inputs(
             Padding::Zero,
         )?;
     }
-    // GDN per-forward indices (hybrid arches only). i32 slot ids + u32
-    // fresh flags, one per batched sequence in cu_seqlens order.
+    // GDN per-forward indices (hybrid arches only): a `GdnSeqSlots` record
+    // (6 i32s) + a u32 step code per batched sequence in cu_seqlens order.
     if let Some(idx) = inputs.gdn_state_indices {
         // i32 and u32 share the 4-byte layout the kernels read as int.
         let as_u32 = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u32, idx.len()) };

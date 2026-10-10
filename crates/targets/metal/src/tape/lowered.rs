@@ -1299,8 +1299,10 @@ pub enum RuntimeBindingKind {
     GdnSsmLanes {
         layer: LayerId,
     },
-    /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence
-    /// (cu_seqlens order). Written per forward by the worker.
+    /// `[num_seqs]` `GdnSeqSlots` (`scratchy_layers::gdn_state`, the shaders' `gdn_state.h`) —
+    /// per batched sequence (cu_seqlens order) its state-pool slot, the snapshot a restore reads
+    /// its start state from and the snapshots a save stores into, 6 i32s. Written per forward by
+    /// the worker.
     GdnStateIndices,
     /// `[num_seqs]` u32 — 1 when the sequence is on its first (fresh)
     /// forward; the GDN conv1d/scan kernels then treat the slot's state

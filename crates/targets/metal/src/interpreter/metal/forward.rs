@@ -84,9 +84,9 @@ pub struct ForwardInputs<'a> {
     /// GEMM (used by chunked-prefill intermediate chunks that produce
     /// no sampled tokens).
     pub last_token_indices: Option<&'a [u32]>,
-    /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence
-    /// (cu_seqlens order). `None` for non-hybrid arches; required for any
-    /// bucket that runs `Instruction::GatedDeltaNet`.
+    /// `[num_seqs * 6]` i32 — a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) record per
+    /// batched sequence (cu_seqlens order), flattened as `GdnSeqSlots::words`. `None` for
+    /// non-hybrid arches; required for any bucket that runs `Instruction::GatedDeltaNet`.
     pub gdn_state_indices: Option<&'a [i32]>,
     /// `[num_seqs]` u32 — 1 when the sequence is on its first (fresh)
     /// forward (GDN kernels treat its state as zero). `None` for
