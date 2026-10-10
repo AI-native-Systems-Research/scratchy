@@ -705,22 +705,40 @@ mod tests {
                 ConstantValue::uint(5, crate::BLOCKS_PER_CHUNK),
                 ConstantValue::uint(6, W::ROT_DIM / 2),
             ],
-            KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => vec![
-                ConstantValue::uint(0, W::HEAD_DIM),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::float(3, W::ATTN_SCALE),
-                ConstantValue::uint(4, W::BLOCK_SIZE),
-                ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
-                // Slots 6/7 = `ATTN_BLOCKS_PER_CHUNK` / `ATTN_WINDOW`. Both
-                // are read unconditionally by the sdpa-paged + via-cache
-                // readers; unset on the MTL4 specialized build → indeterminate
-                // → OOB block-table walk / wrong masking. Mirrors
-                // `AttentionViaCacheConstants` / `AttentionPrefillPagedConstants`
-                // for a full-attention (window=0) dispatch.
-                ConstantValue::uint(6, crate::BLOCKS_PER_CHUNK),
-                ConstantValue::int(7, 0),
-            ],
+            KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => {
+                let mut v = vec![
+                    ConstantValue::uint(0, W::HEAD_DIM),
+                    ConstantValue::uint(1, W::NUM_Q_HEADS),
+                    ConstantValue::uint(2, W::NUM_KV_HEADS),
+                    ConstantValue::float(3, W::ATTN_SCALE),
+                    ConstantValue::uint(4, W::BLOCK_SIZE),
+                    ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
+                    // Slots 6/7 = `ATTN_BLOCKS_PER_CHUNK` / `ATTN_WINDOW`. Both
+                    // are read unconditionally by the sdpa-paged + via-cache
+                    // readers; unset on the MTL4 specialized build → indeterminate
+                    // → OOB block-table walk / wrong masking. Mirrors
+                    // `AttentionViaCacheConstants` / `AttentionPrefillPagedConstants`
+                    // for a full-attention (window=0) dispatch.
+                    ConstantValue::uint(6, crate::BLOCKS_PER_CHUNK),
+                    ConstantValue::int(7, 0),
+                ];
+                // Slot 16 = `ATTN_TQ_HEADS`, read unconditionally by the via-cache
+                // kernel — its threadgroups count query-head groups, the baked
+                // GQA divisor (mirrors the lowering's `AttentionViaCacheConstants`).
+                // The sdpa-paged prefill kernel never references it.
+                if matches!(kernel, KernelId::AttentionViaCache) {
+                    v.push(ConstantValue::uint(
+                        16,
+                        crate::tape::ids::TqDecodeHeads::largest_group(
+                            crate::tape::ids::HeadDim(W::HEAD_DIM),
+                            crate::tape::ids::NumQHeads(W::NUM_Q_HEADS),
+                            crate::tape::ids::NumKvHeads(W::NUM_KV_HEADS),
+                        )
+                        .get(),
+                    ));
+                }
+                v
+            }
             KernelId::Add | KernelId::ScalarMul => Vec::new(),
             KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
             KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
@@ -855,6 +873,19 @@ mod tests {
         SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT)
     }
 
+    /// The via-cache dispatch's threadgroup height: its query-head groups,
+    /// `num_q` over the baked GQA divisor (`ATTN_TQ_HEADS`) — what the
+    /// lowering's plain via-cache arm bakes.
+    fn via_cache_groups(num_q: usize, head_dim: usize, num_kv: usize) -> usize {
+        num_q
+            / crate::tape::ids::TqDecodeHeads::largest_group(
+                crate::tape::ids::HeadDim(head_dim as u32),
+                crate::tape::ids::NumQHeads(num_q as u32),
+                crate::tape::ids::NumKvHeads(num_kv as u32),
+            )
+            .get() as usize
+    }
+
     /// Pure-CPU stub of `CanonicalParams` modelled on TinyLlama-1.1B.
     /// Lets us exercise the test-side `constants_for` helper without
     /// standing up a Metal device or a real model variant.
@@ -953,13 +984,15 @@ mod tests {
     fn attention_via_cache_pulls_consts_from_canonical_params() {
         let bag =
             constants_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1).expect("attn bag");
-        assert_eq!(bag.len(), 8);
+        assert_eq!(bag.len(), 9);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[3], ConstantValue::float(3, 0.125));
         assert_eq!(bag[4], ConstantValue::uint(4, 16)); // BLOCK_SIZE default
         assert_eq!(bag[5], ConstantValue::uint(5, 128)); // MAX_BLOCKS_PER_SEQ default
         assert_eq!(bag[6], ConstantValue::uint(6, 128)); // BLOCKS_PER_CHUNK
         assert_eq!(bag[7], ConstantValue::int(7, 0)); // ATTN_WINDOW (full)
+        // ATTN_TQ_HEADS: the GQA group of 8 (32q/4kv) at head_dim 64 fits 8.
+        assert_eq!(bag[8], ConstantValue::uint(16, 8));
     }
 
     #[test]
@@ -1727,7 +1760,7 @@ mod tests {
             ],
             MTLSize {
                 width: (batch as u64) as usize,
-                height: (num_q as u64) as usize,
+                height: via_cache_groups(num_q, head_dim, num_kv),
                 depth: 1_usize,
             },
             MTLSize {
@@ -2179,7 +2212,7 @@ mod tests {
             ],
             MTLSize {
                 width: (batch as u64) as usize,
-                height: (num_q as u64) as usize,
+                height: via_cache_groups(num_q, head_dim, num_kv),
                 depth: 1_usize,
             },
             MTLSize {
@@ -2385,7 +2418,7 @@ mod tests {
             ],
             MTLSize {
                 width: (batch as u64) as usize,
-                height: (num_q as u64) as usize,
+                height: via_cache_groups(num_q, head_dim, num_kv),
                 depth: 1_usize,
             },
             MTLSize {
@@ -2595,7 +2628,7 @@ mod tests {
             ],
             MTLSize {
                 width: (batch as u64) as usize,
-                height: (num_q as u64) as usize,
+                height: via_cache_groups(num_q, head_dim, num_kv),
                 depth: 1_usize,
             },
             MTLSize {

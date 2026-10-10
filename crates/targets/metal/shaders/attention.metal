@@ -275,10 +275,13 @@ constant bool ATTN_TQ_KB = ATTN_TQ_K_BIAS_SET;
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_V_BIAS, 15);
 constant bool ATTN_TQ_VB = ATTN_TQ_V_BIAS_SET;
 
-//  16  ATTN_TQ_HEADS — query heads per decode threadgroup under TurboQuant:
-//      consecutive heads of one KV head, so each key's codes are decoded once
-//      for all of them (decode is ALU-bound on that decode). Unset: 1.
-//      heads * head_dim / 32 <= 32.
+//  16  ATTN_TQ_HEADS — query heads per decode threadgroup: consecutive heads of
+//      one KV head. TurboQuant variants bind the tape variant's count (each
+//      key's codes are decoded once for all of them — decode is ALU-bound on
+//      that decode); the plain path bakes the largest divisor of the GQA group
+//      so each key is WALKED once for all of them (the plain walk is bound by
+//      the K/V reads, and one threadgroup per query head re-reads the group's
+//      K/V g times a step). Unset: 1. heads * head_dim / 32 <= 32.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_HEADS_FC, 16);
 constant uint ATTN_TQ_HEADS = ATTN_TQ_HEADS_FC_SET ? ATTN_TQ_HEADS_FC : 1u;
 
@@ -680,9 +683,12 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
             }
         }
     } else if (simd_lid == 0) {
-        // Lane 0 of each simdgroup writes its qk_per_thread output slice.
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = T(o_reg[j]);
+        // Lane 0 of each simdgroup writes its heads' qk_per_thread output slices.
+        for (uint h = 0; h < heads; ++h) {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_row[h * head_dim + attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] =
+                    T(o_reg[h * qk_per_thread + j]);
+            }
         }
     }
 }
@@ -733,8 +739,8 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
 //                dispatch carrying sinks can't collide with the TQ slots
 //                7..=13.
 //
-// Dispatch: threadgroups (batch, num_q_heads, 1), threads (1024, 1, 1)
-// = 32 simdgroups × 32 lanes. HEAD_DIM must be a multiple of 32.
+// Dispatch: threadgroups (batch, num_q_heads / ATTN_TQ_HEADS, 1), threads
+// (1024, 1, 1) = 32 simdgroups × 32 lanes. HEAD_DIM must be a multiple of 32.
 //
 // max_total_threads_per_threadgroup(1024) = BN*BD (32*32) — REQUIRED. Without
 // it the metal compiler picks a per-GPU register budget optimized for speed;
@@ -803,7 +809,7 @@ template <typename T>
     // Query heads this threadgroup serves (ATTN_TQ_HEADS): `heads`
     // consecutive heads of one KV head; per-head state is indexed
     // `[h * qk_per_thread + j]`.
-    const uint heads = (ATTN_TQ != 0u) ? ATTN_TQ_HEADS : 1u;
+    const uint heads = ATTN_TQ_HEADS;
 
     const uint seq_idx     = tg_pos.x;            // batch index
     const uint q_head_idx  = tg_pos.y * heads;    // first of `heads` query heads
@@ -815,7 +821,7 @@ template <typename T>
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim <= 512)
+    thread U q_reg[32];                 // [h * qk_per_thread + j], <= 32 (ATTN_TQ_HEADS)
     thread U o_reg[32];                 // [h * qk_per_thread + j], <= 32 (ATTN_TQ_HEADS)
 
     // Threadgroup scratch for per-simdgroup max + sum_exp combine; first, under the TurboQuant
@@ -898,14 +904,19 @@ template <typename T>
         }
     }
 
-    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
-    // Element ownership follows attn_elem_off (contiguous, or co-resident
-    // NeoX pairs under ATTN_PAIR_CORESIDENT) — Q must match K's per-lane set.
-    // Under TurboQuant only the rare plain-domain keys (the tail, span blocks)
-    // use it, and they read it per head from q_row instead (`q_plain`).
+    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`),
+    // one register copy per served head. Element ownership follows
+    // attn_elem_off (contiguous, or co-resident NeoX pairs under
+    // ATTN_PAIR_CORESIDENT) — Q must match K's per-lane set. Under TurboQuant
+    // only the rare plain-domain keys (the tail, span blocks) use it, and they
+    // read it per head from q_row instead (`q_plain`).
     if (ATTN_TQ == 0u) {
-        for (uint i = 0; i < qk_per_thread; ++i) {
-            q_reg[i] = U(scale) * U(q_row[attn_elem_off(simd_lid, i, qk_per_thread, head_dim)]);
+        for (uint h = 0; h < heads; ++h) {
+            for (uint i = 0; i < qk_per_thread; ++i) {
+                q_reg[h * qk_per_thread + i] =
+                    U(scale) * U(q_row[h * head_dim
+                                       + attn_elem_off(simd_lid, i, qk_per_thread, head_dim)]);
+            }
         }
     }
     for (uint i = 0; i < heads * qk_per_thread; ++i) {
@@ -913,7 +924,7 @@ template <typename T>
     }
     auto q_plain = [&](uint h, uint j) -> U {
         return ATTN_TQ == 0u
-            ? q_reg[j]
+            ? q_reg[h * qk_per_thread + j]
             : U(scale) * U(q_row[h * head_dim + attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
     };
 
@@ -1147,15 +1158,27 @@ template <typename T>
         // fast::exp for both factor + exp_score. k_scale is
         // simdgroup-uniform, so a K bias's term joins the one reduction;
         // without one this is exactly the plain score.
+        // Split by dependency, not one fused loop: the per-head butterflies are
+        // independent of each other, so issued back-to-back they pipeline
+        // through the shuffle unit; fused, each head's dependent max/exp
+        // chain stalls in-order issue before the next head's butterfly,
+        // serializing heads × butterfly-latency per key. `score` is dead
+        // after its reduction, so it carries the reduced logits. The sum
+        // update splits out for the same reason: it depends on both exps,
+        // and fused it parks the next head's max behind them.
         U factor[8];
         U exp_score[8];
         for (uint h = 0; h < heads; ++h) {
-            const U s = k_biased ? simd_sum(score[h] * k_scale + k_off[h]) + kb_c[h]
-                                 : simd_sum(score[h]) * k_scale;
-            const U new_max = max(max_score[h], s);
+            score[h] = k_biased ? simd_sum(score[h] * k_scale + k_off[h]) + kb_c[h]
+                                : simd_sum(score[h]) * k_scale;
+        }
+        for (uint h = 0; h < heads; ++h) {
+            const U new_max = max(max_score[h], score[h]);
             factor[h] = metal::fast::exp(max_score[h] - new_max);
-            exp_score[h] = metal::fast::exp(s - new_max);
+            exp_score[h] = metal::fast::exp(score[h] - new_max);
             max_score[h] = new_max;
+        }
+        for (uint h = 0; h < heads; ++h) {
             sum_exp_score[h] = sum_exp_score[h] * factor[h] + exp_score[h];
         }
 
@@ -1318,8 +1341,12 @@ SCRATCHY_KERNEL(attention_via_cache_v2_combine_f16_specialized, attention_via_ca
 SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_cache_v2_combine<bfloat>)
 
 // attention_decode_gqa_tq_{f16,bf16}_specialized — the TurboQuant decode attention of a KV head's
-// 8 query heads together (`ATTN_NUM_Q_HEADS == 8 · ATTN_NUM_KV_HEADS`, 4-bit codes, no projection
-// bias): each key's codes decode once for all 8, straight into 8x8 simdgroup-matrix fragments (MLX
+// whole query-head group together (`GA = ATTN_NUM_Q_HEADS / ATTN_NUM_KV_HEADS` heads, at most the
+// matrix units' 8 rows — a smaller group zero-pads them; 4-bit codes; a K/V projection bias
+// restored as `attention_via_cache_v2` does — the K bias's q·R_i·b folded into the S partials,
+// the span path's keys re-centered before their re-rope, the own key's V centered into the
+// partials and the V bias returned by the combine): each
+// key's codes decode once for the group, straight into 8x8 simdgroup-matrix fragments (MLX
 // `BaseMMAFrag<T, 8, 8>`: lane `l` holds row fm = (l/4 & 4) + (l/2 % 4) and columns
 // fn = (l/4 & 2)·2 + (l % 2)·2, fn + 1; the lanes sharing a row differ in bits 0 and 3), so
 // S = Q·Kᵀ and O += P·V run on the matrix units a block of 8 keys at a time. A key group's
@@ -1362,7 +1389,15 @@ template <typename T>
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
+    // G is the matrix units' row count — the fragment geometry, qb's padded row count, ml's
+    // layout, and this kernel's per-head array sizes: the bake compiles the file whole, so a
+    // staging pass's constant set (which carries no query heads) reaches this one, and a group
+    // off the function constants is not a constant expression there. GA is the group actually
+    // served — every per-head loop, store and partial runs GA, the rows past it are padding:
+    // the fragments run G with those rows zeroed, so their S rows read 0 and nothing is stored
+    // for them. Not `constexpr`: a bake that leaves the query heads unset cannot fold it.
     constexpr uint G = 8u;
+    const uint GA = ATTN_NUM_Q_HEADS / ATTN_NUM_KV_HEADS;
     constexpr uint KB = 8u;
     // Another kernel's bake may set a head dim this one cannot take: its arrays need a size all
     // the same (the asserts below refuse baking this kernel with one).
@@ -1383,12 +1418,14 @@ template <typename T>
     constexpr uint XS_S = KG * 2u * SG * 64u;
     constexpr uint XS_ENC = tq_encode_floats(2u, D) + 2u * D;
     constexpr uint XS = XS_S > XS_ENC ? XS_S : XS_ENC;
+    // The slice of the rotary pairs [0, head_dim/2) a simdgroup holds of the K-bias coefficients
+    // below: rope never covers more than the head dim, and a bake that leaves the rotary dims
+    // unset cannot size an array off them, so the head dim bounds the slice.
+    constexpr uint KBIAS_SLICE = D / 2u / SG;
     // Checked where this kernel is baked (`sizeof(T)` defers them to its instantiation).
     static_assert(sizeof(T) && ATTN_TQ == 4u, "a packed word holds one 8-wide tile row");
-    static_assert(sizeof(T) && ATTN_NUM_Q_HEADS == G * ATTN_NUM_KV_HEADS, "8 query heads a KV head");
     static_assert(sizeof(T) && D_OK, "head_dim a multiple of 128, at most 512");
     static_assert(sizeof(T) && ATTN_BLOCK_SIZE % KB == 0u, "a key block in one KV block");
-    static_assert(sizeof(T) && !ATTN_TQ_KB && !ATTN_TQ_VB, "no projection bias");
     static_assert(sizeof(T) && ATTN_WINDOW <= 0, "full attention");
     static_assert(sizeof(T) && (ATTN_ROR == 0u || ATTN_PAIR_OFF % QK == 0u),
                   "a rotary pair's partner a whole lane stride away");
@@ -1401,7 +1438,7 @@ template <typename T>
     const uint seq = tg_pos.x;
     const uint kvh = tg_pos.y;
     const uint z = tg_pos.z;
-    const uint q0 = kvh * G;
+    const uint q0 = kvh * GA;
     const uint kv_len = seq_used_k[seq];
     const uint tid = simd_gid * 32u + simd_lid;
     const uint kg = simd_gid / SG;
@@ -1481,7 +1518,8 @@ template <typename T>
             const uint vpw = 32u / ATTN_TQ;
             threadgroup uint* codes = (threadgroup uint*)(xs + tq_encode_floats(2u, D));
             kv_row_encode<T>(float(fold_kv[tid]), float(fold_kv[ATTN_FOLD_DIM + tid]), tid, D,
-                             num_kv, kvh, slot, fold_pos, ATTN_TQ, vpw, pdim, 0u, 0u,
+                             num_kv, kvh, slot, fold_pos, ATTN_TQ, vpw, pdim,
+                             ATTN_TQ_KB ? 2u : 0u, ATTN_TQ_VB ? 1u : 0u,
                              ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, tq_signs, tq_boundaries,
                              tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias,
                              tq_v_bias, tq_bias_cos_sin, xs, codes);
@@ -1492,10 +1530,10 @@ template <typename T>
     // query, scaled, for the keys the plain domain scores. With two simdgroups a head, each takes
     // half its dims (the index's top bit) and the transform's stages run in the same order: the
     // low bits in a lane, the lane bits by shuffles, the top bit across the pair through `qb`.
-    if (NSG == 2u * G) {
+    if (NSG == 2u * GA) {
         constexpr uint HQ = QK / 2u;
-        const uint h = simd_gid % G;
-        const uint hi = simd_gid / G;
+        const uint h = simd_gid % GA;
+        const uint hi = simd_gid / GA;
         const uint own = h * QS + hi * (D / 2u) + simd_lid * HQ;
         float x[HQ];
         for (uint j = 0; j < HQ; ++j) {
@@ -1517,7 +1555,7 @@ template <typename T>
             qb[own + j] = x[j] / float(D);
         }
     } else {
-        for (uint h = simd_gid; h < G; h += NSG) {
+        for (uint h = simd_gid; h < GA; h += NSG) {
             float x[QK];
             for (uint j = 0; j < QK; ++j) {
                 const uint e = simd_lid * QK + j;
@@ -1529,13 +1567,19 @@ template <typename T>
             }
         }
     }
+    // The fragment rows past GA hold no head: zero them so their S rows read 0. Nothing is
+    // stored for them — every per-head loop below runs GA — but the fragments and the merge's
+    // qb layout run G.
+    for (uint i = tid; i < (G - GA) * QS; i += D) {
+        qb[GA * QS + i] = 0.0f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_float8x8 Qf[TILES];
     for (uint t = 0; t < TILES; ++t) {
         simdgroup_load(Qf[t], qb + sg * DS + t * 8u, QS);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < G * D; i += D) {
+    for (uint i = tid; i < GA * D; i += D) {
         qb[i / D * QS + i % D] = ATTN_SCALE_FC * q_plain(i / D, i % D);
     }
 
@@ -1567,7 +1611,7 @@ template <typename T>
     };
     // Every query head's score against a plain K row, on every lane.
     auto plain_scores = [&](thread float* x, thread float* s) {
-        for (uint h = 0; h < G; ++h) {
+        for (uint h = 0; h < GA; ++h) {
             float acc = 0.0f;
             for (uint j = 0; j < QK; ++j) {
                 acc += qb[h * QS + simd_lid * QK + j] * x[j];
@@ -1579,6 +1623,42 @@ template <typename T>
     const uint qid = simd_lid / 4u;
     const uint fm = (qid & 4u) + ((simd_lid / 2u) % 4u);
     const uint fn = (qid & 2u) * 2u + (simd_lid % 2u) * 2u;
+    // TurboQuant K bias (`ATTN_TQ_KB`): the packed store holds R_i·(k − b), so a packed key's
+    // score owes q·R_i·b back — the twin's factorization on this kernel's lanes: per NeoX pair
+    // (d, d + ATTN_PAIR_OFF), kb_a = q0·b0 + q1·b1 and kb_b = q1·b0 − q0·b1 turn the term into
+    // kb_a·cos + kb_b·sin against the key's rope row. Each simdgroup holds a slice of the pairs
+    // and adds its share into the S partial the sx butterfly sums with the dims slices; kbc, the
+    // unrotated dims' q·b over its slice of the dims, rides the same sum. The plain query rows
+    // carry the scale, as the twin's staging reads it. The rows past GA read qb's zero padding:
+    // their coefficients are 0, like their S rows.
+    device const T* kbias = tq_k_bias + kvh * D;
+    device const T* vbias = tq_v_bias + kvh * D;
+    thread float kba[KBIAS_SLICE];
+    thread float kbb[KBIAS_SLICE];
+    float kbc = 0.0f;
+    if (ATTN_TQ_KB) {
+        const uint half_rot = ATTN_ROT_DIM / 2u;
+        const uint d0 = sg * KBIAS_SLICE;
+        for (uint j = 0; j < KBIAS_SLICE; ++j) {
+            const uint d = d0 + j;
+            kba[j] = 0.0f;
+            kbb[j] = 0.0f;
+            if (d < half_rot) {
+                const float q0 = qb[fm * QS + d];
+                const float q1 = qb[fm * QS + d + ATTN_PAIR_OFF];
+                const float b0 = float(kbias[d]);
+                const float b1 = float(kbias[d + ATTN_PAIR_OFF]);
+                kba[j] = q0 * b0 + q1 * b1;
+                kbb[j] = q1 * b0 - q0 * b1;
+            }
+        }
+        for (uint j = 0; j < DS; ++j) {
+            const uint e = sg * DS + j;
+            if (e >= half_rot && (e < ATTN_PAIR_OFF || e >= ATTN_PAIR_OFF + half_rot)) {
+                kbc += qb[fm * QS + e] * float(kbias[e]);
+            }
+        }
+    }
     const uint n_blocks = (n_packed + KB - 1u) / KB;
     const uint per = (n_blocks + ATTN_SPLITS - 1u) / ATTN_SPLITS;
     const uint b_lo = min(z * per, n_blocks);
@@ -1624,13 +1704,42 @@ template <typename T>
             }
             s0 = S.thread_elements()[0];
             s1 = S.thread_elements()[1];
+            if (ATTN_TQ_KB) {
+                // q·R_i·b for this lane's row against its two keys, over its simdgroup's slice
+                // of the pairs — the keys' rope rows, the coefficients staged above, kbc once
+                // a key. The butterfly below sums the slices with the dims' partials.
+                const uint half_rot = ATTN_ROT_DIM / 2u;
+                const uint d0 = sg * KBIAS_SLICE;
+                if (v0) {
+                    device const T* cs = cos_sin + k0 * ATTN_ROT_DIM + d0;
+                    device const T* sn = cs + half_rot;
+                    float acc = kbc;
+                    for (uint j = 0; j < KBIAS_SLICE; ++j) {
+                        if (d0 + j < half_rot) {
+                            acc += kba[j] * float(cs[j]) + kbb[j] * float(sn[j]);
+                        }
+                    }
+                    s0 += acc;
+                }
+                if (v1) {
+                    device const T* cs = cos_sin + k1 * ATTN_ROT_DIM + d0;
+                    device const T* sn = cs + half_rot;
+                    float acc = kbc;
+                    for (uint j = 0; j < KBIAS_SLICE; ++j) {
+                        if (d0 + j < half_rot) {
+                            acc += kba[j] * float(cs[j]) + kbb[j] * float(sn[j]);
+                        }
+                    }
+                    s1 += acc;
+                }
+            }
         } else if (live) {
             // A span block: this simdgroup's KPS keys decoded whole, rounded to T as the dequant
             // pass leaves them, re-roped, and scored in the plain domain.
             float sc[KPS][G];
             for (uint u = 0; u < KPS; ++u) {
                 const uint key = kb + KPS * sg + u;
-                for (uint h = 0; h < G; ++h) {
+                for (uint h = 0; h < GA; ++h) {
                     sc[u][h] = 0.0f;
                 }
                 if (key < n_packed) {
@@ -1642,7 +1751,11 @@ template <typename T>
                     tq_wht(x, QK, simd_lid);
                     const float n = tq_norms_k[r] / float(D);
                     for (uint j = 0; j < QK; ++j) {
-                        x[j] = float(T(x[j] * tq_signs[simd_lid * QK + j] * n));
+                        const uint e = simd_lid * QK + j;
+                        const float x0 = x[j] * tq_signs[e] * n;
+                        // The span's codes are centered too: the bias back before the re-rope,
+                        // rounded as the dequant pass leaves the key (the twin's span path).
+                        x[j] = float(T(ATTN_TQ_KB ? x0 + float(kbias[e]) : x0));
                     }
                     rope_row(x, key);
                     plain_scores(x, sc[u]);
@@ -1724,7 +1837,10 @@ template <typename T>
         for (uint j = 0; j < QK; ++j) {
             const uint e = simd_lid * QK + j;
             x[j] = float(ATTN_FOLD ? fold_kv[e] : k_ptr[e]);
-            y[j] = float(ATTN_FOLD ? fold_kv[ATTN_FOLD_DIM + e] : v_ptr[e]) * tq_signs[e];
+            // The cache holds the true V; the partials hold the centered one every packed key
+            // contributes, so the combine's one vb add stays right (the twin's tail path).
+            const float v = float(ATTN_FOLD ? fold_kv[ATTN_FOLD_DIM + e] : v_ptr[e]);
+            y[j] = (ATTN_TQ_VB ? v - float(vbias[e]) : v) * tq_signs[e];
         }
         if (do_rot) {
             rope_row(x, i);
@@ -1735,7 +1851,7 @@ template <typename T>
         for (uint j = 0; j < QK; ++j) {
             xs[simd_lid * QK + j] = y[j];
         }
-        if (simd_lid < G) {
+        if (simd_lid < GA) {
             own_s[simd_lid] = s[simd_lid];
         }
     }
@@ -1766,8 +1882,9 @@ template <typename T>
     }
 
     // Partials, `[batch, num_q_heads, ATTN_SPLITS, 2 + D]`: each head's max and sum, then its
-    // output; the step's own key folded in by the split taking it.
-    for (uint i = tid; i < G * D; i += D) {
+    // output; the step's own key folded in by the split taking it. GA heads — a row past the
+    // group would collide with the next KV head's head 0.
+    for (uint i = tid; i < GA * D; i += D) {
         const uint h = i / D;
         float hm = -FLT_MAX;
         for (uint g = 0; g < KG; ++g) {
