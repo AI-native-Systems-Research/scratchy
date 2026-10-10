@@ -46,7 +46,7 @@ zero-md:not(:defined) {
  * behind the header's menu button below it. */
 cds-header ~ .cds--content { margin-block-start: 3rem; }
 @media (min-width: 66rem) {
-  cds-side-nav ~ .cds--content { margin-inline-start: 16rem; }
+  cds-side-nav:not([is-not-persistent]) ~ .cds--content { margin-inline-start: 16rem; }
 }
 
 a { color: var(--accent-2); text-decoration: none; }
@@ -95,6 +95,13 @@ cds-header-name::part(prefix) { color: var(--accent); }
 /* A Carbon toggletip sits in the sentence it explains; Carbon displays it as
  * a block, which breaks the sentence onto its own line. */
 cds-toggletip { display: inline-flex; vertical-align: middle; }
+
+/* cds-stack lays its children out as a CSS grid, and a grid item is by
+ * default at least as wide as its widest content: one wide table or chart
+ * then widens the whole stack past the screen, and every paragraph in it
+ * with it. Letting the items shrink keeps the stack to its container; wide
+ * content scrolls in its own box instead. */
+cds-stack > * { min-width: 0; }
 
 /* diff-view-element (https://konnorrogers.github.io/diff-view-element/) does
  * its own diffing and PrismJS highlighting in shadow DOM. Every property set

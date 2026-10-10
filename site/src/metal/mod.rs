@@ -20,8 +20,8 @@ use serde::Serialize;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, Column, Fold, Grid, Heading, Layer, Orientation, Section, Span, Stack, Table,
-    TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
+    Alignment, Column, Fold, Grid, Heading, Layer, Section, Span, Stack, Table, TableCell,
+    TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
@@ -628,10 +628,13 @@ struct Enabled {
     enabled: bool,
 }
 
-/// A chart's mount point: charts.js draws `spec` into it.
-fn chart(spec: &Chart, label: &str) -> Element {
+/// A fixed-size chart's box: wider than the screen, it scrolls sideways.
+const FIXED_MOUNT: &str = "max-width: 100%; overflow-x: auto";
+
+/// A chart's mount point, styled by `mount`: charts.js draws `spec` into it.
+fn chart(spec: &Chart, label: &str, mount: &str) -> Element {
     rsx! {
-        div { role: "img", "aria-label": label,
+        div { role: "img", "aria-label": label, style: "{mount}",
             "data-chart": serde_json::to_string(spec).unwrap_or_default(),
         }
     }
@@ -688,7 +691,7 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
             toolbar: Enabled { enabled: false },
         },
     };
-    chart(&spec, label)
+    chart(&spec, label, FIXED_MOUNT)
 }
 
 /// A model's full grid as a heatmap. With a rival, values are how many times
@@ -731,7 +734,7 @@ fn grid_heatmap(
         },
         ratio,
     };
-    chart(&spec, label)
+    chart(&spec, label, FIXED_MOUNT)
 }
 
 /// One small multiple: a model's whole grid as a tiny heatmap, colour only;
@@ -759,8 +762,9 @@ fn mini_heatmap(
                 },
                 color_domain: Some(RATIO_RANGE),
             }),
-            height: "88px".to_string(),
-            width: Some("88px".to_string()),
+            // Its box decides: square, half its cell.
+            height: "100%".to_string(),
+            width: Some("100%".to_string()),
             legend: Some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
             theme: "white",
@@ -768,7 +772,7 @@ fn mini_heatmap(
         },
         ratio: true,
     };
-    chart(&spec, label)
+    chart(&spec, label, "width: 100%; aspect-ratio: 1")
 }
 
 /// The ratio heatmaps' colour scale, upright: RATIO_STEPS fastest at the top,
@@ -779,18 +783,12 @@ fn ratio_scale(fit: ScaleFit) -> Element {
     let middle = rows / 2 + 1;
     let (place, track) = match fit {
         ScaleFit::Fixed => (String::new(), "0.5rem"),
-        ScaleFit::Rows {
-            column,
-            first,
-            count,
-        } => (
-            // From the top of the first row's grids to the bottom of the
-            // last's: the last row's two label lines (and the gap above them)
-            // are left out.
-            format!(
-                "grid-column: {column}; grid-row: {first} / span {count}; align-self: stretch; \
-                 margin-block-end: 2.25rem; margin-inline-start: 0.5rem; "
-            ),
+        ScaleFit::Beside => (
+            // Stretched to the rows beside it: from the top of the first
+            // row's grids (below its model names, 1.5rem) to the bottom of the
+            // last's (above its two label lines, 2.25rem). Wrapped onto its
+            // own line on a narrow screen, it keeps a readable height.
+            "align-self: stretch; margin-block: 1.5rem 2.25rem; min-height: 12rem; ".to_string(),
             "1fr",
         ),
     };
@@ -807,15 +805,11 @@ fn ratio_scale(fit: ScaleFit) -> Element {
 }
 
 /// Where the ratio scale goes: fixed-size steps beside a model's grids, or
-/// stretched over rows of a CSS grid.
+/// stretched to the height of the overview's rows beside it.
 #[derive(Clone, Copy, PartialEq)]
 enum ScaleFit {
     Fixed,
-    Rows {
-        column: usize,
-        first: usize,
-        count: usize,
-    },
+    Beside,
 }
 
 /// A ratio as a heatmap value: log2, so a factor of two either way is the
@@ -1190,7 +1184,9 @@ fn grid_maps(m: &Model, run: &Run) -> Element {
         "Prompt size × answer size",
         rsx! { "{conc} users at once; {note}." },
         rsx! {
-            Stack { gap: 6, orientation: Orientation::Horizontal,
+            // Side by side while they fit; wrapped onto new lines on a
+            // narrow screen.
+            div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
                 for (metric, title) in GRID_METRICS { {heat_map(&g, metric, title)} }
                 if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed)} }
             }
@@ -1319,30 +1315,25 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             _ => "no ratios".to_string(),
         };
         rsx! {
-            Stack { gap: 2,
-                {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", rival.label()), &format!("{stem} on {chip}: scratchy {range}"))}
-                // Name over range, centred under the grid.
-                div { style: "text-align: center",
-                    div { strong { "{name}" } }
-                    div { "{range}" }
+            // Half its cell, however wide the cell grows.
+            div { style: "flex: 1 1 0; min-width: 0",
+                Stack { gap: 2,
+                    {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", rival.label()), &format!("{stem} on {chip}: scratchy {range}"))}
+                    // Name over range, centred under the grid.
+                    div { style: "text-align: center",
+                        div { strong { "{name}" } }
+                        div { "{range}" }
+                    }
                 }
             }
         }
     };
-    // As wide as its content: a CSS grid whose columns (machine names, then
-    // one per model) are each as wide as their widest cell, so rows line up
-    // without stretching to the page. Gaps are Carbon spacing steps (06 and
-    // 05). In each model's cell, its prefill grid and its decode grid.
-    let set = format!(
-        "display: grid; grid-template-columns: max-content repeat({}, max-content) max-content; gap: 1.5rem 1rem; align-items: start",
-        stems.len()
-    );
-    // Row 1 is the model names; the machines' rows follow.
-    let scale = ScaleFit::Rows {
-        column: stems.len() + 2,
-        first: 2,
-        count: machines.len(),
-    };
+    // Each machine a wrapping row: its name in a fixed-width label, then a cell
+    // per model (its name over its prefill and decode grids), 11.5rem wide or
+    // more. On a wide screen the rows line up as columns at 11.5rem; on a
+    // narrow one the cells wrap, each growing to fill its line, the grids in
+    // it with it, so nothing scrolls sideways and nothing sits in a corner. The scale stands beside the rows, or
+    // wraps below them.
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
     rsx! {
         Section { id: "glance", level: 2,
@@ -1356,25 +1347,25 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                      Hover a square for its ratio."
                 }
                 // The tile shrink-wraps the set instead of spanning the page.
-                Tile { style: "width: fit-content",
-                    div { style: "{set}",
-                        // The header row has a cell for every column, the
-                        // scale's included, so the machine rows start below it.
-                        div {}
-                        for stem in &stems { div { style: "text-align: center", "{stem}" } }
-                        div {}
-                        for chip in machines.keys() {
-                            div { "{chip}" }
-                            for stem in &stems {
-                                // A flex row, not a horizontal cds-stack: that is an
-                                // inline-grid, which sits on the cell's text baseline
-                                // and so starts lower than the machine's name.
-                                div { style: "display: flex; gap: 0.5rem; align-items: flex-start; justify-content: center",
-                                    for (metric, name) in metrics { {mini(chip, stem, metric, name)} }
+                Tile { style: "width: fit-content; max-width: 100%",
+                    div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem 2rem",
+                        div { style: "display: flex; flex-direction: column; gap: 1.5rem; min-width: 0",
+                            for chip in machines.keys() {
+                                div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-start",
+                                    div { style: "flex: none; width: 7rem", "{chip}" }
+                                    for stem in &stems {
+                                        // At least two 88px grids and the 8px between them.
+                                        div { style: "flex: 1 1 11.5rem; min-width: 11.5rem; display: flex; flex-direction: column; gap: 0.5rem",
+                                            div { style: "text-align: center", "{stem}" }
+                                            div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                                                for (metric, name) in metrics { {mini(chip, stem, metric, name)} }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        {ratio_scale(scale)}
+                        {ratio_scale(ScaleFit::Beside)}
                     }
                 }
             }

@@ -252,6 +252,15 @@ pub fn Content(children: Element) -> Element {
     rsx! { main { class: "cds--content", {children} } }
 }
 
+/// The header's tabs as side-nav links, for the side nav on small screens.
+pub fn top_links(root: Root, active: Option<Tab>) -> Element {
+    rsx! {
+        for tab in Tab::ALL {
+            SideNavLink { href: "{root}{tab.href()}", active: active == Some(tab), "{tab.label()}" }
+        }
+    }
+}
+
 /// Pages under the Performance tab, in left-nav order. A new page joins the
 /// left nav by adding one row here, without touching the others.
 const PERFORMANCE: [(&str, &str); 1] = [("metal.html", "Metal")];
@@ -260,7 +269,7 @@ const PERFORMANCE: [(&str, &str); 1] = [("metal.html", "Metal")];
 /// sections, given as (anchor, label); every other page is a link.
 pub fn perf_side_nav(active: &str, sections: &[(String, String)]) -> Element {
     rsx! {
-        SideNav { label: "Performance",
+        SideNav { label: "Performance", top: top_links(Root(0), Some(Tab::Performance)),
             for (href, label) in PERFORMANCE {
                 if href == active {
                     SideNavMenu { title: label,

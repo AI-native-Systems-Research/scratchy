@@ -107,7 +107,7 @@ fn build_chapter(site: &Site, c: &Chapter) -> Result<(), String> {
     let body = rsx! {
         {chrome::header(root, Some(Tab::Docs))}
 
-        SideNav { label: "Docs navigation",
+        SideNav { label: "Docs navigation", top: chrome::top_links(root, Some(Tab::Docs)),
             {nav_links(&CHAPTERS, c.slug, root)}
             SideNavMenu { title: "Blogs", {nav_links(&BLOGS, c.slug, root)} }
         }

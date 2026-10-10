@@ -190,7 +190,7 @@ fn page(
     let body = rsx! {
         {chrome::header(Root(0), Some(Tab::Models))}
 
-        SideNav { label: "Model architectures", id: "model-nav",
+        SideNav { label: "Model architectures", id: "model-nav", top: chrome::top_links(Root(0), Some(Tab::Models)),
             for n in order {
                 SideNavLink { href: "#{n}", data_arch: n.clone(), active: n == base, "{n}" }
             }

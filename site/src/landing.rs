@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 
 use crate::carbon::{
     Button, ButtonKind, ClickableTile, CodeSnippet, Column, Grid, Gutter, Heading, Link,
-    Orientation, Page, Section, Span, Stack, Tile,
+    Orientation, Page, Section, SideNav, Span, Stack, Tile,
 };
 use crate::chrome::{self, Content, Head, OpenGraph, REPO, Root, Theme};
 use crate::{highlight, repo};
@@ -106,6 +106,9 @@ fn target(flag: &str, what: &str) -> Element {
 pub fn page() -> Result<String, String> {
     let body = rsx! {
         {chrome::header(Root(0), None)}
+        // No side nav of its own: only the header's links, opened from the
+        // header's menu button on small screens.
+        SideNav { label: "scratchy", top: chrome::top_links(Root(0), None), menu_only: true }
 
         Content {
         Page {

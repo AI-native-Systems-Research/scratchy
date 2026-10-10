@@ -319,7 +319,10 @@ pub fn Layer(level: u8, children: Element) -> Element {
 /// A small `cds-table` with one header row.
 #[component]
 pub fn Table(headers: Vec<String>, children: Element) -> Element {
+    // Scrolls sideways in its own box on a narrow screen, rather than
+    // widening the page around it.
     rsx! {
+      div { style: "max-width: 100%; overflow-x: auto",
         cds-table { "size": "sm",
             cds-table-head {
                 cds-table-header-row {
@@ -328,6 +331,7 @@ pub fn Table(headers: Vec<String>, children: Element) -> Element {
             }
             cds-table-body { {children} }
         }
+      }
     }
 }
 
@@ -374,11 +378,18 @@ pub fn Fold(#[props(into)] title: String, children: Element) -> Element {
 pub fn SideNav(
     #[props(into)] label: String,
     #[props(into)] id: Option<String>,
+    top: Element,
+    #[props(default)] menu_only: bool,
     children: Element,
 ) -> Element {
     rsx! {
-        cds-side-nav { "aria-label": label, "id": id,
-            cds-side-nav-items { {children} }
+        cds-side-nav { "aria-label": label, "id": id, "is-not-persistent": menu_only.then_some(""),
+            cds-side-nav-items {
+                // The header's links, which Carbon hides on small screens: shown
+                // here instead, above the page's own, below 66rem only.
+                cds-header-side-nav-items { "has-divider": "", {top} }
+                {children}
+            }
         }
     }
 }
