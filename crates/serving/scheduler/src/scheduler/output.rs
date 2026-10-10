@@ -189,6 +189,12 @@ pub struct SchedulerOutput {
     #[serde(default)]
     pub draft_req_ids: HashSet<String>,
 
+    /// This step is past its drafter's gate: its head's pass 1 primes KV only — no chain, nothing
+    /// read back — so the step behind it needs no outcome of it. Stamped by the engine when it
+    /// plans, not by the scheduler.
+    #[serde(default)]
+    pub primes_only: bool,
+
     /// Where this step stands among speculative steps scheduled ahead of their outcomes.
     #[serde(default)]
     pub spec_pipeline: SpecPipeline,
@@ -208,10 +214,11 @@ pub struct SpecPipeline {
 
 impl SchedulerOutput {
     /// Whether the step after this one needs this one's outcome to be scheduled: the drafts it
-    /// makes (`draft_req_ids`), or how many of the drafts it verifies it keeps. A loop that
-    /// schedules ahead queues nothing behind it.
+    /// makes (`draft_req_ids`; a step past its gate makes none), or how many of the drafts it
+    /// verifies it keeps. A loop that schedules ahead queues nothing behind it.
     pub fn is_speculative(&self) -> bool {
-        !self.draft_req_ids.is_empty() || !self.scheduled_spec_decode_tokens.is_empty()
+        (!self.draft_req_ids.is_empty() && !self.primes_only)
+            || !self.scheduled_spec_decode_tokens.is_empty()
     }
 
     /// Create an empty `SchedulerOutput` with no scheduled work.
@@ -228,6 +235,7 @@ impl SchedulerOutput {
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
             draft_req_ids: HashSet::new(),
+            primes_only: false,
             spec_pipeline: SpecPipeline::default(),
         }
     }
@@ -321,10 +329,30 @@ mod tests {
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
             draft_req_ids: HashSet::new(),
+            primes_only: false,
             spec_pipeline: SpecPipeline::default(),
         };
         assert_eq!(so.total_num_scheduled_tokens, 150);
         assert_eq!(so.scheduled_new_reqs.len(), 1);
         assert_eq!(so.scheduled_cached_reqs.num_reqs(), 1);
+    }
+
+    #[test]
+    fn test_scheduler_output_is_speculative() {
+        let mut so = SchedulerOutput::make_empty();
+        assert!(!so.is_speculative());
+
+        // A step that drafts: the step after it needs its drafts.
+        so.draft_req_ids.insert("r1".into());
+        assert!(so.is_speculative());
+
+        // Past the gate the head primes KV only — nothing drafted, nothing read back.
+        so.primes_only = true;
+        assert!(!so.is_speculative());
+
+        // A gated step that still verifies drafts decides what follows it: how many it keeps.
+        so.scheduled_spec_decode_tokens
+            .insert("r1".into(), vec![7, 8]);
+        assert!(so.is_speculative());
     }
 }

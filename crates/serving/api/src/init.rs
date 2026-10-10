@@ -699,10 +699,11 @@ fn build_proposer_config(
     // Non-"ngram" value: a draft checkpoint (path / HF repo) — a multi-token-prediction head
     // drafts with the MTP proposer (its compiled drafts, `resolve_speculative_decoding`); anything
     // else is a standalone draft model.
-    if draft_head(config, spec)?.is_some() {
+    if let Some(head) = draft_head(config, spec)? {
         return Ok(Some(ProposerConfig::Mtp(MtpProposerConfig {
             model: spec.to_string(),
             num_speculative_tokens: config.num_speculative_tokens,
+            max_seqs: usize::from(head.max_seqs),
             max_model_len,
         })));
     }

@@ -155,6 +155,13 @@ pub trait Proposer {
         std::collections::HashSet::new()
     }
 
+    /// The most sequences a step drafts for, when a worker-side head drafts: a step of more runs
+    /// as its target alone, its head's pass 1 priming KV only. `None` for a proposer that drafts
+    /// on the host.
+    fn max_seqs(&self) -> Option<usize> {
+        None
+    }
+
     fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>>;
 }
 

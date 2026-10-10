@@ -146,6 +146,10 @@ pub struct MtpProposerConfig {
     pub model: String,
     /// Drafts per step (`k`): one pass-1 row plus `k - 1` chained passes.
     pub num_speculative_tokens: usize,
+    /// The most sequences a step drafts for: the head's compiled `spec_max_seqs`, the engine's
+    /// copy of the gate the worker's `MtpDrafter.max_seqs` carries (both derive from the head's
+    /// registration, so they cannot disagree).
+    pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
 }
@@ -522,6 +526,10 @@ impl Proposer for MtpProposer {
             .collect()
     }
 
+    fn max_seqs(&self) -> Option<usize> {
+        Some(self.config.max_seqs)
+    }
+
     fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>> {
         // The worker drafted for the requests this step planned.
         ctx.worker_drafts.cloned().unwrap_or_default()
@@ -632,6 +640,7 @@ mod tests {
         MtpProposer::new(MtpProposerConfig {
             model: "head".into(),
             num_speculative_tokens: 3,
+            max_seqs: 2,
             max_model_len: 4096,
         })
     }
@@ -810,6 +819,7 @@ mod tests {
     fn a_step_past_the_head_s_sequences_plans_all_of_them() {
         let takes = |_: &str| true;
         let mut proposer = proposer();
+        assert_eq!(proposer.max_seqs(), Some(2));
         assert_eq!(
             proposer.plan(&scheduled(&[("a", 10), ("b", 20), ("c", 30)]), &takes),
             ids(&["a", "b", "c"])

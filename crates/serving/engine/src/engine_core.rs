@@ -657,6 +657,11 @@ impl EngineCore {
         };
         let scheduler = &self.scheduler;
         sched.draft_req_ids = proposer.plan(sched, &|req_id| takes_drafts(scheduler, req_id));
+        // A step past the gate runs its head's pass 1 KV-only — no chain, nothing read back — so
+        // the step behind it pre-schedules as behind a plain one.
+        sched.primes_only = proposer
+            .max_seqs()
+            .is_some_and(|gate| sched.num_scheduled_tokens.len() > gate);
     }
 
     /// Post-execution processing: update state from model output, process
@@ -1863,6 +1868,7 @@ mod tests {
                 crate::spec_decode::MtpProposerConfig {
                     model: "head".into(),
                     num_speculative_tokens: 2,
+                    max_seqs: 2,
                     max_model_len: 4096,
                 },
             )),
