@@ -1855,8 +1855,12 @@ fn rmsnorm_unit_f16_matches_cpu() {
 /// A per-head norm's rows, narrower than [`NORM_THREADS`], run on `norm_threads(width)` threads:
 /// every count covering the row sums it in the same order (a thread holds at most one element,
 /// the extra tree levels add zeros), so the outputs are the 1024-thread ones bit for bit, in both
-/// activation types — and a quarter of that count (up to four elements a thread, summed in a row)
-/// is shown not to be.
+/// activation types. A sub-covering count sums its share sequentially in a thread, which reorders
+/// the sum — but WHETHER that shows in the f16 bits is codegen, not a kernel property: on M1 Max
+/// the unit kernel's ragged ≤3-element share compiles to the tree's own association (nothing
+/// differs below covering/8 at width 80), while the weighted symbol's does not. So the
+/// demonstration asserts that a sub-covering count reorders the sum SOMEWHERE for each symbol —
+/// the covering invariance above is not vacuous — not that it does at every width.
 #[test]
 fn rmsnorm_narrow_rows_sum_alike_at_every_covering_threadgroup() {
     use scratchy_target_metal::tape::kernel_constants::{NORM_THREADS, norm_threads};
@@ -1884,6 +1888,13 @@ fn rmsnorm_narrow_rows_sum_alike_at_every_covering_threadgroup() {
         ("f16", &f16_bits as &dyn Fn(f32) -> u16),
         ("bf16", &bf16_bits),
     ] {
+        let symbols = [
+            format!("rmsnorm_{act}_s_{act}_specialized"),
+            format!("rmsnorm_unit_{act}_specialized"),
+        ];
+        // Whether a sub-covering count's reordered sum shows in the f16 bits, per symbol,
+        // across every width — see the test's doc.
+        let mut saw_reordered_sum = [false; 2];
         for width in [256usize, 128, 80] {
             // Enough rows that a different sum order shows through the outputs' rounding.
             let rows = 4096;
@@ -1921,11 +1932,7 @@ fn rmsnorm_narrow_rows_sum_alike_at_every_covering_threadgroup() {
                 let out = out_buf.contents().as_ptr() as *const u16;
                 ran.then(|| unsafe { std::slice::from_raw_parts(out, rows * width) }.to_vec())
             };
-            let symbols = [
-                format!("rmsnorm_{act}_s_{act}_specialized"),
-                format!("rmsnorm_unit_{act}_specialized"),
-            ];
-            for symbol in &symbols {
+            for (sym_i, symbol) in symbols.iter().enumerate() {
                 let Some(want) = run(symbol, NORM_THREADS) else {
                     return;
                 };
@@ -1936,13 +1943,22 @@ fn rmsnorm_narrow_rows_sum_alike_at_every_covering_threadgroup() {
                 }
                 // f16's 10 mantissa bits show a reordered sum; bf16's 7 hide nearly all of it.
                 if act == "f16" {
-                    let quarter = run(symbol, covering / 4).expect("ran");
-                    let differ = quarter.iter().zip(&want).filter(|(a, b)| a != b).count();
-                    assert!(
-                        differ > 0,
-                        "{symbol} width {width}: up to four elements a thread changed nothing"
-                    );
+                    for div in [2u32, 4, 8] {
+                        let sub = run(symbol, covering / div).expect("ran");
+                        if sub.iter().zip(&want).any(|(a, b)| a != b) {
+                            saw_reordered_sum[sym_i] = true;
+                        }
+                    }
                 }
+            }
+        }
+        if act == "f16" {
+            for (sym_i, symbol) in symbols.iter().enumerate() {
+                assert!(
+                    saw_reordered_sum[sym_i],
+                    "{symbol}: no sub-covering thread count reordered any f16 sum — \
+                     the covering invariance above would be vacuous"
+                );
             }
         }
     }
