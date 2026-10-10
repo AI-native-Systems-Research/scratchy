@@ -273,13 +273,15 @@ pub fn lower_canonical(
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
     let fold_projections = facts.mlp == MlpForm::Packed || m == 1;
-    // The affine matvecs normalize their input and add into the residual on every bucket in the
-    // matvec band: its floor is `QMV_MATVEC_BAND_ROWS` (the qmv batch limit's minimum, so no
-    // shape or gen class crosses below it) — the fold can never ask the matmul band (qmm_t,
-    // which takes no ends) to lower one.
+    // The affine matvecs add into the residual on every bucket in the matvec band (floor
+    // `QMV_MATVEC_BAND_ROWS`, the qmv batch limit's minimum, so the fold can never ask the
+    // matmul band, qmm_t, to lower one) but take their input's norm only on the one-row bucket:
+    // the fast kernel re-loads the norm's gain per row, so past it the fold costs more L2 than
+    // the dispatch it saves.
     let model = ModelFoldFacts {
         fold_projections,
         matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
+        matvec_norms: m == 1,
         row_programs: m == 1,
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
