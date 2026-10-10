@@ -111,12 +111,24 @@ pub struct ModelRunnerOutput {
     /// Matches Python's `AsyncOutput` pattern: the GPU enqueues a D2H copy
     /// on a transfer stream and returns immediately. The closure syncs the
     /// CUDA event and reads from a pinned host buffer.
-    pub d2h_resolver: Option<D2hResolver>,
+    pub d2h_resolver: Option<D2hResolve>,
 }
 
 /// A deferred step's tokens, one per request in `req_ids` order, once its device work is done; `Err`
 /// if that work failed.
 pub type D2hResolver = Box<dyn FnOnce() -> Result<Vec<u32>, String> + Send>;
+
+/// A deferred speculative step's outputs once its device work is done: each request's tokens, in
+/// `req_ids` order — the drafts it kept and the target's next — and the drafts it made for its
+/// next step; `Err` if that work failed.
+pub type SpecResolver =
+    Box<dyn FnOnce() -> Result<(Vec<Vec<u32>>, HashMap<String, Vec<u32>>), String> + Send>;
+
+/// How a deferred output resolves.
+pub enum D2hResolve {
+    Tokens(D2hResolver),
+    Speculative(SpecResolver),
+}
 
 impl std::fmt::Debug for ModelRunnerOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -157,9 +169,17 @@ impl ModelRunnerOutput {
     /// host buffer. No-op if the output is already resolved. `Err`: the step
     /// failed on the device, and its tokens are not to be used.
     pub fn resolve(&mut self) -> Result<(), String> {
-        if let Some(resolver) = self.d2h_resolver.take() {
-            let token_ids = resolver()?;
-            self.sampled_token_ids = token_ids.into_iter().map(|t| vec![t]).collect();
+        match self.d2h_resolver.take() {
+            None => {}
+            Some(D2hResolve::Tokens(resolver)) => {
+                let token_ids = resolver()?;
+                self.sampled_token_ids = token_ids.into_iter().map(|t| vec![t]).collect();
+            }
+            Some(D2hResolve::Speculative(resolver)) => {
+                let (tokens, drafts) = resolver()?;
+                self.sampled_token_ids = tokens;
+                self.draft_token_ids = Some(drafts);
+            }
         }
         Ok(())
     }
@@ -260,7 +280,16 @@ impl ModelRunnerOutput {
             pooler_output: None,
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
-            d2h_resolver: Some(resolver),
+            d2h_resolver: Some(D2hResolve::Tokens(resolver)),
+        }
+    }
+
+    /// A speculative step committed without waiting for it: its tokens and drafts once `resolver`
+    /// runs ([`Self::resolve`]).
+    pub fn deferred_speculative(req_ids: Vec<String>, resolver: SpecResolver) -> Self {
+        Self {
+            d2h_resolver: Some(D2hResolve::Speculative(resolver)),
+            ..Self::deferred(req_ids, Box::new(|| Ok(Vec::new())))
         }
     }
 }

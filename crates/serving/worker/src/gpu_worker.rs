@@ -313,6 +313,13 @@ pub struct MetalWorker {
     /// The deferred forward `forward_argmax_blocking` committed, back for
     /// `execute_model`.
     committed: Option<(InFlight, Arc<ArgmaxSlot>)>,
+    /// The chain buffer and layout `execute_model` laid this step's head passes out in, and whether
+    /// the step is behind a speculative one in flight, for `forward_argmax_then`.
+    pending_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
+    /// The chain of the deferred step `forward_argmax_then` committed, back for `execute_model`.
+    committed_chain: Option<(ChainLayout, Arc<ChainBuffer>)>,
+    /// The last speculative step committed without waiting: what a step behind it reads.
+    spec_tail: Option<SpecTail>,
     /// Steps committed without waiting for them, oldest first.
     in_flight: std::collections::VecDeque<InFlightStep>,
     /// Per-request grammar FSM state for constrained / guided decoding
@@ -350,7 +357,11 @@ pub struct MetalWorker {
     /// An MTP head's chain between its passes, and the buffer its inputs and outputs live in
     /// ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)).
     mtp_chain_kernel: Option<scratchy_target_metal::mtp_chain::MtpChainKernel>,
-    mtp_chain_buffer: Option<scratchy_target_metal::residency::Pinned>,
+    /// One a step, free when no step in flight holds it ([`free_chain_buffer`]).
+    mtp_chain_buffers: Vec<Arc<ChainBuffer>>,
+    /// A drafting target's pick of a step's inputs by the step before it, which may still be in
+    /// flight ([`scratchy_target_metal::select_rows`]).
+    select_rows_kernel: Option<scratchy_target_metal::select_rows::SelectRowsKernel>,
     /// Second `MTLCommandQueue` on the same device, dedicated to the
     /// draft chain. Metal device-level parallelism: dispatches on
     /// distinct queues run concurrently on Apple Silicon when they
@@ -891,6 +902,9 @@ impl MetalWorker {
             pending_sampler: None,
             argmax_slots: Vec::new(),
             deferral: None,
+            pending_chain: None,
+            committed_chain: None,
+            spec_tail: None,
             committed: None,
             in_flight: std::collections::VecDeque::new(),
             #[cfg(feature = "guided-decoding")]
@@ -908,7 +922,8 @@ impl MetalWorker {
             chain_advance_kernel: None,
             draft_chain_advance_kernel: None,
             mtp_chain_kernel: None,
-            mtp_chain_buffer: None,
+            mtp_chain_buffers: Vec::new(),
+            select_rows_kernel: None,
             draft_queue: None,
             target_tensor_refs: None,
             target_kv_layers: Vec::new(),
@@ -1633,16 +1648,20 @@ impl MetalWorker {
             scratchy_core_common::sampler_telemetry::SamplerTelemetry::global().is_enabled();
         #[cfg(not(feature = "sampler-telemetry"))]
         let telemetry = false;
+        // A speculative step the engine pipelines: one leading, whose successor reads its outcome
+        // on the device, and one behind it, which does.
+        let pipelined = sched.spec_pipeline.leads || sched.spec_pipeline.behind;
         !telemetry
             && sched.total_num_scheduled_tokens > 0
             && self.input_batch.num_active() > 0
-            && sched.scheduled_spec_decode_tokens.is_empty()
             && !self.config.is_pooling
-            // A head runs after the steps it drafts from, so every other step defers.
-            && match self.mtp_drafter {
-                Some(_) => sched.draft_req_ids.is_empty(),
-                None => self.draft_model.is_none(),
-            }
+            && (pipelined
+                || sched.scheduled_spec_decode_tokens.is_empty()
+                    // A head runs after the steps it drafts from, so every other step defers.
+                    && match self.mtp_drafter {
+                        Some(_) => sched.draft_req_ids.is_empty(),
+                        None => self.draft_model.is_none(),
+                    })
             && sched.num_scheduled_tokens.keys().all(|req_id| {
                 !self
                     .sampling_params_map
@@ -1657,6 +1676,16 @@ impl MetalWorker {
     /// sampled to its requests' histories.
     fn resolve_oldest(&mut self) -> ExecutorResult<()> {
         let step = self.in_flight.pop_front().expect("a step in flight");
+        if let Some(spec) = &step.spec {
+            let (tokens, _) = (spec.read(&step.done, &step.argmax))
+                .map_err(|e| ExecutorError::WorkerExecution(format!("deferred forward: {e}")))?;
+            self.input_batch
+                .resolve_rows(&spec.req_id, &tokens, spec.rows);
+            if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
+                alloc.verified(gdn_slot_key(&spec.req_id), tokens.len() - 1, spec.rows - 1);
+            }
+            return Ok(());
+        }
         let tokens = sampled(
             &step.done,
             &step.argmax,
@@ -1667,6 +1696,272 @@ impl MetalWorker {
             self.input_batch.resolve(req_id, token);
         }
         Ok(())
+    }
+
+    /// The chain buffer a step's head passes lay out in, written with their host tables, and
+    /// whether the step is behind a speculative one in flight; `None` without a chain.
+    fn lay_out_chain(
+        &mut self,
+        passes: &::scratchy_serving_engine::spec_decode::HeadPasses,
+        behind: bool,
+    ) -> ExecutorResult<Option<(ChainLayout, Arc<ChainBuffer>, bool)>> {
+        let Some(chain) = &passes.chain else {
+            return Ok(None);
+        };
+        let fail = |what: &str| ExecutorError::WorkerExecution(format!("MTP chain: {what}"));
+        let model = (self.draft_model.as_deref()).ok_or_else(|| fail("no head"))?;
+        let device = (self.gpu_device.as_ref()).ok_or_else(|| fail("no device"))?;
+        let rope_bytes = model.metal_rope_rows(&[0]).map_or(0, |row| row.len());
+        let layout = ChainLayout::of(passes, model.hidden_size() as usize, rope_bytes);
+        let buffer = free_chain_buffer(
+            &mut self.mtp_chain_buffers,
+            &device.device,
+            device.allocator.residency(),
+            layout.bytes,
+        );
+        layout.write(chain, &buffer.0, |positions| {
+            model.metal_rope_rows(positions)
+        });
+        Ok(Some((layout, buffer, behind)))
+    }
+
+    /// A step behind the speculative step before it (`spec_tail`), which is still in flight: the
+    /// selections that pick, by how many of its `k` drafts that step keeps (`a`), what depends on
+    /// it. The step's one sequence is laid out as if every draft were kept — its first row's
+    /// token placeholders, the rest its drafts' — so for each `a` its rows sit `k - a` positions
+    /// earlier: their slots, used KV length and rope rows (or positions), its Gated-DeltaNet start
+    /// (the checkpoint after row `a`), and its head's pass 1 inputs and chain tables. Its first
+    /// token is that step's target token at row `a`, its drafts that step's.
+    fn behind_selections(
+        &self,
+        positions: &[u32],
+        used: &[u32],
+        block_ids: &[Vec<usize>],
+        block_size: usize,
+        passes: Option<&::scratchy_serving_engine::spec_decode::HeadPasses>,
+        req_ids: &[String],
+    ) -> ExecutorResult<Vec<scratchy_target_metal::select_rows::Selection>> {
+        use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
+        use scratchy_target_metal::select_rows::{SelectFrom, SelectInto, Selection};
+        let fail = |what: &str| {
+            ExecutorError::WorkerExecution(format!("a step behind a speculative one: {what}"))
+        };
+        let tail =
+            (self.spec_tail.as_ref()).ok_or_else(|| fail("no speculative step before it"))?;
+        match req_ids {
+            [one] if *one == tail.req_id && used.len() == 1 => {}
+            _ => return Err(fail("not the one request the step before it ran")),
+        }
+        let (rows, first) = (positions.len(), 0usize);
+        let k = rows - 1;
+        let selector = || ((*tail.chain.0).clone(), tail.accepted_at);
+        let table =
+            |words: Vec<u32>, stride: usize, len: usize, to: SelectInto, at: usize| Selection {
+                source: SelectFrom::Table(words),
+                stride,
+                len,
+                selector: selector(),
+                to,
+                at,
+            };
+        // Per kept count `a`, in order, what `f` makes of the rows `k - a` positions earlier.
+        let variants = |f: &dyn Fn(u32) -> Vec<u32>| -> Vec<u32> {
+            (0..=k).flat_map(|a| f((k - a) as u32)).collect()
+        };
+        let slot = |p: u32| -> u32 {
+            let (p, bs) = (p as usize, block_size);
+            (block_ids[0].get(p / bs)).map_or(u32::MAX, |&b| (b * bs + p % bs) as u32)
+        };
+        let slots = variants(&|d| positions.iter().map(|&p| slot(p - d)).collect());
+        let useds = variants(&|d| vec![used[0] - d]);
+        let shifted = variants(&|d| positions.iter().map(|&p| p - d).collect());
+        // Rope rows over the window `k` positions before the first row's through its last: kept
+        // count `a` reads `k + 1` rows from row `a`.
+        let window: Vec<u32> = (0..=2 * k as u32)
+            .map(|j| positions[first] - k as u32 + j)
+            .collect();
+        let words = |bytes: &[u8]| -> Vec<u32> {
+            (bytes.as_chunks::<4>().0.iter())
+                .map(|w| u32::from_ne_bytes(*w))
+                .collect()
+        };
+        let rope = |rows: Option<Vec<u8>>| {
+            rows.map(|bytes| {
+                let words = words(&bytes);
+                let row = words.len() / window.len();
+                (words, row)
+            })
+        };
+        let model = (self.model.as_deref()).ok_or_else(|| fail("no target"))?;
+        let mut out = vec![
+            Selection {
+                source: SelectFrom::Device((*tail.argmax.out).clone(), tail.first * 4),
+                stride: 1,
+                len: 1,
+                selector: selector(),
+                to: SelectInto::Input(Into::InputIds),
+                at: first * 4,
+            },
+            Selection {
+                source: SelectFrom::Device((*tail.chain.0).clone(), tail.drafts_at),
+                stride: 0,
+                len: k,
+                selector: selector(),
+                to: SelectInto::Input(Into::InputIds),
+                at: (first + 1) * 4,
+            },
+            table(
+                slots.clone(),
+                rows,
+                rows,
+                SelectInto::Input(Into::SlotMapping),
+                first * 4,
+            ),
+            table(useds.clone(), 1, 1, SelectInto::Input(Into::SeqUsedK), 0),
+        ];
+        out.push(match rope(model.metal_rope_rows(&window)) {
+            Some((words, row)) => table(
+                words,
+                row,
+                rows * row,
+                SelectInto::Input(Into::RopeRows),
+                first * row * 4,
+            ),
+            None => table(
+                shifted.clone(),
+                rows,
+                rows,
+                SelectInto::Input(Into::Positions),
+                first * 4,
+            ),
+        });
+        if let Some((_, codes)) = &self.gdn_pending {
+            // The step starts from the checkpoint after row `a` of the step before it.
+            let code = codes[0] & !0xff;
+            let starts = variants(&|d| vec![code | (2 + k as u32 - d)]);
+            out.push(table(starts, 1, 1, SelectInto::Input(Into::GdnSteps), 0));
+        }
+        let (Some((layout, buffer, _)), Some(chain)) =
+            (&self.pending_chain, passes.and_then(|p| p.chain.as_ref()))
+        else {
+            return Ok(out);
+        };
+        let head = (self.draft_model.as_deref()).ok_or_else(|| fail("no head"))?;
+        let to = || SelectInto::Buffer((*buffer.0).clone());
+        let at = |section: usize| layout.at[section];
+        out.push(Selection {
+            source: SelectFrom::Device((*tail.chain.0).clone(), tail.drafts_at),
+            stride: 0,
+            len: k,
+            selector: selector(),
+            to: to(),
+            at: at(ChainLayout::DRAFTED) + first * 4,
+        });
+        out.push(table(slots, rows, rows, to(), at(ChainLayout::ONE_SLOTS)));
+        out.push(table(useds, 1, 1, to(), at(ChainLayout::ONE_USED)));
+        out.push(match rope(head.metal_rope_rows(&window)) {
+            Some((words, row)) => table(words, row, rows * row, to(), at(ChainLayout::ONE_ROPE)),
+            None => table(shifted, rows, rows, to(), at(ChainLayout::ONE_POSITIONS)),
+        });
+        // The chain's next-pass tables: each pass's `[position, slot, used]` per kept count of this
+        // step, the step `k - a` positions earlier (the last pass's zeros stay).
+        let next = |d: u32| -> Vec<Vec<u32>> {
+            (chain.next.iter())
+                .map(|pass| {
+                    (pass.as_chunks::<3>().0.iter())
+                        .flat_map(|&e| match e {
+                            [0, 0, 0] => [0; 3],
+                            [p, _, u] => [p - d, slot(p - d), u - d],
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let next_len = chain.next.iter().map(Vec::len).sum();
+        out.push(table(
+            variants(&|d| next(d).concat()),
+            next_len,
+            next_len,
+            to(),
+            at(ChainLayout::NEXT),
+        ));
+        if layout.rope_bytes > 0 {
+            let rope_rows = |d: u32| -> Vec<u32> {
+                (next(d).iter())
+                    .flat_map(|pass| {
+                        let positions: Vec<u32> =
+                            pass.as_chunks::<3>().0.iter().map(|e| e[0]).collect();
+                        words(&head.metal_rope_rows(&positions).unwrap_or_default())
+                    })
+                    .collect()
+            };
+            let len = rope_rows(0).len();
+            out.push(table(
+                variants(&rope_rows),
+                len,
+                len,
+                to(),
+                at(ChainLayout::ROPE),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// A speculative step the engine pipelined, committed without waiting: its one request's rows
+    /// in flight, what a step behind it reads ([`SpecTail`]), and its output once its device work is
+    /// done — the tokens it keeps and the drafts its head made.
+    fn commit_speculative(
+        &mut self,
+        done: InFlight,
+        argmax: Arc<ArgmaxSlot>,
+        layout: &ChainLayout,
+        chain: Arc<ChainBuffer>,
+        req_ids: &[String],
+        q_lens: &[usize],
+    ) -> ExecutorResult<ModelRunnerOutput> {
+        let ([req_id], [rows]) = (req_ids, q_lens) else {
+            return Err(ExecutorError::WorkerExecution(format!(
+                "a pipelined speculative step of {} requests",
+                req_ids.len()
+            )));
+        };
+        let spec = SpecFlight {
+            req_id: req_id.clone(),
+            first: 0,
+            rows: *rows,
+            k: layout.k,
+            chain,
+            accepted_at: layout.at[ChainLayout::ACCEPTED],
+            drafts_at: layout.at[ChainLayout::DRAFTS],
+        };
+        self.input_batch.commit_in_flight_rows(req_id, *rows, *rows);
+        self.spec_tail = Some(SpecTail {
+            req_id: req_id.clone(),
+            first: spec.first,
+            argmax: Arc::clone(&argmax),
+            chain: Arc::clone(&spec.chain),
+            accepted_at: spec.accepted_at,
+            drafts_at: spec.drafts_at,
+        });
+        let done = Arc::new(done);
+        let resolver: ::scratchy_serving_engine::executor::SpecResolver = {
+            let (done, argmax, spec) = (Arc::clone(&done), Arc::clone(&argmax), spec.clone());
+            Box::new(move || {
+                let (tokens, drafts) = spec.read(&done, &argmax).map_err(|e| e.to_string())?;
+                let drafts = std::collections::HashMap::from([(spec.req_id.clone(), drafts)]);
+                Ok((vec![tokens], drafts))
+            })
+        };
+        self.in_flight.push_back(InFlightStep {
+            done,
+            argmax,
+            rows: Vec::new(),
+            spec: Some(spec),
+        });
+        Ok(ModelRunnerOutput::deferred_speculative(
+            vec![req_id.clone()],
+            resolver,
+        ))
     }
 
     /// Allocate the draft model's KV pool. Mirrors `initialize_cache`'s
@@ -2831,18 +3126,13 @@ impl MetalWorker {
                     .ok_or_else(|| BackendError::Backend("MTP head not loaded".into()))?;
                 // An MRoPE head reads a rotary cos/sin row a token in place of its position.
                 let rope_bytes = model.metal_rope_rows(&[0]).map_or(0, |row| row.len());
-                let layout = ChainLayout::of(passes, model.hidden_size() as usize, rope_bytes);
-                let buffer = match &passes.chain {
-                    Some(chain) => {
-                        let slot = &mut self.mtp_chain_buffer;
-                        if reserve_pinned(slot, &mtl_device, &residency, layout.bytes) {
-                            residency.commit();
-                        }
-                        let buffer = (self.mtp_chain_buffer.as_ref()).expect("reserved above");
-                        layout.write(chain, buffer, |positions| model.metal_rope_rows(positions));
-                        Some(&**buffer)
+                let (layout, buffer, behind) = match self.pending_chain.take() {
+                    Some((layout, buffer, behind)) => (layout, Some(buffer), behind),
+                    None => {
+                        let layout =
+                            ChainLayout::of(passes, model.hidden_size() as usize, rope_bytes);
+                        (layout, None, false)
                     }
-                    None => None,
                 };
                 Some(HeadPassesEncoder {
                     passes,
@@ -2856,14 +3146,11 @@ impl MetalWorker {
                     buffer,
                     layout,
                     device,
+                    behind,
                 })
             }
             _ => None,
         };
-        assert!(
-            head.is_none() || deferral.is_none(),
-            "a step with a head's pass is waited for"
-        );
         let head = std::cell::RefCell::new(head);
         let head_onto: std::cell::RefCell<
             Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + '_>>,
@@ -3068,6 +3355,9 @@ impl MetalWorker {
                 BackendError::Backend("a deferred forward returned uncommitted".into())
             })?;
             self.committed = Some((in_flight, argmax));
+            // The head's worker goes back now: its staging slot outlives this step (`Onto`).
+            self.committed_chain = (head.borrow().as_ref())
+                .and_then(|h| h.buffer.clone().map(|b| (h.layout.clone(), b)));
             return Ok(Forwarded::default());
         }
 
@@ -3159,6 +3449,7 @@ fn retained(
 /// Where an MTP head's chain ([`Chain`](::scratchy_serving_engine::spec_decode::Chain)) keeps
 /// what it reads and writes, in one pinned buffer: the host's tables, then the device's.
 #[cfg(feature = "metal")]
+#[derive(Clone)]
 struct ChainLayout {
     /// Drafting sequences.
     n: usize,
@@ -3170,8 +3461,8 @@ struct ChainLayout {
     /// Pass 1's rows its argmax runs: its first token row through its last.
     window: std::ops::Range<u32>,
     /// Byte offsets: `[seqs, drafted, next, consts, picked, accepted, ids, positions, slots,
-    /// used, hidden, drafts, rope, next_rope]`.
-    at: [usize; 14],
+    /// used, hidden, drafts, rope, next_rope, one_positions, one_slots, one_used, one_rope]`.
+    at: [usize; 18],
     bytes: usize,
 }
 
@@ -3193,6 +3484,12 @@ impl ChainLayout {
     /// After each pass, per drafting sequence and accepted count, the next pass's rope row.
     const ROPE: usize = 12;
     const NEXT_ROPE: usize = 13;
+    /// Behind a speculative step in flight: pass 1's positions, slots, used KV lengths and rope
+    /// rows, picked on the device by that step's outcome ([`behind_selections`]).
+    const ONE_POSITIONS: usize = 14;
+    const ONE_SLOTS: usize = 15;
+    const ONE_USED: usize = 16;
+    const ONE_ROPE: usize = 17;
 
     fn of(
         passes: &::scratchy_serving_engine::spec_decode::HeadPasses,
@@ -3206,6 +3503,7 @@ impl ChainLayout {
             None => (0, 0, 0),
         };
         let hidden_bytes = hidden * 2;
+        let (rows, seqs) = (passes.one.positions.len(), passes.one.seqused_k.len());
         let u32s = |count: usize| count * size_of::<u32>();
         let sizes = [
             u32s(3 * n),
@@ -3222,8 +3520,12 @@ impl ChainLayout {
             u32s(n * k),
             k * n * (k + 1) * rope_bytes,
             n * rope_bytes,
+            u32s(rows),
+            u32s(rows),
+            u32s(seqs),
+            rows * rope_bytes,
         ];
-        let mut at = [0; 14];
+        let mut at = [0; 18];
         let mut bytes = 0;
         for (at, size) in at.iter_mut().zip(sizes) {
             *at = bytes;
@@ -3313,9 +3615,12 @@ struct HeadPassesEncoder<'a> {
     argmax_kernels: &'a scratchy_target_metal::argmax::ArgmaxKernels,
     chain_kernel: Option<&'a scratchy_target_metal::mtp_chain::MtpChainKernel>,
     /// The buffer the chain's [`ChainLayout`] lays out; `None` without a chain.
-    buffer: Option<&'a scratchy_target_metal::mtl4_dispatch::Buffer>,
+    buffer: Option<Arc<ChainBuffer>>,
     layout: ChainLayout,
     device: GpuDevice,
+    /// The step is behind a speculative one in flight: pass 1 reads its positions, slots and used
+    /// KV lengths from the chain buffer, where the device picked them.
+    behind: bool,
 }
 
 #[cfg(feature = "metal")]
@@ -3342,7 +3647,21 @@ impl<'a> HeadPassesEncoder<'a> {
             let (row, step_row, rows) = (row as usize, step_row as usize, rows as usize);
             DeviceInput::hidden_rows(hidden.clone(), step_row, row, rows, row_bytes)
         });
-        let device_inputs: Vec<DeviceInput> = token_inputs.chain(hidden_inputs).collect();
+        let picked = (self.buffer.as_ref()).filter(|_| self.behind).map(|b| {
+            let (l, rows, seqs) = (&self.layout, one.positions.len(), one.seqused_k.len());
+            let position = match l.rope_bytes {
+                0 => l.input(&b.0, ChainLayout::ONE_POSITIONS, rows * 4, Into::Positions),
+                rope => l.input(&b.0, ChainLayout::ONE_ROPE, rows * rope, Into::RopeRows),
+            };
+            [
+                position,
+                l.input(&b.0, ChainLayout::ONE_SLOTS, rows * 4, Into::SlotMapping),
+                l.input(&b.0, ChainLayout::ONE_USED, seqs * 4, Into::SeqUsedK),
+            ]
+        });
+        let device_inputs: Vec<DeviceInput> = (token_inputs.chain(hidden_inputs))
+            .chain(picked.into_iter().flatten())
+            .collect();
         let req = one.request();
         let ctx = head_ctx(self.kv_cache, &req, &device_inputs, one.has_spec_tokens);
         let n = req.num_tokens as u64;
@@ -3356,9 +3675,10 @@ impl<'a> HeadPassesEncoder<'a> {
                 enc,
             )
         }?;
-        let (Some(chain), Some(buffer)) = (&self.passes.chain, self.buffer) else {
+        let (Some(chain), Some(buffer)) = (&self.passes.chain, self.buffer.clone()) else {
             return Ok(onto);
         };
+        let buffer = &buffer.0;
         let kernel = self
             .chain_kernel
             .ok_or("an MTP head without its chain kernel")?;
@@ -3447,9 +3767,10 @@ impl<'a> HeadPassesEncoder<'a> {
     /// The drafts the passes picked, `k` a drafting sequence, once the command buffer they ran in
     /// is done.
     fn drafts(&self) -> Vec<u32> {
-        let Some(buffer) = self.buffer else {
+        let Some(buffer) = &self.buffer else {
             return Vec::new();
         };
+        let buffer = &buffer.0;
         let (at, len) = (
             self.layout.at[ChainLayout::DRAFTS],
             self.layout.n * self.layout.k,
@@ -3640,6 +3961,102 @@ struct InFlightStep {
     argmax: Arc<ArgmaxSlot>,
     /// `(request, argmax row)` of each row that samples a token.
     rows: Vec<(String, usize)>,
+    /// A speculative step's: its tokens are the drafts it keeps and the target's next.
+    spec: Option<SpecFlight>,
+}
+
+/// A speculative step committed without waiting ([`SpecPipeline`]): its one request's rows, from
+/// `first`, and its chain — the drafts its head made, how many of its own it kept.
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+struct SpecFlight {
+    req_id: String,
+    first: usize,
+    rows: usize,
+    k: usize,
+    chain: Arc<ChainBuffer>,
+    accepted_at: usize,
+    drafts_at: usize,
+}
+
+#[cfg(feature = "metal")]
+impl SpecFlight {
+    /// Once its command buffer is done: its tokens (the target's at its rows up to the last kept
+    /// draft's, and the next), and the drafts its head made.
+    fn read(
+        &self,
+        done: &InFlight,
+        argmax: &ArgmaxSlot,
+    ) -> Result<(Vec<u32>, Vec<u32>), ForwardError> {
+        done.wait()?;
+        let words = |at: usize, len: usize| -> Vec<u32> {
+            // SAFETY: `at..at + 4 len` lies in the chain's sections, which the done command buffer
+            // wrote.
+            unsafe {
+                let base = self
+                    .chain
+                    .0
+                    .contents()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(at)
+                    .cast::<u32>();
+                std::slice::from_raw_parts(base, len).to_vec()
+            }
+        };
+        let kept = words(self.accepted_at, 1)[0] as usize;
+        let out: Vec<u32> =
+            scratchy_target_metal::mtl4_dispatch::read_slice(&argmax.out, self.first + kept + 1);
+        Ok((out[self.first..].to_vec(), words(self.drafts_at, self.k)))
+    }
+}
+
+/// What a step behind a speculative one in flight reads from it on the device: its target's token
+/// a row (`argmax`), the drafts its head made and how many of its own it kept (`chain`).
+#[cfg(feature = "metal")]
+struct SpecTail {
+    req_id: String,
+    first: usize,
+    argmax: Arc<ArgmaxSlot>,
+    chain: Arc<ChainBuffer>,
+    accepted_at: usize,
+    drafts_at: usize,
+}
+
+/// A step's [`ChainLayout`] buffer.
+#[cfg(feature = "metal")]
+struct ChainBuffer(scratchy_target_metal::residency::Pinned);
+
+// SAFETY: as for `ArgmaxSlot`: the host writes a chain buffer only while no step holds it, and reads
+// it only once the step that wrote it is done.
+#[cfg(feature = "metal")]
+unsafe impl Send for ChainBuffer {}
+#[cfg(feature = "metal")]
+unsafe impl Sync for ChainBuffer {}
+
+/// A chain buffer of at least `bytes` no step holds: one of `slots`, or a new one replacing a free
+/// smaller one (or added).
+#[cfg(feature = "metal")]
+fn free_chain_buffer(
+    slots: &mut Vec<Arc<ChainBuffer>>,
+    device: &scratchy_target_metal::mtl4_dispatch::Device,
+    residency: &scratchy_target_metal::residency::MetalResidencySet,
+    bytes: usize,
+) -> Arc<ChainBuffer> {
+    use ::objc2_metal::MTLBuffer;
+    let free = slots.iter().position(|s| Arc::strong_count(s) == 1);
+    if let Some(i) = free.filter(|&i| slots[i].0.length() >= bytes) {
+        return Arc::clone(&slots[i]);
+    }
+    let buffer = Arc::new(ChainBuffer(residency.pin(
+        scratchy_target_metal::mtl4_dispatch::shared_zeroed(device, bytes.max(1)),
+    )));
+    match free {
+        Some(i) => slots[i] = Arc::clone(&buffer),
+        None => slots.push(Arc::clone(&buffer)),
+    }
+    residency.commit();
+    buffer
 }
 
 /// The tokens at `rows` of a step's argmax, once its command buffer is done.
@@ -3660,7 +4077,7 @@ fn sampled(
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", feature = "guided-decoding"))]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -4047,6 +4464,9 @@ impl Worker for MetalWorker {
             );
             self.grammar_mask_kernels = Some(grammar_mask);
         }
+        self.select_rows_kernel =
+            scratchy_target_metal::select_rows::SelectRowsKernel::new(&gpu_device.device, off_tape)
+                .map_err(|e| ExecutorError::WorkerInit(format!("select_rows compile: {e:?}")))?;
 
         self.gpu_device = Some(gpu_device);
         self.model = Some(model);
@@ -4943,9 +5363,12 @@ impl Worker for MetalWorker {
         // engine sized to the largest resident bucket.
         let mut prepared = self.input_batch.prepare_inputs(scheduler_output);
         // A deferred step reads each token still on the device from the step
-        // that samples it, the newest one in flight.
+        // that samples it, the newest one in flight; a step behind a speculative one picks its
+        // own by that step's outcome ([`Self::behind_selections`]).
+        let behind = scheduler_output.spec_pipeline.behind;
         self.deferral = deferrable.then(|| {
             let inputs = (prepared.pending.iter())
+                .filter(|_| !behind)
                 .map(|input| {
                     let step = self
                         .in_flight
@@ -5410,6 +5833,28 @@ impl Worker for MetalWorker {
             }
             _ => None,
         };
+        // The head's chain lays out here, where a step behind a speculative one in flight picks
+        // into it, with the rest of what depends on that step's outcome.
+        self.pending_chain = match &head_passes {
+            Some(passes) => self.lay_out_chain(passes, behind)?,
+            None => None,
+        };
+        if behind {
+            let selections = self.behind_selections(
+                &positions_u32,
+                &seqused_k_u32,
+                &attn.block_ids,
+                full_block_size,
+                head_passes.as_ref(),
+                &req_ids_in_order,
+            )?;
+            let select = (self.select_rows_kernel.as_ref()).map(|k| (*k.pipeline).clone());
+            let (deferral, _) = (self.deferral.as_mut()).ok_or_else(|| {
+                ExecutorError::WorkerExecution("a step behind another is not deferred".into())
+            })?;
+            deferral.selections = selections;
+            deferral.select = select;
+        }
         let mut picked_drafts: Vec<u32> = Vec::new();
         let phase8_parallel_lockstep = self.draft_model.is_some()
             && !draft_is_head
@@ -5885,6 +6330,16 @@ impl Worker for MetalWorker {
         // the next step but one, wait for them.
         if let Some((done, argmax)) = self.committed.take() {
             self.sampler_logits = None;
+            if let Some((layout, chain)) = self.committed_chain.take() {
+                return self.commit_speculative(
+                    done,
+                    argmax,
+                    &layout,
+                    chain,
+                    &req_ids_in_order,
+                    &q_lens,
+                );
+            }
             let mut rows = Vec::with_capacity(num_reqs);
             for (i, req_id) in req_ids_in_order.iter().enumerate() {
                 if prepared.req_inputs[i].emits_token {
@@ -5898,6 +6353,7 @@ impl Worker for MetalWorker {
                 done: Arc::new(done),
                 argmax,
                 rows,
+                spec: None,
             };
             let (done, argmax) = (Arc::clone(&step.done), Arc::clone(&step.argmax));
             let rows: Vec<usize> = step.rows.iter().map(|&(_, row)| row).collect();
@@ -6287,6 +6743,10 @@ impl Worker for MetalWorker {
         &mut self,
     ) -> Option<&mut dyn scratchy_serving_engine::spec_decode::SpecDecodeBackend> {
         Some(self as &mut dyn scratchy_serving_engine::spec_decode::SpecDecodeBackend)
+    }
+
+    fn pipelines_speculative_steps(&self) -> bool {
+        self.mtp_drafter.is_some() && self.select_rows_kernel.is_some()
     }
 }
 

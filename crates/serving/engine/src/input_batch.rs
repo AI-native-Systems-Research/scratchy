@@ -644,6 +644,35 @@ impl InputBatch {
         self.step[slot] = StepState::Committed;
     }
 
+    /// Commit a speculative step whose tokens the host does not have yet — its own and every draft
+    /// it keeps, `rows` at most: advance the pool cursor past its `input_token_count` tokens, and
+    /// count `rows` in flight until [`Self::resolve_rows`].
+    pub fn commit_in_flight_rows(&mut self, req_id: &str, input_token_count: usize, rows: usize) {
+        let Some(&slot) = self.req_id_to_slot.get(req_id) else {
+            return;
+        };
+        self.tokens_in_pool[slot] += input_token_count;
+        self.in_flight[slot] += rows;
+        self.step[slot] = StepState::Committed;
+    }
+
+    /// The oldest in-flight speculative step of `req_id`, now on the host: `tokens` of its `rows`.
+    /// Append them to the history; the rows it did not keep leave the pool cursor.
+    pub fn resolve_rows(&mut self, req_id: &str, tokens: &[u32], rows: usize) {
+        let Some(&slot) = self.req_id_to_slot.get(req_id) else {
+            return;
+        };
+        assert!(
+            self.in_flight[slot] >= rows && tokens.len() <= rows,
+            "{req_id}: resolved {} tokens of {rows} rows with {} in flight",
+            tokens.len(),
+            self.in_flight[slot]
+        );
+        self.in_flight[slot] -= rows;
+        self.tokens_in_pool[slot] -= rows - tokens.len();
+        self.generated[slot].extend_from_slice(tokens);
+    }
+
     /// The oldest in-flight token of `req_id`, now on the host: append it to the history.
     pub fn resolve(&mut self, req_id: &str, token: u32) {
         let Some(&slot) = self.req_id_to_slot.get(req_id) else {

@@ -604,9 +604,9 @@ impl EngineCore {
 
     /// Where `sched` stands in the speculative pipeline ([`SpecPipeline`]): behind, when it verifies
     /// drafts of a step still unfinalized — its request holds that step's output placeholders
-    /// beside its own; leading, when the executor pipelines and `sched` is one request that drafts
-    /// with nothing waiting: its next step's drafts are then placeholders, so that step can be
-    /// scheduled now.
+    /// beside its own; leading, when the executor pipelines and `sched` is one greedy request that
+    /// verifies drafts and drafts again, with nothing waiting: its next step's drafts are then
+    /// placeholders, so that step can be scheduled now.
     fn mark_pipeline(&mut self, sched: &mut SchedulerOutput) {
         let mut ids = sched.num_scheduled_tokens.iter();
         let (Some((req_id, &scheduled)), None) = (ids.next(), ids.next()) else {
@@ -620,7 +620,10 @@ impl EngineCore {
         let (Some(drafts), true) = (self.head_drafts, self.pipelines_speculative) else {
             return;
         };
-        if sched.draft_req_ids.contains(req_id)
+        let greedy = request.sampling_params.is_greedy();
+        if greedy
+            && sched.draft_req_ids.contains(req_id)
+            && sched.scheduled_spec_decode_tokens.contains_key(req_id)
             && takes_drafts(&self.scheduler, req_id)
             && self.scheduler.get_request_counts().1 == 0
         {
@@ -1841,11 +1844,12 @@ mod tests {
         }
     }
 
-    /// A drafting step of an executor that pipelines leads: the step scheduled before it is
-    /// finalized verifies its drafts behind it, `k` placeholders; a request arriving meanwhile
-    /// waits for every lead to be finalized. An executor that does not pipeline leads nothing.
+    /// A greedy verify step that drafts, of an executor that pipelines, leads: the step scheduled
+    /// before it is finalized verifies its drafts behind it, `k` placeholders; a request arriving
+    /// meanwhile waits for every lead to be finalized. The prompt step verifies nothing and leads
+    /// nothing; an executor that does not pipeline leads nothing.
     #[test]
-    fn a_drafting_step_leads_the_verify_scheduled_behind_it() {
+    fn a_greedy_verify_step_leads_the_verify_scheduled_behind_it() {
         let config = || EngineCoreConfig {
             async_scheduling: true,
             scheduler_config: SchedulerConfig {
@@ -1865,33 +1869,43 @@ mod tests {
         let request = |id: &str| {
             let params = SamplingParams {
                 max_tokens: Some(50),
+                temperature: 0.0,
                 ..Default::default()
             };
             Request::new(id.to_string(), vec![1, 2, 3, 4], params, 0.0, 0, 0, None)
         };
+        // The prompt step, finalized with the drafts its head made.
+        let prompt = |engine: &mut EngineCore, executor: &mut Box<dyn Executor>| {
+            engine.add_request(request("a"));
+            let prefill = engine.schedule_next().expect("the prompt");
+            assert!(
+                prefill.draft_req_ids.contains("a"),
+                "the prompt step drafts"
+            );
+            assert_eq!(prefill.spec_pipeline, Default::default());
+            let out = executor.execute_model(&prefill).expect("runs");
+            let _ = engine.finalize_step(&prefill, &out);
+            engine.scheduler.set_spec_token_ids("a", vec![7, 8]);
+        };
 
         let plain = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config(), plain);
-        let _executor = engine.take_executor();
-        engine.add_request(request("a"));
-        let prefill = engine.schedule_next().expect("the prompt");
-        assert!(
-            prefill.draft_req_ids.contains("a"),
-            "the prompt step drafts"
-        );
-        assert_eq!(prefill.spec_pipeline, Default::default());
+        let mut executor = engine.take_executor().expect("an executor");
+        prompt(&mut engine, &mut executor);
+        let verify = engine.schedule_next().expect("the first verify");
+        assert_eq!(verify.spec_pipeline, Default::default());
 
         let pipelining = Box::new(NoopExecutor::new(1024).with_pipelining());
         let mut engine = EngineCore::new(config(), pipelining);
         let mut executor = engine.take_executor().expect("an executor");
-        engine.add_request(request("a"));
-        let prefill = engine.schedule_next().expect("the prompt");
-        assert!(prefill.spec_pipeline.leads && !prefill.spec_pipeline.behind);
-        let out = executor.execute_model(&prefill).expect("runs");
-        let r = engine.scheduler.get_request("a").unwrap();
+        prompt(&mut engine, &mut executor);
+        let lead = engine.schedule_next().expect("the first verify");
+        assert_eq!(lead.scheduled_spec_decode_tokens["a"], [7, 8]);
+        assert!(lead.spec_pipeline.leads && !lead.spec_pipeline.behind);
+        let out = executor.execute_model(&lead).expect("runs");
         let verify = engine
             .schedule_next()
-            .expect("scheduled before the prompt is finalized");
+            .expect("scheduled before the lead is finalized");
         assert_eq!(
             verify.num_scheduled_tokens["a"], 3,
             "its token and two drafts"
@@ -1901,7 +1915,7 @@ mod tests {
 
         engine.add_request(request("b"));
         assert!(engine.schedule_next().is_none(), "b waits behind the leads");
-        let _ = engine.finalize_step(&prefill, &out);
+        let _ = engine.finalize_step(&lead, &out);
         assert!(engine.schedule_next().is_none(), "the verify still leads");
         let out = executor.execute_model(&verify).expect("runs");
         let _ = engine.finalize_step(&verify, &out);
