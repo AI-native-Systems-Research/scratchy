@@ -170,6 +170,47 @@ impl std::error::Error for UnrollError {}
 
 // ── Unroller ──────────────────────────────────────────────────────
 
+impl Fuf {
+    /// Rewire every shared attention's cache to the target layer its class reads: a drafter that
+    /// reads its target's KV (`reads_target_kv`) has no KV of its own, and its configs name the
+    /// target's last sliding and last full layer (`target_kv_sliding_layer`,
+    /// `target_kv_full_layer`). Any other KV-touching op in such a model is refused.
+    pub fn read_target_kv(&mut self, model: &crate::config::ModelParams) -> Result<(), String> {
+        let bound = |k: &str| {
+            (model.bounds.get(k).copied()).ok_or_else(|| format!("its config does not name `{k}`"))
+        };
+        let (sliding, full) = (
+            bound("target_kv_sliding_layer")?,
+            bound("target_kv_full_layer")?,
+        );
+        for node in &mut self.nodes {
+            let layer = match node.op {
+                OpKind::SharedSlidingAttention => sliding,
+                OpKind::SharedAttention => full,
+                op => {
+                    let kv = node.inputs.iter().any(|i| {
+                        matches!(i, FufInput::Extern { kind: ExternKind::KvCache, .. })
+                    });
+                    if kv {
+                        return Err(format!("`{}` would touch its own KV, which it has none of", op.as_str()));
+                    }
+                    continue;
+                }
+            };
+            for input in &mut node.inputs {
+                if let FufInput::Extern {
+                    kind: ExternKind::KvCache,
+                    index,
+                } = input
+                {
+                    *index = Some(UnrollIndex(layer));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn unroll(cfg: &Cfg, inferred: &Inferred) -> Result<Fuf, UnrollError> {
     let mut u = Unroller {
         cfg,

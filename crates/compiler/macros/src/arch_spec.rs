@@ -72,6 +72,19 @@ pub struct DeclaredArchSpec {
     /// How a head published apart from its target names its repo: the target's repo id with this
     /// inserted before its last `-`-delimited token (MLX: `org/X-4bit` → `org/X-MTP-4bit`).
     pub drafter_repo_infix: Option<String>,
+    /// A head published as its own checkpoint, with a config of its own (Gemma 4's assistant):
+    /// each config stem's target config, `<arch>/<stem>`. It compiles when that target is selected
+    /// under `spec/mtp`, the target's verify steps carry its drafts, and it drafts for the target's
+    /// architectures. Empty for a head whose config is its target's (the same file).
+    pub head_targets: Vec<(String, String)>,
+    /// The head's attention reads its target's KV (`num_kv_shared_layers`: every layer of it): it
+    /// writes none and has no KV pool of its own; each layer reads the target layer its config's
+    /// overrides name for its class (`target_kv_sliding_layer`, `target_kv_full_layer`).
+    pub reads_target_kv: bool,
+    /// The weights a head borrows from its target (`embed_tokens`, `lm_head`); `None`: both.
+    pub borrows: Option<Vec<String>>,
+    /// Weights at the checkpoint's top level beside the decoder root, as `lm_head` is.
+    pub top_level_weights: Vec<String>,
     pub tie_default: Option<bool>,
     pub bound_defaults: Vec<(String, u64)>,
     /// Float-valued analogue of `bound_defaults` for arch-constant

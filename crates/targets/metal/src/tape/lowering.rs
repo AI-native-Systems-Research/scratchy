@@ -1945,7 +1945,7 @@ fn lower_one(
         }
 
         // ── Token embedding ────────────────────────────────────────
-        I::Embed(Slot(out_slot)) => LoweredCommand {
+        I::Embed(Slot(out_slot), width) => LoweredCommand {
             kernel: KernelId::Embed,
             library: "embed",
             function: pick_specialized_symbol(
@@ -1955,10 +1955,10 @@ fn lower_one(
             ),
             constants: super::kernel_constants::EmbedConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
-                // Embedding-table row stride = residual-stream width =
-                // HIDDEN_SIZE (NOT Q_SIZE — they differ when head_dim !=
-                // hidden/num_heads, e.g. Qwen3.5 head_dim=256).
-                q_size: super::ids::QSize(p.hidden_size as u32),
+                // Embedding-table row stride = the rows the step writes: the residual-stream
+                // width (NOT Q_SIZE — they differ when head_dim != hidden/num_heads, e.g.
+                // Qwen3.5 head_dim=256), or a drafter's target's through its target's table.
+                q_size: super::ids::QSize(width.get()),
             }
             .into_baked(),
             // 1D dispatch over the `bucket_m` tokens; one thread per
@@ -3174,7 +3174,7 @@ fn lower_one(
         //   buffer(0) packed weight   buffer(1) scales   buffer(2) biases
         //   buffer(3) input_ids       buffer(4) out (arena[out_slot])
         // hidden_size rides as `[[function_constant(0)]]`.
-        I::AffineEmbed(Slot(out_slot), AffineGroupSize(group_size), AffineBits(bits)) => {
+        I::AffineEmbed(Slot(out_slot), AffineGroupSize(group_size), AffineBits(bits), width) => {
             let dtype = dequant_dtype_for(p);
             let scale_dtype = scale_dtype_for(p);
             let bits_v = *bits;
@@ -3193,14 +3193,13 @@ fn lower_one(
                  (mlx-community uses gs=64 for every Llama/Qwen/Gemma 4bit); \
                  got gs={gs}"
             );
-            // AffineEmbed reads rows of `hidden_size` (residual-stream
-            // width) — NOT `Q_SIZE` (= num_q_heads * head_dim).
-            // Llama-3.x / Qwen2.5 have hidden==Q_SIZE so the
-            // pre-existing `p.q_size` worked by coincidence;
-            // Qwen3-30B-A3B has hidden=2048, Q_SIZE=4096 — the
-            // wrong width yielded out-of-bounds `gindex` into scales
-            // and garbage embed output (silent, no fault).
-            let hidden_size = p.hidden_size as u32;
+            // AffineEmbed reads rows of the step's width (the residual-stream width, or a
+            // drafter's target's through its target's table) — NOT `Q_SIZE` (= num_q_heads *
+            // head_dim). Llama-3.x / Qwen2.5 have hidden==Q_SIZE so the pre-existing `p.q_size`
+            // worked by coincidence; Qwen3-30B-A3B has hidden=2048, Q_SIZE=4096 — the wrong
+            // width yielded out-of-bounds `gindex` into scales and garbage embed output (silent,
+            // no fault).
+            let hidden_size = width.get();
             // Grid: bits=4 packs 2 codes/byte (hidden/2 threads), bits=8
             // packs 1 code/byte (hidden threads) — one thread per packed
             // byte. bits=3 packs 8 codes per 3 bytes — one thread per
@@ -3427,6 +3426,9 @@ fn lower_one(
                 rd / 2
             };
             let n_q_heads = p.num_q_heads;
+            let query_only = *write == KvWrite::None;
+            // The query alone binds its slot, the rotary table and the positions.
+            let bound = |b: &Binding| !query_only || matches!(b.index(), 0 | 3 | 4);
             LoweredCommand {
                 kernel: KernelId::RopeAppend,
                 library: "rope",
@@ -3447,6 +3449,7 @@ fn lower_one(
                     // for flagged blocks). None → byte-identical when off.
                     rope_on_read: if p.rope_on_read { Some(1) } else { None },
                     tq: codec.as_ref().map(|(c, _)| *c),
+                    query_only,
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3467,6 +3470,7 @@ fn lower_one(
                         layer: super::ids::LayerId(*layer + layer_offset),
                     })
                     .into_iter()
+                    .filter(bound)
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
@@ -11268,6 +11272,7 @@ mod tests {
             /*out_slot=*/ Slot(0),
             AffineGroupSize(64),
             AffineBits(4),
+            crate::tape::lowered::ActivationWidth::of_cols(2048),
         );
         let bucket_m = 32u32;
         let mut scratch = 0u32;
@@ -11299,7 +11304,7 @@ mod tests {
         // TestParams pins Bf16; group_size=64 → bf16 / s_f16 / gs_64 symbol.
         assert_eq!(cmd.function, "affine_embed_bf16_s_f16_gs_64_b_4");
 
-        // function_constant(0) = hidden_size = p.hidden_size = 2048.
+        // function_constant(0) = hidden_size = the step's width = 2048.
         assert_eq!(cmd.constants, vec![ConstantValue::uint(0, 2048)]);
 
         // 2D dispatch: (HIDDEN_SIZE/2 / THREADS_PER_GROUP, bucket_m, 1).

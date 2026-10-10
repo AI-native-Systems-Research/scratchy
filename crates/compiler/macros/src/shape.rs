@@ -404,6 +404,25 @@ pub fn apply_signature_with_geometry(
         OpKind::SinkSlidingAttention => {
             sig_sink_attention(solver, inputs, op, hybrid_attention_geometry)
         }
+        // RoPE on a query alone: shape-preserving on q.
+        OpKind::RopeQuery => {
+            expect_args(op, inputs, 3)?;
+            Ok(OpSig {
+                output: inputs[0].clone(),
+            })
+        }
+        // Attention over the cache's KV alone: the query's per-class heads layout, as
+        // `attention`'s; no k/v of the step's.
+        OpKind::SharedAttention | OpKind::SharedSlidingAttention => {
+            sig_shared_attention(solver, inputs, op, hybrid_attention_geometry)
+        }
+        // The exported hidden state: identity.
+        OpKind::ExportHidden => {
+            expect_args(op, inputs, 1)?;
+            Ok(OpSig {
+                output: inputs[0].clone(),
+            })
+        }
         // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
         // No heads-layout anchoring — vision shapes are pinned at
         // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
@@ -521,7 +540,7 @@ pub fn apply_signature_with_geometry(
 /// `embed(ids: [..ids.shape], table: [rows, hidden_size])` → `[..ids.shape, hidden_size]`. The
 /// table's rows are its own — `vocab_size`, or a draft head's `embed_vocab_size` (it embeds every
 /// token of a vocabulary its logits only cover a prefix of): no output dim reads them.
-fn sig_embed(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+fn sig_embed(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
     expect_args(OpKind::Embed, inputs, 2)?;
     let ids = &inputs[0];
     let table = &inputs[1];
@@ -531,9 +550,10 @@ fn sig_embed(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError>
             reason: format!("embed weight must have rank 2, got {}", table.len()),
         });
     }
-    solver.unify(&table[1], &Dim::Bound("hidden_size".into()))?;
+    // The row width is the table's: the model's own embedding's is its `hidden_size` (weights.json
+    // anchors it), a drafter's of its target's embedding its target's.
     let mut output = ids.clone();
-    output.push(Dim::Bound("hidden_size".into()));
+    output.push(table[1].clone());
     Ok(OpSig { output })
 }
 
@@ -735,6 +755,28 @@ fn sig_attention(
         solver.unify(v.last().unwrap(), &kv_heads)?;
     }
     Ok(OpSig { output: q.clone() })
+}
+
+/// `shared_attention(q, kv_cache, block_table)` /
+/// `shared_sliding_attention(q, kv_cache, block_table)` → `[.., num_attention_heads * head_dim]`:
+/// [`sig_attention`]'s query constraint for the same class, without the step's k/v.
+fn sig_shared_attention(
+    solver: &mut Solver,
+    inputs: &[Shape],
+    op: OpKind,
+    hybrid_attention_geometry: bool,
+) -> Result<OpSig, ShapeError> {
+    expect_args(op, inputs, 3)?;
+    let class = match op {
+        OpKind::SharedSlidingAttention => OpKind::SlidingAttention,
+        _ => OpKind::Attention,
+    };
+    sig_attention(
+        solver,
+        &[inputs[0].clone(), Shape::default(), Shape::default()],
+        class,
+        hybrid_attention_geometry,
+    )
 }
 
 /// `sink_attention(q, k, v, sinks, kv_cache, block_table)` (6-arg,
@@ -1162,6 +1204,10 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // sinks weight (dense tensor — the sig unifies its dim).
         OpKind::SinkAttention => &[(3, 1)],
         OpKind::SinkSlidingAttention => &[(3, 1)],
+        OpKind::RopeQuery => &[],
+        OpKind::SharedAttention => &[],
+        OpKind::SharedSlidingAttention => &[],
+        OpKind::ExportHidden => &[],
         OpKind::VarlenAttention => &[],
         OpKind::Silu => &[],
         OpKind::Gelu => &[],
@@ -1299,10 +1345,10 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
             Dim::Bound("num_tokens".into()),
             Dim::Bound("vision_embed_dim".into()),
         ],
-        // A target model's final hidden states: one residual-width row per token.
+        // A target model's final hidden states: one row per token of the target's residual width.
         ExternKind::TargetHidden => vec![
             Dim::Bound("num_tokens".into()),
-            Dim::Bound("hidden_size".into()),
+            Dim::Bound("backbone_hidden_size".into()),
         ],
     }
 }

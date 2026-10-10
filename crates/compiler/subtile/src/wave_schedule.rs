@@ -275,6 +275,7 @@ mod tests {
                 op(vec![InputRef::Op(1), InputRef::Op(2)]),
             ],
             result: 3,
+            exported: None,
         };
         assert_eq!(wave_levels(&input), vec![0, 1, 1, 2]);
     }
@@ -289,6 +290,7 @@ mod tests {
                 op(vec![InputRef::Op(1)]),
             ],
             result: 2,
+            exported: None,
         };
         assert_eq!(wave_levels(&input), vec![0, 1, 2]);
     }
@@ -312,6 +314,7 @@ mod tests {
             input: LoweringInput {
                 sources: vec![],
                 result: n - 1,
+                exported: None,
                 ops,
             },
             bindings: vec![],

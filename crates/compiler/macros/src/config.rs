@@ -603,6 +603,11 @@ fn load_dir_mode(
         Ok(same)
     };
     let target_selected = |head_path: &Path| -> Result<bool, ConfigError> {
+        let stem = head_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| s == stem) {
+            let (arch, stem) = target.split_once('/').unwrap_or_default();
+            return Ok(model_feature_enabled(arch, stem));
+        }
         Ok(same_file_elsewhere(head_path)?
             .iter()
             .any(|(arch, config)| {
@@ -618,6 +623,33 @@ fn load_dir_mode(
             let head = load_arch_json(config.parent().expect("a config lies in its arch's dir"))?;
             let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
             if let (false, Some(&(_, drafts))) = (head.hf_architectures.is_empty(), drafts) {
+                return Ok(Some(drafts));
+            }
+        }
+        // A head with a config of its own names this one its target (`head_targets`) — when that
+        // head is selected, which it is with its target under `spec/mtp`.
+        let this = format!("{arch_name}/{}", stem_of(target_path)?);
+        let configs = dir
+            .parent()
+            .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
+        for arch_dir in fs::read_dir(configs).map_err(|source| ConfigError::Io {
+            path: configs.to_path_buf(),
+            source,
+        })? {
+            let arch_dir = arch_dir
+                .map_err(|source| ConfigError::Io {
+                    path: configs.to_path_buf(),
+                    source,
+                })?
+                .path();
+            if !arch_dir.is_dir() {
+                continue;
+            }
+            let head = load_arch_json(&arch_dir)?;
+            let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
+            if let (true, Some(&(_, drafts))) =
+                (head.head_targets.iter().any(|(_, t)| *t == this), drafts)
+            {
                 return Ok(Some(drafts));
             }
         }
@@ -1405,6 +1437,24 @@ fn parse_name(source_stem: &str, source_path: &Path) -> Result<String, ConfigErr
     })
 }
 
+/// The architectures a head drafts for: its target config's, named by its arch's `head_targets`
+/// when it has a config of its own; else its config's own (it is its target's, verbatim).
+fn head_drafts_for(
+    spec: &crate::arch_spec::DeclaredArchSpec,
+    json: &serde_json::Value,
+    source_stem: &str,
+    source_path: &Path,
+) -> Result<Vec<String>, ConfigError> {
+    let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| s == source_stem) else {
+        return Ok(parse_architectures(json));
+    };
+    let configs = (source_path.parent().and_then(Path::parent))
+        .ok_or_else(|| ConfigError::NotADirectory(source_path.to_path_buf()))?;
+    let path = configs.join(format!("{target}.json"));
+    let (_, target_json) = read_json_file(&path)?;
+    Ok(parse_architectures(&target_json))
+}
+
 fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
     json.get("architectures")
         .and_then(|v| v.as_array())
@@ -1589,7 +1639,7 @@ fn model_params_from_json(
     // identity it declares, not the architecture its (the whole checkpoint's) config names.
     let (architectures, drafts_for) = match spec.hf_architectures.is_empty() {
         true => (parse_architectures(json), Vec::new()),
-        false => (spec.hf_architectures.clone(), parse_architectures(json)),
+        false => (spec.hf_architectures.clone(), head_drafts_for(spec, json, source_stem, source_path)?),
     };
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
@@ -1858,6 +1908,22 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     }
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
+    spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
+    spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
+    let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
+        json.get(key)
+            .map(|v| {
+                (v.as_array())
+                    .and_then(|a| a.iter().map(|s| s.as_str().map(str::to_string)).collect())
+                    .ok_or_else(|| ConfigError::ArchJson {
+                        path: path.clone(),
+                        reason: format!("`{key}` must be an array of strings"),
+                    })
+            })
+            .transpose()
+    };
+    spec.borrows = strings("borrows")?;
+    spec.top_level_weights = strings("top_level_weights")?.unwrap_or_default();
 
     if let Some(s) = as_str("vision_rope_style") {
         check_enum(
@@ -1906,6 +1972,10 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "decoder_safetensors_root",
     "hf_architectures",
     "drafter_repo_infix",
+    "head_targets",
+    "reads_target_kv",
+    "borrows",
+    "top_level_weights",
     "scale_dtype",
     "tie_default",
     "bound_defaults",
@@ -2668,6 +2738,13 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
 /// here — they are `bound_defaults` / `tie_default` declarations on
 /// the owning crate's `#[forward]` attribute (see [`crate::arch_spec`]).
 fn apply_generic_bound_defaults(bounds: &mut BTreeMap<String, u64>) {
+    // A drafter reading its target's hidden states and embedding reads them at its target's
+    // residual width (Gemma 4's assistant declares it); a head of its target's width omits it.
+    if !bounds.contains_key("backbone_hidden_size")
+        && let Some(&h) = bounds.get("hidden_size")
+    {
+        bounds.insert("backbone_hidden_size".to_string(), h);
+    }
     // Per-class attention geometry defaults: uniform-geometry arches
     // never declare global_* keys, but the shape sigs anchor the
     // `attention()` (global-class) tile to `global_head_dim` /

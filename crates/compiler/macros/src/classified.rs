@@ -259,6 +259,19 @@ pub enum OpKind {
     /// exactly as [`Self::SlidingAttention`] relates to
     /// [`Self::Attention`].
     SinkSlidingAttention,
+    /// RoPE on a query alone, at the row's position: `rope_query(q, positions, rotary)`. A model
+    /// that appends no K/V of its own (a drafter reading its target's KV) ropes its query apart.
+    RopeQuery,
+    /// `shared_attention(q, kv_cache[layer], block_table)`: [`Self::Attention`] over the cache's
+    /// KV alone — the step appends none, so every key is one the cache holds, up to the row's used
+    /// length. A drafter reads its target's KV with it (the target layer its class reads).
+    SharedAttention,
+    /// [`Self::SharedAttention`] at a sliding-window layer, as [`Self::SlidingAttention`] relates
+    /// to [`Self::Attention`].
+    SharedSlidingAttention,
+    /// `export_hidden(x)`: the hidden state the forward exports for a reader after it (an MTP
+    /// drafter's next draft), in place of the final matmul's input.
+    ExportHidden,
     /// Variable-length attention used by vision encoders (Qwen2-VL,
     /// Qwen2.5-VL, ViT-style towers). Same q/k/v shape as `Attention`
     /// but with a `cu_seqlens` ragged-batch index instead of a paged
@@ -574,6 +587,10 @@ impl OpKind {
             "sliding_attention" => Some(Self::SlidingAttention),
             "sink_attention" => Some(Self::SinkAttention),
             "sink_sliding_attention" => Some(Self::SinkSlidingAttention),
+            "rope_query" => Some(Self::RopeQuery),
+            "shared_attention" => Some(Self::SharedAttention),
+            "shared_sliding_attention" => Some(Self::SharedSlidingAttention),
+            "export_hidden" => Some(Self::ExportHidden),
             // Vision-tower ops. Unambiguous names: the four below are
             // unused on the decoder side, so the lookup is shared with
             // the decoder prelude — a `#[forward]` body that wrote
@@ -631,6 +648,10 @@ impl OpKind {
             Self::SlidingAttention => "sliding_attention",
             Self::SinkAttention => "sink_attention",
             Self::SinkSlidingAttention => "sink_sliding_attention",
+            Self::RopeQuery => "rope_query",
+            Self::SharedAttention => "shared_attention",
+            Self::SharedSlidingAttention => "shared_sliding_attention",
+            Self::ExportHidden => "export_hidden",
             Self::VarlenAttention => "varlen_attention",
             Self::Silu => "silu",
             Self::Gelu => "gelu",

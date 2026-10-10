@@ -57,6 +57,9 @@ pub struct LentActivation {
     pub scratch: Vec<Buffer>,
     /// A TurboQuant pool's fp16 scratch, staged through by a borrower of the same geometry.
     pub tq_scratch: Option<super::runtime::TqScratch>,
+    /// The lender's whole TurboQuant runtime — its packed KV stores, codebook and scratch: a
+    /// borrower that reads the lender's KV (an MTP head with none of its own) binds them.
+    pub tq: Option<super::runtime::TqRuntimeBuffers>,
 }
 
 /// One unit of execution in a bucket's plan.
@@ -304,6 +307,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             arena,
             scratch,
             tq_scratch: None,
+            tq: None,
         }
     }
 

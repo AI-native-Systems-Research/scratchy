@@ -1034,6 +1034,13 @@ pub fn compile_carrier(
                 syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
             })?;
             model_fuf.annotate_storage_formats(&model_prog, model);
+            // A drafter reading its target's KV reads, at every layer, the target layer its class
+            // reads: its configs name them.
+            if model.arch.reads_target_kv {
+                model_fuf.read_target_kv(model).map_err(|e| {
+                    syn::Error::new(args.span, format!("target KV [{}]: {e}", model.source_stem))
+                })?;
+            }
             // Tensor-parallel lowering pass. At tp=1 (every existing
             // SolvedModel until task #7's canonical fanout lands) this is
             // a strict no-op — the FUF flowing into the solver is
@@ -1852,6 +1859,7 @@ pub fn compile_carrier(
             Vec<String>,
             Option<String>,
             [u64; 2],
+            bool,
         );
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
@@ -1869,7 +1877,15 @@ pub fn compile_carrier(
                     .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0));
                 (
                     sm.mod_name.clone(),
-                    (reads, lent, vocab, drafts_for.clone(), infix.clone(), spec),
+                    (
+                        reads,
+                        lent,
+                        vocab,
+                        drafts_for.clone(),
+                        infix.clone(),
+                        spec,
+                        sm.model.arch.reads_target_kv,
+                    ),
                 )
             })
             .collect();
@@ -1919,12 +1935,13 @@ pub fn compile_carrier(
                 &'a [String],
                 &'a Option<String>,
                 [u64; 2],
+                bool,
             );
             let heads: Vec<Head<'_>> = head_facts
                 .values()
                 .filter(|(reads, ..)| *reads)
-                .map(|(_, lent, vocab, drafts_for, infix, spec)| {
-                    (lent, *vocab, &drafts_for[..], infix, *spec)
+                .map(|(_, lent, vocab, drafts_for, infix, spec, kv)| {
+                    (lent, *vocab, &drafts_for[..], infix, *spec, *kv)
                 })
                 .collect();
             match heads.first() {
@@ -1936,13 +1953,17 @@ pub fn compile_carrier(
                          how many lm_head rows they read, whose head they are or how many tokens \
                          they draft ({heads:?}); a loader must know them before the head loads"
                     );
-                    let ([Some(embed_tokens), Some(lm_head)], vocab, drafts_for, infix, spec) =
+                    let ([Some(embed_tokens), lm_head], vocab, drafts_for, infix, spec, kv) =
                         first
                     else {
                         panic!(
                             "{arch_ident}: a head reading `target_hidden` must name embed_tokens \
-                             and lm_head (it has {first:?})"
+                             (it has {first:?})"
                         );
+                    };
+                    let lm_head = match lm_head {
+                        Some(lm_head) => quote! { ::core::option::Option::Some(#lm_head) },
+                        None => quote! { ::core::option::Option::None },
                     };
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*vocab as u32);
                     let [drafts, max_seqs] =
@@ -1956,6 +1977,7 @@ pub fn compile_carrier(
                             embed_tokens: #embed_tokens,
                             lm_head: #lm_head,
                             lm_head_rows: #lm_head_rows,
+                            reads_target_kv: #kv,
                             drafts_for: &[#(#drafts_for),*],
                             repo_infix: #infix,
                             drafts: #drafts,

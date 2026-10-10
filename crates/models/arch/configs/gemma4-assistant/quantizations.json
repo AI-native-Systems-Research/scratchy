@@ -1,0 +1,6 @@
+{
+  "_comment": "The MLX preset compiles a drafter for an MLX target. The QAT drafter's MLX conversion (mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit) is 4-bit throughout, the embedding its target lends included; Google's bf16 drafter keeps its own weights dense under it, only the lent embedding the target's 4-bit triple (that stem's preset overrides).",
+  "quantizations": [
+    "mlx-affine-b4-g64"
+  ]
+}

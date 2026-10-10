@@ -30,6 +30,7 @@ use super::lowered::RuntimeBindingKind;
 /// for the worker's largest bucket; the worker itself only borrows.
 /// TurboQuant per-forward buffers (packed canonical KV stores + codebook).
 /// `packed_*`/`norms_*` are `[num_layers]`; codebook buffers are shared.
+#[derive(Clone)]
 pub struct TqRuntimeBuffers {
     pub packed_k: Vec<Buffer>,
     pub packed_v: Vec<Buffer>,

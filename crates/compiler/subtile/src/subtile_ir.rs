@@ -3107,6 +3107,7 @@ mod tests {
     fn tiled_elementwise_depends_on_matching_block() {
         let (m, n, k) = (1u32, 6u32, 8u32);
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: m, cols: k },
                 SourceShape { rows: n, cols: k },
@@ -3151,6 +3152,7 @@ mod tests {
     fn silu_mul_nblock_aligns_with_two_gemms() {
         let (m, k, n) = (1u32, 4u32, 6u32);
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: m, cols: k }, // 0: x  [m, k]
                 SourceShape { rows: k, cols: n }, // 1: Wg [k, n] (gate)
@@ -3213,6 +3215,7 @@ mod tests {
     fn decompose_rmsnorm_rewrites_into_reduce_plus_apply_chunks() {
         let (m, k) = (1u32, 6u32);
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: m, cols: k }, // 0: x     [m, k]
                 SourceShape { rows: 1, cols: k }, // 1: gamma [1, k]
@@ -3292,6 +3295,7 @@ mod tests {
         let (m, hd, hq, h) = (1u32, 2u32, 4u32, 4u32);
         let qdim = hq * hd; // 8
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: m, cols: h }, // 0: x  [m, h]
                 SourceShape {
@@ -3362,6 +3366,7 @@ mod tests {
         let kvdim = hkv * hd; // = qdim (hq * hd) = 4
         let scale = 0.5f32;
         let input = crate::lower::LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: m, cols: hd }, // 0: q   [m, qdim]
                 SourceShape {

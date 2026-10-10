@@ -50,6 +50,7 @@ arch-qwen3 = []
 arch-qwen3-5 = []
 arch-qwen3-5-moe = []
 arch-qwen3-5-mtp = []
+arch-gemma4-assistant = []
 arch-qwen3-5-vl = ["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3-moe = []
 
@@ -87,6 +88,7 @@ all-arches = [
     "arch-qwen3-5",
     "arch-qwen3-5-moe",
     "arch-qwen3-5-mtp",
+    "arch-gemma4-assistant",
     "arch-qwen3-5-vl",
     "arch-qwen3-moe",
 ]
@@ -313,6 +315,10 @@ all-arches = [
 # qwen3-5-mtp (1 config)
 "qwen3.6-35b-a3b-mtp" = ["arch-qwen3-5-mtp"]
 
+# gemma4-assistant (2 configs)
+"gemma-4-26b-a4b-it-assistant" = ["arch-gemma4-assistant"]
+"gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant" = ["arch-gemma4-assistant"]
+
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
 "qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
@@ -523,6 +529,10 @@ all-arches = [
 "qwen3-5-mtp" = [
     "qwen3.6-35b-a3b-mtp",
 ]
+"gemma4-assistant" = [
+    "gemma-4-26b-a4b-it-assistant",
+    "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
+]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
@@ -676,6 +686,8 @@ all = [
     "qwen3.5-35b-a3b-parity-tiny",
     "qwen3.6-35b-a3b",
     "qwen3.6-35b-a3b-mtp",
+    "gemma-4-26b-a4b-it-assistant",
+    "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
@@ -701,7 +713,7 @@ all = [
 # file — a head's config is its target's). Reached as `spec/mtp` from
 # scratchy-cli through scratchy-spec (crates/models/spec), which forwards
 # here: like quant scope, it needs its own crate for its own CLI alias.
-mtp = ["arch-qwen3-5-mtp"]
+mtp = ["arch-qwen3-5-mtp", "arch-gemma4-assistant"]
 
 # Backends — ONE definition each (this is what kills the per-arch duplication).
 # The build-dep pipeline lib gets the backend so its emit matches; the runtime

@@ -1520,6 +1520,7 @@ impl MetalWorker {
                 drafts: usize::from(head.drafts),
                 max_seqs: usize::from(head.max_seqs),
                 max_model_len: self.max_model_len(),
+                reads_target_kv: head.reads_target_kv,
             });
             let (Some(target), Some(refs)) =
                 (self.model.as_deref(), self.target_tensor_refs.as_ref())
@@ -1528,18 +1529,20 @@ impl MetalWorker {
                     "MTP head: the target must load first (its weight refs lend the head)".into(),
                 ));
             };
-            for w in scratchy_forward_compiler::LentWeight::ALL {
+            let borrowed = scratchy_forward_compiler::LentWeight::ALL
+                .into_iter()
+                .filter_map(|w| head.prefix(w).map(|to| (w, to)));
+            for (w, to) in borrowed {
                 let from = target.lent_weight_prefix(w).ok_or_else(|| {
                     ExecutorError::WorkerInit(format!("MTP head: the target has no {w:?} to lend"))
                 })?;
                 let lent = draft_weights
-                    .lend(refs, from, head.prefix(w), head.rows(w))
+                    .lend(refs, from, to, head.rows(w))
                     .map_err(|e| {
                         ExecutorError::WorkerInit(format!("MTP head: lending {w:?}: {e}"))
                     })?;
                 info!(
-                    "ScratchyWorker(metal): MTP head lent the target's {w:?} ({lent} tensors, {from} → {})",
-                    head.prefix(w)
+                    "ScratchyWorker(metal): MTP head lent the target's {w:?} ({lent} tensors, {from} → {to})"
                 );
             }
         }
@@ -1728,7 +1731,9 @@ impl MetalWorker {
         let model = (self.draft_model.as_deref()).ok_or_else(|| fail("no head"))?;
         let device = (self.gpu_device.as_ref()).ok_or_else(|| fail("no device"))?;
         let rope_bytes = model.metal_rope_rows(&[0]).map_or(0, |row| row.len());
-        let layout = ChainLayout::of(passes, model.hidden_size() as usize, rope_bytes);
+        // A head's hidden rows, read and exported, are its target's width.
+        let target = (self.model.as_deref()).ok_or_else(|| fail("no target"))?;
+        let layout = ChainLayout::of(passes, target.hidden_size() as usize, rope_bytes);
         let buffer = free_chain_buffer(
             &mut self.mtp_chain_buffers,
             &device.device,
@@ -1752,11 +1757,16 @@ impl MetalWorker {
         &self,
         positions: &[u32],
         used: &[u32],
-        block_ids: &[Vec<usize>],
-        block_size: usize,
+        blocks: StepBlocks<'_>,
         passes: Option<&::scratchy_serving_engine::spec_decode::HeadPasses>,
         req_ids: &[String],
     ) -> ExecutorResult<Vec<scratchy_target_metal::select_rows::Selection>> {
+        let StepBlocks {
+            full: block_ids,
+            full_block_size: block_size,
+            sliding,
+            sliding_block_size,
+        } = blocks;
         use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
         use scratchy_target_metal::select_rows::{SelectFrom, SelectInto, Selection};
         let fail = |what: &str| {
@@ -1789,6 +1799,17 @@ impl MetalWorker {
             (block_ids[0].get(p / bs)).map_or(u32::MAX, |&b| (b * bs + p % bs) as u32)
         };
         let slots = variants(&|d| positions.iter().map(|&p| slot(p - d)).collect());
+        // Each sliding KV group's slots (gemma4 SWA), in its own blocks at the sliding block size.
+        let sliding_slots: Vec<Vec<u32>> = (sliding.iter())
+            .map(|group| {
+                let bs = sliding_block_size;
+                let slot = |p: u32| -> u32 {
+                    let p = p as usize;
+                    (group[0].get(p / bs)).map_or(u32::MAX, |&b| (b * bs + p % bs) as u32)
+                };
+                variants(&|d| positions.iter().map(|&p| slot(p - d)).collect())
+            })
+            .collect();
         let useds = variants(&|d| vec![used[0] - d]);
         let shifted = variants(&|d| positions.iter().map(|&p| p - d).collect());
         // Rope rows over the window `k` positions before the first row's through its last: kept
@@ -1835,6 +1856,11 @@ impl MetalWorker {
             ),
             table(useds.clone(), 1, 1, SelectInto::Input(Into::SeqUsedK), 0),
         ];
+        for (n, slots) in sliding_slots.into_iter().enumerate() {
+            let n = u8::try_from(n).map_err(|_| fail("more sliding KV groups than fit a u8"))?;
+            let into = SelectInto::Input(Into::SlidingSlotMapping(n));
+            out.push(table(slots, rows, rows, into, first * 4));
+        }
         out.push(match rope(model.metal_rope_rows(&window)) {
             Some((words, row)) => table(
                 words,
@@ -1873,12 +1899,23 @@ impl MetalWorker {
             to: to(),
             at: at(ChainLayout::DRAFTED) + first * 4,
         });
+        // A head reading its target's KV writes none, its query one past the row it reads.
+        let target_kv = self.head_reads_target_kv();
+        let (slots, shifted) = match target_kv {
+            true => (
+                vec![u32::MAX; slots.len()],
+                shifted.iter().map(|p| p + 1).collect(),
+            ),
+            false => (slots, shifted),
+        };
+        let head_window: Vec<u32> = window.iter().map(|p| p + u32::from(target_kv)).collect();
         out.push(table(slots, rows, rows, to(), at(ChainLayout::ONE_SLOTS)));
         out.push(table(useds, 1, 1, to(), at(ChainLayout::ONE_USED)));
-        out.push(match rope(head.metal_rope_rows(&window)) {
+        out.push(match rope(head.metal_rope_rows(&head_window)) {
             Some((words, row)) => table(words, row, rows * row, to(), at(ChainLayout::ONE_ROPE)),
             None => table(shifted, rows, rows, to(), at(ChainLayout::ONE_POSITIONS)),
         });
+        let next_slot = |p: u32| if target_kv { u32::MAX } else { slot(p) };
         // The chain's next-pass tables: each pass's `[position, slot, used]` per kept count of this
         // step, the step `k - a` positions earlier (the last pass's zeros stay).
         let next = |d: u32| -> Vec<Vec<u32>> {
@@ -1887,7 +1924,7 @@ impl MetalWorker {
                     (pass.as_chunks::<3>().0.iter())
                         .flat_map(|&e| match e {
                             [0, 0, 0] => [0; 3],
-                            [p, _, u] => [p - d, slot(p - d), u - d],
+                            [p, _, u] => [p - d, next_slot(p - d), u - d],
                         })
                         .collect()
                 })
@@ -2154,7 +2191,16 @@ impl MetalWorker {
         );
     }
 
+    /// The MTP head reads its target's KV and has none of its own (Gemma 4's assistant).
+    fn head_reads_target_kv(&self) -> bool {
+        (self.mtp_drafter.as_ref()).is_some_and(|d| d.reads_target_kv)
+    }
+
     fn initialize_draft_cache_metal(&mut self, num_gpu_blocks: usize) -> ExecutorResult<()> {
+        // A head reading its target's KV has no pool: its forwards run on the target's.
+        if self.head_reads_target_kv() {
+            return Ok(());
+        }
         let model = self.draft_model.as_ref().ok_or_else(|| {
             ExecutorError::WorkerInit(
                 "initialize_draft_cache_metal called before draft_model load".into(),
@@ -3184,18 +3230,27 @@ impl MetalWorker {
                 let (layout, buffer, behind) = match self.pending_chain.take() {
                     Some((layout, buffer, behind)) => (layout, Some(buffer), behind),
                     None => {
-                        let layout =
-                            ChainLayout::of(passes, model.hidden_size() as usize, rope_bytes);
-                        (layout, None, false)
+                        let target = (self.model.as_deref())
+                            .ok_or_else(|| BackendError::Backend("target not loaded".into()))?;
+                        let width = target.hidden_size() as usize;
+                        (ChainLayout::of(passes, width, rope_bytes), None, false)
                     }
+                };
+                // A head reading its target's KV runs on the target's pool, reading each layer's
+                // group's table of the step's.
+                let reads_target_kv = (self.mtp_drafter.as_ref()).is_some_and(|d| d.reads_target_kv);
+                let (kv_cache, sliding) = match reads_target_kv {
+                    true => (self.kv_cache.as_ref(), StepTables::of(req)),
+                    false => (self.draft_kv_cache.as_ref(), StepTables::default()),
                 };
                 Some(HeadPassesEncoder {
                     passes,
                     model,
                     target: (self.model.as_deref())
                         .ok_or_else(|| BackendError::Backend("target not loaded".into()))?,
-                    kv_cache: (self.draft_kv_cache.as_ref())
+                    kv_cache: kv_cache
                         .ok_or_else(|| BackendError::Backend("MTP head kv_cache missing".into()))?,
+                    sliding,
                     argmax_kernels: (self.draft_argmax_kernels.as_ref()).ok_or_else(|| {
                         BackendError::Backend("draft argmax_kernels not built".into())
                     })?,
@@ -3691,6 +3746,8 @@ struct HeadPassesEncoder<'a> {
     /// The target whose command buffer the passes ride, whose buffers the head's pool is built in.
     target: &'a dyn scratchy_forward_compiler::ScratchyWeights,
     kv_cache: &'a KvCachePool,
+    /// The step's sliding KV groups' tables, when the head reads its target's KV.
+    sliding: StepTables,
     argmax_kernels: &'a scratchy_target_metal::argmax::ArgmaxKernels,
     chain_kernel: Option<&'a scratchy_target_metal::mtp_chain::MtpChainKernel>,
     /// The buffer the chain's [`ChainLayout`] lays out; `None` without a chain.
@@ -3741,7 +3798,11 @@ impl<'a> HeadPassesEncoder<'a> {
         let device_inputs: Vec<DeviceInput> = (token_inputs.chain(hidden_inputs))
             .chain(picked.into_iter().flatten())
             .collect();
-        let req = one.request();
+        let mut req = one.request();
+        let (tables, slots) = self.sliding.rows(&one.steps, req.num_tokens);
+        let (table_refs, slot_refs) = (refs(&tables), refs(&slots));
+        req.sliding_block_tables = &table_refs;
+        req.sliding_slot_mappings = &slot_refs;
         let ctx = head_ctx(self.kv_cache, &req, &device_inputs, one.has_spec_tokens);
         let n = req.num_tokens as u64;
         // The head's pool is built at its first forward, in the target's buffers: the target's own
@@ -3766,7 +3827,11 @@ impl<'a> HeadPassesEncoder<'a> {
             .chain_kernel
             .ok_or("an MTP head without its chain kernel")?;
         let layout = &self.layout;
-        let creq = chain.request();
+        let mut creq = chain.request();
+        let (ctables, cslots) = self.sliding.rows(chain.steps(), creq.num_tokens);
+        let (ctable_refs, cslot_refs) = (refs(&ctables), refs(&cslots));
+        creq.sliding_block_tables = &ctable_refs;
+        creq.sliding_slot_mappings = &cslot_refs;
         let n = layout.n;
         // An MRoPE head reads its rope rows in place of positions, which index them.
         let position = match layout.rope_bytes {
@@ -3874,6 +3939,53 @@ impl<'a> HeadPassesEncoder<'a> {
 
 /// An MTP head forward's context over `req` on its KV cache, its `device_inputs` landing over the
 /// host's.
+/// A step's block ids by KV group: the full group's at its (page-unified) block size, and each
+/// sliding group's (gemma4 SWA) at the sliding one.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+struct StepBlocks<'a> {
+    full: &'a [Vec<usize>],
+    full_block_size: usize,
+    sliding: &'a [Vec<Vec<usize>>],
+    sliding_block_size: usize,
+}
+
+/// A step's sliding KV groups' block tables (gemma4 SWA), for a head that reads its target's KV:
+/// per group, `seqs` rows of `stride` entries.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct StepTables {
+    groups: Vec<Vec<u32>>,
+    stride: usize,
+}
+
+#[cfg(feature = "metal")]
+impl StepTables {
+    fn of(req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>) -> Self {
+        Self {
+            groups: req.sliding_block_tables.iter().map(|t| t.to_vec()).collect(),
+            stride: req.block_table_stride,
+        }
+    }
+
+    /// Each group's table rows of the step's sequences `steps`, and a slot mapping of `tokens`
+    /// sentinels per group: the head writes no KV.
+    fn rows(&self, steps: &[usize], tokens: usize) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        let stride = self.stride;
+        let tables = (self.groups.iter())
+            .map(|g| (steps.iter()).flat_map(|&i| g[i * stride..][..stride].to_vec()).collect())
+            .collect();
+        let slots = self.groups.iter().map(|_| vec![u32::MAX; tokens]).collect();
+        (tables, slots)
+    }
+}
+
+/// Borrowed slices of `v`'s vectors.
+#[cfg(feature = "metal")]
+fn refs(v: &[Vec<u32>]) -> Vec<&[u32]> {
+    v.iter().map(Vec::as_slice).collect()
+}
+
 #[cfg(feature = "metal")]
 fn head_ctx<'c>(
     kv_cache: &'c KvCachePool,
@@ -3897,8 +4009,13 @@ fn head_ctx<'c>(
         seqused_k: view(req.seqused_k, &[num_seqs]),
         span_ids: None,
         block_table: view(req.block_table, &[num_seqs, req.block_table_stride]),
-        sliding_slot_mappings: Vec::new(),
-        sliding_block_tables: Vec::new(),
+        // A head reading its target's KV reads each layer's group's table (gemma4 SWA).
+        sliding_slot_mappings: (req.sliding_slot_mappings.iter())
+            .map(|s| view(s, &[n]))
+            .collect(),
+        sliding_block_tables: (req.sliding_block_tables.iter())
+            .map(|t| view(t, &[num_seqs, req.block_table_stride]))
+            .collect(),
         max_seqlen_q: req.max_seqlen_q,
         max_seqlen_k: req.max_seqlen_k,
         kv_cache,
@@ -5117,7 +5234,8 @@ impl Worker for MetalWorker {
         let reach = match self.model.as_deref() {
             Some(target) if target.per_layer_kv_token_elems().is_none() => {
                 let draft = self.draft_model.as_deref();
-                let draft_pb = draft.map_or(0, |d| draft_block_bytes(d, bs, self.draft_scratch()));
+                let draft_pb = (draft.filter(|_| !self.head_reads_target_kv()))
+                    .map_or(0, |d| draft_block_bytes(d, bs, self.draft_scratch()));
                 let pair = target_block_bytes(target, bs) + draft_pb;
                 kv_left(self.metal_peak_activation_estimate(None, None, Some(total), 1)?)
                     / pair.max(1)
@@ -5144,7 +5262,10 @@ impl Worker for MetalWorker {
             let target = self.model.as_ref().expect("model loaded before draft");
             let bs = self.config.block_size;
             let t_pb = target_block_bytes(target.as_ref(), bs);
-            let d_pb = draft_block_bytes(draft.as_ref(), bs, self.draft_scratch());
+            let d_pb = match self.head_reads_target_kv() {
+                true => 0,
+                false => draft_block_bytes(draft.as_ref(), bs, self.draft_scratch()),
+            };
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
             let scaled = (available as u128 * t_pb as u128 / denom as u128) as usize;
@@ -5916,8 +6037,12 @@ impl Worker for MetalWorker {
             let selections = self.behind_selections(
                 &positions_u32,
                 &seqused_k_u32,
-                &attn.block_ids,
-                full_block_size,
+                StepBlocks {
+                    full: &attn.block_ids,
+                    full_block_size,
+                    sliding: &attn.sliding_groups,
+                    sliding_block_size: block_size,
+                },
                 head_passes.as_ref(),
                 &req_ids_in_order,
             )?;

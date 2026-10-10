@@ -650,6 +650,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let first = pool.spawn_worker(&lent)?;
         pool.lendable = LentActivation {
             tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
+            tq: first.runtime.tq.clone(),
             ..first.worker.activation()
         };
         {
@@ -1746,6 +1747,7 @@ fn begin_step<W: CanonicalParams>(
         DeviceInputInto::TargetHidden => &runtime.target_hidden,
         DeviceInputInto::Positions => &runtime.positions,
         DeviceInputInto::SlotMapping => &runtime.slot_mappings[0],
+        DeviceInputInto::SlidingSlotMapping(n) => &runtime.slot_mappings[1 + usize::from(n)],
         DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
         DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
         DeviceInputInto::GdnSteps => &runtime.gdn_is_fresh,

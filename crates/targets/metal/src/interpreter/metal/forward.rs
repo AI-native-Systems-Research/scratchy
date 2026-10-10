@@ -256,6 +256,9 @@ pub enum DeviceInputInto {
     Positions,
     /// The full KV-cache group's `slot_mapping`, over the host's placeholders.
     SlotMapping,
+    /// Sliding KV-cache group `n`'s `slot_mapping` (gemma4 SWA: the runtime's group `1 + n`), over
+    /// the host's placeholders.
+    SlidingSlotMapping(u8),
     /// `seq_used_k`, over the host's placeholders.
     SeqUsedK,
     /// An MRoPE model's rotary cos/sin rows (`mrope_cos_sin`), over the host's placeholders.

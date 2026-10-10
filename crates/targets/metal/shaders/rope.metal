@@ -108,6 +108,10 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_VALS_PER_WORD, 11);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_PACKED_DIM, 12);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_K_OFFSET, 13);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_V_OFFSET, 14);
+// The query alone (a model that appends no K/V of its own — a drafter reading its target's KV):
+// rotate Q and stop; buffers 1, 2 and 5..7 are not read.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_Q_ONLY, 15);
+constant bool ROPE_QUERY_ONLY = ROPE_Q_ONLY_SET && ROPE_Q_ONLY != 0u;
 constant constexpr uint ROPE_TQ_FLOATS = ROPE_TQ_BITS_SET ? tq_encode_floats(2, ROPE_HEAD_DIM) : 1u;
 constant constexpr uint ROPE_TQ_CODES = ROPE_TQ_BITS_SET ? 2u * ROPE_HEAD_DIM : 1u;
 
@@ -183,7 +187,7 @@ kernel void rope_append_f16_specialized(
     }
 
     // ── K/V rotation + paged write (only owning q_head per kv_head) ─
-    if (q_head % group_r != 0) return;
+    if (ROPE_QUERY_ONLY || q_head % group_r != 0) return;
     const uint kv_head = q_head / group_r;
     const uint kv_dim  = num_kv * head_dim;
     device half* k_row = k_inout + t * kv_dim + kv_head * head_dim;
@@ -303,7 +307,7 @@ kernel void rope_append_bf16_specialized(
         q_row[pair_off + d] = bfloat(r.y);
     }
 
-    if (q_head % group_r != 0) return;
+    if (ROPE_QUERY_ONLY || q_head % group_r != 0) return;
     const uint kv_head = q_head / group_r;
     const uint kv_dim  = num_kv * head_dim;
     device bfloat* k_row = k_inout + t * kv_dim + kv_head * head_dim;

@@ -58,11 +58,14 @@ use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(
     program: &Program,
-    decoder_root: &str,
-    vision_layout: Option<&crate::config::VisionSafetensorsLayout>,
+    arch: &crate::arch_spec::DeclaredArchSpec,
     id: WeightId,
     index: Option<UnrollIndex>,
 ) -> String {
+    let decoder_root = arch.decoder_root();
+    let vision_layout = arch.safetensors.as_ref();
+    // Weights at the checkpoint's top level beside the decoder root (as `lm_head`).
+    let top_level = &arch.top_level_weights;
     // DSL idents can't start with a digit, so paths like
     // `merger.mlp.0` are written `merger.mlp_0` in the body /
     // manifest; translate `_<digit>` suffixes back to `.<digit>`
@@ -129,8 +132,9 @@ fn safetensors_prefix(
     // tree at the file's top level in every checkpoint ordering.
     match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
-        (Some(l), _) => under_root(decoder_root, &format!("layers.{l}.{joined}")),
-        (None, _) => under_root(decoder_root, &joined),
+        (None, w) if top_level.iter().any(|t| t == w) => w.to_string(),
+        (Some(l), _) => under_root(&decoder_root, &format!("layers.{l}.{joined}")),
+        (None, _) => under_root(&decoder_root, &joined),
     }
 }
 
@@ -151,15 +155,21 @@ pub(crate) fn lent_weight_prefix(
     w: scratchy_forward_compiler::LentWeight,
 ) -> Option<String> {
     use scratchy_forward_compiler::LentWeight;
+    // A head borrowing a subset (`borrows`, arch.json) reports none of the rest.
+    let borrowed = |name: &str| (model.arch.borrows.as_ref()).is_none_or(|b| b.iter().any(|n| n == name));
     let name = match w {
+        LentWeight::LmHead if !borrowed("lm_head") => return None,
         LentWeight::LmHead if !model.tie_word_embeddings => "lm_head",
+        // A head with an embedding of its own names its target's apart.
+        LentWeight::EmbedTokens if program.weights.find(&["target_embed_tokens"]).is_some() => {
+            "target_embed_tokens"
+        }
         LentWeight::EmbedTokens | LentWeight::LmHead => "embed_tokens",
     };
     let id = program.weights.find(&[name])?;
     Some(safetensors_prefix(
         program,
-        &model.arch.decoder_root(),
-        model.arch.safetensors.as_ref(),
+        &model.arch,
         id,
         None,
     ))
@@ -983,8 +993,7 @@ fn plan_field_load(
         .map(|(id, idx)| {
             safetensors_prefix(
                 program,
-                &model.arch.decoder_root(),
-                model.arch.safetensors.as_ref(),
+                &model.arch,
                 *id,
                 *idx,
             )
@@ -2173,8 +2182,7 @@ fn expert_input_probe(
     let k = *crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?.first()? as usize;
     let prefix = safetensors_prefix(
         program,
-        &model.arch.decoder_root(),
-        model.arch.safetensors.as_ref(),
+        &model.arch,
         id,
         index,
     );
@@ -2676,9 +2684,14 @@ fn emit_fingerprint_check(
         Some(crate::quantization::QuantMethod::Ggml) | None => quote! {},
         // The probe reads the fingerprint leaf's `.scales`, so it runs only where this variant
         // reads that leaf affine: an MLX per-module map may leave it dense (Nemotron-H's
-        // experts-only parity checkpoint quantizes the routed experts alone), and then the
-        // per-role bit-map gate below carries the positive affine sniff.
-        Some(crate::quantization::QuantMethod::Affine { .. }) if !fp_leaf_affine => quote! {},
+        // experts-only parity checkpoint quantizes the routed experts alone; a draft head's only
+        // affine weight may be the embedding its target lends it). Each module the map DOES list
+        // must then ship its `.scales` sibling, and the per-role bit-map gate below carries the
+        // positive affine sniff.
+        Some(crate::quantization::QuantMethod::Affine { per_module, .. }) if !fp_leaf_affine => {
+            let scales = per_module.iter().map(|(k, _)| format!("{k}.scales"));
+            quote! { #(if !gw.contains(#scales) { return false; })* }
+        }
         Some(crate::quantization::QuantMethod::Affine { group_size, .. }) => {
             // Group-size discriminator. The packed `.weight` (U32) has
             // the SAME shape for every group_size — 4-bit packs 8 values
@@ -3006,14 +3019,20 @@ fn emit_fingerprint_check(
             // A `bits_overrides` entry naming the embed implies packed the same
             // way (gpt-oss's proper low-bit recipes ship a 4-bit embed over a
             // 2/3-bit default) — same agreement, same reason.
-            model.tie_word_embeddings
-                || *quantize_embed
-                || per_module
-                    .iter()
-                    .any(|(k, _)| crate::quantization::names_embed(k, embed_role))
-                || bits_overrides
-                    .iter()
-                    .any(|(s, _)| crate::quantization::names_embed(s, embed_role))
+            // A non-empty per-module map is authoritative, exactly as `storage_format_for_weight`
+            // reads it: the embedding is packed iff the map lists IT (not a `target_embed_tokens`
+            // a draft head borrows).
+            match per_module.is_empty() {
+                false => (per_module.iter())
+                    .any(|(k, _)| crate::quantization::names_embed(k, embed_role)),
+                true => {
+                    model.tie_word_embeddings
+                        || *quantize_embed
+                        || bits_overrides
+                            .iter()
+                            .any(|(s, _)| crate::quantization::names_embed(s, embed_role))
+                }
+            }
         }
         _ => false,
     };
@@ -7345,13 +7364,14 @@ enum BackboneLayout {
 /// nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
 /// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
-/// logits `width` and `dtype`, and — `head_drafts`, a multi-token-prediction head's drafts a step —
-/// its chain between passes (`scratchy_target_metal::off_tape`).
+/// logits `width` and `dtype`, and — `head`, a multi-token-prediction head's drafts a step and the
+/// width of the hidden rows its passes read — its chain between passes
+/// (`scratchy_target_metal::off_tape`).
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    head_drafts: Option<u32>,
+    head: Option<(u32, u32)>,
 ) -> TokenStream {
     use scratchy_target_metal::off_tape::OffTape;
     use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
@@ -7359,8 +7379,8 @@ fn metal_off_tape_tokens(
     let width = u32::try_from(width).expect("logits width fits u32");
     // The chain advances the full-context group's slots (KV group 0).
     let block_size = BlockSize(mc.global_block_size);
-    let head = head_drafts.map(|drafts| MtpChainConstants {
-        hidden: HiddenSize(u32::try_from(mc.hidden_size).expect("hidden size fits u32")),
+    let head = head.map(|(drafts, hidden)| MtpChainConstants {
+        hidden: HiddenSize(hidden),
         drafts: NumDrafts(drafts),
         // An MRoPE head reads a cos/sin row a token in place of its position.
         rope: RotDim(if mc.mrope { mc.rot_dim } else { 0 }),
@@ -10653,8 +10673,7 @@ fn dump_wavefront_mega(
                                 let is_gemm = gemm_weight.contains(&i);
                                 let disk = safetensors_prefix(
                                     program,
-                                    &model.arch.decoder_root(),
-                                    model.arch.safetensors.as_ref(),
+                                    &model.arch,
                                     WeightId(*id),
                                     *index,
                                 );
@@ -10699,8 +10718,7 @@ fn dump_wavefront_mega(
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
                                     program,
-                                    &model.arch.decoder_root(),
-                                    model.arch.safetensors.as_ref(),
+                                    &model.arch,
                                     WeightId(*id),
                                     *index,
                                 );
@@ -11776,6 +11794,8 @@ pub fn emit_model(
     // gate must too. `None` for canonicals themselves.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
+    // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
+    let reads_target_kv = model.arch.reads_target_kv;
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
     // (which already covers text-side encoders like ModernBERT)
@@ -13013,6 +13033,14 @@ pub fn emit_model(
             scratchy_forward_compiler::RowsExtern::TargetHidden,
         )
     });
+    // The width of those rows (the `TargetHidden` extern's): its target's hidden size — which a
+    // drafter of its own width (Gemma 4's assistant) reads and exports at, its passes chained at.
+    let target_hidden_width: u64 = model
+        .bounds
+        .get("backbone_hidden_size")
+        .or_else(|| model.bounds.get("hidden_size"))
+        .copied()
+        .unwrap_or(0);
     let (
         vision_freqs_bytes_lit,
         vision_pixels_bytes_lit,
@@ -13032,10 +13060,10 @@ pub fn emit_model(
         // pos_embeds: model-dtype (bf16) `[num_tokens, vision_embed_dim]`,
         // host-interpolated and added to the patch-embed output.
         let posemb_bytes = max_m * vis_embed_dim * 2;
-        // target_hidden (MTP heads): model-dtype `[num_tokens, hidden]`, the target's final
-        // hidden rows. Zero unless the body reads the extern.
+        // target_hidden (MTP heads): model-dtype `[num_tokens, target_hidden_width]`, the
+        // target's final hidden rows. Zero unless the body reads the extern.
         let target_hidden_bytes = match reads_target_hidden {
-            true => max_m * hidden_size * 2,
+            true => max_m * target_hidden_width * 2,
             false => 0,
         };
         // mm splice (text decoder): mm_embeds = bf16 `[max_m, hidden]`;
@@ -13236,11 +13264,14 @@ pub fn emit_model(
         metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
         // A multi-token-prediction head (its body reads the target's hidden rows) chains its
         // passes on the device.
-        let head_drafts = reads_target_hidden.then(|| {
+        let head = reads_target_hidden.then(|| {
             let drafts = model.bounds.get("spec_drafts").copied();
-            u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32")
+            let drafts =
+                u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32");
+            let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
+            (drafts, hidden)
         });
-        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head_drafts));
+        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head));
     }
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
@@ -13519,6 +13550,13 @@ pub fn emit_model(
                         // packed/norms/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
                         // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
                         let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
+                            // A head reading its target's KV binds its target's packed stores.
+                            if #reads_target_kv {
+                                return lent.tq.clone().expect(
+                                    "a head reading its target's TurboQuant KV builds its pool on \
+                                     its target's, which lends it",
+                                );
+                            }
                             ::scratchy_target_metal::turboquant::build_tq_provision(
                                 &__tq_allocator,
                                 ::scratchy_target_metal::turboquant::TqPool {

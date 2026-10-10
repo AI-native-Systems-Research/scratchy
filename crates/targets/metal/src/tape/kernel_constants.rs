@@ -284,6 +284,8 @@ pub struct RopeAppendConstants {
     pub rope_on_read: Option<u32>,
     /// The TurboQuant encode folded in: see [`RopeAppendNormedConstants`].
     pub tq: Option<RopeTqConstants>,
+    /// The query alone (slot 15, `ROPE_Q_ONLY`): no K/V rotation or cache write.
+    pub query_only: bool,
 }
 
 impl From<RopeAppendConstants> for Vec<ConstantValue> {
@@ -301,6 +303,9 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
         RopeTqConstants::push(c.tq, c.head_dim, &mut v);
+        if c.query_only {
+            v.push(ConstantValue::uint(ConstSlot(15), 1));
+        }
         v
     }
 }

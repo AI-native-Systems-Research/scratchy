@@ -761,6 +761,33 @@ impl Recording<'_> {
 
     /// A KV codec step's writer — the KV writer of `encode`'s construct, `encode` being the
     /// step's `KvEncode` — as the writer's own record states it. Its class is its attention's.
+    /// The writer facts of codec step `i`'s packed operand `k`: its writer's, or — read with no
+    /// writer of this forward's (a drafter reading its target's coded KV, its prefix source in
+    /// place of the encode) — the cache's layer, the class of the attention reading it, a centred
+    /// cache, and the rotary site.
+    fn codec_operand(&self, i: usize, k: u8) -> Result<CodecWriter, StepRefusal> {
+        let e = match self.arg(i, k) {
+            Ok(InputRef::Ext(e)) => e,
+            _ => return self.codec_writer(i, self.step_arg(i, k)?),
+        };
+        let no = || self.no(i, Refused::CodecUnanchored);
+        let layer = match self.l.bindings[e] {
+            SourceBinding::PrefixK { layer } | SourceBinding::PrefixV { layer } => layer,
+            _ => return Err(no()),
+        };
+        let reads = |od: &scratchy_subtile::lower::OpDesc| {
+            od.inputs.len() == 3 && od.inputs[1..].contains(&InputRef::Ext(e))
+        };
+        let class = (self.l.input.ops.iter())
+            .find_map(|od| match od.op {
+                SubOp::AttnDecode { mask, .. } if reads(od) => Some(mask),
+                _ => None,
+            })
+            .ok_or_else(no)?;
+        let layer = LayerId(layer as u32);
+        Ok((layer, RopeFormTag::NeoX, class, st::KvOffsets::CENTERED, vec![self.rotary(i)]))
+    }
+
     fn codec_writer(&self, i: usize, encode: usize) -> Result<CodecWriter, StepRefusal> {
         let rope = |j: &usize| {
             matches!(
@@ -993,17 +1020,19 @@ impl Recording<'_> {
             return Err(canonical_refusal(Refused::NoFirstNorm));
         }
         let embedded = SourceBinding::EmbeddedHidden;
-        if !self.l.bindings.contains(&embedded) {
+        let Some(e) = self.l.bindings.iter().position(|b| *b == embedded) else {
             return Ok((Vec::new(), None));
-        }
+        };
         let zero = Slot(0);
         let base = self.facts.embed_base.to_string();
+        // The embedding table's rows: a drafter reading its target's table writes its target's.
+        let width = st::ActivationWidth::of_cols(self.l.input.sources[e].cols);
         let (embed, kind) = match self.facts.embed_quant {
             Some((gs, bits)) => (
-                MetalStep::AffineEmbed(zero, gs, bits),
+                MetalStep::AffineEmbed(zero, gs, bits, width),
                 WeightKind::AffineQuantEmbedding,
             ),
-            None => (MetalStep::Embed(zero), WeightKind::Embedding),
+            None => (MetalStep::Embed(zero, width), WeightKind::Embedding),
         };
         let mut rows = vec![em(embed, &[], &[zero], vec![WeightSlot { kind, base }])];
         let mut skip = None;
@@ -1582,6 +1611,38 @@ impl Recording<'_> {
         ))
     }
 
+    /// The layer the cache an attention reads belongs to, from its prefix K source.
+    fn prefix_layer(&self, i: usize) -> Option<LayerId> {
+        match self.arg(i, 1).ok()? {
+            InputRef::Ext(e) => match self.l.bindings[e] {
+                SourceBinding::PrefixK { layer } => Some(LayerId(layer as u32)),
+                _ => None,
+            },
+            InputRef::Op(_) => None,
+        }
+    }
+
+    /// A query rotation no K-side writer folds (a model appending no K/V): the layer and class of
+    /// the writer-less attention that reads it, when one does.
+    fn query_only_rotate(&self, i: usize) -> Option<(LayerId, AttnMask)> {
+        let ops = &self.l.input.ops;
+        // The attention reads the rotation directly, or through the codec's query rotation.
+        let reads = |q: Option<&InputRef>| match q {
+            Some(&InputRef::Op(j)) if j == i => true,
+            Some(&InputRef::Op(j)) => {
+                matches!(ops[j].op, SubOp::RotateRows { .. })
+                    && ops[j].inputs.first() == Some(&InputRef::Op(i))
+            }
+            _ => false,
+        };
+        ops.iter().enumerate().find_map(|(j, od)| match od.op {
+            SubOp::AttnDecode { mask, .. } if od.inputs.len() == 3 && reads(od.inputs.first()) => {
+                Some((self.prefix_layer(j)?, mask))
+            }
+            _ => None,
+        })
+    }
+
     fn rope_fields(&self, i: usize) -> Result<(LayerId, RopeFormTag, AttnMask), StepRefusal> {
         match *self.op(i) {
             SubOp::RopeAppend {
@@ -1906,16 +1967,37 @@ impl Recording<'_> {
                 e.sig.kv_w = Some(layer);
                 e
             }
+            // A query's rotation alone — a model appending no K/V of its own: the rope step with no
+            // write, at the layer and class of the attention that reads it.
+            L::RopeRotate { .. } if self.query_only_rotate(i).is_some() => {
+                let (layer, class) = self.query_only_rotate(i).expect("checked by the guard");
+                let q = self.colour(self.step_arg(i, 0)?)?;
+                let step = S::RopeAppend(
+                    q,
+                    q,
+                    q,
+                    q,
+                    q,
+                    q,
+                    layer,
+                    RopeFormTag::NeoX,
+                    class,
+                    st::KvOffsets::CENTERED,
+                    st::KvWrite::None,
+                );
+                em(step, &[q], &[q], vec![self.rotary(i)])
+            }
             L::AttnDecode { mask, .. } => {
                 let out = out()?;
                 let q = self.colour(self.step_arg(i, 0)?)?;
                 // The layer and pairing come from the KV writer whose cache it reads; an
-                // un-rotated writer's cache is read as stored, with no rotary table.
-                let writer = self.step_arg(i, 3)?;
-                let (layer, pairing, rotated) = match *self.op(writer) {
-                    L::RopeAppend { layer, pairing, .. } => (LayerId(layer), pairing, true),
-                    L::KvAppend { layer, .. } => (LayerId(layer), RopeFormTag::NeoX, false),
-                    _ => (LayerId(0), RopeFormTag::NeoX, true),
+                // un-rotated writer's cache is read as stored, with no rotary table; an attention
+                // appending nothing reads its cache's layer off its prefix K source.
+                let writer = self.step_arg(i, 3).ok();
+                let (layer, pairing, rotated) = match writer.map(|w| *self.op(w)) {
+                    Some(L::RopeAppend { layer, pairing, .. }) => (LayerId(layer), pairing, true),
+                    Some(L::KvAppend { layer, .. }) => (LayerId(layer), RopeFormTag::NeoX, false),
+                    _ => (self.prefix_layer(i).unwrap_or(LayerId(0)), RopeFormTag::NeoX, true),
                 };
                 // Prefill runs the paged kernel with K arriving pre-roped: no rotary. Decode's
                 // CosSin is the GLOBAL rotary whatever the class (only the rope uses the local).
@@ -1962,7 +2044,8 @@ impl Recording<'_> {
                     Ok(InputRef::Op(v)) => self.colour(v).ok(),
                     _ => None,
                 };
-                let reads: Vec<Slot> = [Some(q), self.colour(writer).ok(), v]
+                let writer = writer.and_then(|w| self.colour(w).ok());
+                let reads: Vec<Slot> = [Some(q), writer, v]
                     .into_iter()
                     .flatten()
                     .collect();
@@ -1977,8 +2060,7 @@ impl Recording<'_> {
             }
             // The KV codec: each step's operands are its writer's, its site the writer's.
             L::KvStage { operand } => {
-                let (layer, _, class, offsets, sites) =
-                    self.codec_writer(i, self.step_arg(i, 0)?)?;
+                let (layer, _, class, offsets, sites) = self.codec_operand(i, 0)?;
                 let mut e = em(S::KvStage(operand, layer, class, offsets), &[], &[], sites);
                 // The layer's packed store in, the staging buffer out.
                 e.sig.kv_r = Some(layer);
@@ -1991,8 +2073,7 @@ impl Recording<'_> {
             }
             L::AttnPackedKv => {
                 // The layer's decode attention: its writer's layer and pairing.
-                let (layer, pairing, class, offsets, mut sites) =
-                    self.codec_writer(i, self.step_arg(i, 2)?)?;
+                let (layer, pairing, class, offsets, mut sites) = self.codec_operand(i, 2)?;
                 let (q, out) = (self.read(i, 0)?, out()?);
                 // gpt-oss attention sinks: the twin's TRAILING weight input (arg 4 —
                 // the attention's 6th operand, carried by the codec expansion) binds the

@@ -10,8 +10,13 @@
 #[derive(Clone, Copy, Debug)]
 pub struct HeadRegistration {
     pub embed_tokens: &'static str,
-    pub lm_head: &'static str,
+    /// `None`: the head's logits are its own (Gemma 4's assistant: its tied embedding).
+    pub lm_head: Option<&'static str>,
     pub lm_head_rows: u32,
+    /// Its attention reads its target's KV and writes none (Gemma 4's assistant): it has no KV pool
+    /// of its own, its query sits at the position after the row it reads, and its chained drafts
+    /// keep that position.
+    pub reads_target_kv: bool,
     /// The checkpoint architectures of the targets it drafts for: its config is its target's.
     pub drafts_for: &'static [&'static str],
     /// How its repo is named when published apart from its target's (an MLX conversion strips the
@@ -32,10 +37,10 @@ pub struct HeadRegistration {
 }
 
 impl HeadRegistration {
-    /// The on-disk prefix the head loads `w` from.
-    pub fn prefix(&self, w: crate::LentWeight) -> &'static str {
+    /// The on-disk prefix the head loads `w` from, when it borrows `w`.
+    pub fn prefix(&self, w: crate::LentWeight) -> Option<&'static str> {
         match w {
-            crate::LentWeight::EmbedTokens => self.embed_tokens,
+            crate::LentWeight::EmbedTokens => Some(self.embed_tokens),
             crate::LentWeight::LmHead => self.lm_head,
         }
     }

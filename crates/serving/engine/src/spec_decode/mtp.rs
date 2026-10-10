@@ -180,6 +180,12 @@ pub struct MtpDrafter {
     pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
+    /// The head reads its target's KV and writes none (Gemma 4's assistant): row `r`'s query sits
+    /// at the position after it (the token it reads is there), attending the target's KV through
+    /// `r`; no row writes KV; and a sequence's chained drafts keep its newest row's query position
+    /// and KV. A head with KV of its own writes its row's KV at the row's position, and each
+    /// chained draft is one position further.
+    pub reads_target_kv: bool,
 }
 
 /// A step's rows as its target runs them, in sequence order: what the head's passes read.
@@ -253,6 +259,8 @@ pub struct PassOne {
     /// `(row, step row, rows)`: each sequence's rows, reading the target's final hidden states at
     /// its rows of the step.
     pub hidden_rows: Vec<(u32, u32, u32)>,
+    /// Each planned sequence's index in the step: whose rows of the step's block tables it reads.
+    pub steps: Vec<usize>,
 }
 
 /// Passes 2..=k, one row per drafting sequence — one the step gives a token — chained on the
@@ -313,6 +321,11 @@ impl Chain {
     pub fn num_seqs(&self) -> usize {
         self.steps.len()
     }
+
+    /// Each drafting sequence's index in the step.
+    pub fn steps(&self) -> &[usize] {
+        &self.steps
+    }
 }
 
 /// A head forward's request over `rows` (its tokens, positions and slots) and `seqs` (its
@@ -369,6 +382,7 @@ impl MtpDrafter {
             kv_only: false,
             token_rows: Vec::new(),
             hidden_rows: Vec::new(),
+            steps: Vec::new(),
         };
         // Per drafting sequence: its index in the step, its token rows' span of `token_rows`.
         let mut drafting: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
@@ -387,8 +401,16 @@ impl MtpDrafter {
                     0
                 });
                 one.input_ids.push(token);
-                one.positions.push(step.positions[r]);
-                one.slot_mapping.push(step.slot_mapping[r]);
+                match self.reads_target_kv {
+                    true => {
+                        one.positions.push(step.positions[r] + 1);
+                        one.slot_mapping.push(u32::MAX);
+                    }
+                    false => {
+                        one.positions.push(step.positions[r]);
+                        one.slot_mapping.push(step.slot_mapping[r]);
+                    }
+                }
             }
             let (row, step_row) = (start as u32, rows.start as u32);
             one.hidden_rows.push((row, step_row, rows.len() as u32));
@@ -403,9 +425,14 @@ impl MtpDrafter {
             return None;
         }
         let kv_only = step.req_ids.len() > self.max_seqs;
+        // A head reading its target's KV keeps none of its own: past the gate it primes nothing.
+        if kv_only && self.reads_target_kv {
+            return None;
+        }
         one.kv_only = kv_only;
         one.has_spec_tokens = !kv_only && drafting.iter().any(|(_, tokens)| tokens.len() > 1);
         one.block_table = step.block_rows(&included);
+        one.steps = included.clone();
         let chain = (!kv_only && !drafting.is_empty()).then(|| self.chain(step, &one, &drafting));
         Some(HeadPasses { one, chain })
     }
@@ -431,18 +458,24 @@ impl MtpDrafter {
         let mut drafted = step.input_ids[1..].to_vec();
         drafted.push(0);
         // After pass `d`, the next pass's row at accepted count `a` sits at `first + a + d`, the
-        // newest row's position plus `d`.
+        // newest row's position plus `d` — or, reading the target's KV, at `first + a + 1` for
+        // every pass, attending the target's KV through `first + a`, writing none.
+        let target_kv = self.reads_target_kv;
         let next = (1..=k)
             .map(|d| {
                 (drafting.iter().zip(&seqs))
                     .flat_map(|(&(i, _), &[step_row, ..])| {
                         let first = step.positions[step_row as usize] as usize;
-                        (0..=k).flat_map(move |a| match d < k {
-                            true => {
+                        (0..=k).flat_map(move |a| match (d < k, target_kv) {
+                            (true, false) => {
                                 let p = first + a + d;
                                 [p as u32, step.slot(i, p), p as u32 + 1]
                             }
-                            false => [0; 3],
+                            (true, true) => {
+                                let p = (first + a + 1) as u32;
+                                [p, u32::MAX, p]
+                            }
+                            (false, _) => [0; 3],
                         })
                     })
                     .collect()
@@ -450,7 +483,13 @@ impl MtpDrafter {
             .collect();
         // Placeholders: the last pass's position at the most drafts accepted.
         let last: Vec<u32> = (seqs.iter())
-            .map(|&[step_row, rows, _]| step.positions[step_row as usize] + rows - 1 + k as u32 - 1)
+            .map(|&[step_row, rows, _]| {
+                let newest = step.positions[step_row as usize] + rows - 1;
+                match target_kv {
+                    true => newest + 1,
+                    false => newest + k as u32 - 1,
+                }
+            })
             .collect();
         Chain {
             seqs,
@@ -650,6 +689,7 @@ mod tests {
         drafts: 3,
         max_seqs: 2,
         max_model_len: 4096,
+        reads_target_kv: false,
     };
 
     fn ids(of: &[&str]) -> HashSet<String> {
@@ -679,6 +719,7 @@ mod tests {
             kv_only: false,
             token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
             hidden_rows: vec![(0, 0, 4), (4, 4, 3)],
+            steps: vec![0, 1],
         };
         assert_eq!(both.one, one);
         let chain = both.chain.expect("a chains");
@@ -741,6 +782,7 @@ mod tests {
             drafts: 3,
             max_seqs: 2,
             max_model_len,
+            reads_target_kv: false,
         };
         let produced = vec![vec![0, 1, 2, 3], Vec::new()];
         let drafts = |max_model_len| {
@@ -786,6 +828,7 @@ mod tests {
                 kv_only: true,
                 token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3), (7, 7)],
                 hidden_rows: vec![(0, 0, 4), (4, 4, 3), (7, 7, 1)],
+                steps: vec![0, 1, 2],
             }
         );
         let request = gated.one.request();
@@ -797,6 +840,27 @@ mod tests {
             .passes(&two.rows(), &two.before(), &ids(&["a", "b"]))
             .expect("passes");
         assert!(!within.one.kv_only);
+        within.chain.expect("a chains");
+    }
+
+    /// A head reading its target's KV (Gemma 4's assistant) keeps no KV of its own, so past the
+    /// gate there is nothing to prime: no pass runs. Within it, pass 1 queries one past each row
+    /// and writes no slot.
+    #[test]
+    fn a_head_reading_its_target_kv_runs_no_pass_past_the_gate() {
+        let drafter = MtpDrafter {
+            reads_target_kv: true,
+            ..DRAFTER
+        };
+        let three = ThreeSequences::new();
+        let gated = drafter.passes(&three.rows(), &three.before(), &ids(&["a", "b", "c"]));
+        assert_eq!(gated, None);
+
+        let two = TwoSequences::new();
+        let within = (drafter.passes(&two.rows(), &two.before(), &ids(&["a", "b"])))
+            .expect("passes");
+        assert_eq!(within.one.positions, [11, 12, 13, 14, 1, 2, 3]);
+        assert!(within.one.slot_mapping.iter().all(|&s| s == u32::MAX));
         within.chain.expect("a chains");
     }
 

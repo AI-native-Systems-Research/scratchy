@@ -1900,6 +1900,7 @@ mod tests {
                     .map(|&(rows, cols)| SourceShape { rows, cols })
                     .collect(),
                 result: ops.len() - 1,
+                exported: None,
                 ops,
             },
             bindings,
