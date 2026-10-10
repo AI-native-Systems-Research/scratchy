@@ -1960,6 +1960,22 @@ mod tests {
             None,
             "a non-affine method keeps its storage format's bits"
         );
+    /// A module at the checkpoint's top level (Gemma 4's drafter's `pre_projection`) is keyed by
+    /// its bare name; a layered role of the same leaf is not, and a bare key names no other module
+    /// it ends.
+    #[test]
+    fn per_module_lookup_matches_a_top_level_module() {
+        let per_module = vec![
+            ("model.target_embed_tokens".to_string(), (4, 64)),
+            ("pre_projection".to_string(), (4, 32)),
+        ];
+        let program = Program::default();
+        let lookup = |role, index| per_module_lookup(&program, &per_module, role, index);
+        assert_eq!(lookup("pre_projection", None), Some((4, 32)));
+        assert_eq!(lookup("pre_projection", Some(UnrollIndex(0))), None);
+        assert_eq!(lookup("post_projection", None), None);
+        assert_eq!(lookup("target_embed_tokens", None), Some((4, 64)));
+        assert_eq!(lookup("embed_tokens", None), None, "`target_embed_tokens` is not the embedding");
     }
 
     /// Opt-in: parse the FULL upstream OptiQ `config.json` and assert
