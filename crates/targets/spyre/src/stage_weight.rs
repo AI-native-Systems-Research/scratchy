@@ -363,6 +363,133 @@ mod tests {
         assert_eq!(dev16, naive(&host16, walk, Element::F16));
     }
 
+    /// ⭐⭐⭐⭐⭐ THE HEAD-MAJOR PERMUTED WALK — the o_proj copy's staging law, pinned against an
+    /// INDEPENDENT re-derivation of the feature order. The contract is stated from the MODEL's
+    /// semantics, not from the emitter's stride map (which is what these literals would otherwise
+    /// just mirror):
+    ///
+    /// the attention finalize writes `out` SLAB-MAJOR — `out[s·nqh·64 + h·64 + d]` holds head
+    /// `h`'s feature `s·64 + d` — so the permuted o_proj copy must put, at every device
+    /// contraction position `k`, the weight column of exactly that feature. The kernel reads the
+    /// staged buffer through its unchanged `[n/64, k/2, 64, 2]` view, which is itself half the
+    /// claim: the restructure moves bytes at STAGING only.
+    ///
+    /// Geometry: granite-3.1-8b's head dim (hd=128, two feature slabs) scaled to nqh=2 — the
+    /// multi-slab head dim is the whole point, so hd stays real.
+    #[test]
+    fn headmajor_permuted_walk_meets_the_slab_major_order() {
+        const HD: u64 = 128;
+        const NQH: u64 = 2;
+        const K: u64 = NQH * HD; // 256
+        const N: u64 = 128;
+        // A row-AND-feature-dependent byte pattern: a wrong law reads a different host offset,
+        // and with 32k comparisons only a collision-everywhere law could still pass.
+        let host: Vec<u8> = (0..N * K)
+            .map(|i| ((i / K) * 131 + (i % K) * 197) as u8)
+            .collect();
+        // The two walks, VERBATIM as the emitter writes them: the fp8 packed tile, and its
+        // head-major refinement. `32` is POOL_STICK/2 — the k-pairs in one feature slab.
+        let norm_ds = [N / 64, K / 2, 64, 2];
+        let norm_sm = [64 * K, 2, K, 1];
+        let perm_ds = [N / 64, HD / 64, NQH, 32, 64, 2];
+        let perm_sm = [64 * K, 64, HD, 2, K, 1];
+        let norm = RetileWalk {
+            device_size: &norm_ds,
+            stride_map: &norm_sm,
+        };
+        let perm = RetileWalk {
+            device_size: &perm_ds,
+            stride_map: &perm_sm,
+        };
+        assert_eq!(norm.total_elems(), perm.total_elems());
+        let mut norm_dev = vec![0u8; norm.total_elems()];
+        let mut perm_dev = vec![0u8; perm.total_elems()];
+        stage_weight_tiled(&host, &mut norm_dev, norm, Element::Fp8);
+        stage_weight_tiled(&host, &mut perm_dev, perm, Element::Fp8);
+
+        // The KERNEL-VIEW linear offset — the same addressing for both buffers, which is the
+        // "the device program is untouched" half of the claim.
+        let lin = |n_stick: u64, k: u64, n_in: u64| -> usize {
+            (((n_stick * (K / 2) + k / 2) * 64 + n_in) * 2 + k % 2) as usize
+        };
+        // The slab-major feature each device k position owns, derived from the MODEL's order:
+        // k = s·nqh·64 + h·64 + d is head h's feature s·64 + d, i.e. host feature h·hd + s·64 + d.
+        let pi = |k: u64| -> u64 {
+            let s = k / (NQH * 64);
+            let rem = k % (NQH * 64);
+            let h = rem / 64;
+            let d = rem % 64;
+            h * HD + s * 64 + d
+        };
+        for n_stick in 0..N / 64 {
+            for k in 0..K {
+                for n_in in 0..64u64 {
+                    let row = 64 * n_stick + n_in;
+                    let at = lin(n_stick, k, n_in);
+                    assert_eq!(
+                        perm_dev[at],
+                        host[(row * K + pi(k)) as usize],
+                        "perm: device k={k} (row {row}) must hold head-major feature {}'s column",
+                        pi(k)
+                    );
+                    assert_eq!(
+                        norm_dev[at],
+                        host[(row * K + k) as usize],
+                        "norm: device k={k} (row {row}) must hold feature {k}'s column"
+                    );
+                }
+            }
+        }
+        // ⛔ THE CONTRACTION IDENTITY — the restructure's whole claim as one number: o_proj's
+        // output for a row is UNCHANGED. `a_slab` is what the finalize writes (the token-stream
+        // activation of feature pi(k), relocated); against the permuted walk it must contract to
+        // the same value the token-stream activation contracts to against the normal walk.
+        let a_tok: Vec<u32> = (0..K).map(|f| (f * 73 % 251) as u32).collect();
+        let a_slab: Vec<u32> = (0..K).map(|k| a_tok[pi(k) as usize]).collect();
+        let row = 17u64;
+        let (n_stick, n_in) = (row / 64, row % 64);
+        let (mut via_perm, mut via_norm) = (0u64, 0u64);
+        for k in 0..K {
+            let at = lin(n_stick, k, n_in);
+            via_perm += u64::from(a_slab[k as usize]) * u64::from(perm_dev[at]);
+            via_norm += u64::from(a_tok[k as usize]) * u64::from(norm_dev[at]);
+        }
+        assert_eq!(
+            via_perm, via_norm,
+            "the slab-major contraction must equal the token-stream one"
+        );
+    }
+
+    /// ⭐ AT ONE SLAB THE PERMUTED WALK **IS** THE FP8 PACKED WALK, byte for byte — the property
+    /// that makes the mint's multi-slab gate a gate and not a behavior change: an hd=64 model's
+    /// o_proj stages identically through either descriptor, so a copy minted by mistake (or a
+    /// future caller at one slab) cannot corrupt anything.
+    #[test]
+    fn headmajor_permuted_walk_degenerates_to_the_fp8_tile_at_one_slab() {
+        const HD: u64 = 64;
+        const NQH: u64 = 4;
+        const K: u64 = NQH * HD; // 256
+        const N: u64 = 128;
+        let host: Vec<u8> = (0..N * K).map(|i| (i * 37 % 251) as u8).collect();
+        let norm_ds = [N / 64, K / 2, 64, 2];
+        let norm_sm = [64 * K, 2, K, 1];
+        let perm_ds = [N / 64, HD / 64, NQH, 32, 64, 2];
+        let perm_sm = [64 * K, 64, HD, 2, K, 1];
+        let norm = RetileWalk {
+            device_size: &norm_ds,
+            stride_map: &norm_sm,
+        };
+        let perm = RetileWalk {
+            device_size: &perm_ds,
+            stride_map: &perm_sm,
+        };
+        let mut norm_dev = vec![0u8; norm.total_elems()];
+        let mut perm_dev = vec![0u8; perm.total_elems()];
+        stage_weight_tiled(&host, &mut norm_dev, norm, Element::Fp8);
+        stage_weight_tiled(&host, &mut perm_dev, perm, Element::Fp8);
+        assert_eq!(perm_dev, norm_dev);
+    }
+
     #[test]
     fn word_length_is_a_closed_set() {
         assert_eq!(Element::from_word_length(1), Some(Element::Fp8));

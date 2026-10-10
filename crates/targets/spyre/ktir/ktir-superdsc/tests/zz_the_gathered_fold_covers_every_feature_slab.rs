@@ -52,7 +52,48 @@ struct Op {
 }
 
 /// The whole attention body at one head dim and width, gather ON.
-fn emit_at<const HD: u32>(mq: u32) -> Vec<Op> {
+///
+/// `handoff` is the caller-side statement of the head-major o_proj restructure
+/// (`BundleAttnParams::headmajor_handoff` at the spyre door): every test that does not name it
+/// passes `false`, which is the emission every bundle without the restructure still gets.
+fn emit_at<const HD: u32>(mq: u32, handoff: bool) -> Vec<Op> {
+    try_emit_at::<HD>(mq, handoff)
+        .unwrap_or_else(|e| {
+            panic!(
+                "hd={HD} mq={mq} handoff={handoff}: assemble_attn refused: {}",
+                e.0
+            )
+        })
+        .iter()
+        .map(|e| {
+            let v = serde_json::to_value(&e.op).expect("serializes");
+            let (name, body) = v["dscs_"][0]
+                .as_object()
+                .and_then(|m| m.iter().next())
+                .map(|(k, b)| (k.clone(), b.clone()))
+                .expect("one named dsc per emitted op");
+            let n = body["N_"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, x)| x.as_i64().map(|i| (k.clone(), i)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Op {
+                name,
+                n,
+                body: serde_json::to_string(&body).expect("serializes"),
+            }
+        })
+        .collect()
+}
+
+/// [`emit_at`]'s refusal-preserving twin — the desync tests need the `Err`, not a panic.
+fn try_emit_at<const HD: u32>(
+    mq: u32,
+    handoff: bool,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, ktir_superdsc::superdsc_error::SuperDscError> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let bundle_rows =
         attn_bundle_rows(geom, mq, true).unwrap_or_else(|| panic!("mq={mq} is not a baked rung"));
@@ -76,33 +117,10 @@ fn emit_at<const HD: u32>(mq: u32) -> Vec<Op> {
         Some("t_kv_idx"),
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        handoff,
         &mut sym,
         None,
     )
-    .unwrap_or_else(|e| panic!("hd={HD} mq={mq}: assemble_attn refused: {}", e.0))
-    .iter()
-    .map(|e| {
-        let v = serde_json::to_value(&e.op).expect("serializes");
-        let (name, body) = v["dscs_"][0]
-            .as_object()
-            .and_then(|m| m.iter().next())
-            .map(|(k, b)| (k.clone(), b.clone()))
-            .expect("one named dsc per emitted op");
-        let n = body["N_"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, x)| x.as_i64().map(|i| (k.clone(), i)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Op {
-            name,
-            n,
-            body: serde_json::to_string(&body).expect("serializes"),
-        }
-    })
-    .collect()
 }
 
 /// The PREFIX fold's gathered ops of one leg, keyed by their name. `p{b}` is a fold pass; `nsc`/`nov` are
@@ -128,9 +146,9 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
     for (hd, nslab) in [(HD_2B, 1u32), (HD_8B, 2)] {
         for mq in [2u32, 8] {
             let ops = if hd == HD_2B {
-                emit_at::<HD_2B>(mq)
+                emit_at::<HD_2B>(mq, false)
             } else {
-                emit_at::<HD_8B>(mq)
+                emit_at::<HD_8B>(mq, false)
             };
             let leg = prefix_leg(&ops, "ov");
             // `nb = active_cap / 64` fold passes, each with `nkvh * mq * nslab` value ops.
@@ -199,9 +217,9 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
     for (hd, nslab) in [(HD_2B, 1u32), (HD_8B, 2)] {
         for mq in [2u32, 8] {
             let ops = if hd == HD_2B {
-                emit_at::<HD_2B>(mq)
+                emit_at::<HD_2B>(mq, false)
             } else {
-                emit_at::<HD_8B>(mq)
+                emit_at::<HD_8B>(mq, false)
             };
             let leg = prefix_leg(&ops, "sc");
             let nb = CAP / POOL_STICK;
@@ -269,9 +287,9 @@ fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
     for (hd, nslab) in [(HD_2B, 1u32), (HD_8B, 2)] {
         for mq in [1u32, 2, 8] {
             let ops = if hd == HD_2B {
-                emit_at::<HD_2B>(mq)
+                emit_at::<HD_2B>(mq, false)
             } else {
-                emit_at::<HD_8B>(mq)
+                emit_at::<HD_8B>(mq, false)
             };
             let legs = (prefix_leg(&ops, "sc").len() + prefix_leg(&ops, "ov").len()) as u32;
             let copies = ops
@@ -295,4 +313,97 @@ fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
             );
         }
     }
+}
+
+/// ⭐⭐⭐⭐⭐ THE HEAD-MAJOR HANDOFF'S FINALIZE — the single-row body's slab-major form, MEASURED OFF
+/// THE EMITTED DESCRIPTORS like everything else in this file, because the restructure it belongs to
+/// has TWO halves keyed on ONE bundle fact and each half alone is fluent wrong output:
+///
+/// * THIS form — at `mq == 1` over a multi-slab head dim, ONE op per feature slab (`nslab`, not
+///   `nqh·nslab`), each ALL heads at once (`mb == nqh`) and ONE STICK wide (`out == POOL_STICK`),
+///   writing `out` where the accumulator already holds it (slab-major). On granite-3.1-8b that is
+///   the 64 → 2 op collapse per layer — 2,480 of ~15,400 descriptor executions per decode step
+///   (the baked mq=1 body loses exactly 62 descriptors: 187 → 125 at the attention program).
+/// * the o matmul's B-operand swap to the permuted o_proj copy, keyed on the SAME fact at the
+///   matmul door (`lower_ktir_to_superdsc`'s `HeadmajorOproj`), whose staging walk the spyre
+///   crate's own tests pin.
+///
+/// ⛔ AND EVERY DESYNC IS REFUSED, NOT CORRECTED. The handoff at `mq > 1` — where NO weight
+/// permutation can fix the relayout, because `run_o` carries the head on its ROW axis and a matmul
+/// contracts along its activation's COLUMN axis only — and at `nslab == 1` — where there is
+/// nothing to restructure and the shipped one-op form already applies — each refuse here, so the
+/// bundle never bakes half a restructure.
+#[test]
+fn the_headmajor_finalizes_one_op_per_slab_and_refuses_every_desync() {
+    // ⭐ THE FORM, at the only geometry it is minted for: hd=128 (nslab=2), mq=1.
+    let ops = emit_at::<HD_8B>(1, true);
+    // (A nested fn, not a closure: the returned `&str` borrows the op's own name, and a
+    // closure's elided input lifetime cannot say that.)
+    fn bare(o: &Op) -> &str {
+        o.name.rsplit('/').next().unwrap_or(&o.name)
+    }
+    let slab_ops: Vec<&Op> = ops
+        .iter()
+        .filter(|o| bare(o).starts_with("attn_o_s"))
+        .collect();
+    assert_eq!(
+        slab_ops.len(),
+        2,
+        "hd=128 mq=1 handoff: the finalize must be ONE op per feature slab (2), got {}: {:?}",
+        slab_ops.len(),
+        slab_ops.iter().map(|o| o.name.as_str()).collect::<Vec<_>>()
+    );
+    // ⛔ AND THE PER-HEAD LOOP IS GONE — this IS the collapse being pinned. A handoff that still
+    // paid `nqh·nslab` single-core relayout ops would satisfy every extent assertion below.
+    let per_head = ops
+        .iter()
+        .filter(|o| bare(o).starts_with("attn_o_h"))
+        .count();
+    assert_eq!(
+        per_head, 0,
+        "hd=128 mq=1 handoff: the per-head finalize loop must not run — the handoff replaces it"
+    );
+    for o in &slab_ops {
+        assert_eq!(
+            o.n.get("mb_").copied(),
+            Some(NQH as i64),
+            "hd=128 mq=1 handoff {}: one slab's finalize carries ALL {NQH} heads at once — at \
+             mq == 1 a row IS a head",
+            o.name
+        );
+        assert_eq!(
+            o.n.get("out_").copied(),
+            Some(POOL_STICK as i64),
+            "hd=128 mq=1 handoff {}: a slab's finalize is ONE STICK wide — the stick-blocked write \
+             law's contiguous degeneracy over one slab of columns is what makes one op per slab possible",
+            o.name
+        );
+    }
+    // ⛔ AND THE TWO SLABS MUST NOT BE THE SAME DESCRIPTOR — a loop emitting the same op twice
+    // would satisfy every count above and leave slab 1 of `out` unwritten.
+    assert_ne!(
+        slab_ops[0].body, slab_ops[1].body,
+        "hd=128 mq=1 handoff: the two slabs' finalizes emit IDENTICAL descriptors, so slab 1 \
+         writes slab 0's bytes and the upper half of every head's output is never produced"
+    );
+
+    // ⛔ THE DESYNCS — each is half a restructure, and each must refuse rather than bake.
+    // (`.err().expect` and not `expect_err`: the Ok type is `Vec<EmittedOp>`, which carries no
+    // `Debug`, and the refusal — not the success — is what this pass is about.)
+    for mq in [2u32, 8] {
+        let err = try_emit_at::<HD_8B>(mq, true).err().expect(
+            "handoff at mq > 1 must refuse: no weight permutation can fix the relayout there",
+        );
+        assert!(
+            err.0.contains("mq"),
+            "hd=128 mq={mq} handoff refusal must name the width: {err}"
+        );
+    }
+    let err = try_emit_at::<HD_2B>(1, true)
+        .err()
+        .expect("handoff at one slab must refuse: there is nothing to restructure");
+    assert!(
+        err.0.contains("slab"),
+        "hd=64 mq=1 handoff refusal must name the slab count: {err}"
+    );
 }

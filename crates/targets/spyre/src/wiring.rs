@@ -571,6 +571,12 @@ pub struct Wiring {
     /// would have shipped, times the multiplier, once, at load. Not a per-forward cost and not a
     /// requantize: dense weights scale in place, fp8 dequant rows scale their `ws` row.
     pub weight_scale_folds: &'static [(u32, f32)],
+    /// The head-major o_proj permuted copies: `(companion weight id, permuted copy id)` for each
+    /// second, k-shuffled o_proj copy the bundle stages. `spyre_load` materializes each copy from
+    /// its companion's bytes at load — the copy is retiled through its own `kernel_weights`
+    /// descriptor (the permuted walk), so the one runtime half is a source re-read. Empty for
+    /// every bundle whose model the restructure's geometry gate excludes.
+    pub weight_copies: &'static [(u32, u32)],
     /// EVERY compile-time scalar this program's KTIR reads, in registry order: entry `i` is bound at
     /// `lower_subtile_tape_to_superdsc::scalarmul_scale_tid(i)` as a `[1,1]` fp16 — the model's own
     /// multipliers and RMSNorm epsilons, exactly the set and order `subtile→superdsc` registers.

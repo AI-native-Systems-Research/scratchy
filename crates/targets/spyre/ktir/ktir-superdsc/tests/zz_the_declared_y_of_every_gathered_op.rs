@@ -261,6 +261,7 @@ fn emit_at(mq: u32, gather: bool) -> Vec<OpPicture> {
         gather.then_some("t_kv_idx"),
         ktir_superdsc::place::PlaceId::Act(900),
         true,
+        false,
         &mut sym,
         None,
     )

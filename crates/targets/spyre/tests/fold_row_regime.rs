@@ -39,6 +39,7 @@ fn batch_decode_ops() -> Vec<ktir_superdsc::emit::EmittedOp> {
         None,
         scratchy_target_spyre::bundle_code::PlaceId::Act(7),
         true, // rows_are_requests: a decode batch
+        false,
         &mut sym,
         None,
     )

@@ -18,6 +18,7 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
+use ktir_superdsc::sdsc_abstract::POOL_STICK;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
@@ -289,6 +290,136 @@ pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(Subtile
     folds
 }
 
+/// ⭐⭐⭐ THE o_proj EDGES — every (attention output, o matmul weight, precision) triple the graph
+/// states, which is the ONE dataflow fact the head-major o_proj restructure keys on.
+///
+/// The restructure has two doors that must agree on WHICH matmul is the o projection — the
+/// attention finalize's slab-major form ([`crate::ktir_superdsc_door::BundleAttnParams`]) and the
+/// o matmul's B-operand swap (`HeadmajorOproj`) — and a SHAPE cannot say: at `k == n`
+/// (granite-3.1-8b's `[4096, 4096]` o_proj) the extents cannot tell the o matmul from any other
+/// square projection, and a shape-keyed swap would re-point every square projection at the
+/// permuted copy. The DATAFLOW can: the o matmul is the one whose `inputs[0]` is an attention's
+/// whole output.
+///
+/// ⛔ EVERY REFUSAL IS A CORRECTNESS FACT, and the class is the fold walks' own:
+///   * an attention output consumed by anything but ONE whole-reading matmul is a graph the
+///     restructure cannot describe — the slab-major finalize hands EVERY consumer head-permuted
+///     bytes, so a second consumer or a non-matmul reader is refused at recognition rather than
+///     silently excluded while the finalize still fires for it;
+///   * where the head dim is multi-slab (`hd > POOL_STICK`), every o matmul must agree on
+///     fp8-ness — the handoff is ONE fact per bundle, so a mixed model would emit a slab-major
+///     finalize for a dense layer whose weight was never permuted: fluent, wrong output.
+pub(crate) struct OprojEdge {
+    /// The o matmul's weight tid — `inputs[1]`, the slot law every weight recognizer in this file
+    /// already uses (dense `[A, W]` and fp8 W8A8 `[A, qW, ws]` agree on it).
+    pub w: u32,
+    /// The head dim of this edge's attention — the restructure's own geometry input.
+    pub hd: u32,
+    /// The o matmul is fp8 W8A8 (arity-3). The permuted staging walk is derived for the fp8
+    /// packed tile; a dense o_proj keeps the shipped emission byte-for-byte.
+    pub fp8: bool,
+}
+
+/// The edges plus the ONE gate both restructure doors key on. See [`OprojEdge`]'s doc for the
+/// walk; this carries what each consumer derives from it so none re-derives a second copy that
+/// could disagree.
+pub(crate) struct OprojEdges {
+    /// Every edge, in node order. The FIRST is the CANONICAL one — the rolled body's
+    /// representative, whose weight tid the bundle facts name and the matmul door swaps on.
+    pub edges: Vec<OprojEdge>,
+    /// ⭐ THE RESTRUCTURE'S GEOMETRY GATE, BUNDLE-INVARIANT BY CONSTRUCTION: every edge's
+    /// attention is multi-slab (`hd > POOL_STICK` — 8b's 128; at one slab there is nothing to
+    /// restructure) and every o matmul is fp8 W8A8. This is what the LAYOUT MINT keys on —
+    /// never the bundle's row count, because every bundle of a model shares ONE staged weight
+    /// segment: a rows-gated mint would hand the single-row body addresses no other bundle
+    /// staged. Only the EMISSION gates on rows (the bundle's own `headmajor_handoff`).
+    pub geometry_applies: bool,
+}
+
+pub(crate) fn oproj_edges<F: RopeForm>(ir: &SubtileIR<F>) -> Result<OprojEdges, SuperDscError> {
+    let mut edges: Vec<OprojEdge> = Vec::new();
+    for node in &ir.nodes {
+        let SubOp::AttnDecode { geom, .. } = &node.op else {
+            continue;
+        };
+        // The attention's consumers — every node reading any region of its output tensor. The
+        // clean shape is EXACTLY ONE MatmulTile reading `inputs[0]` as the whole output, which is
+        // the chain every shipped attention arch states (`attention → o_proj → residual`).
+        let consumers: Vec<&SubtileNode<F>> = ir
+            .nodes
+            .iter()
+            .filter(|c| c.id != node.id && c.inputs.iter().any(|r| r.tensor == node.output.tensor))
+            .collect();
+        if consumers.is_empty() {
+            // An attention whose output nobody reads states no edge — nothing to swap and no
+            // o_proj to companion. The graph result is not a consumer (nothing reads it), so an
+            // attention that IS the result lands here too.
+            continue;
+        }
+        let clean = consumers.len() == 1
+            && matches!(consumers[0].op, SubOp::MatmulTile { .. })
+            && consumers[0].inputs.len() >= 2
+            && consumers[0].inputs[0].tensor == node.output.tensor
+            && consumers[0].inputs[0].region == node.output.region;
+        if !clean {
+            let kind = |c: &SubtileNode<F>| {
+                if matches!(c.op, SubOp::MatmulTile { .. }) {
+                    "MatmulTile"
+                } else {
+                    host_glue_kind(&c.op)
+                }
+            };
+            return Err(SuperDscError(format!(
+                "AttnDecode t{}'s output is read by {} consumer(s) ({}), and the head-major o_proj \
+                 restructure needs exactly ONE matmul reading it as that matmul's whole `inputs[0]` \
+                 — the attention finalize's slab-major form hands EVERY reader head-permuted bytes, \
+                 so a second reader or a non-matmul one is a graph the restructure cannot describe. \
+                 Fix the graph, not the recognition.",
+                node.output.tensor.index(),
+                consumers.len(),
+                consumers
+                    .iter()
+                    .map(|c| kind(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
+        let o = consumers[0];
+        edges.push(OprojEdge {
+            w: o.inputs[1].tensor.index() as u32,
+            hd: geom.hd().get(),
+            fp8: o.inputs.len() == 3,
+        });
+    }
+    // ⛔ WHERE THE HEAD DIM IS MULTI-SLAB, PRECISION IS ONE FACT PER MODEL. The handoff is stated
+    // per bundle, so a dense o matmul under a multi-slab attention (or the reverse mix) would
+    // emit a slab-major finalize whose weight was never permuted. One model is one precision; a
+    // graph carrying both is refused naming the disagreement. At one slab nothing applies and
+    // no precision is demanded — the 2b's dense and fp8 builds both pass through untouched.
+    let multi_slab = edges.iter().any(|e| e.hd > POOL_STICK);
+    if multi_slab && edges.iter().any(|e| e.fp8 != edges[0].fp8) {
+        let dense = edges
+            .iter()
+            .find(|e| !e.fp8)
+            .expect("the mix was just measured");
+        let fp8 = edges
+            .iter()
+            .find(|e| e.fp8)
+            .expect("the mix was just measured");
+        return Err(SuperDscError(format!(
+            "the graph's o_proj matmuls disagree on precision — t{} is dense while t{} is fp8 W8A8 \
+             over a multi-slab head dim. The head-major handoff is one fact per bundle, so half a \
+             restructure (a slab-major finalize whose weight was never permuted) would be fluent, \
+             wrong output. One model is one precision.",
+            dense.w, fp8.w,
+        )));
+    }
+    Ok(OprojEdges {
+        geometry_applies: multi_slab && edges.iter().all(|e| e.fp8),
+        edges,
+    })
+}
+
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
 ///
 /// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `SubOp::AttnDecode`'s
@@ -312,6 +443,10 @@ pub(crate) fn weight_scale_folds<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<(Subtile
 pub(crate) fn attn_bundle_params<F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
+    // The decode ladder's ONE-REQUEST rung — the bake's own call-site fact
+    // (`!is_prefill && decode_rows == 1 && seq_sym.is_none()` in the `#[forward]` emission):
+    // a CONCRETE single-row decode, never a symbolic batch template and never a prefill chunk.
+    one_request_decode: bool,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
     // The fold's node set, taken once: a node is folded iff the attention-fold recognition named
     // it (which is also why the door's `scale_folded` is a fact about the program, not a
@@ -320,20 +455,24 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         .into_iter()
         .map(|(id, ..)| id)
         .collect();
-    let mut found: Option<(ktir_superdsc::head_counts::ModelAttnGeometry, u32)> = None;
+    let mut found: Option<(ktir_superdsc::head_counts::ModelAttnGeometry, u32, u32)> = None;
     let mut first_folded: Option<bool> = None;
     for n in &ir.nodes {
         let SubOp::AttnDecode { geom, .. } = &n.op else {
             continue;
         };
         let t = n.output.tensor.index() as u32;
+        // ⭐ THE OUTPUT'S OWN ROW COUNT — the bundle's attention width, which at a decode rung IS
+        // the request count (`lower_attn` reads this same `region.rows.len` as its `mq`). The
+        // head-major handoff is minted exactly where this is ONE row.
+        let rows = n.output.region.rows.len;
         let n_folded = folded.contains(&n.id);
         match (found, first_folded) {
             (None, _) => {
-                found = Some((*geom, t));
+                found = Some((*geom, t, rows));
                 first_folded = Some(n_folded);
             }
-            (Some((g0, t0)), Some(f0)) => {
+            (Some((g0, t0, _r0)), Some(f0)) => {
                 if g0 != *geom {
                     return Err(SuperDscError(format!(
                         "AttnDecode t{t0} declares geometry ({g0}) while AttnDecode t{t} declares \
@@ -361,13 +500,53 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
             (Some(_), None) => unreachable!("first_folded tracks found"),
         }
     }
-    Ok(
-        found.map(|(geom, _)| crate::ktir_superdsc_door::BundleAttnParams {
-            geom,
-            rows_are_requests,
-            scale_folded: first_folded.unwrap_or(false),
-        }),
-    )
+    let oproj = oproj_edges(ir)?;
+    let Some((geom, t, rows)) = found else {
+        return Ok(None);
+    };
+    // ⛔ THE CALL SITE'S FACT AND THE GRAPH'S OWN COUNT ARE ONE FACT. `one_request_decode`
+    // names THIS bake as the one-request rung, and the graph's `AttnDecode` states its own
+    // width; a call site naming the rung over a wider graph is not a bundle that quietly
+    // skips the handoff — it is two authorities disagreeing about one count, and it refuses,
+    // naming both. (The symbolic CB batch deliberately passes `decode_rows = 1` over a
+    // 96-row template; the emission's `seq_sym.is_none()` term keeps that bake off this fact
+    // entirely, so the refusal below can only fire on a real disagreement.)
+    if one_request_decode && rows != 1 {
+        return Err(SuperDscError(format!(
+            "the bake names a one-request decode rung while AttnDecode t{t} is {rows} rows \
+             wide — the call site's fact and the graph's own count disagree, and a handoff \
+             minted on the wrong one would slab-major a finalize whose weight no permuted \
+             copy answers to",
+        )));
+    }
+    // ⭐⭐⭐ THE HEAD-MAJOR o_proj HANDOFF — the restructure's bundle fact, minted ONLY where it
+    // is fully expressible, and every term is this bundle's own:
+    //   * `one_request_decode` — the decode ladder's ONE-REQUEST rung, where a row IS a head
+    //     and o_proj's contraction axis can be permuted to meet `out` where the accumulator
+    //     holds it. NOT `rows_are_requests`: that arg is FALSE at the one-request rung (it
+    //     gates the batched-decode emission — the W8A8 splices, the layout's row kind, the
+    //     split-mb ban — and the single-row bake keeps the shipped value of every one of
+    //     them) and TRUE of rungs two rows and wider, where the handoff cannot apply anyway;
+    //     a one-token PREFILL is also one row, but its rows are positions and its bundle is
+    //     the prefill chain's — both are excluded by the call-site fact, not by the count;
+    //   * `rows == 1` — proven by the refusal above, not assumed here;
+    //   * `geometry_applies` — the head dim is multi-slab AND the o matmul is fp8 W8A8 (see
+    //     [`OprojEdges::geometry_applies`]; a dense o_proj keeps the shipped emission).
+    // The layout mint keys on the SAME geometry gate but NEVER on the row count — every bundle
+    // of a model shares one staged weight segment, so a rows-gated mint would hand this body
+    // addresses no other bundle staged.
+    let headmajor_handoff = one_request_decode && oproj.geometry_applies;
+    Ok(Some(crate::ktir_superdsc_door::BundleAttnParams {
+        geom,
+        rows_are_requests,
+        scale_folded: first_folded.unwrap_or(false),
+        headmajor_handoff,
+        // The CANONICAL o_proj — the first edge's weight, the rolled body's layer-0
+        // representative. `Some` whenever the dataflow found the o matmul, whatever the
+        // handoff: it is a fact about the graph, and the door reads it only under the
+        // handoff.
+        oproj_wtid: oproj.edges.first().map(|e| e.w),
+    }))
 }
 
 /// Lower ONE [`SubtileNode`] to its SuperDSC op(s) — the single source of the
@@ -633,7 +812,18 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
     // The four facts no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
-    let attn_params = attn_bundle_params(ir, rows_are_requests)?;
+    //
+    // ⛔ AND THE HEAD-MAJOR HANDOFF IS ZEROED HERE, BECAUSE THIS IS THE UNROLLED BODY. The handoff's
+    // matmul half keys on ONE canonical weight tid (the rolled body's layer-0 representative); this
+    // walk lowers every layer's o matmul under its OWN per-layer weight tid, so a handoff here would
+    // slab-major every attention's finalize while swapping only the canonical's weight. The
+    // restructure is a rolled-body fact — see the codegen's `unrolled_params`, the same seal on the
+    // bake's cardless arm. `one_request_decode` is false for the same reason: the unrolled body is
+    // never the bake the fact names.
+    let mut attn_params = attn_bundle_params(ir, rows_are_requests, false)?;
+    if let Some(p) = attn_params.as_mut() {
+        p.headmajor_handoff = false;
+    }
     let mut sym_id_base: i64 = 0;
     let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(programs.len());
@@ -725,6 +915,14 @@ pub struct BundleWiring {
     /// double-applies the scale. (An attention-scale fold's node is NOT host-routed — it still
     /// runs, at the scale 1.0 the same arm rewrote it to.)
     pub weight_scale_folds: Vec<(u32, f32)>,
+    /// The head-major o_proj permuted copies: `(companion weight id, permuted copy id)` for each
+    /// second, k-shuffled o_proj copy the layout minted. The unrolled walk's wiring carries them
+    /// for the SAME reason it carries the folds — `spyre_load` materializes every listed copy at
+    /// load, and a wiring that omitted one while the layout placed it would stage a copy whose
+    /// bytes nothing filled. (The unrolled body never READS its permuted copies — the handoff is a
+    /// rolled-body fact, see the codegen's `unrolled_params` — but the mint is bundle-invariant,
+    /// so the copies exist here too and are staged and unread, like any other resident weight.)
+    pub weight_copies: Vec<(u32, u32)>,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -817,6 +1015,7 @@ pub fn graph_wiring<F: RopeForm>(
         attn_mask,
         scalarmul_scales: layout.scalarmul_scales.clone(),
         weight_scale_folds: layout.weight_scale_folds.clone(),
+        weight_copies: layout.weight_copies.clone(),
     })
 }
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -836,6 +1035,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
+    // The decode ladder's ONE-REQUEST rung — see [`attn_bundle_params`]. The `#[forward]`
+    // emission states it as `!is_prefill && decode_rows == 1 && seq_sym.is_none()`.
+    one_request_decode: bool,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
@@ -1135,7 +1337,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // throwaways because only the layout is wanted; the descriptors are dropped.
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
     // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
-    let attn_params = attn_bundle_params(ir, rows_are_requests)?;
+    let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode)?;
     for ops in [&prefix, &body, &suffix] {
         let mut declare_syms: i64 = 0;
         let mut declare_fp8: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1224,6 +1426,75 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 bundle_layout.kernel_weights.insert(t, desc.clone());
             }
         }
+    }
+    // ⭐⭐⭐ THE HEAD-MAJOR PERMUTED COPIES' MANIFEST + PER-LAYER FAMILY — this walk's half of the
+    //    mint `compute_bundle_layout` performed (it placed every layer's copy, one after its
+    //    companion). Here the copies join the two registries the ROLLED body's runtime reads:
+    //    the retile manifest — the copy's OWN walk, because the permutation is a STAGING walk,
+    //    not a byte transform: the worker stages the SAME source bytes through it — and the
+    //    per-layer family map (kct-style), so the executor's one-base-per-segment advance
+    //    reaches layer v's copy exactly as it reaches layer v's companion, which the stride
+    //    guard below then proves against the placements.
+    let oproj = oproj_edges(ir)?;
+    if oproj.geometry_applies {
+        let canonical = oproj.edges[0].w;
+        // The o_proj's own (k, n) — read from the manifest entry the walk collected for the o
+        // matmul, the same program-tile pair the permuted walk is derived from.
+        let Some(&(_, in_k, out_n)) = kernel0.iter().find(|(w, ..)| *w == canonical) else {
+            return Err(SuperDscError(format!(
+                "the head-major o_proj weight t{canonical} has no kernel manifest entry — the walk \
+                 collects one for every body matmul, so its absence means the o matmul never \
+                 lowered and the handoff would have nothing to swap",
+            )));
+        };
+        let (k, n) = (in_k as u64, out_n as u64);
+        let hd = oproj.edges[0].hd as u64;
+        let nslab = hd / POOL_STICK as u64;
+        let nqh = k / hd;
+        if !k.is_multiple_of(2)
+            || !n.is_multiple_of(64)
+            || !hd.is_multiple_of(POOL_STICK as u64)
+            || k != nqh * hd
+        {
+            return Err(SuperDscError(format!(
+                "head-major o_proj t{canonical}: the permuted packed tile needs K({k})%2==0, \
+                 N({n})%64==0, hd({hd})%64==0 and K == nqh·hd = {nqh}·{hd}",
+            )));
+        }
+        // ⭐ THE 6-AXIS PERMUTED WALK — the fp8 packed tile's k-enumeration REFINED into
+        // (slab, head, half-stick pair) so the device's contraction axis runs HEAD-MAJOR. The
+        // device's logical k position is `s·nqh·64 + h·64 + 2·hp + k_in` — exactly the order the
+        // slab-major finalize writes `out` in — and the host fetch for that position is
+        // `host[n, h·hd + s·64 + 2·hp + k_in]`, the TRUE feature the weight column owns:
+        //   device_size = [n/64, nslab, nqh, 64/2, 64, 2]
+        //   stride_map  = [64·k, 64, hd, 2, k, 1]
+        // which sums to `host[(64·n_stick + n_in)·k + (h·hd + s·64 + 2·hp + k_in)]` — the same
+        // `[out, in]` disk-order law the fp8 tile above states, with the k axis permuted and
+        // NOTHING else moved. The kernel still reads the staged buffer as the SAME
+        // `[n/64, k/2, 64, 2]` packed tile (its k_pair is `s·nqh·32 + h·32 + hp`, its inner
+        // stick still 64 n × 2 k), so the device program is untouched — only the staging walk
+        // knows. At `nslab == 1` the walk degenerates to the fp8 tile's identity (s = 0:
+        // `h·64 + 2·hp + k_in` on both sides at hd == 64), which is why the mint gates on a
+        // multi-slab head dim.
+        let perm_desc = RetileDescriptor {
+            device_size: vec![n / 64, nslab, nqh, POOL_STICK as u64 / 2, 64, 2],
+            stride_map: vec![64 * k, POOL_STICK as u64, hd, 2, k, 1],
+            stick_size: Fp8::ELEMS_PER_STICK,
+            word_length: Fp8::WORD_LENGTH,
+        };
+        let perms: Vec<u32> = oproj
+            .edges
+            .iter()
+            .map(|e| oproj_headmajor_tid(e.w))
+            .collect();
+        for &p in &perms {
+            bundle_layout.kernel_weights.insert(p, perm_desc.clone());
+        }
+        // The family: representative (layer 0's perm) → every layer's perm, in layer order —
+        // the same law the kct registration above states for the resident Kᵀ.
+        per_layer
+            .entry(oproj_headmajor_tid(canonical))
+            .or_insert(perms);
     }
     let seg3 = SegRole::Intermediate.segment();
     let synth_high = bundle_layout.synth.borrow().next;

@@ -404,6 +404,53 @@ fn apply_weight_scale_folds(
     Ok(())
 }
 
+/// ⭐ THE RUNTIME HALF OF THE HEAD-MAJOR o_proj RESTRUCTURE — materialize the permuted copies.
+///
+/// The layout minted, at BUILD time, a second, k-shuffled o_proj copy for every layer
+/// (`oproj_headmajor_tid`) wherever the geometry gate applies (multi-slab head dim + fp8 W8A8 o
+/// matmul). The wiring carries the `(companion id, copy id)` list and this is the whole of the
+/// copy at runtime: each listed `to` row is the SAME bytes, dtype and shape as its `from` row.
+/// The PERMUTATION itself is not here — it happens at staging, through the copy's own
+/// `kernel_weights` retile descriptor (the 6-axis walk that enumerates the head-major
+/// contraction order), so this is a source re-read, not a transform.
+///
+/// ⛔ RUNS AFTER THE FOLD PASS, so a folded o_proj's permuted copy carries the same post-fold
+/// bytes its companion stages — the two must agree element-for-element, and the fold is the last
+/// pass that touches the companion.
+/// ⛔ REFUSES WHAT THE MINT DID NOT PREVENT: a copy naming a `from` row the binding did not
+/// stage, or a `to` id the binding already owns — either is a wiring↔mint desync, not an input
+/// to interpret.
+fn materialize_weight_copies(
+    weights: &mut Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+    copies: &[(u32, u32)],
+) -> ExecutorResult<()> {
+    for (from, to) in copies {
+        if weights.iter().any(|(id, ..)| *id == *to as usize) {
+            return Err(werr(format!(
+                "head-major weight copy names t{to}, which the generated binding already staged — \
+                 the layout minted a permuted copy for an id the binding owns, so the two \
+                 disagree about the sources"
+            )));
+        }
+        // Cloned out of the borrow before the push — the row is the copy's whole content.
+        let (bytes, dt, shape) = {
+            let (_, bytes, dt, shape) = weights
+                .iter()
+                .find(|(id, ..)| *id == *from as usize)
+                .ok_or_else(|| {
+                    werr(format!(
+                        "head-major weight copy names companion t{from}, which the generated \
+                         binding did not stage — the wiring and the weight binding disagree about \
+                         the sources"
+                    ))
+                })?;
+            (bytes.clone(), *dt, shape.clone())
+        };
+        weights.push((*to as usize, bytes, dt, shape));
+    }
+    Ok(())
+}
+
 pub(crate) fn stage_bound_weights(
     bound: &[scratchy_forward_compiler::BoundWeight],
     // ⛔ FOR PLACEMENT EXISTENCE ONLY — never for names. The K-split branches
@@ -591,6 +638,9 @@ pub(crate) fn stage_bound_weights(
     //    emulator; the folded ScalarMul has no program on either tier, so the scale enters the run
     //    HERE and nowhere else. ──
     apply_weight_scale_folds(&mut weights, wiring.weight_scale_folds)?;
+    // ── THE HEAD-MAJOR o_proj COPIES' RUNTIME HALF — after the folds, so each permuted copy
+    //    carries the same post-fold bytes its companion stages. ──
+    materialize_weight_copies(&mut weights, wiring.weight_copies)?;
     tracing::debug!(
         "[timing] load_weights ({} tensors) took {:.2}s (of which take/disk {:.2}s; transpose = remainder)",
         weights.len(),
@@ -2267,6 +2317,102 @@ mod weight_scale_fold_tests {
         assert!(
             err.to_string().contains("desynced"),
             "the refusal says what reaching here means: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod weight_copy_tests {
+    use super::*;
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::oproj_headmajor_tid;
+
+    /// One staged fp8 o_proj-shaped weight as `stage_bound_weights` shapes it:
+    /// `(id, bytes, dtype, dims)`. The values are arbitrary — the copy is byte-for-byte
+    /// and dims-agnostic, which is the law under test.
+    fn oproj_row(id: usize, bytes: &[u8]) -> (usize, Vec<u8>, SDType, Vec<usize>) {
+        (id, bytes.to_vec(), SDType::Fp8E4m3, vec![4096, 4096])
+    }
+
+    /// Each listed copy is the COMPANION'S OWN ROW under the reserved tid — same bytes,
+    /// same dtype, same dims — because the permutation is not here: it happens at staging,
+    /// through the copy's own retile descriptor, so this is a source re-read, not a
+    /// transform. The companions and any neighbor keep their rows; the binding grows by
+    /// exactly the copy count.
+    #[test]
+    fn stages_each_copy_as_the_companions_own_bytes() {
+        let mut weights = vec![
+            oproj_row(9, &[1, 2, 3, 4, 5, 6, 7, 8]),  // layer 0's o_w
+            oproj_row(11, &[0, 0, 0, 0, 0, 0, 0, 0]), // the gate — no copy names it
+            oproj_row(21, &[9, 9, 9, 9]),             // layer 1's o_w (different bytes AND length)
+        ];
+        let copies = vec![
+            (9u32, oproj_headmajor_tid(9)),
+            (21u32, oproj_headmajor_tid(21)),
+        ];
+        materialize_weight_copies(&mut weights, &copies).expect("both copies stage");
+        assert_eq!(
+            weights.len(),
+            5,
+            "the binding grows by exactly the copy count"
+        );
+        for (from, to) in &copies {
+            let row = weights
+                .iter()
+                .find(|(id, ..)| *id == *to as usize)
+                .unwrap_or_else(|| panic!("the copy t{to} is staged"));
+            let companion = weights
+                .iter()
+                .find(|(id, ..)| *id == *from as usize)
+                .unwrap_or_else(|| panic!("the companion t{from} is staged"));
+            assert_eq!(
+                row.1, companion.1,
+                "t{to}: byte-for-byte — the shuffle is at staging, not here"
+            );
+            assert_eq!(row.2, companion.2, "t{to}: same dtype");
+            assert_eq!(row.3, companion.3, "t{to}: same dims");
+        }
+        // Append-only: the three staged rows are exactly what they were.
+        assert_eq!(weights[0], oproj_row(9, &[1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(weights[1], oproj_row(11, &[0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(weights[2], oproj_row(21, &[9, 9, 9, 9]));
+    }
+
+    /// A copy naming a companion the binding did not stage is a wiring↔mint desync —
+    /// refused with the tid in the message, never silently skipped, and the staged rows
+    /// are left alone.
+    #[test]
+    fn refuses_a_copy_naming_an_unstaged_companion() {
+        let mut weights = vec![oproj_row(9, &[1, 2, 3, 4])];
+        let err = materialize_weight_copies(&mut weights, &[(7u32, oproj_headmajor_tid(7))])
+            .expect_err("unstaged companion");
+        assert!(
+            err.to_string().contains("t7"),
+            "the refusal names the companion: {err}"
+        );
+        assert_eq!(
+            weights,
+            vec![oproj_row(9, &[1, 2, 3, 4])],
+            "a refusal leaves the staged rows alone"
+        );
+    }
+
+    /// A copy whose id the binding already staged is the mirror desync — the layout minted
+    /// a permuted copy for an id the binding owns. Refused rather than overwriting the
+    /// binding's own row.
+    #[test]
+    fn refuses_a_copy_whose_id_the_binding_already_staged() {
+        let to = oproj_headmajor_tid(9);
+        let mut weights = vec![oproj_row(9, &[1, 2, 3, 4]), oproj_row(to as usize, &[5, 6])];
+        let err = materialize_weight_copies(&mut weights, &[(9u32, to)])
+            .expect_err("copy id the binding owns");
+        assert!(
+            err.to_string().contains("already staged"),
+            "the refusal says what the collision is: {err}"
+        );
+        assert_eq!(
+            weights,
+            vec![oproj_row(9, &[1, 2, 3, 4]), oproj_row(to as usize, &[5, 6])],
+            "a refusal leaves the staged rows alone"
         );
     }
 }

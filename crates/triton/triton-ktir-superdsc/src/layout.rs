@@ -505,6 +505,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // is a matmul), and one Triton kernel's parameter list is not a graph — its scale consts
         // are the `scalarmul_scales` above, bound per launch.
         weight_scale_folds: Vec::new(),
+        // No head-major o_proj copies: the restructure is minted from a spyre bundle's
+        // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
+        weight_copies: Vec::new(),
         synth,
         // The arrangement authority starts empty and every op declares into it — that is the point:
         // the FIRST op to address a tensor fixes its device layout and a later disagreement is a
