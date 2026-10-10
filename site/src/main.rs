@@ -39,8 +39,33 @@ pub struct Site {
     pub out: PathBuf,
 }
 
-/// Static files copied as they are.
-const ASSETS: [&str; 2] = ["styles.css", "favicon.png"];
+const STYLES: &str = "styles.css";
+const FAVICON: &str = "favicon.png";
+
+/// The static files, under site/; each is published under its content hash.
+const ASSETS: [&str; 2] = [STYLES, FAVICON];
+
+/// A file's published name: `<stem>.<hash>.<ext>`, the hash (64-bit FNV-1a)
+/// of its bytes, so the name changes exactly when the file does.
+fn hashed_name(name: &str, bytes: &[u8]) -> String {
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}.{hash:016x}.{ext}"),
+        None => format!("{name}.{hash:016x}"),
+    }
+}
+
+/// Copies one static file into the site under its hashed name, which it returns.
+fn publish(site: &Site, name: &str) -> Result<String, String> {
+    let from = site.root.join(name);
+    let bytes = fs::read(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+    let published = hashed_name(name, &bytes);
+    let to = site.out.join(&published);
+    fs::write(&to, bytes).map_err(|e| format!("{}: {e}", to.display()))?;
+    Ok(published)
+}
 
 /// `n` with thousands separators, `1,580`.
 pub fn thousands(n: usize) -> String {
@@ -65,12 +90,6 @@ pub fn thousands_f(v: f64, decimals: usize) -> String {
     }
 }
 
-fn copy(from: &Path, to: &Path) -> Result<(), String> {
-    fs::copy(from, to)
-        .map(|_| ())
-        .map_err(|e| format!("{}: {e}", from.display()))
-}
-
 fn build(site: &Site) -> Result<(), String> {
     match fs::remove_dir_all(&site.out) {
         Ok(()) => {}
@@ -80,13 +99,14 @@ fn build(site: &Site) -> Result<(), String> {
     fs::create_dir_all(site.out.join("book"))
         .map_err(|e| format!("{}: {e}", site.out.display()))?;
 
-    for asset in ASSETS {
-        copy(&site.root.join(asset), &site.out.join(asset))?;
-    }
-    fs::write(site.out.join("index.html"), landing::page()?).map_err(|e| e.to_string())?;
-    book::build(site)?;
-    println!("{}", archs::build(site)?);
-    println!("{}", metal::build(site)?);
+    let assets = chrome::Published {
+        styles: publish(site, STYLES)?,
+        favicon: publish(site, FAVICON)?,
+    };
+    fs::write(site.out.join("index.html"), landing::page(&assets)?).map_err(|e| e.to_string())?;
+    book::build(site, &assets)?;
+    println!("{}", archs::build(site, &assets)?);
+    println!("{}", metal::build(site, &assets)?);
 
     let broken = book::broken_links(site)?;
     if !broken.is_empty() {
@@ -161,7 +181,17 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::thousands_f;
+    use super::{hashed_name, thousands_f};
+
+    #[test]
+    fn a_published_name_changes_exactly_when_its_bytes_do() {
+        let a = hashed_name("styles.css", b"body { color: red }");
+        assert_eq!(a, hashed_name("styles.css", b"body { color: red }"));
+        assert_ne!(a, hashed_name("styles.css", b"body { color: blue }"));
+        assert!(
+            a.starts_with("styles.") && a.ends_with(".css") && a.len() == "styles..css".len() + 16
+        );
+    }
 
     #[test]
     fn thousands_groups_the_integer_part_only() {
