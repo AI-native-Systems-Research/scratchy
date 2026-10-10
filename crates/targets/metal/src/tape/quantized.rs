@@ -68,6 +68,14 @@ pub enum QmvKernel {
     /// chunks. The decode hot path for Llama / Qwen / Gemma. MLX `qmv_fast`, which takes only
     /// whole 512-value blocks; ours finishes the row's last partial block too.
     Fast,
+    /// `affine_qmv_fast_*_t8_*` — [`QmvKernel::Fast`] at MLX's 8-row threadgroups
+    /// ([`QMV_FAST_FOLD_TILE_ROWS`]), the pick for the m≥2 buckets a pre-gen-15 GPU decodes
+    /// with: the small-M wide band that would take them needs gen-15+ (`wide_ok`, gated at
+    /// M5 here). The fold streams each matrix's weights once per row at either tile, and
+    /// there the 4-row tile only doubles the threadgroup count — #312 cost a third of
+    /// granite c4 decode TPOT on an M1 Max this way — so it keeps MLX's tile. One-row
+    /// buckets keep [`QmvKernel::Fast`]: #312's measured single-stream win.
+    FastFold,
     /// `affine_qmv_*` — generic fallback with bounds-checked tail.
     Generic,
     /// `affine_qmv_wide_*_nv_<nv>_kl_8` — the small-M band (`2 ≤ M <
@@ -90,6 +98,11 @@ pub enum QmvKernel {
 /// else                                              → qmv(...)
 ///   bool fast = N % bn == 0 && K % 512 == 0;  // bn = 8
 /// ```
+///
+/// Our one departure from MLX's `dispatch_qmv`: without the wide band (a pre-gen-15
+/// target), the m≥2 buckets the band would have taken decode on the fast kernel's
+/// fold twin (`FastFold`) instead — MLX's 8-row threadgroups, not the one-row
+/// kernel's 4 ([`QMV_FAST_TILE_ROWS`]).
 pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) -> QmvKernel {
     let pow2_bits = bits != 0 && (bits & (bits - 1)) == 0;
     if (k == 64 || k == 128) && pow2_bits {
@@ -101,7 +114,11 @@ pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) ->
             nv: m.div_ceil(n_tiles),
         }
     } else if qmv_fast_covers(n, k) {
-        QmvKernel::Fast
+        if m >= 2 {
+            QmvKernel::FastFold
+        } else {
+            QmvKernel::Fast
+        }
     } else {
         QmvKernel::Generic
     }
@@ -127,6 +144,10 @@ pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
 /// `QMV_FAST_ROWS` (2; MLX's tile is 8).
 pub const QMV_FAST_TILE_ROWS: u32 = 4;
 
+/// The rows an `affine_qmv_fast_t8` — the fold twin — threadgroup takes: its 2 simdgroups ×
+/// MLX's 4 rows a simdgroup. [`QmvKernel::FastFold`].
+pub const QMV_FAST_FOLD_TILE_ROWS: u32 = 8;
+
 /// Threadgroup grid + threads-per-group for a picked qmv variant.
 ///
 /// `qmv_quad`: `bn = quads_per_simd * results_per_quadgroup = 8 * 8 = 64`
@@ -147,6 +168,7 @@ pub fn qmv_dispatch_shape(
             ((m, n.div_ceil(bn), b), (32, 1, 1))
         }
         QmvKernel::Fast => ((m, n.div_ceil(QMV_FAST_TILE_ROWS), b), (32, 2, 1)),
+        QmvKernel::FastFold => ((m, n.div_ceil(QMV_FAST_FOLD_TILE_ROWS), b), (32, 2, 1)),
         QmvKernel::Generic => ((m, n.div_ceil(8), b), (32, 2, 1)),
         QmvKernel::Wide { nv } => {
             // quantized.cpp:559-571: rows_per_tg = (32 / k_lanes=8) × 2
@@ -179,6 +201,13 @@ pub fn qmv_kernel_name(
         }
         QmvKernel::Fast => {
             format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+        }
+        QmvKernel::FastFold => {
+            assert!(
+                !batched,
+                "FastFold is the fold (m≥2) decode matvec — never batched"
+            );
+            format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_t8_batch_0")
         }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
@@ -247,6 +276,9 @@ pub fn qmv_kernel_static_name(
         }
         QmvKernel::Fast => {
             format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
+        }
+        QmvKernel::FastFold => {
+            format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_t8_batch_0")
         }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
@@ -1142,6 +1174,37 @@ mod tests {
     }
 
     #[test]
+    fn qmv_kernel_pick_splits_the_fast_tile_by_fold() {
+        // m≥2 takes the wide band on a gen-15+ (M5) target…
+        for m in [2u32, 3, 4, 8] {
+            assert!(matches!(
+                pick_qmv_kernel_wide(2048, 2048, 4, m, true),
+                QmvKernel::Wide { .. }
+            ));
+            // …and before it, the same buckets decode on the fast kernel's fold
+            // twin: MLX's 8-row threadgroups, not the one-row kernel's 4.
+            assert_eq!(
+                pick_qmv_kernel_wide(2048, 2048, 4, m, false),
+                QmvKernel::FastFold
+            );
+        }
+        // One-row buckets keep the one-row kernel at either gate.
+        assert_eq!(
+            pick_qmv_kernel_wide(2048, 2048, 4, 1, false),
+            QmvKernel::Fast
+        );
+        assert_eq!(
+            pick_qmv_kernel_wide(2048, 2048, 4, 1, true),
+            QmvKernel::Fast
+        );
+        // The twin follows fast's coverage rule.
+        assert_eq!(
+            pick_qmv_kernel_wide(2049, 2048, 4, 4, false),
+            QmvKernel::Generic
+        );
+    }
+
+    #[test]
     fn qmv_dispatch_shape_matches_mlx_grid_dims() {
         // qmv_quad: bn = 64
         let ((tx, ty, tz), (gx, gy, gz)) =
@@ -1152,6 +1215,11 @@ mod tests {
         // qmv_fast: 4-row threadgroups of 2 simdgroups
         let ((tx, ty, tz), (gx, gy, gz)) = qmv_dispatch_shape(QmvKernel::Fast, 1, 2048, 1);
         assert_eq!((tx, ty, tz), (1, 2048 / 4, 1));
+        assert_eq!((gx, gy, gz), (32, 2, 1));
+
+        // its fold twin: MLX's 8-row threadgroups over the same 2 simdgroups
+        let ((tx, ty, tz), (gx, gy, gz)) = qmv_dispatch_shape(QmvKernel::FastFold, 4, 2048, 1);
+        assert_eq!((tx, ty, tz), (4, 2048 / 8, 1));
         assert_eq!((gx, gy, gz), (32, 2, 1));
 
         // qmv_generic: bn = 8
@@ -1173,6 +1241,17 @@ mod tests {
                 false
             ),
             "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0"
+        );
+        assert_eq!(
+            qmv_kernel_name(
+                QmvKernel::FastFold,
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                64,
+                4,
+                false
+            ),
+            "affine_qmv_fast_bf16_s_f16_gs_64_b_4_t8_batch_0"
         );
         assert_eq!(
             qmv_kernel_name(
