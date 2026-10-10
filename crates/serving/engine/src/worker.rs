@@ -198,6 +198,20 @@ pub trait Worker: Send {
         scratchy_core_common::KvAddressing::ByToken
     }
 
+    /// ⭐⭐⭐ HOW MANY SNAPSHOTS OF ITS MODEL'S RECURRENT STATE THIS WORKER KEEPS FOR THE PREFIX CACHE
+    /// — a CAPABILITY, known once `initialize_cache` has allocated them.
+    ///
+    /// A Gated-DeltaNet hybrid (Qwen3.5 / Qwen3.6) carries a per-sequence scan state that a cached KV
+    /// prefix cannot rebuild, so a prefix hit on it must also restore a snapshot of that state, and
+    /// the scheduler — which owns the snapshots as it owns KV blocks — needs to know how many slots
+    /// exist. 0 (the default) means this worker cannot snapshot one: every worker without recurrent
+    /// state, and every backend that has not implemented the copies. For a recurrent-hybrid model
+    /// that keeps prefix caching off, which is the only correct answer a backend without snapshots
+    /// has.
+    fn recurrent_state_snapshots(&self) -> usize {
+        0
+    }
+
     /// Whether this worker's DECODE path implements the hybrid sliding-window
     /// KV layout — separate paged cache groups per sliding window, addressed by
     /// the `sliding_groups` per-request block tables. Metal wires this; the CUDA

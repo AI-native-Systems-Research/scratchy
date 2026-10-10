@@ -22,8 +22,50 @@ use scratchy_core_config::{SchedulerConfig, SchedulerPolicy, SpansConfig};
 use tracing::warn;
 
 use super::interface::{PauseState, SchedulerInterface};
-use super::output::{CachedRequestData, NewRequestData, SchedulerOutput};
+use super::output::{
+    CachedRequestData, NewRequestData, RecurrentStateOps, SchedulerOutput, StateSnapshotOp,
+};
+use super::recurrent_state::StateSnapshots;
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
+
+/// ⭐ HOW FAR BEFORE A PROMPT'S END ITS RECURRENT-STATE SNAPSHOT SITS.
+///
+/// The next turn of a chat re-renders the generation prompt that ends this one. Qwen3.5/3.6 end a
+/// prompt with `<|im_start|>assistant\n<think>\n` (5 tokens; 7 with thinking off), and the next
+/// turn's history renders that same turn as `<|im_start|>assistant\n` + the reply — so it diverges
+/// 2-4 tokens before this prompt's end (1 in a tool loop). A snapshot inside that tail is never
+/// reused, and the turn that needed it falls back to the turn before. 8 covers every case measured
+/// on the template, at the price of recomputing at most 8 tokens more per turn, and it needs no
+/// knowledge of the template — so `/v1/completions` and `scr chat` get it too.
+pub const GENERATION_PROMPT_ALLOWANCE: usize = 8;
+
+/// ⭐ THE SMALLEST GAIN A RECURRENT-STATE SNAPSHOT IS TAKEN FOR, in tokens past the state the
+/// request already has (0 cold, else the snapshot it restored).
+///
+/// A snapshot is not free: its prefill chunk must END at it — one extra forward — and the slot
+/// costs as much memory as ~3,200 tokens of KV on Qwen3.6-35B-A3B (62.8 MiB). A snapshot that
+/// would save a later request fewer tokens than that forward costs is not worth taking.
+pub const MIN_SNAPSHOT_GAIN: usize = 256;
+
+/// Where a request with recurrent state resumes on admission — see
+/// [`KVCacheManagerOps::plan_recurrent_prefix`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecurrentPrefixPlan {
+    /// Tokens the request skips: the deepest block-aligned position, within its KV hit and
+    /// before its last token, that has a READY snapshot. 0 = cold.
+    pub tokens: u32,
+    /// The snapshot to restore when `tokens > 0`: `(slot, key)`.
+    pub restore: Option<(usize, u64)>,
+    /// Every ready snapshot slot on this request's prefix at or below `tokens`, `restore`
+    /// included — touched on admission so a conversation's older snapshots age with its newest.
+    /// An agent loop needs that: once the next user message arrives, the template re-renders the
+    /// loop's turns, and the snapshot that turn can use is the OLDEST one of the loop. Touched,
+    /// not pinned: only `restore` is read this step, so the others stay evictable.
+    pub prefix_slots: Vec<usize>,
+    /// Positions where this request's prefill must END a forward so its state there is
+    /// snapshotted, ascending: `(position, key)`.
+    pub save_points: Vec<(u32, u64)>,
+}
 
 // ---------------------------------------------------------------------------
 // KVCacheManagerOps -- trait for KV cache interaction
@@ -110,6 +152,38 @@ pub trait KVCacheManagerOps: Send {
     fn num_cached_blocks(&self) -> usize {
         0
     }
+
+    /// ⭐ WHERE A REQUEST WITH RECURRENT STATE MAY RESUME, given its KV hit.
+    ///
+    /// `None` = this cache tracks no recurrent state, and the KV hit stands. `Some` = it does:
+    /// the request resumes at `plan.tokens` (possibly 0) and NEVER at a KV hit past it, because
+    /// its recurrent state exists only where a snapshot does. Pure — nothing is committed until
+    /// [`Self::admit_recurrent_prefix`], after the request's blocks were allocated.
+    fn plan_recurrent_prefix(
+        &self,
+        _request: &Request,
+        _kv_hit_tokens: u32,
+    ) -> Option<RecurrentPrefixPlan> {
+        None
+    }
+
+    /// Commit a plan from [`Self::plan_recurrent_prefix`] for a request that was just admitted.
+    fn admit_recurrent_prefix(&mut self, _request_id: &str, _plan: &RecurrentPrefixPlan) {}
+
+    /// The next position past `num_computed_tokens` where `request_id`'s prefill must end a
+    /// forward to be snapshotted.
+    fn next_state_save_point(&self, _request_id: &str, _num_computed_tokens: u32) -> Option<u32> {
+        None
+    }
+
+    /// `request_id`'s chunk this step ends at `position`: reserve the snapshot slot its state is
+    /// saved into, if `position` is one of its save points and a slot is free or evictable.
+    fn reserve_state_save(&mut self, _request_id: &str, _position: u32) -> Option<StateSnapshotOp> {
+        None
+    }
+
+    /// The step that carried `saves` reported back: those snapshots now hold their state.
+    fn commit_state_saves(&mut self, _saves: &[StateSnapshotOp]) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +306,19 @@ pub struct SimpleBlockTracker {
     /// Vec_by_group<Vec_by_logical_block<hash>>`. Sliding groups only ever
     /// register hashes for blocks still in-window at seal time.
     hybrid_req_hashes: HashMap<String, Vec<Vec<u64>>>,
+
+    /// Recurrent-state snapshots, for a model whose layers carry a per-sequence scan state
+    /// (Gated-DeltaNet hybrids). `Some` makes EVERY prefix hit resume at a snapshot — see
+    /// [`KVCacheManagerOps::plan_recurrent_prefix`]. `None` for every attention-only model.
+    recurrent: Option<RecurrentTracking>,
+}
+
+/// [`SimpleBlockTracker`]'s recurrent-state bookkeeping.
+struct RecurrentTracking {
+    snapshots: StateSnapshots,
+    /// `request_id -> (position, key)` save points still ahead of the request, ascending.
+    /// Committed at admission, dropped when the request's blocks are freed.
+    save_points: HashMap<String, Vec<(u32, u64)>>,
 }
 
 /// One KV-cache group's allocation spec on the hybrid (SWA) path.
@@ -272,6 +359,7 @@ impl SimpleBlockTracker {
             hybrid_hash_to_id: HashMap::new(),
             hybrid_id_to_key: HashMap::new(),
             hybrid_req_hashes: HashMap::new(),
+            recurrent: None,
         }
     }
 
@@ -361,6 +449,39 @@ impl SimpleBlockTracker {
     pub fn sharing_one_write_slot(mut self) -> Self {
         self.addressing = scratchy_core_common::KvAddressing::OneSharedWriteSlot;
         self
+    }
+
+    /// ⭐⭐⭐ DECLARE THAT THE MODEL CARRIES RECURRENT STATE, AND HOW MANY SNAPSHOTS OF IT THE WORKER
+    /// KEEPS — Gated-DeltaNet hybrids (Qwen3.5 / Qwen3.6).
+    ///
+    /// From then on a prefix hit resumes only where a snapshot of that state exists, and a
+    /// request's prefill ENDS a forward at the positions worth snapshotting — the worker writes
+    /// the state only at forward ends, so that is the only place an exact one exists.
+    ///
+    /// ⛔ ONLY WITH PREFIX CACHING ON, AND NOT ON THE SLIDING-WINDOW PATH. Without caching there is
+    /// nothing to resume; the SWA path has its own hit logic, and no arch mixes the two yet.
+    pub fn with_state_snapshots(mut self, num_slots: usize) -> Self {
+        assert!(
+            self.enable_caching && self.swa_groups.is_none(),
+            "recurrent-state snapshots need prefix caching on the uniform KV path"
+        );
+        assert!(
+            num_slots > 0,
+            "recurrent-state snapshots need at least one slot"
+        );
+        self.recurrent = Some(RecurrentTracking {
+            snapshots: StateSnapshots::new(num_slots),
+            save_points: HashMap::new(),
+        });
+        self
+    }
+
+    /// Drop the recurrent-state bookkeeping of a request whose blocks are being freed.
+    fn forget_recurrent(&mut self, request_id: &str) {
+        if let Some(rec) = self.recurrent.as_mut() {
+            rec.save_points.remove(request_id);
+            rec.snapshots.drop_pending_of(request_id);
+        }
     }
 
     /// Create a new block tracker with a specific spans configuration.
@@ -588,8 +709,12 @@ impl SimpleBlockTracker {
             self.num_free_blocks -= 1;
 
             // Lazy eviction: remove hash mapping if this block was cached.
-            // Matches Python's `_maybe_evict_cached_block`.
-            if let Some(hash) = self.block_id_to_hash.remove(&block_id) {
+            // Matches Python's `_maybe_evict_cached_block`. Only the mapping that points at THIS
+            // block: a later request that computed the same hash into a block of its own moved
+            // the mapping there, and evicting the older copy must not take it along.
+            if let Some(hash) = self.block_id_to_hash.remove(&block_id)
+                && self.block_hash_to_id.get(&hash) == Some(&block_id)
+            {
                 self.block_hash_to_id.remove(&hash);
             }
 
@@ -1355,6 +1480,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn free(&mut self, request_id: &str) {
+        self.forget_recurrent(request_id);
         if let Some((block_ids_groups, _num_blocks)) = self.allocations.remove(request_id) {
             // Remove per-request hash tracking (hashes stay in block_hash_to_id).
             self.req_to_hashes.remove(request_id);
@@ -1459,6 +1585,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn free_volatile(&mut self, request_id: &str) {
+        self.forget_recurrent(request_id);
         if let Some((block_ids_groups, _num_blocks)) = self.allocations.remove(request_id) {
             self.req_to_hashes.remove(request_id);
             self.hybrid_req_hashes.remove(request_id);
@@ -1572,12 +1699,18 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn new_step_starts(&mut self) {
-        // Nothing to do for the simple tracker.
+        if let Some(rec) = self.recurrent.as_mut() {
+            rec.snapshots.tick();
+        }
     }
 
     fn reset_prefix_cache(&mut self) -> bool {
         if !self.enable_caching {
             return true;
+        }
+        if let Some(rec) = self.recurrent.as_mut() {
+            rec.snapshots.clear();
+            rec.save_points.clear();
         }
         self.block_hash_to_id.clear();
         self.block_id_to_hash.clear();
@@ -1620,6 +1753,138 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .keys()
             .filter(|&&bid| self.ref_cnt[bid] == 0)
             .count()
+    }
+
+    fn plan_recurrent_prefix(
+        &self,
+        request: &Request,
+        kv_hit_tokens: u32,
+    ) -> Option<RecurrentPrefixPlan> {
+        let rec = self.recurrent.as_ref()?;
+        let bs = self.block_size;
+        // ⛔ Span annotations RELOCATE KV, which a scan state cannot follow, and a vision prompt
+        // runs its encoder only on its first prefill step: neither resumes nor snapshots.
+        if request.block_annotations.is_some() || request.mm_data.is_some() {
+            return Some(RecurrentPrefixPlan {
+                tokens: 0,
+                restore: None,
+                prefix_slots: Vec::new(),
+                save_points: Vec::new(),
+            });
+        }
+        // The strict-prefix chain: each block's hash covers every token before it, which is the
+        // identity a snapshot has. (No annotations or images reach here, so it is also exactly the
+        // chain `get_computed_blocks` matched.)
+        let hashes = self.hash_all_blocks(&request.all_token_ids, None, None);
+        let kv_blocks = (kv_hit_tokens as usize / bs).min(hashes.len());
+        // At least one token must still run: its logits are the next token.
+        let resumable = kv_blocks.min(request.num_tokens().saturating_sub(1) / bs);
+        let hit = (1..=resumable).rev().find_map(|b| {
+            rec.snapshots
+                .ready_slot(hashes[b - 1])
+                .map(|slot| (b, slot))
+        });
+        let hit_blocks = hit.map_or(0, |(b, _)| b);
+        let tokens = (hit_blocks * bs) as u32;
+        let prefix_slots = hashes[..hit_blocks]
+            .iter()
+            .filter_map(|&h| rec.snapshots.ready_slot(h))
+            .collect();
+
+        let mut save_points = Vec::new();
+        // A pooling request finishes after one step and a volatile one is one-shot by contract:
+        // nothing resumes from either, so neither pays an extra forward for a snapshot.
+        if !request.is_pooling && !request.volatile {
+            // Two positions are worth a snapshot: where this prompt's KV match with an earlier
+            // one ends (a prefix two requests share with no state to show for it — the next one
+            // to share it resumes there), and the prompt's own end, short of the generation
+            // prompt the next turn re-renders. A resumed request is planned from its PROMPT, not
+            // its output so far: the prompt end is the snapshot that it — and its next turn — can
+            // use.
+            let end = (request.num_prompt_tokens as usize)
+                .saturating_sub(GENERATION_PROMPT_ALLOWANCE)
+                / bs;
+            let mut from = tokens as usize;
+            for b in [kv_blocks.min(end), end] {
+                let position = b * bs;
+                if position >= from + MIN_SNAPSHOT_GAIN && !rec.snapshots.contains(hashes[b - 1]) {
+                    save_points.push((position as u32, hashes[b - 1]));
+                    from = position;
+                }
+            }
+        }
+        tracing::info!(
+            "[CACHE] req={} recurrent state: resume at {} (KV hit {}), snapshot at {:?} ({}/{} slots ready)",
+            request.request_id,
+            tokens,
+            kv_hit_tokens,
+            save_points.iter().map(|&(p, _)| p).collect::<Vec<_>>(),
+            rec.snapshots.num_ready(),
+            rec.snapshots.num_slots(),
+        );
+        Some(RecurrentPrefixPlan {
+            tokens,
+            restore: hit.map(|(b, slot)| (slot, hashes[b - 1])),
+            prefix_slots,
+            save_points,
+        })
+    }
+
+    fn admit_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
+        let Some(rec) = self.recurrent.as_mut() else {
+            return;
+        };
+        // The restored slot is READ before this step's forward, so it is pinned for the step;
+        // its ancestors only age with it.
+        for &slot in &plan.prefix_slots {
+            rec.snapshots.touch(slot);
+        }
+        if let Some((slot, _)) = plan.restore {
+            rec.snapshots.pin(slot);
+        }
+        if plan.save_points.is_empty() {
+            rec.save_points.remove(request_id);
+        } else {
+            rec.save_points
+                .insert(request_id.to_owned(), plan.save_points.clone());
+        }
+    }
+
+    fn next_state_save_point(&self, request_id: &str, num_computed_tokens: u32) -> Option<u32> {
+        self.recurrent
+            .as_ref()?
+            .save_points
+            .get(request_id)?
+            .iter()
+            .map(|&(position, _)| position)
+            .find(|&position| position > num_computed_tokens)
+    }
+
+    fn reserve_state_save(&mut self, request_id: &str, position: u32) -> Option<StateSnapshotOp> {
+        let rec = self.recurrent.as_mut()?;
+        let points = rec.save_points.get_mut(request_id)?;
+        let i = points.iter().position(|&(p, _)| p == position)?;
+        let (_, key) = points[i];
+        // Consumed whether or not a slot is free: the chunk already ended here.
+        points.drain(..=i);
+        if points.is_empty() {
+            rec.save_points.remove(request_id);
+        }
+        let slot = rec.snapshots.reserve(key, position, request_id)?;
+        Some(StateSnapshotOp {
+            req_id: request_id.to_owned(),
+            slot,
+            position,
+            key,
+        })
+    }
+
+    fn commit_state_saves(&mut self, saves: &[StateSnapshotOp]) {
+        if let Some(rec) = self.recurrent.as_mut() {
+            for op in saves {
+                rec.snapshots.commit(op.slot, op.key, &op.req_id);
+            }
+        }
     }
 }
 
@@ -2053,6 +2318,13 @@ impl Scheduler {
         self.kv_cache.set_kv_pool_reach(reach);
     }
 
+    /// The step that carried `saves` reported back, so its recurrent-state snapshots hold their
+    /// state and may be resumed from. Called from the step's output, never at scheduling time:
+    /// a step that fails never gets here, and its snapshots never become hittable.
+    pub fn commit_state_saves(&mut self, saves: &[StateSnapshotOp]) {
+        self.kv_cache.commit_state_saves(saves);
+    }
+
     pub fn set_kv_extent(&mut self, request_id: &str, extent: scratchy_core_common::KvExtent) {
         if let Some(request) = self.requests.get_mut(request_id) {
             request.kv_extent = Some(extent);
@@ -2157,6 +2429,7 @@ impl SchedulerInterface for Scheduler {
         // reused cache hits (shared via §a) → worker skips rewriting their KV.
         let mut req_to_reused_blocks: HashMap<String, Vec<usize>> = HashMap::new();
         let mut num_scheduled_tokens: HashMap<String, usize> = HashMap::new();
+        let mut state_restores: Vec<StateSnapshotOp> = Vec::new();
         let mut token_budget = self.max_num_scheduled_tokens;
         let mut scheduled_spec_decode_tokens: HashMap<String, Vec<u32>> = HashMap::new();
 
@@ -2221,6 +2494,16 @@ impl SchedulerInterface for Scheduler {
                 .max_model_len
                 .saturating_sub(1 + request.num_computed_tokens as usize);
             num_new_tokens = num_new_tokens.min(max_remaining);
+
+            // A prefill chunk ENDS at the request's next recurrent-state save point, the only
+            // place an exact state for it exists (see `plan_recurrent_prefix`).
+            if let Some(save_at) = self
+                .kv_cache
+                .next_state_save_point(&request.request_id, request.num_computed_tokens)
+            {
+                num_new_tokens =
+                    num_new_tokens.min((save_at - request.num_computed_tokens) as usize);
+            }
 
             if num_new_tokens == 0 {
                 req_index += 1;
@@ -2364,6 +2647,19 @@ impl SchedulerInterface for Scheduler {
                 // threaded into allocate_slots so span blocks are SHARED.
                 let (num_cached_tokens, cached_blocks) =
                     self.kv_cache.get_computed_blocks(&request);
+                // ⭐ RECURRENT STATE: THE KV HIT STANDS ONLY WHERE A SNAPSHOT OF THE STATE DOES.
+                // The plan resumes the request at the deepest snapshot within the hit (or at 0).
+                // The matched blocks past that point stay shared, and the request recomputes their
+                // KV IN PLACE — as the full-hit back-off below recomputes a shared last block. A
+                // private copy would leave the cache pointing at the OLD copy: the request's next
+                // turn, or a resend, would read it beside a snapshot taken over the new one, and
+                // could not replay this forward exactly.
+                let recurrent = self
+                    .kv_cache
+                    .plan_recurrent_prefix(&request, num_cached_tokens);
+                let num_cached_tokens = recurrent
+                    .as_ref()
+                    .map_or(num_cached_tokens, |plan| plan.tokens);
 
                 // How many tokens need to be scheduled.
                 let total_tokens = request.num_tokens();
@@ -2435,6 +2731,14 @@ impl SchedulerInterface for Scheduler {
                 }
 
                 num_new_tokens = num_new_tokens.min(token_budget);
+                // The first chunk ends at the first save point, as in Phase 1.
+                if let Some(&(save_at, _)) = recurrent
+                    .iter()
+                    .flat_map(|plan| &plan.save_points)
+                    .find(|&&(position, _)| position > num_computed_tokens)
+                {
+                    num_new_tokens = num_new_tokens.min((save_at - num_computed_tokens) as usize);
+                }
                 if num_new_tokens == 0 {
                     // Put the request back.
                     self.waiting.prepend_request(request);
@@ -2475,6 +2779,17 @@ impl SchedulerInterface for Scheduler {
                                 (0..hits.len()).filter(|&i| hits[i] != usize::MAX).collect();
                             if !reused.is_empty() {
                                 req_to_reused_blocks.insert(request_id.clone(), reused);
+                            }
+                        }
+                        if let Some(plan) = &recurrent {
+                            self.kv_cache.admit_recurrent_prefix(&request_id, plan);
+                            if let Some((slot, key)) = plan.restore {
+                                state_restores.push(StateSnapshotOp {
+                                    req_id: request_id.clone(),
+                                    slot,
+                                    position: plan.tokens,
+                                    key,
+                                });
                             }
                         }
                         // Mutate request to running state.
@@ -2533,6 +2848,20 @@ impl SchedulerInterface for Scheduler {
         // ---------------------------------------------------------------
         let total_num_scheduled_tokens: usize = num_scheduled_tokens.values().sum();
 
+        // Recurrent-state saves, reserved only now that this step's set of requests is final (a
+        // request preempted above runs nothing). In `running` order, so which save gets the last
+        // free slot does not depend on hash-map iteration.
+        let mut state_saves: Vec<StateSnapshotOp> = Vec::new();
+        for request in &self.running {
+            if let Some(&n) = num_scheduled_tokens.get(&request.request_id)
+                && let Some(op) = self
+                    .kv_cache
+                    .reserve_state_save(&request.request_id, request.num_computed_tokens + n as u32)
+            {
+                state_saves.push(op);
+            }
+        }
+
         // Build NewRequestData for newly scheduled requests.
         // Use into_iter() to move fields out instead of cloning.
         let new_reqs_data: Vec<NewRequestData> = scheduled_new_reqs
@@ -2582,6 +2911,10 @@ impl SchedulerInterface for Scheduler {
                 None
             } else {
                 Some(preempted_req_ids)
+            },
+            recurrent_state: RecurrentStateOps {
+                restores: state_restores,
+                saves: state_saves,
             },
         };
 
@@ -5657,6 +5990,585 @@ mod tests {
                 max_tokens as usize,
                 "r{i} must emit all its tokens"
             );
+        }
+    }
+
+    // ----- Recurrent-state (Gated-DeltaNet) snapshots -----
+
+    /// A caching tracker over a uniform pool that tracks `slots` recurrent-state snapshots.
+    fn recurrent_scheduler(slots: usize, budget: usize) -> Scheduler {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: budget,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            ..Default::default()
+        };
+        let kv: Box<dyn KVCacheManagerOps> =
+            Box::new(SimpleBlockTracker::with_caching(1000, 16).with_state_snapshots(slots));
+        Scheduler::new(&cfg, 8192, kv)
+    }
+
+    fn request_with(id: &str, prompt: Vec<u32>) -> Request {
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(4),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    /// One step as the engine runs it: schedule, and — the step having executed — commit the
+    /// snapshots it saved, as `update_from_output` does.
+    fn run_step(sched: &mut Scheduler) -> SchedulerOutput {
+        let out = sched.schedule();
+        sched.commit_state_saves(&out.recurrent_state.saves);
+        out
+    }
+
+    /// Run `id`'s prefill to completion through committed steps, then finish it.
+    fn prefill_and_finish(sched: &mut Scheduler, id: &str) {
+        let done = |sched: &Scheduler| {
+            let r = sched.get_request(id).unwrap();
+            r.num_computed_tokens >= r.num_tokens() as u32
+        };
+        for _ in 0..64 {
+            if done(sched) {
+                break;
+            }
+            run_step(sched);
+        }
+        assert!(done(sched), "{id} never finished its prefill");
+        sched.finish_requests(&[id], RequestStatus::FinishedStopped);
+        run_step(sched);
+    }
+
+    #[test]
+    fn recurrent_cold_prompt_ends_a_forward_at_its_snapshot_point() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        sched.add_request(make_request("r1", 600));
+        let out = run_step(&mut sched);
+        // floor((600 - GENERATION_PROMPT_ALLOWANCE) / 16) * 16 = 592.
+        assert_eq!(out.num_scheduled_tokens["r1"], 592);
+        assert!(out.recurrent_state.restores.is_empty());
+        assert_eq!(out.recurrent_state.saves.len(), 1);
+        assert_eq!(out.recurrent_state.saves[0].req_id, "r1");
+        assert_eq!(out.recurrent_state.saves[0].position, 592);
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.num_scheduled_tokens["r1"], 8,
+            "the tail runs as its own forward"
+        );
+        assert!(out.recurrent_state.is_empty());
+    }
+
+    #[test]
+    fn recurrent_hit_resumes_at_a_ready_snapshot_and_restores_it() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let turn1: Vec<u32> = (0..600).collect();
+        sched.add_request(request_with("t1", turn1.clone()));
+        let saved = sched.schedule();
+        sched.commit_state_saves(&saved.recurrent_state.saves);
+        prefill_and_finish(&mut sched, "t1");
+
+        // The next turn extends the prompt; its KV hit is t1's 37 full blocks.
+        let turn2: Vec<u32> = turn1.iter().copied().chain(1000..1100).collect();
+        sched.add_request(request_with("t2", turn2));
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores,
+            vec![StateSnapshotOp {
+                req_id: "t2".into(),
+                slot: saved.recurrent_state.saves[0].slot,
+                position: 592,
+                key: saved.recurrent_state.saves[0].key,
+            }]
+        );
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 592);
+        assert_eq!(out.num_scheduled_tokens["t2"], 108);
+        assert_eq!(sched.get_request("t2").unwrap().num_cached_tokens, 592);
+        assert!(
+            out.recurrent_state.saves.is_empty(),
+            "96 tokens past the restored state is below MIN_SNAPSHOT_GAIN"
+        );
+    }
+
+    #[test]
+    fn recurrent_kv_hit_without_a_snapshot_resumes_at_zero() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        sched.add_request(make_request("r1", 200)); // too short to snapshot
+        let out = run_step(&mut sched);
+        assert_eq!(out.num_scheduled_tokens["r1"], 200);
+        assert!(out.recurrent_state.is_empty());
+        prefill_and_finish(&mut sched, "r1");
+
+        sched.add_request(make_request("r2", 200));
+        let out = run_step(&mut sched);
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
+        assert_eq!(out.num_scheduled_tokens["r2"], 200);
+        assert!(out.recurrent_state.restores.is_empty());
+    }
+
+    #[test]
+    fn recurrent_snapshot_is_not_hit_before_its_step_reports_back() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        sched.add_request(make_request("r1", 600));
+        let first = sched.schedule(); // its saves are NOT committed: the step is still running
+        assert_eq!(first.recurrent_state.saves.len(), 1);
+
+        sched.add_request(make_request("r2", 600));
+        let out = sched.schedule();
+        assert!(
+            out.recurrent_state.restores.is_empty(),
+            "a pending snapshot is not hittable"
+        );
+        assert_eq!(
+            out.num_scheduled_tokens["r2"], 600,
+            "no second split for the same prefix"
+        );
+        assert!(
+            out.recurrent_state.saves.is_empty(),
+            "one prefix is snapshotted once"
+        );
+
+        // Once it reports back, the next request with that prefix resumes from it.
+        sched.commit_state_saves(&first.recurrent_state.saves);
+        sched.add_request(make_request("r3", 600));
+        let out = sched.schedule();
+        assert_eq!(out.recurrent_state.restores.len(), 1);
+        assert_eq!(out.recurrent_state.restores[0].req_id, "r3");
+    }
+
+    #[test]
+    fn recurrent_snapshot_of_a_failed_step_never_becomes_hittable() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        sched.add_request(make_request("r1", 600));
+        let failed = sched.schedule();
+        assert_eq!(failed.recurrent_state.saves.len(), 1);
+        // The step failed: the engine aborts its requests and never commits.
+        sched.finish_requests(&["r1"], RequestStatus::FinishedAborted);
+        let _ = sched.schedule();
+
+        sched.add_request(make_request("r2", 600));
+        let retry = sched.schedule();
+        assert!(retry.recurrent_state.restores.is_empty());
+        assert_eq!(
+            retry.num_scheduled_tokens["r2"], 592,
+            "r2 takes the snapshot r1 never wrote"
+        );
+        assert_eq!(retry.recurrent_state.saves.len(), 1);
+        // r1's step ran after all (queued behind the failure) and reports back: it must not
+        // make r2's reservation of the same prefix ready before r2's own step writes it.
+        sched.commit_state_saves(&failed.recurrent_state.saves);
+        sched.add_request(make_request("r3", 600));
+        assert!(sched.schedule().recurrent_state.restores.is_empty());
+        sched.commit_state_saves(&retry.recurrent_state.saves);
+        sched.add_request(make_request("r4", 600));
+        let out = sched.schedule();
+        assert_eq!(out.recurrent_state.restores.len(), 1);
+        assert_eq!(out.recurrent_state.restores[0].req_id, "r4");
+    }
+
+    #[test]
+    fn recurrent_junction_snapshot_where_two_prompts_share_a_prefix() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let system: Vec<u32> = (0..512).collect();
+        let with_user = |user: u32| -> Vec<u32> {
+            system
+                .iter()
+                .copied()
+                .chain((0..100).map(|t| user * 1000 + t))
+                .collect()
+        };
+        sched.add_request(request_with("a", with_user(1)));
+        prefill_and_finish(&mut sched, "a");
+
+        // b shares a's 512-token system prompt but no state exists there: snapshot it.
+        sched.add_request(request_with("b", with_user(2)));
+        let out = run_step(&mut sched);
+        assert!(out.recurrent_state.restores.is_empty());
+        assert_eq!(out.num_scheduled_tokens["b"], 512);
+        assert_eq!(out.recurrent_state.saves[0].position, 512);
+        // b's own end (592) is under MIN_SNAPSHOT_GAIN past the junction: no second split.
+        let out = run_step(&mut sched);
+        assert_eq!(out.num_scheduled_tokens["b"], 100);
+        assert!(out.recurrent_state.saves.is_empty());
+        prefill_and_finish(&mut sched, "b");
+
+        // c resumes at the junction.
+        sched.add_request(request_with("c", with_user(3)));
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores.len(), 1);
+        assert_eq!(out.recurrent_state.restores[0].position, 512);
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 512);
+    }
+
+    #[test]
+    fn recurrent_long_prompt_chunks_end_at_the_save_point() {
+        let mut sched = recurrent_scheduler(4, 256);
+        sched.add_request(make_request("r1", 600));
+        let chunks: Vec<(usize, usize)> = (0..4)
+            .map(|_| {
+                let out = run_step(&mut sched);
+                (
+                    out.num_scheduled_tokens["r1"],
+                    out.recurrent_state.saves.len(),
+                )
+            })
+            .collect();
+        assert_eq!(chunks, vec![(256, 0), (256, 0), (80, 1), (8, 0)]);
+    }
+
+    #[test]
+    fn recurrent_annotated_volatile_and_pooling_requests_take_no_snapshot() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let mut annotated = make_request("ann", 600);
+        annotated.block_annotations = Some(Default::default());
+        let mut volatile = make_request("vol", 600);
+        volatile.volatile = true;
+        let mut pooling = make_request("pool", 600);
+        pooling.is_pooling = true;
+        for r in [annotated, volatile, pooling] {
+            sched.add_request(r);
+        }
+        let out = run_step(&mut sched);
+        assert!(out.recurrent_state.is_empty());
+        assert!(out.num_scheduled_tokens.values().all(|&n| n == 600));
+    }
+
+    #[test]
+    fn recurrent_annotated_requests_never_resume() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        sched.add_request(make_request("r1", 600));
+        prefill_and_finish(&mut sched, "r1");
+        let mut annotated = make_request("ann", 600);
+        annotated.block_annotations = Some(Default::default());
+        sched.add_request(annotated);
+        let out = run_step(&mut sched);
+        assert!(out.recurrent_state.restores.is_empty());
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
+    }
+
+    #[test]
+    fn recurrent_snapshots_are_evicted_least_recently_used_first() {
+        let mut sched = recurrent_scheduler(1, 4096);
+        sched.add_request(make_request("r1", 600));
+        prefill_and_finish(&mut sched, "r1");
+        // A different prompt takes the only slot.
+        sched.add_request(request_with("other", (5000..5600).collect()));
+        prefill_and_finish(&mut sched, "other");
+
+        sched.add_request(make_request("r2", 600));
+        let out = run_step(&mut sched);
+        assert!(
+            out.recurrent_state.restores.is_empty(),
+            "r1's snapshot was evicted"
+        );
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
+    }
+
+    #[test]
+    fn recurrent_reset_prefix_cache_forgets_snapshots() {
+        let mut sched = recurrent_scheduler(2, 4096);
+        sched.add_request(make_request("r1", 600));
+        prefill_and_finish(&mut sched, "r1");
+        assert!(sched.reset_prefix_cache());
+        sched.add_request(make_request("r2", 600));
+        let out = run_step(&mut sched);
+        assert!(out.recurrent_state.restores.is_empty());
+        assert_eq!(
+            out.recurrent_state.saves.len(),
+            1,
+            "the slot is free to snapshot again"
+        );
+    }
+
+    #[test]
+    fn evicting_an_older_copy_of_a_block_keeps_the_newer_ones_mapping() {
+        // Two requests compute the same prefix into blocks of their own; the second's
+        // registration moves the mapping. Recycling the FIRST copy must not delete it.
+        let mut t = SimpleBlockTracker::with_caching(4, 16);
+        let b1 = t
+            .allocate_slots(&make_request("r1", 32), 32, 0, &[])
+            .unwrap()[0]
+            .clone();
+        let b2 = t
+            .allocate_slots(&make_request("r2", 32), 32, 0, &[])
+            .unwrap()[0]
+            .clone();
+        assert_ne!(b1, b2);
+        let hit =
+            |t: &SimpleBlockTracker| t.get_computed_blocks(&make_request("q", 32)).1[0].clone();
+        assert_eq!(hit(&t), b2, "the latest registration stands");
+        t.free("r1");
+        t.free("r2");
+        // r1's blocks were freed first, so they are recycled first.
+        let other = request_with("r3", (900..932).collect());
+        let b3 = t.allocate_slots(&other, 32, 0, &[]).unwrap()[0].clone();
+        assert_eq!(b3, b1.iter().rev().copied().collect::<Vec<_>>());
+        assert_eq!(hit(&t), b2);
+    }
+
+    #[test]
+    fn recurrent_resume_below_the_kv_hit_recomputes_the_shared_blocks_in_place() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let turn1: Vec<u32> = (0..640).collect(); // 40 full blocks, snapshot at 624
+        sched.add_request(request_with("t1", turn1.clone()));
+        let first = run_step(&mut sched);
+        let tail = run_step(&mut sched);
+        let i = tail
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .position(|r| r == "t1")
+            .unwrap();
+        let t1_blocks = tail.scheduled_cached_reqs.new_block_ids[i]
+            .clone()
+            .unwrap_or_else(|| first.scheduled_new_reqs[0].block_ids.clone())[0]
+            .clone();
+        assert_eq!(t1_blocks.len(), 40);
+        sched.finish_requests(&["t1"], RequestStatus::FinishedStopped);
+        run_step(&mut sched);
+
+        sched.add_request(request_with(
+            "t2",
+            turn1.iter().copied().chain(900..1000).collect(),
+        ));
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores[0].position, 624);
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 624);
+        let t2_blocks = &out.scheduled_new_reqs[0].block_ids[0];
+        assert_eq!(
+            &t2_blocks[..40],
+            &t1_blocks[..40],
+            "the whole KV hit is shared, the block past the snapshot recomputed in place"
+        );
+        assert!(!t1_blocks.contains(&t2_blocks[40]));
+    }
+
+    #[test]
+    fn recurrent_multimodal_requests_neither_resume_nor_snapshot() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        sched.add_request(make_request("r1", 600));
+        prefill_and_finish(&mut sched, "r1");
+        let mut mm = make_request("mm", 600);
+        mm.mm_data = Some(Default::default());
+        sched.add_request(mm);
+        let out = run_step(&mut sched);
+        assert!(out.recurrent_state.is_empty());
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
+        assert_eq!(out.num_scheduled_tokens["mm"], 600);
+    }
+
+    #[test]
+    fn recurrent_junction_and_end_snapshots_in_one_prefill() {
+        let mut sched = recurrent_scheduler(4, 4096);
+        let system: Vec<u32> = (0..512).collect();
+        let with_user = |user: u32| -> Vec<u32> {
+            system
+                .iter()
+                .copied()
+                .chain((0..400).map(|t| user * 1000 + t))
+                .collect()
+        };
+        sched.add_request(request_with("a", with_user(1)));
+        prefill_and_finish(&mut sched, "a");
+        // b shares a's 512-token system prompt: a junction there, then its own end at 896.
+        sched.add_request(request_with("b", with_user(2)));
+        let mut chunks = Vec::new();
+        for _ in 0..3 {
+            let out = run_step(&mut sched);
+            let saved: Vec<u32> = out
+                .recurrent_state
+                .saves
+                .iter()
+                .map(|op| op.position)
+                .collect();
+            chunks.push((out.num_scheduled_tokens["b"], saved));
+        }
+        assert_eq!(
+            chunks,
+            vec![(512, vec![512]), (384, vec![896]), (16, vec![])]
+        );
+        sched.finish_requests(&["b"], RequestStatus::FinishedStopped);
+        run_step(&mut sched);
+
+        let mut next = with_user(2);
+        next.extend(5000..5050);
+        sched.add_request(request_with("b2", next));
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores[0].position, 896);
+    }
+
+    #[test]
+    fn recurrent_a_request_resumes_at_its_snapshot_after_preemption() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            ..Default::default()
+        };
+        // r0 (1 block) + r1 (600 tokens, 38 blocks) fill the pool exactly.
+        let kv: Box<dyn KVCacheManagerOps> =
+            Box::new(SimpleBlockTracker::with_caching(39, 16).with_state_snapshots(4));
+        let mut sched = Scheduler::new(&cfg, 8192, kv);
+        let long = |id: &str, n: usize| {
+            let mut r = make_request(id, n);
+            r.max_tokens = 64;
+            r.sampling_params.max_tokens = Some(64);
+            r
+        };
+        sched.add_request(long("r0", 15));
+        sched.add_request(long("r1", 600));
+        let mut preempted = false;
+        for _ in 0..32 {
+            let out = run_step(&mut sched);
+            if out
+                .preempted_req_ids
+                .as_ref()
+                .is_some_and(|p| p.contains("r1"))
+            {
+                preempted = true;
+                break;
+            }
+            for id in out.num_scheduled_tokens.keys() {
+                let r = sched.get_request(id).unwrap();
+                if r.num_computed_tokens as usize >= r.num_tokens() {
+                    sched.append_output_tokens(id, &[7]);
+                }
+            }
+        }
+        assert!(
+            preempted,
+            "r0's decode must preempt r1 for this test to mean anything"
+        );
+        sched.finish_requests(&["r0"], RequestStatus::FinishedStopped);
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores,
+            vec![StateSnapshotOp {
+                req_id: "r1".into(),
+                slot: out.recurrent_state.restores[0].slot,
+                position: 592,
+                key: out.recurrent_state.restores[0].key,
+            }]
+        );
+        assert!(out.scheduled_cached_reqs.resumed_req_ids.contains("r1"));
+        let i = out
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .position(|r| r == "r1")
+            .unwrap();
+        assert_eq!(out.scheduled_cached_reqs.num_computed_tokens[i], 592);
+        assert!(
+            out.recurrent_state.saves.is_empty(),
+            "its prompt end is already snapshotted"
+        );
+    }
+
+    #[test]
+    fn recurrent_a_request_that_cannot_be_admitted_restores_nothing_until_it_is() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            ..Default::default()
+        };
+        let kv: Box<dyn KVCacheManagerOps> =
+            Box::new(SimpleBlockTracker::with_caching(79, 16).with_state_snapshots(4));
+        let mut sched = Scheduler::new(&cfg, 8192, kv);
+        sched.add_request(make_request("r1", 600));
+        prefill_and_finish(&mut sched, "r1");
+        // A blocker holds 38 fresh blocks, leaving 3 free beside r1's 38 cached ones.
+        sched.add_request(request_with("blocker", (7000..7600).collect()));
+        for _ in 0..3 {
+            run_step(&mut sched);
+        }
+        // r2 resumes at r1's snapshot but needs 7 fresh blocks: not admissible yet.
+        let mut prompt: Vec<u32> = (0..600).collect();
+        prompt.extend(8000..8100);
+        sched.add_request(request_with("r2", prompt));
+        let out = run_step(&mut sched);
+        assert!(!out.num_scheduled_tokens.contains_key("r2"));
+        assert!(out.recurrent_state.is_empty());
+        sched.finish_requests(&["blocker"], RequestStatus::FinishedStopped);
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores.len(), 1);
+        assert_eq!(out.recurrent_state.restores[0].req_id, "r2");
+        assert_eq!(out.recurrent_state.restores[0].position, 592);
+    }
+
+    #[test]
+    fn recurrent_older_snapshots_of_a_conversation_age_with_its_newest() {
+        let mut sched = recurrent_scheduler(3, 4096);
+        let p: Vec<u32> = (0..600).collect();
+        let grow = |base: &[u32], from: u32, n: u32| -> Vec<u32> {
+            base.iter().copied().chain(from..from + n).collect()
+        };
+        sched.add_request(request_with("a1", p.clone())); // snapshot at 592
+        prefill_and_finish(&mut sched, "a1");
+        let a2 = grow(&p, 10_000, 400); // resumes at 592, snapshot at 992
+        sched.add_request(request_with("a2", a2.clone()));
+        prefill_and_finish(&mut sched, "a2");
+        sched.add_request(request_with("b", (20_000..20_600).collect()));
+        prefill_and_finish(&mut sched, "b");
+        // a3 resumes at 992 and touches 592 with it; it takes no snapshot of its own.
+        sched.add_request(request_with("a3", grow(&a2, 30_000, 100)));
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores[0].position, 992);
+        assert!(out.recurrent_state.saves.is_empty());
+        sched.finish_requests(&["a3"], RequestStatus::FinishedStopped);
+        run_step(&mut sched);
+        // A fourth snapshot evicts b's — the least recently used — not the conversation's 592.
+        sched.add_request(request_with("x", (40_000..40_600).collect()));
+        prefill_and_finish(&mut sched, "x");
+        sched.add_request(request_with("a4", grow(&p, 50_000, 100)));
+        let out = run_step(&mut sched);
+        assert_eq!(out.recurrent_state.restores[0].position, 592);
+    }
+
+    #[test]
+    fn recurrent_a_conversation_that_fills_the_pool_keeps_taking_snapshots() {
+        // Two slots, one conversation of growing turns: once its own snapshots fill the pool,
+        // each turn restores the newest (pinned), touches the older (evictable), and still
+        // snapshots its own end.
+        let mut sched = recurrent_scheduler(2, 4096);
+        let mut prompt: Vec<u32> = (0..600).collect();
+        let mut previous_end = None;
+        for turn in 0..5u32 {
+            let id = format!("t{turn}");
+            sched.add_request(request_with(&id, prompt.clone()));
+            let out = run_step(&mut sched);
+            if let Some(previous_end) = previous_end {
+                assert_eq!(
+                    out.recurrent_state.restores[0].position, previous_end,
+                    "turn {turn} resumes at the previous turn's end"
+                );
+            }
+            let end = (prompt.len() as u32 - 8) / 16 * 16;
+            previous_end = Some(end);
+            assert_eq!(
+                out.recurrent_state
+                    .saves
+                    .iter()
+                    .map(|op| op.position)
+                    .collect::<Vec<_>>(),
+                vec![end],
+                "turn {turn} snapshots its own end"
+            );
+            prefill_and_finish(&mut sched, &id);
+            // The next turn drops the 4-token generation prompt and adds 400 tokens.
+            prompt.truncate(prompt.len() - 4);
+            prompt.extend((0..400).map(|t| 100_000 * (turn + 1) + t));
         }
     }
 }

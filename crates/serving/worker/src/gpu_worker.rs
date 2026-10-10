@@ -50,7 +50,7 @@ use tracing::info;
 // `KvCachePool` is `cfg(any(cuda, metal))` in `scratchy-target-cuda::kv_cache`,
 // and `DType` is unconditional in `scratchy-target-cuda::dtype`.
 #[cfg(feature = "metal")]
-use scratchy_forward_compiler::gdn_slot_allocator::GdnSlotAllocator;
+use scratchy_forward_compiler::gdn_slot_allocator::{ClaimError, GdnSlotAllocator, SlotStart};
 #[cfg(feature = "metal")]
 use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
@@ -176,6 +176,21 @@ pub struct MetalWorker {
     /// `forward_argmax_blocking` to populate `ForwardCtx::{gdn_state_indices,
     /// gdn_is_fresh}`. `None` between steps / for non-hybrid arches.
     gdn_pending: Option<(Vec<i32>, Vec<u32>)>,
+    /// The prefix cache's snapshots of the GDN recurrent state: a second pool in `gdn_state`'s
+    /// layout with [`Self::recurrent_snapshot_slots`] slots, never bound to the forward. The
+    /// scheduler picks which slot holds which prefix (`SchedulerOutput::recurrent_state`); this
+    /// worker copies a live slot out after a forward that ends at a snapshot position, and into a
+    /// live slot before the first forward of a request resuming there. `None` without GDN state
+    /// or without prefix caching.
+    gdn_snapshots: Option<GdnStatePool<scratchy_target_metal::PoolMem>>,
+    /// The prefix key each snapshot slot was last saved under (`None` = never). A restore whose
+    /// key differs is refused: the scheduler and this worker would disagree about the slot, and
+    /// the copy would be another prefix's state.
+    gdn_snapshot_keys: Vec<Option<u64>>,
+    /// How many snapshots `gdn_snapshots` is built with — resolved with the width at the end of
+    /// `load_model` (from the same memory facts), charged against KV in
+    /// `determine_available_memory`. 0 = this worker keeps none.
+    recurrent_snapshot_slots: usize,
     model_dir: Option<PathBuf>,
     hf_config: Option<HfModelConfig>,
     /// How `/v1/embeddings` turns this step's hidden states into one
@@ -604,6 +619,17 @@ impl StepSlotMapping {
 #[cfg(feature = "metal")]
 const METAL_KV_ELEM_BYTES: usize = 2;
 
+/// The copy [`GdnStatePool::copy_slot_into`] runs on metal, for the prefix cache's
+/// recurrent-state snapshots.
+#[cfg(feature = "metal")]
+fn host_copy(dst: *mut u8, src: *const u8, bytes: usize) {
+    // SAFETY: both pools are StorageModeShared MTLBuffers, so their pointers are CPU pointers
+    // to `bytes` in-bounds bytes (the helper bounds-checks the slots); they are distinct
+    // allocations, so the ranges cannot overlap; and a step carrying recurrent-state copies is
+    // never deferred, so no command buffer touches either slot while this runs.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, bytes) }
+}
+
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
 /// × [`METAL_KV_ELEM_BYTES`].
 #[cfg(feature = "metal")]
@@ -783,7 +809,7 @@ pub use scratchy_serving_engine::gpu_budget::{
 // backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
 // both the CUDA and Metal workers) and are re-exported here.
 #[cfg(feature = "metal")]
-use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
+use scratchy_serving_engine::gpu_budget::{MaxNumSeqsFacts, resolve_width_and_snapshots};
 pub use scratchy_serving_engine::gpu_budget::{gdn_slot_key, resolve_default_max_num_seqs};
 
 #[cfg(feature = "metal")]
@@ -795,6 +821,9 @@ impl MetalWorker {
             gdn_state: None,
             gdn_slot_allocator: None,
             gdn_pending: None,
+            gdn_snapshots: None,
+            gdn_snapshot_keys: Vec::new(),
+            recurrent_snapshot_slots: 0,
             model_dir: None,
             hf_config: None,
             pooling_strategy: scratchy_core_model::embedding::PoolingStrategy::Last,
@@ -978,77 +1007,48 @@ impl MetalWorker {
         if self.resolved_max_num_seqs.is_some() {
             return Ok(());
         }
-        let resolved = match self.config.max_num_seqs {
-            Some(asked) => asked,
-            None => {
-                // Facts for the shared resolver — everything the guard's
-                // arithmetic names, gathered here so the resolver stays
-                // backend-neutral arithmetic (no near-copy can grow in any
-                // target crate).
-                let gdn_per_slot = model.gdn_runtime_config().map(|cfg| {
-                    GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
-                        cfg.num_linear_layers(),
-                        1,
-                        cfg.conv_dim as usize,
-                        cfg.conv_kernel as usize,
-                        cfg.num_v_heads as usize,
-                        cfg.head_v_dim as usize,
-                        cfg.head_k_dim as usize,
-                    )
-                });
-                let (budget, allocated) = self
-                    .metal_device
-                    .as_ref()
-                    .map(|dev| {
-                        (
-                            (dev.device.recommendedMaxWorkingSetSize() as f64
-                                * self.config.gpu_memory_utilization)
-                                as usize,
-                            dev.device.currentAllocatedSize(),
-                        )
-                    })
-                    // No device = no budget to clamp against: the base
-                    // constant survives as-is (the OOM guard still refuses
-                    // an unaffordable pool at determine_available_memory).
-                    .map(|(b, a)| (Some(b), a))
-                    .unwrap_or((None, 0));
-                // The ONE peak-activation estimate this worker has (see
-                // `metal_peak_activation_estimate`) — already draft-doubled
-                // and rung-summed; the resolver and the OOM guard share it.
-                // The target is still a local here, not `self.model` (see
-                // the helper's parameter doc).
-                let peak =
-                    self.metal_peak_activation_estimate(Some(model), Some(gpu_device), None)?;
-                // The sampler arena allocated right AFTER this resolves is
-                // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
-                // the sliced buffers' terms — count its per-row cost so the
-                // default accounts for what it triggers.
-                let max_model_len = self
-                    .config
-                    .max_model_len
-                    .or_else(|| {
-                        self.hf_config
-                            .as_ref()
-                            .and_then(|c| c.max_position_embeddings())
-                    })
-                    .unwrap_or(4096);
-                let sampler_row = scratchy_target_metal::sampling::SamplerArena::bytes_per_row(
-                    u32::try_from(model.vocab_size()).unwrap_or(u32::MAX),
-                    u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
+        // One GDN state slot: the live pool's cost per resident sequence, and the cost of one
+        // prefix-cache snapshot of a sequence's state — kept only when prefix caching is on.
+        let gdn_per_slot = model.gdn_runtime_config().map(|cfg| {
+            GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
+                cfg.num_linear_layers(),
+                1,
+                cfg.conv_dim as usize,
+                cfg.conv_kernel as usize,
+                cfg.num_v_heads as usize,
+                cfg.head_v_dim as usize,
+                cfg.head_k_dim as usize,
+            )
+        });
+        // Snapshots only where a prefix hit can use one. Not for a pooling run, whose requests
+        // never take one; not beside a draft model, whose lockstep verify path swallows a
+        // failed target forward that a snapshot would then capture (and a GDN state has no
+        // rollback for rejected drafts anyway).
+        let snapshot_bytes = gdn_per_slot.filter(|_| {
+            let usable = self.config.enable_prefix_caching
+                && !self.config.is_pooling
+                && self.config.draft_model_path.is_none();
+            if self.config.enable_prefix_caching && !usable {
+                info!(
+                    "ScratchyWorker(metal): no recurrent-state snapshots for the prefix cache — a \
+                     {} run cannot resume from one",
+                    if self.config.is_pooling {
+                        "pooling"
+                    } else {
+                        "draft-model"
+                    }
                 );
-                let facts = MaxNumSeqsFacts {
-                    // Metal reports no device facts — the base constant, the
-                    // SAME default as before the resolver existed.
-                    device_total_bytes: None,
-                    device_name: None,
-                    device_budget_bytes: budget,
-                    allocated_bytes: allocated,
-                    peak_activation_bytes: peak,
-                    gdn_per_slot_bytes: gdn_per_slot,
-                    sampler_bytes_per_row: sampler_row,
-                };
-                resolve_default_max_num_seqs(&facts, false)
             }
+            usable
+        });
+        let (resolved, snapshots) = match (self.config.max_num_seqs, snapshot_bytes) {
+            (Some(asked), None) => (asked, 0),
+            (asked, _) => resolve_width_and_snapshots(
+                &self.max_num_seqs_facts(model, gpu_device, gdn_per_slot)?,
+                asked,
+                snapshot_bytes,
+                false,
+            ),
         };
         info!(
             "ScratchyWorker(metal): max_num_seqs = {resolved} ({}; pass \
@@ -1059,8 +1059,82 @@ impl MetalWorker {
                 "default"
             }
         );
+        if let Some(bytes) = snapshot_bytes {
+            info!(
+                "ScratchyWorker(metal): {snapshots} recurrent-state snapshots for the prefix cache \
+                 ({:.1} MiB each, {:.2} GiB){}",
+                bytes as f64 / 1_048_576.0,
+                (snapshots * bytes) as f64 / 1_073_741_824.0,
+                if snapshots == 0 {
+                    " — no room for one beside the KV floor, so prefix caching stays off"
+                } else {
+                    ""
+                }
+            );
+        }
         self.resolved_max_num_seqs = Some(resolved);
+        self.recurrent_snapshot_slots = snapshots;
         Ok(())
+    }
+
+    /// Facts for the shared width resolver — everything the OOM guard's arithmetic names,
+    /// gathered here so the resolver stays backend-neutral arithmetic (no near-copy can grow in
+    /// any target crate).
+    fn max_num_seqs_facts(
+        &self,
+        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        gpu_device: &scratchy_target_metal::GpuDevice,
+        gdn_per_slot: Option<usize>,
+    ) -> ExecutorResult<MaxNumSeqsFacts> {
+        let (budget, allocated) = self
+            .metal_device
+            .as_ref()
+            .map(|dev| {
+                (
+                    (dev.device.recommendedMaxWorkingSetSize() as f64
+                        * self.config.gpu_memory_utilization) as usize,
+                    dev.device.currentAllocatedSize(),
+                )
+            })
+            // No device = no budget to clamp against: the base
+            // constant survives as-is (the OOM guard still refuses
+            // an unaffordable pool at determine_available_memory).
+            .map(|(b, a)| (Some(b), a))
+            .unwrap_or((None, 0));
+        // The ONE peak-activation estimate this worker has (see
+        // `metal_peak_activation_estimate`) — already draft-doubled
+        // and rung-summed; the resolver and the OOM guard share it.
+        // The target is still a local here, not `self.model` (see
+        // the helper's parameter doc).
+        let peak = self.metal_peak_activation_estimate(Some(model), Some(gpu_device), None)?;
+        // The sampler arena allocated right AFTER this resolves is
+        // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
+        // the sliced buffers' terms — count its per-row cost so the
+        // default accounts for what it triggers.
+        let max_model_len = self
+            .config
+            .max_model_len
+            .or_else(|| {
+                self.hf_config
+                    .as_ref()
+                    .and_then(|c| c.max_position_embeddings())
+            })
+            .unwrap_or(4096);
+        let sampler_row = scratchy_target_metal::sampling::SamplerArena::bytes_per_row(
+            u32::try_from(model.vocab_size()).unwrap_or(u32::MAX),
+            u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
+        );
+        Ok(MaxNumSeqsFacts {
+            // Metal reports no device facts — the base constant, the
+            // SAME default as before the resolver existed.
+            device_total_bytes: None,
+            device_name: None,
+            device_budget_bytes: budget,
+            allocated_bytes: allocated,
+            peak_activation_bytes: peak,
+            gdn_per_slot_bytes: gdn_per_slot,
+            sampler_bytes_per_row: sampler_row,
+        })
     }
 
     /// The peak-activation estimate BOTH the unset-`--max-num-seqs` resolver
@@ -1145,6 +1219,71 @@ impl MetalWorker {
             .sum::<ExecutorResult<u64>>()?;
         Ok((arena_peak_pair.saturating_add(64 * 1024 * 1024))
             .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX)))
+    }
+
+    /// Copy each saving row's live GDN state into the snapshot slot the scheduler reserved, after
+    /// the forward that ended the row there — and tag the slot with the prefix it now holds.
+    fn save_recurrent_state(
+        &mut self,
+        sched: &SchedulerOutput,
+        rows: &[String],
+        tokens_before: &[usize],
+        q_lens: &[usize],
+    ) -> ExecutorResult<()> {
+        let (Some(alloc), Some(live), Some(snapshots)) = (
+            self.gdn_slot_allocator.as_ref(),
+            self.gdn_state.as_ref(),
+            self.gdn_snapshots.as_ref(),
+        ) else {
+            return Err(ExecutorError::WorkerExecution(
+                "recurrent-state save scheduled for a worker without GDN state snapshots".into(),
+            ));
+        };
+        for op in &sched.recurrent_state.saves {
+            let row = rows.iter().position(|r| *r == op.req_id);
+            let slot = alloc.slot_of(gdn_slot_key(&op.req_id));
+            // The chunk must END at the snapshot position, on a block boundary, with no draft
+            // tokens a rejection would take back — else the state saved is not the prefix's.
+            let (Some(row), Some(slot)) = (row, slot) else {
+                return Err(ExecutorError::WorkerExecution(format!(
+                    "recurrent-state save for {} which this step did not run",
+                    op.req_id
+                )));
+            };
+            let end = tokens_before[row] + q_lens[row];
+            if end != op.position as usize
+                || !end.is_multiple_of(self.config.block_size)
+                || sched.scheduled_spec_decode_tokens.contains_key(&op.req_id)
+                || op.slot >= snapshots.num_slots
+            {
+                return Err(ExecutorError::WorkerExecution(format!(
+                    "recurrent-state save for {} at {} disagrees with this step: its chunk ends at \
+                     {end} (block size {}), snapshot slot {} of {}",
+                    op.req_id, op.position, self.config.block_size, op.slot, snapshots.num_slots,
+                )));
+            }
+            live.copy_slot_into(slot as usize, snapshots, op.slot, host_copy);
+            self.gdn_snapshot_keys[op.slot] = Some(op.key);
+        }
+        Ok(())
+    }
+
+    /// Bytes of the recurrent-state snapshot pool `initialize_cache` builds (0 without one).
+    fn recurrent_snapshot_reserve_bytes(&self) -> usize {
+        self.model
+            .as_ref()
+            .and_then(|m| m.gdn_runtime_config())
+            .map_or(0, |cfg| {
+                GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
+                    cfg.num_linear_layers(),
+                    self.recurrent_snapshot_slots,
+                    cfg.conv_dim as usize,
+                    cfg.conv_kernel as usize,
+                    cfg.num_v_heads as usize,
+                    cfg.head_v_dim as usize,
+                    cfg.head_k_dim as usize,
+                )
+            })
     }
 
     /// The resolved width, floored at 1. Every consumer of the width calls
@@ -1432,6 +1571,10 @@ impl MetalWorker {
             && sched.total_num_scheduled_tokens > 0
             && self.input_batch.num_active() > 0
             && sched.scheduled_spec_decode_tokens.is_empty()
+            // A recurrent-state copy is a host memcpy on the Shared GDN buffers: nothing may
+            // be in flight while a restore writes a live slot, and a save reads the state the
+            // forward leaves, so that forward must have finished.
+            && sched.recurrent_state.is_empty()
             && !self.config.is_pooling
             && self.draft_model.is_none()
             && sched.num_scheduled_tokens.keys().all(|req_id| {
@@ -2974,6 +3117,12 @@ impl Worker for MetalWorker {
         self.metal_prefill_bucket_max_m
     }
 
+    fn recurrent_state_snapshots(&self) -> usize {
+        // The pool `initialize_cache` built, not the count resolved for it: what the
+        // scheduler may address is what exists.
+        self.gdn_snapshots.as_ref().map_or(0, |p| p.num_slots)
+    }
+
     fn max_num_seqs_override(&self) -> Option<usize> {
         // The width this worker resolved (caller's ask, or the memory-
         // affordable default) and built every pool at. Reported so the
@@ -3663,6 +3812,33 @@ impl Worker for MetalWorker {
             );
             self.gdn_state = Some(gdn_pool);
             self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots));
+
+            // The prefix cache's snapshots of that state: the same layout, the slot count
+            // `resolve_max_num_seqs` sized from the memory facts. Shared + pinned like the live
+            // pool — the copies are host memcpys, and pinned is what the budget charged for.
+            let snapshot_slots = self.recurrent_snapshot_slots;
+            if snapshot_slots > 0 {
+                let snapshots = unsafe {
+                    scratchy_target_metal::gdn_state::GdnStatePool::new(
+                        num_layers,
+                        &gdn_cfg.linear_layers,
+                        snapshot_slots,
+                        gdn_cfg.conv_dim as usize,
+                        gdn_cfg.conv_kernel as usize,
+                        gdn_cfg.num_v_heads as usize,
+                        gdn_cfg.head_v_dim as usize,
+                        gdn_cfg.head_k_dim as usize,
+                        |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerInit(format!("GDN state snapshots: {e}")))?;
+                info!(
+                    "ScratchyWorker(metal): GDN state snapshots for the prefix cache — {snapshot_slots} \
+                     slots (the pool above), never bound to the forward"
+                );
+                self.gdn_snapshot_keys = vec![None; snapshot_slots];
+                self.gdn_snapshots = Some(snapshots);
+            }
         }
 
         // Allocate the draft model's
@@ -3907,6 +4083,12 @@ impl Worker for MetalWorker {
                     * kv_per_block_bytes(m, self.config.block_size)
             });
         let available = available.saturating_sub(tq_seed);
+        // The recurrent-state snapshots `initialize_cache` builds for the prefix cache come out
+        // of KV — before the draft split, which divides what is really left. Charged here rather
+        // than as overhead: they were sized from the headroom (`resolve_max_num_seqs`), so they
+        // are never what makes the guard below refuse a model.
+        let snapshot_reserve = self.recurrent_snapshot_reserve_bytes();
+        let available = available.saturating_sub(snapshot_reserve);
         // Per-pair split: when a draft model is loaded, every target KV
         // block has a 1:1 mirror in the draft pool, so the engine should
         // think it has only `target / (target + draft)` of the budget.
@@ -3929,14 +4111,15 @@ impl Worker for MetalWorker {
         };
         info!(
             "ScratchyWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             arena_peak={:.1} MiB (pair={:.1} MiB), rung_scratch={:.1} MiB, tq_seed={:.1} MiB, kv_budget={:.1} GiB \
-             (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
+             arena_peak={:.1} MiB (pair={:.1} MiB), rung_scratch={:.1} MiB, tq_seed={:.1} MiB, \
+             state_snapshots={:.2} GiB, kv_budget={:.1} GiB (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
             arena_peak as f64 / 1_048_576.0,
             arena_peak_pair as f64 / 1_048_576.0,
             rung_scratch as f64 / 1_048_576.0,
             tq_seed as f64 / 1_048_576.0,
+            snapshot_reserve as f64 / 1_073_741_824.0,
             available as f64 / 1_073_741_824.0,
             available_reported as f64 / 1_073_741_824.0,
             draft_reservation as f64 / 1_073_741_824.0,
@@ -4485,6 +4668,7 @@ impl Worker for MetalWorker {
         let sample_indices: Vec<u32> = attn.sample_indices();
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
         let q_lens: Vec<usize> = attn.q_lens.clone();
+        let tokens_before: Vec<usize> = attn.tokens_before.clone();
 
         // ── Constrained / guided decoding: gather this step's grammar
         // allow-masks ───────────────────────────────────────────────────
@@ -4539,28 +4723,96 @@ impl Worker for MetalWorker {
         // slot id + u32 fresh flag per batched sequence, in the SAME
         // order as `cu_seqlens_q` / `req_ids_in_order`. The metal
         // `forward_argmax_blocking` uploads these into
-        // `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`. `slot_for`
-        // returns `is_fresh=true` on a request's FIRST forward (including
-        // a recycled slot's new owner) so the GDN conv1d/scan kernels
-        // zero-init the slot's conv/ssm state instead of continuing from
-        // a finished sequence's stale data (the degeneration guard).
+        // `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`. `claim` decides
+        // each row's start from WHERE IT STANDS: fresh (the kernels
+        // zero-init) at token 0 — including a recycled slot's new owner,
+        // the degeneration guard — a continuation past it, or a restore: a
+        // prefix-cache hit whose recurrent state is copied in from a
+        // snapshot here, before the forward. A row past token 0 with no
+        // state anywhere is refused rather than run on a zeroed state.
         self.gdn_pending = if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
+            let capacity = alloc.capacity();
+            let restores = &scheduler_output.recurrent_state.restores;
+            // Rows the scheduler (re)admitted THIS step: the only ones a prefix hit can resume.
+            let admitted: std::collections::HashSet<&str> = scheduler_output
+                .scheduled_new_reqs
+                .iter()
+                .map(|r| r.req_id.as_str())
+                .chain(
+                    scheduler_output
+                        .scheduled_cached_reqs
+                        .resumed_req_ids
+                        .iter()
+                        .map(String::as_str),
+                )
+                .collect();
+            let mut restored = 0usize;
             let mut indices = Vec::with_capacity(req_ids_in_order.len());
             let mut fresh = Vec::with_capacity(req_ids_in_order.len());
-            for req_id in &req_ids_in_order {
-                match alloc.slot_for(gdn_slot_key(req_id)) {
-                    Some((slot, is_fresh)) => {
-                        indices.push(slot as i32);
-                        fresh.push(u32::from(is_fresh));
-                    }
-                    None => {
+            for (req_id, &before) in req_ids_in_order.iter().zip(&tokens_before) {
+                let restore = restores.iter().find(|op| op.req_id == *req_id);
+                let key = gdn_slot_key(req_id);
+                // A running row that owns no slot never ran a step here: the step that admitted
+                // it failed (`open_step` refused it), and the engine is aborting it. Run it fresh,
+                // as before snapshots existed — its output is dropped, and its pending snapshots
+                // with it — rather than fail this step and doom the next one's admissions in turn.
+                let doomed = !admitted.contains(req_id.as_str())
+                    && restore.is_none()
+                    && alloc.slot_of(key).is_none();
+                let (slot, start) = alloc
+                    .claim(
+                        key,
+                        if doomed { 0 } else { before as u32 },
+                        restore.is_some(),
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(match e {
+                            ClaimError::Exhausted => format!(
+                                "GDN state-slot pool exhausted (capacity {capacity}): scheduler \
+                                 admitted more concurrent sequences than max_num_seqs",
+                            ),
+                            ClaimError::MissingState => format!(
+                                "request {req_id} resumes at token {before} with no GDN state: a \
+                                 prefix-cache hit on a recurrent-hybrid model must restore a \
+                                 state snapshot"
+                            ),
+                        })
+                    })?;
+                if let Some(op) = restore {
+                    restored += 1;
+                    // The scheduler and this worker must agree on the slot and the position,
+                    // or the copy would be another prefix's state.
+                    let (Some(live), Some(snapshots)) =
+                        (self.gdn_state.as_ref(), self.gdn_snapshots.as_ref())
+                    else {
+                        return Err(ExecutorError::WorkerExecution(
+                            "recurrent-state restore scheduled for a worker without GDN state \
+                             snapshots"
+                                .into(),
+                        ));
+                    };
+                    if op.position as usize != before
+                        || self.gdn_snapshot_keys.get(op.slot) != Some(&Some(op.key))
+                    {
                         return Err(ExecutorError::WorkerExecution(format!(
-                            "GDN state-slot pool exhausted (capacity {}): scheduler \
-                             admitted more concurrent sequences than max_num_seqs",
-                            alloc.capacity(),
+                            "recurrent-state restore for {req_id} at token {before} disagrees with \
+                             this worker: snapshot slot {} at {} holds {:?}, expected key {:#x}",
+                            op.slot,
+                            op.position,
+                            self.gdn_snapshot_keys.get(op.slot),
+                            op.key,
                         )));
                     }
+                    snapshots.copy_slot_into(op.slot, live, slot as usize, host_copy);
                 }
+                indices.push(slot as i32);
+                fresh.push(u32::from(start == SlotStart::Fresh));
+            }
+            if restored != restores.len() {
+                return Err(ExecutorError::WorkerExecution(format!(
+                    "{} recurrent-state restores scheduled for requests not in this step",
+                    restores.len() - restored
+                )));
             }
             Some((indices, fresh))
         } else {
@@ -5113,6 +5365,17 @@ impl Worker for MetalWorker {
                     })?
             }
         };
+        // ⭐ Recurrent-state saves: each saving row's chunk ended at its snapshot position, and a
+        // step carrying them is not deferred, so the forward has finished and the row's slot
+        // holds exactly the state the scan left there.
+        if !scheduler_output.recurrent_state.saves.is_empty() {
+            self.save_recurrent_state(
+                scheduler_output,
+                &req_ids_in_order,
+                &tokens_before,
+                &q_lens,
+            )?;
+        }
         // A deferred step: its tokens stay on the device until the engine, and
         // the next step but one, wait for them.
         if let Some((done, argmax)) = self.committed.take() {

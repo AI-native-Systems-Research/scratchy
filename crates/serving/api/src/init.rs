@@ -459,6 +459,7 @@ fn create_worker(
         // the width itself (device tier / memory-affordable GDN slots), while
         // `Some(n)` pins every worker-side consumer to the caller's ask.
         max_num_seqs: config.max_num_seqs,
+        enable_prefix_caching: requested_prefix_caching(config),
         enforce_eager: config.enforce_eager,
         cuda_graph_mode: config
             .cuda_graph_mode
@@ -1016,9 +1017,11 @@ fn human_bytes(b: u64) -> String {
 
 /// Whether an architecture is recurrent / hybrid — it keeps a sequential
 /// conv/ssm (Mamba-style) or Gated-DeltaNet state that cannot be reconstructed
-/// from a cached KV prefix. Prefix caching must be disabled for these models
-/// (a prefix-cache hit would feed only the new tokens, leaving the recurrent
-/// state computed over the wrong span). Mirrors vLLM's hybrid/SSM handling.
+/// from a cached KV prefix. A prefix-cache hit on one is only correct where a
+/// snapshot of that state is restored with it (a hit would otherwise feed only
+/// the new tokens, leaving the recurrent state computed over the wrong span), so
+/// prefix caching is off for these models unless the worker keeps snapshots —
+/// see [`effective_prefix_caching`]. Mirrors vLLM's hybrid/SSM handling.
 /// Detected by HF `architectures` string since the marker is per-layer.
 fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
     architectures.iter().any(|a| {
@@ -1036,6 +1039,27 @@ fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
             || a.contains("Lfm2")
             || a.contains("GraniteMoeHybrid")
     })
+}
+
+/// Prefix caching as requested AND as the backend can honour it at all
+/// (`WorkerFactory::supports_prefix_caching`) — what the worker is created with,
+/// so it reserves recurrent-state snapshots only for an engine that will use them.
+fn requested_prefix_caching(config: &VllmConfig) -> bool {
+    config.enable_prefix_caching
+        && !inventory::iter::<&dyn scratchy_serving_engine::worker_factory::WorkerFactory>()
+            .find(|f| f.matches(&config.device))
+            .is_some_and(|f| !f.supports_prefix_caching())
+}
+
+/// ⭐ THE ONE RULE FOR WHETHER THE ENGINE SERVES CACHED PREFIXES, at every `EngineCoreConfig` site.
+///
+/// `requested` is [`requested_prefix_caching`]; a recurrent-hybrid model (see
+/// [`is_recurrent_hybrid_arch`]) additionally needs a worker that keeps `snapshots` of its
+/// recurrent state, because a hit that restores no state runs the model over the wrong span.
+/// The multi-GPU paths have no snapshotting worker and pass 0 — they used to copy the flag
+/// straight through, prefix caching a Gated-DeltaNet model with no state behind the hit.
+fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: usize) -> bool {
+    requested && (!recurrent_hybrid || snapshots > 0)
 }
 
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
@@ -1228,6 +1252,9 @@ fn initialize_core(
     // Same reason, same moment: the widest concurrency this backend can DECODE in one batched step, on a
     // backend whose decode-width ladder is fixed at bake time and so cannot grow to meet `max_num_seqs`.
     let worker_max_num_seqs = worker.max_num_seqs_override();
+    // And the snapshots of the model's recurrent state it allocated, which decide whether a
+    // recurrent-hybrid model may be prefix cached at all.
+    let worker_state_snapshots = worker.recurrent_state_snapshots();
 
     info!(
         "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
@@ -1272,18 +1299,33 @@ fn initialize_core(
         !config.disable_async_scheduling && !spec_decode_requires_sync(config);
     // Recurrent / hybrid arches (Mamba, Gated-DeltaNet — Qwen3.5/3.6/Next, …)
     // carry a sequential conv/ssm state that CANNOT be reconstructed from a
-    // cached KV prefix: a prefix-cache hit would feed the sequence only its
-    // *new* tokens, leaving the recurrent state computed over the wrong span
-    // (garbage output). vLLM disables prefix caching for these models; do the
-    // same. (Per-layer linear-attention is the marker; detect by arch string.)
+    // cached KV prefix: a prefix-cache hit that fed the sequence only its *new*
+    // tokens would leave the recurrent state computed over the wrong span
+    // (garbage output). A hit on one is correct only where a SNAPSHOT of that
+    // state is restored with it, so caching stays off for these models unless
+    // the worker keeps snapshots (`Worker::recurrent_state_snapshots`) — see
+    // `effective_prefix_caching`. (Per-layer linear-attention is the marker;
+    // detect by arch string.)
     let enable_prefix_caching = {
         let hybrid = is_recurrent_hybrid_arch(&hf_config.architectures);
-        if hybrid && config.enable_prefix_caching {
-            info!(
-                "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
-                 architecture — its conv/ssm state cannot be reconstructed from a cached KV prefix",
-                hf_config.architectures
-            );
+        let requested = requested_prefix_caching(config);
+        if hybrid && requested {
+            if worker_state_snapshots > 0 {
+                info!(
+                    "Prefix caching on for {:?}, a recurrent/hybrid (Gated-DeltaNet) architecture: \
+                     the worker keeps {worker_state_snapshots} snapshots of its recurrent state, \
+                     and a hit resumes only where one exists",
+                    hf_config.architectures
+                );
+            } else {
+                info!(
+                    "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
+                     architecture and the worker keeps no snapshots of its conv/ssm state, which a \
+                     cached KV prefix cannot reconstruct (a backend without them, a pooling or \
+                     draft-model run, or no memory for one beside the KV floor)",
+                    hf_config.architectures
+                );
+            }
         }
         // ⛔ AND THE BACKEND MUST BE ABLE TO HONOUR IT — asked HERE, where every entry point passes.
         //
@@ -1321,18 +1363,14 @@ fn initialize_core(
         //      count and only its first contiguous run is token-addressed.
         //
         // Asked at the ONE point that computes the flag, so no future entry point can skip it.
-        let backend_refuses =
-            inventory::iter::<&dyn scratchy_serving_engine::worker_factory::WorkerFactory>()
-                .find(|f| f.matches(&config.device))
-                .is_some_and(|f| !f.supports_prefix_caching());
-        if backend_refuses && config.enable_prefix_caching && !hybrid {
+        if config.enable_prefix_caching && !requested {
             info!(
                 "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
                  would skip the prefill for a prefix the worker holds no KV for",
                 config.device
             );
         }
-        config.enable_prefix_caching && !hybrid && !backend_refuses
+        effective_prefix_caching(requested, hybrid, worker_state_snapshots)
     };
 
     // Device-specific `max_num_batched_tokens` default — no flat constant on any
@@ -1493,6 +1531,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 // resolve the width itself, `Some(n)` pins worker-side
                 // consumers to the ask.
                 max_num_seqs: config.max_num_seqs,
+                enable_prefix_caching: requested_prefix_caching(config),
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
@@ -1681,7 +1720,11 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 
         let use_async_scheduling =
             !config.disable_async_scheduling && !spec_decode_requires_sync(config);
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = effective_prefix_caching(
+            requested_prefix_caching(config),
+            is_recurrent_hybrid_arch(&hf_config.architectures),
+            0,
+        );
 
         let eos_token_ids: Vec<u32> = hf_config
             .extra
@@ -2065,6 +2108,7 @@ fn initialize_stack_multinode(
             // resolve the width itself, `Some(n)` pins worker-side
             // consumers to the ask.
             max_num_seqs: config.max_num_seqs,
+            enable_prefix_caching: requested_prefix_caching(config),
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
             cuda_graph_sizes: config
@@ -2253,7 +2297,11 @@ fn initialize_stack_multinode(
 
         let use_async_scheduling =
             !config.disable_async_scheduling && !spec_decode_requires_sync(config);
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = effective_prefix_caching(
+            requested_prefix_caching(config),
+            is_recurrent_hybrid_arch(&hf_config.architectures),
+            0,
+        );
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
@@ -2382,6 +2430,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         block_size: config.block_size,
         device_id: 0, // Each node has 1 GPU at device 0.
         max_num_seqs: config.max_num_seqs,
+        enable_prefix_caching: requested_prefix_caching(config),
         enforce_eager: config.enforce_eager,
         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
         cuda_graph_sizes: config
@@ -2576,6 +2625,7 @@ fn initialize_stack_tp_pp(
                         // the worker resolve the width itself, `Some(n)` pins
                         // worker-side consumers to the ask.
                         max_num_seqs: config.max_num_seqs,
+                        enable_prefix_caching: requested_prefix_caching(config),
                         enforce_eager: config.enforce_eager,
                         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
                         cuda_graph_sizes: config
@@ -2823,7 +2873,11 @@ fn initialize_stack_tp_pp(
             // PP: force sync scheduling — async scheduling with PP requires token broadcast
             // from last stage to non-last stages, which is not yet implemented.
             let use_async_scheduling = false;
-            let enable_prefix_caching = config.enable_prefix_caching;
+            let enable_prefix_caching = effective_prefix_caching(
+                requested_prefix_caching(config),
+                is_recurrent_hybrid_arch(&hf_config.architectures),
+                0,
+            );
             let engine_config = EngineCoreConfig {
                 scheduler_config: SchedulerConfig {
                     max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
@@ -2973,6 +3027,7 @@ fn initialize_stack_tp(
                 // resolve the width itself, `Some(n)` pins worker-side
                 // consumers to the ask.
                 max_num_seqs: config.max_num_seqs,
+                enable_prefix_caching: requested_prefix_caching(config),
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
@@ -3183,7 +3238,11 @@ fn initialize_stack_tp(
 
         let use_async_scheduling =
             !config.disable_async_scheduling && !spec_decode_requires_sync(config);
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = effective_prefix_caching(
+            requested_prefix_caching(config),
+            is_recurrent_hybrid_arch(&hf_config.architectures),
+            0,
+        );
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
@@ -3426,6 +3485,7 @@ fn initialize_stack_external(
             // resolve the width itself, `Some(n)` pins worker-side consumers
             // to the ask.
             max_num_seqs: config.max_num_seqs,
+            enable_prefix_caching: requested_prefix_caching(config),
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
             cuda_graph_sizes: config
@@ -3579,7 +3639,11 @@ fn initialize_stack_external(
 
         let use_async_scheduling =
             !config.disable_async_scheduling && !spec_decode_requires_sync(config);
-        let enable_prefix_caching = config.enable_prefix_caching;
+        let enable_prefix_caching = effective_prefix_caching(
+            requested_prefix_caching(config),
+            is_recurrent_hybrid_arch(&hf_config.architectures),
+            0,
+        );
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
@@ -4076,6 +4140,23 @@ fn extract_model_name(model_path: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recurrent_hybrid_is_prefix_cached_only_with_snapshots() {
+        assert!(
+            effective_prefix_caching(true, false, 0),
+            "attention-only: as requested"
+        );
+        assert!(
+            !effective_prefix_caching(true, true, 0),
+            "no snapshots: off"
+        );
+        assert!(effective_prefix_caching(true, true, 32), "snapshots: on");
+        assert!(
+            !effective_prefix_caching(false, true, 32),
+            "never past the request"
+        );
+    }
 
     #[test]
     fn test_extract_model_name_hf_id() {

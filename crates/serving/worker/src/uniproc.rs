@@ -117,6 +117,11 @@ impl Executor for UniProcExecutor {
         self.worker.kv_addressing()
     }
 
+    /// Straight through to the worker, which allocated them.
+    fn recurrent_state_snapshots(&self) -> usize {
+        self.worker.recurrent_state_snapshots()
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,
