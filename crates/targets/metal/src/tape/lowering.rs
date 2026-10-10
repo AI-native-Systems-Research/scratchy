@@ -1212,7 +1212,8 @@ const fn combine_threads(hd: u32) -> u32 {
 /// group, where `attention_via_cache_v2` decodes them once per head. Every bucket m takes it:
 /// the kernel is per-row throughout (`seq = tg_pos.x` drives the row's length, block table,
 /// slot and position), so a batched step's rows spread the grid's x axis and nothing else
-/// changes. Its keys spread over the
+/// changes; a multi-row bucket's rows are tokens (`ATTN_ROW_QUERIES`, each reading its
+/// sequence's keys up to its own: a verify step's last token and drafts). Its keys spread over the
 /// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
 /// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
@@ -9253,8 +9254,8 @@ mod tests {
     /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
     /// front, its constants less the TurboQuant heads and plus the rung's split count, a
     /// threadgroup per (KV head, split) of head_dim threads — then a combine of one simdgroup a
-    /// query head. A many-row bucket's decode, and a geometry it cannot take, keep the
-    /// per-head-group kernel.
+    /// query head. A verify-sized bucket's takes it a token a threadgroup row; a bucket past the
+    /// verify rows, and a geometry it cannot take, keep the per-head-group kernel.
     #[test]
     fn turboquant_decode_serves_each_kv_heads_query_heads_together() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
@@ -9357,6 +9358,19 @@ mod tests {
             1,
         );
         assert!(kernels(&between).contains(&KernelId::AttentionViaCacheTq));
+        // A verify-sized bucket: a threadgroup row a token (`ATTN_ROW_QUERIES`, its sequence's
+        // start in `cu_seqlens_q`), partials for every row.
+        let verify = lower_tq(&p, rows(), 4);
+        assert_eq!(gated_steps(&verify), gated_steps(&tape));
+        let (gqa, combine) = (&verify.commands[2].command, &verify.commands[3].command);
+        assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
+        assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
+        assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
+        assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
+        assert_eq!(
+            verify.moe_scratch_bytes,
+            4 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+        );
 
         // Running its KV writer (Gemma 4's global layers), it is the tape's only encoder.
         use crate::tape::step::RopedAttention;
