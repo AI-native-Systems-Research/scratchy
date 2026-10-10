@@ -2008,7 +2008,7 @@ impl AsyncEngine {
                 while gpu_in_flight < 2 && !awaits_step {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
-                            let speculative = sched.is_speculative();
+                            let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
                             if sched_tx
                                 .send(ExecutorWork::Execute(Box::new(sched)))
                                 .await
@@ -2049,6 +2049,7 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
+                            client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
                             let req_ids: Vec<String> =
                                 sched.num_scheduled_tokens.keys().cloned().collect();

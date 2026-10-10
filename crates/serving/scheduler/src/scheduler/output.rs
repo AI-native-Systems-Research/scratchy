@@ -188,6 +188,22 @@ pub struct SchedulerOutput {
     /// engine's proposer after scheduling, not by the scheduler.
     #[serde(default)]
     pub draft_req_ids: HashSet<String>,
+
+    /// Where this step stands among speculative steps scheduled ahead of their outcomes.
+    #[serde(default)]
+    pub spec_pipeline: SpecPipeline,
+}
+
+/// A speculative step scheduled ahead (#240): the engine schedules the step after one that drafts
+/// before that one is finalized, and the worker picks what depends on its outcome on the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecPipeline {
+    /// The step after this one may be scheduled before this one is finalized: its one request
+    /// drafts here, and the engine gave its next step placeholder drafts the device fills.
+    pub leads: bool,
+    /// Scheduled while the step before it was in flight: its positions assume every draft that
+    /// step verifies kept, its tokens and drafts are that step's on the device.
+    pub behind: bool,
 }
 
 impl SchedulerOutput {
@@ -212,6 +228,7 @@ impl SchedulerOutput {
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
             draft_req_ids: HashSet::new(),
+            spec_pipeline: SpecPipeline::default(),
         }
     }
 }
@@ -304,6 +321,7 @@ mod tests {
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
             draft_req_ids: HashSet::new(),
+            spec_pipeline: SpecPipeline::default(),
         };
         assert_eq!(so.total_num_scheduled_tokens, 150);
         assert_eq!(so.scheduled_new_reqs.len(), 1);

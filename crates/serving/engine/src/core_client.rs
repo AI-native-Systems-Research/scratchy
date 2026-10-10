@@ -112,6 +112,9 @@ pub trait EngineCoreClient {
         ))
     }
 
+    /// A step the executor failed, never to be finalized ([`EngineCore::abandon_step`]).
+    fn abandon_step(&mut self, _sched: &SchedulerOutput) {}
+
     /// Whether async scheduling is enabled on the underlying engine.
     fn async_scheduling(&self) -> bool {
         false
@@ -340,7 +343,7 @@ impl InprocClient {
         // 1. Pre-schedule: fill pipeline up to 2 in-flight batches.
         while pipeline.gpu_in_flight < 2 && !pipeline.awaits_step {
             if let Some(sched) = engine.schedule_next() {
-                let speculative = sched.is_speculative();
+                let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
                 if pipeline
                     .sched_tx
                     .send(PipelineMsg::Step(Box::new(sched)))
@@ -505,6 +508,10 @@ impl EngineCoreClient for InprocClient {
 
     fn schedule_next(&mut self) -> EngineResult<Option<SchedulerOutput>> {
         Ok(self.engine.schedule_next())
+    }
+
+    fn abandon_step(&mut self, sched: &SchedulerOutput) {
+        self.engine.abandon_step(sched);
     }
 
     fn async_scheduling(&self) -> bool {
