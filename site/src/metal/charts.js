@@ -1,23 +1,19 @@
-// Draws every [data-chart] with Carbon Charts. The data and options are
-// rendered by the site build; this only adds what JSON can't carry: a
-// tooltip that also lists any point's note (e.g. "3 of 12 untimed").
+// Draws every [data-chart] with Carbon Charts, from the data and options the
+// site build rendered. A ratio heatmap stores log2(ratio), so a factor of two
+// either way is the same distance from ×1; its tooltip shows the ratio
+// itself, "×1.23", through Carbon's valueFormatter.
 (function () {
+  var charts = { line: Charts.LineChart, heatmap: Charts.HeatmapChart };
   document.querySelectorAll('[data-chart]').forEach(function (el) {
     var spec = JSON.parse(el.getAttribute('data-chart'));
-    spec.options.tooltip = {
-      customHTML: function (points, html) {
-        var notes = points.filter(function (p) { return p.note; });
-        if (!notes.length) return html;
-        var box = document.createElement('div');
-        box.className = 'mchartnote';
-        notes.forEach(function (p) {
-          var line = document.createElement('div');
-          line.textContent = p.group + ': ' + p.note;
-          box.appendChild(line);
-        });
-        return html + box.outerHTML;
-      },
-    };
-    new Charts.LineChart(el, spec);
+    if (spec.ratio) {
+      var total = spec.options.locale.translations.total;
+      spec.options.tooltip = {
+        valueFormatter: function (value, label) {
+          return label === total ? '×' + Math.pow(2, value).toFixed(2) : value;
+        },
+      };
+    }
+    new charts[spec.kind](el, { data: spec.data, options: spec.options });
   });
 })();

@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 
-use crate::carbon::{Button, ButtonKind, ClickableTile, CodeSnippet, Module, Tile};
+use crate::carbon::{Button, ButtonKind, ClickableTile, CodeSnippet, Tile};
 use crate::chrome::{self, Head, OpenGraph, REPO, Root, Theme};
 use crate::{highlight, repo};
 
@@ -66,7 +66,7 @@ fn target(flag: &str, what: &str) -> Element {
     rsx! { div { class: "tg {CELL}", code { "{flag}" } span { "{what}" } } }
 }
 
-pub fn page() -> String {
+pub fn page() -> Result<String, String> {
     let body = rsx! {
         {chrome::header(Root(0), None)}
 
@@ -286,12 +286,6 @@ pub fn page() -> String {
                               to be bespoke.",
             }),
             root: Root(0),
-            modules: &[
-                Module::Button,
-                Module::Tile,
-                Module::UiShell,
-                Module::CodeSnippet,
-            ],
             libraries: &[],
             theme: Theme::FollowSystem,
         },

@@ -99,15 +99,6 @@ impl Metric {
         }
     }
 
-    /// A short name for element ids.
-    pub fn id(self) -> &'static str {
-        match self {
-            Metric::Ttft => "ttft",
-            Metric::Tpot => "tpot",
-            Metric::Throughput => "tput",
-        }
-    }
-
     /// Decimals it is written with.
     pub fn decimals(self) -> usize {
         match self {
@@ -243,37 +234,3 @@ pub fn cfmt(c: Option<&Cell>, metric: Metric) -> String {
 /// Run-to-run spread on one machine at one commit: two M1 Max runs of af009bf1
 /// agreed within about 2%, so a smaller change is noise, not a result.
 pub const NOISE: f64 = 0.03;
-
-/// ColorBrewer RdBu, 7 classes: diverging, colour-blind safe, stepped so "a bit
-/// faster" and "much faster" read differently. Bounds are symmetric in log
-/// space (×0.8 is as far from ×1 as ×1.25) and the middle class is the noise
-/// band. The colours live in styles.css as .hm0 to .hm6.
-const HEAT_BOUNDS: [f64; 6] = [0.5, 0.8, 1.0 - NOISE, 1.0 + NOISE, 1.25, 2.0];
-pub const HEAT_LABELS: [&str; 7] = [
-    "much slower (x0.5 or less)",
-    "slower",
-    "a bit slower",
-    "about the same",
-    "a bit faster",
-    "faster",
-    "much faster (x2 or more)",
-];
-
-/// The heat class for a "how many times faster is scratchy" ratio: hm0 (much
-/// slower) to hm6 (much faster), hm3 inside the noise band.
-pub fn heat_class(r: f64) -> String {
-    format!("hm{}", HEAT_BOUNDS.iter().filter(|&&b| r >= b).count())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn noise_band_is_the_middle_class() {
-        assert_eq!(heat_class(1.0), "hm3");
-        assert_eq!(heat_class(0.5), "hm1");
-        assert_eq!(heat_class(0.49), "hm0");
-        assert_eq!(heat_class(2.0), "hm6");
-    }
-}

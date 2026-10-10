@@ -19,12 +19,15 @@ use dioxus::prelude::*;
 use serde::Serialize;
 
 use crate::Site;
-use crate::carbon::{Alignment, Fold, Module, Toggletip, Tooltip};
+use crate::carbon::{
+    Alignment, Column, Fold, Grid, Heading, Layer, Orientation, Section, Span, Stack, Table,
+    TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
+};
 use crate::chrome::{self, Head, Library, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
 use numbers::{
-    Engine, HEAT_LABELS, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, heat_class,
-    lfmt, med, partial, served, timing, untimed_note,
+    Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
+    served, timing, untimed_note,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -149,46 +152,27 @@ fn index(runs: &[Run]) -> BTreeMap<&str, MachineRuns<'_>> {
 
 // ------------------------------------------------------------------- render
 
-/// One engine's line in a tooltip.
-struct TipRow {
-    value: String,
-    label: String,
-    engine: Engine,
-}
-
-/// A tooltip's body: what the mark is, then one line per engine.
-fn tip_body(head: &str, rows: &[TipRow]) -> Element {
-    rsx! {
-        div { class: "mtiphead", "{head}" }
-        for r in rows {
-            div {
-                span { class: "lkey {r.engine.series()}" }
-                b { "{r.value}" }
-                span { class: "mtipdim", " {r.label}" }
-            }
-        }
-    }
-}
-
-/// A change badge against the previous run: arrow plus percent, the arrow
-/// coloured by better/worse so colour is never the only signal; "≈" inside the
-/// noise band; nothing when either side is missing.
+/// A change badge against the previous run: a Carbon tag, green better, red
+/// worse, grey inside the noise band. The arrow and the tag's title say it
+/// too, so colour is never the only signal; nothing when either side is
+/// missing.
 fn delta(new: Option<f64>, old: Option<f64>, higher_better: bool) -> Element {
     let (Some(new), Some(old)) = (new, old.filter(|o| *o != 0.0)) else {
         return rsx! {};
     };
     let ch = (new - old) / old;
     if ch.abs() < NOISE {
-        return rsx! { span { class: "delta", title: "within 3% of the previous run", "≈" } };
+        return rsx! { Tag { kind: TagKind::Gray, title: "within 3% of the previous run", "≈" } };
     }
-    let word = if (ch > 0.0) == higher_better {
-        "better"
+    let better = (ch > 0.0) == higher_better;
+    let (kind, word) = if better {
+        (TagKind::Green, "better")
     } else {
-        "worse"
+        (TagKind::Red, "worse")
     };
     let arrow = if ch > 0.0 { "▲" } else { "▼" };
     let pct = format!("{:.0}", ch.abs() * 100.0);
-    rsx! { span { class: "delta", title: "{word} than the previous run", i { class: word, "{arrow}" } "{pct}%" } }
+    rsx! { Tag { kind, title: "{word} than the previous run", "{arrow} {pct}%" } }
 }
 
 /// The summary row's numbers, unformatted, for comparing two runs, each with
@@ -240,10 +224,10 @@ fn startup_info() -> Element {
     info(
         "",
         rsx! {
-            b { "frozen" } ": first launch after memory and scratchy's weights cache are cleared. "
-            b { "cold" } ": a normal relaunch. Both run until the server is ready, no request included. "
-            b { "1st req" } ": the cold server's first request, send to first token. "
-            b { "warm" } ": the median over many requests once it is running. ollama reports ready before \
+            strong { "frozen" } ": first launch after memory and scratchy's weights cache are cleared. "
+            strong { "cold" } ": a normal relaunch. Both run until the server is ready, no request included. "
+            strong { "1st req" } ": the cold server's first request, send to first token. "
+            strong { "warm" } ": the median over many requests once it is running. ollama reports ready before \
                           loading the model, so its load time lands in 1st req."
         },
     )
@@ -253,8 +237,8 @@ fn timing_info() -> Element {
     info(
         "",
         rsx! {
-            b { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
-            b { "†" } ": some answers did; the timing comes from the rest (hover for how many). mlx-lm and \
+            strong { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
+            strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). mlx-lm and \
                        ollama can stop answers early, which flatters tok/s."
         },
     )
@@ -290,6 +274,23 @@ fn opt(v: Option<u32>) -> String {
     v.map_or("?".to_string(), |v| v.to_string())
 }
 
+fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
+    names.map(String::from).to_vec()
+}
+
+/// A part of a model's tile: its heading, then what explains it, then it.
+fn part(heading: &str, intro: Element, body: Element) -> Element {
+    rsx! {
+        Section { level: 4,
+            Stack { gap: 3,
+                Heading { "{heading}" }
+                p { {intro} }
+                {body}
+            }
+        }
+    }
+}
+
 fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
     let shape = run
         .config
@@ -297,13 +298,16 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
         .map(|b| format!("{} in / {} out", opt(b.input), opt(b.output)));
     let rows = Engine::ALL.into_iter().filter_map(|e| {
         let (ladder, one) = (e.ladder(m), cell(e.cells(m), At::Conc(1)));
-        let key = rsx! { span { class: "key {e.series()}" } };
         if e == Engine::Scratchy && !served(m) {
-            let why = if m.built { "the server never served" } else { "build failed" };
+            let why = if m.built {
+                "the server never served"
+            } else {
+                "build failed"
+            };
             return Some(rsx! {
-                tr {
-                    th { scope: "row", {key} "{e.label()}" }
-                    td { colspan: "8", class: "gap", "No numbers: {why}. See the run's raw logs." }
+                TableRow {
+                    TableCell { "{e.label()}" }
+                    TableCell { colspan: 8, "No numbers: {why}. See the run's raw logs." }
                 }
             });
         }
@@ -321,21 +325,25 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             fmt(med(ladder, Scenario::Cold, Startup::PeakRss), 0),
         ];
         let now = summary_raw(m);
-        let then = prev.filter(|_| e == Engine::Scratchy).map(|p| summary_raw(p.m));
-        let ollama = m.ollama.as_ref().filter(|_| e == Engine::Ollama);
-        Some(rsx! {
-            tr {
-                th { scope: "row", {key} "{e.label()}"
-                    if let Some(o) = ollama {
-                        " "
-                        span { class: "dim",
-                            "{o.tag.as_deref().unwrap_or_default()}"
-                            if let Some(q) = o.quantization.as_deref().filter(|q| !q.is_empty()) { ", {q}" }
-                        }
-                    }
+        let then = prev
+            .filter(|_| e == Engine::Scratchy)
+            .map(|p| summary_raw(p.m));
+        // ollama runs its own GGUF: name it on its row.
+        let name = match m.ollama.as_ref().filter(|_| e == Engine::Ollama) {
+            None => e.label().to_string(),
+            Some(o) => {
+                let tag = o.tag.as_deref().unwrap_or_default();
+                match o.quantization.as_deref().filter(|q| !q.is_empty()) {
+                    Some(q) => format!("{} ({tag}, {q})", e.label()),
+                    None => format!("{} ({tag})", e.label()),
                 }
+            }
+        };
+        Some(rsx! {
+            TableRow {
+                TableCell { "{name}" }
                 for (i, v) in vals.iter().enumerate() {
-                    td { "{v}"
+                    TableCell { "{v} "
                         if let Some(then) = then { {delta(now[i].0, then[i].0, now[i].1)} }
                     }
                 }
@@ -345,45 +353,27 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
     let changed = prev
         .map(|p| settings_changed(run, p.run))
         .unwrap_or_default();
-    let one_user = shape
-        .as_ref()
-        .map_or("one user".to_string(), |s| format!("one user, {s}"));
-    rsx! {
-        div { class: "mpart",
-            h4 { "Startup and single-user speed" }
-            p { class: "msub",
-                "One row per engine. Startup in seconds (warm in ms); one user at {shape.as_deref().unwrap_or(\"the base shape\")}."
-                if let Some(p) = prev {
-                    " Under scratchy: change since its previous run here ({p.run.generated_utc.date()}, "
-                    code { "{p.run.repo.sha8()}" }
-                    "); ≈ is within 3%."
-                    if !changed.is_empty() {
-                        " " b { "Settings differ from that run" } " ({changed}), so a change is not the code alone."
-                    }
-                }
-                " What the columns mean: startup " {startup_info()} " one user " {timing_info()} " peak RSS " {rss_info()}
-            }
-            div { class: "mtable",
-                table {
-                    thead {
-                        tr {
-                            th { rowspan: "2", scope: "col", class: "first", "engine" }
-                            th { colspan: "4", scope: "colgroup", "startup" }
-                            th { colspan: "3", scope: "colgroup", "{one_user}" }
-                            th { rowspan: "2", scope: "col", "peak RSS" br {} span { class: "dim", "MiB" } }
-                        }
-                        tr {
-                            for (h, u) in [("frozen", "s"), ("cold", "s"), ("1st req", "s"), ("warm", "ms"), ("TTFT", "ms"), ("TPOT", "ms")] {
-                                th { scope: "col", "{h}" br {} span { class: "dim", "{u}" } }
-                            }
-                            th { scope: "col", "tok/s" }
-                        }
-                    }
-                    tbody { {rows} }
+    part(
+        "Startup and single-user speed",
+        rsx! {
+            "One row per engine. Startup in seconds (warm in ms); one user at {shape.as_deref().unwrap_or(\"the base shape\")}."
+            if let Some(p) = prev {
+                " Under scratchy: change since its previous run here ({p.run.generated_utc.date()}, "
+                code { "{p.run.repo.sha8()}" }
+                "); ≈ is within 3%."
+                if !changed.is_empty() {
+                    " " strong { "Settings differ from that run" } " ({changed}), so a change is not the code alone."
                 }
             }
-        }
-    }
+            " What the columns mean: startup " {startup_info()} " one user " {timing_info()} " peak RSS " {rss_info()}
+        },
+        rsx! {
+            Table {
+                headers: headers(["engine", "frozen s", "cold s", "1st req s", "warm ms", "TTFT ms", "TPOT ms", "tok/s", "peak RSS MiB"]),
+                {rows}
+            }
+        },
+    )
 }
 
 /// One line of a chart: its label, series colour, and (x, value) points; a
@@ -394,8 +384,10 @@ struct Series {
     pts: Vec<(u32, Option<f64>)>,
 }
 
-/// A series' colour, as Carbon Charts needs it: a value, not a class. The
-/// same hues as `--s1` to `--s3` in styles.css; the previous run is a light
+/// A series' colour, fixed per engine: blue, orange, aqua from the data-viz
+/// reference palette, validated as a set (all pairs, CVD and normal vision)
+/// against Carbon's white and g100 surfaces. Aqua is under 3:1 on white, so
+/// every chart has a legend and a table view. The previous run is a light
 /// grey so it reads as behind.
 fn colour(class: &str) -> &'static str {
     match class {
@@ -406,30 +398,56 @@ fn colour(class: &str) -> &'static str {
     }
 }
 
-/// What charts.js hands `new Charts.LineChart`: the points and the options,
-/// in Carbon Charts' own field names.
+/// What charts.js hands Carbon Charts: which chart, its points, and its
+/// options, in Carbon Charts' own field names.
 #[derive(Serialize)]
-struct LineChart<'a> {
-    data: Vec<Point<'a>>,
-    options: ChartOptions<'a>,
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Chart<'a> {
+    Line {
+        data: Vec<LinePoint<'a>>,
+        options: ChartOptions<'a>,
+    },
+    Heatmap {
+        data: Vec<HeatPoint>,
+        options: ChartOptions<'a>,
+        /// The values are log2(ratio): charts.js shows them as "×1.23".
+        ratio: bool,
+    },
 }
 
-/// One measured point. A None value (present but not measured: no stream)
-/// leaves a gap in its line; `note` is added to its tooltip.
+/// One measured point of a line. A None value (present but not measured: no
+/// stream) leaves a gap.
 #[derive(Serialize)]
-struct Point<'a> {
+struct LinePoint<'a> {
     group: &'a str,
     key: u32,
     value: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+}
+
+/// One cell of a heatmap: x is answer tokens, y prompt tokens.
+#[derive(Serialize)]
+struct HeatPoint {
+    x: String,
+    y: String,
+    value: Option<f64>,
 }
 
 #[derive(Serialize)]
 struct ChartOptions<'a> {
+    title: String,
     axes: Axes<'a>,
-    color: ColourScale<'a>,
-    height: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<Colour<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heatmap: Option<HeatmapOptions>,
+    height: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legend: Option<Enabled>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locale: Option<Locale>,
+    // The page is always Carbon's light theme.
     theme: &'static str,
     toolbar: Enabled,
 }
@@ -451,6 +469,39 @@ struct Axis<'a> {
     ticks: Option<Ticks<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include_zero: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visible: Option<bool>,
+    /// A label axis's labels in order; Carbon puts the first at the left of
+    /// a horizontal axis and at the bottom of a vertical one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<Vec<String>>,
+}
+
+/// A grid's heatmap axes, read like a table: answer tokens across, prompt
+/// tokens down, each smallest first, so the smallest prompt is on top.
+fn grid_axes<'a>(ins: &[u32], outs: &[u32], visible: Option<bool>) -> Axes<'a> {
+    let labels = |maps_to, title, domain: Vec<String>| Axis {
+        maps_to,
+        title,
+        scale_type: Some("labels"),
+        ticks: None,
+        include_zero: None,
+        visible,
+        domain: Some(domain),
+    };
+    Axes {
+        bottom: labels(
+            "x",
+            "answer tokens",
+            outs.iter().map(u32::to_string).collect(),
+        ),
+        // Carbon draws a vertical axis's first label at the bottom.
+        left: labels(
+            "y",
+            "prompt tokens",
+            ins.iter().rev().map(u32::to_string).collect(),
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -458,9 +509,118 @@ struct Ticks<'a> {
     values: &'a [u32],
 }
 
+/// Carbon Charts' colour options: a colour per series, or the steps of a
+/// heatmap's quantized scale.
 #[derive(Serialize)]
-struct ColourScale<'a> {
-    scale: BTreeMap<&'a str, &'static str>,
+#[serde(untagged)]
+enum Colour<'a> {
+    Scale {
+        scale: BTreeMap<&'a str, &'static str>,
+    },
+    Gradient {
+        gradient: Gradient,
+    },
+}
+
+#[derive(Serialize)]
+struct Gradient {
+    colors: &'static [&'static str],
+}
+
+/// The widest speedup the ratio heatmaps tell apart, either way: ×4 faster
+/// and ×0.25 (4× slower). Anything beyond takes the end colour.
+const RATIO_SPAN: f64 = 4.0;
+
+/// The ratio heatmaps plot log2 of the ratio, so a factor of two is the same
+/// distance from ×1 whichever way it goes: ±log2(RATIO_SPAN).
+const RATIO_RANGE: Domain = Domain {
+    min: -2.0,
+    max: 2.0,
+};
+
+/// The ratio heatmaps' 33 steps, slowest to fastest, from Carbon's red, gray
+/// and cyan. 33 equal steps over ±2 put ×0.96 to ×1.04 (about the run-to-run
+/// noise band) in the gray 40 middle step. Carbon's own diverging palette
+/// fades to white in the middle, down to 1.0:1 against the page and tiles, so
+/// the cells near ×1, most of them, vanish; here the steps past the middle
+/// start at red/cyan 40 and darken outward to 100, every one at least 2.37:1
+/// on white and 2.15:1 on the grey tile (#f4f4f4).
+const RATIO_STEPS: [&str; 33] = [
+    "#2d0709", // red 100: ×0.25 or slower
+    "#520408", // red 90
+    "#520408", // red 90
+    "#750e13", // red 80
+    "#750e13", // red 80
+    "#a2191f", // red 70
+    "#a2191f", // red 70
+    "#a2191f", // red 70
+    "#da1e28", // red 60
+    "#da1e28", // red 60
+    "#da1e28", // red 60
+    "#fa4d56", // red 50
+    "#fa4d56", // red 50
+    "#fa4d56", // red 50
+    "#ff8389", // red 40
+    "#ff8389", // red 40
+    "#a8a8a8", // gray 40: ×0.96 to ×1.04, within noise
+    "#33b1ff", // cyan 40
+    "#33b1ff", // cyan 40
+    "#1192e8", // cyan 50
+    "#1192e8", // cyan 50
+    "#1192e8", // cyan 50
+    "#0072c3", // cyan 60
+    "#0072c3", // cyan 60
+    "#0072c3", // cyan 60
+    "#00539a", // cyan 70
+    "#00539a", // cyan 70
+    "#00539a", // cyan 70
+    "#003a6d", // cyan 80
+    "#003a6d", // cyan 80
+    "#012749", // cyan 90
+    "#012749", // cyan 90
+    "#061727", // cyan 100: ×4 or faster
+];
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeatmapOptions {
+    color_legend: ColorLegend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color_domain: Option<Domain>,
+}
+
+#[derive(Serialize)]
+struct ColorLegend {
+    title: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct Domain {
+    min: f64,
+    max: f64,
+}
+
+/// Carbon's heatmap tooltip lists the axis values, then the cell's value
+/// under `locale.translations.total` (Carbon's default: "Total"; it outranks
+/// `tooltip.totalLabel`).
+#[derive(Serialize)]
+struct Locale {
+    translations: Translations,
+}
+
+#[derive(Serialize)]
+struct Translations {
+    total: String,
+}
+
+impl Locale {
+    fn total(label: String) -> Option<Self> {
+        Some(Locale {
+            translations: Translations { total: label },
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -468,30 +628,31 @@ struct Enabled {
     enabled: bool,
 }
 
-/// One line chart: offered users on x, one line per engine, drawn in the
-/// browser by Carbon Charts (see charts.js). `notes` maps (engine label, x)
-/// to a suffix for that point's tooltip.
-fn line_chart(
-    series: &[Series],
-    xs: &[u32],
-    ylabel: &str,
-    title: &str,
-    notes: &BTreeMap<(String, u32), String>,
-) -> Element {
-    let spec = LineChart {
+/// A chart's mount point: charts.js draws `spec` into it.
+fn chart(spec: &Chart, label: &str) -> Element {
+    rsx! {
+        div { role: "img", "aria-label": label,
+            "data-chart": serde_json::to_string(spec).unwrap_or_default(),
+        }
+    }
+}
+
+/// One line chart: offered users on x, one line per engine.
+fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &str) -> Element {
+    let spec = Chart::Line {
         data: series
             .iter()
             .flat_map(|s| {
-                s.pts.iter().map(|&(x, v)| Point {
+                s.pts.iter().map(|&(x, v)| LinePoint {
                     group: &s.label,
                     key: x,
                     // Carbon prints values as given: round to what the tables show.
                     value: v.map(|v| (v * 10.0).round() / 10.0),
-                    note: notes.get(&(s.label.clone(), x)).cloned(),
                 })
             })
             .collect(),
         options: ChartOptions {
+            title: title.to_string(),
             axes: Axes {
                 bottom: Axis {
                     maps_to: "key",
@@ -499,6 +660,8 @@ fn line_chart(
                     scale_type: Some("linear"),
                     ticks: Some(Ticks { values: xs }),
                     include_zero: None,
+                    visible: None,
+                    domain: None,
                 },
                 left: Axis {
                     maps_to: "value",
@@ -506,24 +669,168 @@ fn line_chart(
                     scale_type: None,
                     ticks: None,
                     include_zero: Some(true),
+                    visible: None,
+                    domain: None,
                 },
             },
-            color: ColourScale {
+            color: Some(Colour::Scale {
                 scale: series
                     .iter()
                     .map(|s| (s.label.as_str(), colour(s.class)))
                     .collect(),
-            },
-            height: "260px",
-            // The page is always Carbon's light theme.
+            }),
+            heatmap: None,
+            height: "280px".to_string(),
+            width: None,
+            legend: None,
+            locale: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
     };
+    chart(&spec, label)
+}
+
+/// A model's full grid as a heatmap. With a rival, values are how many times
+/// faster scratchy is (as log2), coloured over RATIO_RANGE by RATIO_STEPS. Without one,
+/// scratchy's own values on Carbon's sequential palette.
+fn grid_heatmap(
+    title: String,
+    (ins, outs): (&[u32], &[u32]),
+    data: Vec<HeatPoint>,
+    total_label: String,
+    ratio: bool,
+    label: &str,
+) -> Element {
+    let spec = Chart::Heatmap {
+        data,
+        options: ChartOptions {
+            title,
+            axes: grid_axes(ins, outs, None),
+            color: ratio.then_some(Colour::Gradient {
+                gradient: Gradient {
+                    colors: &RATIO_STEPS,
+                },
+            }),
+            heatmap: Some(HeatmapOptions {
+                color_legend: ColorLegend {
+                    // Shown only without a rival; ratio grids use ratio_scale.
+                    title: total_label.clone(),
+                    kind: "quantize",
+                },
+                color_domain: ratio.then_some(RATIO_RANGE),
+            }),
+            // Room for the axes (and Carbon's legend when it shows), then
+            // about 64px a cell.
+            height: format!("{}px", if ratio { 100 } else { 160 } + 56 * ins.len()),
+            width: Some(format!("{}px", 140 + 72 * outs.len())),
+            legend: ratio.then_some(Enabled { enabled: false }),
+            locale: Locale::total(total_label),
+            theme: "white",
+            toolbar: Enabled { enabled: false },
+        },
+        ratio,
+    };
+    chart(&spec, label)
+}
+
+/// One small multiple: a model's whole grid as a tiny heatmap, colour only;
+/// no title, axes or legend, the table around it names it.
+fn mini_heatmap(
+    (ins, outs): (&[u32], &[u32]),
+    data: Vec<HeatPoint>,
+    total_label: String,
+    label: &str,
+) -> Element {
+    let spec = Chart::Heatmap {
+        data,
+        options: ChartOptions {
+            title: String::new(),
+            axes: grid_axes(ins, outs, Some(false)),
+            color: Some(Colour::Gradient {
+                gradient: Gradient {
+                    colors: &RATIO_STEPS,
+                },
+            }),
+            heatmap: Some(HeatmapOptions {
+                color_legend: ColorLegend {
+                    title: String::new(),
+                    kind: "quantize",
+                },
+                color_domain: Some(RATIO_RANGE),
+            }),
+            height: "88px".to_string(),
+            width: Some("88px".to_string()),
+            legend: Some(Enabled { enabled: false }),
+            locale: Locale::total(total_label),
+            theme: "white",
+            toolbar: Enabled { enabled: false },
+        },
+        ratio: true,
+    };
+    chart(&spec, label)
+}
+
+/// The ratio heatmaps' colour scale, upright: RATIO_STEPS fastest at the top,
+/// labelled at the ends and the middle. Carbon's heatmap only draws its legend
+/// as a bar underneath.
+fn ratio_scale(fit: ScaleFit) -> Element {
+    let rows = RATIO_STEPS.len();
+    let middle = rows / 2 + 1;
+    let (place, track) = match fit {
+        ScaleFit::Fixed => (String::new(), "0.5rem"),
+        ScaleFit::Rows {
+            column,
+            first,
+            count,
+        } => (
+            // From the top of the first row's grids to the bottom of the
+            // last's: the last row's two label lines (and the gap above them)
+            // are left out.
+            format!(
+                "grid-column: {column}; grid-row: {first} / span {count}; align-self: stretch; \
+                 margin-block-end: 2.25rem; margin-inline-start: 0.5rem; "
+            ),
+            "1fr",
+        ),
+    };
     rsx! {
-        div { class: "mchart", role: "img", "aria-label": title,
-            "data-chart": serde_json::to_string(&spec).unwrap_or_default(),
+        div { style: "{place}display: grid; grid-template-columns: 0.75rem max-content; grid-template-rows: repeat({rows}, {track}); column-gap: 0.5rem; font-size: 0.75rem; line-height: 1",
+            for (row, colour) in RATIO_STEPS.iter().rev().enumerate() {
+                div { style: "grid-column: 1; grid-row: {row + 1}; background: {colour}" }
+            }
+            div { style: "grid-column: 2; grid-row: 1; align-self: start", strong { "×{RATIO_SPAN}" } " or faster" }
+            div { style: "grid-column: 2; grid-row: {middle}; align-self: center", strong { "×1" } }
+            div { style: "grid-column: 2; grid-row: {rows}; align-self: end", strong { "×{1.0 / RATIO_SPAN}" } " or slower" }
         }
+    }
+}
+
+/// Where the ratio scale goes: fixed-size steps beside a model's grids, or
+/// stretched over rows of a CSS grid.
+#[derive(Clone, Copy, PartialEq)]
+enum ScaleFit {
+    Fixed,
+    Rows {
+        column: usize,
+        first: usize,
+        count: usize,
+    },
+}
+
+/// A ratio as a heatmap value: log2, so a factor of two either way is the
+/// same distance from ×1.
+fn log2_ratio(r: f64) -> f64 {
+    (r.log2() * 1000.0).round() / 1000.0
+}
+
+/// A cell's value for a table view, with how many requests went untimed when
+/// the timing is partial.
+fn table_value(c: Option<&Cell>, metric: Metric) -> String {
+    if partial(c, metric) {
+        format!("{} ({})", cfmt(c, metric), untimed_note(c))
+    } else {
+        cfmt(c, metric)
     }
 }
 
@@ -601,19 +908,14 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
     };
     let (tput, tpot) = (series(Metric::Throughput), series(Metric::Tpot));
 
-    let mut charts: Vec<(&str, &str, Element, Element)> = Vec::new();
+    let mut charts: Vec<Element> = Vec::new();
     if !tput.is_empty() {
-        charts.push((
-            "Throughput",
-            "tok/s, higher is better",
-            line_chart(
-                &tput,
-                &xs,
-                "tok/s",
-                "Output tokens per second against offered concurrent users, per engine",
-                &BTreeMap::new(),
-            ),
-            rsx! {},
+        charts.push(line_chart(
+            &tput,
+            &xs,
+            "Throughput (tok/s, higher is better)",
+            "tok/s",
+            "Output tokens per second against offered concurrent users, per engine",
         ));
     }
     if !tpot.is_empty() {
@@ -624,31 +926,18 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             .filter(|s| s.class != "prev" && !tpot.iter().any(|t| t.label == s.label))
             .map(|s| s.label.as_str())
             .collect();
-        let note = if gone.is_empty() {
-            rsx! {}
-        } else {
-            rsx! { p { class: "msub", "{gone.join(\", \")}: {NO_STREAM}, not plotted." } }
-        };
-        let marks: BTreeMap<(String, u32), String> = cells
-            .iter()
-            .flat_map(|(e, cs)| {
-                cs.iter()
-                    .filter(|(_, c)| partial(Some(c), Metric::Tpot))
-                    .map(move |(x, c)| ((e.label().to_string(), *x), untimed_note(Some(c))))
-            })
-            .collect();
-        charts.push((
-            "Time per output token",
-            "ms, lower is better",
-            line_chart(
+        charts.push(rsx! {
+            {line_chart(
                 &tpot,
                 &xs,
+                "Time per output token (ms, lower is better)",
                 "TPOT ms",
                 "Median time per output token against offered concurrent users, per engine",
-                &marks,
-            ),
-            note,
-        ));
+            )}
+            if !gone.is_empty() {
+                p { "{gone.join(\", \")}: {NO_STREAM}, not plotted." }
+            }
+        });
     }
     let users = match xs.split_last() {
         Some((l, rest)) if !rest.is_empty() => format!(
@@ -665,43 +954,32 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
         opt(base.and_then(|b| b.input)),
         opt(base.and_then(|b| b.output)),
     );
-    rsx! {
-        figure { class: "mfig",
-            figcaption {
-                h4 { "As users are added" }
-                p { class: "msub",
-                    "Throughput and time per output token with {users} users at once " {users_info()}
-                    "; {input}-token prompts, {output}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine."
-                }
-            }
-            div { class: "chartrow",
-                for (title, unit, chart, note) in charts {
-                    div { class: "chartpane",
-                        div { class: "heatttl", "{title} " span { class: "dim", "({unit})" } }
-                        {chart}
-                        {note}
-                    }
-                }
+    let mut table_headers = vec!["offered users".to_string()];
+    table_headers.extend(xs.iter().map(u32::to_string));
+    part(
+        "As users are added",
+        rsx! {
+            "Throughput and time per output token with {users} users at once " {users_info()}
+            "; {input}-token prompts, {output}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine."
+        },
+        rsx! {
+            Grid {
+                for c in charts { Column { span: Span::HALF, {c} } }
             }
             Fold { title: "Table view",
-                div { class: "mtable",
-                    table {
-                        thead { tr { th { scope: "col", "offered users" } for x in &xs { th { scope: "col", "{x}" } } } }
-                        tbody {
-                            for (e, cs) in cells.iter().filter(|(_, cs)| !cs.is_empty()) {
-                                for (metric, name) in [(Metric::Throughput, "tok/s"), (Metric::Ttft, "TTFT ms"), (Metric::Tpot, "TPOT ms")] {
-                                    tr {
-                                        th { scope: "row", "{e.label()} · {name}" }
-                                        for x in &xs { td { {cfmt(cs.get(x).copied(), metric)} } }
-                                    }
-                                }
+                Table { headers: table_headers,
+                    for (e, cs) in cells.iter().filter(|(_, cs)| !cs.is_empty()) {
+                        for (metric, name) in [(Metric::Throughput, "tok/s"), (Metric::Ttft, "TTFT ms"), (Metric::Tpot, "TPOT ms")] {
+                            TableRow {
+                                TableCell { "{e.label()} · {name}" }
+                                for x in &xs { TableCell { {table_value(cs.get(x).copied(), metric)} } }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+        },
+    )
 }
 
 /// One engine's grid cells, by (prompt, answer) tokens.
@@ -709,7 +987,7 @@ type ByShape<'a> = BTreeMap<(u32, u32), &'a Cell>;
 
 /// A model's prompt-by-answer grid: the axes, each engine's cells, and the
 /// engines scratchy is compared against.
-struct Grid<'a> {
+struct ShapeGrid<'a> {
     ins: &'a [u32],
     outs: &'a [u32],
     have: Vec<(Engine, ByShape<'a>)>,
@@ -719,7 +997,7 @@ struct Grid<'a> {
     other: Option<Engine>,
 }
 
-impl<'a> Grid<'a> {
+impl<'a> ShapeGrid<'a> {
     /// None when scratchy has no grid.
     fn of(m: &'a Model, run: &'a Run) -> Option<Self> {
         let sc = run.config.scaling.as_ref()?;
@@ -744,7 +1022,7 @@ impl<'a> Grid<'a> {
                 (e, cs)
             })
             .collect();
-        let g = Grid {
+        let g = ShapeGrid {
             ins,
             outs,
             have,
@@ -758,7 +1036,7 @@ impl<'a> Grid<'a> {
             .into_iter()
             .filter(|&e| !g.cells(e).is_empty())
             .collect();
-        Some(Grid {
+        Some(ShapeGrid {
             rival: present.first().copied(),
             other: present.get(1).copied(),
             ..g
@@ -777,20 +1055,26 @@ impl<'a> Grid<'a> {
     fn at(&self, e: Option<Engine>, rung: (u32, u32)) -> Option<&'a Cell> {
         e.and_then(|e| self.cells(e).get(&rung).copied())
     }
+
+    /// scratchy against `rival` at one cell: the ratio, and how it reads.
+    fn versus(&self, metric: Metric, rung: (u32, u32), rival: Engine) -> (Option<f64>, String) {
+        let (cs, cr) = (
+            self.at(Some(Engine::Scratchy), rung),
+            self.at(Some(rival), rung),
+        );
+        let s = timing(cs, metric);
+        match metric.faster(s, timing(cr, metric)) {
+            Some(r) => (Some(r), format!("×{r:.2}{}", mark(metric, &[cs, cr]))),
+            None if s.is_none() => (None, why(cs, "scratchy")),
+            None => (None, why(cr, rival.label())),
+        }
+    }
 }
 
 const GRID_METRICS: [(Metric, &str); 2] = [
     (Metric::Throughput, "throughput"),
     (Metric::Ttft, "time to first token"),
 ];
-
-fn heat_legend() -> Element {
-    rsx! {
-        for (i, label) in HEAT_LABELS.iter().enumerate() {
-            span { i { class: "sw hm{i}" } "{label}" }
-        }
-    }
-}
 
 fn mark(metric: Metric, cells: &[Option<&Cell>]) -> &'static str {
     if cells.iter().any(|c| partial(*c, metric)) {
@@ -800,66 +1084,75 @@ fn mark(metric: Metric, cells: &[Option<&Cell>]) -> &'static str {
     }
 }
 
-fn heat_table(g: &Grid, mid: &str, metric: Metric, title: &str) -> Element {
-    let why = |c: Option<&Cell>, name: &str| {
-        if c.is_some() {
-            format!("{name}: {NO_STREAM}")
-        } else {
-            format!("no {name}")
+/// Why a cell has no ratio.
+fn why(c: Option<&Cell>, name: &str) -> String {
+    if c.is_some() {
+        format!("{name}: {NO_STREAM}")
+    } else {
+        format!("no {name}")
+    }
+}
+
+/// One model's grid for one metric, coloured by scratchy against its rival.
+fn heat_map(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
+    let mut data = Vec::new();
+    for &i in g.ins {
+        for &o in g.outs {
+            let value = match g.rival {
+                Some(rival) => g.versus(metric, (i, o), rival).0.map(log2_ratio),
+                // Nothing to compare against: scratchy's own value.
+                None => timing(g.at(Some(Engine::Scratchy), (i, o)), metric),
+            };
+            data.push(HeatPoint {
+                x: o.to_string(),
+                y: i.to_string(),
+                value,
+            });
         }
+    }
+    let (heading, total_label) = match g.rival {
+        Some(r) => (
+            format!("{title}, scratchy vs {}", r.label()),
+            format!("scratchy/{}", r.label()),
+        ),
+        None => (
+            format!("{title} ({})", metric.unit()),
+            format!("scratchy, {}", metric.unit()),
+        ),
     };
-    let versus = g.rival.map_or(" · scratchy".to_string(), |r| {
-        format!(" · scratchy vs {}", r.label())
-    });
+    grid_heatmap(
+        heading,
+        (g.ins, g.outs),
+        data,
+        total_label,
+        g.rival.is_some(),
+        title,
+    )
+}
+
+/// The grid's numbers for one metric: per cell the ratio against the rival,
+/// then against the other engine; just scratchy's value with neither.
+fn heat_table(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
+    let mut cols = vec![format!("{title}: prompt ↓ / answer →")];
+    cols.extend(g.outs.iter().map(u32::to_string));
     rsx! {
-        div { class: "heat",
-            div { class: "heatttl", b { "{title}" } "{versus}" }
-            div { class: "mtable",
-                table {
-                    thead { tr { th { scope: "col", span { class: "dim", "prompt ↓ / answer →" } } for o in g.outs { th { scope: "col", "{o}" } } } }
-                    tbody {
-                        for &i in g.ins {
-                            tr {
-                                th { scope: "row", "{i}" }
-                                for &o in g.outs {
-                                    {
-                                        let rung = (i, o);
-                                        let cs = g.at(Some(Engine::Scratchy), rung);
-                                        let (cr, co) = (g.at(g.rival, rung), g.at(g.other, rung));
-                                        let s = timing(cs, metric);
-                                        let (r_r, r_o) = (metric.faster(s, timing(cr, metric)), metric.faster(s, timing(co, metric)));
-                                        let tiprows: Vec<TipRow> = g.have.iter().filter(|(_, h)| !h.is_empty()).map(|&(engine, ref h)| {
-                                            let c = h.get(&rung).copied();
-                                            let label = if partial(c, metric) { format!("{} ({})", engine.label(), untimed_note(c)) } else { engine.label().to_string() };
-                                            TipRow { value: cfmt(c, metric), label, engine }
-                                        }).collect();
-                                        let (big, small) = match g.rival {
-                                            // Nothing to compare against.
-                                            None => (cfmt(cs, metric), if s.is_some() { metric.unit().to_string() } else { String::new() }),
-                                            Some(rival) => (
-                                                match r_r {
-                                                    Some(r) => format!("×{r:.2}{}", mark(metric, &[cs, cr])),
-                                                    None if s.is_none() => why(cs, "scratchy"),
-                                                    None => why(cr, rival.label()),
-                                                },
-                                                match (r_o, g.other) {
-                                                    (Some(r), Some(other)) => format!("vs {} ×{r:.2}{}", other.label(), mark(metric, &[cs, co])),
-                                                    (_, Some(other)) if s.is_some() => why(co, other.label()),
-                                                    _ => String::new(),
-                                                },
-                                            ),
-                                        };
-                                        rsx! {
-                                            td { class: r_r.map(heat_class).unwrap_or_default(),
-                                                Tooltip { id: "tip-{mid}-{metric.id()}-{i}x{o}", class: "mcell", focusable: true,
-                                                    trigger: rsx! { b { "{big}" } span { class: "msmall", "{small}" } },
-                                                    {tip_body(&format!("{i} in × {o} out · {title}"), &tiprows)}
-                                                }
-                                            }
-                                        }
+        Table { headers: cols,
+            for &i in g.ins {
+                TableRow {
+                    TableCell { "{i}" }
+                    for &o in g.outs {
+                        {
+                            let text = match g.rival {
+                                None => cfmt(g.at(Some(Engine::Scratchy), (i, o)), metric),
+                                Some(rival) => {
+                                    let mut t = g.versus(metric, (i, o), rival).1;
+                                    if let Some(other) = g.other {
+                                        t += &format!(" (vs {} {})", other.label(), g.versus(metric, (i, o), other).1);
                                     }
+                                    t
                                 }
-                            }
+                            };
+                            rsx! { TableCell { "{text}" } }
                         }
                     }
                 }
@@ -868,8 +1161,8 @@ fn heat_table(g: &Grid, mid: &str, metric: Metric, title: &str) -> Element {
     }
 }
 
-fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
-    let Some(g) = Grid::of(m, run) else {
+fn grid_maps(m: &Model, run: &Run) -> Element {
+    let Some(g) = ShapeGrid::of(m, run) else {
         return rsx! {};
     };
     let conc = opt(run.config.base().and_then(|b| b.conc));
@@ -880,36 +1173,38 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         Some(rival) => {
             let missing = Engine::RIVALS.into_iter().find(|&e| g.cells(e).is_empty());
             format!(
-                "prompt size down the side, answer size across the top. Each large number is how many times faster scratchy is than {}{}: ×1.20 is 20% faster, below ×1 is slower{}. Hover for every engine's value",
+                "prompt size down the side, answer size across the bottom. Colour is how many times faster scratchy is than {}{}: blue is faster, red is slower, the middle step is within noise. Hover a cell for its ratio; the table view has every cell's ratio{}",
                 rival.label(),
                 missing.map_or(String::new(), |e| format!(
                     " (this run has no {})",
                     e.label()
                 )),
                 g.other.map_or(String::new(), |o| format!(
-                    "; the small line is the same against {}",
+                    " and the same against {}",
                     o.label()
                 )),
             )
         }
     };
-    rsx! {
-        figure { class: "mfig",
-            figcaption {
-                h4 { "Prompt size × answer size" }
-                p { class: "msub", "{conc} users at once; {note}." }
+    part(
+        "Prompt size × answer size",
+        rsx! { "{conc} users at once; {note}." },
+        rsx! {
+            Stack { gap: 6, orientation: Orientation::Horizontal,
+                for (metric, title) in GRID_METRICS { {heat_map(&g, metric, title)} }
+                if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed)} }
             }
-            div { class: "heatrow",
-                for (metric, title) in GRID_METRICS { {heat_table(&g, mid, metric, title)} }
-            }
-            if let Some(rival) = g.rival {
-                div { class: "scale",
-                    span { class: "scalekey", "Colour and large number, scratchy vs {rival.label()}:" }
-                    {heat_legend()}
+            Fold { title: "Table view",
+                Stack { gap: 4,
+                    for (metric, title) in GRID_METRICS { {heat_table(&g, metric, title)} }
                 }
             }
-        }
-    }
+        },
+    )
+}
+
+fn commit(run: &Run) -> Element {
+    rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
 }
 
 fn history(entries: &[Entry]) -> Element {
@@ -918,41 +1213,31 @@ fn history(entries: &[Entry]) -> Element {
     }
     rsx! {
         Fold { title: "Runs of this model ({entries.len()})",
-            div { class: "mtable",
-                table {
-                    thead {
-                        tr {
-                            for h in ["run", "scratchy", "quant", "cold s", "1st req s", "warm ms", "tok/s, 1 user", "tok/s, most users", "TPOT ms, most users"] {
-                                th { scope: "col", "{h}" }
+            Table {
+                headers: headers(["run", "scratchy", "quant", "cold s", "1st req s", "warm ms", "tok/s, 1 user", "tok/s, most users", "TPOT ms, most users"]),
+                for Entry { run, m } in entries.iter().rev() {
+                    TableRow {
+                        TableCell { "{run.generated_utc.date()}" }
+                        TableCell { {commit(run)} }
+                        TableCell { "{m.quant.as_deref().unwrap_or_default()}" }
+                        if served(m) {
+                            {
+                                let (ladder, cells) = (Engine::Scratchy.ladder(m), Engine::Scratchy.cells(m));
+                                let one = cell(cells, At::Conc(1));
+                                let top = cells.iter().filter_map(|c| if let At::Conc(n) = c.at { Some(n) } else { None }).max().filter(|&n| n != 0);
+                                let many = top.and_then(|n| cell(cells, At::Conc(n)));
+                                let vals = [
+                                    fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
+                                    fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
+                                    fmt(med(ladder, Scenario::Warm, Startup::FirstToken).map(|v| v * 1000.0), 0),
+                                    fmt(timing(one, Metric::Throughput), 1),
+                                    fmt(timing(many, Metric::Throughput), 1),
+                                    cfmt(many, Metric::Tpot),
+                                ];
+                                rsx! { for v in vals { TableCell { "{v}" } } }
                             }
-                        }
-                    }
-                    tbody {
-                        for Entry { run, m } in entries.iter().rev() {
-                            tr {
-                                th { scope: "row", "{run.generated_utc.date()}" }
-                                td { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
-                                td { "{m.quant.as_deref().unwrap_or_default()}" }
-                                if served(m) {
-                                    {
-                                        let (ladder, cells) = (Engine::Scratchy.ladder(m), Engine::Scratchy.cells(m));
-                                        let one = cell(cells, At::Conc(1));
-                                        let top = cells.iter().filter_map(|c| if let At::Conc(n) = c.at { Some(n) } else { None }).max().filter(|&n| n != 0);
-                                        let many = top.and_then(|n| cell(cells, At::Conc(n)));
-                                        let vals = [
-                                            fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
-                                            fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
-                                            fmt(med(ladder, Scenario::Warm, Startup::FirstToken).map(|v| v * 1000.0), 0),
-                                            fmt(timing(one, Metric::Throughput), 1),
-                                            fmt(timing(many, Metric::Throughput), 1),
-                                            cfmt(many, Metric::Tpot),
-                                        ];
-                                        rsx! { for v in vals { td { "{v}" } } }
-                                    }
-                                } else {
-                                    td { colspan: "6", class: "gap", "no numbers" }
-                                }
-                            }
+                        } else {
+                            TableCell { colspan: 6, "no numbers" }
                         }
                     }
                 }
@@ -964,31 +1249,21 @@ fn history(entries: &[Entry]) -> Element {
 fn runs_table(runs: &[&Run]) -> Element {
     rsx! {
         Fold { title: "Runs on this machine ({runs.len()})",
-            div { class: "mtable",
-                table {
-                    thead {
-                        tr {
-                            for h in ["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "data"] {
-                                th { scope: "col", "{h}" }
-                            }
-                        }
-                    }
-                    tbody {
-                        for run in runs.iter().rev() {
-                            {
-                                let [(_, flags), (_, kv)] = settings(run);
-                                let file = run.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                rsx! {
-                                    tr {
-                                        th { scope: "row", "{run.generated_utc.minute()} UTC" }
-                                        td { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
-                                        td { "{run.config.scenarios.join(\", \")}" }
-                                        td { {run.config.cold_priming_launches.map_or("not recorded".to_string(), |n| n.to_string())} }
-                                        td { "{kv}" }
-                                        td { code { "{flags}" } }
-                                        td { a { href: "{DATA}/{file}", "json" } }
-                                    }
-                                }
+            Table {
+                headers: headers(["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "data"]),
+                for run in runs.iter().rev() {
+                    {
+                        let [(_, flags), (_, kv)] = settings(run);
+                        let file = run.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        rsx! {
+                            TableRow {
+                                TableCell { "{run.generated_utc.minute()} UTC" }
+                                TableCell { {commit(run)} }
+                                TableCell { "{run.config.scenarios.join(\", \")}" }
+                                TableCell { {run.config.cold_priming_launches.map_or("not recorded".to_string(), |n| n.to_string())} }
+                                TableCell { "{kv}" }
+                                TableCell { code { "{flags}" } }
+                                TableCell { a { href: "{DATA}/{file}", "json" } }
                             }
                         }
                     }
@@ -998,9 +1273,9 @@ fn runs_table(runs: &[&Run]) -> Element {
     }
 }
 
-/// Every model's prompt-by-answer grid on every machine as one small multiple
-/// per metric: the same colours as the full grids, no numbers in the squares,
-/// each linking to its model's full section.
+/// Every model's prompt-by-answer grid on every machine as small multiples,
+/// one table per metric: a machine per row, a model per column, each cell that
+/// model's grid as a tiny heatmap coloured like the full ones.
 fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     let mut stems: Vec<&str> = Vec::new();
     for mr in machines.values() {
@@ -1013,97 +1288,95 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     if stems.is_empty() {
         return rsx! {};
     }
-    let mini = |chip: &str, stem: &str, metric: Metric| -> Element {
+    let mini = |chip: &str, stem: &str, metric: Metric, name: &str| -> Element {
         let Some(Entry { run, m }) = machines[chip].latest(stem) else {
-            return rsx! { td { class: "gnone", "not run" } };
+            return rsx! { "not run" };
         };
-        let Some(g) = Grid::of(m, run) else {
-            return rsx! { td { class: "gnone", "no grid" } };
+        let Some(g) = ShapeGrid::of(m, run) else {
+            return rsx! { "no grid" };
         };
         let Some(rival) = g.rival else {
-            return rsx! { td { class: "gnone", "nothing to compare" } };
+            return rsx! { "nothing to compare" };
         };
         let mut ratios = Vec::new();
-        let mut squares = Vec::new();
+        let mut data = Vec::new();
         for &i in g.ins {
             for &o in g.outs {
-                let (cs, cr) = (
-                    g.at(Some(Engine::Scratchy), (i, o)),
-                    g.at(Some(rival), (i, o)),
-                );
-                let r = metric.faster(timing(cs, metric), timing(cr, metric));
+                let r = g.versus(metric, (i, o), rival).0;
                 ratios.extend(r);
-                let value = r.map_or("no comparison".to_string(), |r| {
-                    format!("×{r:.2}{}", mark(metric, &[cs, cr]))
-                });
-                // A square with nothing to compare is hollow, so it never reads
-                // as "about the same".
-                let class = r.map_or("gnil".to_string(), heat_class);
-                // Not focusable: the grid is one link, whose label sums it up.
-                let row = TipRow {
-                    value,
-                    label: format!("vs {}", rival.label()),
-                    engine: Engine::Scratchy,
-                };
-                squares.push(rsx! {
-                    Tooltip { id: "tip-glance-{metric.id()}-{slug(chip)}-{slug(stem)}-{i}x{o}", class: "gsq {class}",
-                        trigger: rsx! {},
-                        {tip_body(&format!("{chip} · {stem} · {i} in × {o} out"), &[row])}
-                    }
+                data.push(HeatPoint {
+                    x: o.to_string(),
+                    y: i.to_string(),
+                    value: r.map(log2_ratio),
                 });
             }
         }
-        let span = match (
+        let range = match (
             ratios.iter().copied().reduce(f64::min),
             ratios.iter().copied().reduce(f64::max),
         ) {
-            (Some(lo), Some(hi)) => format!("×{lo:.2} to ×{hi:.2}"),
+            (Some(lo), Some(hi)) => format!("×{lo:.2}–×{hi:.2}"),
             _ => "no ratios".to_string(),
         };
         rsx! {
-            td {
-                a { class: "gmini", href: "#{slug(chip)}-{slug(stem)}",
-                    "aria-label": "{stem} on {chip}: scratchy {span} against {rival.label()}; open the full grid",
-                    style: "grid-template-columns: repeat({g.outs.len()}, 1fr)",
-                    {squares.into_iter()}
+            Stack { gap: 2,
+                {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", rival.label()), &format!("{stem} on {chip}: scratchy {range}"))}
+                // Name over range, centred under the grid.
+                div { style: "text-align: center",
+                    div { strong { "{name}" } }
+                    div { "{range}" }
                 }
-                span { class: "grange", "{span} vs {rival.label()}" }
             }
         }
     };
+    // As wide as its content: a CSS grid whose columns (machine names, then
+    // one per model) are each as wide as their widest cell, so rows line up
+    // without stretching to the page. Gaps are Carbon spacing steps (06 and
+    // 05). In each model's cell, its prefill grid and its decode grid.
+    let set = format!(
+        "display: grid; grid-template-columns: max-content repeat({}, max-content) max-content; gap: 1.5rem 1rem; align-items: start",
+        stems.len()
+    );
+    // Row 1 is the model names; the machines' rows follow.
+    let scale = ScaleFit::Rows {
+        column: stems.len() + 2,
+        first: 2,
+        count: machines.len(),
+    };
+    let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
     rsx! {
-        section { class: "msection", id: "glance",
-            h2 { "At a glance" }
-            p { class: "msub",
-                "Every model's prompt size × answer size grid on every machine. Each square is one cell of the \
-                 full grid (rows: prompt, short to long; columns: answer, short to long), coloured by how many \
-                 times faster scratchy is than mlx-lm (ollama where a run has no mlx-lm). Hover a square for \
-                 its ratio; click a grid for its model."
-            }
-            div { class: "heatrow",
-                for (metric, title) in GRID_METRICS {
-                    div { class: "heat",
-                        div { class: "heatttl", "{title}" }
-                        div { class: "mtable",
-                            table { class: "gtable",
-                                thead { tr { th { scope: "col" } for stem in &stems { th { scope: "col", "{stem}" } } } }
-                                tbody {
-                                    for chip in machines.keys() {
-                                        tr {
-                                            th { scope: "row", "{chip}" }
-                                            for stem in &stems { {mini(chip, stem, metric)} }
-                                        }
-                                    }
+        Section { id: "glance", level: 2,
+            Stack { gap: 4,
+                Heading { "At a glance" }
+                p {
+                    "Every model's prompt size × answer size grid on every machine: in each cell, the model's \
+                     prefill (time to first token) grid, then its decode (throughput) grid (rows: prompt, short to \
+                     long; columns: answer, short to long). Colour is how many times faster scratchy is than mlx-lm \
+                     (ollama where a run has no mlx-lm): blue faster, red slower, the middle step within noise. \
+                     Hover a square for its ratio."
+                }
+                // The tile shrink-wraps the set instead of spanning the page.
+                Tile { style: "width: fit-content",
+                    div { style: "{set}",
+                        // The header row has a cell for every column, the
+                        // scale's included, so the machine rows start below it.
+                        div {}
+                        for stem in &stems { div { style: "text-align: center", "{stem}" } }
+                        div {}
+                        for chip in machines.keys() {
+                            div { "{chip}" }
+                            for stem in &stems {
+                                // A flex row, not a horizontal cds-stack: that is an
+                                // inline-grid, which sits on the cell's text baseline
+                                // and so starts lower than the machine's name.
+                                div { style: "display: flex; gap: 0.5rem; align-items: flex-start; justify-content: center",
+                                    for (metric, name) in metrics { {mini(chip, stem, metric, name)} }
                                 }
                             }
                         }
+                        {ratio_scale(scale)}
                     }
                 }
-            }
-            div { class: "scale",
-                span { class: "scalekey", "scratchy is:" }
-                {heat_legend()}
-                span { i { class: "sw nil" } "no comparison" }
             }
         }
     }
@@ -1121,39 +1394,55 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
         None => format!("{} cores", mc.cores_total),
     };
     rsx! {
-        section { class: "msection", id: "{mslug}",
-            h2 { "{chip}" }
-            p { class: "mmeta", "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
-            {runs_table(&mr.runs)}
-            for (stem, seen) in &mr.models {
-                {
-                    let Entry { run, m } = seen[seen.len() - 1];
-                    // Before/after: the newest earlier run of this model, here, that scratchy served.
-                    let prev = seen[..seen.len() - 1].iter().rev().find(|e| served(e.m)).copied();
-                    let mid = format!("{mslug}-{}", slug(stem));
-                    let f = m.footprint.as_ref();
-                    let build = match f.and_then(|f| f.build_seconds) {
-                        None => String::new(),
-                        Some(s) => {
-                            let binary = f.and_then(|f| f.binary_bytes).filter(|&b| b != 0)
-                                .map_or(String::new(), |b| format!(", {} MiB binary", (b as f64 / 1_048_576.0).round_ties_even()));
-                            format!(" · scratchy build {s} s{binary}")
-                        }
-                    };
-                    rsx! {
-                        article { class: "mmodel cds--tile", id: "{mid}",
-                            h3 { "{stem} " span { class: "onmachine", "on {chip}" } }
-                            p { class: "mmeta",
-                                a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
-                                " · {m.quant.as_deref().unwrap_or(\"default\")}{build} · run {run.generated_utc.date()}, "
-                                code { "{run.repo.sha8()}" }
+        Section { id: "{mslug}", level: 2,
+            Stack { gap: 4,
+                Heading { "{chip}" }
+                p { "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
+                Tile {
+                  Layer { level: 1,
+                    Stack { gap: 5,
+                {runs_table(&mr.runs)}
+                for (stem, seen) in &mr.models {
+                    {
+                        let Entry { run, m } = seen[seen.len() - 1];
+                        // Before/after: the newest earlier run of this model, here, that scratchy served.
+                        let prev = seen[..seen.len() - 1].iter().rev().find(|e| served(e.m)).copied();
+                        let mid = format!("{mslug}-{}", slug(stem));
+                        let f = m.footprint.as_ref();
+                        let build = match f.and_then(|f| f.build_seconds) {
+                            None => String::new(),
+                            Some(s) => {
+                                let binary = f.and_then(|f| f.binary_bytes).filter(|&b| b != 0)
+                                    .map_or(String::new(), |b| format!(", {} MiB binary", (b as f64 / 1_048_576.0).round_ties_even()));
+                                format!(" · scratchy build {s} s{binary}")
                             }
-                            {summary_table(m, run, prev)}
-                            {conc_chart(m, run, prev)}
-                            {grid_maps(m, &mid, run)}
-                            {history(seen)}
+                        };
+                        rsx! {
+                            Tile { id: mid,
+                              Section { level: 3,
+                              Layer { level: 2,
+                                Stack { gap: 6,
+                                    Stack { gap: 2,
+                                        Heading { "{stem} on {chip}" }
+                                        p {
+                                            a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
+                                            " · {m.quant.as_deref().unwrap_or(\"default\")}{build} · run {run.generated_utc.date()}, "
+                                            code { "{run.repo.sha8()}" }
+                                        }
+                                    }
+                                    {summary_table(m, run, prev)}
+                                    {conc_chart(m, run, prev)}
+                                    {grid_maps(m, run)}
+                                    {history(seen)}
+                                }
+                              }
+                              }
+                            }
                         }
                     }
+                }
+                    }
+                  }
                 }
             }
         }
@@ -1166,7 +1455,7 @@ pub fn build(site: &Site) -> Result<String, String> {
     let mut sections: Vec<(String, String)> = Vec::new();
     let body = if machines.is_empty() {
         rsx! {
-            p { class: "empty",
+            p {
                 "No runs published yet. Run " code { "scripts/bench_metal_matrix.sh" } " and copy its JSON into "
                 code { "site/data/metal/" } "."
             }
@@ -1184,19 +1473,21 @@ pub fn build(site: &Site) -> Result<String, String> {
         {chrome::header(Root(0), Some(Tab::Performance))}
         {chrome::perf_side_nav("metal.html", &sections)}
         div { class: "docs-layout",
-            main { class: "docs-content metalpage",
-                div { class: "hero-body",
-                    h1 { "Metal performance" }
-                    p { class: "lede",
+            main { class: "docs-content",
+              Stack { gap: 6,
+                Stack { gap: 4,
+                    Heading { "Metal performance" }
+                    p {
                         "scratchy against mlx-lm and ollama on Apple silicon: how long each takes to start, how \
                          fast it answers one user, and how it holds up as prompts, answers and users grow. \
                          {count} runs on {n_machines} machines, every number measured by "
                         a { href: "{REPO}/blob/main/scripts/bench_metal_matrix.sh", code { "scripts/bench_metal_matrix.sh" } }
                         "."
                     }
-                    div { class: "mabout", {about()} }
+                    div { {about()} }
                 }
                 {body}
+              }
             }
         }
         script { dangerous_inner_html: CHARTS_JS }
@@ -1209,17 +1500,11 @@ pub fn build(site: &Site) -> Result<String, String> {
             ),
             og: None,
             root: Root(0),
-            modules: &[
-                Module::UiShell,
-                Module::ToggleTip,
-                Module::Tooltip,
-                Module::Accordion,
-            ],
             libraries: &[Library::CarbonCharts],
             theme: Theme::AlwaysLight,
         },
         page,
-    );
+    )?;
     let out = site.out.join("metal.html");
     fs::write(&out, html).map_err(|e| format!("{}: {e}", out.display()))?;
     let dest = site.out.join(DATA);
@@ -1234,4 +1519,22 @@ pub fn build(site: &Site) -> Result<String, String> {
         "metal page: {count} runs on {n_machines} machines -> {}",
         out.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RATIO_RANGE, RATIO_SPAN, RATIO_STEPS};
+
+    #[test]
+    fn ratio_range_is_the_span_either_way() {
+        assert_eq!(RATIO_RANGE.max, RATIO_SPAN.log2());
+        assert_eq!(RATIO_RANGE.min, -RATIO_SPAN.log2());
+    }
+
+    #[test]
+    fn ratio_steps_mirror_around_a_gray_middle() {
+        let n = RATIO_STEPS.len();
+        assert_eq!(n % 2, 1);
+        assert_eq!(RATIO_STEPS[n / 2], "#a8a8a8");
+    }
 }

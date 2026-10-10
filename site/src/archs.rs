@@ -9,7 +9,7 @@ use std::fs;
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{Module, SideNav, SideNavLink, Tile};
+use crate::carbon::{SideNav, SideNavLink, Tile};
 use crate::chrome::{self, Head, Library, Root, Tab, Theme};
 use crate::highlight;
 use crate::{Site, thousands};
@@ -167,7 +167,7 @@ pub fn build(site: &Site) -> Result<String, String> {
     })
     .map_err(|e| e.to_string())?;
 
-    let page = page(&archs, &order, &base, total, &data);
+    let page = page(&archs, &order, &base, total, &data)?;
     let out = site.out.join("architectures.html");
     fs::write(&out, page).map_err(|e| format!("{}: {e}", out.display()))?;
     Ok(format!(
@@ -184,7 +184,7 @@ fn page(
     base: &str,
     total: usize,
     data: &str,
-) -> String {
+) -> Result<String, String> {
     let count = archs.len();
     let total = thousands(total);
     let body = rsx! {
@@ -240,12 +240,6 @@ fn page(
             ),
             og: None,
             root: Root(0),
-            modules: &[
-                Module::UiShell,
-                Module::Button,
-                Module::Tile,
-                Module::Select,
-            ],
             libraries: &[Library::DiffView],
             theme: Theme::FollowSystem,
         },

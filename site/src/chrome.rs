@@ -147,12 +147,11 @@ pub struct Head<'a> {
     pub description: Option<&'static str>,
     pub og: Option<OpenGraph>,
     pub root: Root,
-    pub modules: &'a [Module],
     pub libraries: &'a [Library],
     pub theme: Theme,
 }
 
-fn head(h: &Head) -> Element {
+fn head(h: &Head, modules: &[Module]) -> Element {
     let root = h.root;
     rsx! {
         meta { charset: "utf-8" }
@@ -173,7 +172,7 @@ fn head(h: &Head) -> Element {
             link { rel: "stylesheet", href: css }
         }
         link { rel: "stylesheet", href: "{root}styles.css" }
-        for m in h.modules {
+        for m in modules {
             script { r#type: "module", src: m.src() }
         }
         for (src, module) in h.libraries.iter().map(|l| l.script()) {
@@ -185,12 +184,14 @@ fn head(h: &Head) -> Element {
 
 /// A whole page: the head, then `body`. dioxus-html has no `<html>` element,
 /// so the document shell around the two is fixed text.
-pub fn document(h: Head, body: Element) -> String {
-    format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{}\n</body>\n</html>\n",
-        dioxus_ssr::render_element(head(&h)),
-        dioxus_ssr::render_element(body),
-    )
+/// The head loads the Carbon modules for exactly the tags `body` renders.
+pub fn document(h: Head, body: Element) -> Result<String, String> {
+    let body = dioxus_ssr::render_element(body);
+    let modules = Module::used_by(&body).map_err(|e| format!("{}: {e}", h.title))?;
+    Ok(format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{body}\n</body>\n</html>\n",
+        dioxus_ssr::render_element(head(&h, &modules)),
+    ))
 }
 
 /// The GitHub octicon "mark-github", inlined so the global action needs no

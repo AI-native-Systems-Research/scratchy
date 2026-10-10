@@ -83,7 +83,7 @@ fn build(site: &Site) -> Result<(), String> {
     for asset in ASSETS {
         copy(&site.root.join(asset), &site.out.join(asset))?;
     }
-    fs::write(site.out.join("index.html"), landing::page()).map_err(|e| e.to_string())?;
+    fs::write(site.out.join("index.html"), landing::page()?).map_err(|e| e.to_string())?;
     book::build(site)?;
     println!("{}", archs::build(site)?);
     println!("{}", metal::build(site)?);

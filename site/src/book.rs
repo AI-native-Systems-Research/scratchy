@@ -10,7 +10,7 @@ use std::path::Path;
 
 use dioxus::prelude::*;
 
-use crate::carbon::{Module, SideNav, SideNavLink, SideNavMenu};
+use crate::carbon::{SideNav, SideNavLink, SideNavMenu};
 use crate::chrome::{self, Head, Library, Root, Tab, Theme};
 use crate::{Site, repo};
 
@@ -130,12 +130,11 @@ fn build_chapter(site: &Site, c: &Chapter) -> Result<(), String> {
             description: None,
             og: None,
             root,
-            modules: &[Module::UiShell],
             libraries: &[Library::ZeroMd],
             theme: Theme::FollowSystem,
         },
         body,
-    );
+    )?;
     write(&dest.with_extension("html"), &page)
 }
 
