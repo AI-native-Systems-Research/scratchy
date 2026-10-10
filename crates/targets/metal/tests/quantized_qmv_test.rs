@@ -42,8 +42,9 @@ type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 /// and the `qmv_dispatch_shape` grid. Returns `false` if the host has no
 /// MTL4 queue. bits is fixed at 4 and B at 1 (decode-only), matching the
 /// original test's `execute(.., 1 /* B */, group_size, 4, ..)` call.
-/// M ≥ 2 picks the small-M band (`qmv_wide`) as an M5 target does, with M
-/// baked at slot 7 (`AffineQmvWideConstants`).
+/// M ≥ 2 picks the small-M band (`qmv_wide`) when `wide_ok` passes, as an
+/// M5 target does; without it the buckets take the fast kernel's fold twin.
+/// M is baked at slot 7 (`AffineQmvWideConstants`) for the wide pick.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_qmv(
     device: &Device,
@@ -58,8 +59,9 @@ fn dispatch_qmv(
     group_size: u32,
     scale_dtype: ScaleDtype,
     codes: AffineCodes,
+    wide_ok: bool,
 ) -> bool {
-    let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, true);
+    let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, wide_ok);
     let kernel_name = qmv_kernel_name(
         kernel,
         DequantDtype::Bf16,
@@ -194,9 +196,11 @@ fn run_qmv_bf16(
         (m, n, k),
         group_size,
         AffineCodes::AsWritten,
+        /*wide_ok=*/ true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_qmv_bf16_codes(
     packed: &[u8],
     scales: &[half::f16],
@@ -205,6 +209,7 @@ fn run_qmv_bf16_codes(
     (m, n, k): (usize, usize, usize),
     group_size: u32,
     codes: AffineCodes,
+    wide_ok: bool,
 ) -> Option<Vec<half::bf16>> {
     let device = detect_device()?.device;
 
@@ -238,6 +243,7 @@ fn run_qmv_bf16_codes(
         group_size,
         ScaleDtype::F16,
         codes,
+        wide_ok,
     ) {
         return Some(Vec::new());
     }
@@ -495,6 +501,7 @@ fn run_qmv_bf16_with_packed_prefix(
         group_size,
         ScaleDtype::F16,
         AffineCodes::AsWritten,
+        /*wide_ok=*/ true,
     ) {
         return Some(Vec::new());
     }
@@ -790,6 +797,7 @@ fn run_qmv_bf16_s_bf16(
         group_size,
         ScaleDtype::Bf16,
         AffineCodes::AsWritten,
+        /*wide_ok=*/ true,
     ) {
         return Some(Vec::new());
     }
@@ -909,6 +917,7 @@ fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
                     (m, n, k),
                     group_size as u32,
                     codes,
+                    /*wide_ok=*/ true,
                 )
             };
             let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
@@ -933,6 +942,58 @@ fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
     }
 }
 
+/// The fast kernel's fold twin (`affine_qmv_fast_*_t8_batch_0`): the m≥2 buckets a
+/// pre-gen-15 target decodes with — `wide_ok` false, the pick `qmv_kernel_wide` makes
+/// there. The same `qmv_fast_impl` at MLX's 8-row threadgroups, so the parity bound is
+/// the one-row test's. Each case also runs on XOR-0x88 codes under
+/// `AffineCodes::Offset8` and must match the as-written run exactly.
+#[test]
+fn affine_qmv_fast_fold_b4_bf16_matches_cpu_reference() {
+    let (n, k) = (64, 512);
+    for group_size in [32usize, 64, 128] {
+        for m in [2usize, 3, 4, 8] {
+            assert_eq!(
+                pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, false),
+                QmvKernel::FastFold,
+                "M={m} must pick the fast fold twin"
+            );
+            let (packed, scales, biases, x) =
+                make_inputs_bf16(0xF01D ^ (group_size * 16 + m) as u64, n, k, m, group_size);
+            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let run = |packed: &[u8], codes| {
+                run_qmv_bf16_codes(
+                    packed,
+                    &scales,
+                    &biases,
+                    &x,
+                    (m, n, k),
+                    group_size as u32,
+                    codes,
+                    /*wide_ok=*/ false,
+                )
+            };
+            let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+                eprintln!("skipping: no Metal 4 GPU");
+                return;
+            };
+            assert!(!as_written.is_empty(), "no MTL4 queue");
+            let (idx, mv, ev, abs_err, allowed) =
+                worst_abs_error_vs_noise_floor(&as_written, &expected, k, 0.5);
+            assert!(
+                abs_err <= allowed,
+                "qmv_fast fold twin gs={group_size} M={m}: worst abs_err={abs_err:.5} at idx {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+            let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+            assert_eq!(
+                run(&offset8, AffineCodes::Offset8),
+                Some(as_written),
+                "qmv_fast fold twin offset-8 gs={group_size} M={m}"
+            );
+        }
+    }
+}
+
 /// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
 /// read under `AFFINE_CODES_OFFSET8` give bit-identical output to the codes
 /// as written, on every qmv kernel.
@@ -942,7 +1003,16 @@ fn affine_qmv_b4_offset8_codes_match_as_written() {
     for (m, n, k) in [(1, 64, 128), (1, 64, 512), (1, 12, 384), (4, 64, 512)] {
         let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7 ^ k as u64, n, k, m, 64);
         let run = |packed: &[u8], codes| {
-            run_qmv_bf16_codes(packed, &scales, &biases, &x, (m, n, k), 64, codes)
+            run_qmv_bf16_codes(
+                packed,
+                &scales,
+                &biases,
+                &x,
+                (m, n, k),
+                64,
+                codes,
+                /*wide_ok=*/ true,
+            )
         };
         let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
             eprintln!("skipping: no Metal 4 GPU");

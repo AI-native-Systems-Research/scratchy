@@ -327,10 +327,11 @@ fn slices(plain: &[GatedCommand], bucket_m: u32) -> bool {
 
 /// An MLX-affine matmul's matvec (qmv) command over `rows` rows, bound to `layer`'s weight `ix`.
 /// The kernel is MLX's `dispatch_qmv` pick for the shape (quad for K∈{64,128}, fast when N%8 = 0 ∧
-/// K%512 = 0, else generic); the grid `(rows, ⌈N/bn⌉, 1)` scales along X with the live token
-/// count, or — `seq_axis` — is SET to the live sequence count: the lm_head slice's qmv reads just
-/// the gathered sampled rows, one threadgroup row per sequence, instead of sweeping the
-/// `⌈bucket_m/32⌉` qmm_t tiles.
+/// K%512 = 0, else generic; without the wide band — a pre-M5 target — the m≥2 buckets take the
+/// fast kernel's fold twin, `_t8`); the grid `(rows, ⌈N/bn⌉, 1)` scales along X with the live
+/// token count, or — `seq_axis` — is SET to the live sequence count: the lm_head slice's qmv
+/// reads just the gathered sampled rows, one threadgroup row per sequence, instead of sweeping
+/// the `⌈bucket_m/32⌉` qmm_t tiles.
 fn affine_qmv_command(
     p: &MetalModelConsts,
     g: &AffineMatmul,
@@ -360,7 +361,7 @@ fn affine_qmv_command(
             }
             .into_baked(),
         ),
-        QmvKernel::Fast => (
+        QmvKernel::Fast | QmvKernel::FastFold => (
             KernelId::AffineQmvFast,
             super::kernel_constants::AffineQmvConstants {
                 k: super::ids::KDimI32(k as i32),

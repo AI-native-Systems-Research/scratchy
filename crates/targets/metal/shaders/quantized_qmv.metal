@@ -12,13 +12,14 @@
 //   group_size in {32, 64, 128}
 //   dtype in {f16, bf16}
 //   qmv_quad: D in {64, 128} × batched in {0, 1}
-//   qmv_fast: batched in {0, 1}
+//   qmv_fast: batched in {0, 1}; its _t8 fold twin: batch 0 only
 //   qmv:      batched in {0, 1}
 //
 // Symbol naming follows the existing scratchy-target-metal precedent
 // (`affine_dequantize_<dtype>_gs_<gs>_b_<bits>`):
 //   affine_qmv_quad_<dtype>_gs_<gs>_b_<bits>_d_<D>_batch_<batched>
 //   affine_qmv_fast_<dtype>_gs_<gs>_b_<bits>_batch_<batched>
+//   affine_qmv_fast_<dtype>_gs_<gs>_b_<bits>_t8_batch_0
 //   affine_qmv_<dtype>_gs_<gs>_b_<bits>_batch_<batched>
 //
 // The helper templates (load_vector / qdot / etc.) keep the full
@@ -39,7 +40,9 @@ using namespace metal;
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 // Rows a simdgroup of the one-row `affine_qmv_fast` (MLX's 4): its 4-row threadgroups
-// (`QMV_FAST_TILE_ROWS`) put twice MLX's simdgroups on each matrix's weight stream.
+// (`QMV_FAST_TILE_ROWS`) put twice MLX's simdgroups on each matrix's weight stream. The
+// `_t8` fold twin — the m>=2 buckets a pre-gen-15 GPU decodes with — instantiates the
+// same template at MLX's 4 (`INST_QMV_FAST_T8`).
 MLX_MTL_CONST int QMV_FAST_ROWS = 2;
 
 // ─────────────────────────────────────────────────────────────────
@@ -1035,7 +1038,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
 // affine_qmv_fast — quantized.h:1495-1545
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool batched>
+template <typename T_act, typename T_scale, int group_size, int bits, bool batched,
+          int results_per_simdgroup = QMV_FAST_ROWS>
 [[kernel]] void affine_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device T_scale* scales [[buffer(1)]],
@@ -1076,7 +1080,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
         b_strides,
         tid);
   }
-  qmv_fast_impl<T_act, T_scale, group_size, bits, device T_act*, QMV_FAST_ROWS>(
+  qmv_fast_impl<T_act, T_scale, group_size, bits, device T_act*, results_per_simdgroup>(
       w, scales, biases, x, y, IN_VEC_SIZE, OUT_VEC_SIZE, tid, simd_gid, simd_lid, gain, bias);
 }
 
@@ -1405,9 +1409,20 @@ template <
       name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_d_##D##_batch_##batched,      \
       name<act_type, scale_type, gs, bits, D, batched>)
 
+// The fold twin: `affine_qmv_fast` at MLX's 4 rows a simdgroup (8-row threadgroups), for the
+// m>=2 buckets a pre-gen-15 GPU decodes with — the small-M wide band that would take them needs
+// gen-15+ (ours gates it at M5). The fold streams each matrix's weights once per row at either
+// tile, and there the 4-row tile only doubles the threadgroup count. batch_0 only: the fold is
+// a decode-batch shape, never an MoE weight batch.
+#define INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, bits)                  \
+  SCRATCHY_KERNEL(                                                                            \
+      affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_t8_batch_0,            \
+      affine_qmv_fast<act_type, scale_type, gs, bits, /*batched=*/false, /*rows a simdgroup=*/4>)
+
 #define INST_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs)                          \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 1)     \
+  INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 4)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4, 1)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 0) \
@@ -1442,6 +1457,7 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 // the batched variants for the MLP).
 #define INST_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs)                       \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
+  INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 8)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 64, 0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128,0)
@@ -1462,6 +1478,7 @@ INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
 #define INST_QMV_ALL_B3(act_tag, act_type, scale_tag, scale_type, gs)                       \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3, 0)     \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 3, 1)     \
+  INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 3)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3, 0)     \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 3, 1)
 
@@ -1481,6 +1498,7 @@ INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
 #define INST_QMV_ALL_B2(act_tag, act_type, scale_tag, scale_type, gs)                       \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 2)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 0) \

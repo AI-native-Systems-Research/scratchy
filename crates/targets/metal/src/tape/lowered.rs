@@ -161,7 +161,9 @@ pub enum KernelId {
     /// `affine_qmv_quad` (`quantized.h:1444`).
     AffineQmvQuad,
     /// MLX-affine int4 decode matvec, `N % 8 == 0 ∧ K % 512 == 0`.
-    /// Maps to `affine_qmv_fast_<dtype>_gs_<gs>_b_4_batch_<batched>`.
+    /// Maps to `affine_qmv_fast_<dtype>_gs_<gs>_b_4_batch_<batched>`; the m≥2 fold
+    /// buckets without the wide band (pre-M5) name its 8-row-threadgroup twin
+    /// `affine_qmv_fast_<dtype>_gs_<gs>_b_4_t8_batch_0`.
     /// Faithful port of MLX's `affine_qmv_fast` (`quantized.h:1496`).
     AffineQmvFast,
     /// MLX-affine int4 decode matvec, generic shape fallback.
