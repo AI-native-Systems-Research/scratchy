@@ -1971,6 +1971,10 @@ pub enum LoweringError {
     /// offset's norm, not the signal's, set the codec's error: a K bias, with no
     /// rotary table to rotate it to each key (rope-on-read off).
     TurboQuantOffsetUnbound { index: usize },
+    /// A TurboQuant-coded KV writer at tape index `index` that writes its K/V un-rotated
+    /// (`KvAppend`) with an additive offset: the codec's restores rotate a K bias to the key and
+    /// bind the writer's rotary table for either, and such a writer has none.
+    UnrotatedWriterOffset { index: usize },
     /// A step at tape index `index` binds the `slot`-th `kind` weight of its site, and its
     /// site holds no such source — the step records and the opcode lowering disagree.
     NoSource {
@@ -2044,6 +2048,11 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
                  operand's additive offset (no rotary table rotates its K bias)"
+            ),
+            Self::UnrotatedWriterOffset { index } => write!(
+                f,
+                "lowering: the TurboQuant-coded un-rotated KV writer at tape index {index} \
+                 carries a projection bias the codec cannot restore"
             ),
             Self::NoSource { index, kind, slot } => write!(
                 f,

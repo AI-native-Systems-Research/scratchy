@@ -174,7 +174,7 @@ pub fn lower_subtile_tape_to_metal(
     // too ([`ATTN_FOLD`]).
     let encodes = |c: &GatedCommand| {
         let writes = match c.command.kernel {
-            KernelId::RopeAppend | KernelId::RopeAppendNormed => true,
+            KernelId::RopeAppend | KernelId::RopeAppendNormed | KernelId::KvAppend => true,
             KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
                 c.command.constants.iter().any(|k| k.index == ATTN_FOLD.0)
             }
@@ -719,7 +719,7 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
 
 /// A KV writer's folded-in TurboQuant encode ([`KvWrite::PoolAndPacked`]): the codebook, the
 /// layer's packed stores and each operand's offset, as the writer's constants and the bindings it
-/// adds from 16 (`rope.metal`'s `ROPE_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
+/// adds from 16 (`kv_writer.h`'s `KV_WRITER_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
 /// The coded layers are the GLOBAL class (every layer on uniform arches).
 fn kv_writer_codec(
     p: &MetalModelConsts,
@@ -3361,7 +3361,13 @@ fn lower_one(
         // One threadgroup per (token, kv head), one thread per head
         // element: K and V copied as projected into the layer's paged
         // cache page. Same geometry-class selection as `RopeAppend`.
-        I::KvAppend(Slot(k_slot), Slot(v_slot), LayerId(layer), class) => {
+        I::KvAppend(Slot(k_slot), Slot(v_slot), LayerId(layer), class, offsets, write) => {
+            // Its codec restores no offset: a K bias's restore rotates it to the key, and a V
+            // bias's binds the rotary table the writer has none of.
+            if *write == KvWrite::PoolAndPacked && *offsets != KvOffsets::CENTERED {
+                return Err(LoweringError::UnrotatedWriterOffset { index: w.index });
+            }
+            let codec = kv_writer_codec(p, *write, *offsets, LayerId(*layer), layer_offset, w)?;
             let (hd, n_kv, bs) = match class {
                 AttnMask::Causal => (
                     p.global_head_dim,
@@ -3379,6 +3385,7 @@ fn lower_one(
                     num_kv_heads: super::ids::NumKvHeads(n_kv),
                     block_size: super::ids::BlockSize(bs),
                     blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
+                    tq: codec.as_ref().map(|(c, _)| *c),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3390,11 +3397,16 @@ fn lower_one(
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
                 },
-                bindings: baked(Vec::from(super::kernel_bindings::KvAppendBindingSet {
-                    k: super::ids::ArenaSlotIdx(*k_slot),
-                    v: super::ids::ArenaSlotIdx(*v_slot),
-                    layer: super::ids::LayerId(*layer + layer_offset),
-                })),
+                bindings: baked(
+                    Vec::from(super::kernel_bindings::KvAppendBindingSet {
+                        k: super::ids::ArenaSlotIdx(*k_slot),
+                        v: super::ids::ArenaSlotIdx(*v_slot),
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                    })
+                    .into_iter()
+                    .chain(codec.into_iter().flat_map(|(_, b)| b))
+                    .collect(),
+                ),
                 gemm_dims: None,
             }
         }
@@ -8233,6 +8245,64 @@ mod tests {
         let want = [(conv, None), (simd, None), (norm, None)];
         assert_eq!(shape(&lowered((2, 4, 128, 48), 64)), want);
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
+    }
+
+    /// The un-rotated KV writer coded (`KvWrite::PoolAndPacked`, Nemotron-H under TurboQuant):
+    /// its one `kv_append` command carries the rope writer's encode constants (slots 10-14, no
+    /// offset) and binds the codebook and the layer's packed stores at 16-21 — no bias, no
+    /// rotary table. Plain (a dense model), it carries neither. With a projection bias the codec
+    /// cannot restore it refuses. Its layer's packed decode twin lowers after it. Pure-CPU
+    /// lowering checks.
+    #[test]
+    fn a_coded_kv_append_encodes_as_it_writes() {
+        use scratchy_ir::{BiasStorage, KvOffset};
+        let writer = |offsets, write| {
+            MetalStep::KvAppend(Slot(1), Slot(2), LayerId(0), Causal, offsets, write)
+        };
+        let lower = |step: MetalStep| try_lower_tq(&tq_consts(), plain(&[step]), 1);
+        let coded = lower(writer(LLAMA_KV, KvWrite::PoolAndPacked)).expect("lowers");
+        let c = &coded.commands[0].command;
+        assert_eq!((c.library, coded.commands.len()), ("kv_append", 1));
+        let slot = |i: u16| c.constants.iter().find(|k| k.index == i).map(|k| k.bits);
+        let hd = tq_consts().global_head_dim as usize;
+        assert_eq!(
+            (10..15).map(slot).collect::<Vec<_>>(),
+            [
+                Some(TQ_BITS.get()),
+                Some(scratchy_layers::turboquant::vals_per_word(TQ_BITS.get()) as u32),
+                Some(scratchy_layers::turboquant::packed_dim(hd, TQ_BITS.get()) as u32),
+                Some(0),
+                Some(0)
+            ]
+        );
+        let mut tq: Vec<u8> = c
+            .bindings
+            .iter()
+            .map(|b| b.index())
+            .filter(|&i| i >= 16)
+            .collect();
+        tq.sort_unstable();
+        assert_eq!(tq, [16, 17, 18, 19, 20, 21]);
+        // Plain on a dense model (a coded model refuses a writer that encodes nothing).
+        let plain_writer = try_lower_tq(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
+        let plain_writer = plain_writer.expect("lowers");
+        let c = &plain_writer.commands[0].command;
+        assert!(c.constants.iter().all(|k| k.index < 10));
+        assert!(c.bindings.iter().all(|b| b.index() < 16));
+        let k_biased = scratchy_ir::KvOffsets {
+            k: KvOffset::LinearBias(BiasStorage::Dense),
+            v: KvOffset::Centered,
+        };
+        assert!(matches!(
+            lower(writer(k_biased, KvWrite::PoolAndPacked)),
+            Err(LoweringError::UnrotatedWriterOffset { index: 0 })
+        ));
+        // The layer's packed decode twin, after its coded writer.
+        let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
+        let rows = plain(&[writer(LLAMA_KV, KvWrite::PoolAndPacked), twin]);
+        let layer = try_lower_tq(&tq_consts(), rows, 1).expect("the coded layer lowers");
+        let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.command.kernel).collect();
+        assert_eq!(kernels, [KernelId::KvAppend, KernelId::AttentionViaCacheTq]);
     }
 
     /// A Mamba-2 layer lowers to the GDN kernels in their Mamba-2 forms, ungated at every

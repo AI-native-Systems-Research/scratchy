@@ -720,7 +720,12 @@ impl Recording<'_> {
     /// A KV codec step's writer — the KV writer of `encode`'s construct, `encode` being the
     /// step's `KvEncode` — as the writer's own record states it. Its class is its attention's.
     fn codec_writer(&self, i: usize, encode: usize) -> Result<CodecWriter, StepRefusal> {
-        let rope = |j: &usize| matches!(self.op(*j), SubOp::RopeAppend { .. });
+        let rope = |j: &usize| {
+            matches!(
+                self.op(*j),
+                SubOp::RopeAppend { .. } | SubOp::KvAppend { .. }
+            )
+        };
         let no = || self.no(i, Refused::CodecUnanchored);
         let w = self.group(encode).find(rope).ok_or_else(no)?;
         // The writer's command — its last fold's — whether it runs it or the attention does.
@@ -734,6 +739,8 @@ impl Recording<'_> {
             MetalStep::RopeAppend(.., l, p, c, offsets, _) => (l, p, c, offsets),
             // Normed K/V: a norm adds nothing.
             MetalStep::RopeAppendNormed(.., l, p, c, _) => (l, p, c, st::KvOffsets::CENTERED),
+            // Un-rotated: its cache is read as stored, the attention's convention for it.
+            MetalStep::KvAppend(_, _, l, c, offsets, _) => (l, RopeFormTag::NeoX, c, offsets),
             _ => return Err(no()),
         };
         Ok((layer, pairing, class, offsets, e.sites))
@@ -1276,6 +1283,9 @@ impl Recording<'_> {
                     MetalStep::RopeAppendNormed(q, k, v, qo, ko, vo, l, p, c, _) => {
                         MetalStep::RopeAppendNormed(q, k, v, qo, ko, vo, l, p, c, packed)
                     }
+                    MetalStep::KvAppend(k, v, l, c, o, _) => {
+                        MetalStep::KvAppend(k, v, l, c, o, packed)
+                    }
                     _ => return Err(self.no(i, Refused::FusionShape)),
                 };
                 Ok(e)
@@ -1804,13 +1814,21 @@ impl Recording<'_> {
             L::RopeAppend { .. } => return Err(self.no(i, Refused::NoFoldedRotate)),
             L::KvAppend { layer, attn, .. } => {
                 let (k, v) = (self.read(i, 0)?, self.read(i, 1)?);
+                let (k_op, v_op) = (self.step_arg(i, 0)?, self.step_arg(i, 1)?);
+                let layer = LayerId(layer);
+                // Each operand's offset, for a codec to remove (`kv_writer_codec` refuses one).
+                let offsets = st::KvOffsets {
+                    k: self.kv_offset(i, k_op, layer)?.0,
+                    v: self.kv_offset(i, v_op, layer)?.0,
+                };
+                let pool = st::KvWrite::Pool;
                 let mut e = em(
-                    S::KvAppend(k, v, LayerId(layer), attn),
+                    S::KvAppend(k, v, layer, attn, offsets, pool),
                     &[k, v],
                     &[k],
                     Vec::new(),
                 );
-                e.sig.kv_w = Some(LayerId(layer));
+                e.sig.kv_w = Some(layer);
                 e
             }
             L::AttnDecode { mask, .. } => {

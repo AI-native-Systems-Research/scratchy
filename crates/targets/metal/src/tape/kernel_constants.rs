@@ -295,16 +295,20 @@ pub struct KvAppendConstants {
     pub num_kv_heads: NumKvHeads,
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
+    /// The folded-in TurboQuant encode, at the rope writer's slots 10-14.
+    pub tq: Option<RopeTqConstants>,
 }
 
 impl From<KvAppendConstants> for Vec<ConstantValue> {
     fn from(c: KvAppendConstants) -> Self {
-        vec![
+        let mut v = vec![
             ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
             ConstantValue::uint(ConstSlot(1), c.num_kv_heads.get()),
             ConstantValue::uint(ConstSlot(2), c.block_size.get()),
             ConstantValue::uint(ConstSlot(3), c.blocks_per_chunk.get()),
-        ]
+        ];
+        RopeTqConstants::push(c.tq, c.head_dim, &mut v);
+        v
     }
 }
 

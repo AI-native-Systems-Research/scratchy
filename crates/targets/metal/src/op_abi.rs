@@ -508,6 +508,11 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     encode: K::KvEncode,
                     kernel: F::KvEncoded,
                 },
+                FoldPattern::Encoded {
+                    writer: K::KvAppend,
+                    encode: K::KvEncode,
+                    kernel: F::KvEncoded,
+                },
                 FoldPattern::NormAdd {
                     add: K::Add,
                     norm: K::RmsNorm,

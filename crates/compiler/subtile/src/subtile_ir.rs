@@ -1224,8 +1224,8 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
 
     // ── A KV codec, step by step (see `KvOperand`) ────────────────
     /// A writer's new `operand` rows, encoded into the layer's packed store, their additive
-    /// offset removed first. `inputs` = `[cache, cos, bias?]`: the cache half the writer filled,
-    /// its rotary row, and the projection whose bias the operand carries.
+    /// offset removed first. `inputs` = `[cache, cos?, bias?]`: the cache half the writer filled,
+    /// a rotating writer's rotary row, and the projection whose bias the operand carries.
     KvEncode { operand: KvOperand },
     /// The layer's `operand`, decoded out of its packed store into the codec's rotated domain,
     /// where the attention reads it. `inputs` = `[packed]`.

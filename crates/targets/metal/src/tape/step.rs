@@ -283,8 +283,9 @@ pub enum MetalStep {
         AttnMask,
         KvWrite,
     ),
-    /// `(k, v, layer, class)`: paged KV write of the un-rotated projections.
-    KvAppend(Slot, Slot, LayerId, AttnMask),
+    /// `(k, v, layer, class, offsets, write)`: paged KV write of the un-rotated projections
+    /// (and, coded, their encode into the packed store).
+    KvAppend(Slot, Slot, LayerId, AttnMask, KvOffsets, KvWrite),
     /// `(q, out, layer, pairing)`: decode attention over the paged cache.
     AttentionViaCache(Slot, Slot, LayerId, RopeFormTag),
     /// `(q, out, layer, pairing)`: sliding-window decode attention.
@@ -639,7 +640,7 @@ impl MetalStep {
             | S::NormAdd(_, _, _, RowNorm { layer: l, .. }, _)
             | S::RopeAppend(_, _, _, _, _, _, l, ..)
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
-            | S::KvAppend(_, _, l, _)
+            | S::KvAppend(_, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)
             | S::Mamba2(_, _, l)
             | S::KvStage(_, l, ..)

@@ -92,7 +92,7 @@ macro_rules! for_each_subop {
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
-            KvEncode [SubOp::KvEncode { .. }] arity = (|n| n == 2 || n == 3), cols = [one];
+            KvEncode [SubOp::KvEncode { .. }] arity = (|n| (1..=3).contains(&n)), cols = [one];
             KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one];
             RotateRows [SubOp::RotateRows { .. }] arity = (|n| n == 1), cols = [in0];
             // `[q, out, packed_k, packed_v]`, optionally with the attention's
