@@ -90,6 +90,14 @@ pub struct EngineCore {
     /// 🦭 Sealed request IDs that have already generated an EOS/stop token.
     /// Tracked so check_stop_criteria can defer stopping until block-aligned.
     seal_eos_seen: HashSet<String>,
+
+    /// The drafts a step of a worker-side head makes; `None` without one.
+    head_drafts: Option<usize>,
+    /// The executor runs a speculative step scheduled behind one still in flight
+    /// ([`Executor::pipelines_speculative_steps`]), as read when it was taken.
+    pipelines_speculative: bool,
+    /// Steps scheduled leading ([`SpecPipeline::leads`]) and not yet finalized or abandoned.
+    leading: usize,
 }
 
 /// Configuration for creating an EngineCore.
@@ -269,6 +277,10 @@ impl EngineCore {
         let scheduler = Scheduler::new(&config.scheduler_config, config.max_model_len, kv_cache);
 
         let mut async_scheduling = config.async_scheduling;
+        let head_drafts = match &config.proposer_config {
+            Some(ProposerConfig::Mtp(cfg)) => Some(cfg.num_speculative_tokens),
+            _ => None,
+        };
         let proposer: Option<Box<dyn Proposer + Send>> =
             config.proposer_config.map(|cfg| -> Box<dyn Proposer + Send> {
                 match cfg {
@@ -352,6 +364,9 @@ impl EngineCore {
             is_pooling: config.is_pooling,
             block_size: config.block_size,
             seal_eos_seen: HashSet::new(),
+            head_drafts,
+            pipelines_speculative: false,
+            leading: 0,
         }
     }
 
@@ -557,7 +572,9 @@ impl EngineCore {
     /// `step()` and `embed()` will error — the caller must use
     /// `schedule_next()` + `finalize_step()` with the taken executor.
     pub fn take_executor(&mut self) -> Option<Box<dyn Executor>> {
-        self.executor.take()
+        let executor = self.executor.take()?;
+        self.pipelines_speculative = executor.pipelines_speculative_steps();
+        Some(executor)
     }
 
     /// Run scheduling if there is work to do.
@@ -568,8 +585,14 @@ impl EngineCore {
         if !self.scheduler.has_requests() {
             return None;
         }
+        // Behind a leading step runs its one request alone: one still waiting is admitted once
+        // that step is finalized.
+        if self.leading > 0 && self.scheduler.get_request_counts().1 > 0 {
+            return None;
+        }
         let mut sched = self.scheduler.schedule();
         self.plan_drafts(&mut sched);
+        self.mark_pipeline(&mut sched);
         // Still return the output if there are finished request IDs to clean up,
         // even when no tokens are scheduled. The executor needs to see these IDs
         // to release per-request resources (KV cache buffers, token buffers, etc.).
@@ -577,6 +600,47 @@ impl EngineCore {
             return None;
         }
         Some(sched)
+    }
+
+    /// Where `sched` stands in the speculative pipeline ([`SpecPipeline`]): behind, when it verifies
+    /// drafts of a step still unfinalized — its request holds that step's output placeholders
+    /// beside its own; leading, when the executor pipelines and `sched` is one request that drafts
+    /// with nothing waiting: its next step's drafts are then placeholders, so that step can be
+    /// scheduled now.
+    fn mark_pipeline(&mut self, sched: &mut SchedulerOutput) {
+        let mut ids = sched.num_scheduled_tokens.iter();
+        let (Some((req_id, &scheduled)), None) = (ids.next(), ids.next()) else {
+            return;
+        };
+        let Some(request) = self.scheduler.get_request(req_id) else {
+            return;
+        };
+        sched.spec_pipeline.behind = !sched.scheduled_spec_decode_tokens.is_empty()
+            && request.num_output_placeholders as usize > scheduled;
+        let (Some(drafts), true) = (self.head_drafts, self.pipelines_speculative) else {
+            return;
+        };
+        if sched.draft_req_ids.contains(req_id)
+            && takes_drafts(&self.scheduler, req_id)
+            && self.scheduler.get_request_counts().1 == 0
+        {
+            let req_id = req_id.clone();
+            self.scheduler.set_spec_token_ids(&req_id, vec![0; drafts]);
+            sched.spec_pipeline.leads = true;
+            self.leading += 1;
+        }
+    }
+
+    /// A step the executor failed: it is never finalized, so it leads no more.
+    pub fn abandon_step(&mut self, sched: &SchedulerOutput) {
+        self.end_lead(sched);
+    }
+
+    /// A step done — finalized or failed: the step behind it waits on it no more.
+    fn end_lead(&mut self, sched: &SchedulerOutput) {
+        if sched.spec_pipeline.leads {
+            self.leading -= 1;
+        }
     }
 
     /// The requests the worker-side draft head runs for in the step `sched` scheduled
@@ -598,6 +662,7 @@ impl EngineCore {
         scheduler_output: &SchedulerOutput,
         model_output: &ModelRunnerOutput,
     ) -> StepOutputs {
+        self.end_lead(scheduler_output);
         // 1. Snapshot scheduler stats BEFORE processing outputs (which frees
         //    blocks for finished requests). This gives an accurate view of
         //    blocks in use during the step.
@@ -1774,6 +1839,75 @@ mod tests {
             enable_prefix_caching: false,
             hybrid_kv: None,
         }
+    }
+
+    /// A drafting step of an executor that pipelines leads: the step scheduled before it is
+    /// finalized verifies its drafts behind it, `k` placeholders; a request arriving meanwhile
+    /// waits for every lead to be finalized. An executor that does not pipeline leads nothing.
+    #[test]
+    fn a_drafting_step_leads_the_verify_scheduled_behind_it() {
+        let config = || EngineCoreConfig {
+            async_scheduling: true,
+            scheduler_config: SchedulerConfig {
+                async_scheduling: Some(true),
+                ..make_spec_decode_config().scheduler_config
+            },
+            proposer_config: Some(crate::spec_decode::ProposerConfig::Mtp(
+                crate::spec_decode::MtpProposerConfig {
+                    model: "head".into(),
+                    num_speculative_tokens: 2,
+                    max_seqs: 1,
+                    max_model_len: 4096,
+                },
+            )),
+            ..make_spec_decode_config()
+        };
+        let request = |id: &str| {
+            let params = SamplingParams {
+                max_tokens: Some(50),
+                ..Default::default()
+            };
+            Request::new(id.to_string(), vec![1, 2, 3, 4], params, 0.0, 0, 0, None)
+        };
+
+        let plain = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config(), plain);
+        let _executor = engine.take_executor();
+        engine.add_request(request("a"));
+        let prefill = engine.schedule_next().expect("the prompt");
+        assert!(
+            prefill.draft_req_ids.contains("a"),
+            "the prompt step drafts"
+        );
+        assert_eq!(prefill.spec_pipeline, Default::default());
+
+        let pipelining = Box::new(NoopExecutor::new(1024).with_pipelining());
+        let mut engine = EngineCore::new(config(), pipelining);
+        let mut executor = engine.take_executor().expect("an executor");
+        engine.add_request(request("a"));
+        let prefill = engine.schedule_next().expect("the prompt");
+        assert!(prefill.spec_pipeline.leads && !prefill.spec_pipeline.behind);
+        let out = executor.execute_model(&prefill).expect("runs");
+        let r = engine.scheduler.get_request("a").unwrap();
+        let verify = engine
+            .schedule_next()
+            .expect("scheduled before the prompt is finalized");
+        assert_eq!(
+            verify.num_scheduled_tokens["a"], 3,
+            "its token and two drafts"
+        );
+        assert_eq!(verify.scheduled_spec_decode_tokens["a"], [0, 0]);
+        assert!(verify.spec_pipeline.behind && verify.spec_pipeline.leads);
+
+        engine.add_request(request("b"));
+        assert!(engine.schedule_next().is_none(), "b waits behind the leads");
+        let _ = engine.finalize_step(&prefill, &out);
+        assert!(engine.schedule_next().is_none(), "the verify still leads");
+        let out = executor.execute_model(&verify).expect("runs");
+        let _ = engine.finalize_step(&verify, &out);
+        let next = engine.schedule_next().expect("b is admitted");
+        assert!(next.num_scheduled_tokens.contains_key("b"));
+        assert!(!next.spec_pipeline.leads, "two requests lead nothing");
     }
 
     #[test]

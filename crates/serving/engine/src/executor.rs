@@ -292,6 +292,12 @@ pub trait Executor: Send {
         1
     }
 
+    /// Whether the executor runs a speculative step scheduled behind one still in flight
+    /// ([`crate::worker::Worker::pipelines_speculative_steps`]).
+    fn pipelines_speculative_steps(&self) -> bool {
+        false
+    }
+
     /// Initialize KV cache on workers with the given configuration.
     fn initialize_cache(
         &mut self,
@@ -384,6 +390,8 @@ pub struct NoopExecutor {
     next_token_id: u32,
     /// Whether the executor has been shut down.
     is_shutdown: bool,
+    /// Reports [`Executor::pipelines_speculative_steps`].
+    pipelines: bool,
 }
 
 impl NoopExecutor {
@@ -393,11 +401,24 @@ impl NoopExecutor {
             num_gpu_blocks,
             next_token_id: 1000,
             is_shutdown: false,
+            pipelines: false,
+        }
+    }
+
+    /// One that reports running a speculative step behind one still in flight.
+    pub fn with_pipelining(self) -> Self {
+        Self {
+            pipelines: true,
+            ..self
         }
     }
 }
 
 impl Executor for NoopExecutor {
+    fn pipelines_speculative_steps(&self) -> bool {
+        self.pipelines
+    }
+
     fn execute_model(
         &mut self,
         scheduler_output: &SchedulerOutput,

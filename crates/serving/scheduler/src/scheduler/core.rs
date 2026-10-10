@@ -2584,6 +2584,7 @@ impl SchedulerInterface for Scheduler {
                 Some(preempted_req_ids)
             },
             draft_req_ids: HashSet::new(),
+            spec_pipeline: Default::default(),
         };
 
         // Post-schedule updates.
