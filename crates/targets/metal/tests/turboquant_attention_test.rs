@@ -1796,15 +1796,62 @@ fn per_row_nax_reads_roped_keys() {
 /// earlier rows' too, as the step's quantize leaves it; on an fp16 cache every key is in the cache.
 #[test]
 fn verify_rows_attend_as_each_would_decoding() {
+    verify_rows(
+        Case {
+            seqs: vec![(1000, 4), (300, 3)],
+            ..llama_3b("verify rows llama-3b bf16")
+        },
+        VerifyKernel::PerHeadGroup,
+    );
+}
+
+/// The verify rows through `attention_decode_gqa_tq`, each KV head's 8 query heads together, whole
+/// and over 4 and 16 threadgroups: Gemma 4's global geometry (a row's own key in a span block,
+/// re-roped) and Qwen3.6's (head_dim 256, a partial rotary).
+#[test]
+fn verify_rows_per_kv_head_attend_as_each_would_decoding() {
+    for splits in [1, 4, 16] {
+        verify_rows(
+            Case {
+                seqs: vec![(900, 3), (300, 4)],
+                ..gemma4_global("verify rows gemma4 global gqa")
+            },
+            VerifyKernel::PerKvHead(splits),
+        );
+    }
+    verify_rows(
+        Case {
+            head_dim: 256,
+            attn_scale: 1.0 / 16.0,
+            block_size: 16,
+            rope: Some(Rope {
+                rot_dim: 64,
+                pair_off: 32,
+                coresident: false,
+            }),
+            seqs: vec![(700, 3), (40, 3), (3, 3)],
+            span_blocks: vec![2],
+            ..gemma4_global("verify rows qwen3.6 gqa")
+        },
+        VerifyKernel::PerKvHead(4),
+    );
+}
+
+/// The decode kernel a verify step's rows run through.
+#[derive(Clone, Copy)]
+enum VerifyKernel {
+    /// `attention_via_cache_v2`: a threadgroup a row and query-head group.
+    PerHeadGroup,
+    /// `attention_decode_gqa_tq` over this many threadgroups a KV head, then its combine.
+    PerKvHead(u32),
+}
+
+fn verify_rows(c: Case, kernel: VerifyKernel) {
     let Some(di) = detect_device() else {
-        eprintln!("skipping verify rows: no Metal 4 GPU");
+        eprintln!("skipping {}: no Metal 4 GPU", c.name);
         return;
     };
     let device = di.device.clone();
-    let c = Case {
-        seqs: vec![(1000, 4), (300, 3)],
-        ..llama_3b("verify rows llama-3b bf16")
-    };
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
     let compress: [PipelineKey; 2] = [false, true].map(|_| {
         let (rot_dim, pair_off) = c.rope.map_or((0, 0), |r| (r.rot_dim, r.pair_off));
@@ -1822,8 +1869,8 @@ fn verify_rows_attend_as_each_would_decoding() {
         PipelineKey::new("turboquant", c.dtype.compress(), constants.into())
     });
     cache.register_baked(&baked_kernels(&compress));
-    let pso = |consts: Vec<ConstantValue>| {
-        let name = format!("attention_via_cache_v2_{}_specialized", c.dtype.tag());
+    let pso = |kernel: &str, consts: Vec<ConstantValue>| {
+        let name = format!("{kernel}_{}_specialized", c.dtype.tag());
         let name: &'static str = Box::leak(name.into_boxed_str());
         baked_build(&cache, &PipelineKey::new("attention", name, consts)).expect("pipeline")
     };
@@ -1911,7 +1958,16 @@ fn verify_rows_attend_as_each_would_decoding() {
     let cu_seqlens = shared(&device, &f.cu_seqlens);
     let slot_mapping = shared(&device, &f.slot_mapping());
     let heads = c.decode_heads;
-    for coded in [true, false] {
+    // The per-KV-head kernel reads a coded cache only.
+    let codings: &[bool] = match kernel {
+        VerifyKernel::PerHeadGroup => &[true, false],
+        VerifyKernel::PerKvHead(_) => &[true],
+    };
+    let splits = match kernel {
+        VerifyKernel::PerHeadGroup => 1,
+        VerifyKernel::PerKvHead(splits) => splits,
+    };
+    for &coded in codings {
         // TurboQuant reads a row's own key from the cache its writer filled (NaN elsewhere); an
         // fp16 cache holds every key.
         let nan = c.dtype.bits(f32::NAN);
@@ -1920,11 +1976,16 @@ fn verify_rows_attend_as_each_would_decoding() {
         let scratch_v = f.pool(&device, &f.v, nan, written);
         let run = |per_token: bool| -> Vec<u16> {
             let mut consts = Vec::new();
-            if coded {
-                consts.extend([
+            match kernel {
+                VerifyKernel::PerHeadGroup if coded => consts.extend([
                     ConstantValue::uint(13, c.bits),
                     ConstantValue::uint(16, heads),
-                ]);
+                ]),
+                VerifyKernel::PerHeadGroup => {}
+                VerifyKernel::PerKvHead(splits) => consts.extend([
+                    ConstantValue::uint(13, c.bits),
+                    ConstantValue::uint(18, splits),
+                ]),
             }
             if c.rope.is_some_and(|r| r.coresident) {
                 consts.push(ConstantValue::uint(12, 1));
@@ -1937,6 +1998,10 @@ fn verify_rows_attend_as_each_would_decoding() {
                 false => (&alone_used, &alone_table),
             };
             let out = shared(&device, &vec![0u16; n_q * c.num_q_heads * hd]);
+            let partials = shared(
+                &device,
+                &vec![f32::NAN; n_q * c.num_q_heads * splits as usize * (hd + 2)],
+            );
             let mut binds = vec![
                 (&out, 0),
                 (&q, 1),
@@ -1960,20 +2025,39 @@ fn verify_rows_attend_as_each_would_decoding() {
             if per_token {
                 binds.push((&cu_seqlens, 23));
             }
-            let groups = match coded {
-                true => c.num_q_heads / heads as usize,
-                false => c.num_q_heads,
-            };
+            let resident = [&scratch_k.data, &scratch_v.data];
+            let consts = f.attn_constants(&consts);
             let mut batch = Mtl4DispatchBatch::begin(&device).expect("batch");
-            batch.encode(
-                &pso(f.attn_constants(&consts)),
-                &binds,
-                &[],
-                &[],
-                &[&scratch_k.data, &scratch_v.data],
-                tg(n_q, groups, 1),
-                tg(1024, 1, 1),
-            );
+            match kernel {
+                VerifyKernel::PerHeadGroup => {
+                    let groups = match coded {
+                        true => c.num_q_heads / heads as usize,
+                        false => c.num_q_heads,
+                    };
+                    let attention = pso("attention_via_cache_v2", consts);
+                    let grid = tg(n_q, groups, 1);
+                    batch.encode(
+                        &attention,
+                        &binds,
+                        &[],
+                        &[],
+                        &resident,
+                        grid,
+                        tg(1024, 1, 1),
+                    );
+                }
+                VerifyKernel::PerKvHead(splits) => {
+                    binds.push((&partials, 16));
+                    let attention = pso("attention_decode_gqa_tq", consts.clone());
+                    let grid = tg(n_q, nkv, splits as usize);
+                    batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1, 1));
+                    batch.barrier();
+                    let combine = pso("attention_via_cache_v2_combine", consts);
+                    let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
+                    let grid = tg(n_q, c.num_q_heads, 1);
+                    batch.encode(&combine, &binds, &[], &[], &[], grid, tg(128, 1, 1));
+                }
+            }
             batch.commit(true);
             read::<u16>(&out, n_q * c.num_q_heads * hd)
         };

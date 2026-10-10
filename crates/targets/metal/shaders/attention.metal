@@ -1350,8 +1350,11 @@ SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_c
 // under the fold (`ATTN_FOLD`) built it here, exactly as `attention_via_cache_v2` does. Under the
 // fold each split ropes the query heads, never writing the query back, the last builds the KV row
 // in threadgroup memory, and one threadgroup more (z = ATTN_SPLITS) builds it, writes it to the
-// cache and encodes it. Bindings: `attention_via_cache_v2`'s, buffer 0 unread. Dispatch:
-// threadgroups (batch, num_kv_heads, ATTN_SPLITS + the fold's writer), threads (head_dim, 1, 1).
+// cache and encodes it. A threadgroup row is a sequence's query, or under ATTN_ROW_QUERIES a
+// token's of its sequence (buffer 23, cu_seqlens_q), its keys up to its own, as
+// `attention_via_cache_v2` reads them. Bindings: `attention_via_cache_v2`'s, buffer 0 unread.
+// Dispatch: threadgroups (batch — ATTN_ROW_QUERIES: tokens — , num_kv_heads, ATTN_SPLITS + the
+// fold's writer), threads (head_dim, 1, 1).
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(ATTN_HEAD_DIM)]] void attention_decode_gqa_tq(
     device const T*     q             [[buffer(1)]],
@@ -1376,6 +1379,7 @@ template <typename T>
     device const float* tq_boundaries [[buffer(20)]],
     device const T*     fold_cos_sin  [[buffer(21)]],
     device const T*     tq_bias_cos_sin [[buffer(22)]],
+    device const uint*  cu_seqlens_q  [[buffer(23)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
@@ -1416,15 +1420,24 @@ template <typename T>
     const uint pdim = D / 8u;
     const uint kv_blk_stride = num_kv * bs * D;
     const uint kv_head_stride = bs * D;
+    // The query row (ATTN_ROW_QUERIES: a token), and the sequence whose keys it reads.
     const uint seq = tg_pos.x;
     const uint kvh = tg_pos.y;
     const uint z = tg_pos.z;
     const uint q0 = kvh * G;
-    const uint kv_len = seq_used_k[seq];
+    uint seq_idx = seq;
+    uint kv_len = seq_used_k[seq];
+    if (ATTN_ROW_QUERIES != 0u) {
+        seq_idx = 0;
+        while (cu_seqlens_q[seq_idx + 1u] <= seq) {
+            ++seq_idx;
+        }
+        kv_len = seq_used_k[seq_idx] - (cu_seqlens_q[seq_idx + 1u] - 1u - seq);
+    }
     const uint tid = simd_gid * 32u + simd_lid;
     const uint kg = simd_gid / SG;
     const uint sg = simd_gid % SG;
-    device const uint* row_bt = block_table + seq * ATTN_MAX_BLOCKS_PER_SEQ;
+    device const uint* row_bt = block_table + seq_idx * ATTN_MAX_BLOCKS_PER_SEQ;
     const uint slot = slot_mapping[seq];
     // The step's own key is not in the packed store: its writer left it in the cache, or the fold
     // builds it here. A write-skip slot's key is packed like the rest.

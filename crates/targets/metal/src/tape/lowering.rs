@@ -1176,15 +1176,18 @@ const GQA_HEADS: u32 = 8;
 /// simdgroups.
 const COMBINE_THREADS: u32 = 4 * 32;
 
-/// A one-row bucket's TurboQuant decode attention (the codec's packed twin, or it running its KV
-/// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
+/// A one-row or verify-sized bucket's ([`METAL_VERIFY_ROWS`](crate::op_abi::METAL_VERIFY_ROWS))
+/// TurboQuant decode attention (the codec's packed twin, or at one row it running its KV writer)
+/// whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
 /// head_dim a multiple of 128 up to 512, KV blocks of whole 8-key blocks, no projection bias, a
 /// rotary pair's partner a whole lane stride away — serves each KV head's query heads together:
 /// its keys decode once for all 8, where `attention_via_cache_v2` decodes them once per head
 /// group. Its keys spread over the threadgroups the rung's KV cap calls for (`ATTN_SPLITS`,
 /// [`ATTN_SPLIT_KEYS`] of the cap each, at most [`ATTN_MAX_SPLITS`]), each storing its heads'
-/// partials at the op scratch's front, `[num_q_heads, splits, 2 + head_dim]` floats, and a
-/// combine merges them into the output.
+/// partials at the op scratch's front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a
+/// combine merges them into the output. A verify-sized bucket's rows are tokens, each reading its
+/// sequence's keys up to its own, where the per-head-group kernel walks the whole context with a
+/// threadgroup per row and head group.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -1223,12 +1226,17 @@ fn decode_attention_per_kv_head(
         && hd.is_multiple_of(128)
         && hd <= 512
         && p.global_block_size.is_multiple_of(8);
-    if at.bucket_m != 1 || !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
+    let rows = at.bucket_m;
+    if rows > crate::op_abi::METAL_VERIFY_ROWS
+        || !full
+        || !geometry
+        || !cmds.iter().any(|c| takes(&c.command))
+    {
         return cmds;
     }
     let keys = at.block_cap.saturating_mul(p.global_block_size);
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
-    let partials = p.num_q_heads * splits * (2 + hd) * 4;
+    let partials = rows * p.num_q_heads * splits * (2 + hd) * 4;
     *moe_scratch_bytes = (*moe_scratch_bytes).max(partials);
     let partials = scratch_at(16, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
@@ -8491,8 +8499,8 @@ mod tests {
     /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
     /// front, its constants less the TurboQuant heads and plus the rung's split count, a
     /// threadgroup per (KV head, split) of head_dim threads — then a combine of one simdgroup a
-    /// query head. A many-row bucket's decode, and a geometry it cannot take, keep the
-    /// per-head-group kernel.
+    /// query head. A verify-sized bucket's takes it a token a threadgroup row; a bucket past the
+    /// verify rows, and a geometry it cannot take, keep the per-head-group kernel.
     #[test]
     fn turboquant_decode_serves_each_kv_heads_query_heads_together() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
@@ -8581,7 +8589,22 @@ mod tests {
                 .map(|c| c.command.kernel)
                 .collect::<Vec<_>>()
         };
-        assert!(!kernels(&lower_tq(&p, rows(), 2)).contains(&KernelId::AttentionDecodeGqaTq));
+        // A verify-sized bucket: a threadgroup row a token (`ATTN_ROW_QUERIES`, its sequence's
+        // start in `cu_seqlens_q`), partials for every row.
+        let verify = lower_tq(&p, rows(), 4);
+        assert_eq!(gated_steps(&verify), gated_steps(&tape));
+        let (gqa, combine) = (&verify.commands[2].command, &verify.commands[3].command);
+        assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
+        assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
+        assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
+        assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
+        assert_eq!(
+            verify.moe_scratch_bytes,
+            4 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+        );
+        let past = lower_tq(&p, rows(), 2 * crate::op_abi::METAL_VERIFY_ROWS);
+        assert!(!kernels(&past).contains(&KernelId::AttentionDecodeGqaTq));
+        assert!(kernels(&past).contains(&KernelId::AttentionViaCacheTq));
         let narrow = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
         assert!(kernels(&narrow).contains(&KernelId::AttentionViaCacheTq));
 
