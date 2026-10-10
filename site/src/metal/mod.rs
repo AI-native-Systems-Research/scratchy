@@ -20,8 +20,8 @@ use serde::Serialize;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, Column, Fold, Grid, Heading, Layer, Section, Span, Stack, Table, TableCell,
-    TableRow, Tag, TagKind, Tile, Toggletip,
+    Alignment, Column, Definition, Fold, Grid, Heading, Layer, Section, Span, Stack, Table,
+    TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
@@ -797,9 +797,24 @@ fn ratio_scale(fit: ScaleFit) -> Element {
             for (row, colour) in RATIO_STEPS.iter().rev().enumerate() {
                 div { style: "grid-column: 1; grid-row: {row + 1}; background: {colour}" }
             }
-            div { style: "grid-column: 2; grid-row: 1; align-self: start", strong { "×{RATIO_SPAN}" } " or faster" }
-            div { style: "grid-column: 2; grid-row: {middle}; align-self: center", strong { "×1" } }
-            div { style: "grid-column: 2; grid-row: {rows}; align-self: end", strong { "×{1.0 / RATIO_SPAN}" } " or slower" }
+            div { style: "grid-column: 2; grid-row: 1; align-self: start",
+                Definition { alignment: Alignment::Left,
+                    definition: "scratchy at least {RATIO_SPAN} times as fast as mlx-lm (ollama where a run has no mlx-lm); anything faster takes this colour too.",
+                    strong { "×{RATIO_SPAN}" }
+                }
+            }
+            div { style: "grid-column: 2; grid-row: {middle}; align-self: center",
+                Definition { alignment: Alignment::Left,
+                    definition: "The same speed, within run-to-run noise: ×0.96 to ×1.04.",
+                    strong { "×1" }
+                }
+            }
+            div { style: "grid-column: 2; grid-row: {rows}; align-self: end",
+                Definition { alignment: Alignment::Left,
+                    definition: "scratchy at most a quarter as fast as mlx-lm (ollama where a run has no mlx-lm), {RATIO_SPAN} times slower; anything slower takes this colour too.",
+                    strong { "×{1.0 / RATIO_SPAN}" }
+                }
+            }
         }
     }
 }
