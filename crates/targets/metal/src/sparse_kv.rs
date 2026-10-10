@@ -52,8 +52,10 @@ impl KvMapper {
 }
 
 /// Placement-sparse buffers that grow together, as one pool's stores do (each `(tensor, K/V)` of
-/// the fp16 pool, or TurboQuant's packed codes, norms and scratch): ONE contiguous range each, so
-/// readers address any block off its base, whose pages are mapped only as the pool reaches them.
+/// the fp16 pool, TurboQuant's packed codes, norms and scratch, or a recurrent model's conv and
+/// ssm state per layer): ONE contiguous range each, so readers address any block off its base,
+/// whose pages are mapped only as the pool reaches them — each store through the tile its last
+/// block ends in, so a block need not fill whole tiles.
 /// A sparse buffer in the wired residency set takes no memory, where a plain capacity-sized one
 /// is committed in full when made resident (gemma-4-26b on a 64 GB Mac: ~19 GiB of KV at
 /// startup). Each step maps the next run of blocks of every buffer from ONE heap and at least
@@ -64,7 +66,7 @@ pub struct SparseStores {
     residency: MetalResidencySet,
     /// Each store's buffer, a block's bytes in it, and whether a new block must read zero.
     stores: Vec<(Pinned, usize, bool)>,
-    /// Steps map a whole number of these blocks: whole tiles of every store.
+    /// Steps map a whole number of these blocks (the granule).
     unit: usize,
     /// Blocks mapped so far (shared with the forwards that bind the stores), and all a store
     /// holds (a whole number of `unit`s).
@@ -84,14 +86,11 @@ impl SparseStores {
         stores: &[(usize, bool)],
     ) -> Result<Self, String> {
         let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
-        let whole = |unit: usize| stores.iter().all(|s| (unit * s.0).is_multiple_of(tile));
-        let mut unit = granule.max(1);
-        while !whole(unit) {
-            unit *= 2;
-        }
+        let unit = granule.max(1);
         let capacity = blocks.max(1).next_multiple_of(unit);
         let sparse = |&(bytes, zeroed): &(usize, bool)| {
-            let (len, private) = (capacity * bytes, MTLResourceOptions::StorageModePrivate);
+            let len = (capacity * bytes).next_multiple_of(tile);
+            let private = MTLResourceOptions::StorageModePrivate;
             // SAFETY: a fresh allocation; nothing reads it until a step maps it and is waited out.
             let buffer = unsafe {
                 device.newBufferWithLength_options_placementSparsePageSize(len, private, PAGE)
@@ -152,13 +151,19 @@ impl SparseStores {
         }
         let to = blocks.next_multiple_of(self.unit).max(2 * from);
         let to = to.min(self.capacity);
+        let tile = self.device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+        // A store's bytes through block `b`, rounded up to its tile: the last tile may be shared
+        // with block `b`'s successor, which the step that reaches it then finds already mapped —
+        // and zeroed, when its store must read zero, as `map_step` zeroes whole new tiles.
+        let through = |b: usize, bytes: usize| (b * bytes).next_multiple_of(tile);
         let ranges: Vec<MapRange<'_>> = (self.stores.iter())
             .map(|(buffer, bytes, zeroed)| MapRange {
                 buffer,
-                from: from * bytes,
-                to: to * bytes,
+                from: through(from, *bytes),
+                to: through(to, *bytes),
                 zeroed: *zeroed,
             })
+            .filter(|r| r.to > r.from)
             .collect();
         let heap = map_step(&self.device, &self.residency, mapper, &ranges)?;
         self.heaps.push(heap);
@@ -328,5 +333,51 @@ mod tests {
             (1024, 4)
         );
         assert!(stores.grow_to(1025, &mapper).is_err(), "past the capacity");
+    }
+
+    /// Blocks that do not fill whole tiles (a recurrent state slot): each step maps every store
+    /// through the tile its last block ends in, one block at a time, and a block that straddles
+    /// a tile boundary keeps the writes made before its second tile was mapped.
+    #[test]
+    fn blocks_that_straddle_tiles_grow_one_at_a_time() {
+        let Some(device) = crate::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let residency = MetalResidencySet::new(&device);
+        let mapper = KvMapper::new(&device).expect("mapper");
+        // 1.5 tiles, and a store whose block is a sliver of one.
+        let (big, small) = (3 * 32 * 1024, 2048);
+        let mut stores =
+            SparseStores::new(&device, &residency, 5, 1, &[(big, true), (small, false)])
+                .expect("stores");
+        assert_eq!((stores.unit, stores.capacity), (1, 5));
+        let host = shared_zeroed(&device, 3 * big);
+        let a = stores.buffer(0);
+        let gpu = |body: &dyn Fn(&ProtocolObject<dyn MTL4ComputeCommandEncoder>)| {
+            let batch = Mtl4DispatchBatch::begin(&device).expect("MTL4 queue");
+            batch.declare(&residency);
+            let _host = batch.residency().pin(host.clone());
+            body(batch.encoder());
+            batch.commit(true);
+        };
+        assert!(stores.grow_to(1, &mapper).expect("block 0"));
+        // SAFETY (both): the ranges are mapped and resident, and `host` is shared.
+        gpu(&|e| unsafe { e.fillBuffer_range_value(&a, NSRange::new(0, big), 0xab) });
+        assert!(stores.grow_to(3, &mapper).expect("blocks 1 and 2"));
+        gpu(&|e| unsafe {
+            e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&a, 0, &host, 0, 3 * big)
+        });
+        let got: Vec<u8> = read_slice(&host, 3 * big);
+        assert!(
+            got[..big].iter().all(|&x| x == 0xab),
+            "block 0 keeps its writes"
+        );
+        assert!(
+            got[big..].iter().all(|&x| x == 0),
+            "blocks 1 and 2 read zero"
+        );
+        assert!(stores.grow_to(5, &mapper).expect("the rest"));
+        assert_eq!(stores.mapped().load(Ordering::Relaxed), 5);
     }
 }

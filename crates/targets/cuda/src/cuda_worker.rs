@@ -27,7 +27,7 @@ use crate::kv_cache::CudaKvCacheExt;
 use crate::kv_cache::KvCachePool;
 #[cfg(feature = "cuda")]
 use crate::weights::CudaWeightsExt;
-use scratchy_forward_compiler::gdn_slot_allocator::GdnSlotAllocator;
+use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 
 use crate::OwnedTensor;
 use crate::cpu_gpu_buf::PinnedBuf;
@@ -5608,21 +5608,25 @@ impl CudaWorker {
         // gdn_is_fresh}` via `Self::h2d_i32` / `Self::h2d_u32`; a request's FIRST forward
         // (including a recycled slot's new owner) is flagged fresh so the GDN eval zero-inits
         // the slot instead of continuing from a finished sequence's stale data (the degeneration
-        // guard). The cuda GDN eval reads no checkpoints, so its steps carry no drafts.
+        // guard). The cuda GDN eval reads no checkpoints, so its steps carry no drafts, and it
+        // keeps no state snapshots, so only each sequence's own slot reaches it.
+        let input_batch = &self.input_batch;
         self.gdn_pending = self
             .gdn_slot_allocator
             .as_mut()
             .map(|alloc| {
                 alloc.step(
-                    prepared
-                        .attn_meta
-                        .req_ids
-                        .iter()
-                        .map(|req_id| (gdn_slot_key(req_id), 0)),
+                    (prepared.attn_meta.req_ids.iter())
+                        .zip(&prepared.attn_meta.tokens_before)
+                        .map(|(req_id, &before)| GdnRow {
+                            refused: input_batch.refused(req_id),
+                            ..GdnRow::new(gdn_slot_key(req_id), 0, before as u32)
+                        }),
                 )
             })
             .transpose()
-            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?
+            .map(|(entries, codes)| (entries.iter().map(|e| e.slot).collect(), codes));
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.

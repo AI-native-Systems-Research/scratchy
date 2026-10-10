@@ -11,12 +11,13 @@
 //! continuation across a chunk boundary (chunks shorter than the conv window included), decode
 //! steps of one token a sequence, and a slot re-taken fresh mid-run. Both scan mappings run — the
 //! per-thread scan (state 16, the parity-tiny geometry) and the simd scan (state 128, the real
-//! checkpoints'). GPU tests — run with `--test-threads=1` (standing rule).
+//! checkpoints'). The tests take turns on the GPU ([`gpu_turn`]).
 
 use half::bf16;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::gdn_state::GdnSeqSlots;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -28,6 +29,19 @@ type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>
 const EPS: f32 = 1e-5;
 /// The lowering's 1-D / channel threadgroup cap (`THREADS_PER_GROUP`).
 const THREADS: usize = 256;
+
+/// The GPU, one test at a time. Apple's driver corrupts its own heap when these tests build their
+/// pipelines at the same time, each through its own `SpecializedPipelineCache` (crash reports: in
+/// `AGX::UserCommonShaderFactory` and `ReflectionKey::initGPUCompilerSPIOptionsHash`, under
+/// `SpecializedPipelineCache::get_or_build`), and `cargo test -p scratchy-target-metal` runs them
+/// on parallel threads.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// This test's turn on the GPU; a test that panicked with it held leaves it usable.
+fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
+    GPU.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The model dtype a kernel instantiation reads its activations and `T` weights in.
 #[derive(Clone, Copy, Debug)]
@@ -277,6 +291,55 @@ struct Gpu {
 }
 
 impl Gpu {
+    /// `w`'s weights and pools holding `conv` and `ssm`, on `device`.
+    fn new(
+        device: Device,
+        geo: Geometry,
+        dtype: Dtype,
+        w: &Weights,
+        conv: &[f32],
+        ssm: &[f32],
+    ) -> Self {
+        Self {
+            cache: SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders"),
+            conv_state: shared(&device, conv),
+            ssm_state: shared(&device, ssm),
+            conv_w: shared(&device, &dtype.bytes(&w.conv_w)),
+            conv_b: shared(&device, &dtype.bytes(&w.conv_b)),
+            a_log: shared(&device, &w.a_log),
+            dt_bias: shared(&device, &dtype.bytes(&w.dt_bias)),
+            d: shared(&device, &w.d),
+            norm: shared(&device, &w.norm),
+            device,
+            geo,
+            dtype,
+        }
+    }
+
+    /// The pools' contents, conv then ssm.
+    fn pools(&self) -> (Vec<f32>, Vec<f32>) {
+        let floats = |b: &Buffer| b.length() / 4;
+        (
+            read(&self.conv_state, floats(&self.conv_state)),
+            read(&self.ssm_state, floats(&self.ssm_state)),
+        )
+    }
+
+    /// Make the pools hold `conv` and `ssm`.
+    fn load(&self, conv: &[f32], ssm: &[f32]) {
+        for (buf, data) in [(&self.conv_state, conv), (&self.ssm_state, ssm)] {
+            assert_eq!(buf.length(), std::mem::size_of_val(data), "a whole pool");
+            // SAFETY: `buf` holds exactly `data`'s bytes and does not overlap it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents().as_ptr() as *mut u8,
+                    std::mem::size_of_val(data),
+                );
+            }
+        }
+    }
+
     fn key(
         &self,
         library: &'static str,
@@ -286,17 +349,24 @@ impl Gpu {
         PipelineKey::new(library, symbol, c)
     }
 
-    /// Run one step's commands, as the lowering emits them a barrier apart; the `[tokens, inner]`
-    /// output, or `None` with no MTL4 queue.
-    fn step(&self, zx: &[f32], cu: &[i32], slots: &[i32], fresh: &[u32]) -> Option<Vec<f32>> {
+    /// Run one step's commands, as the lowering emits them a barrier apart, a record a sequence;
+    /// the `[tokens, inner]` output, or `None` with no MTL4 queue.
+    fn step(
+        &self,
+        zx: &[f32],
+        cu: &[i32],
+        seqs: &[GdnSeqSlots],
+        fresh: &[u32],
+    ) -> Option<Vec<f32>> {
         let (geo, dtype) = (self.geo, self.dtype);
         let (inner, conv_dim, row) = (geo.inner(), geo.conv_dim(), geo.row());
         let (heads, groups) = (geo.heads as u32, geo.groups as u32);
         let tokens = *cu.last().unwrap() as usize;
-        let num_seqs = slots.len();
+        let num_seqs = seqs.len();
         let dev = &self.device;
         let zx_buf = shared(dev, &dtype.bytes(zx));
-        let (cu_b, si_b, fr_b) = (shared(dev, cu), shared(dev, slots), shared(dev, fresh));
+        let words: Vec<i32> = seqs.iter().flat_map(|s| s.words()).collect();
+        let (cu_b, si_b, fr_b) = (shared(dev, cu), shared(dev, &words), shared(dev, fresh));
         let conv_out = shared(dev, &vec![0f32; tokens * conv_dim]);
         let (g_buf, beta_buf) = (
             shared(dev, &vec![0f32; tokens * geo.heads]),
@@ -454,26 +524,12 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step]) {
         eprintln!("skipping: no Metal device");
         return;
     };
-    let device = di.device.clone();
-    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
     let w = Weights::new(geo, dtype);
     let ring = (geo.kernel - 1) * geo.conv_dim();
     let ssm = geo.heads * geo.head_dim * geo.state;
     // Garbage in every slot: a fresh sequence must not read it.
-    let gpu = Gpu {
-        conv_state: shared(&device, &fill(slots * ring, 11, 9.0)),
-        ssm_state: shared(&device, &fill(slots * ssm, 12, 9.0)),
-        conv_w: shared(&device, &dtype.bytes(&w.conv_w)),
-        conv_b: shared(&device, &dtype.bytes(&w.conv_b)),
-        a_log: shared(&device, &w.a_log),
-        dt_bias: shared(&device, &dtype.bytes(&w.dt_bias)),
-        d: shared(&device, &w.d),
-        norm: shared(&device, &w.norm),
-        device,
-        cache,
-        geo,
-        dtype,
-    };
+    let (conv0, ssm0) = (fill(slots * ring, 11, 9.0), fill(slots * ssm, 12, 9.0));
+    let gpu = Gpu::new(di.device.clone(), geo, dtype, &w, &conv0, &ssm0);
     let mut states = vec![SeqState::fresh(geo); slots];
     for (i, step) in steps.iter().enumerate() {
         let tokens: usize = step.iter().map(|s| s.1).sum();
@@ -492,9 +548,12 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step]) {
             let rows = &zx[at * geo.row()..(at + n) * geo.row()];
             want.extend(reference(geo, &w, rows, n, &mut states[slot]));
         }
-        let slot_ids: Vec<i32> = step.iter().map(|s| s.0 as i32).collect();
+        let seqs: Vec<GdnSeqSlots> = step
+            .iter()
+            .map(|s| GdnSeqSlots::plain(s.0 as i32))
+            .collect();
         let fresh: Vec<u32> = step.iter().map(|s| u32::from(s.2)).collect();
-        let Some(got) = gpu.step(&zx, &cu, &slot_ids, &fresh) else {
+        let Some(got) = gpu.step(&zx, &cu, &seqs, &fresh) else {
             eprintln!("skipping: no MTL4 queue");
             return;
         };
@@ -551,6 +610,7 @@ fn schedule() -> Vec<Step> {
 /// The parity-tiny geometry (state 16): the gating, then the per-thread scan.
 #[test]
 fn mamba2_per_thread_scan_matches_reference() {
+    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 16,
@@ -568,6 +628,7 @@ fn mamba2_per_thread_scan_matches_reference() {
 /// `dt` read straight off the in-projection row.
 #[test]
 fn mamba2_simd_scan_matches_reference() {
+    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 64,
@@ -581,11 +642,137 @@ fn mamba2_simd_scan_matches_reference() {
     }
 }
 
+/// `got` is `want`, bit for bit.
+fn assert_bits(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let differs = |(g, w): (&f32, &f32)| g.to_bits() != w.to_bits();
+    if let Some(i) = got.iter().zip(want).position(differs) {
+        let n = got.iter().zip(want).filter(|&p| differs(p)).count();
+        panic!(
+            "{what}: {n} of {} differ, the first [{i}]: {} vs {}",
+            got.len(),
+            got[i],
+            want[i]
+        );
+    }
+}
+
+/// Prefix-cache snapshots (`shaders/gdn_state.h`) through the whole mixer, dispatched as the
+/// lowering dispatches it. A prefill on slot 1 — beside a fresh neighbour's on slot 2 — saves its
+/// state after row 2 (a block junction) into snapshot slot 3 and after its last row into slot 4:
+/// slot 3 holds what a step of just those two rows leaves, slot 4 what the prefill leaves. A later
+/// step on slot 0 restores slot 3 and runs the prefill's remaining rows: its output is the
+/// prefill's rows past the junction and its state the prefill's, the snapshot as it was. All bit
+/// for bit: a save stores the registers the scan carries on, a restore loads them back.
+fn snapshots(geo: Geometry, dtype: Dtype) {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let w = Weights::new(geo, dtype);
+    let ring = (geo.kernel - 1) * geo.conv_dim();
+    let ssm = geo.heads * geo.head_dim * geo.state;
+    let (conv0, ssm0) = (fill(5 * ring, 11, 1.0), fill(5 * ssm, 12, 1.0));
+    let gpu = Gpu::new(di.device.clone(), geo, dtype, &w, &conv0, &ssm0);
+    let slot = |pools: &(Vec<f32>, Vec<f32>), s: usize| {
+        let (conv, ssm_state) = pools;
+        let ssm_slot = &ssm_state[s * ssm..][..ssm];
+        [conv[s * ring..][..ring].to_vec(), ssm_slot.to_vec()]
+    };
+    let what = format!("{geo:?} {dtype:?}");
+    let same = |got: [Vec<f32>; 2], want: [Vec<f32>; 2], at: &str| {
+        assert_bits(&got[0], &want[0], &format!("{what}: {at}'s conv ring"));
+        assert_bits(&got[1], &want[1], &format!("{what}: {at}'s ssm state"));
+    };
+    let (t, junction, neighbour, row) = (6usize, 2usize, 3usize, geo.row());
+    let zx: Vec<f32> = fill((t + neighbour) * row, 300, 1.5)
+        .into_iter()
+        .map(|x| dtype.round(x))
+        .collect();
+
+    // The rows up to the junction alone, from slot 1's state.
+    let prefix = gpu.step(
+        &zx[..junction * row],
+        &[0, junction as i32],
+        &[GdnSeqSlots::plain(1)],
+        &[0],
+    );
+    let Some(_) = prefix else {
+        eprintln!("skipping: no MTL4 queue");
+        return;
+    };
+    let at_junction = slot(&gpu.pools(), 1);
+
+    // The prefill, saving, beside its neighbour.
+    gpu.load(&conv0, &ssm0);
+    let prefill = GdnSeqSlots {
+        saves: [[junction as i32, 3], [t as i32, 4]],
+        ..GdnSeqSlots::plain(1)
+    };
+    let cu = [0, t as i32, (t + neighbour) as i32];
+    let seqs = [prefill, GdnSeqSlots::plain(2)];
+    let Some(out) = gpu.step(&zx, &cu, &seqs, &[0, 1]) else {
+        return;
+    };
+    let after = gpu.pools();
+    same(slot(&after, 3), at_junction, "the junction's snapshot");
+    same(slot(&after, 4), slot(&after, 1), "the last row's snapshot");
+    let start = (conv0, ssm0);
+    same(slot(&after, 0), slot(&start, 0), "slot 0");
+
+    // The junction restored on slot 0, running the prefill's rows past it.
+    let restore = GdnSeqSlots {
+        source: 3 + 1,
+        ..GdnSeqSlots::plain(0)
+    };
+    let rest = &zx[junction * row..t * row];
+    let Some(resumed) = gpu.step(rest, &[0, (t - junction) as i32], &[restore], &[0]) else {
+        return;
+    };
+    let inner = geo.inner();
+    let past_junction = &out[junction * inner..t * inner];
+    assert_bits(
+        &resumed,
+        past_junction,
+        &format!("{what}: the resumed rows"),
+    );
+    let restored = gpu.pools();
+    same(slot(&restored, 0), slot(&after, 1), "the resumed state");
+    same(slot(&restored, 3), slot(&after, 3), "the restored snapshot");
+}
+
+/// [`snapshots`] for both scan mappings — the per-thread scan (state 16) and the simd one (state
+/// 128) — in both dtypes.
+#[test]
+fn mamba2_snapshots_resume_a_prefill() {
+    let _turn = gpu_turn();
+    let per_thread = Geometry {
+        heads: 8,
+        head_dim: 16,
+        groups: 2,
+        state: 16,
+        kernel: 4,
+    };
+    let simd = Geometry {
+        heads: 8,
+        head_dim: 64,
+        groups: 2,
+        state: 128,
+        kernel: 4,
+    };
+    for geo in [per_thread, simd] {
+        for dtype in [Dtype::F32, Dtype::Bf16] {
+            snapshots(geo, dtype);
+        }
+    }
+}
+
 /// The gate-before-norm grouped RMSNorm alone (`gdn_rms_norm_gated`, Mamba-2 form) at a group
 /// wider than the threadgroup (Nano's 512 over 256 threads) and one narrower than a power of two:
 /// `rmsnorm_g(silu(z)·y)·w`, `z` a column slice of a wider row, the weight spanning all groups.
 #[test]
 fn mamba2_gate_before_norm_matches_reference() {
+    let _turn = gpu_turn();
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;

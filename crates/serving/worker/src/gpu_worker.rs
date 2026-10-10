@@ -46,7 +46,7 @@ use scratchy_serving_engine::executor::ModelRunnerOutput;
 #[cfg(feature = "metal")]
 use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
 #[cfg(feature = "metal")]
-use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
+use scratchy_serving_scheduler::scheduler::output::{SchedulerOutput, StateSnapshotOp};
 #[cfg(feature = "metal")]
 use tracing::info;
 
@@ -54,7 +54,7 @@ use tracing::info;
 // `KvCachePool` is `cfg(any(cuda, metal))` in `scratchy-target-cuda::kv_cache`,
 // and `DType` is unconditional in `scratchy-target-cuda::dtype`.
 #[cfg(feature = "metal")]
-use scratchy_forward_compiler::gdn_slot_allocator::GdnSlotAllocator;
+use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 #[cfg(feature = "metal")]
 use scratchy_serving_engine::worker_factory::VerifySeqs;
 #[cfg(feature = "metal")]
@@ -180,12 +180,24 @@ pub struct MetalWorker {
     /// N requests" guard). `Some` iff the model is hybrid; drives the
     /// per-step `gdn_state_indices` / `gdn_is_fresh` the forward reads.
     gdn_slot_allocator: Option<GdnSlotAllocator>,
-    /// Per-step GDN scratch: the `(state_indices, is_fresh)` vectors
-    /// built in `execute_model` (one entry per batched sequence in
-    /// cu_seqlens order) and consumed by the metal
-    /// `forward_argmax_blocking` to populate `ForwardCtx::{gdn_state_indices,
-    /// gdn_is_fresh}`. `None` between steps / for non-hybrid arches.
+    /// Per-step GDN scratch: each batched sequence's state record (`GdnSeqSlots::words`) and
+    /// step code, built in `execute_model` in cu_seqlens order and consumed by the metal
+    /// `forward_argmax_blocking` to populate `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`.
+    /// `None` between steps / for non-hybrid arches.
     gdn_pending: Option<(Vec<i32>, Vec<u32>)>,
+    /// How many recurrent-state snapshots the prefix cache keeps: slots past the live ones in
+    /// every GDN state buffer, out of the KV budget (`gpu_budget::recurrent_snapshot_capacity`).
+    /// 0 without recurrent state or prefix caching.
+    gdn_snapshot_cap: usize,
+    /// The prefix hash each snapshot slot was last saved under. A restore whose key differs is a
+    /// scheduler/worker disagreement, refused rather than run on another prefix's state.
+    gdn_snapshot_keys: Vec<Option<u64>>,
+    /// The GDN state buffers' placement-sparse pages: the live slots are mapped at init, the
+    /// snapshot slots past them only as saves reach them.
+    gdn_state_stores: Option<scratchy_target_metal::sparse_kv::SparseStores>,
+    /// Requests resumed short of their KV hit (`CachedKvOp`): the position below which their KV
+    /// is the cached blocks', which their steps leave unwritten.
+    kv_cached_through: HashMap<String, usize>,
     model_dir: Option<PathBuf>,
     hf_config: Option<HfModelConfig>,
     /// How `/v1/embeddings` turns this step's hidden states into one
@@ -913,6 +925,10 @@ impl MetalWorker {
             gdn_state: None,
             gdn_slot_allocator: None,
             gdn_pending: None,
+            gdn_snapshot_cap: 0,
+            gdn_snapshot_keys: Vec::new(),
+            gdn_state_stores: None,
+            kv_cached_through: HashMap::new(),
             model_dir: None,
             hf_config: None,
             pooling_strategy: scratchy_core_model::embedding::PoolingStrategy::Last,
@@ -2219,6 +2235,104 @@ impl MetalWorker {
             vec![req_id.clone()],
             resolver,
         ))
+    }
+
+    /// This step's GDN state records (`GdnSeqSlots::words`, flattened) and step codes, in batch
+    /// order ([`GdnSlotAllocator::step`]): each sequence's live slot, the snapshot a prefix-cache
+    /// hit's scan starts from, and the snapshots its scan stores as it passes their rows — checked
+    /// against its chunk and the slots' keys, and mapped before the forward reads them. A row in
+    /// a refused step does no snapshot work: its output is dropped.
+    fn gdn_step(
+        &mut self,
+        scheduler_output: &SchedulerOutput,
+        prepared: &crate::input_batch::PreparedInputs,
+    ) -> ExecutorResult<(Vec<i32>, Vec<u32>)> {
+        let ops = &scheduler_output.recurrent_state;
+        let attn = &prepared.attn_meta;
+        let live = self.max_num_seqs_resolved();
+        let bad = |what: String| ExecutorError::WorkerExecution(format!("state snapshot: {what}"));
+        let cap = self.gdn_snapshot_cap;
+        let slot = |op: &StateSnapshotOp| match op.slot < cap {
+            true => Ok((live + op.slot) as i32),
+            false => Err(bad(format!(
+                "{} names slot {} of {cap}",
+                op.req_id, op.slot
+            ))),
+        };
+        let mut rows = Vec::with_capacity(attn.num_reqs);
+        let mut saved: Vec<(usize, u64)> = Vec::new();
+        let mut reach = 0;
+        for (i, (req_id, input)) in attn.req_ids.iter().zip(&prepared.req_inputs).enumerate() {
+            let (before, q_len) = (attn.tokens_before[i] as u32, attn.q_lens[i] as u32);
+            let drafts = input.spec_token_ids.len();
+            let mut row = GdnRow {
+                refused: self.input_batch.refused(req_id),
+                ..GdnRow::new(gdn_slot_key(req_id), drafts, before)
+            };
+            if row.refused {
+                rows.push(row);
+                continue;
+            }
+            if let Some(op) = ops.restores.iter().find(|op| op.req_id == *req_id) {
+                if op.position != before {
+                    let at = op.position;
+                    return Err(bad(format!(
+                        "{req_id} restores {at} but resumes at {before}"
+                    )));
+                }
+                if self.gdn_snapshot_keys.get(op.slot) != Some(&Some(op.key)) {
+                    let s = op.slot;
+                    return Err(bad(format!(
+                        "{req_id} restores slot {s}, saved for another prefix"
+                    )));
+                }
+                row.restore = Some(slot(op)?);
+                reach = reach.max(op.slot + 1);
+            }
+            let saves = ops.saves.iter().filter(|op| op.req_id == *req_id);
+            for (n, op) in saves.enumerate() {
+                let at = op.position;
+                let through = at.checked_sub(before).filter(|r| (1..=q_len).contains(r));
+                let Some(through) = through else {
+                    return Err(bad(format!(
+                        "{req_id} saves {at} from {q_len} rows at {before}"
+                    )));
+                };
+                let Some(save) = row.saves.get_mut(n) else {
+                    return Err(bad(format!(
+                        "{req_id} saves more than two snapshots in a step"
+                    )));
+                };
+                *save = [through as i32, slot(op)?];
+                saved.push((op.slot, op.key));
+                reach = reach.max(op.slot + 1);
+            }
+            rows.push(row);
+        }
+        if reach > 0 {
+            let stores = self.gdn_state_stores.as_mut();
+            let (Some(stores), Some(mapper)) = (stores, self.kv_mapper.as_ref()) else {
+                return Err(bad("this worker keeps no snapshot slots".into()));
+            };
+            let t_grow = std::time::Instant::now();
+            let grew = (stores.grow_to(live + reach, mapper))
+                .map_err(|e| bad(format!("mapping slots through {}: {e}", live + reach)))?;
+            if grew {
+                let mapped = stores.mapped().load(std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    "ScratchyWorker(metal): {} of {cap} state snapshot slots mapped in {:.1} ms",
+                    mapped - live,
+                    t_grow.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+        }
+        let alloc = (self.gdn_slot_allocator.as_mut()).expect("a recurrent model's allocator");
+        let (entries, codes) =
+            (alloc.step(rows)).map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+        for (s, key) in saved {
+            self.gdn_snapshot_keys[s] = Some(key);
+        }
+        Ok((entries.iter().flat_map(|e| e.words()).collect(), codes))
     }
 
     /// Allocate the draft model's KV pool. Mirrors `initialize_cache`'s
@@ -4542,6 +4656,10 @@ impl Worker for MetalWorker {
         self.metal_prefill_bucket_max_m
     }
 
+    fn recurrent_state_snapshots(&self) -> usize {
+        self.gdn_state.as_ref().map_or(0, |_| self.gdn_snapshot_cap)
+    }
+
     fn max_num_seqs_override(&self) -> Option<usize> {
         // The width this worker resolved (caller's ask, or the memory-
         // affordable default) and built every pool at. Reported so the
@@ -5226,37 +5344,79 @@ impl Worker for MetalWorker {
         // `self.gdn_state` / `self.gdn_slot_allocator` `None`. One
         // recurrent-state slot per concurrently-resident sequence
         // (`max_num_seqs`), matching the scheduler's `max_num_running_reqs`
-        // so the slot allocator never exhausts.
+        // so the slot allocator never exhausts — and past them, the prefix
+        // cache's snapshot slots (`determine_available_memory`).
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
-            let num_slots = self.max_num_seqs_resolved();
+            let live = self.max_num_seqs_resolved();
+            let num_slots = live + self.gdn_snapshot_cap;
             let num_layers = model.num_hidden_layers() as usize;
             let lanes = self.gdn_lanes(&gdn_cfg);
+            let dims = gdn_cfg.state_dims();
             let t_gdn = std::time::Instant::now();
+            // f32 conv/ssm state, placement-sparse like the KV pool: one store per linear layer's
+            // conv and ssm buffer, a block per slot, pinned in the KV pool's set so the lazy pager
+            // can't drop it mid-scan. The live slots are mapped now, a snapshot slot only once a
+            // save reaches it — an unused one costs nothing. The forwards bind these buffers whole
+            // and never read them from the host, so Private storage serves. Nothing reads a slot
+            // before writing it — a live slot's first step starts from zero (`GdnSlotAllocator`),
+            // a snapshot is saved before it is restored — so a newly mapped one is not zeroed.
+            // A model that drafts keeps its draft lanes apart, in plain buffers: as many as the
+            // sequences that draft at once, and every lane in use while they do.
+            let (conv_slot, ssm_slot) = dims.slot_bytes();
+            let layout: Vec<(usize, bool)> = (0..gdn_cfg.num_linear_layers())
+                .flat_map(|_| [(conv_slot, false), (ssm_slot, false)])
+                .collect();
+            let mapper = self.kv_mapper.clone().ok_or_else(|| {
+                ExecutorError::WorkerInit("GDN state pool before the KvMapper".into())
+            })?;
+            let stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+                &mtl_device,
+                &residency,
+                num_slots,
+                1,
+                &layout,
+            )
+            .and_then(|mut s| s.grow_to(live, &mapper).map(|_| s))
+            .map_err(|e| ExecutorError::WorkerInit(format!("GDN state stores: {e}")))?;
+            let next = std::cell::Cell::new(0usize);
             let gdn_pool = unsafe {
                 scratchy_target_metal::gdn_state::GdnStatePool::new(
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
                     lanes,
-                    gdn_cfg.state_dims(),
-                    // f32 conv/ssm state. Every per-layer conv/ssm pointer
-                    // derives from the CPU base of this StorageModeShared
-                    // buffer (a Private one gave the Qwen3.5-MoE-35B pool wild
-                    // addresses on macOS 26.5.1). Pinned in the same set as
-                    // the KV pool so the lazy pager can't drop it mid-attention.
-                    |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
+                    dims,
+                    // `new` takes each linear layer's conv then ssm slot buffer, in `layout`'s
+                    // order, then — with lanes — its conv and ssm lane buffers.
+                    |bytes| {
+                        let per_layer = if lanes.is_some() { 4 } else { 2 };
+                        let call = next.replace(next.get() + 1);
+                        let (layer, which) = (call / per_layer, call % per_layer);
+                        Ok(match which {
+                            0 | 1 => MetalMem::from_buffer_with_offset(
+                                stores.buffer(2 * layer + which),
+                                0,
+                                bytes,
+                            ),
+                            _ => MetalMem::new_pinned(&mtl_device, &residency, bytes),
+                        })
+                    },
                 )
             }
             .map_err(|e| ExecutorError::WorkerInit(format!("GdnStatePool: {e}")))?;
             info!(
-                "ScratchyWorker(metal): GDN state pool — {} linear / {} layers × {} slots in {:?}",
+                "ScratchyWorker(metal): GDN state pool — {} linear / {} layers × {} live + {} \
+                 snapshot slots in {:?}",
                 gdn_cfg.num_linear_layers(),
                 num_layers,
-                num_slots,
+                live,
+                self.gdn_snapshot_cap,
                 t_gdn.elapsed(),
             );
             self.gdn_state = Some(gdn_pool);
-            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots, lanes));
+            self.gdn_state_stores = Some(stores);
+            self.gdn_snapshot_keys = vec![None; self.gdn_snapshot_cap];
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(live, lanes));
         }
 
         // Allocate the draft model's
@@ -5502,6 +5662,34 @@ impl Worker for MetalWorker {
             _ => 0,
         };
         let available = kv_left(peak_activation_estimate);
+        // The prefix cache's recurrent-state snapshots, out of the KV budget: KV pages once mapped
+        // stay mapped, so snapshot pages mapped beside a full pool would overrun the device. A
+        // snapshot is a slot like any other, without draft lanes.
+        let snapshot_bytes = (self.model.as_ref())
+            .and_then(|m| m.gdn_runtime_config())
+            .filter(|_| self.config.enable_prefix_caching)
+            .map_or(0, |cfg| {
+                GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
+                    cfg.num_linear_layers(),
+                    1,
+                    None,
+                    cfg.state_dims(),
+                )
+            });
+        self.gdn_snapshot_cap = scratchy_serving_engine::gpu_budget::recurrent_snapshot_capacity(
+            available,
+            snapshot_bytes,
+        );
+        let available = available - self.gdn_snapshot_cap * snapshot_bytes;
+        if snapshot_bytes > 0 {
+            info!(
+                "ScratchyWorker(metal): state_snapshots={} × {:.1} MiB = {:.2} GiB of the KV \
+                 budget, mapped only as the prefix cache saves into them",
+                self.gdn_snapshot_cap,
+                snapshot_bytes as f64 / 1_048_576.0,
+                (self.gdn_snapshot_cap * snapshot_bytes) as f64 / 1_073_741_824.0,
+            );
+        }
         // Per-pair split: when a draft model is loaded, every target KV
         // block has a 1:1 mirror in the draft pool, so the engine should
         // think it has only `target / (target + draft)` of the budget.
@@ -5666,6 +5854,7 @@ impl Worker for MetalWorker {
         for req_id in &scheduler_output.finished_req_ids {
             self.annotation_buffers.remove(req_id);
             self.reused_block_buffers.remove(req_id);
+            self.kv_cached_through.remove(req_id);
             self.mm_data_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
@@ -5687,9 +5876,14 @@ impl Worker for MetalWorker {
         ) {
             for req_id in preempted {
                 alloc.release(gdn_slot_key(req_id));
+                self.kv_cached_through.remove(req_id);
             }
         }
         self.input_batch.update_states(scheduler_output);
+        // A recompute over cached KV, from the request's (re)admission on.
+        for op in &scheduler_output.recurrent_state.cached_kv {
+            (self.kv_cached_through).insert(op.req_id.clone(), op.through as usize);
+        }
 
         // ── 2. Lifecycle: the per-request state beside the batch ──
         for new_req in &scheduler_output.scheduled_new_reqs {
@@ -5912,11 +6106,19 @@ impl Worker for MetalWorker {
             } else {
                 None
             };
+            let cached_through = self.kv_cached_through.get(&attn.req_ids[i]);
+            let cached_through = cached_through.copied().unwrap_or(0);
             for t in 0..q_len {
                 let abs_pos = tokens_before + t;
                 let block_idx = abs_pos / full_block_size;
                 let offset = abs_pos % full_block_size;
                 if block_idx >= block_ids.len() {
+                    slot_mapping.skip();
+                    continue;
+                }
+                // A recurrent request resumed short of its KV hit runs these positions for its
+                // state alone: the cached block keeps the KV every request sharing it reads.
+                if abs_pos < cached_through {
                     slot_mapping.skip();
                     continue;
                 }
@@ -6147,25 +6349,17 @@ impl Worker for MetalWorker {
             }
         }
 
-        // GDN per-step state entries + step codes (hybrid arches only), one per batched
+        // GDN per-step state records + step codes (hybrid arches only), one per batched
         // sequence in the SAME order as `cu_seqlens_q` / `req_ids_in_order`. The metal
         // `forward_argmax_blocking` uploads these into `ForwardCtx::{gdn_state_indices,
         // gdn_is_fresh}`. A request's FIRST forward (including a recycled slot's new owner)
         // starts from zero instead of a finished sequence's stale data (the degeneration
-        // guard); a verify step checkpoints its drafts.
-        self.gdn_pending = self
-            .gdn_slot_allocator
-            .as_mut()
-            .map(|alloc| {
-                alloc.step(
-                    req_ids_in_order
-                        .iter()
-                        .zip(&prepared.req_inputs)
-                        .map(|(req_id, input)| (gdn_slot_key(req_id), input.spec_token_ids.len())),
-                )
-            })
-            .transpose()
-            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+        // guard); a verify step checkpoints its drafts; a prefix-cache hit's scan starts from
+        // its snapshot, and a scan passing a save point stores its state there.
+        self.gdn_pending = match self.gdn_slot_allocator.is_some() {
+            true => Some(self.gdn_step(scheduler_output, &prepared)?),
+            false => None,
+        };
 
         // ── 5b. Vision encoder for any MM-bearing req at its first
         // prefill step. Output [n_img_tokens, hidden] + per-image patch

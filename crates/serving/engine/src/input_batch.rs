@@ -109,6 +109,10 @@ per_slot_fields! {
 enum StepState {
     Committed,
     Open,
+    /// In a step [`InputBatch::open_step`] refused. The engine aborts every request of a step that
+    /// fails, so this one's next step — queued before the abort reached the worker — runs on
+    /// state the refused step never produced, and its output is dropped ([`InputBatch::refused`]).
+    Refused,
 }
 
 /// A step scheduled behind one that failed: the engine queued it on tokens the failed step never
@@ -311,12 +315,28 @@ impl InputBatch {
             .collect();
         if let Some(&slot) = slots.iter().find(|&&s| self.step[s] == StepState::Open) {
             let req_id = self.req_ids[slot].clone();
+            for &s in &slots {
+                if self.step[s] != StepState::Open {
+                    self.step[s] = StepState::Refused;
+                }
+            }
             return Err(FailedPredecessor { req_id });
         }
         for slot in slots {
-            self.step[slot] = StepState::Open;
+            if self.step[slot] != StepState::Refused {
+                self.step[slot] = StepState::Open;
+            }
         }
         Ok(())
+    }
+
+    /// Whether `req_id` was in a step [`Self::open_step`] refused, and has not run a step since —
+    /// the engine is aborting it. What a step computes for it is dropped, so a worker may run it
+    /// on state it lacks (a recurrent model's is zeroed) rather than fail the requests beside it.
+    pub fn refused(&self, req_id: &str) -> bool {
+        self.req_id_to_slot
+            .get(req_id)
+            .is_some_and(|&slot| self.step[slot] == StepState::Refused)
     }
 
     /// Remove a finished request (swap-remove to keep dense packing).
@@ -1395,13 +1415,20 @@ mod tests {
         };
         assert_eq!(batch.open_step(&decode), Err(refused));
         assert_eq!(batch.tokens_in_pool_for("r1"), 2);
+        // The engine aborts every request of a failed step: r2, refused beside r1, is one.
+        assert!(batch.refused("r2"));
+        assert!(
+            !batch.refused("r1"),
+            "r1's own step stays open, so the next one refuses again"
+        );
 
-        // The other request, alone, still runs.
+        // The other request, alone, still runs — once, before its abort arrives.
         let other = step(&[("r2", 0, 1)]);
         assert_eq!(batch.open_step(&other), Ok(()));
         let p = batch.prepare_inputs(&other);
         batch.reclaim_buffers(p);
         batch.commit_in_flight("r2", 1);
+        assert!(!batch.refused("r2"), "a step that ran clears it");
         assert_eq!(batch.open_step(&step(&[("r2", 1, 1)])), Ok(()));
     }
 

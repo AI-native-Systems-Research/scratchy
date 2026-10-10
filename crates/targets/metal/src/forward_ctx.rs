@@ -68,8 +68,9 @@ pub struct ForwardCtx<'a> {
     /// `conv_state`/`ssm_state` here, indexed by [`Self::gdn_state_indices`].
     /// `None` for non-hybrid arches.
     pub gdn_state: Option<&'a GdnStatePool<crate::PoolMem>>,
-    /// Per-sequence GDN state-slot ids, shape `[num_seqs]` i32. `None` for
-    /// non-hybrid arches.
+    /// Per-sequence GDN state records, a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) a
+    /// sequence flattened to `GdnSeqSlots::WORDS` i32s (`[num_seqs * 6]` elements, read whole).
+    /// `None` for non-hybrid arches.
     pub gdn_state_indices: Option<TensorView<'a>>,
     /// Per-sequence GDN fresh flags, shape `[num_seqs]` u32 — 1 on a
     /// sequence's first (fresh) forward. `None` for non-hybrid arches.

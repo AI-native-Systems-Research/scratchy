@@ -200,6 +200,11 @@ pub struct SchedulerOutput {
     /// Where this step stands among speculative steps scheduled ahead of their outcomes.
     #[serde(default)]
     pub spec_pipeline: SpecPipeline,
+
+    /// This step's recurrent-state snapshot copies. Empty unless the model carries recurrent
+    /// state (Gated-DeltaNet hybrids) and prefix caching is on.
+    #[serde(default)]
+    pub recurrent_state: RecurrentStateOps,
 }
 
 /// A speculative step scheduled ahead (#240): the engine schedules the step after one that drafts
@@ -212,6 +217,65 @@ pub struct SpecPipeline {
     /// Scheduled while the step before it was in flight: its positions assume every draft that
     /// step verifies kept, its tokens and drafts are that step's on the device.
     pub behind: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Recurrent-state snapshots
+// ---------------------------------------------------------------------------
+
+/// One copy of a request's recurrent state between its scan and a snapshot slot.
+///
+/// A Gated-DeltaNet or Mamba-2 layer (Qwen3.5 / Qwen3.6, Nemotron-H) carries a per-sequence state
+/// that a cached KV prefix cannot rebuild: it is the scan over EVERY earlier token. So a
+/// prefix-cache hit on such a model is only real where a snapshot of that state exists, stored
+/// when an earlier request's scan passed the same prefix. The scheduler owns the snapshots the way
+/// it owns KV blocks — it picks the slot and the prefix — and the worker only points the
+/// recurrent kernels at them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSnapshotOp {
+    /// The request whose live state is copied to or from the snapshot.
+    pub req_id: String,
+    /// Index into the worker's snapshot pool.
+    pub slot: usize,
+    /// The snapshot holds the state after tokens `[0, position)`. Block-aligned; equal to the
+    /// row's `num_computed_tokens` for a restore, and within the row's chunk —
+    /// `(num_computed_tokens, num_computed_tokens + num_scheduled_tokens]` — for a save. The
+    /// worker checks both.
+    pub position: u32,
+    /// The prefix hash the snapshot is keyed by. The worker tags the slot with it on save and
+    /// refuses a restore whose tag differs, so a disagreement between scheduler and worker is an
+    /// error rather than another request's state.
+    pub key: u64,
+}
+
+/// A request with recurrent state resumed short of the end of its KV hit: its positions
+/// `[num_computed_tokens, through)` run again only to rebuild that state. Their KV is the cached
+/// blocks' — shared with every request that hits them — so the worker does not write it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedKvOp {
+    pub req_id: String,
+    /// The end of the KV hit, block-aligned: every step of the request leaves the KV of the
+    /// positions before it as cached.
+    pub through: u32,
+}
+
+/// The recurrent-state work of one step (see [`StateSnapshotOp`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrentStateOps {
+    /// The request was just (re)admitted at a prefix-cache hit and this is its first step: its
+    /// scan starts from the snapshot, not from its own slot.
+    pub restores: Vec<StateSnapshotOp>,
+    /// The request's scan writes its state at `position` into the snapshot as it passes it.
+    pub saves: Vec<StateSnapshotOp>,
+    /// Requests (re)admitted this step whose recompute runs over cached KV.
+    pub cached_kv: Vec<CachedKvOp>,
+}
+
+impl RecurrentStateOps {
+    /// Whether this step does any recurrent-state work.
+    pub fn is_empty(&self) -> bool {
+        self.restores.is_empty() && self.saves.is_empty() && self.cached_kv.is_empty()
+    }
 }
 
 impl SchedulerOutput {
@@ -239,6 +303,7 @@ impl SchedulerOutput {
             draft_req_ids: HashSet::new(),
             primes_only: false,
             spec_pipeline: SpecPipeline::default(),
+            recurrent_state: RecurrentStateOps::default(),
         }
     }
 }
@@ -333,6 +398,7 @@ mod tests {
             draft_req_ids: HashSet::new(),
             primes_only: false,
             spec_pipeline: SpecPipeline::default(),
+            recurrent_state: RecurrentStateOps::default(),
         };
         assert_eq!(so.total_num_scheduled_tokens, 150);
         assert_eq!(so.scheduled_new_reqs.len(), 1);

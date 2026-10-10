@@ -230,6 +230,51 @@ impl GdnStep {
     }
 }
 
+/// Where one sequence's recurrent state comes from and goes in a step — the per-sequence element
+/// of the `state_indices` buffer every GDN and Mamba-2 kernel reads (the shaders' `GdnSeqSlots`,
+/// `shaders/gdn_state.h`, the same 24 bytes).
+///
+/// The prefix cache keeps snapshots of the state in slots past the live ones, in the same
+/// buffers, so a kernel reaches them by index alone:
+/// * a restore — a request resuming at a cached prefix — reads its start state from the
+///   snapshot (`source`) and writes the step's state to its own `slot`, with no copy;
+/// * a save stores the state after a given row into a snapshot slot as the scan passes that row,
+///   inside the forward that runs it.
+///
+/// All zeros is a plain step on slot 0: a zeroed buffer tail is a no-op (`runtime.rs`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GdnSeqSlots {
+    /// The sequence's own slot: where the step's state lands.
+    pub slot: i32,
+    /// `0`: a [`GdnStart::Slot`] start reads `slot`. `s + 1`: it reads slot `s` instead — the
+    /// snapshot a restore resumes from. Ignored by every other start.
+    pub source: i32,
+    /// Up to two snapshot stores, as `[rows_through, slot]`: once the sequence's first
+    /// `rows_through` rows of this step have run, store its state into `slot` too. `0` rows
+    /// through = no store.
+    pub saves: [[i32; 2]; 2],
+}
+
+impl GdnSeqSlots {
+    /// `i32`s per sequence in the flattened `state_indices` buffer.
+    pub const WORDS: usize = 6;
+
+    /// A step on `slot` with no snapshot work — what every sequence was before snapshots.
+    pub fn plain(slot: i32) -> Self {
+        Self {
+            slot,
+            ..Self::default()
+        }
+    }
+
+    /// The record as the kernels read it.
+    pub fn words(self) -> [i32; Self::WORDS] {
+        let [[r0, s0], [r1, s1]] = self.saves;
+        [self.slot, self.source, r0, s0, r1, s1]
+    }
+}
+
 /// One GDN layer's state geometry: its causal conv's channels and width, and its delta-rule
 /// heads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +303,13 @@ impl GdnStateDims {
     /// kernels lay a lane out the same way.
     pub fn ssm_lane_len(self, rows: CheckpointRows) -> usize {
         2 * rows.rows() * self.ssm_record_len()
+    }
+
+    /// One slot's conv and ssm bytes: the stride a slot index steps through each of a linear
+    /// layer's two slot buffers.
+    pub fn slot_bytes(self) -> (usize, usize) {
+        let ([conv, ssm], _) = self.bytes(1, None);
+        (conv, ssm)
     }
 
     /// Conv-state ring length: `conv_kernel - 1` past tokens retained per channel.

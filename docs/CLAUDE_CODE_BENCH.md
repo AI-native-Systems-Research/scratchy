@@ -91,7 +91,8 @@ cargo build --release -p scratchy-cli \
   --features metal,claude,model/gemma-4-26b-a4b-it,quant/mlx-affine-b4-g64
 scr launch claude -m mlx-community/gemma-4-26b-a4b-it-4bit --device metal
 
-# MoE + GDN: prefix caching is off by design, so this one measures the cost
+# MoE + GDN: a prefix hit resumes only at a snapshot of the recurrent state
+# (taken ~8-23 tokens before each prompt's end); --no-prefix-caching measures the cost
 cargo build --release -p scratchy-cli \
   --features metal,claude,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
 scr launch claude -m mlx-community/Qwen3.6-35B-A3B-4bit --device metal
