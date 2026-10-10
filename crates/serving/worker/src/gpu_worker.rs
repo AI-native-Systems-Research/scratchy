@@ -1131,8 +1131,9 @@ impl MetalWorker {
                     allocated_bytes: allocated,
                     peak_activation_bytes: peak,
                     gdn_per_slot_bytes: gdn_per_slot,
-                    // A verify step samples each sequence's every row: its token and its drafts.
-                    sampler_bytes_per_row: sampler_row * (1 + model.spec_drafts() as usize),
+                    // One sampled row a sequence: only a step of at most the compiled head's
+                    // `max_seqs` sequences samples their drafts too (the sampler arena's rows).
+                    sampler_bytes_per_row: sampler_row,
                 };
                 resolve_default_max_num_seqs(&facts, false)
             }
@@ -4620,11 +4621,18 @@ impl Worker for MetalWorker {
         // resident. Per-step sampler work is then a pure host memcpy
         // (`prepare_step`).
         let t_arena = std::time::Instant::now();
+        // A verify step samples each of its sequences' every row — its token and its drafts — and
+        // only a step of at most the compiled head's `max_seqs` sequences drafts; any other step
+        // samples one row a sequence.
+        let sampled_rows = match scratchy_forward_compiler::head_of(&arch) {
+            Some(head) => (self.max_num_seqs_resolved())
+                .max(usize::from(head.max_seqs) * (1 + usize::from(head.drafts))),
+            None => self.max_num_seqs_resolved(),
+        };
         let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
             &gpu_device.device,
             gpu_device.allocator.residency(),
-            // A verify step samples each sequence's every row: its token and its drafts.
-            (self.max_num_seqs_resolved() * (1 + model.spec_drafts() as usize)) as u32,
+            sampled_rows as u32,
             &sampler,
             max_model_len.max(1) as u32,
         );
@@ -5208,8 +5216,10 @@ impl Worker for MetalWorker {
             _ => arena_peak,
         };
         // A uniform TurboQuant pool still reserves one fp16 chunk per layer
-        // (`initialize_cache`, `initialize_draft_cache_metal`), whatever its block count.
-        let tq_seed = [self.model.as_deref(), self.draft_model.as_deref()]
+        // (`initialize_cache`, `initialize_draft_cache_metal`), whatever its block count. A head
+        // reading its target's KV builds no pool.
+        let draft_pool = (self.draft_model.as_deref()).filter(|_| !self.head_reads_target_kv());
+        let tq_seed = [self.model.as_deref(), draft_pool]
             .into_iter()
             .flatten()
             .filter(|m| uniform_turboquant(*m, self.config.block_size))
