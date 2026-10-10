@@ -1518,6 +1518,7 @@ impl MetalWorker {
         if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
             self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
                 drafts: usize::from(head.drafts),
+                max_seqs: usize::from(head.max_seqs),
                 max_model_len: self.max_model_len(),
             });
             let (Some(target), Some(refs)) =
@@ -1667,9 +1668,14 @@ impl MetalWorker {
             && (pipelined
                 || !telemetry
                     && sched.scheduled_spec_decode_tokens.is_empty()
-                    // A head runs after the steps it drafts from, so every other step defers.
+                    // A head runs after the steps it drafts from, so every other step defers; so
+                    // does a step past its gate, which primes KV only — no chain, nothing read
+                    // back.
                     && match self.mtp_drafter {
-                        Some(_) => sched.draft_req_ids.is_empty(),
+                        Some(drafter) => {
+                            sched.draft_req_ids.is_empty()
+                                || sched.num_scheduled_tokens.len() > drafter.max_seqs
+                        }
                         None => self.draft_model.is_none(),
                     }
                     && sched.num_scheduled_tokens.keys().all(|req_id| {

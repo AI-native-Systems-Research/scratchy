@@ -31,9 +31,10 @@
 //! planned when it scheduled the step ([`MtpProposer`]'s `plan`), and returns their drafts with
 //! the step's output — so the engine schedules asynchronously, waiting only on a step that drafts
 //! or verifies. A step of more than the head's `max_seqs` sequences (its compiled
-//! `spec_max_seqs`) plans none: it costs what its target alone does. Its sequences' head KV then
-//! misses the step's rows, so they draft no more (`stale`) until a recompute runs them from their
-//! first position.
+//! `spec_max_seqs`) costs what its target alone does, so it drafts nothing — but its pass 1
+//! still runs, KV-only (no lm_head, no argmax, no chain), keeping every sequence's head KV
+//! current: no request ever goes stale, and drafting resumes as soon as a step is back within
+//! the gate.
 //!
 //! # TODO
 //!
@@ -42,13 +43,15 @@
 //!
 //! **The gate** (`spec_max_seqs`, the head's `arch.json`):
 //!
-//! - TODO: derive the gate per device, at expansion. It is 1 sequence on every GPU, the one point
-//!   measured to pay on both GPUs measured: one request, base M5 output tok/s 1.36-1.38x sampled;
-//!   M5 Max TPOT 1.14x sampled, 1.28x greedy (an earlier build of this head, at
-//!   `--max-num-seqs 1`). Past it, where drafting stops paying depends on the GPU: on the base M5,
-//!   before the gate came down to 1, sampled output tok/s was 1.07-1.18x at 2 sequences and
-//!   1.03-1.17x at 4, greedy 0.96-1.06x at 4 (two rounds each); the M5 Max was not measured past
-//!   one request. A verify step
+//! - TODO: derive the gate per device, at expansion. It is 2 sequences on every GPU: a verify
+//!   step of two runs six rows, within the eight-row verify-sized bucket, and one request pays on
+//!   both GPUs measured (base M5 output tok/s 1.36-1.38x sampled; M5 Max, at this head, TPOT
+//!   1.33x on the code prompt and 1.51x on a long one, greedy) — on the base M5, before the gate
+//!   came down to 1, sampled output tok/s was 1.07-1.18x at 2 sequences and 1.03-1.17x at 4,
+//!   greedy 0.96-1.06x at 4 (two rounds each); the M5 Max was not measured past one request.
+//!   Past 2 the gate does not rise until the verify-sized rungs do: a verify step of 3 sequences
+//!   runs 9 rows, past the 8-row bucket onto the 64-row prefill-shaped tape
+//!   (`METAL_VERIFY_ROWS`' TODO: derive the rungs from the gate). A verify step
 //!   of `B` sequences runs `B * (k + 1)` rows, and a MoE target reads every distinct expert those
 //!   rows pick (Qwen3.6: 256 experts, 8 a row; at 8 sequences the verify step's 24 rows pick about
 //!   135, the plain step's 8 about 57, under uniform routing). So on the base M5 a verify step
@@ -63,19 +66,15 @@
 //!   default, so every target of `qwen3-5-mtp` shares it, but its cost is the target's: a dense
 //!   target's verify rows cost far less than a MoE's (Llama-3.2-3B: a 4-row step costs 1.27x a
 //!   1-row step), so a dense Qwen3.5/3.6 target would pay at more sequences.
-//! - TODO: let stale requests draft again. A request that shares one step past the gate drafts no
-//!   more for the rest of its life, even once it runs alone again: at a gate of 1, once a second
-//!   request arrives (its prompt's step counts), neither drafts again. Two ways back: run pass 1
-//!   KV-only on a gated step (the head's layer over the step's rows; no lm_head, no drafts), so no
-//!   request goes stale, at the head's per-row cost on every step past the gate; or keep a stale
-//!   request's target hidden rows (4 KiB a token at Qwen3.6's 2048-wide 16-bit hidden) and run them
-//!   through pass 1 once its steps are back under the gate.
-//! - TODO: a prefix-cache hit can reuse head KV that was never written. The head's KV lives in the
-//!   target's blocks, so a request that hits cached blocks reuses their head KV too, and blocks
-//!   written while their request was stale hold none: a request drafting over them gets fewer
-//!   drafts accepted (the target verifies every draft, so the output is unaffected). Not measured.
-//!   A KV-only pass 1 on gated steps closes it; a catch-up does not for blocks cached before it
-//!   runs.
+//! - TODO: priming costs the head's layer over every row of every step past the gate. The
+//!   alternative — keep a stale request's target hidden rows (4 KiB a token at Qwen3.6's
+//!   2048-wide 16-bit hidden) and run them through pass 1 once its steps are back under the
+//!   gate — defers that cost to the requests that resume drafting; not taken.
+//! - TODO: a prefix-cache hit can still reuse head KV that was never written: the head's KV
+//!   lives in the target's blocks, so a request that hits cached blocks reuses their head KV
+//!   too, and blocks written by a request that takes no drafts (its sampling reads its token
+//!   history) hold none. A request drafting over them gets fewer drafts accepted (the target
+//!   verifies every draft, so the output is unaffected). Not measured.
 //!
 //! **Cost:**
 //!
@@ -147,8 +146,6 @@ pub struct MtpProposerConfig {
     pub model: String,
     /// Drafts per step (`k`): one pass-1 row plus `k - 1` chained passes.
     pub num_speculative_tokens: usize,
-    /// The most sequences a step drafts for (module docs).
-    pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
 }
@@ -157,16 +154,11 @@ pub struct MtpProposerConfig {
 #[derive(Debug)]
 pub struct MtpProposer {
     config: MtpProposerConfig,
-    /// Requests whose head KV missed a step's rows (module docs): they draft no more.
-    stale: HashSet<String>,
 }
 
 impl MtpProposer {
     pub fn new(config: MtpProposerConfig) -> Self {
-        Self {
-            config,
-            stale: HashSet::new(),
-        }
+        Self { config }
     }
 
     pub fn config(&self) -> &MtpProposerConfig {
@@ -179,6 +171,9 @@ impl MtpProposer {
 pub struct MtpDrafter {
     /// Drafts per step (`k`, the head's compiled `spec_drafts`).
     pub drafts: usize,
+    /// The most sequences a step drafts for (the head's compiled `spec_max_seqs`): a step of more
+    /// runs as its target alone, its pass 1 priming KV only (module docs).
+    pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
 }
@@ -222,7 +217,8 @@ impl StepRows<'_> {
 pub struct HeadPasses {
     pub one: PassOne,
     /// `None` when no planned sequence gets a token from the step (prefill chunks short of their
-    /// prompt's end): pass 1 primes their head KV, and nothing drafts.
+    /// prompt's end), or the step is past the head's `max_seqs`: pass 1 primes head KV, and
+    /// nothing drafts.
     pub chain: Option<Chain>,
 }
 
@@ -243,6 +239,10 @@ pub struct PassOne {
     pub last_rows: Vec<u32>,
     /// Some sequence has more than one row that can be its newest: the lm_head runs every row.
     pub has_spec_tokens: bool,
+    /// The step is past the head's `max_seqs`: the pass primes KV only — no lm_head (no sampled
+    /// rows), no argmax, no chain — so its sequences' head KV misses no row and drafting resumes
+    /// once a step is back within the gate.
+    pub kv_only: bool,
     /// `(row, step row)` of each row whose input is the target's token at its step row — one the
     /// host does not have yet. One of a sequence's is its newest; their argmax runs on the device.
     pub token_rows: Vec<(u32, u32)>,
@@ -280,13 +280,14 @@ pub struct Chain {
 }
 
 impl PassOne {
-    /// The forward's host-side request (its target hidden states come from the device).
+    /// The forward's host-side request (its target hidden states come from the device). KV-only
+    /// passes sample no row: `last_token_indices` is `None`.
     pub fn request(&self) -> ForwardArgmaxRequest<'_> {
         request(
             [&self.input_ids, &self.positions, &self.slot_mapping],
             [&self.cu_seqlens_q, &self.seqused_k, &self.block_table],
             self.block_table_stride,
-            &self.last_rows,
+            (!self.kv_only).then(|| &self.last_rows[..]),
             self.has_spec_tokens,
         )
     }
@@ -299,7 +300,7 @@ impl Chain {
             [&self.input_ids, &self.positions, &self.slot_mapping],
             [&self.cu_seqlens_q, &self.seqused_k, &self.block_table],
             self.block_table_stride,
-            &self.last_rows,
+            Some(&self.last_rows),
             false,
         )
     }
@@ -316,7 +317,7 @@ fn request<'a>(
     [input_ids, positions, slot_mapping]: [&'a [u32]; 3],
     [cu_seqlens_q, seqused_k, block_table]: [&'a [u32]; 3],
     block_table_stride: usize,
-    last_rows: &'a [u32],
+    last_rows: Option<&'a [u32]>,
     has_spec_tokens: bool,
 ) -> ForwardArgmaxRequest<'a> {
     ForwardArgmaxRequest {
@@ -337,7 +338,7 @@ fn request<'a>(
         max_seqlen_k: seqused_k.iter().copied().max().unwrap_or(0) as usize,
         num_tokens: input_ids.len(),
         has_spec_tokens,
-        last_token_indices: Some(last_rows),
+        last_token_indices: last_rows,
         target_hidden: None,
     }
 }
@@ -361,6 +362,7 @@ impl MtpDrafter {
             block_table_stride: step.block_table_stride,
             last_rows: Vec::new(),
             has_spec_tokens: false,
+            kv_only: false,
             token_rows: Vec::new(),
             hidden_rows: Vec::new(),
         };
@@ -396,9 +398,11 @@ impl MtpDrafter {
         if included.is_empty() {
             return None;
         }
-        one.has_spec_tokens = drafting.iter().any(|(_, tokens)| tokens.len() > 1);
+        let kv_only = step.req_ids.len() > self.max_seqs;
+        one.kv_only = kv_only;
+        one.has_spec_tokens = !kv_only && drafting.iter().any(|(_, tokens)| tokens.len() > 1);
         one.block_table = step.block_rows(&included);
-        let chain = (!drafting.is_empty()).then(|| self.chain(step, &one, &drafting));
+        let chain = (!kv_only && !drafting.is_empty()).then(|| self.chain(step, &one, &drafting));
         Some(HeadPasses { one, chain })
     }
 
@@ -509,32 +513,11 @@ impl Proposer for MtpProposer {
         sched: &SchedulerOutput,
         takes_drafts: &dyn Fn(&str) -> bool,
     ) -> HashSet<String> {
-        // A request gone drafts no more; one run from its first position has its head KV whole.
-        self.stale.retain(|r| takes_drafts(r));
-        let cached = &sched.scheduled_cached_reqs;
-        let from_start = (sched.scheduled_new_reqs.iter())
-            .filter(|r| r.num_computed_tokens == 0)
-            .map(|r| &r.req_id)
-            .chain(
-                (cached.req_ids.iter().zip(&cached.num_computed_tokens))
-                    .filter(|&(_, &n)| n == 0)
-                    .map(|(r, _)| r),
-            );
-        for r in from_start {
-            self.stale.remove(r);
-        }
-        let scheduled = sched
-            .num_scheduled_tokens
-            .keys()
-            .filter(|r| takes_drafts(r));
-        // A step of more sequences than the head drafts for runs as the target alone.
-        // TODO: its requests go stale for good (module docs: two ways back).
-        if sched.num_scheduled_tokens.len() > self.config.max_seqs {
-            self.stale.extend(scheduled.cloned());
-            return HashSet::new();
-        }
-        scheduled
-            .filter(|r| !self.stale.contains(*r))
+        // Every request `takes_drafts` admits is planned, gated or not: a step within the head's
+        // `max_seqs` chains for them, and a step past it runs pass 1 KV-only over their rows
+        // (module docs), so head KV never has a hole.
+        (sched.num_scheduled_tokens.keys())
+            .filter(|r| takes_drafts(r))
             .cloned()
             .collect()
     }
@@ -602,17 +585,61 @@ mod tests {
         }
     }
 
-    fn proposer(max_seqs: usize) -> MtpProposer {
+    /// A step of three sequences: `a` and `b` as [`TwoSequences`]'s, plus `c` decoding at position
+    /// 5 of its history (its block 7).
+    struct ThreeSequences {
+        req_ids: Vec<String>,
+        block_ids: Vec<Vec<u32>>,
+        history_c: Vec<u32>,
+    }
+
+    impl ThreeSequences {
+        fn new() -> Self {
+            Self {
+                req_ids: vec!["a".into(), "b".into(), "c".into()],
+                block_ids: vec![vec![3], vec![5], vec![7]],
+                history_c: (800..805).collect(),
+            }
+        }
+
+        fn rows(&self) -> StepRows<'_> {
+            StepRows {
+                req_ids: &self.req_ids,
+                input_ids: &[510, 21, 22, 23, 700, 701, 702, 804],
+                positions: &[10, 11, 12, 13, 0, 1, 2, 5],
+                slot_mapping: &[58, 59, 60, 61, 80, 81, 82, 117],
+                cu_seqlens_q: &[0, 4, 7, 8],
+                seqused_k: &[14, 3, 6],
+                block_table: &[3, 0, 5, 0, 7, 0],
+                block_table_stride: 2,
+                block_ids: &self.block_ids,
+                block_size: 16,
+            }
+        }
+
+        /// The histories before the step: `a`'s and `b`'s as [`TwoSequences`]'s.
+        fn before(&self) -> impl Fn(&str) -> Option<Vec<u32>> + '_ {
+            |id| match id {
+                "a" => Some((500..511).collect()),
+                "b" => Some((700..708).collect()),
+                "c" => Some(self.history_c.clone()),
+                _ => None,
+            }
+        }
+    }
+
+    fn proposer() -> MtpProposer {
         MtpProposer::new(MtpProposerConfig {
             model: "head".into(),
             num_speculative_tokens: 3,
-            max_seqs,
             max_model_len: 4096,
         })
     }
 
+    /// The head's compiled gate is two sequences: [`TwoSequences`] chains, three primes.
     const DRAFTER: MtpDrafter = MtpDrafter {
         drafts: 3,
+        max_seqs: 2,
         max_model_len: 4096,
     };
 
@@ -640,6 +667,7 @@ mod tests {
             block_table_stride: 2,
             last_rows: vec![3, 6],
             has_spec_tokens: true,
+            kv_only: false,
             token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
             hidden_rows: vec![(0, 0, 4), (4, 4, 3)],
         };
@@ -702,6 +730,7 @@ mod tests {
         // Kept all three: the newest row is at 13, so pass 2 runs at 14 and its draft lands at 16.
         let near = |max_model_len| MtpDrafter {
             drafts: 3,
+            max_seqs: 2,
             max_model_len,
         };
         let produced = vec![vec![0, 1, 2, 3], Vec::new()];
@@ -721,6 +750,47 @@ mod tests {
         assert_eq!(drafts(15), picked[..1], "draft 1 is pass 1's, never cut");
     }
 
+    /// A step past the gate (three sequences at a two-sequence head) runs pass 1 KV-only: every
+    /// planned row is still there — the head's layer reads the target's tokens and hidden states
+    /// as ever, so its KV misses no row — but its request samples no row and reports no
+    /// speculative tokens, and no chain is built. Back within the gate the same two sequences
+    /// chain again.
+    #[test]
+    fn a_step_past_the_gate_primes_head_kv_only() {
+        let step = ThreeSequences::new();
+        let gated = DRAFTER
+            .passes(&step.rows(), &step.before(), &ids(&["a", "b", "c"]))
+            .expect("passes");
+        assert_eq!(gated.chain, None);
+        assert_eq!(
+            gated.one,
+            PassOne {
+                input_ids: vec![0, 0, 0, 0, 701, 702, 703, 0],
+                positions: vec![10, 11, 12, 13, 0, 1, 2, 5],
+                slot_mapping: vec![58, 59, 60, 61, 80, 81, 82, 117],
+                cu_seqlens_q: vec![0, 4, 7, 8],
+                seqused_k: vec![14, 3, 6],
+                block_table: vec![3, 0, 5, 0, 7, 0],
+                block_table_stride: 2,
+                last_rows: vec![3, 6, 7],
+                has_spec_tokens: false,
+                kv_only: true,
+                token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3), (7, 7)],
+                hidden_rows: vec![(0, 0, 4), (4, 4, 3), (7, 7, 1)],
+            }
+        );
+        let request = gated.one.request();
+        assert_eq!(request.last_token_indices, None);
+        assert!(!request.has_spec_tokens);
+
+        let two = TwoSequences::new();
+        let within = DRAFTER
+            .passes(&two.rows(), &two.before(), &ids(&["a", "b"]))
+            .expect("passes");
+        assert!(!within.one.kv_only);
+        within.chain.expect("a chains");
+    }
+
     /// A scheduled step of `(request, num_computed_tokens)`: one at 0 runs from its first position.
     fn scheduled(reqs: &[(&str, u32)]) -> SchedulerOutput {
         let mut s = SchedulerOutput::make_empty();
@@ -732,33 +802,29 @@ mod tests {
         s
     }
 
-    /// A step of more sequences than the head drafts for plans none and stales them — their head
-    /// KV misses its rows — until a recompute runs one from its first position. A request whose
-    /// sampling reads its history takes no drafts. The proposer hands back the worker's drafts.
+    /// A step of more sequences than the head drafts for plans every request `takes_drafts`
+    /// admits — the worker runs its pass 1 KV-only (module docs) — and once a step is back
+    /// within the gate they chain again: no request goes stale. A request whose sampling reads
+    /// its history takes no drafts. The proposer hands back the worker's drafts.
     #[test]
-    fn a_step_past_the_head_s_sequences_plans_none_and_stales_them() {
+    fn a_step_past_the_head_s_sequences_plans_all_of_them() {
         let takes = |_: &str| true;
-        let mut proposer = proposer(1);
-        assert!(
-            proposer
-                .plan(&scheduled(&[("a", 10), ("b", 20)]), &takes)
-                .is_empty()
+        let mut proposer = proposer();
+        assert_eq!(
+            proposer.plan(&scheduled(&[("a", 10), ("b", 20), ("c", 30)]), &takes),
+            ids(&["a", "b", "c"])
         );
 
-        // Within its sequences again: both stale.
-        proposer.config.max_seqs = 2;
-        assert!(
-            proposer
-                .plan(&scheduled(&[("a", 11), ("b", 21)]), &takes)
-                .is_empty()
+        // Back within the gate: both planned again — neither went stale.
+        assert_eq!(
+            proposer.plan(&scheduled(&[("a", 11), ("b", 21)]), &takes),
+            ids(&["a", "b"])
         );
-
-        // `a` recomputed from its first position: whole again.
-        let plan = proposer.plan(&scheduled(&[("a", 0), ("b", 22)]), &takes);
-        assert_eq!(plan, ids(&["a"]));
         let not_b = |id: &str| id != "b";
-        let plan = proposer.plan(&scheduled(&[("a", 1), ("b", 0)]), &not_b);
-        assert_eq!(plan, ids(&["a"]));
+        assert_eq!(
+            proposer.plan(&scheduled(&[("a", 1), ("b", 0)]), &not_b),
+            ids(&["a"])
+        );
 
         let drafts = HashMap::from([("a".to_string(), vec![7, 8])]);
         let none = |_: &str| None;

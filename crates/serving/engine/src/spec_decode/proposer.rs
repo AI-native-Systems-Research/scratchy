@@ -145,8 +145,8 @@ pub struct ProposerStepCtx<'a> {
 /// `ctx.backend`; ngram impls treat it as `&self` effectively.
 pub trait Proposer {
     /// The requests a worker-side draft head runs for in the step `sched` scheduled
-    /// (`SchedulerOutput::draft_req_ids`), of those `takes_drafts` admits. A proposer that drafts
-    /// on the host plans none.
+    /// (`SchedulerOutput::draft_req_ids`), of those `takes_drafts` admits — its pass 1 on every
+    /// one, chained drafts only within its gate. A proposer that drafts on the host plans none.
     fn plan(
         &mut self,
         _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,

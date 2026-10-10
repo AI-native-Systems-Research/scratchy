@@ -22,7 +22,7 @@ pub struct HeadRegistration {
     /// carry them, as both models' kernels bake them.
     pub drafts: u8,
     /// The most sequences a step drafts for (`spec_max_seqs`, its arch.json): a step of more runs
-    /// as its target alone.
+    /// as its target alone, its head's pass 1 priming KV only.
     ///
     /// TODO: one gate per declared device profile and target, computed at expansion from the
     /// verify and plain tapes' costs, in place of one count for every GPU and every target of the
