@@ -317,6 +317,8 @@ const SAMPLER_TELEM_K: u32 = 8;
 /// `row_state` word count per row — MUST equal `ROW_STATE_LEN` in
 /// `shaders/sampling.metal`.
 const ROW_STATE_LEN: usize = 16;
+/// The `row_state` word holding a row's uniform draw.
+const UNIFORM_WORD: usize = 6;
 
 /// The descent's histogram words per row — MUST equal
 /// `DESCENT_ROUNDS * DESCENT_BUCKETS` in `shaders/sampling.metal`.
@@ -647,6 +649,12 @@ impl SamplerArena {
         }
     }
 
+    /// Where job `job`'s uniform lives: the row-state buffer and the word's byte offset.
+    pub fn uniform_slot(&self, job: usize) -> (Buffer, usize) {
+        let word = job * ROW_STATE_LEN + UNIFORM_WORD;
+        (self.row_state_buf.clone(), word * size_of::<u32>())
+    }
+
     /// Fill the arena's shared buffers with THIS step's sampler inputs and
     /// return the lightweight handle the forward followup encodes. Pure host
     /// memcpy — no Metal calls, no allocation. `any_penalty` gates the
@@ -699,7 +707,7 @@ impl SamplerArena {
             s[3] = params.top_ks[r].max(0) as u32;
             s[4] = params.top_ps[r].to_bits();
             s[5] = params.min_ps[r].to_bits();
-            s[6] = params.uniforms[r].to_bits();
+            s[UNIFORM_WORD] = params.uniforms[r].to_bits();
             // cap = effective k; top_k == 0 → MAX_CANDIDATES (the shader's
             // `effective_k` fallback, computed host-side so the descent's
             // `pick` kernel never needs vocab).

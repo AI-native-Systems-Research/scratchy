@@ -1649,27 +1649,28 @@ impl MetalWorker {
         #[cfg(not(feature = "sampler-telemetry"))]
         let telemetry = false;
         // A speculative step the engine pipelines: one leading, whose successor reads its outcome
-        // on the device, and one behind it, which does.
+        // on the device, and one behind it, which does. The engine marks only requests that need
+        // nothing of the host between steps.
         let pipelined = sched.spec_pipeline.leads || sched.spec_pipeline.behind;
-        !telemetry
-            && sched.total_num_scheduled_tokens > 0
+        sched.total_num_scheduled_tokens > 0
             && self.input_batch.num_active() > 0
             && !self.config.is_pooling
             && (pipelined
-                || sched.scheduled_spec_decode_tokens.is_empty()
+                || !telemetry
+                    && sched.scheduled_spec_decode_tokens.is_empty()
                     // A head runs after the steps it drafts from, so every other step defers.
                     && match self.mtp_drafter {
                         Some(_) => sched.draft_req_ids.is_empty(),
                         None => self.draft_model.is_none(),
-                    })
-            && sched.num_scheduled_tokens.keys().all(|req_id| {
-                !self
-                    .sampling_params_map
-                    .get(req_id)
-                    .is_some_and(SamplingParams::reads_history)
-                    && !self.mm_data_buffers.contains_key(req_id)
-                    && !constrained(req_id)
-            })
+                    }
+                    && sched.num_scheduled_tokens.keys().all(|req_id| {
+                        !self
+                            .sampling_params_map
+                            .get(req_id)
+                            .is_some_and(SamplingParams::reads_history)
+                            && !self.mm_data_buffers.contains_key(req_id)
+                            && !constrained(req_id)
+                    }))
     }
 
     /// Wait for the oldest step still on the device and append the tokens it
@@ -1903,6 +1904,54 @@ impl MetalWorker {
                 to(),
                 at(ChainLayout::ROPE),
             ));
+        }
+        Ok(out)
+    }
+
+    /// A step behind a speculative one in flight: each sampled row's uniform, picked on the device
+    /// by how many of its `k` drafts that step keeps (`a`). An unseeded row's seed follows its
+    /// position — the request's tokens before it — which counts that step's as if it kept every
+    /// draft, `k - a` more than it does. (A seeded request's draws are its own stream's, in step
+    /// order: nothing to pick.)
+    fn behind_uniforms(
+        &self,
+        jobs: &[(usize, u32)],
+        req_ids: &[String],
+    ) -> ExecutorResult<Vec<scratchy_target_metal::select_rows::Selection>> {
+        use scratchy_target_metal::select_rows::{SelectFrom, SelectInto, Selection};
+        let fail = |what: &str| {
+            ExecutorError::WorkerExecution(format!(
+                "a sampled step behind a speculative one: {what}"
+            ))
+        };
+        let tail = (self.spec_tail.as_ref()).ok_or_else(|| fail("no step before it"))?;
+        let arena = (self.sampler_arena.as_ref()).ok_or_else(|| fail("no sampler"))?;
+        let mut out = Vec::new();
+        for (n, &(i, _)) in jobs.iter().enumerate() {
+            let req_id = &req_ids[i];
+            if self.seeded_rngs.contains_key(req_id) {
+                continue;
+            }
+            let ahead = jobs[..n].iter().filter(|&&(j, _)| j == i).count();
+            let k = (self.input_batch.num_in_flight(req_id).checked_sub(1))
+                .ok_or_else(|| fail("nothing of it in flight"))?;
+            let laid = self.input_batch.num_generated(req_id) + ahead;
+            let table: Vec<u32> = (0..=k)
+                .map(|a| {
+                    let position = (laid - (k - a)) as u32;
+                    let seed = scratchy_core_common::fnv_seed(req_id, position);
+                    scratchy_core_common::seed_to_uniform(seed).to_bits()
+                })
+                .collect();
+            let (buffer, at) = arena.uniform_slot(n);
+            out.push(Selection {
+                source: SelectFrom::Table(table),
+                stride: 1,
+                len: 1,
+                selector: ((*tail.chain.0).clone(), tail.accepted_at),
+                to: SelectInto::Buffer(buffer),
+                at,
+            });
         }
         Ok(out)
     }
@@ -5906,6 +5955,13 @@ impl Worker for MetalWorker {
             match self.prepare_gpu_sampler(&fused_sample_jobs, &req_ids_in_order) {
                 Ok(ps) => self.pending_sampler = Some(ps),
                 Err(e) => tracing::warn!("fused sampler prep failed ({e}); using argmax fallback"),
+            }
+            if behind && self.pending_sampler.is_some() {
+                let uniforms = self.behind_uniforms(&fused_sample_jobs, &req_ids_in_order)?;
+                let (deferral, _) = (self.deferral.as_mut()).ok_or_else(|| {
+                    ExecutorError::WorkerExecution("a step behind another is not deferred".into())
+                })?;
+                deferral.selections.extend(uniforms);
             }
         }
         let argmax_vec: Vec<u32> = {
