@@ -686,6 +686,13 @@ impl InputBatch {
         self.generated[slot].push(token);
     }
 
+    /// Tokens of `req_id` sampled by steps still on the device, as many as they may keep.
+    pub fn num_in_flight(&self, req_id: &str) -> usize {
+        self.req_id_to_slot
+            .get(req_id)
+            .map_or(0, |&slot| self.in_flight[slot])
+    }
+
     /// Where this request's prompt ends — the position sampling starts at. DERIVED, never stored.
     pub fn prompt_len(&self, req_id: &str) -> usize {
         self.req_id_to_slot

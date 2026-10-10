@@ -604,9 +604,11 @@ impl EngineCore {
 
     /// Where `sched` stands in the speculative pipeline ([`SpecPipeline`]): behind, when it verifies
     /// drafts of a step still unfinalized — its request holds that step's output placeholders
-    /// beside its own; leading, when the executor pipelines and `sched` is one greedy request that
+    /// beside its own; leading, when the executor pipelines and `sched` is one request that
     /// verifies drafts and drafts again, with nothing waiting: its next step's drafts are then
-    /// placeholders, so that step can be scheduled now.
+    /// placeholders, so that step can be scheduled now. A request whose steps need the host between
+    /// them — a grammar's state, an image's — leads nothing; the executor defers every step this
+    /// marks.
     fn mark_pipeline(&mut self, sched: &mut SchedulerOutput) {
         let mut ids = sched.num_scheduled_tokens.iter();
         let (Some((req_id, &scheduled)), None) = (ids.next(), ids.next()) else {
@@ -620,8 +622,9 @@ impl EngineCore {
         let (Some(drafts), true) = (self.head_drafts, self.pipelines_speculative) else {
             return;
         };
-        let greedy = request.sampling_params.is_greedy();
-        if greedy
+        let on_device =
+            request.sampling_params.guided_grammar.is_none() && request.mm_data.is_none();
+        if on_device
             && sched.draft_req_ids.contains(req_id)
             && sched.scheduled_spec_decode_tokens.contains_key(req_id)
             && takes_drafts(&self.scheduler, req_id)
@@ -1849,7 +1852,7 @@ mod tests {
     /// meanwhile waits for every lead to be finalized. The prompt step verifies nothing and leads
     /// nothing; an executor that does not pipeline leads nothing.
     #[test]
-    fn a_greedy_verify_step_leads_the_verify_scheduled_behind_it() {
+    fn a_verify_step_leads_the_verify_scheduled_behind_it() {
         let config = || EngineCoreConfig {
             async_scheduling: true,
             scheduler_config: SchedulerConfig {
@@ -1866,17 +1869,25 @@ mod tests {
             )),
             ..make_spec_decode_config()
         };
-        let request = |id: &str| {
-            let params = SamplingParams {
-                max_tokens: Some(50),
-                temperature: 0.0,
-                ..Default::default()
-            };
-            Request::new(id.to_string(), vec![1, 2, 3, 4], params, 0.0, 0, 0, None)
+        let greedy = SamplingParams {
+            max_tokens: Some(50),
+            temperature: 0.0,
+            ..Default::default()
         };
-        // The prompt step, finalized with the drafts its head made.
-        let prompt = |engine: &mut EngineCore, executor: &mut Box<dyn Executor>| {
-            engine.add_request(request("a"));
+        let request = |id: &str, params: &SamplingParams| {
+            Request::new(
+                id.to_string(),
+                vec![1, 2, 3, 4],
+                params.clone(),
+                0.0,
+                0,
+                0,
+                None,
+            )
+        };
+        // The prompt step of request "a", finalized with the drafts its head made.
+        let prompt = |engine: &mut EngineCore, executor: &mut Box<dyn Executor>, a: Request| {
+            engine.add_request(a);
             let prefill = engine.schedule_next().expect("the prompt");
             assert!(
                 prefill.draft_req_ids.contains("a"),
@@ -1891,14 +1902,14 @@ mod tests {
         let plain = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config(), plain);
         let mut executor = engine.take_executor().expect("an executor");
-        prompt(&mut engine, &mut executor);
+        prompt(&mut engine, &mut executor, request("a", &greedy));
         let verify = engine.schedule_next().expect("the first verify");
         assert_eq!(verify.spec_pipeline, Default::default());
 
-        let pipelining = Box::new(NoopExecutor::new(1024).with_pipelining());
-        let mut engine = EngineCore::new(config(), pipelining);
+        let pipelining = || Box::new(NoopExecutor::new(1024).with_pipelining());
+        let mut engine = EngineCore::new(config(), pipelining());
         let mut executor = engine.take_executor().expect("an executor");
-        prompt(&mut engine, &mut executor);
+        prompt(&mut engine, &mut executor, request("a", &greedy));
         let lead = engine.schedule_next().expect("the first verify");
         assert_eq!(lead.scheduled_spec_decode_tokens["a"], [7, 8]);
         assert!(lead.spec_pipeline.leads && !lead.spec_pipeline.behind);
@@ -1913,7 +1924,7 @@ mod tests {
         assert_eq!(verify.scheduled_spec_decode_tokens["a"], [0, 0]);
         assert!(verify.spec_pipeline.behind && verify.spec_pipeline.leads);
 
-        engine.add_request(request("b"));
+        engine.add_request(request("b", &greedy));
         assert!(engine.schedule_next().is_none(), "b waits behind the leads");
         let _ = engine.finalize_step(&lead, &out);
         assert!(engine.schedule_next().is_none(), "the verify still leads");
@@ -1922,6 +1933,34 @@ mod tests {
         let next = engine.schedule_next().expect("b is admitted");
         assert!(next.num_scheduled_tokens.contains_key("b"));
         assert!(!next.spec_pipeline.leads, "two requests lead nothing");
+
+        // A sampled request leads as a greedy one does; one whose steps need the host between
+        // them — its grammar's state, its image's — leads nothing.
+        let sampled = SamplingParams {
+            temperature: 0.8,
+            ..greedy.clone()
+        };
+        let grammar = SamplingParams {
+            guided_grammar: Some(scratchy_core_common::sampling::GuidedGrammar::Json),
+            ..greedy.clone()
+        };
+        let mut image = request("a", &greedy);
+        image.mm_data = Some(scratchy_core_common::MultimodalData {
+            images: Vec::new(),
+            image_placeholders: Vec::new(),
+        });
+        let cases = [
+            ("sampled", request("a", &sampled), true),
+            ("grammar", request("a", &grammar), false),
+            ("image", image, false),
+        ];
+        for (name, a, leads) in cases {
+            let mut engine = EngineCore::new(config(), pipelining());
+            let mut executor = engine.take_executor().expect("an executor");
+            prompt(&mut engine, &mut executor, a);
+            let verify = engine.schedule_next().expect("the first verify");
+            assert_eq!(verify.spec_pipeline.leads, leads, "{name}");
+        }
     }
 
     #[test]
