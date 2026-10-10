@@ -5,7 +5,8 @@
 //! - Decode (one query per sequence): `attention_via_cache_v2` with
 //!   `ATTN_TQ_BITS`, reading the packed store in the codebook domain, each
 //!   threadgroup serving the production `TqDecodeHeads` query heads; or
-//!   `attention_decode_gqa_tq`, each KV head's 8 query heads together over
+//!   `attention_decode_gqa_tq`, each KV head's whole query-head group
+//!   together (the GQA ratio, at most the matrix units' 8 rows) over
 //!   `ATTN_SPLITS` threadgroups, merged by `attention_via_cache_v2_combine`.
 //! - Prefill (a chunk of queries per sequence): `tq_stage_rotated` stages K and
 //!   V in the codebook's rotated domain, `tq_rotate_rows` rotates q in and the
@@ -680,7 +681,10 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         if c.rope.is_some_and(|r| r.coresident) {
             consts.push(ConstantValue::uint(12, 1));
         }
-        let binds = [
+        if offset_on {
+            consts.extend([k_bias, v_bias]);
+        }
+        let mut binds = vec![
             (&q, 1),
             (&seq_used, 2),
             (&block_table, 3),
@@ -694,8 +698,11 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             (&signs, 11),
             (&centroids, 12),
             (&slot_mapping, 13),
-            (&partials, 16),
         ];
+        if offset_on {
+            binds.extend([(&kb, 14), (&vb, 15)]);
+        }
+        binds.push((&partials, 16));
         let attention = pso(
             "attention",
             format!("attention_decode_gqa_tq_{}_specialized", c.dtype.tag()),
@@ -712,7 +719,11 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             ),
             consts,
         );
-        let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
+        let mut binds = vec![(&out, 0), (&signs, 11)];
+        if offset_on {
+            binds.push((&vb, 15));
+        }
+        binds.push((&partials, 16));
         let grid = tg(n_seqs, c.num_q_heads, 1);
         batch.encode(&combine, &binds, &[], &[], &[], grid, tg(128, 1, 1));
     } else if decode {
@@ -1167,6 +1178,98 @@ fn decode_gemma4_global_gqa_eight_sequences() {
             (2, 1),
         ],
         ..gemma4_global("decode gemma4 global gqa eight seqs")
+    });
+}
+
+/// qwen2.5-7b: GQA 7 — 28 query heads over 4 KV heads, 4-bit — a group smaller
+/// than the matrix units' 8 rows, its empty fragment rows zero-padded. Whole and
+/// over two and sixteen threadgroups, span blocks re-roped, the step's own key
+/// from the cache: the split kernel serving the group a production model has.
+#[test]
+fn decode_qwen7b_gqa_group_seven() {
+    for splits in [1, 2, 16] {
+        check(Case {
+            num_q_heads: 28,
+            num_kv_heads: 4,
+            bits: 4,
+            gqa: Some(splits),
+            span_blocks: vec![1, 14],
+            ..llama_3b("decode qwen-7b gqa group 7")
+        });
+    }
+}
+
+/// The other groups below the matrix rows, all 4-bit over four threadgroups:
+/// GQA 3 (llama-3.2's 24 over 8) stages a head a simdgroup with one idle, GQA 4
+/// (mistral's 32 over 8) one each, GQA 2 (16 over 8) takes the two-simdgroups-a-
+/// head staging — four simdgroups at head_dim 128 — and GQA 1 (MQA, 8 over 1)
+/// runs one head over seven zero rows.
+#[test]
+fn decode_gqa_groups_below_four() {
+    for (nq, nkv) in [(24, 8), (32, 8), (16, 8), (8, 1)] {
+        check(Case {
+            num_q_heads: nq,
+            num_kv_heads: nkv,
+            bits: 4,
+            gqa: Some(4),
+            ..llama_3b("decode gqa groups below four")
+        });
+    }
+}
+
+/// GQA 4 at head_dim 256: eight simdgroups, two a head — the pair staging at a
+/// width the key groups split (two of them, four simdgroups each), a span block
+/// re-roped through it.
+#[test]
+fn decode_gqa_group_four_head_dim_256() {
+    check(Case {
+        head_dim: 256,
+        num_q_heads: 32,
+        num_kv_heads: 8,
+        bits: 4,
+        attn_scale: 1.0 / 16.0,
+        gqa: Some(2),
+        span_blocks: vec![3],
+        ..llama_3b("decode gqa group 4 hd256")
+    });
+}
+
+/// Qwen2.5-7b's biased form on the split path: the packed store's centered codes, the K bias's
+/// q·R_i·b back in the score, the own key's V centered for the combine's one V-bias add. Whole
+/// and over two and sixteen threadgroups, span blocks re-roped, the step's own key from the
+/// cache.
+#[test]
+fn decode_qwen7b_gqa_group_seven_biased_kv() {
+    for splits in [1, 2, 16] {
+        check(Case {
+            gqa: Some(splits),
+            span_blocks: vec![1, 14],
+            ..qwen2_7b("decode qwen-7b gqa group 7 biased")
+        });
+    }
+}
+
+/// The biased group's write-skipped own key: packed and centered like the rest, in a span block.
+#[test]
+fn decode_qwen7b_gqa_group_seven_biased_kv_write_skipped_key() {
+    check(Case {
+        gqa: Some(4),
+        span_blocks: vec![14],
+        first_new_write_skipped: true,
+        ..qwen2_7b("decode qwen-7b gqa group 7 biased write-skipped key")
+    });
+}
+
+/// A biased group of four (qwen3's 32 over 8): the loop-branch query staging with the bias
+/// registers live.
+#[test]
+fn decode_gqa_group_four_biased_kv() {
+    check(Case {
+        num_q_heads: 32,
+        num_kv_heads: 8,
+        gqa: Some(2),
+        span_blocks: vec![3],
+        ..qwen2_7b("decode gqa group 4 biased")
     });
 }
 
