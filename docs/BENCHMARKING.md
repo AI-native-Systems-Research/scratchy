@@ -5,9 +5,46 @@ report.
 
 | harness | question | scenarios |
 |---|---|---|
+| [`scripts/bench_perf_regress.sh`](../scripts/bench_perf_regress.sh) | did *our own* numbers move vs the locked baseline | per-arch decode / fold / prefill cells (see [the perf regression gate](#the-perf-regression-gate)) |
 | [`scripts/bench_serve_compare.sh`](../scripts/bench_serve_compare.sh) | steady-state serving throughput and latency under load | input × output × concurrency sweep |
 | `scr bench startup --exec` | how long from `exec` until the user sees a word | frozen / cold / warm cache ladder |
 | `scr bench startup` (no `--exec`) | in-process engine construction cost | cold / warm iterations |
+
+## The perf regression gate
+
+[`scripts/bench_perf_regress.sh`](../scripts/bench_perf_regress.sh) locks per-arch
+performance to a recorded baseline so a change that moves a number has to say so.
+It is the gate every `perf:` change runs through, and the results table belongs in
+the commit message / PR body of every `perf:` commit.
+
+- **What runs:** one `scr bench latency` per (model, cell) over the manifest in the
+  script — one canonical model per supported arch — against a binary built from the
+  worktree it runs in. Three cells per model, all with prefix caching **off** so
+  every iteration pays its full prefill: `decode1` (in 64 / out 128 / bs 1),
+  `fold4` (in 64 / out 128 / bs 4), `prefill2k` (in 2048 / out 8 / bs 1). The
+  metric is the p50 of per-iteration total latency: engine-internal, greedy, fixed
+  token-id prompts, detokenization excluded — no server, no HTTP, no sampling
+  noise.
+- **What it locks:** `scripts/perf-regress/baselines/<chip>.json`, one baseline per
+  chip, two-sided bands per cell — ±5% for decode/fold (they repeat to ±3.5%
+  back-to-back) and ±15% for prefill (measured cross-process drift up to ±13%:
+  within a run p99≈p50, so the shift is between processes — memory layout,
+  thermal/power state). A cell outside its band in *either* direction fails the
+  run — faster is a behavior change worth acknowledging too.
+- **SKIPPED rows:** a model whose weights are not in the HF cache is skipped, not
+  failed. A chip's locked coverage is exactly what it ran; the manifest still
+  names every arch, so a machine with the weights picks the row up on its next
+  `--update`.
+- **Recording:** `scripts/bench_perf_regress.sh --update --markdown` re-records the
+  baseline for this chip and prints the table. `--quick` runs the small-model tier
+  in minutes; the full pass is what a `perf:` PR that touches shared paths should
+  show. Run it on AC power, from a worktree of the commit under test, with no
+  other scr process alive.
+- **Policy:** a `perf:` commit re-records the baseline for the chip it measured on
+  in the same commit and carries the table in its message. Anything else that
+  moves outside the band is a regression to fix or explain before merge.
+
+---
 
 ## `--exec` vs plain `bench startup` — two different measurements
 

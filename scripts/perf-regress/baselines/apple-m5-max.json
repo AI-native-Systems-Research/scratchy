@@ -1,0 +1,65 @@
+{
+  "bands": {
+    "decode1": 0.05,
+    "fold4": 0.05,
+    "prefill2k": 0.15
+  },
+  "chip": "Apple M5 Max",
+  "models": {
+    "gemma-3-1b-it": {
+      "decode1": 247.4005415,
+      "fold4": 433.950875,
+      "prefill2k": 81.41104150000001
+    },
+    "gemma-4-26b-a4b-it": {
+      "decode1": 725.5900829999999,
+      "fold4": 1668.561083,
+      "prefill2k": 413.9282085
+    },
+    "glm-4.5-air": {
+      "decode1": 2106.1052499999996,
+      "fold4": 5237.1124795000005,
+      "prefill2k": 1721.065917
+    },
+    "gpt-oss-20b": {
+      "decode1": 697.5965625,
+      "fold4": 1968.1660005,
+      "prefill2k": 3887.0302915
+    },
+    "granite-3.3-2b-instruct": {
+      "decode1": 423.0613335,
+      "fold4": 749.2726465,
+      "prefill2k": 235.0903545
+    },
+    "llama-3.2-1b": {
+      "decode1": 196.744125,
+      "fold4": 344.799125,
+      "prefill2k": 90.2766455
+    },
+    "qwen2.5-3b": {
+      "decode1": 505.91712450000006,
+      "fold4": 892.2553330000001,
+      "prefill2k": 275.0348955
+    },
+    "qwen3-0.6b": {
+      "decode1": 146.4520835,
+      "fold4": 303.82681249999996,
+      "prefill2k": 75.00008299999999
+    },
+    "qwen3.5-0.8b": {
+      "decode1": 171.8365625,
+      "fold4": 334.8780625,
+      "prefill2k": 81.8167915
+    },
+    "qwen3.6-35b-a3b": {
+      "decode1": 625.368438,
+      "fold4": 1380.9604375,
+      "prefill2k": 341.35629199999994
+    }
+  },
+  "repo": {
+    "branch": "perf-regress-test",
+    "dirty": true,
+    "sha": "ae124bbef4ad96aea04557fe2d0c76308e89b639"
+  }
+}
