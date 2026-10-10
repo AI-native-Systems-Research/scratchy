@@ -45,6 +45,11 @@ pub struct ModelParams {
     /// `rms_norm_eps`. Downstream callers read these by name; this
     /// module doesn't know which ones are used where.
     pub scalars: BTreeMap<String, f64>,
+    /// Config-derived layer-index sets, keyed by the name a DSL
+    /// `if layer in <name>:` predicate reads (`mamba_layers`, …) — see
+    /// [`derive_layer_sets`]. Empty for configs without a per-layer
+    /// block schedule.
+    pub layer_sets: BTreeMap<String, LayerSet>,
     /// Parsed `quantization_config` subobject, if present in the
     /// JSON. `None` for plain dense models. Consumers resolve
     /// per-weight storage format via
@@ -245,6 +250,13 @@ pub enum ConfigError {
         path: PathBuf,
         reason: String,
     },
+    /// A per-layer block schedule (`hybrid_override_pattern` /
+    /// `layers_block_type` / `layer_types`) that names an unknown block
+    /// or disagrees with `num_hidden_layers`.
+    LayerPattern {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -267,6 +279,9 @@ impl std::fmt::Display for ConfigError {
             }
             Self::ArchJson { path, reason } => {
                 write!(f, "arch declaration {}: {reason}", path.display())
+            }
+            Self::LayerPattern { path, reason } => {
+                write!(f, "layer schedule in {}: {reason}", path.display())
             }
         }
     }
@@ -1339,6 +1354,17 @@ fn resolve_arch_spec(
     {
         a.decoder_prefix = Some(p.to_string());
     }
+    if let Some(r) = json
+        .get("decoder_safetensors_root")
+        .and_then(|v| v.as_str())
+    {
+        a.decoder_root = Some(r.to_string());
+    }
+    assert!(
+        a.decoder_prefix.is_none() || a.decoder_root.is_none(),
+        "config `{source_stem}`: decoder_safetensors_prefix (a wrapper around `model`) and \
+         decoder_safetensors_root (a rename of `model`) are exclusive",
+    );
     if let Some(s) = json.get("scale_dtype").and_then(|v| v.as_str()) {
         assert!(
             matches!(s, "f16" | "bf16"),
@@ -1375,6 +1401,11 @@ fn model_params_from_json(
     let name = parse_name(source_stem, source_path)?;
     let mut bounds = extract_bounds(json);
     derive_sliding_window_pattern(json, &mut bounds);
+    let layer_sets =
+        derive_layer_sets(json, &mut bounds).map_err(|reason| ConfigError::LayerPattern {
+            path: source_path.to_path_buf(),
+            reason,
+        })?;
     derive_implicit_bounds(&mut bounds);
     // Arch-declared bound defaults (zero-centered norms, sliding
     // cadence, router renorm, …): explicit config values always win.
@@ -1414,6 +1445,7 @@ fn model_params_from_json(
         source_path: source_path.to_path_buf(),
         bounds,
         scalars,
+        layer_sets,
         quantization,
         tie_word_embeddings,
         architectures,
@@ -1540,6 +1572,7 @@ fn vision_params_from_json(
         source_path: source_path.to_path_buf(),
         bounds,
         scalars,
+        layer_sets: BTreeMap::new(),
         quantization,
         tie_word_embeddings,
         architectures,
@@ -1637,6 +1670,14 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     let as_str = |k: &str| json.get(k).and_then(|v| v.as_str()).map(str::to_string);
     spec.pos_embed_key = as_str("vision_pos_embed_key");
     spec.decoder_prefix = as_str("decoder_safetensors_prefix");
+    spec.decoder_root = as_str("decoder_safetensors_root");
+    if spec.decoder_prefix.is_some() && spec.decoder_root.is_some() {
+        return Err(ConfigError::ArchJson {
+            path: path.clone(),
+            reason: "decoder_safetensors_prefix and decoder_safetensors_root are exclusive"
+                .to_string(),
+        });
+    }
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
 
@@ -1684,6 +1725,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "vision_pos_emb_interp",
     "vision_norm_eps",
     "decoder_safetensors_prefix",
+    "decoder_safetensors_root",
     "scale_dtype",
     "tie_default",
     "bound_defaults",
@@ -2165,6 +2207,151 @@ fn derive_sliding_window_pattern(json: &serde_json::Value, bounds: &mut BTreeMap
     if let Some(idx) = types.iter().position(|t| t.as_str() != Some(first)) {
         bounds.insert("sliding_window_pattern".to_string(), (idx + 1) as u64);
     }
+}
+
+/// One block of a hybrid per-layer schedule — what mlx-lm's
+/// `nemotron_h.ModelArgs._block_type_to_char` normalizes every spelling
+/// to (`M` / `*` / `E` / `-`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HybridBlock {
+    Mamba,
+    Attention,
+    Moe,
+    Mlp,
+}
+
+impl HybridBlock {
+    const ALL: [Self; 4] = [Self::Mamba, Self::Attention, Self::Moe, Self::Mlp];
+
+    /// A `hybrid_override_pattern` character.
+    fn from_pattern_char(c: char) -> Option<Self> {
+        match c {
+            'M' => Some(Self::Mamba),
+            '*' => Some(Self::Attention),
+            'E' => Some(Self::Moe),
+            '-' => Some(Self::Mlp),
+            _ => None,
+        }
+    }
+
+    /// A transformers >= 5.13 `layers_block_type` / `layer_types` entry,
+    /// legacy spellings included.
+    fn from_block_type(s: &str) -> Option<Self> {
+        match s {
+            "linear_attention" | "mamba" | "conv" => Some(Self::Mamba),
+            "full_attention" | "attention" => Some(Self::Attention),
+            "moe" => Some(Self::Moe),
+            "mlp" => Some(Self::Mlp),
+            _ => None,
+        }
+    }
+
+    /// The layer-set name a DSL predicate reads (`if layer in mamba_layers:`).
+    pub fn set_name(self) -> &'static str {
+        match self {
+            Self::Mamba => "mamba_layers",
+            Self::Attention => "attention_layers",
+            Self::Moe => "moe_layers",
+            Self::Mlp => "mlp_layers",
+        }
+    }
+}
+
+/// A set of layer indices derived from the config's block schedule,
+/// read by `if layer in <name>:`. Sorted and deduplicated by
+/// construction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayerSet(Vec<u64>);
+
+impl LayerSet {
+    pub fn members(&self) -> &[u64] {
+        &self.0
+    }
+}
+
+/// Derive the per-block layer sets (`mamba_layers`, `attention_layers`,
+/// `moe_layers`, `mlp_layers`) from the config's per-layer block
+/// schedule, the way mlx-lm's `nemotron_h.ModelArgs.__post_init__`
+/// normalizes it: `hybrid_override_pattern` (a string, or a list of
+/// one-character strings) wins; otherwise `layers_block_type`, then
+/// `layer_types`, mapped through [`HybridBlock::from_block_type`].
+///
+/// `hybrid_override_pattern` is unambiguous, so an unknown character is
+/// an error. `layer_types` is shared with non-hybrid schedules (Gemma's
+/// `sliding_attention`), so a list naming any non-block entry derives
+/// nothing. A schedule's length IS the layer count: it fills an absent
+/// `num_hidden_layers` and must equal a present one. All four sets are
+/// inserted once a schedule exists, so an absent block kind reads as the
+/// empty set rather than an unknown name.
+pub(crate) fn derive_layer_sets(
+    json: &serde_json::Value,
+    bounds: &mut BTreeMap<String, u64>,
+) -> Result<BTreeMap<String, LayerSet>, String> {
+    let pattern_block = |c: char| {
+        HybridBlock::from_pattern_char(c)
+            .ok_or_else(|| format!("hybrid_override_pattern: unknown block `{c}`"))
+    };
+    let schedule: Vec<HybridBlock> = match json.get("hybrid_override_pattern") {
+        Some(serde_json::Value::String(p)) => {
+            p.chars().map(pattern_block).collect::<Result<_, _>>()?
+        }
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                let s = v.as_str().unwrap_or_default();
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => pattern_block(c),
+                    _ => Err(format!(
+                        "hybrid_override_pattern: `{v}` is not one block character"
+                    )),
+                }
+            })
+            .collect::<Result<_, _>>()?,
+        Some(other) => {
+            return Err(format!(
+                "hybrid_override_pattern: expected a string or a list, got {other}"
+            ));
+        }
+        None => {
+            let Some(types) = ["layers_block_type", "layer_types"]
+                .iter()
+                .find_map(|k| json.get(k).and_then(|v| v.as_array()))
+            else {
+                return Ok(BTreeMap::new());
+            };
+            let Some(schedule) = types
+                .iter()
+                .map(|t| t.as_str().and_then(HybridBlock::from_block_type))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(BTreeMap::new());
+            };
+            schedule
+        }
+    };
+    if schedule.is_empty() {
+        return Err("the block schedule is empty".to_string());
+    }
+    let n = schedule.len() as u64;
+    match bounds.get("num_hidden_layers") {
+        Some(&declared) if declared != n => {
+            return Err(format!(
+                "the block schedule names {n} layers but num_hidden_layers is {declared}"
+            ));
+        }
+        Some(_) => {}
+        None => {
+            bounds.insert("num_hidden_layers".to_string(), n);
+        }
+    }
+    Ok(HybridBlock::ALL
+        .into_iter()
+        .map(|block| {
+            let members = (0..n).filter(|&l| schedule[l as usize] == block).collect();
+            (block.set_name().to_string(), LayerSet(members))
+        })
+        .collect())
 }
 
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
@@ -2683,6 +2870,188 @@ mod tests {
         assert_eq!(bounds.get("k_global_dim"), bounds.get("kv_dim"));
         assert_eq!(bounds.get("q_global_dim"), Some(&2048)); // 32 * 64
         assert_eq!(bounds.get("k_global_dim"), Some(&512)); // 8 * 64
+    }
+
+    fn layer_sets(json: serde_json::Value) -> Result<BTreeMap<String, Vec<u64>>, String> {
+        derive_layer_sets(&json, &mut BTreeMap::new()).map(|sets| {
+            sets.into_iter()
+                .map(|(k, v)| (k, v.members().to_vec()))
+                .collect()
+        })
+    }
+
+    /// Every spelling of a hybrid block schedule derives the same four
+    /// sets: the pattern string, the list-of-characters form, and the
+    /// transformers >= 5.13 `layers_block_type` / `layer_types` names
+    /// (legacy `mamba` / `attention` included).
+    #[test]
+    fn layer_sets_derive_from_every_schedule_spelling() {
+        let want: BTreeMap<String, Vec<u64>> = [
+            ("mamba_layers", vec![0, 2, 5]),
+            ("attention_layers", vec![3]),
+            ("moe_layers", vec![1, 4]),
+            ("mlp_layers", vec![6]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let types = [
+            "mamba",
+            "moe",
+            "linear_attention",
+            "full_attention",
+            "moe",
+            "conv",
+            "mlp",
+        ];
+        for json in [
+            serde_json::json!({ "hybrid_override_pattern": "MEM*EM-" }),
+            serde_json::json!({ "hybrid_override_pattern": ["M", "E", "M", "*", "E", "M", "-"] }),
+            serde_json::json!({ "layers_block_type": types }),
+            serde_json::json!({ "layer_types": types }),
+        ] {
+            assert_eq!(layer_sets(json).as_ref(), Ok(&want));
+        }
+        // The pattern wins over a block-type list.
+        let json = serde_json::json!({
+            "hybrid_override_pattern": "MEM*EM-",
+            "layers_block_type": ["moe"],
+        });
+        assert_eq!(layer_sets(json), Ok(want));
+    }
+
+    /// A schedule's length is the layer count: it fills an absent
+    /// `num_hidden_layers` and must agree with a present one. An unknown
+    /// pattern character is an error; a `layer_types` list naming a
+    /// non-block entry (Gemma's `sliding_attention`) derives nothing.
+    #[test]
+    fn layer_sets_check_the_layer_count_and_the_vocabulary() {
+        let mut bounds = BTreeMap::new();
+        let json = serde_json::json!({ "hybrid_override_pattern": "M*E" });
+        derive_layer_sets(&json, &mut bounds).expect("derive");
+        assert_eq!(bounds.get("num_hidden_layers"), Some(&3));
+        bounds.insert("num_hidden_layers".to_string(), 4);
+        assert!(derive_layer_sets(&json, &mut bounds).is_err());
+        assert!(layer_sets(serde_json::json!({ "hybrid_override_pattern": "M*X" })).is_err());
+        assert!(layer_sets(serde_json::json!({ "hybrid_override_pattern": ["ME"] })).is_err());
+        assert!(layer_sets(serde_json::json!({ "hybrid_override_pattern": "" })).is_err());
+        let gemma = serde_json::json!({ "layer_types": ["sliding_attention", "full_attention"] });
+        assert_eq!(layer_sets(gemma), Ok(BTreeMap::new()));
+        assert_eq!(layer_sets(serde_json::json!({})), Ok(BTreeMap::new()));
+    }
+
+    /// The checked-in Nemotron-3 configs, through the full decoder parse
+    /// with their arch.json: the irregular pattern's sets, the
+    /// `backbone` decoder root, the `layer_norm_epsilon` alias, and the
+    /// Mamba-2 widths the arch's `params` derive.
+    #[test]
+    fn nemotron_h_configs_derive_their_schedule_and_widths() {
+        for (arch, stem, layers, attn, mamba_heads) in [
+            ("nemotron-h", "nemotron-3-nano-30b-a3b", 52, 6, 64),
+            (
+                "nemotron-h-latent",
+                "nemotron-3-super-120b-a12b",
+                88,
+                8,
+                128,
+            ),
+        ] {
+            let dir = repo_model_archs(arch);
+            let spec = load_arch_json(&dir).expect("arch.json");
+            let path = dir.join(format!("{stem}.json"));
+            let json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            let set = |name: &str| mp.layer_sets.get(name).expect(name).members().to_vec();
+            let (mamba, attention, moe, mlp) = (
+                set("mamba_layers"),
+                set("attention_layers"),
+                set("moe_layers"),
+                set("mlp_layers"),
+            );
+            assert_eq!(mp.bounds["num_hidden_layers"], layers);
+            assert_eq!(attention.len(), attn, "{stem}");
+            assert_eq!(mamba.len() + attention.len() + moe.len(), layers as usize);
+            assert!(mlp.is_empty());
+            assert_eq!(
+                (mamba[0], moe[0]),
+                (0, 1),
+                "{stem}: the schedule opens `ME`"
+            );
+            assert_eq!(
+                *moe.last().unwrap(),
+                layers - 1,
+                "{stem}: and closes on `E`"
+            );
+            assert_eq!(mp.arch.decoder_root(), "backbone");
+            assert_eq!(mp.scalars.get("rms_norm_eps"), Some(&1e-5));
+            let (h, p, g, s) = (mamba_heads, 64, 8, 128);
+            assert_eq!(mp.bounds["mamba_d_inner"], h * p);
+            assert_eq!(mp.bounds["mamba_conv_dim"], h * p + 2 * g * s);
+            assert_eq!(mp.bounds["mamba_in_proj_dim"], 2 * h * p + 2 * g * s + h);
+        }
+        // Super: in_proj 2·8192 + 2·8·128 + 128, conv_dim 10240 (brief).
+        let dir = repo_model_archs("nemotron-h-latent");
+        let spec = load_arch_json(&dir).expect("arch.json");
+        let path = dir.join("nemotron-3-super-120b-a12b.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        let mp = model_params_from_json(&json, "s", &path, Vec::new(), &spec).expect("parse");
+        assert_eq!(mp.bounds["mamba_conv_dim"], 10240);
+        assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
+    }
+
+    /// The parity-tiny configs keep every property the carrier gate
+    /// needs: all three block kinds, an aperiodic schedule, grouped
+    /// B/C (`n_groups > 1`) shared by several heads each, GQA, top-k > 1,
+    /// and (Super) a latent width below the hidden width.
+    #[test]
+    fn nemotron_h_parity_tiny_configs_exercise_every_path() {
+        for (arch, stem, latent) in [
+            ("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny", false),
+            (
+                "nemotron-h-latent",
+                "nemotron-3-super-120b-a12b-parity-tiny",
+                true,
+            ),
+        ] {
+            let dir = repo_model_archs(arch);
+            let spec = load_arch_json(&dir).expect("arch.json");
+            let path = dir.join(format!("{stem}.json"));
+            let json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            let b = |k: &str| mp.bounds[k];
+            let set = |name: &str| mp.layer_sets[name].members().to_vec();
+            for kind in ["mamba_layers", "attention_layers", "moe_layers"] {
+                assert!(!set(kind).is_empty(), "{stem}: no {kind}");
+            }
+            let n = b("num_hidden_layers") as usize;
+            let schedule: Vec<&str> = (0..n as u64)
+                .map(|l| {
+                    [
+                        "mamba_layers",
+                        "attention_layers",
+                        "moe_layers",
+                        "mlp_layers",
+                    ]
+                    .into_iter()
+                    .find(|k| mp.layer_sets[*k].members().contains(&l))
+                    .expect("every layer has a block")
+                })
+                .collect();
+            assert!(
+                (1..n).all(|p| (0..n).any(|l| schedule[l] != schedule[l % p])),
+                "{stem}: schedule is periodic"
+            );
+            assert!(b("n_groups") > 1 && b("mamba_num_heads") / b("n_groups") > 1);
+            assert!(b("num_attention_heads") / b("num_key_value_heads") > 1);
+            assert!(b("num_experts_per_tok") > 1);
+            assert_eq!(latent, mp.bounds.contains_key("moe_latent_size"));
+            if latent {
+                assert!(b("moe_latent_size") < b("hidden_size"));
+            }
+        }
     }
 
     /// `sliding_window_pattern` is read off the verbatim `layer_types`

@@ -29,7 +29,7 @@
 //! Anything else — classes, comprehensions, walrus, star-args, keyword
 //! args, `while`, `try`, one-line suites, tabs — is a loud error.
 
-use crate::ast::{Ast, BoolExpr, BoundExpr, DimSpec, Expr, Stmt};
+use crate::ast::{Ast, BoolExpr, BoundExpr, DimSpec, Expr, InSet, Stmt};
 use proc_macro2::Span;
 use std::fmt;
 
@@ -1217,7 +1217,7 @@ fn lower_bool(e: &PyExpr, span: Span) -> Result<BoolExpr, String> {
         err(
             e.at(),
             "`if` condition must be `ivar % N == M`, `ivar % N != M`, `ivar < N`, \
-             or `ivar in [lit, lit, ...]`",
+             `ivar in [lit, lit, ...]`, or `ivar in <layer set>`",
         )
     };
     let ivar_of = |x: &PyExpr| match x {
@@ -1232,21 +1232,27 @@ fn lower_bool(e: &PyExpr, span: Span) -> Result<BoolExpr, String> {
     };
     match (op, &**lhs) {
         (CmpOp::In, _) => {
-            let PyExpr::List(elts, _) = &**rhs else {
-                return Err(err(
-                    rhs.at(),
-                    "`in` predicate requires a list literal `[lit, lit, ...]`",
-                ));
+            let members = match &**rhs {
+                PyExpr::List(elts, _) if elts.is_empty() => {
+                    return Err(err(rhs.at(), "`in` list must have at least one element"));
+                }
+                PyExpr::List(elts, _) => InSet::Lit(
+                    elts.iter()
+                        .map(|m| int_lit(m, "an `in` list element"))
+                        .collect::<Result<_, _>>()?,
+                ),
+                PyExpr::Name(n, _) => InSet::Named(ident(n, span)),
+                other => {
+                    return Err(err(
+                        other.at(),
+                        "`in` predicate requires a list literal `[lit, lit, ...]` or a \
+                         config-derived layer set name",
+                    ));
+                }
             };
-            if elts.is_empty() {
-                return Err(err(rhs.at(), "`in` list must have at least one element"));
-            }
             Ok(BoolExpr::In {
                 ivar: ivar_of(lhs)?,
-                members: elts
-                    .iter()
-                    .map(|m| int_lit(m, "an `in` list element"))
-                    .collect::<Result<_, _>>()?,
+                members,
             })
         }
         (
@@ -1699,7 +1705,47 @@ mod tests {
                 ..
             } => {
                 assert_eq!(ivar.to_string(), "layer");
-                assert_eq!(members, &vec![7u64, 15, 23, 31]);
+                assert_eq!(members, &InSet::Lit(vec![7u64, 15, 23, 31]));
+            }
+            other => panic!("expected In If, got {other:?}"),
+        }
+    }
+
+    /// Both Nemotron-H carriers parse as written, and every layer branches on a config-derived
+    /// layer set — the irregular `hybrid_override_pattern` has no `%` / `<` form.
+    #[test]
+    fn nemotron_h_carriers_parse() {
+        for arch in ["nemotron-h", "nemotron-h-latent"] {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../models/arch/dsl")
+                .join(format!("{arch}.py"));
+            let src = std::fs::read_to_string(&path).expect("read carrier");
+            let carrier = parse_python_file(&src).unwrap_or_else(|e| panic!("{arch}: {e}"));
+            let text = format!("{:?}", carrier.ast);
+            for set in ["mamba_layers", "attention_layers", "moe_layers"] {
+                assert!(text.contains(set), "{arch}: no `{set}` predicate");
+            }
+        }
+    }
+
+    #[test]
+    fn if_in_named_layer_set_parses() {
+        let ast = body(
+            "
+            for layer in range(num_hidden_layers):
+                if layer in mamba_layers:
+                    x = gemm(a, b)
+                else:
+                    x = gemm(a, b)
+            ",
+        );
+        match &loop_body(&ast)[0] {
+            Stmt::If {
+                cond: BoolExpr::In { ivar, members },
+                ..
+            } => {
+                assert_eq!(ivar.to_string(), "layer");
+                assert!(matches!(members, InSet::Named(n) if n == "mamba_layers"));
             }
             other => panic!("expected In If, got {other:?}"),
         }

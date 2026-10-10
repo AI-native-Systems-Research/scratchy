@@ -8179,6 +8179,7 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         OpKind::Embed
         | OpKind::RopeAppend
         | OpKind::RopeAppendInterleaved
+        | OpKind::KvAppend
         | OpKind::Attention
         | OpKind::SlidingAttention
         | OpKind::VarlenAttention
@@ -8186,6 +8187,7 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::Gelu
         | OpKind::QuickGelu
         | OpKind::GeluErf
+        | OpKind::Relu2
         | OpKind::TanhSoftCap
         | OpKind::ScalarWeightMul
         | OpKind::Add
@@ -16648,6 +16650,7 @@ mod tests {
             source_path: std::path::PathBuf::new(),
             bounds,
             scalars,
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16695,6 +16698,7 @@ mod tests {
                 b
             },
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16776,6 +16780,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect::<std::collections::BTreeMap<_, _>>(),
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16880,6 +16885,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect::<std::collections::BTreeMap<_, _>>(),
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -17417,6 +17423,7 @@ mod tests {
             source_path: std::path::PathBuf::new(),
             bounds: std::collections::BTreeMap::new(),
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),

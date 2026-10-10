@@ -58,7 +58,7 @@ use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(
     program: &Program,
-    decoder_safetensors_prefix: Option<&str>,
+    decoder_root: &str,
     vision_layout: Option<&crate::config::VisionSafetensorsLayout>,
     id: WeightId,
     index: Option<UnrollIndex>,
@@ -121,46 +121,15 @@ fn safetensors_prefix(
             None => format!("{}.{}", layout.default_root, joined),
         };
     }
-    // Multimodal arches that nest the text decoder under
-    // `language_model.<...>` (Gemma3-MM). Variant configs set
-    // `decoder_safetensors_prefix: "language_model"`; we prepend it to
-    // every text-decoder key (lm_head, model.layers.*, model.<...>).
-    // Text-only and Qwen-style VL leave it `None` → byte-equivalent
-    // `model.<...>` / `lm_head` keys.
-    let key = match (index, joined.as_str()) {
+    // The decoder tree sits under `decoder_root`
+    // ([`crate::arch_spec::DeclaredArchSpec::decoder_root`]): `model` for
+    // HF decoders, `language_model.model` for Gemma3-MM-style wrappers,
+    // `backbone` for Nemotron-H. `lm_head` sits beside that tree at the
+    // file's top level in every checkpoint ordering.
+    match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
-        (Some(l), _) => format!("model.layers.{l}.{joined}"),
-        (None, _) => format!("model.{joined}"),
-    };
-    match decoder_safetensors_prefix {
-        None => key,
-        Some(prefix) => {
-            // Tolerate a trailing dot in the config value.
-            let prefix = prefix.trim_end_matches('.');
-            // `lm_head` is always at the safetensors top level — VL repos
-            // (Qwen3.5, Gemma3-MM, ...) don't nest it under the decoder
-            // prefix because it sits beside the `model` namespace, not
-            // inside it. Both checkpoint orderings (the official
-            // `model.language_model.*` and the mlx-community
-            // `language_model.model.*`) keep `lm_head.weight` at the root.
-            if key == "lm_head" {
-                return key;
-            }
-            match key.strip_prefix("model") {
-                // Replace-the-`model`-root form: the prefix already names
-                // the `model` root (e.g. Qwen3.5-VL `model.language_model`),
-                // so the decoder's keys sit DIRECTLY under it —
-                // `model.language_model.embed_tokens`,
-                // `model.language_model.layers.N.*`, `model.language_model.norm`
-                // — NOT nested as `<prefix>.model.<key>`. Splice the prefix
-                // in for the leading `model` segment.
-                Some(rest) if prefix.starts_with("model") => format!("{prefix}{rest}"),
-                // Namespace-wrapper form (Gemma3-MM `language_model`): the
-                // whole standard `model.<key>` / `lm_head` namespace nests
-                // under the prefix → `language_model.model.<key>`.
-                _ => format!("{prefix}.{key}"),
-            }
-        }
+        (Some(l), _) => format!("{decoder_root}.layers.{l}.{joined}"),
+        (None, _) => format!("{decoder_root}.{joined}"),
     }
 }
 
@@ -900,7 +869,7 @@ fn plan_field_load(
         .map(|(id, idx)| {
             safetensors_prefix(
                 program,
-                model.arch.decoder_prefix.as_deref(),
+                &model.arch.decoder_root(),
                 model.arch.safetensors.as_ref(),
                 *id,
                 *idx,
@@ -2210,27 +2179,11 @@ fn emit_fingerprint_check(
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
-    // Per-arch decoder root for fingerprint-tensor names. MUST agree
-    // with [`safetensors_prefix`]'s prefix handling (replace-vs-prepend)
-    // — the fingerprint looks up `{dec_root}.embed_tokens.weight` /
-    // `{dec_root}.layers.N.q_proj.weight`, and if that name doesn't
-    // match what the loader actually reads, every variant rejects and
-    // `try_load` returns `Ok(None)` → `ArchNotSupported`.
-    let dec_root: String = match model.arch.decoder_prefix.as_deref() {
-        None => "model".to_string(),
-        Some(prefix) => {
-            let prefix = prefix.trim_end_matches('.');
-            if prefix.starts_with("model") {
-                // Replace-the-`model`-root form (Qwen3.5-VL
-                // `model.language_model`): decoder root IS the prefix.
-                prefix.to_string()
-            } else {
-                // Namespace-wrapper form (Gemma3-MM `language_model`):
-                // `language_model.model`.
-                format!("{prefix}.model")
-            }
-        }
-    };
+    // Per-arch decoder root for fingerprint-tensor names — the same
+    // resolution [`safetensors_prefix`] keys the loader by, so the
+    // fingerprint's `{dec_root}.embed_tokens.weight` /
+    // `{dec_root}.layers.N.*` lookups name what the loader reads.
+    let dec_root = model.arch.decoder_root();
     // Pick a layered tensor that ACTUALLY EXISTS ON DISK to use as the
     // fingerprint sniff. Packed parents come first (Phi-3 ships
     // `self_attn.qkv_proj.weight` on disk; ModernBERT ships
@@ -3250,14 +3203,8 @@ fn emit_weights_struct(
     let affine_rows = compress_affine_rows(plans.iter().flat_map(affine_tensors_of).collect());
     let fingerprint_rows =
         effective_fingerprint_rows(&mode, &affine_rows, canonical_affine_rows).to_vec();
-    // Per-arch decoder root for embed_tokens probes etc. `model` for
-    // text-only and Qwen-style VL, `<prefix>.model` for arches whose
-    // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
-    // text decoder weights under `language_model.<...>`).
-    let dec_root_for_emit: String = match model.arch.decoder_prefix.as_deref() {
-        Some(prefix) => format!("{prefix}.model"),
-        None => "model".to_string(),
-    };
+    // Per-arch decoder root for embed_tokens probes etc.
+    let dec_root_for_emit = model.arch.decoder_root();
     let embed_tokens_weight_path: String = format!("{dec_root_for_emit}.embed_tokens.weight");
     let any_marlin = plans
         .iter()
@@ -5636,26 +5583,9 @@ fn emit_group_let(
             } else {
                 None
             };
-            // Decoder-side layered root: `model.layers` (text-only) or a
-            // `decoder_safetensors_prefix`-derived root. MUST agree with
-            // [`safetensors_prefix`]'s prefix handling (replace-vs-prepend),
-            // or the L=0 key the loader looks up won't match this root and
-            // the `layered_suffix` invariant fires.
-            let decoder_root_owned: String = match model.arch.decoder_prefix.as_deref() {
-                None => "model.layers".to_string(),
-                Some(prefix) => {
-                    let prefix = prefix.trim_end_matches('.');
-                    if prefix.starts_with("model") {
-                        // Replace-the-`model`-root form (Qwen3.5-VL
-                        // `model.language_model`): `model.language_model.layers`.
-                        format!("{prefix}.layers")
-                    } else {
-                        // Namespace-wrapper form (Gemma3-MM `language_model`):
-                        // `language_model.model.layers`.
-                        format!("{prefix}.model.layers")
-                    }
-                }
-            };
+            // Decoder-side layered root, from the one decoder-root
+            // resolution [`safetensors_prefix`] also keys by.
+            let decoder_root_owned = format!("{}.layers", model.arch.decoder_root());
             let call = emit_layered_load_body(
                 plan,
                 n_layers,
@@ -10333,7 +10263,7 @@ fn dump_wavefront_mega(
                                 let is_gemm = gemm_weight.contains(&i);
                                 let disk = safetensors_prefix(
                                     program,
-                                    model.arch.decoder_prefix.as_deref(),
+                                    &model.arch.decoder_root(),
                                     model.arch.safetensors.as_ref(),
                                     WeightId(*id),
                                     *index,
@@ -10379,7 +10309,7 @@ fn dump_wavefront_mega(
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
                                     program,
-                                    model.arch.decoder_prefix.as_deref(),
+                                    &model.arch.decoder_root(),
                                     model.arch.safetensors.as_ref(),
                                     WeightId(*id),
                                     *index,
@@ -14228,6 +14158,7 @@ mod tests {
             source_path: PathBuf::new(),
             bounds,
             scalars: BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),

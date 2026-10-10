@@ -103,7 +103,7 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
             .pinned_on(1)
             .delta_when_absorbed(0),
         // Elementwise activations rewrite their input buffer.
-        L::TanhSoftCap | L::Elementwise(E::Gelu | E::QuickGelu | E::GeluErf) => {
+        L::TanhSoftCap | L::Elementwise(E::Gelu | E::QuickGelu | E::GeluErf | E::Relu2) => {
             FRESH.output(A::Operand(OperandIx(0)))
         }
         // The fused-norm winner mutates the delta in place (NormDeltaResidual).
@@ -118,6 +118,8 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         L::RopeRotate { .. } | L::RopeAppend { .. } => {
             FRESH.output(A::PeeledWhenNormed(OperandIx(0)))
         }
+        // The un-rotated writer only reads K and V; its K output IS its K operand.
+        L::KvAppend { .. } => FRESH.output(A::Operand(OperandIx(0))),
         L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn { .. } => {
             FRESH.reads_across()
         }

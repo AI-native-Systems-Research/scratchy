@@ -110,6 +110,14 @@ pub mod mixtral;
 #[path = "arch/modernbert.rs"]
 pub mod modernbert;
 
+#[cfg(all(feature = "arch-nemotron-h", feature = "metal"))]
+#[path = "arch/nemotron_h.rs"]
+pub mod nemotron_h;
+
+#[cfg(all(feature = "arch-nemotron-h-latent", feature = "metal"))]
+#[path = "arch/nemotron_h_latent.rs"]
+pub mod nemotron_h_latent;
+
 #[cfg(all(feature = "arch-phi3", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/phi3.rs"]
 pub mod phi3;

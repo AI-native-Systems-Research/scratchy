@@ -58,14 +58,22 @@ pub enum BoolExpr {
     },
     /// `ivar < bound`.
     Less { ivar: Ident, bound: BoundExpr },
-    /// `ivar in [lit, lit, ...]` — set-membership over a
-    /// closed list of integer literals. Surface predicate for arches
-    /// like Qwen2.5-VL whose `fullatt_block_indexes = [7, 15, 23, 31]`
-    /// selects 4-of-32 transformer blocks for full attention; the
-    /// `Modulo` / `Less` shapes can't express a non-strided subset.
-    /// Members are integer literals only (no bound idents) — the
-    /// pattern is "a static, hand-listed set of layer indices."
-    In { ivar: Ident, members: Vec<u64> },
+    /// `ivar in [lit, lit, ...]` / `ivar in <layer set>` — set
+    /// membership. The `Modulo` / `Less` shapes can't express a
+    /// non-strided subset: Qwen2.5-VL's hand-listed
+    /// `fullatt_block_indexes = [7, 15, 23, 31]`, or Nemotron-H's
+    /// irregular `hybrid_override_pattern` read as `mamba_layers`.
+    In { ivar: Ident, members: InSet },
+}
+
+/// The right-hand side of an `in` predicate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InSet {
+    /// A closed list of integer literals written in the DSL.
+    Lit(Vec<u64>),
+    /// A layer set the model's config derives
+    /// ([`crate::config::ModelParams::layer_sets`]), resolved per model.
+    Named(Ident),
 }
 
 /// A loop bound expression. Always either an integer literal

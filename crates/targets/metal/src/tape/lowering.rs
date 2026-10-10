@@ -27,6 +27,7 @@ use crate::tape::step::{
     KDim, KvOffsets, KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
     MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
     RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    UnaryAct,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -3355,6 +3356,49 @@ fn lower_one(
             }
         }
 
+        // ── Un-rotated KV cache append (no-RoPE attention) ─────────
+        //
+        // One threadgroup per (token, kv head), one thread per head
+        // element: K and V copied as projected into the layer's paged
+        // cache page. Same geometry-class selection as `RopeAppend`.
+        I::KvAppend(Slot(k_slot), Slot(v_slot), LayerId(layer), class) => {
+            let (hd, n_kv, bs) = match class {
+                AttnMask::Causal => (
+                    p.global_head_dim,
+                    p.num_global_kv_heads,
+                    p.global_block_size,
+                ),
+                AttnMask::SlidingWindow => (p.head_dim, p.num_kv_heads, p.block_size),
+            };
+            LoweredCommand {
+                kernel: KernelId::KvAppend,
+                library: "kv_append",
+                function: pick_specialized_symbol("kv_append_f16", "kv_append_bf16", p.metal_dtype),
+                constants: super::kernel_constants::KvAppendConstants {
+                    head_dim: super::ids::HeadDim(hd),
+                    num_kv_heads: super::ids::NumKvHeads(n_kv),
+                    block_size: super::ids::BlockSize(bs),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, n_kv, 1),
+                    threads_per_threadgroup: (hd, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(Vec::from(super::kernel_bindings::KvAppendBindingSet {
+                    k: super::ids::ArenaSlotIdx(*k_slot),
+                    v: super::ids::ArenaSlotIdx(*v_slot),
+                    layer: super::ids::LayerId(*layer + layer_offset),
+                })),
+                gemm_dims: None,
+            }
+        }
+
         // ── Gemma4 norm-prologue rope: per-head q/k rmsnorm + v unit-
         // norm folded into the rope dispatch ────────────────────────
         I::RopeAppendNormed(
@@ -5151,91 +5195,28 @@ fn lower_one(
             }
         }
 
-        // ── Vision standalone tanh-approx GELU (ViT MLP / merger MLP) ─
+        // ── Standalone elementwise activations (`activation.metal`) ──
         //
-        // Faithful to the cuda `Instruction::Gelu` eval
-        // (`kernels::gelu_tanh_inplace`). Flat token-parallel; `n` =
-        // bucket-level element count `eff_m * width`, so the merger's
-        // post-reshape gelu (`eff_m = bucket_m / vision_merge_factor`,
-        // `width = vision_merge_hidden`) shrinks rows by the merge
-        // factor for free. The `gelu_tanh` kernel guards `gid >= n`, so
-        // the m_scaling tail and any padding rows are no-ops. `n` is
-        // baked (`GeluConstants`).
-        I::Gelu(Slot(in_slot), Slot(out_slot), width) => {
+        // Flat token-parallel; `n` = bucket-level element count
+        // `eff_m * width`, so the vision merger's post-reshape gelu
+        // (`eff_m = bucket_m / vision_merge_factor`, `width =
+        // vision_merge_hidden`) shrinks rows by the merge factor for
+        // free. Every kernel guards `gid >= n`, so the m_scaling tail
+        // and any padding rows are no-ops. `n` is baked
+        // (`GeluConstants`). The flavors coexist in one tape (MoonViT:
+        // tanh GELU in the blocks, erf GELU in the projector).
+        I::Activation(Slot(in_slot), Slot(out_slot), width, act) => {
             let n_elems = eff_m * width.get();
+            let (f16, bf16) = match act {
+                UnaryAct::GeluTanh => ("gelu_tanh_f16", "gelu_tanh_bf16"),
+                UnaryAct::GeluErf => ("gelu_erf_f16", "gelu_erf_bf16"),
+                UnaryAct::QuickGelu => ("quick_gelu_f16", "quick_gelu_bf16"),
+                UnaryAct::Relu2 => ("relu2_f16", "relu2_bf16"),
+            };
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
-                function: gelu_tanh_static_name(p.metal_dtype),
-                constants: gelu_constants(n_elems),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    });
-                    d
-                },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *in_slot,
-                        binding_index: 1,
-                    },
-                ]),
-                gemm_dims: None,
-            }
-        }
-
-        // ── Vision standalone erf-exact GELU (LocateAnything projector) ─
-        //
-        // Same dispatch shape as `I::Gelu` above; only the kernel symbol
-        // differs (`gelu_erf` = exact erf, NOT the tanh approximation —
-        // the two flavors coexist in one model: MoonViT block MLPs use
-        // tanh, the multimodal projector uses erf).
-        I::GeluErf(Slot(in_slot), Slot(out_slot), width) => {
-            let n_elems = eff_m * width.get();
-            LoweredCommand {
-                kernel: KernelId::VisionGelu,
-                library: "activation",
-                function: gelu_erf_static_name(p.metal_dtype),
-                constants: gelu_constants(n_elems),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    });
-                    d
-                },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *in_slot,
-                        binding_index: 1,
-                    },
-                ]),
-                gemm_dims: None,
-            }
-        }
-
-        // Same dispatch shape again; QuickGELU = x·sigmoid(1.702x)
-        // (Qwen2-VL tower blocks — its merger uses `gelu_erf`, so both
-        // flavors appear in one tape).
-        I::QuickGelu(Slot(in_slot), Slot(out_slot), width) => {
-            let n_elems = eff_m * width.get();
-            LoweredCommand {
-                kernel: KernelId::VisionGelu,
-                library: "activation",
-                function: quick_gelu_static_name(p.metal_dtype),
+                function: pick_specialized_symbol(f16, bf16, p.metal_dtype),
                 constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
@@ -5869,40 +5850,6 @@ fn vision_layernorm_static_name(dtype: MetalDtype, scale: ScaleDtype) -> &'stati
 fn gelu_constants(n: u32) -> &'static [ConstantValue] {
     let elements = super::ids::ElementCount(n);
     super::kernel_constants::GeluConstants { elements }.into_baked()
-}
-
-/// `activation.metal` `gelu_tanh` (tanh-approx GELU) host-name picker.
-fn gelu_tanh_static_name(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "gelu_tanh_f16",
-        MetalDtype::Bf16 => "gelu_tanh_bf16",
-        MetalDtype::Int4 => {
-            panic!("gelu_tanh: Int4 unsupported (activations are bf16/f16)")
-        }
-    }
-}
-
-/// `activation.metal` `gelu_erf` host-name picker (erf-exact GELU).
-fn gelu_erf_static_name(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "gelu_erf_f16",
-        MetalDtype::Bf16 => "gelu_erf_bf16",
-        MetalDtype::Int4 => {
-            panic!("gelu_erf: Int4 unsupported (activations are bf16/f16)")
-        }
-    }
-}
-
-/// `activation.metal` `quick_gelu` host-name picker
-/// (x·sigmoid(1.702x) — Qwen2-VL tower blocks).
-fn quick_gelu_static_name(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "quick_gelu_f16",
-        MetalDtype::Bf16 => "quick_gelu_bf16",
-        MetalDtype::Int4 => {
-            panic!("quick_gelu: Int4 unsupported (activations are bf16/f16)")
-        }
-    }
 }
 
 /// `embedding_gather.metal` host-name picker (row gather by a runtime

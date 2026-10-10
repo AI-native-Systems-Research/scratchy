@@ -198,6 +198,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 | EwKind::Add
                 | EwKind::QuickGelu
                 | EwKind::GeluErf
+                | EwKind::Relu2
                 | EwKind::Sub,
             )
             | O::RmsNormReduce { .. }
@@ -219,6 +220,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::Mean
             | O::RopeRotate { .. }
             | O::RopeAppend { .. }
+            | O::KvAppend { .. }
             | O::AttnDecode { .. } => None,
         }
     }

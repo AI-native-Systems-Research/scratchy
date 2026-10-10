@@ -258,6 +258,12 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
              and there is no `erf` op to decompose with — the realization is a kernel \
              family of its own",
         ),
+        // No elementwise kernel for squared ReLU in `elementwise.py`; the arch using it
+        // (Nemotron-H) is not spyre-capable.
+        EwKind::Relu2 => TritonKernelRow::Refused(
+            "relu2: no squared-ReLU kernel in the elementwise family — a realization is a \
+             new `elementwise.py` entry",
+        ),
     }
 }
 
@@ -348,6 +354,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
+        | SubOp::KvAppend { .. }
         | SubOp::Mean
         | scratchy_subtile::expansion_ops!() => TritonKernelRow::Refused(
             "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \

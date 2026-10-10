@@ -65,6 +65,10 @@ pub enum KernelId {
     /// paged KV cache at the per-request slot. Output: rotated Q
     /// only (K/V are sunk into cache).
     RopeAppend,
+    /// Write a fresh K/V projection, un-rotated, to the paged KV cache
+    /// at the per-request slot (no-RoPE attention). `kv_append_<dtype>`
+    /// in `kv_append.metallib`.
+    KvAppend,
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,
@@ -524,6 +528,7 @@ impl KernelId {
             | Self::NormedGemv
             | Self::FusedGateUpSiluMul
             | Self::RopeAppend
+            | Self::KvAppend
             | Self::AttentionViaCache
             | Self::AttentionPrefillSdpaPaged
             | Self::AttnQConvert

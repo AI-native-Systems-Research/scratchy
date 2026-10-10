@@ -241,6 +241,36 @@ def derive_bounds(cfg):
     return b
 
 
+# config.rs HybridBlock: every spelling of a hybrid block schedule entry
+# (mlx-lm nemotron_h `_block_type_to_char`), by the layer-set name a DSL
+# `if layer in <name>:` predicate reads.
+PATTERN_BLOCKS = {"M": "mamba_layers", "*": "attention_layers", "E": "moe_layers", "-": "mlp_layers"}
+BLOCK_TYPE_CHARS = {
+    "linear_attention": "M", "mamba": "M", "conv": "M",
+    "full_attention": "*", "attention": "*",
+    "moe": "E", "mlp": "-",
+}
+
+
+def derive_layer_sets(cfg, bounds):
+    """config.rs derive_layer_sets: hybrid_override_pattern (string or
+    list of chars) wins, then layers_block_type, then layer_types (only
+    when every entry is a block type). Fills / checks num_hidden_layers."""
+    pattern = cfg.get("hybrid_override_pattern")
+    if pattern is None:
+        types = cfg.get("layers_block_type") or cfg.get("layer_types")
+        if not isinstance(types, list) or not all(t in BLOCK_TYPE_CHARS for t in types):
+            return {}
+        pattern = [BLOCK_TYPE_CHARS[t] for t in types]
+    pattern = list(pattern)
+    if not pattern or not all(c in PATTERN_BLOCKS for c in pattern):
+        raise ValueError(f"hybrid_override_pattern {pattern!r}: unknown block")
+    n = bounds.setdefault("num_hidden_layers", len(pattern))
+    if n != len(pattern):
+        raise ValueError(f"block schedule names {len(pattern)} layers, num_hidden_layers is {n}")
+    return {name: [l for l, c in enumerate(pattern) if c == ch] for ch, name in PATTERN_BLOCKS.items()}
+
+
 def eval_params(arch, cfg, bounds):
     """Evaluate the arch.json `params` table (config.rs `eval_params`):
     each entry is {name, from} (dotted config path, optional default) or
@@ -724,6 +754,11 @@ def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 
 
+def relu2(x):
+    """mlx `nn.relu2`: square(relu(x))."""
+    return torch.relu(x).square()
+
+
 def tanh_softcap(x):
     cap = STATE["final_logit_softcapping"]
     return cap * torch.tanh(x / cap)
@@ -800,6 +835,16 @@ def rope_append(q, k, v, positions, rotary, layer_cache):
     out_k = _rope_one(k, kvh, cos, sin, half, pair_off)
     _paged_write(out_k, v, layer, kvh, head_dim)
     return out_q, out_k, v
+
+
+def kv_append(k, v, layer_cache):
+    """(k, v) = kv_append(k, v, kv_cache[layer]): K and V appended to the
+    paged cache as projected (no positional rotation — nemotron-h's
+    attention); both pass through unchanged."""
+    layer = STATE["layer_of"][id(layer_cache)]
+    b = STATE["bounds"]
+    _paged_write(k, v, layer, b["num_key_value_heads"], b["head_dim"])
+    return k, v
 
 
 def rope_append_interleaved(q, k, v, positions, rotary, layer_cache):
@@ -1373,20 +1418,27 @@ def is_tied(arch, cfg):
 # facts are the arch.json / weights.json declarations already read.
 
 
-def _ckpt_key(joined, index, dec_prefix):
-    """safetensors_prefix for a non-vision path: layered/unlayered/lm_head
-    + decoder_safetensors_prefix wrap/replace."""
+def decoder_root(aj):
+    """DeclaredArchSpec::decoder_root: `decoder_safetensors_root` renames
+    the decoder tree's `model` root (nemotron-h `backbone`);
+    `decoder_safetensors_prefix` wraps it (`language_model.model`) unless
+    it already names a `model.*` root."""
+    root, prefix = aj.get("decoder_safetensors_root"), aj.get("decoder_safetensors_prefix")
+    assert not (root and prefix), "decoder_safetensors_root/_prefix are exclusive"
+    if root:
+        return root.rstrip(".")
+    if prefix:
+        prefix = prefix.rstrip(".")
+        return prefix if prefix.startswith("model") else f"{prefix}.model"
+    return "model"
+
+
+def _ckpt_key(joined, index, dec_root):
+    """safetensors_prefix for a non-vision path: layered/unlayered under
+    the decoder root; lm_head at the top level."""
     if joined == "lm_head":
         return "lm_head"
-    key = f"model.layers.{index}.{joined}" if index is not None else f"model.{joined}"
-    if dec_prefix is None:
-        return key
-    prefix = dec_prefix.rstrip(".")
-    if key == "lm_head":
-        return key
-    if key.startswith("model") and prefix.startswith("model"):
-        return f"{prefix}{key[len('model'):]}"
-    return f"{prefix}.{key}"
+    return f"{dec_root}.layers.{index}.{joined}" if index is not None else f"{dec_root}.{joined}"
 
 
 def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier_text):
@@ -1404,7 +1456,7 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     aj_path = ARCH_DIR / arch / "arch.json"
     if aj_path.exists():
         aj = json.loads(aj_path.read_text())
-    dec_prefix = aj.get("decoder_safetensors_prefix")
+    dec_root = decoder_root(aj)
     renames = aj.get("weight_leaf_renames") or {}
     packed = manifest.get("__packed_splits__") or {}
     packed_targets = {t for targets in packed.values() for t in targets}
@@ -1437,20 +1489,23 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
         return node
 
     def dsl_to_disk(key):
-        """digit-suffix translation + weight_leaf_renames (longest-suffix
-        match — codegen applies first hit; renames are ordered by
-        descending suffix length in arch.json authoring)."""
+        """digit-suffix translation + weight_leaf_renames, as
+        `Program::rename_dotted`: whole-segment runs, longest key first,
+        matched as the trailing run, every interior run, or the leading
+        run (nemotron-h's `attn.q_proj` → `mixer.q_proj`)."""
         segs = [re.sub(r"_(\d+)$", r".\1", s) for s in key.split(".")]
-        joined = ".".join(segs)
-        for dsl_leaf, disk_leaf in renames.items():
-            if joined == dsl_leaf:
-                return disk_leaf
-            if (head := joined[: -len(dsl_leaf) - 1] if joined.endswith("." + dsl_leaf) else None) is not None:
-                return f"{head}.{disk_leaf}"
-        return joined
+        out = ".".join(segs)
+        for dsl_leaf, disk_leaf in sorted(renames.items(), key=lambda kv: -len(kv[0])):
+            if out == dsl_leaf or out.endswith("." + dsl_leaf):
+                out = out[: len(out) - len(dsl_leaf)] + disk_leaf
+                continue
+            out = out.replace(f".{dsl_leaf}.", f".{disk_leaf}.")
+            if out.startswith(dsl_leaf + "."):
+                out = disk_leaf + out[len(dsl_leaf):]
+        return out
 
     def disk_prefix(key, index):
-        return _ckpt_key(dsl_to_disk(key), index, dec_prefix)
+        return _ckpt_key(dsl_to_disk(key), index, dec_root)
 
     # The GDN bundle: GatedDeltaNetLayer::load reads
     # `{prefix}.conv1d.weight` (capital-A) `A_log` / `dt_bias` /
@@ -1968,6 +2023,7 @@ def main():
                 new[i] += pair - sum(new)
                 set_json_path(cfg, dotted, new)
     bounds = derive_bounds(cfg)
+    layer_sets = derive_layer_sets(cfg, bounds)
     # Vision arches: arch.json `params` table derives the vision_* / d_model
     # bounds (config.rs eval_params — additive over the flat harvest).
     eval_params(arch, cfg, bounds)
@@ -2105,6 +2161,8 @@ def main():
         **{k: v for k, v in vars(trees).items()},
         # bounds by NAME — loop bounds and predicates
         **bounds,
+        # config-derived layer sets by NAME — `if layer in mamba_layers:`
+        **layer_sets,
         # numeric config fields by NAME — `scalar(<config key>)` passes the
         # key as a bare identifier (Expr::ConfigScalar), so the name must
         # resolve here (commandr logit_scale, granite embedding_multiplier).

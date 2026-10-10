@@ -37,7 +37,7 @@ use scratchy_target_metal::tape::lowered::{Fence, RuntimeGate};
 use scratchy_target_metal::tape::step::{
     self as st, AffineBits as Bits, AffineGroupSize as Gs, ArenaSlotIdx as Slot, HiddenSize as W,
     IntermediateSize as Inter, LayerId, MetalStep, MoeRegion, MoeRows, MoeStep,
-    RowsPerToken as Rows, StepRow,
+    RowsPerToken as Rows, StepRow, UnaryAct as Act,
 };
 
 use crate::canonical::MetalStepFacts;
@@ -1784,9 +1784,12 @@ impl Recording<'_> {
             }
             L::LoadPixels { .. } => em(S::LoadPixels(out()?), &[], &[out()?], Vec::new()),
             L::LoadPosEmbeds { .. } => em(S::LoadPosEmbeds(out()?), &[], &[out()?], Vec::new()),
-            L::Elementwise(E::Gelu) => unary(&S::Gelu)?,
-            L::Elementwise(E::QuickGelu) => unary(&S::QuickGelu)?,
-            L::Elementwise(E::GeluErf) => unary(&S::GeluErf)?,
+            L::Elementwise(E::Gelu) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluTanh))?,
+            L::Elementwise(E::QuickGelu) => {
+                unary(&|i, o, w| S::Activation(i, o, w, Act::QuickGelu))?
+            }
+            L::Elementwise(E::GeluErf) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluErf))?,
+            L::Elementwise(E::Relu2) => unary(&|i, o, w| S::Activation(i, o, w, Act::Relu2))?,
             L::TanhSoftCap => unary(&S::TanhSoftCap)?,
             L::RmsNorm { gain, .. } => self.norm(i, gain)?,
             L::MatmulTile { .. } => {
@@ -1799,24 +1802,38 @@ impl Recording<'_> {
             L::SampleRowsScatter => self.matmul(i, Some(st::SampleRowsStep::Scatter))?,
             L::AllRowsMatmul => self.matmul(i, Some(st::SampleRowsStep::AllRows))?,
             L::RopeAppend { .. } => return Err(self.no(i, Refused::NoFoldedRotate)),
+            L::KvAppend { layer, attn, .. } => {
+                let (k, v) = (self.read(i, 0)?, self.read(i, 1)?);
+                let mut e = em(
+                    S::KvAppend(k, v, LayerId(layer), attn),
+                    &[k, v],
+                    &[k],
+                    Vec::new(),
+                );
+                e.sig.kv_w = Some(LayerId(layer));
+                e
+            }
             L::AttnDecode { mask, .. } => {
                 let out = out()?;
                 let q = self.colour(self.step_arg(i, 0)?)?;
-                // The layer and pairing come from the rope append whose cache it reads.
-                let rope = self.step_arg(i, 3)?;
-                let (layer, pairing) = match *self.op(rope) {
-                    L::RopeAppend { layer, pairing, .. } => (LayerId(layer), pairing),
-                    _ => (LayerId(0), RopeFormTag::NeoX),
+                // The layer and pairing come from the KV writer whose cache it reads; an
+                // un-rotated writer's cache is read as stored, with no rotary table.
+                let writer = self.step_arg(i, 3)?;
+                let (layer, pairing, rotated) = match *self.op(writer) {
+                    L::RopeAppend { layer, pairing, .. } => (LayerId(layer), pairing, true),
+                    L::KvAppend { layer, .. } => (LayerId(layer), RopeFormTag::NeoX, false),
+                    _ => (LayerId(0), RopeFormTag::NeoX, true),
                 };
                 // Prefill runs the paged kernel with K arriving pre-roped: no rotary. Decode's
                 // CosSin is the GLOBAL rotary whatever the class (only the rope uses the local).
                 let neox = RopeFormTag::NeoX;
                 let rotary = || {
                     let base = "rotary".to_string();
-                    vec![WeightSlot {
+                    let site = WeightSlot {
                         kind: WeightKind::CosSin,
                         base,
-                    }]
+                    };
+                    rotated.then_some(site).into_iter().collect::<Vec<_>>()
                 };
                 use AttnMask::{Causal, SlidingWindow as Sliding};
                 let (step, sites) = match (self.l.input.ops[i].m > 1, mask) {
@@ -1852,7 +1869,7 @@ impl Recording<'_> {
                     Ok(InputRef::Op(v)) => self.colour(v).ok(),
                     _ => None,
                 };
-                let reads: Vec<Slot> = [Some(q), self.colour(rope).ok(), v]
+                let reads: Vec<Slot> = [Some(q), self.colour(writer).ok(), v]
                     .into_iter()
                     .flatten()
                     .collect();

@@ -39,6 +39,8 @@ arch-locateanything = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half"
 arch-mistral = []
 arch-mixtral = []
 arch-modernbert = []
+arch-nemotron-h = []
+arch-nemotron-h-latent = []
 arch-phi3 = []
 arch-qwen2 = []
 arch-qwen2-5-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
@@ -73,6 +75,8 @@ all-arches = [
     "arch-mistral",
     "arch-mixtral",
     "arch-modernbert",
+    "arch-nemotron-h",
+    "arch-nemotron-h-latent",
     "arch-phi3",
     "arch-qwen2",
     "arch-qwen2-5-vl",
@@ -225,6 +229,14 @@ all-arches = [
 "modernbert-base-1-layer" = ["arch-modernbert"]
 "modernbert-base-1-layer-parity-tiny" = ["arch-modernbert"]
 "modernbert-base" = ["arch-modernbert"]
+
+# nemotron-h (2 configs)
+"nemotron-3-nano-30b-a3b" = ["arch-nemotron-h"]
+"nemotron-3-nano-30b-a3b-parity-tiny" = ["arch-nemotron-h"]
+
+# nemotron-h-latent (2 configs)
+"nemotron-3-super-120b-a12b" = ["arch-nemotron-h-latent"]
+"nemotron-3-super-120b-a12b-parity-tiny" = ["arch-nemotron-h-latent"]
 
 # phi3 (10 configs)
 "phi-3-5-mini-instruct" = ["arch-phi3"]
@@ -423,6 +435,14 @@ all-arches = [
     "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
 ]
+"nemotron-h" = [
+    "nemotron-3-nano-30b-a3b",
+    "nemotron-3-nano-30b-a3b-parity-tiny",
+]
+"nemotron-h-latent" = [
+    "nemotron-3-super-120b-a12b",
+    "nemotron-3-super-120b-a12b-parity-tiny",
+]
 "phi3" = [
     "phi-3-5-mini-instruct",
     "phi-3-5-mini-instruct-parity-tiny",
@@ -585,6 +605,10 @@ all = [
     "modernbert-base-1-layer",
     "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
+    "nemotron-3-nano-30b-a3b",
+    "nemotron-3-nano-30b-a3b-parity-tiny",
+    "nemotron-3-super-120b-a12b",
+    "nemotron-3-super-120b-a12b-parity-tiny",
     "phi-3-5-mini-instruct",
     "phi-3-5-mini-instruct-parity-tiny",
     "phi-3-medium-128k-instruct",

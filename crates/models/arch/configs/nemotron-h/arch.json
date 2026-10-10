@@ -1,0 +1,11 @@
+{
+  "_comment": "Nemotron-H (`NemotronHForCausalLM`, mlx-lm `nemotron_h.py`): one pre-norm block per layer, its mixer picked by `hybrid_override_pattern` — `M` Mamba-2, `*` attention (GQA, NO RoPE), `E` MoE (sigmoid + e_score_correction_bias routing, non-gated relu2 experts + relu2 shared expert), `-` dense relu2 MLP. The pattern derives the `mamba_layers` / `attention_layers` / `moe_layers` / `mlp_layers` sets the DSL branches on. The decoder tree is `backbone.*` (`backbone.embeddings`, `backbone.layers.N.{norm,mixer.*}`, `backbone.norm_f`), not `model.*`; every mixer sits under `mixer`, which the DSL names per kind (`attn` / `mamba` / `moe`) so each kind keeps its own accessor. Norm eps is `layer_norm_epsilon`.",
+  "decoder_safetensors_root": "backbone",
+  "weight_leaf_renames": { "attn": "mixer", "mamba": "mixer", "moe": "mixer", "mlp": "mixer" },
+  "config_aliases": { "rms_norm_eps": "layer_norm_epsilon" },
+  "params": [
+    { "name": "mamba_d_inner", "expr": "mamba_num_heads * mamba_head_dim" },
+    { "name": "mamba_conv_dim", "expr": "mamba_d_inner + 2 * n_groups * ssm_state_size" },
+    { "name": "mamba_in_proj_dim", "expr": "mamba_d_inner + mamba_conv_dim + mamba_num_heads" }
+  ]
+}

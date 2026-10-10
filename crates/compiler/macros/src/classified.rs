@@ -8,6 +8,7 @@
 //! user's original identifiers (via the tables). Passes below here
 //! work with IDs only.
 
+use crate::ast::InSet;
 use syn::Ident;
 
 /// A local binding. Each assignment statement introduces a fresh
@@ -217,6 +218,11 @@ pub enum OpKind {
     /// rather than a flag on `RopeAppend`. Used by Cohere's CommandR
     /// family.
     RopeAppendInterleaved,
+    /// `(k, v) = kv_append(k, v, kv_cache[layer])` — append K and V to the
+    /// layer's paged KV cache AS PROJECTED: the KV writer of an attention
+    /// with no positional rotation (Nemotron-H). Both outputs are their
+    /// inputs, unchanged; the query never passes through it.
+    KvAppend,
     Attention,
     /// Same signature as `Attention`; picked by the DSL body at
     /// sliding-window attention layers. The distinction is carried
@@ -266,6 +272,10 @@ pub enum OpKind {
     /// elementwise, shape-preserving. Numerically distinct from
     /// tanh-form `Gelu` and `QuickGelu`.
     GeluErf,
+    /// Squared ReLU: `relu(x)^2` (mlx `nn.relu2`). The non-gated MLP
+    /// activation of Nemotron-H's dense, shared-expert and routed-expert
+    /// MLPs. Unary elementwise, shape-preserving.
+    Relu2,
     /// Tanh-based soft-cap: `y = cap * tanh(x / cap)`. Unary
     /// elementwise with an additional scalar argument; shape-
     /// preserving. Used at logit exit for architectures that cap
@@ -541,6 +551,7 @@ impl OpKind {
             "gemm" => Some(Self::Gemm),
             "rope_append" => Some(Self::RopeAppend),
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
+            "kv_append" => Some(Self::KvAppend),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
             "sink_attention" => Some(Self::SinkAttention),
@@ -558,6 +569,7 @@ impl OpKind {
             "vision_rope" => Some(Self::VisionRope),
             "quick_gelu" => Some(Self::QuickGelu),
             "gelu_erf" => Some(Self::GeluErf),
+            "relu2" => Some(Self::Relu2),
             "silu" => Some(Self::Silu),
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),
@@ -594,6 +606,7 @@ impl OpKind {
             Self::Gemm => "gemm",
             Self::RopeAppend => "rope_append",
             Self::RopeAppendInterleaved => "rope_append_interleaved",
+            Self::KvAppend => "kv_append",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
             Self::SinkAttention => "sink_attention",
@@ -603,6 +616,7 @@ impl OpKind {
             Self::Gelu => "gelu",
             Self::QuickGelu => "quick_gelu",
             Self::GeluErf => "gelu_erf",
+            Self::Relu2 => "relu2",
             Self::VisionRope => "vision_rope",
             Self::TanhSoftCap => "tanh_softcap",
             Self::RmsNormUnit => "rmsnorm_unit",
@@ -892,9 +906,9 @@ pub enum BoolPred {
     },
     /// `ivar < bound`.
     Less { ivar: LocalId, bound: Bound },
-    /// `members.contains(&ivar)` — set membership over a closed list
-    /// of integer literals. See [`crate::ast::BoolExpr::In`].
-    In { ivar: LocalId, members: Vec<u64> },
+    /// `ivar in members` — set membership over a literal list or a
+    /// config-derived layer set. See [`crate::ast::BoolExpr::In`].
+    In { ivar: LocalId, members: InSet },
 }
 
 /// A value-producing expression.

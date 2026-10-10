@@ -123,6 +123,8 @@ pub enum EwKind {
     /// Kept apart from [`EwKind::Gelu`] because a target with only one of the two must say so
     /// rather than substitute the other and shift every merged patch slightly.
     GeluErf,
+    /// `relu(x)²` — Nemotron-H's non-gated MLP activation (mlx `nn.relu2`).
+    Relu2,
     /// `a - b`, with a `[m, 1]` broadcast on `b` (the mean-centering half of a LayerNorm).
     Sub,
     /// `a + bias`, with a `[1, n]` row broadcast on `bias` — a weight source (a projection's
@@ -371,8 +373,9 @@ impl KvCacheLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KvCacheProducer {
-    /// The cache was written by a `SubOp::RopeAppend` earlier in this
-    /// same forward (the producer is `nodes[producer_node_idx]`).
+    /// The cache was written by a KV writer (`SubOp::RopeAppend` or
+    /// `SubOp::KvAppend`) earlier in this same forward (the producer is
+    /// `nodes[producer_node_idx]`).
     SameForwardRopeAppend {
         producer_node_idx: u32,
         #[doc(hidden)]
@@ -729,7 +732,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
     /// layer-carrying op in the body measures that.
     pub fn layer_index(&self) -> Option<u32> {
         match self {
-            SubOp::RopeAppend { layer, .. } => Some(*layer),
+            SubOp::RopeAppend { layer, .. } | SubOp::KvAppend { layer, .. } => Some(*layer),
             _ => None,
         }
     }
@@ -840,6 +843,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 std::mem::discriminant(attn).hash(h);
                 pairing.hash(h);
             }
+            SubOp::KvAppend { head_dim, attn, .. } => {
+                head_dim.get().hash(h);
+                std::mem::discriminant(attn).hash(h);
+            }
             // `layout`, `producer`'s node index and `softmax_state` are per-layer identity;
             // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs.
             SubOp::AttnDecode {
@@ -897,6 +904,16 @@ impl<F: RopeForm> SubOp<F, Arch> {
             pairing,
             layout: Unbound,
             _form: PhantomData,
+        }
+    }
+
+    /// `KvAppend` for `layer`: the cache tensors it writes are bound by [`lower_region`].
+    pub const fn kv_append(head_dim: HeadDim, layer: u32, attn: AttnMask) -> Self {
+        SubOp::KvAppend {
+            head_dim,
+            layer,
+            attn,
+            layout: Unbound,
         }
     }
 
@@ -1049,6 +1066,19 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         layout: S::KvLayout,
         #[doc(hidden)]
         _form: PhantomData<F>,
+    },
+    /// The KV-cache writer of an attention with no positional rotation
+    /// (Nemotron-H): write K and V, as projected, into the paged KV cache
+    /// (the cache identity is bound by `layout`). The host eval is the
+    /// identity on K; the cache write is GPU-only.
+    /// `inputs` = `[K, V, K_cache, V_cache]`.
+    KvAppend {
+        head_dim: HeadDim,
+        layer: u32,
+        /// The class of the layer whose K/V this appends — the value its
+        /// attention's `mask` carries.
+        attn: AttnMask,
+        layout: S::KvLayout,
     },
     /// Decode attention. `inputs[0]` = Q `[Mq, geom.q_width()]`;
     /// the remaining inputs are alternating `(K_seg, V_seg)` pairs.
@@ -1448,6 +1478,7 @@ pub fn eval_node<F: RopeForm>(
                         0.5 * x * (1.0 + erf)
                     })
                     .collect(),
+                EwKind::Relu2 => a.iter().map(|&x| x.max(0.0) * x.max(0.0)).collect(),
                 EwKind::Mul | EwKind::Add | EwKind::Sub => {
                     // `Sub` broadcasts a `[m, 1]` right operand across the row (the
                     // mean-centering); `Mul`/`Add` are same-shape. One gather, one
@@ -1548,6 +1579,9 @@ pub fn eval_node<F: RopeForm>(
             }
             out
         }
+        // KvAppend writes K as projected: the identity on K; its V input +
+        // the paged-cache write are GPU-only.
+        SubOp::KvAppend { .. } => gather(&node.inputs[0], graph, bufs).0,
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
         SubOp::RopeRotate { head_dim, _form: _ } | SubOp::RopeAppend { head_dim, .. } => {
@@ -2244,6 +2278,24 @@ pub fn lower_region(
                     pairing,
                     layout,
                     _form,
+                }
+            }
+            SubOp::KvAppend {
+                head_dim,
+                layer,
+                attn,
+                ..
+            } => {
+                // `[K, V, K_cache, V_cache]` — the arity-4 contract.
+                let k_cache_t = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors).0;
+                let v_cache_t = resolve(desc.inputs[3], &op_tensor, &op_cols, &tensors).0;
+                let layout = KvCacheLayout::for_cache_tensors(k_cache_t, v_cache_t);
+                k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
+                SubOp::KvAppend {
+                    head_dim,
+                    layer,
+                    attn,
+                    layout,
                 }
             }
             SubOp::AttnDecode {
@@ -3354,6 +3406,102 @@ mod tests {
             },
             _ => unreachable!(),
         }
+    }
+
+    /// The un-rotated writer is a KV writer like the rope's: `lower_region` binds its cache
+    /// pair (`[K, V, K_cache, V_cache]` operands 2 and 3) and the attention reading that cache
+    /// names it as its producer, over the SAME layout witness. It carries its layer, and its
+    /// host eval is the identity on K.
+    #[test]
+    fn kv_append_is_the_producer_of_the_cache_its_attention_reads() {
+        let (m, hq, hkv, hd, l, layer) = (1u32, 2u32, 1u32, 4u32, 3u32, 5u32);
+        let (qdim, kvdim) = (hq * hd, hkv * hd);
+        let source = |rows, cols| SourceShape { rows, cols };
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                source(m, qdim),  // 0: q
+                source(m, kvdim), // 1: k
+                source(m, kvdim), // 2: v
+                source(l, kvdim), // 3: prefixK
+                source(l, kvdim), // 4: prefixV
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::kv_append(HeadDim::new(hd), layer, AttnMask::Causal),
+                    m,
+                    inputs: vec![
+                        InputRef::Ext(1),
+                        InputRef::Ext(2),
+                        InputRef::Ext(3),
+                        InputRef::Ext(4),
+                    ],
+                },
+                OpDesc {
+                    op: SubOp::attn_decode(
+                        ModelAttnGeometry::mint(
+                            QueryHeads::new(hq),
+                            KvHeads::new(hkv),
+                            HeadDim::new(hd),
+                        )
+                        .expect("the fixture's kv heads divide its query heads"),
+                        0.5,
+                        l + 1,
+                        AttnMask::Causal,
+                    ),
+                    m,
+                    inputs: vec![
+                        InputRef::Ext(0),
+                        InputRef::Ext(3),
+                        InputRef::Ext(4),
+                        InputRef::Op(0),
+                        InputRef::Ext(2),
+                    ],
+                },
+            ],
+            result: 1,
+        };
+        let g = lower_region(&input, std::num::NonZeroU32::new(hd).unwrap());
+        let (writer, attn) = (&g.nodes[0], &g.nodes[1]);
+        let SubOp::KvAppend {
+            layout: written,
+            layer: at,
+            ..
+        } = writer.op
+        else {
+            panic!("expected KvAppend, got {:?}", writer.op);
+        };
+        assert_eq!(at, layer);
+        assert_eq!(writer.op.layer_index(), Some(layer));
+        assert_eq!(
+            (written.cache_tensor(), written.v_cache_tensor()),
+            (TensorId::from_index(3), TensorId::from_index(4))
+        );
+        let SubOp::AttnDecode {
+            layout: read,
+            producer,
+            ..
+        } = attn.op
+        else {
+            panic!("expected AttnDecode, got {:?}", attn.op);
+        };
+        assert_eq!(
+            read, written,
+            "the attention reads the cache the writer writes"
+        );
+        assert_eq!(producer, KvCacheProducer::from_rope_append(0));
+        assert_eq!(writer.op.name(), "KvAppend");
+
+        let k: Vec<f32> = (0..kvdim).map(|i| i as f32 - 1.5).collect();
+        let zeros = |n: u32| vec![0f32; n as usize];
+        let (q, v, pk, pv) = (
+            zeros(qdim),
+            zeros(kvdim),
+            zeros(l * kvdim),
+            zeros(l * kvdim),
+        );
+        let bufs = eval_dag(&g, &[&q, &k, &v, &pk, &pv]);
+        let out = writer.output.tensor.0 as usize;
+        assert_eq!(bufs[out], k, "the writer's K output is its K operand");
     }
 
     #[test]

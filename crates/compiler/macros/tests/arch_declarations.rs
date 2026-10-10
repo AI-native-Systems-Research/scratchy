@@ -27,6 +27,7 @@ const KNOWN_KEYS: &[&str] = &[
     "vision_pos_emb_interp",
     "vision_norm_eps",
     "decoder_safetensors_prefix",
+    "decoder_safetensors_root",
     "scale_dtype",
     "tie_default",
     "bound_defaults",
@@ -194,5 +195,5 @@ fn no_dsl_file_declares_anything_but_math() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 25, "expected 25 DSL files, found {seen}");
+    assert_eq!(seen, 29, "expected 29 DSL files, found {seen}");
 }

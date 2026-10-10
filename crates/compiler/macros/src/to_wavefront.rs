@@ -1018,6 +1018,38 @@ pub fn lower_decode_to_wavefront(
                     },
                 );
             }
+            // kv_append(k, v, kv_cache[layer]) → (k, v): the un-rotated KV
+            // writer, `[K, V, K_cache, V_cache]`. Slot 0 is the writer (the
+            // attention's new-K edge, as a rope writer's is); V passes
+            // through aliasing its projection, as under rope_append.
+            OpKind::KvAppend => {
+                let head_dim = bx
+                    .geom
+                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                    .hd();
+                let k = bx.input_at(tile, 0)?;
+                let v = bx.input_at(tile, 1)?;
+                let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "kv_append missing kv_cache extern index",
+                })? as u32;
+                let (pk, pv) = bx.prefix_for(layer as u64);
+                let ki = bx.push_op(
+                    // `Causal` by default; the consuming attention arm backpatches
+                    // `SlidingWindow` for sliding layers.
+                    SubOp::kv_append(head_dim, layer, AttnMask::Causal),
+                    vec![k, v, InputRef::Ext(pk), InputRef::Ext(pv)],
+                );
+                bx.produced.insert((tile.0, 0), Producer::Op(ki));
+                bx.produced.insert(
+                    (tile.0, 1),
+                    match v {
+                        InputRef::Op(j) => Producer::Op(j),
+                        InputRef::Ext(e) => Producer::Ext(e),
+                    },
+                );
+            }
             // attention(q', k', v, kv_cache, block_table): AttnDecode
             // reading Q_rot, prefix-cache Source segments, then the new
             // token's (K_rot, V) as Sub edges.
@@ -1106,7 +1138,8 @@ pub fn lower_decode_to_wavefront(
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
                     if let InputRef::Op(ri) = k
-                        && let SubOp::RopeAppend { attn, .. } = &mut bx.ops[ri].op
+                        && let SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } =
+                            &mut bx.ops[ri].op
                     {
                         *attn = AttnMask::SlidingWindow;
                     }
@@ -1610,6 +1643,12 @@ pub fn lower_decode_to_wavefront(
             OpKind::GeluErf => {
                 let x = bx.input_at(tile, 0)?;
                 let idx = bx.push_op(SubOp::Elementwise(EwKind::GeluErf), vec![x]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            OpKind::Relu2 => {
+                let x = bx.input_at(tile, 0)?;
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::Relu2), vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

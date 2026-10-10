@@ -180,6 +180,19 @@ pub enum CuSeqlens {
     VisionWindow,
 }
 
+/// The elementwise activation a [`MetalStep::Activation`] applies (`activation.metal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryAct {
+    /// GELU, tanh approximation.
+    GeluTanh,
+    /// GELU, exact erf form.
+    GeluErf,
+    /// `x · σ(1.702x)`.
+    QuickGelu,
+    /// `relu(x)²`.
+    Relu2,
+}
+
 /// One command-emitting step. Slot operands are arena colours; `LayerId` is the step's own layer
 /// (a rolled body's rows name iteration 0's); an [`ActivationWidth`] is the width of the rows the
 /// step writes. Field order per kind: inputs, outputs, layer, shape.
@@ -235,12 +248,8 @@ pub enum MetalStep {
     SiluMul(Slot, Slot, Slot, IntermediateSize),
     /// `(gate, up, out)`: `gelu(gate) * up`.
     GeluMul(Slot, Slot, Slot),
-    /// `(in, out, width)`: GELU (tanh approximation).
-    Gelu(Slot, Slot, ActivationWidth),
-    /// `(in, out, width)`: GELU (erf form).
-    GeluErf(Slot, Slot, ActivationWidth),
-    /// `(in, out, width)`: quick GELU.
-    QuickGelu(Slot, Slot, ActivationWidth),
+    /// `(in, out, width, act)`: an elementwise activation.
+    Activation(Slot, Slot, ActivationWidth, UnaryAct),
     /// `(in, out, width)`: final logit softcap.
     TanhSoftCap(Slot, Slot, ActivationWidth),
     /// `(delta, residual, width)`: `residual += delta`.
@@ -274,6 +283,8 @@ pub enum MetalStep {
         AttnMask,
         KvWrite,
     ),
+    /// `(k, v, layer, class)`: paged KV write of the un-rotated projections.
+    KvAppend(Slot, Slot, LayerId, AttnMask),
     /// `(q, out, layer, pairing)`: decode attention over the paged cache.
     AttentionViaCache(Slot, Slot, LayerId, RopeFormTag),
     /// `(q, out, layer, pairing)`: sliding-window decode attention.
@@ -626,6 +637,7 @@ impl MetalStep {
             | S::NormAdd(_, _, _, RowNorm { layer: l, .. }, _)
             | S::RopeAppend(_, _, _, _, _, _, l, ..)
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
+            | S::KvAppend(_, _, l, _)
             | S::GatedDeltaNet(_, _, _, _, _, l)
             | S::KvStage(_, l, ..)
             | S::AttnPackedKv(_, _, l, ..)
@@ -664,9 +676,7 @@ impl MetalStep {
             | S::ScalarMul(..)
             | S::SiluMul(..)
             | S::GeluMul(..)
-            | S::Gelu(..)
-            | S::GeluErf(..)
-            | S::QuickGelu(..)
+            | S::Activation(..)
             | S::TanhSoftCap(..)
             | S::Add(..)
             | S::EncoderAttention(..)

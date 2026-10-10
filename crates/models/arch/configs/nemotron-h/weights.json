@@ -1,0 +1,22 @@
+{
+  "embeddings": ["vocab_size", "hidden_size"],
+  "lm_head": ["hidden_size", "vocab_size"],
+  "norm_f": ["hidden_size"],
+  "norm": ["hidden_size"],
+
+  "attn.q_proj": ["hidden_size", "head_dim * num_attention_heads"],
+  "attn.k_proj": ["hidden_size", "head_dim * num_key_value_heads"],
+  "attn.v_proj": ["hidden_size", "head_dim * num_key_value_heads"],
+  "attn.o_proj": ["head_dim * num_attention_heads", "hidden_size"],
+
+  "mamba": ["hidden_size"],
+  "mamba.in_proj": ["hidden_size", "mamba_in_proj_dim"],
+  "mamba.out_proj": ["mamba_d_inner", "hidden_size"],
+
+  "moe": ["hidden_size"],
+  "moe.shared_experts.up_proj": ["hidden_size", "moe_shared_expert_intermediate_size"],
+  "moe.shared_experts.down_proj": ["moe_shared_expert_intermediate_size", "hidden_size"],
+
+  "mlp.up_proj": ["hidden_size", "intermediate_size"],
+  "mlp.down_proj": ["intermediate_size", "hidden_size"]
+}

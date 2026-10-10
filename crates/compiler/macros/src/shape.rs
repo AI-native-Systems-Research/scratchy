@@ -392,6 +392,7 @@ pub fn apply_signature_with_geometry(
         // in the picked kernel (interleaved pair vs. NeoX), not in
         // the type signature.
         OpKind::RopeAppendInterleaved => sig_rope_append(solver, inputs),
+        OpKind::KvAppend => sig_kv_append(solver, inputs),
         OpKind::Attention => sig_attention(solver, inputs, op, hybrid_attention_geometry),
         // Same q/k/v constraints as `attention`; the distinction is
         // in the picked kernel (window-masked vs. dense), not in
@@ -413,6 +414,7 @@ pub fn apply_signature_with_geometry(
         // numerical distinction lives in the picked kernel.
         OpKind::QuickGelu => sig_unary_elementwise(solver, inputs, op),
         OpKind::GeluErf => sig_unary_elementwise(solver, inputs, op),
+        OpKind::Relu2 => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         // Shape-preserving; the per-head reduction width is baked by
         // the Impl at fan_out (per attention class), not by the sig.
@@ -673,6 +675,22 @@ fn sig_rope_append(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shap
     // The caller binds the other two targets separately (see
     // `infer::classify_rope_append_tuple`).
     Ok(OpSig { output: q.clone() })
+}
+
+/// `kv_append((k, v, kv_cache))` → `(k, v)`, shape-preserving on both.
+/// Like [`sig_rope_append`] the heads layout is the downstream
+/// attention's to anchor; the caller binds the two targets
+/// (`Stmt::AssignTuple`).
+fn sig_kv_append(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::KvAppend, inputs, 3)?;
+    let k = &inputs[0];
+    if k.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::KvAppend,
+            reason: "k must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: k.clone() })
 }
 
 /// `attention(q, k, v, kv_cache, block_table)` (5-arg, decoder) OR
@@ -1095,6 +1113,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gemm => &[(1, 2)],
         OpKind::RopeAppend => &[],
         OpKind::RopeAppendInterleaved => &[],
+        OpKind::KvAppend => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
         // Sink attention: arg 3 is the per-layer `[num_attention_heads]`
@@ -1106,6 +1125,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gelu => &[],
         OpKind::QuickGelu => &[],
         OpKind::GeluErf => &[],
+        OpKind::Relu2 => &[],
         OpKind::VisionRope => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::RmsNormUnit => &[],
@@ -2033,6 +2053,35 @@ impl InferCtx {
                     }
                     Ok(())
                 } else if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::KvAppend)
+                {
+                    // `(k, v) = kv_append(k, v, kv_cache[layer])`: both
+                    // outputs are their inputs.
+                    if targets.len() != 2 {
+                        return Err(ShapeError::BadArgs {
+                            op: *op,
+                            reason: format!(
+                                "kv_append returns 2 values, got {} targets",
+                                targets.len()
+                            ),
+                        });
+                    }
+                    let shapes = [self.expr_shape(&args[0])?, self.expr_shape(&args[1])?];
+                    let all_input_shapes: Vec<Shape> = args
+                        .iter()
+                        .map(|a| self.expr_shape(a))
+                        .collect::<Result<_, _>>()?;
+                    apply_signature_with_geometry(
+                        &mut self.solver,
+                        *op,
+                        &all_input_shapes,
+                        self.hybrid_attention_geometry,
+                    )?;
+                    for (t, s) in targets.iter().zip(shapes) {
+                        self.locals.insert(*t, s);
+                    }
+                    Ok(())
+                } else if let Expr::Call { op, args } = value
                     && matches!(op, OpKind::VisionRope)
                 {
                     // `(q, k) = vision_rope(q, k, cos, sin)`
@@ -2127,7 +2176,10 @@ impl InferCtx {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append, rope_append_interleaved, vision_rope, mla_split, and gate_split return a tuple".into(),
+                        reason:
+                            "only rope_append, rope_append_interleaved, kv_append, vision_rope, \
+                                 mla_split, and gate_split return a tuple"
+                                .into(),
                     })
                 }
             }
@@ -2679,6 +2731,36 @@ mod tests {
     }
 
     #[test]
+    fn relu2_is_shape_preserving_unary() {
+        let mut solver = Solver::new();
+        let x = vec![
+            bound("num_tokens"),
+            bound("moe_shared_expert_intermediate_size"),
+        ];
+        let sig = apply_signature(&mut solver, OpKind::Relu2, std::slice::from_ref(&x))
+            .expect("relu2 sig");
+        assert_eq!(sig.output, x);
+    }
+
+    /// `kv_append(k, v, kv_cache[layer])` is shape-preserving on K (its first output) and takes
+    /// exactly three arguments.
+    #[test]
+    fn kv_append_is_shape_preserving_on_k() {
+        let mut solver = Solver::new();
+        let k = vec![bound("num_tokens"), bound("kv_dim")];
+        let sig = apply_signature(
+            &mut solver,
+            OpKind::KvAppend,
+            &[k.clone(), k.clone(), vec![]],
+        )
+        .expect("kv_append sig");
+        assert_eq!(sig.output, k);
+        assert!(apply_signature(&mut solver, OpKind::KvAppend, &[k.clone(), k]).is_err());
+        assert_eq!(OpKind::from_name("kv_append"), Some(OpKind::KvAppend));
+        assert_eq!(OpKind::KvAppend.as_str(), "kv_append");
+    }
+
+    #[test]
     fn gelu_erf_is_shape_preserving_unary() {
         let mut solver = Solver::new();
         let x = vec![bound("total_L"), bound("vision_intermediate_size")];
@@ -2786,6 +2868,8 @@ mod tests {
         assert_eq!(OpKind::from_name("vision_rope"), Some(OpKind::VisionRope));
         assert_eq!(OpKind::from_name("quick_gelu"), Some(OpKind::QuickGelu));
         assert_eq!(OpKind::from_name("gelu_erf"), Some(OpKind::GeluErf));
+        assert_eq!(OpKind::from_name("relu2"), Some(OpKind::Relu2));
+        assert_eq!(OpKind::Relu2.as_str(), "relu2");
     }
 
     #[test]

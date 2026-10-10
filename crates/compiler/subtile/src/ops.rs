@@ -50,6 +50,7 @@ macro_rules! for_each_subop {
             Gelu [SubOp::Elementwise(EwKind::Gelu)] arity = (|n| n == 1), cols = [in0];
             QuickGelu [SubOp::Elementwise(EwKind::QuickGelu)] arity = (|n| n == 1), cols = [in0];
             GeluErf [SubOp::Elementwise(EwKind::GeluErf)] arity = (|n| n == 1), cols = [in0];
+            Relu2 [SubOp::Elementwise(EwKind::Relu2)] arity = (|n| n == 1), cols = [in0];
             Mul [SubOp::Elementwise(EwKind::Mul)] arity = (|n| n == 2), cols = [in0];
             Add [SubOp::Elementwise(EwKind::Add)] arity = (|n| n == 2), cols = [in0];
             Sub [SubOp::Elementwise(EwKind::Sub)] arity = (|n| n == 2), cols = [in0];
@@ -64,6 +65,8 @@ macro_rules! for_each_subop {
             // — the caches are per-layer PrefixK / PrefixV sources used
             // as TMA-store destinations for the new decode token's K/V.
             RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0];
+            // `[K, V, K_cache, V_cache]`: the un-rotated writer.
+            KvAppend [SubOp::KvAppend { .. }] arity = (|n| n == 4), cols = [in0];
             // `[Q, (K_seg, V_seg)...]`, optionally with a trailing
             // `[num_heads]` sinks weight source (gpt-oss attention
             // sinks — a 6th input read as a weight, not a K/V pair).
