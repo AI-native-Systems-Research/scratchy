@@ -1368,20 +1368,16 @@ impl MetalWorker {
         let main = (self.gpu_device.as_ref())
             .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
         let lent = match self.model.as_deref() {
-            Some(target) if self.draft_is_head() => target.metal_lend_activation(),
-            _ => None,
+            Some(target) if self.draft_is_head() => lent_by(target)?,
+            _ => Default::default(),
         };
-        let lent =
-            lent.map(|l| l.downcast::<scratchy_target_metal::interpreter::metal::LentActivation>());
-        let lent = (lent.transpose())
-            .map_err(|_| BackendError::Backend("target lent no LentActivation".into()))?;
         Ok(GpuDevice {
             device: main.device.clone(),
             queue: (self.draft_queue.clone()).unwrap_or_else(|| main.queue.clone()),
             allocator: main.allocator.clone(),
             metal_bucket_max_m: main.metal_bucket_max_m,
             kv_addressing: main.kv_addressing,
-            lent: lent.map(|l| *l).unwrap_or_default(),
+            lent,
         })
     }
 
@@ -3186,6 +3182,8 @@ impl MetalWorker {
                 Some(HeadPassesEncoder {
                     passes,
                     model,
+                    target: (self.model.as_deref())
+                        .ok_or_else(|| BackendError::Backend("target not loaded".into()))?,
                     kv_cache: (self.draft_kv_cache.as_ref())
                         .ok_or_else(|| BackendError::Backend("MTP head kv_cache missing".into()))?,
                     argmax_kernels: (self.draft_argmax_kernels.as_ref()).ok_or_else(|| {
@@ -3653,6 +3651,26 @@ impl ChainLayout {
     }
 }
 
+/// The buffers `target`'s pool lends a model whose forwards never overlap its own — an MTP head's:
+/// none until the target's first forward builds that pool.
+#[cfg(feature = "metal")]
+fn lent_by(
+    target: &dyn scratchy_forward_compiler::ScratchyWeights,
+) -> Result<
+    scratchy_target_metal::interpreter::metal::LentActivation,
+    ::scratchy_serving_engine::spec_decode::BackendError,
+> {
+    let lent = (target.metal_lend_activation())
+        .map(|l| l.downcast::<scratchy_target_metal::interpreter::metal::LentActivation>())
+        .transpose()
+        .map_err(|_| {
+            ::scratchy_serving_engine::spec_decode::BackendError::Backend(
+                "target lent no LentActivation".into(),
+            )
+        })?;
+    Ok(lent.map(|l| *l).unwrap_or_default())
+}
+
 /// An MTP head's passes over a step ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)),
 /// encoded in its target's command buffer after the target's forward and argmax: pass 1, then each
 /// chained pass behind the device's pick of its inputs.
@@ -3660,6 +3678,8 @@ impl ChainLayout {
 struct HeadPassesEncoder<'a> {
     passes: &'a ::scratchy_serving_engine::spec_decode::HeadPasses,
     model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    /// The target whose command buffer the passes ride, whose buffers the head's pool is built in.
+    target: &'a dyn scratchy_forward_compiler::ScratchyWeights,
     kv_cache: &'a KvCachePool,
     argmax_kernels: &'a scratchy_target_metal::argmax::ArgmaxKernels,
     chain_kernel: Option<&'a scratchy_target_metal::mtp_chain::MtpChainKernel>,
@@ -3714,6 +3734,10 @@ impl<'a> HeadPassesEncoder<'a> {
         let req = one.request();
         let ctx = head_ctx(self.kv_cache, &req, &device_inputs, one.has_spec_tokens);
         let n = req.num_tokens as u64;
+        // The head's pool is built at its first forward, in the target's buffers: the target's own
+        // pool exists by now — its forward, which this rides, built it — where at the step's start
+        // it may not have.
+        self.device.lent = lent_by(self.target).map_err(|e| e.to_string())?;
         // SAFETY: every view points at the passes' vectors, alive for the call; the forward is
         // encoded onto `enc`, which the target's command buffer outlives.
         let mut onto = unsafe {

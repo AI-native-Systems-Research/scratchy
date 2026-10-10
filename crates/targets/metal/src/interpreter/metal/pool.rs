@@ -323,6 +323,8 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
+    /// The first worker's arena slots, scratch and TurboQuant scratch ([`Self::lend_activation`]).
+    lendable: LentActivation,
 }
 
 /// Pool-owned MTL4 surface. The command buffer is re-created per forward
@@ -618,7 +620,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // out of the pool struct until the hot path actually uses it.
         probe_mtl4_availability(&device);
 
-        let pool = Self {
+        let mut pool = Self {
             device,
             allocator,
             pipelines,
@@ -635,8 +637,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 total_created: 0,
             }),
             cv: Condvar::new(),
+            lendable: LentActivation::default(),
         };
         let first = pool.spawn_worker(&lent)?;
+        pool.lendable = LentActivation {
+            tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
+            ..first.worker.activation()
+        };
         {
             let mut inner = pool.inner.lock().unwrap();
             inner.total_created = 1;
@@ -1449,14 +1456,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
-    /// An idle worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose forwards
-    /// never overlap this one's ([`LentActivation`]); none while every worker is out.
+    /// The first worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose
+    /// forwards never overlap this one's ([`LentActivation`]), out of the pool or not: the borrower
+    /// places its buffers in them once, building its pool, and every forward of it follows this
+    /// pool's — an MTP head's even on the command buffer of the target forward that holds the worker.
     pub fn lend_activation(&self) -> LentActivation {
-        let inner = self.inner.lock().unwrap();
-        (inner.available.first()).map_or_else(LentActivation::default, |p| LentActivation {
-            tq_scratch: p.runtime.tq.as_ref().map(|t| t.scratch.clone()),
-            ..p.worker.activation()
-        })
+        self.lendable.clone()
     }
 
     fn checkin(&self, pooled: PooledWorker<W>) {
