@@ -724,6 +724,45 @@ fn affine_qmv_generic_b4_bf16_matches_cpu_reference() {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// qmv_tiny parity (sub-tile N)
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn affine_qmv_tiny_b4_bf16_matches_cpu_reference() {
+    // N<8 at one row → qmv_tiny (the pick routes it; the b8 production
+    // shape, Qwen3.6's shared-expert gate, is covered in
+    // quantized_b8_test::qwen_shared_expert_gate_b8_bf16_n1). Two shapes:
+    // odd N=7 over two whole K passes, and N=1 over a partial second pass
+    // (K = 1024 + 8 lane chunks — only 8 of 64 lanes take a second trip,
+    // so the cross-simdgroup reduce must hold when one group contributes
+    // nothing past the first pass).
+    let m = 1;
+    for &(n, k) in &[(7usize, 2048usize), (1, 1152)] {
+        for &group_size in &[32usize, 64, 128] {
+            if k % group_size != 0 {
+                continue;
+            }
+            let seed = 0x71DE_u64 ^ (n as u64) << 12 ^ (k as u64) << 4 ^ group_size as u64;
+            let (packed, scales, biases, x) = make_inputs_bf16(seed, n, k, m, group_size);
+            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let Some(metal) =
+                run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
+            else {
+                eprintln!("skipping: no Metal 4 GPU");
+                return;
+            };
+            let (idx, mv, ev, abs_err, allowed) =
+                worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+            assert!(
+                abs_err <= allowed,
+                "qmv_tiny n={n} K={k} gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // BF16 SCALES — Qwen3 mlx-community 4bit convention. Mirrors the
 // three F16-scale tests above but loads scales/biases as `half::bf16`
 // and dispatches the `_s_bf16_` kernel arms (instantiated via

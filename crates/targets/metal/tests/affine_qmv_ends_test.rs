@@ -400,6 +400,14 @@ fn cases() -> Vec<Case> {
             n: 256,
             ..base
         },
+        // Sub-tile N at one row → the tiny kernel, with every end: the
+        // normed variant is the one place its cross-simdgroup sum-of-
+        // squares combine (red[7] + red[15]) does real work.
+        Case {
+            k: 2048,
+            n: 7,
+            ..base
+        },
     ]
 }
 

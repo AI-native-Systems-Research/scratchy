@@ -379,6 +379,15 @@ fn affine_qmv_command(
             }
             .into_baked(),
         ),
+        QmvKernel::Tiny => (
+            KernelId::AffineQmvTiny,
+            super::kernel_constants::AffineQmvConstants {
+                k: super::ids::KDimI32(k as i32),
+                n: super::ids::NDimI32(n as i32),
+                codes,
+            }
+            .into_baked(),
+        ),
         QmvKernel::Wide { .. } => (
             KernelId::AffineQmvWide,
             super::kernel_constants::AffineQmvWideConstants {

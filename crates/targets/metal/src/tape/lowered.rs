@@ -180,6 +180,12 @@ pub enum KernelId {
     /// `affine_qmv_wide_<dtype>_gs_<gs>_b_4_nv_<nv>_kl_8_batch_0`.
     /// Faithful port of MLX's `affine_qmv_wide` (`quantized.h:1723`).
     AffineQmvWide,
+    /// Sub-tile-N (`N < 8`) one-row matvec, power-of-two bits: both
+    /// simdgroups of one threadgroup split K, partials combined through
+    /// threadgroup memory — where the generic kernel parks a whole
+    /// simdgroup and serializes K. Maps to
+    /// `affine_qmv_tiny_<dtype>_s_<sdtype>_gs_<gs>_b_<bits>_batch_0`.
+    AffineQmvTiny,
     /// MLX-affine int4 prefill matmul, transpose=true. Maps to
     /// `affine_qmm_t_<dtype>_gs_<gs>_b_4_alN_<bool>_batch_0` in
     /// `quantized_qmm.metallib`. Faithful port of MLX's
@@ -532,6 +538,7 @@ impl KernelId {
             | Self::AffineQmv
             | Self::AffineQmvGated
             | Self::AffineQmvWide
+            | Self::AffineQmvTiny
             | Self::AffineQmmT
             | Self::AffineGatherQmmT
             | Self::AffineGatherQmmTNax

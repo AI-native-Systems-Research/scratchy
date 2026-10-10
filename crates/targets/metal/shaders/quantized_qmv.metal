@@ -1145,6 +1145,180 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 }
 
 // ─────────────────────────────────────────────────────────────────
+// qmv_tiny — sub-tile N (N < 8) at one row. NOT an MLX port: MLX's
+// `dispatch_qmv` has no sub-tile-N branch, so its `qvm` runs the
+// guarded path `qmv_impl` takes when `out_vec_size < 8` — one
+// simdgroup parked (its lanes map to output rows that don't exist),
+// the other walking K in `values_per_thread × 32`-value blocks: 16
+// serial blocks at 8-bit's 4 values per thread, K = 2048, measured
+// 9.3 µs for 2 KB of codes on M5 Max while an 8-threadgroup 4-bit
+// fast matvec over 32 KB runs 3.7 µs. Ours splits K across BOTH
+// simdgroups of the one threadgroup — 64 lanes, 16 values each, two
+// passes at K = 2048 — and combines the simdgroup partials through
+// threadgroup memory. Same math (f32 accumulate, `qdot`, the ends
+// constants), a deliberate divergence of the same class as the NAX
+// floor (#326).
+// ─────────────────────────────────────────────────────────────────
+
+MLX_MTL_CONST int TINY_VALUES_PER_LANE = 16;
+MLX_MTL_CONST int TINY_LANES = 64;
+MLX_MTL_CONST int TINY_PASS_VALUES = TINY_VALUES_PER_LANE * TINY_LANES;
+
+template <typename T_act, typename T_scale, int group_size, int bits>
+METAL_FUNC void qmv_tiny_impl(
+    const device uint32_t* w,
+    const device T_scale* scales,
+    const device T_scale* biases,
+    const device T_act* x,
+    device T_act* y,
+    int in_vec_size,
+    int out_vec_size,
+    threadgroup float* red,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sidx [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const device T_scale* gain = nullptr,
+    const device T_act* bias = nullptr) {
+  static_assert(
+      bits == 2 || bits == 4 || bits == 8,
+      "qmv_tiny_impl: scratchy picks tiny only at power-of-two bits");
+  // A lane's 16 values weigh 16 * bits / 8 code bytes (the weight offset
+  // below) and sit inside one quant group — the pick requires K % 16 == 0
+  // and every instantiated group size is a multiple of 16 — so one
+  // (scale, bias) pair covers the whole lane chunk.
+  const int row_code_bytes = in_vec_size * bits / 8;
+  const int row_groups = in_vec_size / group_size;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+  thread U x_thread[TINY_VALUES_PER_LANE];
+  thread U result[8] = {0};
+  U sum_sq = 0;
+
+  x += tid.x * in_vec_size;
+  y += tid.x * out_vec_size;
+
+  // Lane `sidx` dots values [base, base + 16); the 64 lanes stride K in
+  // TINY_PASS_VALUES passes. The pick's K % 16 == 0 keeps every lane chunk
+  // whole — lanes past K take no trip.
+  for (int base = int(sidx) * TINY_VALUES_PER_LANE; base < in_vec_size;
+       base += TINY_PASS_VALUES) {
+    U sum;
+    if (QMV_NORMED) {
+      thread U xg[TINY_VALUES_PER_LANE];
+      qmv_normalize<U, TINY_VALUES_PER_LANE>(
+          x + base, gain + base, xg, sum_sq, TINY_VALUES_PER_LANE);
+      sum = load_vector<T_act, U, TINY_VALUES_PER_LANE, bits>(xg, x_thread);
+    } else {
+      sum = load_vector<T_act, U, TINY_VALUES_PER_LANE, bits>(x + base, x_thread);
+    }
+    const int g = base / group_size;
+    for (int r = 0; r < out_vec_size; r++) {
+      const device uint8_t* wl = ws + r * row_code_bytes + base * bits / 8;
+      result[r] += qdot<U, TINY_VALUES_PER_LANE, bits>(
+          wl,
+          x_thread,
+          U(scales[r * row_groups + g]),
+          U(biases[r * row_groups + g]),
+          sum);
+    }
+  }
+
+  // Fold each simdgroup's 32 lanes, then the two groups through threadgroup
+  // memory: row partials in [0, N), the norm's sum of squares at [7]. `red`
+  // is the entry's threadgroup block — a METAL_FUNC can't declare one.
+  for (int r = 0; r < out_vec_size; r++) {
+    result[r] = simd_sum(result[r]);
+  }
+  const U group_sq = simd_sum(sum_sq);
+  if (simd_lid == 0) {
+    for (int r = 0; r < out_vec_size; r++) {
+      red[simd_gid * 8 + r] = result[r];
+    }
+    red[simd_gid * 8 + 7] = group_sq;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sidx == 0) {
+    const U scale = qmv_row_scale(red[7] + red[15], in_vec_size);
+    for (int r = 0; r < out_vec_size; r++) {
+      qmv_store<T_act>(y + r, (red[r] + red[8 + r]) * scale, bias, r);
+    }
+  }
+}
+
+template <typename T_act, typename T_scale, const int group_size, const int bits, bool batched>
+[[kernel]] void affine_qmv_tiny(
+    const device uint32_t* w [[buffer(0)]],
+    const device T_scale* scales [[buffer(1)]],
+    const device T_scale* biases [[buffer(2)]],
+    const device T_act* x [[buffer(3)]],
+    device T_act* y [[buffer(4)]],
+    // buffer(5) / buffer(6): see note on affine_qmv_quad above —
+    // K / N are the compiled-in IN_VEC_SIZE / OUT_VEC_SIZE.
+    const constant int& x_batch_ndims [[buffer(7)]],
+    const constant int* x_shape [[buffer(8)]],
+    const constant int64_t* x_strides [[buffer(9)]],
+    const constant int& w_batch_ndims [[buffer(10)]],
+    const constant int* w_shape [[buffer(11)]],
+    const constant int64_t* w_strides [[buffer(12)]],
+    const constant int64_t* s_strides [[buffer(13)]],
+    const constant int64_t* b_strides [[buffer(14)]],
+    const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sidx [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  // The conditions name `bits` so the frontend defers them to instantiation:
+  // a static_assert over the baked constants alone fires in EVERY namespace
+  // the batch compiles this shader into, whatever kernel it carries.
+  static_assert(
+      bits > 0 && OUT_VEC_SIZE >= 1 && OUT_VEC_SIZE < 8,
+      "affine_qmv_tiny: sub-tile N only — the pick gates N < 8");
+  static_assert(
+      bits > 0 && IN_VEC_SIZE % TINY_VALUES_PER_LANE == 0,
+      "affine_qmv_tiny: K must be a whole multiple of the 16-value lane chunk");
+  // One row's two simdgroup partials (+ the norm's sum of squares at [7]).
+  threadgroup float red[16];
+  if (batched) {
+    int M = x_shape[x_batch_ndims];
+    adjust_matrix_offsets<T_act, T_scale>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        OUT_VEC_SIZE * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        b_strides,
+        tid);
+  }
+  qmv_tiny_impl<T_act, T_scale, group_size, bits>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      IN_VEC_SIZE,
+      OUT_VEC_SIZE,
+      red,
+      tid,
+      sidx,
+      simd_gid,
+      simd_lid,
+      gain,
+      bias);
+}
+
+// ─────────────────────────────────────────────────────────────────
 // dequantize — quantized.h:482-556. Decode one quantized block
 // (scale * q + bias) into w_local. Bits 2, 3, 4 and 8 (the wide
 // kernel's instantiations); the other branches dropped rather than
@@ -1425,6 +1599,7 @@ template <
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 4)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4, 1)     \
+  INST_QMV_BATCHED(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 1) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,0) \
@@ -1459,6 +1634,7 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 8)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
+  INST_QMV_BATCHED(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 64, 0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128,0)
 
@@ -1501,6 +1677,7 @@ INST_QMV_ALL_B3(f16,  half,   f16,  half,   64)
   INST_QMV_FAST_T8(act_tag, act_type, scale_tag, scale_type, gs, 2)                         \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 2, 1)     \
+  INST_QMV_BATCHED(affine_qmv_tiny, act_tag, act_type, scale_tag, scale_type, gs, 2, 0)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 64, 1) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 2, 128,0) \

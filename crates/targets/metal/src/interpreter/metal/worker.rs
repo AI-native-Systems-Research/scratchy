@@ -941,6 +941,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineQmvQuad
         | K::AffineQmvFast
         | K::AffineQmvWide
+        | K::AffineQmvTiny
         | K::AffineQmv
         | K::AffineQmvGated
         | K::AffineQmmT
