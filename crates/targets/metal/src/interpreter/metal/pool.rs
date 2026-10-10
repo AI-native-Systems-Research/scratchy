@@ -1725,9 +1725,12 @@ fn begin_step<W: CanonicalParams>(
         .and_then(|d| d.select.clone().map(|p| (d, p)))
         .filter(|(d, _)| !d.selections.is_empty())
     {
-        use crate::select_rows::{SelectInto, SelectOp};
+        use crate::select_rows::{SelectFrom, SelectInto, SelectOp};
         let tables: Vec<usize> = (d.selections.iter())
-            .map(|s| writes.raw(bytemuck_words(&s.table)))
+            .map(|s| match &s.source {
+                SelectFrom::Table(table) => writes.raw(bytemuck_words(table)),
+                SelectFrom::Device(..) => 0,
+            })
             .collect();
         let ops: Vec<u8> = (d.selections.iter().zip(tables))
             .flat_map(|(s, at)| {
@@ -2806,7 +2809,7 @@ mod tests {
         let positions: Vec<u32> = (0..4).collect();
         let mut deferral = Deferral::default();
         deferral.selections = vec![crate::select_rows::Selection {
-            table: vec![60, 61, 70, 71, 80, 81],
+            source: crate::select_rows::SelectFrom::Table(vec![60, 61, 70, 71, 80, 81]),
             stride: 2,
             len: 2,
             selector: ((*picked).clone(), 0),

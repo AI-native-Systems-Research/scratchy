@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `select_rows`: each op copies the variant its selector names — variants a stride apart,
-//! overlapping where the stride is shorter than the copy — to its destination, at its offset; ops of
-//! one dispatch pick independently. GPU test — run with `--test-threads=1` (standing rule).
+//! overlapping where the stride is shorter than the copy — from a staged table or a device buffer,
+//! to its destination at its offset; ops of one dispatch pick independently. GPU test — run with
+//! `--test-threads=1` (standing rule).
 
 mod common;
 
@@ -9,7 +10,7 @@ use objc2_metal::{MTLBuffer as _, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{read_slice, shared_slice, shared_zeroed};
-use scratchy_target_metal::select_rows::{SelectInto, SelectOp, Selection};
+use scratchy_target_metal::select_rows::{SelectFrom, SelectInto, SelectOp, Selection};
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
 
 #[test]
@@ -28,27 +29,27 @@ fn select_rows_copies_the_variant_each_selector_names() {
 
     // Selectors, as an earlier command buffer leaves them: sequence 0 kept 2, sequence 1 kept 1.
     let selectors = shared_slice(&device, &[2u32, 1]);
-    let (dst_a, dst_b) = (shared_zeroed(&device, 64), shared_zeroed(&device, 64));
-    // Three variants of four words; then a window table of five two-word rows, three rows a copy.
-    let variants: Vec<u32> = (0..12).map(|i| 100 + i).collect();
-    let window: Vec<u32> = (0..10).map(|i| 200 + i).collect();
+    // An earlier step's outputs: its rows' tokens, and its drafts.
+    let tokens = shared_slice(&device, &[300u32, 301, 302, 303]);
+    let drafts = shared_slice(&device, &[400u32, 401]);
+    let dsts: Vec<_> = (0..4).map(|_| shared_zeroed(&device, 64)).collect();
+    let selection = |source, stride, len, selector, to: usize, at| Selection {
+        source,
+        stride,
+        len,
+        selector: (selectors.clone(), selector),
+        to: SelectInto::Buffer(dsts[to].clone()),
+        at,
+    };
     let selections = [
-        Selection {
-            table: variants,
-            stride: 4,
-            len: 4,
-            selector: (selectors.clone(), 0),
-            to: SelectInto::Buffer(dst_a.clone()),
-            at: 0,
-        },
-        Selection {
-            table: window,
-            stride: 2,
-            len: 6,
-            selector: (selectors.clone(), 4),
-            to: SelectInto::Buffer(dst_b.clone()),
-            at: 8,
-        },
+        // Three variants of four words.
+        selection(SelectFrom::Table((100..112).collect()), 4, 4, 0, 0, 0),
+        // A window over five two-word rows, three rows a copy, 8 bytes into its destination.
+        selection(SelectFrom::Table((200..210).collect()), 2, 6, 4, 1, 8),
+        // The token at the row sequence 0 kept up to, from row 1 on.
+        selection(SelectFrom::Device(tokens.clone(), 4), 1, 1, 0, 2, 0),
+        // The drafts whole: stride 0.
+        selection(SelectFrom::Device(drafts.clone(), 0), 0, 2, 4, 3, 4),
     ];
     // The staged region: the ops, then each table.
     let ops_bytes = selections.len() * size_of::<SelectOp>();
@@ -59,7 +60,9 @@ fn select_rows_copies_the_variant_each_selector_names() {
             unreachable!("the test's selections land in buffers");
         };
         let src_at = region.len();
-        region.extend(s.table.iter().flat_map(|w| w.to_le_bytes()));
+        if let SelectFrom::Table(table) = &s.source {
+            region.extend(table.iter().flat_map(|w| w.to_le_bytes()));
+        }
         ops.push(SelectOp::new(src_at, s, to.gpuAddress() + s.at as u64));
     }
     for (i, op) in ops.iter().enumerate() {
@@ -73,20 +76,22 @@ fn select_rows_copies_the_variant_each_selector_names() {
         depth: 1,
     };
     // Bound past the kernel's two so the buffers its ops address are resident.
-    let bufs = [&region, &region, &selectors, &dst_a, &dst_b];
+    let mut bufs = vec![&region, &region, &selectors, &tokens, &drafts];
+    bufs.extend(dsts.iter());
     if !common::dispatch_threadgroups(&device, &pso, &bufs, size(ops.len()), size(64)) {
         return;
     }
+    let read = |i: usize, n| read_slice::<u32>(&dsts[i], n);
+    assert_eq!(read(0, 4), [108, 109, 110, 111], "variant 2 of 3");
     assert_eq!(
-        read_slice::<u32>(&dst_a, 4),
-        [108, 109, 110, 111],
-        "variant 2 of 3"
+        read(1, 8),
+        [0, 0, 202, 203, 204, 205, 206, 207],
+        "rows 1-3 of the window, past the op's offset"
     );
-    let b: Vec<u32> = read_slice::<u32>(&dst_b, 8);
-    assert_eq!(b[..2], [0, 0], "nothing before the op's offset");
+    assert_eq!(read(2, 1), [303], "row 1 + 2 of the earlier step's tokens");
     assert_eq!(
-        b[2..],
-        [202, 203, 204, 205, 206, 207],
-        "rows 1-3 of the window"
+        read(3, 3),
+        [0, 400, 401],
+        "the drafts, past the op's offset"
     );
 }

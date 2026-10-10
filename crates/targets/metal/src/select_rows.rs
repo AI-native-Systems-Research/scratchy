@@ -33,16 +33,25 @@ impl SelectRowsKernel {
     }
 }
 
-/// One copy the device picks: `len` words of `table` from word `*selector · stride` — variants
-/// `stride` words apart, overlapping where `stride < len` — to `at` bytes into `to`.
+/// One copy the device picks: `len` words of `source` from word `*selector · stride` — variants
+/// `stride` words apart, overlapping where `stride < len`; stride 0, a plain copy — to `at` bytes
+/// into `to`.
 pub struct Selection {
-    pub table: Vec<u32>,
+    pub source: SelectFrom,
     pub stride: usize,
     pub len: usize,
     /// The variant's index: a `u32` `.1` bytes into `.0`, which an earlier command buffer wrote.
     pub selector: (crate::mtl4_dispatch::Buffer, usize),
     pub to: SelectInto,
     pub at: usize,
+}
+
+/// What a [`Selection`] copies from.
+pub enum SelectFrom {
+    /// Every outcome, laid out by the host: staged with the step's inputs.
+    Table(Vec<u32>),
+    /// An earlier command buffer's output: `.1` bytes into `.0`.
+    Device(crate::mtl4_dispatch::Buffer, usize),
 }
 
 /// Where a [`Selection`] lands.
@@ -53,8 +62,8 @@ pub enum SelectInto {
     Buffer(crate::mtl4_dispatch::Buffer),
 }
 
-/// The kernel's op, as `select_rows.metal` lays it out: the table `src_at` bytes into the staged
-/// region, the destination and selector by address.
+/// The kernel's op, as `select_rows.metal` lays it out: the source by address, or (0) its table
+/// `src_at` bytes into the staged region; the destination and selector by address.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SelectOp {
@@ -62,18 +71,25 @@ pub struct SelectOp {
     pub stride: u32,
     pub len: u32,
     pub _pad: u32,
+    pub src: u64,
     pub dst: u64,
     pub sel: u64,
 }
 
 impl SelectOp {
+    /// `s`'s op: its table staged `src_at` bytes into the region (a device source has none).
     pub fn new(src_at: usize, s: &Selection, dst: u64) -> Self {
         let words = |n: usize| u32::try_from(n).expect("a selection fits u32 words");
+        let src = match &s.source {
+            SelectFrom::Table(_) => 0,
+            SelectFrom::Device(buffer, at) => buffer.gpuAddress() + *at as u64,
+        };
         Self {
             src_at: words(src_at),
             stride: words(s.stride),
             len: words(s.len),
             _pad: 0,
+            src,
             dst,
             sel: s.selector.0.gpuAddress() + s.selector.1 as u64,
         }
