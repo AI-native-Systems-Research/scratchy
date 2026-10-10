@@ -511,10 +511,10 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
  * Engine colours are fixed per engine and the same in both themes: blue,
  * orange, aqua from the data-viz reference palette, validated as a set
  * (all pairs, CVD and normal vision) against cds--white and cds--g100
- * surfaces. Aqua is under 3:1 on white, so every chart carries direct end
- * labels and a table view. Every Carbon size token here has a fallback:
+ * surfaces. Aqua is under 3:1 on white, so every chart has a legend and a
+ * table view. Every Carbon size token here has a fallback:
  * this site only resolves Carbon's colour tokens. */
-.metalpage, .mtip {
+.metalpage {
   --s1: #2a78d6;           /* scratchy */
   --s2: #d95926;           /* mlx-lm */
   --s3: #1baf7a;           /* ollama */
@@ -544,10 +544,9 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .metalpage .empty { color: var(--muted); }
 /* Each model is a Carbon tile (the cds--tile class, so its numbers never wait
  * on a script). Inside it the surface is --bg-soft, so the heat-map neutral
- * steps up to --panel and chart dots ring in the tile's own colour. */
+ * steps up to --panel. */
 .metalpage { --heat-mid: var(--bg-soft); }
 .metalpage .mmodel { margin-top: 1.5rem; padding: 0.5rem 1.5rem 1rem; --heat-mid: var(--panel); }
-.metalpage .mmodel .mchart .dot { stroke: var(--bg-soft); }
 .metalpage .mfold { margin: 0.5rem 0 0; }
 
 /* Wide tables scroll inside their own box, never the page. */
@@ -566,7 +565,6 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .key.s1, .lkey.s1 { background: var(--s1); }
 .key.s2, .lkey.s2 { background: var(--s2); }
 .key.s3, .lkey.s3 { background: var(--s3); }
-.lkey.prev { background: var(--muted); opacity: 0.7; }
 
 /* Before/after badge under a scratchy number: the arrow carries better/worse
  * in Carbon's support colours; the figure itself stays in text ink. */
@@ -577,25 +575,11 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 
 .mfig { margin: 2rem 0; }
 .mfig figcaption { margin-bottom: 0.5rem; }
-.legend { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--fg); margin-bottom: 0.25rem; }
 .chartrow { display: flex; flex-wrap: wrap; gap: 1.5rem 2.5rem; }
 .chartpane { flex: 1 1 22rem; max-width: 34rem; min-width: 0; }
-.mchart { width: 100%; height: auto; display: block; overflow: visible; }
-.mchart .grid { stroke: var(--line); stroke-width: 1; }
-.mchart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.mchart .axis { fill: var(--muted); font-size: 11px; }
-.mchart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.mchart .dot { stroke: var(--bg); stroke-width: 2; }
-.mchart .ln.s1 { stroke: var(--s1); } .mchart .dot.s1 { fill: var(--s1); }
-.mchart .ln.s2 { stroke: var(--s2); } .mchart .dot.s2 { fill: var(--s2); }
-.mchart .ln.s3 { stroke: var(--s3); } .mchart .dot.s3 { fill: var(--s3); }
-/* The previous run: de-emphasis grey, thinner, hollow dots, behind the rest. */
-.mchart .ln.prev { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
-.mchart .dot.prev { fill: var(--bg); stroke: var(--muted); stroke-width: 1.5; opacity: 0.8; }
-.mchart .endlbl { fill: var(--fg); font-size: 12px; }
-.mchart .leader, .mchart .xhair { stroke: var(--muted); stroke-width: 1; }
-.mchart .hit { fill: transparent; outline: none; }
-.mchart .hit:focus-visible { fill: color-mix(in srgb, var(--fg) 6%, transparent); }
+/* A Carbon Charts line chart (charts.js); its notes sit under Carbon's tooltip. */
+.mchart { width: 100%; }
+.mchartnote { margin-top: 0.25rem; color: var(--muted); }
 
 .heatrow { display: flex; flex-wrap: wrap; gap: 2rem; }
 /* Flex items default to min-width: auto, which lets a wide grid stretch the
@@ -605,10 +589,11 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .heat table { border-collapse: separate; border-spacing: 2px; font-size: var(--cds-body-01-font-size, 0.875rem); }
 .heat th { color: var(--muted); font-weight: 600; padding: 0.25rem 0.5rem; text-align: right; }
 .heat td { background: var(--heat-mid); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
-.heat td b { display: block; font-size: 1rem; }
+.heat .mcell { display: block; outline: none; }
+.heat .mcell b { display: block; font-size: 1rem; }
 /* Text ink, not muted grey: on a strong tint grey loses its contrast. */
-.heat td span { display: block; color: inherit; font-size: var(--cds-label-01-font-size, 0.75rem); }
-.heat td:hover, .heat td:focus-visible { outline: 1px solid var(--fg); outline-offset: -1px; }
+.heat .mcell .msmall { display: block; color: inherit; font-size: var(--cds-label-01-font-size, 0.75rem); }
+.heat td:hover, .heat td:focus-within { outline: 1px solid var(--fg); outline-offset: -1px; }
 .scale { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-top: 0.5rem; }
 .scale .scalekey { color: var(--fg); }
 .scale .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.35rem; }
@@ -635,16 +620,20 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .gtable td.gnone { color: var(--muted); font-style: italic; font-size: var(--cds-label-01-font-size, 0.75rem); }
 .gmini { display: grid; gap: 2px; width: 4.5rem; text-decoration: none; }
 .gmini:focus-visible { outline: 2px solid var(--cds-focus, var(--accent)); outline-offset: 2px; }
+/* A square is an empty trigger sized by its width: the tooltip's own popover
+ * box would shrink it to nothing, so it fills the grid cell instead. */
+.gmini cds-tooltip, .gmini cds-tooltip::part(popover-container) { display: block; }
 .gsq { display: block; aspect-ratio: 1; background: var(--heat-mid); border-radius: 2px; }
 .gsq:hover { outline: 1px solid var(--fg); }
 .gsq.gnil, .scale .sw.nil { background: none; border: 1px solid var(--line); }
 .grange { display: block; margin-top: 0.3rem; color: var(--muted); font-size: var(--cds-label-01-font-size, 0.75rem); white-space: nowrap; }
 
-.mtip { position: absolute; z-index: 10; pointer-events: none; background: var(--panel); color: var(--fg);
-  border: 1px solid var(--line); border-radius: 4px; padding: 0.5rem 0.65rem; font-size: var(--cds-label-01-font-size, 0.75rem);
-  font-variant-numeric: tabular-nums; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
-.mtip .mtiphead { color: var(--muted); margin-bottom: 0.25rem; }
+/* Tooltip bodies (Carbon draws the inverse surface). Inside a table cell they
+ * must not take the cell's alignment, wrapping or weight. */
+cds-tooltip-content { text-align: left; white-space: nowrap; font-weight: 400; font-variant-numeric: tabular-nums; }
+cds-tooltip-content b { font-weight: 600; }
+.mtiphead { margin-bottom: 0.25rem; }
+.mtiphead, .mtipdim { opacity: 0.75; }
 @media (max-width: 672px) {
   .metalpage { padding: 0 1rem 3rem; }
 }
-.mtip b { font-weight: 600; }

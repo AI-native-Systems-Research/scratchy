@@ -1,5 +1,3 @@
 # Build output.
 /_site/
-
-# build.py imports build_archs.py
-__pycache__/
+/target/
