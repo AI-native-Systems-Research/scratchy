@@ -10393,8 +10393,8 @@ mod tests {
         );
     }
 
-    /// The writer's encode binds exactly the ABI `rope.metal`'s `ROPE_TQ_BUFFERS` declares, in
-    /// order, and carries its constants slot by slot — written out here, independently of the
+    /// The writer's encode binds exactly the ABI `kv_writer.h`'s `KV_WRITER_TQ_BUFFERS` declares,
+    /// in order, and carries its constants slot by slot — written out here, independently of the
     /// builder, for a centered layer (the offset tail is pinned above).
     #[test]
     fn turboquant_writer_encode_binds_the_kernel_abi() {
