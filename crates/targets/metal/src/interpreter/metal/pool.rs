@@ -229,9 +229,21 @@ impl RuntimeFactory {
 pub struct PooledWorker<W: CanonicalParams> {
     pub worker: MetalWorker<W>,
     pub runtime: RuntimeBindings,
-    /// What a forward played in another pool's command buffer ([`MetalWorkerPool::forward_onto`])
-    /// stages its input writes in: its worker is out until that command buffer is done.
-    staging: Option<crate::residency::Pinned>,
+    /// What forwards played in another pool's command buffer ([`MetalWorkerPool::forward_onto`])
+    /// stage their input writes in: two, a checkout each in turn, so the worker may go back to its
+    /// pool once they are encoded — the command buffer of the checkout before reads the other
+    /// ([`Onto`]).
+    staging: [Staging; 2],
+    /// The slot the next checkout takes.
+    next_staging: usize,
+}
+
+/// One of a [`PooledWorker`]'s staging slots: its buffer, and those a larger one replaced, kept
+/// until the slot is next taken.
+#[derive(Default)]
+struct Staging {
+    buffer: Option<crate::residency::Pinned>,
+    retired: Vec<crate::residency::Pinned>,
 }
 
 /// RAII guard returned by [`MetalWorkerPool::checkout`]. Returns the
@@ -1347,11 +1359,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
     ) -> Result<Onto<'_, W>, ForwardError> {
         self.attach_residency();
+        let mut guard = self.checkout()?;
+        let slot = guard.next_staging;
+        guard.next_staging ^= 1;
+        guard.staging[slot].retired.clear();
         let mut onto = Onto {
-            guard: self.checkout()?,
+            guard,
+            slot,
             bucket_idx: 0,
             staged: 0,
-            retired: Vec::new(),
         };
         onto.then(inputs, enc)?;
         Ok(onto)
@@ -1428,7 +1444,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(PooledWorker {
             worker,
             runtime,
-            staging: None,
+            staging: Default::default(),
+            next_staging: 0,
         })
     }
 
@@ -1541,15 +1558,18 @@ fn bytemuck_words(words: &[u32]) -> &[u8] {
 }
 
 /// The forwards [`MetalWorkerPool::forward_onto`] and [`Self::then`] encoded onto another pool's
-/// command buffer, and the worker they run on, out of its pool until this drops.
+/// command buffer, and the worker they run on, out of its pool until this drops. It may drop once
+/// they are encoded, before that command buffer is done, only while at most one other command
+/// buffer the pool's forwards were played onto is still running: the worker's next checkout but
+/// one takes this one's staging slot again.
 pub struct Onto<'p, W: CanonicalParams> {
     guard: WorkerGuard<'p, W>,
+    /// The worker's staging slot its forwards' input writes take.
+    slot: usize,
     /// The bucket the last forward ran.
     bucket_idx: usize,
-    /// The bytes of the worker's staging the forwards' input writes take.
+    /// The bytes of the slot's buffer the forwards' input writes take.
     staged: usize,
-    /// Staging buffers the forwards' input writes read that a larger one replaced.
-    retired: Vec<crate::residency::Pinned>,
 }
 
 impl<W: CanonicalParams> Onto<'_, W> {
@@ -1573,8 +1593,9 @@ impl<W: CanonicalParams> Onto<'_, W> {
         );
         let writes = begin_step(&self.guard, inputs, pool.block_table_stride)?;
         let pooled = &mut *self.guard;
-        let (at, replaced) = pool.stage(&mut pooled.staging, self.staged, &writes.staged);
-        self.retired.extend(replaced);
+        let staging = &mut pooled.staging[self.slot];
+        let (at, replaced) = pool.stage(&mut staging.buffer, self.staged, &writes.staged);
+        staging.retired.extend(replaced);
         self.staged = at + writes.staged.len();
         // After everything on the encoder so far: it wrote what the device inputs read, and may
         // read this worker's runtime inputs or share its activation (an arena lent to it).
@@ -1587,7 +1608,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
         encode_input_writes(
             enc,
             &pool.device,
-            pooled.staging.as_deref(),
+            pooled.staging[self.slot].buffer.as_deref(),
             at,
             &writes.ops,
         );
@@ -1710,6 +1731,7 @@ fn begin_step<W: CanonicalParams>(
         DeviceInputInto::SlotMapping => &runtime.slot_mappings[0],
         DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
         DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
+        DeviceInputInto::GdnSteps => &runtime.gdn_is_fresh,
     };
     for input in inputs.device_inputs.iter().map(|d| (d, input(d.into))) {
         let (input, to) = input;

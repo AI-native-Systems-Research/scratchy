@@ -260,6 +260,8 @@ pub enum DeviceInputInto {
     SeqUsedK,
     /// An MRoPE model's rotary cos/sin rows (`mrope_cos_sin`), over the host's placeholders.
     RopeRows,
+    /// Each sequence's Gated-DeltaNet step code (`gdn_is_fresh`), over the host's.
+    GdnSteps,
 }
 
 /// A committed command buffer the host has not waited for.
