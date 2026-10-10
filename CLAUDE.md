@@ -99,3 +99,8 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 ## Commits & PR titles
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for
 both, scoped to the crate or area touched (`fix(metal): ...`).
+
+Every `perf:` commit carries the perf-regress table in its message and the
+re-recorded baseline for the chip it was measured on (see
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md), "The perf regression gate"):
+`scripts/bench_perf_regress.sh --update --markdown` from the commit's worktree.
