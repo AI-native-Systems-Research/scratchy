@@ -8,8 +8,9 @@
 //!   unfused `rmsnorm` then matvec is — and the plain matvec of the raw `x`, which the same bound
 //!   must reject, shows the bound sees a missing norm.
 //! - The epilogue — the projection's bias, a scale, the residual add — must be the plain matvec's
-//!   row biased, scaled and added, to within the row's own rounding: the result takes one rounding
-//!   where the unfused steps each took one.
+//!   row biased, scaled and added, to within the plain row's own rounding carried through the
+//!   scale plus the result's one rounding: the fused store rounds once where the unfused steps
+//!   each rounded, and its reference builds on the plain output's already-rounded row.
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
@@ -473,8 +474,12 @@ fn an_ending_matvec_is_the_plain_matvec_biased_scaled_and_added() {
                 "{c:?} biased row {i}: {} vs {want_b}",
                 biased[i]
             );
+            // The ending kernel adds its bias to its own unrounded dot; the reference builds on
+            // the plain output's already-rounded row, so the plain row's rounding — one ulp of
+            // |p|, which the bias can shrink far past |scaled| by cancelling the dot —
+            // propagates through SCALE, on top of the ending's single store rounding.
             assert!(
-                near(ended[i], want_e, scaled),
+                (ended[i] - want_e).abs() <= ulp * (want_e.abs() + SCALE * p[i].abs()),
                 "{c:?} ended row {i}: {} vs {want_e}",
                 ended[i]
             );
