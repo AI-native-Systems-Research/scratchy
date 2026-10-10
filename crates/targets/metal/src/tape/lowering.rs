@@ -766,7 +766,8 @@ fn kv_writer_codec(
 /// operand's offset (a rotated K bias by the rope-on-read table and pairing).
 /// Its threadgroups count query heads; one serves the tape variant's
 /// [`ConstantType::TqHeads`] of them, which divides them where the worker
-/// builds the dispatch.
+/// builds the dispatch — so the twin carries the UNdivided count, restoring
+/// the plain command's `num_q_heads / heads` to `n_q_heads`.
 ///
 /// [`ConstantType::TqHeads`]: super::constants::ConstantType::TqHeads
 fn tq_attention_command(
@@ -774,8 +775,13 @@ fn tq_attention_command(
     layer: u32,
     ops: TqOperands,
     bits: TqBits,
+    n_q_heads: u32,
 ) -> LoweredCommand {
     let mut constants = attn.constants.to_vec();
+    // The twin's heads are the tape variant's: drop the plain command's baked
+    // count so the variant-bound entry below is slot 16's only value.
+    let heads_slot = super::kernel_constants::AttentionViaCacheTqConstants::HEADS.0;
+    constants.retain(|k| k.index != heads_slot);
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
             bits: super::ids::TqCodeBits(bits.get()),
@@ -789,10 +795,15 @@ fn tq_attention_command(
     }));
     bindings.extend(ops.k.0.map(|b| b.bias_binding(14)));
     bindings.extend(ops.v.0.map(|b| b.bias_binding(15)));
+    let (tg_x, _, tg_z) = attn.dispatch.threadgroups;
     LoweredCommand {
         kernel: KernelId::AttentionViaCacheTq,
         constants: baked(constants),
         bindings: baked(bindings),
+        dispatch: DispatchShape {
+            threadgroups: (tg_x, n_q_heads, tg_z),
+            ..attn.dispatch
+        },
         ..*attn
     }
 }
@@ -1098,7 +1109,9 @@ const ATTN_SPLIT_KEYS: u32 = 1024;
 /// At most this many threadgroups a KV head's keys spread over.
 const ATTN_MAX_SPLITS: u32 = 16;
 
-/// The query heads `attention_decode_gqa_tq` serves a KV head.
+/// The query heads `attention_decode_gqa_tq` serves a KV head: the matrix units' row count —
+/// the kernel takes the whole group when it divides the count evenly and fits, a smaller one
+/// zero-pads the fragment rows past it.
 const GQA_HEADS: u32 = 8;
 
 /// The threads of `attention_via_cache_v2_combine`'s threadgroup: its `ATTN_COMBINE_GROUPS`
@@ -1106,14 +1119,15 @@ const GQA_HEADS: u32 = 8;
 const COMBINE_THREADS: u32 = 4 * 32;
 
 /// A one-row bucket's TurboQuant decode attention (the codec's packed twin, or it running its KV
-/// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
-/// head_dim a multiple of 128 up to 512, KV blocks of whole 8-key blocks, no projection bias, a
-/// rotary pair's partner a whole lane stride away — serves each KV head's query heads together:
-/// its keys decode once for all 8, where `attention_via_cache_v2` decodes them once per head
-/// group. Its keys spread over the threadgroups the rung's KV cap calls for (`ATTN_SPLITS`,
-/// [`ATTN_SPLIT_KEYS`] of the cap each, at most [`ATTN_MAX_SPLITS`]), each storing its heads'
-/// partials at the op scratch's front, `[num_q_heads, splits, 2 + head_dim]` floats, and a
-/// combine merges them into the output.
+/// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, the whole query-head
+/// group a KV head (up to [`GQA_HEADS`] heads, dividing evenly), head_dim a multiple of 128 up
+/// to 512, KV blocks of whole 8-key blocks, a rotary pair's partner a whole lane stride away —
+/// serves each KV head's query heads together: its keys decode once for the
+/// group, where `attention_via_cache_v2` decodes them once per head. Its keys spread over the
+/// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
+/// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
+/// front, `[num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them into the
+/// output.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -1137,7 +1151,6 @@ fn decode_attention_per_kv_head(
     };
     let takes = |c: &LoweredCommand| {
         c.kernel == KernelId::AttentionViaCacheTq
-            && !c.constants.iter().any(|k| matches!(k.index, 14 | 15))
             // A sinks dispatch stays on its one-pass twin: the split pair
             // (`attention_decode_gqa_tq` + combine) has no sink math, and the
             // combine keeps only buffers 0/11/15 — the sink column would be
@@ -1147,8 +1160,10 @@ fn decode_attention_per_kv_head(
             && !c.bindings.iter().any(|b| b.index() == 16)
             && lane_stride(c)
     };
+    let group = p.num_q_heads / p.num_global_kv_heads.max(1);
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
-        && p.num_q_heads == GQA_HEADS * p.num_global_kv_heads
+        && (1..=GQA_HEADS).contains(&group)
+        && p.num_q_heads == group * p.num_global_kv_heads
         && hd.is_multiple_of(128)
         && hd <= 512
         && p.global_block_size.is_multiple_of(8);
@@ -3435,6 +3450,15 @@ fn lower_one(
             // error per layer on Llama-3.2 decode and produced
             // degenerate output after the first decode token).
             let n_q_heads = p.num_q_heads;
+            // One threadgroup serves the largest divisor of the GQA group
+            // (`TqDecodeHeads::largest_group`), so the walk reads each key
+            // once for the whole group instead of once per query head; the
+            // threadgroups count drops to the KV heads' head groups.
+            let served = super::ids::TqDecodeHeads::largest_group(
+                super::ids::HeadDim(p.global_head_dim),
+                super::ids::NumQHeads(n_q_heads),
+                super::ids::NumKvHeads(p.num_global_kv_heads),
+            );
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 library: "attention",
@@ -3473,10 +3497,11 @@ fn lower_one(
                     // gpt-oss sinks: the const mirrors the binding's presence
                     // (the 0/1 master switch the shader gates its column on).
                     sinks: w.sinks().map(|_| 1),
+                    heads: served,
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
-                    threadgroups: (bucket_m, n_q_heads, 1),
+                    threadgroups: (bucket_m, n_q_heads / served.get(), 1),
                     threads_per_threadgroup: (1024, 1, 1),
                     // AttentionViaCache (decode) — bucket_m == 1 here
                     // (decode bucket). Scaling is a no-op but kept
@@ -4344,6 +4369,13 @@ fn lower_one(
             // Spans rope-on-read (SLIDING class). All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, false);
             let n_q_heads = p.num_q_heads;
+            // The sliding class serves its own GQA group per threadgroup
+            // (the global arm's note), on the sliding geometry.
+            let served = super::ids::TqDecodeHeads::largest_group(
+                super::ids::HeadDim(p.head_dim),
+                super::ids::NumQHeads(n_q_heads),
+                super::ids::NumKvHeads(p.num_kv_heads),
+            );
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 library: "attention",
@@ -4368,10 +4400,11 @@ fn lower_one(
                     pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, p.head_dim),
                     // gpt-oss sinks: the const mirrors the binding's presence.
                     sinks: w.sinks().map(|_| 1),
+                    heads: served,
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
-                    threadgroups: (bucket_m, n_q_heads, 1),
+                    threadgroups: (bucket_m, n_q_heads / served.get(), 1),
                     threads_per_threadgroup: (1024, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
@@ -4643,7 +4676,8 @@ fn lower_one(
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
-            let twin = |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits);
+            let twin =
+                |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits, p.num_q_heads);
             return Ok(via_cache.first().map(twin).into_iter().collect());
         }
         I::Moe(block, step) => {
@@ -8076,14 +8110,24 @@ mod tests {
             ]
         );
         let (fp16, tq) = (&tape.commands[1].command, &tape.commands[2].command);
+        // Same kernel; the plain command's threadgroups count head groups —
+        // the baked GQA divisor, 8 heads a group here — while the twin's
+        // count heads for the worker's variant division.
+        assert_eq!((fp16.library, fp16.function), (tq.library, tq.function));
+        assert_eq!(fp16.dispatch.threadgroups, (1, 4, 1));
+        assert_eq!(tq.dispatch.threadgroups, (1, 32, 1));
         assert_eq!(
-            (fp16.library, fp16.function, fp16.dispatch),
-            (tq.library, tq.function, tq.dispatch)
+            fp16.dispatch.threads_per_threadgroup,
+            tq.dispatch.threads_per_threadgroup
         );
         let bits = TQ_BITS.get();
-        assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
+        // The twin drops the plain set's baked heads (slot 16, its last
+        // entry) for its variant-bound one, then adds the codebook width.
+        let mut dense = fp16.constants.to_vec();
+        assert_eq!(dense.pop(), Some(ConstantValue::uint(16, 8)));
+        assert_eq!(tq.constants[..dense.len()], *dense);
         assert_eq!(
-            tq.constants[fp16.constants.len()..],
+            tq.constants[dense.len()..],
             [ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)]
         );
         assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
@@ -8158,10 +8202,15 @@ mod tests {
             find(KernelId::AttentionViaCache),
             find(KernelId::AttentionViaCacheTq),
         );
-        // The twin copies the dense command's constants wholesale — sinks included —
-        // then extends with the TQ pair.
-        assert_eq!(fp16.constants.last(), Some(&ConstantValue::uint(21, 1)));
-        assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
+        // The plain set bakes its served heads at slot 16, after the sinks
+        // entry; the twin drops that entry (its own slot 16 is variant-bound)
+        // and copies the rest wholesale — sinks included — then extends with
+        // the TQ pair. The geometry's group of 8 at head_dim 64 serves 8.
+        assert_eq!(fp16.constants.last(), Some(&ConstantValue::uint(16, 8)));
+        let mut dense = fp16.constants.to_vec();
+        dense.pop();
+        assert_eq!(dense.last(), Some(&ConstantValue::uint(21, 1)));
+        assert_eq!(tq.constants[..dense.len()], *dense);
         // Both bind the layer's `[num_heads]` sink tensor at slot 16.
         let sink_binding = Binding::Source {
             ix: sinks,
@@ -8211,9 +8260,16 @@ mod tests {
             );
         }
         assert_eq!(p.num_q_heads / p.num_kv_heads, 8);
+        // The plain command bakes the largest group divisor — 8 heads at
+        // head_dim 64 — so its threadgroups count head groups, not heads; the
+        // twin keeps the undivided count for the variant's division.
         let (x, y, z) = fp16.dispatch.threadgroups;
-        assert_eq!(y, p.num_q_heads);
-        assert_eq!(tq.dispatch.threadgroups, (x, y, z));
+        assert_eq!(y, p.num_q_heads / 8);
+        assert_eq!(
+            (fp16.constants.iter()).find(|k| k.index == 16),
+            Some(&ConstantValue::uint(16, 8))
+        );
+        assert_eq!(tq.dispatch.threadgroups, (x, p.num_q_heads, z));
         assert_eq!(tq.constants.last(), Some(&ConstantValue::tq_heads(16)));
         let bound_heads = |c: &LoweredCommand| {
             (c.constants.iter()).any(|k| k.ty == super::super::constants::ConstantType::TqHeads)
@@ -8433,6 +8489,117 @@ mod tests {
             Some(fold.dispatch.threadgroups),
             fold_splits.map(|s| (1, 4, s + 1))
         );
+    }
+
+    /// A group smaller than the matrix units' 8 rows takes the split kernel too —
+    /// qwen2.5-7b's GQA 7 (28 query heads over 4 KV heads, head_dim 128): the twin's
+    /// per-head decode would walk and decode each of its KV head's keys seven times.
+    /// The dispatch keeps the split pair's shape — KV heads and key runs in the grid,
+    /// one thread a head dim — and the partials the whole query-head count.
+    #[test]
+    fn turboquant_decode_takes_groups_below_the_matrix_rows() {
+        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
+        let p = MetalModelConsts {
+            global_head_dim: 128,
+            num_q_heads: 28,
+            num_global_kv_heads: 4,
+            global_block_size: 16,
+            ..tq_consts()
+        };
+        let rows = || {
+            coded(
+                tq_writer(0, Causal, LLAMA_KV),
+                attention(MetalStep::AttentionViaCache, 0, Interleaved),
+            )
+        };
+        let tape = lower_tq(&p, rows(), 1);
+        assert_eq!(
+            gated_steps(&tape),
+            [
+                (KernelId::RopeAppend, None),
+                (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
+            ]
+        );
+        let (gqa, combine) = (&tape.commands[2].command, &tape.commands[3].command);
+        let splits = (128 * p.global_block_size).div_ceil(ATTN_SPLIT_KEYS);
+        assert_eq!(splits, 2);
+        assert_eq!(gqa.dispatch.threadgroups, (1, 4, splits));
+        assert_eq!(gqa.dispatch.threads_per_threadgroup, (128, 1, 1));
+        assert_eq!(combine.dispatch.threadgroups, (1, p.num_q_heads, 1));
+        assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
+        assert_eq!(
+            tape.moe_scratch_bytes,
+            p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+        );
+        // A group that does not divide the query heads evenly cannot fill the
+        // fragments' rows — 29 over 4 — so it stays on the twin.
+        let kernels = |tape: &LoweredMetalTape| {
+            (tape.commands.iter())
+                .map(|c| c.command.kernel)
+                .collect::<Vec<_>>()
+        };
+        let ragged = MetalModelConsts {
+            num_q_heads: 29,
+            ..p
+        };
+        let ragged = kernels(&lower_tq(&ragged, rows(), 1));
+        assert!(ragged.contains(&KernelId::AttentionViaCacheTq));
+        assert!(!ragged.contains(&KernelId::AttentionDecodeGqaTq));
+        // granite-3.3-2b (head_dim 64, GQA 4): the fragments need a head dim the
+        // matrix units step — 128 at least — so it stays on the twin too.
+        let granite = MetalModelConsts {
+            global_head_dim: 64,
+            num_q_heads: 32,
+            num_global_kv_heads: 8,
+            ..p
+        };
+        let granite = kernels(&lower_tq(&granite, rows(), 1));
+        assert!(granite.contains(&KernelId::AttentionViaCacheTq));
+        assert!(!granite.contains(&KernelId::AttentionDecodeGqaTq));
+        // Qwen2's biased K/V projections ride the split too: the store's centered codes and
+        // the combine's V-bias add are the twin's own contract, carried over — the refusal
+        // the twin's per-head decode forced on them is gone. The split inherits the twin's
+        // bias constants and bindings.
+        let biased_rows = || {
+            coded(
+                tq_writer(
+                    0,
+                    Causal,
+                    scratchy_ir::KvOffsets {
+                        k: scratchy_ir::KvOffset::LinearBias(scratchy_ir::BiasStorage::Affine),
+                        v: scratchy_ir::KvOffset::LinearBias(scratchy_ir::BiasStorage::Affine),
+                    },
+                ),
+                attention(MetalStep::AttentionViaCache, 0, Interleaved),
+            )
+        };
+        let biased = lower_tq(
+            &MetalModelConsts {
+                rope_on_read: true,
+                ..p
+            },
+            biased_rows(),
+            1,
+        );
+        let split = (biased.commands.iter())
+            .find(|c| c.command.kernel == KernelId::AttentionDecodeGqaTq)
+            .expect("the biased twin takes the split");
+        assert!(
+            split
+                .command
+                .constants
+                .contains(&ConstantValue::uint(14, 1))
+        );
+        assert!(
+            split
+                .command
+                .constants
+                .contains(&ConstantValue::uint(15, 1))
+        );
+        assert!(split.command.bindings.iter().any(|b| b.index() == 14));
+        assert!(split.command.bindings.iter().any(|b| b.index() == 15));
     }
 
     /// The NAX paged attention is instantiated for the pages it reads: 16-token pages at head_dims

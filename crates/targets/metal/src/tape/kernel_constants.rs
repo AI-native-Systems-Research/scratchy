@@ -22,7 +22,7 @@ use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
     HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim,
     NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK,
-    TopK, TqCodeBits,
+    TopK, TqCodeBits, TqDecodeHeads,
 };
 use crate::tape::lowered::ActivationWidth;
 
@@ -328,6 +328,12 @@ pub struct AttentionViaCacheConstants {
     /// byte-identical (no slot 21) and the shader const-folds the column
     /// away.
     pub sinks: Option<u32>,
+    /// Query heads one threadgroup serves (`ATTN_TQ_HEADS`, slot 16, as a
+    /// baked uint — the TurboQuant twin's entry is variant-bound instead):
+    /// the largest divisor of the GQA group that fits the per-lane state, so
+    /// the walk reads each key once for the whole group. The dispatch counts
+    /// `num_q_heads / heads` threadgroups.
+    pub heads: TqDecodeHeads,
 }
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
@@ -349,6 +355,10 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
         if let Some(sinks) = c.sinks {
             v.push(ConstantValue::uint(ConstSlot(21), sinks));
         }
+        v.push(ConstantValue::uint(
+            AttentionViaCacheTqConstants::HEADS,
+            c.heads.get(),
+        ));
         v
     }
 }
@@ -365,7 +375,9 @@ pub struct AttentionViaCacheTqConstants {
 }
 
 impl AttentionViaCacheTqConstants {
-    /// `ATTN_TQ_HEADS`: the query heads one threadgroup serves, the tape variant's.
+    /// `ATTN_TQ_HEADS` (slot 16): the query heads one threadgroup serves —
+    /// the twin's variant-bound value, or the plain `AttentionViaCache`
+    /// set's baked one.
     pub const HEADS: ConstSlot = ConstSlot(16);
 }
 

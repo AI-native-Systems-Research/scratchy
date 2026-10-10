@@ -354,6 +354,22 @@ impl TqDecodeHeads {
             .last()
             .unwrap_or(Self(1))
     }
+
+    /// The most heads a threadgroup serves for this geometry, baked for the
+    /// plain (non-TurboQuant) decode: the largest divisor of the GQA group
+    /// that fits the per-lane state. Unlike [`Self::for_group`] there is no
+    /// occupancy floor — that filter is tuned for TurboQuant's ALU-bound
+    /// decode, while the plain walk is bound by the K/V reads, which the
+    /// largest group reads the fewest times over.
+    pub fn largest_group(
+        head_dim: HeadDim,
+        num_q_heads: NumQHeads,
+        num_kv_heads: NumKvHeads,
+    ) -> Self {
+        Self::candidates(head_dim, num_q_heads, num_kv_heads)
+            .last()
+            .unwrap_or(Self(1))
+    }
 }
 
 i32_newtype!(
