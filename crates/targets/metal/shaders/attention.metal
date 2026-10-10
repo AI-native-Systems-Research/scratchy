@@ -1258,9 +1258,10 @@ SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<
 // (buffer 16, `[batch, num_q_heads, ATTN_SPLITS, 2 + head_dim]`: max, sum, unnormalized output in
 // the codebook domain) and writes the head's output as `attention_via_cache_v2`'s merge does.
 // Its ATTN_COMBINE_GROUPS simdgroups each sum their share of every lane's elements over the
-// splits; the first divides and rotates them. Dispatch: threadgroups (batch, num_q_heads, 1), threads
-// (32 · ATTN_COMBINE_GROUPS, 1, 1).
-constant constexpr uint ATTN_COMBINE_GROUPS = 4u;
+// splits; the first divides and rotates them. Head_dim 64's partials fill two simdgroups'
+// lanes — the head_dim/32 elements each — so the count follows the head dim. Dispatch:
+// threadgroups (batch, num_q_heads, 1), threads (32 · ATTN_COMBINE_GROUPS, 1, 1).
+constant constexpr uint ATTN_COMBINE_GROUPS = ATTN_HEAD_DIM >= 128u ? 4u : 2u;
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(32 * ATTN_COMBINE_GROUPS)]] void
 attention_via_cache_v2_combine(
@@ -1401,12 +1402,13 @@ template <typename T>
     constexpr uint KB = 8u;
     // Another kernel's bake may set a head dim this one cannot take: its arrays need a size all
     // the same (the asserts below refuse baking this kernel with one).
-    constexpr bool D_OK = ATTN_HEAD_DIM % 128u == 0u && ATTN_HEAD_DIM - 1u < 512u;
+    constexpr bool D_OK = ATTN_HEAD_DIM % 64u == 0u && ATTN_HEAD_DIM - 1u < 512u;
     constexpr uint D = D_OK ? ATTN_HEAD_DIM : 128u;
     constexpr uint NSG = D / 32u;
     // A key group's simdgroups, each a slice of the head dims (8 at head_dim 512: 8 Q and 8 O
-    // fragments a lane), and its keys of a span block.
-    constexpr uint SG = NSG >= 16u ? 8u : 4u;
+    // fragments a lane), and its keys of a span block. Head_dim 64's two simdgroups form one
+    // group of two — the butterfly, the span keys and the fragments all take it.
+    constexpr uint SG = NSG >= 16u ? 8u : (NSG >= 4u ? 4u : 2u);
     constexpr uint KG = NSG / SG;
     constexpr uint KPS = KB / SG;
     constexpr uint DS = D / SG;
@@ -1424,7 +1426,8 @@ template <typename T>
     constexpr uint KBIAS_SLICE = D / 2u / SG;
     // Checked where this kernel is baked (`sizeof(T)` defers them to its instantiation).
     static_assert(sizeof(T) && ATTN_TQ == 4u, "a packed word holds one 8-wide tile row");
-    static_assert(sizeof(T) && D_OK, "head_dim a multiple of 128, at most 512");
+    static_assert(sizeof(T) && D_OK, "head_dim a multiple of 64, at most 512");
+    static_assert(sizeof(T) && NSG % SG == 0u, "the simdgroups tile into whole key groups");
     static_assert(sizeof(T) && ATTN_BLOCK_SIZE % KB == 0u, "a key block in one KV block");
     static_assert(sizeof(T) && ATTN_WINDOW <= 0, "full attention");
     static_assert(sizeof(T) && (ATTN_ROR == 0u || ATTN_PAIR_OFF % QK == 0u),

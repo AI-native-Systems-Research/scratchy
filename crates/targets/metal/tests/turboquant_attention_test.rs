@@ -725,7 +725,10 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         }
         binds.push((&partials, 16));
         let grid = tg(n_seqs, c.num_q_heads, 1);
-        batch.encode(&combine, &binds, &[], &[], &[], grid, tg(128, 1, 1));
+        // Head_dim 64's partials fill two simdgroups' lanes: the combine's
+        // ATTN_COMBINE_GROUPS follows the head dim.
+        let combine_threads = if hd >= 128 { 128 } else { 64 };
+        batch.encode(&combine, &binds, &[], &[], &[], grid, tg(combine_threads, 1, 1));
     } else if decode {
         let heads = c.decode_heads;
         let mut consts = f.attn_constants(&[bits, ConstantValue::uint(16, heads)]);
@@ -1313,6 +1316,75 @@ fn decode_gqa_group_three_batched_rows() {
         gqa: Some(1),
         span_blocks: vec![2, 9],
         ..llama_3b("decode gqa group 3 batched rows")
+    });
+}
+
+/// Granite-3.3-2b: head_dim 64 — the split's two simdgroups form one key group of
+/// two — GQA 4, unbiased, NeoX rope-on-read co-resident. Whole and split.
+fn granite_2b(name: &'static str) -> Case {
+    Case {
+        head_dim: 64,
+        num_q_heads: 32,
+        num_kv_heads: 8,
+        bits: 4,
+        attn_scale: 0.125,
+        rope: Some(Rope {
+            rot_dim: 64,
+            pair_off: 32,
+            coresident: true,
+        }),
+        ..llama_3b(name)
+    }
+}
+
+#[test]
+fn decode_gqa_granite_head_dim_64() {
+    for splits in [1, 2, 4] {
+        check(Case {
+            gqa: Some(splits),
+            span_blocks: vec![2, 9],
+            ..granite_2b("decode gqa granite hd64")
+        });
+    }
+}
+
+/// The same geometry's batched rows: different KV lengths per row, a span block,
+/// and a write-skipped own key.
+#[test]
+fn decode_gqa_granite_head_dim_64_batched_rows() {
+    check(Case {
+        seqs: vec![(1, 1), (66, 1), (130, 1), (514, 1)],
+        gqa: Some(4),
+        span_blocks: vec![9],
+        first_new_write_skipped: true,
+        ..granite_2b("decode gqa granite hd64 batched rows")
+    });
+}
+
+/// A head_dim-64 MHA model: the pair staging serves one head across the two
+/// simdgroups of a key group (NSG == 2 · GA).
+#[test]
+fn decode_gqa_mha_head_dim_64() {
+    check(Case {
+        num_q_heads: 8,
+        gqa: Some(2),
+        seqs: vec![(513, 1), (66, 1)],
+        span_blocks: vec![2],
+        ..granite_2b("decode gqa mha hd64")
+    });
+}
+
+/// gpt-oss's geometry without its sinks — a sinks dispatch keeps the twin; this
+/// pins the K/V projection-bias restore on the split's two-simdgroup key groups
+/// (each simdgroup's KBIAS_SLICE of 16 rotary pairs).
+#[test]
+fn decode_gqa_group_eight_biased_kv_head_dim_64() {
+    check(Case {
+        sinks: None,
+        gqa: Some(2),
+        seqs: vec![(1000, 1), (257, 1)],
+        span_blocks: vec![3],
+        ..gpt_oss_biased_rope("decode gqa group 8 biased hd64")
     });
 }
 
