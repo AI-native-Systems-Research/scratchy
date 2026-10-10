@@ -240,6 +240,7 @@ pub mod mtp_chain;
 /// the target. It depends only on `scratchy_ir` + `scratchy_subtile`, so nothing had to
 /// move with it.
 pub mod op_abi;
+pub mod select_rows;
 // Core-facing metal runtime: the `DeviceAllocator`-trait weight-loader
 // (`MetalAllocator`) and the worker-facing `GpuDevice`. The canonical metal
 // allocator — distinct from `allocator::PooledBufferAllocator` (legacy

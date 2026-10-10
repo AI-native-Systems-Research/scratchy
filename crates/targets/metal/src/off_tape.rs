@@ -7,8 +7,9 @@
 //! [`ArgmaxKernels`](crate::argmax::ArgmaxKernels),
 //! [`GrammarMaskKernels`](crate::grammar_mask::GrammarMaskKernels),
 //! [`SamplerKernels`](crate::sampling::SamplerKernels),
-//! [`ChainAdvanceKernel`](crate::chain_advance::ChainAdvanceKernel) and
-//! [`MtpChainKernel`](crate::mtp_chain::MtpChainKernel) from it.
+//! [`ChainAdvanceKernel`](crate::chain_advance::ChainAdvanceKernel),
+//! [`MtpChainKernel`](crate::mtp_chain::MtpChainKernel) and
+//! [`SelectRowsKernel`](crate::select_rows::SelectRowsKernel) from it.
 
 use objc2_foundation::NSString;
 use objc2_metal::{MTLDevice as _, MTLLibrary as _};
@@ -39,18 +40,22 @@ pub struct OffTape<K> {
     pub chain_advance: K,
     /// A multi-token-prediction head's chain between its passes; `None` for any other model.
     pub mtp_chain: Option<K>,
+    /// A drafting model's pick of a step's inputs by the step before it; `None` for any other.
+    pub select_rows: Option<K>,
 }
 
 pub type OffTapeKernels = OffTape<BakedKernel>;
 
 impl OffTape<PipelineKey> {
     /// The keys of the off-tape kernels reading logits `vocab` wide, of activation `dtype`, over a
-    /// KV cache paged in blocks of `block_size`; `head`: a multi-token-prediction head's chain.
+    /// KV cache paged in blocks of `block_size`; `head`: a multi-token-prediction head's chain;
+    /// `drafts`: the model drafts.
     pub fn keys(
         vocab: LogitsWidth,
         dtype: MetalDtype,
         block_size: BlockSize,
         head: Option<MtpChainConstants>,
+        drafts: bool,
     ) -> Self {
         let (argmax, dual_write, grammar_mask, cast) = match dtype {
             MetalDtype::F16 => (
@@ -85,6 +90,7 @@ impl OffTape<PipelineKey> {
                 ChainAdvanceConstants { block_size }.into(),
             ),
             mtp_chain: head.map(|c| PipelineKey::new("mtp_chain", "mtp_chain", c.into())),
+            select_rows: drafts.then(|| PipelineKey::new("select_rows", "select_rows", Vec::new())),
         }
     }
 }
@@ -98,7 +104,8 @@ impl<K> OffTape<K> {
             grammar_mask: f(self.grammar_mask),
             sampler: self.sampler.map(|row| row.map(&mut f)),
             chain_advance: f(self.chain_advance),
-            mtp_chain: self.mtp_chain.map(f),
+            mtp_chain: self.mtp_chain.map(&mut f),
+            select_rows: self.select_rows.map(f),
         }
     }
 }
