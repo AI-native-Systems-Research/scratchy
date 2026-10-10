@@ -28,8 +28,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: site
+
+      # The site crate is its own workspace, so the repo-wide gates in
+      # rust.yml never see it: lint and test it here.
+      - name: Lint and test the site renderer
+        run: |
+          cargo clippy --manifest-path site/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path site/Cargo.toml
+
       - name: Build site
-        run: ./site/build.sh
+        run: cargo run --release --manifest-path site/Cargo.toml
 
       - uses: actions/configure-pages@v6
 

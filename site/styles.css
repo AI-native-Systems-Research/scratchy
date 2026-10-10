@@ -3,23 +3,16 @@
  * values those resolve to is decided by the cds--g100/cds--white class on
  * <html>, toggled by the inline script in index.html to track system
  * preference — so this file carries no light/dark branching of its own. */
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap");
-
 :root {
-  --bg: var(--cds-background);
   --bg-soft: var(--cds-layer-01);
-  --panel: var(--cds-layer-02);
   --line: var(--cds-border-subtle-01);
   --fg: var(--cds-text-primary);
   --muted: var(--cds-text-secondary);
   --accent: var(--cds-link-primary);
   --accent-2: var(--cds-link-primary);
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --wide: 1080px;
 }
 
-* { box-sizing: border-box; }
 
 /* Carbon custom elements render unstyled/unboxed until their module has
  * loaded and upgraded them — hide them until then to avoid a FOUC flash. */
@@ -45,57 +38,15 @@ zero-md:not(:defined) {
   visibility: hidden;
 }
 
-/* ---------- docs pages (site/build.py's Carbon UI Shell) ---------- */
-
-/* cds-side-nav only becomes a persistent, always-visible rail at Carbon's own
- * `lg` breakpoint (66rem — the exact value @carbon/styles uses to switch it
- * out of mobile/overlay mode); below that it's collapsed behind the header's
- * hamburger regardless of what this file says. .docs-layout must reserve
- * space for it on the same breakpoint, or there's a window (e.g. 1000–1055px
- * under a mismatched cutoff) where this file still reserves the margin but
- * the rail isn't there to fill it — a wide empty gutter with squished
- * content. Mobile-first here so that can't happen: no margin by default,
- * added only once Carbon's own breakpoint says the rail is actually shown. */
-.docs-layout {
-  display: flex;
-  align-items: flex-start;
-  gap: 2.5rem;
-  padding: 0 1.5rem;
-}
-
-.docs-content { flex: 1; min-width: 0; }
-
-.page-toc {
-  display: none;
-  position: sticky;
-  top: 4rem;
-  width: 200px;
-  flex: none;
-  padding: 2.5rem 0;
-  font-size: 0.85rem;
-}
-.page-toc ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
-.page-toc li.h3 { padding-left: 0.85rem; }
-.page-toc a { color: var(--muted); }
-.page-toc a:hover { color: var(--fg); }
-
+/* Carbon offsets its UI-shell content area (.cds--content) below its header
+ * and beside its side nav, but only for the class-based shell
+ * (.cds--header ~ .cds--content, .cds--side-nav--expanded ~ .cds--content).
+ * The same offsets for the cds-header and cds-side-nav web components; the
+ * side nav is a persistent 16rem rail from Carbon's lg breakpoint (66rem),
+ * behind the header's menu button below it. */
+cds-header ~ .cds--content { margin-block-start: 3rem; }
 @media (min-width: 66rem) {
-  .docs-layout { margin-left: 16rem; }
-  .page-toc { display: block; }
-}
-
-html { scroll-behavior: smooth; }
-
-body {
-  margin: 0;
-  /* cds-header is fixed at the top of the viewport, 3rem tall. */
-  padding-top: 3rem;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--sans);
-  font-size: 17.5px;
-  line-height: 1.7;
-  -webkit-font-smoothing: antialiased;
+  cds-side-nav:not([is-not-persistent]) ~ .cds--content { margin-inline-start: 16rem; }
 }
 
 a { color: var(--accent-2); text-decoration: none; }
@@ -111,26 +62,6 @@ code {
   padding: 0.1em 0.35em;
 }
 
-/* cds-code-snippet supplies its own <pre>/<code> chrome via shadow DOM;
- * .codehead is just our filename/caption strip sitting above it. */
-cds-code-snippet {
-  font-family: var(--mono);
-  font-size: 14px;
-  border-radius: 0 0 8px 8px;
-  overflow: hidden;
-}
-
-.codehead {
-  font-family: var(--mono);
-  font-size: 12.5px;
-  letter-spacing: 0.04em;
-  color: var(--muted);
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px 8px 0 0;
-  padding: 0.5rem 1.15rem;
-}
-
 /* syntax accents */
 .c-at { color: var(--accent); }
 .c-kw { color: #c792ea; }
@@ -138,15 +69,6 @@ cds-code-snippet {
 .c-n  { color: #f2b05e; }
 .c-s  { color: #86d99a; }
 .c-cm { color: var(--muted); font-style: italic; }
-
-/* ---------- hero ---------- */
-
-.hero {
-  border-bottom: 1px solid var(--line);
-  background:
-    radial-gradient(900px 420px at 15% -10%, rgba(255, 138, 76, 0.13), transparent 70%),
-    radial-gradient(800px 420px at 85% 0%, rgba(99, 179, 245, 0.11), transparent 70%);
-}
 
 /* cds-header, cds-header-name, cds-header-nav-item are Carbon UI Shell
  * elements — styled entirely by the component itself via the --cds-* tokens
@@ -161,292 +83,25 @@ cds-header-name::part(prefix) { color: var(--accent); }
  * The `.cds--header__global` div is Carbon's own light-DOM slotting class
  * for right-aligning header children. */
 
-.hero-body {
-  margin: 0 auto;
-  padding-top: 3.5rem;
-}
-.hero .hero-body {
-    padding-left: 1.5rem;
-    padding-right: 1.5rem;
-    padding-bottom: 4rem;
-}
+/* A Carbon grid pads its inner grid (exposed as part "grid") by the grid
+ * margin, 1rem from 42rem wide. The content area already has its padding, so
+ * grids here line up with the text around them instead of sitting a margin in. */
+.cds--content cds-grid::part(grid) { padding-inline: 0; }
 
-/* Type sizes are Carbon's own scale (--cds-heading-*, --cds-body-*,
- * --cds-label-*), never hand-picked rem values. h1 uses Carbon's actual hero
- * token, display-01 — @carbon/styles' precompiled CSS only exposes its flat
- * base value (42px) as a custom property, not the responsive step table, so
- * the breakpoints below are transcribed from @carbon/type's real source
- * (display01 in lib/index.js: 42px up to md, 54px at lg/66rem, 60px at
- * xlg/82rem, 76px at max/99rem — the same breakpoint widths as
- * @carbon/layout's `breakpoints`). Carbon doesn't mandate a weight here —
- * 300 is its "expressive" marketing convention, but other Carbon headings go
- * up to 600/700 (e.g. heading-02) — this site keeps the bolder, tighter
- * tracking on top of Carbon's real hero size scale. */
-h1 {
-  font-size: 2.625rem;
-  font-weight: 700;
-  line-height: 1.1;
-  letter-spacing: -0.03em;
-  margin: 0 0 1.25rem;
-}
+/* The overview's small multiples: names and ranges in Carbon's label-01
+ * type (its stylesheet exposes no global token or class for it). */
+#glance cds-tile { font-size: 0.75rem; line-height: 1.33333; letter-spacing: 0.32px; }
 
-@media (min-width: 66rem) { h1 { font-size: 3.375rem; } }
-@media (min-width: 82rem) { h1 { font-size: 3.75rem; } }
-@media (min-width: 99rem) { h1 { font-size: 4.75rem; line-height: 1.05; } }
+/* A Carbon toggletip sits in the sentence it explains; Carbon displays it as
+ * a block, which breaks the sentence onto its own line. */
+cds-toggletip { display: inline-flex; vertical-align: middle; }
 
-h1 .accent { color: var(--accent); }
-
-.lede {
-  max-width: var(--wide);
-  font-size: var(--cds-fluid-paragraph-01-font-size);
-  font-weight: var(--cds-fluid-paragraph-01-font-weight);
-  line-height: var(--cds-fluid-paragraph-01-line-height);
-  color: var(--muted);
-  margin: 0 0 2.75rem;
-}
-
-/* Carbon's real 16-column CSS Grid (--cds-css-grid/--cds-css-grid-column,
- * from @carbon/styles), not a hand-rolled auto-fit track list. Column spans
- * live on each child in the markup (cds--sm:col-span-4 etc.); .triple here
- * is just the row gap and bottom margin layered on top. */
-.triple {
-  margin-bottom: 2.5rem;
-}
-
-/* .tcard/.ncard/.dcard style the content inside a <cds-tile>/<cds-clickable-tile>,
- * which already supplies its own background, border and padding via shadow DOM. */
-.tcard { position: relative; }
-
-.tnum {
-  position: absolute;
-  top: 0.9rem;
-  right: 1rem;
-  font-family: var(--mono);
-  font-size: 1.6rem;
-  font-weight: 700;
-  color: var(--line);
-}
-
-.tcard h3 {
-  margin: 0 0 0.35rem;
-  font-size: var(--cds-heading-01-font-size);
-  font-weight: var(--cds-heading-01-font-weight);
-  letter-spacing: var(--cds-heading-01-letter-spacing);
-}
-.tcard p { margin: 0 0 0.7rem; color: var(--muted); font-size: var(--cds-body-01-font-size); }
-.tcard a { font-size: var(--cds-label-01-font-size); }
-.tcard a code { background: none; border: none; padding: 0; }
-
-.cta { display: flex; gap: 0.75rem; flex-wrap: wrap; }
-
-/* ---------- sections ---------- */
-
-/* `body > main` (direct child), not a bare `main` — docs pages also have a
- * <main class="docs-content">, but it's nested one level deeper inside
- * .docs-layout, not a direct child of <body>. An unscoped `main{}` here
- * matched that one too, stacking an extra 1.5rem of padding and a max-width/
- * auto-margin centering pass on top of .docs-layout's own padding: content
- * squeezed into a narrow centered column, most visible on phones (that's
- * also why it only showed up on hamburger/side-nav pages — that's the only
- * place <main> ends up nested rather than a direct <body> child). */
-body > main { margin: 0 auto; padding: 0 1.5rem; }
-
-/* cds--css-grid sets its own centering/margin/padding, meant for a bare page
- * grid — redundant and doubled-up when nested inside main's own padding. */
-body .cds--css-grid { max-inline-size: none; margin-inline: 0; padding-inline: 0; }
-
-section { padding: 4rem 0; border-bottom: 1px solid var(--line); }
-section:last-child { border-bottom: none; }
-
-h2 {
-  font-size: var(--cds-heading-04-font-size);
-  font-weight: var(--cds-heading-04-font-weight);
-  line-height: var(--cds-heading-04-line-height);
-  letter-spacing: var(--cds-heading-04-letter-spacing);
-  margin: 0 0 0.6rem;
-}
-
-.sub { color: var(--muted); max-width: 46rem; font-size: var(--cds-body-01-font-size); margin: 0 0 2rem; }
-
-.more { display: inline-block; margin-top: 1.25rem; font-weight: 600; font-size: var(--cds-label-01-font-size); }
-
-/* numbers */
-
-.ngrid { margin-top: 1.75rem; }
-
-/* Same hero-scale treatment as h1 (see the note above it): display-02's real
- * breakpoint table, transcribed from @carbon/type's source since the CDN
- * bundle only exposes its flat 42px base as a custom property. */
-.nval {
-  font-family: var(--mono);
-  font-size: 2.625rem;
-  font-weight: 600;
-  line-height: 1.19;
-  letter-spacing: 0;
-  color: var(--accent);
-}
-@media (min-width: 66rem) { .nval { font-size: 3.375rem; } }
-@media (min-width: 82rem) { .nval { font-size: 3.75rem; line-height: 1.16; } }
-@media (min-width: 99rem) { .nval { font-size: 4.75rem; line-height: 1.13; } }
-
-.nunit { font-size: var(--cds-heading-03-font-size); margin-left: 0.1rem; }
-
-.nlabel { margin-top: 0.6rem; font-weight: 600; font-size: var(--cds-body-01-font-size); }
-.ncard p { margin: 0.3rem 0 0; color: var(--muted); font-size: var(--cds-label-01-font-size); }
-
-/* idea */
-
-.idea {
-  display: grid;
-  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
-  gap: 2.5rem;
-  align-items: start;
-}
-
-.idea-text p { color: var(--muted); }
-.idea-text .punch { color: var(--fg); }
-.idea-code { min-width: 0; }
-
-/* spyre — a prose-only section, held to a readable measure */
-
-.spyre .idea-text { max-width: 46rem; }
-
-/* targets */
-
-.tg {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--accent);
-  border-radius: 8px;
-  padding: 1rem 1.1rem;
-}
-.tg code { background: none; border: none; padding: 0; font-weight: 700; font-size: var(--cds-body-02-font-size); }
-.tg span { display: block; margin-top: 0.3rem; color: var(--muted); font-size: var(--cds-label-01-font-size); }
-
-/* getting started */
-
-.conv { margin-top: 1.75rem; display: grid; gap: 0.75rem; }
-.conv > div { display: flex; gap: 1rem; flex-wrap: wrap; align-items: baseline; }
-.conv > div > code { flex: none; }
-.conv span { color: var(--muted); font-size: 0.9rem; }
-
-/* docs */
-
-.dgrid { margin-top: 1.75rem; }
-
-.dcard h3 {
-  margin: 0 0 0.3rem;
-  font-size: var(--cds-heading-01-font-size);
-  font-weight: var(--cds-heading-01-font-weight);
-  color: var(--accent-2);
-}
-.dcard p { margin: 0; color: var(--muted); font-size: var(--cds-label-01-font-size); }
-
-/* footer */
-
-footer {
-  border-top: 1px solid var(--line);
-  padding: 2rem 1.5rem 3rem;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.88rem;
-}
-
-footer .credit {
-  max-width: 44rem;
-  margin: 1rem auto 0;
-  font-size: 0.82rem;
-  line-height: 1.6;
-}
-
-@media (max-width: 800px) {
-  .idea { grid-template-columns: 1fr; gap: 2rem; }
-  .hero-body { padding: 2.5rem 1.5rem 3rem; }
-  section { padding: 3rem 0; }
-}
-
-/* architectures page ---------------------------------------------------------
- * The controls and panes are real Carbon Web Components; what stays here is
- * the diff view, which has no Carbon component. Colors come from the aliases
- * at the top of this file plus --cds-support-success/error for the
- * added/removed lines, the same pair Carbon uses for success and error status. */
-
-/* .archpage sits inside .docs-content (the shared docs-page container, see
- * "docs pages" above) so it picks up the same left-margin reservation for
- * the side-nav rail and the same horizontal gutter as every other page —
- * it only adds the vertical rhythm specific to this page's own sections. */
-.archpage {
-  padding: var(--cds-spacing-08) 0 var(--cds-spacing-10);
-}
-
-.archpage .sub {
-  max-width: 46rem;
-}
-
-.archpage h2 {
-  margin: var(--cds-spacing-10) 0 var(--cds-spacing-03);
-  font-size: var(--cds-heading-03-font-size);
-  font-weight: 400;
-  line-height: 1.4;
-}
-
-/* controls */
-
-.archbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--cds-spacing-05);
-  margin: var(--cds-spacing-07) 0 var(--cds-spacing-05);
-}
-
-.archbar cds-select { min-width: 16rem; }
-.archbar cds-button { margin-bottom: 1px; }        /* sit on the selects' baseline */
-
-/* panes */
-
-.archpane { padding: 0; min-width: 0; overflow: hidden; margin: 0 0 var(--cds-spacing-05); }
-
-.archpane .codehead {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--cds-spacing-05);
-  border-bottom: 1px solid var(--line);
-}
-
-.archpane .cmeta { color: var(--muted); white-space: nowrap; }
-
-/* Carbon's precompiled styles.min.css never actually defines --cds-code-01-*
- * at :root (it's only defined, oddly, under an unrelated .cds--guidebanner
- * rule) — every var() reference to it needs its own literal fallback, or it
- * silently resolves to nothing. cds-code-snippet's own real compiled CSS
- * does exactly this (`font-size: var(--cds-code-01-font-size, .75rem)`, etc.)
- * — matched here, and again below for diff-view-element, so both code
- * views render at the same real Carbon code-01 size instead of drifting. */
-.archcode {
-  margin: 0;
-  padding: var(--cds-spacing-03) 0;
-  max-height: 32rem;
-  overflow: auto;
-  background: var(--bg-soft);
-  font-family: var(--mono);
-  font-size: var(--cds-code-01-font-size, 0.75rem);
-  line-height: var(--cds-code-01-line-height, 1.33333);
-  letter-spacing: var(--cds-code-01-letter-spacing, 0.32px);
-}
-
-/* Undo every part of the global `code {}` prose-chip rule above (font-size,
- * border, border-radius) that isn't already reset here — that rule is sized
- * for an inline snippet inside a sentence, and left alone it compounds an
- * extra 0.875em on top of .archcode's own already-correct code-01 size. */
-.archcode code {
-  display: block;
-  background: none;
-  border: 0;
-  border-radius: 0;
-  padding: 0;
-  font-size: inherit;
-}
+/* cds-stack lays its children out as a CSS grid, and a grid item is by
+ * default at least as wide as its widest content: one wide table or chart
+ * then widens the whole stack past the screen, and every paragraph in it
+ * with it. Letting the items shrink keeps the stack to its container; wide
+ * content scrolls in its own box instead. */
+cds-stack > * { min-width: 0; }
 
 /* diff-view-element (https://konnorrogers.github.io/diff-view-element/) does
  * its own diffing and PrismJS highlighting in shadow DOM. Every property set
@@ -502,149 +157,3 @@ diff-view-element::part(table) { border-color: var(--line); }
 diff-view-element::part(line) { border-color: var(--line); }
 diff-view-element::part(character-diff--inserted) { background: color-mix(in srgb, var(--cds-support-success) 32%, transparent); }
 diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb, var(--cds-support-error) 28%, transparent); }
-
-@media (max-width: 900px) {
-  .archbar cds-select { min-width: 100%; }
-}
-
-/* ---- Metal performance page (built by build_metal.py) ----------------------
- * Engine colours are fixed per engine and the same in both themes: blue,
- * orange, aqua from the data-viz reference palette, validated as a set
- * (all pairs, CVD and normal vision) against cds--white and cds--g100
- * surfaces. Aqua is under 3:1 on white, so every chart carries direct end
- * labels and a table view. Every Carbon size token here has a fallback:
- * this site only resolves Carbon's colour tokens. */
-.metalpage, .mtip {
-  --s1: #2a78d6;           /* scratchy */
-  --s2: #d95926;           /* mlx-lm */
-  --s3: #1baf7a;           /* ollama */
-}
-.metalpage {
-  padding: 0 var(--cds-spacing-07, 2rem) var(--cds-spacing-10, 4rem);
-  max-width: 72rem;
-}
-/* Three heading levels, each clearly a step below the last: machine, model,
- * then the parts of a model. */
-.metalpage h2 { font-size: 2rem; font-weight: 600; line-height: 1.25; margin: 4rem 0 0.5rem;
-  padding-top: 1.5rem; border-top: 2px solid var(--fg); }
-/* The first section follows the title, not another machine: no need for the
- * full gap that separates machines. */
-.metalpage #glance h2 { margin-top: 1.5rem; }
-.metalpage h3 { font-size: 1.5rem; font-weight: 600; line-height: 1.3; margin: 2.5rem 0 0.25rem; }
-.metalpage h3 .onmachine { font-size: 1rem; font-weight: 400; color: var(--muted); margin-left: 0.4rem; }
-.metalpage h4 { font-size: 1.125rem; font-weight: 600; line-height: 1.4; margin: 0 0 0.15rem; }
-.metalpage .msub { color: var(--muted); font-size: var(--cds-body-01-font-size, 0.875rem); margin: 0 0 0.75rem; max-width: 48rem; }
-.metalpage .mpart { margin: 1.75rem 0; }
-.metalpage .mmeta { color: var(--muted); margin: 0 0 1rem; font-size: var(--cds-body-01-font-size, 0.875rem); }
-.metalpage .dim { color: var(--muted); font-weight: 400; }
-.metalpage b { font-weight: 600; }
-/* Toggletips sit inline with the text or heading they explain. */
-.metalpage .minfo { display: inline-flex; vertical-align: middle; }
-.metalpage .mabout { margin: 1rem 0 0; color: var(--muted); }
-.metalpage .empty { color: var(--muted); }
-/* Each model is a Carbon tile (the cds--tile class, so its numbers never wait
- * on a script). Inside it the surface is --bg-soft, so the heat-map neutral
- * steps up to --panel and chart dots ring in the tile's own colour. */
-.metalpage { --heat-mid: var(--bg-soft); }
-.metalpage .mmodel { margin-top: 1.5rem; padding: 0.5rem 1.5rem 1rem; --heat-mid: var(--panel); }
-.metalpage .mmodel .mchart .dot { stroke: var(--bg-soft); }
-.metalpage .mfold { margin: 0.5rem 0 0; }
-
-/* Wide tables scroll inside their own box, never the page. */
-.mtable { overflow-x: auto; margin: 0 0 1rem; }
-.mtable table { border-collapse: collapse; font-size: var(--cds-body-01-font-size, 0.875rem); }
-.mtable th, .mtable td { padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
-.mtable thead th { color: var(--muted); font-weight: 600; vertical-align: bottom; }
-.mtable th[scope="row"], .mtable th.first { text-align: left; font-weight: 600; }
-.mtable th[scope="colgroup"] { text-align: center; border-bottom: 1px solid var(--line); }
-.mtable td { font-variant-numeric: tabular-nums; }
-.mtable td.gap { text-align: left; color: var(--muted); font-style: italic; }
-
-.key, .lkey { display: inline-block; vertical-align: middle; margin-right: 0.45rem; }
-.key { width: 8px; height: 8px; border-radius: 50%; }
-.lkey { width: 14px; height: 2px; border-radius: 1px; }
-.key.s1, .lkey.s1 { background: var(--s1); }
-.key.s2, .lkey.s2 { background: var(--s2); }
-.key.s3, .lkey.s3 { background: var(--s3); }
-.lkey.prev { background: var(--muted); opacity: 0.7; }
-
-/* Before/after badge under a scratchy number: the arrow carries better/worse
- * in Carbon's support colours; the figure itself stays in text ink. */
-.delta { display: block; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); font-weight: 600; }
-.delta i { font-style: normal; margin-right: 0.15rem; }
-.delta i.better { color: var(--cds-support-success); }
-.delta i.worse { color: var(--cds-support-error); }
-
-.mfig { margin: 2rem 0; }
-.mfig figcaption { margin-bottom: 0.5rem; }
-.legend { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--fg); margin-bottom: 0.25rem; }
-.chartrow { display: flex; flex-wrap: wrap; gap: 1.5rem 2.5rem; }
-.chartpane { flex: 1 1 22rem; max-width: 34rem; min-width: 0; }
-.mchart { width: 100%; height: auto; display: block; overflow: visible; }
-.mchart .grid { stroke: var(--line); stroke-width: 1; }
-.mchart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.mchart .axis { fill: var(--muted); font-size: 11px; }
-.mchart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.mchart .dot { stroke: var(--bg); stroke-width: 2; }
-.mchart .ln.s1 { stroke: var(--s1); } .mchart .dot.s1 { fill: var(--s1); }
-.mchart .ln.s2 { stroke: var(--s2); } .mchart .dot.s2 { fill: var(--s2); }
-.mchart .ln.s3 { stroke: var(--s3); } .mchart .dot.s3 { fill: var(--s3); }
-/* The previous run: de-emphasis grey, thinner, hollow dots, behind the rest. */
-.mchart .ln.prev { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
-.mchart .dot.prev { fill: var(--bg); stroke: var(--muted); stroke-width: 1.5; opacity: 0.8; }
-.mchart .endlbl { fill: var(--fg); font-size: 12px; }
-.mchart .leader, .mchart .xhair { stroke: var(--muted); stroke-width: 1; }
-.mchart .hit { fill: transparent; outline: none; }
-.mchart .hit:focus-visible { fill: color-mix(in srgb, var(--fg) 6%, transparent); }
-
-.heatrow { display: flex; flex-wrap: wrap; gap: 2rem; }
-/* Flex items default to min-width: auto, which lets a wide grid stretch the
- * whole page past a phone's width; 0 makes it scroll inside its own box. */
-.heatrow > .heat { min-width: 0; max-width: 100%; }
-.heatttl { font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-bottom: 0.25rem; }
-.heat table { border-collapse: separate; border-spacing: 2px; font-size: var(--cds-body-01-font-size, 0.875rem); }
-.heat th { color: var(--muted); font-weight: 600; padding: 0.25rem 0.5rem; text-align: right; }
-.heat td { background: var(--heat-mid); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
-.heat td b { display: block; font-size: 1rem; }
-/* Text ink, not muted grey: on a strong tint grey loses its contrast. */
-.heat td span { display: block; color: inherit; font-size: var(--cds-label-01-font-size, 0.75rem); }
-.heat td:hover, .heat td:focus-visible { outline: 1px solid var(--fg); outline-offset: -1px; }
-.scale { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-top: 0.5rem; }
-.scale .scalekey { color: var(--fg); }
-.scale .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.35rem; }
-/* Heat map: ColorBrewer RdBu, 7 classes (build_metal.py's HEAT_BOUNDS). The
- * same fills in both themes, so each class picks its own ink: white on the two
- * darkest, near-black on the rest, every pair at least 5.9:1. The middle
- * class is the site's neutral, so "about the same" never glares in dark.
- * hm, not h: the docs table of contents already uses .h3. */
-.sw.hm0, .heat td.hm0, .gsq.hm0 { background: #b2182b; color: #fff; }
-.sw.hm1, .heat td.hm1, .gsq.hm1 { background: #ef8a62; color: #161616; }
-.sw.hm2, .heat td.hm2, .gsq.hm2 { background: #fddbc7; color: #161616; }
-.sw.hm3, .heat td.hm3, .gsq.hm3 { background: var(--heat-mid); color: var(--fg); }
-.sw.hm4, .heat td.hm4, .gsq.hm4 { background: #d1e5f0; color: #161616; }
-.sw.hm5, .heat td.hm5, .gsq.hm5 { background: #67a9cf; color: #161616; }
-.sw.hm6, .heat td.hm6, .gsq.hm6 { background: #2166ac; color: #fff; }
-.scale .sw.hm3 { border: 1px solid var(--line); }
-
-/* At a glance: one small grid per machine and model, colour only. */
-.heat .gtable td { background: none; min-width: 0; padding: 0.4rem 0.75rem 0.6rem 0; text-align: left; }
-.heat .gtable th { text-align: left; padding-left: 0; }
-.gtable td, .gtable th { vertical-align: top; }
-/* Popover text always wraps at normal weight, whatever its trigger sits in. */
-.minfo-body { display: block; white-space: normal; text-align: left; font-weight: 400; }
-.gtable td.gnone { color: var(--muted); font-style: italic; font-size: var(--cds-label-01-font-size, 0.75rem); }
-.gmini { display: grid; gap: 2px; width: 4.5rem; text-decoration: none; }
-.gmini:focus-visible { outline: 2px solid var(--cds-focus, var(--accent)); outline-offset: 2px; }
-.gsq { display: block; aspect-ratio: 1; background: var(--heat-mid); border-radius: 2px; }
-.gsq:hover { outline: 1px solid var(--fg); }
-.gsq.gnil, .scale .sw.nil { background: none; border: 1px solid var(--line); }
-.grange { display: block; margin-top: 0.3rem; color: var(--muted); font-size: var(--cds-label-01-font-size, 0.75rem); white-space: nowrap; }
-
-.mtip { position: absolute; z-index: 10; pointer-events: none; background: var(--panel); color: var(--fg);
-  border: 1px solid var(--line); border-radius: 4px; padding: 0.5rem 0.65rem; font-size: var(--cds-label-01-font-size, 0.75rem);
-  font-variant-numeric: tabular-nums; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
-.mtip .mtiphead { color: var(--muted); margin-bottom: 0.25rem; }
-@media (max-width: 672px) {
-  .metalpage { padding: 0 1rem 3rem; }
-}
-.mtip b { font-weight: 600; }

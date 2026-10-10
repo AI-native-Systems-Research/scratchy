@@ -293,10 +293,11 @@ newest one is `$(basename "$f")`.
 
 ## 6. Preview
 
-`site/open.sh` keeps serving until it's stopped, so run it in the background:
+The site's dev server keeps serving (and re-rendering on every change) until
+it's stopped, so run it in the background:
 
 ```bash
-PORT=8001 site/open.sh    # then open http://localhost:8001/metal.html
+site/open.sh --port 8001    # then open http://localhost:8001/metal.html
 ```
 
 If the build fails, it lists every problem in the data files. CI would fail
