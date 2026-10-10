@@ -127,6 +127,11 @@ pub struct ProposerStepCtx<'a> {
     /// with `draft_seed.req_ids`). The K-step chain seeds each req
     /// from this req's last accepted token.
     pub sampled_token_ids: Option<&'a [Vec<u32>]>,
+    /// Whether a request takes drafts. A verify step keeps a draft while the target's token at its
+    /// row — argmax, or sampled for a sampled request — equals it: rejection sampling of one-token
+    /// drafts. A request whose sampling reads its token history (penalties) runs undrafted: a
+    /// verify row's history would need the drafts before it.
+    pub takes_drafts: &'a dyn Fn(&str) -> bool,
 }
 
 /// Single-step speculative-decoding proposer interface.
@@ -139,6 +144,17 @@ pub struct ProposerStepCtx<'a> {
 /// Takes `&mut` because draft-model proposers issue GPU work via
 /// `ctx.backend`; ngram impls treat it as `&self` effectively.
 pub trait Proposer {
+    /// The requests a worker-side draft head runs for in the step `sched` scheduled
+    /// (`SchedulerOutput::draft_req_ids`), of those `takes_drafts` admits. A proposer that drafts
+    /// on the host plans none.
+    fn plan(
+        &mut self,
+        _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        _takes_drafts: &dyn Fn(&str) -> bool,
+    ) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>>;
 }
 
@@ -240,6 +256,7 @@ impl DraftModelProposer {
                 num_tokens: seed.num_tokens,
                 has_spec_tokens: false,
                 last_token_indices: None,
+                target_hidden: None,
             };
             if backend
                 .forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &prefill_req)
@@ -384,6 +401,7 @@ impl DraftModelProposer {
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
                 last_token_indices: None,
+                target_hidden: None,
             };
             match backend.forward_chain_k(DRAFT_MODEL, DRAFT_KV, &iter0_req, seed.block_size, k) {
                 Ok(per_iter) => {
@@ -450,6 +468,7 @@ impl DraftModelProposer {
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
                 last_token_indices: None,
+                target_hidden: None,
             };
             let step_argmax =
                 match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &step_req) {

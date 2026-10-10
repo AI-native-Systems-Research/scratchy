@@ -112,6 +112,9 @@ pub trait EngineCoreClient {
         ))
     }
 
+    /// A step the executor failed, never to be finalized ([`EngineCore::abandon_step`]).
+    fn abandon_step(&mut self, _sched: &SchedulerOutput) {}
+
     /// Whether async scheduling is enabled on the underlying engine.
     fn async_scheduling(&self) -> bool {
         false
@@ -143,6 +146,9 @@ struct PipelineState {
     result_rx: std::sync::mpsc::Receiver<PipelineResult>,
     /// Number of batches currently in-flight on the executor thread.
     gpu_in_flight: u32,
+    /// The last batch queued drafts or verifies, and is in flight: nothing is queued behind it
+    /// ([`SchedulerOutput::is_speculative`]).
+    awaits_step: bool,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -246,7 +252,9 @@ impl InprocClient {
     /// Does nothing if the pipeline is already started or the executor has
     /// been taken by the server path.
     pub fn start_pipeline(&mut self) {
-        if self.pipeline.is_some() {
+        // Speculative decoding that drafts on the host (no async scheduling) steps synchronously;
+        // a worker-side head's pipeline queues nothing behind a step that drafts or verifies.
+        if self.pipeline.is_some() || !self.engine.async_scheduling() {
             return;
         }
         if let Some(executor) = self.engine.take_executor() {
@@ -261,6 +269,7 @@ impl InprocClient {
                 sched_tx,
                 result_rx,
                 gpu_in_flight: 0,
+                awaits_step: false,
                 _thread: thread,
             });
         }
@@ -332,8 +341,9 @@ impl InprocClient {
         pipeline: &mut PipelineState,
     ) -> EngineResult<StepOutcome<StepOutputs>> {
         // 1. Pre-schedule: fill pipeline up to 2 in-flight batches.
-        while pipeline.gpu_in_flight < 2 {
+        while pipeline.gpu_in_flight < 2 && !pipeline.awaits_step {
             if let Some(sched) = engine.schedule_next() {
+                let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
                 if pipeline
                     .sched_tx
                     .send(PipelineMsg::Step(Box::new(sched)))
@@ -342,6 +352,7 @@ impl InprocClient {
                     return Err(EngineError::Executor("executor thread exited".into()));
                 }
                 pipeline.gpu_in_flight += 1;
+                pipeline.awaits_step = speculative;
             } else {
                 break;
             }
@@ -355,6 +366,8 @@ impl InprocClient {
                 .recv()
                 .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
             pipeline.gpu_in_flight -= 1;
+            // The last batch queued is finalized here once none is in flight.
+            pipeline.awaits_step &= pipeline.gpu_in_flight > 0;
             let mut model_output = result?;
             model_output.resolve().map_err(EngineError::Executor)?;
             return Ok(StepOutcome::Progressed {
@@ -495,6 +508,10 @@ impl EngineCoreClient for InprocClient {
 
     fn schedule_next(&mut self) -> EngineResult<Option<SchedulerOutput>> {
         Ok(self.engine.schedule_next())
+    }
+
+    fn abandon_step(&mut self, sched: &SchedulerOutput) {
+        self.engine.abandon_step(sched);
     }
 
     fn async_scheduling(&self) -> bool {

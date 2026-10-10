@@ -68,6 +68,10 @@ use crate::tape::constants::{TapeVariant, UnboundConstant};
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
 pub const GEMV_ROWS: u32 = 4;
 
+/// The most input rows the GEMV takes (`MAX_ROWS` in `gemm.metal`): a speculative verify step's
+/// rows, each weight slice loaded once for all of them. More rows run a tiled GEMM.
+pub const GEMV_MAX_ROWS: u32 = 8;
+
 /// Rows from which a bf16 GEMM runs blocked (`gemm_bf16_blocked`): 2.1-2.2x the 8×8-tile GEMM at
 /// a 2048-row MoE router on base M5 (128 × 2816, 256 × 2048), ahead from 256 rows; under them
 /// its few threadgroups lose.
@@ -231,8 +235,9 @@ impl SpecializedPipelines {
 
 /// A dense GEMM's pipeline key at `dtype` and `dims` for `body`, keyed on its `(M, N, K)` (the
 /// simdgroup bodies' constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`).
-/// One row of at least [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV
-/// (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per [`GEMV_ROWS`] outputs.
+/// Up to [`GEMV_MAX_ROWS`] rows of at least [`GEMV_ROWS`] outputs are matrix-vector products:
+/// MLX's GEMV per row (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per
+/// [`GEMV_ROWS`] outputs of every row, each weight slice loaded once for all of them.
 /// Otherwise the body [`gemm_body`] picked runs: the NAX body (`gemm_nax_bf16_dense`) on the
 /// matrix unit's 64×64 tiles, a bf16 GEMM `blocked` taking the blocked body
 /// (`gemm_bf16_blocked`): 32×32 output tiles over 4 simdgroups sharing their A/B tiles, the
@@ -246,7 +251,7 @@ pub fn gemm_pipeline(
     body: GemmBody,
 ) -> Result<(PipelineKey, DispatchShape), PipelineLookupError> {
     let GemmDims { m, n, k } = dims;
-    let gemv = m == 1 && n >= GEMV_ROWS;
+    let gemv = m <= GEMV_MAX_ROWS && n >= GEMV_ROWS;
     // The NAX body's own library and constants: the quantized_qmm_nax kernels read K, N, M as
     // int slots 0 / 1 / 2 — not the gemm library's M, N, K as uint — and dispatch MLX's 3D
     // threadgroup (32, 2, 2), which the MPP matmul2d scheduler prefers ~7% over a flat
@@ -622,7 +627,8 @@ mod tests {
             | KernelId::EmbeddingGather
             | KernelId::AvgPool2d
             | KernelId::VisionGelu
-            | KernelId::VisionLoadPixels
+            | KernelId::LoadRows
+            | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
             // hd512 unfused attention kernels carry their library/function +
             // constants explicitly on the LoweredCommand (NAX vs steel chosen by
@@ -786,7 +792,8 @@ mod tests {
             | KernelId::EmbeddingGather
             | KernelId::AvgPool2d
             | KernelId::VisionGelu
-            | KernelId::VisionLoadPixels
+            | KernelId::LoadRows
+            | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
             | KernelId::AttnGatherKRope
             | KernelId::AttnGatherVCopyT

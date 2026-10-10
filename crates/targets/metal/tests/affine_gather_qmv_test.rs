@@ -1568,15 +1568,15 @@ fn routed_gated_b3_case(num_experts: usize, k: usize, n_out: usize, top_k: usize
         &scores_buf, // buffer(12) expert_scale — unused (EXPERT_SCALE off)
         &bias_buf,
     ];
-    // Dispatch (1, n_out/8, pairs) × (32, 4, 1) — DS9's shape.
+    // Dispatch (pairs, n_out/8, 1) × (32, 4, 1): a pair a threadgroup along X.
     if !common::dispatch_threadgroups(
         &mdev.device,
         &pipeline,
         &bufs,
         MTLSize {
-            width: 1,
+            width: pairs,
             height: n_out / 8,
-            depth: pairs,
+            depth: 1,
         },
         MTLSize {
             width: 32,

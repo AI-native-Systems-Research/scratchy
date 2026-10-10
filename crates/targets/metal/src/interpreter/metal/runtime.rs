@@ -38,13 +38,25 @@ pub struct TqRuntimeBuffers {
     pub signs: Buffer,
     pub boundaries: Buffer,
     pub centroids: Buffer,
-    /// The reused per-layer fp16 SCRATCH: chunk-table (bound at every layer's
-    /// `kv_cache_k/v` slot — attention + rope + dequant + quantize all use it)
-    /// and its backing data (kept alive + resident here).
-    pub scratch_k_table: Buffer,
-    pub scratch_v_table: Buffer,
-    pub scratch_k_data: Buffer,
-    pub scratch_v_data: Buffer,
+    /// The reused per-layer fp16 scratch ([`TqScratch`]).
+    pub scratch: TqScratch,
+}
+
+/// A TurboQuant pool's fp16 scratch: one layer's K and V at the pool's capacity, reused by every
+/// coded layer of a forward — chunk tables (bound at each layer's `kv_cache_k/v` slot: attention,
+/// rope, dequant and quantize all use it) and their backing data (kept alive and resident here).
+/// Its contents live within one layer of one forward, so a model whose forwards never overlap this
+/// one's stages through it too ([`super::worker::LentActivation`]) when its geometry is the same.
+#[derive(Clone)]
+pub struct TqScratch {
+    pub k_table: Buffer,
+    pub v_table: Buffer,
+    pub k_data: Buffer,
+    pub v_data: Buffer,
+    /// The bytes of each of K and V, and of one chunk the tables address: the geometry a borrower
+    /// must match.
+    pub bytes: usize,
+    pub chunk_bytes: usize,
 }
 
 pub struct RuntimeBindings {
@@ -134,6 +146,10 @@ pub struct RuntimeBindings {
     /// overwritten per forward. 16-byte placeholder on non-vision arches
     /// and on towers without a learned positional embedding.
     pub vision_pos_embeds: Buffer,
+    /// `[num_tokens, hidden]` model-dtype — a target model's final hidden states, what an MTP
+    /// head reads. Shared storage; overwritten per forward. 16-byte placeholder on every arch
+    /// but an MTP head.
+    pub target_hidden: Buffer,
     /// `[max_m, hidden]` model-dtype — projected vision embeddings for
     /// the multimodal splice. Shared storage; overwritten per forward
     /// (text-only batches leave it untouched). 16-byte placeholder on
@@ -203,25 +219,30 @@ impl WrittenExtents {
         padding: Padding,
         writes: &mut InputWrites,
     ) -> Result<(), usize> {
-        let len = buffer.length();
-        if src.len() > len {
-            return Err(src.len());
-        }
-        let mut written = self.0.lock().expect("written extents");
-        let stale = written
-            .insert(buffer.gpuAddress(), src.len())
-            .unwrap_or(len);
+        self.cover(buffer, src.len(), padding, writes)?;
         if !src.is_empty() {
             writes.stage(buffer, src);
         }
-        if stale > src.len() {
-            let range = src.len()..stale;
-            let byte = padding.byte();
-            writes.ops.push(InputWrite::Fill {
-                to: buffer.clone(),
-                range,
-                byte,
-            });
+        Ok(())
+    }
+
+    /// Record the head `len` bytes of `buffer` as this forward's — written by the caller — and
+    /// every byte past them the `padding`. `Err`: `len`, more than the buffer holds.
+    pub fn cover(
+        &self,
+        buffer: &Buffer,
+        len: usize,
+        padding: Padding,
+        writes: &mut InputWrites,
+    ) -> Result<(), usize> {
+        if len > buffer.length() {
+            return Err(len);
+        }
+        let mut written = self.0.lock().expect("written extents");
+        let stale = (written.insert(buffer.gpuAddress(), len)).unwrap_or(buffer.length());
+        if stale > len {
+            let (to, range, byte) = (buffer.clone(), len..stale, padding.byte());
+            writes.ops.push(InputWrite::Fill { to, range, byte });
         }
         Ok(())
     }
@@ -238,11 +259,17 @@ pub struct InputWrites {
 impl InputWrites {
     /// `src`, staged for the head of `to`.
     pub(super) fn stage(&mut self, to: &Buffer, src: &[u8]) {
-        let at = self.staged.len().next_multiple_of(4);
-        self.staged.resize(at, 0);
-        self.staged.extend_from_slice(src);
+        let at = self.raw(src);
         let (to, len) = (to.clone(), src.len());
         self.ops.push(InputWrite::Staged { to, at, len });
+    }
+
+    /// `src`, staged for the device to read in place: its offset in `staged`.
+    pub(super) fn raw(&mut self, src: &[u8]) -> usize {
+        let at = self.staged.len().next_multiple_of(16);
+        self.staged.resize(at, 0);
+        self.staged.extend_from_slice(src);
+        at
     }
 }
 
@@ -257,12 +284,20 @@ pub(super) enum InputWrite {
         range: std::ops::Range<usize>,
         byte: u8,
     },
-    /// The `u32` `offset` bytes into `src`, which an earlier command buffer wrote, to `to` at `at`.
+    /// `len` bytes `offset` into `src`, which an earlier forward wrote, to `to` at `at`.
     Device {
         src: Buffer,
         offset: usize,
         to: Buffer,
         at: usize,
+        len: usize,
+    },
+    /// `count` [`SelectOp`](crate::select_rows::SelectOp)s `ops_at` bytes into `staged`, their
+    /// tables there too, run by `pipeline` after the writes before them.
+    Select {
+        ops_at: usize,
+        count: usize,
+        pipeline: super::__re::ComputePipelineState,
     },
 }
 
@@ -325,6 +360,7 @@ impl RuntimeBindings {
             RuntimeBindingKind::VisionRopeFreqs => &self.vision_rope_freqs,
             RuntimeBindingKind::Pixels => &self.pixels,
             RuntimeBindingKind::VisionPosEmbeds => &self.vision_pos_embeds,
+            RuntimeBindingKind::TargetHidden => &self.target_hidden,
             RuntimeBindingKind::MmEmbeds => &self.mm_embeds,
             RuntimeBindingKind::MmDstRows => &self.mm_dst_rows,
             RuntimeBindingKind::MropeCosSin => &self.mrope_cos_sin,

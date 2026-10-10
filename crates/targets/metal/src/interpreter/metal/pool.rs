@@ -21,16 +21,17 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer};
 use objc2_metal::{
-    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
+    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue,
+    MTL4ComputeCommandEncoder, MTLDevice,
 };
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
-use super::forward::{Deferral, ForwardError, ForwardInputs, InFlight};
+use super::forward::{Deferral, DeviceInputInto, ForwardError, ForwardInputs, InFlight};
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
-use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
+use super::worker::{ArenaLayout, LentActivation, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads};
@@ -69,6 +70,10 @@ pub struct MetalBucketSpec {
     /// `forward()` callback reads `worker.arena[terminal_slot]` to
     /// expose logits to the engine.
     pub terminal_slot: u32,
+    /// Index in the colored arena of the lm_head's input — the final (post-norm) hidden states,
+    /// `[num_tokens, hidden]`. Kept live through the lm_head, so it is readable after the
+    /// forward (an MTP head's next input). Equal to `terminal_slot` for encoder layouts.
+    pub backbone_slot: u32,
     /// Per-arena-slot byte sizes derived from the FUF tile shapes
     /// at macro-expansion time (post-coloring, with bucket-specific
     /// `num_tokens` baked in). `len() == num_arena_slots`. The
@@ -198,7 +203,7 @@ impl From<WorkerError> for PoolBuildError {
 #[derive(Clone)]
 pub struct RuntimeFactory(Arc<FactoryFn>);
 
-struct FactoryFn(Box<dyn Fn(&Device) -> RuntimeBindings>);
+struct FactoryFn(Box<dyn Fn(&Device, &LentActivation) -> RuntimeBindings>);
 
 // SAFETY: the boxed closure captures only Metal object handles (objc2
 // `Retained`, thread-safe retain/release) and POD; identical grounds to
@@ -208,13 +213,14 @@ unsafe impl Sync for FactoryFn {}
 
 impl RuntimeFactory {
     /// Wrap a per-worker `RuntimeBindings` builder.
-    pub fn new(f: impl Fn(&Device) -> RuntimeBindings + 'static) -> Self {
+    pub fn new(f: impl Fn(&Device, &LentActivation) -> RuntimeBindings + 'static) -> Self {
         Self(Arc::new(FactoryFn(Box::new(f))))
     }
 
-    /// Build a fresh set of runtime bindings for a worker on `device`.
-    pub fn build(&self, device: &Device) -> RuntimeBindings {
-        ((self.0).0)(device)
+    /// Build a fresh set of runtime bindings for a worker on `device`, placing what it can in
+    /// `lent` ([`LentActivation::tq_scratch`]).
+    pub fn build(&self, device: &Device, lent: &LentActivation) -> RuntimeBindings {
+        ((self.0).0)(device, lent)
     }
 }
 
@@ -223,6 +229,21 @@ impl RuntimeFactory {
 pub struct PooledWorker<W: CanonicalParams> {
     pub worker: MetalWorker<W>,
     pub runtime: RuntimeBindings,
+    /// What forwards played in another pool's command buffer ([`MetalWorkerPool::forward_onto`])
+    /// stage their input writes in: two, a checkout each in turn, so the worker may go back to its
+    /// pool once they are encoded — the command buffer of the checkout before reads the other
+    /// ([`Onto`]).
+    staging: [Staging; 2],
+    /// The slot the next checkout takes.
+    next_staging: usize,
+}
+
+/// One of a [`PooledWorker`]'s staging slots: its buffer, and those a larger one replaced, kept
+/// until the slot is next taken.
+#[derive(Default)]
+struct Staging {
+    buffer: Option<crate::residency::Pinned>,
+    retired: Vec<crate::residency::Pinned>,
 }
 
 /// RAII guard returned by [`MetalWorkerPool::checkout`]. Returns the
@@ -302,6 +323,8 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
+    /// The first worker's arena slots, scratch and TurboQuant scratch ([`Self::lend_activation`]).
+    lendable: LentActivation,
 }
 
 /// Pool-owned MTL4 surface. The command buffer is re-created per forward
@@ -424,13 +447,41 @@ impl PickedRung<'_> {
 }
 
 impl PickedRung<'_> {
-    /// The bytes of the scratch buffers a worker allocates for these tapes: each buffer the
-    /// largest any tape needs.
-    pub fn scratch_bytes(&self) -> u64 {
+    /// The bytes of each scratch buffer a worker allocates for these tapes (split-K, MoE, roped K,
+    /// hd512 unfused): the largest any tape needs.
+    pub fn scratch_sizes(&self) -> [u64; 4] {
         let tapes = || self.tapes.iter().map(|(_, rung)| rung.tape.scratch_bytes());
-        (0..4)
-            .map(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
-            .sum()
+        std::array::from_fn(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
+    }
+
+    /// The bytes of the scratch buffers a worker allocates for these tapes.
+    pub fn scratch_bytes(&self) -> u64 {
+        self.scratch_sizes().iter().sum()
+    }
+
+    /// The worker's arena: sized for the largest activation across every bucket, AND for the
+    /// largest colored slot count across buckets. Slot counts can differ per bucket: a bucket
+    /// whose solver picked a fusion that needs extra scratch — e.g. the synth pre-attn /
+    /// mlp-pre-down kernels, which write the updated residual to a distinct `residual_out` slot
+    /// instead of in place to avoid a cross-threadgroup race — carries more colored slots than a
+    /// bucket that didn't. A bucket's tape only ever references slots in `0..its own
+    /// num_arena_slots`, so an arena sized to the max serves every bucket; smaller buckets simply
+    /// leave the tail slots resident and idle. `arena_bytes` is elementwise-maxed over whatever
+    /// slots each spec defines.
+    pub fn arena_layout(&self) -> ArenaLayout {
+        let num_slots = (self.tapes.iter())
+            .map(|(s, _)| s.num_arena_slots as usize)
+            .max()
+            .unwrap_or(0);
+        let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
+        for (spec, _) in &self.tapes {
+            for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
+                if bytes > arena_layout[slot] {
+                    arena_layout[slot] = bytes;
+                }
+            }
+        }
+        arena_layout
     }
 }
 
@@ -534,7 +585,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ///
     /// Eager creation surfaces allocation/recording/pipeline-lookup
     /// failures at construction time and warms the first-forward
-    /// path (no creation cost on the first checkout).
+    /// path (no creation cost on the first checkout). The first worker places its
+    /// buffers in `lent` ([`LentActivation`]); any later one allocates its own.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
@@ -546,6 +598,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
+        lent: LentActivation,
     ) -> Result<Self, WorkerError>
     where
         W: ModelSources,
@@ -567,7 +620,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // out of the pool struct until the hot path actually uses it.
         probe_mtl4_availability(&device);
 
-        let pool = Self {
+        let mut pool = Self {
             device,
             allocator,
             pipelines,
@@ -584,8 +637,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 total_created: 0,
             }),
             cv: Condvar::new(),
+            lendable: LentActivation::default(),
         };
-        let first = pool.spawn_worker()?;
+        let first = pool.spawn_worker(&lent)?;
+        pool.lendable = LentActivation {
+            tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
+            ..first.worker.activation()
+        };
         {
             let mut inner = pool.inner.lock().unwrap();
             inner.total_created = 1;
@@ -618,6 +676,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // [`pick_rung`]): every step's block tables are rows of this width.
         block_cap: usize,
         addressing: KvAddressing,
+        // Buffers of a pool whose forwards never overlap this one's, for the first worker to place
+        // its own in ([`LentActivation`]).
+        lent: LentActivation,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
@@ -636,32 +697,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             addressing,
         )?;
         let variant = rung.variant();
+        let arena_layout = rung.arena_layout();
         let picked = rung.tapes;
-
-        // Worker arena is sized for the largest activation across every
-        // bucket, AND for the largest colored slot count across buckets.
-        // Slot counts can differ per bucket: a bucket whose solver picked
-        // a fusion that needs extra scratch — e.g. the synth pre-attn /
-        // mlp-pre-down kernels, which write the updated residual to a
-        // distinct `residual_out` slot instead of in place to avoid a
-        // cross-threadgroup race — carries more colored slots than a
-        // bucket that didn't. A bucket's tape only ever references slots
-        // in `0..its own num_arena_slots`, so an arena sized to the max
-        // serves every bucket; smaller buckets simply leave the tail
-        // slots resident and idle. `arena_bytes` is elementwise-maxed
-        // over whatever slots each spec defines.
-        let num_slots = (picked.iter())
-            .map(|(s, _)| s.num_arena_slots as usize)
-            .max()
-            .unwrap_or(0);
-        let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
-        for (spec, _) in &picked {
-            for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
-                if bytes > arena_layout[slot] {
-                    arena_layout[slot] = bytes;
-                }
-            }
-        }
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
@@ -686,6 +723,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             arena_layout,
             runtime_factory,
             max_workers,
+            lent,
         )
         .map_err(PoolBuildError::Worker)
     }
@@ -737,7 +775,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if inner.total_created < self.max_workers {
                 inner.total_created += 1;
                 drop(inner);
-                match self.spawn_worker() {
+                match self.spawn_worker(&LentActivation::default()) {
                     Ok(pooled) => {
                         return Ok(WorkerGuard {
                             pool: self,
@@ -777,7 +815,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if inner.total_created < self.max_workers {
             inner.total_created += 1;
             drop(inner);
-            match self.spawn_worker() {
+            match self.spawn_worker(&LentActivation::default()) {
                 Ok(pooled) => Some(Ok(WorkerGuard {
                     pool: self,
                     inner: Some(pooled),
@@ -1020,9 +1058,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<R, ForwardError>,
     ) -> Result<(R, Committed), ForwardError> {
         use objc2::runtime::AnyObject;
-        use objc2_metal::{
-            MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLSharedEvent, MTLStages,
-        };
+        use objc2_metal::MTLSharedEvent;
         use std::ptr::NonNull;
         let t_pre = std::time::Instant::now();
         let cb = self
@@ -1041,25 +1077,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
             ring.allocator.reset();
             cb.beginCommandBufferWithAllocator(&ring.allocator);
-            let staged = writes.map_or(&[][..], |w| &w.staged[..]);
-            if !staged.is_empty() {
-                if ring
-                    .staging
-                    .as_ref()
-                    .is_none_or(|b| b.length() < staged.len())
-                {
-                    let buffer = crate::mtl4_dispatch::shared_zeroed(&self.device, staged.len());
-                    ring.staging = Some(self.allocator.residency().pin(buffer));
-                    self.allocator.residency().commit();
-                }
-                let staging = ring.staging.as_ref().expect("sized above");
-                // SAFETY: `staging` is shared storage of at least `staged.len()` bytes, and no
-                // command buffer reads it: the last one that did is done.
-                unsafe {
-                    let dst = staging.contents().as_ptr().cast::<u8>();
-                    std::ptr::copy_nonoverlapping(staged.as_ptr(), dst, staged.len());
-                }
-            }
+            // No command buffer reads the slot's staging, nor a buffer it replaces: the last one
+            // that did is done.
+            self.stage(
+                &mut ring.staging,
+                0,
+                writes.map_or(&[][..], |w| &w.staged[..]),
+            );
             // Residency: MTL4 cmdbufs declare per-cmdbuf.
             // Reuse the same set as the pool (weights + arenas + KV cache).
             let cb_ptr: *mut AnyObject =
@@ -1080,51 +1104,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 .computeCommandEncoder()
                 .expect("MTL4 computeCommandEncoder returned nil");
             let ops = writes.map_or(&[][..], |w| &w.ops[..]);
-            let barrier = |before| {
-                enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                    MTLStages::Blit,
-                    before,
-                    MTL4VisibilityOptions::Device,
-                )
-            };
-            let mut earlier_writes = true;
-            for op in ops {
-                // SAFETY: every range is inside its buffers, checked when it was recorded.
-                unsafe {
-                    match op {
-                        InputWrite::Staged { to, at, len } => {
-                            let staging = ring.staging.as_ref().expect("filled above");
-                            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                                staging, *at, to, 0, *len,
-                            );
-                        }
-                        InputWrite::Fill { to, range, byte } => {
-                            enc.fillBuffer_range_value(to, (*range).clone().into(), *byte);
-                        }
-                        InputWrite::Device {
-                            src,
-                            offset,
-                            to,
-                            at,
-                        } => {
-                            // It overwrites the placeholder a staged write put there.
-                            if std::mem::take(&mut earlier_writes) {
-                                barrier(MTLStages::Blit);
-                            }
-                            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                                src,
-                                *offset,
-                                to,
-                                *at,
-                                size_of::<u32>(),
-                            );
-                        }
-                    }
-                }
-            }
-            if !ops.is_empty() {
-                barrier(MTLStages::Dispatch);
-            }
+            encode_input_writes(&enc, &self.device, ring.staging.as_deref(), 0, ops);
             let encoded = encode(&enc);
             enc.endEncoding();
             cb.endCommandBuffer();
@@ -1236,19 +1216,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     {
         self.ensure_mtl4();
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
-
-        if !self
-            .residency_attached
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.allocator.residency().commit();
-            // Commit the weights set too. When it is a distinct un-wired set
-            // (default), its inserts — including weight-memcpy arenas added at
-            // load — take effect only on commit; without this the un-wired
-            // weight buffers are not resident and the GPU reads garbage.
-            // No-op when it aliases the wired set (WeightResidency::Wired).
-            self.allocator.weights_residency().commit();
-        }
+        self.attach_residency();
 
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
@@ -1309,44 +1277,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<(), ForwardError>,
     {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
-        // num_seqs = number of sequences packed into this forward.
-        // Computed once here from the staged `cu_seqlens_q` slice
-        // (`batch + 1` entries) and threaded through the dispatch
-        // path so the per-sub-dispatch `RuntimeGate` checks can
-        // pick the lm_head slice (single-seq) vs the full
-        // M=bucket_m fallback (multi-seq). Defaults to 1 when
-        // `cu_seqlens_q` is absent — those are the
-        // `Instruction::AttentionViaCache` decode buckets that
-        // always run a single-token forward, never the slice.
-        let num_seqs: u32 = inputs
-            .cu_seqlens_q
-            .map(|cu| (cu.len().saturating_sub(1)).max(1) as u32)
-            .unwrap_or(1);
+        let num_seqs = num_seqs(inputs);
         let has_spec_tokens = inputs.has_spec_tokens;
-
-        // Lazily commit the allocator's residency set on the first
-        // forward — gated with an atomic bool so the one-time commit
-        // isn't repeated across thousands of forwards. MTL4 command
-        // buffers declare the set per-CB via `useResidencySet:`.
-        //
-        // commit() applies any inserts queued by `register_mmap` /
-        // arena push / `gpu_worker::initialize_cache`'s KV-cache
-        // wiring (~125ms on Llama-3.2-3B's 4.7 GB KV pool). Done
-        // here rather than in init_cache so it overlaps with the
-        // pool build / first-dispatch encoding instead of blocking
-        // the engine init path.
-        if !self
-            .residency_attached
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.allocator.residency().commit();
-            // Commit the weights set too. When it is a distinct un-wired set
-            // (default), its inserts — including weight-memcpy arenas added at
-            // load — take effect only on commit; without this the un-wired
-            // weight buffers are not resident and the GPU reads garbage.
-            // No-op when it aliases the wired set (WeightResidency::Wired).
-            self.allocator.weights_residency().commit();
-        }
+        self.attach_residency();
 
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
@@ -1422,8 +1355,89 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(with_output(&guard.worker, bucket_idx))
     }
 
-    fn spawn_worker(&self) -> Result<PooledWorker<W>, WorkerError> {
-        let runtime = self.runtime_factory.build(&self.device);
+    /// Encode one forward onto `enc` — another pool's command buffer, after what is already on it:
+    /// typically that pool's forward, whose outputs [`ForwardInputs::device_inputs`] read — with its
+    /// input writes at its head; [`Onto::then`] encodes more on the same worker. The worker stays
+    /// out of the pool until the returned [`Onto`] drops, which must wait until that command buffer
+    /// is done: the command buffer reads and writes the worker's buffers.
+    pub fn forward_onto(
+        &self,
+        inputs: &ForwardInputs<'_>,
+        enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    ) -> Result<Onto<'_, W>, ForwardError> {
+        self.attach_residency();
+        let mut guard = self.checkout()?;
+        let slot = guard.next_staging;
+        guard.next_staging ^= 1;
+        guard.staging[slot].retired.clear();
+        let mut onto = Onto {
+            guard,
+            slot,
+            bucket_idx: 0,
+            staged: 0,
+        };
+        onto.then(inputs, enc)?;
+        Ok(onto)
+    }
+
+    /// Lazily commit the allocator's residency sets on the pool's first forward — gated with an
+    /// atomic bool so the one-time commit isn't repeated across thousands of forwards. MTL4
+    /// command buffers declare the sets per-CB via `useResidencySet:`.
+    ///
+    /// commit() applies any inserts queued by `register_mmap` / arena push /
+    /// `gpu_worker::initialize_cache`'s KV-cache wiring (~125ms on Llama-3.2-3B's 4.7 GB KV pool).
+    /// Done here rather than in init_cache so it overlaps with the pool build / first-dispatch
+    /// encoding instead of blocking the engine init path. The weights set too: when it is a
+    /// distinct un-wired set (default), its inserts — including weight-memcpy arenas added at load
+    /// — take effect only on commit; without this the un-wired weight buffers are not resident and
+    /// the GPU reads garbage. No-op when it aliases the wired set (WeightResidency::Wired).
+    fn attach_residency(&self) {
+        use std::sync::atomic::Ordering::AcqRel;
+        if !self.residency_attached.swap(true, AcqRel) {
+            self.allocator.residency().commit();
+            self.allocator.weights_residency().commit();
+        }
+    }
+
+    /// Copy `staged` into `staging` past its first `used` bytes — which only command buffers not
+    /// yet committed read — returning where it starts. A buffer too small is replaced by one that
+    /// holds it from the start, and handed back for the caller to keep while command buffers read
+    /// it.
+    fn stage(
+        &self,
+        staging: &mut Option<crate::residency::Pinned>,
+        used: usize,
+        staged: &[u8],
+    ) -> (usize, Option<crate::residency::Pinned>) {
+        let mut at = used.next_multiple_of(16);
+        if staged.is_empty() {
+            return (at, None);
+        }
+        let mut replaced = None;
+        if staging
+            .as_ref()
+            .is_none_or(|b| b.length() < at + staged.len())
+        {
+            let len = staged
+                .len()
+                .max(staging.as_ref().map_or(0, |b| 2 * b.length()));
+            let buffer = crate::mtl4_dispatch::shared_zeroed(&self.device, len);
+            replaced = staging.replace(self.allocator.residency().pin(buffer));
+            self.allocator.residency().commit();
+            at = 0;
+        }
+        let staging = staging.as_ref().expect("sized above");
+        // SAFETY: `staging` is shared storage of at least `at + staged.len()` bytes, and no command
+        // buffer reads them: the ones that read what is before `used` are not committed.
+        unsafe {
+            let dst = staging.contents().as_ptr().cast::<u8>().add(at);
+            std::ptr::copy_nonoverlapping(staged.as_ptr(), dst, staged.len());
+        }
+        (at, replaced)
+    }
+
+    fn spawn_worker(&self, lent: &LentActivation) -> Result<PooledWorker<W>, WorkerError> {
+        let runtime = self.runtime_factory.build(&self.device, lent);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
@@ -1432,8 +1446,22 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &self.sources,
             &runtime,
             Some(self.allocator.residency()),
+            lent,
         )?;
-        Ok(PooledWorker { worker, runtime })
+        Ok(PooledWorker {
+            worker,
+            runtime,
+            staging: Default::default(),
+            next_staging: 0,
+        })
+    }
+
+    /// The first worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose
+    /// forwards never overlap this one's ([`LentActivation`]), out of the pool or not: the borrower
+    /// places its buffers in them once, building its pool, and every forward of it follows this
+    /// pool's — an MTP head's even on the command buffer of the target forward that holds the worker.
+    pub fn lend_activation(&self) -> LentActivation {
+        self.lendable.clone()
     }
 
     fn checkin(&self, pooled: PooledWorker<W>) {
@@ -1442,6 +1470,181 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // Wake exactly one waiter — at most one of them can claim
         // this worker, the others stay blocked.
         self.cv.notify_one();
+    }
+}
+
+/// num_seqs = number of sequences packed into this forward, from the staged `cu_seqlens_q` slice
+/// (`batch + 1` entries), threaded through the dispatch path so the per-sub-dispatch `RuntimeGate`
+/// checks can pick the lm_head slice (single-seq) vs the full M=bucket_m fallback (multi-seq).
+/// Defaults to 1 when `cu_seqlens_q` is absent — those are the `Instruction::AttentionViaCache`
+/// decode buckets that always run a single-token forward, never the slice.
+fn num_seqs(inputs: &ForwardInputs<'_>) -> u32 {
+    (inputs.cu_seqlens_q).map_or(1, |cu| (cu.len().saturating_sub(1)).max(1) as u32)
+}
+
+/// Encode a forward's input writes `ops` onto `enc` — `Staged` bytes copied from `staging`, from
+/// `base` on — then a barrier before the dispatches that read them.
+fn encode_input_writes(
+    enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    device: &Device,
+    staging: Option<&Buffer>,
+    base: usize,
+    ops: &[InputWrite],
+) {
+    use objc2_metal::{MTL4VisibilityOptions, MTLStages};
+    let barrier = |before| {
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Blit,
+            before,
+            MTL4VisibilityOptions::Device,
+        )
+    };
+    let mut earlier_writes = true;
+    for op in ops {
+        // SAFETY: every range is inside its buffers, checked when it was recorded.
+        unsafe {
+            match op {
+                InputWrite::Staged { to, at, len } => {
+                    let staging = staging.expect("staged bytes have a staging buffer");
+                    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        staging,
+                        base + *at,
+                        to,
+                        0,
+                        *len,
+                    );
+                }
+                InputWrite::Fill { to, range, byte } => {
+                    enc.fillBuffer_range_value(to, (*range).clone().into(), *byte);
+                }
+                InputWrite::Device {
+                    src,
+                    offset,
+                    to,
+                    at,
+                    len,
+                } => {
+                    // It overwrites what a staged write or fill put there.
+                    if std::mem::take(&mut earlier_writes) {
+                        barrier(MTLStages::Blit);
+                    }
+                    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        src, *offset, to, *at, *len,
+                    );
+                }
+                InputWrite::Select {
+                    ops_at,
+                    count,
+                    pipeline,
+                } => {
+                    let staging = staging.expect("selections have a staging buffer");
+                    let region = staging.gpuAddress() + base as u64;
+                    let ops = (region, region + *ops_at as u64);
+                    crate::select_rows::encode_select_rows(pipeline, enc, device, ops, *count);
+                    // The forward's dispatches read what it wrote.
+                    enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                        MTLStages::Dispatch,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::Device,
+                    );
+                }
+            }
+        }
+    }
+    if !ops.is_empty() {
+        barrier(MTLStages::Dispatch);
+    }
+}
+
+/// A table's words as the bytes the staged region holds.
+fn bytemuck_words(words: &[u32]) -> &[u8] {
+    // SAFETY: `u32` has no padding; the slice covers exactly its words' bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
+}
+
+/// The forwards [`MetalWorkerPool::forward_onto`] and [`Self::then`] encoded onto another pool's
+/// command buffer, and the worker they run on, out of its pool until this drops. It may drop once
+/// they are encoded, before that command buffer is done, only while at most one other command
+/// buffer the pool's forwards were played onto is still running: the worker's next checkout but
+/// one takes this one's staging slot again.
+pub struct Onto<'p, W: CanonicalParams> {
+    guard: WorkerGuard<'p, W>,
+    /// The worker's staging slot its forwards' input writes take.
+    slot: usize,
+    /// The bucket the last forward ran.
+    bucket_idx: usize,
+    /// The bytes of the slot's buffer the forwards' input writes take.
+    staged: usize,
+}
+
+impl<W: CanonicalParams> Onto<'_, W> {
+    /// Encode another forward on the same worker onto `enc`, after what is on it — the forwards
+    /// before it among that — with its input writes at its head.
+    pub fn then(
+        &mut self,
+        inputs: &ForwardInputs<'_>,
+        enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    ) -> Result<(), ForwardError> {
+        use objc2_metal::{MTL4VisibilityOptions, MTLStages};
+        assert!(
+            inputs.deferred.is_none(),
+            "a forward played in another's command buffer is waited for with it"
+        );
+        let pool = self.guard.pool;
+        let bucket_idx = pool.pick_bucket(inputs.num_tokens)?;
+        assert!(
+            !self.guard.worker.bucket_has_avg_pool_2d(bucket_idx),
+            "a serialized forward runs in command buffers of its own"
+        );
+        let writes = begin_step(&self.guard, inputs, pool.block_table_stride)?;
+        let pooled = &mut *self.guard;
+        let staging = &mut pooled.staging[self.slot];
+        let (at, replaced) = pool.stage(&mut staging.buffer, self.staged, &writes.staged);
+        staging.retired.extend(replaced);
+        self.staged = at + writes.staged.len();
+        // After everything on the encoder so far: it wrote what the device inputs read, and may
+        // read this worker's runtime inputs or share its activation (an arena lent to it).
+        let all = MTLStages::Dispatch | MTLStages::Blit;
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            all,
+            all,
+            MTL4VisibilityOptions::Device,
+        );
+        encode_input_writes(
+            enc,
+            &pool.device,
+            pooled.staging[self.slot].buffer.as_deref(),
+            at,
+            &writes.ops,
+        );
+        (pooled.worker)
+            .run_bucket_mtl4(
+                bucket_idx,
+                inputs.num_tokens,
+                num_seqs(inputs),
+                inputs.has_spec_tokens,
+                enc,
+            )
+            .map_err(ForwardError::Worker)?;
+        if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
+            let dispatches = pooled.worker.count_dispatches(bucket_idx);
+            eprintln!(
+                "[forward-onto bucket={bucket_idx} num_tokens={} mtl4 dispatches={dispatches}]",
+                inputs.num_tokens
+            );
+        }
+        self.bucket_idx = bucket_idx;
+        Ok(())
+    }
+
+    /// The worker whose arena holds the last forward's outputs once the command buffer is done.
+    pub fn worker(&self) -> &MetalWorker<W> {
+        &self.guard.worker
+    }
+
+    /// The bucket the last forward ran.
+    pub fn bucket_idx(&self) -> usize {
+        self.bucket_idx
     }
 }
 
@@ -1498,8 +1701,8 @@ fn commit_options(
 }
 
 /// Record the step's writes — into the worker's runtime buffers, its deferral's other buffers,
-/// then the tokens an earlier forward wrote on the device — and set the per-step values its
-/// dispatch reads.
+/// then the bytes earlier forwards wrote on the device — and set the per-step values its dispatch
+/// reads.
 fn begin_step<W: CanonicalParams>(
     worker: &PooledWorker<W>,
     inputs: &ForwardInputs<'_>,
@@ -1507,16 +1710,70 @@ fn begin_step<W: CanonicalParams>(
 ) -> Result<InputWrites, ForwardError> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut writes = InputWrites::default();
-    write_runtime_inputs(&worker.runtime, inputs, block_table_stride, &mut writes)?;
+    let runtime = &worker.runtime;
+    write_runtime_inputs(runtime, inputs, block_table_stride, &mut writes)?;
     for (to, bytes) in inputs.deferred.iter().flat_map(|d| &d.host_writes) {
         writes.stage(to, bytes);
     }
-    for input in inputs.deferred.iter().flat_map(|d| &d.device_inputs) {
+    let device_hidden = (inputs.device_inputs.iter())
+        .filter(|d| d.into == DeviceInputInto::TargetHidden)
+        .map(|d| d.at + d.len)
+        .max();
+    if let (None, Some(len)) = (inputs.target_hidden, device_hidden) {
+        let hidden = &runtime.target_hidden;
+        (runtime.written)
+            .cover(hidden, len, Padding::Zero, &mut writes)
+            .map_err(|bytes_needed| ForwardError::BufferTooSmall {
+                kind: "target_hidden",
+                bytes_needed,
+                bytes_available: hidden.length(),
+            })?;
+    }
+    let input = |into: DeviceInputInto| match into {
+        DeviceInputInto::InputIds => &runtime.input_ids,
+        DeviceInputInto::TargetHidden => &runtime.target_hidden,
+        DeviceInputInto::Positions => &runtime.positions,
+        DeviceInputInto::SlotMapping => &runtime.slot_mappings[0],
+        DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
+        DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
+        DeviceInputInto::GdnSteps => &runtime.gdn_is_fresh,
+    };
+    for input in inputs.device_inputs.iter().map(|d| (d, input(d.into))) {
+        let (input, to) = input;
         writes.ops.push(InputWrite::Device {
             src: input.src.clone(),
             offset: input.offset,
-            to: worker.runtime.input_ids.clone(),
-            at: input.flat_index * size_of::<u32>(),
+            to: to.clone(),
+            at: input.at,
+            len: input.len,
+        });
+    }
+    if let Some((d, pipeline)) = (inputs.deferred)
+        .and_then(|d| d.select.clone().map(|p| (d, p)))
+        .filter(|(d, _)| !d.selections.is_empty())
+    {
+        use crate::select_rows::{SelectFrom, SelectInto, SelectOp};
+        let tables: Vec<usize> = (d.selections.iter())
+            .map(|s| match &s.source {
+                SelectFrom::Table(table) => writes.raw(bytemuck_words(table)),
+                SelectFrom::Device(..) => 0,
+            })
+            .collect();
+        let ops: Vec<u8> = (d.selections.iter().zip(tables))
+            .flat_map(|(s, at)| {
+                let to = match &s.to {
+                    SelectInto::Input(into) => input(*into),
+                    SelectInto::Buffer(b) => b,
+                };
+                SelectOp::new(at, s, to.gpuAddress() + s.at as u64).bytes()
+            })
+            .collect();
+        let ops_at = writes.raw(&ops);
+        let count = d.selections.len();
+        writes.ops.push(InputWrite::Select {
+            ops_at,
+            count,
+            pipeline,
         });
     }
     worker.worker.tq_dequant_max_blocks.store(
@@ -1525,6 +1782,14 @@ fn begin_step<W: CanonicalParams>(
     );
     worker.worker.unrotated_blocks.store(
         step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
+        Relaxed,
+    );
+    worker.worker.gdn_plain.store(
+        inputs.gdn_is_fresh.is_none_or(|codes| {
+            codes
+                .iter()
+                .all(|&c| crate::gdn_state::GdnStep::decode(c).is_plain())
+        }),
         Relaxed,
     );
     Ok(writes)
@@ -1753,6 +2018,9 @@ fn write_runtime_inputs(
     if let Some(b) = inputs.pos_embeds {
         write("pos_embeds", &runtime.vision_pos_embeds, b, Padding::Zero)?;
     }
+    if let Some(b) = inputs.target_hidden {
+        write("target_hidden", &runtime.target_hidden, b, Padding::Zero)?;
+    }
     // Qwen2.5-VL windowed-attention externs (i32/u32 bytes, verbatim).
     if let Some(b) = inputs.vision_cu_seqlens_full {
         write(
@@ -1928,6 +2196,7 @@ mod tests {
             vision_rope_freqs: alloc(device, 16),
             pixels: alloc(device, 16),
             vision_pos_embeds: alloc(device, 16),
+            target_hidden: alloc(device, 16),
             mm_embeds: alloc(device, 16),
             mm_dst_rows: alloc(device, 16),
             mrope_cos_sin: alloc(device, 16),
@@ -2014,7 +2283,7 @@ mod tests {
         let (weights, allocator) = build_test_weights(&device);
 
         let arena_layout: ArenaLayout = vec![4096, 4096];
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
 
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,
@@ -2026,6 +2295,7 @@ mod tests {
             arena_layout,
             runtime_factory,
             max,
+            LentActivation::default(),
         )
         .expect("pool builds");
         Some(pool)
@@ -2222,7 +2492,7 @@ mod tests {
         let arena_layout: ArenaLayout = vec![slot_bytes, slot_bytes];
         // Per-token runtime arrays sized for max bucket.
         let max_m_bytes = (max_m * 4).max(16);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(move |d| RuntimeBindings {
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(move |d, _| RuntimeBindings {
             input_ids: alloc(d, max_m_bytes),
             positions: alloc(d, max_m_bytes),
             slot_mappings: vec![alloc(d, max_m_bytes)],
@@ -2245,6 +2515,7 @@ mod tests {
             vision_rope_freqs: alloc(d, 16),
             pixels: alloc(d, 16),
             vision_pos_embeds: alloc(d, 16),
+            target_hidden: alloc(d, 16),
             mm_embeds: alloc(d, 16),
             mm_dst_rows: alloc(d, 16),
             mrope_cos_sin: alloc(d, 16),
@@ -2265,6 +2536,7 @@ mod tests {
             arena_layout,
             runtime_factory,
             max_workers,
+            LentActivation::default(),
         )
         .expect("pool builds");
         Some(pool)
@@ -2354,9 +2626,11 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         }
     }
@@ -2415,9 +2689,11 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         // Closure runs *while* the worker is checked out — assertion
@@ -2486,9 +2762,9 @@ mod tests {
         pool.allocator.residency().commit();
         let guard = pool.checkout().expect("a worker");
         let input_ids = || crate::mtl4_dispatch::read_slice::<u32>(&guard.runtime.input_ids, 4);
-        let run = |ids: &[u32], device_inputs| {
+        let run = |ids: &[u32], device_inputs: &[crate::interpreter::metal::DeviceInput]| {
             let positions: Vec<u32> = (0..ids.len() as u32).collect();
-            let deferral = Deferral::new(device_inputs);
+            let deferral = Deferral::default();
             let inputs = ForwardInputs {
                 span_ids: None,
                 num_tokens: ids.len() as u32,
@@ -2513,6 +2789,8 @@ mod tests {
                 mm_embeds: None,
                 mm_dst_rows: None,
                 mrope_cos_sin: None,
+                target_hidden: None,
+                device_inputs,
                 deferred: Some(&deferral),
             };
             let before = input_ids();
@@ -2526,13 +2804,199 @@ mod tests {
             committed.in_flight.wait().expect("runs");
             input_ids()
         };
-        let device_input = crate::interpreter::metal::DeviceInput {
-            src: (*sampled).clone(),
-            offset: size_of::<u32>(),
-            flat_index: 1,
+        let device_input =
+            crate::interpreter::metal::DeviceInput::token((*sampled).clone(), size_of::<u32>(), 1);
+        assert_eq!(run(&[5, 0, 9], &[device_input]), [5, 42, 9, 0]);
+        assert_eq!(run(&[8], &[]), [8, 0, 0, 0]);
+
+        // A selection: the variant a device-side selector names (2) of a host table, over the host's
+        // placeholders in the middle of `input_ids`.
+        let cache = crate::specialized_pipeline_cache::SpecializedPipelineCache::new(
+            (*pool.device).clone(),
+            &[],
+        )
+        .expect("pipeline cache");
+        let select = crate::aot::baked_build(
+            &cache,
+            &crate::specialized_pipeline_cache::PipelineKey::new(
+                "select_rows",
+                "select_rows",
+                Vec::new(),
+            ),
+        )
+        .expect("select_rows");
+        let picked = pool
+            .allocator
+            .residency()
+            .pin(crate::mtl4_dispatch::shared_bytes(
+                &pool.device,
+                bytes_of(&[2]),
+            ));
+        pool.allocator.residency().commit();
+        let positions: Vec<u32> = (0..4).collect();
+        let mut deferral = Deferral::default();
+        deferral.selections = vec![crate::select_rows::Selection {
+            source: crate::select_rows::SelectFrom::Table(vec![60, 61, 70, 71, 80, 81]),
+            stride: 2,
+            len: 2,
+            selector: ((*picked).clone(), 0),
+            to: crate::select_rows::SelectInto::Input(DeviceInputInto::InputIds),
+            at: size_of::<u32>(),
+        }];
+        deferral.select = Some(select);
+        let inputs = ForwardInputs {
+            span_ids: None,
+            num_tokens: 4,
+            input_ids: &[5, 0, 0, 9],
+            positions: &positions,
+            slot_mappings: Vec::new(),
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_tables: Vec::new(),
+            has_spec_tokens: false,
+            last_token_indices: None,
+            gdn_state_indices: None,
+            gdn_is_fresh: None,
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            target_hidden: None,
+            device_inputs: &[],
+            deferred: Some(&deferral),
         };
-        assert_eq!(run(&[5, 0, 9], vec![device_input]), [5, 42, 9, 0]);
-        assert_eq!(run(&[8], Vec::new()), [8, 0, 0, 0]);
+        let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
+        let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
+        committed.in_flight.wait().expect("runs");
+        assert_eq!(
+            input_ids(),
+            [5, 80, 81, 9],
+            "variant 2, picked on the device"
+        );
+    }
+
+    /// Two forwards played onto one command buffer, on one worker: each reads its own inputs — its
+    /// host bytes staged past the first's, its device inputs over the host's placeholders, and
+    /// target hidden rows the host gave none of, padded past them.
+    #[test]
+    fn forwards_onto_one_command_buffer_read_their_own_inputs() {
+        use crate::interpreter::metal::{DeviceInput, DeviceInputInto};
+        use objc2_metal::{MTL4VisibilityOptions, MTLStages};
+        let Some(pool) = build_multi_bucket_pool(&[4], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        pool.ensure_mtl4();
+        let pin = |buffer| pool.allocator.residency().pin(buffer);
+        let src = pin(crate::mtl4_dispatch::shared_bytes(
+            &pool.device,
+            bytes_of(&[10, 11, 12, 13, 20, 21, 22, 23]),
+        ));
+        let seen = pin(crate::mtl4_dispatch::shared_zeroed(&pool.device, 96));
+        pool.allocator.residency().commit();
+        let inputs = |ids, positions, device_inputs| ForwardInputs {
+            span_ids: None,
+            num_tokens: <[u32]>::len(ids) as u32,
+            input_ids: ids,
+            positions,
+            slot_mappings: Vec::new(),
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_tables: Vec::new(),
+            has_spec_tokens: false,
+            last_token_indices: None,
+            gdn_state_indices: None,
+            gdn_is_fresh: None,
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            target_hidden: None,
+            device_inputs,
+            deferred: None,
+        };
+        let first = [
+            DeviceInput::head((*src).clone(), 0, 8, DeviceInputInto::Positions),
+            DeviceInput::hidden_rows((*src).clone(), 1, 0, 2, 4),
+        ];
+        let second = [
+            DeviceInput::head((*src).clone(), 16, 4, DeviceInputInto::Positions),
+            DeviceInput::head((*src).clone(), 20, 4, DeviceInputInto::TargetHidden),
+        ];
+        // What each forward's tape read: its input ids, positions and target hidden rows.
+        let record = |enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+                      runtime: &RuntimeBindings,
+                      at: usize| {
+            let all = MTLStages::Dispatch | MTLStages::Blit;
+            let device = MTL4VisibilityOptions::Device;
+            enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(all, all, device);
+            let from = [
+                &runtime.input_ids,
+                &runtime.positions,
+                &runtime.target_hidden,
+            ];
+            for (i, from) in from.into_iter().enumerate() {
+                // SAFETY: every buffer holds 16 bytes; `seen` holds 96.
+                unsafe {
+                    enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        from,
+                        0,
+                        &seen,
+                        at + 16 * i,
+                        16,
+                    );
+                }
+            }
+            enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(all, all, device);
+        };
+        let ((), committed) = pool
+            .commit(None, |enc| {
+                let mut onto = pool.forward_onto(&inputs(&[1, 2], &[100, 101], &first), enc)?;
+                record(enc, &onto.guard.runtime, 0);
+                onto.then(&inputs(&[3], &[200], &second), enc)?;
+                record(enc, &onto.guard.runtime, 48);
+                Ok(())
+            })
+            .expect("commits");
+        committed.in_flight.wait().expect("runs");
+        let seen = crate::mtl4_dispatch::read_slice::<u32>(&seen, 24);
+        let read = |forward: usize, input: usize| &seen[12 * forward + 4 * input..][..4];
+        assert_eq!(read(0, 0), [1, 2, 0, 0], "the first forward's tokens");
+        assert_eq!(
+            read(0, 1),
+            [10, 11, 0, 0],
+            "the first forward's device positions"
+        );
+        assert_eq!(
+            read(0, 2),
+            [11, 12, 0, 0],
+            "the first forward's device hidden rows"
+        );
+        assert_eq!(read(1, 0), [3, 0, 0, 0], "the second forward's tokens");
+        assert_eq!(
+            read(1, 1),
+            [20, 0, 0, 0],
+            "the second forward's device positions"
+        );
+        assert_eq!(
+            read(1, 2),
+            [21, 0, 0, 0],
+            "the second forward's row, the first's padded"
+        );
     }
 
     #[test]
@@ -2562,9 +3026,11 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         let err = pool
@@ -2603,9 +3069,11 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         match pool.forward(&inputs, |_, _| ()) {
@@ -2654,9 +3122,11 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            device_inputs: &[],
             deferred: None,
         };
         let err = pool
@@ -2737,7 +3207,7 @@ mod tests {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
         let (weights, allocator) = build_test_weights(&device);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
         Some(MetalWorkerPool::<TestWeights>::for_buckets(
             device,
             &weights,
@@ -2748,6 +3218,7 @@ mod tests {
             None,
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
             KvAddressing::Direct,
+            LentActivation::default(),
         ))
     }
 
@@ -2767,7 +3238,7 @@ mod tests {
             }
         };
         let (weights, allocator) = build_test_weights(&device);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
         let res = MetalWorkerPool::<TestWeights>::for_buckets(
             device,
             &weights,
@@ -2778,6 +3249,7 @@ mod tests {
             None,
             128, // block_cap (unused — NoBuckets fires first)
             KvAddressing::Direct,
+            LentActivation::default(),
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}
@@ -2797,6 +3269,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             terminal_slot: 1,
+            backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
@@ -2827,6 +3300,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             terminal_slot: 1,
+            backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
@@ -2861,6 +3335,7 @@ mod tests {
                 bucket_m: 1,
                 num_arena_slots: 2,
                 terminal_slot: 1,
+                backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,
@@ -2873,6 +3348,7 @@ mod tests {
                 bucket_m: 8,
                 num_arena_slots: 2,
                 terminal_slot: 1,
+                backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,

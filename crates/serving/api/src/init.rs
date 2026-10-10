@@ -28,7 +28,7 @@ use scratchy_serving_engine::core_client::InprocClient;
 use scratchy_serving_engine::engine_core::{EngineCoreConfig, HybridKvConfig};
 use scratchy_serving_engine::gpu_budget::{MaxNumSeqsFacts, resolve_default_max_num_seqs};
 use scratchy_serving_engine::spec_decode::{
-    DraftModelProposerConfig, NgramProposerConfig, ProposerConfig,
+    DraftModelProposerConfig, MtpProposerConfig, NgramProposerConfig, ProposerConfig,
 };
 use scratchy_serving_worker::uniproc::UniProcExecutor;
 use scratchy_serving_worker::worker::Worker;
@@ -696,16 +696,113 @@ fn build_proposer_config(
             max_model_len,
         })));
     }
-    // Non-"ngram" value: treat as a draft-model path / HF repo. The
-    // engine logs the registration and proceeds as baseline until phase 4
-    // wires the real proposer (`EngineCore::new` handles this variant by
-    // leaving the proposer as `None`).
+    // Non-"ngram" value: a draft checkpoint (path / HF repo) — a multi-token-prediction head
+    // drafts with the MTP proposer (its compiled drafts, `resolve_speculative_decoding`); anything
+    // else is a standalone draft model.
+    if let Some(head) = draft_head(config, spec)? {
+        return Ok(Some(ProposerConfig::Mtp(MtpProposerConfig {
+            model: spec.to_string(),
+            num_speculative_tokens: config.num_speculative_tokens,
+            max_seqs: usize::from(head.max_seqs),
+            max_model_len,
+        })));
+    }
     Ok(Some(ProposerConfig::DraftModel(DraftModelProposerConfig {
         model: spec.to_string(),
         num_speculative_tokens: config.num_speculative_tokens,
         dtype: config.draft_model_dtype.clone(),
         max_model_len,
     })))
+}
+
+/// The registration of the `--speculative-model` checkpoint's multi-token-prediction head, when
+/// its arch, as compiled into this build, is one (it reads the target's hidden states).
+fn draft_head(
+    config: &VllmConfig,
+    spec: &str,
+) -> Result<Option<scratchy_forward_compiler::HeadRegistration>> {
+    let draft_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
+        spec,
+        config.hf_token.as_deref(),
+        None,
+        None,
+    )
+    .with_context(|| format!("resolving draft model path {spec:?}"))?;
+    let draft_cfg = HfModelConfig::from_dir(&draft_dir)
+        .with_context(|| format!("reading draft config.json at {draft_dir:?}"))?;
+    Ok(draft_cfg
+        .arch_hint()
+        .and_then(scratchy_forward_compiler::draft_head))
+}
+
+/// The speculative decoding a run does, validated ([`validate_speculative_decoding`]). A build that
+/// compiled the target's multi-token-prediction head drafts with it (no `--speculative-model`):
+/// the head is a fact of the compiled model, its repo the target's as the head's registration
+/// names it. A head drafts what it was compiled to (`HeadRegistration::drafts`) — its target's
+/// verify steps carry exactly those rows, which both models' kernels bake — so
+/// `--num-speculative-tokens` is not a head's: it counts an n-gram or draft model's drafts.
+///
+/// TODO: a `--num-speculative-tokens` given with a head is ignored, and the flag's default (2)
+/// cannot be told from a given value: make it optional, and refuse one that is not the head's.
+fn resolve_speculative_decoding(config: &VllmConfig) -> Result<std::borrow::Cow<'_, VllmConfig>> {
+    let head = match config.speculative_model.as_deref() {
+        Some("ngram") => None,
+        Some(spec) => draft_head(config, spec)?.map(|head| (spec.to_string(), head)),
+        None if !cfg!(feature = "metal") => None,
+        None => target_head(config)?,
+    };
+    let config = match head {
+        None => std::borrow::Cow::Borrowed(config),
+        Some((repo, head)) => {
+            info!(
+                "spec-decode: {} drafts {} tokens a step with its compiled multi-token-prediction \
+                 head {repo}.",
+                config.model, head.drafts,
+            );
+            std::borrow::Cow::Owned(VllmConfig {
+                speculative_model: Some(repo),
+                num_speculative_tokens: usize::from(head.drafts),
+                ..config.clone()
+            })
+        }
+    };
+    validate_speculative_decoding(&config)?;
+    Ok(config)
+}
+
+/// The repo and registration of the target's multi-token-prediction head, when this build compiled
+/// one for the target's checkpoint architecture and the target's config declares MTP layers.
+fn target_head(
+    config: &VllmConfig,
+) -> Result<Option<(String, scratchy_forward_compiler::HeadRegistration)>> {
+    let target_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
+        &config.model,
+        config.hf_token.as_deref(),
+        None,
+        None,
+    )
+    .with_context(|| format!("resolving model path {:?}", config.model))?;
+    let target = HfModelConfig::from_dir(&target_dir)
+        .with_context(|| format!("reading config.json at {target_dir:?}"))?;
+    // A multimodal checkpoint nests its language model's fields under `text_config`.
+    let text = target.extra.get("text_config");
+    let mtp_layers = (target.extra.get("mtp_num_hidden_layers"))
+        .or_else(|| text?.get("mtp_num_hidden_layers"))
+        .and_then(|v| v.as_u64());
+    let Some(head) = (target.arch_hint())
+        .and_then(scratchy_forward_compiler::head_of)
+        .filter(|_| mtp_layers.is_some_and(|n| n > 0))
+    else {
+        return Ok(None);
+    };
+    let repo = head.repo_of(&config.model).with_context(|| {
+        format!(
+            "this build compiled {:?}'s multi-token-prediction head, but its repo cannot be named \
+             from the target's; pass --speculative-model <head>",
+            config.model
+        )
+    })?;
+    Ok(Some((repo, head)))
 }
 
 /// Validate `--speculative-model` against the phase guards before any
@@ -729,6 +826,12 @@ fn validate_speculative_decoding(config: &VllmConfig) -> Result<()> {
     if spec == "ngram" {
         return Ok(());
     }
+    // A head embeds and decodes through the target's own embedding and lm_head (the worker lends
+    // them), so its token IDs are the target's by construction; its repo's tokenizer is unused.
+    if draft_head(config, spec)?.is_some() {
+        info!("spec-decode: {spec:?} is a multi-token-prediction head of the target.");
+        return Ok(());
+    }
     validate_target_draft_pair(config, spec)?;
     info!(
         "spec-decode: draft model {:?} accepted; worker-side proposer runs a K-step \
@@ -742,10 +845,14 @@ fn validate_speculative_decoding(config: &VllmConfig) -> Result<()> {
 /// scheduling for non-EAGLE spec-decode methods. Both ngram and draft-model
 /// paths seed K-step drafts from step N's output for step N+1's verify;
 /// async's 1-step lookahead skews that to N+2 and acceptance collapses to
-/// ~0. EAGLE/MTP methods (not yet ported) re-use hidden states directly
-/// and are compatible with async.
+/// ~0. A multi-token-prediction head drafts in the worker, at the end of the
+/// step it drafts from, and the async loop waits only on a step that drafts
+/// or verifies, so it is compatible with async.
 fn spec_decode_requires_sync(config: &VllmConfig) -> bool {
-    config.speculative_model.is_some()
+    match config.speculative_model.as_deref() {
+        None => false,
+        Some(spec) => !matches!(draft_head(config, spec), Ok(Some(_))),
+    }
 }
 
 /// Phase-2 guards: vocab/tokenizer match + memory budget for the
@@ -1781,7 +1888,8 @@ fn load_generation_defaults(
 }
 
 pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
-    validate_speculative_decoding(config)?;
+    let resolved = resolve_speculative_decoding(config)?;
+    let config = &*resolved;
     let init_start = Instant::now();
 
     // Create progress bar if logging is below INFO level
@@ -1874,7 +1982,8 @@ pub fn initialize_stack(
     config: &VllmConfig,
     progress: Option<Arc<crate::progress::StartupProgress>>,
 ) -> Result<InitializedStack> {
-    validate_speculative_decoding(config)?;
+    let resolved = resolve_speculative_decoding(config)?;
+    let config = &*resolved;
     let init_start = Instant::now();
 
     // Create progress bar if not provided and logging is below INFO level

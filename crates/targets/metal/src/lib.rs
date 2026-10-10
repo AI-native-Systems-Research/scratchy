@@ -232,6 +232,7 @@ pub mod device;
 /// in the target crate, beside spyre's `lower_subtile_tape_to_superdsc`.
 pub mod from_tape;
 pub mod grammar_mask;
+pub mod mtp_chain;
 /// ⛔ THE METAL OP ABI — which operand a kernel writes over, which ops are in-place,
 /// the source/unary constructor tables. It lived in `compiler/macros/src/metal_op_abi.rs`:
 /// target ABI facts inside the shared compiler, which is the arrangement CLAUDE.md says
@@ -239,6 +240,7 @@ pub mod grammar_mask;
 /// the target. It depends only on `scratchy_ir` + `scratchy_subtile`, so nothing had to
 /// move with it.
 pub mod op_abi;
+pub mod select_rows;
 // Core-facing metal runtime: the `DeviceAllocator`-trait weight-loader
 // (`MetalAllocator`) and the worker-facing `GpuDevice`. The canonical metal
 // allocator — distinct from `allocator::PooledBufferAllocator` (legacy
@@ -345,7 +347,7 @@ pub mod weights {
     /// `scratchy_target_cuda::weights::GpuWeights` path under metal.
     pub type GpuWeights<A = crate::MetalAllocator> = scratchy_layers::weights::GpuWeights<A>;
     pub use crate::weights_metal::MetalWeightsExt;
-    pub use scratchy_layers::weights::UploadSrc;
+    pub use scratchy_layers::weights::{TensorRefs, UploadSrc};
 }
 pub use weights::GpuWeights;
 
@@ -366,7 +368,7 @@ pub mod forward_ctx;
 pub mod mm_dispatch;
 #[cfg(feature = "vision")]
 pub mod vision_arch;
-pub use forward_ctx::{EmbedPatch, ForwardCtx};
+pub use forward_ctx::{EmbedPatch, ForwardCtx, HiddenRowsOut};
 #[cfg(feature = "vision")]
 pub use mm_dispatch::{MultimodalForward, PixelInput};
 #[cfg(feature = "vision")]

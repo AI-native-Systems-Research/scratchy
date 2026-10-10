@@ -445,10 +445,13 @@ pub enum KernelId {
     /// Maps to `gelu_tanh_{f16,bf16}` (and the erf / quick flavours) in
     /// `activation.metal`. Bindings: `(out @ 0, in @ 1)`, `GeluConstants` baked.
     VisionGelu,
-    /// Copy the vision `pixels` runtime extern into an arena slot
-    /// (materialized by `vision_lowering::materialize_pixels`). Maps to
-    /// `copy_rows_{f16,bf16}` in `elementwise.metallib`.
-    VisionLoadPixels,
+    /// Copy a host-staged rows runtime extern (vision pixels, position embeddings, a target's
+    /// hidden states) into an arena slot (materialized by `rows_lowering::materialize_rows`).
+    /// Maps to `copy_rows_{f16,bf16}` in `elementwise.metallib`.
+    LoadRows,
+    /// Row concatenation `out[t] = a[t] ++ b[t]` of two same-width activations (an MTP head's
+    /// input fusion). Maps to `concat_rows_{f16,bf16}` in `elementwise.metallib`.
+    ConcatRows,
     /// Multimodal embed splice — scatter the projected vision embeddings
     /// (`MmEmbeds`) into the text embedding stream at the placeholder
     /// rows (`MmDstRows`). Maps to `mm_embed_splice_{f16,bf16}` in
@@ -577,7 +580,8 @@ impl KernelId {
             | Self::EmbeddingGather
             | Self::AvgPool2d
             | Self::VisionGelu
-            | Self::VisionLoadPixels
+            | Self::LoadRows
+            | Self::ConcatRows
             | Self::MmEmbedSplice
             | Self::TqStageRotated
             | Self::TqRotateRows
@@ -716,8 +720,19 @@ pub enum RuntimeGate {
     /// Run unless the step's block tables hold an unrotated block: the
     /// per-row attention twin that reads the cache's already-roped K as is.
     UnlessUnrotatedBlocks,
+    /// Run only on a step whose every sequence's Gated-DeltaNet step is plain
+    /// (`GdnStep::is_plain`: it neither replays nor records): the one-command
+    /// decode and the pipelined prefill scan, which know only a slot's state
+    /// entry.
+    OnlyIfPlainGdn,
+    /// Run on a step one of whose sequences replays or records its
+    /// Gated-DeltaNet rows (a speculative verify step, the step after one):
+    /// the conv and the simd scan, which replay and record.
+    UnlessPlainGdn,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
+    /// Run when some gate in the list matches.
+    Any(&'static [RuntimeGate]),
 }
 
 impl RuntimeGate {
@@ -866,7 +881,7 @@ pub enum Binding {
     /// (one buffer, serial commands per layer; overwritten each layer).
     AttnUnfusedScratch { offset: u32, binding_index: u8 },
     /// A bound sub-region of the worker's shared MoE scratch buffer
-    /// (`MetalWorker.moe_scratch`, sized to
+    /// (sized to
     /// `LoweredMetalTape::moe_scratch_bytes`). Each lowered MoE
     /// command picks the named region it operates on by passing
     /// `byte_offset` into `setBuffer_offset_atIndex`. Sub-regions are
@@ -1259,15 +1274,19 @@ pub enum RuntimeBindingKind {
     /// forward by the worker. Carried on `ForwardCtx::vision_rope_freqs`.
     VisionRopeFreqs,
     /// `[num_tokens, vision_in_features]` model-dtype — the vision patch
-    /// pixel rows. `Instruction::LoadPixels` copies it into an arena slot.
+    /// pixel rows. `LoadRows(Pixels)` copies it into an arena slot.
     /// Carried on `ForwardCtx::pixels`, written per forward by the worker.
     Pixels,
     /// `[num_tokens, vision_embed_dim]` model-dtype — the Qwen3.5-VL
     /// host-interpolated learned positional embedding.
-    /// `Instruction::LoadPosEmbeds` copies it into an arena slot.
+    /// `LoadRows(PosEmbeds)` copies it into an arena slot.
     /// Carried on `ForwardCtx::pos_embeds`, written per forward by the
     /// worker.
     VisionPosEmbeds,
+    /// `[num_tokens, hidden]` model-dtype — a target model's final hidden states, what an MTP
+    /// head reads. `LoadRows(TargetHidden)` copies it into an arena slot. Carried on
+    /// `ForwardCtx::target_hidden`, written per forward by the worker.
+    TargetHidden,
     /// `[num_tokens, hidden]` model-dtype — the projected vision-encoder
     /// embeddings (`ForwardCtx::mm_embeds`), copied row-blockwise into
     /// the text embedding stream at the image-placeholder rows by
@@ -1658,6 +1677,7 @@ impl RuntimeBindingKind {
             | Self::VisionRopeFreqs
             | Self::Pixels
             | Self::VisionPosEmbeds
+            | Self::TargetHidden
             | Self::MmEmbeds
             | Self::MmDstRows
             | Self::MropeCosSin

@@ -205,10 +205,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::ScalarWeightMul
             | O::GateSplit { .. }
             | O::GateApply
+            | O::Concat { .. }
             | O::GateScale
-            | O::LoadPixels { .. }
+            | O::LoadRows { .. }
             | O::EmbeddingGather { .. }
-            | O::LoadPosEmbeds { .. }
             | O::VisionRope
             | O::VarlenAttention { .. }
             | O::EncoderAttn { .. }
@@ -306,6 +306,18 @@ pub struct LoweringInput {
     pub ops: Vec<OpDesc>,
     /// Which op's output is the forward's result.
     pub result: usize,
+}
+
+impl LoweringInput {
+    /// The op whose output is every row's final hidden state: the one the result's vocabulary
+    /// projection reads, when the forward ends with one.
+    pub fn hidden(&self) -> Option<usize> {
+        let od = &self.ops[self.result];
+        match (od.op, od.inputs.first()) {
+            (SubOp::MatmulTile { .. } | SubOp::AllRowsMatmul, Some(&InputRef::Op(j))) => Some(j),
+            _ => None,
+        }
+    }
 }
 
 // ── Silu + Mul → SiluMul fusion ─────────────────────────────────────

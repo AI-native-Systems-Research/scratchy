@@ -117,17 +117,21 @@ pub struct ForwardInputs<'a> {
     pub vision_position_ids: Option<&'a [u8]>,
     /// Vision patch pixel rows (`[num_tokens, vision_in_features]`,
     /// model dtype) as raw bytes. `None` for non-vision arches;
-    /// required for any bucket that runs `Instruction::LoadPixels`.
+    /// required for any bucket that runs `LoadRows(Pixels)`.
     pub pixels: Option<&'a [u8]>,
     /// Qwen3.5-VL host-interpolated learned positional embedding
     /// (`[num_tokens, vision_embed_dim]`, model dtype) as raw bytes.
     /// `None` for non-vision arches and towers without a learned
     /// positional embedding; required for any bucket that runs
-    /// `Instruction::LoadPosEmbeds`. (Field name matches the macro's
+    /// `LoadRows(PosEmbeds)`. (Field name matches the macro's
     /// emitted `ForwardInputs { .., pos_embeds }` shorthand, which reads
     /// `ctx.pos_embeds`; the worker copies it into
     /// `RuntimeBindings::vision_pos_embeds`.)
     pub pos_embeds: Option<&'a [u8]>,
+    /// A target model's final hidden states (`[num_tokens, hidden_size]`, model dtype) as raw
+    /// bytes. `None` for every forward but an MTP head's; required for any bucket that runs
+    /// `LoadRows(TargetHidden)`.
+    pub target_hidden: Option<&'a [u8]>,
     /// Projected vision embeddings (`[total_mm, hidden]`, model dtype) as
     /// raw bytes, for the multimodal splice. `None` for text-only
     /// forwards / non-MM arches.
@@ -144,6 +148,8 @@ pub struct ForwardInputs<'a> {
     /// reads it in place of the static cos/sin cache, with identity
     /// positions). `None` for 1D-rope arches.
     pub mrope_cos_sin: Option<&'a [u8]>,
+    /// Bytes earlier forwards wrote on the device, for this one's runtime inputs.
+    pub device_inputs: &'a [DeviceInput],
     /// `Some`: the host does not wait for this forward ([`Deferral`]).
     pub deferred: Option<&'a Deferral>,
 }
@@ -153,25 +159,17 @@ pub struct ForwardInputs<'a> {
 /// before it may still be reading those buffers — and it starts once that forward is done.
 #[derive(Default)]
 pub struct Deferral {
-    /// Input tokens an earlier forward wrote on the device, copied into `input_ids` before this one
-    /// reads them.
-    pub device_inputs: Vec<DeviceInput>,
     /// Bytes for buffers outside the runtime inputs that an earlier command buffer may still be
     /// reading (the sampler's per-step parameters), written on the device like the runtime inputs.
     pub host_writes: Vec<(super::__re::Buffer, Vec<u8>)>,
+    /// Inputs that depend on how many drafts the step before it kept, picked on the device after
+    /// the writes above ([`crate::select_rows`]), by `select`, the model's kernel for it.
+    pub selections: Vec<crate::select_rows::Selection>,
+    pub select: Option<super::__re::ComputePipelineState>,
     in_flight: std::sync::OnceLock<InFlight>,
 }
 
 impl Deferral {
-    /// A deferred forward that reads `device_inputs`.
-    pub fn new(device_inputs: Vec<DeviceInput>) -> Self {
-        Self {
-            device_inputs,
-            host_writes: Vec::new(),
-            in_flight: std::sync::OnceLock::new(),
-        }
-    }
-
     /// Record the command buffer this forward was committed in.
     pub(super) fn committed(&self, in_flight: InFlight) {
         assert!(
@@ -186,12 +184,84 @@ impl Deferral {
     }
 }
 
-/// One input token an earlier forward wrote on the device: the `u32` `offset` bytes into `src`,
-/// for `input_ids[flat_index]`.
+/// Bytes an earlier forward wrote on the device — in an earlier command buffer, or earlier in this
+/// one ([`super::pool::MetalWorkerPool::forward_onto`]) — for one of this forward's runtime inputs:
+/// `len` bytes `offset` into `src`, to `at` bytes into `into`, over what the host wrote there.
 pub struct DeviceInput {
     pub src: super::__re::Buffer,
     pub offset: usize,
-    pub flat_index: usize,
+    pub len: usize,
+    pub into: DeviceInputInto,
+    pub at: usize,
+}
+
+impl DeviceInput {
+    /// `input_ids[flat_index]`: the `u32` token `offset` bytes into `src`.
+    pub fn token(src: super::__re::Buffer, offset: usize, flat_index: usize) -> Self {
+        let len = size_of::<u32>();
+        let (into, at) = (DeviceInputInto::InputIds, flat_index * len);
+        Self {
+            src,
+            offset,
+            len,
+            into,
+            at,
+        }
+    }
+
+    /// `len` bytes `offset` into `src`, to the head of `into`.
+    pub fn head(
+        src: super::__re::Buffer,
+        offset: usize,
+        len: usize,
+        into: DeviceInputInto,
+    ) -> Self {
+        let at = 0;
+        Self {
+            src,
+            offset,
+            len,
+            into,
+            at,
+        }
+    }
+
+    /// `rows` rows of `target_hidden` from row `row`: `src`'s from row `src_row`, `row_bytes` each.
+    pub fn hidden_rows(
+        src: super::__re::Buffer,
+        src_row: usize,
+        row: usize,
+        rows: usize,
+        row_bytes: usize,
+    ) -> Self {
+        Self {
+            src,
+            offset: src_row * row_bytes,
+            len: rows * row_bytes,
+            into: DeviceInputInto::TargetHidden,
+            at: row * row_bytes,
+        }
+    }
+}
+
+/// The runtime input a [`DeviceInput`] lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceInputInto {
+    /// `input_ids`: tokens an earlier forward picked, over the host's placeholders.
+    InputIds,
+    /// `target_hidden`: a target's final hidden states, for its MTP head. Given no host bytes, the
+    /// forward's target hidden rows are these.
+    TargetHidden,
+    /// `positions`, over the host's placeholders.
+    Positions,
+    /// The full KV-cache group's `slot_mapping`, over the host's placeholders.
+    SlotMapping,
+    /// `seq_used_k`, over the host's placeholders.
+    SeqUsedK,
+    /// An MRoPE model's rotary cos/sin rows (`mrope_cos_sin`), over the host's placeholders.
+    RopeRows,
+    /// Each sequence's Gated-DeltaNet step code (`gdn_is_fresh`), over the host's.
+    GdnSteps,
 }
 
 /// A committed command buffer the host has not waited for.

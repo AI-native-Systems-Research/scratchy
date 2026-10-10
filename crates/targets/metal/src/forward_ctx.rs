@@ -18,6 +18,16 @@ use crate::TensorView;
 use crate::gdn_state::GdnStatePool;
 use crate::kv_cache::KvCachePool;
 
+/// Rows of a forward's final (post-norm) hidden states — the lm_head's input — copied out for
+/// the caller, row-major in the model dtype: what a multi-token-prediction head reads next.
+#[derive(Clone, Copy)]
+pub struct HiddenRowsOut<'a> {
+    /// The rows to copy, in order.
+    pub rows: &'a [u32],
+    /// Where they land (replacing what it held).
+    pub out: &'a std::cell::RefCell<Vec<u8>>,
+}
+
 /// Ambient runtime args the emitted forward fn needs. The caller builds a
 /// `ForwardCtx` per forward call and passes it in. Fields are the union of what
 /// any ported kernel needs at invocation time; new kernels can reference new
@@ -95,6 +105,12 @@ pub struct ForwardCtx<'a> {
     /// Qwen3.5-VL learned positional embedding, host-interpolated, `[num_tokens,
     /// vision_embed_dim]`. `None` for text-side calls / towers without one.
     pub pos_embeds: Option<TensorView<'a>>,
+    /// A target model's final hidden states, `[num_tokens, hidden_size]` — what an MTP head
+    /// fuses with the next token's embedding. `None` for every forward but an MTP head's.
+    pub target_hidden: Option<TensorView<'a>>,
+    /// Rows of this forward's final hidden states to copy out — the next input of an MTP head.
+    /// `None` for every forward no head reads.
+    pub hidden_out: Option<HiddenRowsOut<'a>>,
     /// Qwen2.5-VL: cu_seqlens for the per-image full-frame segmentation.
     /// `None` outside windowed-attention vision arches.
     pub vision_cu_seqlens_full: Option<TensorView<'a>>,
@@ -118,6 +134,8 @@ pub struct ForwardCtx<'a> {
     /// `num_seqs < num_tokens` so the lm_head GEMM gathers before the matmul;
     /// `None` at decode or when not built by the worker.
     pub last_token_indices: Option<TensorView<'a>>,
+    /// Bytes earlier forwards wrote on the device, for this one's runtime inputs.
+    pub device_inputs: &'a [crate::interpreter::metal::DeviceInput],
     /// `Some`: the host does not wait for this forward
     /// ([`crate::interpreter::metal::Deferral`]).
     pub deferred: Option<&'a crate::interpreter::metal::Deferral>,

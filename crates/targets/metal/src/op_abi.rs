@@ -74,9 +74,10 @@ pub fn rope_append_bias_slots(o: KvOffsets) -> [Option<(BiasStorage, u32)>; 2] {
 
 /// Metal's colouring facts: the per-op rule table, and the embedded hidden as colour 0 (the
 /// step records' head emits the embed at slot 0).
-/// The widest bucket metal lays out in wave order (`wave_schedule::wave_order`): a one-row tape,
-/// whose steps are latency-bound — a wider bucket would hold more rows' buffers live at once.
-pub const METAL_WAVE_ORDER_ROWS: u64 = 1;
+/// The widest bucket metal lays out in wave order (`wave_schedule::wave_order`): a decode-shaped
+/// tape — the one-row bucket and the verify-sized ones ([`METAL_VERIFY_ROWS`]) — whose steps are
+/// latency-bound; a wider bucket would hold more rows' buffers live at once.
+pub const METAL_WAVE_ORDER_ROWS: u64 = METAL_VERIFY_ROWS as u64;
 
 pub const METAL_COLOUR_FACTS: ColourFacts = ColourFacts {
     rule: metal_colour_rule,
@@ -133,11 +134,11 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::RmsNormApply { .. }
         | L::Mean
         | L::GateApply
+        | L::Concat { .. }
         | L::GateScale
         | L::GatedDeltaNet
         | L::AttnDecode { .. }
-        | L::LoadPixels { .. }
-        | L::LoadPosEmbeds { .. }
+        | L::LoadRows { .. }
         | L::EmbeddingGather { .. }
         | L::ExpertCombine { .. } => FRESH,
         // The rest of a MoE block lives in the op scratch (`moe_write`), not the arena.
@@ -211,19 +212,60 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
     }
 };
 
+/// The most rows a verify-sized bucket holds: a speculative verify step's, each sequence's last
+/// token and its drafts (an MTP head's: `spec_max_seqs * (spec_drafts + 1)`, 3). Such a bucket's
+/// steps are decode-shaped — a few query rows over a whole context — and run decode-shaped
+/// kernels: its paged attention is the decode kernel's, one query row per token; a gathered MoE
+/// block runs the pairs that share an expert once ([`METAL_SHARED_EXPERTS_FROM`]). Larger buckets
+/// keep prefill-shaped kernels: a 31-token prompt took 20% longer to its first token at a 32-row
+/// verify-sized bucket than at the 64-row prefill one (Qwen3.6-35B-A3B, base M5: 176 vs 147 ms).
+///
+/// TODO: derive it, and the decoder ladder's verify-sized rungs, from the compiled heads'
+/// `spec_max_seqs * (spec_drafts + 1)`: a gate above 2 sequences puts verify steps past 8 rows,
+/// onto the 64-row prefill-shaped tape.
+pub const METAL_VERIFY_ROWS: u32 = 8;
+
+/// Whether a guarded codec step runs at a bake, and under which runtime gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardRun {
+    /// Its commands run under the gate (`None`: on every step).
+    Gated(Option<RuntimeGate>),
+    /// The bake drops it.
+    Dropped,
+}
+
 /// The runtime gate each codec guard runs under on metal. The codec is the model's, fixed at
 /// build (`MetalModelConsts::kv_codec`): a dense model inserts no codec step, so a coded one's
 /// guards only ask whether the step is a decode step.
-pub const METAL_GUARD_GATES: GuardGates<Option<RuntimeGate>> = GuardGates {
-    codec: None,
-    codec_decode: Some(RuntimeGate::OnlyIfDecodeStep),
-    codec_not_decode: Some(RuntimeGate::UnlessDecodeStep),
-    unless_codec_decode: Some(RuntimeGate::UnlessDecodeStep),
+pub const METAL_GUARD_GATES: GuardGates<GuardRun> = GuardGates {
+    codec: GuardRun::Gated(None),
+    codec_decode: GuardRun::Gated(Some(RuntimeGate::OnlyIfDecodeStep)),
+    codec_not_decode: GuardRun::Gated(Some(RuntimeGate::UnlessDecodeStep)),
+    unless_codec_decode: GuardRun::Gated(Some(RuntimeGate::UnlessDecodeStep)),
 };
+
+/// A verify-sized multi-row bucket's guards ([`METAL_VERIFY_ROWS`]): its coded attention is the
+/// packed-store decode twin, one query row per token, on every step; the prefill form, and the
+/// staging and rotations around it, are dropped.
+pub const METAL_VERIFY_GUARD_GATES: GuardGates<GuardRun> = GuardGates {
+    codec: GuardRun::Gated(None),
+    codec_decode: GuardRun::Gated(None),
+    codec_not_decode: GuardRun::Dropped,
+    unless_codec_decode: GuardRun::Dropped,
+};
+
+/// The guards' realization at a bucket of `bucket_m` rows.
+pub fn metal_guard_gates(bucket_m: u32) -> &'static GuardGates<GuardRun> {
+    match bucket_m {
+        2..=METAL_VERIFY_ROWS => &METAL_VERIFY_GUARD_GATES,
+        _ => &METAL_GUARD_GATES,
+    }
+}
 
 // `MetalFusion::KvEncoded` folds the codec's encodes into their KV writer, which runs ungated.
 const _: () = assert!(
-    METAL_GUARD_GATES.codec.is_none(),
+    matches!(METAL_GUARD_GATES.codec, GuardRun::Gated(None))
+        && matches!(METAL_VERIFY_GUARD_GATES.codec, GuardRun::Gated(None)),
     "a gated encode cannot fold into its ungated writer"
 );
 
@@ -295,6 +337,11 @@ pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 /// thicker, they lose to the gathered ones on a short prompt (Qwen3.6, 2 per expert: 161 ms vs
 /// 98 ms).
 pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
+
+/// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
+/// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
+/// one row's picks are distinct experts.
+pub const METAL_SHARED_EXPERTS_FROM: u32 = 2;
 
 /// The steps whose commands a bake may drop: a gathered block's sort, the unsort (the combine
 /// reads through it), and an unsliced bake's sampled rows around its matmul.
@@ -514,6 +561,7 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     top_k: K::RouteTopK,
                     sort: K::ExpertSort,
                     gathered_below: METAL_SORTED_PAIRS,
+                    shared_from: METAL_SHARED_EXPERTS_FROM,
                     kernel: F::MoeRouted,
                 },
                 // `attention_via_cache_v2`'s `ATTN_FOLD`: the plain writer, encoding or not.

@@ -227,6 +227,30 @@ pub unsafe fn memcpy_dtod_async(
     ))
 }
 
+/// Async device-to-device copy of `rows` rows of `row_bytes` each, from rows `src_pitch` bytes
+/// apart into rows `dst_pitch` bytes apart, on a specific stream.
+pub unsafe fn memcpy_2d_dtod_async(
+    dst: *mut u8,
+    dst_pitch: usize,
+    src: *const u8,
+    src_pitch: usize,
+    row_bytes: usize,
+    rows: usize,
+    stream: CUstream,
+) -> Result<()> {
+    // A plain C struct: zero is "offset 0, no host/array endpoint" for every field not set.
+    let mut copy: sys::CUDA_MEMCPY2D = std::mem::zeroed();
+    copy.srcMemoryType = sys::CUmemorytype::CU_MEMORYTYPE_DEVICE;
+    copy.srcDevice = src as CUdeviceptr;
+    copy.srcPitch = src_pitch;
+    copy.dstMemoryType = sys::CUmemorytype::CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = dst as CUdeviceptr;
+    copy.dstPitch = dst_pitch;
+    copy.WidthInBytes = row_bytes;
+    copy.Height = rows;
+    check(sys::cuMemcpy2DAsync_v2(&copy, stream))
+}
+
 // ---------------------------------------------------------------------------
 // Streams
 // ---------------------------------------------------------------------------

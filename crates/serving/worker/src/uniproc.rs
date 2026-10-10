@@ -111,6 +111,10 @@ impl Executor for UniProcExecutor {
         self.worker.spec_decode_backend()
     }
 
+    fn pipelines_speculative_steps(&self) -> bool {
+        self.worker.pipelines_speculative_steps()
+    }
+
     /// Straight through to the worker — it is the thing that knows whether its batched step appends every
     /// row at one shared slot, and the scheduler needs the answer before the first allocation.
     fn kv_addressing(&self) -> scratchy_core_common::KvAddressing {

@@ -79,6 +79,19 @@ impl BoundWeight {
     }
 }
 
+/// A weight a multi-token-prediction head does not carry and borrows from its target model: the
+/// token embedding it embeds its input tokens with, and the lm_head it drafts through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LentWeight {
+    EmbedTokens,
+    LmHead,
+}
+
+impl LentWeight {
+    /// Every lent weight.
+    pub const ALL: [Self; 2] = [Self::EmbedTokens, Self::LmHead];
+}
+
 /// Arch-agnostic handle for a loaded model. Every
 /// `#[forward] fn <arch>()` emits an `impl ScratchyWeights` for
 /// its per-arch `Weights` type; callers hold
@@ -184,6 +197,20 @@ pub trait ScratchyWeights: Send + Sync {
         None
     }
 
+    /// Whether this model's forward reads `target_hidden`: a multi-token-prediction head, which
+    /// drafts from its target model's final hidden states. The macro emits `true` for such
+    /// forwards; the default is `false`.
+    fn reads_target_hidden(&self) -> bool {
+        false
+    }
+
+    /// The on-disk prefix (no `.weight` / `.scales` / `.biases`) this model loads `w` from — a
+    /// tied lm_head's is its embedding's — so a head can be lent its target's tensors under its
+    /// own names. `None` when the model has no such weight. Emitted by the macro.
+    fn lent_weight_prefix(&self, _w: LentWeight) -> Option<&'static str> {
+        None
+    }
+
     /// Per-layer `kv_heads * head_dim` for hybrid-attention-geometry
     /// arches whose sliding and global classes differ in dims
     /// (Gemma4: sliding 8×256 = 2048 elems/token, global 1×512 =
@@ -219,6 +246,13 @@ pub trait ScratchyWeights: Send + Sync {
     /// set the `max_blocks_per_seq` config key (Gemma4: 2048).
     fn max_blocks_per_seq(&self) -> usize {
         128
+    }
+
+    /// The drafts each sequence of a speculative verify step carries (`CanonicalParams::
+    /// SPEC_DRAFTS`): an MTP head's, and its target's when this build compiles the head. 0 for a
+    /// model without one.
+    fn spec_drafts(&self) -> u32 {
+        0
     }
 
     /// # Safety
@@ -332,6 +366,13 @@ pub trait ScratchyWeights: Send + Sync {
     #[cfg(feature = "metal")]
     fn metal_rungs(&self) -> &'static (dyn core::any::Any + Send + Sync);
 
+    /// The arena slots and scratch of the model's resident pool, a
+    /// `scratchy_target_metal::interpreter::metal::LentActivation` typed `Any` (as
+    /// [`Self::metal_rungs`]): what a model whose forwards never overlap this one's places its own
+    /// in. `None` until this model's first forward builds the pool.
+    #[cfg(feature = "metal")]
+    fn metal_lend_activation(&self) -> Option<Box<dyn core::any::Any>>;
+
     /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
     /// its KV cache without monomorphizing on `W`.
     #[cfg(feature = "metal")]
@@ -358,6 +399,28 @@ pub trait ScratchyWeights: Send + Sync {
     ) -> OwnedTensor {
         unsafe { self.forward(ctx, device, num_tokens) }
     }
+
+    /// The rotary cos/sin rows a forward at `positions` (one a token) reads in place of a
+    /// position-indexed cache — an MRoPE model's, its positions then each row's own index; `None`
+    /// for a model whose rope reads positions.
+    #[cfg(feature = "metal")]
+    fn metal_rope_rows(&self, positions: &[u32]) -> Option<Vec<u8>>;
+
+    /// Encode a forward onto `encoder` — another model's command buffer, after that model's forward,
+    /// whose outputs the context's device inputs read — rather than into a command buffer of its
+    /// own. The returned forward holds the worker the command buffer reads and writes until it
+    /// drops, which must wait until that command buffer is done.
+    ///
+    /// # Safety
+    /// Same as [`Self::forward`].
+    #[cfg(feature = "metal")]
+    unsafe fn metal_forward_onto<'w>(
+        &'w self,
+        ctx: ForwardCtxHandle<'_>,
+        device: ForwardDeviceHandle<'_>,
+        num_tokens: u64,
+        encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<Box<dyn MetalForwardOnto + 'w>, String>;
 
     /// Phase 6 spec-decode K-step chain entry point. Opens ONE MTL4
     /// command buffer on the pool's MTL4 queue and invokes `body`
@@ -390,11 +453,13 @@ pub trait ScratchyWeights: Send + Sync {
 /// Box for a Metal forward-encoder tail hook. Invoked on the same
 /// MTL4 compute encoder used to encode the forward, AFTER the
 /// forward dispatches and BEFORE `endEncoding`. The callee can
-/// append additional dispatches (e.g. argmax sampling) so they
-/// run inside the same command buffer with one commit and one
-/// host wait. Receives:
+/// append additional dispatches (e.g. argmax sampling, an MTP head's
+/// forward) so they run inside the same command buffer with one
+/// commit and one host wait. Receives:
 ///   - the MTL4 compute encoder to append dispatches onto;
 ///   - the logits MTLBuffer (the bucket's terminal arena slot);
+///   - the final (post-norm) hidden states, `[total_n, hidden]` (the
+///     bucket's backbone slot);
 ///   - `total_n` (logits row count) and `vocab` (column count).
 ///
 /// MTL4 only.
@@ -403,11 +468,42 @@ pub type MetalForwardFollowup<'a> = Box<
     dyn FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
             u32,
             u32,
         ) -> Result<(), String>
         + 'a,
 >;
+
+/// The forwards [`ScratchyWeights::metal_forward_onto`] and [`Self::then`] encoded onto another
+/// model's command buffer, on one worker. Their outputs are read once that command buffer is done;
+/// dropping it returns the worker.
+#[cfg(feature = "metal")]
+pub trait MetalForwardOnto {
+    /// Encode another forward on the same worker onto `encoder`, after what is on it; the outputs
+    /// below are then its.
+    ///
+    /// # Safety
+    /// Same as [`ScratchyWeights::forward`].
+    unsafe fn then(
+        &mut self,
+        ctx: ForwardCtxHandle<'_>,
+        num_tokens: u64,
+        encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<(), String>;
+
+    /// The final (post-norm) hidden states, `[num_tokens, hidden]` (the bucket's backbone slot).
+    fn hidden(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
+
+    /// The lm_head output, `[num_tokens, vocab]` rows (the bucket's terminal arena slot).
+    fn logits(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
+
+    /// The logits' row width.
+    fn vocab(&self) -> u32;
+
+    /// Rows `rows` of the final (post-norm) hidden states, as bytes.
+    fn hidden_rows(&self, rows: &[u32]) -> Vec<u8>;
+}
 
 /// Non-generic view of the macro-emitted MetalWorker for the
 /// spec-decode K-step chain body. The body holds an

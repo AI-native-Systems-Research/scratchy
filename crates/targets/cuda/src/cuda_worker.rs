@@ -387,6 +387,7 @@ impl CudaModel {
                     vision_rope_freqs: None,
                     pixels: None,
                     pos_embeds: None,
+                    target_hidden: None,
                     vision_cu_seqlens_full: None,
                     vision_cu_seqlens_window: None,
                     vision_max_seqlen_full: None,
@@ -497,6 +498,7 @@ impl CudaModel {
                     vision_rope_freqs: None,
                     pixels: None,
                     pos_embeds: None,
+                    target_hidden: None,
                     vision_cu_seqlens_full: None,
                     vision_cu_seqlens_window: None,
                     vision_max_seqlen_full: None,
@@ -833,6 +835,7 @@ impl PiecewiseDecodeRunner {
             vision_rope_freqs: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,
@@ -1006,6 +1009,7 @@ impl PiecewiseDecodeRunner {
             vision_rope_freqs: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,
@@ -1256,6 +1260,7 @@ impl PiecewisePrefillRunner {
             vision_rope_freqs: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,
@@ -1436,6 +1441,7 @@ impl PiecewisePrefillRunner {
             vision_rope_freqs: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,
@@ -1857,11 +1863,8 @@ impl CudaWorker {
                         GdnStatePool::<crate::PoolMem>::reserve_bytes(
                             cfg.num_linear_layers(),
                             1,
-                            cfg.conv_dim as usize,
-                            cfg.conv_kernel as usize,
-                            cfg.num_v_heads as usize,
-                            cfg.head_v_dim as usize,
-                            cfg.head_k_dim as usize,
+                            crate::gdn_state::CheckpointRows::NONE,
+                            cfg.state_dims(),
                         )
                     });
                 let (budget, allocated) = match total_bytes {
@@ -4030,11 +4033,8 @@ impl Worker for CudaWorker {
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
-                    gdn_cfg.conv_dim as usize,
-                    gdn_cfg.conv_kernel as usize,
-                    gdn_cfg.num_v_heads as usize,
-                    gdn_cfg.head_v_dim as usize,
-                    gdn_cfg.head_k_dim as usize,
+                    crate::gdn_state::CheckpointRows::NONE,
+                    gdn_cfg.state_dims(),
                     |bytes| {
                         // f32 conv/ssm state, GPU-resident across forwards
                         // (no CPU touches). Same alloc path as the KV pool
@@ -4054,7 +4054,10 @@ impl Worker for CudaWorker {
                 t_gdn.elapsed(),
             );
             self.gdn_state = Some(gdn_pool);
-            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots));
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(
+                num_slots,
+                crate::gdn_state::CheckpointRows::NONE,
+            ));
         }
 
         Ok(())
@@ -4110,11 +4113,8 @@ impl Worker for CudaWorker {
                     crate::gdn_state::GdnStatePool::<crate::PoolMem>::reserve_bytes(
                         cfg.num_linear_layers(),
                         self.max_num_seqs_resolved(),
-                        cfg.conv_dim as usize,
-                        cfg.conv_kernel as usize,
-                        cfg.num_v_heads as usize,
-                        cfg.head_v_dim as usize,
-                        cfg.head_k_dim as usize,
+                        crate::gdn_state::CheckpointRows::NONE,
+                        cfg.state_dims(),
                     )
                 })
                 .unwrap_or(0);
@@ -5614,40 +5614,27 @@ impl CudaWorker {
         // Compute once before the split borrow below (self is borrowed mutably for device).
         let max_blocks_per_seq = self.max_blocks_per_seq();
 
-        // GDN per-step state-slot indices (hybrid arches only). One i32
-        // slot id + u32 fresh flag per batched sequence, in the SAME
-        // order as `cu_seqlens_q` (== `prepared.attn_meta.req_ids`). The
-        // CUDA forward downstream H2Ds these into `ForwardCtx::{
-        // gdn_state_indices, gdn_is_fresh}` via `Self::h2d_i32` /
-        // `Self::h2d_u32`. `slot_for` returns `is_fresh=true` on a
-        // request's FIRST forward (including a recycled slot's new owner)
-        // so the GDN conv1d/scan kernels zero-init the slot's conv/ssm
-        // state instead of continuing from a finished sequence's stale
-        // data (the degeneration guard). Mirrors the metal arm at line
-        // 9551 onward.
-        self.gdn_pending = if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
-            let req_ids = &prepared.attn_meta.req_ids;
-            let mut indices: Vec<i32> = Vec::with_capacity(req_ids.len());
-            let mut fresh: Vec<u32> = Vec::with_capacity(req_ids.len());
-            for req_id in req_ids {
-                match alloc.slot_for(gdn_slot_key(req_id)) {
-                    Some((slot, is_fresh)) => {
-                        indices.push(slot as i32);
-                        fresh.push(u32::from(is_fresh));
-                    }
-                    None => {
-                        return Err(ExecutorError::WorkerExecution(format!(
-                            "GDN state-slot pool exhausted (capacity {}): scheduler \
-                             admitted more concurrent sequences than max_num_seqs",
-                            alloc.capacity(),
-                        )));
-                    }
-                }
-            }
-            Some((indices, fresh))
-        } else {
-            None
-        };
+        // GDN per-step state entries + fresh flags (hybrid arches only), one per batched
+        // sequence in the SAME order as `cu_seqlens_q` (== `prepared.attn_meta.req_ids`). The
+        // CUDA forward downstream H2Ds these into `ForwardCtx::{gdn_state_indices,
+        // gdn_is_fresh}` via `Self::h2d_i32` / `Self::h2d_u32`; a request's FIRST forward
+        // (including a recycled slot's new owner) is flagged fresh so the GDN eval zero-inits
+        // the slot instead of continuing from a finished sequence's stale data (the degeneration
+        // guard). The cuda GDN eval reads no checkpoints, so its steps carry no drafts.
+        self.gdn_pending = self
+            .gdn_slot_allocator
+            .as_mut()
+            .map(|alloc| {
+                alloc.step(
+                    prepared
+                        .attn_meta
+                        .req_ids
+                        .iter()
+                        .map(|req_id| (gdn_slot_key(req_id), 0)),
+                )
+            })
+            .transpose()
+            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.

@@ -205,6 +205,8 @@ pub struct AttentionViaCacheBindingSet {
     /// `TqAttentionBindingSet`'s slots 7..=13); `None` → sinks-off,
     /// byte-identical to the pre-sinks ABI.
     pub sinks: Option<SourceIx>,
+    /// Per-token rows read their sequences from `cu_seqlens_q` (slot 23).
+    pub query_rows: super::kernel_constants::QueryRows,
 }
 
 impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
@@ -241,6 +243,12 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
         }
         if let Some(sinks) = s.sinks {
             v.push(source(sinks, WeightTensor::Weight, s.kv_layer, 16));
+        }
+        if s.query_rows == super::kernel_constants::QueryRows::PerToken {
+            v.push(Binding::Runtime {
+                kind: RuntimeBindingKind::CuSeqlensQ,
+                binding_index: 23,
+            });
         }
         v
     }

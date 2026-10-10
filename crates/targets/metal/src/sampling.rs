@@ -235,7 +235,7 @@ pub fn gather_gpu_sample_params<'h>(
         ..Default::default()
     };
 
-    for &(i, row) in jobs {
+    for (n, &(i, row)) in jobs.iter().enumerate() {
         let req_id = &req_ids[i];
         let (t, k, tp, mp, rep, freq, pres) = sampling_params_map.get(req_id).map_or(
             (1.0f32, 0i32, 1.0f32, 0.0f32, 1.0f32, 0.0f32, 0.0f32),
@@ -265,9 +265,10 @@ pub fn gather_gpu_sample_params<'h>(
         let seed = if let Some(rng) = seeded_rngs.get_mut(req_id) {
             rng.random::<u32>()
         } else {
-            // Generated-token count = the request's decode position; advances
-            // each step so the seed varies. Shared with cuda_worker.
-            let position = generated(req_id) as u32;
+            // Generated-token count + the request's earlier rows (a verify step's) = the row's
+            // decode position; advances each step so the seed varies. Shared with cuda_worker.
+            let ahead = jobs[..n].iter().filter(|&&(j, _)| j == i).count();
+            let position = (generated(req_id) + ahead) as u32;
             scratchy_core_common::fnv_seed(req_id, position)
         };
         params
@@ -316,6 +317,8 @@ const SAMPLER_TELEM_K: u32 = 8;
 /// `row_state` word count per row — MUST equal `ROW_STATE_LEN` in
 /// `shaders/sampling.metal`.
 const ROW_STATE_LEN: usize = 16;
+/// The `row_state` word holding a row's uniform draw.
+const UNIFORM_WORD: usize = 6;
 
 /// The descent's histogram words per row — MUST equal
 /// `DESCENT_ROUNDS * DESCENT_BUCKETS` in `shaders/sampling.metal`.
@@ -646,6 +649,12 @@ impl SamplerArena {
         }
     }
 
+    /// Where job `job`'s uniform lives: the row-state buffer and the word's byte offset.
+    pub fn uniform_slot(&self, job: usize) -> (Buffer, usize) {
+        let word = job * ROW_STATE_LEN + UNIFORM_WORD;
+        (self.row_state_buf.clone(), word * size_of::<u32>())
+    }
+
     /// Fill the arena's shared buffers with THIS step's sampler inputs and
     /// return the lightweight handle the forward followup encodes. Pure host
     /// memcpy — no Metal calls, no allocation. `any_penalty` gates the
@@ -698,7 +707,7 @@ impl SamplerArena {
             s[3] = params.top_ks[r].max(0) as u32;
             s[4] = params.top_ps[r].to_bits();
             s[5] = params.min_ps[r].to_bits();
-            s[6] = params.uniforms[r].to_bits();
+            s[UNIFORM_WORD] = params.uniforms[r].to_bits();
             // cap = effective k; top_k == 0 → MAX_CANDIDATES (the shader's
             // `effective_k` fallback, computed host-side so the descent's
             // `pick` kernel never needs vocab).
@@ -844,6 +853,39 @@ impl PendingSampler {
 mod tests {
     use super::*;
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice, shared_slice};
+
+    /// A verify step samples a request's every row: each row draws at its own position (the
+    /// first at the request's generated count, as a decode step's row does), so the rows' draws
+    /// are independent — one uniform on every row would correlate the drafts' acceptances.
+    #[test]
+    fn a_requests_rows_draw_at_their_own_positions() {
+        let req_ids = vec!["a".to_string(), "b".to_string()];
+        let params: std::collections::HashMap<_, _> = (req_ids.iter())
+            .map(|r| (r.clone(), scratchy_core_common::SamplingParams::default()))
+            .collect();
+        let empty: &[u32] = &[];
+        let gather = |jobs: &[(usize, u32)]| {
+            let mut rngs = std::collections::HashMap::new();
+            gather_gpu_sample_params(
+                jobs,
+                &req_ids,
+                &params,
+                &mut rngs,
+                |_| (empty, empty),
+                |_| 7,
+                32,
+            )
+            .uniforms
+        };
+        let at = |req: &str, position: u32| {
+            scratchy_core_common::seed_to_uniform(scratchy_core_common::fnv_seed(req, position))
+        };
+        // "a" verifies two drafts (rows 0..3), "b" decodes (row 3).
+        let verify = gather(&[(0, 0), (0, 1), (0, 2), (1, 3)]);
+        assert_eq!(verify, [at("a", 7), at("a", 8), at("a", 9), at("b", 7)]);
+        // A decode step's row draws as before.
+        assert_eq!(gather(&[(0, 0)]), [at("a", 7)]);
+    }
 
     /// The sampler's kernels baked for logits `vocab` wide of `dtype`, as a
     /// model's are.

@@ -41,16 +41,17 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
 pub use forward::{
-    Deferral, DeviceInput, ForwardError, ForwardInputs, InFlight, build_mrope_cos_sin_override,
+    Deferral, DeviceInput, DeviceInputInto, ForwardError, ForwardInputs, InFlight,
+    build_mrope_cos_sin_override,
 };
 pub use pool::{
-    MetalBucketSpec, MetalRungs, MetalWorkerPool, PickedRung, PoolBuildError, PooledWorker,
+    MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError, PooledWorker,
     RuntimeFactory, TqGroup, WorkerGuard, pick_rung,
 };
 pub use runtime::RuntimeBindings;
 pub use worker::{
-    ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, ResolvedSources, SourceMiss,
-    WorkerError,
+    ArenaLayout, BoundBuffer, BucketBaking, BucketStep, LentActivation, MetalWorker,
+    ResolvedSources, SourceMiss, WorkerError,
 };
 
 // Centralized type aliases for the objc2-metal `Retained` wrapper

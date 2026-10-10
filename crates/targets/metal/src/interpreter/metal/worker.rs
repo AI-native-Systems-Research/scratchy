@@ -46,6 +46,19 @@ use std::collections::hash_map::Entry;
 /// for the Phase 5.C smoke test the test sets it explicitly.
 pub type ArenaLayout = Vec<u64>;
 
+/// A worker's arena slots and scratch, lent to a new worker of a model that never runs at the same
+/// time ([`scratchy_core_common::lend`]): it places its own in them, allocating only what they do
+/// not hold.
+#[derive(Clone, Default)]
+pub struct LentActivation {
+    /// Arena slots: shared storage, as the borrower's arena slots.
+    pub arena: Vec<Buffer>,
+    /// Scratch: private storage, as the borrower's scratch.
+    pub scratch: Vec<Buffer>,
+    /// A TurboQuant pool's fp16 scratch, staged through by a borrower of the same geometry.
+    pub tq_scratch: Option<super::runtime::TqScratch>,
+}
+
 /// One unit of execution in a bucket's plan.
 ///
 /// `Dispatch` is a contiguous run of commands sharing a single pipeline.
@@ -260,32 +273,9 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// Residency pins for every buffer the baked dispatches reach by address.
     _pins: Vec<crate::residency::Pinned>,
     pub bucket_bakings: Vec<BucketBaking>,
-    /// Shared SplitK scratch buffer. `Some` when any bucket tape
-    /// requested a non-zero `splitk_scratch_bytes` (i.e. at least one
-    /// `Instruction::AffineQmm` in the tape picked
-    /// `QmmTKernel::SplitK`); `None` otherwise. Sized to the max
-    /// `splitk_scratch_bytes` across all bucket tapes, since
-    /// successive `affine_qmm_t_splitk` calls inside a single dispatch
-    /// run sequentially and can reuse the same buffer.
-    pub splitk_scratch: Option<Buffer>,
-    /// Shared MoE scratch buffer for `Binding::MoeScratch` resolution.
-    /// Sized to `max(bucket_tapes.moe_scratch_bytes)`. `None` when no
-    /// MoE instruction lowered (every bucket reports
-    /// `moe_scratch_bytes = 0`). Layout decisions
-    /// (router_logits / sorted_full / topk_inds / topk_scores /
-    /// gate_out / up_out / down_out byte offsets) are owned by the
-    /// lowering pass — see `MoeScratchLayout` in `lowering.rs`.
-    pub moe_scratch: Option<Buffer>,
-    /// Shared roped-K scratch buffer for `Binding::RopedKScratch`
-    /// resolution (spans rope-on-read on NAX). Sized to
-    /// `max(bucket_tapes.roped_k_scratch_bytes)`. `None` when no NAX
-    /// spans prefill lowered. `RopeOnceNax` writes one layer's pre-roped
-    /// K here; the following NAX attention reads it (no per-tile rope).
-    pub roped_k_scratch: Option<Buffer>,
-    /// Shared hd512-unfused-attention scratch (`Binding::AttnUnfusedScratch`),
-    /// sized to `max(attn_unfused_scratch_bytes)`. `None` when no hd512-unfused
-    /// attention was lowered.
-    pub attn_unfused_scratch: Option<Buffer>,
+    /// The scratch buffers the baked dispatches bind by address (split-K, MoE, roped K, hd512
+    /// unfused: those some tape needs, see [`Self::new_with_residency`]), held for them.
+    scratch: Vec<Buffer>,
     /// Per-forward count of the blocks the step's longest sequence spans
     /// (`live_block_width` in `pool.rs`, set before each forward), for the
     /// `TqStageRotated` and `RopeOnce*` grids: they cover the WHOLE active
@@ -298,10 +288,25 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// `tq_dequant_max_blocks`. Only a prefill attention that re-ropes K can
     /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
     pub unrotated_blocks: std::sync::atomic::AtomicBool,
+    /// Whether every sequence of the step about to run takes a plain
+    /// Gated-DeltaNet step (`GdnStep::is_plain`), set with `unrotated_blocks`.
+    /// Only such a step runs the one-command decode and the pipelined prefill
+    /// scan (`RuntimeGate::OnlyIfPlainGdn`).
+    pub gdn_plain: std::sync::atomic::AtomicBool,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
 impl<W: CanonicalParams> MetalWorker<W> {
+    /// This worker's arena slots and scratch, to lend ([`LentActivation`]).
+    pub fn activation(&self) -> LentActivation {
+        let (arena, scratch) = (self.arena.clone(), self.scratch.clone());
+        LentActivation {
+            arena,
+            scratch,
+            tq_scratch: None,
+        }
+    }
+
     /// Build a worker.
     ///
     /// `arena_layout[i]` = byte size of arena slot `i`. The arena is
@@ -328,6 +333,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             sources,
             runtime,
             None,
+            &LentActivation::default(),
         )
     }
 
@@ -335,7 +341,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// that worker-local arena slots get inserted into. Used by the
     /// pool to pin every per-worker arena into the wired set so cmdbuf
     /// dispatches don't race against Apple's lazy paging on
-    /// Llama-3.2-class working sets.
+    /// Llama-3.2-class working sets. The arena slots and scratch take
+    /// `lent` buffers where they hold them ([`LentActivation`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
@@ -345,6 +352,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         sources: &ResolvedSources,
         runtime: &RuntimeBindings,
         residency: Option<&crate::residency::MetalResidencySet>,
+        lent: &LentActivation,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
         // coloring). The shared arena is sized to the MAX colored slot
@@ -374,11 +382,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .and_then(|len| device.newBufferWithLength_options(len, mode));
             buf.ok_or(WorkerError::BufferAlloc { what, bytes })
         };
+        // Need `i`'s lent buffer, where one holds it; else it is allocated.
+        fn place<'a>(needs: &[u64], from: &'a [Buffer]) -> impl Fn(usize) -> Option<Buffer> + 'a {
+            use crate::interpreter::metal::__re::MTLBuffer as _;
+            let lengths: Vec<u64> = from.iter().map(|b| b.length() as u64).collect();
+            let lent = scratchy_core_common::lend::lend(needs, &lengths);
+            move |i| lent[i].map(|j| from[j].clone())
+        }
         // Shared storage so test code can seed/inspect arena contents without staging copies.
         // dispatch-bound buffers are fine in shared on Apple silicon — the existing
         // `MetalAllocator` uses the same mode.
-        let arena: Vec<Buffer> = (arena_layout.iter())
-            .map(|&size| alloc(size, MTLResourceOptions::StorageModeShared, "arena slot"))
+        let lent_slot = place(arena_layout, &lent.arena);
+        let arena: Vec<Buffer> = (arena_layout.iter().enumerate())
+            .map(|(i, &size)| match lent_slot(i) {
+                Some(buf) => Ok(buf),
+                None => alloc(size, MTLResourceOptions::StorageModeShared, "arena slot"),
+            })
             .collect::<Result<_, _>>()?;
         arena.iter().for_each(&mut pin);
 
@@ -396,16 +415,16 @@ impl<W: CanonicalParams> MetalWorker<W> {
         //   scratch, is the persistent artifact).
         // - hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head packed at baked
         //   offsets): one buffer, overwritten per layer.
-        let scratch = |i: usize, what| {
-            let max = bucket_tapes
-                .iter()
-                .map(|t| t.scratch_bytes()[i])
-                .max()
-                .unwrap_or(0);
-            let private = MTLResourceOptions::StorageModePrivate;
-            (max > 0)
-                .then(|| alloc(max.into(), private, what))
-                .transpose()
+        let sizes: [u64; 4] = std::array::from_fn(|i| {
+            let max = bucket_tapes.iter().map(|t| t.scratch_bytes()[i]).max();
+            max.map_or(0, u64::from)
+        });
+        let lent_scratch = place(&sizes, &lent.scratch);
+        let scratch = |i: usize, what| match lent_scratch(i) {
+            Some(buf) => Ok(Some(buf)),
+            None => (sizes[i] > 0)
+                .then(|| alloc(sizes[i], MTLResourceOptions::StorageModePrivate, what))
+                .transpose(),
         };
         let splitk_scratch = scratch(0, "splitk scratch")?;
         let moe_scratch = scratch(1, "moe scratch")?;
@@ -472,6 +491,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 vision_rope_freqs,
                 pixels,
                 vision_pos_embeds,
+                target_hidden,
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
@@ -525,7 +545,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Vision per-forward externs (vision towers: Qwen3.5-VL ViT).
             // Same baked-gpuAddress / lazy-pager hazard as the GDN
             // buffers above — the `vision_rope_2d` / `vision_varlen_attn`
-            // / `LoadPixels` kernels read `freqs` / `cu_seqlens` / `pixels`
+            // / `LoadRows` kernels read `freqs` / `cu_seqlens` / `pixels`
             // by dispatch-baked address, so an un-pinned buffer is served stale
             // zero pages (garbage rope angles / all-token-0 pixels). The
             // factory allocates 16-byte placeholders on non-vision arches,
@@ -533,6 +553,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             pin(vision_rope_freqs);
             pin(pixels);
             pin(vision_pos_embeds);
+            // An MTP head's target hidden rows: read by `LoadRows(TargetHidden)` at a
+            // dispatch-baked address, so the same lazy-pager hazard (16-byte placeholder
+            // elsewhere).
+            pin(target_hidden);
             pin(mm_embeds);
             pin(mm_dst_rows);
             pin(mrope_cos_sin);
@@ -562,10 +586,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 pin(&t.centroids);
                 // The fp16 scratch (table + backing data) is bound at every
                 // layer's kv_cache slot + dereffed via the table's gpuAddress.
-                pin(&t.scratch_k_table);
-                pin(&t.scratch_v_table);
-                pin(&t.scratch_k_data);
-                pin(&t.scratch_v_data);
+                pin(&t.scratch.k_table);
+                pin(&t.scratch.v_table);
+                pin(&t.scratch.k_data);
+                pin(&t.scratch.v_data);
             }
             r.commit();
         }
@@ -597,12 +621,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
             arena,
             _pins: pins,
             bucket_bakings,
-            splitk_scratch,
-            moe_scratch,
-            roped_k_scratch,
-            attn_unfused_scratch,
+            scratch: [
+                splitk_scratch,
+                moe_scratch,
+                roped_k_scratch,
+                attn_unfused_scratch,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
+            gdn_plain: std::sync::atomic::AtomicBool::new(true),
             _marker: std::marker::PhantomData,
         })
     }
@@ -733,6 +763,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             unrotated_blocks: self
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
+            gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
         };
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
@@ -974,12 +1005,9 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         K::GatherLastToken | K::ScatterFirstToLastRow | K::Softmax | K::SliceTrailingColsU32 => {
             KernelKind::Sample
         }
-        K::VisionLayerNorm
-        | K::VisionRope
-        | K::VisionVarlenAttn
-        | K::AvgPool2d
-        | K::VisionGelu
-        | K::VisionLoadPixels => KernelKind::Vision,
+        K::VisionLayerNorm | K::VisionRope | K::VisionVarlenAttn | K::AvgPool2d | K::VisionGelu => {
+            KernelKind::Vision
+        }
         K::ScalarWeightMul
         | K::ScalarMul
         | K::TanhSoftCap
@@ -987,7 +1015,9 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::BiasAdd
         | K::Reshape
         | K::TqStageRotated
-        | K::TqRotateRows => KernelKind::Elementwise,
+        | K::TqRotateRows
+        | K::LoadRows
+        | K::ConcatRows => KernelKind::Elementwise,
     }
 }
 
@@ -1463,6 +1493,7 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         num_seqs,
         has_spec_tokens,
         unrotated_blocks,
+        gdn_plain,
     } = step;
     // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
     // tokens to drop (prefill / chunked-prefill / mixed batches);
@@ -1491,8 +1522,13 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         Some(super::lowered::RuntimeGate::UnlessOneSequence) => num_seqs > 1,
         Some(super::lowered::RuntimeGate::OnlyIfUnrotatedBlocks) => unrotated_blocks,
         Some(super::lowered::RuntimeGate::UnlessUnrotatedBlocks) => !unrotated_blocks,
+        Some(super::lowered::RuntimeGate::OnlyIfPlainGdn) => gdn_plain,
+        Some(super::lowered::RuntimeGate::UnlessPlainGdn) => !gdn_plain,
         Some(super::lowered::RuntimeGate::All(gates)) => {
             gates.iter().all(|g| gate_matches(Some(*g), step))
+        }
+        Some(super::lowered::RuntimeGate::Any(gates)) => {
+            gates.iter().any(|g| gate_matches(Some(*g), step))
         }
     }
 }
@@ -1505,6 +1541,8 @@ pub struct StepFacts {
     pub has_spec_tokens: bool,
     /// Some sequence's block table has an unrotated (bit-31, span) block.
     pub unrotated_blocks: bool,
+    /// Every sequence's Gated-DeltaNet step is plain: no replay, no records.
+    pub gdn_plain: bool,
 }
 
 fn scale_tg_for_num_tokens(
@@ -1630,20 +1668,23 @@ mod tests {
 
     /// The decode-step gates follow whether every sequence contributes one
     /// token; the sequence gates follow the step's sequence count, not its
-    /// token count; the span-block gates follow the step's block tables; and
-    /// `All` needs every gate: a decode step runs none of a TurboQuant prefill
-    /// attention's variants.
+    /// token count; the span-block gates follow the step's block tables; the
+    /// plain-GDN gates follow the step's GDN codes; `All` needs every gate: a
+    /// decode step runs none of a TurboQuant prefill attention's variants; and
+    /// `Any` needs one: a replaying decode step runs a drafting model's GDN
+    /// conv, which a plain one leaves to the one-command decode.
     #[test]
     fn step_gates_follow_the_step() {
         use super::super::lowered::RuntimeGate::{
-            All, OnlyIfDecodeStep, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep,
-            UnlessOneSequence, UnlessUnrotatedBlocks,
+            All, Any, OnlyIfDecodeStep, OnlyIfOneSequence, OnlyIfPlainGdn, OnlyIfUnrotatedBlocks,
+            UnlessDecodeStep, UnlessOneSequence, UnlessPlainGdn, UnlessUnrotatedBlocks,
         };
         let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
             num_tokens,
             num_seqs,
             has_spec_tokens: false,
             unrotated_blocks,
+            gdn_plain: true,
         };
         for (tokens, seqs, decode) in [
             (1, 1, true),
@@ -1665,6 +1706,28 @@ mod tests {
             assert_eq!(gate_matches(Some(OnlyIfUnrotatedBlocks), s), unrotated);
             assert_eq!(gate_matches(Some(UnlessUnrotatedBlocks), s), !unrotated);
         }
+        // A drafting model's GDN commands: the one-command decode on a plain decode step, its
+        // conv on any other.
+        let (decode, conv) = (
+            All(&[OnlyIfDecodeStep, OnlyIfPlainGdn]),
+            Any(&[UnlessDecodeStep, UnlessPlainGdn]),
+        );
+        for (tokens, seqs, gdn_plain, decodes) in [
+            (1, 1, true, true),
+            (2, 2, true, true),
+            (1, 1, false, false),
+            (3, 1, false, false),
+            (512, 1, true, false),
+        ] {
+            let s = StepFacts {
+                gdn_plain,
+                ..step(tokens, seqs, false)
+            };
+            assert_eq!(gate_matches(Some(OnlyIfPlainGdn), s), gdn_plain);
+            assert_eq!(gate_matches(Some(UnlessPlainGdn), s), !gdn_plain);
+            assert_eq!(gate_matches(Some(decode), s), decodes);
+            assert_eq!(gate_matches(Some(conv), s), !decodes);
+        }
         let plain = All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         assert!(gate_matches(Some(plain), step(512, 2, false)));
         assert!(!gate_matches(Some(plain), step(512, 2, true)));
@@ -1676,10 +1739,11 @@ mod tests {
     }
 
     /// The lm_head sample slice, as the tape builds and dispatches it: the
-    /// gather moves each sequence's last row to row `i`, the scatter moves
+    /// gather swaps each sequence's last row into row `i`, the scatter swaps
     /// row `i` back, both in place. In a mixed step, decodes and short chunks
     /// put some sequences' last rows inside `0..num_seqs`, the rows the
-    /// others are moved to; every sequence must still get its own row.
+    /// others are moved to; every sequence must still get its own row, and
+    /// the scatter after the gather must leave every row where it started.
     #[test]
     fn sample_slice_moves_each_sequences_own_row() {
         let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
@@ -1705,33 +1769,21 @@ mod tests {
         let last = |i: usize| cu[i + 1] as usize - 1;
         let width = 1024u32;
         let bucket_m = 512;
-        for gather in [true, false] {
-            let cmd = if gather {
-                crate::tape::lowering::gather_last_token_command(
-                    &p,
-                    crate::tape::ids::ArenaSlotIdx(0),
-                    width,
-                )
-            } else {
-                crate::tape::lowering::scatter_first_to_last_row_command(
-                    &p,
-                    crate::tape::ids::ArenaSlotIdx(0),
-                    width,
-                )
-            };
-            let key = crate::specialized_pipeline_cache::PipelineKey::new(
-                cmd.library,
-                cmd.function,
-                cmd.constants.to_vec(),
-            );
-            let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
-            let (grid, threads) = mtl_size_pair(&cmd, TEST_VARIANT);
-            let grid = scale_tg_for_num_tokens(
-                grid,
-                cmd.dispatch.m_scaling,
-                super::super::ids::NumTokens(num_tokens as u32),
-                num_seqs as u32,
-            );
+        let slot = crate::tape::ids::ArenaSlotIdx(0);
+        let gather = crate::tape::lowering::gather_last_token_command(&p, slot, width);
+        let scatter = crate::tape::lowering::scatter_first_to_last_row_command(&p, slot, width);
+        // `(row, the row it holds)`. Gather: row i holds sequence i's last
+        // row. Scatter: that last row holds row i, sequence i's logits. Both:
+        // every row holds itself.
+        let gathered = (0..num_seqs).map(|i| (i, last(i))).collect();
+        let scattered = (0..num_seqs).map(|i| (last(i), i)).collect();
+        let restored = (0..num_tokens).map(|r| (r, r)).collect();
+        let cases: [(&str, Vec<&LoweredCommand>, Vec<(usize, usize)>); 3] = [
+            ("gather", vec![&gather], gathered),
+            ("scatter", vec![&scatter], scattered),
+            ("gather then scatter", vec![&gather, &scatter], restored),
+        ];
+        for (name, cmds, wants) in cases {
             // Every element of row `r` holds `r`.
             let rows: Vec<u16> = (0..bucket_m as usize)
                 .flat_map(|r| {
@@ -1741,27 +1793,38 @@ mod tests {
             let buf = crate::mtl4_dispatch::shared_slice(&device, &rows);
             let cu_buf = crate::mtl4_dispatch::shared_slice(&device, &cu);
             let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_seqs as u32);
-            assert!(crate::mtl4_dispatch::dispatch_threadgroups(
-                &device,
-                &pso,
-                &[&buf, &cu_buf, &n_buf],
-                grid,
-                threads,
-            ));
+            for cmd in cmds {
+                let key = crate::specialized_pipeline_cache::PipelineKey::new(
+                    cmd.library,
+                    cmd.function,
+                    cmd.constants.to_vec(),
+                );
+                let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
+                let (grid, threads) = mtl_size_pair(cmd, TEST_VARIANT);
+                let grid = scale_tg_for_num_tokens(
+                    grid,
+                    cmd.dispatch.m_scaling,
+                    super::super::ids::NumTokens(num_tokens as u32),
+                    num_seqs as u32,
+                );
+                assert!(crate::mtl4_dispatch::dispatch_threadgroups(
+                    &device,
+                    &pso,
+                    &[&buf, &cu_buf, &n_buf],
+                    grid,
+                    threads,
+                ));
+            }
             let got: Vec<u16> = crate::mtl4_dispatch::read_slice(&buf, rows.len());
-            let row = |r: usize| &got[r * width as usize..][..width as usize];
-            for (i, q_len) in q_lens.iter().enumerate() {
-                // Gather: row i holds sequence i's last row. Scatter: that
-                // last row holds row i, sequence i's logits.
-                let (at, want) = if gather { (i, last(i)) } else { (last(i), i) };
+            for (at, want) in wants {
                 let want = half::f16::from_f32(want as f32).to_bits();
-                let wrong = row(at).iter().filter(|&&x| x != want).count();
+                let wrong = got[at * width as usize..][..width as usize]
+                    .iter()
+                    .filter(|&&x| x != want)
+                    .count();
                 assert_eq!(
-                    wrong,
-                    0,
-                    "{}: sequence {i} ({} tokens): {wrong} of {width} elements of row {at} are another row's",
-                    if gather { "gather" } else { "scatter" },
-                    q_len
+                    wrong, 0,
+                    "{name}: {wrong} of {width} elements of row {at} are another row's"
                 );
             }
         }
@@ -1900,6 +1963,7 @@ mod tests {
             vision_rope_freqs: alloc_buffer(device, 16),
             pixels: alloc_buffer(device, 16),
             vision_pos_embeds: alloc_buffer(device, 16),
+            target_hidden: alloc_buffer(device, 16),
             mm_embeds: alloc_buffer(device, 16),
             mm_dst_rows: alloc_buffer(device, 16),
             mrope_cos_sin: alloc_buffer(device, 16),
@@ -2076,6 +2140,49 @@ mod tests {
             assert_eq!(mtl4_step_dispatch_count(baking, 0), 2);
             assert_eq!(mtl4_step_dispatch_count(baking, 1), 2);
         }
+    }
+
+    /// A worker built with another's activation lent places each arena slot in the smallest lent
+    /// buffer that holds it, and allocates the slot no lent buffer holds.
+    #[test]
+    fn a_worker_places_its_arena_in_lent_buffers() {
+        use crate::interpreter::metal::__re::MTLBuffer as _;
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+        let (weights, allocator) = build_test_weights();
+        let runtime = empty_runtime(&device, 1);
+        let tapes = vec![build_synthetic_tape(1)];
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
+        let build = |layout: &ArenaLayout, lent: &LentActivation| {
+            MetalWorker::<TestWeights>::new_with_residency(
+                device.clone(),
+                layout,
+                &tapes,
+                &pipelines,
+                &sources(&weights, &allocator, &tapes),
+                &runtime,
+                None,
+                lent,
+            )
+            .expect("worker builds")
+        };
+        let lender = build(&vec![64 * 1024, 4 * 1024], &LentActivation::default());
+        let borrower = build(&vec![4 * 1024, 16 * 1024, 128 * 1024], &lender.activation());
+        let address = |b: &Buffer| b.gpuAddress();
+        assert_eq!(address(&borrower.arena[0]), address(&lender.arena[1]));
+        assert_eq!(address(&borrower.arena[1]), address(&lender.arena[0]));
+        assert!(
+            lender
+                .arena
+                .iter()
+                .all(|b| address(b) != address(&borrower.arena[2]))
+        );
+        assert_eq!(borrower.arena[2].length(), 128 * 1024);
     }
 
     #[test]

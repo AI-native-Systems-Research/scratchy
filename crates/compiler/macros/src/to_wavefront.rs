@@ -1292,6 +1292,14 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
+            OpKind::Concat => {
+                let a = bx.input_at(tile, 0)?;
+                let b = bx.input_at(tile, 1)?;
+                let cols = bx.out_cols(tile, 0, "concat cols")?;
+                let idx = bx.push_op(SubOp::Concat { cols }, vec![a, b]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
             OpKind::GateScale => {
                 let routed = bx.input_at(tile, 0)?;
                 let shared = bx.input_at(tile, 1)?;
@@ -1579,17 +1587,10 @@ pub fn lower_decode_to_wavefront(
                     }
                 }
             }
-            OpKind::LoadPixels => {
-                let cols = bx.out_cols(tile, 0, "pixels cols")?;
-                let idx = bx.push_op(SubOp::LoadPixels { in_features: cols }, vec![]);
-                bx.produced.insert((tile.0, 0), Producer::Op(idx));
-                result = Some(idx);
-            }
-            OpKind::LoadPosEmbeds => {
-                // Same shape as LoadPixels: a synthesized source tile
-                // whose width the FUF already carries.
-                let cols = bx.out_cols(tile, 0, "pos_embeds cols")?;
-                let idx = bx.push_op(SubOp::LoadPosEmbeds { width: cols }, vec![]);
+            OpKind::LoadRows(source) => {
+                // A synthesized source tile whose width the FUF already carries.
+                let width = bx.out_cols(tile, 0, "host-staged rows cols")?;
+                let idx = bx.push_op(SubOp::LoadRows { source, width }, vec![]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

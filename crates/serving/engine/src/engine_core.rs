@@ -36,7 +36,7 @@ use tracing::{debug, error, info};
 use crate::error::{EngineError, EngineResult};
 use crate::executor::{Executor, ModelRunnerOutput};
 use crate::spec_decode::{
-    DraftModelProposer, NgramProposer, Proposer, ProposerConfig, ProposerStepCtx,
+    DraftModelProposer, MtpProposer, NgramProposer, Proposer, ProposerConfig, ProposerStepCtx,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,14 @@ pub struct EngineCore {
     /// 🦭 Sealed request IDs that have already generated an EOS/stop token.
     /// Tracked so check_stop_criteria can defer stopping until block-aligned.
     seal_eos_seen: HashSet<String>,
+
+    /// The drafts a step of a worker-side head makes; `None` without one.
+    head_drafts: Option<usize>,
+    /// The executor runs a speculative step scheduled behind one still in flight
+    /// ([`Executor::pipelines_speculative_steps`]), as read when it was taken.
+    pipelines_speculative: bool,
+    /// Steps scheduled leading ([`SpecPipeline::leads`]) and not yet finalized or abandoned.
+    leading: usize,
 }
 
 /// Configuration for creating an EngineCore.
@@ -215,6 +223,14 @@ impl<T> StepOutcome<T> {
     }
 }
 
+/// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
+/// history (a verify row's would need the drafts before it).
+fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
+    scheduler
+        .get_request(req_id)
+        .is_some_and(|r| !r.status.is_finished() && !r.sampling_params.reads_history())
+}
+
 impl EngineCore {
     /// Create a new EngineCore.
     pub fn new(config: EngineCoreConfig, executor: Box<dyn Executor>) -> Self {
@@ -261,6 +277,10 @@ impl EngineCore {
         let scheduler = Scheduler::new(&config.scheduler_config, config.max_model_len, kv_cache);
 
         let mut async_scheduling = config.async_scheduling;
+        let head_drafts = match &config.proposer_config {
+            Some(ProposerConfig::Mtp(cfg)) => Some(cfg.num_speculative_tokens),
+            _ => None,
+        };
         let proposer: Option<Box<dyn Proposer + Send>> =
             config.proposer_config.map(|cfg| -> Box<dyn Proposer + Send> {
                 match cfg {
@@ -309,6 +329,15 @@ impl EngineCore {
                         }
                         Box::new(DraftModelProposer::new(cfg))
                     }
+                    ProposerConfig::Mtp(cfg) => {
+                        info!(
+                            "MTP speculative decoding enabled ({}, k={}, up to {} sequences): the \
+                             worker's head drafts from the target's final hidden states at the end \
+                             of each step it drafts from.",
+                            cfg.model, cfg.num_speculative_tokens, cfg.max_seqs,
+                        );
+                        Box::new(MtpProposer::new(cfg))
+                    }
                 }
             });
 
@@ -335,6 +364,9 @@ impl EngineCore {
             is_pooling: config.is_pooling,
             block_size: config.block_size,
             seal_eos_seen: HashSet::new(),
+            head_drafts,
+            pipelines_speculative: false,
+            leading: 0,
         }
     }
 
@@ -469,10 +501,11 @@ impl EngineCore {
     ///
     /// Requires the executor to be present (not taken for async scheduling).
     pub fn step(&mut self) -> EngineResult<StepOutcome<StepOutputs>> {
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| EngineError::Executor("executor taken for async scheduling".into()))?;
+        if self.executor.is_none() {
+            return Err(EngineError::Executor(
+                "executor taken for async scheduling".into(),
+            ));
+        }
 
         if !self.scheduler.has_requests() {
             return Ok(StepOutcome::Idle);
@@ -487,7 +520,8 @@ impl EngineCore {
         let _t_sched = std::time::Instant::now();
 
         // 1. Schedule.
-        let scheduler_output = self.scheduler.schedule();
+        let mut scheduler_output = self.scheduler.schedule();
+        self.plan_drafts(&mut scheduler_output);
         let model_executed = scheduler_output.total_num_scheduled_tokens > 0;
         let _d_sched = _t_sched.elapsed();
 
@@ -501,6 +535,7 @@ impl EngineCore {
         // 2. Execute model (also handles cleanup of finished requests even
         //    when no tokens are scheduled).
         let _t_exec = std::time::Instant::now();
+        let executor = self.executor.as_mut().expect("checked above");
         let mut model_output = executor
             .execute_model(&scheduler_output)
             .map_err(|e| EngineError::Executor(e.to_string()))?;
@@ -537,7 +572,9 @@ impl EngineCore {
     /// `step()` and `embed()` will error — the caller must use
     /// `schedule_next()` + `finalize_step()` with the taken executor.
     pub fn take_executor(&mut self) -> Option<Box<dyn Executor>> {
-        self.executor.take()
+        let executor = self.executor.take()?;
+        self.pipelines_speculative = executor.pipelines_speculative_steps();
+        Some(executor)
     }
 
     /// Run scheduling if there is work to do.
@@ -548,7 +585,14 @@ impl EngineCore {
         if !self.scheduler.has_requests() {
             return None;
         }
-        let sched = self.scheduler.schedule();
+        // Behind a leading step runs its one request alone: one still waiting is admitted once
+        // that step is finalized.
+        if self.leading > 0 && self.scheduler.get_request_counts().1 > 0 {
+            return None;
+        }
+        let mut sched = self.scheduler.schedule();
+        self.plan_drafts(&mut sched);
+        self.mark_pipeline(&mut sched);
         // Still return the output if there are finished request IDs to clean up,
         // even when no tokens are scheduled. The executor needs to see these IDs
         // to release per-request resources (KV cache buffers, token buffers, etc.).
@@ -556,6 +600,63 @@ impl EngineCore {
             return None;
         }
         Some(sched)
+    }
+
+    /// Where `sched` stands in the speculative pipeline ([`SpecPipeline`]): behind, when it verifies
+    /// drafts of a step still unfinalized — its request holds that step's output placeholders
+    /// beside its own; leading, when the executor pipelines and `sched` is one request that
+    /// verifies drafts and drafts again, with nothing waiting: its next step's drafts are then
+    /// placeholders, so that step can be scheduled now. A request whose steps need the host between
+    /// them — a grammar's state, an image's — leads nothing; the executor defers every step this
+    /// marks.
+    fn mark_pipeline(&mut self, sched: &mut SchedulerOutput) {
+        let mut ids = sched.num_scheduled_tokens.iter();
+        let (Some((req_id, &scheduled)), None) = (ids.next(), ids.next()) else {
+            return;
+        };
+        let Some(request) = self.scheduler.get_request(req_id) else {
+            return;
+        };
+        sched.spec_pipeline.behind = !sched.scheduled_spec_decode_tokens.is_empty()
+            && request.num_output_placeholders as usize > scheduled;
+        let (Some(drafts), true) = (self.head_drafts, self.pipelines_speculative) else {
+            return;
+        };
+        let on_device =
+            request.sampling_params.guided_grammar.is_none() && request.mm_data.is_none();
+        if on_device
+            && sched.draft_req_ids.contains(req_id)
+            && sched.scheduled_spec_decode_tokens.contains_key(req_id)
+            && takes_drafts(&self.scheduler, req_id)
+            && self.scheduler.get_request_counts().1 == 0
+        {
+            let req_id = req_id.clone();
+            self.scheduler.set_spec_token_ids(&req_id, vec![0; drafts]);
+            sched.spec_pipeline.leads = true;
+            self.leading += 1;
+        }
+    }
+
+    /// A step the executor failed: it is never finalized, so it leads no more.
+    pub fn abandon_step(&mut self, sched: &SchedulerOutput) {
+        self.end_lead(sched);
+    }
+
+    /// A step done — finalized or failed: the step behind it waits on it no more.
+    fn end_lead(&mut self, sched: &SchedulerOutput) {
+        if sched.spec_pipeline.leads {
+            self.leading -= 1;
+        }
+    }
+
+    /// The requests the worker-side draft head runs for in the step `sched` scheduled
+    /// ([`Proposer::plan`]).
+    fn plan_drafts(&mut self, sched: &mut SchedulerOutput) {
+        let Some(proposer) = self.proposer.as_mut() else {
+            return;
+        };
+        let scheduler = &self.scheduler;
+        sched.draft_req_ids = proposer.plan(sched, &|req_id| takes_drafts(scheduler, req_id));
     }
 
     /// Post-execution processing: update state from model output, process
@@ -567,6 +668,7 @@ impl EngineCore {
         scheduler_output: &SchedulerOutput,
         model_output: &ModelRunnerOutput,
     ) -> StepOutputs {
+        self.end_lead(scheduler_output);
         // 1. Snapshot scheduler stats BEFORE processing outputs (which frees
         //    blocks for finished requests). This gives an accurate view of
         //    blocks in use during the step.
@@ -613,6 +715,7 @@ impl EngineCore {
                     }
                 })
             };
+            let takes_drafts = |req_id: &str| takes_drafts(scheduler_ref, req_id);
             let backend = self.executor.as_mut().and_then(|e| e.spec_decode_backend());
             let mut ctx = ProposerStepCtx {
                 scheduled_req_ids: &scheduled_req_ids,
@@ -621,17 +724,20 @@ impl EngineCore {
                 backend,
                 draft_seed: model_output.draft_seed_inputs.as_ref(),
                 sampled_token_ids: Some(&model_output.sampled_token_ids),
+                takes_drafts: &takes_drafts,
             };
             let drafts_map = proposer.propose_for_step(&mut ctx);
             for (req_id, drafts) in drafts_map {
                 if drafts.is_empty() {
                     continue;
                 }
-                let still_running = self
-                    .scheduler
-                    .get_request(&req_id)
-                    .is_some_and(|r| !r.status.is_finished() && !r.all_token_ids.is_empty());
-                if !still_running {
+                // Still running, and drafting (`takes_drafts`).
+                let keeps_drafts = self.scheduler.get_request(&req_id).is_some_and(|r| {
+                    !r.status.is_finished()
+                        && !r.all_token_ids.is_empty()
+                        && !r.sampling_params.reads_history()
+                });
+                if !keeps_drafts {
                     continue;
                 }
                 self.scheduler.set_spec_token_ids(&req_id, drafts);
@@ -785,13 +891,7 @@ impl EngineCore {
             }
 
             // Generation request: normal token-based processing.
-            let new_token_ids_slice: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
-
-            // Append new tokens to the request's state in the scheduler.
-            if !new_token_ids_slice.is_empty() {
-                self.scheduler
-                    .append_output_tokens(req_id, new_token_ids_slice);
-            }
+            let generated: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
 
             // Rewind num_computed_tokens for rejected spec decode drafts.
             // The scheduler already advanced num_computed_tokens by num_scheduled_tokens
@@ -803,10 +903,10 @@ impl EngineCore {
                 .scheduled_spec_decode_tokens
                 .get(req_id)
                 .filter(|ids| !ids.is_empty())
-                && !new_token_ids_slice.is_empty()
+                && !generated.is_empty()
             {
                 let num_draft_tokens = scheduled_spec_ids.len();
-                let num_accepted = new_token_ids_slice.len().saturating_sub(1);
+                let num_accepted = generated.len().saturating_sub(1);
                 let num_rejected = num_draft_tokens.saturating_sub(num_accepted);
                 if num_rejected > 0 {
                     self.scheduler
@@ -814,9 +914,25 @@ impl EngineCore {
                 }
             }
 
-            // Check stop criteria against the updated request state.
-            let (finish_reason, stop_reason) =
-                self.check_stop_criteria(req_id, new_token_ids_slice);
+            // Append the new tokens one at a time, checking the stop criteria after each: a verify
+            // step can accept tokens past the one that ends the request, and those are dropped.
+            // Matches Python: scheduler._update_request_with_output().
+            let mut kept = generated.len();
+            let (mut finish_reason, mut stop_reason) = if generated.is_empty() {
+                self.check_stop_criteria(req_id, generated)
+            } else {
+                (None, None)
+            };
+            for (n, token) in generated.iter().enumerate() {
+                let token = std::slice::from_ref(token);
+                self.scheduler.append_output_tokens(req_id, token);
+                (finish_reason, stop_reason) = self.check_stop_criteria(req_id, token);
+                if finish_reason.is_some() {
+                    kept = n + 1;
+                    break;
+                }
+            }
+            let new_token_ids_slice = &generated[..kept];
 
             if let Some(reason) = finish_reason {
                 let status = match reason {
@@ -1480,6 +1596,46 @@ mod tests {
         assert_eq!(req_out.stop_reason, Some(StopReason::Token(1000)));
     }
 
+    /// A verify step can accept tokens past the one that ends the request — an n-gram proposer
+    /// drafts the chat template's `<|im_end|>\n<|im_start|>` straight out of the prompt. They are
+    /// dropped, as vLLM's `_update_request_with_output` drops them.
+    #[test]
+    fn test_tokens_after_the_stop_are_dropped() {
+        for (eos, max_tokens, reason) in [
+            (vec![1000], 100, FinishReason::Stop),
+            (vec![], 2, FinishReason::Length),
+        ] {
+            let mut config = make_test_config();
+            config.eos_token_ids = eos;
+            let mut engine = EngineCore::new(config, Box::new(NoopExecutor::new(1024)));
+            let params = SamplingParams {
+                max_tokens: Some(max_tokens),
+                ..Default::default()
+            };
+            let req = Request::new("req-1".to_string(), vec![10, 20], params, 0.0, 0, 0, None);
+            engine.add_request(req);
+            let scheduler_output = engine.scheduler.schedule();
+            let model_output = ModelRunnerOutput {
+                req_ids: vec!["req-1".to_string()],
+                req_id_to_index: [("req-1".to_string(), 0)].into_iter().collect(),
+                sampled_token_ids: vec![vec![42, 1000, 43, 44]],
+                logprobs: None,
+                prompt_logprobs_dict: std::collections::HashMap::new(),
+                draft_token_ids: None,
+                pooler_output: None,
+                d2h_resolver: None,
+                draft_seed_inputs: None,
+                kv_extent: std::collections::HashMap::new(),
+                kv_pool_reach: None,
+            };
+
+            let outputs = engine.update_from_output(&scheduler_output, &model_output);
+            let req_out = &outputs[&0].outputs[0];
+            assert_eq!(req_out.new_token_ids, [42, 1000], "{reason:?}");
+            assert_eq!(req_out.finish_reason, Some(reason));
+        }
+    }
+
     #[test]
     fn test_stop_token_ids_stop() {
         let config = make_test_config();
@@ -1688,6 +1844,122 @@ mod tests {
             is_pooling: false,
             enable_prefix_caching: false,
             hybrid_kv: None,
+        }
+    }
+
+    /// A greedy verify step that drafts, of an executor that pipelines, leads: the step scheduled
+    /// before it is finalized verifies its drafts behind it, `k` placeholders; a request arriving
+    /// meanwhile waits for every lead to be finalized. The prompt step verifies nothing and leads
+    /// nothing; an executor that does not pipeline leads nothing.
+    #[test]
+    fn a_verify_step_leads_the_verify_scheduled_behind_it() {
+        let config = || EngineCoreConfig {
+            async_scheduling: true,
+            scheduler_config: SchedulerConfig {
+                async_scheduling: Some(true),
+                ..make_spec_decode_config().scheduler_config
+            },
+            proposer_config: Some(crate::spec_decode::ProposerConfig::Mtp(
+                crate::spec_decode::MtpProposerConfig {
+                    model: "head".into(),
+                    num_speculative_tokens: 2,
+                    max_seqs: 1,
+                    max_model_len: 4096,
+                },
+            )),
+            ..make_spec_decode_config()
+        };
+        let greedy = SamplingParams {
+            max_tokens: Some(50),
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let request = |id: &str, params: &SamplingParams| {
+            Request::new(
+                id.to_string(),
+                vec![1, 2, 3, 4],
+                params.clone(),
+                0.0,
+                0,
+                0,
+                None,
+            )
+        };
+        // The prompt step of request "a", finalized with the drafts its head made.
+        let prompt = |engine: &mut EngineCore, executor: &mut Box<dyn Executor>, a: Request| {
+            engine.add_request(a);
+            let prefill = engine.schedule_next().expect("the prompt");
+            assert!(
+                prefill.draft_req_ids.contains("a"),
+                "the prompt step drafts"
+            );
+            assert_eq!(prefill.spec_pipeline, Default::default());
+            let out = executor.execute_model(&prefill).expect("runs");
+            let _ = engine.finalize_step(&prefill, &out);
+            engine.scheduler.set_spec_token_ids("a", vec![7, 8]);
+        };
+
+        let plain = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config(), plain);
+        let mut executor = engine.take_executor().expect("an executor");
+        prompt(&mut engine, &mut executor, request("a", &greedy));
+        let verify = engine.schedule_next().expect("the first verify");
+        assert_eq!(verify.spec_pipeline, Default::default());
+
+        let pipelining = || Box::new(NoopExecutor::new(1024).with_pipelining());
+        let mut engine = EngineCore::new(config(), pipelining());
+        let mut executor = engine.take_executor().expect("an executor");
+        prompt(&mut engine, &mut executor, request("a", &greedy));
+        let lead = engine.schedule_next().expect("the first verify");
+        assert_eq!(lead.scheduled_spec_decode_tokens["a"], [7, 8]);
+        assert!(lead.spec_pipeline.leads && !lead.spec_pipeline.behind);
+        let out = executor.execute_model(&lead).expect("runs");
+        let verify = engine
+            .schedule_next()
+            .expect("scheduled before the lead is finalized");
+        assert_eq!(
+            verify.num_scheduled_tokens["a"], 3,
+            "its token and two drafts"
+        );
+        assert_eq!(verify.scheduled_spec_decode_tokens["a"], [0, 0]);
+        assert!(verify.spec_pipeline.behind && verify.spec_pipeline.leads);
+
+        engine.add_request(request("b", &greedy));
+        assert!(engine.schedule_next().is_none(), "b waits behind the leads");
+        let _ = engine.finalize_step(&lead, &out);
+        assert!(engine.schedule_next().is_none(), "the verify still leads");
+        let out = executor.execute_model(&verify).expect("runs");
+        let _ = engine.finalize_step(&verify, &out);
+        let next = engine.schedule_next().expect("b is admitted");
+        assert!(next.num_scheduled_tokens.contains_key("b"));
+        assert!(!next.spec_pipeline.leads, "two requests lead nothing");
+
+        // A sampled request leads as a greedy one does; one whose steps need the host between
+        // them — its grammar's state, its image's — leads nothing.
+        let sampled = SamplingParams {
+            temperature: 0.8,
+            ..greedy.clone()
+        };
+        let grammar = SamplingParams {
+            guided_grammar: Some(scratchy_core_common::sampling::GuidedGrammar::Json),
+            ..greedy.clone()
+        };
+        let mut image = request("a", &greedy);
+        image.mm_data = Some(scratchy_core_common::MultimodalData {
+            images: Vec::new(),
+            image_placeholders: Vec::new(),
+        });
+        let cases = [
+            ("sampled", request("a", &sampled), true),
+            ("grammar", request("a", &grammar), false),
+            ("image", image, false),
+        ];
+        for (name, a, leads) in cases {
+            let mut engine = EngineCore::new(config(), pipelining());
+            let mut executor = engine.take_executor().expect("an executor");
+            prompt(&mut engine, &mut executor, a);
+            let verify = engine.schedule_next().expect("the first verify");
+            assert_eq!(verify.spec_pipeline.leads, leads, "{name}");
         }
     }
 

@@ -183,6 +183,10 @@ struct RequestState {
     /// Accumulated generated text so far (for streaming tool parsing).
     accumulated_text: String,
 
+    /// The generated text past the reasoning so far: what the streaming tool parser reads when a
+    /// reasoning parser routes text first.
+    accumulated_content: String,
+
     /// Accumulated generated token IDs (for streaming reasoning parsing).
     accumulated_token_ids: Vec<u32>,
 
@@ -1935,6 +1939,10 @@ impl AsyncEngine {
                 ModelRunnerOutput,
             )> = None;
             let mut gpu_in_flight: u32 = 0;
+            // A step in flight that drafts (the worker's head drafts the next step's tokens) or
+            // verifies (the next step's positions depend on how many drafts it keeps): nothing is
+            // scheduled behind it until it is finalized.
+            let mut awaits_step = false;
             let mut last_progress = Instant::now();
 
             loop {
@@ -1975,6 +1983,8 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
+                    // The last step sent is finalized once none is in flight.
+                    awaits_step &= gpu_in_flight > 0;
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             route_step_outputs(&requests, outputs).await;
@@ -1995,9 +2005,10 @@ impl AsyncEngine {
                 // 3. Pre-schedule: fill the pipeline up to 2 in-flight
                 //    batches. With placeholder tracking, the scheduler
                 //    correctly accounts for tokens still on the GPU.
-                while gpu_in_flight < 2 {
+                while gpu_in_flight < 2 && !awaits_step {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
+                            let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
                             if sched_tx
                                 .send(ExecutorWork::Execute(Box::new(sched)))
                                 .await
@@ -2006,6 +2017,7 @@ impl AsyncEngine {
                                 break; // Executor thread exited.
                             }
                             gpu_in_flight += 1;
+                            awaits_step = speculative;
                         }
                         Ok(None) => break, // Nothing to schedule.
                         Err(e) => {
@@ -2037,6 +2049,7 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
+                            client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
                             let req_ids: Vec<String> =
                                 sched.num_scheduled_tokens.keys().cloned().collect();
@@ -2232,6 +2245,7 @@ impl AsyncEngine {
                     reasoning_ended: false,
                     include_reasoning,
                     accumulated_text: String::new(),
+                    accumulated_content: String::new(),
                     accumulated_token_ids: Vec::new(),
                     tool_calls_emitted: false,
                     forced_function_name,
@@ -2323,6 +2337,11 @@ impl AsyncEngine {
                     debug!("Output for unknown request {}, ignoring", output.request_id);
                     return None;
                 };
+                // Finished here already (a stop string matched; a non-streaming entry waits to be
+                // collected): what the steps still in flight for it produced is not its output.
+                if req_state.finish_reason.is_some() {
+                    return None;
+                }
 
                 // Track output tokens.
                 #[cfg(feature = "metrics")]
@@ -2474,6 +2493,10 @@ impl AsyncEngine {
                 // Already logged in Phase 1.
                 continue;
             };
+            // Finished here already: dropped in Phase 1.
+            if req_state.finish_reason.is_some() {
+                continue;
+            }
 
             // NOTHING TO PUT BACK — the detokenizer never left. This arm used to reinstall it, and
             // when the state had already been removed it `continue`d above and dropped it forever.
@@ -2576,11 +2599,13 @@ impl AsyncEngine {
                 // Phase 2: Tool parsing on content portion (only after reasoning ends).
                 if let Some(ref mut parser_state) = req_state.tool_parser_state {
                     if let Some(ref content_text) = content_text_for_tools {
-                        // Build previous/current text for tool parser (content portion only).
-                        let previous_text_for_tools = req_state.accumulated_text.clone(); // approximation
+                        // The tool parser reads the content alone: past the reasoning, which
+                        // it would otherwise emit as content (`</think>` included).
+                        let previous_len = req_state.accumulated_content.len();
+                        req_state.accumulated_content.push_str(content_text);
                         let parser_result = parser_state.process_delta(
-                            &previous_text_for_tools,
-                            &req_state.accumulated_text,
+                            &req_state.accumulated_content[..previous_len],
+                            &req_state.accumulated_content,
                             content_text,
                         );
 
@@ -2818,6 +2843,9 @@ impl AsyncEngine {
             debug!("Output for unknown request {}, ignoring", output.request_id);
             return;
         };
+        if req_state.finish_reason.is_some() {
+            return;
+        }
 
         // Track output tokens.
         #[cfg(feature = "metrics")]
@@ -4048,6 +4076,7 @@ mod tests {
             reasoning_ended: false,
             include_reasoning: true,
             accumulated_text: String::new(),
+            accumulated_content: String::new(),
             accumulated_token_ids: Vec::new(),
             tool_calls_emitted: false,
             forced_function_name: None,
@@ -4368,6 +4397,35 @@ mod tests {
         };
         // Should not panic.
         AsyncEngine::process_output(&mut requests, output);
+    }
+
+    /// An output for a request finished here already — a stop string matched, its non-streaming
+    /// entry waiting to be collected — came from a step still in flight for it: every path drops
+    /// it, the request's tokens as they were.
+    #[test]
+    fn an_output_for_a_finished_request_is_dropped() {
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(None);
+        state.generated_token_ids = vec![10, 11];
+        state.finish_reason = Some(FinishReason::Stop);
+        requests.insert("req-1".to_string(), state);
+        let output = || EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let work = AsyncEngine::process_outputs_phase1(&mut requests, &[output()]);
+        assert!(work.iter().all(Option::is_none), "nothing to detokenize");
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output()], results);
+        AsyncEngine::process_output(&mut requests, output());
+        assert_eq!(requests["req-1"].generated_token_ids, [10, 11]);
     }
 
     #[test]
@@ -5722,6 +5780,62 @@ mod tests {
             "content done",
             "content should be everything after </think>"
         );
+    }
+
+    /// Qwen3.6 behind Claude Code: the template opens `<think>`, so the output starts in
+    /// reasoning, closes it, then calls a tool. The tool parser reads only the text past the
+    /// reasoning — no reasoning and no `</think>` stream as content — and the call goes out
+    /// whole, its arguments included.
+    #[test]
+    fn test_streaming_reasoning_then_qwen3_coder_tool_call() {
+        use crate::reasoning_parser::Qwen3ReasoningParser;
+        let parser = Qwen3ReasoningParser::new(&reasoning_test_vocab()).unwrap();
+        let tools = crate::tool_parser::get_tool_parser("qwen3_coder").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state = Some(parser.create_streaming_state());
+        state.tool_parser_state = Some(tools.create_streaming_state());
+        state.include_reasoning = true;
+        requests.insert("req-1".to_string(), state);
+        let pieces: [(&[u32], &str); 5] = [
+            (&[10], "I will run ls."),
+            (&[101, 11], "\n</think>\n\n"),
+            (&[12], "<tool_call>\n<function=Bash>\n"),
+            (&[13], "<parameter=command>\nls\n</parameter>\n"),
+            (&[14], "</function>\n</tool_call>"),
+        ];
+        for (i, (ids, text)) in pieces.iter().enumerate() {
+            let output = EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: ids.to_vec(),
+                finish_reason: (i + 1 == pieces.len()).then_some(FinishReason::Stop),
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            };
+            let detok = Some((None, Some(text.to_string())));
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        }
+        let (mut content, mut reasoning, mut calls) = (String::new(), String::new(), Vec::new());
+        while let Ok(delta) = rx.try_recv() {
+            content.push_str(delta.text.as_deref().unwrap_or(""));
+            reasoning.push_str(delta.reasoning.as_deref().unwrap_or(""));
+            calls.extend(delta.tool_call_deltas.unwrap_or_default());
+        }
+        assert_eq!(content.trim(), "", "content: {content:?}");
+        assert!(
+            reasoning.contains("I will run ls."),
+            "reasoning: {reasoning:?}"
+        );
+        assert_eq!(calls.len(), 1, "one call: {calls:?}");
+        assert_eq!(calls[0].function_name.as_deref(), Some("Bash"));
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0].function_arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["command"], "ls");
     }
 
     #[test]

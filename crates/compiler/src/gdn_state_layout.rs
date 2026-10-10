@@ -61,12 +61,31 @@ pub struct GdnRuntimeConfig {
     /// Per global-layer-index linear-attention mask, length `num_hidden_layers`.
     /// `true` = this layer is a GDN (linear-attention) layer.
     pub linear_layers: Vec<bool>,
+    /// The drafts each sequence of a verify step carries (`CanonicalParams::SPEC_DRAFTS`): what a
+    /// slot keeps to undo them, as the GDN kernels bake it.
+    pub spec_drafts: u8,
 }
 
 impl GdnRuntimeConfig {
+    /// A slot's checkpoints: the model's drafts.
+    pub fn checkpoint_rows(&self) -> scratchy_layers::gdn_state::CheckpointRows {
+        scratchy_layers::gdn_state::CheckpointRows(self.spec_drafts)
+    }
+
     /// Number of GDN (linear-attention) layers.
     pub fn num_linear_layers(&self) -> usize {
         self.linear_layers.iter().filter(|&&b| b).count()
+    }
+
+    /// The state geometry the GDN state pool allocates each linear layer.
+    pub fn state_dims(&self) -> scratchy_layers::gdn_state::GdnStateDims {
+        scratchy_layers::gdn_state::GdnStateDims {
+            conv_dim: self.conv_dim as usize,
+            conv_kernel: self.conv_kernel as usize,
+            num_v_heads: self.num_v_heads as usize,
+            head_v_dim: self.head_v_dim as usize,
+            head_k_dim: self.head_k_dim as usize,
+        }
     }
 }
 

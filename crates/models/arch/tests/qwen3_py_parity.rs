@@ -248,6 +248,8 @@ fn qwen3_py_carrier_parity() {
         vision_rope_freqs: None,
         pixels: None,
         pos_embeds: None,
+        target_hidden: None,
+        hidden_out: None,
         vision_cu_seqlens_full: None,
         vision_cu_seqlens_window: None,
         vision_max_seqlen_full: None,
@@ -256,6 +258,7 @@ fn qwen3_py_carrier_parity() {
         vision_reverse_indices: None,
         vision_position_ids: None,
         last_token_indices: Some(unsafe { lti_buf.as_view() }),
+        device_inputs: &[],
         deferred: None,
     };
     let _ = null_view; // completeness placeholder, unused fields are None

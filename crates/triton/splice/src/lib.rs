@@ -340,9 +340,9 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ScalarWeightMul
         | SubOp::GateSplit { .. }
         | SubOp::GateApply
+        | SubOp::Concat { .. }
         | SubOp::GateScale
-        | SubOp::LoadPixels { .. }
-        | SubOp::LoadPosEmbeds { .. }
+        | SubOp::LoadRows { .. }
         | SubOp::EmbeddingGather { .. }
         | SubOp::VisionRope
         | SubOp::VarlenAttention { .. }

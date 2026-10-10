@@ -2366,6 +2366,7 @@ pub fn starter_library() -> ImplementationLibrary {
             lib.push(Box::new(GatedDeltaNetImpl));
             lib.push(Box::new(GateSplitImpl));
             lib.push(Box::new(GateApplyImpl));
+            lib.push(Box::new(ConcatImpl));
             lib.push(Box::new(GateScaleImpl));
             lib.push(Box::new(DeepSeekMoeRefImpl));
             lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
@@ -2398,13 +2399,10 @@ pub fn starter_library() -> ImplementationLibrary {
             // `ctx.fwd.input_ids`. Used by SigLIP / Gemma3-MM and any future
             // tower with a learned positional table.
             lib.push(Box::new(PosEmbedRefImpl));
-            // Pixels materialization (Phase G.5.e.1). Synthesized by
-            // `vision_lowering::materialize_pixels` after `fuf::unroll`
-            // under `Prelude::Vision`; the Impl runs only when that pass
-            // produced a tile. Decoder bodies never see this OpKind.
-            lib.push(Box::new(LoadPixelsImpl));
-            // Qwen3.5-VL pos_embeds materialization (sibling of LoadPixels).
-            lib.push(Box::new(LoadPosEmbedsImpl));
+            // Host-staged rows materialization (pixels, pos_embeds, a target's hidden rows).
+            // Synthesized by `rows_lowering::materialize_rows` after `fuf::unroll`; the Impl
+            // runs only when that pass produced a tile.
+            lib.push(Box::new(LoadRowsImpl));
             // Row-permutation gather (Phase G.6.4). Claims any DSL call to
             // `embedding_gather(x, indices)`. The `indices` arg is one of
             // `vision_window_index` / `vision_reverse_indices` (both vision-
@@ -8206,9 +8204,9 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::GatedDeltaNet
         | OpKind::GateSplit
         | OpKind::GateApply
+        | OpKind::Concat
         | OpKind::GateScale
-        | OpKind::LoadPixels
-        | OpKind::LoadPosEmbeds
+        | OpKind::LoadRows(_)
         | OpKind::EmbeddingGather
         | OpKind::AvgPool2d
         | OpKind::StripCls
@@ -15639,6 +15637,84 @@ impl Implementation for GateApplyImpl {
     }
 }
 
+// ── ConcatImpl ───────────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::Concat` — two same-width row tiles side by side,
+// `[T, W] ++ [T, W] → [T, 2W]` (an MTP head's input fusion).
+
+#[derive(Debug, Default)]
+#[cfg(feature = "cuda")]
+pub struct ConcatImpl;
+
+#[cfg(feature = "cuda")]
+impl Implementation for ConcatImpl {
+    fn name(&self) -> &'static str {
+        "concat_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Concat)
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Concat",
+            vec![
+                ("a_slot", syn::parse_quote!(u32)),
+                ("b_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<scratchy_forward_compiler::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let slot_of = |idx: usize| match node.inputs.get(idx) {
+            Some(FufInput::Tile { id, slot }) => slots.of(*id, *slot),
+            other => panic!("Concat: input {idx} must be a Tile (got {other:?})"),
+        };
+        Some(vec![scratchy_forward_compiler::Instruction::Concat(
+            slot_of(0),
+            slot_of(1),
+            slots.of(tile, 0),
+        )])
+    }
+}
+
 // ── GateScaleImpl ────────────────────────────────────────────────────────────
 //
 // Singleton for `OpKind::GateScale` — Qwen3.5-MoE shared-expert combine:
@@ -18658,31 +18734,28 @@ impl Implementation for MmEmbedSpliceImpl {
 // (G.5+); registering them now keeps `OpKind::from_name`'s vision
 // arms total (parse ⟺ codegen) per the handoff bar.
 
-// ── LoadPixelsImpl (Phase G.5.e.1) ───────────────────────────────
+// ── LoadRowsImpl ─────────────────────────────────────────────────
 //
-// Singleton claiming `OpKind::LoadPixels` — synthesized by the
-// `vision_lowering::materialize_pixels` pass between `fuf::unroll`
-// and the solver. No FUF inputs, no weight inputs: the runtime tile
-// is built from `ctx.fwd.pixels` (the view the vision-side host
-// wrapper writes onto `ForwardCtx` before invoking the interpreter,
-// mirroring how text-side `Embed` reads `ctx.input_ids`). Emits a
-// single `Instruction::LoadPixels { out_slot }` row.
+// Singleton claiming `OpKind::LoadRows(source)` — synthesized by the
+// `rows_lowering::materialize_rows` pass between `fuf::unroll` and the solver. No FUF inputs, no
+// weight inputs: the runtime tile is built from the source's `ForwardCtx` view (`pixels`,
+// `pos_embeds`, `target_hidden`), which the host writes before invoking the interpreter,
+// mirroring how `Embed` reads `ctx.input_ids`. Emits a single
+// `Instruction::LoadRows(out_slot, source)` row.
 //
-// This is the vision-side analog of `EmbedRefImpl`: both publish a
-// tile from an ambient `ForwardCtx` field rather than a tile
-// dataflow. The text path packs the read into `Embed` directly
-// (which also has a weight input — embed_tokens); the vision path
-// has no weight to anchor on, so the materialization needs its own
+// The analog of `EmbedRefImpl`: both publish a tile from an ambient `ForwardCtx` field rather
+// than a tile dataflow. `Embed` packs the read in directly (it also has a weight input —
+// embed_tokens); a row extern has no weight to anchor on, so the materialization needs its own
 // OpKind + Impl.
 
 #[derive(Debug, Default)]
 #[cfg(feature = "cuda")]
-pub struct LoadPixelsImpl;
+pub struct LoadRowsImpl;
 
 #[cfg(feature = "cuda")]
-impl Implementation for LoadPixelsImpl {
+impl Implementation for LoadRowsImpl {
     fn name(&self) -> &'static str {
-        "load_pixels"
+        "load_rows"
     }
 
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
@@ -18691,7 +18764,7 @@ impl Implementation for LoadPixelsImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let node = fuf.get(seed);
-        if node.op != OpKind::LoadPixels || !node.inputs.is_empty() {
+        if !matches!(node.op, OpKind::LoadRows(_)) || !node.inputs.is_empty() {
             return None;
         }
         Some(MatchInfo {
@@ -18702,10 +18775,9 @@ impl Implementation for LoadPixelsImpl {
     }
 
     fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
-        // Pure host-side metadata wrap of `ctx.fwd.pixels` — no
-        // device work and no alternative covering, so the DP
-        // tiebreaker value doesn't affect routing. Same zero-cost
-        // story as `MmEmbedSpliceImpl`.
+        // Pure host-side metadata wrap of the source's view — no device work and no
+        // alternative covering, so the DP tiebreaker value doesn't affect routing. Same
+        // zero-cost story as `MmEmbedSpliceImpl`.
         0.0
     }
 
@@ -18736,104 +18808,31 @@ impl Implementation for LoadPixelsImpl {
     }
 
     fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new("LoadPixels", vec![("out_slot", syn::parse_quote!(u32))])
+        OpcodeShape::new(
+            "LoadRows",
+            vec![
+                ("out_slot", syn::parse_quote!(u32)),
+                (
+                    "source",
+                    syn::parse_quote!(::scratchy_forward_compiler::RowsExtern),
+                ),
+            ],
+        )
     }
 
     fn fan_out(
         &self,
         m: &MatchInfo,
-        _fuf: &Fuf,
+        fuf: &Fuf,
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<scratchy_forward_compiler::Instruction>> {
         let tile = m.claimed_tiles[0];
-        let out_slot = slots.of(tile, 0);
-        Some(vec![Instruction::LoadPixels(out_slot)])
-    }
-}
-
-// ── LoadPosEmbedsImpl (Qwen3.5-VL pos_embed) ─────────────────────
-//
-// The exact sibling of `LoadPixelsImpl`: a singleton claiming
-// `OpKind::LoadPosEmbeds`, synthesized by
-// `vision_lowering::materialize_pos_embeds`. No FUF/weight inputs —
-// the runtime tile is built from `ctx.fwd.pos_embeds` (the
-// host-interpolated learned positional embedding the vision wrapper
-// writes onto `ForwardCtx` before driving the interpreter). Emits a
-// single `Instruction::LoadPosEmbeds { out_slot }` row.
-
-#[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
-pub struct LoadPosEmbedsImpl;
-
-#[cfg(feature = "cuda")]
-impl Implementation for LoadPosEmbedsImpl {
-    fn name(&self) -> &'static str {
-        "load_pos_embeds"
-    }
-
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
-    }
-
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        if node.op != OpKind::LoadPosEmbeds || !node.inputs.is_empty() {
-            return None;
-        }
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: Vec::new(),
-            boundary_outputs: vec![seed],
-        })
-    }
-
-    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
-        0.0
-    }
-
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
-    }
-
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
-    }
-
-    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
-    }
-
-    fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new("LoadPosEmbeds", vec![("out_slot", syn::parse_quote!(u32))])
-    }
-
-    fn fan_out(
-        &self,
-        m: &MatchInfo,
-        _fuf: &Fuf,
-        _program: &Program,
-        _bounds: &BTreeMap<String, u64>,
-        slots: &SlotMap,
-    ) -> Option<Vec<scratchy_forward_compiler::Instruction>> {
-        let tile = m.claimed_tiles[0];
-        let out_slot = slots.of(tile, 0);
-        Some(vec![Instruction::LoadPosEmbeds(out_slot)])
+        let OpKind::LoadRows(source) = fuf.get(tile).op else {
+            unreachable!("LoadRowsImpl claims only LoadRows tiles");
+        };
+        Some(vec![Instruction::LoadRows(slots.of(tile, 0), source)])
     }
 }
 

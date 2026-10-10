@@ -473,19 +473,20 @@ kernel void gemm_bf16_blocked(
 // gemv_{f16,bf16}_specialized
 // ---------------------------------------------------------------------------
 //
-// One row (M == 1): output = weight @ input, the GEMM's product as MLX's GEMVKernel computes it
-// at its standard instantiation (`instantiate_gemv(name, itype, 1, 8, 1, 32, 4, 4)`; the same
-// loop `fused_gate_up_silu_mul_decode_*_specialized` runs for its gate rows). Each threadgroup's
-// 8 simdgroups split K, each thread holding 4 outputs' float sums over its 4-element slices;
-// the simdgroups reduce by shuffle, then through threadgroup memory.
+// A few rows (M <= GEMV_MAX_ROWS): output = input @ weight^T, each row's product as MLX's
+// GEMVKernel computes it at its standard instantiation (`instantiate_gemv(name, itype, 1, 8, 1,
+// 32, 4, 4)`; the same loop `fused_gate_up_silu_mul_decode_*_specialized` runs for its gate rows).
+// Each threadgroup's 8 simdgroups split K, each thread holding 4 outputs' float sums per row over
+// its 4-element slices; the simdgroups reduce by shuffle, then through threadgroup memory. Each
+// weight slice is loaded once for every row — a verify step's rows read the matrix once.
 //
-// Bindings and constants are the GEMM's: buffer(0) = output [1, N], buffer(1) = input [1, K],
-// buffer(2) = weight [N, K]; 0 / 1 / 2 = M / N / K (M must be 1).
+// Bindings and constants are the GEMM's: buffer(0) = output [M, N], buffer(1) = input [M, K],
+// buffer(2) = weight [N, K]; 0 / 1 / 2 = M / N / K.
 //
 // `gemv_normed_*` (`MetalFusion::NormedRouter`, `NormedQmv`): a router's pre-norm, or the RMSNorm
 // whose rows it reads, folded in. Constant 5 is its epsilon, 6 its gain offset, buffer(3) its
 // gain: each thread dots the weights with `x ⊙ (gain + offset)` and sums `x²` as it loads `x`,
-// and the rows are scaled by `1 / rms(x)` when they store.
+// and each row is scaled by its own `1 / rms(x)` when it stores.
 //
 // Dispatch: threadgroups (ceil(N/4), 1, 1), threads (256, 1, 1). Needs N >= 4: the last
 // threadgroup moves back to the last 4 rows.
@@ -499,13 +500,15 @@ SCRATCHY_CONSTANT_OPTIONAL(float, GEMV_NORM_EPS, 5);
 SCRATCHY_CONSTANT_OPTIONAL(float, GEMV_NORM_W_OFFSET, 6);
 constant constexpr bool GEMV_NORMED = GEMV_NORM_EPS_SET;
 
-template <typename T, typename G>
+// `M` (<= MAX_ROWS) rows of `input`, `tgp` holding MAX_ROWS rows' partials.
+template <typename T, typename G, int MAX_ROWS>
 METAL_FUNC void gemv_specialized_impl(
     device       T*       output,
     device const T*       input,
     device const T*       weight,
     device const G*       gain,
     threadgroup float*    tgp,
+    int                    M,
     uint                   tid_x,
     uint                   simd_gid,
     uint                   simd_lid)
@@ -516,14 +519,15 @@ METAL_FUNC void gemv_specialized_impl(
     constexpr int TN = 4;              // K elements per thread per step
     constexpr int blockM = TM;         // outputs per threadgroup
     constexpr int blockN = BN * SN * TN;
+    constexpr int row_tgp = BN * (blockM + TM);  // one row's partials in `tgp`
 
     const int N = int(GEMM_N);
     const int K = int(GEMM_K);
 
-    thread float result[TM] = {0};
-    thread float in_buf[TN];
+    thread float result[MAX_ROWS][TM] = {{0}};
+    thread float in_buf[MAX_ROWS][TN];
     thread T w_buf[TN];
-    float sum_sq = 0.0f;
+    float sum_sq[MAX_ROWS] = {0};
 
     const int sgN = int(simd_gid) % BN;
     int bn = (SN * sgN + int(simd_lid)) * TN;
@@ -537,11 +541,13 @@ METAL_FUNC void gemv_specialized_impl(
     const int leftover = K - blockN * n_iter;
 
     for (int i = 0; i < n_iter; ++i) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-            const float x = float(input[bn + tn]);
-            sum_sq += GEMV_NORMED ? x * x : 0.0f;
-            in_buf[tn] = GEMV_NORMED ? x * (float(gain[bn + tn]) + GEMV_NORM_W_OFFSET) : x;
+        for (int r = 0; r < M; r++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                const float x = float(input[r * K + bn + tn]);
+                sum_sq[r] += GEMV_NORMED ? x * x : 0.0f;
+                in_buf[r][tn] = GEMV_NORMED ? x * (float(gain[bn + tn]) + GEMV_NORM_W_OFFSET) : x;
+            }
         }
         int mat_offset = 0;
         MLX_MTL_PRAGMA_UNROLL
@@ -550,9 +556,11 @@ METAL_FUNC void gemv_specialized_impl(
             for (int tn = 0; tn < TN; tn++) {
                 w_buf[tn] = mat[mat_offset + bn + tn];
             }
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                result[tm] += float(w_buf[tn]) * float(in_buf[tn]);
+            for (int r = 0; r < M; r++) {
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    result[r][tm] += float(w_buf[tn]) * in_buf[r][tn];
+                }
             }
             mat_offset += K;
         }
@@ -560,12 +568,15 @@ METAL_FUNC void gemv_specialized_impl(
     }
 
     if (leftover > 0) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-            const float x = (bn + tn < K) ? float(input[bn + tn]) : 0.0f;
-            sum_sq += GEMV_NORMED ? x * x : 0.0f;
-            in_buf[tn] =
-                GEMV_NORMED && bn + tn < K ? x * (float(gain[bn + tn]) + GEMV_NORM_W_OFFSET) : x;
+        for (int r = 0; r < M; r++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                const float x = (bn + tn < K) ? float(input[r * K + bn + tn]) : 0.0f;
+                sum_sq[r] += GEMV_NORMED ? x * x : 0.0f;
+                in_buf[r][tn] = GEMV_NORMED && bn + tn < K
+                                    ? x * (float(gain[bn + tn]) + GEMV_NORM_W_OFFSET)
+                                    : x;
+            }
         }
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
@@ -573,50 +584,59 @@ METAL_FUNC void gemv_specialized_impl(
             for (int tn = 0; tn < TN; tn++) {
                 w_buf[tn] = (bn + tn < K) ? mat[tm * K + bn + tn] : T(0);
             }
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                result[tm] += float(w_buf[tn]) * float(in_buf[tn]);
+            for (int r = 0; r < M; r++) {
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    result[r][tm] += float(w_buf[tn]) * in_buf[r][tn];
+                }
             }
         }
     }
 
-    MLX_MTL_PRAGMA_UNROLL
-    for (int tm = 0; tm < TM; tm++) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
-            result[tm] += simd_shuffle_down(result[tm], sn);
-        }
-    }
-
-    // A simdgroup's sum of squares rides in its slot's spare word.
-    sum_sq = GEMV_NORMED ? simd_sum(sum_sq) : 0.0f;
-    if (simd_lid == 0) {
+    for (int r = 0; r < M; r++) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
-            tgp[sgN * (blockM + TM) + tm] = result[tm];
+            MLX_MTL_PRAGMA_UNROLL
+            for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+            }
         }
-        tgp[sgN * (blockM + TM) + TM] = sum_sq;
+        // A simdgroup's sum of squares of the row rides in its slot's spare word.
+        sum_sq[r] = GEMV_NORMED ? simd_sum(sum_sq[r]) : 0.0f;
+    }
+
+    if (simd_lid == 0) {
+        for (int r = 0; r < M; r++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                tgp[r * row_tgp + sgN * (blockM + TM) + tm] = result[r][tm];
+            }
+            tgp[r * row_tgp + sgN * (blockM + TM) + TM] = sum_sq[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (sgN == 0 && simd_lid == 0) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int sgn = 1; sgn < BN; sgn++) {
+        for (int r = 0; r < M; r++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int sgn = 1; sgn < BN; sgn++) {
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tm = 0; tm < TM; tm++) {
+                    result[r][tm] += tgp[r * row_tgp + sgn * (blockM + TM) + tm];
+                }
+                sum_sq[r] += tgp[r * row_tgp + sgn * (blockM + TM) + TM];
+            }
+            const float scale =
+                GEMV_NORMED ? 1.0f / sqrt(sum_sq[r] / float(K) + GEMV_NORM_EPS) : 1.0f;
             MLX_MTL_PRAGMA_UNROLL
             for (int tm = 0; tm < TM; tm++) {
-                result[tm] += tgp[sgn * (blockM + TM) + tm];
+                output[r * N + out_row + tm] = T(GEMV_NORMED ? result[r][tm] * scale : result[r][tm]);
             }
-            sum_sq += tgp[sgn * (blockM + TM) + TM];
-        }
-        const float scale = GEMV_NORMED ? 1.0f / sqrt(sum_sq / float(K) + GEMV_NORM_EPS) : 1.0f;
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-            output[out_row + tm] = T(GEMV_NORMED ? result[tm] * scale : result[tm]);
         }
     }
 }
 
-// One row (GEMM_M == 1): the gemv above, on the GEMM's buffers.
+// Up to GEMV_MAX_ROWS rows (GEMM_M): the gemv above, on the GEMM's buffers.
 template <typename T, typename G>
 [[kernel]] void gemv_specialized(
     device       T* output [[buffer(0)]],
@@ -627,11 +647,13 @@ template <typename T, typename G>
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
-    if (GEMM_M != 1u) return;
-    constexpr int BN = 8;   // simdgroups per threadgroup, all along K
-    constexpr int TM = 4;   // outputs per thread
-    threadgroup float tgp[BN * (TM + TM)];
-    gemv_specialized_impl(output, input, weight, gain, tgp, tid.x, simd_gid, simd_lid);
+    constexpr int MAX_ROWS = 8;   // = GEMV_MAX_ROWS (pipelines.rs)
+    if (GEMM_M > uint(MAX_ROWS)) return;
+    constexpr int BN = 8;         // simdgroups per threadgroup, all along K
+    constexpr int TM = 4;         // outputs per thread
+    threadgroup float tgp[MAX_ROWS * BN * (TM + TM)];
+    gemv_specialized_impl<T, G, MAX_ROWS>(
+        output, input, weight, gain, tgp, int(GEMM_M), tid.x, simd_gid, simd_lid);
 }
 
 // `gemv_normed_rows_*`: the normed gemv over EVERY row of an M-row batch — a router's pre-norm
@@ -651,12 +673,13 @@ template <typename T, typename G>
     constexpr int BN = 8;   // simdgroups per threadgroup, all along K
     constexpr int TM = 4;   // outputs per thread
     threadgroup float tgp[BN * (TM + TM)];
-    gemv_specialized_impl<T, G>(
+    gemv_specialized_impl<T, G, 1>(
         output + size_t(tid.y) * uint(GEMM_N),
         input + size_t(tid.y) * uint(GEMM_K),
         weight,
         gain,
         tgp,
+        1,
         tid.x,
         simd_gid,
         simd_lid);

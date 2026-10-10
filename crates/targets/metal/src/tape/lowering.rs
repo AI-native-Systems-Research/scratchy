@@ -19,7 +19,7 @@
 use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::{QSize, SourceIx};
 use crate::tape::kernel_bindings::{CosSinTable, source};
-use crate::tape::kernel_constants::norm_threads;
+use crate::tape::kernel_constants::{QueryRows, norm_threads};
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertBundle,
@@ -41,6 +41,7 @@ use scratchy_subtile::handoff::WeightKind;
 fn attention_blocks_per_chunk(chunked: bool) -> u32 {
     if chunked { crate::BLOCKS_PER_CHUNK } else { 0 }
 }
+use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
     W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide,
@@ -257,7 +258,12 @@ fn sample_rows(
                 Vec::new(),
             ))
         }
-        (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
+        // The logits onto the sampled rows, and the gathered activation put back.
+        (true, R::Scatter) => [(g.output, g.n.get()), (g.input, g.k.get())]
+            .map(|(slot, width)| scatter_first_to_last_row_command(p, slot, width))
+            .into_iter()
+            .flat_map(sampled)
+            .collect(),
         (true, R::AllRows) => plain
             .into_iter()
             .map(|c| GatedCommand::gated(c.command, OnlyIfSpec))
@@ -469,7 +475,7 @@ const SCATTER: (KernelId, [&str; 2]) = (
     ],
 );
 
-/// The lm_head slice's input: each sequence's last row of `slot` moved to row `i`, in place.
+/// The lm_head slice's input: each sequence's last row of `slot` swapped into row `i`, in place.
 pub(crate) fn gather_last_token_command(
     p: &MetalModelConsts,
     slot: Slot,
@@ -478,7 +484,7 @@ pub(crate) fn gather_last_token_command(
     sample_slice_command(p, slot, hidden_size, GATHER)
 }
 
-/// The lm_head slice's output: row `i` of `slot` moved back to sequence `i`'s last row, in place.
+/// The gather undone over `slot`, in place: row `i` swapped back to sequence `i`'s last row.
 pub(crate) fn scatter_first_to_last_row_command(
     p: &MetalModelConsts,
     slot: Slot,
@@ -927,7 +933,9 @@ fn route_by_sequence_count(
 /// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
 /// `AffineQmm` in a bucket that can see a `SMALL_M_TOKENS` step: the twin runs
 /// on those steps (`OnlyIfSmallMTokens`) and the instruction's own GEMM on
-/// every other (`UnlessSmallMTokens`).
+/// every other (`UnlessSmallMTokens`). The twin computes the bare product, so a
+/// matmul whose ends were folded into it (its input's norm, its bias, scale or
+/// residual add) has none: its own matvec runs on every step.
 fn route_small_m(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -949,6 +957,13 @@ fn route_small_m(
         k: KDim(k),
         group_size: AffineGroupSize(group_size),
         bits: AffineBits(4),
+        ends:
+            QmvEnds {
+                norm: None,
+                bias: None,
+                scale: None,
+                residual: false,
+            },
         ..
     } = g
     else {
@@ -1006,29 +1021,101 @@ fn route_small_m(
         .collect())
 }
 
-/// A GDN layer's commands by the step they serve — the runtime-gate twin pattern
-/// `route_small_m` runs for the small-M GEMM. A decode step (every sequence one token) runs the
-/// one-command decode (`gdn_decode`) where `lower_one` emitted one ahead of the conv, scan and
-/// norm: it under `OnlyIfDecodeStep`, they under `UnlessDecodeStep`. On the steps they serve, a
-/// geometry the block-staged pipelined scan covers (`gdn_scan_pipelined`: head_k 128 — 8 lanes
-/// own 16 state channels each in four float4 granules — and head_v a multiple of its
-/// [`GDN_PIPE_ROWS`]-row threadgroups) runs it in place of the simd scan, with the SAME bindings
-/// and its own dispatch (grid (value_dim/[`GDN_PIPE_ROWS`], 1, 1) scaled by num_seqs on Z,
-/// threads (128,1,1)); with no decode command, the simd scan stays
-/// under `OnlyIfDecodeStep` as its twin. The norm that follows reads the scan's `o` scratch, so
-/// the scan sits between the two.
-fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
+/// What a bake knows of every step it runs, as a GDN layer's commands ask it: a one-row
+/// bucket's every step is a decode step, and a model without drafts has only plain GDN steps
+/// (`GdnStep::is_plain`) — only a verify step records, and only the step after one replays.
+#[derive(Clone, Copy)]
+struct GdnStepsKnown {
+    decode: Option<bool>,
+    plain: Option<bool>,
+}
+
+impl GdnStepsKnown {
+    fn at(p: &MetalModelConsts, bucket_m: u32) -> Self {
+        Self {
+            decode: (bucket_m == 1).then_some(true),
+            plain: (p.spec_drafts == 0).then_some(true),
+        }
+    }
+
+    /// How a command that runs on the steps `runs(decode, plain)` accepts runs at this bake: on
+    /// every step, under the gate on what the bake does not know, or not at all.
+    fn run(self, runs: impl Fn(bool, bool) -> bool) -> GuardRun {
+        use crate::tape::lowered::RuntimeGate::{
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessPlainGdn,
+        };
+        let both = [false, true];
+        let ds = self.decode.as_ref().map_or(&both[..], std::slice::from_ref);
+        let qs = self.plain.as_ref().map_or(&both[..], std::slice::from_ref);
+        let on: Vec<(bool, bool)> = (ds.iter().flat_map(|&d| qs.iter().map(move |&q| (d, q))))
+            .filter(|&(d, q)| runs(d, q))
+            .collect();
+        let decode = |d: bool| {
+            if d {
+                OnlyIfDecodeStep
+            } else {
+                UnlessDecodeStep
+            }
+        };
+        let plain = |q: bool| if q { OnlyIfPlainGdn } else { UnlessPlainGdn };
+        let only_d = |d: bool| qs.iter().all(|&q| runs(d, q) != runs(!d, q));
+        let only_q = |q: bool| ds.iter().all(|&d| runs(d, q) != runs(d, !q));
+        GuardRun::Gated(match on.as_slice() {
+            [] => return GuardRun::Dropped,
+            all if all.len() == ds.len() * qs.len() => None,
+            [(d, _), ..] if ds.len() == 2 && on.iter().all(|c| c.0 == *d) && only_d(*d) => {
+                Some(decode(*d))
+            }
+            [(_, q), ..] if qs.len() == 2 && on.iter().all(|c| c.1 == *q) && only_q(*q) => {
+                Some(plain(*q))
+            }
+            [(d, q)] => Some(All(baked(vec![decode(*d), plain(*q)]))),
+            three if three.len() == 3 => {
+                let (d, q) = (ds.iter().flat_map(|&d| qs.iter().map(move |&q| (d, q))))
+                    .find(|&(d, q)| !runs(d, q))
+                    .expect("one step of four is off");
+                Some(Any(baked(vec![decode(!d), plain(!q)])))
+            }
+            pairs => Some(Any(baked(
+                pairs
+                    .iter()
+                    .map(|&(d, q)| All(baked(vec![decode(d), plain(q)])))
+                    .collect(),
+            ))),
+        })
+    }
+}
+
+/// A GDN layer's commands by the steps they serve — the runtime-gate twin pattern
+/// `route_small_m` runs for the small-M GEMM — each command gated on what its kernel can run
+/// (`GdnStepsKnown::run`):
+/// - the one-command decode (`gdn_decode`, where `lower_one` emitted one ahead of the conv, scan
+///   and norm): a decode step (every sequence one token) whose GDN steps are all plain;
+/// - on a geometry the block-staged pipelined scan covers (`gdn_scan_pipelined`: head_k 128 — 8
+///   lanes own 16 state channels each in four float4 granules — and head_v a multiple of its
+///   [`GDN_PIPE_ROWS`]-row threadgroups), it: any other plain step, with the SAME bindings as the
+///   simd scan and its own dispatch (grid (value_dim/[`GDN_PIPE_ROWS`], 1, 1) scaled by num_seqs
+///   on Z, threads (128,1,1));
+/// - the simd scan: what those two leave — a step that replays or records among them, which only
+///   the conv and the simd scan can run;
+/// - the conv and the norm: every step the decode command leaves.
+///
+/// A model without drafts thus runs main's split: decode steps the decode command (a one-row
+/// bucket only it), the rest the conv, scan and norm. The norm that follows reads the scan's `o`
+/// scratch, so the scan sits between the two.
+fn route_gdn(
+    p: &MetalModelConsts,
+    step: &MetalStep,
+    cmds: Vec<GatedCommand>,
+    bucket_m: u32,
+) -> Vec<GatedCommand> {
     use crate::tape::ids::BucketM;
-    use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
     use crate::tape::lowered::{MScaleAxis, MScaling};
     if !matches!(step, MetalStep::GatedDeltaNet(..)) {
         return cmds;
     }
+    let known = GdnStepsKnown::at(p, bucket_m);
     let decodes = cmds.iter().any(|c| c.command.library == "gdn_decode");
-    // A one-row bucket's every step is a decode step: the decode command alone.
-    if decodes && cmds.len() == 1 {
-        return cmds;
-    }
     let hv = p.gdn_head_v_dim;
     let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
@@ -1040,7 +1127,7 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
             scan.constants
                 .iter()
                 .copied()
-                .chain([ConstantValue::uint(5, GDN_PIPE_TB)])
+                .chain([ConstantValue::uint(6, GDN_PIPE_TB)])
                 .collect(),
         ),
         dispatch: DispatchShape {
@@ -1055,20 +1142,22 @@ fn route_gdn(p: &MetalModelConsts, step: &MetalStep, cmds: Vec<GatedCommand>) ->
         bindings: scan.bindings,
         gemm_dims: None,
     };
-    let mut out = Vec::with_capacity(cmds.len() + 1);
+    let decoded = |d: bool, q: bool| decodes && d && q;
+    let piped = |d: bool, q: bool| pipelines && !d && q;
+    let gated = |command: LoweredCommand, runs: &dyn Fn(bool, bool) -> bool| match known.run(runs) {
+        GuardRun::Gated(gate) => Some(GatedCommand { command, gate }),
+        GuardRun::Dropped => None,
+    };
+    let mut out = Vec::with_capacity(cmds.len() + 2);
     for GatedCommand { command, .. } in cmds {
-        let scan = pipelines && command.library == "gdn_scan_varlen" && command.function == simd;
-        match (decodes, scan) {
-            (true, _) if command.library == "gdn_decode" => {
-                out.push(GatedCommand::gated(command, OnlyIfDecodeStep));
-            }
-            (true, true) => out.push(GatedCommand::gated(pipelined(&command), UnlessDecodeStep)),
-            (true, false) => out.push(GatedCommand::gated(command, UnlessDecodeStep)),
-            (false, true) => {
-                let twin = GatedCommand::gated(pipelined(&command), UnlessDecodeStep);
-                out.extend([GatedCommand::gated(command, OnlyIfDecodeStep), twin]);
-            }
-            (false, false) => out.push(GatedCommand::ungated(command)),
+        if command.library == "gdn_decode" {
+            out.extend(gated(command, &decoded));
+        } else if pipelines && command.library == "gdn_scan_varlen" && command.function == simd {
+            let twin = pipelined(&command);
+            out.extend(gated(command, &|d, q| !decoded(d, q) && !piped(d, q)));
+            out.extend(gated(twin, &piped));
+        } else {
+            out.extend(gated(command, &|d, q| !decoded(d, q)));
         }
     }
     out
@@ -1087,15 +1176,18 @@ const GQA_HEADS: u32 = 8;
 /// simdgroups.
 const COMBINE_THREADS: u32 = 4 * 32;
 
-/// A one-row bucket's TurboQuant decode attention (the codec's packed twin, or it running its KV
-/// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
+/// A one-row or verify-sized bucket's ([`METAL_VERIFY_ROWS`](crate::op_abi::METAL_VERIFY_ROWS))
+/// TurboQuant decode attention (the codec's packed twin, or at one row it running its KV writer)
+/// whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, 8 query heads a KV head,
 /// head_dim a multiple of 128 up to 512, KV blocks of whole 8-key blocks, no projection bias, a
 /// rotary pair's partner a whole lane stride away — serves each KV head's query heads together:
 /// its keys decode once for all 8, where `attention_via_cache_v2` decodes them once per head
 /// group. Its keys spread over the threadgroups the rung's KV cap calls for (`ATTN_SPLITS`,
 /// [`ATTN_SPLIT_KEYS`] of the cap each, at most [`ATTN_MAX_SPLITS`]), each storing its heads'
-/// partials at the op scratch's front, `[num_q_heads, splits, 2 + head_dim]` floats, and a
-/// combine merges them into the output.
+/// partials at the op scratch's front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a
+/// combine merges them into the output. A verify-sized bucket's rows are tokens, each reading its
+/// sequence's keys up to its own, where the per-head-group kernel walks the whole context with a
+/// threadgroup per row and head group.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -1134,12 +1226,17 @@ fn decode_attention_per_kv_head(
         && hd.is_multiple_of(128)
         && hd <= 512
         && p.global_block_size.is_multiple_of(8);
-    if at.bucket_m != 1 || !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
+    let rows = at.bucket_m;
+    if rows > crate::op_abi::METAL_VERIFY_ROWS
+        || !full
+        || !geometry
+        || !cmds.iter().any(|c| takes(&c.command))
+    {
         return cmds;
     }
     let keys = at.block_cap.saturating_mul(p.global_block_size);
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
-    let partials = p.num_q_heads * splits * (2 + hd) * 4;
+    let partials = rows * p.num_q_heads * splits * (2 + hd) * 4;
     *moe_scratch_bytes = (*moe_scratch_bytes).max(partials);
     let partials = scratch_at(16, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
@@ -1411,7 +1508,7 @@ fn lower(
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
-                let cmds = route_gdn(p, step, cmds);
+                let cmds = route_gdn(p, step, cmds, bucket_m);
                 let cmds = decode_attention_per_kv_head(p, step, cmds, at, &mut moe_scratch_bytes);
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = sampled_soft_cap(p, step, cmds, bucket_m);
@@ -1690,6 +1787,38 @@ fn lower_one(
     // offsets; the read keeps it from reading as unused here.
     let _ = &moe_scratch_bytes;
     use MetalStep as I;
+
+    // A verify-sized bucket's paged attention is the decode kernel's, one query row per token: its
+    // few rows each read the whole context, which the paged prefill kernel walks with a handful of
+    // threadgroups where the decode kernel splits the keys.
+    if bucket_m <= crate::op_abi::METAL_VERIFY_ROWS {
+        let decode = match inst {
+            I::AttentionPrefillPaged(q, out, layer, pairing) => {
+                Some(I::AttentionViaCache(*q, *out, *layer, *pairing))
+            }
+            I::SlidingAttentionPrefillPaged(q, out, layer, pairing) => {
+                Some(I::SlidingAttentionViaCache(*q, *out, *layer, *pairing))
+            }
+            _ => None,
+        };
+        if let Some(decode) = decode {
+            return lower_one(
+                p,
+                chunked,
+                &decode,
+                w,
+                bucket_m,
+                layer_offset,
+                splitk_scratch_bytes,
+                moe_scratch_bytes,
+                roped_k_scratch_bytes,
+                attn_unfused_scratch_bytes,
+                block_cap,
+                profile,
+                m_divisor,
+            );
+        }
+    }
 
     let cmd = match inst {
         // ── A one-row decode attention running its KV writer ──
@@ -3455,6 +3584,7 @@ fn lower_one(
                     // gpt-oss sinks: the const mirrors the binding's presence
                     // (the 0/1 master switch the shader gates its column on).
                     sinks: w.sinks().map(|_| 1),
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3475,6 +3605,7 @@ fn lower_one(
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
                     sinks: w.sinks(),
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -4350,6 +4481,7 @@ fn lower_one(
                     pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, p.head_dim),
                     // gpt-oss sinks: the const mirrors the binding's presence.
                     sinks: w.sinks().map(|_| 1),
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -4367,6 +4499,7 @@ fn lower_one(
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
                     sinks: w.sinks(),
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -4693,6 +4826,7 @@ fn lower_one(
                     ConstantValue::uint(2, hk),
                     ConstantValue::uint(3, hv),
                     ConstantValue::float(4, scale),
+                    ConstantValue::uint(5, p.spec_drafts),
                 ]
             };
             // head_k a multiple of 32: lanes split it (`gdn_scan_simd`, `gdn_decode`).
@@ -4701,8 +4835,9 @@ fn lower_one(
             // A decode step's token — every sequence's one — is one command, not three a
             // barrier apart (`gdn_decode`): a threadgroup of 1024 per (sequence, key head) runs its
             // conv channels, its value heads' scan and their norm. Its shader's static asserts are
-            // these bounds. `route_gdn` runs it on decode steps and the commands below on the
-            // rest; a one-row bucket's every step is a decode step, so there it runs alone.
+            // these bounds. `route_gdn` runs it on plain decode steps and the commands below on
+            // the rest; where it runs every step — a one-row bucket of a model without drafts —
+            // it runs alone.
             let per_key = nv / nk.max(1);
             let decode = (simd_scan
                 && nv.is_multiple_of(nk)
@@ -4714,8 +4849,8 @@ fn lower_one(
                 .then(|| {
                     let mut constants = scan_constants();
                     constants.extend([
-                        ConstantValue::uint(5, kernel),
-                        ConstantValue::float(6, p.rms_norm_eps),
+                        ConstantValue::uint(6, kernel),
+                        ConstantValue::float(7, p.rms_norm_eps),
                     ]);
                     let bindings = vec![
                         arena(out_slot, 0),
@@ -4751,8 +4886,8 @@ fn lower_one(
                         gemm_dims: None,
                     }
                 });
-            if bucket_m == 1
-                && let Some(decode) = decode
+            if let Some(decode) = decode
+                && GdnStepsKnown::at(p, bucket_m).run(|d, q| d && q) == GuardRun::Gated(None)
             {
                 return Ok(vec![decode]);
             }
@@ -4772,6 +4907,7 @@ fn lower_one(
                 constants: baked(vec![
                     ConstantValue::uint(0, conv_dim),
                     ConstantValue::uint(1, kernel),
+                    ConstantValue::uint(2, p.spec_drafts),
                 ]),
                 dispatch: {
                     let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
@@ -5192,24 +5328,20 @@ fn lower_one(
             }
         }
 
-        // ── Vision pixels materialization (Qwen3.5-VL ViT prelude) ──
+        // ── Row concatenation: out[t] = a[t] ++ b[t] ───────────────
         //
-        // Faithful to the cuda `Instruction::LoadPixels` eval (a D2D
-        // copy of `ForwardCtx::pixels` into a fresh tile). Here the
-        // pixels live in the `Pixels` runtime extern (overwritten per
-        // forward); `copy_rows` blits them into the arena `out_slot` the
-        // patch_embed GEMM reads. `n` = bucket-level pixel count
-        // `eff_m * VISION_IN_FEATURES` (LoadPixels is the prelude op, so
-        // eff_m == bucket_m); m_scaling shrinks the grid to live
-        // num_tokens and the kernel's `gid >= n` guard caps the tail.
-        I::LoadPixels(Slot(out_slot)) => {
-            let n_elems = eff_m * p.vision_in_features as u32;
+        // An MTP head's input fusion. One thread per output element over `eff_m * 2 * width`;
+        // m_scaling shrinks the grid to live num_tokens and the kernel's `gid >= n` guard caps
+        // the tail.
+        I::Concat(Slot(a_slot), Slot(b_slot), Slot(out_slot), width) => {
+            let n_elems = eff_m * 2 * width.get();
             LoweredCommand {
-                kernel: KernelId::VisionLoadPixels,
+                kernel: KernelId::ConcatRows,
                 library: "elementwise",
-                function: copy_rows_static_name(p.metal_dtype),
-                constants: super::kernel_constants::CopyRowsConstants {
+                function: concat_rows_static_name(p.metal_dtype),
+                constants: super::kernel_constants::ConcatRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
+                    width: *width,
                 }
                 .into_baked(),
                 dispatch: {
@@ -5226,30 +5358,39 @@ fn lower_one(
                         slot: *out_slot,
                         binding_index: 0,
                     },
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::Pixels,
+                    Binding::ArenaSlot {
+                        slot: *a_slot,
                         binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *b_slot,
+                        binding_index: 2,
                     },
                 ]),
                 gemm_dims: None,
             }
         }
 
-        // ── Vision pos_embeds materialization (Qwen3.5-VL ViT) ──────
+        // ── Host-staged rows materialization ──────────────────────
         //
-        // The exact sibling of the `LoadPixels` arm above: `copy_rows`
-        // blits the host-interpolated learned positional embedding from
-        // the `VisionPosEmbeds` runtime extern into the arena `out_slot`
-        // that the downstream `add(pos_embeds, hidden_states)` consumes.
-        // `n` = `eff_m * VISION_Q_SIZE` — VISION_Q_SIZE (=
-        // vision_num_heads * vision_head_dim) is the residual-stream
-        // width (= vision_embed_dim), matching the patch_embed output
-        // pos_embeds is added to. m_scaling shrinks the grid to live
-        // num_tokens; the kernel's `gid >= n` guard caps the tail.
-        I::LoadPosEmbeds(Slot(out_slot)) => {
-            let n_elems = eff_m * p.vision_q_size as u32;
+        // Faithful to the cuda `Instruction::LoadRows` eval (a D2D copy of the source's
+        // `ForwardCtx` view into a fresh tile). Here the rows live in the source's runtime
+        // extern (overwritten per forward); `copy_rows` blits them into the arena `out_slot`
+        // the first consumer reads. `n` = `eff_m * width` (LoadRows is a prelude op, so
+        // eff_m == bucket_m); m_scaling shrinks the grid to live num_tokens and the kernel's
+        // `gid >= n` guard caps the tail.
+        I::LoadRows(Slot(out_slot), source) => {
+            use scratchy_ir::RowsExtern;
+            let (width, kind) = match source {
+                RowsExtern::Pixels => (p.vision_in_features, RuntimeBindingKind::Pixels),
+                // VISION_Q_SIZE (= vision_num_heads * vision_head_dim) is the residual-stream
+                // width the interpolated positional embedding is added to.
+                RowsExtern::PosEmbeds => (p.vision_q_size, RuntimeBindingKind::VisionPosEmbeds),
+                RowsExtern::TargetHidden => (p.hidden_size, RuntimeBindingKind::TargetHidden),
+            };
+            let n_elems = eff_m * width as u32;
             LoweredCommand {
-                kernel: KernelId::VisionLoadPixels,
+                kernel: KernelId::LoadRows,
                 library: "elementwise",
                 function: copy_rows_static_name(p.metal_dtype),
                 constants: super::kernel_constants::CopyRowsConstants {
@@ -5271,7 +5412,7 @@ fn lower_one(
                         binding_index: 0,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::VisionPosEmbeds,
+                        kind,
                         binding_index: 1,
                     },
                 ]),
@@ -5978,12 +6119,21 @@ fn vision_varlen_attn_static_name(dtype: MetalDtype) -> &'static str {
     }
 }
 
-/// `elementwise.metal` `copy_rows` host-name picker (LoadPixels blit).
+/// `elementwise.metal` `copy_rows` host-name picker (LoadRows blit).
 fn copy_rows_static_name(dtype: MetalDtype) -> &'static str {
     match dtype {
         MetalDtype::F16 => "copy_rows_f16",
         MetalDtype::Bf16 => "copy_rows_bf16",
         MetalDtype::Int4 => panic!("copy_rows: Int4 unsupported (pixels are bf16/f16)"),
+    }
+}
+
+/// `elementwise.metal` `concat_rows` host-name picker (row concatenation).
+fn concat_rows_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "concat_rows_f16",
+        MetalDtype::Bf16 => "concat_rows_bf16",
+        MetalDtype::Int4 => panic!("concat_rows: Int4 unsupported (activations are bf16/f16)"),
     }
 }
 
@@ -6129,23 +6279,24 @@ fn fused_add_rmsnorm_kernel_static_name(
     }
 }
 
-/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype. `rows`: the
-/// multi-row variant (`gemv_normed_rows_*`), one threadgroup per (row block, token).
+/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype. A one-row
+/// bucket's is the one-row gemv; a multi-row bucket's the per-row variant (`gemv_normed_rows_*`),
+/// one threadgroup per (row block, token).
 fn normed_gemv_kernel_static_name(
     p: &MetalModelConsts,
     scale_dtype: ScaleDtype,
-    rows: bool,
+    bucket_m: super::ids::BucketM,
 ) -> &'static str {
     use ScaleDtype as S;
-    match (p.metal_dtype, scale_dtype, rows) {
-        (MetalDtype::F16, S::F16, false) => "gemv_normed_f16_s_f16",
-        (MetalDtype::Bf16, S::F16, false) => "gemv_normed_bf16_s_f16",
-        (MetalDtype::F16, S::Bf16, false) => "gemv_normed_f16_s_bf16",
-        (MetalDtype::Bf16, S::Bf16, false) => "gemv_normed_bf16_s_bf16",
-        (MetalDtype::F16, S::F16, true) => "gemv_normed_rows_f16_s_f16",
-        (MetalDtype::Bf16, S::F16, true) => "gemv_normed_rows_bf16_s_f16",
-        (MetalDtype::F16, S::Bf16, true) => "gemv_normed_rows_f16_s_bf16",
-        (MetalDtype::Bf16, S::Bf16, true) => "gemv_normed_rows_bf16_s_bf16",
+    match (p.metal_dtype, scale_dtype, bucket_m.0 == 1) {
+        (MetalDtype::F16, S::F16, true) => "gemv_normed_f16_s_f16",
+        (MetalDtype::Bf16, S::F16, true) => "gemv_normed_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16, true) => "gemv_normed_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16, true) => "gemv_normed_bf16_s_bf16",
+        (MetalDtype::F16, S::F16, false) => "gemv_normed_rows_f16_s_f16",
+        (MetalDtype::Bf16, S::F16, false) => "gemv_normed_rows_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16, false) => "gemv_normed_rows_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16, false) => "gemv_normed_rows_bf16_s_bf16",
         (dt, sdt, _) => {
             unreachable!("gemv_normed: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
         }
@@ -6774,8 +6925,9 @@ fn lower_moe_step(
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
     use super::kernel_constants::{
         AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
-        AffineQmvConstants, ArgsortConstants, GatherRows, MoeRouteConstants, MoeTopKConstants,
-        RoutedConstants, ScoresRow, SoftmaxConstants,
+        AffineQmvConstants, ArgsortConstants, GatedGatherQmvConstants, GatherRows,
+        MoeRouteConstants, MoeTopKConstants, RoutedConstants, ScoresRow, SharedExperts,
+        SoftmaxConstants,
     };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
@@ -6933,7 +7085,11 @@ fn lower_moe_step(
             vec![LoweredCommand {
                 kernel: KernelId::NormedGemv,
                 library: "gemm",
-                function: normed_gemv_kernel_static_name(p, scale_dtype, one_row),
+                function: normed_gemv_kernel_static_name(
+                    p,
+                    scale_dtype,
+                    super::ids::BucketM(bucket_m),
+                ),
                 constants: super::kernel_constants::NormedGemvConstants {
                     n: super::ids::NDim(e),
                     k: super::ids::KDim(hidden),
@@ -7413,19 +7569,27 @@ fn lower_moe_step(
             bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
             bindings.push(s.at(9, R::ExpertUp));
             bindings.extend(gain);
-            // Full static grid when sorted — a short step's live pairs sit past the m-scaled
-            // edge, on rows the init sentinel-filled.
+            // Pairs along X. Gathered: the live pairs exactly — a verify bucket runs an expert's
+            // pairs in its first pair's threadgroup, scanning the live ones. Sorted: the full
+            // static grid — a short step's live pairs sit past the m-scaled edge, on rows the init
+            // sentinel-filled.
             let scaling = match s.grouping {
-                MoeGrouping::Gathered => ms(A::Z),
+                MoeGrouping::Gathered => ms(A::X),
                 MoeGrouping::Sorted | MoeGrouping::Grouped => None,
             };
-            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
+            let shape = grid((pairs, inter.div_ceil(8), 1), (32, 4, 1), scaling);
             let gather = AffineGatherQmvConstants {
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let mut constants: Vec<ConstantValue> =
-                AffineGatedQmvConstants { qmv: gather, act }.into();
+            // A sorted bake's same-expert pairs are adjacent already, their repeat reads cache hits.
+            // A routed command's pairs know their own token's picks only, not the pairs before.
+            let shared = match (s.grouping, routed.is_some()) {
+                (MoeGrouping::Gathered, false) => SharedExperts::for_bucket(bucket_m),
+                _ => SharedExperts::Apart,
+            };
+            let qmv = GatedGatherQmvConstants { gather, shared };
+            let mut constants: Vec<ConstantValue> = AffineGatedQmvConstants { qmv, act }.into();
             constants.extend(norm);
             if let Some(program) = routed {
                 bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
@@ -7492,7 +7656,8 @@ fn lower_moe_step(
             if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {
                 bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
             }
-            let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
+            // Tokens fastest, as the gate/up's pairs.
+            let shape = grid((bucket_m, hidden.div_ceil(4), 1), (32, k, 1), ms(A::X));
             let mut constants: Vec<ConstantValue> = AffineCombineQmvConstants {
                 qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
                 top_k: b.top_k,
@@ -7771,7 +7936,12 @@ mod tests {
             S::SlidingAttentionPrefillPaged(q, o, l, p) => (false, q, o, l, p, SlidingWindow),
             other => panic!("a coded attention: {other:?}"),
         };
-        let gated = |step, guard| StepRow::Step(step, METAL_GUARD_GATES.gate(guard));
+        let gated = |step, guard| match METAL_GUARD_GATES.gate(guard) {
+            crate::op_abi::GuardRun::Gated(gate) => StepRow::Step(step, gate),
+            crate::op_abi::GuardRun::Dropped => {
+                panic!("{guard:?}: the default guards drop nothing")
+            }
+        };
         let codec = METAL_KV_CODEC;
         assert_eq!(codec.after_writer.len(), 2, "the writer's K and V encodes");
         let packed = KvWrite::PoolAndPacked;
@@ -7888,18 +8058,23 @@ mod tests {
     /// block-staged pipelined kernel where that covers the geometry too, else the simd mapping;
     /// a one-row bucket, all decode steps, runs the decode command alone. Without the decode
     /// command a pipelined geometry twins its scan (simd on decode steps, pipelined on the rest)
-    /// between the ungated conv and norm, and any other keeps the ungated chain. Pure-CPU
-    /// lowering checks.
+    /// between the ungated conv and norm, and any other keeps the ungated chain. A drafting
+    /// model's steps may replay or record, which only the conv and the simd scan run: the decode
+    /// command and the pipelined scan take the plain steps, the simd scan every other, at every
+    /// bucket — a one-row bucket's too. Pure-CPU lowering checks.
     #[test]
     fn gdn_lowers_by_the_step_it_serves() {
-        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
-        let lowered = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m| {
+        use crate::tape::lowered::RuntimeGate::{
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessPlainGdn,
+        };
+        let drafting = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m, spec_drafts| {
             let p = MetalModelConsts {
                 gdn_num_k_heads: nk,
                 gdn_num_v_heads: nv,
                 gdn_head_k_dim: hk,
                 gdn_head_v_dim: hv,
                 gdn_conv_dim: 2 * (nk * hk) as usize + (nv * hv) as usize,
+                spec_drafts,
                 ..tp()
             };
             let step =
@@ -7910,6 +8085,7 @@ mod tests {
                 .cloned()
                 .collect::<Vec<GatedCommand>>()
         };
+        let lowered = |geometry, bucket_m| drafting(geometry, bucket_m, 0);
         let shape = |c: &[GatedCommand]| -> Vec<(&str, Option<_>)> {
             c.iter().map(|c| (c.command.function, c.gate)).collect()
         };
@@ -7959,6 +8135,59 @@ mod tests {
         let want = [(conv, None), (simd, None), (norm, None)];
         assert_eq!(shape(&lowered((2, 4, 128, 48), 64)), want);
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
+
+        // A drafting model.
+        let plain_decode = Some(All(&[OnlyIfDecodeStep, OnlyIfPlainGdn]));
+        let plain_prefill = Some(All(&[UnlessDecodeStep, OnlyIfPlainGdn]));
+        let not_plain_decode = Some(Any(&[UnlessDecodeStep, UnlessPlainGdn]));
+        let (plain, replays) = (Some(OnlyIfPlainGdn), Some(UnlessPlainGdn));
+        let q27 = drafting((16, 48, 128, 128), 64, 2);
+        let want = [
+            (decode, plain_decode),
+            (conv, not_plain_decode),
+            (simd, replays),
+            (pipe, plain_prefill),
+            (norm, not_plain_decode),
+        ];
+        assert_eq!(shape(&q27), want);
+        // The kernels share the scan's constants, the drafts (their slot stride) at 5; the decode
+        // command's conv width and eps follow at 6 and 7, the pipelined scan's block at 6.
+        let constants = |i: usize| q27[i].command.constants;
+        assert!(constants(2).contains(&ConstantValue::uint(5, 2)));
+        assert_eq!(constants(0)[..6], constants(2)[..]);
+        assert_eq!(
+            constants(0)[6],
+            ConstantValue::uint(6, tp().gdn_conv_kernel)
+        );
+        assert_eq!(
+            constants(3),
+            [constants(2), &[ConstantValue::uint(6, GDN_PIPE_TB)][..]].concat()
+        );
+        assert_eq!(q27[2].command.bindings, q27[3].command.bindings);
+        let want = [
+            (decode, plain),
+            (conv, replays),
+            (simd, replays),
+            (norm, replays),
+        ];
+        assert_eq!(shape(&drafting((16, 48, 128, 128), 1, 2)), want);
+        let want = [
+            (decode, plain_decode),
+            (conv, not_plain_decode),
+            (simd, not_plain_decode),
+            (norm, not_plain_decode),
+        ];
+        assert_eq!(shape(&drafting((2, 6, 64, 128), 64, 2)), want);
+        let want = [
+            (conv, None),
+            (simd, Some(Any(&[OnlyIfDecodeStep, UnlessPlainGdn]))),
+            (pipe, plain_prefill),
+            (norm, None),
+        ];
+        assert_eq!(shape(&drafting((1, 8, 128, 128), 64, 2)), want);
+        let want = [(conv, None), (simd, None), (norm, None)];
+        assert_eq!(shape(&drafting((2, 4, 128, 48), 64, 2)), want);
+        assert_eq!(shape(&drafting((2, 4, 64, 48), 64, 2)), want);
     }
 
     /// A dense model's tape carries no TurboQuant command and gates nothing on
@@ -8270,8 +8499,8 @@ mod tests {
     /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
     /// front, its constants less the TurboQuant heads and plus the rung's split count, a
     /// threadgroup per (KV head, split) of head_dim threads — then a combine of one simdgroup a
-    /// query head. A many-row bucket's decode, and a geometry it cannot take, keep the
-    /// per-head-group kernel.
+    /// query head. A verify-sized bucket's takes it a token a threadgroup row; a bucket past the
+    /// verify rows, and a geometry it cannot take, keep the per-head-group kernel.
     #[test]
     fn turboquant_decode_serves_each_kv_heads_query_heads_together() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
@@ -8360,7 +8589,22 @@ mod tests {
                 .map(|c| c.command.kernel)
                 .collect::<Vec<_>>()
         };
-        assert!(!kernels(&lower_tq(&p, rows(), 2)).contains(&KernelId::AttentionDecodeGqaTq));
+        // A verify-sized bucket: a threadgroup row a token (`ATTN_ROW_QUERIES`, its sequence's
+        // start in `cu_seqlens_q`), partials for every row.
+        let verify = lower_tq(&p, rows(), 4);
+        assert_eq!(gated_steps(&verify), gated_steps(&tape));
+        let (gqa, combine) = (&verify.commands[2].command, &verify.commands[3].command);
+        assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
+        assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
+        assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
+        assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
+        assert_eq!(
+            verify.moe_scratch_bytes,
+            4 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+        );
+        let past = lower_tq(&p, rows(), 2 * crate::op_abi::METAL_VERIFY_ROWS);
+        assert!(!kernels(&past).contains(&KernelId::AttentionDecodeGqaTq));
+        assert!(kernels(&past).contains(&KernelId::AttentionViaCacheTq));
         let narrow = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
         assert!(kernels(&narrow).contains(&KernelId::AttentionViaCacheTq));
 
@@ -8654,6 +8898,38 @@ mod tests {
                 "bucket {bucket_m}: no small-M twin"
             );
         }
+        // A matvec whose input's norm and residual add were folded into it has no twin to take
+        // a 4–16-token step: the twin's bare product would skip both. Its matvec runs on every
+        // step, ends and all.
+        let ends = QmvEnds {
+            norm: Some(crate::tape::step::RowNorm {
+                layer: LayerId(0),
+                eps: crate::tape::step::Eps(1e-6),
+                offset: crate::tape::step::GainOffset(0.0),
+            }),
+            residual: true,
+            ..QmvEnds::default()
+        };
+        for bucket_m in [4, 8] {
+            let folded = MetalStep::AffineQmm(AffineMatmul {
+                ends,
+                ..(match gemm(4) {
+                    MetalStep::AffineQmm(g) => g,
+                    _ => unreachable!("gemm is an AffineQmm"),
+                })
+            });
+            let tape = lower_at(folded, bucket_m, m5);
+            assert_eq!(
+                gated_steps(&tape),
+                [(KernelId::AffineQmvWide, None)],
+                "bucket {bucket_m}"
+            );
+            let constants = tape.commands[0].command.constants;
+            assert!(
+                constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
+                "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
+            );
+        }
     }
 
     /// Llama-1B's `q_proj` shape (N=K=2048, gs=64, 4-bit, qmv batch limit 18), slot 7 into slot 11
@@ -8692,9 +8968,10 @@ mod tests {
     }
 
     /// Where the matmul lowers to one qmm_t command (bucket 512: Standard), the rows slice: the
-    /// gather, the matmul's qmv at the sampled rows and the scatter run on a step with rows to
-    /// drop and no speculative tokens; the plain matmul over every row on a speculative step.
-    /// Each row's flag rides its command.
+    /// gather, the matmul's qmv at the sampled rows and the scatter — of the logits, then of the
+    /// gathered activation back — run on a step with rows to drop and no speculative tokens; the
+    /// plain matmul over every row on a speculative step. Each row's flag rides its first
+    /// command.
     #[test]
     fn sampled_rows_slice_where_the_matmul_is_one_qmm_t() {
         use crate::tape::lowered::Fence as F;
@@ -8709,20 +8986,22 @@ mod tests {
                 (KernelId::GatherLastToken, Some(OnlyIfNoSpec)),
                 (KernelId::AffineQmvFast, Some(OnlyIfNoSpec)),
                 (KernelId::ScatterFirstToLastRow, Some(OnlyIfNoSpec)),
+                (KernelId::ScatterFirstToLastRow, Some(OnlyIfNoSpec)),
                 (KernelId::AffineQmmT, Some(OnlyIfSpec)),
             ]
         );
         assert_eq!(
             tape.barrier_before,
-            [F::Coherent, F::None, F::Coherent, F::None]
+            [F::Coherent, F::None, F::Coherent, F::Coherent, F::None]
         );
         // The all-rows command IS the plain matmul's.
         let plain = plain_q_proj(at);
-        assert!(plain.commands.len() == 1 && tape.commands[3].command == plain.commands[0].command);
-        // The gather over the matmul's input, `k` wide; the scatter over its output, `n` wide; one
-        // thread per column, walking the sequences in order (the rows move in place).
-        let [gather, qmv, scatter] = [0, 1, 2].map(|i| tape.commands[i].command);
-        for (c, slot, width) in [(gather, 7, 2048), (scatter, 11, 2048)] {
+        assert!(plain.commands.len() == 1 && tape.commands[4].command == plain.commands[0].command);
+        // The gather over the matmul's input, `k` wide; the scatter over its output, `n` wide, and
+        // back over its input; one thread per column, walking the sequences in order (the rows
+        // swap in place).
+        let [gather, qmv, scatter, restore] = [0, 1, 2, 3].map(|i| tape.commands[i].command);
+        for (c, slot, width) in [(gather, 7, 2048), (scatter, 11, 2048), (restore, 7, 2048)] {
             assert!(
                 matches!(c.bindings[0], Binding::ArenaSlot { slot: s, binding_index: 0 } if s == slot)
             );
@@ -9422,12 +9701,22 @@ mod tests {
             (stage, vec![bias(1, 10)], vec![v_bias]),
             2,
         ));
-        want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
+        // A multi-row bucket's twin reads each row's sequence from `cu_seqlens_q` (one query row
+        // per token), bound before the codec's operands.
+        let rows = Binding::Runtime {
+            kind: RuntimeBindingKind::CuSeqlensQ,
+            binding_index: 23,
+        };
+        want.push((
+            twin,
+            vec![rows, bias(0, 14), bias(1, 15)],
+            vec![k_bias, v_bias],
+        ));
         assert_eq!(offsets(qwen2, prefill.clone(), 64), want);
 
         let mut want = vec![(writer, vec![], modes(0, 0))];
         want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
-        want.push((twin, vec![], vec![]));
+        want.push((twin, vec![rows], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
     }
 
@@ -10127,5 +10416,44 @@ mod tests {
             sorted_rows(8).0 == MoeGrouping::Sorted,
             "bucket 8 is the sorted bake"
         );
+    }
+
+    /// A router with its block's input norm folded in writes every row's logits: one row runs the
+    /// one-row normed gemv, a multi-row bucket the per-row kernel, a threadgroup row per token.
+    #[test]
+    fn a_normed_router_writes_every_row() {
+        use crate::tape::step::{Eps, GainOffset, MoeRows, MoeStep, RowNorm};
+        let block = qwen_moe_block(256);
+        let p = tp();
+        let norm = RowNorm {
+            layer: LayerId(0),
+            eps: Eps(1e-6),
+            offset: GainOffset(0.0),
+        };
+        let step = MoeStep::RouterLogits(MoeRows::Normed(Slot(1), norm), LayerId(0), None);
+        for bucket_m in [1, 2, 8, 64] {
+            let at = MoeBake {
+                bucket_m,
+                layer_offset: 0,
+                is_nax: false,
+                f16_compute: false,
+                codes: super::super::kernel_constants::AffineCodesTarget::of(None),
+            };
+            let router = lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("lowers");
+            let [c] = router.as_slice() else {
+                panic!(
+                    "bucket {bucket_m}: one router command, got {}",
+                    router.len()
+                );
+            };
+            assert_eq!(c.kernel, KernelId::NormedGemv, "bucket {bucket_m}");
+            assert_eq!(
+                c.function.starts_with("gemv_normed_rows_"),
+                bucket_m > 1,
+                "bucket {bucket_m}: {}",
+                c.function
+            );
+            assert_eq!(c.dispatch.threadgroups, (256 / 4, bucket_m, 1));
+        }
     }
 }

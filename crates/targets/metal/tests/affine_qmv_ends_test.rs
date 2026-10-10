@@ -430,6 +430,81 @@ fn a_normalizing_matvec_is_as_close_to_the_exact_normed_product_as_the_norm_then
     }
 }
 
+/// The wide matvec (`affine_qmv_wide`, a bucket of 2–5 rows): every row normalized on load is as
+/// close to its exact `W · rmsnorm(x)` as the one-row bound allows — the norm's sum of squares and
+/// gain folded once for the threadgroup and the row's weights, not per output row — and the plain
+/// wide matvec of the raw rows is not.
+#[test]
+fn a_normalizing_wide_matvec_is_as_close_to_the_exact_normed_product_on_every_row() {
+    use scratchy_target_metal::tape::ids::MDimI32;
+    use scratchy_target_metal::tape::kernel_constants::AffineQmvWideConstants;
+    use scratchy_target_metal::tape::quantized::pick_qmv_kernel_wide;
+    for c in cases() {
+        let Some(device) = detect_device().map(|d| d.device.clone()) else {
+            return;
+        };
+        let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+        for m in 2..=5usize {
+            // K 64 / 128 run the quad kernel at any rows: no wide matvec to check.
+            let kernel = pick_qmv_kernel_wide(c.n as u32, c.k as u32, 4, m as u32, true);
+            if !matches!(kernel, QmvKernel::Wide { .. }) {
+                continue;
+            }
+            let gs = c.group_size as u32;
+            let name = qmv_kernel_static_name(kernel, c.dtype.dequant(), c.dtype.scale(), 4, gs);
+            let pso = |e: QmvEnds| {
+                let mut v: Vec<ConstantValue> = AffineQmvWideConstants {
+                    k: KDimI32(c.k as i32),
+                    n: NDimI32(c.n as i32),
+                    m: MDimI32(m as i32),
+                    codes: AffineCodes::AsWritten,
+                }
+                .into();
+                v.extend(Vec::<ConstantValue>::from(e));
+                baked_build(&cache, &PipelineKey::new("quantized_qmv", name, v)).expect(name)
+            };
+            let (normed_pso, plain_pso) = (pso(normed(&c)), pso(QmvEnds::default()));
+            let mut rng = Lcg(c.k as u64 * 31 + c.n as u64 + m as u64);
+            let w = Weights::new(&device, &c, &mut rng);
+            let (mut x, mut want) = (Vec::new(), Vec::new());
+            let (_, gain) = inputs(&c, &mut rng);
+            for _ in 0..m {
+                let (row, _) = inputs(&c, &mut rng);
+                want.push(exact(&c, &w, &row, &gain));
+                x.extend(row);
+            }
+            let (xb, gb) = (shared(&device, &x), shared(&device, &gain));
+            let run = |pso| {
+                let y = shared(&device, &vec![0u16; m * c.n]);
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4");
+                let (grid, threads) = qmv_dispatch_shape(kernel, m as u32, c.n as u32, 1);
+                let binds = [
+                    (&w.w, 0),
+                    (&w.scales, 1),
+                    (&w.biases, 2),
+                    (&xb, 3),
+                    (&y, 4),
+                    (&gb, 15),
+                    (&gb, 16),
+                ];
+                batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                batch.commit(true);
+                read_u16(&y, m * c.n)
+            };
+            let (normed_y, plain_y) = (run(&normed_pso), run(&plain_pso));
+            for (r, want) in want.iter().enumerate() {
+                let rows = r * c.n..(r + 1) * c.n;
+                within(&c, &normed_y[rows.clone()], want)
+                    .unwrap_or_else(|e| panic!("{c:?}, {m} rows, row {r}: the wide matvec: {e}"));
+                assert!(
+                    within(&c, &plain_y[rows], want).is_err(),
+                    "{c:?}, {m} rows, row {r}: the bound accepts the raw wide matvec"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn an_ending_matvec_is_the_plain_matvec_biased_scaled_and_added() {
     for c in cases() {
