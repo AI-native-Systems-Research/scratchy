@@ -161,20 +161,10 @@ pub fn lower_subtile_tape_to_metal(
         &steps.lm_head_barriers,
         &steps.lm_head_sources,
     )?;
-    let binds_kv_cache = |c: &GatedCommand| {
-        c.command.bindings.iter().any(|b| {
-            matches!(
-                b,
-                Binding::Runtime {
-                    kind: RuntimeBindingKind::KvCacheK { .. } | RuntimeBindingKind::KvCacheV { .. },
-                    ..
-                }
-            )
-        })
-    };
-    // A KV writer encodes when it binds the packed store — a coded attention running its writer
-    // too ([`ATTN_FOLD`]).
-    let encodes = |c: &GatedCommand| {
+    // A KV writer — a rope append, or a coded attention running its writer too ([`ATTN_FOLD`]) —
+    // binding `kind`. A query-only rope binds no cache: a drafter reading its target's packed
+    // stores writes none, so has none to encode.
+    let writer_binds = |c: &GatedCommand, kind: fn(&RuntimeBindingKind) -> bool| {
         let writes = match c.command.kernel {
             KernelId::RopeAppend | KernelId::RopeAppendNormed | KernelId::KvAppend => true,
             KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
@@ -183,18 +173,20 @@ pub fn lower_subtile_tape_to_metal(
             _ => false,
         };
         writes
-            && c.command.bindings.iter().any(|b| {
-                matches!(
-                    b,
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::TqPackedK { .. },
-                        ..
-                    }
-                )
-            })
+            && (c.command.bindings.iter())
+                .any(|b| matches!(b, Binding::Runtime { kind: k, .. } if kind(k)))
+    };
+    let writes_kv_cache = |c: &GatedCommand| {
+        writer_binds(c, |k| {
+            matches!(k, RuntimeBindingKind::KvCacheK { .. } | RuntimeBindingKind::KvCacheV { .. })
+        })
+    };
+    // A KV writer encodes when it binds the packed store.
+    let encodes = |c: &GatedCommand| {
+        writer_binds(c, |k| matches!(k, RuntimeBindingKind::TqPackedK { .. }))
     };
     if p.kv_codec.is_turboquant()
-        && bb.commands.iter().any(binds_kv_cache)
+        && bb.commands.iter().any(writes_kv_cache)
         && !bb.commands.iter().any(encodes)
     {
         return Err(LoweringError::TurboQuantCompressesNothing);
