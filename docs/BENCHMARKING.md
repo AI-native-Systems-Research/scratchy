@@ -6,6 +6,7 @@ report.
 | harness | question | scenarios |
 |---|---|---|
 | [`scripts/bench_serve_compare.sh`](../scripts/bench_serve_compare.sh) | steady-state serving throughput and latency under load | input × output × concurrency sweep |
+| `bench_serve_compare.sh --multi-turn-cells` | how much prefix reuse cuts TTFT on a conversation's later turns | system prompt × turns × concurrency ([multi-turn cells](#multi-turn-prefix-reuse-cells)) |
 | `scr bench startup --exec` | how long from `exec` until the user sees a word | frozen / cold / warm cache ladder |
 | `scr bench startup` (no `--exec`) | in-process engine construction cost | cold / warm iterations |
 
@@ -143,7 +144,27 @@ bimodal ITL distribution in this repo for a week
    unique per rep. This is not hypothetical — a `bench serve` run against a
    shared-prefix dataset reported a 98% prefix-cache hit rate, which inflated
    throughput 1.84× and understated TTFT 11× before it was caught. Pass
-   `--no-prefix-caching` to the server under test as well.
+   `--no-prefix-caching` to the server under test as well. `scr bench serve`
+   sends its pre-flight and warmup requests throwaway prompts from a seed
+   disjoint from `--seed`, for every dataset, so no measured prompt is cached
+   before it is timed.
+
+   **Exception: [multi-turn cells](#multi-turn-prefix-reuse-cells).** There
+   the reuse *is* the measurement, so prefix caching stays **on** for every
+   backend (`scratchy-nocache` is the deliberate baseline). Sharing is still
+   confined: a request repeats only its own conversation's earlier turns, plus
+   the one system prompt every conversation shares; pre-flight and warmups use
+   disjoint throwaway conversations with a system prompt of their own. The
+   backends do not reuse at the same granularity, and the published numbers
+   must say so:
+
+   - **scratchy** reuses whole 16-token KV blocks. On Gated-DeltaNet models
+     (Qwen3.5/3.6) a hit can resume only from a recurrent-state snapshot,
+     taken at `floor((N-8)/16)*16` of an earlier N-token prompt — up to ~23
+     tokens short of the shared prefix — and only when it saves at least 256
+     tokens.
+   - **mlx-lm** reuses through its own prompt cache, on its own rules. Read
+     the `cached_tokens` it reports rather than assuming it matches scratchy.
 2. **Pin the sampling params.** Every request is greedy (`temperature 0`).
    Leaving temperature *unset* is the trap: the field is omitted, each **server**
    applies its own default, and the backends get timed on different sampling
@@ -258,6 +279,57 @@ scr bench startup --exec -m "$MODEL" --mode cli \
 A run whose validity checks fail prints them and exits non-zero. That is
 intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
 start, and reporting it would be worse than reporting nothing.
+
+### Multi-turn prefix-reuse cells
+
+`scr bench serve --dataset-name multi-turn` runs closed-loop conversations: each
+request is a non-streaming POST to `/v1/chat/completions` (unless `--endpoint`
+says otherwise) whose `messages` are the system prompt, user 1, assistant 1, …,
+user k. The server renders its own chat template; the client never does.
+
+| flag | default | meaning |
+|---|---|---|
+| `--num-prompts` | 1000 | conversations |
+| `--multi-turn-system-len` | 2048 | tokens (approx.) in the one system prompt every conversation shares |
+| `--multi-turn-turns` | 3 | requests per conversation; turn k+1 is sent once turn k has answered |
+| `--multi-turn-user-len` | 128 | tokens (approx.) per user message |
+| `--multi-turn-reply-len` | 256 | tokens (approx.) per assistant reply in the history |
+| `--chat-template-kwargs` | not sent | JSON object sent as `chat_template_kwargs` |
+| `--max-concurrency` | unbounded | conversations in flight |
+| `--request-rate` | `inf` | paces conversation starts |
+| `--num-warmups` | 0 | warmup requests, walking throwaway conversations turn by turn |
+
+- Messages are whole words from a fixed list, cut to length with the model's
+  tokenizer — never decoded token ids, which can spell out special tokens. The
+  assistant replies in the history are seeded text, not what the model said,
+  so every backend is sent byte-identical requests on every turn.
+- Nothing streams, so the request latency is reported as the TTFT. It is one
+  only at `--output-len 1`, which the compare script always uses.
+- The results JSON adds, per turn k (1-based): `completed_turn{k}`,
+  `median_ttft_ms_turn{k}`, `p{P}_ttft_ms_turn{k}` for each
+  `--metric-percentiles` value, `mean_prompt_tokens_turn{k}`
+  (`usage.prompt_tokens`) and `mean_cached_tokens_turn{k}`
+  (`usage.prompt_tokens_details.cached_tokens`). The cached count is null when
+  the server reported none in the whole run; scratchy leaves the field out on a
+  full miss, so once a run has reported one, a missing count reads as 0.
+- Turn 1 is not uniformly cold: the first `--max-concurrency` conversations
+  prefill the system prompt, and later ones can reuse it.
+  `mean_cached_tokens_turn1` shows how much they did.
+
+```bash
+# scratchy against itself without reuse, and against mlx-lm. Qwen3.5/3.6: pin
+# thinking off so both servers render the same prompt (mlx_lm.server reads a
+# request's chat_template_kwargs; scr serve merges them over its defaults).
+scripts/bench_serve_compare.sh --model mlx-community/Qwen3.5-9B-4bit \
+    --backends scratchy,scratchy-nocache,mlx-lm \
+    --multi-turn-cells 2048x3x1,2048x3x4 \
+    --chat-template-kwargs '{"enable_thinking":false}'
+```
+
+Each cell (`SYSxTURNSxCONC`) gets its own seed, shared across backends, and
+each of the script's `--warmups` is one whole throwaway conversation. The
+summary reports each turn's median TTFT and cached/prompt tokens, plus every
+later turn's TTFT as a ratio of turn 1's.
 
 ## 6. Reproducing without a GPU
 

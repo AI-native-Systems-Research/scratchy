@@ -11,16 +11,20 @@
 //!   `CachedRequestData`).
 //! * [`request_queue`] -- Request queue implementations (FCFS and Priority).
 //! * [`core`] -- The main `Scheduler` struct and its scheduling algorithm.
+//! * `recurrent_state` -- The prefix cache's recurrent-state (GDN) snapshot index.
 
 pub mod core;
 pub mod interface;
 pub mod output;
+mod recurrent_state;
 pub mod request_queue;
 
 // Re-export the key types for convenience.
 pub use self::core::Scheduler;
 pub use interface::{PauseState, SchedulerInterface};
-pub use output::{CachedRequestData, NewRequestData, SchedulerOutput};
+pub use output::{
+    CachedRequestData, NewRequestData, RecurrentStateOps, SchedulerOutput, StateSnapshotOp,
+};
 pub use request_queue::{
     FCFSRequestQueue, PriorityRequestQueue, RequestQueue, SchedulingPolicy, create_request_queue,
 };

@@ -254,3 +254,293 @@ async fn test_prefix_cache_reports_cached_tokens_metal() {
     let client = Client::new(server.base_url());
     assert_reports_cached_tokens(&client, "metal").await;
 }
+
+// ---------------------------------------------------------------------------
+// Recurrent-hybrid (Gated-DeltaNet) prefix caching — issue #261
+//
+// Qwen3.6's linear-attention layers carry a per-sequence scan state that a cached KV prefix
+// cannot rebuild, so a hit resumes only at a SNAPSHOT of that state, taken where an earlier
+// request's prefill ended a forward: `floor((N - 8) / 16) * 16` of its N-token prompt
+// (`GENERATION_PROMPT_ALLOWANCE` before the end, on a 16-token block), and only when it saves at
+// least 256 tokens (`MIN_SNAPSHOT_GAIN`). The tests assert that EXACT resume point.
+//
+// Text is compared only between runs whose last prefill forward is identical: the same tokens,
+// the same KV bits for the shared prefix, the same recurrent state (one live, one restored from a
+// copy of it). Those must agree token for token. Runs that split a prefill differently (caching
+// off vs on, a warm turn vs a cold one) agree only to f32 rounding, which a 256-expert MoE can
+// turn into a different token — so no such comparison is made here.
+//
+// Needs a Metal 4 GPU and `mlx-community/Qwen3.6-35B-A3B-4bit` in the HF cache. Run against a
+// prebuilt server so its flags apply, one test at a time:
+//
+//   cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
+//   VLLM_TEST_SPAWN=1 VLLM_TEST_BINARY=$PWD/target/release/scr cargo test -p scratchy-e2e \
+//     -p scratchy-models --features e2e,metal,scratchy-models/smollm2-135m \
+//     --test e_prefix_caching gdn_ -- --ignored --test-threads=1 --nocapture
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+mod gdn {
+    use std::time::Duration;
+
+    use scratchy_e2e::{Client, TestServer};
+    use scratchy_serving_api::protocol::{ChatCompletionRequest, ChatCompletionResponse};
+
+    const MODEL: &str = "mlx-community/Qwen3.6-35B-A3B-4bit";
+
+    /// Where an `n`-token prompt snapshots its recurrent state.
+    fn snapshot_point(n: u32) -> u32 {
+        (n - 8) / 16 * 16
+    }
+
+    async fn start() -> (TestServer, Client) {
+        let server = TestServer::builder(MODEL)
+            .with_device("metal")
+            .with_max_num_seqs(4)
+            .with_timeout(Duration::from_secs(600))
+            .start()
+            .await
+            .expect("server should start");
+        let client = Client::new(server.base_url());
+        (server, client)
+    }
+
+    /// Deterministic filler text about `topic`, `sentences` sentences long (~16 tokens each).
+    fn passage(topic: &str, sentences: usize) -> String {
+        (0..sentences)
+            .map(|i| {
+                format!(
+                    "Note {i} on {topic}: depot {} ships crate class {} on route {} every {} days. ",
+                    (i * 7) % 13,
+                    (i * 3) % 11,
+                    (i * 5) % 17,
+                    1 + i % 6,
+                )
+            })
+            .collect()
+    }
+
+    /// Greedy, thinking off (a short, deterministic reply), at most `max_tokens`.
+    fn chat(messages: &[(&str, &str)], max_tokens: u32) -> ChatCompletionRequest {
+        let messages: Vec<_> = messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "chat_template_kwargs": { "enable_thinking": false },
+        }))
+        .unwrap()
+    }
+
+    fn cached(resp: &ChatCompletionResponse) -> u32 {
+        resp.usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0)
+    }
+
+    fn text(resp: &ChatCompletionResponse) -> String {
+        resp.choices[0].message.content.clone().unwrap_or_default()
+    }
+
+    /// The same request twice: the second resumes at the first's snapshot, and — its last
+    /// forward being the first's last forward over a copy of the same state — answers alike.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn gdn_resend_resumes_at_the_snapshot_and_answers_alike() {
+        scratchy_e2e::skip_if_no_gpu!();
+        let (_server, client) = start().await;
+        let system = passage("freight", 40);
+        let request = chat(
+            &[
+                ("system", &system),
+                (
+                    "user",
+                    "Which depot ships crate class 4? Answer in one sentence.",
+                ),
+            ],
+            24,
+        );
+
+        let cold = client.chat_completion(&request).await.unwrap();
+        let n = cold.usage.prompt_tokens;
+        assert_eq!(cached(&cold), 0, "a fresh server has nothing cached");
+        assert!(
+            snapshot_point(n) >= 256,
+            "the prompt must be long enough to snapshot ({n})"
+        );
+        for resend in 1..=2 {
+            let warm = client.chat_completion(&request).await.unwrap();
+            assert_eq!(warm.usage.prompt_tokens, n);
+            assert_eq!(cached(&warm), snapshot_point(n), "resend {resend}");
+            assert_eq!(text(&warm), text(&cold), "resend {resend}");
+        }
+    }
+
+    /// Two prompts that share everything up to their snapshot point and differ after it: the
+    /// second, resuming from a snapshot the FIRST request wrote, answers exactly as it does cold.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn gdn_a_snapshot_written_by_one_request_resumes_another() {
+        scratchy_e2e::skip_if_no_gpu!();
+        let (_server, client) = start().await;
+        let system = passage("orchards", 40);
+        let ask = |pad: usize, fruit: &str| {
+            format!(
+                "{}Name one crate class shipped on route 3, then say the word {fruit}.",
+                "Please be brief. ".repeat(pad)
+            )
+        };
+        // Differ only in the last word, and land the snapshot point at least 4 tokens before
+        // the earliest place the two prompts can differ (the word, then 9 template tokens).
+        let mut chosen = None;
+        for pad in 0..16 {
+            let (a, b) = (ask(pad, "apple"), ask(pad, "lemon"));
+            let na = client
+                .chat_completion(&chat(&[("system", &system), ("user", &a)], 1))
+                .await
+                .unwrap()
+                .usage
+                .prompt_tokens;
+            let nb = client
+                .chat_completion(&chat(&[("system", &system), ("user", &b)], 1))
+                .await
+                .unwrap()
+                .usage
+                .prompt_tokens;
+            if na == nb && (na - 8) % 16 >= 4 {
+                chosen = Some((a, b, na));
+                break;
+            }
+        }
+        let (a, b, n) = chosen.expect("some padding lands the snapshot point clear of the word");
+
+        client.reset_prefix_cache().await.unwrap();
+        let b_cold = client
+            .chat_completion(&chat(&[("system", &system), ("user", &b)], 24))
+            .await
+            .unwrap();
+        assert_eq!(cached(&b_cold), 0, "the reset must have emptied the cache");
+
+        client.reset_prefix_cache().await.unwrap();
+        // An unrelated prompt takes the first snapshot slot, so a's snapshot lands in one b
+        // never wrote: b can then match its cold run only by restoring what a saved.
+        let unrelated = passage("unrelated", 30);
+        client
+            .chat_completion(&chat(&[("user", &unrelated)], 1))
+            .await
+            .unwrap();
+        let a_cold = client
+            .chat_completion(&chat(&[("system", &system), ("user", &a)], 24))
+            .await
+            .unwrap();
+        assert_eq!(cached(&a_cold), 0);
+        let b_warm = client
+            .chat_completion(&chat(&[("system", &system), ("user", &b)], 24))
+            .await
+            .unwrap();
+        assert_eq!(
+            cached(&b_warm),
+            snapshot_point(n),
+            "b resumes at a's snapshot"
+        );
+        assert_eq!(text(&b_warm), text(&b_cold));
+    }
+
+    /// Three turns of one conversation: each turn resumes at the previous prompt's snapshot,
+    /// and a resend of each turn — resuming at that turn's own snapshot, in a slot of its own —
+    /// answers exactly as the turn did.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn gdn_multi_turn_resumes_each_turn_at_the_previous_prompts_snapshot() {
+        scratchy_e2e::skip_if_no_gpu!();
+        let (_server, client) = start().await;
+        let system = passage("harbors", 40);
+        // Each turn adds well over MIN_SNAPSHOT_GAIN tokens, so every prompt is snapshotted.
+        let users: Vec<String> = (0..3)
+            .map(|t| {
+                format!(
+                    "{}Which route is used most? One sentence.",
+                    passage(&format!("week {t}"), 22)
+                )
+            })
+            .collect();
+        let mut history: Vec<(String, String)> = vec![("system".into(), system)];
+        let mut previous_prompt: Option<u32> = None;
+        for (turn, user) in users.iter().enumerate() {
+            history.push(("user".into(), user.clone()));
+            let messages: Vec<(&str, &str)> = history
+                .iter()
+                .map(|(r, c)| (r.as_str(), c.as_str()))
+                .collect();
+            let resp = client.chat_completion(&chat(&messages, 24)).await.unwrap();
+            let n = resp.usage.prompt_tokens;
+            let expected = previous_prompt.map_or(0, snapshot_point);
+            eprintln!(
+                "[gdn multi-turn] turn {} prompt={n} cached={}",
+                turn + 1,
+                cached(&resp)
+            );
+            assert_eq!(cached(&resp), expected, "turn {}", turn + 1);
+            let resend = client.chat_completion(&chat(&messages, 24)).await.unwrap();
+            assert_eq!(
+                cached(&resend),
+                snapshot_point(n),
+                "turn {} resend",
+                turn + 1
+            );
+            assert_eq!(text(&resend), text(&resp), "turn {} resend", turn + 1);
+            history.push(("assistant".into(), text(&resp)));
+            previous_prompt = Some(n);
+        }
+    }
+
+    /// Four conversations interleaved on one server: each turn 2 resumes at its own turn 1's
+    /// snapshot. Turn 2 adds under MIN_SNAPSHOT_GAIN tokens, so it takes no snapshot and the
+    /// test needs only one slot per conversation (a 32 GB Mac has a handful).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn gdn_concurrent_conversations_each_resume_at_their_turn_1_snapshot() {
+        scratchy_e2e::skip_if_no_gpu!();
+        let (server, _client) = start().await;
+        let conversation = |i: usize| {
+            let client = Client::new(server.base_url());
+            async move {
+                let system = format!("Conversation {i}. {}", passage(&format!("fleet {i}"), 30));
+                let user1 = "Which depot ships crate class 2? One sentence.".to_string();
+                let first = client
+                    .chat_completion(&chat(&[("system", &system), ("user", &user1)], 16))
+                    .await
+                    .unwrap();
+                let reply = text(&first);
+                let user2 = format!("{}And class 5?", passage(&format!("addendum {i}"), 4));
+                let second = client
+                    .chat_completion(&chat(
+                        &[
+                            ("system", &system),
+                            ("user", &user1),
+                            ("assistant", &reply),
+                            ("user", &user2),
+                        ],
+                        16,
+                    ))
+                    .await
+                    .unwrap();
+                (first.usage.prompt_tokens, cached(&first), cached(&second))
+            }
+        };
+        let handles: Vec<_> = (0..4).map(|i| tokio::spawn(conversation(i))).collect();
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("conversation task"));
+        }
+        for (i, (n1, cached1, cached2)) in results.into_iter().enumerate() {
+            assert_eq!(cached1, 0, "conversation {i} turn 1");
+            assert_eq!(cached2, snapshot_point(n1), "conversation {i} turn 2");
+        }
+    }
+}

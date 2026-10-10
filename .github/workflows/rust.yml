@@ -146,6 +146,13 @@ jobs:
         run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
           --lib -- tcp_store multinode
 
+      # The scheduler (prefix-cache hits, recurrent-state snapshots), the engine's
+      # memory-budget arithmetic and the GDN state-slot allocator are plain Rust:
+      # no backend, no GPU, and no other step runs their unit tests.
+      - name: Scheduler, engine and slot-allocator unit tests (no backend feature)
+        run: cargo test -p scratchy-serving-scheduler -p scratchy-serving-engine
+          -p scratchy-forward-compiler --lib
+
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
       # invisible to it and no job anywhere compiles them. These three steps

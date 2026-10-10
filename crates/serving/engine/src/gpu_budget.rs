@@ -77,20 +77,107 @@ impl MaxNumSeqsFacts {
     fn affordable_width(&self) -> usize {
         // No budget = nothing to clamp against — clamping a tier on absent
         // facts would be a silent width cut, not a memory decision.
-        let Some(budget) = self.device_budget_bytes else {
+        let Some(headroom) = self.kv_headroom_bytes(0) else {
             return usize::MAX;
         };
-        let per_row = self
-            .gdn_per_slot_bytes
+        let slot_budget = headroom.saturating_sub(KV_FLOOR_BYTES);
+        (slot_budget / self.per_row_bytes().max(1)).max(1)
+    }
+
+    /// Per-sequence bytes: one GDN state slot plus one sampler-arena row.
+    fn per_row_bytes(&self) -> usize {
+        self.gdn_per_slot_bytes
             .unwrap_or(0)
-            .saturating_add(self.sampler_bytes_per_row);
+            .saturating_add(self.sampler_bytes_per_row)
+    }
+
+    /// The bytes left for KV at `width` resident sequences: the budget less what is allocated,
+    /// the activation peak, the 150 MiB pad and `width` per-sequence rows. `None` without a
+    /// budget.
+    pub fn kv_headroom_bytes(&self, width: usize) -> Option<usize> {
         let fixed = self
             .allocated_bytes
             .saturating_add(self.peak_activation_bytes)
-            .saturating_add(Self::REDUNDANCY_BYTES);
-        let slot_budget = budget.saturating_sub(fixed).saturating_sub(KV_FLOOR_BYTES);
-        (slot_budget / per_row.max(1)).max(1)
+            .saturating_add(Self::REDUNDANCY_BYTES)
+            .saturating_add(width.saturating_mul(self.per_row_bytes()));
+        Some(self.device_budget_bytes?.saturating_sub(fixed))
     }
+}
+
+/// The share of the KV headroom recurrent-state snapshots may take (1/8).
+///
+/// A snapshot is only useful beside the KV of the prefix it resumes, so KV keeps the larger part;
+/// an eighth still buys ~47 snapshots of Qwen3.6-35B-A3B's 62.8 MiB state on a 64 GB Mac, enough
+/// for a long agent loop plus its side requests, and a handful on a 32 GB one.
+pub const SNAPSHOT_HEADROOM_SHARE: usize = 8;
+
+/// At most this many recurrent-state snapshots, however roomy the device: past it they are
+/// wired memory the prefix cache of a single box does not use.
+pub const MAX_RECURRENT_SNAPSHOTS: usize = 64;
+
+/// Below this many snapshots prefix caching on a recurrent-hybrid model is not worth its extra
+/// forward per prompt: any second request evicts the first one's snapshot.
+pub const MIN_RECURRENT_SNAPSHOTS: usize = 2;
+
+/// ⭐ HOW MANY RECURRENT-STATE SNAPSHOTS (prefix-cache resume points of a Gated-DeltaNet hybrid's
+/// per-sequence state) to keep, given `headroom_bytes` of KV headroom before any are reserved and
+/// `snapshot_bytes` per snapshot (one state slot).
+///
+/// [`SNAPSHOT_HEADROOM_SHARE`] of the headroom, never past [`KV_FLOOR_BYTES`] of KV left, at most
+/// [`MAX_RECURRENT_SNAPSHOTS`]; 0 — prefix caching off for the model — below
+/// [`MIN_RECURRENT_SNAPSHOTS`]. Derived from the same facts as the width, so neither a flag nor the
+/// OOM guard's arithmetic has to know about it.
+pub fn recurrent_snapshot_slots(headroom_bytes: usize, snapshot_bytes: usize) -> usize {
+    if snapshot_bytes == 0 {
+        return 0;
+    }
+    let share = headroom_bytes / SNAPSHOT_HEADROOM_SHARE / snapshot_bytes;
+    let above_floor = headroom_bytes.saturating_sub(KV_FLOOR_BYTES) / snapshot_bytes;
+    let n = share.min(above_floor).min(MAX_RECURRENT_SNAPSHOTS);
+    if n < MIN_RECURRENT_SNAPSHOTS { 0 } else { n }
+}
+
+/// ⭐ THE WIDTH AND THE RECURRENT-STATE SNAPSHOT COUNT, resolved together from one set of facts:
+/// `(max_num_seqs, snapshots)`.
+///
+/// `asked` is an explicit `--max-num-seqs`, honoured as is (snapshots then share what that width
+/// leaves). `snapshot_bytes` is one snapshot — `None` when the model has no recurrent state or
+/// the worker keeps no snapshots, which leaves the width exactly what
+/// [`resolve_default_max_num_seqs`] answers.
+///
+/// Unset: snapshots take [`recurrent_snapshot_slots`] of what the default width leaves for KV —
+/// or, on a box where that width already spends the headroom down to the KV floor, of what ONE
+/// sequence leaves, paid for in width (the width is then resolved with the snapshots counted as
+/// allocated). There resuming a long prompt is worth more than the last few resident
+/// sequences, and taking it from KV would leave none. One, not zero: the width never resolves
+/// below 1, so sizing against zero rows could put KV under the floor.
+pub fn resolve_width_and_snapshots(
+    facts: &MaxNumSeqsFacts,
+    asked: Option<usize>,
+    snapshot_bytes: Option<usize>,
+    is_offline: bool,
+) -> (usize, usize) {
+    let snapshots_at = |facts: &MaxNumSeqsFacts, width: usize| match (
+        facts.kv_headroom_bytes(width),
+        snapshot_bytes,
+    ) {
+        (Some(headroom), Some(bytes)) => recurrent_snapshot_slots(headroom, bytes),
+        _ => 0,
+    };
+    if let Some(width) = asked {
+        return (width, snapshots_at(facts, width));
+    }
+    let width = resolve_default_max_num_seqs(facts, is_offline);
+    let snapshots = match snapshots_at(facts, width) {
+        0 => snapshots_at(facts, 1),
+        n => n,
+    };
+    let mut charged = facts.clone();
+    charged.allocated_bytes += snapshots * snapshot_bytes.unwrap_or(0);
+    (
+        resolve_default_max_num_seqs(&charged, is_offline),
+        snapshots,
+    )
 }
 
 /// Resolve an UNSET `--max-num-seqs` from device memory + per-sequence state
@@ -360,6 +447,135 @@ mod max_num_seqs_default_tests {
             false,
         );
         assert_eq!(w, BASE_MAX_NUM_SEQS);
+    }
+}
+
+#[cfg(test)]
+mod recurrent_snapshot_tests {
+    use super::{
+        BASE_MAX_NUM_SEQS, KV_FLOOR_BYTES, MAX_RECURRENT_SNAPSHOTS, MaxNumSeqsFacts,
+        recurrent_snapshot_slots, resolve_default_max_num_seqs, resolve_width_and_snapshots,
+    };
+
+    const GIB: usize = 1024 * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+    /// Qwen3.6-35B-A3B: 30 GDN layers × (8192×3 + 32×128×128) f32.
+    const SNAP: usize = 65_863_680;
+
+    #[test]
+    fn an_eighth_of_the_headroom_on_a_roomy_box() {
+        // The 64 GB M5 Max at width 1: ~23.5 GiB of KV headroom.
+        let n = recurrent_snapshot_slots(23 * GIB + GIB / 2, SNAP);
+        assert_eq!(n, 47);
+        assert!(n * SNAP <= (23 * GIB + GIB / 2) / 8);
+    }
+
+    #[test]
+    fn capped_on_a_huge_box_and_off_on_a_starved_one() {
+        assert_eq!(
+            recurrent_snapshot_slots(400 * GIB, SNAP),
+            MAX_RECURRENT_SNAPSHOTS
+        );
+        // An eighth of 1 GiB is 2 snapshots, but nothing may come out of the KV floor.
+        assert_eq!(recurrent_snapshot_slots(GIB, SNAP), 0);
+        // One that fits is not worth an extra forward per prompt.
+        assert_eq!(
+            recurrent_snapshot_slots(KV_FLOOR_BYTES + SNAP + MIB, SNAP),
+            0
+        );
+        assert_eq!(recurrent_snapshot_slots(10 * GIB, 0), 0);
+    }
+
+    /// Qwen3.6-35B-A3B on a box shaped by `budget` GiB, with weights and the arena allocated.
+    fn box_with(budget: usize, allocated: usize) -> MaxNumSeqsFacts {
+        MaxNumSeqsFacts {
+            device_total_bytes: None,
+            device_name: None,
+            device_budget_bytes: Some(budget),
+            allocated_bytes: allocated,
+            peak_activation_bytes: 64 * MIB,
+            gdn_per_slot_bytes: Some(SNAP),
+            sampler_bytes_per_row: 0,
+        }
+    }
+
+    /// KV left once `width` sequences and `snapshots` snapshots are paid for.
+    fn kv_after(f: &MaxNumSeqsFacts, width: usize, snapshots: usize) -> usize {
+        f.kv_headroom_bytes(width).unwrap() - snapshots * SNAP
+    }
+
+    #[test]
+    fn a_roomy_box_keeps_its_default_width_and_shares_the_kv_left_beside_it() {
+        // The 64 GB M5 Max: 46.7 GiB budget, ~22.3 GiB of weights and arena.
+        let f = box_with(46 * GIB + 700 * MIB, 22 * GIB + 300 * MIB);
+        let (width, snapshots) = resolve_width_and_snapshots(&f, None, Some(SNAP), false);
+        assert_eq!(width, BASE_MAX_NUM_SEQS);
+        let left = f.kv_headroom_bytes(width).unwrap();
+        assert_eq!(snapshots, recurrent_snapshot_slots(left, SNAP));
+        assert!(snapshots * SNAP <= left / 8);
+        assert!(kv_after(&f, width, snapshots) >= KV_FLOOR_BYTES);
+    }
+
+    #[test]
+    fn a_squeezed_box_pays_for_snapshots_in_width_and_keeps_the_kv_floor() {
+        // The 32 GB incident shape: the default width spends the headroom to the floor.
+        let f = box_with(22 * GIB + GIB / 2, 19 * GIB + 600 * MIB);
+        let bare = resolve_default_max_num_seqs(&f, false);
+        assert_eq!(
+            recurrent_snapshot_slots(f.kv_headroom_bytes(bare).unwrap(), SNAP),
+            0,
+            "the shape this test is about"
+        );
+        let (width, snapshots) = resolve_width_and_snapshots(&f, None, Some(SNAP), false);
+        assert!(
+            snapshots >= 2,
+            "a squeezed box still gets a few, got {snapshots}"
+        );
+        assert!(width < bare && width >= 1, "{width} vs {bare}");
+        assert!(kv_after(&f, width, snapshots) >= KV_FLOOR_BYTES);
+    }
+
+    #[test]
+    fn the_last_band_above_the_floor_never_dips_below_it() {
+        // Headroom for the floor, two snapshots and less than one more row: the width floors at
+        // 1, so the snapshots must be sized against one row, not zero.
+        for extra in [0, MIB, 30 * MIB, 62 * MIB] {
+            let budget = 20 * GIB;
+            let headroom = KV_FLOOR_BYTES + 2 * SNAP + extra;
+            let f = box_with(budget, budget - headroom - 64 * MIB - 150 * MIB);
+            let (width, snapshots) = resolve_width_and_snapshots(&f, None, Some(SNAP), false);
+            assert!(width >= 1);
+            assert!(
+                kv_after(&f, width, snapshots) >= KV_FLOOR_BYTES,
+                "extra {extra}: width {width}, {snapshots} snapshots"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_width_is_honoured_and_snapshots_share_what_it_leaves() {
+        let f = box_with(46 * GIB + 700 * MIB, 22 * GIB + 300 * MIB);
+        let (width, snapshots) = resolve_width_and_snapshots(&f, Some(1), Some(SNAP), false);
+        assert_eq!(width, 1);
+        assert_eq!(
+            snapshots,
+            recurrent_snapshot_slots(f.kv_headroom_bytes(1).unwrap(), SNAP)
+        );
+        let (width, snapshots) = resolve_width_and_snapshots(&f, Some(400), Some(SNAP), false);
+        assert_eq!(
+            (width, snapshots),
+            (400, 0),
+            "an ask that spends the headroom gets none"
+        );
+    }
+
+    #[test]
+    fn without_snapshots_the_width_is_the_resolvers() {
+        let f = box_with(22 * GIB + GIB / 2, 19 * GIB + 600 * MIB);
+        assert_eq!(
+            resolve_width_and_snapshots(&f, None, None, false),
+            (resolve_default_max_num_seqs(&f, false), 0)
+        );
     }
 }
 

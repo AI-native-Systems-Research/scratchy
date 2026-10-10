@@ -255,6 +255,17 @@ impl EngineCore {
                 );
                 tracker.enable_hybrid(num_blocks, groups);
             }
+            // ⭐ AND HOW MANY SNAPSHOTS OF THE MODEL'S RECURRENT STATE IT KEEPS. A Gated-DeltaNet
+            // hybrid's prefix hit must also restore one; with none, `initialize_core` already kept
+            // prefix caching off for it.
+            let snapshots = executor.recurrent_state_snapshots();
+            if config.enable_prefix_caching && snapshots > 0 {
+                info!(
+                    "Prefix caching tracks recurrent state: {snapshots} snapshot slots — a hit \
+                     resumes only where a snapshot of the model's recurrent state exists"
+                );
+                tracker = tracker.with_state_snapshots(snapshots);
+            }
             Box::new(tracker)
         };
 
@@ -714,6 +725,10 @@ impl EngineCore {
         let mut client_outputs: StepOutputs = HashMap::new();
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
+        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE — committed
+        // here and not when they were scheduled, because a step that fails never gets here.
+        self.scheduler
+            .commit_state_saves(&scheduler_output.recurrent_state.saves);
         // ⭐ THE WORKER'S KV REPORT, BEFORE ANY OF THE TOKEN BOOKKEEPING. Empty for every backend whose
         // keys sit at their token positions; on one where they do not, this is what the next step's block
         // allocation is sized by and what bounds the prefix it may cache. Over the whole report rather
@@ -2317,5 +2332,81 @@ mod tests {
 
         assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
         assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    /// A [`NoopExecutor`] whose worker keeps recurrent-state snapshots (a GDN hybrid on metal).
+    struct SnapshottingExecutor(NoopExecutor);
+
+    impl Executor for SnapshottingExecutor {
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            self.0.execute_model(scheduler_output)
+        }
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
+            self.0.initialize_cache(gpu, cpu)
+        }
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            self.0.determine_available_memory()
+        }
+        fn shutdown(&mut self) {
+            self.0.shutdown()
+        }
+        fn is_sleeping(&self) -> bool {
+            self.0.is_sleeping()
+        }
+        fn recurrent_state_snapshots(&self) -> usize {
+            4
+        }
+    }
+
+    #[test]
+    fn a_recurrent_snapshot_is_hit_only_once_its_step_is_finalized() {
+        let mut config = make_test_config();
+        config.enable_prefix_caching = true;
+        let mut engine = EngineCore::new(
+            config,
+            Box::new(SnapshottingExecutor(NoopExecutor::new(1024))),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(make_request("r1", 600));
+        let saving = engine.schedule_next().unwrap();
+        assert_eq!(saving.recurrent_state.saves.len(), 1);
+        assert_eq!(saving.recurrent_state.saves[0].position, 592);
+
+        // Async scheduling: the next step is scheduled while the saving one is still running.
+        engine.add_request(make_request("r2", 600));
+        let behind = engine.schedule_next().unwrap();
+        assert!(behind.recurrent_state.restores.is_empty());
+        assert_eq!(behind.num_scheduled_tokens["r2"], 600);
+
+        for step in [&saving, &behind] {
+            let out = executor.execute_model(step).unwrap();
+            engine.finalize_step(step, &out);
+        }
+        engine.add_request(make_request("r3", 600));
+        let resumed = engine.schedule_next().unwrap();
+        assert!(
+            resumed
+                .recurrent_state
+                .restores
+                .iter()
+                .any(|op| op.req_id == "r3" && op.position == 592),
+            "{:?}",
+            resumed.recurrent_state
+        );
+    }
+
+    #[test]
+    fn without_prefix_caching_a_snapshotting_worker_changes_nothing() {
+        let mut engine = EngineCore::new(
+            make_test_config(),
+            Box::new(SnapshottingExecutor(NoopExecutor::new(1024))),
+        );
+        engine.add_request(make_request("r1", 600));
+        let step = engine.schedule_next().unwrap();
+        assert!(step.recurrent_state.is_empty());
+        assert_eq!(step.num_scheduled_tokens["r1"], 600);
     }
 }

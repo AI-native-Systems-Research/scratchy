@@ -65,6 +65,8 @@ impl TestServer {
             device: None,
             spawn: should_spawn(),
             enforce_eager: None,
+            max_num_seqs: None,
+            prefix_caching: true,
         }
     }
 
@@ -117,6 +119,8 @@ pub struct TestServerBuilder {
     pipeline_parallel_size: usize,
     spawn: bool,
     enforce_eager: Option<bool>,
+    max_num_seqs: Option<usize>,
+    prefix_caching: bool,
 }
 
 impl TestServerBuilder {
@@ -208,6 +212,21 @@ impl TestServerBuilder {
         self
     }
 
+    /// Cap the resident sequences (default: 256 in-process, the CLI's own default spawned).
+    ///
+    /// A model with per-sequence recurrent state (Qwen3.5 / Qwen3.6) allocates one state slot
+    /// per sequence — 62.8 MiB each on Qwen3.6-35B-A3B — so its tests pass a small width.
+    pub fn with_max_num_seqs(mut self, n: usize) -> Self {
+        self.max_num_seqs = Some(n);
+        self
+    }
+
+    /// Turn prefix caching off (`--no-prefix-caching`), in either mode.
+    pub fn without_prefix_caching(mut self) -> Self {
+        self.prefix_caching = false;
+        self
+    }
+
     /// Override the enforce-eager setting.
     /// When `false`, CUDA graphs are enabled (default for CLI).
     /// When `true`, CUDA graphs are disabled (default for in-process tests).
@@ -287,6 +306,14 @@ impl TestServerBuilder {
             cmd.arg("--enforce-eager");
         }
 
+        if let Some(n) = self.max_num_seqs {
+            cmd.arg("--max-num-seqs").arg(n.to_string());
+        }
+
+        if !self.prefix_caching {
+            cmd.arg("--no-prefix-caching");
+        }
+
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
@@ -351,7 +378,8 @@ impl TestServerBuilder {
             model: model.clone(),
             device,
             dtype,
-            max_num_seqs: Some(256),
+            max_num_seqs: Some(self.max_num_seqs.unwrap_or(256)),
+            enable_prefix_caching: self.prefix_caching,
             block_size: 16,
             gpu_memory_utilization: 0.9,
             lora_adapter: self.lora_adapter.clone(),

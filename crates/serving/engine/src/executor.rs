@@ -314,6 +314,16 @@ pub trait Executor: Send {
         scratchy_core_common::KvAddressing::ByToken
     }
 
+    /// ⭐ HOW MANY RECURRENT-STATE SNAPSHOTS THE WORKER KEEPS FOR THE PREFIX CACHE — asked once,
+    /// when the engine builds the block tracker, for the same reason as [`Self::kv_addressing`].
+    ///
+    /// Forwarded from [`crate::worker::Worker::recurrent_state_snapshots`]. 0 (the default) for
+    /// every executor that does not forward it: the tracker then tracks no recurrent state, and
+    /// `initialize_core` keeps prefix caching off for a recurrent-hybrid model.
+    fn recurrent_state_snapshots(&self) -> usize {
+        0
+    }
+
     /// Check whether the executor is healthy.
     ///
     /// Returns `Ok(())` if healthy, or an error describing the problem.

@@ -206,7 +206,7 @@ pub struct BenchThroughputArgs {
     pub dtype: String,
 
     /// Dataset name: "random" (default) or "sharegpt".
-    #[arg(long, default_value = "random")]
+    #[arg(long, default_value = "random", value_parser = ["random", "sharegpt"])]
     pub dataset_name: String,
 
     /// Path to dataset file (required for sharegpt).
@@ -339,11 +339,12 @@ pub struct BenchServeArgs {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub base_url: String,
 
-    /// API endpoint path.
-    #[arg(long, default_value = "/v1/completions")]
-    pub endpoint: String,
+    /// API endpoint path. Default: `/v1/completions`, or
+    /// `/v1/chat/completions` for `--dataset-name multi-turn`.
+    #[arg(long)]
+    pub endpoint: Option<String>,
 
-    /// Number of prompts to send.
+    /// Number of prompts to send (conversations, for `multi-turn`).
     #[arg(long, default_value_t = 1000)]
     pub num_prompts: usize,
 
@@ -351,15 +352,18 @@ pub struct BenchServeArgs {
     #[arg(long, default_value_t = 1024)]
     pub input_len: usize,
 
-    /// Output length for each request (tokens).
+    /// Output length for each request (tokens). `multi-turn` requests are
+    /// not streamed, so their latency is the TTFT only at `--output-len 1`.
     #[arg(long, default_value_t = 128)]
     pub output_len: usize,
 
-    /// Request rate (requests/sec). Use "inf" for all-at-once.
+    /// Request rate (requests/sec). Use "inf" for all-at-once. Paces
+    /// conversation starts for `multi-turn`.
     #[arg(long, default_value_t = f64::INFINITY)]
     pub request_rate: f64,
 
-    /// Maximum number of concurrent requests.
+    /// Maximum number of concurrent requests (conversations, for
+    /// `multi-turn`).
     #[arg(long)]
     pub max_concurrency: Option<usize>,
 
@@ -389,13 +393,15 @@ pub struct BenchServeArgs {
     #[arg(long, default_value_t = 1.0)]
     pub burstiness: f64,
 
-    /// Number of warmup requests to send before timing.
+    /// Number of warmup requests to send before timing. They and the
+    /// pre-flight request use throwaway prompts from a seed disjoint from
+    /// `--seed`, so no measured prompt is in a prefix cache before it is timed.
     #[arg(long, default_value_t = 0)]
     pub num_warmups: usize,
 
-    /// Dataset name: "random" (default) or "sharegpt".
-    #[arg(long, default_value = "random")]
-    pub dataset_name: String,
+    /// Which prompts to send.
+    #[arg(long, value_enum, default_value_t = ServeDataset::Random)]
+    pub dataset_name: ServeDataset,
 
     /// Path to dataset file (required for sharegpt).
     #[arg(long)]
@@ -453,6 +459,67 @@ pub struct BenchServeArgs {
     /// Label for this benchmark run (used in auto-generated filenames).
     #[arg(long)]
     pub label: Option<String>,
+
+    /// `multi-turn`: approximate tokens in the one system prompt every
+    /// conversation shares.
+    #[arg(long, default_value_t = 2048)]
+    pub multi_turn_system_len: usize,
+
+    /// `multi-turn`: requests per conversation. Turn k+1 is sent only once
+    /// turn k's response has arrived.
+    #[arg(long, default_value_t = 3)]
+    pub multi_turn_turns: usize,
+
+    /// `multi-turn`: approximate tokens in each user message.
+    #[arg(long, default_value_t = 128)]
+    pub multi_turn_user_len: usize,
+
+    /// `multi-turn`: approximate tokens in each assistant reply in the
+    /// history. Replies are seeded text, not the model's output, so every
+    /// backend is sent byte-identical requests.
+    #[arg(long, default_value_t = 256)]
+    pub multi_turn_reply_len: usize,
+
+    /// JSON object sent as `chat_template_kwargs` on `multi-turn` requests,
+    /// e.g. '{"enable_thinking":false}'. Not sent when unset.
+    #[arg(long, value_parser = parse_json_object)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The prompts `scr bench serve` sends.
+///
+/// A closed set because a typo used to fall through to `random` silently,
+/// benchmarking a workload nobody asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ServeDataset {
+    /// Seeded random-token prompts of `--input-len` tokens, streamed.
+    Random,
+    /// The first human turn of each ShareGPT conversation (`--dataset-path`).
+    Sharegpt,
+    /// Closed-loop chats sharing one system prompt, sent non-streaming to
+    /// the chat endpoint: measures prefix reuse from one turn to the next.
+    MultiTurn,
+}
+
+impl BenchServeArgs {
+    /// `--endpoint`, or the dataset's own default.
+    pub(crate) fn endpoint(&self) -> &str {
+        match (&self.endpoint, self.dataset_name) {
+            (Some(endpoint), _) => endpoint,
+            (None, ServeDataset::MultiTurn) => "/v1/chat/completions",
+            (None, ServeDataset::Random | ServeDataset::Sharegpt) => "/v1/completions",
+        }
+    }
+}
+
+/// `--chat-template-kwargs`: refused at parse time unless it is a JSON object,
+/// rather than sent for each server to reject (or ignore) differently.
+fn parse_json_object(s: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str(s) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err(r#"expected a JSON object, e.g. '{"enable_thinking":false}'"#.to_string()),
+        Err(e) => Err(format!("invalid JSON: {e}")),
+    }
 }
 
 /// Arguments for `scr bench startup`.
@@ -1528,5 +1595,54 @@ impl BenchLongbenchArgs {
                 Err("model is required: provide as positional arg or --model flag".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_serve_dataset_names_are_refused() {
+        assert!(BenchServeArgs::try_parse_from(["serve", "--dataset-name", "multiturn"]).is_err());
+        let a = BenchServeArgs::try_parse_from(["serve"]).unwrap();
+        assert_eq!(a.dataset_name, ServeDataset::Random);
+        assert_eq!(a.endpoint(), "/v1/completions");
+    }
+
+    #[test]
+    fn unknown_throughput_dataset_names_are_refused() {
+        let parse = |name| BenchThroughputArgs::try_parse_from(["t", "--dataset-name", name]);
+        assert!(parse("shareGPT").is_err());
+        assert_eq!(parse("sharegpt").unwrap().dataset_name, "sharegpt");
+    }
+
+    #[test]
+    fn multi_turn_defaults_to_the_chat_endpoint_unless_overridden() {
+        let a = BenchServeArgs::try_parse_from(["serve", "--dataset-name", "multi-turn"]).unwrap();
+        assert_eq!(a.dataset_name, ServeDataset::MultiTurn);
+        assert_eq!(a.endpoint(), "/v1/chat/completions");
+        let a = BenchServeArgs::try_parse_from([
+            "serve",
+            "--dataset-name",
+            "multi-turn",
+            "--endpoint",
+            "/chat/completions",
+        ])
+        .unwrap();
+        assert_eq!(a.endpoint(), "/chat/completions");
+    }
+
+    #[test]
+    fn chat_template_kwargs_must_be_a_json_object() {
+        let parse =
+            |v: &str| BenchServeArgs::try_parse_from(["serve", "--chat-template-kwargs", v]);
+        let a = parse(r#"{"enable_thinking":false}"#).unwrap();
+        assert_eq!(
+            a.chat_template_kwargs.unwrap()["enable_thinking"],
+            serde_json::json!(false)
+        );
+        assert!(parse("[false]").is_err());
+        assert!(parse("enable_thinking=false").is_err());
     }
 }

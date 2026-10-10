@@ -52,6 +52,10 @@ pub struct WorkerCreateConfig {
     /// resident sequence for hybrid arches (Qwen3.5 / Qwen3-Next); unused by
     /// non-hybrid arches.
     pub max_num_seqs: Option<usize>,
+    /// Whether the engine will serve cached prefixes (prefix caching requested and the backend able to
+    /// honour it). A worker whose model carries recurrent state reserves the snapshots a prefix hit
+    /// must restore only when this is set, so a run without caching does not pay their memory.
+    pub enable_prefix_caching: bool,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).

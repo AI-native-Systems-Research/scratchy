@@ -24,6 +24,24 @@
 
 use std::collections::HashMap;
 
+/// How a row's state slot starts a step — see [`GdnSlotAllocator::claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotStart {
+    /// Zero-initialize: the row's forward starts at its first token.
+    Fresh,
+    /// Read the slot: it holds the state after the row's earlier tokens.
+    Continue,
+}
+
+/// Why [`GdnSlotAllocator::claim`] refused a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimError {
+    /// No free slot: more resident sequences than slots.
+    Exhausted,
+    /// The row starts past its first token, owns no slot and restores no snapshot.
+    MissingState,
+}
+
 /// Maps live request/sequence ids to GDN state slots, recycling on release.
 #[derive(Debug)]
 pub struct GdnSlotAllocator {
@@ -65,6 +83,54 @@ impl GdnSlotAllocator {
         let slot = self.free.pop()?;
         self.assigned.insert(request_id, slot);
         Some((slot, true))
+    }
+
+    /// ⭐ RESOLVE A ROW'S SLOT AND HOW IT STARTS THIS STEP — from where the row stands, not from
+    /// whether this allocator has seen the id before.
+    ///
+    /// `tokens_before` is the row's `num_computed_tokens` this step; `restoring` says its state is
+    /// copied into the slot from a prefix-cache snapshot before the forward.
+    ///
+    /// * `restoring` → [`SlotStart::Continue`]: the slot holds the snapshot's state.
+    /// * `tokens_before == 0` → [`SlotStart::Fresh`], whatever the slot held. A sequence's first
+    ///   token starts from zero — the degeneration guard above, and also right for a preempted
+    ///   request whose release never reached the worker (its slot is still assigned).
+    /// * otherwise → `Continue` when the request owns a slot. When it does not, its state over
+    ///   the tokens it skips exists nowhere: [`ClaimError::MissingState`] — what a prefix-cache
+    ///   hit without a snapshot would be, refused instead of run on a zeroed state.
+    ///
+    /// [`Self::slot_for`] is the id-only rule this replaces where the worker can say where a row
+    /// stands.
+    pub fn claim(
+        &mut self,
+        request_id: u64,
+        tokens_before: u32,
+        restoring: bool,
+    ) -> Result<(u32, SlotStart), ClaimError> {
+        let owned = self.assigned.get(&request_id).copied();
+        let start = if restoring {
+            SlotStart::Continue
+        } else if tokens_before == 0 {
+            SlotStart::Fresh
+        } else if owned.is_some() {
+            SlotStart::Continue
+        } else {
+            return Err(ClaimError::MissingState);
+        };
+        let slot = match owned {
+            Some(slot) => slot,
+            None => {
+                let slot = self.free.pop().ok_or(ClaimError::Exhausted)?;
+                self.assigned.insert(request_id, slot);
+                slot
+            }
+        };
+        Ok((slot, start))
+    }
+
+    /// The slot `request_id` owns, if any.
+    pub fn slot_of(&self, request_id: u64) -> Option<u32> {
+        self.assigned.get(&request_id).copied()
     }
 
     /// Release a finished request's slot back to the free list. The state in
@@ -172,6 +238,40 @@ mod tests {
         }
         // No leak: all slots back in the free list.
         assert_eq!(a.free.len(), cap);
+    }
+
+    #[test]
+    fn claim_is_fresh_at_token_zero_even_on_a_slot_still_owned() {
+        let mut a = GdnSlotAllocator::new(2);
+        let (s, start) = a.claim(1, 0, false).unwrap();
+        assert_eq!(start, SlotStart::Fresh);
+        assert_eq!(a.claim(1, 16, false), Ok((s, SlotStart::Continue)));
+        // Preempted, release never seen, re-run from token 0: zero-init, same slot.
+        assert_eq!(a.claim(1, 0, false), Ok((s, SlotStart::Fresh)));
+    }
+
+    #[test]
+    fn claim_restoring_continues_on_a_newly_claimed_slot() {
+        let mut a = GdnSlotAllocator::new(2);
+        let (s, start) = a.claim(9, 512, true).unwrap();
+        assert_eq!(start, SlotStart::Continue);
+        assert_eq!(a.slot_of(9), Some(s));
+        assert_eq!(a.claim(9, 600, false), Ok((s, SlotStart::Continue)));
+    }
+
+    #[test]
+    fn claim_refuses_a_row_past_token_zero_with_no_state() {
+        let mut a = GdnSlotAllocator::new(2);
+        assert_eq!(a.claim(5, 256, false), Err(ClaimError::MissingState));
+        assert_eq!(a.num_active(), 0, "a refused row claims nothing");
+    }
+
+    #[test]
+    fn claim_reports_exhaustion() {
+        let mut a = GdnSlotAllocator::new(1);
+        a.claim(1, 0, false).unwrap();
+        assert_eq!(a.claim(2, 0, false), Err(ClaimError::Exhausted));
+        assert_eq!(a.claim(3, 64, true), Err(ClaimError::Exhausted));
     }
 
     #[test]

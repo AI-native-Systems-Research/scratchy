@@ -7,13 +7,25 @@
 #   - input-lens × output-lens cross product at concurrency 1
 #   - concurrency sweep at (--base-input × --base-output)
 #   - or an explicit --cells "INxOUTxCONC,..." override
+#   - plus --multi-turn-cells "SYSxTURNSxCONC,...": `--dataset-name
+#     multi-turn` cells, one shared ~SYS-token system prompt, TURNS
+#     closed-loop turns per conversation, CONC conversations in flight,
+#     --output-len 1 (non-streamed, so the request latency is the TTFT).
+#     Given alone, they replace the default in×out sweep; with --cells,
+#     both run. They keep prefix caching ON (the reuse is what they
+#     measure; docs/BENCHMARKING.md §3 has the exception) — add the
+#     `scratchy-nocache` backend (`scr serve --no-prefix-caching`) to
+#     --backends to see the win against scratchy itself. Qwen3.5/3.6
+#     runs should pass --chat-template-kwargs '{"enable_thinking":false}'
+#     so both servers render the same prompt.
 #
 # Hard-won rules baked in (see memory feedback_real_benchmarks +
 # project_gemma4_port "BENCH LESSONS"):
 #   - UNIQUE SEED PER CELL: same --seed ⇒ identical random prompts ⇒ the
 #     the scratchy prefix cache serves later cells and TTFT collapses to ~0.
 #     Seeds are shared across backends (same prompts ⇒ fair) but unique
-#     across cells. Servers are started once per backend, solo.
+#     across cells (multi-turn cells continue the count after the in×out
+#     ones). Servers are started once per backend, solo.
 #   - mlx-lm does NOT honor ignore_eos and under-generates: compare
 #     TTFT/TPOT directly; E2E only via the work-normalized
 #     E2E* = median_ttft + (output_len-1) * median_tpot. The summary
@@ -28,6 +40,11 @@
 #       --model mlx-community/gemma-4-12B-it-4bit \
 #       --vllm-bin <gemma4-worktree>/vllm-rs/target/release/scr \
 #       --mlx-server "python <gemma4-worktree>/vllm-rs/scripts/gemma4/mlx_lm_server_gemma4.py"
+#   scripts/bench_serve_compare.sh \
+#       --model mlx-community/Qwen3.5-9B-4bit \
+#       --backends scratchy,scratchy-nocache,mlx-lm \
+#       --multi-turn-cells 2048x3x1,2048x3x4 \
+#       --chat-template-kwargs '{"enable_thinking":false}'
 #
 # The scratchy binary must be built with the model compiled in — no default
 # model scope, name it explicitly (quant defaults are already on for metal):
@@ -51,7 +68,9 @@ CONCURRENCIES="2,4,8"
 BASE_INPUT=512
 BASE_OUTPUT=128
 CELLS=""
-NUM_PROMPTS=0          # 0 = auto: max(6, 2*concurrency)
+MULTI_TURN_CELLS=""
+CHAT_TEMPLATE_KWARGS=""
+NUM_PROMPTS=0          # 0 = auto: max(6, 2*concurrency); conversations for multi-turn
 WARMUPS=1
 PORT=8731
 SEED_BASE=1000
@@ -71,6 +90,8 @@ while [[ $# -gt 0 ]]; do
         --base-input)          BASE_INPUT="$2"; shift 2 ;;
         --base-output)         BASE_OUTPUT="$2"; shift 2 ;;
         --cells)               CELLS="$2"; shift 2 ;;
+        --multi-turn-cells)    MULTI_TURN_CELLS="$2"; shift 2 ;;
+        --chat-template-kwargs) CHAT_TEMPLATE_KWARGS="$2"; shift 2 ;;
         --num-prompts)         NUM_PROMPTS="$2"; shift 2 ;;
         --warmups)             WARMUPS="$2"; shift 2 ;;
         --port)                PORT="$2"; shift 2 ;;
@@ -103,8 +124,8 @@ if ! "${VLLM_BIN}" bench --help >/dev/null 2>&1; then
 fi
 
 # ---- build the cell list ----------------------------------------------------
-# Each cell is "INPUTxOUTPUTxCONC".
-if [[ -z "${CELLS}" ]]; then
+# Each cell is "INPUTxOUTPUTxCONC"; each multi-turn cell "SYSxTURNSxCONC".
+if [[ -z "${CELLS}" && -z "${MULTI_TURN_CELLS}" ]]; then
     IFS=',' read -r -a in_arr   <<<"${INPUT_LENS}"
     IFS=',' read -r -a out_arr  <<<"${OUTPUT_LENS}"
     IFS=',' read -r -a conc_arr <<<"${CONCURRENCIES}"
@@ -118,8 +139,20 @@ if [[ -z "${CELLS}" ]]; then
         [[ "${c}" == "1" ]] && continue
         cells+=("${BASE_INPUT}x${BASE_OUTPUT}x${c}")
     done
-else
+elif [[ -n "${CELLS}" ]]; then
     IFS=',' read -r -a cells <<<"${CELLS}"
+else
+    cells=()
+fi
+mt_cells=()
+if [[ -n "${MULTI_TURN_CELLS}" ]]; then
+    IFS=',' read -r -a mt_cells <<<"${MULTI_TURN_CELLS}"
+    for c in "${mt_cells[@]}"; do
+        if [[ ! "${c}" =~ ^[0-9]+x[0-9]+x[0-9]+$ ]]; then
+            echo "bad --multi-turn-cells entry '${c}': want SYSxTURNSxCONC" >&2
+            exit 2
+        fi
+    done
 fi
 
 if [[ -z "${LABEL}" ]]; then
@@ -136,11 +169,15 @@ mkdir -p "${OUT_DIR}"
     echo "vllm_bin: ${VLLM_BIN}"
     echo "mlx_server: ${MLX_SERVER}"
     echo "backends: ${BACKENDS}"
-    echo "cells: ${cells[*]}"
+    echo "cells: ${cells[*]-}"
     echo "num_prompts: ${NUM_PROMPTS} (0 = max(6, 2*conc))"
     echo "warmups: ${WARMUPS}"
     echo "seed_base: ${SEED_BASE} (seed = base + cell index; shared across backends)"
     echo "scratchy_serve_extra: ${SCRATCHY_SERVE_EXTRA:-<none>}"
+    if [[ -n "${MULTI_TURN_CELLS}" ]]; then
+        echo "multi_turn_cells: ${mt_cells[*]} (sys×turns×conc, --output-len 1; warmups are whole conversations)"
+        echo "chat_template_kwargs: ${CHAT_TEMPLATE_KWARGS:-<none>}"
+    fi
 } > "${OUT_DIR}/run_config.txt"
 echo "results -> ${OUT_DIR}"
 
@@ -199,6 +236,13 @@ start_backend() {
                 ${SCRATCHY_SERVE_EXTRA} \
                 >"${SERVER_LOG}" 2>&1 &
             ;;
+        scratchy-nocache)
+            # The multi-turn cells' baseline: scratchy without the reuse.
+            # shellcheck disable=SC2086  # intentional word-split of extras
+            "${VLLM_BIN}" serve "${MODEL}" --port "${PORT}" --no-prefix-caching \
+                ${SCRATCHY_SERVE_EXTRA} \
+                >"${SERVER_LOG}" 2>&1 &
+            ;;
         mlx-lm)
             # shellcheck disable=SC2086  # MLX_SERVER may be "python script.py"
             ${MLX_SERVER} --model "${MODEL}" --host 127.0.0.1 --port "${PORT}" \
@@ -248,6 +292,50 @@ run_cell() {
         2>&1 | tee "${log}" | tail -n 4
 }
 
+# ---- bench one multi-turn cell ----------------------------------------------
+run_mt_cell() {
+    local backend="$1" cell="$2" idx="$3"
+    local sys turns conc
+    IFS='x' read -r sys turns conc <<<"${cell}"
+
+    local np="${NUM_PROMPTS}"
+    if [[ "${np}" -eq 0 ]]; then
+        np=$(( conc * 2 ))
+        (( np < 6 )) && np=6
+    fi
+    local seed=$(( SEED_BASE + idx ))
+    local tag="mt${sys}x${turns}x${conc}"
+    local json="${OUT_DIR}/${backend}.${tag}.json"
+    local log="${OUT_DIR}/${backend}.${tag}.bench.log"
+    local kwargs=()
+    if [[ -n "${CHAT_TEMPLATE_KWARGS}" ]]; then
+        kwargs=(--chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}")
+    fi
+
+    echo
+    echo "=== [${backend}] multi-turn cell ${sys}x${turns}x${conc} (conversations=${np} seed=${seed}) ==="
+    # Each warmup is one whole throwaway conversation, so the reuse path is
+    # warm too; `bench serve` counts warmups in requests.
+    "${VLLM_BIN}" bench serve \
+        --base-url "http://127.0.0.1:${PORT}" \
+        --model "${MODEL}" \
+        --dataset-name multi-turn \
+        --num-prompts "${np}" \
+        --multi-turn-system-len "${sys}" \
+        --multi-turn-turns "${turns}" \
+        --output-len 1 \
+        --max-concurrency "${conc}" \
+        --temperature 0 \
+        --seed "${seed}" \
+        --num-warmups "$(( WARMUPS * turns ))" \
+        --percentile-metrics ttft,e2el \
+        --metric-percentiles 50,99 \
+        ${kwargs[@]+"${kwargs[@]}"} \
+        --output-json "${json}" \
+        --disable-tqdm \
+        2>&1 | tee "${log}" | tail -n "$(( turns + 4 ))"
+}
+
 # ---- run --------------------------------------------------------------------
 IFS=',' read -r -a backend_arr <<<"${BACKENDS}"
 for backend in "${backend_arr[@]}"; do
@@ -259,9 +347,14 @@ for backend in "${backend_arr[@]}"; do
         continue
     fi
     idx=0
-    for cell in "${cells[@]}"; do
+    for cell in ${cells[@]+"${cells[@]}"}; do
         run_cell "${backend}" "${cell}" "${idx}" || \
             echo "[${backend}] cell ${cell} failed; continuing" >&2
+        idx=$(( idx + 1 ))
+    done
+    for cell in ${mt_cells[@]+"${mt_cells[@]}"}; do
+        run_mt_cell "${backend}" "${cell}" "${idx}" || \
+            echo "[${backend}] multi-turn cell ${cell} failed; continuing" >&2
         idx=$(( idx + 1 ))
     done
     stop_server
@@ -269,7 +362,10 @@ done
 
 # ---- summary ----------------------------------------------------------------
 SUMMARY="${OUT_DIR}/summary.md"
-python3 - "${OUT_DIR}" "${MODEL}" "${BACKENDS}" "${cells[@]}" <<'PY' > "${SUMMARY}"
+if (( ${#cells[@]} == 0 )); then
+    printf "# serve compare — %s\n\nresults: \`%s\`\n" "${MODEL}" "${OUT_DIR}" > "${SUMMARY}"
+else
+    python3 - "${OUT_DIR}" "${MODEL}" "${BACKENDS}" "${cells[@]}" <<'PY' > "${SUMMARY}"
 import json, os, sys
 
 out_dir, model, backends_csv = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -340,6 +436,59 @@ for cell in cells:
         row += ["—"]
     print("| " + " | ".join(row) + " |")
 PY
+fi
+
+if (( ${#mt_cells[@]} )); then
+    python3 - "${OUT_DIR}" "${BACKENDS}" "${mt_cells[@]}" <<'PY' >> "${SUMMARY}"
+import json, os, sys
+
+out_dir, backends = sys.argv[1], sys.argv[2].split(",")
+cells = sys.argv[3:]
+
+def load(backend, tag):
+    path = os.path.join(out_dir, f"{backend}.{tag}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+def num(v):
+    return "—" if v is None else f"{v:.0f}"
+
+print()
+print("## multi-turn prefix reuse")
+print()
+print("Every conversation shares one system prompt; turn k+1 resends turn k plus a")
+print("synthetic reply and a new question, closed loop, at `--output-len 1`, so the")
+print("request latency is the TTFT. Prefix caching is on for every backend except")
+print("`scratchy-nocache`. tK = turn-K median TTFT (ms); cached/prompt = mean tokens")
+print("the server reported reusing / its prompt tokens (— = not reported); tK/t1 =")
+print("turn-K median TTFT over turn 1's, below 1× when the reuse pays.")
+for cell in cells:
+    sys_len, turns, conc = (int(x) for x in cell.split("x"))
+    ks = range(1, turns + 1)
+    print()
+    print(f"### system {sys_len} tok × {turns} turns × conc {conc}")
+    print()
+    hdr = (["backend", "ok"] + [f"t{k}" for k in ks]
+           + [f"t{k} cached/prompt" for k in ks]
+           + [f"t{k}/t1" for k in ks if k > 1])
+    print("| " + " | ".join(hdr) + " |")
+    print("|" + "---|" * len(hdr))
+    for bk in backends:
+        d = load(bk, f"mt{cell}")
+        if d is None:
+            print("| " + " | ".join([bk] + ["—"] * (len(hdr) - 1)) + " |")
+            continue
+        ttft = [d.get(f"median_ttft_ms_turn{k}") for k in ks]
+        reuse = [num(d.get(f"mean_cached_tokens_turn{k}")) + "/"
+                 + num(d.get(f"mean_prompt_tokens_turn{k}")) for k in ks]
+        ratios = ["—" if not ttft[0] or t is None else f"{t / ttft[0]:.2f}×"
+                  for t in ttft[1:]]
+        row = [bk, str(d["completed"])] + [num(t) for t in ttft] + reuse + ratios
+        print("| " + " | ".join(row) + " |")
+PY
+fi
 
 echo
 echo "summary -> ${SUMMARY}"
