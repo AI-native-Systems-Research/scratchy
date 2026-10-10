@@ -18,6 +18,8 @@ pub enum Module {
     Grid,
     Heading,
     Layer,
+    Link,
+    List,
     Select,
     Stack,
     Tag,
@@ -28,7 +30,7 @@ pub enum Module {
 
 /// Which module defines each `cds-*` tag family: the tag itself and every
 /// `<family>-...` tag.
-const FAMILIES: [(&str, Module); 17] = [
+const FAMILIES: [(&str, Module); 21] = [
     ("cds-accordion", Module::Accordion),
     ("cds-button", Module::Button),
     ("cds-clickable-tile", Module::Tile),
@@ -38,6 +40,9 @@ const FAMILIES: [(&str, Module); 17] = [
     ("cds-header", Module::UiShell),
     ("cds-heading", Module::Heading),
     ("cds-layer", Module::Layer),
+    ("cds-link", Module::Link),
+    ("cds-list-item", Module::List),
+    ("cds-ordered-list", Module::List),
     ("cds-section", Module::Heading),
     ("cds-select", Module::Select),
     ("cds-side-nav", Module::UiShell),
@@ -46,6 +51,7 @@ const FAMILIES: [(&str, Module); 17] = [
     ("cds-tag", Module::Tag),
     ("cds-tile", Module::Tile),
     ("cds-toggletip", Module::ToggleTip),
+    ("cds-unordered-list", Module::List),
 ];
 
 impl Module {
@@ -89,6 +95,8 @@ impl Module {
             Module::Grid => "grid",
             Module::Heading => "heading",
             Module::Layer => "layer",
+            Module::Link => "link",
+            Module::List => "list",
             Module::Select => "select",
             Module::Stack => "stack",
             Module::Tag => "tag",
@@ -128,7 +136,7 @@ pub fn Tile(
 
 #[component]
 pub fn ClickableTile(
-    #[props(into)] class: String,
+    #[props(into)] class: Option<String>,
     #[props(into)] href: String,
     children: Element,
 ) -> Element {
@@ -138,8 +146,8 @@ pub fn ClickableTile(
 /// A multi-line `cds-code-snippet`. Its text is rendered verbatim, so the
 /// children carry their own newlines.
 #[component]
-pub fn CodeSnippet(children: Element) -> Element {
-    rsx! { cds-code-snippet { "type": "multi", {children} } }
+pub fn CodeSnippet(#[props(into)] id: Option<String>, children: Element) -> Element {
+    rsx! { cds-code-snippet { "id": id, "type": "multi", {children} } }
 }
 
 /// Where a toggletip's popover opens, relative to its button.
@@ -198,12 +206,44 @@ pub fn Stack(gap: u8, #[props(default)] orientation: Orientation, children: Elem
 }
 
 /// A `cds-grid`: Carbon's 16-column responsive grid (4 columns small, 8
-/// medium), condensed gutters so it can nest inside tiles. Full width: by
-/// default Carbon caps a grid at 99rem and centres it, which in a wide content
-/// area leaves it floating in from the left.
+/// medium). Full width: by default Carbon caps a grid at 99rem and centres
+/// it, which in a wide content area leaves it floating in from the left.
 #[component]
-pub fn Grid(children: Element) -> Element {
-    rsx! { cds-grid { "condensed": "", "full-width": "", {children} } }
+pub fn Grid(#[props(default)] gutter: Gutter, children: Element) -> Element {
+    let (condensed, row_gap) = match gutter {
+        Gutter::Condensed => (Some(""), None),
+        Gutter::Cards => (None, Some("")),
+    };
+    rsx! { cds-grid { "condensed": condensed, "with-row-gap": row_gap, "full-width": "", {children} } }
+}
+
+/// The space between a grid's columns (and rows), as Carbon sets it.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum Gutter {
+    /// 1px columns, no row gap: one block, e.g. inside a tile.
+    #[default]
+    Condensed,
+    /// Carbon's standard 2rem gutter, and the same between rows: separate
+    /// cards.
+    Cards,
+}
+
+/// A page's content: one Carbon grid, at its default 99rem max width with
+/// its own page margins, holding a single full-width column. Grids inside it
+/// are Carbon subgrids, so their columns line up with the page's.
+#[component]
+pub fn Page(children: Element) -> Element {
+    rsx! {
+        cds-grid {
+            cds-column { "sm": "4", "md": "8", "lg": "16", {children} }
+        }
+    }
+}
+
+/// A `cds-link`: Carbon's link, for a call to action standing on its own.
+#[component]
+pub fn Link(#[props(into)] href: String, children: Element) -> Element {
+    rsx! { cds-link { "href": href, {children} } }
 }
 
 /// How many grid columns a `cds-column` spans at each breakpoint.
@@ -215,6 +255,29 @@ pub struct Span {
 }
 
 impl Span {
+    /// Full width on small screens, half on medium, a third on large.
+    pub const THIRD: Span = Span {
+        sm: 4,
+        md: 4,
+        lg: 5,
+    };
+    /// Full width on small screens, half on medium, a quarter on large.
+    pub const QUARTER: Span = Span {
+        sm: 4,
+        md: 4,
+        lg: 4,
+    };
+    /// A text column beside a wider one (with WIDE), stacked below large.
+    pub const NARROW: Span = Span {
+        sm: 4,
+        md: 8,
+        lg: 7,
+    };
+    pub const WIDE: Span = Span {
+        sm: 4,
+        md: 8,
+        lg: 9,
+    };
     /// Full width on small screens, half from medium up.
     pub const HALF: Span = Span {
         sm: 4,
@@ -314,7 +377,7 @@ pub fn SideNav(
     children: Element,
 ) -> Element {
     rsx! {
-        cds-side-nav { "aria-label": label, "class": "docs-side-nav", "id": id,
+        cds-side-nav { "aria-label": label, "id": id,
             cds-side-nav-items { {children} }
         }
     }

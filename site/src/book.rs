@@ -10,8 +10,8 @@ use std::path::Path;
 
 use dioxus::prelude::*;
 
-use crate::carbon::{SideNav, SideNavLink, SideNavMenu};
-use crate::chrome::{self, Head, Library, Root, Tab, Theme};
+use crate::carbon::{Column, Grid, SideNav, SideNavLink, SideNavMenu, Span};
+use crate::chrome::{self, Content, Head, Library, Root, Tab, Theme};
 use crate::{Site, repo};
 
 pub struct Chapter {
@@ -112,13 +112,20 @@ fn build_chapter(site: &Site, c: &Chapter) -> Result<(), String> {
             SideNavMenu { title: "Blogs", {nav_links(&BLOGS, c.slug, root)} }
         }
 
-        div { class: "docs-layout",
-            main { class: "docs-content",
-                zero-md { "src": "{name}.md",
-                    template { "data-append": "", style { dangerous_inner_html: CONTENT_CSS } }
+        Content {
+            Grid {
+                Column { span: Span { sm: 4, md: 8, lg: 12 },
+                    zero-md { "src": "{name}.md",
+                        template { "data-append": "", style { dangerous_inner_html: CONTENT_CSS } }
+                    }
+                }
+                // "On this page", filled in by TOC_JS; large screens only.
+                Column { span: Span { sm: 0, md: 0, lg: 4 },
+                    nav { "aria-label": "On this page", style: "position: sticky; top: 5rem",
+                        cds-unordered-list { "id": "toc" }
+                    }
                 }
             }
-            nav { class: "page-toc", "aria-label": "On this page" }
         }
 
         script { dangerous_inner_html: TOC_JS }

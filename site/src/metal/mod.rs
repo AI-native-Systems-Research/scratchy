@@ -23,7 +23,7 @@ use crate::carbon::{
     Alignment, Column, Fold, Grid, Heading, Layer, Orientation, Section, Span, Stack, Table,
     TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
-use crate::chrome::{self, Head, Library, REPO, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
 use numbers::{
     Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
@@ -1472,8 +1472,8 @@ pub fn build(site: &Site) -> Result<String, String> {
     let page = rsx! {
         {chrome::header(Root(0), Some(Tab::Performance))}
         {chrome::perf_side_nav("metal.html", &sections)}
-        div { class: "docs-layout",
-            main { class: "docs-content",
+        Content {
+            div {
               Stack { gap: 6,
                 Stack { gap: 4,
                     Heading { "Metal performance" }

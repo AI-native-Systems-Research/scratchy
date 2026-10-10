@@ -245,6 +245,13 @@ pub fn header(root: Root, active: Option<Tab>) -> Element {
     }
 }
 
+/// A page's content, in Carbon's UI-shell content area (`cds--content`,
+/// padded by Carbon), offset below the header and beside any side nav.
+#[component]
+pub fn Content(children: Element) -> Element {
+    rsx! { main { class: "cds--content", {children} } }
+}
+
 /// Pages under the Performance tab, in left-nav order. A new page joins the
 /// left nav by adding one row here, without touching the others.
 const PERFORMANCE: [(&str, &str); 1] = [("metal.html", "Metal")];

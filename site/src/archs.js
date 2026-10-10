@@ -37,7 +37,11 @@ function render() {
   $('diffpane').style.display = diffing ? '' : 'none';
 
   if (!diffing) {
-    $('code').innerHTML = A[L].html.join('\n');
+    // Replace the snippet's content outright (not its innerHTML), so the
+    // cds-code-snippet sees a slot change and re-measures its "Show more".
+    const lines = document.createElement('span');
+    lines.innerHTML = A[L].html.join('\n');
+    $('code').replaceChildren(lines);
     $('path').textContent = A[L].path;
     $('meta').textContent = A[L].lines + ' lines';
   } else {

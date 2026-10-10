@@ -9,8 +9,8 @@ use std::fs;
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{SideNav, SideNavLink, Tile};
-use crate::chrome::{self, Head, Library, Root, Tab, Theme};
+use crate::carbon::{CodeSnippet, Column, Grid, Heading, SideNav, SideNavLink, Span, Stack, Tile};
+use crate::chrome::{self, Content, Head, Library, Root, Tab, Theme};
 use crate::highlight;
 use crate::{Site, thousands};
 
@@ -196,36 +196,45 @@ fn page(
             }
         }
 
-        div { class: "docs-layout",
-            main { class: "docs-content archpage",
-                div { class: "hero-body",
-                    h1 { "Scratchy model architectures" }
-                    p { class: "lede",
-                        "{count} architectures, {total} lines of DSL between them. Each one is
-  the model's math, written once; the compiler turns it into the code for every
-  target. Pick a model from the list on the left, then optionally diff it
-  against another below."
+        Content {
+            div {
+              Stack { gap: 7,
+                Stack { gap: 5,
+                    Heading { "Scratchy model architectures" }
+                    p {
+                        "{count} architectures, {total} lines of DSL between them. Each one is the model's math, \
+                         written once; the compiler turns it into the code for every target. Pick a model from the \
+                         list on the left, then optionally diff it against another below."
                     }
                 }
 
-                div { class: "archbar",
-                    cds-select { "id": "right", "label-text": "Diff against", "value": "",
-                        cds-select-item { "value": "", "selected": true, "— none —" }
-                        for n in order {
-                            cds-select-item { "value": "{n}", "{n} — {archs[n].lines} lines" }
+                Grid {
+                    Column { span: Span::THIRD,
+                        cds-select { "id": "right", "label-text": "Diff against", "value": "",
+                            cds-select-item { "value": "", "selected": true, "— none —" }
+                            for n in order {
+                                cds-select-item { "value": "{n}", "{n} — {archs[n].lines} lines" }
+                            }
                         }
                     }
                 }
 
-                Tile { id: "archpane", class: "archpane",
-                    div { class: "codehead", span { id: "path" } span { id: "meta", class: "cmeta" } }
-                    pre { class: "archcode", code { id: "code" } }
+                // The baseline is rendered here, so the page is right before its
+                // script runs; the script swaps in the model picked.
+                Tile { id: "archpane",
+                    Stack { gap: 3,
+                        p { code { id: "path", "{archs[base].path}" } " · " span { id: "meta", "{archs[base].lines} lines" } }
+                        CodeSnippet { id: "code", {highlight::block(&archs[base].raw.join("\n"))} }
+                    }
                 }
 
-                Tile { id: "diffpane", class: "archpane", style: "display: none",
-                    div { class: "codehead", span { id: "diffhead" } }
-                    diff-view-element { "id": "diffview", "language": "python", "disable-line-numbers": "" }
+                Tile { id: "diffpane", style: "display: none",
+                    Stack { gap: 3,
+                        p { id: "diffhead" }
+                        diff-view-element { "id": "diffview", "language": "python", "disable-line-numbers": "" }
+                    }
                 }
+              }
             }
         }
 
