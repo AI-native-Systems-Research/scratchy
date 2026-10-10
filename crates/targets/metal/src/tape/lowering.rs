@@ -739,7 +739,7 @@ fn kv_writer_codec(
 ) -> Result<Option<(super::kernel_constants::RopeTqConstants, Vec<Binding>)>, LoweringError> {
     use super::kernel_constants::{RopeTqConstants, TqOffset};
     use RuntimeBindingKind as RB;
-    if write == KvWrite::Pool {
+    if matches!(write, KvWrite::Pool | KvWrite::None) {
         return Ok(None);
     }
     let bits = tq_bits(p)?;
