@@ -6,7 +6,7 @@ use crate::carbon::{
     Button, ButtonKind, ClickableTile, CodeSnippet, Column, Grid, Gutter, Heading, Link,
     Orientation, Page, Section, SideNav, Span, Stack, Tile,
 };
-use crate::chrome::{self, Content, Head, OpenGraph, REPO, Root, Theme};
+use crate::chrome::{self, Content, Head, OpenGraph, Published, REPO, Root, Theme};
 use crate::{highlight, repo};
 
 /// The opening of crates/models/arch/dsl/llama.py, as the landing page quotes it.
@@ -103,7 +103,7 @@ fn target(flag: &str, what: &str) -> Element {
     }
 }
 
-pub fn page() -> Result<String, String> {
+pub fn page(assets: &Published) -> Result<String, String> {
     let body = rsx! {
         {chrome::header(Root(0), None)}
         // No side nav of its own: only the header's links, opened from the
@@ -331,6 +331,7 @@ pub fn page() -> Result<String, String> {
     };
     chrome::document(
         Head {
+            assets,
             title: "Scratchy — A Hyper-specializing Inference Stack Compiler",
             description: Some(
                 "Once ideas are the unit of reuse, every project gets to be bespoke. Scratchy compiles one model, \

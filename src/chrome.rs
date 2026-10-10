@@ -142,8 +142,18 @@ impl Library {
     }
 }
 
+/// The static files' published names: each content-hashed, so a changed file
+/// is a URL no browser or CDN has cached. GitHub Pages lets both cache every
+/// file for 10 minutes; under a fixed name, a deploy's new pages could arrive
+/// with the previous stylesheet until a hard reload.
+pub struct Published {
+    pub styles: String,
+    pub favicon: String,
+}
+
 pub struct Head<'a> {
     pub title: &'a str,
+    pub assets: &'a Published,
     pub description: Option<&'static str>,
     pub og: Option<OpenGraph>,
     pub root: Root,
@@ -165,13 +175,13 @@ fn head(h: &Head, modules: &[Module]) -> Element {
             meta { "property": "og:description", content: og.description }
             meta { "property": "og:type", content: "website" }
         }
-        link { rel: "icon", r#type: "image/png", href: "{root}favicon.png" }
+        link { rel: "icon", r#type: "image/png", href: "{root}{h.assets.favicon}" }
         link { rel: "stylesheet", href: CARBON_STYLES }
         // Before styles.css, so the site's own rules win.
         for css in h.libraries.iter().filter_map(|l| l.stylesheet()) {
             link { rel: "stylesheet", href: css }
         }
-        link { rel: "stylesheet", href: "{root}styles.css" }
+        link { rel: "stylesheet", href: "{root}{h.assets.styles}" }
         for m in modules {
             script { r#type: "module", src: m.src() }
         }

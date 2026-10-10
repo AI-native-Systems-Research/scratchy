@@ -10,7 +10,7 @@ use dioxus::prelude::*;
 use serde::Serialize;
 
 use crate::carbon::{CodeSnippet, Column, Grid, Heading, SideNav, SideNavLink, Span, Stack, Tile};
-use crate::chrome::{self, Content, Head, Library, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, Root, Tab, Theme};
 use crate::highlight;
 use crate::{Site, thousands};
 
@@ -98,7 +98,7 @@ fn diff_count(a: &[String], b: &[String]) -> (usize, usize) {
     (n - common, m - common)
 }
 
-pub fn build(site: &Site) -> Result<String, String> {
+pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let dsl = site.repo.join(DSL);
     let mut files: Vec<_> = fs::read_dir(&dsl)
         .map_err(|e| format!("{}: {e}", dsl.display()))?
@@ -167,7 +167,7 @@ pub fn build(site: &Site) -> Result<String, String> {
     })
     .map_err(|e| e.to_string())?;
 
-    let page = page(&archs, &order, &base, total, &data)?;
+    let page = page(&archs, &order, &base, total, &data, assets)?;
     let out = site.out.join("architectures.html");
     fs::write(&out, page).map_err(|e| format!("{}: {e}", out.display()))?;
     Ok(format!(
@@ -184,6 +184,7 @@ fn page(
     base: &str,
     total: usize,
     data: &str,
+    assets: &Published,
 ) -> Result<String, String> {
     let count = archs.len();
     let total = thousands(total);
@@ -243,6 +244,7 @@ fn page(
     };
     chrome::document(
         Head {
+            assets,
             title: "Model architectures — scratchy",
             description: Some(
                 "Every model architecture scratchy supports, written in its math DSL, diffable side by side.",

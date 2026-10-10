@@ -11,7 +11,7 @@ use std::path::Path;
 use dioxus::prelude::*;
 
 use crate::carbon::{Column, Grid, SideNav, SideNavLink, SideNavMenu, Span};
-use crate::chrome::{self, Content, Head, Library, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, Root, Tab, Theme};
 use crate::{Site, repo};
 
 pub struct Chapter {
@@ -86,7 +86,7 @@ fn nav_links(chapters: &[Chapter], current: &str, root: Root) -> Element {
     }
 }
 
-fn build_chapter(site: &Site, c: &Chapter) -> Result<(), String> {
+fn build_chapter(site: &Site, c: &Chapter, assets: &Published) -> Result<(), String> {
     // book/<slug>.html sits one directory per path segment below _site/.
     let root = Root(c.slug.matches('/').count() + 1);
     let src = site.repo.join(c.src);
@@ -133,6 +133,7 @@ fn build_chapter(site: &Site, c: &Chapter) -> Result<(), String> {
     let title = format!("{} — scratchy", c.title);
     let page = chrome::document(
         Head {
+            assets,
             title: &title,
             description: None,
             og: None,
@@ -154,11 +155,11 @@ pub fn sources() -> impl Iterator<Item = &'static str> {
     CHAPTERS.iter().chain(&BLOGS).map(|c| c.src)
 }
 
-pub fn build(site: &Site) -> Result<(), String> {
+pub fn build(site: &Site, assets: &Published) -> Result<(), String> {
     CHAPTERS
         .iter()
         .chain(&BLOGS)
-        .try_for_each(|c| build_chapter(site, c))
+        .try_for_each(|c| build_chapter(site, c, assets))
 }
 
 /// Every `](target)` in `text`, as markdown's inline-link syntax reads it.

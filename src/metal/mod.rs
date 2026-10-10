@@ -23,7 +23,7 @@ use crate::carbon::{
     Alignment, Column, Fold, Grid, Heading, Layer, Section, Span, Stack, Table, TableCell,
     TableRow, Tag, TagKind, Tile, Toggletip,
 };
-use crate::chrome::{self, Content, Head, Library, REPO, Root, Tab, Theme};
+use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
 use numbers::{
     Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
@@ -1440,7 +1440,7 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
     }
 }
 
-pub fn build(site: &Site) -> Result<String, String> {
+pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -1485,6 +1485,7 @@ pub fn build(site: &Site) -> Result<String, String> {
     };
     let html = chrome::document(
         Head {
+            assets,
             title: "Metal performance — scratchy",
             description: Some(
                 "scratchy against mlx-lm and ollama on Apple silicon: startup, single-user speed, and scaling, per machine.",
