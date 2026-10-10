@@ -259,11 +259,17 @@ pub struct InputWrites {
 impl InputWrites {
     /// `src`, staged for the head of `to`.
     pub(super) fn stage(&mut self, to: &Buffer, src: &[u8]) {
-        let at = self.staged.len().next_multiple_of(4);
-        self.staged.resize(at, 0);
-        self.staged.extend_from_slice(src);
+        let at = self.raw(src);
         let (to, len) = (to.clone(), src.len());
         self.ops.push(InputWrite::Staged { to, at, len });
+    }
+
+    /// `src`, staged for the device to read in place: its offset in `staged`.
+    pub(super) fn raw(&mut self, src: &[u8]) -> usize {
+        let at = self.staged.len().next_multiple_of(16);
+        self.staged.resize(at, 0);
+        self.staged.extend_from_slice(src);
+        at
     }
 }
 
@@ -285,6 +291,13 @@ pub(super) enum InputWrite {
         to: Buffer,
         at: usize,
         len: usize,
+    },
+    /// `count` [`SelectOp`](crate::select_rows::SelectOp)s `ops_at` bytes into `staged`, their
+    /// tables there too, run by `pipeline` after the writes before them.
+    Select {
+        ops_at: usize,
+        count: usize,
+        pipeline: super::__re::ComputePipelineState,
     },
 }
 

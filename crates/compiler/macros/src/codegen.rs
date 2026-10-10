@@ -7214,7 +7214,13 @@ fn metal_off_tape_tokens(
         // An MRoPE head reads a cos/sin row a token in place of its position.
         rope: RotDim(if mc.mrope { mc.rot_dim } else { 0 }),
     });
-    let keys = OffTape::keys(LogitsWidth(width), mc.metal_dtype, block_size, head);
+    let keys = OffTape::keys(
+        LogitsWidth(width),
+        mc.metal_dtype,
+        block_size,
+        head,
+        mc.spec_drafts > 0,
+    );
     let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
     let OffTape {
         vocab,
@@ -7224,16 +7230,18 @@ fn metal_off_tape_tokens(
         sampler,
         chain_advance,
         mtp_chain,
+        select_rows,
     } = ids;
     let vocab = vocab.get();
     let sampler = sampler.iter().map(|row| {
         let row = row.iter();
         quote!([#(#row),*])
     });
-    let mtp_chain = match mtp_chain {
+    let option = |k: Option<TokenStream>| match k {
         Some(k) => quote!(::core::option::Option::Some(#k)),
         None => quote!(::core::option::Option::None),
     };
+    let (mtp_chain, select_rows) = (option(mtp_chain), option(select_rows));
     quote! {
         /// This model's off-tape kernels, baked for its logits.
         #[cfg(feature = "metal")]
@@ -7246,6 +7254,7 @@ fn metal_off_tape_tokens(
                 sampler: [#(#sampler),*],
                 chain_advance: #chain_advance,
                 mtp_chain: #mtp_chain,
+                select_rows: #select_rows,
             }
         };
     }

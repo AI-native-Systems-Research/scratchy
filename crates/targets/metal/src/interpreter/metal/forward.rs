@@ -162,6 +162,10 @@ pub struct Deferral {
     /// Bytes for buffers outside the runtime inputs that an earlier command buffer may still be
     /// reading (the sampler's per-step parameters), written on the device like the runtime inputs.
     pub host_writes: Vec<(super::__re::Buffer, Vec<u8>)>,
+    /// Inputs that depend on how many drafts the step before it kept, picked on the device after
+    /// the writes above ([`crate::select_rows`]), by `select`, the model's kernel for it.
+    pub selections: Vec<crate::select_rows::Selection>,
+    pub select: Option<super::__re::ComputePipelineState>,
     in_flight: std::sync::OnceLock<InFlight>,
 }
 

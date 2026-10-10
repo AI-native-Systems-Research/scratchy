@@ -1085,7 +1085,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 .computeCommandEncoder()
                 .expect("MTL4 computeCommandEncoder returned nil");
             let ops = writes.map_or(&[][..], |w| &w.ops[..]);
-            encode_input_writes(&enc, ring.staging.as_deref(), 0, ops);
+            encode_input_writes(&enc, &self.device, ring.staging.as_deref(), 0, ops);
             let encoded = encode(&enc);
             enc.endEncoding();
             cb.endCommandBuffer();
@@ -1386,7 +1386,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         used: usize,
         staged: &[u8],
     ) -> (usize, Option<crate::residency::Pinned>) {
-        let mut at = used.next_multiple_of(4);
+        let mut at = used.next_multiple_of(16);
         if staged.is_empty() {
             return (at, None);
         }
@@ -1464,6 +1464,7 @@ fn num_seqs(inputs: &ForwardInputs<'_>) -> u32 {
 /// `base` on — then a barrier before the dispatches that read them.
 fn encode_input_writes(
     enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    device: &Device,
     staging: Option<&Buffer>,
     base: usize,
     ops: &[InputWrite],
@@ -1509,12 +1510,34 @@ fn encode_input_writes(
                         src, *offset, to, *at, *len,
                     );
                 }
+                InputWrite::Select {
+                    ops_at,
+                    count,
+                    pipeline,
+                } => {
+                    let staging = staging.expect("selections have a staging buffer");
+                    let region = staging.gpuAddress() + base as u64;
+                    let ops = (region, region + *ops_at as u64);
+                    crate::select_rows::encode_select_rows(pipeline, enc, device, ops, *count);
+                    // The forward's dispatches read what it wrote.
+                    enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                        MTLStages::Dispatch,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::Device,
+                    );
+                }
             }
         }
     }
     if !ops.is_empty() {
         barrier(MTLStages::Dispatch);
     }
+}
+
+/// A table's words as the bytes the staged region holds.
+fn bytemuck_words(words: &[u32]) -> &[u8] {
+    // SAFETY: `u32` has no padding; the slice covers exactly its words' bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
 }
 
 /// The forwards [`MetalWorkerPool::forward_onto`] and [`Self::then`] encoded onto another pool's
@@ -1561,7 +1584,13 @@ impl<W: CanonicalParams> Onto<'_, W> {
             all,
             MTL4VisibilityOptions::Device,
         );
-        encode_input_writes(enc, pooled.staging.as_deref(), at, &writes.ops);
+        encode_input_writes(
+            enc,
+            &pool.device,
+            pooled.staging.as_deref(),
+            at,
+            &writes.ops,
+        );
         (pooled.worker)
             .run_bucket_mtl4(
                 bucket_idx,
@@ -1674,21 +1703,47 @@ fn begin_step<W: CanonicalParams>(
                 bytes_available: hidden.length(),
             })?;
     }
-    for input in inputs.device_inputs {
-        let to = match input.into {
-            DeviceInputInto::InputIds => &runtime.input_ids,
-            DeviceInputInto::TargetHidden => &runtime.target_hidden,
-            DeviceInputInto::Positions => &runtime.positions,
-            DeviceInputInto::SlotMapping => &runtime.slot_mappings[0],
-            DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
-            DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
-        };
+    let input = |into: DeviceInputInto| match into {
+        DeviceInputInto::InputIds => &runtime.input_ids,
+        DeviceInputInto::TargetHidden => &runtime.target_hidden,
+        DeviceInputInto::Positions => &runtime.positions,
+        DeviceInputInto::SlotMapping => &runtime.slot_mappings[0],
+        DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
+        DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
+    };
+    for input in inputs.device_inputs.iter().map(|d| (d, input(d.into))) {
+        let (input, to) = input;
         writes.ops.push(InputWrite::Device {
             src: input.src.clone(),
             offset: input.offset,
             to: to.clone(),
             at: input.at,
             len: input.len,
+        });
+    }
+    if let Some((d, pipeline)) = (inputs.deferred)
+        .and_then(|d| d.select.clone().map(|p| (d, p)))
+        .filter(|(d, _)| !d.selections.is_empty())
+    {
+        use crate::select_rows::{SelectInto, SelectOp};
+        let tables: Vec<usize> = (d.selections.iter())
+            .map(|s| writes.raw(bytemuck_words(&s.table)))
+            .collect();
+        let ops: Vec<u8> = (d.selections.iter().zip(tables))
+            .flat_map(|(s, at)| {
+                let to = match &s.to {
+                    SelectInto::Input(into) => input(*into),
+                    SelectInto::Buffer(b) => b,
+                };
+                SelectOp::new(at, s, to.gpuAddress() + s.at as u64).bytes()
+            })
+            .collect();
+        let ops_at = writes.raw(&ops);
+        let count = d.selections.len();
+        writes.ops.push(InputWrite::Select {
+            ops_at,
+            count,
+            pipeline,
         });
     }
     worker.worker.tq_dequant_max_blocks.store(
@@ -2723,6 +2778,78 @@ mod tests {
             crate::interpreter::metal::DeviceInput::token((*sampled).clone(), size_of::<u32>(), 1);
         assert_eq!(run(&[5, 0, 9], &[device_input]), [5, 42, 9, 0]);
         assert_eq!(run(&[8], &[]), [8, 0, 0, 0]);
+
+        // A selection: the variant a device-side selector names (2) of a host table, over the host's
+        // placeholders in the middle of `input_ids`.
+        let cache = crate::specialized_pipeline_cache::SpecializedPipelineCache::new(
+            (*pool.device).clone(),
+            &[],
+        )
+        .expect("pipeline cache");
+        let select = crate::aot::baked_build(
+            &cache,
+            &crate::specialized_pipeline_cache::PipelineKey::new(
+                "select_rows",
+                "select_rows",
+                Vec::new(),
+            ),
+        )
+        .expect("select_rows");
+        let picked = pool
+            .allocator
+            .residency()
+            .pin(crate::mtl4_dispatch::shared_bytes(
+                &pool.device,
+                bytes_of(&[2]),
+            ));
+        pool.allocator.residency().commit();
+        let positions: Vec<u32> = (0..4).collect();
+        let mut deferral = Deferral::default();
+        deferral.selections = vec![crate::select_rows::Selection {
+            table: vec![60, 61, 70, 71, 80, 81],
+            stride: 2,
+            len: 2,
+            selector: ((*picked).clone(), 0),
+            to: crate::select_rows::SelectInto::Input(DeviceInputInto::InputIds),
+            at: size_of::<u32>(),
+        }];
+        deferral.select = Some(select);
+        let inputs = ForwardInputs {
+            span_ids: None,
+            num_tokens: 4,
+            input_ids: &[5, 0, 0, 9],
+            positions: &positions,
+            slot_mappings: Vec::new(),
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_tables: Vec::new(),
+            has_spec_tokens: false,
+            last_token_indices: None,
+            gdn_state_indices: None,
+            gdn_is_fresh: None,
+            vision_rope_freqs: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            pixels: None,
+            pos_embeds: None,
+            mm_embeds: None,
+            mm_dst_rows: None,
+            mrope_cos_sin: None,
+            target_hidden: None,
+            device_inputs: &[],
+            deferred: Some(&deferral),
+        };
+        let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
+        let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
+        committed.in_flight.wait().expect("runs");
+        assert_eq!(
+            input_ids(),
+            [5, 80, 81, 9],
+            "variant 2, picked on the device"
+        );
     }
 
     /// Two forwards played onto one command buffer, on one worker: each reads its own inputs — its
