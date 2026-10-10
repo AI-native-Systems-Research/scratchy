@@ -313,6 +313,8 @@ pub enum MetalStep {
     GateScale(Slot, Slot, Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.
     GatedDeltaNet(Slot, Slot, Slot, Slot, Slot, LayerId),
+    /// `(zxbcdt, out, layer)`: Mamba-2 selective state-space mixer over the whole in-projection.
+    Mamba2(Slot, Slot, LayerId),
     /// One step of a MoE block.
     Moe(MoeBlock, MoeStep),
     /// `(operand, layer, class, offsets)`: the layer's `operand` staged out of its packed store for
@@ -639,6 +641,7 @@ impl MetalStep {
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
             | S::KvAppend(_, _, l, _)
             | S::GatedDeltaNet(_, _, _, _, _, l)
+            | S::Mamba2(_, _, l)
             | S::KvStage(_, l, ..)
             | S::AttnPackedKv(_, _, l, ..)
             | S::SampleRows(

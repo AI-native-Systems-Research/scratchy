@@ -87,6 +87,7 @@ macro_rules! for_each_subop {
             VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0];
             EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [q_width geom];
             GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1];
+            Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.

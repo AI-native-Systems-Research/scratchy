@@ -1333,11 +1333,14 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
-            OpKind::GatedDeltaNet => {
-                let qkv = bx.input_at(tile, 0)?;
-                let z = bx.input_at(tile, 1)?;
-                let a = bx.input_at(tile, 2)?;
-                let b2 = bx.input_at(tile, 3)?;
+            OpKind::GatedDeltaNet | OpKind::Mamba2 => {
+                let (op, mut inputs) = if node.op == OpKind::Mamba2 {
+                    let inner = bx.out_cols(tile, 0, "mamba2 d_inner")?;
+                    (SubOp::Mamba2 { inner }, vec![bx.input_at(tile, 0)?])
+                } else {
+                    let ins = (0..4).map(|i| bx.input_at(tile, i));
+                    (SubOp::GatedDeltaNet, ins.collect::<Result<Vec<_>, _>>()?)
+                };
                 let w = node
                     .inputs
                     .iter()
@@ -1350,10 +1353,11 @@ pub fn lower_decode_to_wavefront(
                     })
                     .ok_or(BridgeError::MalformedOp {
                         tile,
-                        op: OpKind::GatedDeltaNet,
-                        detail: "gated_delta_net without a weight bundle",
+                        op: node.op,
+                        detail: "recurrent mixer without a weight bundle",
                     })?;
-                let idx = bx.push_op(SubOp::GatedDeltaNet, vec![qkv, z, a, b2, w]);
+                inputs.push(w);
+                let idx = bx.push_op(op, inputs);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

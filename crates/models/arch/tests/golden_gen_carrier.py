@@ -402,7 +402,31 @@ BUNDLE_LEAVES = {
         ("dt_bias", lambda b: [b["linear_num_value_heads"]]),
         ("norm", lambda b: [b["gdn_value_dim"]]),
     ],
+    # Nemotron-H Mamba-2 mixer (GatedDeltaNetLayer with its conv bias and
+    # `D`) — mamba2 input 1. conv1d is [conv_dim, 1, K] on disk. Leaves
+    # given as (shape, init) pairs take the module's own init (mlx-lm
+    # `NemotronHMamba2Mixer`: nn.Conv1d's U(±1/sqrt(K)) taps and bias,
+    # A_log = log(1..H), the gated norm's ones — jittered so a per-group
+    # weight index shows). Under the generic 0.02 randn the gated norm's
+    # input sits far below its eps and the mixer's output vanishes under
+    # the residual: zeroing the whole scan readout moved the last logits'
+    # cosine by 1e-5. `D` and `dt_bias` keep the generic init, so the
+    # scan, not the skip, dominates the mixer output.
+    "mamba": [
+        ("conv1d", lambda b: ([b["mamba_conv_dim"], 1, b["conv_kernel"]], _conv_init(b))),
+        ("conv_bias", lambda b: ([b["mamba_conv_dim"]], _conv_init(b))),
+        ("a_log", lambda b: ([b["mamba_num_heads"]],
+                             lambda shape: torch.log(torch.arange(1, shape[0] + 1).float()))),
+        ("d", lambda b: [b["mamba_num_heads"]]),
+        ("dt_bias", lambda b: [b["mamba_num_heads"]]),
+        ("norm", lambda b: ([b["mamba_d_inner"]], lambda shape: 1.0 + 0.1 * torch.randn(*shape))),
+    ],
 }
+
+
+def _conv_init(b):
+    bound = 1.0 / math.sqrt(b["conv_kernel"])
+    return lambda shape: (torch.rand(*shape) * 2.0 - 1.0) * bound
 
 
 def bundle_key_for(manifest_key, dims, bounds):
@@ -416,7 +440,7 @@ def bundle_key_for(manifest_key, dims, bounds):
     if len(dims) != 1 or not isinstance(dims[0], str):
         return None
     leaf = manifest_key.split(".")[-1]
-    if leaf in ("router", "switch_glu", "linear_attn"):
+    if leaf in ("router", "switch_glu", "linear_attn", "mamba"):
         return leaf
     marker = dims[0]
     if marker != "hidden_size":
@@ -436,7 +460,11 @@ def synth_bundle(marker, bounds):
     leaves = {}
     for name, shp in leaves_spec:
         shape = shp(bounds) if callable(shp) else shp
-        leaves[name] = rand_tensor(shape)
+        if isinstance(shape, tuple):
+            shape, init = shape
+            leaves[name] = init(shape).float()
+        else:
+            leaves[name] = rand_tensor(shape)
     return Tree(**leaves)
 
 
@@ -454,7 +482,7 @@ def scan_bias_refs(carrier_text, layered_keys):
 # shape.rs `weight_arg_ranks` skips the tensor-rank assertion for
 # exactly these (Moe/GemmaMoe/GatedDeltaNet). A manifest key is a
 # bundle iff the carrier passes it to one of them.
-BUNDLE_OPS = ("moe_block", "gemma_moe", "gated_delta_net")
+BUNDLE_OPS = ("moe_block", "gemma_moe", "gated_delta_net", "mamba2")
 
 
 def bundle_call_args(carrier_text):
@@ -1225,6 +1253,55 @@ def gated_delta_net(qkv, z, a, b, layer_w):
     return xn * layer_w.norm * torch.nn.functional.silu(z)
 
 
+# ── Mamba-2 (mlx-lm nemotron_h.py `NemotronHMamba2Mixer` + ssm.py) ──
+
+
+def mamba2(zxbcdt, layer_w):
+    """`NemotronHMamba2Mixer.__call__` minus the projections, fresh state:
+    split z | xBC | dt; causal depthwise conv1d (+bias) over xBC, SiLU;
+    split x | B | C; dt = softplus(dt + dt_bias) (time_step_limit (0, inf)
+    — no clip); the selective scan `ssm_update_kernel` runs per token
+    (state = exp(dt·A)·state + x·dt ⊗ B_g; y = state·C_g + D·x, A =
+    -exp(A_log), head h in group h // (H/G)); then `MambaRMSNormGated`:
+    swiglu(z, y) = silu(z)·y, RMSNorm per group of d_inner/n_groups,
+    times the weight."""
+    bnds = STATE["bounds"]
+    heads, head_dim = bnds["mamba_num_heads"], bnds["mamba_head_dim"]
+    groups, state_size = bnds["n_groups"], bnds["ssm_state_size"]
+    inner = heads * head_dim
+    conv_dim = inner + 2 * groups * state_size
+    t = zxbcdt.shape[0]
+    z, xbc, dt = torch.split(zxbcdt.float(), [inner, conv_dim, heads], dim=-1)
+
+    w = layer_w.conv1d.float()
+    kk = w.shape[-1]
+    padded = torch.cat([torch.zeros(kk - 1, conv_dim), xbc])
+    conv = torch.nn.functional.conv1d(
+        padded.T.unsqueeze(0), w, layer_w.conv_bias.float(), groups=conv_dim)
+    conv = torch.nn.functional.silu(conv[0].T)
+    x, bm, cm = torch.split(conv, [inner, groups * state_size, groups * state_size], dim=-1)
+    x = x.reshape(t, heads, head_dim)
+    bm = bm.reshape(t, groups, state_size)
+    cm = cm.reshape(t, groups, state_size)
+
+    dt = torch.nn.functional.softplus(dt + layer_w.dt_bias.float())
+    a = -torch.exp(layer_w.a_log.float())
+    d = layer_w.d.float()
+    per_group = heads // groups
+    state = torch.zeros(heads, head_dim, state_size)
+    y = torch.zeros(t, heads, head_dim)
+    for ti in range(t):
+        for h in range(heads):
+            g = h // per_group
+            d_a = torch.exp(dt[ti, h] * a[h])
+            state[h] = d_a * state[h] + (x[ti, h] * dt[ti, h]).unsqueeze(-1) * bm[ti, g].unsqueeze(0)
+            y[ti, h] = state[h] @ cm[ti, g] + d[h] * x[ti, h]
+    y = y.reshape(t, inner) * torch.nn.functional.silu(z)
+    yg = y.reshape(t, groups, inner // groups)
+    yg = yg * torch.rsqrt(yg.pow(2).mean(-1, keepdim=True) + STATE["rms_eps"])
+    return yg.reshape(t, inner) * layer_w.norm.float()
+
+
 # ── gates (gate_split / gate_apply / gate_scale kernels) ──
 
 
@@ -1261,6 +1338,7 @@ def _swiglu_stacked(x, w1, w2, weight):
 
 
 def moe_block(x, layer_w):
+    STATE["dense_moe"] = True
     b = STATE["bounds"]
     cfg = STATE["cfg"]
     top_k = b.get("num_experts_per_tok") or b.get("top_k_experts") or b.get("top_k")
@@ -1346,6 +1424,7 @@ def gemma_moe(router_in, moe_in, router_w, experts_w):
     """lower_gemma_moe: xr = rmsnorm(router_in, router.scale); logits =
     xr @ router.gate.T; topk; × hidden^-0.5; softmax; × per_expert_scale;
     GeGLU experts; weighted sum."""
+    STATE["dense_moe"] = True
     b = STATE["bounds"]
     top_k = b.get("top_k_experts") or b.get("num_experts_per_tok")
     hidden = b["hidden_size"]
@@ -1513,7 +1592,7 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     # is lowercase `a_log`. in_proj/out_proj siblings are ordinary
     # gemms under their own manifest keys.
     def is_gdn_bundle(key):
-        return f"{key}[" in bundle_args and key.split(".")[-1] == "linear_attn"
+        return f"{key}[" in bundle_args and key.split(".")[-1] in ("linear_attn", "mamba")
 
     out = {}
 
@@ -1541,6 +1620,10 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
                 put_f32(f"{pre}.A_log", bundle.a_log)
                 put(f"{pre}.dt_bias", bundle.dt_bias)
                 put_f32(f"{pre}.norm.weight", bundle.norm)
+                # Mamba-2's two extra leaves (the loader takes them when present).
+                if hasattr(bundle, "conv_bias"):
+                    put(f"{pre}.conv1d.bias", bundle.conv_bias)
+                    put(f"{pre}.D", bundle.d)
             continue
         # Dual-class per-layer leaves (gemma4): `weight_leaf_renames` maps
         # `q_proj_global` onto the SAME disk leaf as `q_proj`, but in a
@@ -1560,7 +1643,9 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
             base_of_rename = (
                 dsl_leaf[:-len("_global")] if dsl_leaf.endswith("_global")
                 else dsl_leaf)
-            if key == dsl_leaf or key == base_of_rename:
+            # A bundle marker renamed onto its mixer (nemotron-h's
+            # `moe` → `mixer`) is not a class-split leaf.
+            if (key == dsl_leaf or key == base_of_rename) and f"{key}[" not in bundle_args:
                 class_shared = base_of_rename
                 break
         if class_shared is not None:
@@ -2032,6 +2117,9 @@ def main():
     # ── STATE the shims read ──
     STATE["bounds"] = bounds
     STATE["cfg"] = cfg
+    # Set by a dense MoE shim that EXECUTES (not by expert-count config
+    # keys: a hybrid schedule may name experts no layer runs).
+    STATE["dense_moe"] = False
     STATE["arch"] = arch
     STATE["rms_eps"] = float(cfg.get("rms_norm_eps", cfg.get("layer_norm_eps", 1e-6)))
     # Vision block-norm eps (config.rs: explicit flat key → arch-declared
@@ -2229,6 +2317,7 @@ def main():
         "kv_heads": kv_heads, "head_dim": head_dim, "layers": depth,
         "vision": is_vision,
         "rotary": {k: v["spec"] for k, v in rot_objs.items()},
+        "dense_moe": STATE["dense_moe"],
     }
     if is_vision:
         v = {k[7:]: val for k, val in bounds.items() if k.startswith("vision_")}

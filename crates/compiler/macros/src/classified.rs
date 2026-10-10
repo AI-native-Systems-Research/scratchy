@@ -449,6 +449,17 @@ pub enum OpKind {
     /// the `layer` carried on the `Instruction`. Output: `[T, value_dim]`
     /// (feeds `out_proj`). Used by Qwen3.5 / Qwen3-Next linear layers.
     GatedDeltaNet,
+    /// Mamba-2 selective state-space mixer (Nemotron-H). One coarse op over
+    /// the WHOLE `in_proj` output: `y = mamba2(zxbcdt, mamba[layer])` where
+    /// `zxbcdt` `[T, mamba_in_proj_dim]` = `z`[d_inner] | `xBC`[conv_dim] |
+    /// `dt`[num_heads]. Causal conv1d (+bias, +SiLU) on `xBC` → split
+    /// `x`|`B`|`C` → `S_h = exp(dt·A)·S_h + dt·x_h⊗B_g`, `y_h = S_h·C_g +
+    /// D_h·x_h` → gate-before-norm grouped RMSNorm `rmsnorm_g(silu(z)·y)·w`.
+    /// `mamba[layer]` resolves to the same recurrent-mixer bundle as GDN
+    /// (`GatedDeltaNetLayer`, with its conv bias and `D`), and the conv/ssm
+    /// state is the same ambient one-slot-per-sequence pool. Output
+    /// `[T, mamba_d_inner]` (feeds `out_proj`).
+    Mamba2,
     /// Qwen3.5 attention output-gate split. Deinterleaves the DOUBLED
     /// `q_proj` output `[T, num_heads*2*head_dim]` (viewed `[T, nh, 2, hd]`)
     /// into `query` (`[:,:,0,:]`) and `gate` (`[:,:,1,:]`), each
@@ -588,6 +599,7 @@ impl OpKind {
             "gemma_moe" => Some(Self::GemmaMoe),
             "gptoss_moe" => Some(Self::GptOssMoe),
             "gated_delta_net" => Some(Self::GatedDeltaNet),
+            "mamba2" => Some(Self::Mamba2),
             "gate_split" => Some(Self::GateSplit),
             "gate_apply" => Some(Self::GateApply),
             "gate_scale" => Some(Self::GateScale),
@@ -633,6 +645,7 @@ impl OpKind {
             Self::GemmaMoe => "gemma_moe",
             Self::GptOssMoe => "gptoss_moe",
             Self::GatedDeltaNet => "gated_delta_net",
+            Self::Mamba2 => "mamba2",
             Self::GateSplit => "gate_split",
             Self::GateApply => "gate_apply",
             Self::GateScale => "gate_scale",
@@ -713,33 +726,40 @@ impl Program {
     /// the `_<digit>` leaf warning in lib.rs) mirror this — keep them
     /// in lockstep.
     pub fn rename_dotted(&self, dotted: &str) -> String {
-        let mut pairs: Vec<&(String, String)> = self.weight_leaf_renames.iter().collect();
-        pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-        let mut out = dotted.to_string();
-        for (dsl_leaf, disk_leaf) in pairs {
-            // Whole-segment boundaries only: the char before a match
-            // (if any) and the char after (if any) must be `.`.
-            // Exact match and trailing match both fall out of the
-            // suffix arm; a leading segment run falls out of the
-            // prefix arm; interior occurrences go through the
-            // `.<leaf>.` replace loop.
-            if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str())
-                && (stripped.is_empty() || stripped.ends_with('.'))
-            {
-                out = format!("{stripped}{disk_leaf}");
-                continue;
-            }
-            let pat = format!(".{dsl_leaf}.");
-            let rep = format!(".{disk_leaf}.");
-            while let Some(pos) = out.find(&pat) {
-                out.replace_range(pos..pos + pat.len(), &rep);
-            }
-            if let Some(tail) = out.strip_prefix(&format!("{dsl_leaf}.")) {
-                out = format!("{disk_leaf}.{tail}");
-            }
-        }
-        out
+        rename_dotted_under(&self.weight_leaf_renames, dotted)
     }
+}
+
+/// [`Program::rename_dotted`] under an explicit rename list — for a
+/// caller holding the arch spec's renames rather than a `Program` (the
+/// fingerprint's sniffed tensor names).
+pub fn rename_dotted_under(renames: &[(String, String)], dotted: &str) -> String {
+    let mut pairs: Vec<&(String, String)> = renames.iter().collect();
+    pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    let mut out = dotted.to_string();
+    for (dsl_leaf, disk_leaf) in pairs {
+        // Whole-segment boundaries only: the char before a match
+        // (if any) and the char after (if any) must be `.`.
+        // Exact match and trailing match both fall out of the
+        // suffix arm; a leading segment run falls out of the
+        // prefix arm; interior occurrences go through the
+        // `.<leaf>.` replace loop.
+        if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str())
+            && (stripped.is_empty() || stripped.ends_with('.'))
+        {
+            out = format!("{stripped}{disk_leaf}");
+            continue;
+        }
+        let pat = format!(".{dsl_leaf}.");
+        let rep = format!(".{disk_leaf}.");
+        while let Some(pos) = out.find(&pat) {
+            out.replace_range(pos..pos + pat.len(), &rep);
+        }
+        if let Some(tail) = out.strip_prefix(&format!("{dsl_leaf}.")) {
+            out = format!("{disk_leaf}.{tail}");
+        }
+    }
+    out
 }
 
 /// Side table: `LocalId` → debug ident.

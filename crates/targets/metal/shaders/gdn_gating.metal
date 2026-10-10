@@ -16,9 +16,17 @@
 // regardless of `T_act`, NOT the model dtype. All values f32-accumulate.
 // Outputs g/beta are f32 (consumed by the f32 recurrent-scan kernel).
 //
+// Mamba-2 (Nemotron-H) gates by the same `-exp(A_log) * softplus(dt + dt_bias)`, its `dt` the
+// trailing columns of the in-projection row: with `GDN_GATING_MAMBA` set, `a` is read as that column
+// slice and `beta` carries `dt = softplus(dt + dt_bias)` itself (the scan's input scale); `b` is
+// unread.
+//
 // Baked constants:
 //   GDN_GATING_N         — total element count (= T * num_heads)
 //   GDN_GATING_NUM_HEADS — num_v_heads (to recover h = gid % num_heads)
+//   GDN_GATING_MAMBA     — optional: the Mamba-2 form above
+//   GDN_GATING_A_STRIDE  — optional: `a`'s row stride (unset: num_heads)
+//   GDN_GATING_A_OFFSET  — optional: `a`'s first column in that row (unset: 0)
 //
 // Dispatch: 1 thread per (t, h) element.
 
@@ -29,6 +37,9 @@ using namespace metal;
 
 SCRATCHY_CONSTANT(uint, GDN_GATING_N, 0);
 SCRATCHY_CONSTANT(uint, GDN_GATING_NUM_HEADS, 1);
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_GATING_MAMBA, 2);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_GATING_A_STRIDE, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_GATING_A_OFFSET, 4);
 
 template <typename T>
 [[kernel]] void gdn_gating(
@@ -44,10 +55,17 @@ template <typename T>
     return;
   }
   uint h = gid % GDN_GATING_NUM_HEADS;
+  uint a_ix = GDN_GATING_A_STRIDE_SET
+                  ? (gid / GDN_GATING_NUM_HEADS) * GDN_GATING_A_STRIDE + GDN_GATING_A_OFFSET + h
+                  : gid;
   // g = -exp(A_log[h]) * softplus(a + dt_bias[h])
-  float av = float(a[gid]) + float(dt_bias[h]);
+  float av = float(a[a_ix]) + float(dt_bias[h]);
   float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
   g_out[gid] = -exp(float(a_log[h])) * sp;
+  if (GDN_GATING_MAMBA) {
+    beta_out[gid] = sp;  // dt
+    return;
+  }
   // beta = sigmoid(b)
   float bv = float(b[gid]);
   beta_out[gid] = 1.0f / (1.0f + exp(-bv));

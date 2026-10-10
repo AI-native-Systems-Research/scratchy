@@ -798,6 +798,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
+            SubOp::Mamba2 { inner } => inner.hash(h),
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
             SubOp::RouteSigmoidBias { router } => router.hash(h),
@@ -1157,6 +1158,10 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `inputs` = `[qkv, z, a, b, weight_bundle]`; the conv/ssm state is runtime-ambient per
     /// layer, which is why there is no host reference.
     GatedDeltaNet,
+    /// Mamba-2 selective state-space mixer (Nemotron-H). `inputs` = `[zxbcdt, weight_bundle]`,
+    /// `zxbcdt` the whole in-projection `z | xBC | dt`; `inner` = `d_inner`, the gated-normed
+    /// output's width. The conv/ssm state is runtime-ambient per layer, as GDN's.
+    Mamba2 { inner: u32 },
     /// Row mean: `out[m, 1] = mean(x, axis = -1)`. `inputs` = `[x]`.
     Mean,
 
@@ -1753,10 +1758,10 @@ pub fn eval_node<F: RopeForm>(
             "SubOp::VarlenAttention has no host reference: the sequence boundaries are \
              the runtime cu_seqlens/max_seqlen extern set, not operands"
         ),
-        SubOp::GatedDeltaNet => panic!(
-            "SubOp::GatedDeltaNet has no host reference: the conv/ssm state is \
-             runtime-ambient per layer, so a single node's output is not a function of \
-             its operands alone"
+        SubOp::GatedDeltaNet | SubOp::Mamba2 { .. } => panic!(
+            "{} has no host reference: the conv/ssm state is runtime-ambient per layer, so a \
+             single node's output is not a function of its operands alone",
+            node.op.name()
         ),
         expansion_ops!() => panic!(
             "{} has no host reference: the router and expert weights arrive as opaque \
@@ -2345,6 +2350,7 @@ pub fn lower_region(
             SubOp::VarlenAttention { cu_kind } => SubOp::VarlenAttention { cu_kind },
             SubOp::EncoderAttn { geom, scale } => SubOp::EncoderAttn { geom, scale },
             SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
+            SubOp::Mamba2 { inner } => SubOp::Mamba2 { inner },
             SubOp::Mean => SubOp::Mean,
             SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },

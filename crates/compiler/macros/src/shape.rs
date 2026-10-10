@@ -473,6 +473,7 @@ pub fn apply_signature_with_geometry(
         OpKind::GemmaMoe => sig_gemma_moe(solver, inputs),
         OpKind::GptOssMoe => sig_gptoss_moe(solver, inputs),
         OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
+        OpKind::Mamba2 => sig_mamba2(solver, inputs),
         OpKind::GateSplit => sig_gate_split(solver, inputs),
         OpKind::GateApply => sig_gate_apply(solver, inputs),
         OpKind::GateScale => sig_gate_scale(solver, inputs),
@@ -919,6 +920,23 @@ fn sig_gated_delta_net(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, 
     })
 }
 
+/// `mamba2(zxbcdt, mamba[layer])` → `[T, mamba_d_inner]`. `zxbcdt` is the
+/// whole `in_proj` output `[T, mamba_in_proj_dim]`; the bundle is a struct
+/// (no tensor-rank assertion, like `gated_delta_net`'s).
+fn sig_mamba2(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::Mamba2, inputs, 2)?;
+    let zxbcdt = &inputs[0];
+    if zxbcdt.len() != 2 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::Mamba2,
+            reason: "zxbcdt must be [T, mamba_in_proj_dim]".into(),
+        });
+    }
+    Ok(OpSig {
+        output: vec![zxbcdt[0].clone(), Dim::Bound("mamba_d_inner".into())],
+    })
+}
+
 /// `gate_split(qg: [T, num_attention_heads*2*head_dim])` → (single-output sig
 /// for `apply_signature` validation; the real 2-tuple `(q, gate)` binding is in
 /// `Stmt::AssignTuple`). Returns `q` shape `[T, attn_q_dim]`
@@ -1157,6 +1175,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // GatedDeltaNet's linear_attn[layer] is a GatedDeltaNetLayer struct
         // (not a tensor); like Moe, skip the tensor-rank assertion.
         OpKind::GatedDeltaNet => &[],
+        // Mamba2's mamba[layer] is the same recurrent-mixer bundle struct.
+        OpKind::Mamba2 => &[],
         // GateSplit/GateApply/GateScale take only activation inputs; no tensor weight args.
         OpKind::GateSplit => &[],
         OpKind::GateApply => &[],
@@ -2758,6 +2778,25 @@ mod tests {
         assert!(apply_signature(&mut solver, OpKind::KvAppend, &[k.clone(), k]).is_err());
         assert_eq!(OpKind::from_name("kv_append"), Some(OpKind::KvAppend));
         assert_eq!(OpKind::KvAppend.as_str(), "kv_append");
+    }
+
+    /// `mamba2(zxbcdt, mamba[layer])` maps the whole in-projection row to `mamba_d_inner`, takes
+    /// exactly two arguments, and wants a rank-2 `zxbcdt`.
+    #[test]
+    fn mamba2_maps_the_in_projection_to_d_inner() {
+        let mut solver = Solver::new();
+        let zx = vec![bound("num_tokens"), bound("mamba_in_proj_dim")];
+        let sig = apply_signature(&mut solver, OpKind::Mamba2, &[zx.clone(), vec![]])
+            .expect("mamba2 sig");
+        assert_eq!(
+            sig.output,
+            vec![bound("num_tokens"), bound("mamba_d_inner")]
+        );
+        assert!(apply_signature(&mut solver, OpKind::Mamba2, std::slice::from_ref(&zx)).is_err());
+        let rank1 = vec![bound("mamba_in_proj_dim")];
+        assert!(apply_signature(&mut solver, OpKind::Mamba2, &[rank1, vec![]]).is_err());
+        assert_eq!(OpKind::from_name("mamba2"), Some(OpKind::Mamba2));
+        assert_eq!(OpKind::Mamba2.as_str(), "mamba2");
     }
 
     #[test]

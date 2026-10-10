@@ -3054,6 +3054,58 @@ mod tests {
         }
     }
 
+    /// A Mamba-2 mixer fills the GDN state pool's geometry — groups as key heads, heads as value
+    /// heads, `[mamba_head_dim, ssm_state_size]` a head, the conv over `xBC` — and a GDN arch
+    /// keeps its own (`linear_*`).
+    #[test]
+    fn recurrent_state_dims_come_from_either_mixer() {
+        use crate::codegen::RecurrentDims;
+        let dims = |arch: &str, stem: &str| {
+            let dir = repo_model_archs(arch);
+            let spec = load_arch_json(&dir).expect("arch.json");
+            let path = dir.join(format!("{stem}.json"));
+            let json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+            let mp = model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse");
+            RecurrentDims::of(&mp).expect("a recurrent mixer")
+        };
+        let mamba = |groups, heads, head_dim| RecurrentDims {
+            num_k_heads: groups,
+            num_v_heads: heads,
+            head_k_dim: 128,
+            head_v_dim: head_dim,
+            conv_kernel: 4,
+            conv_dim: heads * head_dim + 2 * groups * 128,
+        };
+        assert_eq!(
+            dims("nemotron-h", "nemotron-3-nano-30b-a3b"),
+            mamba(8, 64, 64)
+        );
+        let super_dims = dims("nemotron-h-latent", "nemotron-3-super-120b-a12b");
+        assert_eq!(super_dims, mamba(8, 128, 64));
+        assert_eq!(super_dims.conv_dim, 10240);
+        let tiny = dims("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny");
+        assert_eq!(
+            (
+                tiny.num_k_heads,
+                tiny.num_v_heads,
+                tiny.head_k_dim,
+                tiny.head_v_dim
+            ),
+            (2, 8, 16, 16)
+        );
+        let gdn = dims("qwen3-5", "qwen3.5-0.8b");
+        assert_eq!(
+            (
+                gdn.num_k_heads,
+                gdn.num_v_heads,
+                gdn.head_k_dim,
+                gdn.conv_dim
+            ),
+            (16, 16, 128, 6144)
+        );
+    }
+
     /// `sliding_window_pattern` is read off the verbatim `layer_types`
     /// schedule (Gemma-4 12B/31B: full_attention every 6th layer →
     /// period 6), NOT a hardcoded default. An explicit scalar wins.

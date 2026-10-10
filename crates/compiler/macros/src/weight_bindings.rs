@@ -230,7 +230,7 @@ fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String>
         },
         L::RmsNorm { .. } | L::RmsNormUnit { .. } => WeightKind::RmsNorm,
         L::EmbeddingGather { .. } => WeightKind::Embedding,
-        L::GatedDeltaNet => WeightKind::GatedDeltaNet,
+        L::GatedDeltaNet | L::Mamba2 { .. } => WeightKind::GatedDeltaNet,
         // A MoE block's steps bind their router's or their experts' bundle — the bundle table.
         L::RouterNorm { router, .. }
         | L::RouterLogits { router, .. }

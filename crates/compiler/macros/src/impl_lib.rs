@@ -8206,6 +8206,7 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::SinkAttention
         | OpKind::SinkSlidingAttention
         | OpKind::GatedDeltaNet
+        | OpKind::Mamba2
         | OpKind::GateSplit
         | OpKind::GateApply
         | OpKind::GateScale

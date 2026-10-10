@@ -354,6 +354,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
+        | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }
         | SubOp::Mean
         | scratchy_subtile::expansion_ops!() => TritonKernelRow::Refused(

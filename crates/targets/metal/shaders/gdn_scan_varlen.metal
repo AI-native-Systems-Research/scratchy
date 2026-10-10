@@ -24,9 +24,22 @@
 // State layout (cuda-symmetric): ssm_state[num_slots, HV, head_v, head_k],
 //   row = ((slot*HV + i_hv)*head_v + i_v)*head_k. is_fresh → S starts at 0.
 //
+// Mamba-2 (Nemotron-H, `GDN_SCAN_MAMBA`) runs the same mapping over the same state layout — its
+// heads the value heads, its groups the key heads, a head's `[head_dim, state]` matrix the
+// `[head_v, head_k]` one — with mlx-lm's selective-scan recurrence (`ssm.py`) in place of the delta
+// rule. `conv_out` is `[x:value_dim | B:key_dim | C:key_dim]`; per token, per head h in group g:
+//
+//   S  ← exp(dt·A)·S + (x·dt) ⊗ B_g          (no L2 norm, no beta, no scale)
+//   y  ← S·C_g + D_h·x
+//
+// `g` carries dt·A and `beta` carries dt (`gdn_gating`'s Mamba-2 form); `D` is buffer 8 (f32).
+//
 // Baked constants:
 //   GDN_SCAN_NUM_K_HEADS (H), GDN_SCAN_NUM_V_HEADS (HV),
-//   GDN_SCAN_HEAD_K (K), GDN_SCAN_HEAD_V (head_v), GDN_SCAN_SCALE (1/sqrt(K)).
+//   GDN_SCAN_HEAD_K (K), GDN_SCAN_HEAD_V (head_v), GDN_SCAN_SCALE (1/sqrt(K); Mamba-2: unread),
+//   GDN_SCAN_MAMBA (optional: the Mamba-2 recurrence), GDN_SCAN_A_STRIDE / GDN_SCAN_A_OFFSET
+//   (optional, `gdn_scan_simd` only: `a`'s row stride and first column — Mamba-2's `dt` slice of
+//   the in-projection row; unset: `a` is `[T, HV]`).
 //
 // Dispatch: grid (ceil(head_v/tg), HV, num_seqs); thread = (value-dim, head, seq).
 
@@ -40,6 +53,16 @@ SCRATCHY_CONSTANT(uint, GDN_SCAN_NUM_V_HEADS, 1);
 SCRATCHY_CONSTANT(uint, GDN_SCAN_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_SCAN_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_SCAN_SCALE, 4);
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_SCAN_MAMBA, 5);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_SCAN_A_STRIDE, 6);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_SCAN_A_OFFSET, 7);
+
+// The columns of q / k / v (Mamba-2: C / B / x) in a `conv_out` row.
+constant constexpr uint GDN_SCAN_KEY_DIM = GDN_SCAN_NUM_K_HEADS * GDN_SCAN_HEAD_K;
+constant constexpr uint GDN_SCAN_VALUE_DIM = GDN_SCAN_NUM_V_HEADS * GDN_SCAN_HEAD_V;
+constant constexpr uint GDN_SCAN_COL_Q = GDN_SCAN_MAMBA ? GDN_SCAN_VALUE_DIM + GDN_SCAN_KEY_DIM : 0u;
+constant constexpr uint GDN_SCAN_COL_K = GDN_SCAN_MAMBA ? GDN_SCAN_VALUE_DIM : GDN_SCAN_KEY_DIM;
+constant constexpr uint GDN_SCAN_COL_V = GDN_SCAN_MAMBA ? 0u : 2u * GDN_SCAN_KEY_DIM;
 
 // Matches CUDA `MAX_HEAD_K_DIM` (gdn_recurrent_kernels.cu): register state row.
 constant constexpr uint GDN_SCAN_KMAX = 128;
@@ -54,6 +77,7 @@ template <typename T>
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
     const device uint*  is_fresh      [[buffer(7)]],
+    const device float* d_skip        [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
 {
@@ -97,8 +121,20 @@ template <typename T>
   for (int i_t = 0; i_t < seq_len; i_t++) {
     uint t = uint(bos + i_t);
     // q from key-head i_h; k from key-head i_h (offset key_dim); v from value-head i_hv.
-    const device T* q_ptr = conv_out + t * conv_dim + i_h * K;
-    const device T* k_ptr = conv_out + t * conv_dim + key_dim + i_h * K;
+    const device T* q_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_Q + i_h * K;
+    const device T* k_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_K + i_h * K;
+    if (GDN_SCAN_MAMBA) {
+      const float x = float(conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v]);
+      const float decay = exp(g[t * HV + i_hv]);
+      const float x_dt = x * beta[t * HV + i_hv];
+      float y = 0.0f;
+      for (uint ki = 0; ki < K; ki++) {
+        b_h[ki] = decay * b_h[ki] + x_dt * float(k_ptr[ki]);
+        y += b_h[ki] * float(q_ptr[ki]);
+      }
+      o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
+      continue;
+    }
 
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
@@ -115,7 +151,7 @@ template <typename T>
       b_h[ki] *= decay;
     }
 
-    float b_v = float(conv_out[t * conv_dim + 2u * key_dim + i_hv * Vd + i_v]);
+    float b_v = float(conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v]);
     float dot_hk = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
       dot_hk += b_h[ki] * (float(k_ptr[ki]) * k_inv);
@@ -162,6 +198,7 @@ template <typename T>
     const device uint*  is_fresh      [[buffer(7)]],
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
+    const device float* d_skip        [[buffer(10)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  lane     [[thread_index_in_simdgroup]])
@@ -200,13 +237,29 @@ template <typename T>
   for (int i_t = 0; i_t < seq_len; i_t++) {
     const uint t = uint(bos + i_t);
     // gdn_gating
-    const float av = float(a[t * HV + i_hv]) + float(dt_bias[i_hv]);
+    const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
+                                            : t * HV + i_hv;
+    const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
     const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
     const float decay = exp(neg_a * sp);
-    const float beta = 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
 
-    const device float* q_ptr = conv_out + t * conv_dim + i_h * K + lane * NPT;
-    const device float* k_ptr = conv_out + t * conv_dim + key_dim + i_h * K + lane * NPT;
+    const device float* q_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
+    const device float* k_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_K + i_h * K + lane * NPT;
+    if (GDN_SCAN_MAMBA) {
+      const float x = conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v];
+      const float x_dt = x * sp;
+      float y = 0.0f;
+      for (uint i = 0; i < NPT; i++) {
+        st[i] = decay * st[i] + x_dt * k_ptr[i];
+        y += st[i] * q_ptr[i];
+      }
+      y = simd_sum(y);
+      if (lane == 0u) {
+        o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
+      }
+      continue;
+    }
+    const float beta = 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
     float q[NPT], k[NPT];
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint i = 0; i < NPT; i++) {
@@ -224,7 +277,7 @@ template <typename T>
       kv += st[i] * (k[i] * k_inv);
     }
     kv = simd_sum(kv);
-    const float v = conv_out[t * conv_dim + 2u * key_dim + i_hv * Vd + i_v];
+    const float v = conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v];
     const float delta = (v - kv) * beta;
     float out = 0.0f;
     for (uint i = 0; i < NPT; i++) {

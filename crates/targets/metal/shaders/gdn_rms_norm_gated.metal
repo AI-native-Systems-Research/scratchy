@@ -16,10 +16,23 @@
 // `weight` (`linear_attn.norm.weight`) is **float32 on disk** (kept un-cast
 // by the loader), so it is bound as `float*` regardless of `T`.
 //
+// Mamba-2 (Nemotron-H `MambaRMSNormGated`, mlx-lm `nemotron_h.py`) gates BEFORE the norm, and
+// normalizes per group of `d_inner / n_groups`:
+//
+//   out[r,i] = rmsnorm_over_d(silu(z[r]) * x[r])[i] * weight[g*d + i]
+//
+// its `z` the leading columns of the in-projection row and its weight spanning the whole
+// `d_inner` row (row r = token t, group g = r % groups).
+//
 // Baked constants:
-//   GDN_RMS_D    — head_v_dim (the per-row reduction width)
-//   GDN_RMS_ROWS — total_rows (= num_tokens * num_v_heads)
-//   GDN_RMS_EPS  — rms_norm_eps
+//   GDN_RMS_D           — head_v_dim / group width (the per-row reduction width)
+//   GDN_RMS_ROWS        — total_rows (= num_tokens * num_v_heads; Mamba-2: * n_groups)
+//   GDN_RMS_EPS         — rms_norm_eps
+//   GDN_RMS_Z_STRIDE    — optional: `z`'s row stride, a token's rows a column slice of it (unset:
+//                         `z` is `[total_rows, d]`)
+//   GDN_RMS_GROUPS      — optional: rows a token has (with GDN_RMS_Z_STRIDE); the weight then spans
+//                         all of them (`[groups * d]`) instead of one (`[d]`)
+//   GDN_RMS_GATE_BEFORE — optional: the Mamba-2 order above
 //
 // Dispatch: one threadgroup per row, a power of two of threads; threadgroup
 // reduction over d. Every power of two ≥ d sums in the same order (its extra
@@ -33,6 +46,11 @@ using namespace metal;
 SCRATCHY_CONSTANT(uint, GDN_RMS_D, 0);
 SCRATCHY_CONSTANT(uint, GDN_RMS_ROWS, 1);
 SCRATCHY_CONSTANT(float, GDN_RMS_EPS, 2);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_RMS_Z_STRIDE, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_RMS_GROUPS, 4);
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_RMS_GATE_BEFORE, 5);
+
+constant constexpr uint GDN_RMS_TOKEN_ROWS = GDN_RMS_GROUPS_SET ? GDN_RMS_GROUPS : 1u;
 
 template <typename T>
 [[kernel]] void gdn_rms_norm_gated(
@@ -48,14 +66,22 @@ template <typename T>
     return;
   }
   uint d = GDN_RMS_D;
+  const uint group = gid % GDN_RMS_TOKEN_ROWS;
   const device float* x_row = x + gid * d;
-  const device T*     z_row = z + gid * d;
+  const device T*     z_row = GDN_RMS_Z_STRIDE_SET
+                                  ? z + (gid / GDN_RMS_TOKEN_ROWS) * GDN_RMS_Z_STRIDE + group * d
+                                  : z + gid * d;
+  const device float* w_row = weight + group * d;
   device T*           o_row = out + gid * d;
 
   threadgroup float sdata[1024];
   float ss = 0.0f;
   for (uint i = tid; i < d; i += tg_size) {
     float v = x_row[i];
+    if (GDN_RMS_GATE_BEFORE) {
+      float zi = float(z_row[i]);
+      v *= zi / (1.0f + exp(-zi));
+    }
     ss += v * v;
   }
   sdata[tid] = ss;
@@ -71,7 +97,8 @@ template <typename T>
   for (uint i = tid; i < d; i += tg_size) {
     float zi = float(z_row[i]);
     float silu_z = zi / (1.0f + exp(-zi));  // SiLU(z) = z * sigmoid(z)
-    o_row[i] = T(x_row[i] * inv * float(weight[i]) * silu_z);
+    o_row[i] = GDN_RMS_GATE_BEFORE ? T(x_row[i] * silu_z * inv * float(w_row[i]))
+                                   : T(x_row[i] * inv * float(w_row[i]) * silu_z);
   }
 }
 

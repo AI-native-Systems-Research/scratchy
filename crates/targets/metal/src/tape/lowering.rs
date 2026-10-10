@@ -4876,220 +4876,109 @@ fn lower_one(
             cmds.extend(decode);
 
             // 1. Causal depthwise conv1d (+SiLU), varlen + stateful.
-            //    grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y), 1).
-            cmds.push(LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_conv1d_varlen",
-                function: gdn_conv1d_varlen_static_name(dtype),
-                constants: baked(vec![
-                    ConstantValue::uint(0, conv_dim),
-                    ConstantValue::uint(1, kernel),
-                ]),
-                dispatch: {
-                    let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
-                    DispatchShape {
-                        threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
-                        threads_per_threadgroup: (1, tg_y, 1),
-                        // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
-                        m_scaling: Some(MScaling {
-                            axis: MScaleAxis::X,
-                            bucket_m: BucketM(1),
-                            seq_axis: Some(MScaleAxis::X),
-                        }),
-                    }
-                },
-                bindings: baked(vec![
-                    Binding::MoeScratch {
-                        binding_index: 0,
-                        byte_offset: layout.conv_out,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *qkv_slot,
-                        binding_index: 1,
-                    },
-                    weight(WeightTensor::GdnConv1d, 2),
-                    runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 3),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, 4),
-                    runtime(RuntimeBindingKind::GdnStateIndices, 5),
-                    runtime(RuntimeBindingKind::GdnIsFresh, 6),
-                ]),
-                gemm_dims: None,
-            });
+            cmds.push(recurrent_conv(
+                dtype,
+                (conv_dim, kernel),
+                arena(qkv_slot, 1),
+                weight(WeightTensor::GdnConv1d, 2),
+                layer_id,
+                layout.conv_out,
+                None,
+            ));
 
-            // head_k a multiple of 32: the gating and the scan run as one
-            // command, mlx-lm's simdgroup-per-value-dim mapping
-            // (`gdn_scan_simd`); then the norm. Used at every other bucket size,
-            // prefill included: the mapping is sequence-serial either way, but
-            // a simdgroup's 32 lanes split head_k (4 state elements per lane,
-            // dots via `simd_sum`) where `gdn_scan_varlen`'s CUDA-faithful
-            // mapping runs SIX serial head_k loops per token in ONE thread —
-            // measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill
-            // forward (64%, ~8 µs/token/layer) on the per-thread kernel.
-            // Non-divisible geometries fall back to the varlen kernel.
-            let scan_state = |first: u8| {
+            // 2. The gating and the delta-rule scan → o (f32 scratch).
+            cmds.extend(recurrent_scan(
+                p,
+                ScanForm::DeltaRule {
+                    a: *a_slot,
+                    b: *b_slot,
+                },
+                bucket_m,
+                (ix, layer_id),
+                layout,
+            ));
+
+            // 3. Gated RMSNorm → core (model-dtype arena out_slot), per value head.
+            cmds.push(recurrent_norm(
+                p,
+                (hv, nv),
+                bucket_m,
                 [
-                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, first),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, first + 1),
-                    runtime(RuntimeBindingKind::GdnStateIndices, first + 2),
-                    runtime(RuntimeBindingKind::GdnIsFresh, first + 3),
-                ]
-            };
-            if simd_scan {
-                let mut bindings = vec![
-                    Binding::MoeScratch {
-                        binding_index: 0,
-                        byte_offset: layout.o,
-                    },
-                    Binding::MoeScratch {
-                        binding_index: 1,
-                        byte_offset: layout.conv_out,
-                    },
-                    arena(a_slot, 2),
-                    arena(b_slot, 3),
-                ];
-                bindings.extend(scan_state(4));
-                bindings.extend([
-                    weight(WeightTensor::GdnALog, 8),
-                    weight(WeightTensor::GdnDtBias, 9),
-                ]);
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::GatedDeltaNet,
-                    library: "gdn_scan_varlen",
-                    function: gdn_scan_simd_static_name(dtype),
-                    constants: baked(scan_constants()),
-                    dispatch: DispatchShape {
-                        threadgroups: (1, nv * hv / 4, 1),
-                        threads_per_threadgroup: (32, 4, 1),
-                        m_scaling: Some(MScaling {
-                            axis: MScaleAxis::Z,
-                            bucket_m: BucketM(1),
-                            seq_axis: Some(MScaleAxis::Z),
-                        }),
-                    },
-                    bindings: baked(bindings),
-                    gemm_dims: None,
-                });
-            } else {
-                // 2. Input-dependent gating → g, beta (f32 scratch).
-                //    1D over [num_tokens · nv]; scales X with num_tokens.
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::GatedDeltaNet,
-                    library: "gdn_gating",
-                    function: gdn_gating_static_name(dtype),
-                    constants: baked(vec![
-                        ConstantValue::uint(0, bucket_m * nv),
-                        ConstantValue::uint(1, nv),
-                    ]),
-                    dispatch: {
-                        let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
-                        d.m_scaling = Some(MScaling {
-                            axis: MScaleAxis::X,
-                            bucket_m: BucketM(bucket_m),
-                            seq_axis: None,
-                        });
-                        d
-                    },
-                    bindings: baked(vec![
-                        Binding::MoeScratch {
-                            binding_index: 0,
-                            byte_offset: layout.g,
-                        },
-                        Binding::MoeScratch {
-                            binding_index: 1,
-                            byte_offset: layout.beta,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *a_slot,
-                            binding_index: 2,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *b_slot,
-                            binding_index: 3,
-                        },
-                        weight(WeightTensor::GdnALog, 4),
-                        weight(WeightTensor::GdnDtBias, 5),
-                    ]),
-                    gemm_dims: None,
-                });
-
-                // 3. Recurrent gated delta-rule scan → o (f32 scratch).
-                //    grid (ceil(hv/tgx), nv, num_seqs[set via seq_axis=Z]).
-                //    Always the _f32 instantiation (all I/O is f32 scratch).
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::GatedDeltaNet,
-                    library: "gdn_scan_varlen",
-                    function: "gdn_scan_varlen_f32",
-                    constants: baked(scan_constants()),
-                    dispatch: {
-                        let tgx = hv.clamp(1, THREADS_PER_GROUP);
-                        DispatchShape {
-                            threadgroups: (hv.div_ceil(tgx), nv, 1),
-                            threads_per_threadgroup: (tgx, 1, 1),
-                            m_scaling: Some(MScaling {
-                                axis: MScaleAxis::Z,
-                                bucket_m: BucketM(1),
-                                seq_axis: Some(MScaleAxis::Z),
-                            }),
-                        }
-                    },
-                    bindings: baked(
-                        [
-                            (0, layout.o),
-                            (1, layout.conv_out),
-                            (2, layout.g),
-                            (3, layout.beta),
-                        ]
-                        .map(|(binding_index, byte_offset)| Binding::MoeScratch {
-                            binding_index,
-                            byte_offset,
-                        })
-                        .into_iter()
-                        .chain(scan_state(4))
-                        .collect(),
-                    ),
-                    gemm_dims: None,
-                });
-            }
-
-            // 4. Gated RMSNorm → core (model-dtype arena out_slot).
-            //    One threadgroup per row [num_tokens · nv], the power of two covering head_v
-            //    (any power of two ≥ head_v sums in the same order); scales X.
-            cmds.push(LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_rms_norm_gated",
-                function: gdn_rms_norm_gated_static_name(dtype),
-                constants: baked(vec![
-                    ConstantValue::uint(0, hv),
-                    ConstantValue::uint(1, bucket_m * nv),
-                    ConstantValue::float(2, p.rms_norm_eps),
-                ]),
-                dispatch: DispatchShape {
-                    threadgroups: (bucket_m * nv, 1, 1),
-                    threads_per_threadgroup: (hv.next_power_of_two().min(THREADS_PER_GROUP), 1, 1),
-                    m_scaling: Some(MScaling {
-                        axis: MScaleAxis::X,
-                        bucket_m: BucketM(bucket_m),
-                        seq_axis: None,
-                    }),
-                },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::MoeScratch {
-                        binding_index: 1,
-                        byte_offset: layout.o,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *z_slot,
-                        binding_index: 2,
-                    },
+                    arena(out_slot, 0),
+                    arena(z_slot, 2),
                     weight(WeightTensor::GdnNorm, 3),
-                ]),
-                gemm_dims: None,
-            });
+                ],
+                layout.o,
+                None,
+            ));
 
+            return Ok(cmds);
+        }
+
+        // ── Nemotron-H Mamba-2: conv1d → selective scan → gate-before-norm ──
+        //
+        // The GDN commands in their Mamba-2 forms (`gdn_*.metal`), over the same op scratch and
+        // the same one-slot-per-sequence conv/ssm state (`W::GDN_*` carry the Mamba-2 geometry:
+        // groups as key heads, heads as value heads, `[head_dim, state]` per head). `zxbcdt` is
+        // the whole in-projection row `z | xBC | dt`: the conv reads its `xBC` columns, the
+        // scan (or the gating ahead of the per-thread scan) its `dt` columns, the norm its `z`
+        // columns. A decode step is the same commands over one row a sequence.
+        I::Mamba2(Slot(zx_slot), Slot(out_slot), LayerId(layer)) => {
+            let layer_id = super::ids::LayerId(*layer + layer_offset);
+            let (groups, heads) = (p.gdn_num_k_heads, p.gdn_num_v_heads);
+            let conv_dim = p.gdn_conv_dim as u32;
+            let d_inner = heads * p.gdn_head_v_dim;
+            // The in-projection row: z [d_inner] | xBC [conv_dim] | dt [heads].
+            let row = d_inner + conv_dim + heads;
+            let ix = w.of(WeightKind::GatedDeltaNet, 0)?;
+            let weight = |which, binding_index| source(ix, which, layer_id, binding_index);
+            let zx = |binding_index| Binding::ArenaSlot {
+                slot: *zx_slot,
+                binding_index,
+            };
+            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, heads, d_inner);
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
+            let mut cmds = vec![recurrent_conv(
+                dequant_dtype_for(p),
+                (conv_dim, p.gdn_conv_kernel),
+                zx(1),
+                weight(WeightTensor::GdnConv1d, 2),
+                layer_id,
+                layout.conv_out,
+                Some((
+                    ColumnSlice {
+                        stride: row,
+                        offset: d_inner,
+                    },
+                    weight(WeightTensor::GdnConvBias, 7),
+                )),
+            )];
+            cmds.extend(recurrent_scan(
+                p,
+                ScanForm::Selective {
+                    zx: *zx_slot,
+                    dt: ColumnSlice {
+                        stride: row,
+                        offset: d_inner + conv_dim,
+                    },
+                },
+                bucket_m,
+                (ix, layer_id),
+                layout,
+            ));
+            // The norm per group of d_inner / n_groups, z the row's leading columns.
+            let out = Binding::ArenaSlot {
+                slot: *out_slot,
+                binding_index: 0,
+            };
+            cmds.push(recurrent_norm(
+                p,
+                (d_inner / groups, groups),
+                bucket_m,
+                [out, zx(2), weight(WeightTensor::GdnNorm, 3)],
+                layout.o,
+                Some(row),
+            ));
             return Ok(cmds);
         }
 
@@ -6282,6 +6171,293 @@ struct MoeScratchLayout {
 
 fn align_256(n: u32) -> u32 {
     (n + 255) & !255
+}
+
+/// A column slice of a wider activation row — Mamba-2's `xBC` / `dt` within its in-projection
+/// row: the row's stride and the slice's first column, as a recurrent kernel's optional
+/// `(stride, offset)` constant pair at `slot`, `slot + 1`.
+#[derive(Clone, Copy, Debug)]
+struct ColumnSlice {
+    stride: u32,
+    offset: u32,
+}
+
+impl ColumnSlice {
+    fn constants(self, slot: u16) -> [ConstantValue; 2] {
+        [
+            ConstantValue::uint(slot, self.stride),
+            ConstantValue::uint(slot + 1, self.offset),
+        ]
+    }
+}
+
+/// A recurrent mixer's causal depthwise conv1d (+SiLU), varlen + stateful (`gdn_conv1d_varlen`),
+/// into the f32 scratch `conv_out`: over GDN's qkv rows, or over the `xBC` column slice of
+/// Mamba-2's in-projection rows with its conv bias (`sliced`). Grid (num_seqs[set via
+/// seq_axis=X], ceil(conv_dim/tg_y), 1).
+fn recurrent_conv(
+    dtype: DequantDtype,
+    (conv_dim, kernel): (u32, u32),
+    input: Binding,
+    conv_w: Binding,
+    layer: super::ids::LayerId,
+    conv_out: u32,
+    sliced: Option<(ColumnSlice, Binding)>,
+) -> LoweredCommand {
+    use crate::tape::ids::BucketM;
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let runtime = |kind, binding_index| Binding::Runtime {
+        kind,
+        binding_index,
+    };
+    let mut constants = vec![
+        ConstantValue::uint(0, conv_dim),
+        ConstantValue::uint(1, kernel),
+    ];
+    let mut bindings = vec![
+        Binding::MoeScratch {
+            binding_index: 0,
+            byte_offset: conv_out,
+        },
+        input,
+        conv_w,
+        runtime(RuntimeBindingKind::GdnConvState { layer }, 3),
+        runtime(RuntimeBindingKind::CuSeqlensQ, 4),
+        runtime(RuntimeBindingKind::GdnStateIndices, 5),
+        runtime(RuntimeBindingKind::GdnIsFresh, 6),
+    ];
+    if let Some((slice, bias)) = sliced {
+        constants.extend(slice.constants(2));
+        constants.push(ConstantValue::boolean(4, true));
+        bindings.push(bias);
+    }
+    let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
+    LoweredCommand {
+        kernel: KernelId::GatedDeltaNet,
+        library: "gdn_conv1d_varlen",
+        function: gdn_conv1d_varlen_static_name(dtype),
+        constants: baked(constants),
+        dispatch: DispatchShape {
+            threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
+            threads_per_threadgroup: (1, tg_y, 1),
+            // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
+            m_scaling: Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: BucketM(1),
+                seq_axis: Some(MScaleAxis::X),
+            }),
+        },
+        bindings: baked(bindings),
+        gemm_dims: None,
+    }
+}
+
+/// How a recurrent mixer's scan gates and updates its state: GDN's gated delta rule, its gate
+/// inputs `a` / `b` their own `[T, heads]` activations; Mamba-2's selective scan, `dt` a column
+/// slice of its in-projection row `zx`, with the `D` skip.
+#[derive(Clone, Copy, Debug)]
+enum ScanForm {
+    DeltaRule { a: u32, b: u32 },
+    Selective { zx: u32, dt: ColumnSlice },
+}
+
+/// A recurrent mixer's gating and scan of the f32 scratch `conv_out` into the f32 scratch `o`,
+/// over the pool's ssm state. head_k a multiple of 32 (and head_v of 4): one command, mlx-lm's
+/// simdgroup-per-value-dim mapping (`gdn_scan_simd`, the gating inline). The mapping is
+/// sequence-serial either way, but a simdgroup's 32 lanes split head_k (dots via `simd_sum`)
+/// where `gdn_scan_varlen`'s CUDA-faithful mapping runs serial head_k loops per token in ONE
+/// thread — measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill forward (64%,
+/// ~8 µs/token/layer) on the per-thread kernel. Other geometries: the gating into `g` / `beta`
+/// (1-D over `[num_tokens · heads]`, scaling X), then the per-thread scan, always its `_f32`
+/// instantiation (all its I/O is f32 scratch). Both scans: grid Z = num_seqs.
+fn recurrent_scan(
+    p: &MetalModelConsts,
+    form: ScanForm,
+    bucket_m: u32,
+    (ix, layer): (SourceIx, super::ids::LayerId),
+    layout: GdnScratchLayout,
+) -> Vec<LoweredCommand> {
+    use crate::tape::ids::BucketM;
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let (nk, nv) = (p.gdn_num_k_heads, p.gdn_num_v_heads);
+    let (hk, hv) = (p.gdn_head_k_dim, p.gdn_head_v_dim);
+    let dtype = dequant_dtype_for(p);
+    let (a, b, dt) = match form {
+        ScanForm::DeltaRule { a, b } => (a, b, None),
+        ScanForm::Selective { zx, dt } => (zx, zx, Some(dt)),
+    };
+    let weight = |which, binding_index| source(ix, which, layer, binding_index);
+    let arena = |slot, binding_index| Binding::ArenaSlot {
+        slot,
+        binding_index,
+    };
+    let scratch = |binding_index, byte_offset| Binding::MoeScratch {
+        binding_index,
+        byte_offset,
+    };
+    let runtime = |kind, binding_index| Binding::Runtime {
+        kind,
+        binding_index,
+    };
+    // The selective scan's flag; its scale is unread.
+    let mut scan_constants = vec![
+        ConstantValue::uint(0, nk),
+        ConstantValue::uint(1, nv),
+        ConstantValue::uint(2, hk),
+        ConstantValue::uint(3, hv),
+        ConstantValue::float(4, (hk as f32).powf(-0.5)),
+    ];
+    scan_constants.extend(dt.map(|_| ConstantValue::boolean(5, true)));
+    let state = [
+        runtime(RuntimeBindingKind::GdnSsmState { layer }, 4),
+        runtime(RuntimeBindingKind::CuSeqlensQ, 5),
+        runtime(RuntimeBindingKind::GdnStateIndices, 6),
+        runtime(RuntimeBindingKind::GdnIsFresh, 7),
+    ];
+    let seqs = Some(MScaling {
+        axis: MScaleAxis::Z,
+        bucket_m: BucketM(1),
+        seq_axis: Some(MScaleAxis::Z),
+    });
+    // `inputs` at 2 and 3, the ssm state at 4..=7, then `tail`, then (selective) `D` at `skip`.
+    let scan =
+        |function, constants, inputs: [Binding; 2], tail: &[Binding], skip, dispatch: (_, _)| {
+            let mut bindings = vec![scratch(0, layout.o), scratch(1, layout.conv_out)];
+            bindings.extend(inputs.into_iter().chain(state).chain(tail.iter().copied()));
+            bindings.extend(dt.map(|_| weight(WeightTensor::GdnSkip, skip)));
+            LoweredCommand {
+                kernel: KernelId::GatedDeltaNet,
+                library: "gdn_scan_varlen",
+                function,
+                constants: baked(constants),
+                dispatch: DispatchShape {
+                    threadgroups: dispatch.0,
+                    threads_per_threadgroup: dispatch.1,
+                    m_scaling: seqs,
+                },
+                bindings: baked(bindings),
+                gemm_dims: None,
+            }
+        };
+    if hk.is_multiple_of(32) && hv.is_multiple_of(4) {
+        scan_constants.extend(dt.into_iter().flat_map(|dt| dt.constants(6)));
+        let gating = [
+            weight(WeightTensor::GdnALog, 8),
+            weight(WeightTensor::GdnDtBias, 9),
+        ];
+        let function = gdn_scan_simd_static_name(dtype);
+        let dispatch = ((1, nv * hv / 4, 1), (32, 4, 1));
+        let inputs = [arena(a, 2), arena(b, 3)];
+        return vec![scan(
+            function,
+            scan_constants,
+            inputs,
+            &gating,
+            10,
+            dispatch,
+        )];
+    }
+    let mut gating_constants = vec![
+        ConstantValue::uint(0, bucket_m * nv),
+        ConstantValue::uint(1, nv),
+    ];
+    if let Some(dt) = dt {
+        gating_constants.push(ConstantValue::boolean(2, true));
+        gating_constants.extend(dt.constants(3));
+    }
+    let gating = LoweredCommand {
+        kernel: KernelId::GatedDeltaNet,
+        library: "gdn_gating",
+        function: gdn_gating_static_name(dtype),
+        constants: baked(gating_constants),
+        dispatch: {
+            let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
+            d.m_scaling = Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: BucketM(bucket_m),
+                seq_axis: None,
+            });
+            d
+        },
+        bindings: baked(vec![
+            scratch(0, layout.g),
+            scratch(1, layout.beta),
+            arena(a, 2),
+            arena(b, 3),
+            weight(WeightTensor::GdnALog, 4),
+            weight(WeightTensor::GdnDtBias, 5),
+        ]),
+        gemm_dims: None,
+    };
+    let inputs = [scratch(2, layout.g), scratch(3, layout.beta)];
+    let tgx = hv.clamp(1, THREADS_PER_GROUP);
+    let dispatch = ((hv.div_ceil(tgx), nv, 1), (tgx, 1, 1));
+    vec![
+        gating,
+        scan(
+            "gdn_scan_varlen_f32",
+            scan_constants,
+            inputs,
+            &[],
+            8,
+            dispatch,
+        ),
+    ]
+}
+
+/// A recurrent mixer's gated RMSNorm (`gdn_rms_norm_gated`) of the f32 scratch `o` into the
+/// model-dtype `out` (bindings `[out, z, weight]`): rows of `width` (`per_token` a token), one threadgroup a row of the power
+/// of two covering `width` (any power of two ≥ width sums in the same order); scales X. GDN
+/// norms per value head after the gate; Mamba-2 (`z_stride` = its in-projection row, `z` that
+/// row's leading columns) gates first and norms per group, its weight spanning the row.
+fn recurrent_norm(
+    p: &MetalModelConsts,
+    (width, per_token): (u32, u32),
+    bucket_m: u32,
+    [out, z, norm_w]: [Binding; 3],
+    o: u32,
+    z_stride: Option<u32>,
+) -> LoweredCommand {
+    use crate::tape::ids::BucketM;
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let rows = bucket_m * per_token;
+    let mut constants = vec![
+        ConstantValue::uint(0, width),
+        ConstantValue::uint(1, rows),
+        ConstantValue::float(2, p.rms_norm_eps),
+    ];
+    if let Some(stride) = z_stride {
+        constants.extend([
+            ConstantValue::uint(3, stride),
+            ConstantValue::uint(4, per_token),
+            ConstantValue::boolean(5, true),
+        ]);
+    }
+    LoweredCommand {
+        kernel: KernelId::GatedDeltaNet,
+        library: "gdn_rms_norm_gated",
+        function: gdn_rms_norm_gated_static_name(dequant_dtype_for(p)),
+        constants: baked(constants),
+        dispatch: DispatchShape {
+            threadgroups: (rows, 1, 1),
+            threads_per_threadgroup: (width.next_power_of_two().min(THREADS_PER_GROUP), 1, 1),
+            m_scaling: Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: BucketM(bucket_m),
+                seq_axis: None,
+            }),
+        },
+        bindings: baked(vec![
+            out,
+            Binding::MoeScratch {
+                binding_index: 1,
+                byte_offset: o,
+            },
+            z,
+            norm_w,
+        ]),
+        gemm_dims: None,
+    }
 }
 
 /// Per-bucket Gated-DeltaNet scratch layout. The four GDN sub-commands
@@ -8057,6 +8233,209 @@ mod tests {
         let want = [(conv, None), (simd, None), (norm, None)];
         assert_eq!(shape(&lowered((2, 4, 128, 48), 64)), want);
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
+    }
+
+    /// A Mamba-2 layer lowers to the GDN kernels in their Mamba-2 forms, ungated at every
+    /// bucket (a decode step is the same chain over one row a sequence): the conv over the
+    /// in-projection's `xBC` columns with its bias; the gating then the per-thread scan (state
+    /// 16), or the simd scan reading `dt` off the row itself (state 128); the gate-before-norm
+    /// per group. The constants and bindings are the ones `tests/mamba2_test.rs` dispatches
+    /// against its CPU reference. Pure-CPU lowering checks.
+    #[test]
+    fn mamba2_lowers_the_gdn_kernels_in_their_mamba2_forms() {
+        use ConstantValue as C;
+        use WeightTensor as T;
+        let lowered = |(groups, heads, state, head_dim): (u32, u32, u32, u32), bucket_m| {
+            let p = MetalModelConsts {
+                gdn_num_k_heads: groups,
+                gdn_num_v_heads: heads,
+                gdn_head_k_dim: state,
+                gdn_head_v_dim: head_dim,
+                gdn_conv_kernel: 4,
+                gdn_conv_dim: (heads * head_dim + 2 * groups * state) as usize,
+                ..tp()
+            };
+            let step = MetalStep::Mamba2(Slot(0), Slot(1), LayerId(0));
+            lower_tq(&p, plain(&[step]), bucket_m)
+                .commands
+                .iter()
+                .cloned()
+                .collect::<Vec<GatedCommand>>()
+        };
+        // A binding as (index, what it binds), the scratch by its region's order.
+        let binds = |c: &GatedCommand| -> Vec<(u8, String)> {
+            let mut b: Vec<(u8, String)> = c
+                .command
+                .bindings
+                .iter()
+                .map(|b| match *b {
+                    Binding::ArenaSlot {
+                        slot,
+                        binding_index,
+                    } => (binding_index, format!("arena {slot}")),
+                    Binding::MoeScratch {
+                        binding_index,
+                        byte_offset,
+                    } => (binding_index, format!("scratch {byte_offset}")),
+                    Binding::Source {
+                        which,
+                        binding_index,
+                        ..
+                    } => (binding_index, format!("{which:?}")),
+                    Binding::Runtime {
+                        kind,
+                        binding_index,
+                    } => (binding_index, format!("{kind:?}")),
+                    ref other => panic!("unexpected binding {other:?}"),
+                })
+                .collect();
+            b.sort();
+            b
+        };
+        let named = |pairs: &[(u8, &str)]| -> Vec<(u8, String)> {
+            pairs.iter().map(|&(i, s)| (i, s.to_owned())).collect()
+        };
+        let state = [
+            "GdnSsmState { layer: LayerId(0) }",
+            "CuSeqlensQ",
+            "GdnStateIndices",
+            "GdnIsFresh",
+        ];
+        for bucket_m in [1, 64] {
+            // The parity-tiny geometry: in-projection row 128 + 192 + 8 = 328.
+            let tiny = lowered((2, 8, 16, 16), bucket_m);
+            let functions: Vec<_> = tiny.iter().map(|c| (c.command.function, c.gate)).collect();
+            assert_eq!(
+                functions,
+                [
+                    ("gdn_conv1d_varlen_bf16", None),
+                    ("gdn_gating_bf16", None),
+                    ("gdn_scan_varlen_f32", None),
+                    ("gdn_rms_norm_gated_bf16", None),
+                ]
+            );
+            assert_eq!(
+                tiny[0].command.constants,
+                [
+                    C::uint(0, 192),
+                    C::uint(1, 4),
+                    C::uint(2, 328),
+                    C::uint(3, 128),
+                    C::boolean(4, true)
+                ]
+            );
+            let conv_out = "scratch 0".to_owned();
+            let mut want = named(&[
+                (1, "arena 0"),
+                (2, &format!("{:?}", T::GdnConv1d)),
+                (3, "GdnConvState { layer: LayerId(0) }"),
+                (4, "CuSeqlensQ"),
+                (5, "GdnStateIndices"),
+                (6, "GdnIsFresh"),
+                (7, &format!("{:?}", T::GdnConvBias)),
+            ]);
+            want.insert(0, (0, conv_out.clone()));
+            assert_eq!(binds(&tiny[0]), want);
+            assert_eq!(
+                tiny[1].command.constants,
+                [
+                    C::uint(0, bucket_m * 8),
+                    C::uint(1, 8),
+                    C::boolean(2, true),
+                    C::uint(3, 328),
+                    C::uint(4, 320)
+                ]
+            );
+            let gating = binds(&tiny[1]);
+            assert_eq!(
+                gating[2..],
+                named(&[
+                    (2, "arena 0"),
+                    (3, "arena 0"),
+                    (4, "GdnALog"),
+                    (5, "GdnDtBias")
+                ])
+            );
+            let scan_constants = [
+                C::uint(0, 2),
+                C::uint(1, 8),
+                C::uint(2, 16),
+                C::uint(3, 16),
+                C::float(4, 0.25),
+                C::boolean(5, true),
+            ];
+            assert_eq!(tiny[2].command.constants, scan_constants);
+            let scan = binds(&tiny[2]);
+            assert_eq!(scan[1], (1, conv_out.clone()));
+            // The scan reads the gating's g and dt regions.
+            assert_eq!(scan[2], (2, gating[0].1.clone()));
+            assert_eq!(scan[3], (3, gating[1].1.clone()));
+            assert_eq!(
+                scan[4..8],
+                named(&[(4, state[0]), (5, state[1]), (6, state[2]), (7, state[3])])
+            );
+            assert_eq!(scan[8], (8, "GdnSkip".to_owned()));
+            assert_eq!(
+                tiny[3].command.constants,
+                [
+                    C::uint(0, 64),
+                    C::uint(1, bucket_m * 2),
+                    C::float(2, tp().rms_norm_eps),
+                    C::uint(3, 328),
+                    C::uint(4, 2),
+                    C::boolean(5, true)
+                ]
+            );
+            let norm = binds(&tiny[3]);
+            assert_eq!(norm[0], (0, "arena 1".to_owned()));
+            assert_eq!(norm[1], (1, scan[0].1.clone()));
+            assert_eq!(norm[2..], named(&[(2, "arena 0"), (3, "GdnNorm")]));
+
+            // The real checkpoints' state: the simd scan, dt at the row's last 64 columns.
+            let real = lowered((8, 64, 128, 64), bucket_m);
+            let functions: Vec<_> = real.iter().map(|c| (c.command.function, c.gate)).collect();
+            assert_eq!(
+                functions,
+                [
+                    ("gdn_conv1d_varlen_bf16", None),
+                    ("gdn_scan_simd_bf16", None),
+                    ("gdn_rms_norm_gated_bf16", None),
+                ]
+            );
+            let (inner, conv_dim) = (64 * 64, 64 * 64 + 2 * 8 * 128);
+            let row = inner + conv_dim + 64;
+            let simd_constants = [
+                C::uint(0, 8),
+                C::uint(1, 64),
+                C::uint(2, 128),
+                C::uint(3, 64),
+                C::float(4, 128f32.powf(-0.5)),
+                C::boolean(5, true),
+                C::uint(6, row),
+                C::uint(7, inner + conv_dim),
+            ];
+            assert_eq!(real[1].command.constants, simd_constants);
+            let simd = binds(&real[1]);
+            assert_eq!(simd[2..4], named(&[(2, "arena 0"), (3, "arena 0")]));
+            assert_eq!(
+                simd[4..8],
+                named(&[(4, state[0]), (5, state[1]), (6, state[2]), (7, state[3])])
+            );
+            assert_eq!(
+                simd[8..],
+                named(&[(8, "GdnALog"), (9, "GdnDtBias"), (10, "GdnSkip")])
+            );
+            let d = &real[1].command.dispatch;
+            assert_eq!(
+                (d.threadgroups, d.threads_per_threadgroup),
+                ((1, 64 * 64 / 4, 1), (32, 4, 1))
+            );
+            let d = &real[2].command.dispatch;
+            assert_eq!(
+                (d.threadgroups, d.threads_per_threadgroup),
+                ((bucket_m * 8, 1, 1), (256, 1, 1))
+            );
+        }
     }
 
     /// A dense model's tape carries no TurboQuant command and gates nothing on

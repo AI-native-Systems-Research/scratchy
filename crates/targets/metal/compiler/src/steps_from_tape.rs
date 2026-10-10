@@ -2059,6 +2059,16 @@ impl Recording<'_> {
                 e.sig.op_scratch = Access::Write;
                 e
             }
+            L::Mamba2 { .. } => {
+                let (out, zxbcdt) = (out()?, self.read(i, 0)?);
+                let e = self.weight_of(i)?;
+                let step = S::Mamba2(zxbcdt, out, self.layer(e));
+                let site = self.site(i, WeightKind::GatedDeltaNet, e)?;
+                let mut e = em(step, &[zxbcdt], &[out], site);
+                // Its conv, scan and norm pass their intermediates through the op scratch.
+                e.sig.op_scratch = Access::Write;
+                e
+            }
             L::RouterNorm { eps, router } => {
                 let (x, e) = (self.read(i, 0)?, self.source_arg(i, 1)?);
                 let step = MoeStep::RouterNorm(x, self.layer(e), st::Eps(eps));

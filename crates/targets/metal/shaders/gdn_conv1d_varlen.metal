@@ -28,9 +28,16 @@
 // `x`/`w` are model dtype (`T`), f32-accumulated; `conv_out` + `conv_state`
 // are f32. Per-channel (depthwise) so GVA / head grouping does not apply here.
 //
+// Mamba-2 (Nemotron-H) runs the same conv over the `xBC` columns of its whole in-projection row
+// `z | xBC | dt`, plus a per-channel bias (`use_conv_bias`): the optional constants read `x` as a
+// column slice of a wider row and add the bias ahead of the taps.
+//
 // Baked constants:
-//   GDN_CONV_DIM    — conv_dim (= 2*key_dim + value_dim)
-//   GDN_CONV_KERNEL — kernel_size (<= GDN_CONV_KMAX)
+//   GDN_CONV_DIM       — conv_dim (GDN: 2*key_dim + value_dim; Mamba-2: d_inner + 2*n_groups*state)
+//   GDN_CONV_KERNEL    — kernel_size (<= GDN_CONV_KMAX)
+//   GDN_CONV_IN_STRIDE — optional: `x`'s row stride (unset: conv_dim, the qkv row)
+//   GDN_CONV_IN_OFFSET — optional: the first conv channel's column in that row (unset: 0)
+//   GDN_CONV_HAS_BIAS  — optional: add `bias[c]` (buffer 7; unset: no bias, buffer 7 unread)
 //
 // Dispatch: grid (num_seqs, ceil(conv_dim/tg), 1); one thread per (seq, channel).
 
@@ -41,6 +48,11 @@ using namespace metal;
 
 SCRATCHY_CONSTANT(uint, GDN_CONV_DIM, 0);
 SCRATCHY_CONSTANT(uint, GDN_CONV_KERNEL, 1);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_CONV_IN_STRIDE, 2);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_CONV_IN_OFFSET, 3);
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_CONV_HAS_BIAS, 4);
+
+constant constexpr uint GDN_CONV_X_STRIDE = GDN_CONV_IN_STRIDE_SET ? GDN_CONV_IN_STRIDE : GDN_CONV_DIM;
 
 // Upper bound for the register window/weights (kernel-1 and kernel). GDN conv
 // kernels are tiny (Qwen3.5 uses 4); 8 is a safe compile-time ceiling.
@@ -55,6 +67,7 @@ template <typename T>
     const device int*   cu_seqlens    [[buffer(4)]],
     const device int*   state_indices [[buffer(5)]],
     const device uint*  is_fresh      [[buffer(6)]],
+    const device T*     bias          [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
 {
@@ -90,9 +103,10 @@ template <typename T>
   }
 
   // Walk the sequence's tokens; the window slides through registers.
+  const float b = GDN_CONV_HAS_BIAS ? float(bias[d]) : 0.0f;
   for (int t = 0; t < seqlen; t++) {
-    float x_t = float(x[(uint(base + t)) * conv_dim + d]);
-    float sum = x_t * wlocal[state_len];
+    float x_t = float(x[(uint(base + t)) * GDN_CONV_X_STRIDE + GDN_CONV_IN_OFFSET + d]);
+    float sum = b + x_t * wlocal[state_len];
     for (uint ki = 0; ki < state_len; ki++) {
       sum += window[ki] * wlocal[ki];
     }

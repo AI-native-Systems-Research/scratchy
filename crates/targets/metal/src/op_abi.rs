@@ -137,6 +137,7 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::GateApply
         | L::GateScale
         | L::GatedDeltaNet
+        | L::Mamba2 { .. }
         | L::AttnDecode { .. }
         | L::LoadPixels { .. }
         | L::LoadPosEmbeds { .. }

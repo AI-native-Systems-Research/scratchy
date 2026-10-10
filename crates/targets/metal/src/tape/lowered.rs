@@ -925,7 +925,7 @@ pub enum SourceRef<'w> {
     /// gpt-oss MoE (biased router + SwiGLU-OAI experts with per-expert
     /// linear biases).
     GptOssMoe(&'w scratchy_layers::layers_moe::GptOssMoELayer),
-    /// Qwen3.5 Gated-DeltaNet per-layer weights.
+    /// Qwen3.5 Gated-DeltaNet / Nemotron-H Mamba-2 per-layer weights.
     GatedDeltaNet(&'w scratchy_layers::GatedDeltaNetLayer),
 }
 
@@ -993,6 +993,8 @@ impl SourceRef<'_> {
             (Self::GatedDeltaNet(g), T::GdnALog) => Some(g.a_log),
             (Self::GatedDeltaNet(g), T::GdnDtBias) => Some(g.dt_bias),
             (Self::GatedDeltaNet(g), T::GdnNorm) => Some(g.norm),
+            (Self::GatedDeltaNet(g), T::GdnConvBias) => g.conv_bias,
+            (Self::GatedDeltaNet(g), T::GdnSkip) => g.d,
             (Self::GemmaRouter(r), T::GemmaRouterGate) => Some(r.gate),
             (Self::GemmaRouter(r), T::GemmaPerExpertScale) => Some(r.per_expert_scale),
             (Self::GemmaRouter(r), T::GemmaRouterScale) => Some(r.scale),
@@ -1167,8 +1169,12 @@ pub enum WeightTensor {
     GdnALog,
     /// Per-value-head softplus bias `dt_bias` `[num_v_heads]`.
     GdnDtBias,
-    /// Gated-RMSNorm weight `[head_v_dim]`.
+    /// Gated-RMSNorm weight `[head_v_dim]` (Mamba-2: `[d_inner]`).
     GdnNorm,
+    /// Mamba-2 causal conv1d bias `[conv_dim]` (on-disk dtype).
+    GdnConvBias,
+    /// Mamba-2 per-head skip `D` `[num_heads]` (f32).
+    GdnSkip,
 }
 
 /// Categories of buffers the worker rebinds per forward call.

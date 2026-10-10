@@ -2214,17 +2214,28 @@ fn emit_fingerprint_check(
     } else {
         "self_attn.q_proj".to_string()
     };
+    // On disk under the arch's renames (nemotron-h: `attn.q_proj` →
+    // `mixer.q_proj`), sniffed at the LAST layer that has it: a declared
+    // block schedule (`attention_layers`) names it — nemotron-h's last
+    // layer is a MoE block with no attention projection.
+    let fp_leaf_owned =
+        crate::classified::rename_dotted_under(&model.arch.weight_leaf_renames, &fp_leaf_owned);
     let fp_leaf: &str = fp_leaf_owned.as_str();
-    let last_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.{suffix}");
+    let fp_layer = model
+        .layer_sets
+        .get("attention_layers")
+        .and_then(|set| set.members().last().copied())
+        .unwrap_or(last_layer);
+    let last_tensor = format!("{dec_root}.layers.{fp_layer}.{fp_leaf}.{suffix}");
     // MLX-affine `.scales` sibling of `last_tensor`. The affine group-size
     // gate must probe a layer that ACTUALLY HAS `fp_leaf` (= `self_attn.q_proj`).
     // It MUST NOT hardcode `layers.0`: hybrid arches (Qwen3.5 Gated-DeltaNet,
     // Mamba/Jamba) make layer 0 a linear-attention layer with NO `self_attn.q_proj`,
     // so `layers.0.self_attn.q_proj.scales` is absent there and the gate would
-    // reject every variant → `ArchNotSupported`. `last_layer` is the same layer
+    // reject every variant → `ArchNotSupported`. `fp_layer` is the same layer
     // the present-check (`last_tensor`) already requires, so its `.scales`
     // sibling is guaranteed present for the affine checkpoint.
-    let last_scales_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.scales");
+    let last_scales_tensor = format!("{dec_root}.layers.{fp_layer}.{fp_leaf}.scales");
     let one_past_tensor = format!("{dec_root}.layers.{num_hidden_layers}.{fp_leaf}.{suffix}");
     let opposite_tensor = format!("{dec_root}.layers.0.{fp_leaf}.{opposite_suffix}");
     // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
@@ -7436,12 +7447,15 @@ fn emit_canonical_params_impl(
     // op-scratch layout; the cuda eval reads them too. Not divided by
     // `tp` — GDN tensor-parallel partitioning is a separate concern and
     // bring-up is TP=1 (where the division is a no-op anyway).
-    let gdn_num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
-    let gdn_num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
-    let gdn_head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
-    let gdn_head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
-    let gdn_conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
-    let gdn_conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as usize;
+    let RecurrentDims {
+        num_k_heads: gdn_num_k_heads,
+        num_v_heads: gdn_num_v_heads,
+        head_k_dim: gdn_head_k_dim,
+        head_v_dim: gdn_head_v_dim,
+        conv_kernel: gdn_conv_kernel,
+        conv_dim,
+    } = RecurrentDims::of(model).unwrap_or_default();
+    let gdn_conv_dim = conv_dim as usize;
 
     // Vision-tower constants. Set in `#[vision_forward]` configs via
     // `vision_num_heads` / `vision_head_dim` bounds; absent in text
@@ -8001,9 +8015,56 @@ fn emit_canonical_params_impl(
     }
 }
 
+/// The one-slot-per-sequence recurrent-state geometry of a hybrid arch's
+/// recurrent mixer, in the GDN state pool's terms — read from the config
+/// once for both the `W::GDN_*` consts and the `GdnRuntimeConfig`.
+///
+/// A Mamba-2 mixer fills the same pool: its conv ring spans `xBC`
+/// (`mamba_conv_dim`), its groups are the key heads (`n_groups`), its heads
+/// the value heads (`mamba_num_heads`), each holding a `[head_dim, state]`
+/// state matrix — `head_v_dim = mamba_head_dim`, `head_k_dim =
+/// ssm_state_size`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecurrentDims {
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub head_k_dim: u32,
+    pub head_v_dim: u32,
+    pub conv_kernel: u32,
+    pub conv_dim: u32,
+}
+
+impl RecurrentDims {
+    /// `None` for an arch with no recurrent mixer.
+    pub(crate) fn of(model: &ModelParams) -> Option<Self> {
+        let get = |k: &str| model.bounds.get(k).map(|&v| v as u32);
+        let gdn = || {
+            Some(Self {
+                num_k_heads: get("linear_num_key_heads")?,
+                num_v_heads: get("linear_num_value_heads")?,
+                head_k_dim: get("linear_key_head_dim")?,
+                head_v_dim: get("linear_value_head_dim")?,
+                conv_kernel: get("linear_conv_kernel_dim")?,
+                conv_dim: get("gdn_conv_dim")?,
+            })
+        };
+        let mamba = || {
+            Some(Self {
+                num_k_heads: get("n_groups")?,
+                num_v_heads: get("mamba_num_heads")?,
+                head_k_dim: get("ssm_state_size")?,
+                head_v_dim: get("mamba_head_dim")?,
+                conv_kernel: get("conv_kernel")?,
+                conv_dim: get("mamba_conv_dim")?,
+            })
+        };
+        gdn().or_else(mamba)
+    }
+}
+
 /// Emit a per-variant arm body — the `GdnRuntimeConfig` literal for one
-/// specialization. Returns `None` if the variant has no
-/// `OpKind::GatedDeltaNet` (non-hybrid) — caller emits a `None` arm.
+/// specialization. Returns `None` if the variant has no recurrent mixer
+/// (`OpKind::GatedDeltaNet` / `OpKind::Mamba2`) — caller emits a `None` arm.
 pub fn emit_gdn_runtime_config_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
@@ -8015,7 +8076,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     let mut linear = vec![false; num_hidden_layers];
     let mut is_hybrid = false;
     for node in &fuf.nodes {
-        if node.op != OpKind::GatedDeltaNet {
+        if !matches!(node.op, OpKind::GatedDeltaNet | OpKind::Mamba2) {
             continue;
         }
         is_hybrid = true;
@@ -8031,12 +8092,21 @@ pub fn emit_gdn_runtime_config_arm_body(
     if !is_hybrid {
         return None;
     }
-    let conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as u32;
-    let conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
-    let num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
-    let num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
-    let head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
-    let head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
+    let RecurrentDims {
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        conv_kernel,
+        conv_dim,
+    } = RecurrentDims::of(model).unwrap_or_else(|| {
+        panic!(
+            "model `{}` runs a recurrent mixer but its config declares no GDN \
+             (`linear_*`) or Mamba-2 (`mamba_*`, `n_groups`, `ssm_state_size`, \
+             `conv_kernel`) state geometry",
+            model.source_stem
+        )
+    });
     let bits = linear.iter().copied();
     Some(quote! {
         ::core::option::Option::Some(

@@ -94,6 +94,9 @@ mod imp {
         /// sizes, n_merged. Its presence routes the case to the vision arm.
         #[cfg_attr(not(feature = "vision"), allow(dead_code))]
         vision_grid: Option<serde_json::Value>,
+        /// `harness.json`'s `dense_moe`: whether the oracle EXECUTED a
+        /// dense MoE (a hybrid schedule may declare experts no layer runs).
+        dense_moe: bool,
     }
 
     /// Every `goldens/<arch>-<stem>/` dir carrying a checkpoint — the
@@ -127,6 +130,9 @@ mod imp {
                 arch: harness["arch"].as_str().expect("harness arch").into(),
                 stem: harness["stem"].as_str().expect("harness stem").into(),
                 vision_grid: harness.get("vision_grid").cloned(),
+                dense_moe: harness["dense_moe"]
+                    .as_bool()
+                    .expect("harness dense_moe (regenerate the goldens)"),
                 dir,
             });
         }
@@ -223,11 +229,10 @@ mod imp {
         // would compare an execution against a refusal: not parity, a
         // mechanism gap. Named loudly, not silently passed — the unlock is
         // either a dense-MoE metal kernel or a quant-emulating oracle,
-        // whichever lands first. Sniffed off config keys (num_local_experts
-        // / n_routed_experts / num_experts — the three vocabularies the
-        // bridge itself reads), not an arch list.
-        let moe_keys = ["num_local_experts", "n_routed_experts", "num_experts"];
-        if moe_keys.iter().any(|k| cfg.get(k).is_some()) {
+        // whichever lands first. Read off what the oracle ran (a dense MoE
+        // shim executed), not an arch list — nor the config's expert-count
+        // keys, which a hybrid schedule may declare for no layer.
+        if case.dense_moe {
             eprintln!(
                 "DEFERRED {}/{}: dense MoE — metal requires affine expert storage; \
                  the oracle is dense-only (same refusal both sides)",

@@ -230,8 +230,9 @@ all-arches = [
 "modernbert-base-1-layer-parity-tiny" = ["arch-modernbert"]
 "modernbert-base" = ["arch-modernbert"]
 
-# nemotron-h (2 configs)
+# nemotron-h (3 configs)
 "nemotron-3-nano-30b-a3b" = ["arch-nemotron-h"]
+"nemotron-3-nano-30b-a3b-mamba-parity-tiny" = ["arch-nemotron-h"]
 "nemotron-3-nano-30b-a3b-parity-tiny" = ["arch-nemotron-h"]
 
 # nemotron-h-latent (2 configs)
@@ -437,6 +438,7 @@ all-arches = [
 ]
 "nemotron-h" = [
     "nemotron-3-nano-30b-a3b",
+    "nemotron-3-nano-30b-a3b-mamba-parity-tiny",
     "nemotron-3-nano-30b-a3b-parity-tiny",
 ]
 "nemotron-h-latent" = [
@@ -606,6 +608,7 @@ all = [
     "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
     "nemotron-3-nano-30b-a3b",
+    "nemotron-3-nano-30b-a3b-mamba-parity-tiny",
     "nemotron-3-nano-30b-a3b-parity-tiny",
     "nemotron-3-super-120b-a12b",
     "nemotron-3-super-120b-a12b-parity-tiny",
