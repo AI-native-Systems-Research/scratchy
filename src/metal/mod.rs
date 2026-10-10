@@ -632,9 +632,10 @@ struct Enabled {
 const FIXED_MOUNT: &str = "max-width: 100%; overflow-x: auto";
 
 /// A chart's mount point, styled by `mount`: charts.js draws `spec` into it.
-fn chart(spec: &Chart, label: &str, mount: &str) -> Element {
+/// `scale` is the id of the ratio scale a heatmap's squares highlight on hover.
+fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Element {
     rsx! {
-        div { role: "img", "aria-label": label, style: "{mount}",
+        div { role: "img", "aria-label": label, style: "{mount}", "data-scale": scale,
             "data-chart": serde_json::to_string(spec).unwrap_or_default(),
         }
     }
@@ -691,7 +692,7 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
             toolbar: Enabled { enabled: false },
         },
     };
-    chart(&spec, label, FIXED_MOUNT)
+    chart(&spec, label, FIXED_MOUNT, None)
 }
 
 /// A model's full grid as a heatmap. With a rival, values are how many times
@@ -704,6 +705,7 @@ fn grid_heatmap(
     total_label: String,
     ratio: bool,
     label: &str,
+    scale: Option<&str>,
 ) -> Element {
     let spec = Chart::Heatmap {
         data,
@@ -734,7 +736,7 @@ fn grid_heatmap(
         },
         ratio,
     };
-    chart(&spec, label, FIXED_MOUNT)
+    chart(&spec, label, FIXED_MOUNT, scale)
 }
 
 /// One small multiple: a model's whole grid as a tiny heatmap, colour only;
@@ -772,13 +774,21 @@ fn mini_heatmap(
         },
         ratio: true,
     };
-    chart(&spec, label, "width: 100%; aspect-ratio: 1")
+    chart(
+        &spec,
+        label,
+        "width: 100%; aspect-ratio: 1",
+        Some(GLANCE_SCALE),
+    )
 }
 
 /// The ratio heatmaps' colour scale, upright: RATIO_STEPS fastest at the top,
 /// labelled at the ends and the middle. Carbon's heatmap only draws its legend
 /// as a bar underneath.
-fn ratio_scale(fit: ScaleFit) -> Element {
+/// The overview's ratio scale.
+const GLANCE_SCALE: &str = "scale-glance";
+
+fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
     let rows = RATIO_STEPS.len();
     let middle = rows / 2 + 1;
     let (place, track) = match fit {
@@ -793,9 +803,13 @@ fn ratio_scale(fit: ScaleFit) -> Element {
         ),
     };
     rsx! {
-        div { style: "{place}display: grid; grid-template-columns: 0.75rem max-content; grid-template-rows: repeat({rows}, {track}); column-gap: 0.5rem; font-size: 0.75rem; line-height: 1",
+        div { id: "{id}", style: "{place}display: grid; grid-template-columns: 0.75rem max-content; grid-template-rows: repeat({rows}, {track}); column-gap: 0.5rem; font-size: 0.75rem; line-height: 1",
+            // Fastest at the top; `data-step` counts from the slowest, the way
+            // the heatmap's colours do, so charts.js can find a square's step.
             for (row, colour) in RATIO_STEPS.iter().rev().enumerate() {
-                div { style: "grid-column: 1; grid-row: {row + 1}; background: {colour}" }
+                div { style: "grid-column: 1; grid-row: {row + 1}; background: {colour}",
+                    "data-step": "{rows - 1 - row}",
+                }
             }
             div { style: "grid-column: 2; grid-row: 1; align-self: start",
                 Definition { alignment: Alignment::Left,
@@ -1103,7 +1117,7 @@ fn why(c: Option<&Cell>, name: &str) -> String {
 }
 
 /// One model's grid for one metric, coloured by scratchy against its rival.
-fn heat_map(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
+fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element {
     let mut data = Vec::new();
     for &i in g.ins {
         for &o in g.outs {
@@ -1136,6 +1150,7 @@ fn heat_map(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
         total_label,
         g.rival.is_some(),
         title,
+        g.rival.is_some().then_some(scale),
     )
 }
 
@@ -1170,7 +1185,8 @@ fn heat_table(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
     }
 }
 
-fn grid_maps(m: &Model, run: &Run) -> Element {
+fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
+    let scale = format!("scale-{mid}");
     let Some(g) = ShapeGrid::of(m, run) else {
         return rsx! {};
     };
@@ -1202,8 +1218,8 @@ fn grid_maps(m: &Model, run: &Run) -> Element {
             // Side by side while they fit; wrapped onto new lines on a
             // narrow screen.
             div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
-                for (metric, title) in GRID_METRICS { {heat_map(&g, metric, title)} }
-                if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed)} }
+                for (metric, title) in GRID_METRICS { {heat_map(&g, metric, title, &scale)} }
+                if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &scale)} }
             }
             Fold { title: "Table view",
                 Stack { gap: 4,
@@ -1380,7 +1396,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                 }
                             }
                         }
-                        {ratio_scale(ScaleFit::Beside)}
+                        {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
                     }
                 }
             }
@@ -1424,7 +1440,7 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                             }
                         };
                         rsx! {
-                            Tile { id: mid,
+                            Tile { id: mid.clone(),
                               Section { level: 3,
                               Layer { level: 2,
                                 Stack { gap: 6,
@@ -1438,7 +1454,7 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                                     }
                                     {summary_table(m, run, prev)}
                                     {conc_chart(m, run, prev)}
-                                    {grid_maps(m, run)}
+                                    {grid_maps(m, &mid, run)}
                                     {history(seen)}
                                 }
                               }
