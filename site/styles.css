@@ -103,6 +103,9 @@ cds-toggletip { display: inline-flex; vertical-align: middle; }
  * content scrolls in its own box instead. */
 cds-stack > * { min-width: 0; }
 
+/* The colour-scale step of the heat map square under the pointer (charts.js). */
+[data-step][data-active] { outline: 2px solid var(--cds-focus, #0f62fe); outline-offset: 1px; position: relative; z-index: 1; }
+
 /* diff-view-element (https://konnorrogers.github.io/diff-view-element/) does
  * its own diffing and PrismJS highlighting in shadow DOM. Every property set
  * below is one of the component's own real, documented hooks — either a

@@ -23,8 +23,29 @@
           },
         };
       }
-      new charts[spec.kind](el, { data: spec.data, options: spec.options });
+      var chart = new charts[spec.kind](el, { data: spec.data, options: spec.options });
+      var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
+      if (scale) highlightSteps(chart, spec, scale);
     });
+  }
+  // While the pointer is on a heatmap square, outline its step in the colour
+  // scale: the same equal slices of the colour range the heatmap colours by.
+  function highlightSteps(chart, spec, scale) {
+    var range = spec.options.heatmap.colorDomain;
+    var steps = scale.querySelectorAll('[data-step]').length;
+    function clear() {
+      scale.querySelectorAll('[data-active]').forEach(function (s) { s.removeAttribute('data-active'); });
+    }
+    chart.services.events.addEventListener('heatmap-mouseover', function (e) {
+      clear();
+      var value = e.detail.datum && e.detail.datum.value;
+      if (value === null || value === undefined) return;
+      var step = Math.floor((value - range.min) / (range.max - range.min) * steps);
+      step = Math.min(steps - 1, Math.max(0, step));
+      var swatch = scale.querySelector('[data-step="' + step + '"]');
+      if (swatch) swatch.setAttribute('data-active', '');
+    });
+    chart.services.events.addEventListener('heatmap-mouseout', clear);
   }
   function whenLaidOut() {
     document.fonts.ready.then(draw);
