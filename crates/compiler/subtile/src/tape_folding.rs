@@ -158,8 +158,9 @@ pub enum FoldPattern<K: 'static> {
     },
     /// A `norm` that only `readers` read, each once, as its operand 0, folds into every one of
     /// them: each normalizes the norm's input as it loads it. Only on a model whose matvecs take
-    /// their ends ([`ModelFoldFacts::matvec_ends`]); apply it before the folds that take a norm
-    /// whole.
+    /// their ends ([`ModelFoldFacts::matvec_ends`]), and whose weight-carrying readers take the
+    /// norm at that ([`ModelFoldFacts::matvec_norms`]); apply it before the folds that take a
+    /// norm whole.
     NormedMatvecs {
         norm: SubOpKind,
         readers: &'static [NormReader],
@@ -215,7 +216,9 @@ pub const ROUTE_TAIL_STAGES: usize = 3;
 /// A step that normalizes a norm's input as it loads it ([`FoldPattern::NormedMatvecs`]).
 #[derive(Clone, Copy, Debug)]
 pub enum NormReader {
-    /// A matvec of `kind`, of `weights` (`None`: a kind that carries none, a router's logits).
+    /// A matvec of `kind`, of `weights`. `None` — a kind that carries none, a router's logits —
+    /// takes the norm on every row count; one of weights takes it only while
+    /// [`ModelFoldFacts::matvec_norms`] says so.
     Matvec {
         kind: SubOpKind,
         weights: Option<GemmWeightKind>,
@@ -289,9 +292,15 @@ pub struct RowFold<K: 'static> {
 pub struct ModelFoldFacts {
     /// A gated activation's gate and up projections fold into its command.
     pub fold_projections: bool,
-    /// The one-row matvecs take their ends: their input's norm ([`FoldPattern::NormedMatvecs`])
-    /// and their rows' bias, scale and residual add ([`FoldPattern::MatvecEpilogue`]).
+    /// The matvecs take their rows' bias, scale and residual add
+    /// ([`FoldPattern::MatvecEpilogue`]). Their input's norm ([`FoldPattern::NormedMatvecs`])
+    /// needs [`Self::matvec_norms`] as well.
     pub matvec_ends: bool,
+    /// The matvecs that carry weights take their input's norm
+    /// ([`FoldPattern::NormedMatvecs`]). A router's weightless logits and the gathered experts
+    /// take it whenever `matvec_ends` holds, whatever this is: the one-row kernel re-loads the
+    /// norm's gain per row, so past the first row the fold trades a dispatch for L2 traffic.
+    pub matvec_norms: bool,
     /// The free row-wise steps group into row programs ([`RowFold`]).
     pub row_programs: bool,
 }
@@ -1157,7 +1166,8 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let ops = &self.ops;
         let takes = |j: usize, r: &NormReader| match *r {
             NormReader::Matvec { kind, weights } => {
-                ops.kind(j) == kind && weights.is_none_or(|w| self.is_matvec(j, w))
+                ops.kind(j) == kind
+                    && weights.is_none_or(|w| self.model.matvec_norms && self.is_matvec(j, w))
             }
             NormReader::Gathered {
                 sort,
@@ -1801,6 +1811,7 @@ mod tests {
     const SPLIT: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
         matvec_ends: false,
+        matvec_norms: false,
         row_programs: false,
     };
 
@@ -1885,6 +1896,16 @@ mod tests {
     const ENDS: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
         matvec_ends: true,
+        matvec_norms: true,
+        row_programs: false,
+    };
+
+    /// The band past the one-row bucket: ends fold, but a matvec that carries weights no longer
+    /// takes the norm with them.
+    const BAND: ModelFoldFacts = ModelFoldFacts {
+        fold_projections: false,
+        matvec_ends: true,
+        matvec_norms: false,
         row_programs: false,
     };
 
@@ -1921,6 +1942,9 @@ mod tests {
             ENDS,
         );
         assert_eq!(f.role(s[0]), StepRole::Kept);
+        // The band past the one-row bucket: a matvec that carries weights leaves the norm alone.
+        let (s, f) = fold(&src, weights(4), ops(matvec()), &[], &TABLE, BAND);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
     }
 
     #[test]
@@ -1950,6 +1974,9 @@ mod tests {
             shape: FusedShape::NormedMatvec { norm: s[0] },
         };
         assert_eq!(f.driven(s[1]), [reads]);
+        // The band past the one-row bucket: a router's weightless logits still take the norm.
+        let (s, f) = fold(&src, weights(3), ops.clone(), &[], &TABLE, BAND);
+        assert_eq!(f.role(s[0]), StepRole::Absorbed { into: s[1] });
         // A model whose matvecs do not take their ends.
         let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, SPLIT);
         assert_eq!(f.role(s[0]), StepRole::Kept);
@@ -2026,6 +2053,10 @@ mod tests {
         }
         // 32 rows of 2 picks: the experts read a sorted copy of the rows, which the norm writes.
         let (s, f) = fold(&src(32), weights(5), ops(32), &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+        // The band past the one-row bucket: the shared expert's matvec carries weights, so the
+        // whole fold stands down — every reader takes the norm or none does.
+        let (s, f) = fold(&src(1), weights(5), ops(1), &[], &TABLE, BAND);
         assert_eq!(f.role(s[0]), StepRole::Kept);
     }
 
@@ -2140,6 +2171,7 @@ mod tests {
     const ROW_FACTS: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
         matvec_ends: false,
+        matvec_norms: false,
         row_programs: true,
     };
 
@@ -2470,6 +2502,7 @@ mod tests {
         let fused = ModelFoldFacts {
             fold_projections: true,
             matvec_ends: false,
+            matvec_norms: false,
             row_programs: false,
         };
         let (_, joined) = fold(&src, weights(4), ops(), &[], &TABLE, fused);
