@@ -1918,6 +1918,7 @@ mod tests {
         matvec_ends: true,
         matvec_norms: true,
         row_programs: false,
+        hidden_out: false,
     };
 
     /// The band past the one-row bucket: ends fold, but a matvec that carries weights no longer
