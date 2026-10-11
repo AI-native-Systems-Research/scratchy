@@ -606,6 +606,13 @@ const METAL_KV_ELEM_BYTES: usize = 2;
 
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
 /// × [`METAL_KV_ELEM_BYTES`].
+/// A decode-only step's most rows, `max_num_seqs` (a row a sequence), as the metal device carries
+/// it.
+#[cfg(feature = "metal")]
+fn decode_rows(max_num_seqs: usize) -> scratchy_target_metal::tape::ids::DecodeRows {
+    scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(max_num_seqs).unwrap_or(u32::MAX))
+}
+
 #[cfg(feature = "metal")]
 fn kv_per_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -1194,7 +1201,10 @@ impl MetalWorker {
         let rung = rungs
             .and_then(pick)
             .map_err(|e| ExecutorError::WorkerInit(format!("KV cap rung: {e}")))?;
-        Ok((rung.cap.get() as usize, rung.scratch_bytes()))
+        Ok((
+            rung.cap.get() as usize,
+            rung.scratch_bytes(dev.max_decode_rows),
+        ))
     }
 
     /// Bytes per element for the model's KV cache dtype. Metal forces
@@ -2282,6 +2292,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 allocator: main_dev.allocator.clone(),
                 metal_bucket_max_m: main_dev.metal_bucket_max_m,
                 kv_addressing: main_dev.kv_addressing,
+                max_decode_rows: main_dev.max_decode_rows,
             })
         } else {
             None
@@ -2758,6 +2769,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 allocator: main_dev.allocator.clone(),
                 metal_bucket_max_m: main_dev.metal_bucket_max_m,
                 kv_addressing: main_dev.kv_addressing,
+                max_decode_rows: main_dev.max_decode_rows,
             })
         } else {
             None
@@ -3100,7 +3112,14 @@ impl Worker for MetalWorker {
         // weight allocated through the GpuWeights clone is reachable
         // via the GpuDevice clone — same `MTLBuffer`s, same offsets.
         let allocator = MetalAllocator::new((*device_arc).clone());
-        let gpu_device = GpuDevice::new(device_arc.clone(), std::sync::Arc::new(allocator.clone()));
+        let mut gpu_device =
+            GpuDevice::new(device_arc.clone(), std::sync::Arc::new(allocator.clone()));
+        // A decode-only step brings a row a sequence: at most the batch the resolver below picks,
+        // which never exceeds the requested width or the base one.
+        gpu_device.max_decode_rows = Some(decode_rows(
+            (self.config.max_num_seqs)
+                .unwrap_or(scratchy_serving_engine::gpu_budget::BASE_MAX_NUM_SEQS),
+        ));
         let t_from_dir = std::time::Instant::now();
         let mut weights = GpuWeights::from_dir(&model_dir, allocator)
             .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
@@ -3217,6 +3236,7 @@ impl Worker for MetalWorker {
         // `gpu_device` it needs for rung picking are still locals here
         // (fields assigned at the end of load_model) — pass them in.
         self.resolve_max_num_seqs(model.as_ref(), &gpu_device)?;
+        gpu_device.max_decode_rows = Some(decode_rows(self.max_num_seqs_resolved()));
 
         {
             use std::sync::atomic::Ordering;
@@ -4872,8 +4892,10 @@ impl Worker for MetalWorker {
                             queue: draft_queue_clone,
                             allocator: allocator_clone,
                             // Draft chain shadow device: draft is a small
-                            // non-GDN model; keep all its buckets (no prune).
+                            // non-GDN model; keep all its buckets (no prune),
+                            // and every bucket row's decode partials.
                             metal_bucket_max_m: None,
+                            max_decode_rows: None,
                             // The draft chain runs under spec-decode: chunked addressing.
                             kv_addressing:
                                 scratchy_target_metal::tape::lowered::KvAddressing::Chunked,

@@ -15,7 +15,9 @@
 //! the per-bucket dispatch is fully baked).
 
 use crate::tape::constants::ConstantValue;
-use crate::tape::ids::{BucketM, CommandIx, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads};
+use crate::tape::ids::{
+    BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads,
+};
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
 ///
@@ -1821,11 +1823,15 @@ impl LoweredMetalTape {
     /// Exact because the only per-iteration input to the lowering is `layer_offset`, consumed
     /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
     /// does not vary.
-    /// The bytes of each scratch buffer the tape binds: split-K, MoE, roped K, hd512 unfused.
-    pub fn scratch_bytes(&self) -> [u32; 4] {
+    /// The bytes of each scratch buffer the tape binds: split-K, MoE, roped K, hd512 unfused —
+    /// the MoE scratch holding the decode split's partials for at most `decode_rows` of the
+    /// bucket's rows (`None`: every row).
+    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> [u32; 4] {
+        let rows = decode_rows.map_or(self.bucket_m, |r| r.get().min(self.bucket_m));
+        let partials = self.decode_partials_row_bytes.saturating_mul(rows);
         [
             self.splitk_scratch_bytes,
-            self.moe_scratch_bytes,
+            self.moe_scratch_bytes.max(partials),
             self.roped_k_scratch_bytes,
             self.attn_unfused_scratch_bytes,
         ]
@@ -1936,6 +1942,11 @@ pub struct LoweredMetalTape {
     /// one bucket execute serially through the dispatch, so they can share
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
+    /// Bytes one row of the TurboQuant decode split's partials takes at the MoE scratch's front
+    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode-only step runs the split —
+    /// one row a sequence — so the buffer holds them for the rows such a step can bring, not for
+    /// the bucket's every row ([`Self::scratch_bytes`]). Zero without the split.
+    pub decode_partials_row_bytes: u32,
     /// Byte size of the shared roped-K scratch buffer the worker
     /// allocates if any spans rope-on-read NAX prefill (`KernelId::
     /// RopeOnceNax` + `Binding::RopedKScratch`) was lowered. Computed as

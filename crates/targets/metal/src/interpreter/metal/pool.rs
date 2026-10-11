@@ -33,7 +33,9 @@ use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
-use crate::tape::ids::{HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads};
+use crate::tape::ids::{
+    DecodeRows, HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
+};
 use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
@@ -288,6 +290,9 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     arena_layout: Arc<ArenaLayout>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
+    /// The most rows a decode-only step brings: a worker's MoE scratch holds the decode split's
+    /// partials for at most these ([`LoweredMetalTape::scratch_bytes`]).
+    decode_rows: Option<DecodeRows>,
     /// Tracks whether the allocator's residency set has been committed
     /// yet. Committed lazily on the first `forward()` (after the
     /// `register_mmap` / arena / KV-cache inserts are queued); MTL4
@@ -425,9 +430,9 @@ impl PickedRung<'_> {
 
 impl PickedRung<'_> {
     /// The bytes of the scratch buffers a worker allocates for these tapes: each buffer the
-    /// largest any tape needs.
-    pub fn scratch_bytes(&self) -> u64 {
-        let tapes = || self.tapes.iter().map(|(_, rung)| rung.tape.scratch_bytes());
+    /// largest any tape needs, the decode split's partials for at most `decode_rows` rows.
+    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> u64 {
+        let tapes = || (self.tapes.iter()).map(|(_, rung)| rung.tape.scratch_bytes(decode_rows));
         (0..4)
             .map(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
             .sum()
@@ -546,6 +551,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
+        decode_rows: Option<DecodeRows>,
     ) -> Result<Self, WorkerError>
     where
         W: ModelSources,
@@ -577,6 +583,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             arena_layout: Arc::new(arena_layout),
             runtime_factory,
             max_workers,
+            decode_rows,
             residency_attached: std::sync::atomic::AtomicBool::new(false),
             mtl4: Mutex::new(None),
             inner: Mutex::new(PoolInner {
@@ -618,6 +625,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // [`pick_rung`]): every step's block tables are rows of this width.
         block_cap: usize,
         addressing: KvAddressing,
+        // The most rows a decode-only step brings (`GpuDevice::max_decode_rows`).
+        decode_rows: Option<DecodeRows>,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
@@ -686,6 +695,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             arena_layout,
             runtime_factory,
             max_workers,
+            decode_rows,
         )
         .map_err(PoolBuildError::Worker)
     }
@@ -1432,6 +1442,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &self.sources,
             &runtime,
             Some(self.allocator.residency()),
+            self.decode_rows,
         )?;
         Ok(PooledWorker { worker, runtime })
     }
@@ -1993,6 +2004,7 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
             moe_scratch_bytes: 0,
+            decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
         }
@@ -2026,6 +2038,7 @@ mod tests {
             arena_layout,
             runtime_factory,
             max,
+            None,
         )
         .expect("pool builds");
         Some(pool)
@@ -2265,6 +2278,7 @@ mod tests {
             arena_layout,
             runtime_factory,
             max_workers,
+            None,
         )
         .expect("pool builds");
         Some(pool)
@@ -2707,6 +2721,7 @@ mod tests {
             loops: &[],
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
+            decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
         };
@@ -2748,6 +2763,7 @@ mod tests {
             None,
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
             KvAddressing::Direct,
+            None,
         ))
     }
 
@@ -2778,6 +2794,7 @@ mod tests {
             None,
             128, // block_cap (unused — NoBuckets fires first)
             KvAddressing::Direct,
+            None,
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}

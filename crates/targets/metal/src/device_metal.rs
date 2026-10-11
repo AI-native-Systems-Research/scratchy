@@ -29,6 +29,11 @@ pub struct GpuDevice {
     /// The KV addressing the workload's tapes run (spec-decode: chunked), which the lazy
     /// `MetalWorkerPool::for_buckets` picks its rung by.
     pub kv_addressing: crate::tape::lowered::KvAddressing,
+    /// The most rows a decode-only step brings — the serving engine's `max_num_seqs`, one row a
+    /// sequence — stashed by the worker once resolved: the rows the TurboQuant decode split's
+    /// partials are reserved for (`LoweredMetalTape::scratch_bytes`). `None`: a bucket's every
+    /// row.
+    pub max_decode_rows: Option<crate::tape::ids::DecodeRows>,
 }
 
 impl GpuDevice {
@@ -42,6 +47,7 @@ impl GpuDevice {
             allocator,
             metal_bucket_max_m: None,
             kv_addressing: Default::default(),
+            max_decode_rows: None,
         }
     }
 
