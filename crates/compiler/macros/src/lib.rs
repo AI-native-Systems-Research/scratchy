@@ -353,7 +353,16 @@ fn fmt_us(us: f64) -> String {
 /// the affordable subset is chosen per device at load time by
 /// `select_prefill_bucket` (Metal prunes its colored arena, CUDA its captured
 /// graph shapes). Mirrors the llama arch's historical ladder.
-const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
+///
+/// The multi-row rungs are geometric through 64 so a decode batch never pads
+/// more than ~2×: without them `pick_bucket` sends 9–63 rows to the 64 rung's
+/// static M=64 grids, and at 9 rows that is 7× dead compute per step —
+/// measured on gemma-4-26b-a4b (MoE, M1 Max), the 9th concurrent request
+/// doubles TPOT (62→124 ms), degrading to 351 ms at 40. The 16 and 32 rungs
+/// cut the same cells to 70/85/104/209 ms at conc 9/12/16/24, leaving conc 8
+/// and 40 (bucket 8 and 64 either way) unchanged; dense models already
+/// amortized the 64 rung, MoE did not.
+const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096];
 
 /// Default KV-cache-span (`sk_bucket`) ladder. Every `#[forward]` arch that
 /// does not explicitly override `sk_buckets` solves at THESE spans; all
