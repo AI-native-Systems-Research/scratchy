@@ -10696,13 +10696,21 @@ mod tests {
             (stage, vec![bias(1, 10)], vec![v_bias]),
             2,
         ));
-        want.push(split_restores);
+        // A multi-row bucket's split reads each row's sequence from `cu_seqlens_q` (one query row
+        // per token), bound before the codec's operands.
+        let rows = Binding::Runtime {
+            kind: RuntimeBindingKind::CuSeqlensQ,
+            binding_index: 23,
+        };
+        let (_, mut split_bindings, split_consts) = split_restores;
+        split_bindings.insert(0, rows);
+        want.push((split, split_bindings, split_consts));
         want.push(combine_restores);
         assert_eq!(offsets(qwen2, prefill.clone(), 64), want);
 
         let mut want = vec![(writer, vec![], modes(0, 0))];
         want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
-        want.push((split, vec![partials], vec![]));
+        want.push((split, vec![rows, partials], vec![]));
         want.push((combine, vec![partials], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
 
