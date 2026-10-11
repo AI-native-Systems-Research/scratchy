@@ -599,7 +599,9 @@ pub fn detect_reasoning_parser(arch: &str) -> Option<&'static str> {
     } else if a.contains("deepseek") {
         // deepseek_v3 / R1 emit `<think>…</think>`.
         Some("deepseek_r1")
-    } else if a.contains("qwen3") || a.contains("qwq") {
+    } else if a.contains("qwen3") || a.contains("qwq") || a.contains("nemotron_h") {
+        // Nemotron-H's template opens `<think>\n` in the prompt (`</think>` closed
+        // there when thinking is off), Qwen3.5's convention.
         Some("qwen3")
     } else {
         None
@@ -1476,6 +1478,7 @@ mod gpt_oss_tests {
         assert_eq!(detect_reasoning_parser("gpt_oss"), Some("gpt_oss"));
         assert_eq!(detect_reasoning_parser("qwen3"), Some("qwen3"));
         assert_eq!(detect_reasoning_parser("qwen3_5_moe"), Some("qwen3"));
+        assert_eq!(detect_reasoning_parser("nemotron_h"), Some("qwen3"));
         assert_eq!(detect_reasoning_parser("deepseek_v3"), Some("deepseek_r1"));
         // Architectures with no known reasoning format get no parser.
         assert_eq!(detect_reasoning_parser("gemma4"), None);

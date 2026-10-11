@@ -3004,8 +3004,9 @@ pub fn detect_tool_parser(arch: &str) -> Option<&'static str> {
         Some("mistral")
     } else if a.contains("llama") {
         Some("llama3_json")
-    } else if a.contains("qwen3_5") || a.contains("qwen3.5") {
-        // Qwen3.5 / 3.6 (`qwen3_5_moe`) emit the XML `<function=…><parameter=…>` format.
+    } else if a.contains("qwen3_5") || a.contains("qwen3.5") || a.contains("nemotron_h") {
+        // Qwen3.5 / 3.6 (`qwen3_5_moe`) and Nemotron-H (its tokenizer config names
+        // `qwen3_coder`) emit the XML `<function=…><parameter=…>` format.
         Some("qwen3_coder")
     } else if a.contains("qwen") {
         // Qwen (≤3) emits `<tool_call>{json}</tool_call>`.
@@ -4572,6 +4573,7 @@ mod qwen3_coder_tests {
     fn routes_by_architecture() {
         // model_type values from config.json.
         assert_eq!(detect_tool_parser("qwen3_5_moe"), Some("qwen3_coder"));
+        assert_eq!(detect_tool_parser("nemotron_h"), Some("qwen3_coder"));
         assert_eq!(detect_tool_parser("qwen3"), Some("hermes"));
         assert_eq!(detect_tool_parser("gemma4"), Some("gemma4"));
         assert_eq!(detect_tool_parser("llama"), Some("llama3_json"));
