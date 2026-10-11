@@ -156,7 +156,8 @@ pub(crate) fn lent_weight_prefix(
 ) -> Option<String> {
     use scratchy_forward_compiler::LentWeight;
     // A head borrowing a subset (`borrows`, arch.json) reports none of the rest.
-    let borrowed = |name: &str| (model.arch.borrows.as_ref()).is_none_or(|b| b.iter().any(|n| n == name));
+    let borrowed =
+        |name: &str| (model.arch.borrows.as_ref()).is_none_or(|b| b.iter().any(|n| n == name));
     let name = match w {
         LentWeight::LmHead if !borrowed("lm_head") => return None,
         LentWeight::LmHead if !model.tie_word_embeddings => "lm_head",
@@ -167,12 +168,7 @@ pub(crate) fn lent_weight_prefix(
         LentWeight::EmbedTokens | LentWeight::LmHead => "embed_tokens",
     };
     let id = program.weights.find(&[name])?;
-    Some(safetensors_prefix(
-        program,
-        &model.arch,
-        id,
-        None,
-    ))
+    Some(safetensors_prefix(program, &model.arch, id, None))
 }
 
 /// Translate trailing `_<digits>` in a DSL path segment back to
@@ -990,14 +986,7 @@ fn plan_field_load(
     let prefixes: Vec<String> = accessor
         .source_weights
         .iter()
-        .map(|(id, idx)| {
-            safetensors_prefix(
-                program,
-                &model.arch,
-                *id,
-                *idx,
-            )
-        })
+        .map(|(id, idx)| safetensors_prefix(program, &model.arch, *id, *idx))
         .collect();
 
     if is_marlin {
@@ -2180,12 +2169,7 @@ fn expert_input_probe(
         })?;
     let width = node.outputs.first()?.last()?.clone();
     let k = *crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?.first()? as usize;
-    let prefix = safetensors_prefix(
-        program,
-        &model.arch,
-        id,
-        index,
-    );
+    let prefix = safetensors_prefix(program, &model.arch, id, index);
     let packed_cols = match storage {
         crate::quantization::StorageFormat::Dense => k,
         crate::quantization::StorageFormat::Affine { bits, .. } => {
@@ -2380,7 +2364,10 @@ fn emit_fingerprint_check(
         let at = |layer: &str| under_root(&dec_root, &format!("layers.{layer}.{fp_leaf}.weight"));
         *name == at(&fp_layer.to_string()) || *name == at("*")
     });
-    let one_past_tensor = under_root(&dec_root, &format!("layers.{num_hidden_layers}.{fp_leaf}.{suffix}"));
+    let one_past_tensor = under_root(
+        &dec_root,
+        &format!("layers.{num_hidden_layers}.{fp_leaf}.{suffix}"),
+    );
     // The format-marker probes below read `fp_leaf`'s siblings at the FIRST layer that has it:
     // layer 0 on a uniform decoder, the first `attention_layers` member on a hybrid one (layer 0
     // is a Gated-DeltaNet / Mamba block there, and a probe of an absent leaf is inert).
@@ -2389,7 +2376,10 @@ fn emit_fingerprint_check(
         .get("attention_layers")
         .and_then(|set| set.members().first().copied())
         .unwrap_or(0);
-    let opposite_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.{opposite_suffix}"));
+    let opposite_tensor = under_root(
+        &dec_root,
+        &format!("layers.{marker_layer}.{fp_leaf}.{opposite_suffix}"),
+    );
     // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
     // (same suffix as dense bf16 weights) with a sibling
     // `.weight.absmax` that's unique to bitsandbytes. Dense + AWQ
@@ -2400,7 +2390,10 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Bnb4 { .. })
     );
-    let bnb4_marker_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.weight.absmax"));
+    let bnb4_marker_tensor = under_root(
+        &dec_root,
+        &format!("layers.{marker_layer}.{fp_leaf}.weight.absmax"),
+    );
     let bnb4_marker_tensor = bnb4_marker_tensor.as_str();
     // FP8 checkpoints ship `.weight` (FP8E4M3 bytes — same suffix
     // as dense bf16) alongside a sibling `.weight_scale`. Dense /
@@ -2425,7 +2418,10 @@ fn emit_fingerprint_check(
                 ..
             })
     );
-    let fp8_marker_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.weight_scale"));
+    let fp8_marker_tensor = under_root(
+        &dec_root,
+        &format!("layers.{marker_layer}.{fp_leaf}.weight_scale"),
+    );
     let fp8_marker_tensor = fp8_marker_tensor.as_str();
     // MLX-affine marker exclusion. `mlx_lm.convert` ships every
     // quantized linear as a `.{weight,scales,biases}` triple. The
@@ -2445,7 +2441,10 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Affine { .. })
     );
-    let mlx_marker_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.scales"));
+    let mlx_marker_tensor = under_root(
+        &dec_root,
+        &format!("layers.{marker_layer}.{fp_leaf}.scales"),
+    );
     let mlx_marker_tensor = mlx_marker_tensor.as_str();
 
     // Each marker exclusion is a compile-time bool, so fold it in HERE rather
@@ -2920,8 +2919,14 @@ fn emit_fingerprint_check(
             // MLA archs ship `q_a_proj` instead of `q_proj` — match
             // the leaf the fingerprint already chose above so V3 / K2
             // FP8-block fixtures aren't silently rejected.
-            let inv_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.weight_scale_inv"));
-            let scale_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.weight_scale"));
+            let inv_tensor = under_root(
+                &dec_root,
+                &format!("layers.{marker_layer}.{fp_leaf}.weight_scale_inv"),
+            );
+            let scale_tensor = under_root(
+                &dec_root,
+                &format!("layers.{marker_layer}.{fp_leaf}.weight_scale"),
+            );
             let inv_tensor = inv_tensor.as_str();
             let scale_tensor = scale_tensor.as_str();
             quote! {
@@ -2942,8 +2947,14 @@ fn emit_fingerprint_check(
         Some(crate::quantization::QuantMethod::Fp8 {
             block_size: None, ..
         }) => {
-            let inv_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.weight_scale_inv"));
-            let scale_tensor = under_root(&dec_root, &format!("layers.{marker_layer}.{fp_leaf}.weight_scale"));
+            let inv_tensor = under_root(
+                &dec_root,
+                &format!("layers.{marker_layer}.{fp_leaf}.weight_scale_inv"),
+            );
+            let scale_tensor = under_root(
+                &dec_root,
+                &format!("layers.{marker_layer}.{fp_leaf}.weight_scale"),
+            );
             let inv_tensor = inv_tensor.as_str();
             let scale_tensor = scale_tensor.as_str();
             quote! {
@@ -10671,12 +10682,8 @@ fn dump_wavefront_mega(
                                 let (wbase, _) = split_base_layer(&name);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let is_gemm = gemm_weight.contains(&i);
-                                let disk = safetensors_prefix(
-                                    program,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
+                                let disk =
+                                    safetensors_prefix(program, &model.arch, WeightId(*id), *index);
                                 // lm_head weight binding — resolve the tie decision HERE, at
                                 // bake (compile) time, from the SAME `tie_word_embeddings` flag
                                 // the metal `FieldLoad::LinearTiedToEmbedding` path uses. TIED
@@ -10716,12 +10723,8 @@ fn dump_wavefront_mega(
                                 let (wbase, _) = split_base_layer(&name);
                                 let scale_base = format!("{wbase}.weight_scale");
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk = safetensors_prefix(
-                                    program,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
+                                let disk =
+                                    safetensors_prefix(program, &model.arch, WeightId(*id), *index);
                                 let loc_json = match base_to_loc.get(&scale_base) {
                                     Some(li) => format!(
                                         "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",

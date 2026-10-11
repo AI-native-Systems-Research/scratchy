@@ -1977,7 +1977,11 @@ mod tests {
         assert_eq!(lookup("pre_projection", Some(UnrollIndex(0))), None);
         assert_eq!(lookup("post_projection", None), None);
         assert_eq!(lookup("target_embed_tokens", None), Some((4, 64)));
-        assert_eq!(lookup("embed_tokens", None), None, "`target_embed_tokens` is not the embedding");
+        assert_eq!(
+            lookup("embed_tokens", None),
+            None,
+            "`target_embed_tokens` is not the embedding"
+        );
     }
 
     /// Opt-in: parse the FULL upstream OptiQ `config.json` and assert

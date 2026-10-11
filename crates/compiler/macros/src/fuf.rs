@@ -189,10 +189,19 @@ impl Fuf {
                 OpKind::SharedAttention => full,
                 op => {
                     let kv = node.inputs.iter().any(|i| {
-                        matches!(i, FufInput::Extern { kind: ExternKind::KvCache, .. })
+                        matches!(
+                            i,
+                            FufInput::Extern {
+                                kind: ExternKind::KvCache,
+                                ..
+                            }
+                        )
                     });
                     if kv {
-                        return Err(format!("`{}` would touch its own KV, which it has none of", op.as_str()));
+                        return Err(format!(
+                            "`{}` would touch its own KV, which it has none of",
+                            op.as_str()
+                        ));
                     }
                     continue;
                 }

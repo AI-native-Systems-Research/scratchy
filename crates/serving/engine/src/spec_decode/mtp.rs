@@ -857,8 +857,8 @@ mod tests {
         assert_eq!(gated, None);
 
         let two = TwoSequences::new();
-        let within = (drafter.passes(&two.rows(), &two.before(), &ids(&["a", "b"])))
-            .expect("passes");
+        let within =
+            (drafter.passes(&two.rows(), &two.before(), &ids(&["a", "b"]))).expect("passes");
         assert_eq!(within.one.positions, [11, 12, 13, 14, 1, 2, 3]);
         assert!(within.one.slot_mapping.iter().all(|&s| s == u32::MAX));
         within.chain.expect("a chains");

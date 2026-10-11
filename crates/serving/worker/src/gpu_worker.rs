@@ -3244,7 +3244,8 @@ impl MetalWorker {
                 };
                 // A head reading its target's KV runs on the target's pool, reading each layer's
                 // group's table of the step's.
-                let reads_target_kv = (self.mtp_drafter.as_ref()).is_some_and(|d| d.reads_target_kv);
+                let reads_target_kv =
+                    (self.mtp_drafter.as_ref()).is_some_and(|d| d.reads_target_kv);
                 let (kv_cache, sliding) = match reads_target_kv {
                     true => (self.kv_cache.as_ref(), StepTables::of(req)),
                     false => (self.draft_kv_cache.as_ref(), StepTables::default()),
@@ -3969,7 +3970,11 @@ struct StepTables {
 impl StepTables {
     fn of(req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>) -> Self {
         Self {
-            groups: req.sliding_block_tables.iter().map(|t| t.to_vec()).collect(),
+            groups: req
+                .sliding_block_tables
+                .iter()
+                .map(|t| t.to_vec())
+                .collect(),
             stride: req.block_table_stride,
         }
     }
@@ -3979,7 +3984,11 @@ impl StepTables {
     fn rows(&self, steps: &[usize], tokens: usize) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
         let stride = self.stride;
         let tables = (self.groups.iter())
-            .map(|g| (steps.iter()).flat_map(|&i| g[i * stride..][..stride].to_vec()).collect())
+            .map(|g| {
+                (steps.iter())
+                    .flat_map(|&i| g[i * stride..][..stride].to_vec())
+                    .collect()
+            })
             .collect();
         let slots = self.groups.iter().map(|_| vec![u32::MAX; tokens]).collect();
         (tables, slots)

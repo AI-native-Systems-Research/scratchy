@@ -603,7 +603,10 @@ fn load_dir_mode(
         Ok(same)
     };
     let target_selected = |head_path: &Path| -> Result<bool, ConfigError> {
-        let stem = head_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = head_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         if let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| s == stem) {
             let (arch, stem) = target.split_once('/').unwrap_or_default();
             return Ok(model_feature_enabled(arch, stem));
@@ -1639,7 +1642,10 @@ fn model_params_from_json(
     // identity it declares, not the architecture its (the whole checkpoint's) config names.
     let (architectures, drafts_for) = match spec.hf_architectures.is_empty() {
         true => (parse_architectures(json), Vec::new()),
-        false => (spec.hf_architectures.clone(), head_drafts_for(spec, json, source_stem, source_path)?),
+        false => (
+            spec.hf_architectures.clone(),
+            head_drafts_for(spec, json, source_stem, source_path)?,
+        ),
     };
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);

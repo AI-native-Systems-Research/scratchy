@@ -1953,8 +1953,7 @@ pub fn compile_carrier(
                          how many lm_head rows they read, whose head they are or how many tokens \
                          they draft ({heads:?}); a loader must know them before the head loads"
                     );
-                    let ([Some(embed_tokens), lm_head], vocab, drafts_for, infix, spec, kv) =
-                        first
+                    let ([Some(embed_tokens), lm_head], vocab, drafts_for, infix, spec, kv) = first
                     else {
                         panic!(
                             "{arch_ident}: a head reading `target_hidden` must name embed_tokens \

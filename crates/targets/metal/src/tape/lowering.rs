@@ -178,13 +178,15 @@ pub fn lower_subtile_tape_to_metal(
     };
     let writes_kv_cache = |c: &GatedCommand| {
         writer_binds(c, |k| {
-            matches!(k, RuntimeBindingKind::KvCacheK { .. } | RuntimeBindingKind::KvCacheV { .. })
+            matches!(
+                k,
+                RuntimeBindingKind::KvCacheK { .. } | RuntimeBindingKind::KvCacheV { .. }
+            )
         })
     };
     // A KV writer encodes when it binds the packed store.
-    let encodes = |c: &GatedCommand| {
-        writer_binds(c, |k| matches!(k, RuntimeBindingKind::TqPackedK { .. }))
-    };
+    let encodes =
+        |c: &GatedCommand| writer_binds(c, |k| matches!(k, RuntimeBindingKind::TqPackedK { .. }));
     if p.kv_codec.is_turboquant()
         && bb.commands.iter().any(writes_kv_cache)
         && !bb.commands.iter().any(encodes)

@@ -785,7 +785,13 @@ impl Recording<'_> {
             })
             .ok_or_else(no)?;
         let layer = LayerId(layer as u32);
-        Ok((layer, RopeFormTag::NeoX, class, st::KvOffsets::CENTERED, vec![self.rotary(i)]))
+        Ok((
+            layer,
+            RopeFormTag::NeoX,
+            class,
+            st::KvOffsets::CENTERED,
+            vec![self.rotary(i)],
+        ))
     }
 
     fn codec_writer(&self, i: usize, encode: usize) -> Result<CodecWriter, StepRefusal> {
@@ -1997,7 +2003,11 @@ impl Recording<'_> {
                 let (layer, pairing, rotated) = match writer.map(|w| *self.op(w)) {
                     Some(L::RopeAppend { layer, pairing, .. }) => (LayerId(layer), pairing, true),
                     Some(L::KvAppend { layer, .. }) => (LayerId(layer), RopeFormTag::NeoX, false),
-                    _ => (self.prefix_layer(i).unwrap_or(LayerId(0)), RopeFormTag::NeoX, true),
+                    _ => (
+                        self.prefix_layer(i).unwrap_or(LayerId(0)),
+                        RopeFormTag::NeoX,
+                        true,
+                    ),
                 };
                 // Prefill runs the paged kernel with K arriving pre-roped: no rotary. Decode's
                 // CosSin is the GLOBAL rotary whatever the class (only the rope uses the local).
@@ -2045,10 +2055,7 @@ impl Recording<'_> {
                     _ => None,
                 };
                 let writer = writer.and_then(|w| self.colour(w).ok());
-                let reads: Vec<Slot> = [Some(q), writer, v]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let reads: Vec<Slot> = [Some(q), writer, v].into_iter().flatten().collect();
                 let mut e = em(step, &reads, &[out], sites);
                 e.sig.kv_r = Some(layer);
                 // A coded attention reads its K/V staged, off decode steps.
