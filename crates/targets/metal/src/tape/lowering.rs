@@ -8350,12 +8350,22 @@ mod tests {
             lower(writer(k_biased, KvWrite::PoolAndPacked)),
             Err(LoweringError::UnrotatedWriterOffset { index: 0 })
         ));
-        // The layer's packed decode twin, after its coded writer.
+        // The layer's packed decode twin, after its coded writer. The fixture's geometry
+        // (TurboQuant-4, a whole query-head group of 8 per KV head, head_dim 64) is one
+        // `decode_attention_per_kv_head` serves per KV head (#350), so the twin lowers as
+        // the split pair, not the one-pass `attention_via_cache_v2`.
         let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
         let rows = plain(&[writer(LLAMA_KV, KvWrite::PoolAndPacked), twin]);
         let layer = try_lower_tq(&tq_consts(), rows, 1).expect("the coded layer lowers");
         let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.command.kernel).collect();
-        assert_eq!(kernels, [KernelId::KvAppend, KernelId::AttentionViaCacheTq]);
+        assert_eq!(
+            kernels,
+            [
+                KernelId::KvAppend,
+                KernelId::AttentionDecodeGqaTq,
+                KernelId::AttentionDecodeCombine,
+            ]
+        );
     }
 
     /// A Mamba-2 layer lowers to the GDN kernels in their Mamba-2 forms, ungated at every
