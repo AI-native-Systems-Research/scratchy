@@ -62,10 +62,10 @@ SCRATCHY_KERNEL(residual_add_bf16_specialized, residual_add<bfloat>)
 // source row `s` of `mm` (the projected vision output), copy it into text
 // embedding row `dst_rows[s]`; `dst_rows[s] == 0xFFFFFFFF` skips (text-only
 // batches and the padding tail past `total_mm` are all marked skip).
-// One thread per element; `embed` is in/out (buffer 0). Dispatched over
-// `num_tokens * hidden` (m_scaling shrinks from the baked `bucket_m *
-// hidden` to the live num_tokens), so `s < num_tokens` always indexes
-// `dst_rows`. The row width is `MmEmbedSpliceConstants` (slot 5).
+// One thread per element; `embed` is in/out (buffer 0). A 2D grid — x a row's columns, y a
+// source row, m_scaling scaling y to the live num_tokens — so `s < num_tokens` always indexes
+// `dst_rows`, even where 256 does not divide `hidden` (Nemotron-3-Nano's 2688). The row
+// width is `MmEmbedSpliceConstants` (slot 5).
 #ifdef SCRATCHY_CONSTANT_5
 SCRATCHY_CONSTANT(uint, MM_EMBED_HIDDEN, 5);
 
@@ -74,10 +74,11 @@ template <typename T>
     device T* embed [[buffer(0)]],
     device const T* mm [[buffer(1)]],
     device const uint* dst_rows [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    uint s = gid / MM_EMBED_HIDDEN;
-    uint c = gid % MM_EMBED_HIDDEN;
+    const uint c = gid.x;
+    const uint s = gid.y;
+    if (c >= MM_EMBED_HIDDEN) return;
     uint dst = dst_rows[s];
     if (dst == 0xFFFFFFFFu) return;
     embed[dst * MM_EMBED_HIDDEN + c] = mm[s * MM_EMBED_HIDDEN + c];

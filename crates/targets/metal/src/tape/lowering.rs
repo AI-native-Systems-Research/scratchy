@@ -5504,13 +5504,12 @@ fn lower_one(
         // which covers text-only batches AND the padding tail past
         // `total_mm`). `slot` is the Embed-output arena tile (in/out —
         // `MmEmbedSpliceImpl` aliases its output onto this input).
-        // `n` = `bucket_m * HIDDEN_SIZE` (safe upper bound: total_mm <=
-        // num_tokens <= bucket_m); m_scaling shrinks the grid to the
-        // live num_tokens. HIDDEN_SIZE is the residual width (matches
-        // the `Embed` arm; mm_embeds rows are HIDDEN_SIZE wide).
+        // Grid (a row's columns, `bucket_m` rows: total_mm <= num_tokens <=
+        // bucket_m), m_scaled to the live rows — no thread reads a padding
+        // row's destination. HIDDEN_SIZE is the residual width (the `Embed`
+        // arm's; mm_embeds rows are HIDDEN_SIZE wide).
         I::SpliceMmEmbeds(Slot(slot)) => {
             let hidden = p.hidden_size as u32;
-            let n_elems = bucket_m * hidden;
             LoweredCommand {
                 kernel: KernelId::MmEmbedSplice,
                 library: "elementwise",
@@ -5519,14 +5518,14 @@ fn lower_one(
                     hidden: HiddenSize(hidden),
                 }
                 .into_baked(),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                dispatch: DispatchShape {
+                    threadgroups: (hidden.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
+                        axis: crate::tape::lowered::MScaleAxis::Y,
                         bucket_m: super::ids::BucketM(bucket_m),
-                    });
-                    d
+                    }),
                 },
                 bindings: baked(vec![
                     Binding::ArenaSlot {
@@ -10581,6 +10580,46 @@ mod tests {
             cmd.dispatch.m_scaling.is_some(),
             "ScalarMul carries X-axis m_scaling for the num_tokens rescale"
         );
+    }
+
+    /// `step` lowered alone at `bucket_m` for a model of `p`. Pure-CPU.
+    fn lower_alone(p: &MetalModelConsts, step: &MetalStep, bucket_m: u32) -> Vec<LoweredCommand> {
+        let (mut scratch, mut moe, mut roped_k, mut unfused) = (0u32, 0u32, 0u32, 0u32);
+        lower_one(
+            p,
+            false,
+            step,
+            row(),
+            bucket_m,
+            0,
+            &mut scratch,
+            &mut moe,
+            &mut roped_k,
+            &mut unfused,
+            128,
+            None,
+            1,
+        )
+        .expect("lower")
+    }
+
+    /// The embed splice dispatches whole rows: a grid row per bucket row,
+    /// m_scaled on Y to the live tokens, at a width 256 does not divide —
+    /// a flat grid over `rows · hidden` rounded up to whole threadgroups
+    /// reached a padding row and spliced its destination lane (0) onto row 0.
+    #[test]
+    fn the_embed_splice_dispatches_whole_rows() {
+        let p = MetalModelConsts {
+            hidden_size: 2688,
+            ..tp()
+        };
+        let cmds = lower_alone(&p, &MetalStep::SpliceMmEmbeds(Slot(0)), 8);
+        let d = cmds[0].dispatch;
+        assert_eq!(d.threadgroups, (2688u32.div_ceil(256), 8, 1));
+        assert_eq!(d.threads_per_threadgroup, (256, 1, 1));
+        let scaling = d.m_scaling.expect("row m_scaling");
+        assert!(matches!(scaling.axis, crate::tape::lowered::MScaleAxis::Y));
+        assert!(scaling.seq_axis.is_none());
     }
 
     /// At `bucket_m < vector_limit` we should land in the qmv branch
