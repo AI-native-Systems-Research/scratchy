@@ -913,7 +913,7 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
 }
 
 /// The gated MoE gather's matvec constants: the gather's ([`AffineGatherQmvConstants`]) and where
-/// its pairs that share an expert run (slot 20).
+/// its pairs that share an expert run (slot 21).
 pub struct GatedGatherQmvConstants {
     pub gather: AffineGatherQmvConstants,
     pub shared: SharedExperts,
@@ -949,9 +949,9 @@ impl SharedExperts {
         }
     }
 
-    /// Slot 20: 0 apart, 1 in the first pair.
+    /// Slot 21: 0 apart, 1 in the first pair.
     pub fn constant(self) -> ConstantValue {
-        ConstantValue::int(ConstSlot(20), i32::from(self == Self::InFirstPair))
+        ConstantValue::int(ConstSlot(21), i32::from(self == Self::InFirstPair))
     }
 }
 

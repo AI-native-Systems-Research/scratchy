@@ -2135,9 +2135,9 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 }
 
 #ifdef SCRATCHY_CONSTANT_3
-// Where the pairs that share an expert run (slot 20, `SharedExperts`): unset or 0 each in its own
+// Where the pairs that share an expert run (slot 21, `SharedExperts`): unset or 0 each in its own
 // threadgroup, 1 one after another in the threadgroup of the expert's first pair.
-SCRATCHY_CONSTANT_OPTIONAL(int, GATHER_SHARED_EXPERTS_FC, 20);
+SCRATCHY_CONSTANT_OPTIONAL(int, GATHER_SHARED_EXPERTS_FC, 21);
 constant constexpr bool GATHER_SHARED_EXPERTS =
     GATHER_SHARED_EXPERTS_FC_SET && GATHER_SHARED_EXPERTS_FC == 1;
 
