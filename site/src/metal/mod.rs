@@ -915,6 +915,15 @@ fn log2_ratio(r: f64) -> f64 {
     (r.log2() * 1000.0).round() / 1000.0
 }
 
+/// The RATIO_STEPS colour a ratio heatmap gives a ratio, as Carbon's quantize
+/// scale picks it: RATIO_RANGE in equal slices, beyond it the end colours.
+fn ratio_step(r: f64) -> usize {
+    let n = RATIO_STEPS.len();
+    let at = (log2_ratio(r) - RATIO_RANGE.min) / (RATIO_RANGE.max - RATIO_RANGE.min);
+    // Truncation is the floor here: clamped to 0 first.
+    ((at.max(0.0) * n as f64) as usize).min(n - 1)
+}
+
 /// A cell's value for a table view, with how many requests went untimed when
 /// the timing is partial.
 fn table_value(c: Option<&Cell>, metric: Metric) -> String {
@@ -1710,11 +1719,15 @@ fn runs_table(runs: &[&Run]) -> Element {
     }
 }
 
-/// How many of the overview's heat map squares, and of each sparkline panel's
-/// steps, at each end, have their factor written in them: the ones scratchy
-/// is furthest ahead at, and the ones it is furthest behind at (or least
-/// ahead), over every machine, model and metric.
+/// How many of each sparkline panel's steps, at each end, have their factor
+/// written in them: the ones scratchy is furthest ahead at, and the ones it
+/// is furthest behind at (or least ahead), over every machine, model and
+/// metric.
 const HIGHLIGHTS: usize = 3;
+
+/// How many of the overview's heat map squares have their factor written in
+/// them: at most one per colour step, spread over the steps the squares use.
+const HEAT_LABELS: usize = 12;
 
 /// Where an overview heat map square is: machine, model, metric, and its
 /// prompt and answer lengths.
@@ -1786,7 +1799,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
         }
     }
-    let mut ranked: Vec<(Square, f64)> = grids
+    let squares: Vec<(Square, f64)> = grids
         .iter()
         .filter_map(|(&(chip, stem, name), g)| Some((chip, stem, name, g.as_ref().ok()?)))
         .flat_map(|(chip, stem, name, g)| {
@@ -1802,13 +1815,23 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             })
         })
         .collect();
-    ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
-    let highlights: BTreeSet<Square> = ranked
-        .iter()
-        .take(HIGHLIGHTS)
-        .chain(ranked.iter().rev().take(HIGHLIGHTS))
-        .map(|&(at, _)| at)
-        .collect();
+    // Each colour step's square furthest from ×1; then HEAT_LABELS of those
+    // steps, evenly spread from the slowest to the fastest, both always in.
+    let mut by_step: BTreeMap<usize, (Square, f64)> = BTreeMap::new();
+    for (at, r) in squares {
+        let kept = by_step.entry(ratio_step(r)).or_insert((at, r));
+        if r.log2().abs() > kept.1.log2().abs() {
+            *kept = (at, r);
+        }
+    }
+    let used: Vec<Square> = by_step.into_values().map(|(at, _)| at).collect();
+    let highlights: BTreeSet<Square> = if used.len() <= HEAT_LABELS {
+        used.into_iter().collect()
+    } else {
+        (0..HEAT_LABELS)
+            .map(|k| used[k * (used.len() - 1) / (HEAT_LABELS - 1)])
+            .collect()
+    };
     // Likewise every sparkline's steps, each panel's highlights picked from
     // its own: the steps scratchy is furthest ahead and furthest behind at.
     let mut sparks: BTreeMap<SparkAt, Result<Spark, &str>> = BTreeMap::new();
@@ -2141,7 +2164,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, spark_points};
+    use super::{
+        Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, ratio_step, spark_points,
+    };
 
     #[test]
     fn the_fills_switch_where_the_lines_cross() {
@@ -2190,6 +2215,20 @@ mod tests {
             ttft.iter()
                 .any(|p| p.group == Engine::MlxLm.ahead() && p.key == 1.0 && p.upper.is_some())
         );
+    }
+
+    #[test]
+    fn ratio_steps_split_the_range_evenly_and_clamp() {
+        let last = RATIO_STEPS.len() - 1;
+        assert_eq!(ratio_step(1.0), last / 2);
+        assert_eq!(ratio_step(RATIO_SPAN), last);
+        assert_eq!(ratio_step(1.0 / RATIO_SPAN), 0);
+        assert_eq!(ratio_step(100.0), last);
+        assert_eq!(ratio_step(0.01), 0);
+        // The gray middle step holds the noise band, ×0.96 to ×1.04.
+        assert_eq!(ratio_step(0.96), last / 2);
+        assert_eq!(ratio_step(1.04), last / 2);
+        assert_eq!(ratio_step(1.1), last / 2 + 1);
     }
 
     #[test]
