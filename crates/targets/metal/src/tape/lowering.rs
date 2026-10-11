@@ -11217,13 +11217,14 @@ mod tests {
             top_k: TopK(4),
             inter: IntermediateSize(2880),
             hidden: HiddenSize(2880),
+            router_in: HiddenSize(2880),
             router: RouterBundle::GptOss,
             bundle: ExpertBundle::GptOss,
             input: RouterInput::Raw,
             quant: ExpertQuant {
                 group_size: AffineGroupSize(64),
                 widths: ExpertWidths {
-                    gate: three,
+                    gate: Some(three),
                     up: three,
                     down: three,
                 },
