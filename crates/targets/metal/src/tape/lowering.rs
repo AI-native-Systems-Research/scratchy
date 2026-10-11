@@ -8715,6 +8715,7 @@ mod tests {
                 [
                     C::uint(0, 192),
                     C::uint(1, 4),
+                    C::uint(5, 0),
                     C::uint(2, 328),
                     C::uint(3, 128),
                     C::boolean(4, true)
@@ -8758,6 +8759,7 @@ mod tests {
                 C::uint(2, 16),
                 C::uint(3, 16),
                 C::float(4, 0.25),
+                C::uint(8, 0),
                 C::boolean(5, true),
             ];
             assert_eq!(tiny[2].command.constants, scan_constants);
@@ -8806,6 +8808,7 @@ mod tests {
                 C::uint(2, 128),
                 C::uint(3, 64),
                 C::float(4, 128f32.powf(-0.5)),
+                C::uint(8, 0),
                 C::boolean(5, true),
                 C::uint(6, row),
                 C::uint(7, inner + conv_dim),
@@ -9355,7 +9358,7 @@ mod tests {
         );
         assert!(kernels(&between).contains(&KernelId::AttentionViaCacheTq));
         // A verify-sized bucket: a threadgroup row a token (`ATTN_ROW_QUERIES`, its sequence's
-        // start in `cu_seqlens_q`), partials for every row.
+        // start in `cu_seqlens_q`), a row's partials the same, every row's held at most.
         let verify = lower_tq(&p, rows(), 4);
         assert_eq!(gated_steps(&verify), gated_steps(&tape));
         let (gqa, combine) = (&verify.commands[2].command, &verify.commands[3].command);
@@ -9363,10 +9366,8 @@ mod tests {
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
         assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
         assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
-        assert_eq!(
-            verify.moe_scratch_bytes,
-            4 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
-        );
+        assert_eq!(verify.decode_partials_row_bytes, row);
+        assert_eq!(verify.scratch_bytes(None)[1], 4 * row);
 
         // Running its KV writer (Gemma 4's global layers), it is the tape's only encoder.
         use crate::tape::step::RopedAttention;

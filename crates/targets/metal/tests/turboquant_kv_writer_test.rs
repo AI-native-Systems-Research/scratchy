@@ -203,6 +203,7 @@ fn run(c: &Case, fused: bool) -> Option<Written> {
                 pair_off,
                 rope_on_read,
                 tq,
+                query_only: false,
             }
             .into(),
         ),

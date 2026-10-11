@@ -2239,6 +2239,7 @@ mod tests {
                 &sources(&weights, &allocator, &tapes),
                 &runtime,
                 None,
+                None,
                 lent,
             )
             .expect("worker builds")

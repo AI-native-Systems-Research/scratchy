@@ -1960,6 +1960,8 @@ mod tests {
             None,
             "a non-affine method keeps its storage format's bits"
         );
+    }
+
     /// A module at the checkpoint's top level (Gemma 4's drafter's `pre_projection`) is keyed by
     /// its bare name; a layered role of the same leaf is not, and a bare key names no other module
     /// it ends.
