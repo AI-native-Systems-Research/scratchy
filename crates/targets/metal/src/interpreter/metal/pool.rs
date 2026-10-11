@@ -311,7 +311,7 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     arena_layout: Arc<ArenaLayout>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
-    /// The most rows a decode-only step brings: a worker's MoE scratch holds the decode split's
+    /// The most rows a decode or verify step brings: a worker's MoE scratch holds the decode split's
     /// partials for at most these ([`LoweredMetalTape::scratch_bytes`]).
     decode_rows: Option<DecodeRows>,
     /// Tracks whether the allocator's residency set has been committed
@@ -685,7 +685,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // [`pick_rung`]): every step's block tables are rows of this width.
         block_cap: usize,
         addressing: KvAddressing,
-        // The most rows a decode-only step brings (`GpuDevice::max_decode_rows`).
+        // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`).
         decode_rows: Option<DecodeRows>,
         // Buffers of a pool whose forwards never overlap this one's, for the first worker to place
         // its own in ([`LentActivation`]).

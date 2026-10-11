@@ -1209,12 +1209,12 @@ const fn combine_threads(hd: u32) -> u32 {
 /// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
 /// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
-/// into the output. Only a decode-only step runs it — a row a sequence — so the scratch holds
-/// the partials of the rows such a step brings, not of the bucket's every row: it records a
-/// row's bytes (`decode_partials_row_bytes`, [`LoweredMetalTape::scratch_bytes`]). A bucket whose
-/// every row's partials would outgrow the u32 its offsets are computed in keeps the twin — a
-/// wide prefill bucket carrying the gated decode row (gemma-4's 4096-token buckets at 4.3 GiB)
-/// is the case that refuses.
+/// into the output. Only a decode or verify step runs it — a row a sequence, a verify step's
+/// drafts too — so the scratch holds the partials of the rows such a step brings, not of the
+/// bucket's every row: it records a row's bytes (`decode_partials_row_bytes`,
+/// [`LoweredMetalTape::scratch_bytes`]). A bucket whose every row's partials would outgrow the
+/// u32 its offsets are computed in keeps the twin — a wide prefill bucket carrying the gated
+/// decode row (gemma-4's 4096-token buckets at 4.3 GiB) is the case that refuses.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -9562,8 +9562,7 @@ mod tests {
         let (gqa, combine) = (&batched.commands[2].command, &batched.commands[3].command);
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
-        // Every row's partials, or only those of the rows a decode-only step brings — one a
-        // sequence, at most `max_num_seqs`.
+        // Every row's partials, or only those of the rows a decode or verify step brings.
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
         assert_eq!(batched.decode_partials_row_bytes, row);
         assert_eq!(batched.scratch_bytes(None)[1], 4 * row);

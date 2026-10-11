@@ -1973,9 +1973,10 @@ pub struct LoweredMetalTape {
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
     /// Bytes one row of the TurboQuant decode split's partials takes at the MoE scratch's front
-    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode-only step runs the split —
-    /// one row a sequence — so the buffer holds them for the rows such a step can bring, not for
-    /// the bucket's every row ([`Self::scratch_bytes`]). Zero without the split.
+    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode or verify step runs the split
+    /// — a row a sequence, a verify step's drafts too — so the buffer holds them for the rows such
+    /// a step can bring, not for the bucket's every row ([`Self::scratch_bytes`]). Zero without
+    /// the split.
     pub decode_partials_row_bytes: u32,
     /// Byte size of the shared roped-K scratch buffer the worker
     /// allocates if any spans rope-on-read NAX prefill (`KernelId::

@@ -357,7 +357,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         sources: &ResolvedSources,
         runtime: &RuntimeBindings,
         residency: Option<&crate::residency::MetalResidencySet>,
-        // The most rows a decode-only step brings (`GpuDevice::max_decode_rows`): the decode
+        // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`): the decode
         // split's partials are reserved for at most these.
         decode_rows: Option<crate::tape::ids::DecodeRows>,
         lent: &LentActivation,

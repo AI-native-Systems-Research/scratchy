@@ -628,15 +628,20 @@ impl StepSlotMapping {
 #[cfg(feature = "metal")]
 const METAL_KV_ELEM_BYTES: usize = 2;
 
-/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
-/// × [`METAL_KV_ELEM_BYTES`].
-/// A decode-only step's most rows, `max_num_seqs` (a row a sequence), as the metal device carries
-/// it.
+/// A decode step's most rows, as the metal device carries it: a row a sequence of `max_num_seqs`,
+/// or — a verify step, of at most `arch`'s compiled head's `max_seqs` sequences — each sequence's
+/// token and its drafts. The rows the TurboQuant decode split's partials and the sampler hold.
 #[cfg(feature = "metal")]
-fn decode_rows(max_num_seqs: usize) -> scratchy_target_metal::tape::ids::DecodeRows {
-    scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(max_num_seqs).unwrap_or(u32::MAX))
+fn decode_rows(arch: &str, max_num_seqs: usize) -> scratchy_target_metal::tape::ids::DecodeRows {
+    let rows = match scratchy_forward_compiler::head_of(arch) {
+        Some(head) => max_num_seqs.max(usize::from(head.max_seqs) * (1 + usize::from(head.drafts))),
+        None => max_num_seqs,
+    };
+    scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
+/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
+/// × [`METAL_KV_ELEM_BYTES`].
 #[cfg(feature = "metal")]
 fn kv_per_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -4410,9 +4415,10 @@ impl Worker for MetalWorker {
         let allocator = MetalAllocator::new((*device_arc).clone());
         let mut gpu_device =
             GpuDevice::new(device_arc.clone(), std::sync::Arc::new(allocator.clone()));
-        // A decode-only step brings a row a sequence: at most the batch the resolver below picks,
-        // which never exceeds the requested width or the base one.
+        // A decode step brings a row a sequence (a verify step its drafts too) of at most the batch
+        // the resolver below picks, which never exceeds the requested width or the base one.
         gpu_device.max_decode_rows = Some(decode_rows(
+            &arch,
             (self.config.max_num_seqs)
                 .unwrap_or(scratchy_serving_engine::gpu_budget::BASE_MAX_NUM_SEQS),
         ));
@@ -4539,7 +4545,7 @@ impl Worker for MetalWorker {
         // `gpu_device` it needs for rung picking are still locals here
         // (fields assigned at the end of load_model) — pass them in.
         self.resolve_max_num_seqs(model.as_ref(), &gpu_device)?;
-        gpu_device.max_decode_rows = Some(decode_rows(self.max_num_seqs_resolved()));
+        gpu_device.max_decode_rows = Some(decode_rows(&arch, self.max_num_seqs_resolved()));
 
         {
             use std::sync::atomic::Ordering;
@@ -4621,18 +4627,11 @@ impl Worker for MetalWorker {
         // resident. Per-step sampler work is then a pure host memcpy
         // (`prepare_step`).
         let t_arena = std::time::Instant::now();
-        // A verify step samples each of its sequences' every row — its token and its drafts — and
-        // only a step of at most the compiled head's `max_seqs` sequences drafts; any other step
-        // samples one row a sequence.
-        let sampled_rows = match scratchy_forward_compiler::head_of(&arch) {
-            Some(head) => (self.max_num_seqs_resolved())
-                .max(usize::from(head.max_seqs) * (1 + usize::from(head.drafts))),
-            None => self.max_num_seqs_resolved(),
-        };
+        // A step samples its every row: a decode step's, a verify step's drafts too.
         let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
             &gpu_device.device,
             gpu_device.allocator.residency(),
-            sampled_rows as u32,
+            decode_rows(&arch, self.max_num_seqs_resolved()).0,
             &sampler,
             max_model_len.max(1) as u32,
         );
