@@ -31,7 +31,10 @@
 # Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):
 # one seed per (model, axis, rung) — unique so the prefix cache cannot serve a
 # later cell, shared across engines so all see the same prompts. Concurrency is
-# offered (--max-concurrency), not the effective decode batch.
+# offered (--max-concurrency), not the effective decode batch. The prompt x
+# answer grid runs at each of --scale-grid-conc's user counts, by default 1 and
+# the base count: one user at a time is what most Macs see, the base count how
+# they hold up shared (#349). --scale-grid-conc 1,2,4,8,16 gives the full cube.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
 # greedy, CLI mode (the ladder is server mode, so the gate is its own call). A
@@ -195,6 +198,7 @@ SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
 SCALE_GRID_INPUT="128,1024,4096"
 SCALE_GRID_OUTPUT="16,128,512"
+SCALE_GRID_CONC=""       # empty: 1 and the base users count
 SCALE_BASE_INPUT=512
 SCALE_BASE_OUTPUT=128
 SCALE_BASE_CONC=8
@@ -232,6 +236,7 @@ while [[ $# -gt 0 ]]; do
         --scale-output)      SCALE_OUTPUT="$2"; shift 2 ;;
         --scale-grid-input)  SCALE_GRID_INPUT="$2"; shift 2 ;;
         --scale-grid-output) SCALE_GRID_OUTPUT="$2"; shift 2 ;;
+        --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
         --scale-base-input)  SCALE_BASE_INPUT="$2"; shift 2 ;;
@@ -427,7 +432,7 @@ done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
-       SCALE_GRID_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS \
+       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
@@ -473,6 +478,7 @@ json.dump({
                  "axes": e["SCALE_AXES"].split(","), "conc": ints("SCALE_CONC"),
                  "input": ints("SCALE_INPUT"), "output": ints("SCALE_OUTPUT"),
                  "grid_input": ints("SCALE_GRID_INPUT"), "grid_output": ints("SCALE_GRID_OUTPUT"),
+                 "grid_conc": ints("SCALE_GRID_CONC") or sorted({1, int(e["SCALE_BASE_CONC"])}),
                  "base": {"input": int(e["SCALE_BASE_INPUT"]), "output": int(e["SCALE_BASE_OUTPUT"]),
                           "conc": int(e["SCALE_BASE_CONC"])},
                  "num_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
@@ -625,7 +631,8 @@ axis_size() { # axis
         conc)   par=$(max_of "${CONC_LIST}"); ctx=$(( SCALE_BASE_INPUT + SCALE_BASE_OUTPUT )) ;;
         input)  ctx=$(( $(max_of "${SCALE_INPUT}") + SCALE_BASE_OUTPUT )) ;;
         output) ctx=$(( SCALE_BASE_INPUT + $(max_of "${SCALE_OUTPUT}") )) ;;
-        grid)   ctx=$(( $(max_of "${SCALE_GRID_INPUT}") + $(max_of "${SCALE_GRID_OUTPUT}") )) ;;
+        grid)   par=$(max_of "${GRID_CONC_LIST}")
+                ctx=$(( $(max_of "${SCALE_GRID_INPUT}") + $(max_of "${SCALE_GRID_OUTPUT}") )) ;;
         *)      return 1 ;;
     esac
     # Never past the model's own context: some engines refuse to start there.
@@ -753,9 +760,13 @@ run_scale_cells() { # prefix [axes]
     if [[ "${axes}" == *",grid,"* ]]; then
         IFS=',' read -r -a xs <<<"${SCALE_GRID_INPUT}"
         IFS=',' read -r -a os <<<"${SCALE_GRID_OUTPUT}"
-        for x in "${xs[@]}"; do for o in "${os[@]}"; do
-            run_cell "${prefix}" grid "${x}x${o}" "${x}" "${o}" "${BASE_CONC}"
-        done; done
+        local c; local -a cs
+        IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
+        # Fewest users first: the whole 1-user grid is in hand before a larger
+        # count can run a server out of memory and end its sweep.
+        for c in "${cs[@]}"; do for x in "${xs[@]}"; do for o in "${os[@]}"; do
+            run_cell "${prefix}" grid "${x}x${o}@${c}" "${x}" "${o}" "${c}"
+        done; done; done
     fi
 }
 
@@ -895,10 +906,13 @@ for e in [x for x in d["models"] if x["stem"] == only or not only]:
             if t and t[0].get("output_throughput"):
                 print(f"    scaling {name}: conc {top['rung']} -> {fmt(t[0]['output_throughput'], 1)} tok/s")
     # Text heat maps: scratchy / engine output tok/s per grid cell (>1.00 = scratchy faster).
-    grid = {(c["input_len"], c["output_len"]): c for c in cells(e, "scaling", "grid")}
+    # One user count in the text maps: the base one (grid cells carry their own).
+    gbase = (e.get("scaling_limits") or {}).get("base_conc") or ((d["config"].get("scaling") or {}).get("base") or {}).get("conc")
+    atbase = lambda cs: [c for c in cs if c.get("conc", gbase) == gbase]
+    grid = {(c["input_len"], c["output_len"]): c for c in atbase(cells(e, "scaling", "grid"))}
     ins = sorted({k[0] for k in grid}); outs = sorted({k[1] for k in grid})
     for name, key in rivals:
-        them = {(c["input_len"], c["output_len"]): c for c in cells(e, key, "grid")}
+        them = {(c["input_len"], c["output_len"]): c for c in atbase(cells(e, key, "grid"))}
         if not (grid and them):
             continue
         print(f"    grid, scratchy / {name} output tok/s (rows input, cols output):")
@@ -944,6 +958,10 @@ PY
         [[ -n "${CONC_LIST}" ]] || CONC_LIST=${cap}
         echo "    at most ${cap} users at once: users ${CONC_LIST}, ${BASE_CONC} on the other sweeps"
     fi
+    # The grid's user counts: as asked, else 1 and the base count; never past the cap.
+    GRID_CONC_LIST=$(tr ',' '\n' <<<"${SCALE_GRID_CONC:-1,${BASE_CONC}}" \
+        | awk -v c="${cap:-0}" 'NF && (c == 0 || $1 <= c)' | sort -nu | paste -sd, -)
+    [[ -n "${GRID_CONC_LIST}" ]] || GRID_CONC_LIST=${BASE_CONC}
 
     feats="metal,serve,bench,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
     build_secs=""; bytes=""; built=1
@@ -1104,7 +1122,7 @@ PY
     fi
 
     ENGINE_KEYS="$(for row in "${ENGINE_ROWS[@]}"; do echo "${row%%|*}"; done)"; export ENGINE_KEYS
-    OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" \
+    OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" \
     python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
               "${build_secs}" "${bytes}" "${parity_ok}" "${MLX_PYTHON}" <<'PY'
 import glob, json, os, re, sys
@@ -1114,7 +1132,7 @@ KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms", "media
         "p99_itl_ms", "median_e2el_ms", "output_throughput", "request_throughput",
         "completed", "failed", "total_output_tokens", "duration", "unstreamed_requests",
         "server_mem_peak_mib", "server_mem_median_mib"]
-CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?\.json$")
+CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)
     return json.load(open(p)) if os.path.exists(p) else None
@@ -1126,8 +1144,9 @@ def scaling(engine):
         m = CELL.search(p)
         if not m or not (j := load(os.path.basename(p))):
             continue
-        axis, a, b = m.groups()
-        where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b)}
+        axis, a, b, users = m.groups()
+        where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b),
+                  "conc": int(users or env["BASE_CONC"])}
                  if axis == "grid" else {"rung": int(a)})
         cells.append({"axis": axis, **where, **metrics(j)})
     return cells or None
@@ -1174,7 +1193,8 @@ d["models"].append({
     # The shape this model ran at, when a limit made it differ from config.scaling.
     "scaling_limits": None if (env["BASE_CONC"] == env["SCALE_BASE_CONC"] and env["CONC_LIST"] == env["SCALE_CONC"])
                       else {"base_conc": int(env["BASE_CONC"]),
-                            "conc": [int(x) for x in env["CONC_LIST"].split(",")]},
+                            "conc": [int(x) for x in env["CONC_LIST"].split(",")],
+                            "grid_conc": [int(x) for x in env["GRID_CONC_LIST"].split(",")]},
     **engines,
 })
 json.dump(d, open(js, "w"), indent=2)
