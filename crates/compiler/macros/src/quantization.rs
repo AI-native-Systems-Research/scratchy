@@ -1381,6 +1381,12 @@ pub fn storage_format_for_weight(
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.
     if dotted == "lm_head" && model.tie_word_embeddings {
+        // The table it shares: the embedding's, unless the arch renames the head onto a table of
+        // its own (Gemma 4's drafter embeds with its target's lent table, its logits its own).
+        let tied_role = match program.rename_dotted("lm_head") {
+            renamed if renamed != "lm_head" => renamed,
+            _ => embed_role.clone(),
+        };
         if let QuantMethod::Affine {
             bits,
             group_size,
@@ -1393,7 +1399,7 @@ pub fn storage_format_for_weight(
             // embed's on-disk bits. MLX mixed checkpoints (OptiQ) ship
             // `embed_tokens` at 8-bit while the default is 4-bit.
             if !per_module.is_empty() {
-                return match per_module_lookup(program, per_module, &embed_role, None) {
+                return match per_module_lookup(program, per_module, &tied_role, None) {
                     Some((b, g)) => StorageFormat::Affine {
                         bits: b,
                         group_size: g,
@@ -1407,7 +1413,7 @@ pub fn storage_format_for_weight(
             // and implies the buffer IS quantized.
             if let Some(&(_, b)) = bits_overrides
                 .iter()
-                .find(|(s, _)| names_embed(s, &embed_role))
+                .find(|(s, _)| names_embed(s, &tied_role))
             {
                 return StorageFormat::Affine {
                     bits: b,
