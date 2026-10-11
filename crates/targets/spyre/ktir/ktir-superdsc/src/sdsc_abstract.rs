@@ -3365,12 +3365,18 @@ impl RowPages {
         RowPages(span.get().max(1).div_ceil(PagedKvPool::PAGE_SLOTS as u32))
     }
 
-    /// `None` when the prefix mask cannot reach this deep — [`PagedKvPool::MAX_PAGES_PER_ROW`], which is
-    /// the mask segment's bound and not the pool's. Past it the fold reads mask blocks the host never
-    /// staged; they are ZERO, and zero in an additive mask means VALID, so the row attends whatever the
-    /// pool holds and answers fluently and wrongly.
-    pub fn within_mask_reach(self) -> Option<RowPages> {
-        (self.0 <= PagedKvPool::MAX_PAGES_PER_ROW).then_some(self)
+    /// `None` when the prefix mask cannot reach this deep — past the blocks the bundle BAKED
+    /// ([`BakedMaskBlocks`], read from the rung's own pmask placement). Past them the fold reads
+    /// mask bytes the host never staged; they are ZERO, and zero in an additive mask means VALID,
+    /// so the row attends whatever the pool holds and answers fluently and wrongly.
+    ///
+    /// The baked block count is DERIVED at bake — the device's region cap over the model's own
+    /// page bytes (`compute_bundle_layout`'s pmask arm) — so it covers every pool any card can
+    /// build and the POOL is what binds at runtime. The caller supplies the cap it read from the
+    /// artifact; there is no const to fall back to, because a fallback const is how a hand-picked
+    /// ceiling quietly became the binding one.
+    pub fn within_mask_reach(self, baked: BakedMaskBlocks) -> Option<RowPages> {
+        (self.0 <= baked.get()).then_some(self)
     }
 
     /// The slots these pages hold — for a message that wants to state the context in positions.
@@ -5054,20 +5060,21 @@ const _: () = {
 // need at every rung**, so the mask segment is NOT the deep-row defect.
 //
 // ⭐ A COMMENT CLAIMING A MEASURED NUMBER IS NOT EVIDENCE. Re-run `[mask-cap]` before trusting any figure
-// in this block; the placement moves with `MAX_PAGES_PER_ROW`, the rung ladder and the mask shape, and a
-// number written here outlives all three.
+// in this block; the placement moves with the derived page ceiling, the rung ladder and the mask shape,
+// and a number written here outlives all three.
 //
-// 🛑 AND THIS CANNOT BE SATISFIED TODAY, WHICH IS THE POINT OF PUTTING IT HERE. Pages now come from a FREE
-// LIST (`f5e26a3e`), so ONE REQUEST MAY DRAW THE WHOLE POOL: `pages_per_row` is bounded only by
-// `pool_pages`, a runtime number, while the mask segment is baked. The product is therefore UNBOUNDED
-// against a FIXED reservation — the geometry can express a batch the bundle cannot serve, by construction,
-// and no runtime guard can fix that because by the time it fires the pool has already been sized.
+// 🛑 AND THIS CANNOT BE SATISFIED BY A HAND-PICKED CONST, WHICH IS WHAT IT USED TO BE. Pages come
+// from a FREE LIST (`f5e26a3e`), so ONE REQUEST MAY DRAW THE WHOLE POOL: `pages_per_row` is bounded
+// only by `pool_pages`, a runtime number, while the mask segment is baked. The product is therefore
+// UNBOUNDED against a FIXED reservation — the geometry can express a batch the bundle cannot serve,
+// by construction, and no runtime guard can fix that because by the time it fires the pool has
+// already been sized.
 //
-// So the build must refuse it until ONE of these is true:
-//   (a) `pages_per_row` is bounded by a const (cap a request's context, the old stripe's only real merit),
-//   (b) the decode mask segment is sized from `MAX_FOLD_PASSES` at bake, or
-//   (c) the fold steps the mask WITHOUT one block per pass (re-use a block per row, mask per page).
-// (b) is the honest fix: the emitter already knows the widest rung and the pool's page count at bake.
+// So the reservation is DERIVED from the device instead of chosen: `compute_bundle_layout` bakes
+// `MAX_SEGMENT_BYTES / page_bytes` blocks — every page one region of KV can hold — which covers
+// any pool the runtime can budget for (a pool is ONE allocation, capped at one region) and makes
+// memory the binding constraint. The runtime enforces the baked number from the artifact
+// (`BakedMaskBlocks`): `RowPages::within_mask_reach` at admission, `MaskBlocks::fits` per launch.
 // ⛔⛔⛔ THE QUADRATIC MASK ASSERTION IS DELETED — IT WAS FALSE, AND MEASUREMENT KILLED IT.
 //
 // It asserted `pages * width^2 * nqh * 512 <= 1_638_400` for every rung, i.e. `pages*width^2 <= 100`. Read
@@ -5227,39 +5234,33 @@ impl PagedKvPool {
     // occupies, because there is no such row; and a ragged batch has no per-request hole to mask, because
     // requests do not share a page's slot axis.
 
-    /// PAGES ONE ROW MAY HOLD — a CONST CEILING, and `ensure_pages` must refuse past it.
+    /// ⛔ THERE IS NO `MAX_PAGES_PER_ROW`, AND ITS ABSENCE IS THE LAW.
     ///
-    /// 🛑 IT CANNOT BE "THE WHOLE POOL". The prefix mask costs `pages * width` blocks of
-    /// `nqh * width * PAGE_SLOTS * 2` bytes, so an unbounded page count against a BAKED mask segment is an
-    /// unservable batch by construction — that is what the assertion below caught. 16 pages = 4096
-    /// positions, which is the context a chat request actually reaches (a 1368-token generation off a long
-    /// prompt is ~7 pages) with margin.
+    /// It was a hand-picked const (6, then 16, then 32) that bound a row's context before the
+    /// pool's memory ever got a vote — 8192 tokens reachable inside a pool that could hold ~70k,
+    /// on a card with 100 Gi. The prefix mask's block count is now DERIVED at bake —
+    /// `compute_bundle_layout` reserves `MAX_SEGMENT_BYTES / page_bytes` blocks, the most pages
+    /// ONE region of KV can hold, which is ≥ the pages any runtime pool can be budgeted for
+    /// (`max_single_allocation()` is one region) — so the reservation covers every pool any card
+    /// can express and MEMORY is the binding constraint at runtime, exactly as it is on metal.
+    /// The number itself lives in each bundle's own pmask placement, read back as
+    /// [`BakedMaskBlocks`]; the per-step `MaskBlocks::fits` check and `RowPages::within_mask_reach`
+    /// enforce it from the artifact, never from a const.
     ///
-    /// 🛑 **6, NOT 16, AND THE MASK LAW PICKS IT.** `pages * width^2 <= 100` (see `decode_mask_bytes`), so
-    /// keeping the 4-wide rung — which a 4-request batch REQUIRES — allows exactly 6 pages. 16 pages would
-    /// permit only width 2, and cutting the ladder to `[2]` was MEASURED CATASTROPHIC: `decode_rung_for(4)`
-    /// then finds no rung, the caller falls through to "decode one at a time", and **all 4 of 4 requests
-    /// collapsed to one EOS token, 3/3 trials** — worse than the 3/4 that answered before the cut. So the
-    /// ladder must keep the widths the pool will admit, and DEPTH is what gives way.
-    /// ⇒ 6 pages = 1536 positions per request. A longer request is REFUSED by `ensure_pages`, loudly,
-    /// which is the whole point: a refusal is a bug report, a collapse is a wrong answer.
-    pub const MAX_PAGES_PER_ROW: u32 = 16;
-
+    /// The `rows_are_requests == false` arm (solo decode, prompt chunks) reserves the SAME
+    /// derived count — one expression feeds both arms, so the old guard tying a separate
+    /// `MAX_PAGES_PER_REQUEST` to this const is gone with the pair of constants it related.
+    ///
     /// THE DECODE BATCH LADDER, so the widths that get baked and the requests a page holds cannot
     /// disagree. A rung wider than [`ROWS`](Self::ROWS) would bake a launch whose request axis walks
     /// off the end of the page into the next kv head's keys — silently, and only for the highest rows.
-    /// ⛔ ONLY RUNGS THE PREFIX MASK CAN SERVE AT [`MAX_PAGES_PER_ROW`](Self::MAX_PAGES_PER_ROW).
+    /// ⛔ ONLY RUNGS THE PREFIX MASK CAN SERVE AT THE DERIVED PAGE CEILING.
     ///
-    /// The mask is QUADRATIC in the width (`decode_mask_bytes`), so with a ~1.6 MB decode segment,
-    /// `nqh = 32` and 16 pages per row the constraint `pages * width^2 * 16384 <= 1_638_400` leaves
-    /// `width^2 <= 6` — **width 2 only**. The 4/8/16/32 rungs were baked and SELECTABLE while the mask
-    /// could not serve them past 6 / 1 / 0 / 0 pages, which is exactly the failure the card shows: correct
-    /// at bs=1-2, one EOS token per over-wide row at bs=4 with an 8-page history.
-    ///
-    /// 🛑 THIS IS A CAPABILITY CUT, NOT A TUNING. Wider batching at long context needs the mask to stop
-    /// costing a block per (row, page) — one block per PAGE with a row offset, or a compressed validity
-    /// encoding. Until that exists, a wider rung is a launch that reads unstaged bytes, and an additive
-    /// mask reads those as VALID. Baking it is worse than not having it.
+    /// A gathered fold takes ONE mask block per page, and every rung reserves the same derived
+    /// block count (see the note above), so EVERY rung serves the full depth at full width. An
+    /// UNGATHERED rung body — per-(row, page) fold — is still bounded by `blocks / width`, and the
+    /// launch-side `MaskBlocks::fits` check refuses such a step loudly rather than letting it read
+    /// unstaged mask bytes.
     pub const BATCH_RUNGS: [u32; 5] = [2, 4, 8, 16, 32];
 
     /// THE WIDEST BAKED RUNG, as a const — how many ROWS a pool must be able to give a page each.
@@ -5274,18 +5275,13 @@ impl PagedKvPool {
     /// pages, which is why [`PoolRows`] cannot name one.
     pub const NARROWEST_BATCH_RUNG: u32 = Self::BATCH_RUNGS[0];
 
-    /// POSITIONS ONE SEQUENCE SHOULD REACH before the POOL is the reason it cannot.
-    ///
-    /// Not a capability and not a promise — a sizing TARGET, the depth [`PoolRows::widest_reaching`]
-    /// buys before it spends the remaining budget on width. 4096 because that is the context a single
-    /// chat request actually reaches (a 1368-token generation off a long prompt is ~7 pages) with margin,
-    /// and because the alternative default — always the widest rung — is what capped granite-3.1-8b at
-    /// `121 pages / 32 rows = 3 pages = 768 positions` and failed a long generation outright.
-    pub const TARGET_POSITIONS_PER_ROW: usize = 4096;
-
-    // ⛔ NO LADDER-FITS ASSERT. It tied the widest decode rung to the requests a page holds; a page holds
-    // no requests now, so a batch rung is bounded by the pool's PAGES, which is a host allocation
-    // question and not a baked one.
+    // ⛔ NO `TARGET_POSITIONS_PER_ROW`, AND NO LADDER-FITS ASSERT. The target const was the depth
+    // of a deleted depth-vs-width trade (`widest_reaching` — see `PoolRows::for_admission`'s doc for
+    // how the free list dissolved it), and it tracked the mask ceiling by reading the const that
+    // no longer exists. The ladder-fits assert tied the widest decode rung to the requests a page
+    // holds; a page holds no requests now, so a batch rung is bounded by the pool's PAGES, which is
+    // a host allocation question and not a baked one — and the depth a row may reach is the
+    // artifact-derived pmask ceiling, enforced per launch.
 
     pub fn new(nkvh: usize, hd: usize) -> PagedKvPool {
         PagedKvPool { nkvh, hd }
@@ -5744,7 +5740,7 @@ impl GatherEntry {
 /// ⛔⛔⛔ IT WAS `pass_stride_entries: usize`, COMPUTED AT THE CALL SITE AS `rep_stride_bytes() / 4`.
 /// The index is an ACTIVATION (`SegRole::Activation` == `SEG_MASK`), so it rides the MASK's per-pass
 /// segment shift — one shift moves both tensors, therefore ONE pitch governs both. A `usize` parameter
-/// invites the sibling derivation (a page count, the scratch's own row count, `MAX_FOLD_PASSES`), and
+/// invites the sibling derivation (a page count, the scratch's own row count, a pass ceiling), and
 /// a pitch that disagrees puts pass `p`'s gather on another pass's entries with a clean bake and no
 /// counter moved. Deriving it inside the mask shape is what makes "the same number, two derivations"
 /// stop being expressible.
@@ -8671,12 +8667,13 @@ mod pool_demand_proofs {
     #[kani::proof]
     fn a_pool_sized_by_its_demand_always_splits() {
         let context: u32 = kani::any();
-        // 1 slot to the deepest the prefix mask can address — past that `RowPages::within_mask_reach`
-        // refuses and no pool should be sized for it.
-        kani::assume(
-            context >= 1
-                && context <= PagedKvPool::MAX_PAGES_PER_ROW * PagedKvPool::PAGE_SLOTS as u32,
-        );
+        // The mask ceiling the bundle baked — SYMBOLIC, because it is a per-model derivation
+        // (`MAX_SEGMENT_BYTES / page_bytes`), not a const: the law must hold at EVERY ceiling a
+        // bake can produce. Past it `RowPages::within_mask_reach` refuses and no pool should be
+        // sized for it.
+        let cap: u32 = kani::any();
+        kani::assume(cap >= 1 && cap <= 1 << 16);
+        kani::assume(context >= 1 && context <= cap * PagedKvPool::PAGE_SLOTS as u32);
         let rows_n: u32 = kani::any();
         kani::assume(rows_n >= 1 && rows_n <= PoolRows::WIDEST.get().get());
         let rows = PoolRows::for_admission(AdmittedRequests::new(rows_n as usize).unwrap());

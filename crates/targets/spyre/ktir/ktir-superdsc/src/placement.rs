@@ -101,24 +101,18 @@ pub enum SegRole {
 /// `spill_weight_tail` records, but not built here.
 pub const WEIGHT_SPILL_SEGS: [usize; 1] = [6];
 
-/// Pages one request's block table can address — the validity rows the mask reserves.
-///
-/// 32 is chosen so the reservation is `32 * 256 * 2` = 16384 B, byte-identical to the pre-paged
-/// mask (`nqh * mq * cap * 2` at mq=1), which keeps every activation placed after it at the offset
-/// it had before paging. A larger reserve pushes seven activation tensors along by its excess, and
-/// this path is documented as placement-sensitive. 32 pages is 8192 positions per request; the
-/// binding limit in practice is the runtime pool.
-pub const MAX_PAGES_PER_REQUEST: u64 = 32;
-
-/// Fold passes a batched-decode bundle reserves prefix-mask room for.
-///
-/// A pass is one `(request, page)`, and EVERY page comes from the one shared pool, so the passes in
-/// flight can never exceed the pool's size however the batch is shaped: 32 requests of one page and
-/// one request of 32 pages are the same 32 passes. Sizing the mask as
-/// `requests * MAX_PAGES_PER_REQUEST` instead counts a batch where every request is simultaneously
-/// at full context, which the pool cannot hold — at 32 requests that is 537 MB of mask against 17 MB
-/// of actual worst case, and it is re-uploaded every step.
-pub const MAX_FOLD_PASSES: u64 = 64;
+// ⛔⛔⛔ THERE IS NO `MAX_PAGES_PER_REQUEST` AND NO `MAX_FOLD_PASSES`, AND THE GUARD THAT TIED THEM
+// TO THE ROW CONST IS GONE WITH ALL THREE.
+//
+// Both constants were hand-picked page ceilings on the prefix mask — 32 was chosen to keep the
+// reservation byte-identical to a pre-paged mask that no longer exists, and 64 was the pass budget
+// of an uncollapsed fold the gathered form superseded — and together they bound a row's context
+// before the pool's memory ever got a vote. The mask's block count is now DERIVED at bake from the
+// device (`compute_bundle_layout`: `MAX_SEGMENT_BYTES / page_bytes`, the most pages one region of
+// KV can hold), one expression feeding the `rows_are_requests` and broadcast arms alike, so there
+// are no two constants left to relate and no guard left to fire. The runtime reads the ceiling
+// from the artifact (`BakedMaskBlocks`) — see `sdsc_abstract`'s fold-pass ceiling block for the
+// enforcement chain.
 
 impl SegRole {
     pub fn segment(self) -> usize {

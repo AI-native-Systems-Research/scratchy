@@ -569,6 +569,25 @@ impl LLM {
         }
     }
 
+    /// Admission guard — the in-process twin of the server's `check_prompt_fits`.
+    ///
+    /// `scr chat`, `scr batch` and `--bench` submit through this facade, not through the
+    /// server's `submit_request`, so without this an over-long prompt is admitted and only
+    /// dies mid-forward: measured on granite-3.1-8b, a 5874-token prompt against a 4096-slot
+    /// window crawled one token at a time for 4m42s before the worker's mask-ceiling
+    /// refusal killed the run. `>=` matches the server's check: a prompt equal to the window
+    /// leaves no room for even one output token (`resolve_max_tokens` would silently zero it).
+    fn check_prompt_fits(&self, num_prompt_tokens: usize) -> Result<()> {
+        if num_prompt_tokens >= self.max_model_len {
+            anyhow::bail!(
+                "prompt is {num_prompt_tokens} tokens but this model serves at most {} — the \
+                 limit is what the backend's KV memory funds and its prefix mask addresses",
+                self.max_model_len
+            );
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // generate()
     // -----------------------------------------------------------------------
@@ -783,6 +802,7 @@ impl LLM {
                 sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
                 sp.seal = seal;
                 sp.volatile = volatile;
+                self.check_prompt_fits(prompt_ids.len())?;
                 self.resolve_max_tokens(&mut sp, prompt_ids.len());
 
                 self.client
@@ -1057,6 +1077,7 @@ impl LLM {
         let prompt_token_ids = self.tokenize_text(&prompt)?;
         let _d_tok = _t_tok.elapsed();
         let mut sp = params.clone();
+        self.check_prompt_fits(prompt_token_ids.len())?;
         self.resolve_max_tokens(&mut sp, prompt_token_ids.len());
         if std::env::var_os("VLLM_DEBUG_PARAMS").is_some() {
             eprintln!(

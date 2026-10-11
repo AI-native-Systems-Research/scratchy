@@ -2664,9 +2664,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // first one's.
             //
             // GATED, not made unconditional, because the broadcast is LOAD-BEARING FOR MEMORY. The
-            // mask spans the whole context (MAX_PAGES_PER_REQUEST * PAGE_SLOTS), so one row per op
-            // row is `nqh*mq` of them: about 50 MB at prefill's mq=96, re-uploaded every forward.
-            // At a decode batch of 8 it is ~4 MB, which is affordable — the blow-up is prefill's
+            // mask spans the whole context (the derived page ceiling × PAGE_SLOTS), so one row per
+            // op row is `nqh*mq` of them: tens of MB at prefill's mq=96, re-uploaded every forward.
+            // At a decode batch of 8 it is a few MB, which is affordable — the blow-up is prefill's
             // problem and prefill does not need this.
             if rows_are_requests {
                 // ⭐ FROM THE SHARED SHAPE, not from a nest built here out of `rows` and `cap`. The

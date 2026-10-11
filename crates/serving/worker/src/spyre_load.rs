@@ -930,6 +930,12 @@ impl SpyreWorker {
         // ENGINE sizes the scheduler's block allocator off the SAME number the pool was cut from.
         #[allow(unused_mut, unused_assignments)]
         let mut kv_budget_bytes_v: Option<u64> = None;
+        // The context the sized pool can actually serve (tokens) — `min(declared, budget-funded)`,
+        // decided in the SuperDsc branch below where budget, page stride and launch rows first
+        // meet. `usize::MAX` until then, so paths that never size a paged pool report no cap and
+        // `kv_max_addressable_tokens` falls back to the baked mask reach alone.
+        #[allow(unused_mut, unused_assignments)]
+        let mut served_context_v: usize = usize::MAX;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1243,16 +1249,41 @@ impl SpyreWorker {
                         scratchy_subtile::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u64;
                     let stride = (3 * kv_dim as u64 * plane_slots * 2 * layers as u64).max(1);
 
-                    // THE DECLARED DEPTH, capped by what the prefix mask can address. `--max-model-len`
-                    // when the CLI gave one, else the model's own limit — and `kv_max_addressable_tokens`
-                    // is the same bound the engine applies to admission, so quoting it here cannot invent a
-                    // depth the fold could not serve.
-                    let reach = PagedKvPool::MAX_PAGES_PER_ROW as usize * PagedKvPool::PAGE_SLOTS;
-                    let declared = self
-                        .declared_context
-                        .unwrap_or(max_model_len)
-                        .min(reach)
-                        .max(1);
+                    // THE DECLARED DEPTH, capped by WHAT THIS RUN'S BUDGET FUNDS. `--max-model-len`
+                    // when the CLI gave one, else the model's own limit. The prefix mask is NOT the
+                    // cap here and cannot be: its block count is DERIVED at bake from the device
+                    // (`MAX_SEGMENT_BYTES / page_bytes`, one region of KV), so it covers every pool
+                    // any card can budget for and the binding constraint on a given run is its own
+                    // budget — `(budget/stride − reserve) / rows` pages per row. That is always ≤
+                    // the mask's reach (a pool is ONE allocation, capped at one region), so this
+                    // clamp can never admit past the bake; the artifact still guards every launch
+                    // (`MaskBlocks::fits`) and every page grant (`within_mask_reach`), and the
+                    // engine's admission cap is `min(this, the mask reach)` via
+                    // `kv_max_addressable_tokens`. Context is bound by the KV cache, exactly as it
+                    // is on metal — the number moves with the card, the page stride and the row
+                    // count, not with a hand-picked constant.
+                    let fundable_pages = (pool_budget_bytes / stride).saturating_sub(
+                        scratchy_subtile::sdsc_abstract::PoolPartition::reserve() as u64,
+                    ) / pool_rows.get().get() as u64;
+                    // At least one page per row: a pool that cannot fund that is the REFUSAL's to
+                    // report below, not a zero-context cap to serve.
+                    let affordable = fundable_pages.max(1)
+                        * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64;
+                    let mut declared = self.declared_context.unwrap_or(max_model_len).max(1) as u64;
+                    if declared > affordable {
+                        tracing::info!(
+                            "Capping max_model_len {} → {} (KV budget: {} page(s) of {} MB across \
+                             {} launch row(s) fund {} page(s) per request)",
+                            declared,
+                            affordable,
+                            pool_budget_bytes / stride,
+                            stride / (1024 * 1024),
+                            pool_rows.get().get(),
+                            fundable_pages.max(1),
+                        );
+                        declared = affordable;
+                    }
+                    served_context_v = declared as usize;
                     let demand = scratchy_subtile::sdsc_abstract::PoolDemand::of_declaration(
                         scratchy_subtile::sdsc_abstract::SlotCount::new(declared as u32),
                         pool_rows,
@@ -1915,11 +1946,14 @@ impl SpyreWorker {
                         let per = nqh * rn as u64 * 2;
                         let cap = if per > 0 { bytes / per } else { 0 };
                         let page = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64;
+                        // The block count is the ONE fact; which law binds it is per-BODY (the
+                        // launch's own `gathers` picks the fold form), so state both readings
+                        // instead of printing one of them as if the bundle had picked it.
                         debug!(
-                            "[mask-cap] rung seqs={rn}: pmask={bytes} B, nqh={nqh} => cap={cap} \
-                             slots => pages*width <= {} (this rung allows {} page(s) per row)",
+                            "[mask-cap] rung seqs={rn}: pmask={bytes} B, nqh={nqh} => {} mask \
+                             block(s) — a per-page (gathered) fold bounds pages by it, a \
+                             per-(row,page) fold by blocks/width",
                             cap / page,
-                            (cap / page) / rn.max(1) as u64,
                         );
                         rung_mask_cap =
                             scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
@@ -2200,6 +2234,7 @@ impl SpyreWorker {
             prefill,
             batched_prefill,
             kv_budget_bytes: kv_budget_bytes_v,
+            served_context: served_context_v,
         })
     }
 }
