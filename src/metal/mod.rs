@@ -12,7 +12,7 @@
 mod data;
 mod numbers;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use dioxus::prelude::*;
@@ -433,6 +433,10 @@ struct SparkPoint {
     upper: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lower: Option<f64>,
+    /// On a highlighted step's fill: how many times faster scratchy is there,
+    /// which charts.js writes in the fill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    factor: Option<f64>,
 }
 
 /// One measured point of a line. A None value (present but not measured: no
@@ -444,12 +448,15 @@ struct LinePoint<'a> {
     value: Option<f64>,
 }
 
-/// One cell of a heatmap: x is answer tokens, y prompt tokens.
+/// One cell of a heatmap: x is answer tokens, y prompt tokens. A highlight
+/// has its factor written in it (charts.js).
 #[derive(Serialize)]
 struct HeatPoint {
     x: String,
     y: String,
     value: Option<f64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    highlight: bool,
 }
 
 #[derive(Serialize)]
@@ -1156,7 +1163,7 @@ impl<'a> ShapeGrid<'a> {
 }
 
 /// A dimension a sparkline follows, with the metric it mostly drives.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Trend {
     UsersDecode,
     UsersPrefill,
@@ -1210,6 +1217,7 @@ impl Trend {
                         x: f64::from(*n),
                         scratchy: timing(Some(c), metric),
                         rival: timing(theirs.get(n).copied(), metric),
+                        highlight: false,
                     })
                     .collect();
                 Some((rival, pts))
@@ -1235,6 +1243,7 @@ impl Trend {
                             x: f64::from(a),
                             scratchy: at(Engine::Scratchy),
                             rival: at(rival),
+                            highlight: false,
                         }
                     })
                     .collect();
@@ -1244,12 +1253,15 @@ impl Trend {
     }
 }
 
-/// One step along a sparkline's dimension: where, and each engine's value.
+/// One step along a sparkline's dimension: where, each engine's value, and
+/// whether it is one of its panel's highlights (its factor written in its
+/// fill).
 #[derive(Clone, Copy)]
 struct Step {
     x: f64,
     scratchy: Option<f64>,
     rival: Option<f64>,
+    highlight: bool,
 }
 
 /// The geometric mean, the right average for rates and times; None of nothing.
@@ -1270,6 +1282,7 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
         value,
         upper: None,
         lower: None,
+        factor: None,
     };
     let band = |group, key, a: f64, b: f64| SparkPoint {
         group,
@@ -1277,6 +1290,7 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
         value: Some(a.max(b)),
         upper: Some(a.max(b)),
         lower: Some(a.min(b)),
+        factor: None,
     };
     let gap = |group, key| SparkPoint {
         group,
@@ -1284,6 +1298,7 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
         value: None,
         upper: None,
         lower: None,
+        factor: None,
     };
     // Positive where scratchy is ahead: more tokens a second, or less time.
     let lead = |s: f64, r: f64| {
@@ -1298,6 +1313,7 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
         x,
         scratchy: sv,
         rival: rv,
+        ..
     } in pts
     {
         out.push(line(scratchy, x, sv));
@@ -1310,19 +1326,31 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
             x,
             scratchy: sv,
             rival: rv,
+            highlight,
         },
     ) in pts.iter().enumerate()
     {
         match (sv, rv) {
             (Some(sv), Some(rv)) => {
                 let d = lead(sv, rv);
+                let factor = if highlight {
+                    metric.faster(Some(sv), Some(rv))
+                } else {
+                    None
+                };
                 fills.push(if d > 0.0 {
-                    band(scratchy_ahead, x, sv, rv)
+                    SparkPoint {
+                        factor,
+                        ..band(scratchy_ahead, x, sv, rv)
+                    }
                 } else {
                     gap(scratchy_ahead, x)
                 });
                 fills.push(if d < 0.0 {
-                    band(rival_ahead, x, sv, rv)
+                    SparkPoint {
+                        factor,
+                        ..band(rival_ahead, x, sv, rv)
+                    }
                 } else {
                     gap(rival_ahead, x)
                 });
@@ -1332,6 +1360,7 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
                     x: x1,
                     scratchy: Some(s1),
                     rival: Some(r1),
+                    ..
                 }) = pts.get(k + 1)
                 {
                     let d1 = lead(s1, r1);
@@ -1435,26 +1464,43 @@ fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &st
     chart(&spec, label, "width: 100%", None)
 }
 
-/// One model's sparkline for one trend on one machine, or why there is none.
-fn trend_spark(
-    machines: &BTreeMap<&str, MachineRuns>,
-    chip: &str,
-    stem: &str,
+/// Which overview sparkline: machine, model and trend.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SparkAt<'a> {
+    chip: &'a str,
+    stem: &'a str,
     trend: Trend,
-    height: &str,
-) -> Element {
-    let Some(Entry { run, m }) = machines[chip].latest(stem) else {
-        return rsx! { "not run" };
-    };
-    let Some((rival, pts)) = trend.points(m, run) else {
-        return rsx! { "nothing to compare" };
+}
+
+/// One overview sparkline's steps, against its rival.
+struct Spark {
+    rival: Engine,
+    steps: Vec<Step>,
+}
+
+impl Spark {
+    /// A model's trend on a machine's latest run, or why there is none.
+    fn of(mr: &MachineRuns, stem: &str, trend: Trend) -> Result<Self, &'static str> {
+        let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
+        let (rival, steps) = trend.points(m, run).ok_or("nothing to compare")?;
+        Ok(Spark { rival, steps })
+    }
+}
+
+/// One model's sparkline for one trend on one machine, or why there is none.
+fn trend_spark(at: SparkAt, spark: &Result<Spark, &str>, height: &str) -> Element {
+    let spark = match spark {
+        Ok(s) => s,
+        Err(why) => return rsx! { "{why}" },
     };
     let label = format!(
-        "{stem} on {chip}: {}, scratchy against {}",
-        trend.title(),
-        rival.label()
+        "{} on {}: {}, scratchy against {}",
+        at.stem,
+        at.chip,
+        at.trend.title(),
+        spark.rival.label()
     );
-    sparkline(&pts, trend, rival, height, &label)
+    sparkline(&spark.steps, at.trend, spark.rival, height, &label)
 }
 
 const GRID_METRICS: [(Metric, &str); 2] = [
@@ -1493,6 +1539,7 @@ fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element 
                 x: o.to_string(),
                 y: i.to_string(),
                 value,
+                highlight: false,
             });
         }
     }
@@ -1663,6 +1710,53 @@ fn runs_table(runs: &[&Run]) -> Element {
     }
 }
 
+/// How many of the overview's heat map squares, and of each sparkline panel's
+/// steps, at each end, have their factor written in them: the ones scratchy
+/// is furthest ahead at, and the ones it is furthest behind at (or least
+/// ahead), over every machine, model and metric.
+const HIGHLIGHTS: usize = 3;
+
+/// Where an overview heat map square is: machine, model, metric, and its
+/// prompt and answer lengths.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Square<'a> {
+    chip: &'a str,
+    stem: &'a str,
+    metric: &'a str,
+    prompt: u32,
+    answer: u32,
+}
+
+/// One overview heat map's ratios: its grid's lengths, the rival, and each
+/// square's (prompt, answer, how many times faster scratchy is).
+struct GlanceGrid<'a> {
+    ins: &'a [u32],
+    outs: &'a [u32],
+    rival: Engine,
+    cells: Vec<(u32, u32, Option<f64>)>,
+}
+
+impl<'a> GlanceGrid<'a> {
+    /// A model's grid at a metric on a machine's latest run, or why none.
+    fn of(mr: &'a MachineRuns, stem: &str, metric: Metric) -> Result<Self, &'static str> {
+        let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
+        let g = ShapeGrid::of(m, run).ok_or("no grid")?;
+        let rival = g.rival.ok_or("nothing to compare")?;
+        let cells = g
+            .ins
+            .iter()
+            .flat_map(|&i| g.outs.iter().map(move |&o| (i, o)))
+            .map(|(i, o)| (i, o, g.versus(metric, (i, o), rival).0))
+            .collect();
+        Ok(GlanceGrid {
+            ins: g.ins,
+            outs: g.outs,
+            rival,
+            cells,
+        })
+    }
+}
+
 /// Every model's prompt-by-answer grid on every machine as small multiples,
 /// one table per metric: a machine per row, a model per column, each cell that
 /// model's grid as a tiny heatmap coloured like the full ones.
@@ -1678,29 +1772,106 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     if stems.is_empty() {
         return rsx! {};
     }
-    let mini = |chip: &str, stem: &str, metric: Metric, name: &str| -> Element {
-        let Some(Entry { run, m }) = machines[chip].latest(stem) else {
-            return rsx! { "not run" };
-        };
-        let Some(g) = ShapeGrid::of(m, run) else {
-            return rsx! { "no grid" };
-        };
-        let Some(rival) = g.rival else {
-            return rsx! { "nothing to compare" };
-        };
-        let mut ratios = Vec::new();
-        let mut data = Vec::new();
-        for &i in g.ins {
-            for &o in g.outs {
-                let r = g.versus(metric, (i, o), rival).0;
-                ratios.extend(r);
-                data.push(HeatPoint {
-                    x: o.to_string(),
-                    y: i.to_string(),
-                    value: r.map(log2_ratio),
-                });
+    let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
+    // Every grid's ratios first, keyed by machine, model and metric, or why
+    // the grid has none: the highlights are picked from all of them.
+    let mut grids: BTreeMap<(&str, &str, &str), Result<GlanceGrid, &str>> = BTreeMap::new();
+    for &chip in machines.keys() {
+        for &stem in &stems {
+            for (metric, name) in metrics {
+                grids.insert(
+                    (chip, stem, name),
+                    GlanceGrid::of(&machines[chip], stem, metric),
+                );
             }
         }
+    }
+    let mut ranked: Vec<(Square, f64)> = grids
+        .iter()
+        .filter_map(|(&(chip, stem, name), g)| Some((chip, stem, name, g.as_ref().ok()?)))
+        .flat_map(|(chip, stem, name, g)| {
+            g.cells.iter().filter_map(move |&(i, o, r)| {
+                let at = Square {
+                    chip,
+                    stem,
+                    metric: name,
+                    prompt: i,
+                    answer: o,
+                };
+                Some((at, r?))
+            })
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let highlights: BTreeSet<Square> = ranked
+        .iter()
+        .take(HIGHLIGHTS)
+        .chain(ranked.iter().rev().take(HIGHLIGHTS))
+        .map(|&(at, _)| at)
+        .collect();
+    // Likewise every sparkline's steps, each panel's highlights picked from
+    // its own: the steps scratchy is furthest ahead and furthest behind at.
+    let mut sparks: BTreeMap<SparkAt, Result<Spark, &str>> = BTreeMap::new();
+    for &chip in machines.keys() {
+        for &stem in &stems {
+            for (_, _, trends) in SCALING {
+                for trend in trends {
+                    let at = SparkAt { chip, stem, trend };
+                    sparks.insert(at, Spark::of(&machines[chip], stem, trend));
+                }
+            }
+        }
+    }
+    for (_, _, trends) in SCALING {
+        let mut ranked: Vec<(SparkAt, usize, f64)> = sparks
+            .iter()
+            .filter(|(at, _)| trends.contains(&at.trend))
+            .filter_map(|(&at, spark)| Some((at, spark.as_ref().ok()?)))
+            .flat_map(|(at, spark)| {
+                spark.steps.iter().enumerate().filter_map(move |(k, st)| {
+                    Some((at, k, at.trend.metric().faster(st.scratchy, st.rival)?))
+                })
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let picked: Vec<(SparkAt, usize)> = ranked
+            .iter()
+            .take(HIGHLIGHTS)
+            .chain(ranked.iter().rev().take(HIGHLIGHTS))
+            .map(|&(at, k, _)| (at, k))
+            .collect();
+        for (at, k) in picked {
+            if let Some(Ok(spark)) = sparks.get_mut(&at) {
+                spark.steps[k].highlight = true;
+            }
+        }
+    }
+    let spark = |chip: &str, stem: &str, trend: Trend| -> Element {
+        let at = SparkAt { chip, stem, trend };
+        trend_spark(at, &sparks[&at], "4.5rem")
+    };
+    let mini = |chip: &str, stem: &str, name: &str| -> Element {
+        let g = match &grids[&(chip, stem, name)] {
+            Ok(g) => g,
+            Err(why) => return rsx! { "{why}" },
+        };
+        let ratios: Vec<f64> = g.cells.iter().filter_map(|&(_, _, r)| r).collect();
+        let data = g
+            .cells
+            .iter()
+            .map(|&(i, o, r)| HeatPoint {
+                x: o.to_string(),
+                y: i.to_string(),
+                value: r.map(log2_ratio),
+                highlight: highlights.contains(&Square {
+                    chip,
+                    stem,
+                    metric: name,
+                    prompt: i,
+                    answer: o,
+                }),
+            })
+            .collect();
         let range = match (
             ratios.iter().copied().reduce(f64::min),
             ratios.iter().copied().reduce(f64::max),
@@ -1712,7 +1883,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             // Half its cell, however wide the cell grows.
             div { style: "flex: 1 1 0; min-width: 0",
                 Stack { gap: 2,
-                    {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", rival.label()), &format!("{stem} on {chip}: scratchy {range}"))}
+                    {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", g.rival.label()), &format!("{stem} on {chip}: scratchy {range}"))}
                     // Name over range, centred under the grid.
                     div { style: "text-align: center",
                         div { strong { "{name}" } }
@@ -1728,7 +1899,6 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // narrow one the cells wrap, each growing to fill its line, the grids in
     // it with it, so nothing scrolls sideways and nothing sits in a corner. The scale stands beside the rows, or
     // wraps below them.
-    let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
     rsx! {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
@@ -1767,7 +1937,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                         div { style: "flex: 1 1 11.5rem; min-width: 11.5rem; display: flex; flex-direction: column; gap: 0.5rem",
                                                             div { style: "text-align: center", "{stem}" }
                                                             div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                                                for (metric, name) in metrics { {mini(chip, stem, metric, name)} }
+                                                                for (_, name) in metrics { {mini(chip, stem, name)} }
                                                             }
                                                         }
                                                     }
@@ -1794,9 +1964,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                 for chip in machines.keys() {
                                                     div { style: "grid-row: span 2; align-self: start", "{chip}" }
                                                     div { "Prefill" }
-                                                    for stem in &stems { div { {trend_spark(machines, chip, stem, prefill, "4.5rem")} } }
+                                                    for stem in &stems { div { {spark(chip, stem, prefill)} } }
                                                     div { "Decode" }
-                                                    for stem in &stems { div { {trend_spark(machines, chip, stem, decode, "4.5rem")} } }
+                                                    for stem in &stems { div { {spark(chip, stem, decode)} } }
                                                 }
                                             }
                                         }
@@ -1981,11 +2151,13 @@ mod tests {
                 x: 1.0,
                 scratchy: Some(10.0),
                 rival: Some(5.0),
+                highlight: false,
             },
             Step {
                 x: 4.0,
                 scratchy: Some(5.0),
                 rival: Some(10.0),
+                highlight: false,
             },
         ];
         let pts = spark_points(&steps, Metric::Throughput, Engine::MlxLm);
