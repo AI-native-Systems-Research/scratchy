@@ -1111,7 +1111,9 @@ fn elementwise_per_row(
 /// the same dims to every operand — which is why it has to refuse a degenerate one.
 ///
 /// This is the same emission the hardware-proven bodies already use: `rmsnorm.rs` reads
-/// `In::col(&rinv)` for the per-row `1/rms` and `In::mb(&gamma)` for the `[1, cols]` gain, and
+/// `In::col_at(&rinv, …)` for the per-row `1/rms` (element 8, the first element of the exx2
+/// output's E[x²] half-stick — same RedStick
+/// broadcast, one-element view step in) and `In::mb(&gamma)` for the `[1, cols]` gain, and
 /// `attn.rs`'s softmax reads `In::col(&hm(run_m))` for the per-row max. So the softmax a KTIR producer
 /// spells longhand lowers to the operand modes the fused body was already proving on card.
 ///
@@ -1330,8 +1332,9 @@ pub fn silumul(
     ])
 }
 
-/// main's `lower_rmsnorm_node` (main 8604-8666): the 6-op sequence IBM's `torch_spyre` uses
-/// (`decompositions.py:409 spyre_rms_norm`), assembled by `assemble_rmsnorm`.
+/// main's `lower_rmsnorm_node` (main 8604-8666): the RMS sequence IBM's `torch_spyre` decomposes
+/// (`decompositions.py:999 spyre_rms_norm`) — assembled by `assemble_rmsnorm` with the device's
+/// own fused `exx2` head (5 ops: the vendor's elementary `x·x`+`mean` pair is one reduce).
 ///
 /// Its door: `eps` was an attribute of the node and is now the CARRIED
 /// [`KtirNode::rmsnorm_eps_idx`] — its slot in `BundleLayout::scalarmul_scales`, resolved by the

@@ -3,7 +3,8 @@
 //!
 //! `tiled_op_sdsc_op` (Bridge 3) holds the four PRIMITIVE (one `TileOp` in, one concrete op out,
 //! no internal decomposition) TileIR→SdscOp entry points. Composite-op decomposition (RmsNorm's
-//! 6-op form, RoPE's rotate+xc+rs+add, AttnDecode's fused attention, every `lower_*_node`
+//! 5-op form with the fused `exx2` head, RoPE's rotate+xc+rs+add, AttnDecode's fused attention,
+//! every `lower_*_node`
 //! function) still lives in `crate::lower_subtile_tape_to_superdsc` (the live emitter), which
 //! calls through to this module's functions as its own primitive-op building blocks — migrating
 //! the composite decomposers too would mean relocating the ~13k-line emitter wholesale, not

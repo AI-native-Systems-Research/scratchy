@@ -668,7 +668,8 @@ pub struct ItDim {
 
 /// A `≤ MAX_CORES` core count with no public constructor — minted only by
 /// [`WorkPlan::divide`] (witness (b): the product of the splits is `≤ 32` by
-/// type, not by a runtime re-check).
+/// type, not by a runtime re-check) and [`WorkPlan::replicate`] (all cores,
+/// no splits — the LX-producer shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoresUsed(u32);
 impl CoresUsed {
@@ -822,6 +823,32 @@ impl WorkPlan {
             splits,
             cores: CoresUsed(product),
         })
+    }
+
+    /// Build a REPLICATED work-division for `dims`: EVERY core runs the whole
+    /// iteration space (`splits` empty, `cores = MAX_CORES`). The producer side of
+    /// [`Allocation::Lx`] residency — LX is per-core private, so a consumer on any
+    /// core can only read a byte that core's own producer pass wrote; replicating
+    /// the producer puts the full tensor in every core's scratchpad, and the
+    /// consumer's own work-slice corner (which `per_core_addr` folds into the LX
+    /// base exactly as it does for HBM) then selects its rows there.
+    ///
+    /// The redundant compute is the deliberate trade: it is only ever chosen for
+    /// tiny per-row scalar tensors (the rmsnorm `rinv` stick), where MAX_CORES
+    /// copies of a handful of sticks cost nothing next to the L3 store + multicast
+    /// round-trip through HBM it deletes. A split division would leave the tensor
+    /// partitioned across DIFFERENT cores' private scratchpads — unreadable by the
+    /// cores whose slices reference rows another core wrote.
+    ///
+    /// Infallible by construction: no splits exist to validate (the stick-multiple
+    /// guards of [`Self::divide`] apply to splits, and the per-dim extents keep
+    /// their downstream `DeviceTileLayout` validation).
+    pub fn replicate(dims: &[ItDim]) -> WorkPlan {
+        WorkPlan {
+            dims: dims.to_vec(),
+            splits: BTreeMap::new(),
+            cores: CoresUsed(MAX_CORES),
+        }
     }
 
     /// `≤ N` cores used (witness (b) by type).
@@ -1364,6 +1391,46 @@ pub enum OpFunc {
     Sum,
     Max,
     Mean,
+    /// ⭐ `exx2` — the machine's OWN fused `mean(x²)` reduce: the same `summeanmaxexx2.ddl` template
+    /// [`Mean`] rides (its `%exx2_op` bind, `:50`), computing the square INSIDE the reduce's SFP
+    /// accumulate loop (`SFP_FMA src0=lxlu src1=lxlu src2=R4`, exx2_fwd.smc) so `x` is read ONCE and
+    /// no `x²` intermediate is written to memory. Replaces the `x·x` pointwise + `mean` reduce pair
+    /// (our `rmsq` + `rmmean`) — the vendor's inductor does exactly this fusion (their sdsc fixture
+    /// `ddc/ddl_templates/test/sdsc_exx2.json` is a `mean_2-Exx2` node with the SAME `[data, accum] →
+    /// [accum]` operand shape our reduce emits).
+    ///
+    /// ⭐ BOTH MOMENTS, ONE OP. The op computes `E[x]` AND `E[x²]` and writes them as TWO
+    /// half-stick values (`ElementArrangement.EXX2`, torch-spyre constants.py: "a
+    /// reduction mode (two values per stick)"): row i's E[x] at stick elements [0..8), E[x²] at
+    /// elements [8..16). The vendor's own write of the second value AND their read-back of it
+    /// (cross-chunk accumulation) both carry `stick_replicated_dim_offset_elements=8`
+    /// (summeanmaxexx2.ddl:625/:192), and their layernormscale reads it at the same offset
+    /// (layernormscale_32.ddl:75) — the map is the DDL's, not inferred. The RMS tail IGNORES the
+    /// E[x] half (computed and unread — the plain op always produces both) and reads the E[x²]
+    /// half's first element with a one-element view step ([`crate::emit::In::col_at`] +
+    /// `DevOff::from_view_step(8)`): `rsqrt(E[x²]+eps)·γ` is RMS norm's exact math either way.
+    /// ⚠ THAT VIEW STEP IS LX-ONLY: a sub-stick offset on a collapsed stick dim survives the
+    /// compile chain only when the operand is LX-pinned (`BundleLayout::synth_lx`) — on HBM the
+    /// L3 EBR floors it to the stick base and the reader's 2bsplat reads element 0 instead
+    /// (silently wrong, green bake — the failure mode this chain's first three card runs hit).
+    /// See [`crate::placement::LxAlloc`] for the measured details.
+    ///
+    /// ⛔ THE WIRE FORM: opFuncName is `"exx2"` — the ONLY runtime-supported spelling (the one
+    /// updatelibrary.cpp's `libMapping` resolves to `exx2_fwd.smc`). The `useZeroMean` constant
+    /// must be the RAW integer **0**: at 1, ddc rewrites the name to `exx2_zeromean`
+    /// (ddcv1.cpp:2072) — a DISTINCT `OpFuncs` enum (arch_enums.cpp:395) with NO `libMapping`
+    /// entry, so the runtime's `libMapping.at()` throws on the miss and the op executes as
+    /// garbage (green bake, degenerate output — measured on card 2026-10-10). The vendor's
+    /// production lowering never emits 1 (decompositions.py:1038 passes `False`; the golden
+    /// fixture carrying 1, `sdsc_exx2.json`, is compile-tested only). The scale
+    /// (`exx2scale` = 1/N, SEN169) is read by the
+    /// template's setup (`sum_max_exx2_fwd.cpp:246`, `& 0xFFFF` → `@outDivisor@`) the same way
+    /// `scaling_factor` feeds `mean` — see [`OpInfo::Exx2Scale`].
+    ///
+    /// ⛔ fp16 ONLY: the ddl template binds `%type_fp16` exclusively — there is no fp32 exx2 (the
+    /// mq>1 fp32 `mean(x²)` island keeps its elementary chain). Guarded at build time in
+    /// `reduce_opspec_df`.
+    Exx2,
     /// `identity` — an elementwise copy (sfp unit). Used by in-bundle attention to
     /// GQA-replicate the new chunk's K/V (nkvh→nqh heads) via sliced-read /
     /// offset-write copies, and as a generic relayout/move.
@@ -1478,6 +1545,11 @@ impl OpFunc {
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",
+            // The ONLY runtime-supported spelling: plain `exx2` maps to OpFuncs::EXX2 →
+            // exx2_fwd.smc (updatelibrary.cpp's libMapping). The `exx2_zeromean` spelling ddc
+            // rewrites to at useZeroMean=1 is a distinct enum with NO smc-table entry — see
+            // the variant's doc for the full chain of evidence.
+            OpFunc::Exx2 => "exx2",
             OpFunc::Identity => "identity",
             OpFunc::Maximum => "maximum",
             OpFunc::Minimum => "minimum",
@@ -1847,6 +1919,17 @@ pub struct ArgView<'a> {
 }
 
 impl AnyTensorArg {
+    /// The arg's device-buffer NAME (rank-erased read) — the key the layout's LX-residency
+    /// consult looks the tensor up by.
+    pub fn arg_name(&self) -> &str {
+        match self {
+            AnyTensorArg::R1(t) => &t.name,
+            AnyTensorArg::R2(t) => &t.name,
+            AnyTensorArg::R3(t) => &t.name,
+            AnyTensorArg::R4(t) => &t.name,
+        }
+    }
+
     /// Rank-erased [`TensorArg::with_row_blocked`] setter.
     pub fn set_row_blocked(&mut self, rb: bool) {
         match self {
@@ -1865,6 +1948,20 @@ impl AnyTensorArg {
             AnyTensorArg::R2(t) => t.df = df,
             AnyTensorArg::R3(t) => t.df = df,
             AnyTensorArg::R4(t) => t.df = df,
+        }
+    }
+
+    /// Set the residency on the wrapped arg (rank-erased). The one door for the layout-keyed LX
+    /// consult ([`crate::emit`]'s `apply_lx_residency`): a tensor's residency is decided by its NAME
+    /// in the [`crate::placement::BundleLayout`] — the same name-keyed authority that resolves its
+    /// address — so an operand declared LX-resident there is flipped here rather than by every
+    /// builder growing a residency parameter. Byte-identical for every HBM tensor.
+    pub fn set_allocation(&mut self, allocation: Allocation) {
+        match self {
+            AnyTensorArg::R1(t) => t.allocation = allocation,
+            AnyTensorArg::R2(t) => t.allocation = allocation,
+            AnyTensorArg::R3(t) => t.allocation = allocation,
+            AnyTensorArg::R4(t) => t.allocation = allocation,
         }
     }
 
@@ -2090,6 +2187,20 @@ pub enum OpInfo {
     /// MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
     /// The value is the raw IEEE_FP32 bits (`f32::to_bits`).
     ReduceScalingFp32(u32),
+    /// The TWO named external constants the `exx2` reduce requires (same writer contract as
+    /// [`OpInfo::ReduceScaling`], one entry per name — the ddl reaches them via
+    /// `get_external_constant`):
+    ///
+    /// * `exx2scale` = 1/N — the reduce's own divisor, the twin of `mean`'s `scaling_factor`
+    ///   (`sum_max_exx2_fwd.cpp:246` reads it as `& 0xFFFF` → `@outDivisor@`, the SFP register the
+    ///   `E[x²]` outputs are multiplied by). The value is the single SEN169 word
+    ///   (`sen169_bits(1/cols) as u32`).
+    /// * `useZeroMean` = 0 — the RAW integer, NOT a sen169-encoded value: ddcv1.cpp:2072
+    ///   compares the data word `== 1` to rewrite the opFuncName to `exx2_zeromean`, a name
+    ///   the runtime's smc table cannot resolve (`libMapping.at()` throw — see
+    ///   [`OpFunc::Exx2`]'s doc for the card-measured failure). 0 is the vendor's own
+    ///   production spelling (decompositions.py:1038 passes `False`).
+    Exx2Scale(u32),
     /// A SECOND `computeOp_` entry chained onto this (matmul) op's own PE/SFP-resident output,
     /// mirroring IBM's own golden fixture (`sdsc_bmm_lxopt.json`'s `MatMul_122`: `batchmatmul` +
     /// `biasadd`, the second reading AND writing the first's own output labeled-ds in place).

@@ -77,6 +77,13 @@ fn opfunc_names_are_dxp_recognized() {
         "abs",
         "maximum",
         "minimum",
+        // The fused exx2 reduce head (rmsnorm). Evidence: registered in the dd2 sysconfig's op
+        // array (multi_sentient_dd2_sysconfig.json — the same list that carries sum/max/mean and
+        // our card-proven quantscalepertokenfp8), plus the vendor's own compiled fixture
+        // ddc/ddl_templates/test/sdsc_exx2.json. NOTE dscdefn.cpp's computeTypeToString is the
+        // INTERNAL ComputeOpType namespace (fmul/reduce/exx2_32_p1/…) — "mean"/"sum"/"max" are not
+        // in it either; the sysconfig array is the opFuncName registry.
+        "exx2",
     ];
     // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY THE FOUR ABOVE COULD GO MISSING. `OpFunc` has 27
     // variants; this loop names 21. A new variant is NOT an E0004 here, so it joins the emitter
@@ -109,6 +116,7 @@ fn opfunc_names_are_dxp_recognized() {
         OpFunc::Abs,
         OpFunc::Maximum,
         OpFunc::Minimum,
+        OpFunc::Exx2,
     ] {
         assert!(
             RECOGNIZED.contains(&f.name()),
@@ -220,9 +228,11 @@ fn reduce_and_multiop_invariants() {
         "scaling_factor must be a 16-bit fp16 word, got {val:#x}"
     );
 
-    // multi-op (RMSNorm 6-op): EVERY op's coreIdToDsc_ matches its numCoresUsed_.
+    // multi-op (RMSNorm 5-op): EVERY op's coreIdToDsc_ matches its numCoresUsed_. The chain's HEAD
+    // is now the device's own fused `exx2` reduce (the vendor layernorm head borrowed for RMS —
+    // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
-    for op in assemble_rmsnorm(
+    let ops = assemble_rmsnorm(
         "g",
         64,
         576,
@@ -232,7 +242,13 @@ fn reduce_and_multiop_invariants() {
         "eps",
         &mut sym,
         None,
-    ) {
+    );
+    assert_eq!(ops.len(), 5, "the exx2 head fuses rmsq+rmmean: 6 ops → 5");
+    assert!(
+        ops.iter().all(|o| o.op_name != "rmsq_g"),
+        "the x² pointwise is GONE — the square happens inside the reduce"
+    );
+    for op in &ops {
         let jo: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&op.op).unwrap()).unwrap();
         let nc = jo["numCoresUsed_"].as_u64().unwrap();
@@ -243,6 +259,227 @@ fn reduce_and_multiop_invariants() {
             op.op_name
         );
     }
+    // The head's WIRE FORM. The vendor's own compiled fixture
+    // (ddc/ddl_templates/test/sdsc_exx2.json) carries useZeroMean=1 — but it is compile-tested
+    // only (its RUN line is `ddl_standalone`, no execution), and 1 is NOT a runnable value:
+    //   * opFuncName "exx2" is the ONLY runtime-supported spelling — it is what
+    //     updatelibrary.cpp's libMapping resolves to exx2_fwd.smc. A useZeroMean of 1 makes ddc
+    //     rewrite the name to `exx2_zeromean` (ddcv1.cpp:2072), a DISTINCT OpFuncs enum with NO
+    //     libMapping entry — the runtime's `libMapping.at()` throws on the miss and the op
+    //     executes as garbage (green bake, degenerate text; measured on card 2026-10-10). The
+    //     vendor's production lowering never emits 1 (decompositions.py:1038 passes `False`);
+    //   * constantInfo_ carries BOTH named consts: `exx2scale` (SEN169 bits of 1/cols — the fixture's
+    //     own word for a 4096-wide input is 9728 = sen169(2⁻¹²), and summeanmaxexx2.ddl requires the
+    //     external const by name or ddc DT_ERRORs "Missing external constant in DSC") and
+    //     `useZeroMean` (the RAW integer 0 — NOT a sen169-encoded value, because ddcv1 compares
+    //     == 1; the vendor's production spelling).
+    let head = ops.first().expect("the exx2 head is the chain's first op");
+    assert_eq!(head.op_name, "rmmean_g");
+    let jh: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&head.op).unwrap()).unwrap();
+    assert_eq!(
+        jh["dscs_"][0]["rmmean_g"]["computeOp_"][0]["opFuncName"], "exx2",
+        "the head must emit the plain spelling — the only name the runtime smc table resolves"
+    );
+    let ci = jh["dscs_"][0]["rmmean_g"]["constantInfo_"]
+        .as_object()
+        .expect("the exx2 head carries its two named consts (summeanmaxexx2.ddl)");
+    let const_word = |name: &str| -> u64 {
+        ci.values()
+            .find(|c| c["name_"] == name)
+            .unwrap_or_else(|| panic!("exx2 constantInfo_ must carry {name}"))
+            ["data_"]["data_"]["[0, 0, 0]"][0]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{name}'s fold-manager word (decimal string at [0, 0, 0])"))
+    };
+    assert!(
+        const_word("exx2scale") <= 0xFFFF,
+        "exx2scale must be a single 16-bit sen169 word"
+    );
+    assert_eq!(
+        const_word("useZeroMean"),
+        0,
+        "useZeroMean must stay the RAW integer 0 — at 1 ddc renames the op to exx2_zeromean, \
+         which the runtime's libMapping.at() cannot resolve (card-measured garbage)"
+    );
+    // The E[x²] LANE READ — the address half of the wire contract. The exx2 output's two
+    // half-stick values sit at elements [0..8) (E[x]; computed and unread) and [8..16)
+    // (E[x²]) — the vendor's own write AND cross-chunk read-back of the second value both carry
+    // `stick_replicated_dim_offset_elements=8` (summeanmaxexx2.ddl:625/:192), and their
+    // layernormscale reads it at the same offset (layernormscale_32.ddl:75). So the tail must
+    // read rinv at ELEMENT 8: rmxn's rinv operand startAddr = rinv's own base + 8·2B. The first
+    // card run of this chain read element 1 instead — the E[x] half, ≈0 for a signed activation
+    // row, so the norm multiplied by rsqrt(E[x]+eps) and the model emitted degenerate text. This
+    // delta is the build-time pin on that failure class.
+    let tensor1_addr = |op_idx: usize| -> u64 {
+        let jo: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ops[op_idx].op).unwrap()).unwrap();
+        let name = &ops[op_idx].op_name;
+        jo["dscs_"][0][name.as_str()]["scheduleTree_"][1]["startAddressCoreCorelet_"]["data_"]
+            ["[0, 0, 0]"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{name}'s Tensor1 startAddr (decimal string)"))
+    };
+    // rmrsqrt's Tensor1 is rinv at its own base; rmxn's Tensor1 is the SAME synth read at the
+    // lane offset. ops: [rmmean, rmeps, rmrsqrt, rmxn, rmg].
+    assert_eq!(
+        tensor1_addr(3) - tensor1_addr(2),
+        8 * FP16_BYTES,
+        "rmxn must read rinv at element 8 — the exx2 output's E[x²] half-stick"
+    );
+}
+
+// ── PINNED-LX rinv — the residency half of the lane-read contract. The `+16B` element-8 read
+//    only survives the compile chain when rinv is LX-pinned (`BundleLayout::synth_lx`): on HBM
+//    the L3 EBR floors a sub-stick offset to the stick base and the reader's 2bsplat reads
+//    element 0 (rsqrt(E[x]+eps), a saturated constant — the green-bake garbage of the first
+//    three card runs). An LX allocate is byte-granular end-to-end, so the offset lands
+//    BYTE-exact. This pins the wire shape that mechanism emits.
+#[test]
+fn rmsnorm_rinv_is_pinned_lx() {
+    use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, SegRole, TensorPlacement};
+    use scratchy_target_spyre::bundle_code::PlaceId;
+
+    // A minimal layout holding the chain's real operands (x / gamma / eps / out), so
+    // `resolve_seg_base` finds placements for them and the chain's own synth declarations
+    // (Mean/Meps/Xn in seg3; rinv in the pinned-LX region) fill the rest.
+    fn layout_for(rows: u32, cols: u32) -> BundleLayout {
+        let mut l = BundleLayout::default();
+        let place = |l: &mut BundleLayout, tid: u32, size: u64| {
+            l.ids
+                .borrow_mut()
+                .insert(format!("t{tid}"), PlaceId::Act(tid));
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Intermediate,
+                    segment: 0,
+                    bank: 0,
+                    offset: 0,
+                    size,
+                },
+            );
+        };
+        let xy = rows as u64 * cols as u64 * FP16_BYTES;
+        place(&mut l, 1, xy); // x
+        place(&mut l, 2, cols as u64 * FP16_BYTES); // gamma [1, cols]
+        place(&mut l, 3, 64 * FP16_BYTES); // eps [1, stick]
+        place(&mut l, 7, xy); // out
+        l
+    }
+    let run = |rows: u32| -> Vec<emit::EmittedOp> {
+        let l = layout_for(rows, 576);
+        let mut sym = 0i64;
+        assemble_rmsnorm(
+            "g",
+            rows,
+            576,
+            "t1",
+            "t2",
+            PlaceId::Act(7),
+            "t3",
+            &mut sym,
+            Some(&l),
+        )
+    };
+    let json_of = |op: &emit::EmittedOp| -> (String, serde_json::Value) {
+        (
+            op.op_name.clone(),
+            serde_json::from_str(&serde_json::to_string(&op.op).unwrap()).unwrap(),
+        )
+    };
+    let alloc = |j: &serde_json::Value, dsc: &str, idx: usize| {
+        j["dscs_"][0][dsc]["scheduleTree_"][idx].clone()
+    };
+
+    // ── m>1 (rows=64): the producer REPLICATES and the reader's slice corner folds ──
+    let ops = run(64);
+    assert_eq!(ops.len(), 5, "same 5-op chain under a layout");
+    let (w_name, wj) = json_of(&ops[2]); // rmrsqrt — rinv's producer
+    assert_eq!(w_name, "rmrsqrt_g");
+    assert_eq!(
+        wj["numCoresUsed_"].as_u64(),
+        Some(MAX_CORES as u64),
+        "an LX-resident output's producer REPLICATES across all cores"
+    );
+    assert_eq!(
+        wj["coreIdToDsc_"].as_object().unwrap().len(),
+        MAX_CORES as usize
+    );
+    assert!(
+        wj["numWkSlicesPerDim_"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.as_u64() == Some(1)),
+        "a replicated plan carries NO work-division splits"
+    );
+    // The allocate: an `lx` component at the PIN, same byte on every core.
+    let node = alloc(&wj, "rmrsqrt_g", 1);
+    assert_eq!(node["name_"], "allocate-Tensor1_lx");
+    assert_eq!(node["component_"], "lx");
+    for (k, v) in node["startAddressCoreCorelet_"]["data_"]
+        .as_object()
+        .unwrap()
+    {
+        assert_eq!(
+            v.as_str(),
+            Some(LX_PIN_BASE.to_string().as_str()),
+            "rmrsqrt's rinv pin must be the LX base on every core ({k})"
+        );
+    }
+    // The lds: lx-ONLY residency — no HBM copy exists, so no L3 movement is generated.
+    let rinv_lds = wj["dscs_"][0]["rmrsqrt_g"]["labeledDs_"][1]["memOrg_"].clone();
+    assert!(rinv_lds.get("lx").is_some(), "rinv memOrg_ carries lx");
+    assert!(
+        rinv_lds.get("hbm").is_none(),
+        "rinv memOrg_ must NOT carry hbm — an HBM residency would stage it through the \
+         stick-granular L3 path that floors the lane read away"
+    );
+    // The reader (rmxn, mb-split 32-way at rows=64): rinv at pin + 16, and its per-core
+    // slice corner advances by one row-group — the same fold HBM addressing uses, on the
+    // per-core private copy the replicated producer wrote.
+    let (r_name, rj) = json_of(&ops[3]);
+    assert_eq!(r_name, "rmxn_g");
+    let rnode = alloc(&rj, "rmxn_g", 1);
+    assert_eq!(rnode["component_"], "lx");
+    let pin_str = |s: u64| s.to_string();
+    assert_eq!(
+        rnode["startAddressCoreCorelet_"]["data_"]["[0, 0, 0]"].as_str(),
+        Some(pin_str(LX_PIN_BASE + 8 * FP16_BYTES).as_str()),
+        "rmxn reads rinv at pin + element-8 byte offset (the E[x²] lane)"
+    );
+    assert_eq!(
+        rnode["startAddressCoreCorelet_"]["data_"]["[1, 0, 0]"].as_str(),
+        Some(pin_str(LX_PIN_BASE + 8 * FP16_BYTES + 2 * 64 * FP16_BYTES).as_str()),
+        "core 1's rinv corner = its 2-row work slice (2 rows × one stick) past the pin"
+    );
+
+    // ── m=1 (decode, the lever's bucket): the reader is out-split, its rinv corner is 0 —
+    //    every reader core reads pin+16 out of its OWN private copy ──
+    let ops1 = run(1);
+    let (_, rj1) = json_of(&ops1[3]);
+    let rnode1 = alloc(&rj1, "rmxn_g", 1);
+    for (k, v) in rnode1["startAddressCoreCorelet_"]["data_"]
+        .as_object()
+        .unwrap()
+    {
+        assert_eq!(
+            v.as_str(),
+            Some(pin_str(LX_PIN_BASE + 8 * FP16_BYTES).as_str()),
+            "at m=1 every reader core reads the SAME pinned lane ({k})"
+        );
+    }
+    let (_, wj1) = json_of(&ops1[2]);
+    assert_eq!(
+        wj1["numCoresUsed_"].as_u64(),
+        Some(MAX_CORES as u64),
+        "the m=1 producer replicates too (a 1-core producer would leave cores 1..31 \
+         reading an empty scratchpad)"
+    );
 }
 
 // ── SLICE operand (RoPE prerequisite, proven on-card SLICE_RC=0 2026-06-25): a
@@ -771,9 +1008,9 @@ fn dump_gate_bundles() {
     );
     eprintln!("→ BAKING broadcast-mul gate: time={}", bc.time);
     superdsc::write_dxp_input(&root.join("bcast"), &[bc], superdsc::FoldGrouping::Split).unwrap();
-    // (D) RMSNORM gate: the full 6-op decomposition (IBM spyre_rms_norm) over
-    //     [m=64, hidden=576] (SmolLM2 hidden). Tests the multi-op + broadcast chain
-    //     (reduce→add(eps)→rsqrt→broadcast-mul) on-card.
+    // (D) RMSNORM gate: the full 5-op decomposition (the vendor's spyre_rms_norm formula with the
+    //     device's own fused `exx2` head) over [m=64, hidden=576] (SmolLM2 hidden). Tests the
+    //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;
     let rms = assemble_rmsnorm(
         "gate",

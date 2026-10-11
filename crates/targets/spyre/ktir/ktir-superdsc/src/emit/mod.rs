@@ -166,16 +166,21 @@ fn per_core_addr(
     cores: u32,
 ) -> Result<Vec<u64>, SuperDscError> {
     let cores = cores.max(1);
-    // LX residency is core-local — every core shares the base (reference parity).
-    if view.allocation.is_lx() {
-        let base = intra_base; // LX uses a scratchpad-local offset, no segment.
-        return Ok(vec![base; cores as usize]);
-    }
-    // `seg_base` is the RESOLVED HBM segment base for this tensor — the GLOBAL
-    // role-segment from the BundleLayout (task #55) when the walk supplies one,
-    // else the per-op `segment_base(arg_index)` fallback (single-op fixtures). The
-    // per-core work-slice offset is added on top.
-    let base = seg_base + intra_base;
+    // LX residency is core-local: there is no HBM segment base to add, but the per-core slice
+    // CORNER fold below still applies. A replicated producer ([`WorkPlan::replicate`]) walks the
+    // whole tensor from the pin in EVERY core's private copy; a consumer's own slice corner then
+    // selects its rows inside its core's copy — the SAME corner arithmetic as HBM, minus the
+    // segment. (The old early return here handed every core the bare base: only the corner-0
+    // case, correct at decode m=1 but silently row-0-pinning for a split consumer at m>1.)
+    let base = if view.allocation.is_lx() {
+        intra_base // LX uses a scratchpad-local pinned offset, no segment.
+    } else {
+        // `seg_base` is the RESOLVED HBM segment base for this tensor — the GLOBAL
+        // role-segment from the BundleLayout (task #55) when the walk supplies one,
+        // else the per-op `segment_base(arg_index)` fallback (single-op fixtures). The
+        // per-core work-slice offset is added on top.
+        seg_base + intra_base
+    };
 
     // The per-core start address is the device offset of the core's work-slice CORNER
     // under the SHARED device model `dev_off` — the SAME model that produces the DSC
@@ -1229,6 +1234,38 @@ pub fn pointwise_chunk_out_offset(cols_start: u32) -> u32 {
     cols_start
 }
 
+/// ⭐ THE NAME-KEYED LX-RESIDENCY CONSULT — the pointwise door's residency rewrite, run on the
+/// freshly-built [`OpSpec`] before emission. A tensor's residency is a property of the TENSOR
+/// (decided where its name is minted, `BundleLayout::synth_lx`), not of any one op view, so the
+/// consult is by NAME against the layout — the SAME authority that resolves its address — rather
+/// than a builder parameter every pointwise caller would have to thread and agree on.
+///
+/// Two rewrites, one law each:
+///   * every operand whose name is LX-pinned gets [`Allocation::Lx`] (its `memOrg_` becomes
+///     lx-only, its allocate becomes an `lx` component at the pin — no L3 movement is generated
+///     for it);
+///   * an op whose OUTPUT is LX-pinned gets a REPLICATED plan ([`WorkPlan::replicate`]): LX is
+///     per-core private, so the only copy a consumer on core c can read is the one core c's own
+///     producer pass wrote. A split producer would partition the tensor across different cores'
+///     scratchpads, unreadable where the consumers' slices point.
+///
+/// A no-op (and byte-identical emission) for every bundle that declares no LX intermediates.
+fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
+    let Some(l) = layout else { return };
+    for a in op.args.iter_mut() {
+        if l.lx_pin(a.arg_name()).is_some() {
+            a.set_allocation(Allocation::Lx);
+        }
+    }
+    if op
+        .args
+        .last()
+        .is_some_and(|o| l.lx_pin(o.arg_name()).is_some())
+    {
+        op.iter = WorkPlan::replicate(op.iter.dims());
+    }
+}
+
 /// [`assemble_pointwise_broadcast`] that writes the output to a COLUMN-BLOCK OFFSET
 /// (`out_offset` elements into the output tensor) — see [`pointwise_chunk_out_offset`].
 #[allow(clippy::too_many_arguments)]
@@ -1288,7 +1325,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
             Fp16::ELEMS_PER_STICK,
         );
     }
-    let op = pointwise_broadcast_opspec(
+    let mut op = pointwise_broadcast_opspec(
         op_func_from_str(op_func),
         rows,
         cols,
@@ -1298,6 +1335,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
         head_major,
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"))
@@ -2209,9 +2247,55 @@ fn resolve_seg_base(
     offset_elems: u32,
     arg_bytes: u64,
     df: Df,
+    lane_read: bool,
 ) -> Result<(u64, u64), SuperDscError> {
     let slice = offset_elems as u64 * df.word_length() as u64; // 4 B for fp32, 1 B fp8/int8, else 2 B fp16
+    // The footprint guard's WINDOW END — the last byte this access can touch.
+    //
+    // The default models the access as the operand's whole materialized block at `+slice`: right
+    // for every BLOCK-base offset (stick-multiples — RoPE's half-slices, the per-head attention
+    // `col_at` bases), where the offset genuinely shifts the block.
+    //
+    // ⭐ A `lane_read` is the OTHER addressing shape: a SUB-STICK offset on a COLLAPSED stick dim
+    // (the RedStick stride-0 out-broadcast fold). The fold makes every out-position of the
+    // iteration read the SAME element of the operand's one materialized stick per row, so the
+    // offset addresses a LANE WITHIN each row's stick (exx2's E[x²] pair slot at element 8, read
+    // by rmsnorm's `rmxn`) — it does NOT shift the block. The touched set is one word per
+    // materialized row at `row_base + slice`; its last byte is `arg_bytes − stick + slice + word`
+    // (the block's last row's lane), NOT `slice + arg_bytes` (which shifts EVERY row and overshoots
+    // the last row by the offset — a false positive against a footprint the access never leaves).
+    // Block offsets keep the default model, so this branch is unreachable for every emission that
+    // existed before the first lane read.
+    let word = df.word_length() as u64;
+    let stick = df.elems_per_stick() as u64 * word;
+    let window_end = if lane_read {
+        arg_bytes.max(1).saturating_sub(stick) + slice + word
+    } else {
+        slice + arg_bytes.max(1)
+    };
     if let Some(l) = layout {
+        // 0. PINNED-LX residency — the name-keyed consult, before any HBM placement. An
+        //    LX-resident intermediate's address is its PIN (byte-granular, allocated by
+        //    `BundleLayout::synth_lx`), so resolve to segment 0 + pin and let
+        //    `per_core_addr` fold the per-core slice corner on top. This arm is the ONLY
+        //    place a sub-stick offset on a collapsed stick dim (the `rinv` lane read at
+        //    element 8) survives to the wire BYTE-exact: the HBM path's L3 staging is
+        //    stick-granular (the EBR floors the +16 away and the reader's 2bsplat reads
+        //    the landing stick base at imm 0 — element 0 — silently wrong), while an LX
+        //    allocate is byte-granular end-to-end (bake-verified: the +16 lands in the
+        //    compiled reader's lxlu register).
+        if let Some((pin, fp)) = l.lx_pin(name) {
+            if window_end > fp {
+                return Err(SuperDscError(format!(
+                    "lx-resident '{name}': access window end {window_end}B (offset {slice}B, \
+                     operand {arg_bytes}B) exceeds its pinned-LX footprint {fp}B — shape \
+                     mismatch (the access would run past the pin into the next pinned \
+                     intermediate). Fix the declared shape (BundleLayout::synth_lx) or the \
+                     op's view/offset."
+                )));
+            }
+            return Ok((0, pin + slice));
+        }
         // 1. A real caller-bound buffer → its global placement. The id comes from the layout's own
         //    mint table, NOT from picking the digits back out of the spelling.
         if let Some(crate::place::PlaceId::Act(tid)) = l.id_of(name)
@@ -2223,12 +2307,13 @@ fn resolve_seg_base(
             // cache every layer of every step for weeks before a bus fence. Compared against the
             // 128-B GRANULE the device reads in, so a sub-granule broadcast const (the `[1,1]`
             // scale) is not a false positive.
-            if slice + arg_bytes.max(1) > align128(p.size).max(128) {
+            if window_end > align128(p.size).max(128) {
                 return Err(SuperDscError(format!(
-                    "t{tid}: access offset {slice}B + {arg_bytes}B exceeds its placement \
-                         footprint {}B (seg{}) — the op addresses PAST its own tensor and would \
-                         alias whatever is placed next. The offset arithmetic and the placement must \
-                         come from the SAME layout authority.",
+                    "t{tid}: access window end {window_end}B (offset {slice}B, operand \
+                         {arg_bytes}B) exceeds its placement footprint {}B (seg{}) — the op \
+                         addresses PAST its own tensor and would alias whatever is placed next. \
+                         The offset arithmetic and the placement must come from the SAME layout \
+                         authority.",
                     p.size, p.segment
                 )));
             }
@@ -2278,18 +2363,19 @@ fn resolve_seg_base(
             // write is a SHAPE MISMATCH that would alias the next tensor → `cargo build` Err
             // (the typed-shape contract). This is the principled cure for the under-reservation
             // that aliased sp/spprod/mxp on-card → mxp=0 → softmax overflow → garbage.
-            if slice + arg_bytes.max(1) > fp {
+            if window_end > fp {
                 return Err(SuperDscError(format!(
-                    "synth '{name}': access offset {slice}B + {arg_bytes}B exceeds its declared \
-                     footprint {fp}B — shape mismatch (would alias the next intermediate). Fix the \
-                     declared shape (BundleLayout::synth) or the op's view/offset."
+                    "synth '{name}': access window end {window_end}B (offset {slice}B, operand \
+                     {arg_bytes}B) exceeds its declared footprint {fp}B — shape mismatch (would \
+                     alias the next intermediate). Fix the declared shape (BundleLayout::synth) \
+                     or the op's view/offset."
                 )));
             }
         } else {
             // UNDECLARED synth (rmsnorm/silu decomposition, not yet shape-typed): grow-on-access
             // high-water so a piecewise multi-write still reserves its true footprint (correct,
             // but UNCHECKED — these should be migrated to declared shapes).
-            let end = align128(off + slice + arg_bytes.max(1));
+            let end = align128(off + window_end);
             if end > s.next {
                 s.next = end;
             }
@@ -2309,6 +2395,31 @@ pub fn emit_sdsc(
     let cores = folds.core_fold();
     let views: Vec<ArgView<'_>> = op.args.iter().map(|a| a.view()).collect();
     let out_idx = views.len().saturating_sub(1);
+    // ⭐ AN LX-RESIDENT OUTPUT DEMANDS A REPLICATED PRODUCER — the BACKSTOP for
+    // `apply_lx_residency` (the consult lives in the pointwise door; this guard lives in
+    // the ONE emission path so no future builder can route around it). LX is per-core
+    // private: a consumer on core c reads only the copy core c's own producer pass
+    // wrote, so the producer must run the WHOLE tensor on EVERY core
+    // (`WorkPlan::replicate`: all MAX_CORES, no splits) — and must not be time-tiled
+    // (a trip-sliced producer leaves rows unwritten in most cores' copies).
+    // Violations are a build `Err` naming the law, never silently-unreadable LX bytes.
+    if let Some(v) = views.get(out_idx)
+        && v.allocation.is_lx()
+    {
+        let replicated =
+            op.iter.cores_used().get() == MAX_CORES && op.iter.splits().values().all(|&s| s == 1);
+        if !replicated || op.time_tile.is_some() {
+            return Err(SuperDscError(format!(
+                "op '{op_name}': its LX-resident output '{}' is produced by a non-replicated \
+                 op — an LX-resident tensor must be produced by a REPLICATED op (all \
+                 {MAX_CORES} cores, no work-division splits, no time tiling), because each \
+                 core's LX is private and only holds what its own producer pass wrote. Declare \
+                 the producer through the layout-consulted pointwise door \
+                 (`apply_lx_residency`) or keep the tensor in HBM (`BundleLayout::synth`).",
+                v.name
+            )));
+        }
+    }
     // fp8 W8A8 matmul: a matmul/batchmatmul with an fp8 (SEN143_FP8) NON-OUTPUT operand. The DDL
     // `batchmatmulfp8` kernel (bmm.ddl:55) + its dataflow constraint require a DISTINCT operand layout
     // vs the fp16 kernel (verified against IBM's l0_tethering/fp8_32core_nonmx fixture): the fp8 WEIGHT
@@ -2703,7 +2814,24 @@ pub fn emit_sdsc(
             clamped * v.df.word_length() as u64
         };
         let (seg_base, intra_base) =
-            resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df)?;
+            resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
+                // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
+                // stride-0 fold reads ONE element per materialized row at `row_base + offset`
+                // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
+                // addresses a lane within each row's stick rather than shifting the block. Every
+                // prior offset on a collapsed-stick operand is a stick-MULTIPLE block base (the
+                // per-head attention `col_at` bases), which keeps the default window model — this
+                // fires only for the lane read. See `resolve_seg_base`'s own doc for the window
+                // arithmetic the flag selects.
+                let stick_collapsed = v
+                    .layout
+                    .iter()
+                    .position(|&d| d == v.stick)
+                    .is_some_and(|p| !matches!(v.scale.get(p), Some(Scale::Active) | None));
+                stick_collapsed
+                    && v.offset_elems > 0
+                    && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
+            })?;
         // ── arrangement authority ── record THIS view's device layout for its tensor. If an earlier op
         // addressed the same tensor NON-equivalently (a producer/consumer Dense-vs-stick disagreement, the
         // M>1 scramble), this is a build Err naming the tensor — not silent garbage on-card. Declare only
@@ -2935,6 +3063,7 @@ pub fn emit_sdsc(
             OpInfo::SfpConstTable => sfp_constant_table(folds),
             OpInfo::ReduceScaling(packed) => scaling_factor_const(packed, folds),
             OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits, folds),
+            OpInfo::Exx2Scale(bits) => exx2_consts(bits, folds),
             OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
         }
     };
@@ -4885,6 +5014,10 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "sum" => OpFunc::Sum,
         "max" => OpFunc::Max,
         "mean" => OpFunc::Mean,
+        // The ONLY runtime-supported spelling: plain `exx2` maps to `OpFuncs::EXX2` →
+        // exx2_fwd.smc (updatelibrary.cpp). The `exx2_zeromean` spelling ddc can rewrite to
+        // is a distinct enum with NO smc-table entry — see `exx2_consts`' doc.
+        "exx2" => OpFunc::Exx2,
         "identity" => OpFunc::Identity,
         "maximum" => OpFunc::Maximum,
         "minimum" => OpFunc::Minimum,
@@ -5006,6 +5139,33 @@ fn scaling_factor_const(packed: u32, folds: &SdscFoldSet) -> serde_json::Value {
             "dataFormat_": "SEN169_FP16",
             "name_": "scaling_factor",
             "data_": fold_manager_const(packed, folds)
+        }
+    })
+}
+
+/// The `exx2` reduce's TWO named external constants (`exx2scale` + `useZeroMean`), same
+/// `constantInfo_` shape as [`scaling_factor_const`]. `bits` is the single SEN169 word of 1/N
+/// (the reduce's divisor); `useZeroMean` is the RAW integer 0 — the vendor's own production
+/// spelling (their `lower_exx2` passes `False`, lowering.py:667) — NOT a sen169-encoded value.
+/// ⛔ IT MUST STAY 0: ddcv1.cpp:2072 rewrites the opFuncName to `exx2_zeromean` when the const
+/// compares `== 1`, and that REWRITTEN name is a distinct `OpFuncs` enum value
+/// (arch_enums.cpp:395) with NO entry in the runtime's op→smc table (updatelibrary.cpp has
+/// `EXX2` only, resolved via `libMapping.at()` — a throw on miss). The ZeroMean path is
+/// compile-tested by the vendor's own fixtures but never run: their models all emit 0. The
+/// first card run of this chain with 1 produced degenerate output with a green bake — the
+/// exact silent-failure shape a table miss leaves behind. See
+/// [`crate::superdsc_opspec::OpInfo::Exx2Scale`].
+fn exx2_consts(bits: u32, folds: &SdscFoldSet) -> serde_json::Value {
+    serde_json::json!({
+        "0": {
+            "dataFormat_": "SEN169_FP16",
+            "name_": "exx2scale",
+            "data_": fold_manager_const(bits, folds)
+        },
+        "1": {
+            "dataFormat_": "SEN169_FP16",
+            "name_": "useZeroMean",
+            "data_": fold_manager_const(0, folds)
         }
     })
 }

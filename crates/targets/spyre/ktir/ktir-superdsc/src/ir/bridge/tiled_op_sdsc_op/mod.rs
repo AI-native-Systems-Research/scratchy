@@ -1,5 +1,6 @@
 //! Bridge 3: `TiledOp -> SdscOp`. This is where composite-op decomposition legitimately belongs
-//! (RmsNorm's 6-op form, RoPE's rotate+xc+rs+add, AttnDecode's fused attention): the schedule must
+//! (RmsNorm's 5-op form with the fused `exx2` head, RoPE's rotate+xc+rs+add, AttnDecode's fused
+//! attention): the schedule must
 //! be decided FIRST against the whole composite `TileOp` (Bridge 2), and only THEN does
 //! decomposition into concrete `SdscOp`s happen, informed by that schedule.
 //!
