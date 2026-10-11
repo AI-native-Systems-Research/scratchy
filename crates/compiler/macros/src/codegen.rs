@@ -2007,8 +2007,9 @@ pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// Runtime RMSNorm gain offset for zero-centered (Gemma-style) norms.
 /// When the config sets `"rms_norm_zero_centered": true` (Gemma2/3,
 /// Qwen3.5/3.6/Next — input/post/final layernorms + per-head q/k norm
-/// store gains zero-centered, effective gain `1 + weight`), the standard
-/// `RmsNorm` / `FusedAddRmsNorm` metal kernels fold `weight + 1.0`. The
+/// store gains zero-centered, effective gain `1 + weight`), every RMSNorm
+/// op carries it in its gain convention (`to_wavefront`'s `RmsNorm` arm) and
+/// `NORM_WEIGHT_OFFSET` bakes it for the kernels that read no convention. The
 /// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
@@ -7507,20 +7508,44 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
     })
 }
 
-/// The model reads or writes a paged KV cache (encoders and vision towers
-/// don't).
-pub fn fuf_uses_kv_cache(fuf: &Fuf) -> bool {
-    fuf.nodes.iter().any(|n| {
-        n.inputs.iter().any(|i| {
-            matches!(
-                i,
+/// The layers whose ops read or write the paged KV cache, ascending: every layer of a uniform
+/// decoder, a recurrent hybrid's attention layers only (its Mamba / Gated-DeltaNet layers hold
+/// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors and
+/// the TurboQuant threshold counts their bytes.
+pub struct KvCacheLayers(Vec<u32>);
+
+impl KvCacheLayers {
+    /// The layer index of every `kv_cache[layer]` the unrolled graph names.
+    pub fn of(fuf: &Fuf) -> Self {
+        let layers: std::collections::BTreeSet<u32> = fuf
+            .nodes
+            .iter()
+            .flat_map(|n| &n.inputs)
+            .filter_map(|i| match i {
                 crate::fuf::FufInput::Extern {
                     kind: crate::classified::ExternKind::KvCache,
-                    ..
-                }
-            )
-        })
-    })
+                    index,
+                } => Some(index.map_or(0, |l| u32::try_from(l.0).expect("a u32 layer index"))),
+                _ => None,
+            })
+            .collect();
+        Self(layers.into_iter().collect())
+    }
+
+    /// The model reads or writes a paged KV cache at all.
+    pub fn any(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// How many layers hold KV.
+    pub fn count(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The layers, when they are not all `num_hidden_layers` of them (nor none).
+    pub fn proper_subset(&self, num_hidden_layers: usize) -> Option<&[u32]> {
+        (self.any() && self.count() < num_hidden_layers).then_some(self.0.as_slice())
+    }
 }
 
 /// The model's KV codec. TurboQuant under the `turboquant` feature, on metal
@@ -7530,7 +7555,7 @@ fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
-    uses_kv_cache: bool,
+    kv_layers: &KvCacheLayers,
     bits: scratchy_forward_compiler::TqBits,
 ) -> scratchy_forward_compiler::KvCodec {
     #[cfg(all(feature = "turboquant", feature = "metal"))]
@@ -7538,12 +7563,12 @@ fn kv_codec_for(
         use scratchy_ir::{DenseReason, KvGeometry, codec_for};
         let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
         let geometry = KvGeometry {
-            num_layers: bound("num_hidden_layers"),
+            num_layers: kv_layers.count(),
             num_kv_heads: bound("num_key_value_heads"),
             head_dim,
             global_head_dim,
             latent: bound("kv_lora_rank") > 0,
-            has_kv_cache: uses_kv_cache,
+            has_kv_cache: kv_layers.any(),
         };
         match codec_for(geometry, bits) {
             Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
@@ -7560,7 +7585,7 @@ fn kv_codec_for(
     }
     #[cfg(not(all(feature = "turboquant", feature = "metal")))]
     {
-        let _ = (model, head_dim, global_head_dim, uses_kv_cache, bits);
+        let _ = (model, head_dim, global_head_dim, kv_layers, bits);
         scratchy_forward_compiler::KvCodec::Dense
     }
 }
@@ -7569,7 +7594,7 @@ fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
     uses_rotary: bool,
-    uses_kv_cache: bool,
+    kv_layers: &KvCacheLayers,
     // Filled with the SAME values the impl's consts are emitted from —
     // one derivation, two consumers (the impl tokens and the macro-side
     // tape bake). Built in this fn so drift is impossible.
@@ -8048,7 +8073,7 @@ fn emit_canonical_params_impl(
             .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
         scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
     };
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, uses_kv_cache, tq_bits);
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
     let kv_codec_tokens = match kv_codec {
         scratchy_forward_compiler::KvCodec::Dense => {
             quote! { ::scratchy_forward_compiler::KvCodec::Dense }
@@ -8061,6 +8086,17 @@ fn emit_canonical_params_impl(
                 )
             }
         }
+    };
+
+    let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or(&0) as usize;
+    let kv_cache_layers_tokens = match kv_layers.proper_subset(num_hidden_layers) {
+        Some(layers) => {
+            let layers = layers
+                .iter()
+                .map(|&l| proc_macro2::Literal::u32_unsuffixed(l));
+            quote! { ::core::option::Option::Some(&[#(#layers),*]) }
+        }
+        None => quote! { ::core::option::Option::None },
     };
 
     #[cfg(feature = "metal")]
@@ -8140,6 +8176,7 @@ fn emit_canonical_params_impl(
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
             const SLIDING_WINDOW: i32 = #sliding_window_lit;
             const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
+            const KV_CACHE_LAYERS: ::core::option::Option<&'static [u32]> = #kv_cache_layers_tokens;
             const KV_LORA_RANK: usize = #kv_lora_rank_lit;
             const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
             const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
@@ -12175,7 +12212,7 @@ pub fn emit_model(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
-        fuf_uses_kv_cache(fuf),
+        &KvCacheLayers::of(fuf),
         #[cfg(feature = "metal")]
         &mut resolved_metal_consts,
     );
@@ -12646,7 +12683,7 @@ pub fn emit_model(
         let mc = resolved_metal_consts
             .as_ref()
             .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
-        let max_pos = fuf_uses_kv_cache(fuf).then(|| {
+        let max_pos = KvCacheLayers::of(fuf).any().then(|| {
             let max_pos = model.bounds.get("max_position_embeddings").copied();
             max_pos
                 .and_then(|p| u32::try_from(p).ok())
@@ -13259,13 +13296,17 @@ pub fn emit_model(
                 // GLOBAL geometry; the sliding layers stay fp16.
                 // `is_global[L]` = (group_of(L) == 0): group 0 is always the
                 // full-context group (see `compute_hybrid_kv_layout`); uniform →
-                // all-zero map → all-true.
+                // all-zero map → all-true. A recurrent hybrid's layers that hold
+                // no KV (`KV_CACHE_LAYERS`) get no store.
                 let __tq_nb = ctx.kv_cache.num_blocks;
+                let __tq_kv_layers =
+                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CACHE_LAYERS;
                 let __tq_is_global: ::std::vec::Vec<bool> = ctx
                     .kv_cache
                     .layer_to_group_u32()
                     .iter()
-                    .map(|&g| g == 0)
+                    .zip(0u32..)
+                    .map(|(&g, l)| g == 0 && __tq_kv_layers.is_none_or(|kv| kv.contains(&l)))
                     .collect();
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
                     ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev| {
@@ -14404,6 +14445,12 @@ mod tests {
         }
     }
 
+    /// A uniform decoder's KV layers: all of them.
+    fn every_layer(m: &ModelParams) -> KvCacheLayers {
+        let layers = m.bounds.get("num_hidden_layers").copied().unwrap_or(1) as u32;
+        KvCacheLayers((0..layers).collect())
+    }
+
     /// `emit_canonical_params_impl` at `tp_world_size = 1` is
     /// identity — bounds flow through unchanged. Pinning this so
     /// task #7's outer-loop fanout cannot accidentally regress the
@@ -14418,7 +14465,7 @@ mod tests {
             &m,
             1,
             false,
-            true,
+            &every_layer(&m),
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14454,7 +14501,7 @@ mod tests {
             &m,
             2,
             false,
-            true,
+            &every_layer(&m),
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14502,7 +14549,7 @@ mod tests {
             &m,
             8,
             false,
-            true,
+            &every_layer(&m),
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -15397,6 +15444,65 @@ mod fingerprint_tests {
         let (program, fuf) = fuf_of(arch, model);
         let probe = expert_input_probe(&program, &fuf, model);
         emit_fingerprint_check(model, &manifest, 1, rows, probe.as_ref()).to_string()
+    }
+
+    /// A recurrent hybrid holds KV in its attention layers only: its KV layers are exactly its
+    /// `attention_layers`, a proper subset the pool compacts to (`KV_CACHE_LAYERS`), and the
+    /// TurboQuant threshold reads their bytes — Nano's 6 and Super's 8 attention layers of 2 KV
+    /// heads x 128 are 6 and 8 KiB/token, below `MIN_KV_BYTES_PER_TOKEN`, where every one of
+    /// their 52 / 88 layers would read as 52 / 88 KiB. Layers that all hold KV are no subset.
+    #[test]
+    fn a_recurrent_hybrids_kv_layers_are_its_attention_layers() {
+        use scratchy_ir::{DenseReason, KvGeometry, TqBits, codec_for};
+        let preset = "mlx-affine-b4-g64-qembed";
+        for (arch, stem, kib) in [
+            ("nemotron-h", "nemotron-3-nano-30b-a3b", Some(6)),
+            ("nemotron-h-latent", "nemotron-3-super-120b-a12b", Some(8)),
+            ("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny", None),
+            (
+                "nemotron-h",
+                "nemotron-3-nano-30b-a3b-mamba-parity-tiny",
+                None,
+            ),
+        ] {
+            let model = variant_of(arch, stem, preset);
+            let (_, fuf) = fuf_of(arch, &model);
+            let kv = KvCacheLayers::of(&fuf);
+            let attention: Vec<u32> = model.layer_sets["attention_layers"]
+                .members()
+                .iter()
+                .map(|&l| l as u32)
+                .collect();
+            let layers = model.bounds["num_hidden_layers"] as usize;
+            assert!(!attention.is_empty() && attention.len() < layers, "{stem}");
+            assert_eq!(
+                kv.proper_subset(layers),
+                Some(attention.as_slice()),
+                "{stem}"
+            );
+            if let Some(kib) = kib {
+                let geometry = KvGeometry {
+                    num_layers: kv.count(),
+                    num_kv_heads: model.bounds["num_key_value_heads"] as usize,
+                    head_dim: model.bounds["head_dim"] as u32,
+                    global_head_dim: model.bounds["head_dim"] as u32,
+                    latent: false,
+                    has_kv_cache: kv.any(),
+                };
+                assert_eq!(
+                    codec_for(geometry, TqBits::new(4)),
+                    Err(DenseReason::SmallKv {
+                        bytes_per_token: kib * 1024
+                    }),
+                    "{stem}"
+                );
+            }
+            assert_eq!(
+                kv.proper_subset(kv.count()),
+                None,
+                "{stem}: every layer holds KV"
+            );
+        }
     }
 
     /// Nemotron-H (plain) and Nemotron-H with LatentMoE report ONE architecture string, so the

@@ -29,7 +29,7 @@ extern crate scratchy_models as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use scratchy_core_config::{LayerKvGeometry, compute_hybrid_kv_layout};
+use scratchy_core_config::{LayerKvGeometry, compact_kv_layer_to_tensor, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
@@ -303,7 +303,16 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
             .collect();
         compute_hybrid_kv_layout(&geom, BLOCK_SIZE, usize::MAX / 2, elem_bytes)
     });
-    let num_tensors = hybrid.as_ref().map_or(layers, |h| h.group_size);
+    // The worker's tensors (`kv_pool_tensors`): the hybrid's group-shared positions, else a
+    // tensor per layer that holds KV (a recurrent hybrid's attention layers), else per layer.
+    let layer_to_tensor = match (hybrid.as_ref(), model.kv_cache_layers()) {
+        (Some(h), _) => Some(h.layer_to_tensor.clone()),
+        (None, Some(kv)) => Some(compact_kv_layer_to_tensor(layers, kv)),
+        (None, None) => None,
+    };
+    let num_tensors = layer_to_tensor
+        .as_ref()
+        .map_or(layers, |m| m.iter().max().map_or(0, |t| t + 1));
     let full_block_size = hybrid.as_ref().map_or(BLOCK_SIZE, |h| h.full_block_size());
 
     let residency = gpu.allocator.residency().clone();
@@ -339,7 +348,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
             } else {
                 per_layer_block_elems.clone()
             },
-            hybrid.as_ref().map(|h| h.layer_to_tensor.clone()),
+            layer_to_tensor,
             cache_dtype,
             blocks_per_chunk,
             1,

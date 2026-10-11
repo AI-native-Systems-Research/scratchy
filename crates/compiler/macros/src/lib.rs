@@ -2018,20 +2018,23 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant `ScratchyWeights::kv_codec()` arms: each reads its own
-    // module's `CanonicalParams::KV_CODEC`, so the dispatcher keeps no second
-    // record of it.
-    let kv_codec_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => <#model_ident::Weights as
-                    ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC,
-            }
-        })
-        .collect();
+    // Per-variant `ScratchyWeights::kv_codec()` / `kv_cache_layers()` arms: each
+    // reads its own module's `CanonicalParams` const, so the dispatcher keeps no
+    // second record of it.
+    let canonical_const_arms = |konst: proc_macro2::TokenStream| -> Vec<proc_macro2::TokenStream> {
+        arms.iter()
+            .map(|a| {
+                let variant_ident = pascal_case(&a.model_ident);
+                let model_ident = &a.model_ident;
+                quote! {
+                    Weights::#variant_ident(_) => <#model_ident::Weights as
+                        ::scratchy_forward_compiler::CanonicalParams>::#konst,
+                }
+            })
+            .collect()
+    };
+    let kv_codec_arms = canonical_const_arms(quote! { KV_CODEC });
+    let kv_cache_layers_arms = canonical_const_arms(quote! { KV_CACHE_LAYERS });
 
     // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
     // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
@@ -2742,6 +2745,12 @@ fn emit_arch_dispatcher(
             fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
                 match self {
                     #(#kv_codec_arms)*
+                }
+            }
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            fn kv_cache_layers(&self) -> ::core::option::Option<&'static [u32]> {
+                match self {
+                    #(#kv_cache_layers_arms)*
                 }
             }
 

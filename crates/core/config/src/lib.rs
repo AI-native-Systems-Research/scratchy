@@ -20,7 +20,7 @@ pub mod spans;
 pub use cache::{
     CacheConfig, CacheDType, HybridKvLayout, KVCacheConfig, KVCacheGroupSpec, KVCacheSpec,
     KVCacheSpecType, KVCacheTensor, LayerKvGeometry, MambaCacheMode, PrefixCachingHashAlgo,
-    compute_hybrid_kv_layout,
+    compact_kv_layer_to_tensor, compute_hybrid_kv_layout,
 };
 pub use compilation::{CudaGraphConfig, CudaGraphMode};
 pub use scheduler::{RunnerType, SchedulerConfig, SchedulerPolicy};

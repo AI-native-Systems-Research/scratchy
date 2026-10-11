@@ -1008,6 +1008,12 @@ pub trait CanonicalParams: WeightAccessors {
     /// the packed stores, and the worker sizes and grows the KV pool, all from
     /// this one value — so the tape, its buffers and the pool always agree.
     const KV_CODEC: KvCodec = KvCodec::Dense;
+    /// The layers that hold KV, ascending, when not every layer does: a
+    /// recurrent hybrid's attention layers (its Mamba / Gated-DeltaNet layers
+    /// keep recurrent state instead). The KV pool holds tensors for these
+    /// layers only and its budget counts them; the TurboQuant store provisions
+    /// none for the others. `None`: every layer holds KV.
+    const KV_CACHE_LAYERS: Option<&'static [u32]> = None;
     /// Vision-tower attention head count. Vision encoders run plain
     /// MHA (`num_kv_heads == num_heads`); only one head dim is needed.
     /// Default 0 for text-only arches that never produce

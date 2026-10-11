@@ -29,7 +29,8 @@ the macro-emitted `load`.
 
 Usage:
     python tests/golden_gen_carrier.py --arch qwen3 --stem qwen3-0.6b \
-        [--tiny] [--num-tokens 8] [--out goldens/<arch>-<stem>]
+        [--tiny] [--num-tokens 8] [--decode-steps 2] [--preset <preset>] \
+        [--out goldens/<arch>-<stem>[-<preset>]]
 """
 
 import argparse
@@ -43,6 +44,7 @@ import torch
 
 ARCH_DIR = Path(__file__).parent.parent / "configs"
 DSL_DIR = Path(__file__).parent.parent / "dsl"
+PRESET_DIR = Path(__file__).parent.parent.parent / "quantization" / "presets"
 
 INIT_SCALE = 0.02  # randn scale — deep stacks stay finite, logits non-degenerate
 BLOCK_SIZE = 16    # engine block size (metal worker default)
@@ -155,8 +157,34 @@ def set_json_path(obj, dotted, value):
     cur[segs[-1]] = value
 
 
-def load_config(arch, stem):
+def deep_merge(base, overlay):
+    """config.rs `deep_merge`: objects merge key by key, recursively; any
+    other overlay value replaces the base's."""
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        for k, v in overlay.items():
+            base[k] = deep_merge(base.get(k), v)
+        return base
+    return overlay
+
+
+def merge_overrides(cfg, arch, stem):
+    """config.rs `apply_overrides_file`: deep-merge `<stem>.overrides.json`
+    when the file exists."""
+    path = ARCH_DIR / arch / f"{stem}.overrides.json"
+    if path.exists():
+        deep_merge(cfg, json.loads(path.read_text()))
+
+
+def load_config(arch, stem, preset=None):
+    """The config a build compiles for `stem` (or, under `preset`, for the
+    synthesized `<stem>-<preset>` variant), merged in config.rs's order: the
+    checked-in base, its `<stem>.overrides.json`, then (`merge_variant_config`)
+    the preset fragment and the `<stem>-<preset>.overrides.json` drift."""
     cfg = json.loads((ARCH_DIR / arch / f"{stem}.json").read_text())
+    merge_overrides(cfg, arch, stem)
+    if preset is not None:
+        deep_merge(cfg, json.loads((PRESET_DIR / f"{preset}.json").read_text()))
+        merge_overrides(cfg, arch, f"{stem}-{preset}")
     # normalize_hf_config: hoist text_config + rope_parameters; explicit
     # top-level wins. vision_config stays nested (vision glue owns it).
     flat = dict(cfg)
@@ -1313,15 +1341,28 @@ def gated_delta_net(qkv, z, a, b, layer_w):
 # ── Mamba-2 (mlx-lm nemotron_h.py `NemotronHMamba2Mixer` + ssm.py) ──
 
 
+def _unclipped_dt(cfg):
+    """config.rs `binding_time_step_limit`: the shim runs `dt` unclipped,
+    which is exact only for an absent limit or `[min <= 0, null]`."""
+    limit = cfg.get("time_step_limit")
+    if limit is None:
+        return
+    if not (isinstance(limit, list) and len(limit) == 2 and limit[1] is None
+            and isinstance(limit[0], (int, float)) and limit[0] <= 0):
+        raise ValueError(f"time_step_limit {limit!r} clips dt; no kernel realizes it")
+
+
 def mamba2(zxbcdt, layer_w):
     """`NemotronHMamba2Mixer.__call__` minus the projections, fresh state:
     split z | xBC | dt; causal depthwise conv1d (+bias) over xBC, SiLU;
     split x | B | C; dt = softplus(dt + dt_bias) (time_step_limit (0, inf)
-    — no clip); the selective scan `ssm_update_kernel` runs per token
+    — no clip; config.rs refuses a config whose limit can bind, and so does
+    `_unclipped_dt` here); the selective scan `ssm_update_kernel` runs per token
     (state = exp(dt·A)·state + x·dt ⊗ B_g; y = state·C_g + D·x, A =
     -exp(A_log), head h in group h // (H/G)); then `MambaRMSNormGated`:
     swiglu(z, y) = silu(z)·y, RMSNorm per group of d_inner/n_groups,
     times the weight."""
+    _unclipped_dt(STATE["cfg"])
     bnds = STATE["bounds"]
     heads, head_dim = bnds["mamba_num_heads"], bnds["mamba_head_dim"]
     groups, state_size = bnds["n_groups"], bnds["ssm_state_size"]
@@ -1431,6 +1472,7 @@ def moe_block(x, *bank):
     """`moe_block(x, moe[layer])`, or a LatentMoE's `moe_block(x, latent,
     moe[layer])`: the router reads `x`, the experts the latent."""
     layer_w = bank[-1]
+    STATE["moe_ran"].add(id(layer_w))
     if hasattr(layer_w, "fc1"):
         return _nemotron_moe(x, bank[0] if len(bank) == 2 else x, layer_w)
     if not getattr(layer_w, "affine", False):
@@ -1674,11 +1716,13 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
       included), packed along K (`affine_q` on the tensor);
     - the embedding table (`embed(..)`'s weight), packed along hidden;
     - the routed-expert banks: Nemotron-H's ungated `switch_mlp.fc1/fc2`
-      and the sigmoid-routed gated bank (GLM-4.5 / DeepSeek: `w1` =
-      gate | up, `w2` = down), each projection at its own width
-      (`<leaf>_q` on the bundle). Routers stay dense — the loaders take a
-      router without `.scales` as dense, as mlx ships GLM's and
-      Nemotron-H's.
+      and the gated banks (`w1` = gate | up, `w2` = down: GLM-4.5 /
+      DeepSeek's sigmoid-routed one, Qwen-MoE's softmax-routed one), each
+      projection at its own width (`<leaf>_q` on the bundle). A router is
+      quantized where its mlx module is an `nn.Linear` (Qwen's `mlp.gate`,
+      `GATED_BANKS`); GLM-4.5's, DeepSeek's and Nemotron-H's `MoEGate` hold
+      a raw weight array `nn.quantize` never touches, and the loaders take a
+      router without `.scales` as dense.
 
     Which weights, and at what width, mirrors `storage_format_for_weight`:
     a per-module map is authoritative (a listed module is quantized at its
@@ -1730,7 +1774,7 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
         dims = dims["shape"] if isinstance(dims, dict) else dims
         if f"{key}[" in bundle_args:
             kind = bundle_key_for(key, dims, bounds)
-            if kind in ("switch_mlp", "n_routed_experts"):
+            if kind == "switch_mlp" or kind in GATED_BANKS:
                 banks.append((key, kind))
             elif kind not in (None, "linear_attn", "mamba") and q is not None:
                 if qmap:
@@ -1788,6 +1832,13 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
                 inter = bundle.w2.shape[-1]
                 leaves = {"gate_proj": bundle.w1[:, :inter], "up_proj": bundle.w1[:, inter:],
                           "down_proj": bundle.w2}
+                if GATED_BANKS[kind]:
+                    # The router is a quantizable Linear in this bank's mlx
+                    # module (Qwen's `mlp.gate`): stored at its own width.
+                    spec = width(f"{pre}.gate", f"{key}.gate")
+                    if spec is not None:
+                        bundle.gate = quantize_linear(bundle.gate, *spec)
+                        consumed.add(f"{pre}.gate")
             stored = {}
             for leaf, w in leaves.items():
                 module = f"{pre}.switch_mlp.{leaf}"
@@ -1816,6 +1867,14 @@ def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
             f"the config's per-module quantization lists modules this oracle does not "
             f"quantize: {rest[:4]}")
     return True
+
+
+# The gated expert banks (`BUNDLE_LEAVES` keys holding `w1` = gate | up and
+# `w2` = down), each mapped to whether its router is a quantizable Linear in
+# the mlx module the checkpoints come from: Qwen-MoE's `mlp.gate` is an
+# `nn.Linear` (mlx-community ships it 4-bit on Qwen3.5, 8-bit on Qwen3.6);
+# GLM-4.5 / DeepSeek-V3's `MoEGate` keeps a raw weight array.
+GATED_BANKS = {"n_routed_experts": False, "num_experts": True}
 
 
 # The weight-bundle leaves the checkpoint stores F32 (`write_checkpoint`'s
@@ -1998,15 +2057,15 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
 
     def is_gated_bank(key):
         return f"{key}[" in bundle_args \
-            and bundle_key_for(key, normalized[key], bounds) == "n_routed_experts"
+            and bundle_key_for(key, normalized[key], bounds) in GATED_BANKS
 
     def is_switch_mlp_bundle(key):
         return f"{key}[" in bundle_args \
             and bundle_key_for(key, normalized[key], bounds) == "switch_mlp"
 
-    # The ungated bank runs on the MoE layers only (`moe_layers`, when the
-    # schedule derives it): their bundles are the ones written.
-    moe_layers = set(STATE["layer_sets"].get("moe_layers", range(depth)))
+    # The bank bundles written are the ones a `moe_block` executed.
+    def ran(bundle):
+        return id(bundle) in STATE["moe_ran"]
 
     for key, dims in normalized.items():
         if key in packed_targets:
@@ -2036,7 +2095,7 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
             # stacked `switch_mlp.fc1/fc2` — packed U32 + bf16 scales and
             # biases where the config quantizes them, else dense.
             for l, bundle in enumerate(vals):
-                if l not in moe_layers:
+                if not ran(bundle):
                     continue
                 pre = disk_prefix(key, l if is_layered else None)
                 put(f"{pre}.gate.weight", bundle.gate)
@@ -2049,17 +2108,24 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
                         put(f"{stem_}.weight", getattr(bundle, leaf))
             continue
         if is_gated_bank(key) and all(getattr(b, "affine", False) for b in vals):
-            # AffineSharedFusedMoELayer::load (Qwen naming, GLM-4.5's layout):
-            # the dense router `{prefix}.gate.weight` [E, hidden], its F32
-            # correction bias, and the stacked `switch_mlp.{gate,up,down}_proj`
-            # MLX-affine triples. A dense bank has no metal realization and is
-            # not written (the gate defers it by `dense_moe`).
+            # AffineSharedFusedMoELayer::load (Qwen naming; GLM-4.5's layout
+            # too): the router `{prefix}.gate.weight` [E, hidden] — an affine
+            # triple where the checkpoint quantizes it (Qwen), else dense — the
+            # F32 correction bias of a sigmoid router, and the stacked
+            # `switch_mlp.{gate,up,down}_proj` MLX-affine triples. A dense bank
+            # has no metal realization and is not written (the gate defers it
+            # by `dense_moe`).
             for l, bundle in enumerate(vals):
-                if l not in moe_layers:
+                if not ran(bundle):
                     continue
                 pre = disk_prefix(key, l if is_layered else None)
-                put(f"{pre}.gate.weight", bundle.gate.T)
-                put_f32(f"{pre}.gate.e_score_correction_bias", bundle.e_score_correction_bias)
+                if hasattr(bundle.gate, "affine_q"):
+                    put_affine(f"{pre}.gate", bundle.gate.affine_q)
+                else:
+                    put(f"{pre}.gate.weight", bundle.gate.T)
+                if hasattr(bundle, "e_score_correction_bias"):
+                    put_f32(f"{pre}.gate.e_score_correction_bias",
+                            bundle.e_score_correction_bias)
                 for leaf in ("gate_proj", "up_proj", "down_proj"):
                     put_affine(f"{pre}.switch_mlp.{leaf}", getattr(bundle, f"{leaf}_q"))
             continue
@@ -2351,10 +2417,20 @@ def main():
     ap.add_argument("--num-tokens", type=int, default=8)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--tiny", action="store_true")
+    # Decode steps the Rust gate runs after the prefill (text carriers): the
+    # oracle runs the prefill and its continuation as ONE causal forward over
+    # num_tokens + decode_steps tokens, and the gate compares each decode
+    # step's logits against that forward's row at the same position.
+    ap.add_argument("--decode-steps", type=int, default=2)
+    # A quant preset: generate the golden of the synthesized `<stem>-<preset>`
+    # variant (the base merged with the preset and its drift file, exactly as
+    # the build merges it), for a build selecting `quant/<preset>`.
+    ap.add_argument("--preset", default=None)
     args = ap.parse_args()
 
-    arch, stem = args.arch, args.stem
-    out_dir = args.out or (Path(__file__).parent / "goldens" / f"{arch}-{stem}")
+    arch, stem, preset = args.arch, args.stem, args.preset
+    golden_name = f"{arch}-{stem}" if preset is None else f"{arch}-{stem}-{preset}"
+    out_dir = args.out or (Path(__file__).parent / "goldens" / golden_name)
     out_dir.mkdir(parents=True, exist_ok=True)
     n = args.num_tokens
 
@@ -2372,8 +2448,14 @@ def main():
     # (`ScratchyMmRegistration`) claims the CondGen string verbatim.
     carrier = (DSL_DIR / f"{arch}.py").read_text()
     is_vision = re.search(r"@vision_forward\s*(\(|\n)", carrier) is not None
+    # A vision tower has no decode; a text carrier's sequence is the prefill
+    # plus its continuation.
+    prefill_tokens = n
+    if not is_vision:
+        assert args.decode_steps >= 0, "--decode-steps must be >= 0"
+        n += args.decode_steps
 
-    cfg = load_config(arch, stem)
+    cfg = load_config(arch, stem, preset)
     if args.tiny:
         # Derived keys the derivation below recomputes: drop them before
         # shrinking so a shrunk input (e.g. qk_nope_head_dim) doesn't pair
@@ -2448,7 +2530,7 @@ def main():
         # must still hold after the shrink, or the manifest formulas
         # stop describing the model. Re-impose by overwriting the
         # product field with the shrunk factors' product.
-        full = derive_bounds(dict(load_config(arch, stem)))
+        full = derive_bounds(dict(load_config(arch, stem, preset)))
         shrunk = derive_bounds(dict(cfg))
         for target, factors in (("hidden_size", ("num_attention_heads", "v_head_dim")),):
             if target in full and all(f in full for f in factors) \
@@ -2568,6 +2650,10 @@ def main():
     STATE["route_margin"] = float("inf")
     # Tokens a group-limited router (n_group > 1) picked differently from the flat top-k.
     STATE["group_route_changes"] = 0
+    # The MoE bundles a `moe_block` executed (by identity) — the ones the
+    # checkpoint writer stores. A schedule's `moe_layers` cannot say: Qwen3.5's
+    # `layer_types` schedule names its mixers, and every layer runs an MoE.
+    STATE["moe_ran"] = set()
     STATE["layer_sets"] = layer_sets
     STATE["arch"] = arch
     STATE["rms_eps"] = float(cfg.get("rms_norm_eps", cfg.get("layer_norm_eps", 1e-6)))
@@ -2671,6 +2757,17 @@ def main():
 
     trees = round_to_stored(synth_trees(manifest, bounds, depth, carrier))
     STATE["oracle_quant"] = prepare_quantized(arch, cfg, manifest, bounds, trees, carrier)
+    # codegen.rs `norm_weight_runtime_offset`: an MLX-affine checkpoint of a zero-centred arch
+    # stores its RMSNorm gains sanitized — `mlx_lm.convert` pre-adds the 1.0 — and the compiled
+    # variant reads them as stored, so its checkpoint carries the full gain, executed as is.
+    if STATE["norm_gain_offset"] and STATE["oracle_quant"] and affine_section(cfg) is not None:
+        for key in sorted(rmsnorm_gain_keys(carrier)):
+            node = trees
+            for part in key.split("."):
+                node = getattr(node, part)
+            for layer, gain in (enumerate(node) if isinstance(node, Layered) else [(None, node)]):
+                set_leaf(trees, key, layer, (STATE["norm_gain_offset"] + gain).bfloat16().float())
+        STATE["norm_gain_offset"] = 0.0
     # tie_word_embeddings: HF ties lm_head to the embedding TABLE — the
     # compiled side reuses the embed tensor (LinearTiedToEmbedding; the
     # metal gemm computes x·W^T against the [vocab, hidden] table), so
@@ -2761,6 +2858,11 @@ def main():
     # harness facts the Rust gate needs (no per-arch code on that side)
     harness = {
         "arch": arch, "stem": stem, "num_tokens": n,
+        # The gate prefills these leading tokens in one step and decodes each
+        # later one in a step of its own.
+        "prefill_tokens": n if is_vision else prefill_tokens,
+        # The quant preset whose `(stem, preset)` variant this golden is for.
+        "preset": preset,
         "bounds": {k: bounds[k] for k in sorted(bounds)},
         "rms_eps": STATE["rms_eps"],
         "attn_scale": STATE["attn"][0]["scale"] if STATE["attn"] else 0.0,

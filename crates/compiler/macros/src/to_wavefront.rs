@@ -805,9 +805,14 @@ pub fn lower_decode_to_wavefront(
                     Some(crate::fuf::FufInput::Tile { id, .. }) => Some(id.0),
                     _ => None,
                 };
+                // Plus the model's declared zero-centred offset (`rms_norm_zero_centered` on a
+                // dense checkpoint, `norm_weight_runtime_offset`): every norm's, carried on the
+                // op like a DSL fold's so a fused norm kernel (row program, normed matvec) bakes
+                // it as a standalone one does.
                 let gain_offset = gain_tile
                     .and_then(|t| bx.gain_offsets.get(&t).copied())
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    + crate::codegen::norm_weight_runtime_offset(bx.model);
                 // The (1+w) convention is CARRIED, not dropped and not folded into the weights at
                 // load: folding would make the loaded gain disagree with the checkpoint, so every
                 // consumer that re-reads it (dumps, the numeric reference, a second target) would
@@ -1764,21 +1769,20 @@ pub fn lower_decode_to_wavefront(
             }
             OpKind::Add => {
                 // Gemma's `(1 + w)` norm-gain convention rides the DSL
-                // as `Add(weight, scalar)`. The offset is a KERNEL-time
-                // constant (`NORM_WEIGHT_OFFSET` on metal; each target's
-                // rmsnorm applies it), so the Add tile ALIASES its
-                // weight input on the tape — nothing is emitted, and a
-                // scalar that isn't the arch's declared offset refuses.
+                // as `Add(weight, scalar)`: the Add tile ALIASES its
+                // weight input on the tape — nothing is emitted — and the
+                // consuming rmsnorm carries the offset in its gain
+                // convention (the `RmsNorm` arm).
                 let scalar = node.inputs.iter().find_map(|i| match i {
                     crate::fuf::FufInput::Scalar(v) => Some(*v),
                     _ => None,
                 });
                 if let Some(v) = scalar {
                     let declared = crate::codegen::norm_weight_runtime_offset(bx.model) as f64;
-                    // Declared-offset arches: the kernel const applies it →
-                    // 0 on the tape. Otherwise the offset is DATA the
-                    // consuming rmsnorm carries (Gemma's per-instruction
-                    // offset vocabulary).
+                    // The declared offset the `RmsNorm` arm adds to every
+                    // norm → 0 here, so it counts once. Any other offset is
+                    // DATA the consuming rmsnorm carries (Gemma's
+                    // per-instruction offset vocabulary).
                     let tape_offset = if (v - declared).abs() <= f64::EPSILON {
                         0.0
                     } else {

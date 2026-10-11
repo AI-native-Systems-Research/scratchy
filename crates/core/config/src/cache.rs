@@ -596,9 +596,38 @@ pub fn compute_hybrid_kv_layout(
     })
 }
 
+/// The layer → tensor map of a KV pool holding tensors for `kv_layers` only
+/// (ascending: a recurrent hybrid's attention layers — its Mamba / Gated-DeltaNet
+/// layers hold recurrent state, not KV): each of them its own tensor, in order,
+/// and every other layer tensor 0, which nothing that layer runs reads or writes.
+/// The pool then holds `kv_layers.len()` tensors where one per layer would hold
+/// `num_layers`.
+pub fn compact_kv_layer_to_tensor(num_layers: usize, kv_layers: &[u32]) -> Vec<usize> {
+    let mut map = vec![0; num_layers];
+    for (tensor, &layer) in kv_layers.iter().enumerate() {
+        map[layer as usize] = tensor;
+    }
+    map
+}
+
 #[cfg(test)]
 mod hybrid_layout_tests {
     use super::*;
+
+    /// Nemotron-3-Nano's schedule holds KV in its 6 attention layers of 52:
+    /// six tensors, each attention layer its own, every other layer on tensor 0.
+    #[test]
+    fn a_compact_pool_maps_only_the_kv_layers_to_their_own_tensors() {
+        let attention = [5u32, 12, 19, 26, 33, 42];
+        let map = compact_kv_layer_to_tensor(52, &attention);
+        assert_eq!(map.len(), 52);
+        for (tensor, &layer) in attention.iter().enumerate() {
+            assert_eq!(map[layer as usize], tensor);
+        }
+        let others = (0..52).filter(|l| !attention.contains(&(*l as u32)));
+        assert!(others.into_iter().all(|l| map[l] == 0));
+        assert_eq!(map.iter().max(), Some(&5), "six tensors");
+    }
 
     /// gemma-4-26b: 30 layers, full at idx 5,11,17,23,29 (head_dim 512 / 2 kv);
     /// the other 25 sliding (head_dim 256 / 8 kv, window 1024).

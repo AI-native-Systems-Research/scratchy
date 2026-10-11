@@ -298,6 +298,13 @@ pub enum ConfigError {
         path: PathBuf,
         reason: String,
     },
+    /// A Mamba-2 `time_step_limit` that clips: the gating kernels run `dt = softplus(dt +
+    /// dt_bias)` unclipped — mlx-lm's default `(0, inf)` — so a config whose limit can bind is
+    /// refused rather than run as if it could not ([`binding_time_step_limit`]).
+    TimeStepLimit {
+        path: PathBuf,
+        limit: serde_json::Value,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -324,6 +331,12 @@ impl std::fmt::Display for ConfigError {
             Self::LayerPattern { path, reason } => {
                 write!(f, "layer schedule in {}: {reason}", path.display())
             }
+            Self::TimeStepLimit { path, limit } => write!(
+                f,
+                "{}: time_step_limit {limit} clips Mamba-2's dt, which no kernel realizes \
+                 (only the unclipped default, absent or `[0.0, null]`, is supported)",
+                path.display()
+            ),
         }
     }
 }
@@ -1431,6 +1444,19 @@ fn resolve_arch_spec(
     a
 }
 
+/// The config's Mamba-2 `time_step_limit` when it can bind — mlx-lm `compute_dt`'s
+/// `clip(softplus(dt + dt_bias), min, max)`. `softplus` is positive, so the clip is a no-op only
+/// for `min <= 0` with no `max` (`null`: the `inf` JSON cannot spell); absent is mlx-lm's default
+/// `(0, inf)`. Anything else — a finite `max`, a positive `min`, a malformed value — is returned.
+fn binding_time_step_limit(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    let limit = json.get("time_step_limit")?;
+    let unclipped = match limit.as_array().map(Vec::as_slice) {
+        Some([min, max]) => min.as_f64().is_some_and(|m| m <= 0.0) && max.is_null(),
+        _ => false,
+    };
+    (!unclipped).then_some(limit)
+}
+
 fn model_params_from_json(
     json: &serde_json::Value,
     source_stem: &str,
@@ -1447,6 +1473,12 @@ fn model_params_from_json(
             path: source_path.to_path_buf(),
             reason,
         })?;
+    if let Some(limit) = binding_time_step_limit(json) {
+        return Err(ConfigError::TimeStepLimit {
+            path: source_path.to_path_buf(),
+            limit: limit.clone(),
+        });
+    }
     derive_implicit_bounds(&mut bounds);
     // Arch-declared bound defaults (zero-centered norms, sliding
     // cadence, router renorm, …): explicit config values always win.
@@ -2983,6 +3015,45 @@ mod tests {
         let gemma = serde_json::json!({ "layer_types": ["sliding_attention", "full_attention"] });
         assert_eq!(layer_sets(gemma), Ok(BTreeMap::new()));
         assert_eq!(layer_sets(serde_json::json!({})), Ok(BTreeMap::new()));
+    }
+
+    /// A Mamba-2 `time_step_limit` that can clip `dt` is a compile-time
+    /// error: the checked-in Nano config with a binding limit refuses, the
+    /// unclipped spellings (absent, `[0.0, null]`, a non-positive minimum)
+    /// parse. mlx-community's Nano ships `[0.0, Infinity]`, which is the
+    /// unclipped default but not JSON — the checked-in base omits it.
+    #[test]
+    fn a_binding_time_step_limit_is_a_compile_time_error() {
+        let dir = repo_model_archs("nemotron-h");
+        let spec = load_arch_json(&dir).expect("arch.json");
+        let stem = "nemotron-3-nano-30b-a3b";
+        let path = dir.join(format!("{stem}.json"));
+        let base: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        let parse = |limit: Option<serde_json::Value>| {
+            let mut json = base.clone();
+            if let Some(limit) = limit {
+                json["time_step_limit"] = limit;
+            }
+            model_params_from_json(&json, stem, &path, Vec::new(), &spec)
+        };
+        assert!(parse(None).is_ok());
+        assert!(parse(Some(serde_json::json!([0.0, null]))).is_ok());
+        assert!(parse(Some(serde_json::json!([-1.0, null]))).is_ok());
+        for binding in [
+            serde_json::json!([0.0, 100.0]),
+            serde_json::json!([0.001, null]),
+            serde_json::json!([0.001, 100.0]),
+            serde_json::json!(0.1),
+        ] {
+            assert!(
+                matches!(
+                    parse(Some(binding.clone())),
+                    Err(ConfigError::TimeStepLimit { .. })
+                ),
+                "{binding} must refuse"
+            );
+        }
     }
 
     /// The checked-in Nemotron-3 configs, through the full decoder parse

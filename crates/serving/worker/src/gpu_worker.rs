@@ -629,8 +629,9 @@ fn kv_per_block_bytes(
     ))
 }
 
-/// `kv_bytes_per_token` at `model`'s pool geometry: every layer, its KV heads
-/// and head_dim, `dense_elem_bytes` wide when `codec` is dense.
+/// `kv_bytes_per_token` at `model`'s pool geometry: every layer that holds KV
+/// ([`kv_pool_tensors`]), its KV heads and head_dim, `dense_elem_bytes` wide when
+/// `codec` is dense.
 #[cfg(feature = "metal")]
 fn pool_bytes_per_token(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -639,11 +640,33 @@ fn pool_bytes_per_token(
 ) -> usize {
     scratchy_target_metal::turboquant::kv_bytes_per_token(
         codec,
-        model.num_hidden_layers() as usize,
+        model
+            .kv_cache_layers()
+            .map_or(model.num_hidden_layers() as usize, <[u32]>::len),
         model.num_key_value_heads() as usize,
         model.head_dim() as usize,
         dense_elem_bytes,
     )
+}
+
+/// The KV pool's physical tensors for `model`: `hybrid`'s group-shared
+/// positions (gemma4), else one per layer that holds KV — a recurrent hybrid's
+/// attention layers (`kv_cache_layers`), mapped by
+/// `compact_kv_layer_to_tensor` — else one per layer (`None` map).
+#[cfg(feature = "metal")]
+fn kv_pool_tensors(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    hybrid: Option<&scratchy_core_config::HybridKvLayout>,
+) -> (usize, Option<Vec<usize>>) {
+    let layers = model.num_hidden_layers() as usize;
+    match (hybrid, model.kv_cache_layers()) {
+        (Some(h), _) => (h.group_size, Some(h.layer_to_tensor.clone())),
+        (None, Some(kv)) => (
+            kv.len(),
+            Some(scratchy_core_config::compact_kv_layer_to_tensor(layers, kv)),
+        ),
+        (None, None) => (layers, None),
+    }
 }
 
 /// vLLM group-shared hybrid KV layout (gemma4): infer the per-layer sliding
@@ -1630,6 +1653,9 @@ impl MetalWorker {
         let t_pool = std::time::Instant::now();
         let blocks_per_chunk = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
         let num_layers_draft = model.num_hidden_layers() as usize;
+        // One tensor per layer that holds KV ([`kv_pool_tensors`]; the draft
+        // pool has no group sharing).
+        let (num_tensors_draft, layer_to_tensor_draft) = kv_pool_tensors(model.as_ref(), None);
         let num_chunks_total_draft = draft_blocks.div_ceil(blocks_per_chunk);
         let per_block_elems_draft = (model.num_key_value_heads() as usize)
             * self.config.block_size
@@ -1641,8 +1667,8 @@ impl MetalWorker {
             ExecutorError::WorkerInit("draft KV pool before the target's KvMapper".into())
         })?;
         let mut draft_layers: Vec<scratchy_target_metal::sparse_kv::SparseKvLayer> =
-            Vec::with_capacity(num_layers_draft * 2);
-        for _ in 0..(num_layers_draft * 2) {
+            Vec::with_capacity(num_tensors_draft * 2);
+        for _ in 0..(num_tensors_draft * 2) {
             let layer = scratchy_target_metal::sparse_kv::SparseKvLayer::new(
                 &mtl_device,
                 &residency,
@@ -1659,7 +1685,7 @@ impl MetalWorker {
         );
 
         let pool = unsafe {
-            // Layer-major iteration: outer for layer, inner for chunk.
+            // Tensor-major iteration: outer for tensor, inner for chunk.
             // Draft uses `initial_chunks = num_chunks_total` (eager: the
             // spec-decode draft forward path has no growth hook). The slot
             // formula `(c / (2 * chunks_per_layer)) * 2 + c % 2` matches
@@ -1678,8 +1704,8 @@ impl MetalWorker {
                 // SparseKvLayer sizing above): spec-decode is not
                 // enabled for hybrid-attention-geometry arches (Gemma4).
                 None,
-                // One physical tensor per layer (no group sharing on draft).
-                None,
+                // One physical tensor per KV layer (no group sharing on draft).
+                layer_to_tensor_draft,
                 cache_dtype,
                 blocks_per_chunk,
                 usize::MAX,
@@ -1687,8 +1713,8 @@ impl MetalWorker {
                     let c = alloc_chunk_counter.get();
                     alloc_chunk_counter.set(c + 1);
                     let kv = c % 2;
-                    let layer_idx = c / (2 * chunks_per_layer);
-                    let slot = layer_idx * 2 + kv;
+                    let tensor = c / (2 * chunks_per_layer);
+                    let slot = tensor * 2 + kv;
                     draft_layers_ref[slot]
                         .commit_chunk((c / 2) % chunks_per_layer, bytes)
                         .map_err(|e| anyhow::anyhow!("draft KV commit slot={slot}: {e}"))
@@ -3019,7 +3045,8 @@ impl Worker for MetalWorker {
         // in `determine_available_memory` divides by.
         let model = self.model.as_deref()?;
         (uniform_turboquant(model, block_size)
-            || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some())
+            || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some()
+            || model.kv_cache_layers().is_some())
         .then(|| target_block_bytes(model, block_size))
     }
 
@@ -3459,11 +3486,9 @@ impl Worker for MetalWorker {
 
         let hybrid_layout = hybrid_kv_layout(model.as_ref(), self.config.block_size, elem_bytes);
         // One physical tensor per group POSITION (gemma4: group_size=5) on the
-        // hybrid path; one per layer otherwise.
-        let num_tensors_for_pool = hybrid_layout
-            .as_ref()
-            .map(|l| l.group_size)
-            .unwrap_or(num_layers_for_pool);
+        // hybrid path, per KV layer on a recurrent hybrid, per layer otherwise.
+        let (num_tensors_for_pool, layer_to_tensor) =
+            kv_pool_tensors(model.as_ref(), hybrid_layout.as_ref());
         // The full group's page-unified block size (Gemma4: 32) — the worker
         // encodes the full slot_mapping with this. `config.block_size` (uniform).
         self.kv_full_block_size = hybrid_layout
@@ -3548,8 +3573,9 @@ impl Worker for MetalWorker {
                 } else {
                     per_layer_block_elems.clone()
                 },
-                // vLLM group-shared mapping: layer → physical tensor (position).
-                hybrid_layout.as_ref().map(|l| l.layer_to_tensor.clone()),
+                // Layer → physical tensor: vLLM's group-shared position, or a
+                // recurrent hybrid's KV layer.
+                layer_to_tensor,
                 cache_dtype,
                 blocks_per_chunk,
                 // Reactive: 1 chunk up front; the rest grow on demand via
