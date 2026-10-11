@@ -274,10 +274,13 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
 }
 
 /// The expert bundles metal has a grouped (sorted-by-expert) GEMM for; the others always gather.
+/// GptOss's grouped GEMMs cannot add its per-expert LINEAR biases — the decomposed act and
+/// combine commands do, from the GateUpAct/DownCombine decompositions in `tape/lowering.rs`.
 pub const METAL_GROUPED_EXPERTS: &[ExpertBundle] = &[
     ExpertBundle::SwitchGlu,
     ExpertBundle::Fused,
     ExpertBundle::SharedFused,
+    ExpertBundle::GptOss,
 ];
 
 /// The (row, pick) pairs from which a bake sorts a grouped bundle's pairs by expert; under them it
