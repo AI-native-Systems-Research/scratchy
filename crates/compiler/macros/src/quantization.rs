@@ -1121,9 +1121,12 @@ fn per_module_lookup(
         None => format!(".{role}"),
     };
     let subtree = format!("{candidate}.");
+    // A top-level module's key IS the bare role (`lm_head`, outside the decoder root), which
+    // the dot-anchored candidate cannot match.
+    let top_level = |k: &str| index.is_none() && (k == role || k.starts_with(&format!("{role}.")));
     per_module
         .iter()
-        .find(|(k, _)| k.ends_with(&candidate) || k.contains(&subtree))
+        .find(|(k, _)| k.ends_with(&candidate) || k.contains(&subtree) || top_level(k))
         .map(|&(_, v)| v)
 }
 
@@ -1280,7 +1283,28 @@ pub fn affine_moe_expert_bits(
     })
 }
 
-/// Effective on-disk bit-width of the quantized `embed_tokens` under an
+/// The DSL role of the embedding table: the weight an `embed(..)` op gathers from
+/// (`embed_tokens` on the llama-style fleet, Nemotron-H's `embeddings`), `embed_tokens` when the
+/// program gathers none. Every embed-specific quant rule keys off this one role.
+pub fn embed_table_role(program: &Program, fuf: &Fuf) -> String {
+    fuf.nodes
+        .iter()
+        .filter(|n| n.op == OpKind::Embed)
+        .flat_map(|n| &n.inputs)
+        .find_map(|i| match i {
+            FufInput::Weight { id, .. } => Some(program.weights.path(*id).join(".")),
+            _ => None,
+        })
+        .unwrap_or_else(|| "embed_tokens".to_string())
+}
+
+/// Whether a per-module key (an exact on-disk path) or a `bits_overrides` suffix names the
+/// embedding table `role`: equal, or one ends with the other at a dotted-segment boundary.
+pub fn names_embed(key: &str, role: &str) -> bool {
+    key == role || key.ends_with(&format!(".{role}")) || role.ends_with(&format!(".{key}"))
+}
+
+/// Effective on-disk bit-width of the quantized embedding table `embed_role` under an
 /// MLX-affine method: the per-module entry when the checkpoint is
 /// mixed/dynamic (OptiQ ships `embed_tokens` at 8-bit while the section
 /// default is 4-bit), else a `bits_overrides` entry naming the embed
@@ -1289,8 +1313,8 @@ pub fn affine_moe_expert_bits(
 /// Used by the embedding-fingerprint packed-shape gate so a mixed
 /// checkpoint isn't rejected for computing `hidden / 8` when its
 /// embed is actually packed at `hidden / 4`. Must mirror the untied
-/// `embed_tokens` arm of [`storage_format_for_weight`].
-pub fn affine_embed_bits(method: &QuantMethod) -> Option<u32> {
+/// embedding-table arm of [`storage_format_for_weight`].
+pub fn affine_embed_bits(method: &QuantMethod, embed_role: &str) -> Option<u32> {
     if let QuantMethod::Affine {
         bits,
         bits_overrides,
@@ -1301,12 +1325,12 @@ pub fn affine_embed_bits(method: &QuantMethod) -> Option<u32> {
         Some(
             per_module
                 .iter()
-                .find(|(k, _)| k.ends_with("embed_tokens"))
+                .find(|(k, _)| names_embed(k, embed_role))
                 .map(|&(_, (b, _))| b)
                 .or_else(|| {
                     bits_overrides
                         .iter()
-                        .find(|(s, _)| s.ends_with("embed_tokens"))
+                        .find(|(s, _)| names_embed(s, embed_role))
                         .map(|&(_, b)| b)
                 })
                 .unwrap_or(*bits),
@@ -1328,6 +1352,7 @@ pub fn storage_format_for_weight(
     };
 
     let dotted: String = program.weights.path(id).join(".");
+    let embed_role = embed_table_role(program, fuf);
     for excl in &qc.modules_to_not_convert {
         if dotted.ends_with(excl) {
             return StorageFormat::Dense;
@@ -1368,7 +1393,7 @@ pub fn storage_format_for_weight(
             // embed's on-disk bits. MLX mixed checkpoints (OptiQ) ship
             // `embed_tokens` at 8-bit while the default is 4-bit.
             if !per_module.is_empty() {
-                return match per_module_lookup(program, per_module, "embed_tokens", None) {
+                return match per_module_lookup(program, per_module, &embed_role, None) {
                     Some((b, g)) => StorageFormat::Affine {
                         bits: b,
                         group_size: g,
@@ -1382,7 +1407,7 @@ pub fn storage_format_for_weight(
             // and implies the buffer IS quantized.
             if let Some(&(_, b)) = bits_overrides
                 .iter()
-                .find(|(s, _)| "embed_tokens".ends_with(s.as_str()))
+                .find(|(s, _)| names_embed(s, &embed_role))
             {
                 return StorageFormat::Affine {
                     bits: b,
@@ -1413,7 +1438,7 @@ pub fn storage_format_for_weight(
     // dotted-name lm_head rule already returns Affine above), so the
     // rule below only fires for untied checkpoints; tied checkpoints
     // ignore `quantize_embed` entirely.
-    if dotted == "embed_tokens"
+    if dotted == embed_role
         && !model.tie_word_embeddings
         && let QuantMethod::Affine {
             bits,
@@ -1428,7 +1453,7 @@ pub fn storage_format_for_weight(
         // bits (OptiQ: 8-bit). Otherwise fall back to the `quant_embed`
         // preset flag (older uniform converts).
         if !per_module.is_empty() {
-            return match per_module_lookup(program, per_module, "embed_tokens", None) {
+            return match per_module_lookup(program, per_module, &embed_role, None) {
                 Some((b, g)) => StorageFormat::Affine {
                     bits: b,
                     group_size: g,
@@ -1443,7 +1468,7 @@ pub fn storage_format_for_weight(
         // then the suffix override, then the default.
         if let Some(&(_, b)) = bits_overrides
             .iter()
-            .find(|(s, _)| "embed_tokens".ends_with(s.as_str()))
+            .find(|(s, _)| names_embed(s, &embed_role))
         {
             return StorageFormat::Affine {
                 bits: b,
@@ -1966,6 +1991,158 @@ mod tests {
         assert!(per_module.iter().all(|(_, (_, g))| *g == 64));
     }
 
+    /// `(path under the macro crate, parsed JSON)` of a checked-in file.
+    fn checked_in(rel: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The FULL Nemotron-3-Super-120B-A12B-OptiQ-2bit per-module map, verbatim from the
+    /// checkpoint's `config.json` (`test_fixtures/`), and the per-(stem, preset) drift file the
+    /// build actually compiles: they are the same map, it parses whole, and every MoE layer's
+    /// projections resolve to the widths the checkpoint ships — the 4/2 split bundle on layer 8
+    /// included — with the router gate dense on every one of them.
+    #[test]
+    fn the_full_super_optiq_map_parses_and_resolves_every_expert_projection() {
+        use scratchy_subtile::subtile_ir::{ExpertBody, UngatedAct};
+        let checkpoint = checked_in(
+            "../../models/quantization/test_fixtures/\
+             mlx-community_NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit.config.json",
+        );
+        let drift = checked_in(
+            "../../models/arch/configs/nemotron-h-latent/\
+             nemotron-3-super-120b-a12b-mlx-affine-b4-g64-qembed.overrides.json",
+        );
+        let QuantMethod::Affine {
+            bits,
+            group_size,
+            per_module,
+            ..
+        } = QuantizationConfig::parse(&checkpoint)
+            .unwrap()
+            .expect("some")
+            .method
+        else {
+            panic!("OptiQ is MLX affine");
+        };
+        assert_eq!((bits, group_size), (4, 64));
+        assert_eq!(per_module.len(), 354, "one entry per quantized module");
+        let at = |b: u32| per_module.iter().filter(|(_, (w, _))| *w == b).count();
+        assert_eq!((at(4), at(2)), (291, 63));
+        assert!(per_module.iter().all(|(_, (_, g))| *g == 64));
+
+        // The drift file over the preset is the checkpoint's map, entry for entry.
+        let mut compiled = drift.clone();
+        compiled["quantization_config"]["bits"] = 4.into();
+        compiled["quantization_config"]["group_size"] = 64.into();
+        compiled["quantization_config"]["quant_embed"] = true.into();
+        let method = QuantizationConfig::parse(&compiled)
+            .unwrap()
+            .expect("some")
+            .method;
+        let QuantMethod::Affine {
+            per_module: compiled_map,
+            ..
+        } = &method
+        else {
+            panic!("the compiled variant is MLX affine");
+        };
+        assert_eq!(
+            compiled_map, &per_module,
+            "the drift file drifted from the checkpoint"
+        );
+
+        let program = nemotron_program();
+        let relu2 = ExpertBody::Ungated(UngatedAct::Relu2);
+        let pattern = checkpoint["hybrid_override_pattern"].as_str().unwrap();
+        let moe_layers: Vec<u64> = (0u64..)
+            .zip(pattern.chars())
+            .filter(|&(_, c)| c == 'E')
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(moe_layers.len(), 40);
+        for &layer in &moe_layers {
+            let want = match layer {
+                8 => ExpertBits::Ungated { fc1: 4, fc2: 2 },
+                1 | 3 | 5 | 79 | 81 | 83 | 85 | 87 => ExpertBits::Ungated { fc1: 4, fc2: 4 },
+                _ => ExpertBits::Ungated { fc1: 2, fc2: 2 },
+            };
+            for prefix in ["moe", "backbone.layers.0.mixer"] {
+                assert_eq!(
+                    affine_moe_expert_bits(
+                        &program,
+                        &method,
+                        prefix,
+                        Some(UnrollIndex(layer)),
+                        relu2
+                    ),
+                    Some(want),
+                    "layer {layer} via `{prefix}`",
+                );
+            }
+            assert_eq!(
+                affine_role_bits(&program, &method, "moe.gate", Some(UnrollIndex(layer))),
+                None,
+                "layer {layer}: the router gate is dense"
+            );
+            for role in [
+                "moe.shared_experts.up_proj",
+                "moe.shared_experts.down_proj",
+                "moe.fc1_latent_proj",
+                "moe.fc2_latent_proj",
+            ] {
+                assert_eq!(
+                    affine_role_bits(&program, &method, role, Some(UnrollIndex(layer))),
+                    Some(4),
+                    "layer {layer} {role}"
+                );
+            }
+        }
+        assert_eq!(affine_embed_bits(&method, "embeddings"), Some(4));
+        // `lm_head` sits outside the decoder root: its key is the bare role, which the
+        // dot-anchored layer candidate cannot match — resolving it dense loads the packed U32
+        // as BF16 (the quantized parity-tiny's NaN logits).
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "lm_head", None),
+            Some((4, 64))
+        );
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "embeddings", None),
+            Some((4, 64))
+        );
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "head", None),
+            None,
+            "a top-level match is the whole key, not a suffix"
+        );
+    }
+
+    /// The embedding table is whatever the `embed(..)` op gathers from, by role: a per-module
+    /// map or a `bits_overrides` suffix names Nemotron-H's `backbone.embeddings` the way it names
+    /// the llama fleet's `model.embed_tokens`, and neither name stands in for the other.
+    #[test]
+    fn the_embedding_table_is_named_by_its_role() {
+        assert!(names_embed("backbone.embeddings", "embeddings"));
+        assert!(names_embed("embed_tokens", "embed_tokens"));
+        assert!(names_embed(
+            "language_model.model.embed_tokens",
+            "embed_tokens"
+        ));
+        assert!(names_embed("embeddings", "model.embeddings"));
+        assert!(!names_embed("backbone.embeddings", "embed_tokens"));
+        assert!(!names_embed("model.tok_embeddings", "embeddings"));
+        let method = QuantMethod::Affine {
+            bits: 2,
+            group_size: 64,
+            quantize_embed: false,
+            bits_overrides: Vec::new(),
+            per_module: vec![("backbone.embeddings".to_string(), (8, 64))],
+        };
+        assert_eq!(affine_embed_bits(&method, "embeddings"), Some(8));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(2));
+    }
+
     #[test]
     fn rejects_per_module_bad_bits() {
         // A per-module width other than 4/8 must reject (no kernel).
@@ -2073,7 +2250,7 @@ mod tests {
             bits_overrides: vec![("embed_tokens".to_string(), 4)],
             per_module: Vec::new(),
         };
-        assert_eq!(affine_embed_bits(&method), Some(4));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(4));
 
         // The per-module map outranks the override (OptiQ precedence).
         let method = QuantMethod::Affine {
@@ -2083,7 +2260,7 @@ mod tests {
             bits_overrides: vec![("embed_tokens".to_string(), 4)],
             per_module: vec![("model.embed_tokens".to_string(), (8, 64))],
         };
-        assert_eq!(affine_embed_bits(&method), Some(8));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(8));
 
         // No override, no per-module entry: the section default.
         let method = QuantMethod::Affine {
@@ -2093,7 +2270,7 @@ mod tests {
             bits_overrides: Vec::new(),
             per_module: Vec::new(),
         };
-        assert_eq!(affine_embed_bits(&method), Some(2));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(2));
     }
 
     #[test]

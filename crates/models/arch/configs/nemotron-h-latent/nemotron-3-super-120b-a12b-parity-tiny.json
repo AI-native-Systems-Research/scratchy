@@ -50,6 +50,34 @@
   "pad_token_id": 0,
   "partial_rotary_factor": 1.0,
   "quantization": {
+    "backbone.embeddings": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.0.mixer.in_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.0.mixer.out_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.fc1_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.fc2_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.shared_experts.down_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.shared_experts.up_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
     "backbone.layers.1.mixer.switch_mlp.fc1": {
       "bits": 4,
       "group_size": 64
@@ -58,12 +86,92 @@
       "bits": 2,
       "group_size": 64
     },
+    "backbone.layers.2.mixer.in_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.2.mixer.out_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.k_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.o_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.q_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.v_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.fc1_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.fc2_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.shared_experts.down_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.shared_experts.up_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
     "backbone.layers.4.mixer.switch_mlp.fc1": {
       "bits": 2,
       "group_size": 64
     },
     "backbone.layers.4.mixer.switch_mlp.fc2": {
       "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.5.mixer.in_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.5.mixer.out_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.k_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.o_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.q_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.v_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.fc1_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.fc2_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.shared_experts.down_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.shared_experts.up_proj": {
+      "bits": 4,
       "group_size": 64
     },
     "backbone.layers.7.mixer.switch_mlp.fc1": {
@@ -76,9 +184,41 @@
     },
     "bits": 4,
     "group_size": 64,
+    "lm_head": {
+      "bits": 4,
+      "group_size": 64
+    },
     "mode": "affine"
   },
   "quantization_config": {
+    "backbone.embeddings": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.0.mixer.in_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.0.mixer.out_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.fc1_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.fc2_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.shared_experts.down_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.shared_experts.up_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
     "backbone.layers.1.mixer.switch_mlp.fc1": {
       "bits": 4,
       "group_size": 64
@@ -87,12 +227,92 @@
       "bits": 2,
       "group_size": 64
     },
+    "backbone.layers.2.mixer.in_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.2.mixer.out_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.k_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.o_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.q_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.3.mixer.v_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.fc1_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.fc2_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.shared_experts.down_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.shared_experts.up_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
     "backbone.layers.4.mixer.switch_mlp.fc1": {
       "bits": 2,
       "group_size": 64
     },
     "backbone.layers.4.mixer.switch_mlp.fc2": {
       "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.5.mixer.in_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.5.mixer.out_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.k_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.o_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.q_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.6.mixer.v_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.fc1_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.fc2_latent_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.shared_experts.down_proj": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.shared_experts.up_proj": {
+      "bits": 4,
       "group_size": 64
     },
     "backbone.layers.7.mixer.switch_mlp.fc1": {
@@ -105,6 +325,10 @@
     },
     "bits": 4,
     "group_size": 64,
+    "lm_head": {
+      "bits": 4,
+      "group_size": 64
+    },
     "mode": "affine"
   },
   "rescale_prenorm_residual": true,

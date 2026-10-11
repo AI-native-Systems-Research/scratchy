@@ -1,0 +1,6 @@
+{
+  "_comment": "`mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit` is UNIFORM 4-bit / g64 affine (its config's `quantization` block carries only `group_size`, `bits`, `mode`), with the embedding table and lm_head packed too (`backbone.embeddings.weight` U32 [131072, 336] = 2688 * 4 / 32 on the shard header), hence `-qembed`. The router gate ships dense (`mixer.gate.weight` has no `.scales`), which the shared MoE loader takes as dense. No per-(stem, preset) drift file: the checkpoint's only other drift from the nvidia base config is `eos_token_id` (2 -> 11) and an explicit default `time_step_limit` [0, inf].",
+  "quantizations": [
+    "mlx-affine-b4-g64-qembed"
+  ]
+}

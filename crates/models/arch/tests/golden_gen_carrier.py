@@ -372,11 +372,20 @@ BUNDLE_LEAVES = {
     # DeepSeek moe → DeepSeekV2MoELayer: FusedMoELayer {gate, w1, w2} +
     # e_score_correction_bias [E] + shared_gate_up [2*inter, hidden] +
     # shared_down [hidden, inter] (Linear layouts).
+    # The router and the experts take their modules' init (nn.Linear /
+    # SwitchLinear U(±1/sqrt(in)); the router is gemm-oriented [in, E]) and
+    # the correction bias is spread past the logits' rounding — as the
+    # ungated bank below, for the same reasons: under the generic 0.02 the
+    # experts vanish under the residual and the picks sit on near ties.
     "n_routed_experts": [
-        ("gate", lambda b: [b["hidden_size"], b["n_routed_experts"]]),
-        ("w1", lambda b: [b["n_routed_experts"], 2 * b["moe_intermediate_size"], b["hidden_size"]]),
-        ("w2", lambda b: [b["n_routed_experts"], b["hidden_size"], b["moe_intermediate_size"]]),
-        ("e_score_correction_bias", lambda b: [b["n_routed_experts"]]),
+        ("gate", lambda b: ([b["hidden_size"], b["n_routed_experts"]],
+                            lambda shape: (torch.rand(*shape) * 2.0 - 1.0) / math.sqrt(shape[0]))),
+        ("w1", lambda b: ([b["n_routed_experts"], 2 * b["moe_intermediate_size"], b["hidden_size"]],
+                          _linear_init)),
+        ("w2", lambda b: ([b["n_routed_experts"], b["hidden_size"], b["moe_intermediate_size"]],
+                          _linear_init)),
+        ("e_score_correction_bias", lambda b: ([b["n_routed_experts"]],
+                                               lambda shape: 0.1 * torch.randn(*shape))),
         ("shared_gate_up", lambda b: [2 * b["moe_intermediate_size"], b["hidden_size"]]),
         ("shared_down", lambda b: [b["hidden_size"], b["moe_intermediate_size"]]),
     ],
@@ -1424,7 +1433,8 @@ def moe_block(x, *bank):
     layer_w = bank[-1]
     if hasattr(layer_w, "fc1"):
         return _nemotron_moe(x, bank[0] if len(bank) == 2 else x, layer_w)
-    STATE["dense_moe"] = True
+    if not getattr(layer_w, "affine", False):
+        STATE["dense_moe"] = True
     b = STATE["bounds"]
     cfg = STATE["cfg"]
     top_k = b.get("num_experts_per_tok") or b.get("top_k_experts") or b.get("top_k")
@@ -1449,13 +1459,20 @@ def moe_block(x, *bank):
                 for g in range(n_group)
             ], dim=1)
             sel_groups = group_scores.topk(topk_group, dim=-1).indices
-            mask = torch.zeros_like(biased)
-            for g in sel_groups[0].tolist():
-                mask[:, g * per:(g + 1) * per] = 1.0
+            # Per TOKEN: each row keeps its own selected groups' experts.
+            group_mask = torch.zeros(n, n_group).scatter_(1, sel_groups, 1.0)
+            mask = group_mask.repeat_interleave(per, dim=1)
             cand = biased * mask - 1e9 * (1 - mask)
         else:
             cand = biased
         top_scores, idx = torch.topk(cand, top_k, dim=-1)
+        # How many tokens the group limit moved off the flat top-k (the n_group = 1 pick).
+        flat = torch.topk(biased, top_k, dim=-1).indices
+        STATE["group_route_changes"] += int(
+            (idx.sort(-1).values != flat.sort(-1).values).any(-1).sum())
+        top = torch.topk(cand, top_k + 1, dim=-1).values
+        STATE["route_margin"] = min(STATE["route_margin"],
+                                    float((top[:, top_k - 1] - top[:, top_k]).min()))
         weights = sig.gather(1, idx)
         if b.get("norm_topk_prob"):
             weights = weights / weights.sum(-1, keepdim=True)
@@ -1558,13 +1575,16 @@ def avg_pool_2d(x):
 
 
 def pack_codes(q, bits):
-    """MLX's affine packing: each row's codes as a little-endian bitstream
-    of u32 words, code i at bit offset `bits * i` (2/4/8-bit; the
-    `[.., in * bits / 32]` U32 the gather kernels read)."""
-    assert bits in (2, 4, 8), f"pack_codes: {bits}-bit is not packed here"
-    per = 32 // bits
-    q = q.to(torch.int64).reshape(*q.shape[:-1], q.shape[-1] // per, per)
-    words = (q << (torch.arange(per, dtype=torch.int64) * bits)).sum(-1)
+    """MLX's affine packing: each row's codes as one continuous LSB-first
+    bitstream of little-endian u32 words, code i at bit offset `bits * i` —
+    for 3-bit too, whose codes straddle word boundaries (8 codes per 3
+    bytes). The `[.., in * bits / 32]` U32 the qmv / gather kernels read."""
+    assert bits in (2, 3, 4, 8), f"pack_codes: {bits}-bit is not an MLX affine width"
+    k = q.shape[-1]
+    assert (k * bits) % 32 == 0, f"pack_codes: {k} codes x {bits} bits is not whole words"
+    stream = (q.to(torch.int64).unsqueeze(-1) >> torch.arange(bits, dtype=torch.int64)) & 1
+    stream = stream.reshape(*q.shape[:-1], k * bits // 32, 32)
+    words = (stream << torch.arange(32, dtype=torch.int64)).sum(-1)
     return words.to(torch.uint32)
 
 
@@ -1607,66 +1627,194 @@ def per_module_quant(cfg):
             for k, v in q.items() if isinstance(v, dict)}
 
 
-def prepare_expert_banks(arch, cfg, manifest, bounds, trees, carrier_text):
-    """Ready every relu2 expert bank (Nemotron-H's MoE) for the oracle:
+def affine_section(cfg):
+    """The config's MLX-affine quantization section, or None (dense, or a
+    non-affine method: those carry a `quant_method`)."""
+    q = cfg.get("quantization_config") or cfg.get("quantization")
+    if not q or "quant_method" in q or "bits" not in q or "group_size" not in q:
+        return None
+    return q
 
-    - A LatentMoE's `fc1_latent_proj` / `fc2_latent_proj` take nn.Linear's
-      init, as the bank's experts do: at the generic 0.02 the latent the
-      experts read is two 0.02 projections deep, and relu² of it vanishes —
-      the golden could not see the experts at all.
-    - Every routed-expert projection the config's MLX per-module map lists is
-      stored MLX-affine — packed codes + scales + biases on the bundle
-      (`<leaf>_q`, which `write_checkpoint` writes) — and the leaf the shim
-      executes is replaced by its dequantization, so the oracle computes with
-      exactly the weights the compiled kernels read.
 
-    Returns whether the oracle executes the checkpoint's quantization: True
-    iff the config has a per-module map and every module it lists is such a
-    projection. A map naming anything else raises — this oracle quantizes
-    expert banks only, and a module silently left dense would be a false
-    parity."""
+def set_leaf(trees, key, layer, value):
+    """Replace the tensor a manifest `key` resolves to (at `layer`, or the
+    unlayered one) in the weight trees — on the persistent per-layer node,
+    not on the transient `Layered` an attribute walk builds."""
+    parts = key.split(".")
+    node = trees
+    for part in parts[:-1]:
+        node = getattr(node, part)
+    if layer is None:
+        setattr(node, parts[-1], value)
+    elif len(parts) > 1:
+        setattr(node[layer], parts[-1], value)
+    else:
+        getattr(node, parts[-1])[layer] = value
+
+
+def quantize_linear(w, bits, gs):
+    """An MLX-affine Linear from the gemm-orientation `[K, N]` weight: the
+    on-disk `[N, K]` packed along K. Returns the dequantized `[K, N]` weight
+    the oracle executes, carrying the stored triple (`affine_q`) and the
+    original `.bias`."""
+    packed, scales, biases, w_hat = affine_quantize(w.T, bits, gs)
+    out = w_hat.T.contiguous()
+    out.affine_q = (packed, scales, biases)
+    if isinstance(getattr(w, "bias", None), torch.Tensor):
+        out.bias = w.bias
+    return out
+
+
+def prepare_quantized(arch, cfg, manifest, bounds, trees, carrier_text):
+    """Store, and execute dequantized, every weight the compiled variant
+    reads MLX-affine — so the oracle computes with exactly the weights the
+    kernels read:
+
+    - dense Linears (every 2-D gemm weight the manifest declares, lm_head
+      included), packed along K (`affine_q` on the tensor);
+    - the embedding table (`embed(..)`'s weight), packed along hidden;
+    - the routed-expert banks: Nemotron-H's ungated `switch_mlp.fc1/fc2`
+      and the sigmoid-routed gated bank (GLM-4.5 / DeepSeek: `w1` =
+      gate | up, `w2` = down), each projection at its own width
+      (`<leaf>_q` on the bundle). Routers stay dense — the loaders take a
+      router without `.scales` as dense, as mlx ships GLM's and
+      Nemotron-H's.
+
+    Which weights, and at what width, mirrors `storage_format_for_weight`:
+    a per-module map is authoritative (a listed module is quantized at its
+    own width, an unlisted one stays dense); a uniform section quantizes
+    every gemm weight and bank at `bits` (a `bits_overrides` suffix wins),
+    and the embedding table iff tied, `quant_embed`, or an override names it.
+
+    A LatentMoE's `fc1_latent_proj` / `fc2_latent_proj` take nn.Linear's
+    init, as the bank's experts do: at the generic 0.02 the latent the
+    experts read is two 0.02 projections deep, and relu² of it vanishes.
+
+    Returns whether the oracle executes the checkpoint's quantization. A
+    per-module map naming a module this oracle does not quantize raises (a
+    module silently left dense would be a false parity); a uniform section
+    over a bundle kind it does not quantize returns False before touching
+    any weight (the checkpoint stays dense and the gate skips the case)."""
+    q = affine_section(cfg)
     qmap = per_module_quant(cfg)
     aj_path = ARCH_DIR / arch / "arch.json"
     aj = json.loads(aj_path.read_text()) if aj_path.exists() else {}
     dec_root, renames = decoder_root(aj), aj.get("weight_leaf_renames") or {}
     bundle_args = bundle_call_args(carrier_text)
-    consumed = set()
-    for key, dims in manifest.items():
-        if key.startswith("__") or f"{key}[" not in bundle_args:
-            continue
-        dims = dims["shape"] if isinstance(dims, dict) else dims
-        if bundle_key_for(key, dims, bounds) != "switch_mlp":
-            continue
+    layered_refs = {m.group(1) for m in re.finditer(r"([A-Za-z_][A-Za-z_0-9.]*)\[", carrier_text)}
+    embed_keys = embed_keys_of(carrier_text)
+    packed_targets = {t for ts in (manifest.get("__packed_splits__") or {}).values() for t in ts}
+    tied = is_tied(arch, cfg)
+    overrides = sorted((q or {}).get("bits_overrides", {}).items())
+
+    def node_of(key):
         node = trees
         for part in key.split("."):
             node = getattr(node, part)
-        for layer, bundle in enumerate(node):
+        return node
+
+    def width(module, dsl, embed=False):
+        """(bits, group_size) the compiled variant reads `module` at, or None."""
+        if qmap:
+            return qmap.get(module)
+        if embed and not (tied or q.get("quant_embed")
+                          or any(dsl.endswith(sfx) for sfx, _ in overrides)):
+            return None
+        b = next((b for sfx, b in overrides if dsl.endswith(sfx)), q["bits"])
+        return (b, q["group_size"])
+
+    banks, linears = [], []
+    for key, dims in manifest.items():
+        if key.startswith("__"):
+            continue
+        dims = dims["shape"] if isinstance(dims, dict) else dims
+        if f"{key}[" in bundle_args:
+            kind = bundle_key_for(key, dims, bounds)
+            if kind in ("switch_mlp", "n_routed_experts"):
+                banks.append((key, kind))
+            elif kind not in (None, "linear_attn", "mamba") and q is not None:
+                if qmap:
+                    continue  # the consumed-module census below names what is missing
+                return False
+            continue
+        if len(dims) == 2 and key not in packed_targets:
+            linears.append(key)
+
+    # LatentMoE projections take nn.Linear's init whether or not they are quantized.
+    for key, kind in banks:
+        if kind != "switch_mlp":
+            continue
+        for bundle in node_of(key):
             for proj in ("fc1_latent_proj", "fc2_latent_proj"):
                 if hasattr(bundle, proj):
                     # gemm orientation [K, N]: fan-in is the first dim.
                     w = getattr(bundle, proj)
-                    setattr(bundle, proj, (torch.rand(*w.shape) * 2.0 - 1.0) / math.sqrt(w.shape[0]))
-            pre = _ckpt_key(dsl_to_disk(key, renames), layer, dec_root)
+                    init = (torch.rand(*w.shape) * 2.0 - 1.0) / math.sqrt(w.shape[0])
+                    setattr(bundle, proj, init.bfloat16().float())
             bundle.affine = False
-            for leaf in ("fc1", "fc2"):
-                module = f"{pre}.switch_mlp.{leaf}"
-                if module not in qmap:
-                    continue
-                bits, gs = qmap[module]
-                packed, scales, biases, w_hat = affine_quantize(getattr(bundle, leaf), bits, gs)
-                setattr(bundle, f"{leaf}_q", (packed, scales, biases))
-                setattr(bundle, leaf, w_hat)
-                consumed.add(module)
-            assert hasattr(bundle, "fc1_q") == hasattr(bundle, "fc2_q"), \
-                f"{pre}: the per-module map quantizes one projection of the bank only"
-            bundle.affine = hasattr(bundle, "fc1_q")
-    if not qmap:
+    if q is None:
         return False
+    if packed_targets and not qmap:
+        raise ValueError(f"{arch}: packed-split Linears under a uniform affine section are "
+                         f"not quantized by this oracle")
+
+    consumed = set()
+    for key in linears:
+        layered = key in layered_refs
+        node = node_of(key)
+        for layer, w in enumerate(node if layered else [node]):
+            if not isinstance(w, torch.Tensor) or w.ndim != 2:
+                break
+            l = layer if layered else None
+            module = _ckpt_key(dsl_to_disk(key, renames), l, dec_root)
+            spec = width(module, key, embed=key in embed_keys)
+            if spec is None:
+                continue
+            bits, gs = spec
+            if key in embed_keys:
+                packed, scales, biases, w_hat = affine_quantize(w, bits, gs)
+                w_hat.affine_q = (packed, scales, biases)
+                set_leaf(trees, key, l, w_hat)
+            else:
+                set_leaf(trees, key, l, quantize_linear(w, bits, gs))
+            consumed.add(module)
+
+    for key, kind in banks:
+        for layer, bundle in enumerate(node_of(key)):
+            pre = _ckpt_key(dsl_to_disk(key, renames), layer, dec_root)
+            if kind == "switch_mlp":
+                leaves = {"fc1": bundle.fc1, "fc2": bundle.fc2}
+            else:
+                inter = bundle.w2.shape[-1]
+                leaves = {"gate_proj": bundle.w1[:, :inter], "up_proj": bundle.w1[:, inter:],
+                          "down_proj": bundle.w2}
+            stored = {}
+            for leaf, w in leaves.items():
+                module = f"{pre}.switch_mlp.{leaf}"
+                spec = width(module, f"{key}.switch_mlp.{leaf}")
+                if spec is None:
+                    continue
+                packed, scales, biases, w_hat = affine_quantize(w, spec[0], spec[1])
+                stored[leaf] = ((packed, scales, biases), w_hat)
+                consumed.add(module)
+            if not stored:
+                continue
+            assert len(stored) == len(leaves), \
+                f"{pre}: the quantization map stores part of the expert bank only"
+            for leaf, (triple, _) in stored.items():
+                setattr(bundle, f"{leaf}_q", triple)
+            if kind == "switch_mlp":
+                bundle.fc1, bundle.fc2 = stored["fc1"][1], stored["fc2"][1]
+            else:
+                bundle.w1 = torch.cat([stored["gate_proj"][1], stored["up_proj"][1]], dim=1)
+                bundle.w2 = stored["down_proj"][1]
+            bundle.affine = True
+
     rest = sorted(set(qmap) - consumed)
     if rest:
         raise ValueError(
             f"the config's per-module quantization lists modules this oracle does not "
-            f"quantize (it executes MLX-affine expert banks only): {rest[:4]}")
+            f"quantize: {rest[:4]}")
     return True
 
 
@@ -1842,6 +1990,16 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     def put_f32(key, tensor):
         out[key] = tensor.detach().to(torch.float32).contiguous()
 
+    def put_affine(stem_, triple):
+        codes, scales, biases = triple
+        out[f"{stem_}.weight"] = codes.contiguous()
+        put(f"{stem_}.scales", scales)
+        put(f"{stem_}.biases", biases)
+
+    def is_gated_bank(key):
+        return f"{key}[" in bundle_args \
+            and bundle_key_for(key, normalized[key], bounds) == "n_routed_experts"
+
     def is_switch_mlp_bundle(key):
         return f"{key}[" in bundle_args \
             and bundle_key_for(key, normalized[key], bounds) == "switch_mlp"
@@ -1886,12 +2044,24 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
                 for leaf in ("fc1", "fc2"):
                     stem_ = f"{pre}.switch_mlp.{leaf}"
                     if hasattr(bundle, f"{leaf}_q"):
-                        codes, scales, biases = getattr(bundle, f"{leaf}_q")
-                        out[f"{stem_}.weight"] = codes.contiguous()
-                        put(f"{stem_}.scales", scales)
-                        put(f"{stem_}.biases", biases)
+                        put_affine(stem_, getattr(bundle, f"{leaf}_q"))
                     else:
                         put(f"{stem_}.weight", getattr(bundle, leaf))
+            continue
+        if is_gated_bank(key) and all(getattr(b, "affine", False) for b in vals):
+            # AffineSharedFusedMoELayer::load (Qwen naming, GLM-4.5's layout):
+            # the dense router `{prefix}.gate.weight` [E, hidden], its F32
+            # correction bias, and the stacked `switch_mlp.{gate,up,down}_proj`
+            # MLX-affine triples. A dense bank has no metal realization and is
+            # not written (the gate defers it by `dense_moe`).
+            for l, bundle in enumerate(vals):
+                if l not in moe_layers:
+                    continue
+                pre = disk_prefix(key, l if is_layered else None)
+                put(f"{pre}.gate.weight", bundle.gate.T)
+                put_f32(f"{pre}.gate.e_score_correction_bias", bundle.e_score_correction_bias)
+                for leaf in ("gate_proj", "up_proj", "down_proj"):
+                    put_affine(f"{pre}.switch_mlp.{leaf}", getattr(bundle, f"{leaf}_q"))
             continue
         # Dual-class per-layer leaves (gemma4): `weight_leaf_renames` maps
         # `q_proj_global` onto the SAME disk leaf as `q_proj`, but in a
@@ -1957,7 +2127,10 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
                 # `.bias` sibling (synth_trees attached it, or the
                 # manifest declared it via the dotted namespace).
                 put(f"{pre}.bias", w.bias)
-            if w.ndim == 2 and key not in embed_keys:
+            if hasattr(w, "affine_q"):
+                # MLX-affine Linear / embedding table (`prepare_quantized`).
+                put_affine(pre, w.affine_q)
+            elif w.ndim == 2 and key not in embed_keys:
                 # gemm [K, N] → on-disk Linear [N, K]
                 put(f"{pre}.weight", w.T)
             elif w.ndim == 3 and key.split(".")[-1] == "conv1d":
@@ -2007,7 +2180,7 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     # tiny stem was checked in as, so the gate's fingerprint (embed
     # shape, layer count, theta) matches the compiled variant. Quant
     # blocks are stripped unless the oracle EXECUTED them
-    # (`quantize_expert_banks`): otherwise the synthetic checkpoint is
+    # (`prepare_quantized`): otherwise the synthetic checkpoint is
     # DENSE and the Rust gate refuses a config carrying a quantization
     # the oracle did not run (a false-green guard), so leaving them in
     # would make the gate skip its own case.
@@ -2393,6 +2566,8 @@ def main():
     # last pick's biased score and the first unpicked one — a pick a
     # rounding could flip shows up here.
     STATE["route_margin"] = float("inf")
+    # Tokens a group-limited router (n_group > 1) picked differently from the flat top-k.
+    STATE["group_route_changes"] = 0
     STATE["layer_sets"] = layer_sets
     STATE["arch"] = arch
     STATE["rms_eps"] = float(cfg.get("rms_norm_eps", cfg.get("layer_norm_eps", 1e-6)))
@@ -2495,7 +2670,7 @@ def main():
     STATE["block_table"] = [i for i in range(n_blocks_needed)]
 
     trees = round_to_stored(synth_trees(manifest, bounds, depth, carrier))
-    STATE["oracle_quant"] = prepare_expert_banks(arch, cfg, manifest, bounds, trees, carrier)
+    STATE["oracle_quant"] = prepare_quantized(arch, cfg, manifest, bounds, trees, carrier)
     # tie_word_embeddings: HF ties lm_head to the embedding TABLE — the
     # compiled side reuses the embed tensor (LinearTiedToEmbedding; the
     # metal gemm computes x·W^T against the [vocab, hidden] table), so
@@ -2600,6 +2775,7 @@ def main():
     }
     if STATE["route_margin"] != float("inf"):
         harness["route_margin"] = STATE["route_margin"]
+        harness["group_route_changes"] = STATE["group_route_changes"]
     if is_vision:
         v = {k[7:]: val for k, val in bounds.items() if k.startswith("vision_")}
         merge = v.get("spatial_merge_size", 1)

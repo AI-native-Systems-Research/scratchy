@@ -1598,6 +1598,12 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         )
     }
 
+    /// Whether the checkpoint ships at least one listed MLX-affine weight packed — the
+    /// positive half [`Self::affine_widths_agree`] leaves out. See [`ships_affine_row_in`].
+    pub fn ships_affine_row(&self, widths: &[(&str, u32, u32)]) -> bool {
+        ships_affine_row_in(self.names(), |name| self.contains(name), widths)
+    }
+
     // ----------------------------------------------------------------------
     // GGUF backing-store accessors
     // ----------------------------------------------------------------------
@@ -2551,11 +2557,38 @@ where
     true
 }
 
+/// Whether some checkpoint `.weight` a row of `widths` names ships its `.scales` sibling — i.e.
+/// the checkpoint stores at least one of the variant's affine tensors packed.
+///
+/// The positive sniff for a variant whose fingerprint leaf is DENSE (an MLX per-module map that
+/// quantizes only some roles — Nemotron-H's experts-only parity checkpoint): the width gate
+/// ([`affine_widths_agree_in`]) is silent on a listed tensor without `.scales`, so without this a
+/// dense checkpoint satisfies such a variant vacuously and fails later, in its loader. An
+/// existential (not universal) test on purpose: a row whose tensor is carved at load time (a
+/// packed-split slice) has no on-disk name to probe at fingerprint time.
+pub fn ships_affine_row_in<'a, C>(
+    names: impl Iterator<Item = &'a str>,
+    contains: C,
+    widths: &[(&str, u32, u32)],
+) -> bool
+where
+    C: Fn(&str) -> bool,
+{
+    names
+        .filter(|name| {
+            widths
+                .iter()
+                .any(|(pattern, _, _)| affine_pattern_matches(pattern, name))
+        })
+        .filter_map(|name| name.strip_suffix(".weight"))
+        .any(|role| contains(&format!("{role}.scales")))
+}
+
 #[cfg(test)]
 mod affine_width_tests {
     use std::collections::HashMap;
 
-    use super::{affine_pattern_matches, affine_widths_agree_in};
+    use super::{affine_pattern_matches, affine_widths_agree_in, ships_affine_row_in};
 
     /// What a `mlx-affine-b4-g64-qembed` variant of qwen3-5-moe emits: one
     /// starred row per role, at the width its own load call will use.
@@ -2819,6 +2852,121 @@ mod affine_width_tests {
             !check(&ckpt_b3, widths_b4),
             "b4 variant REJECTS b3 — the b4 loader would derive K=384*8 and \
              silently dequantize with the wrong width"
+        );
+    }
+
+    /// The rows a Nemotron-3-Super variant's fingerprint carries for its routed experts, at the
+    /// layers that matter: OptiQ lists each MoE layer apart (the 4/2 split bundle on layer 8, a
+    /// 2/2 bundle on layer 10, a 4/4 one on layer 1); a uniform 4-bit variant stars one width.
+    fn super_expert_rows(optiq: bool) -> Vec<(String, u32, u32)> {
+        let fc = |l: &str, leaf: &str, b: u32| {
+            (
+                format!("backbone.layers.{l}.mixer.switch_mlp.{leaf}.weight"),
+                b,
+                64,
+            )
+        };
+        if optiq {
+            vec![
+                fc("1", "fc1", 4),
+                fc("1", "fc2", 4),
+                fc("8", "fc1", 4),
+                fc("8", "fc2", 2),
+                fc("10", "fc1", 2),
+                fc("10", "fc2", 2),
+            ]
+        } else {
+            vec![fc("*", "fc1", 4), fc("*", "fc2", 4)]
+        }
+    }
+
+    fn refs(rows: &[(String, u32, u32)]) -> Vec<(&str, u32, u32)> {
+        rows.iter().map(|(n, b, g)| (n.as_str(), *b, *g)).collect()
+    }
+
+    /// A Super checkpoint's routed-expert stacks as `mlx_lm.convert` writes them (E = 512,
+    /// inter 2688, latent 1024, g64), each layer at `(fc1, fc2)` bits; `None` writes them dense.
+    fn super_experts(layers: &[(u32, Option<(usize, usize)>)]) -> HashMap<String, Vec<usize>> {
+        let mut m = HashMap::new();
+        for &(l, bits) in layers {
+            let base = format!("backbone.layers.{l}.mixer.switch_mlp");
+            for (leaf, out, k, b) in [
+                ("fc1", 2688, 1024, bits.map(|b| b.0)),
+                ("fc2", 1024, 2688, bits.map(|b| b.1)),
+            ] {
+                match b {
+                    Some(b) => {
+                        m.insert(format!("{base}.{leaf}.weight"), vec![512, out, k * b / 32]);
+                        m.insert(format!("{base}.{leaf}.scales"), vec![512, out, k / 64]);
+                    }
+                    None => {
+                        m.insert(format!("{base}.{leaf}.weight"), vec![512, out, k]);
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// The Super OptiQ variant accepts the OptiQ checkpoint's packed widths — 2-bit stacks pack
+    /// K/16, 4-bit K/8, and layer 8 packs one of each — and REJECTS a uniform 4-bit checkpoint;
+    /// the uniform variant rejects the OptiQ checkpoint in turn. The routed experts are the only
+    /// rows that differ: every other OptiQ role is 4-bit, like the uniform map.
+    #[test]
+    fn the_super_optiq_rows_accept_their_shapes_and_reject_a_uniform_map() {
+        let optiq_ckpt = super_experts(&[(1, Some((4, 4))), (8, Some((4, 2))), (10, Some((2, 2)))]);
+        let uniform_ckpt =
+            super_experts(&[(1, Some((4, 4))), (8, Some((4, 4))), (10, Some((4, 4)))]);
+        let (optiq, uniform) = (super_expert_rows(true), super_expert_rows(false));
+        assert!(check(&optiq_ckpt, &refs(&optiq)), "OptiQ accepts OptiQ");
+        assert!(
+            !check(&uniform_ckpt, &refs(&optiq)),
+            "OptiQ REJECTS a uniform 4-bit map: layer 8's fc2 and layer 10's stacks pack K/8, \
+             not K/16"
+        );
+        assert!(
+            check(&uniform_ckpt, &refs(&uniform)),
+            "uniform accepts uniform"
+        );
+        assert!(
+            !check(&optiq_ckpt, &refs(&uniform)),
+            "uniform REJECTS OptiQ"
+        );
+    }
+
+    /// The positive half: a variant whose only affine rows are its experts must see at least one
+    /// of them packed. A DENSE checkpoint carries every listed `.weight` without `.scales` — the
+    /// width gate has no opinion on it, and this sniff is what turns it into `NoVariantMatched`.
+    #[test]
+    fn a_dense_checkpoint_ships_none_of_an_experts_only_variants_affine_rows() {
+        let rows = super_expert_rows(true);
+        let rows = refs(&rows);
+        let ships = |m: &HashMap<String, Vec<usize>>| {
+            ships_affine_row_in(m.keys().map(|s| s.as_str()), |n| m.contains_key(n), &rows)
+        };
+        let dense = super_experts(&[(1, None), (8, None), (10, None)]);
+        assert!(
+            check(&dense, &rows),
+            "premise: the width gate is silent on a dense checkpoint"
+        );
+        assert!(
+            !ships(&dense),
+            "a dense checkpoint ships none of the variant's affine rows"
+        );
+        let packed = super_experts(&[(1, Some((4, 4))), (8, Some((4, 2))), (10, Some((2, 2)))]);
+        assert!(ships(&packed));
+        let mut unlisted = dense.clone();
+        unlisted.insert(
+            "backbone.layers.3.mixer.in_proj.weight".to_string(),
+            vec![18560, 512],
+        );
+        unlisted.insert(
+            "backbone.layers.3.mixer.in_proj.scales".to_string(),
+            vec![18560, 64],
+        );
+        assert!(
+            !ships(&unlisted),
+            "a packed tensor no row names is not the variant's"
         );
     }
 }
