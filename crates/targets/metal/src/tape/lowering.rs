@@ -1106,7 +1106,7 @@ const fn combine_threads(hd: u32) -> u32 {
 /// writer) whose geometry `attention_decode_gqa_tq` takes — 4-bit codes, the whole query-head
 /// group a KV head (up to [`GQA_HEADS`] heads, dividing evenly), head_dim 64, 128, 256 or 512
 /// (the dims its simdgroup tiling steps), KV blocks of whole 8-key blocks, a rotary pair's
-/// partner a whole lane stride away —
+/// partner a whole lane stride away, partials that fit the u32 the op scratch is sized in —
 /// serves each KV head's query heads together: its keys decode once for the
 /// group, where `attention_via_cache_v2` decodes them once per head. Every bucket m takes it:
 /// the kernel is per-row throughout (`seq = tg_pos.x` drives the row's length, block table,
@@ -1115,7 +1115,9 @@ const fn combine_threads(hd: u32) -> u32 {
 /// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
 /// front, `[bucket_m, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
-/// into the output.
+/// into the output. A bucket whose partials would not fit keeps the twin — a wide prefill
+/// bucket carrying the gated decode row (gemma-4's 4096-token buckets at 4.3 GiB) is the
+/// case that refuses.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
@@ -1148,6 +1150,17 @@ fn decode_attention_per_kv_head(
             && lane_stride(c)
     };
     let group = p.num_q_heads / p.num_global_kv_heads.max(1);
+    let keys = at.block_cap.saturating_mul(p.global_block_size);
+    let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
+    // The split's partials are `[bucket_m, num_q_heads, splits, 2 + D]` f32s. A wide
+    // prefill bucket carrying the gated decode row can push that past the u32 the op
+    // scratch is sized in — gemma-4's 4096-token prefill buckets land at 4.3 GiB —
+    // and such a bucket keeps the twin.
+    let partials = u64::from(at.bucket_m)
+        * u64::from(p.num_q_heads)
+        * u64::from(splits)
+        * (u64::from(hd) + 2)
+        * 4;
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
         && (1..=GQA_HEADS).contains(&group)
         && p.num_q_heads == group * p.num_global_kv_heads
@@ -1155,14 +1168,12 @@ fn decode_attention_per_kv_head(
         // groups of 8, 4 or 2 — {64, 128, 256, 512} and nothing between (the kernel's
         // `NSG % SG` assert backs the same set at the bake).
         && matches!(hd, 64 | 128 | 256 | 512)
-        && p.global_block_size.is_multiple_of(8);
+        && p.global_block_size.is_multiple_of(8)
+        && partials <= u32::MAX as u64;
     if !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
         return cmds;
     }
-    let keys = at.block_cap.saturating_mul(p.global_block_size);
-    let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
-    let partials = at.bucket_m * p.num_q_heads * splits * (2 + hd) * 4;
-    *moe_scratch_bytes = (*moe_scratch_bytes).max(partials);
+    *moe_scratch_bytes = (*moe_scratch_bytes).max(partials as u32);
     let partials = scratch_at(16, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
     let mut out = Vec::with_capacity(cmds.len() + 1);
@@ -7970,8 +7981,9 @@ mod tests {
         let tape = fold_tape(&writer, &packed);
         let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
             .expect("a one-row fold lowers");
-        let kernels: Vec<KernelId> =
-            (lowered.commands.iter()).map(|c| c.command.kernel).collect();
+        let kernels: Vec<KernelId> = (lowered.commands.iter())
+            .map(|c| c.command.kernel)
+            .collect();
         assert_eq!(
             kernels,
             [
@@ -8192,7 +8204,10 @@ mod tests {
                 split.dispatch.threadgroups,
                 split.dispatch.threads_per_threadgroup
             ),
-            ((1, p.num_global_kv_heads, splits), (p.global_head_dim, 1, 1))
+            (
+                (1, p.num_global_kv_heads, splits),
+                (p.global_head_dim, 1, 1)
+            )
         );
         assert_eq!(
             (
@@ -8211,7 +8226,10 @@ mod tests {
         assert_eq!(split.constants[..dense.len()], *dense);
         assert_eq!(
             split.constants[dense.len()..],
-            [ConstantValue::uint(13, bits), ConstantValue::uint(18, splits)]
+            [
+                ConstantValue::uint(13, bits),
+                ConstantValue::uint(18, splits)
+            ]
         );
         assert_eq!(split.bindings[..fp16.bindings.len()], *fp16.bindings);
         let layer = crate::tape::ids::LayerId(0);
@@ -8245,7 +8263,10 @@ mod tests {
         let kept = (split.bindings.iter())
             .filter(|b| matches!(b.index(), 0 | 11 | 15))
             .copied();
-        assert_eq!(*combine.bindings, kept.chain([partials]).collect::<Vec<_>>());
+        assert_eq!(
+            *combine.bindings,
+            kept.chain([partials]).collect::<Vec<_>>()
+        );
 
         // The twin's own contract, at the sinks geometry that keeps it:
         let tape = lower_subtile_tape_to_metal(&sinks_tape(rows), &p, bake_point(1, None))
@@ -8793,6 +8814,47 @@ mod tests {
         );
     }
 
+    /// A bucket whose partials scratch would not fit the u32 the op scratch is sized in
+    /// keeps the twin: gemma-4's global layers (32 query heads, head_dim 512, the cap's
+    /// sixteen splits) at a 4096-token prefill bucket land at 4.3 GiB — the gated decode
+    /// row such a bucket carries is served by the twin there, while the same geometry at
+    /// a decode bucket fits and takes the split.
+    #[test]
+    fn turboquant_decode_refuses_buckets_whose_partials_do_not_fit() {
+        let p = MetalModelConsts {
+            global_head_dim: 512,
+            num_q_heads: 32,
+            num_global_kv_heads: 4,
+            global_block_size: 256,
+            global_rot_dim: 128,
+            ..tq_consts()
+        };
+        let rows = || {
+            coded(
+                tq_writer(0, Causal, LLAMA_KV),
+                attention(MetalStep::AttentionViaCache, 0, Interleaved),
+            )
+        };
+        let kernels = |tape: &LoweredMetalTape| {
+            (tape.commands.iter())
+                .map(|c| c.command.kernel)
+                .collect::<Vec<_>>()
+        };
+        let splits = (128 * p.global_block_size)
+            .div_ceil(ATTN_SPLIT_KEYS)
+            .clamp(1, ATTN_MAX_SPLITS);
+        assert_eq!(splits, ATTN_MAX_SPLITS);
+        let wide = kernels(&lower_tq(&p, rows(), 4096));
+        assert!(wide.contains(&KernelId::AttentionViaCacheTq));
+        assert!(!wide.contains(&KernelId::AttentionDecodeGqaTq));
+        let decode = kernels(&lower_tq(&p, rows(), 8));
+        assert!(decode.contains(&KernelId::AttentionDecodeGqaTq));
+        assert_eq!(
+            lower_tq(&p, rows(), 8).moe_scratch_bytes,
+            8 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
+        );
+    }
+
     /// The NAX paged attention is instantiated for the pages it reads: 16-token pages at head_dims
     /// 64 / 128 / 256, 32-token pages at 512 (Gemma 4's global layers); a cache of other pages
     /// gets none of its instantiations.
@@ -8932,7 +8994,10 @@ mod tests {
         want.extend(tq_attention_steps(
             &own(global_attention),
             // The global layer's group of 32 exceeds the split's 8 heads a KV head.
-            &[(KernelId::AttentionViaCacheTq, Some(RuntimeGate::OnlyIfDecodeStep))],
+            &[(
+                KernelId::AttentionViaCacheTq,
+                Some(RuntimeGate::OnlyIfDecodeStep),
+            )],
         ));
         want.push((KernelId::RopeAppend, None));
         want.extend(fp16(sliding_attention));
@@ -9414,8 +9479,14 @@ mod tests {
         want.extend(tq_attention_steps(
             &own,
             &[
-                (KernelId::AttentionDecodeGqaTq, Some(RuntimeGate::OnlyIfDecodeStep)),
-                (KernelId::AttentionDecodeCombine, Some(RuntimeGate::OnlyIfDecodeStep)),
+                (
+                    KernelId::AttentionDecodeGqaTq,
+                    Some(RuntimeGate::OnlyIfDecodeStep),
+                ),
+                (
+                    KernelId::AttentionDecodeCombine,
+                    Some(RuntimeGate::OnlyIfDecodeStep),
+                ),
             ],
         ));
         assert_eq!(gated_steps(&tape), want);
@@ -9813,11 +9884,14 @@ mod tests {
             vec![bias(0, 14), bias(1, 15), partials],
             vec![k_bias, v_bias],
         );
-        let combine_restores =
-            (combine, vec![bias(1, 15), partials], vec![k_bias, v_bias]);
+        let combine_restores = (combine, vec![bias(1, 15), partials], vec![k_bias, v_bias]);
         assert_eq!(
             offsets(qwen2, decode.clone(), 1),
-            [encode.clone(), split_restores.clone(), combine_restores.clone()]
+            [
+                encode.clone(),
+                split_restores.clone(),
+                combine_restores.clone()
+            ]
         );
 
         let mut want = vec![encode];

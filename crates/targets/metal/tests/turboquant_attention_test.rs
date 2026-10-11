@@ -728,7 +728,15 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         // Head_dim 64's partials fill two simdgroups' lanes: the combine's
         // ATTN_COMBINE_GROUPS follows the head dim.
         let combine_threads = if hd >= 128 { 128 } else { 64 };
-        batch.encode(&combine, &binds, &[], &[], &[], grid, tg(combine_threads, 1, 1));
+        batch.encode(
+            &combine,
+            &binds,
+            &[],
+            &[],
+            &[],
+            grid,
+            tg(combine_threads, 1, 1),
+        );
     } else if decode {
         let heads = c.decode_heads;
         let mut consts = f.attn_constants(&[bits, ConstantValue::uint(16, heads)]);
