@@ -20,8 +20,9 @@ use serde::Serialize;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, Column, Definition, Fold, Grid, Heading, Layer, Section, Span, Stack, Table,
-    TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
+    Alignment, Column, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Grid,
+    Heading, Layer, Section, Span, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile,
+    Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
@@ -1164,14 +1165,6 @@ enum Trend {
 }
 
 impl Trend {
-    /// Prefill on the left, decode on the right, as in the heat maps.
-    const ALL: [Trend; 4] = [
-        Trend::UsersPrefill,
-        Trend::UsersDecode,
-        Trend::PromptPrefill,
-        Trend::AnswerDecode,
-    ];
-
     fn metric(self) -> Metric {
         match self {
             Trend::UsersDecode | Trend::AnswerDecode => Metric::Throughput,
@@ -1195,21 +1188,6 @@ impl Trend {
             Trend::UsersDecode | Trend::UsersPrefill => "users at once",
             Trend::PromptPrefill => "prompt tokens",
             Trend::AnswerDecode => "answer tokens",
-        }
-    }
-
-    /// What the line runs along, and what is held where.
-    fn axis(self) -> &'static str {
-        match self {
-            Trend::UsersDecode | Trend::UsersPrefill => {
-                "1, 4 and 16 users at once, 512-token prompts and 128-token answers"
-            }
-            Trend::PromptPrefill => {
-                "prompts of 128, 1024 and 4096 tokens, each the geometric mean over its three answer lengths, 8 users"
-            }
-            Trend::AnswerDecode => {
-                "answers of 16, 128 and 512 tokens, each the geometric mean over its three prompt lengths, 8 users"
-            }
         }
     }
 
@@ -1755,50 +1733,72 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
                 Heading { "At a glance" }
-                p {
-                    "Every model's prompt size × answer size grid on every machine: in each cell, the model's \
-                     prefill (time to first token) grid, then its decode (throughput) grid (rows: prompt, short to \
-                     long; columns: answer, short to long). Colour is how many times faster scratchy is than mlx-lm \
-                     (ollama where a run has no mlx-lm): blue faster, red slower, the middle step within noise. \
-                     Hover a square for its ratio."
-                }
-                // The tile shrink-wraps the set instead of spanning the page.
+                // One tile, a content switcher choosing its panel: the heat maps,
+                // then one panel of sparklines per dimension. The tile shrink-wraps
+                // the heat maps instead of spanning the page; the intros and the
+                // sparkline panels add no width of their own (an intro would
+                // otherwise run on one line as wide as it likes) and stretch to the
+                // heat maps'.
                 Tile { style: "width: fit-content; max-width: 100%",
-                    div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem 2rem",
-                        div { style: "display: flex; flex-direction: column; gap: 1.5rem; min-width: 0",
-                            for chip in machines.keys() {
-                                div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-start",
-                                    div { style: "flex: none; width: 7rem", "{chip}" }
-                                    for stem in &stems {
-                                        // At least two 88px grids and the 8px between them.
-                                        div { style: "flex: 1 1 11.5rem; min-width: 11.5rem; display: flex; flex-direction: column; gap: 0.5rem",
-                                            div { style: "text-align: center", "{stem}" }
-                                            div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                                for (metric, name) in metrics { {mini(chip, stem, metric, name)} }
+                    Stack { gap: 5,
+                        ContentSwitcher { selected: slug(HEAT_MAPS),
+                            ContentSwitcherItem { target: slug(HEAT_MAPS), selected: true, "{HEAT_MAPS}" }
+                            for (title, _, _) in SCALING {
+                                ContentSwitcherItem { target: slug(title), selected: false, "{title}" }
+                            }
+                        }
+                        div {
+                            ContentPanel { id: slug(HEAT_MAPS), shown: true,
+                                Stack { gap: 5,
+                                    p { style: "contain: inline-size",
+                                        "Every model's prompt size × answer size grid on every machine: in each cell, the model's \
+                                         prefill (time to first token) grid, then its decode (throughput) grid (rows: prompt, short to \
+                                         long; columns: answer, short to long). Colour is how many times faster scratchy is than mlx-lm \
+                                         (ollama where a run has no mlx-lm): blue faster, red slower, the middle step within noise. \
+                                         Hover a square for its ratio."
+                                    }
+                                    div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem 2rem",
+                                        div { style: "display: flex; flex-direction: column; gap: 1.5rem; min-width: 0",
+                                            for chip in machines.keys() {
+                                                div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-start",
+                                                    div { style: "flex: none; width: 7rem", "{chip}" }
+                                                    for stem in &stems {
+                                                        // At least two 88px grids and the 8px between them.
+                                                        div { style: "flex: 1 1 11.5rem; min-width: 11.5rem; display: flex; flex-direction: column; gap: 0.5rem",
+                                                            div { style: "text-align: center", "{stem}" }
+                                                            div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                                                                for (metric, name) in metrics { {mini(chip, stem, metric, name)} }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
+                                        {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
                                     }
                                 }
                             }
-                        }
-                        {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
-                    }
-                }
-                // Below the heat maps: one panel per trend, each a machine × model
-                // matrix of sparklines.
-                Grid {
-                    for trend in Trend::ALL {
-                        Column { span: Span::HALF,
-                            Tile { style: "height: 100%",
-                                Stack { gap: 3,
-                                    strong { "{trend.title()}" }
-                                    p { style: "font-size: 0.75rem", "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {trend.axis()}: blue fill where scratchy is ahead, red where it is behind." }
-                                    div { style: "display: grid; grid-template-columns: 7rem repeat({stems.len()}, minmax(0, 1fr)); gap: 0.75rem 1rem; align-items: center; font-size: 0.75rem",
-                                        div {}
-                                        for stem in &stems { div { style: "text-align: center", "{stem}" } }
-                                        for chip in machines.keys() {
-                                            div { "{chip}" }
-                                            for stem in &stems { div { {trend_spark(machines, chip, stem, trend, "4.5rem")} } }
+                            // Each a machine × model matrix, every cell its prefill
+                            // sparkline over its decode. The 2rem between models
+                            // holds the end tick labels Carbon centres on each
+                            // chart's edges.
+                            for (title, along, [prefill, decode]) in SCALING {
+                                ContentPanel { id: slug(title), shown: false,
+                                    div { style: "contain: inline-size",
+                                        Stack { gap: 5,
+                                            p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
+                                            div { style: "display: grid; grid-template-columns: 7rem auto repeat({stems.len()}, minmax(0, 1fr)); gap: 0.25rem 2rem; align-items: center",
+                                                div {}
+                                                div {}
+                                                for stem in &stems { div { style: "text-align: center", "{stem}" } }
+                                                for chip in machines.keys() {
+                                                    div { style: "grid-row: span 2; align-self: start", "{chip}" }
+                                                    div { "Prefill" }
+                                                    for stem in &stems { div { {trend_spark(machines, chip, stem, prefill, "4.5rem")} } }
+                                                    div { "Decode" }
+                                                    for stem in &stems { div { {trend_spark(machines, chip, stem, decode, "4.5rem")} } }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1810,6 +1810,24 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         }
     }
 }
+
+/// The glance's first panel's name.
+const HEAT_MAPS: &str = "Heat maps";
+
+/// The sparkline panels: a dimension, what runs along it, and its prefill and
+/// decode trends.
+const SCALING: [(&str, &str, [Trend; 2]); 2] = [
+    (
+        "Concurrency scaling",
+        "1, 4 and 16 users at once, with 512-token prompts and 128-token answers",
+        [Trend::UsersPrefill, Trend::UsersDecode],
+    ),
+    (
+        "Length scaling",
+        "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, with 8 users at once. Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
+        [Trend::PromptPrefill, Trend::AnswerDecode],
+    ),
+];
 
 fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
     let mslug = slug(chip);

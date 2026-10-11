@@ -88,8 +88,9 @@ cds-header-name::part(prefix) { color: var(--accent); }
  * grids here line up with the text around them instead of sitting a margin in. */
 .cds--content cds-grid::part(grid) { padding-inline: 0; }
 
-/* The overview's small multiples: names and ranges in Carbon's label-01
- * type (its stylesheet exposes no global token or class for it). */
+/* The overview's tile, its intros, heat maps and sparklines, all in Carbon's
+ * label-01 type. Neither @carbon/styles' CSS nor @carbon/type (Sass and JS
+ * only) publishes a class or a global token for it. */
 #glance cds-tile { font-size: 0.75rem; line-height: 1.33333; letter-spacing: 0.32px; }
 
 /* A Carbon toggletip sits in the sentence it explains; Carbon displays it as
@@ -105,6 +106,11 @@ cds-stack > * { min-width: 0; }
 
 /* The colour-scale step of the heat map square under the pointer (charts.js). */
 [data-step][data-active] { outline: 2px solid var(--cds-focus, #0f62fe); outline-offset: 1px; position: relative; z-index: 1; }
+
+/* A content switcher's hidden panel (carbon.rs ContentPanel) keeps its width,
+ * at no height: what holds the panels is as wide as the widest, whichever is
+ * shown. */
+[data-panel][hidden] { display: block; height: 0; overflow: hidden; visibility: hidden; }
 
 /* A sparkline's x axis keeps its title, the label Carbon's tooltip gives the
  * x value, but does not print it: the panel's heading names the dimension.
