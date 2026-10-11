@@ -628,13 +628,16 @@ impl StepSlotMapping {
 #[cfg(feature = "metal")]
 const METAL_KV_ELEM_BYTES: usize = 2;
 
-/// A decode step's most rows, as the metal device carries it: a row a sequence of `max_num_seqs`,
-/// or — a verify step, of at most `arch`'s compiled head's `max_seqs` sequences — each sequence's
-/// token and its drafts. The rows the TurboQuant decode split's partials and the sampler hold.
+/// A decode step's most rows, as the metal device carries it: a row for each of `max_num_seqs`
+/// sequences, plus the drafts of the ones that draft — at most `arch`'s compiled head's
+/// `max_seqs`, beside sequences that run plain in the same step. The rows the TurboQuant decode
+/// split's partials and the sampler hold.
 #[cfg(feature = "metal")]
 fn decode_rows(arch: &str, max_num_seqs: usize) -> scratchy_target_metal::tape::ids::DecodeRows {
     let rows = match scratchy_forward_compiler::head_of(arch) {
-        Some(head) => max_num_seqs.max(usize::from(head.max_seqs) * (1 + usize::from(head.drafts))),
+        Some(head) => {
+            max_num_seqs + max_num_seqs.min(usize::from(head.max_seqs)) * usize::from(head.drafts)
+        }
         None => max_num_seqs,
     };
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
@@ -1063,6 +1066,7 @@ impl MetalWorker {
     fn resolve_max_num_seqs(
         &mut self,
         model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        arch: &str,
         gpu_device: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<()> {
         if self.resolved_max_num_seqs.is_some() {
@@ -1127,17 +1131,19 @@ impl MetalWorker {
                     u32::try_from(model.vocab_size()).unwrap_or(u32::MAX),
                     u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
                 );
+                // The arena's rows beyond one a sequence are the drafts of the sequences that
+                // draft, at most the compiled head's `max_seqs` whatever the width: fixed bytes.
+                let draft_rows = scratchy_forward_compiler::head_of(arch)
+                    .map_or(0, |h| usize::from(h.max_seqs) * usize::from(h.drafts));
                 let facts = MaxNumSeqsFacts {
                     // Metal reports no device facts — the base constant, the
                     // SAME default as before the resolver existed.
                     device_total_bytes: None,
                     device_name: None,
                     device_budget_bytes: budget,
-                    allocated_bytes: allocated,
+                    allocated_bytes: allocated + draft_rows * sampler_row,
                     peak_activation_bytes: peak,
                     gdn_per_slot_bytes: gdn_per_slot,
-                    // One sampled row a sequence: only a step of at most the compiled head's
-                    // `max_seqs` sequences samples their drafts too (the sampler arena's rows).
                     sampler_bytes_per_row: sampler_row,
                 };
                 resolve_default_max_num_seqs(&facts, false)
@@ -4553,7 +4559,7 @@ impl Worker for MetalWorker {
         // `initialize_cache`, spec-decode chain bounds). The target and the
         // `gpu_device` it needs for rung picking are still locals here
         // (fields assigned at the end of load_model) — pass them in.
-        self.resolve_max_num_seqs(model.as_ref(), &gpu_device)?;
+        self.resolve_max_num_seqs(model.as_ref(), &arch, &gpu_device)?;
         gpu_device.max_decode_rows = Some(decode_rows(&arch, self.max_num_seqs_resolved()));
 
         {
