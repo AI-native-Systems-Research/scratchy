@@ -7,6 +7,7 @@
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
@@ -160,7 +161,7 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
     );
     let gated = AffineGatedQmvConstants {
         qmv: qmv(),
-        act: c.gated,
+        act: ExpertBody::Gated(c.gated),
     };
     let fused = pso(
         "quantized_qmv",

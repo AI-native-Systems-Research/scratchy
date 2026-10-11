@@ -15,6 +15,7 @@
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::cpu_reference::affine_qmv_b3_bf16_s_bf16;
 use scratchy_target_metal::detect_device;
@@ -505,7 +506,7 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
                 n: NDimI32(c.n as i32),
                 codes: AffineCodes::AsWritten,
             },
-            act: GatedAct::Silu,
+            act: ExpertBody::Gated(GatedAct::Silu),
         }
         .into();
         v.extend(Vec::<ConstantValue>::from(e));
@@ -886,7 +887,7 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
                 n: NDimI32(c.n as i32),
                 codes: AffineCodes::AsWritten,
             },
-            act: GatedAct::Silu,
+            act: ExpertBody::Gated(GatedAct::Silu),
         }
         .into();
         // The M1 dense gated carries the norm (input is the post-attention
