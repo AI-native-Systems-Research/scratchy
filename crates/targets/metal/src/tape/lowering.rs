@@ -3194,17 +3194,15 @@ fn lower_one(
                 },
                 act: *act,
             };
-            // `affine_qmv_fast`'s shape rule, for both matvecs.
-            let fast = if crate::tape::quantized::qmv_fast_covers(n, k) {
-                "_fast"
-            } else {
-                ""
-            };
+            // `affine_qmv_fast`'s shape rule, for both matvecs — and the block rows the gated
+            // kernel then runs (`gated_tile_rows`).
+            let fast = crate::tape::quantized::qmv_fast_covers(n, k);
+            let suffix = if fast { "_fast" } else { "" };
             let (d, s) = (
                 dequant_infix(dequant_dtype_for(p)),
                 scale_infix(scale_dtype_for(p)),
             );
-            let symbol = format!("affine_qmv_gated{fast}_{d}_s_{s}_gs_{gs}_b_{bits}");
+            let symbol = format!("affine_qmv_gated{suffix}_{d}_s_{s}_gs_{gs}_b_{bits}");
             let layer = super::ids::LayerId(g.layer.get() + layer_offset);
             let mut bindings = affine_qmm_bindings(
                 g.input.get(),
@@ -3237,7 +3235,7 @@ fn lower_one(
                     .collect::<Vec<_>>()
                     .into_baked(),
                 dispatch: DispatchShape {
-                    threadgroups: (1, n / 8, 1),
+                    threadgroups: (1, n / crate::tape::quantized::gated_tile_rows(fast), 1),
                     threads_per_threadgroup: (32, 4, 1),
                     m_scaling: None,
                 },

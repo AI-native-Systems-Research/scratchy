@@ -27,7 +27,7 @@ use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, RmsNormConstants, norm_threads,
 };
 use scratchy_target_metal::tape::quantized::{
-    DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, qmv_dispatch_shape,
+    DequantDtype, QmvKernel, ScaleDtype, gated_tile_rows, pick_qmv_kernel, qmv_dispatch_shape,
     qmv_kernel_static_name,
 };
 use scratchy_target_metal::tape::step::{
@@ -570,7 +570,7 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
             &[],
             &[],
             &[],
-            size((1, c.n as u32 / 8, 1)),
+            size((1, c.n as u32 / gated_tile_rows(true), 1)),
             size((32, 4, 1)),
         );
         batch.commit(true);
@@ -937,8 +937,8 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
         let (xb, gb2) = (shared(&r.device, &x), shared(&r.device, &gain));
         let y = shared(&r.device, &vec![0u16; n]);
         let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
-        // Dispatch (1, ceil(n/8), 1) x (32, 4, 1) — the gated kernel's own
-        // shape (4 simdgroups: 0-1 gate, 2-3 up).
+        // Dispatch (1, n / gated_tile_rows(true), 1) x (32, 4, 1) — the gated kernel's own
+        // fast shape (4 simdgroups: 0-1 gate, 2-3 up).
         let binds = [
             (&gw, 0),
             (&gs, 1),
@@ -956,7 +956,7 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
             &[],
             &[],
             &[],
-            size((1, n as u32 / 8, 1)),
+            size((1, n as u32 / gated_tile_rows(true), 1)),
             size((32, 4, 1)),
         );
         batch.commit(true);

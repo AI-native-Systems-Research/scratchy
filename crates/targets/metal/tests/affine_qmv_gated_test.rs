@@ -17,7 +17,7 @@ use scratchy_target_metal::tape::ids::{HiddenSize, KDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, SiluMulConstants,
 };
-use scratchy_target_metal::tape::quantized::{QmvKernel, qmv_dispatch_shape};
+use scratchy_target_metal::tape::quantized::{QmvKernel, gated_tile_rows, qmv_dispatch_shape};
 use scratchy_target_metal::tape::step::GatedAct;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
@@ -236,7 +236,8 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
         (&up.scales, 6),
         (&up.biases, 7),
     ];
-    batch.encode(&fused, &binds, &[], &[], &[], tg(1, c.n / 8), tg(32, 4));
+    let rows = gated_tile_rows(c.fast()) as usize;
+    batch.encode(&fused, &binds, &[], &[], &[], tg(1, c.n / rows), tg(32, 4));
     batch.commit(true);
     Some((read_u16(&out, c.n), read_u16(&unfused, c.n)))
 }
