@@ -34,6 +34,13 @@ using namespace metal;
 SCRATCHY_CONSTANT(uint, SILU_MUL_N, 0);
 SCRATCHY_CONSTANT_OPTIONAL(uint, SILU_MUL_ROW, 1);
 SCRATCHY_CONSTANT_OPTIONAL(uint, SILU_MUL_EXPERTS, 2);
+// 3 (`SILU_MUL_LINEAR_BIAS`): gpt-oss's grouped bake — the pair's expert adds its gate and up
+// LINEAR biases before the activation, the decomposed sibling of the gathered
+// `affine_gather_qmv_gated` epilogue (buffer(14) there). Unset: no buffer(4), and the adds
+// const-fold away.
+SCRATCHY_CONSTANT_OPTIONAL(bool, SILU_MUL_LINEAR_BIAS_FC, 3);
+constant constexpr bool SILU_MUL_LINEAR_BIAS =
+    SILU_MUL_LINEAR_BIAS_FC_SET && SILU_MUL_LINEAR_BIAS_FC;
 
 inline bool silu_mul_skips(const device uint* row_expert, uint gid) {
   return gid >= SILU_MUL_N ||
@@ -96,12 +103,22 @@ template <typename T>
     const device T* gate [[buffer(1)]],
     const device T* up   [[buffer(2)]],
     const device uint* row_expert [[buffer(3)]],
+    const device T* linear_bias [[buffer(4)]],
     uint gid [[thread_position_in_grid]])
 {
   if (silu_mul_skips(row_expert, gid)) {
     return;
   }
-  out[gid] = static_cast<T>(swiglu_oai_mul_f(float(gate[gid]), float(up[gid])));
+  float g = float(gate[gid]);
+  float u = float(up[gid]);
+  if (SILU_MUL_LINEAR_BIAS) {
+    // [E, 2·row]: the expert's gate rows then its up rows.
+    const uint row = max(SILU_MUL_ROW, 1u), col = gid % row;
+    const device T* b = linear_bias + size_t(row_expert[gid / row]) * 2 * size_t(row);
+    g += float(b[col]);
+    u += float(b[row + col]);
+  }
+  out[gid] = static_cast<T>(swiglu_oai_mul_f(g, u));
 }
 
 #define INST_SWIGLU_OAI_MUL(dtype_tag, mtl_type) \

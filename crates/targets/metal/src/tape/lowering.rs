@@ -6876,6 +6876,82 @@ fn lower_moe_step(
         Some(program) if gathered && e <= threads => (Some(program), None),
         routing => (None, routing.map(S::Route)),
     };
+    // The act over the experts' gate/up rows, at `bias_layer` the gpt-oss pair's expert adding its
+    // gate and up LINEAR biases first — the [E, 2·inter] concat the loader interleaves, at 4 with
+    // the kernel's switch at slot 3; the grouped GEMMs cannot. Every other bundle's `None` leaves
+    // both unset and the kernel const-folds the adds away.
+    let gated_act_command =
+        |act, bias_layer: Option<LayerId>| -> Result<Vec<LoweredCommand>, LoweringError> {
+            let (kernel, symbol) = match act {
+                GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
+                GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
+                GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
+            };
+            let (rows, m_scaling) = match s.grouping {
+                MoeGrouping::Gathered => (pairs, ms(A::X)),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
+            };
+            let n = rows * inter;
+            let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
+            let gate = |i| s.at(i, R::ExpertGate);
+            let mut bindings = vec![gate(0), gate(1), s.at(2, R::ExpertUp)];
+            let mut constants = vec![C::uint(0, n)];
+            // The row's expert, when a kernel reads it: a grouped bake's sentinel skip, or the bias
+            // epilogue's lookup — `gather_indices`' buffer, the pair's own top-k index gathered.
+            if s.grouping == MoeGrouping::Grouped || bias_layer.is_some() {
+                bindings.push(gather_indices(&s, 3));
+                constants.extend([C::uint(1, inter), C::uint(2, e)]);
+            }
+            if let Some(l) = bias_layer {
+                bindings.push(source(
+                    router()?,
+                    WeightTensor::MoeExpertGateUpLinearBias,
+                    l,
+                    4,
+                ));
+                constants.push(C::boolean(3, true));
+            }
+            Ok(vec![cmd(
+                kernel, "silu_mul", symbol, constants, shape, bindings,
+            )])
+        };
+    // The combine of the experts' down rows, at `bias_layer` the gpt-oss pair's expert adding its
+    // down LINEAR bias before its score weights it — [E, hidden] at 5, TopKIndices at 4 naming the
+    // pair's expert, switch at slot 3; the grouped GEMM cannot. Same `None` contract as the act's.
+    let combine_command =
+        |out, bias_layer: Option<LayerId>| -> Result<Vec<LoweredCommand>, LoweringError> {
+            let threads = hidden.min(64);
+            let shape = grid(
+                (hidden.div_ceil(threads), bucket_m, 1),
+                (threads, 1, 1),
+                ms(A::Y),
+            );
+            let (rows, scores) = (s.at(0, R::ExpertDown), s.at(1, R::TopKScores));
+            let mut bindings = vec![rows, scores, arena_at(2, out)];
+            let mut constants = vec![C::int(0, k as i32), C::int(1, hidden as i32)];
+            if s.grouping != MoeGrouping::Gathered {
+                bindings.push(scratch_at(3, s.l.grp_pos));
+                constants.push(C::boolean(2, true));
+            }
+            if let Some(l) = bias_layer {
+                bindings.push(s.at(4, R::TopKIndices));
+                bindings.push(source(
+                    router()?,
+                    WeightTensor::MoeExpertDownLinearBias,
+                    l,
+                    5,
+                ));
+                constants.push(C::boolean(3, true));
+            }
+            Ok(vec![cmd(
+                KernelId::MoeWeightedSum,
+                "moe_weighted_sum",
+                moe_weighted_sum_symbol(p),
+                constants,
+                shape,
+                bindings,
+            )])
+        };
     // An expert projection's `[weight, scales, biases]`, bound at `first..first + 3`.
     let expert_weights = |proj, l: LayerId, first: u8| -> Result<[Binding; 3], LoweringError> {
         let (ix, lw) = (w.of(b.bundle.weight_kind(), 0)?, layer(&l));
@@ -7421,9 +7497,13 @@ fn lower_moe_step(
                 width: up_width,
                 ..gate
             };
-            let steps = [S::ExpertMatmul(gate), S::ExpertMatmul(up), S::GatedAct(act)];
+            // A grouped gpt-oss bake's GEMMs cannot add the experts' LINEAR biases; the act does.
+            let bias_layer = (b.bundle == ExpertBundle::GptOss).then(|| layer(&gate.layer));
+            let gemms = [S::ExpertMatmul(gate), S::ExpertMatmul(up)];
             let route = routing.map(S::Route);
-            each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
+            let mut commands = each_step(&[route.as_slice(), &gemms].concat(), moe_scratch_bytes)?;
+            commands.extend(gated_act_command(act, bias_layer)?);
+            commands
         }
         S::GateUpAct(gate, _, act, routing) => {
             let (routed, route) = routed_here(routing, 4 * 128);
@@ -7495,15 +7575,19 @@ fn lower_moe_step(
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
         // grid-adjacency (simdgroup k = pair k), which the sort permutes apart — so a sorted or
         // grouped bake runs each step's own commands.
-        S::DownCombine(down, out, ends)
+        S::DownCombine(down, Slot(out), ends)
             if s.grouping != MoeGrouping::Gathered || matches!(down.rows, MoeRows::Tokens(_)) =>
         {
             // Only the gathered command computes the combine's ends.
             if ends != crate::tape::step::CombineEnds::default() {
                 return Err(LoweringError::CombineEndsUngathered);
             }
-            let steps = [S::ExpertMatmul(down), S::Unsort, S::Combine(out)];
-            each_step(&steps, moe_scratch_bytes)?
+            // A grouped gpt-oss bake's GEMM cannot add the experts' down LINEAR bias; the
+            // combine does.
+            let bias_layer = (b.bundle == ExpertBundle::GptOss).then(|| layer(&down.layer));
+            let mut commands = each_step(&[S::ExpertMatmul(down), S::Unsort], moe_scratch_bytes)?;
+            commands.extend(combine_command(out, bias_layer)?);
+            commands
         }
         S::DownCombine(down, Slot(out), ends) => {
             let (AffineGroupSize(gs), bits) = (down.group_size, down.width.bits().0);
@@ -7544,53 +7628,25 @@ fn lower_moe_step(
         // padded row (the sort's static grid covered them), a grouped one skipping the rows the
         // sort's init left sentinel.
         S::GatedAct(act) => {
-            let (kernel, symbol) = match act {
-                GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
-                GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
-                GatedAct::SwigluOai => (KernelId::SwigluOaiMul, swiglu_oai_mul_static_name(dtype)),
-            };
-            let (rows, m_scaling) = match s.grouping {
-                MoeGrouping::Gathered => (pairs, ms(A::X)),
-                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
-            };
-            let n = rows * inter;
-            let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
-            let gate = |i| s.at(i, R::ExpertGate);
-            let mut bindings = vec![gate(0), gate(1), s.at(2, R::ExpertUp)];
-            let mut constants = vec![C::uint(0, n)];
-            if s.grouping == MoeGrouping::Grouped {
-                bindings.push(scratch_at(3, s.l.grp_indices_pad));
-                constants.extend([C::uint(1, inter), C::uint(2, e)]);
+            // gpt-oss's experts carry LINEAR biases only the fused commands bind — a standalone
+            // act holds no layer to bind them with. Reroll always fuses its gate/up/act, so
+            // refuse the bake rather than drop them silently.
+            if b.bundle == ExpertBundle::GptOss {
+                panic!("a GptOss GatedAct must arrive fused into GateUpAct");
             }
-            vec![cmd(kernel, "silu_mul", symbol, constants, shape, bindings)]
+            gated_act_command(act, None)?
         }
         S::Unsort => vec![],
         // `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]`; a sorted bake's pair rows read where
         // the sort put them, through `pos`.
         S::Combine(Slot(out)) => {
-            let threads = hidden.min(64);
-            let shape = grid(
-                (hidden.div_ceil(threads), bucket_m, 1),
-                (threads, 1, 1),
-                ms(A::Y),
-            );
-            let (rows, scores) = (s.at(0, R::ExpertDown), s.at(1, R::TopKScores));
-            let mut bindings = vec![rows, scores, arena_at(2, out)];
-            let mut constants = vec![C::int(0, k as i32), C::int(1, hidden as i32)];
-            if s.grouping != MoeGrouping::Gathered {
-                bindings.push(scratch_at(3, s.l.grp_pos));
-                constants.push(C::boolean(2, true));
+            // gpt-oss's experts carry a down LINEAR bias only the fused commands bind — a
+            // standalone combine holds no layer to bind it with. Reroll always fuses its
+            // down/unsort/combine, so refuse the bake rather than drop it silently.
+            if b.bundle == ExpertBundle::GptOss {
+                panic!("a GptOss Combine must arrive fused into DownCombine");
             }
-            let symbol = moe_weighted_sum_symbol(p);
-            let kernel = KernelId::MoeWeightedSum;
-            vec![cmd(
-                kernel,
-                "moe_weighted_sum",
-                symbol,
-                constants,
-                shape,
-                bindings,
-            )]
+            combine_command(out, None)?
         }
     })
 }
@@ -7693,8 +7749,9 @@ mod tests {
         kind(Slot(3), Slot(6), LayerId(layer), pairing)
     }
 
-    /// The weight kinds a metal step binds.
-    const KINDS: [WeightKind; 11] = [
+    /// The weight kinds a metal step binds. `GptOssMoe` last: `src()` numbers a kind's sources
+    /// `10·k + slot` by its index here, so appending keeps every earlier kind's numbers.
+    const KINDS: [WeightKind; 12] = [
         WeightKind::Embedding,
         WeightKind::AffineQuantEmbedding,
         WeightKind::RmsNorm,
@@ -7706,6 +7763,7 @@ mod tests {
         WeightKind::GemmaRouter,
         WeightKind::GemmaSwitchGlu,
         WeightKind::GatedDeltaNet,
+        WeightKind::GptOssMoe,
     ];
 
     /// The source every test row's site names as its `slot`-th `kind` weight: `10·k + slot`, so a
@@ -10126,6 +10184,169 @@ mod tests {
             let got = [1, 2, 4, 8, 64, 512].map(|bucket_m| grouping(experts, bucket_m));
             assert!(got == want, "{experts} experts: {:?}", got.map(|g| g.pad()));
         }
+    }
+
+    /// gpt-oss-120b's MoE block: 128 experts, top 4, SwiGLU-OAI over 3-bit g64 experts with
+    /// per-expert LINEAR biases, raw (biased-linear) router input.
+    fn gptoss_moe_block() -> crate::tape::step::MoeBlock {
+        use crate::tape::ids::{
+            AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, NumExperts, TopK,
+        };
+        use crate::tape::step::{ExpertQuant, ExpertWidths, MoeBlock, RouterInput};
+        use scratchy_subtile::subtile_ir::{ExpertBundle, RouterBundle};
+        let three = AffineBits(3);
+        MoeBlock {
+            experts: NumExperts(128),
+            top_k: TopK(4),
+            inter: IntermediateSize(2880),
+            hidden: HiddenSize(2880),
+            router: RouterBundle::GptOss,
+            bundle: ExpertBundle::GptOss,
+            input: RouterInput::Raw,
+            quant: ExpertQuant {
+                group_size: AffineGroupSize(64),
+                widths: ExpertWidths {
+                    gate: three,
+                    up: three,
+                    down: three,
+                },
+            },
+        }
+    }
+
+    /// The whitelist grew GptOss for its prefill: a 512-row prompt re-read each expert slab 16
+    /// times gathered (803 GB, 1462 ms) where the grouped GEMMs read it once. The ladder the
+    /// gates give it: decode buckets gather — the same fused commands as before the whitelist
+    /// grew — bucket 16 sorts (64 pairs at 0.5 per expert, Gemma-4's own regime), and the
+    /// prefill buckets group from 4 pairs per expert (mlx's gate, bucket 128 here).
+    #[test]
+    fn a_gptoss_block_groups_where_mlx_groups_it() {
+        let p = tp();
+        let grouping =
+            |bucket_m| MoeScratch::of(&gptoss_moe_block(), bucket_m, &p, &mut 0).grouping;
+        use MoeGrouping::{Gathered, Grouped, Sorted};
+        let got = [1, 8, 16, 32, 64, 128, 512].map(grouping);
+        let want = [
+            Gathered, Gathered, Sorted, Gathered, Gathered, Grouped, Grouped,
+        ];
+        assert!(got == want, "gpt-oss: {:?}", got.map(|g| g.pad()));
+    }
+
+    /// A grouped GptOss bake's GEMMs cannot add the experts' LINEAR biases, so the decomposed
+    /// act and combine do: the [E, 2·inter] gate/up bias at the act's buffer 4 (its switch at
+    /// constant 3, the row's expert from `indices_pad` at buffer 3), the [E, hidden] down bias
+    /// at the combine's buffer 5 with the pair's own top-k index at 4. At bucket 512 — the
+    /// measured prefill regime, the NAX grouped GEMMs (is_nax, bits 3, gs 64).
+    #[test]
+    fn a_grouped_gptoss_bake_binds_its_linear_biases() {
+        use crate::tape::ids::{AffineBits, AffineGroupSize};
+        use crate::tape::step::{CombineEnds, ExpertMatmul, ExpertWidth, MoeRows, MoeStep};
+        use ConstantValue as C;
+        use scratchy_subtile::subtile_ir::ExpertProj;
+        let (block, p) = (gptoss_moe_block(), tp());
+        let at = MoeBake {
+            bucket_m: 512,
+            layer_offset: 0,
+            is_nax: true,
+            f16_compute: false,
+            codes: super::super::kernel_constants::AffineCodesTarget::of(None),
+        };
+        let lower = |step| {
+            lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a GptOss step lowers")
+        };
+        let three = AffineBits(3);
+        let gate = ExpertMatmul {
+            rows: MoeRows::Tokens(Slot(1)),
+            layer: LayerId(0),
+            proj: ExpertProj::Gate,
+            group_size: AffineGroupSize(64),
+            width: ExpertWidth::OpUniform(three),
+        };
+
+        // The act: the GateUpAct decomposition's tail after its two NAX GEMMs.
+        let commands = lower(MoeStep::GateUpAct(
+            gate,
+            ExpertWidth::OpUniform(three),
+            GatedAct::SwigluOai,
+            None,
+        ));
+        assert_eq!(commands.len(), 3, "gate GEMM, up GEMM, act");
+        let (s, act) = (MoeScratch::of(&block, 512, &p, &mut 0), &commands[2]);
+        assert_eq!(act.kernel, KernelId::SwigluOaiMul);
+        let n = s.l.mpad_max * 2880;
+        assert_eq!(
+            act.constants,
+            vec![
+                C::uint(0, n),
+                C::uint(1, 2880),
+                C::uint(2, 128),
+                C::boolean(3, true),
+            ]
+        );
+        let bias = src(WeightKind::GptOssMoe, 0);
+        assert_eq!(
+            act.bindings,
+            vec![
+                s.at(0, MoeRegion::ExpertGate),
+                s.at(1, MoeRegion::ExpertGate),
+                s.at(2, MoeRegion::ExpertUp),
+                Binding::MoeScratch {
+                    binding_index: 3,
+                    byte_offset: s.l.grp_indices_pad,
+                },
+                Binding::Source {
+                    ix: bias,
+                    which: WeightTensor::MoeExpertGateUpLinearBias,
+                    layer: LayerId(0),
+                    binding_index: 4,
+                },
+            ]
+        );
+
+        // The combine: the DownCombine decomposition's tail after its NAX GEMM, the pair's own
+        // top-k index naming the expert whose down bias it adds.
+        let down = ExpertMatmul {
+            rows: MoeRows::Scratch(MoeRegion::ExpertGate),
+            layer: LayerId(0),
+            proj: ExpertProj::Down,
+            group_size: AffineGroupSize(64),
+            width: ExpertWidth::OpUniform(three),
+        };
+        let commands = lower(MoeStep::DownCombine(down, Slot(2), CombineEnds::default()));
+        assert_eq!(commands.len(), 2, "down GEMM, combine");
+        let combine = &commands[1];
+        assert_eq!(combine.kernel, KernelId::MoeWeightedSum);
+        assert_eq!(
+            combine.constants,
+            vec![
+                C::int(0, 4),
+                C::int(1, 2880),
+                C::boolean(2, true),
+                C::boolean(3, true),
+            ]
+        );
+        assert_eq!(
+            combine.bindings,
+            vec![
+                s.at(0, MoeRegion::ExpertDown),
+                s.at(1, MoeRegion::TopKScores),
+                Binding::ArenaSlot {
+                    slot: 2,
+                    binding_index: 2,
+                },
+                Binding::MoeScratch {
+                    binding_index: 3,
+                    byte_offset: s.l.grp_pos,
+                },
+                s.at(4, MoeRegion::TopKIndices),
+                Binding::Source {
+                    ix: bias,
+                    which: WeightTensor::MoeExpertDownLinearBias,
+                    layer: LayerId(0),
+                    binding_index: 5,
+                },
+            ]
+        );
     }
 
     #[test]
