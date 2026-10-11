@@ -27,8 +27,8 @@ use crate::carbon::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
 use numbers::{
-    Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
-    served, timing, untimed_note,
+    Engine, Metric, NO_STREAM, NOISE, PARTIAL, Quantile, Startup, cell, cfmt, fmt, lfmt, med,
+    partial, served, timing, timing_at, untimed_note,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -419,6 +419,35 @@ enum Chart<'a> {
         data: Vec<SparkPoint>,
         options: ChartOptions<'a>,
     },
+    /// Carbon's StackedBarChart: at each key, the groups' bars one on another.
+    #[serde(rename = "stackedbar")]
+    StackedBar {
+        data: Vec<BarPoint>,
+        options: ChartOptions<'a>,
+    },
+}
+
+/// One bar: its group (stacked at a key), its key on the label axis, its value
+/// (None leaves no bar), and its colour, which charts.js hands Carbon bar by
+/// bar (Carbon's own colours go by group).
+#[derive(Serialize)]
+struct BarPoint {
+    group: &'static str,
+    key: &'static str,
+    value: Option<f64>,
+    fill: String,
+}
+
+/// `hex` (#rrggbb) mixed with as much again of white: the same hue, lighter.
+fn tint(hex: &str) -> String {
+    let channel = |at: usize| {
+        let c = hex
+            .get(at..at + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+            .unwrap_or(0);
+        (u16::from(c) + 255) / 2
+    };
+    format!("#{:02x}{:02x}{:02x}", channel(1), channel(3), channel(5))
 }
 
 /// One point of a sparkline. On the two lines, an engine's value; on the
@@ -662,9 +691,9 @@ struct Domain {
     max: f64,
 }
 
-/// Carbon's heatmap tooltip lists the axis values, then the cell's value
-/// under `locale.translations.total` (Carbon's default: "Total"; it outranks
-/// `tooltip.totalLabel`).
+/// Carbon's tooltip labels: a heatmap's value under `total` (default
+/// "Total"; it outranks `tooltip.totalLabel`), a series' name under `group`
+/// (default "Group"; it outranks `tooltip.groupLabel`).
 #[derive(Serialize)]
 struct Locale {
     translations: Translations,
@@ -672,13 +701,32 @@ struct Locale {
 
 #[derive(Serialize)]
 struct Translations {
-    total: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<&'static str>,
 }
+
+/// What a chart's series are when they are the engines, and their tooltip
+/// label.
+const SERVER: &str = "Server";
 
 impl Locale {
     fn total(label: String) -> Option<Self> {
         Some(Locale {
-            translations: Translations { total: label },
+            translations: Translations {
+                total: Some(label),
+                group: None,
+            },
+        })
+    }
+
+    fn group(label: &'static str) -> Option<Self> {
+        Some(Locale {
+            translations: Translations {
+                total: None,
+                group: Some(label),
+            },
         })
     }
 }
@@ -749,7 +797,7 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
             height: "280px".to_string(),
             width: None,
             legend: None,
-            locale: None,
+            locale: Locale::group(SERVER),
             combo: None,
             bounds: None,
             theme: "white",
@@ -1188,6 +1236,15 @@ impl Trend {
         }
     }
 
+    /// Its time, for a latency sparkline: prefill's to the first token,
+    /// decode's per output token.
+    fn latency(self) -> Metric {
+        match self.metric() {
+            Metric::Ttft => Metric::Ttft,
+            Metric::Tpot | Metric::Throughput => Metric::Tpot,
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             Trend::UsersDecode => "Concurrency scaling — Decode",
@@ -1446,7 +1503,7 @@ fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &st
             height: height.to_string(),
             width: None,
             legend: Some(Enabled { enabled: false }),
-            locale: None,
+            locale: Locale::group(SERVER),
             // Carbon draws an area's bounds only when the layer holds one series.
             combo: Some(vec![
                 ComboLayer {
@@ -1471,6 +1528,104 @@ fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &st
         },
     };
     chart(&spec, label, "width: 100%", None)
+}
+
+/// The users at once the tail bars are measured at: the most, where the
+/// tails are longest.
+const TAIL_USERS: u32 = 16;
+
+/// A tail bar's parts: its p50, then the rest of the way to its p99.
+const TAIL_P50: &str = "p50";
+const TAIL_GAP: &str = "p50 to p99";
+
+/// The engines along the tail bars' axis.
+const TAIL_ENGINES: [Engine; 3] = [Engine::MlxLm, Engine::Ollama, Engine::Scratchy];
+
+/// Tail-latency bars: an engine's bar at TAIL_USERS users is its p99 time, its
+/// p50 the solid part and the rest of the way to p99 lighter; an engine not
+/// run there has none.
+fn tail_bars(mr: &MachineRuns, chip: &str, stem: &str, trend: Trend, height: &str) -> Element {
+    let Some(Entry { m, .. }) = mr.latest(stem) else {
+        return rsx! { "not run" };
+    };
+    let metric = trend.latency();
+    let data: Vec<BarPoint> = TAIL_ENGINES
+        .into_iter()
+        .flat_map(|e| {
+            let cell = conc_cells(e.cells(m)).get(&TAIL_USERS).copied();
+            // Carbon prints values as given: round to what the tables show.
+            let at = |q| timing_at(cell, metric, q).map(|v| (v * 10.0).round() / 10.0);
+            let (p50, p99) = (at(Quantile::P50), at(Quantile::P99));
+            // The engine's colour, as in every other chart: the tail lighter.
+            let hue = colour(e.series());
+            [
+                BarPoint {
+                    group: TAIL_P50,
+                    key: e.label(),
+                    value: p50,
+                    fill: hue.to_string(),
+                },
+                BarPoint {
+                    group: TAIL_GAP,
+                    key: e.label(),
+                    value: p50
+                        .zip(p99)
+                        .map(|(p50, p99)| ((p99 - p50).max(0.0) * 10.0).round() / 10.0),
+                    fill: tint(hue),
+                },
+            ]
+        })
+        .collect();
+    if data.iter().all(|p| p.value.is_none()) {
+        return rsx! { "not run at {TAIL_USERS} users" };
+    }
+    let unit = if metric == Metric::Ttft {
+        "TTFT ms"
+    } else {
+        "TPOT ms"
+    };
+    let spec = Chart::StackedBar {
+        data,
+        options: ChartOptions {
+            title: String::new(),
+            axes: Axes {
+                // Its title is the tooltip's label for a bar's engine.
+                bottom: Axis {
+                    maps_to: "key",
+                    title: SERVER,
+                    scale_type: Some("labels"),
+                    ticks: None,
+                    include_zero: None,
+                    visible: None,
+                    domain: Some(AxisDomain::Labels(
+                        TAIL_ENGINES.map(|e| e.label().to_string()).to_vec(),
+                    )),
+                },
+                // Hidden; its title is the tooltip's label for a value.
+                left: Axis {
+                    maps_to: "value",
+                    title: unit,
+                    scale_type: None,
+                    ticks: None,
+                    include_zero: Some(true),
+                    visible: Some(false),
+                    domain: None,
+                },
+            },
+            color: None,
+            heatmap: None,
+            height: height.to_string(),
+            width: None,
+            legend: Some(Enabled { enabled: false }),
+            locale: Locale::group("Percentile"),
+            combo: None,
+            bounds: None,
+            theme: "white",
+            toolbar: Enabled { enabled: false },
+        },
+    };
+    let label = format!("{stem} on {chip}: {unit}, p50 and p99 at the {TAIL_USERS}-user setting");
+    chart(&spec, &label, "width: 100%", None)
 }
 
 /// Which overview sparkline: machine, model and trend.
@@ -1865,7 +2020,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     let mut sparks: BTreeMap<SparkAt, Result<Spark, &str>> = BTreeMap::new();
     for &chip in machines.keys() {
         for &stem in &stems {
-            for (_, _, trends) in SCALING {
+            for (_, _, trends, _) in SCALING {
                 for trend in trends {
                     let at = SparkAt { chip, stem, trend };
                     sparks.insert(at, Spark::of(&machines[chip], stem, trend));
@@ -1873,7 +2028,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
         }
     }
-    for (_, _, trends) in SCALING {
+    for (_, _, trends, draw) in SCALING {
+        if draw != Draw::Versus {
+            continue;
+        }
         let mut ranked: Vec<(SparkAt, usize, f64)> = sparks
             .iter()
             .filter(|(at, _)| trends.contains(&at.trend))
@@ -1897,9 +2055,14 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
         }
     }
-    let spark = |chip: &str, stem: &str, trend: Trend| -> Element {
-        let at = SparkAt { chip, stem, trend };
-        trend_spark(at, &sparks[&at], "4.5rem")
+    let spark = |chip: &str, stem: &str, trend: Trend, draw: Draw| -> Element {
+        match draw {
+            Draw::Versus => {
+                let at = SparkAt { chip, stem, trend };
+                trend_spark(at, &sparks[&at], "4.5rem")
+            }
+            Draw::Tail => tail_bars(&machines[chip], chip, stem, trend, "4.5rem"),
+        }
     };
     let mini = |chip: &str, stem: &str, name: &str| -> Element {
         let g = match &grids[&(chip, stem, name)] {
@@ -1964,7 +2127,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                     Stack { gap: 5,
                         ContentSwitcher { selected: slug(HEAT_MAPS),
                             ContentSwitcherItem { target: slug(HEAT_MAPS), selected: true, "{HEAT_MAPS}" }
-                            for (title, _, _) in SCALING {
+                            for (title, _, _, _) in SCALING {
                                 ContentSwitcherItem { target: slug(title), selected: false, "{title}" }
                             }
                         }
@@ -2003,11 +2166,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             // sparkline over its decode. The 2rem between models
                             // holds the end tick labels Carbon centres on each
                             // chart's edges.
-                            for (title, along, [prefill, decode]) in SCALING {
+                            for (title, along, [prefill, decode], draw) in SCALING {
                                 ContentPanel { id: slug(title), shown: false,
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
-                                            p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
+                                            p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. {draw.note()}" }
                                             div { style: "display: grid; grid-template-columns: 7rem auto repeat({stems.len()}, minmax(0, 1fr)); gap: 0.25rem 2rem; align-items: center",
                                                 div {}
                                                 div {}
@@ -2015,9 +2178,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                 for chip in machines.keys() {
                                                     div { style: "grid-row: span 2; align-self: start", "{chip}" }
                                                     div { "Prefill" }
-                                                    for stem in &stems { div { {spark(chip, stem, prefill)} } }
+                                                    for stem in &stems { div { {spark(chip, stem, prefill, draw)} } }
                                                     div { "Decode" }
-                                                    for stem in &stems { div { {spark(chip, stem, decode)} } }
+                                                    for stem in &stems { div { {spark(chip, stem, decode, draw)} } }
                                                 }
                                             }
                                         }
@@ -2035,18 +2198,50 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
 /// The glance's first panel's name.
 const HEAT_MAPS: &str = "Heat maps";
 
-/// The sparkline panels: a dimension, what runs along it, and its prefill and
-/// decode trends.
-const SCALING: [(&str, &str, [Trend; 2]); 2] = [
+/// What a sparkline panel's cells draw.
+#[derive(Clone, Copy, PartialEq)]
+enum Draw {
+    /// scratchy against its rival, the gap between them filled.
+    Versus,
+    /// Each engine's p50 and p99 time, as bars.
+    Tail,
+}
+
+impl Draw {
+    /// How to read the panel's sparklines.
+    fn note(self) -> &'static str {
+        match self {
+            Draw::Versus => "Blue fill where scratchy is ahead, red where it is behind.",
+            Draw::Tail => {
+                "Each engine's bar, in its colour, reaches its 99th-percentile (p99) time: the solid \
+                 part is its median (p50), the lighter part how much longer its slowest requests take than its \
+                 typical one. Prefill is the time to the first token, decode the time per output token. Lower is \
+                 better."
+            }
+        }
+    }
+}
+
+/// The sparkline panels: a dimension, what runs along it, its prefill and
+/// decode trends, and what the cells draw.
+const SCALING: [(&str, &str, [Trend; 2], Draw); 3] = [
     (
         "Concurrency scaling",
         "1, 4 and 16 users at once, with 512-token prompts and 128-token answers",
         [Trend::UsersPrefill, Trend::UsersDecode],
+        Draw::Versus,
     ),
     (
         "Length scaling",
         "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, with 8 users at once. Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
         [Trend::PromptPrefill, Trend::AnswerDecode],
+        Draw::Versus,
+    ),
+    (
+        "Tail latency",
+        "the 16-user setting, with 512-token prompts and 128-token answers (its 12 requests, so at most 12 at once; the p99 is close to the slowest of them)",
+        [Trend::UsersPrefill, Trend::UsersDecode],
+        Draw::Tail,
     ),
 ];
 
@@ -2193,7 +2388,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, ratio_step, spark_points,
+        Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, ratio_step, spark_points, tint,
     };
 
     #[test]
@@ -2243,6 +2438,13 @@ mod tests {
             ttft.iter()
                 .any(|p| p.group == Engine::MlxLm.ahead() && p.key == 1.0 && p.upper.is_some())
         );
+    }
+
+    #[test]
+    fn a_tint_is_halfway_to_white() {
+        assert_eq!(tint("#000000"), "#7f7f7f");
+        assert_eq!(tint("#ffffff"), "#ffffff");
+        assert_eq!(tint("#d95926"), "#ecac92");
     }
 
     #[test]

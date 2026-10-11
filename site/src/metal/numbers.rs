@@ -215,6 +215,32 @@ pub fn timing(c: Option<&Cell>, metric: Metric) -> Option<f64> {
     metric.raw(c)
 }
 
+/// A percentile the benchmark reports a timing at.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Quantile {
+    P50,
+    P99,
+}
+
+/// A cell's timing at a percentile, or None where it was not really measured
+/// (as `timing`); None for throughput, which has no percentiles.
+pub fn timing_at(c: Option<&Cell>, metric: Metric, q: Quantile) -> Option<f64> {
+    match q {
+        Quantile::P50 => timing(c, metric),
+        Quantile::P99 => {
+            let c = c?;
+            if !streamed(Some(c)) {
+                return None;
+            }
+            match metric {
+                Metric::Ttft => c.p99_ttft_ms,
+                Metric::Tpot => c.p99_tpot_ms,
+                Metric::Throughput => None,
+            }
+        }
+    }
+}
+
 fn untimed(c: Option<&Cell>) -> u32 {
     c.and_then(|c| c.unstreamed_requests).unwrap_or(0)
 }

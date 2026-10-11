@@ -12,7 +12,7 @@
 // still move text, so wait for them too.
 (function () {
   function draw() {
-    var charts = { line: Charts.LineChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
+    var charts = { line: Charts.LineChart, combo: Charts.ComboChart, stackedbar: Charts.StackedBarChart, heatmap: Charts.HeatmapChart };
     document.querySelectorAll('[data-chart]').forEach(function (el) {
       var spec = JSON.parse(el.getAttribute('data-chart'));
       if (spec.ratio) {
@@ -21,6 +21,16 @@
           valueFormatter: function (value, label) {
             return label === total ? '×' + Math.pow(2, value).toFixed(2) : value;
           },
+        };
+      }
+      // A bar chart's bars carry their own colours: Carbon's go by group,
+      // which is the percentile, not the engine. Carbon hands its hook the
+      // bar's group and key (a stacked bar, not our point), so look it up.
+      if (spec.kind === 'stackedbar') {
+        var fills = {};
+        spec.data.forEach(function (p) { fills[p.group + '\u0000' + p.key] = p.fill; });
+        spec.options.getFillColor = function (group, key, datum, fallback) {
+          return fills[group + '\u0000' + key] || fallback;
         };
       }
       // A log axis's ticks are the measured steps: print them as they are,

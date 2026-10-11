@@ -112,10 +112,12 @@ cds-stack > * { min-width: 0; }
  * shown. */
 [data-panel][hidden] { display: block; height: 0; overflow: hidden; visibility: hidden; }
 
-/* A sparkline's x axis keeps its title, the label Carbon's tooltip gives the
- * x value, but does not print it: the panel's heading names the dimension.
- * Every combo chart is a sparkline. */
-[data-chart^='{"kind":"combo"'] .axis.bottom .axis-title { display: none; }
+/* A sparkline's or tail bar chart's x axis keeps its title, the label
+ * Carbon's tooltip gives the x value, but does not print it: the panel names
+ * the dimension, the ticks the engines. Every combo chart is a sparkline,
+ * every stacked bar chart a tail bar chart. */
+[data-chart^='{"kind":"combo"'] .axis.bottom .axis-title,
+[data-chart^='{"kind":"stackedbar"'] .axis.bottom .axis-title { display: none; }
 
 /* diff-view-element (https://konnorrogers.github.io/diff-view-element/) does
  * its own diffing and PrismJS highlighting in shadow DOM. Every property set
