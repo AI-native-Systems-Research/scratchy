@@ -2,10 +2,11 @@
 //! Every field the page needs is typed here, so a file missing one fails the
 //! build naming it, rather than rendering a blank.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Deserialize)]
 pub struct Run {
@@ -18,6 +19,9 @@ pub struct Run {
     pub repo: Repo,
     pub config: Config,
     pub models: Vec<Model>,
+    /// Models the runner left out on this machine, and why (memory).
+    #[serde(default)]
+    pub skipped_models: Option<Vec<Skipped>>,
     /// The file it was read from, for the link to it.
     #[serde(skip)]
     pub file: PathBuf,
@@ -134,12 +138,43 @@ impl Repo {
 }
 
 #[derive(Deserialize)]
+pub struct Skipped {
+    pub stem: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct Config {
     pub scenarios: Vec<String>,
     pub cold_priming_launches: Option<u32>,
     pub kv_cache_dtype: Option<String>,
     pub scratchy_serve_args: Option<String>,
     pub scaling: Option<Scaling>,
+    /// Every engine with its version and pin; runs before pins have only
+    /// `engine_versions` (mlx-lm and ollama).
+    #[serde(default)]
+    pub engines: Option<Vec<EngineInfo>>,
+    #[serde(default)]
+    pub engine_versions: Option<BTreeMap<String, Option<String>>>,
+    /// Whether every engine matched its pin; absent before pins.
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    #[serde(default)]
+    pub pin_problems: Option<Vec<String>>,
+    /// Every model the runner measures (`--models full`); the first runs to
+    /// record a list kept only the default round, as `default_models`.
+    #[serde(default)]
+    pub current_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_models: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct EngineInfo {
+    pub key: String,
+    pub label: String,
+    pub installed: Option<bool>,
+    pub version: Option<String>,
 }
 
 impl Config {
@@ -153,6 +188,30 @@ pub struct Scaling {
     pub base: Option<Base>,
     pub grid_input: Option<Vec<u32>>,
     pub grid_output: Option<Vec<u32>>,
+}
+
+/// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
+#[derive(Deserialize)]
+pub struct Limits {
+    pub base_conc: Option<u32>,
+}
+
+/// What one engine served for a model.
+#[derive(Deserialize)]
+pub struct Served {
+    pub model: Option<String>,
+    pub quantization: Option<String>,
+}
+
+/// Which version of a model's files a run used.
+#[derive(Deserialize)]
+pub struct Files {
+    pub revision: Option<String>,
+}
+
+/// Some(value) when the field is present, even as null; None when absent.
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<bool>>, D::Error> {
+    Ok(Some(Option::<bool>::deserialize(d)?))
 }
 
 /// The shape every non-grid measurement uses.
@@ -174,9 +233,42 @@ pub struct Model {
     pub cache_ladder: Option<Vec<Rep>>,
     pub cache_ladder_mlx_lm: Option<Vec<Rep>>,
     pub cache_ladder_ollama: Option<Vec<Rep>>,
+    #[serde(default)]
+    pub cache_ladder_omlx: Option<Vec<Rep>>,
+    #[serde(default)]
+    pub cache_ladder_omlx_tq: Option<Vec<Rep>>,
+    #[serde(default)]
+    pub cache_ladder_vllm_metal: Option<Vec<Rep>>,
+    #[serde(default)]
+    pub cache_ladder_llama_cpp: Option<Vec<Rep>>,
+    #[serde(default)]
+    pub cache_ladder_mistralrs: Option<Vec<Rep>>,
     pub scaling: Option<Vec<Cell>>,
     pub scaling_mlx_lm: Option<Vec<Cell>>,
     pub scaling_ollama: Option<Vec<Cell>>,
+    #[serde(default)]
+    pub scaling_omlx: Option<Vec<Cell>>,
+    #[serde(default)]
+    pub scaling_omlx_tq: Option<Vec<Cell>>,
+    #[serde(default)]
+    pub scaling_vllm_metal: Option<Vec<Cell>>,
+    #[serde(default)]
+    pub scaling_llama_cpp: Option<Vec<Cell>>,
+    #[serde(default)]
+    pub scaling_mistralrs: Option<Vec<Cell>>,
+    /// Per engine key, what it served: the ollama tag or GGUF file and its
+    /// quantization, and the files' revision.
+    #[serde(default)]
+    pub engine_models: Option<BTreeMap<String, Served>>,
+    /// The revision of the MLX checkpoint scratchy (and the MLX engines) ran.
+    #[serde(default)]
+    pub model_files: Option<Files>,
+    /// The mlx-lm parity gate: Some(Some(true)) passed, Some(Some(false))
+    /// failed (nothing timed), Some(None) not run, None from before the gate.
+    #[serde(default, deserialize_with = "present")]
+    pub parity_mlx_lm: Option<Option<bool>>,
+    #[serde(default)]
+    pub scaling_limits: Option<Limits>,
     /// Only its presence matters: whether scratchy served anything warm.
     pub warm_serving: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -219,7 +311,11 @@ pub struct Rep {
 pub enum At {
     /// Offered concurrent users, at the base shape.
     Conc(u32),
-    /// Prompt × answer tokens, at the base concurrency.
+    /// Prompt tokens, at the base answer size and users.
+    Input(u32),
+    /// Answer tokens, at the base prompt size and users.
+    Output(u32),
+    /// Prompt × answer tokens, at the cell's own users (`Cell::users`).
     Grid { input: u32, output: u32 },
 }
 
@@ -235,12 +331,22 @@ pub struct Cell {
     /// Requests that arrived in one piece and so were left out of TTFT/TPOT;
     /// absent (so 0) in runs from before it existed.
     pub unstreamed_requests: Option<u32>,
+    /// Requests that errored or timed out: every number here then covers only
+    /// the completed ones. Absent (so 0) in runs from before it existed.
+    pub failed: Option<u32>,
+    /// The server's peak memory footprint during the cell.
+    pub server_mem_peak_mib: Option<f64>,
+    /// A grid cell's users at once; None in runs from before the grid had its
+    /// own, which ran it at the base users count.
+    pub users: Option<u32>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Axis {
     Conc,
+    Input,
+    Output,
     Grid,
 }
 
@@ -260,6 +366,12 @@ struct RawCell {
     output_throughput: Option<f64>,
     completed: Option<u32>,
     unstreamed_requests: Option<u32>,
+    #[serde(default)]
+    failed: Option<u32>,
+    #[serde(default)]
+    server_mem_peak_mib: Option<f64>,
+    #[serde(default)]
+    conc: Option<u32>,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -267,6 +379,8 @@ impl TryFrom<RawCell> for Cell {
     fn try_from(c: RawCell) -> Result<Self, String> {
         let at = match (c.axis, c.rung) {
             (Axis::Conc, RawRung::Users(n)) => At::Conc(n),
+            (Axis::Input, RawRung::Users(n)) => At::Input(n),
+            (Axis::Output, RawRung::Users(n)) => At::Output(n),
             (Axis::Grid, RawRung::Shape(s)) => {
                 let shape = s
                     .split_once('x')
@@ -275,8 +389,8 @@ impl TryFrom<RawCell> for Cell {
                     shape.ok_or_else(|| format!("grid rung {s:?} is not <input>x<output>"))?;
                 At::Grid { input, output }
             }
-            (Axis::Conc, RawRung::Shape(s)) => {
-                return Err(format!("conc rung {s:?} is not a user count"));
+            (Axis::Conc | Axis::Input | Axis::Output, RawRung::Shape(s)) => {
+                return Err(format!("rung {s:?} is not a count"));
             }
             (Axis::Grid, RawRung::Users(n)) => {
                 return Err(format!("grid rung {n} is not <input>x<output>"));
@@ -289,6 +403,9 @@ impl TryFrom<RawCell> for Cell {
             output_throughput: c.output_throughput,
             completed: c.completed,
             unstreamed_requests: c.unstreamed_requests,
+            failed: c.failed,
+            server_mem_peak_mib: c.server_mem_peak_mib,
+            users: c.conc,
         })
     }
 }

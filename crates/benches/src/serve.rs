@@ -241,6 +241,10 @@ fn merge_usage(so_far: Option<usize>, chunk: &serde_json::Value) -> Option<usize
     }
 }
 
+/// XORed into `--seed` for the pre-flight and warmup prompts, so they come
+/// from a stream the measured prompts never do.
+const WARMUP_SEED_XOR: u64 = 0x5741_524d_5550_0001;
+
 fn has_choices(chunk: &serde_json::Value) -> bool {
     chunk
         .get("choices")
@@ -435,49 +439,76 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         output_len: usize,
     }
 
-    let prompt_entries: Vec<PromptEntry> = match args.dataset_name.as_str() {
+    // The pre-flight request and the warmups use prompts OUTSIDE the measured
+    // set. Replaying a measured prompt warms a server's prefix cache for it,
+    // so that request is timed as a full cache hit on an engine that has one
+    // (scratchy does; #344) and as a cold prefill on one that does not.
+    let unmeasured = 1 + args.num_warmups;
+    let (prompt_entries, warm_entries): (Vec<PromptEntry>, Vec<PromptEntry>) = match args
+        .dataset_name
+        .as_str()
+    {
         "sharegpt" => {
             let dataset_path = args.dataset_path.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("--dataset-path is required for sharegpt dataset")
             })?;
             eprintln!("Loading ShareGPT dataset from {dataset_path}...");
+            // Shuffled, then truncated: the first num_prompts are the same
+            // whether or not the extras are loaded, so the extras warm up.
             let samples = datasets::load_sharegpt(
                 Path::new(dataset_path),
                 &tokenizer,
-                args.num_prompts,
+                args.num_prompts + unmeasured,
                 None,
                 args.seed,
             )?;
-            eprintln!("Loaded {} samples from ShareGPT dataset", samples.len());
-            samples
+            let mut entries: Vec<PromptEntry> = samples
                 .into_iter()
                 .map(|s| PromptEntry {
                     text: s.prompt,
                     output_len: s.expected_output_len,
                 })
-                .collect()
+                .collect();
+            let n = entries.len().min(args.num_prompts);
+            let warm = entries.split_off(n);
+            anyhow::ensure!(
+                !warm.is_empty(),
+                "the ShareGPT dataset has no samples left after the {n} measured ones to warm up with"
+            );
+            eprintln!(
+                "Loaded {n} samples from ShareGPT dataset (+{} to warm up)",
+                warm.len()
+            );
+            (entries, warm)
         }
         _ => {
             eprintln!(
                 "Generating {} random prompts (matching Python RandomDataset)...",
                 args.num_prompts
             );
-            let samples = datasets::generate_random(
-                &tokenizer,
-                args.num_prompts,
-                args.input_len,
-                args.output_len,
-                args.random_range_ratio,
-                args.random_prefix_len,
-                args.seed,
-            )?;
-            samples
+            let random = |n, seed| -> Result<Vec<PromptEntry>> {
+                Ok(datasets::generate_random(
+                    &tokenizer,
+                    n,
+                    args.input_len,
+                    args.output_len,
+                    args.random_range_ratio,
+                    args.random_prefix_len,
+                    seed,
+                )?
                 .into_iter()
                 .map(|s| PromptEntry {
                     text: s.prompt,
                     output_len: s.expected_output_len,
                 })
-                .collect()
+                .collect())
+            };
+            // Same lengths, another seed: the measured prompts are exactly
+            // what this seed always produced, and none of them is replayed.
+            (
+                random(args.num_prompts, args.seed)?,
+                random(unmeasured, args.seed ^ WARMUP_SEED_XOR)?,
+            )
         }
     };
 
@@ -490,8 +521,8 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
             &agent,
             &api_url,
             &model,
-            &prompt_entries[0].text,
-            prompt_entries[0].output_len.min(args.output_len),
+            &warm_entries[0].text,
+            warm_entries[0].output_len.min(args.output_len),
             args.ignore_eos,
             args.temperature,
             args.top_p,
@@ -517,13 +548,14 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
             .unwrap(),
         );
         for i in 0..args.num_warmups {
-            let idx = i % num_prompts;
+            // warm_entries[0] was the pre-flight; the warmups take the rest.
+            let warm = &warm_entries[(1 + i) % warm_entries.len()];
             send_request(
                 &agent,
                 &api_url,
                 &model,
-                &prompt_entries[idx].text,
-                prompt_entries[idx].output_len.min(args.output_len),
+                &warm.text,
+                warm.output_len.min(args.output_len),
                 args.ignore_eos,
                 args.temperature,
                 args.top_p,
