@@ -1698,9 +1698,15 @@ mod tests {
         // froze on its first token.
         use super::super::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
         for has_spec in [false, true] {
-            for (tokens, seqs) in
-                [(1u32, 1u32), (9, 9), (16, 16), (80, 80), (18, 16), (512, 9), (4096, 128)]
-            {
+            for (tokens, seqs) in [
+                (1u32, 1u32),
+                (9, 9),
+                (16, 16),
+                (80, 80),
+                (18, 16),
+                (512, 9),
+                (4096, 128),
+            ] {
                 let s = StepFacts {
                     num_tokens: tokens,
                     num_seqs: seqs,
