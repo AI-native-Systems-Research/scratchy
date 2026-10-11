@@ -13008,6 +13008,8 @@ pub fn emit_model(
                 None,
                 block_cap,
                 addressing,
+                // Nor the serving engine's batch: every bucket row's decode partials.
+                None,
             )
         }
 
@@ -13271,6 +13273,9 @@ pub fn emit_model(
                     // pool: it picks the KV cap rung.
                     ctx.kv_cache.max_blocks_per_seq,
                     device.kv_addressing,
+                    // The serving engine's batch, stashed by the worker: the decode split's
+                    // partials are reserved for that many rows.
+                    device.max_decode_rows,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             })

@@ -207,6 +207,8 @@ pub fn lower_subtile_tape_to_metal(
         loops: bb.loops,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
         moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
+        decode_partials_row_bytes: (bb.decode_partials_row_bytes)
+            .max(lh.decode_partials_row_bytes),
         roped_k_scratch_bytes: bb.roped_k_scratch_bytes.max(lh.roped_k_scratch_bytes),
         attn_unfused_scratch_bytes: bb
             .attn_unfused_scratch_bytes
@@ -1132,16 +1134,19 @@ const fn combine_threads(hd: u32) -> u32 {
 /// changes. Its keys spread over the
 /// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
-/// front, `[bucket_m, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
-/// into the output. A bucket whose partials would not fit keeps the twin — a wide prefill
-/// bucket carrying the gated decode row (gemma-4's 4096-token buckets at 4.3 GiB) is the
-/// case that refuses.
+/// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
+/// into the output. Only a decode-only step runs it — a row a sequence — so the scratch holds
+/// the partials of the rows such a step brings, not of the bucket's every row: it records a
+/// row's bytes (`decode_partials_row_bytes`, [`LoweredMetalTape::scratch_bytes`]). A bucket whose
+/// every row's partials would outgrow the u32 its offsets are computed in keeps the twin — a
+/// wide prefill bucket carrying the gated decode row (gemma-4's 4096-token buckets at 4.3 GiB)
+/// is the case that refuses.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
     cmds: Vec<GatedCommand>,
     at: &BakePoint<'_>,
-    moe_scratch_bytes: &mut u32,
+    decode_partials_row_bytes: &mut u32,
 ) -> Vec<GatedCommand> {
     let attention = match step {
         MetalStep::RopedAttention(f) => &f.attention,
@@ -1170,15 +1175,12 @@ fn decode_attention_per_kv_head(
     let group = p.num_q_heads / p.num_global_kv_heads.max(1);
     let keys = at.block_cap.saturating_mul(p.global_block_size);
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
-    // The split's partials are `[bucket_m, num_q_heads, splits, 2 + D]` f32s. A wide
-    // prefill bucket carrying the gated decode row can push that past the u32 the op
-    // scratch is sized in — gemma-4's 4096-token prefill buckets land at 4.3 GiB —
-    // and such a bucket keeps the twin.
-    let partials = u64::from(at.bucket_m)
-        * u64::from(p.num_q_heads)
-        * u64::from(splits)
-        * (u64::from(hd) + 2)
-        * 4;
+    // A row's partials are `[num_q_heads, splits, 2 + D]` f32s. Every row's, a wide prefill
+    // bucket carrying the gated decode row can push past the u32 the kernel's offsets are
+    // computed in — gemma-4's 4096-token prefill buckets land at 4.3 GiB — and such a bucket
+    // keeps the twin.
+    let row_partials = u64::from(p.num_q_heads) * u64::from(splits) * (u64::from(hd) + 2) * 4;
+    let partials = u64::from(at.bucket_m) * row_partials;
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
         && (1..=GQA_HEADS).contains(&group)
         && p.num_q_heads == group * p.num_global_kv_heads
@@ -1191,7 +1193,7 @@ fn decode_attention_per_kv_head(
     if !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
         return cmds;
     }
-    *moe_scratch_bytes = (*moe_scratch_bytes).max(partials as u32);
+    *decode_partials_row_bytes = (*decode_partials_row_bytes).max(row_partials as u32);
     let partials = scratch_at(16, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
     let mut out = Vec::with_capacity(cmds.len() + 1);
@@ -1360,6 +1362,7 @@ fn lower(
     let mut open_spans: Vec<OpenSpan> = Vec::new();
     let mut splitk_scratch_bytes: u32 = 0;
     let mut moe_scratch_bytes: u32 = 0;
+    let mut decode_partials_row_bytes: u32 = 0;
     let mut roped_k_scratch_bytes: u32 = 0;
     let mut attn_unfused_scratch_bytes: u32 = 0;
     // The merger's row reduction: `m_divisor` tracks the row-count divisor
@@ -1463,7 +1466,13 @@ fn lower(
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
                 let cmds = route_gdn(p, step, cmds);
-                let cmds = decode_attention_per_kv_head(p, step, cmds, at, &mut moe_scratch_bytes);
+                let cmds = decode_attention_per_kv_head(
+                    p,
+                    step,
+                    cmds,
+                    at,
+                    &mut decode_partials_row_bytes,
+                );
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = sampled_soft_cap(p, step, cmds, bucket_m);
                 let cmds = row_gate(cmds, *gate, i)?;
@@ -1534,6 +1543,7 @@ fn lower(
         loops: baked(loops),
         splitk_scratch_bytes,
         moe_scratch_bytes,
+        decode_partials_row_bytes,
         roped_k_scratch_bytes,
         attn_unfused_scratch_bytes,
     })
@@ -7657,6 +7667,7 @@ fn moe_per_expert_scale_symbol(p: &MetalModelConsts) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tape::ids::DecodeRows;
     use scratchy_ir::CanonicalParams;
 
     fn tp() -> MetalModelConsts {
@@ -8608,10 +8619,9 @@ mod tests {
             *combine.bindings,
             out_and_signs.copied().chain([partials]).collect::<Vec<_>>()
         );
-        assert_eq!(
-            tape.moe_scratch_bytes,
-            p.num_q_heads * splits * (2 + p.global_head_dim) * 4
-        );
+        let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
+        assert_eq!(tape.decode_partials_row_bytes, row);
+        assert_eq!(tape.scratch_bytes(None)[1], row);
 
         let kernels = |tape: &LoweredMetalTape| {
             (tape.commands.iter())
@@ -8720,10 +8730,9 @@ mod tests {
         assert_eq!(gqa.dispatch.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(combine.dispatch.threadgroups, (1, p.num_q_heads, 1));
         assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
-        assert_eq!(
-            tape.moe_scratch_bytes,
-            p.num_q_heads * splits * (2 + p.global_head_dim) * 4
-        );
+        let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
+        assert_eq!(tape.decode_partials_row_bytes, row);
+        assert_eq!(tape.scratch_bytes(None)[1], row);
         // A group that does not divide the query heads evenly cannot fill the
         // fragments' rows — 29 over 4 — so it stays on the twin.
         let kernels = |tape: &LoweredMetalTape| {
@@ -8829,10 +8838,13 @@ mod tests {
         let (gqa, combine) = (&batched.commands[2].command, &batched.commands[3].command);
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
-        assert_eq!(
-            batched.moe_scratch_bytes,
-            4 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
-        );
+        // Every row's partials, or only those of the rows a decode-only step brings — one a
+        // sequence, at most `max_num_seqs`.
+        let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
+        assert_eq!(batched.decode_partials_row_bytes, row);
+        assert_eq!(batched.scratch_bytes(None)[1], 4 * row);
+        assert_eq!(batched.scratch_bytes(Some(DecodeRows(2)))[1], 2 * row);
+        assert_eq!(batched.scratch_bytes(Some(DecodeRows(128)))[1], 4 * row);
     }
 
     /// A bucket whose partials scratch would not fit the u32 the op scratch is sized in
@@ -8871,7 +8883,7 @@ mod tests {
         let decode = kernels(&lower_tq(&p, rows(), 8));
         assert!(decode.contains(&KernelId::AttentionDecodeGqaTq));
         assert_eq!(
-            lower_tq(&p, rows(), 8).moe_scratch_bytes,
+            lower_tq(&p, rows(), 8).scratch_bytes(None)[1],
             8 * p.num_q_heads * splits * (2 + p.global_head_dim) * 4
         );
     }

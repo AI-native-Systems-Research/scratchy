@@ -313,6 +313,10 @@ u32_newtype!(
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
+    /// The most rows a decode-only step brings — one a sequence, so the serving engine's
+    /// `max_num_seqs` — read at load: the rows the TurboQuant decode split's partials are
+    /// reserved for ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]).
+    DecodeRows,
     /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
     /// kernels (argmax, grammar mask, sampler) read ([`crate::off_tape`]).
     LogitsWidth,

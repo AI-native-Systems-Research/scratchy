@@ -328,6 +328,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             sources,
             runtime,
             None,
+            None,
         )
     }
 
@@ -345,6 +346,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
         sources: &ResolvedSources,
         runtime: &RuntimeBindings,
         residency: Option<&crate::residency::MetalResidencySet>,
+        // The most rows a decode-only step brings (`GpuDevice::max_decode_rows`): the decode
+        // split's partials are reserved for at most these.
+        decode_rows: Option<crate::tape::ids::DecodeRows>,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
         // coloring). The shared arena is sized to the MAX colored slot
@@ -399,7 +403,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let scratch = |i: usize, what| {
             let max = bucket_tapes
                 .iter()
-                .map(|t| t.scratch_bytes()[i])
+                .map(|t| t.scratch_bytes(decode_rows)[i])
                 .max()
                 .unwrap_or(0);
             let private = MTLResourceOptions::StorageModePrivate;
@@ -2002,6 +2006,7 @@ mod tests {
             .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
+            decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             barrier_before: &[],
@@ -2192,6 +2197,7 @@ mod tests {
                 .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
+            decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             barrier_before: &[],
@@ -2282,6 +2288,7 @@ mod tests {
             .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
+            decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             barrier_before: &[],
@@ -2406,6 +2413,7 @@ mod tests {
             .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
+            decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             barrier_before: &[],
