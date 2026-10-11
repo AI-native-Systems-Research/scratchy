@@ -26,8 +26,8 @@ use crate::carbon::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Cell, Model, Run, Scenario};
 use numbers::{
-    Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cell, cfmt, failed, fmt, lfmt, marks,
-    marks_note, med, served, timing,
+    Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed, fmt, lfmt, marks, marks_note,
+    med, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -201,9 +201,9 @@ fn delta(new: Option<f64>, old: Option<f64>, higher_better: bool) -> Element {
 
 /// The summary row's numbers, unformatted, for comparing two runs, each with
 /// whether higher is better (only tok/s is; every time and memory is lower).
-fn summary_raw(m: &Model) -> [(Option<f64>, bool); 8] {
+fn summary_raw(m: &Model, run: &Run) -> [(Option<f64>, bool); 8] {
     let ladder = Engine::Scratchy.ladder(m);
-    let one = cell(Engine::Scratchy.cells(m), At::Conc(1));
+    let one = by_users(m, run, Engine::Scratchy).get(&1).copied();
     [
         (med(ladder, Scenario::Frozen, Startup::Ready), false),
         (med(ladder, Scenario::Cold, Startup::Ready), false),
@@ -250,6 +250,66 @@ fn base_of(run: &Run, m: &Model) -> (Option<u32>, Option<u32>, Option<u32>) {
         .and_then(|l| l.base_conc)
         .or(b.and_then(|b| b.conc));
     (b.and_then(|b| b.input), b.and_then(|b| b.output), conc)
+}
+
+/// Where a model's users numbers come from: the separate users sweep at the
+/// base shape (older runs, or `--scale-axes conc`), else the grid's own users
+/// dimension at its middle cell (#349).
+#[derive(Clone, Copy, PartialEq)]
+enum UsersFrom {
+    Sweep,
+    Grid { input: u32, output: u32 },
+}
+
+fn users_from(m: &Model, run: &Run) -> UsersFrom {
+    if Engine::Scratchy
+        .cells(m)
+        .iter()
+        .any(|c| matches!(c.at, At::Conc(_)))
+    {
+        return UsersFrom::Sweep;
+    }
+    let sc = run.config.scaling.as_ref();
+    let mid = |v: Option<&Vec<u32>>| v.filter(|v| !v.is_empty()).map(|v| v[v.len() / 2]);
+    match (
+        mid(sc.and_then(|s| s.grid_input.as_ref())),
+        mid(sc.and_then(|s| s.grid_output.as_ref())),
+    ) {
+        (Some(input), Some(output)) => UsersFrom::Grid { input, output },
+        _ => UsersFrom::Sweep,
+    }
+}
+
+/// One engine's cells by users count, from wherever this model's come from.
+fn by_users<'a>(m: &'a Model, run: &Run, e: Engine) -> BTreeMap<u32, &'a Cell> {
+    let base = base_of(run, m).2.unwrap_or(0);
+    match users_from(m, run) {
+        UsersFrom::Sweep => e
+            .cells(m)
+            .iter()
+            .filter_map(|c| match c.at {
+                At::Conc(n) => Some((n, c)),
+                _ => None,
+            })
+            .collect(),
+        UsersFrom::Grid { input, output } => e
+            .cells(m)
+            .iter()
+            .filter(|c| c.at == At::Grid { input, output })
+            .map(|c| (c.users.unwrap_or(base), c))
+            .collect(),
+    }
+}
+
+/// The prompt and answer sizes a model's users numbers were measured at.
+fn users_shape(m: &Model, run: &Run) -> (Option<u32>, Option<u32>) {
+    match users_from(m, run) {
+        UsersFrom::Sweep => {
+            let (i, o, _) = base_of(run, m);
+            (i, o)
+        }
+        UsersFrom::Grid { input, output } => (Some(input), Some(output)),
+    }
 }
 
 /// The comparison engines' releases as the runner recorded them: every engine
@@ -470,12 +530,13 @@ fn part(heading: &str, intro: Element, body: Element) -> Element {
 }
 
 fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
-    let shape = run.config.base().map(|_| {
-        let (i, o, _) = base_of(run, m);
-        format!("{} in / {} out", opt(i), opt(o))
-    });
+    let (si, so) = users_shape(m, run);
+    let shape = (si.is_some() || so.is_some()).then(|| format!("{} in / {} out", opt(si), opt(so)));
+    // Badges only against a run whose one-user numbers are at the same shape:
+    // a change of shape is not a speedup.
+    let same_shape = prev.is_some_and(|p| users_shape(p.m, p.run) == (si, so));
     let rows = Engine::ALL.into_iter().filter_map(|e| {
-        let (ladder, one) = (e.ladder(m), cell(e.cells(m), At::Conc(1)));
+        let (ladder, one) = (e.ladder(m), by_users(m, run, e).get(&1).copied());
         if e == Engine::Scratchy && !served(m) {
             let why = if !m.built {
                 "build failed"
@@ -504,10 +565,10 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             fmt(timing(one, Metric::Throughput), 1) + if failed(one) > 0 { FAILED } else { "" },
             fmt(med(ladder, Scenario::Cold, Startup::PeakRss), 0),
         ];
-        let now = summary_raw(m);
+        let now = summary_raw(m, run);
         let then = prev
-            .filter(|_| e == Engine::Scratchy)
-            .map(|p| summary_raw(p.m));
+            .filter(|_| e == Engine::Scratchy && same_shape)
+            .map(|p| summary_raw(p.m, p.run));
         // An engine with its own quantization says which on its row.
         let name = match served_as(m, e) {
             None => e.label().to_string(),
@@ -1118,10 +1179,16 @@ fn sweep_cells(cells: &[Cell], sweep: Sweep) -> BTreeMap<u32, &Cell> {
 /// is compared with, each scratchy (blue) against that one engine (orange)
 /// with scratchy's previous run in grey behind, so however many engines a run
 /// has, no chart holds more than three lines.
-fn sweep_part(m: &Model, run: &Run, prev: Option<Entry>, sweep: Sweep) -> Element {
+fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep) -> Element {
+    let map_of = |mm: &'a Model, rr: &Run, e: Engine| -> BTreeMap<u32, &'a Cell> {
+        match sweep {
+            Sweep::Users => by_users(mm, rr, e),
+            Sweep::Prompt => sweep_cells(e.cells(mm), sweep),
+        }
+    };
     let cells: Vec<(Engine, BTreeMap<u32, &Cell>)> = Engine::ALL
         .iter()
-        .map(|&e| (e, sweep_cells(e.cells(m), sweep)))
+        .map(|&e| (e, map_of(m, run, e)))
         .filter(|(_, cs)| !cs.is_empty())
         .collect();
     let mine = cells
@@ -1140,7 +1207,8 @@ fn sweep_part(m: &Model, run: &Run, prev: Option<Entry>, sweep: Sweep) -> Elemen
 
     // The previous run's scratchy line, drawn first so it sits behind.
     let pcs = prev
-        .map(|p| sweep_cells(Engine::Scratchy.cells(p.m), sweep))
+        .filter(|p| sweep == Sweep::Prompt || users_shape(p.m, p.run) == users_shape(m, run))
+        .map(|p| map_of(p.m, p.run, Engine::Scratchy))
         .unwrap_or_default();
     let plabel = prev.map_or(String::new(), |p| {
         let differ = if settings_changed(run, p.run).is_empty() {
@@ -1231,13 +1299,19 @@ fn sweep_part(m: &Model, run: &Run, prev: Option<Entry>, sweep: Sweep) -> Elemen
         Some((l, _)) => l.to_string(),
         None => String::new(),
     };
-    let (input, output, conc) = base_of(run, m);
+    let (_, output, conc) = base_of(run, m);
+    let (ui, uo) = users_shape(m, run);
+    let from_grid = if matches!(users_from(m, run), UsersFrom::Grid { .. }) {
+        ", the grid's middle cell"
+    } else {
+        ""
+    };
     let (heading, intro) = match sweep {
         Sweep::Users => (
             "As users are added",
             rsx! {
                 "Throughput and time per output token with {xs_text} users at once " {users_info()}
-                "; {opt(input)}-token prompts, {opt(output)}-token answers. One small chart per engine, each scratchy \
+                "; {opt(ui)}-token prompts, {opt(uo)}-token answers{from_grid}. One small chart per engine, each scratchy \
                  against that engine, scratchy's previous run in grey. A line that rises in the second row means \
                  each user's answer slows down as more share the engine."
             },
@@ -1619,10 +1693,10 @@ fn history(entries: &[Entry]) -> Element {
                         TableCell { "{m.quant.as_deref().unwrap_or_default()}" }
                         if served(m) {
                             {
-                                let (ladder, cells) = (Engine::Scratchy.ladder(m), Engine::Scratchy.cells(m));
-                                let one = cell(cells, At::Conc(1));
-                                let top = cells.iter().filter_map(|c| if let At::Conc(n) = c.at { Some(n) } else { None }).max().filter(|&n| n != 0);
-                                let many = top.and_then(|n| cell(cells, At::Conc(n)));
+                                let ladder = Engine::Scratchy.ladder(m);
+                                let us = by_users(m, run, Engine::Scratchy);
+                                let one = us.get(&1).copied();
+                                let many = us.keys().max().filter(|&&n| n != 0).and_then(|n| us.get(n).copied());
                                 let vals = [
                                     fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
                                     fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
@@ -1739,11 +1813,17 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // it with it, so nothing scrolls sideways and nothing sits in a corner. The scale stands beside the rows, or
     // wraps below them.
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
-    // Every users count any shown grid ran at, fewest first: one block each.
+    // One block per users count: 1, and each model's base count, of those its
+    // grid ran at. The full set per users count is in each model's own section.
     let mut counts: Vec<u32> = machines
         .values()
         .flat_map(|mr| mr.models.iter().filter_map(|(stem, _)| mr.latest(stem)))
-        .flat_map(|Entry { run, m }| grid_users(m, run))
+        .flat_map(|Entry { run, m }| {
+            let base = base_of(run, m).2.unwrap_or(0);
+            grid_users(m, run)
+                .into_iter()
+                .filter(move |&u| u == 1 || u == base)
+        })
         .collect();
     counts.sort_unstable();
     counts.dedup();

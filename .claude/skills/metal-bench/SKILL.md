@@ -20,11 +20,15 @@ runs everything else.
 
 **Two kinds of run:**
 - A **full run** is what goes on the site: a whole round of models, every
-  rung, every installed engine, all of them pinned, and default reps, priming
+  rung, the default engines, all of them pinned, and default reps, priming
   and scaling. It takes hours. The default round is the MoE models
   (qwen3.6-35b-a3b, gemma-4-26b-a4b-it, glm-4.5-air); `--models full` adds the
   dense ones (qwen3.6-27b, gemma-4-31b-it), and `--models dense` runs those
-  alone.
+  alone. The default engines are oMLX and oMLX TurboQuant, and the default
+  sweeps are the prompt × answer grid at 1, 2, 4, 8 and 16 users (1, 2, 4
+  for glm-4.5-air) plus prompt length; the grid's users replace the old
+  separate users sweep. `--engines all` adds every other installed engine
+  (much longer), and `--scale-axes conc,grid,input` adds the users sweep back.
 - A **smoke run** checks the setup. It runs gemma-4-26b-a4b-it only, the
   smallest model left, with one rep, no scaling and output in `/tmp`. Its
   JSON never goes on the site, so after step 4 you're done.
@@ -139,7 +143,7 @@ the `--models` flag (none for the default MoE round, or `--models full`).
 
 ## 3. Run
 
-Full run. Pin every installed engine and scratchy's commit to the versions
+Full run. Pin every engine the run uses and scratchy's commit to the versions
 agreed for this round, so all the Macs run the same thing; the script refuses
 to start while any pin is missing or doesn't match, and lists what's wrong.
 Names match in any case, scratchy's pin is a commit prefix, and llama.cpp's
@@ -148,10 +152,13 @@ is its build number:
 ```bash
 source ~/.venvs/mlx/bin/activate
 caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast [--models full] \
-  --pin scratchy=<sha> --pin mlx-lm=<v> --pin ollama=<v> --pin llama.cpp=b<build> \
-  --pin vllm-metal=<v> --pin oMLX=<v> --pin mistral.rs=<v> 2>&1 | tee ~/metal-matrix-run.log
+  --pin scratchy=<sha> --pin oMLX=<v> 2>&1 | tee ~/metal-matrix-run.log
 echo "exit ${PIPESTATUS[0]}"
 ```
+
+With `--engines all`, pin the others too: `--pin mlx-lm=<v> --pin ollama=<v>
+--pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v>`. oMLX
+TurboQuant shares oMLX's pin.
 
 `--unpinned` runs without pins and records that in the JSON (`pinned:
 false`); use it only for a smoke run or a test the user asked for.
@@ -184,8 +191,8 @@ act on each one as it appears:
 
 - the engine lines in the header, one per engine (`llama.cpp : <path>
   (<version>)`): a `skipped` line under one means it isn't installed or
-  `--engines` left it out. If it's an engine the user meant to run, stop the
-  run and go back to step 1.
+  isn't selected (by default only oMLX and oMLX TurboQuant run). If it's an
+  engine the user meant to run, stop the run and go back to step 1.
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
   only the dense ones, since it runs out of memory on MoE GGUFs on Metal.

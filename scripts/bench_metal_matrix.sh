@@ -31,16 +31,21 @@
 # Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):
 # one seed per (model, axis, rung) — unique so the prefix cache cannot serve a
 # later cell, shared across engines so all see the same prompts. Concurrency is
-# offered (--max-concurrency), not the effective decode batch. The prompt x
-# answer grid runs at each of --scale-grid-conc's user counts, by default 1 and
-# the base count: one user at a time is what most Macs see, the base count how
-# they hold up shared (#349). --scale-grid-conc 1,2,4,8,16 gives the full cube.
+# offered (--max-concurrency), not the effective decode batch. The default
+# sweeps are grid and input. The prompt x answer grid runs at every one of
+# --scale-grid-conc's user counts (1, 2, 4, 8 and 16 by default), so it is
+# prompt x answer x users and the separate users sweep (conc) is not needed;
+# one user at a time is what most Macs see (#349). input sweeps prompt length
+# up to each model's context. --scale-axes conc,grid,input adds the old users
+# sweep back.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
 # greedy, CLI mode (the ladder is server mode, so the gate is its own call). A
 # failure skips every timing stage (all engines) for that model and is recorded as
 # "parity_mlx_lm": false.
-# Comparison engines, each on when installed; --engines names the ones to run:
+# Comparison engines. By default oMLX and oMLX TurboQuant, the strongest MLX
+# rival, so the time goes into the users dimension of the grid instead
+# (#349); --engines all runs every installed one, --engines a,b names some:
 #   mlx-lm      python with `import mlx_lm` ($VIRTUAL_ENV, python3, or --mlx-python)
 #   ollama      `ollama serve` on --port, its MLX engine (the -mlx tags); pulls
 #               on first use, ignores ignore_eos
@@ -188,17 +193,18 @@ SEED=""
 MLX_PYTHON=""
 MLX_AUTO=1
 OLLAMA_AUTO=1
-ENGINES=""               # --engines: every installed engine when empty
+ENGINES=""               # --engines: empty for DEFAULT_ENGINES, all for every installed one
+DEFAULT_ENGINES="omlx,omlx_tq"
 PINS=()
 UNPINNED=0
 SCALING=1
-SCALE_AXES="conc,grid"
+SCALE_AXES="grid,input"
 SCALE_CONC="1,4,16"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
 SCALE_GRID_INPUT="128,1024,4096"
 SCALE_GRID_OUTPUT="16,128,512"
-SCALE_GRID_CONC=""       # empty: 1 and the base users count
+SCALE_GRID_CONC="1,2,4,8,16"   # the grid's users dimension; empty: 1 and the base count
 SCALE_BASE_INPUT=512
 SCALE_BASE_OUTPUT=128
 SCALE_BASE_CONC=8
@@ -295,11 +301,23 @@ ENGINE_ROWS=(
     "mistralrs|mistral.rs|MISTRALRS_BIN"
 )
 # --engines: run exactly these (by label or key), and refuse a name that is
-# unknown or not installed. Rows are selected, not their binaries cleared: the
-# two oMLX rows share OMLX_BIN, so clearing it for one would turn off the other.
+# unknown or not installed; all, every installed engine; nothing, the default
+# pair, those of it installed. Rows are selected, not their binaries cleared:
+# the two oMLX rows share OMLX_BIN, so clearing it for one would turn off the other.
 lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 ENGINES_ON=""
-if [[ -n "${ENGINES}" ]]; then
+if [[ -z "${ENGINES}" ]]; then
+    for row in "${ENGINE_ROWS[@]}"; do
+        IFS='|' read -r key label binvar <<<"${row}"
+        [[ ",${DEFAULT_ENGINES}," == *",${key},"* && -n "${!binvar}" ]] && ENGINES_ON+=",${key}"
+    done
+    ENGINES="${DEFAULT_ENGINES}"
+elif [[ "$(lower "${ENGINES}")" == all ]]; then
+    for row in "${ENGINE_ROWS[@]}"; do
+        IFS='|' read -r key label binvar <<<"${row}"
+        [[ -n "${!binvar}" ]] && ENGINES_ON+=",${key}"
+    done
+else
     IFS=',' read -r -a wanted <<<"$(lower "${ENGINES}")"
     for w in "${wanted[@]}"; do
         hit=""
@@ -312,9 +330,9 @@ if [[ -n "${ENGINES}" ]]; then
         [[ -n "${hit}" ]] || { echo "--engines names ${w}, which is not an engine" >&2; exit 2; }
     done
 fi
-engine_on() { # key binvar: does this row run? Installed, and selected when --engines is given.
+engine_on() { # key binvar: does this row run? Installed, and selected.
     [[ -n "${!2}" ]] || return 1
-    [[ -z "${ENGINES}" || "${ENGINES_ON}," == *",$1,"* ]]
+    [[ "${ENGINES_ON}," == *",$1,"* ]]
 }
 
 BIN="${ROOT}/target/release/scr"
@@ -411,7 +429,7 @@ for row in "${ENGINE_ROWS[@]}"; do
     if engine_on "${key}" "${binvar}"; then
         printf '%-10s: %s\n' "${label}" "${!binvar} (${!v:-version unknown})"
     else
-        printf '%-10s: \n%-10s  skipped (not installed, or left out by --engines)\n' "${label}" ""
+        printf '%-10s: \n%-10s  skipped (not installed, or not selected; --engines all runs every one)\n' "${label}" ""
     fi
 done
 (( SCALING )) && echo "scaling : ${SCALE_AXES}"

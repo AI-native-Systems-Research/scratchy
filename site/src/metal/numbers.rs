@@ -1,7 +1,7 @@
 //! What the page computes from a run: per-engine accessors, medians, ratios,
 //! and how each number is written.
 
-use super::data::{At, Cell, Model, Rep, Scenario};
+use super::data::{Cell, Model, Rep, Scenario};
 use crate::thousands_f;
 
 /// The engines a run compares, in page order. Every chart pairs scratchy
@@ -204,10 +204,6 @@ pub fn med(ladder: &[Rep], scenario: Scenario, what: Startup) -> Option<f64> {
             .filter_map(|r| what.of(r))
             .collect(),
     )
-}
-
-pub fn cell(cells: &[Cell], at: At) -> Option<&Cell> {
-    cells.iter().find(|c| c.at == at)
 }
 
 pub const DASH: &str = "—";
