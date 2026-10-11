@@ -207,8 +207,7 @@ pub fn lower_subtile_tape_to_metal(
         loops: bb.loops,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
         moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
-        decode_partials_row_bytes: (bb.decode_partials_row_bytes)
-            .max(lh.decode_partials_row_bytes),
+        decode_partials_row_bytes: (bb.decode_partials_row_bytes).max(lh.decode_partials_row_bytes),
         roped_k_scratch_bytes: bb.roped_k_scratch_bytes.max(lh.roped_k_scratch_bytes),
         attn_unfused_scratch_bytes: bb
             .attn_unfused_scratch_bytes
@@ -1466,13 +1465,8 @@ fn lower(
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
                 let cmds = route_gdn(p, step, cmds);
-                let cmds = decode_attention_per_kv_head(
-                    p,
-                    step,
-                    cmds,
-                    at,
-                    &mut decode_partials_row_bytes,
-                );
+                let cmds =
+                    decode_attention_per_kv_head(p, step, cmds, at, &mut decode_partials_row_bytes);
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = sampled_soft_cap(p, step, cmds, bucket_m);
                 let cmds = row_gate(cmds, *gate, i)?;

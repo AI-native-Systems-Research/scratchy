@@ -1178,7 +1178,10 @@ impl MetalWorker {
         let rung = rungs
             .and_then(pick)
             .map_err(|e| ExecutorError::WorkerInit(format!("KV cap rung: {e}")))?;
-        Ok((rung.cap.get() as usize, rung.scratch_bytes(dev.max_decode_rows)))
+        Ok((
+            rung.cap.get() as usize,
+            rung.scratch_bytes(dev.max_decode_rows),
+        ))
     }
 
     /// Bytes per element for the model's KV cache dtype. Metal forces
@@ -3087,7 +3090,8 @@ impl Worker for MetalWorker {
         // A decode-only step brings a row a sequence: at most the batch the resolver below picks,
         // which never exceeds the requested width or the base one.
         gpu_device.max_decode_rows = Some(decode_rows(
-            (self.config.max_num_seqs).unwrap_or(scratchy_serving_engine::gpu_budget::BASE_MAX_NUM_SEQS),
+            (self.config.max_num_seqs)
+                .unwrap_or(scratchy_serving_engine::gpu_budget::BASE_MAX_NUM_SEQS),
         ));
         let t_from_dir = std::time::Instant::now();
         let mut weights = GpuWeights::from_dir(&model_dir, allocator)
