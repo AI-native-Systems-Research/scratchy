@@ -1453,16 +1453,17 @@ fn resolve_bindings(
 /// should be skipped. `gate == None` (the common case) always
 /// fires.
 ///
-/// `OnlyIfSingleSeq` fires when there's exactly one sequence in
+/// `OnlyIfNoSpec` fires when there's exactly one sequence in
 /// the bucket — either pure single-seq prefill or a one-token
 /// decode forward. The lm_head slice's gather/qmv/scatter trio is
 /// gated this way.
 ///
-/// `OnlyIfMultiSeq` fires when the bucket holds multiple
-/// sequences (batched decode, mixed prefill+decode). The
+/// `OnlyIfSpec` fires on a spec-decode verify step, and on a
+/// decode-only step (every sequence one token). The
 /// full-`M=bucket_m` lm_head fallback is gated this way so the
 /// slice's per-seq-incorrect logits get overwritten with a
-/// correct multi-row GEMM result.
+/// correct multi-row GEMM result — and so a decode-only step,
+/// where the slice is off, still computes logits at all.
 pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
     let StepFacts {
         num_tokens,
@@ -1478,13 +1479,21 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
     // unconditionally on multi-seq regressed c=4 TPOT by +5% on
     // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
     // win without hurting decode.
+    //
+    // That carve-out hands decode-only steps to the full-M fallback
+    // (`OnlyIfSpec`), which must therefore fire there too: the pair
+    // is exhaustive by construction, and before it was, a decode-only
+    // step in a bucket whose lm_head lowers to one `qmm_t` (the slice
+    // band, `bucket_m ≥ vector_limit`) ran NO lm_head command at all —
+    // the argmax re-read the logits slot's stale contents and every
+    // row froze on its first token (issue #361).
     let decode_step = num_tokens == num_seqs;
     match gate {
         None => true,
         Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
             !has_spec_tokens && num_tokens > num_seqs
         }
-        Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
+        Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens || decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfDecodeStep) => decode_step,
         Some(super::lowered::RuntimeGate::UnlessDecodeStep) => !decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
@@ -1679,6 +1688,69 @@ mod tests {
             !gate_matches(Some(plain), step(2, 2, false)),
             "a decode step"
         );
+        // The lm_head pair is exhaustive — no step runs neither, no step runs
+        // both — and each side takes the steps it is for: the slice the
+        // prefill-shaped steps, the full-M fallback the spec verifies and the
+        // decode-only steps. Issue #361: before the fallback took decode-only
+        // steps, a decode step in a bucket whose lm_head lowers to one `qmm_t`
+        // (the slice band, `bucket_m ≥ vector_limit`) ran no lm_head at all —
+        // the argmax re-read the logits slot's stale contents and every row
+        // froze on its first token.
+        use super::super::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+        for has_spec in [false, true] {
+            for (tokens, seqs) in [
+                (1u32, 1u32),
+                (9, 9),
+                (16, 16),
+                (80, 80),
+                (18, 16),
+                (512, 9),
+                (4096, 128),
+            ] {
+                let s = StepFacts {
+                    num_tokens: tokens,
+                    num_seqs: seqs,
+                    has_spec_tokens: has_spec,
+                    unrotated_blocks: false,
+                };
+                let (slice, full) = (
+                    gate_matches(Some(OnlyIfNoSpec), s),
+                    gate_matches(Some(OnlyIfSpec), s),
+                );
+                assert!(
+                    slice ^ full,
+                    "the lm_head gate pair must be exhaustive at num_tokens={tokens} \
+                     num_seqs={seqs} has_spec_tokens={has_spec}"
+                );
+            }
+        }
+        // Decode-only, no spec: the fallback is the only lm_head that runs.
+        let decode_only = StepFacts {
+            num_tokens: 9,
+            num_seqs: 9,
+            has_spec_tokens: false,
+            unrotated_blocks: false,
+        };
+        assert!(!gate_matches(Some(OnlyIfNoSpec), decode_only));
+        assert!(gate_matches(Some(OnlyIfSpec), decode_only));
+        // Prefill-shaped, no spec: the slice runs, the fallback does not.
+        let prefill = StepFacts {
+            num_tokens: 512,
+            num_seqs: 9,
+            has_spec_tokens: false,
+            unrotated_blocks: false,
+        };
+        assert!(gate_matches(Some(OnlyIfNoSpec), prefill));
+        assert!(!gate_matches(Some(OnlyIfSpec), prefill));
+        // A spec verify reads every row: the fallback, never the slice.
+        let verify = StepFacts {
+            num_tokens: 18,
+            num_seqs: 6,
+            has_spec_tokens: true,
+            unrotated_blocks: false,
+        };
+        assert!(!gate_matches(Some(OnlyIfNoSpec), verify));
+        assert!(gate_matches(Some(OnlyIfSpec), verify));
     }
 
     /// The lm_head sample slice, as the tape builds and dispatches it: the

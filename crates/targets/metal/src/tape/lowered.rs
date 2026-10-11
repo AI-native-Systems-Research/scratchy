@@ -693,16 +693,26 @@ pub struct MScaling {
 /// commands that aren't gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum RuntimeGate {
-    /// Run only when `!has_spec_tokens`. Used by the lm_head slice
+    /// Run only when `!has_spec_tokens` **and** the step has rows to
+    /// drop (`num_tokens > num_seqs`). Used by the lm_head slice
     /// trio (gather/qmv/scatter) — the slice writes exactly the
     /// `num_sample_rows` rows pointed at by `last_token_indices`,
-    /// which is correct for single-seq + multi-seq prefill and for
-    /// decode (num_sample_rows == num_seqs), but wrong for spec
-    /// verify where rejection sampling needs every row of logits.
+    /// which is correct for single-seq + multi-seq prefill, but wrong
+    /// for spec verify where rejection sampling needs every row of
+    /// logits, and pure overhead at decode (num_sample_rows ==
+    /// num_seqs) where the full-M fallback covers it with no extra
+    /// launches.
     OnlyIfNoSpec,
-    /// Run only when `has_spec_tokens`. Used by the full
-    /// `M=bucket_m` lm_head fallback that populates every row of
-    /// logits for greedy rejection sampling at spec-decode verify.
+    /// Run when `has_spec_tokens` **or** the step is decode-only
+    /// (`num_tokens == num_seqs`). Used by the full `M=bucket_m`
+    /// lm_head fallback that populates every row of logits for greedy
+    /// rejection sampling at spec-decode verify — and as the only
+    /// lm_head a decode-only step runs, the slice being gated off
+    /// there. The two gates are complements: exactly one fires on
+    /// every step, so no step is left without an lm_head (issue #361:
+    /// before the decode-only term, a decode step in a bucket whose
+    /// lm_head lowers to one `qmm_t` computed no logits and every
+    /// row froze on its first token).
     OnlyIfSpec,
     /// Run only on a decode step — every sequence contributes exactly one
     /// token (`num_tokens == num_seqs`): a TurboQuant model's
