@@ -31,7 +31,81 @@
       var chart = new charts[spec.kind](el, { data: spec.data, options: spec.options });
       var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
       if (scale) highlightSteps(chart, spec, scale);
+      if (spec.kind === 'combo') {
+        labelGaps(el, chart, spec.data);
+        chart.services.events.addEventListener('render-finished', function () { labelGaps(el, chart, spec.data); });
+      }
+      if (spec.ratio) {
+        labelFactors(el, spec.data);
+        chart.services.events.addEventListener('render-finished', function () { labelFactors(el, spec.data); });
+      }
     });
+  }
+  // Writes the factor, "×2.4", in each square the build marked a highlight,
+  // to two figures so it fits the overview's small squares. Carbon's heatmap
+  // has no cell labels and empties its container on every draw (resizes too),
+  // so this runs after each: the label goes in the square's own group
+  // (Carbon's g.cell, d3-bound to {value, index}, index into the data), in
+  // the square's own units. Dark text on a light square, white on a dark one;
+  // the label lets the pointer through to the square, so its tooltip and the
+  // scale highlight still work.
+  function labelFactors(el, data) {
+    el.querySelectorAll('g.cell').forEach(function (cell) {
+      var point = cell.__data__;
+      var square = cell.querySelector('rect.heat');
+      if (!square || !point || point.value === null || point.index === -1) return;
+      if (!data[point.index].highlight) return;
+      var w = Number(square.getAttribute('width'));
+      var h = Number(square.getAttribute('height'));
+      var text = cell.querySelector('text') || cell.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'text'));
+      text.textContent = '×' + Math.pow(2, point.value).toPrecision(2);
+      text.setAttribute('x', w / 2);
+      text.setAttribute('y', h / 2);
+      text.setAttribute('text-anchor', 'middle');
+      text.setAttribute('dominant-baseline', 'central');
+      text.setAttribute('pointer-events', 'none');
+      text.style.fontSize = Math.min(10, w / 4) + 'px';
+      text.style.fontWeight = 'bold';
+      text.style.fill = luminance(getComputedStyle(square).fill) > 0.4 ? '#161616' : '#ffffff';
+    });
+  }
+  // Writes the factor, "×3.1", in a sparkline's fill at each step the build
+  // marked a highlight (that step's fill point carries it), midway between
+  // the lines; at the first and last steps, inside the chart. Carbon draws no
+  // labels on areas either: placed with the chart's own scales, in the group
+  // its fills are drawn in, again after every draw.
+  function labelGaps(el, chart, data) {
+    var area = el.querySelector('path.area');
+    if (!area) return;
+    var layer = area.parentNode;
+    layer.querySelectorAll('text[data-factor]').forEach(function (t) { t.remove(); });
+    var x = chart.services.cartesianScales.getMainXScale();
+    var y = chart.services.cartesianScales.getMainYScale();
+    var keys = data.map(function (p) { return p.key; });
+    var first = Math.min.apply(null, keys), last = Math.max.apply(null, keys);
+    data.forEach(function (p) {
+      if (p.factor === undefined) return;
+      var text = layer.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'text'));
+      text.setAttribute('data-factor', '');
+      text.textContent = '×' + p.factor.toPrecision(2);
+      var anchor = p.key === first ? 'start' : p.key === last ? 'end' : 'middle';
+      text.setAttribute('x', x(p.key) + (anchor === 'start' ? 2 : anchor === 'end' ? -2 : 0));
+      text.setAttribute('y', y((p.upper + p.lower) / 2));
+      text.setAttribute('text-anchor', anchor);
+      text.setAttribute('dominant-baseline', 'central');
+      text.setAttribute('pointer-events', 'none');
+      text.style.fontSize = '9px';
+      text.style.fontWeight = 'bold';
+      text.style.fill = '#161616';
+    });
+  }
+  // The relative luminance of an "rgb(r, g, b)" colour, 0 black to 1 white.
+  function luminance(rgb) {
+    var c = (rgb.match(/[\d.]+/g) || [0, 0, 0]).slice(0, 3).map(function (v) {
+      v = v / 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
   }
   // While the pointer is on a heatmap square, outline its step in the colour
   // scale: the same equal slices of the colour range the heatmap colours by.
