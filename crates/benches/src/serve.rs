@@ -780,6 +780,23 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         }
     }
 
+    // Per-request samples (seconds, send order, every request). `timed` marks
+    // the ones the TTFT/TPOT/ITL statistics above were computed from.
+    if args.save_detailed {
+        let column = |f: fn(&RequestResult) -> serde_json::Value| {
+            serde_json::Value::Array(results.iter().map(f).collect())
+        };
+        obj.insert("start_times".into(), column(|r| r.start_time.into()));
+        obj.insert("ttfts".into(), column(|r| r.ttft.into()));
+        obj.insert("e2els".into(), column(|r| r.e2el.into()));
+        obj.insert("itls".into(), column(|r| r.itl.clone().into()));
+        obj.insert("output_lens".into(), column(|r| r.output_tokens.into()));
+        obj.insert(
+            "timed".into(),
+            column(|r| (r.success && !is_unstreamed(r)).into()),
+        );
+    }
+
     // --output-json: explicit path.
     if let Some(ref path) = args.output_json {
         std::fs::write(path, serde_json::to_string_pretty(&json)?)?;

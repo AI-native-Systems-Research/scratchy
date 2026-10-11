@@ -442,6 +442,12 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub save_result: bool,
 
+    /// Also write every request's samples (send time, TTFT, ITLs, E2EL,
+    /// output length) to the result JSON, in send order, so any statistic can
+    /// be derived later without re-running. Matches Python's `--save-detailed`.
+    #[arg(long)]
+    pub save_detailed: bool,
+
     /// Directory to save results in (used with --save-result).
     #[arg(long)]
     pub result_dir: Option<String>,
