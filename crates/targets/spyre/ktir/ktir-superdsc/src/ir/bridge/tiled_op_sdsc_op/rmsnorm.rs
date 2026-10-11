@@ -1,6 +1,6 @@
 //! Bridge 3 (`TiledOp -> SdscOp`), RmsNorm composite decomposition.
 //!
-//! Ported 1:1 from torch-spyre's `spyre_rms_norm` (`torch_spyre/_inductor/decompositions.py:434`):
+//! The torch-spyre formula (`torch_spyre/_inductor/decompositions.py:999`, `spyre_rms_norm`):
 //!
 //! ```python
 //! mean = torch.mean(input * input, dim=-1, keepdim=True)
@@ -16,8 +16,16 @@
 //! implementation (an amax-normalized Newton-Raphson rsqrt, built as a scratchy-specific
 //! workaround) alongside this exact torch-spyre form for `rows>1` — two independent code paths
 //! that could silently diverge, which is exactly the bug class this whole Islands/Bridges
-//! restructuring exists to eliminate. There is now ONE decomposition, used for every row count,
-//! matching torch-spyre exactly: `mean(x²) → rsqrt(mean+eps) → x·rsqrt → ·gamma`.
+//! restructuring exists to eliminate. There is now ONE decomposition, used for every row count.
+//!
+//! The HEAD is fused one step past the vendor's own RMS shape. torch-spyre lowers `mean(x·x)`
+//! as TWO elementary ops (`x·x` pointwise, then `mean` reduce) — but their LAYER-norm
+//! decomposition (decompositions.py:1020, `spyre_layer_norm`) proves the device's own fused
+//! head: ONE `exx2` reduce squares and accumulates in a single SFP_FMA inside the reduce, so
+//! the [rows,cols] x² intermediate never touches HBM at all. This chain borrows that head for
+//! RMS in the vendor's own production configuration (`useZeroMean` = 0 — the plain op both
+//! moments are computed in, E[x] simply unread), taking the chain from 6 descriptors to 5.
+//! See [`OpFunc::Exx2`]'s doc for the full wire contract.
 
 use super::reduce::assemble_reduce_seeded;
 use crate::emit::{EmittedOp, In, pw1, pw2, rb};
@@ -46,50 +54,52 @@ pub fn assemble_rmsnorm(
     let out_s = out_id.to_string();
     let out = out_s.as_str();
     let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
-    let sq16 = syn(R::Sq16); // x²        [rows, cols]
-    let mean = syn(R::Mean); // mean(x²)  [rows, stk]
-    let rinv = syn(R::Rinv); // 1/√mean    [rows, stk]
+    let mean = syn(R::Mean); // (E[x], E[x²])  [rows, stk]
+    let rinv = syn(R::Rinv); // 1/√E[x²]   [rows, stk]
     let xn = syn(R::Xn); // x·r          [rows, cols]
-    let meps = syn(R::Meps); // mean+eps   [rows, stk]
+    let meps = syn(R::Meps); // E[x²]+eps   [rows, stk]
     if let Some(l) = layout {
         for (r, dims) in [
-            (R::Sq16, [rows, cols]),
             (R::Mean, [rows, stk]),
             (R::Meps, [rows, stk]),
-            (R::Rinv, [rows, stk]),
             (R::Xn, [rows, cols]),
         ] {
             l.synth(out_id.synth(r), &dims);
         }
+        // `rinv` is PINNED-LX, not seg3-HBM (`synth_lx`): its consumer reads a SUB-STICK lane
+        // (element 8 of the exx2 pair — see step 4 below), and a sub-stick read offset survives
+        // the compile chain only on the LX path. On HBM the +16B is floored away twice over —
+        // the L3 EBR is stick-granular (the reader's allocate carries the offset but the
+        // EBR-bound L3 leg rounds to the stick base) and the reader's 2bsplat then reads the
+        // landing stick at imm 0, i.e. element 0 = rsqrt(E[x]+eps) ≈ 316: a saturated constant
+        // that turned every prior card run into byte-identical "signature" garbage with a GREEN
+        // bake. An LX allocate is byte-granular end-to-end (lbrInit_ in bytes → lxlu register →
+        // LDSTU address), so writer-at-pin / reader-at-pin+16 is exactly expressible —
+        // bake-verified against dxp_standalone (the +16 lands in the compiled reader registers;
+        // every HBM leg for the tensor vanishes).
+        //
+        // The producer side of the pin: LX is per-core private, so `apply_lx_residency`
+        // replicates `rmrsqrt` across all cores (each computes the whole [rows, stk] stick into
+        // its own scratchpad) and the reader's own slice corner selects its rows there.
+        l.synth_lx(out_id.synth(R::Rinv), &[rows, stk]);
     }
     // ── HANDLE-FLOW ── bind each tensor's typed handle ONCE, then pass the SAME handle to its producer
     // (as output) and its consumer (as input). A wrong kind is caught at cargo build by whichever consumer
     // REQUIRES a fixed kind.
     //
-    // `sq16` is RowBlocked, NOT Flat (2026-07-28). It used to be `fl()`, on the reasoning that its only
-    // consumer is the mean-reduce and that the reduce could not walk a stick-major activation at
-    // rows>1. That reasoning is now STALE, and forcing Flat here was actively wrong for mq>1:
-    //   * `assemble_pointwise_broadcast_off` derives ONE `head_major` for the WHOLE op from the OUTPUT
-    //     handle's kind. A Flat output forces head_major=true, which (see pointwise.rs's own comment)
-    //     "stays rank-3" -- i.e. it also forces the INPUT `x` to be read rank-3 flat. But `x` is the
-    //     residual stream, WRITTEN stick-major by the previous layer's rank-2 pointwise. Reading a
-    //     stick-major [rows, cols] tensor as rank-3 flat is, in that same comment's words,
-    //     "byte-identical at rows==1, scrambled at rows>1 AND cols>64" -- and here rows=mq=31,
-    //     cols=hidden=2048. So mean(x^2) was computed over a SCRAMBLED element set (each flat "row"
-    //     spans every real row's first stick), giving every row the wrong normalization scale, every
-    //     layer, for batched prefill only.
-    //   * The reduce's stick-major path is fully implemented and its two historical defects are fixed:
-    //     the `vector::_M_range_check` pod crash came from dropping to rank-2 for cols<=64 ops and is
-    //     now gated by `cols > Fp16::ELEMS_PER_STICK` (reduce.rs), and the mixed-rank data/accum
-    //     failure is fixed by making the accum rank-2 as well in that path.
-    // With RowBlocked, `rmsq` and `rmmean` BOTH take the stick-major rank-2 path at rows>1 && cols>64,
-    // so `x` is read in the layout it was actually written in and the reduce walks the same layout.
-    // At rows==1 (decode) `stickmajor` is false in both the pointwise and the reduce, so the emission
-    // is byte-identical to the previous Flat form -- decode is provably unaffected.
+    // `x` feeds the reduce DIRECTLY now (the exx2 head squares inside the reduce), so the reduce's data
+    // kind is `x`'s own kind — RowBlocked, which is exactly what the stick-major reduce path needs
+    // (2026-07-28 history, still load-bearing): `x` is the residual stream, WRITTEN stick-major by the
+    // previous layer's rank-2 pointwise. A Flat data handle would force the reduce rank-3 flat, which
+    // reads a stick-major [rows, cols] tensor "byte-identical at rows==1, scrambled at rows>1 AND
+    // cols>64" — at prefill rows=mq, cols=hidden=2048, so every row would get the wrong normalization
+    // scale, every layer. With RowBlocked, the exx2 reduce takes the stick-major rank-2 path at
+    // rows>1 && cols>64 and walks `x` in the layout it was actually written in. At rows==1 (decode)
+    // `stickmajor` is false in the reduce, so the emission is byte-identical to the flat form — decode
+    // is provably unaffected.
     let x = rb(x, rows, cols);
     let gamma = rb(gamma, 1, cols);
     let out = rb(out, rows, cols);
-    let sq16 = rb(&sq16, rows, cols);
     let mean = rb(&mean, rows, stk);
     let meps = rb(&meps, rows, stk);
     let eps = rb(eps_const, 1, stk);
@@ -100,33 +110,33 @@ pub fn assemble_rmsnorm(
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
-    // torch-spyre `spyre_rms_norm` (decompositions.py:434), EXACTLY:
-    //   mean = torch.mean(input*input, dim=-1)  →  rsqrt(mean+eps)  →  input*·  →  ·*weight
-    // 1. sq16 = x·x  (the `input*input`).
-    ops.push(pw2(
-        &format!("rmsq_{prefix}"),
-        "mul",
-        t_rows,
-        f_cols,
-        In::full(&x),
-        In::full(&x),
-        &sq16,
-        sym_id_base,
-        layout,
-    )); // sq16 = x²
-    // 2. mean(x²) = ONE native `mean` reduce over cols (folds 1/N into the reduce scale) — this IS
-    //    `torch.mean(input*input, dim=-1)`, not a matmul-by-ones substitute + separate ·(1/cols).
+    // The `spyre_rms_norm` formula with the vendor's own LAYER-norm head (their
+    // `spyre_layer_norm`, decompositions.py:1020, opens with exactly this reduce):
+    //   exx2(1/cols)  →  rsqrt(E[x²]+eps)  →  x·r  →  ·γ
+    // 1. E[x²] = ONE native `exx2` reduce reading `x` directly — the square happens INSIDE the
+    //    reduce (SFP_FMA x·x+acc, one rounding — the vendor's own fused numerics), so no [rows,cols]
+    //    x² intermediate is ever materialized in HBM. The reduce writes TWO half-stick values per
+    //    row: elements [0..8) = E[x] (computed and unread — the plain op computes both moments),
+    //    elements [8..16) = E[x²]·(1/cols scale) — the vendor's own write AND read-back of the
+    //    second value both sit at `stick_replicated_dim_offset_elements=8` (summeanmaxexx2.ddl:625/
+    //    :192, and layernormscale_32.ddl:75 reads it there too). The reduce's 1/N rides the op's
+    //    `exx2scale` const (same channel the mean reduce's `scaling_factor` used), and
+    //    `useZeroMean` stays the RAW 0 — the vendor's production spelling (the =1 rewrite names
+    //    an op the runtime smc table cannot resolve) — see OpInfo::Exx2Scale.
     ops.push(assemble_reduce_seeded(
         &format!("rmmean_{prefix}"),
-        "mean",
+        "exx2",
         rows,
         cols,
-        &sq16,
+        &x,
         &mean,
         sym_id_base,
         layout,
     ));
-    // 3. mean + eps  (the `+ eps` inside torch.rsqrt).
+    // 2. E[x²] + eps  (the `+ eps` inside torch.rsqrt). `mean` holds both half-stick values, so
+    //    elements [0..8) compute E[x]+eps and the pad elements compute over stale bytes — both
+    //    unread (the tail reads element 8 only), the same computed-but-unread padding class the
+    //    elementary chain always had.
     ops.push(pw2(
         &format!("rmeps_{prefix}"),
         "add",
@@ -137,8 +147,8 @@ pub fn assemble_rmsnorm(
         &meps,
         sym_id_base,
         layout,
-    )); // mean + eps
-    // 4. rinv = rsqrt(mean+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
+    )); // E[x²] + eps
+    // 3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
     ops.push(pw1(
         &format!("rmrsqrt_{prefix}"),
         "rsqrt",
@@ -148,15 +158,26 @@ pub fn assemble_rmsnorm(
         &rinv,
         sym_id_base,
         layout,
-    )); // 1/√(mean+eps)
-    // 5. apply: xn = x·rinv (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
+    )); // 1/√(E[x²]+eps)
+    // 4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
+    //    `rinv`'s element 8 IS E[x²]'s rsqrt — the FIRST element of the exx2 output's second
+    //    half-stick ([8..16); the vendor's own consumers read it at exactly this offset,
+    //    `stick_replicated_dim_offset_elements=8`) — read via a one-element view step into the
+    //    single-stick-wide view (same `col_at` idiom as the attention finalize's per-head scalar).
+    //    ⛔ NOT element 1: the first card run of this chain read element 1 (the E[x] half, ≈0 for
+    //    a signed activation row), which made the whole norm multiply by rsqrt(E[x]+eps) — a
+    //    saturated, degenerate generation. The half-stick map is the DDL's, not a guess.
+    //    The +8 elements (= +16 B, one fp16 word past the pair's first slot) rides the reader's
+    //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
+    //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx` note above
+    //    for why the same offset on HBM is silently floored to element 0).
     ops.push(pw2(
         &format!("rmxn_{prefix}"),
         "multiply",
         t_rows,
         f_cols,
         In::full(&x),
-        In::col(&rinv),
+        In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
         &xn,
         sym_id_base,
         layout,

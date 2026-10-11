@@ -240,6 +240,15 @@ pub struct BundleLayout {
     /// so a runtime diagnostic can look up a synthetic intermediate's address by NAME, the same way
     /// it looks up a `t{id}`'s.
     pub synth: std::cell::RefCell<SynthAlloc>,
+    /// ⭐ PINNED-LX INTERMEDIATES — the residency twin of [`Self::synth`]. A tensor declared
+    /// here (via [`Self::synth_lx`]) is addressed in the per-core LX scratchpad at a pinned
+    /// byte address instead of the Intermediate HBM segment: its producer replicates across
+    /// all cores ([`crate::superdsc_opspec::WorkPlan::replicate`]) and its consumers read
+    /// their own core's copy. Empty for every bundle that declares none (all models before
+    /// the exx2 rmsnorm chain), keeping those byte-identical. Interior-mutable so the
+    /// `&layout`-threaded emit can consult it by name.
+    #[serde(skip)]
+    pub lx: std::cell::RefCell<LxAlloc>,
     /// THE arrangement authority: `tensor name → its ONE device [`StickLayout`]`. The FIRST op to
     /// address a tensor declares its layout; every later op must address it EQUIVALENTLY
     /// ([`StickLayout::addr_eq`]) or `declare_arrangement` returns a build `Err` naming the tensor. A
@@ -276,6 +285,51 @@ pub struct SynthAlloc {
     /// that no access exceeds it — an out-of-footprint access is a shape mismatch and a
     /// `cargo build` Err, not silent on-card aliasing.
     pub sizes: std::collections::BTreeMap<String, u64>,
+}
+
+/// LX scratchpad size per core: 2 MiB (`sysdef.cpp:587`, `lxSize = 2L*1024*1024`). The hard
+/// ceiling every pinned LX address + footprint must fit under — a build-time fact, so the
+/// pin allocator's overflow is a `cargo build` panic and never an on-card wraparound.
+pub const LX_SIZE: u64 = 2 * 1024 * 1024;
+
+/// Where PINNED LX-resident intermediates start: stick 1024. The runtime's own L3 landing
+/// allocator demonstrably never touches the low region — every landing in a real 128-dsc
+/// granite bundle sits in sticks [12698, 14778] (1.62–1.84 MiB), unchanged when a pin is
+/// placed inside the low zone (measured: a stick-1000 pin compiled with a byte-identical
+/// landing set and zero collisions in the compiled register image) — and the vendor's own
+/// standalone fixtures pin `lxStartAddress_` at exactly this scale (`128*1000`, `128*2000`,
+/// `1000000` in dsc_standalone.cpp:195/:259). Low LX is the pinning zone by the device's
+/// own conventions; the landings live high.
+pub const LX_PIN_BASE: u64 = 128 * 1024;
+
+/// The pinned-LX twin of [`SynthAlloc`]: byte-granular addresses in the per-core LX
+/// scratchpad for intermediates declared via [`BundleLayout::synth_lx`]. LX residency
+/// exists for ONE measured reason: a SUB-STICK read offset on a collapsed stick dim (the
+/// rmsnorm `rinv` lane read at element 8 of the exx2 pair) survives the whole compile chain
+/// only on the LX path — the HBM path floors it away (the L3 EBR is stick-granular, and the
+/// reader's 2bsplat reads the landing stick base with imm 0), which silently reads element 0
+/// instead. An LX-pinned allocate is byte-granular end-to-end (`lbrInit_` in bytes → lxlu
+/// register → LDSTU address), so writer-at-A / reader-at-A+16 is exactly expressible.
+/// Bake-verified against dxp_standalone: the +16 lands in the compiled reader registers and
+/// every HBM leg for the tensor vanishes.
+#[derive(Clone, Debug)]
+pub struct LxAlloc {
+    /// Next free pin byte (starts at [`LX_PIN_BASE`]; bumps by each tensor's
+    /// 128-aligned footprint so pinned tensors never overlap each other).
+    pub next: u64,
+    /// Pinned byte address per synth name.
+    pub map: std::collections::BTreeMap<String, u64>,
+    /// Declared footprint (bytes) per name — the resolve-time window guard's bound.
+    pub sizes: std::collections::BTreeMap<String, u64>,
+}
+impl Default for LxAlloc {
+    fn default() -> Self {
+        LxAlloc {
+            next: LX_PIN_BASE,
+            map: std::collections::BTreeMap::new(),
+            sizes: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// Footprint (bytes) of a synth tensor with shape `dims` (outermost→innermost; the inner dim
@@ -345,6 +399,51 @@ impl BundleLayout {
     /// guess. `synth(name, dims)` is exactly `synth_df(name, dims, Df::Fp16)`.
     pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
         self.synth_bytes(id, synth_footprint_bytes(dims, df));
+    }
+
+    /// Declare a synthetic intermediate LX-RESIDENT at its FULL shape (`dims`, outermost→
+    /// innermost), pinned at the next free byte of the per-core LX scratchpad. This REPLACES
+    /// the seg3 HBM slot [`Self::synth`] would reserve — an LX-resident tensor has no HBM
+    /// copy at all (its `memOrg_` is lx-only, so the runtime generates no L3 movement for it).
+    ///
+    /// The pin is per-tensor (each name gets its own 128-aligned footprint slot) even where
+    /// lifetimes would allow sharing, so correctness never leans on emission order. Idempotent
+    /// per name.
+    ///
+    /// ⛔ PANICS on overflow past [`LX_SIZE`] — this runs at `#[forward]` expansion, so the
+    /// panic IS the cargo-build guard: a bundle whose pinned intermediates do not fit the
+    /// 2 MiB scratchpad is unbuildable, not silently wrapping into unmapped LX.
+    pub fn synth_lx(&self, id: PlaceId, dims: &[u32]) {
+        let name = id.to_string();
+        self.ids.borrow_mut().insert(name.clone(), id);
+        let mut a = self.lx.borrow_mut();
+        if a.map.contains_key(&name) {
+            return;
+        }
+        let o = a.next;
+        let fp = align128(synth_footprint_bytes(dims, Df::Fp16).max(1));
+        a.next = o + fp;
+        let end = a.next;
+        assert!(
+            end <= LX_SIZE,
+            "pinned-LX intermediates overflow the 2 MiB per-core scratchpad: '{name}' pins at \
+             {o} with footprint {fp}, pushing the region to {end} > {LX_SIZE}. LX-resident \
+             intermediates are for small per-row scalars (the rmsnorm rinv stick); a tensor \
+             this large belongs in the HBM Intermediate segment (declare it with \
+             `BundleLayout::synth` instead)."
+        );
+        a.map.insert(name.clone(), o);
+        a.sizes.insert(name, fp);
+    }
+
+    /// The pinned-LX address + declared footprint of `name`, or `None` when the tensor is not
+    /// LX-resident. THE name-keyed residency consult — `resolve_seg_base` turns it into the
+    /// view's address and the pointwise builders' LX pass turns it into `Allocation::Lx`.
+    pub fn lx_pin(&self, name: &str) -> Option<(u64, u64)> {
+        let a = self.lx.borrow();
+        a.map
+            .get(name)
+            .and_then(|&pin| a.sizes.get(name).map(|&fp| (pin, fp)))
     }
 
     /// ⛔⛔⛔ DECLARE A SYNTH AT THE FOOTPRINT OF THE TENSOR IT SHADOWS, NOT OF ONE CHUNK OF IT.

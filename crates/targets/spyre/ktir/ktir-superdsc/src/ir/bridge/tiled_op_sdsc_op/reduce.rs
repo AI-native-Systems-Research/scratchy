@@ -185,9 +185,10 @@ pub fn reduce_opspec_df(
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     // The sum/mean/max reduce template (summeanmaxexx2.ddl) requires a
     // `scaling_factor` external const (= 1/N for mean, 1.0 for sum/max — packed
-    // fp16). `cols` is the reduced extent N.
+    // fp16). `cols` is the reduced extent N. `exx2` divides by the SAME 1/N — its
+    // `exx2scale` const is the E[x²] divisor (the template's own `@outDivisor@`).
     let scale = match op {
-        OpFunc::Mean => 1.0f32 / cols as f32,
+        OpFunc::Mean | OpFunc::Exx2 => 1.0f32 / cols as f32,
         _ => 1.0f32, // sum / max: identity scaling
     };
     // The const is read by the device as SEN169_FP16 (1-6-9), NOT IEEE f16 (1-5-10) — see
@@ -196,7 +197,21 @@ pub fn reduce_opspec_df(
     // `encode_constant(value, data_format)`, compute_ops.py:127): the fp32 reduce (mq>1 rmsnorm
     // mean(x²)) needs an IEEE_FP32 const (raw f32 bits), else a SEN169_FP16 const feeding an fp32 op
     // is a MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
-    let op_info = if matches!(df, Df::Fp32) {
+    let op_info = if op == OpFunc::Exx2 {
+        // BUILD-TIME GUARD (guard-every-crash-at-build-time): the exx2 bind in summeanmaxexx2.ddl
+        // declares %type_fp16 ONLY — an fp32 exx2 does not exist on the device, and emitting one
+        // would fail at dxp with an op-mapping refusal that names neither the dtype nor the op.
+        // The fp32 rmsnorm island keeps its elementary mean(x²) chain instead.
+        if matches!(df, Df::Fp32) {
+            return Err(format!(
+                "reduce `{accum_name}`: exx2 is fp16-only (summeanmaxexx2.ddl binds %type_fp16 \
+                 exclusively) — the fp32 mean(x²) must ride the elementary chain"
+            ));
+        }
+        // The pair `exx2scale` + `useZeroMean` (the RAW 0 — at 1 ddc renames the op to
+        // exx2_zeromean, which the runtime smc table cannot resolve; see OpInfo::Exx2Scale's doc).
+        OpInfo::Exx2Scale(sen169_bits(scale) as u32)
+    } else if matches!(df, Df::Fp32) {
         OpInfo::ReduceScalingFp32(scale.to_bits())
     } else {
         OpInfo::ReduceScaling(sen169_bits(scale) as u32)

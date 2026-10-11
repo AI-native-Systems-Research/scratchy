@@ -509,6 +509,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
         weight_copies: Vec::new(),
         synth,
+        // No pinned-LX intermediates: the triton shim emits no rmsnorm-style scratchpad
+        // tensors, so the per-core pin registry starts empty — same role as `synth` above.
+        lx: Default::default(),
         // The arrangement authority starts empty and every op declares into it — that is the point:
         // the FIRST op to address a tensor fixes its device layout and a later disagreement is a
         // build error. Pre-seeding it would pre-decide arrangements no descriptor has stated.

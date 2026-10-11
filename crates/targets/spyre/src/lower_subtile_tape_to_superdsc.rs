@@ -1598,6 +1598,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
             .map(|(w, perm)| (*w, *perm))
             .collect(),
         synth,
+        // Pinned-LX registry starts empty (stick 1024 base): it fills only when a
+        // decomposition declares an intermediate via `BundleLayout::synth_lx` (the
+        // exx2 rmsnorm `rinv` stick) — every other bundle leaves it untouched.
+        lx: Default::default(),
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
     })
@@ -3226,6 +3230,11 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // otherwise). Its verdict is that the bundle compiled; there is nothing for the runtime to do
         // with the table.
         arrangements: _,
+        // EMIT-ONLY, deliberately not baked: pinned-LX intermediates have no HBM placement by
+        // construction (their `memOrg_` is lx-only and no L3 movement is generated for them), so
+        // there is no address for the runtime to stage — the pin lives in the compiled sdsc
+        // allocates.
+        lx: _,
         kv_request_stride_bytes,
     } = l;
 
