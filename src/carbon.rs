@@ -14,6 +14,7 @@ pub enum Module {
     Accordion,
     Button,
     CodeSnippet,
+    ContentSwitcher,
     DataTable,
     Grid,
     Heading,
@@ -31,12 +32,13 @@ pub enum Module {
 
 /// Which module defines each `cds-*` tag family: the tag itself and every
 /// `<family>-...` tag.
-const FAMILIES: [(&str, Module); 22] = [
+const FAMILIES: [(&str, Module); 23] = [
     ("cds-accordion", Module::Accordion),
     ("cds-button", Module::Button),
     ("cds-clickable-tile", Module::Tile),
     ("cds-code-snippet", Module::CodeSnippet),
     ("cds-column", Module::Grid),
+    ("cds-content-switcher", Module::ContentSwitcher),
     ("cds-definition-tooltip", Module::Tooltip),
     ("cds-grid", Module::Grid),
     ("cds-header", Module::UiShell),
@@ -93,6 +95,7 @@ impl Module {
             Module::Accordion => "accordion",
             Module::Button => "button",
             Module::CodeSnippet => "code-snippet",
+            Module::ContentSwitcher => "content-switcher",
             Module::DataTable => "data-table",
             Module::Grid => "grid",
             Module::Heading => "heading",
@@ -125,6 +128,34 @@ pub fn Button(kind: ButtonKind, #[props(into)] href: String, children: Element) 
         ButtonKind::Tertiary => "tertiary",
     };
     rsx! { cds-button { "kind": kind, "href": href, {children} } }
+}
+
+/// A `cds-content-switcher` over panels: each item shows the element whose id
+/// is its `target` and Carbon hides the others' (`ContentPanel`). As wide as
+/// its items, not (Carbon's default) its container.
+#[component]
+pub fn ContentSwitcher(selected: String, children: Element) -> Element {
+    rsx! { cds-content-switcher { "value": selected, "style": "width: fit-content", {children} } }
+}
+
+/// One `cds-content-switcher-item`: its label, and the id of the panel it
+/// shows, which is also its value.
+#[component]
+pub fn ContentSwitcherItem(target: String, selected: bool, children: Element) -> Element {
+    rsx! {
+        cds-content-switcher-item { "value": "{target}", "target": target, "selected": selected.then_some(true),
+            {children}
+        }
+    }
+}
+
+/// A content switcher's panel: hidden until its item is selected. Carbon
+/// sets `hidden` once the switcher runs; rendering it already set keeps the
+/// other panels from showing until then. Hidden, it still has its width
+/// (`[data-panel]` in styles.css), so switching never resizes what holds it.
+#[component]
+pub fn ContentPanel(id: String, shown: bool, children: Element) -> Element {
+    rsx! { div { id, "data-panel": "", hidden: (!shown).then_some(true), {children} } }
 }
 
 #[component]

@@ -27,6 +27,15 @@ impl Engine {
         }
     }
 
+    /// Its sparkline fill's name, where it is the faster of two.
+    pub fn ahead(self) -> &'static str {
+        match self {
+            Engine::Scratchy => "scratchy ahead",
+            Engine::MlxLm => "mlx-lm ahead",
+            Engine::Ollama => "ollama ahead",
+        }
+    }
+
     /// Its series colour (.s1 to .s3 in styles.css).
     pub fn series(self) -> &'static str {
         match self {
