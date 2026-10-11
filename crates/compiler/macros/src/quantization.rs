@@ -2118,6 +2118,158 @@ mod tests {
         );
     }
 
+    /// The FULL Qwen3.5-122B-A10B OptiQ-2bit per-module map, verbatim from the
+    /// checkpoint's `config.json` (`test_fixtures/`), and the per-(stem, preset) drift
+    /// file the build actually compiles: they are the same map, it parses whole, and
+    /// every one of the 48 MoE layers resolves to the widths the checkpoint ships —
+    /// the 2/2/4 split bundle on layer 42 included — with the router gate, the shared
+    /// expert and the shared-expert gate affine at the section's 4-bit (unlike
+    /// Nemotron-3-Super, whose map leaves the router gate dense), and both attention
+    /// families — 12 full-attention layers, 36 gated-delta-net layers — covered on
+    /// their own roles.
+    #[test]
+    fn the_full_qwen35_122b_optiq_map_parses_and_resolves_every_projection() {
+        use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct};
+        let checkpoint = checked_in(
+            "../../models/quantization/test_fixtures/\
+             mlx-community_Qwen3.5-122B-A10B-OptiQ-2bit.config.json",
+        );
+        let drift = checked_in(
+            "../../models/arch/configs/qwen3-5-moe/\
+             qwen3.5-122b-a10b-mlx-affine-b4-g64-qembed.overrides.json",
+        );
+        let QuantMethod::Affine {
+            bits,
+            group_size,
+            per_module,
+            ..
+        } = QuantizationConfig::parse(&checkpoint)
+            .unwrap()
+            .expect("some")
+            .method
+        else {
+            panic!("OptiQ is MLX affine");
+        };
+        assert_eq!((bits, group_size), (4, 64));
+        assert_eq!(per_module.len(), 614, "one entry per quantized module");
+        let at = |b: u32| per_module.iter().filter(|(_, (w, _))| *w == b).count();
+        assert_eq!((at(4), at(2)), (501, 113));
+        assert!(per_module.iter().all(|(_, (_, g))| *g == 64));
+
+        // The drift file over the preset is the checkpoint's map, entry for entry.
+        let mut compiled = drift.clone();
+        compiled["quantization_config"]["bits"] = 4.into();
+        compiled["quantization_config"]["group_size"] = 64.into();
+        compiled["quantization_config"]["quant_embed"] = true.into();
+        let method = QuantizationConfig::parse(&compiled)
+            .unwrap()
+            .expect("some")
+            .method;
+        let QuantMethod::Affine {
+            per_module: compiled_map,
+            ..
+        } = &method
+        else {
+            panic!("the compiled variant is MLX affine");
+        };
+        assert_eq!(
+            compiled_map, &per_module,
+            "the drift file drifted from the checkpoint"
+        );
+
+        // Every layer is MoE. The routed experts run 2-bit on layers 5-42 — layer 42's
+        // down_proj split back to 4-bit — and whole 4-bit on the outer layers, through
+        // the DSL bundle root and the layer-templated safetensors prefix alike.
+        let program = Program::default();
+        let silu = ExpertBody::Gated(GatedAct::Silu);
+        let layer_types: Vec<&str> = checkpoint["text_config"]["layer_types"]
+            .as_array()
+            .expect("the wrapper nests layer_types under text_config")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(layer_types.len(), 48);
+        for (layer, kind) in layer_types.iter().enumerate() {
+            let layer = layer as u64;
+            let want = match layer {
+                5..=41 => ExpertBits::Gated {
+                    gate: 2,
+                    up: 2,
+                    down: 2,
+                },
+                42 => ExpertBits::Gated {
+                    gate: 2,
+                    up: 2,
+                    down: 4,
+                },
+                _ => ExpertBits::Gated {
+                    gate: 4,
+                    up: 4,
+                    down: 4,
+                },
+            };
+            for prefix in ["mlp", "language_model.model.layers.0.mlp"] {
+                assert_eq!(
+                    affine_moe_expert_bits(
+                        &program,
+                        &method,
+                        prefix,
+                        Some(UnrollIndex(layer)),
+                        silu
+                    ),
+                    Some(want),
+                    "layer {layer} via `{prefix}`",
+                );
+            }
+            // The router gate, the shared expert and the shared-expert gate are affine
+            // at the section's 4-bit.
+            for role in [
+                "mlp.gate",
+                "mlp.shared_expert.gate_proj",
+                "mlp.shared_expert.up_proj",
+                "mlp.shared_expert.down_proj",
+                "mlp.shared_expert_gate",
+            ] {
+                assert_eq!(
+                    affine_role_bits(&program, &method, role, Some(UnrollIndex(layer))),
+                    Some(4),
+                    "layer {layer} {role}"
+                );
+            }
+            let attn_roles: &[&str] = if *kind == "full_attention" {
+                &[
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                ]
+            } else {
+                assert_eq!(*kind, "linear_attention");
+                &[
+                    "linear_attn.in_proj_a",
+                    "linear_attn.in_proj_b",
+                    "linear_attn.in_proj_qkv",
+                    "linear_attn.in_proj_z",
+                    "linear_attn.out_proj",
+                ]
+            };
+            for role in attn_roles {
+                assert_eq!(
+                    affine_role_bits(&program, &method, role, Some(UnrollIndex(layer))),
+                    Some(4),
+                    "layer {layer} {role}"
+                );
+            }
+        }
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(4));
+        // `lm_head` ships under the wrapper's root (`language_model.lm_head`), which
+        // the dot-anchored suffix candidate still resolves.
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "lm_head", None),
+            Some((4, 64))
+        );
+    }
+
     /// The embedding table is whatever the `embed(..)` op gathers from, by role: a per-module
     /// map or a `bits_overrides` suffix names Nemotron-H's `backbone.embeddings` the way it names
     /// the llama fleet's `model.embed_tokens`, and neither name stands in for the other.
