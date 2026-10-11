@@ -8203,6 +8203,10 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::GptOssMoe
         | OpKind::SinkAttention
         | OpKind::SinkSlidingAttention
+        | OpKind::RopeQuery
+        | OpKind::SharedAttention
+        | OpKind::SharedSlidingAttention
+        | OpKind::ExportHidden
         | OpKind::GatedDeltaNet
         | OpKind::Mamba2
         | OpKind::GateSplit
