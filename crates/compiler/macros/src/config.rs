@@ -1622,11 +1622,18 @@ fn model_params_from_json(
     }
     // Arch-declared `Params` schema (additive over the standard flat
     // harvest for decoder crates that need non-standard fields).
+    let scheduled_layers = bounds.get("num_hidden_layers").copied();
     spec.eval_params(json, &mut bounds)
         .map_err(|reason| ConfigError::VisionDerivation {
             path: source_path.to_path_buf(),
             reason,
         })?;
+    // A schema that replaces the layer count leaves the block schedule another model's: an MTP
+    // head's config is its target's verbatim, so its sets name the target's layers, not the head's.
+    let layer_sets = match bounds.get("num_hidden_layers").copied() == scheduled_layers {
+        true => layer_sets,
+        false => BTreeMap::new(),
+    };
     let mut scalars = extract_scalars(json);
     // Arch-declared scalar defaults (`SCALAR_DEFAULTS`): arch-constant
     // floats the checkpoint omits (Gemma-4's `attention_multiplier`).
@@ -3316,6 +3323,28 @@ mod tests {
         let mp = model_params_from_json(&json, "s", &path, Vec::new(), &spec).expect("parse");
         assert_eq!(mp.bounds["mamba_conv_dim"], 10240);
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
+    }
+
+    /// Qwen3.6's MTP head reads its target's config verbatim, whose block schedule names the
+    /// target's 40 layers; the head's schema makes it 1. The target keeps its sets; the head gets
+    /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have).
+    #[test]
+    fn a_schema_replacing_the_layer_count_leaves_no_layer_sets() {
+        let parse = |arch: &str, stem: &str| {
+            let dir = repo_model_archs(arch);
+            let spec = load_arch_json(&dir).expect("arch.json");
+            let path = dir.join(format!("{stem}.json"));
+            let json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+            model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse")
+        };
+        let target = parse("qwen3-5-moe", "qwen3.6-35b-a3b");
+        assert_eq!(target.bounds["num_hidden_layers"], 40);
+        let attention = target.layer_sets["attention_layers"].members();
+        assert_eq!(attention.last(), Some(&39));
+        let head = parse("qwen3-5-mtp", "qwen3.6-35b-a3b-mtp");
+        assert_eq!(head.bounds["num_hidden_layers"], 1);
+        assert!(head.layer_sets.is_empty(), "{:?}", head.layer_sets);
     }
 
     /// The parity-tiny configs keep every property the carrier gate
