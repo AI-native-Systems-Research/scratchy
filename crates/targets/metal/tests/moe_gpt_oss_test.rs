@@ -42,6 +42,7 @@ const PROGRAM: RouteProgram = RouteProgram {
     scale: None,
     post: RoutePost::Softmax,
     expert_scale: None,
+    post_scale: None,
 };
 
 fn size(w: usize, h: usize, d: usize) -> MTLSize {

@@ -113,6 +113,7 @@ macro_rules! for_each_subop {
             ExpertSort [SubOp::ExpertSort { .. }] arity = (|n| n == 2), cols = [pairs in0 k];
             ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3), cols = [pairs n k];
             ExpertGatedAct [SubOp::ExpertGatedAct { .. }] arity = (|n| n == 2), cols = [in0];
+            ExpertAct [SubOp::ExpertAct { .. }] arity = (|n| n == 1), cols = [in0];
             ExpertUnsort [SubOp::ExpertUnsort] arity = (|n| n == 2), cols = [in0];
             ExpertCombine [SubOp::ExpertCombine { .. }] arity = (|n| n == 2), cols = [field hidden];
             SampleRowsGather [SubOp::SampleRowsGather] arity = (|n| n == 1), cols = [in0];

@@ -31,7 +31,7 @@
   "mlp_hidden_act": "relu2",
   "model_type": "nemotron_h",
   "moe_intermediate_size": 64,
-  "moe_latent_size": 32,
+  "moe_latent_size": 64,
   "moe_shared_expert_intermediate_size": 128,
   "moe_shared_expert_overlap": false,
   "mtp_hybrid_override_pattern": "*E",
@@ -49,6 +49,64 @@
   "num_nextn_predict_layers": 1,
   "pad_token_id": 0,
   "partial_rotary_factor": 1.0,
+  "quantization": {
+    "backbone.layers.1.mixer.switch_mlp.fc1": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.switch_mlp.fc2": {
+      "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.switch_mlp.fc1": {
+      "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.switch_mlp.fc2": {
+      "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.switch_mlp.fc1": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.switch_mlp.fc2": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "bits": 4,
+    "group_size": 64,
+    "mode": "affine"
+  },
+  "quantization_config": {
+    "backbone.layers.1.mixer.switch_mlp.fc1": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.1.mixer.switch_mlp.fc2": {
+      "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.switch_mlp.fc1": {
+      "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.4.mixer.switch_mlp.fc2": {
+      "bits": 2,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.switch_mlp.fc1": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "backbone.layers.7.mixer.switch_mlp.fc2": {
+      "bits": 4,
+      "group_size": 64
+    },
+    "bits": 4,
+    "group_size": 64,
+    "mode": "affine"
+  },
   "rescale_prenorm_residual": true,
   "residual_in_fp32": false,
   "rope_theta": 10000,

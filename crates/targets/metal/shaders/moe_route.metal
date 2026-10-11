@@ -24,6 +24,7 @@ SCRATCHY_CONSTANT_OPTIONAL(float, ROUTE_SCALE, 3);
 // 0: none, 1: softmax, 2: renorm.
 SCRATCHY_CONSTANT(int, ROUTE_POST, 4);
 SCRATCHY_CONSTANT(int, ROUTE_EXPERT_SCALE, 5);
+SCRATCHY_CONSTANT_OPTIONAL(float, ROUTE_POST_SCALE, 6);
 
 template <typename T, short BN>
 [[kernel, max_total_threads_per_threadgroup(BN)]] void moe_route(
@@ -47,9 +48,10 @@ template <typename T, short BN>
   route_top_k<T, E, K, ROUTE_PRE>(
       row_logits, row_logits, row_inds, bias, lid.x, simd_lane_id, simd_group_id, local_a,
       local_b);
-  route_scores<T, K, ROUTE_PRE, ROUTE_SCALE_SET, ROUTE_POST, ROUTE_EXPERT_SCALE != 0>(
-      row_logits, row_logits, row_inds, row_scores, bias, expert_scale, ROUTE_SCALE, lid.x,
-      simd_lane_id, simd_group_id, local_a, local_b);
+  route_scores<T, K, ROUTE_PRE, ROUTE_SCALE_SET, ROUTE_POST, ROUTE_EXPERT_SCALE != 0,
+               ROUTE_POST_SCALE_SET>(
+      row_logits, row_logits, row_inds, row_scores, bias, expert_scale, ROUTE_SCALE,
+      ROUTE_POST_SCALE, lid.x, simd_lane_id, simd_group_id, local_a, local_b);
 }
 
 #define INST_MOE_ROUTE(tag, type, bn) \

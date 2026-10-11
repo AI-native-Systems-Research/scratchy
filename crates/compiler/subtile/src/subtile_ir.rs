@@ -626,6 +626,24 @@ pub enum GatedAct {
     SwigluOai,
 }
 
+/// The activation an ungated expert applies to its one in-projection: `act(fc1 · x)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UngatedAct {
+    /// `relu(x)²` — Nemotron-H's `SwitchMLP` experts (mlx `nn.ReLU2`).
+    Relu2,
+}
+
+/// What an expert computes between its in- and out-projections — which also says which
+/// projections it HAS: a gated expert reads a gate and an up projection, an ungated one only its
+/// `fc1`, which the block states as its up projection (and `fc2` as its down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertBody {
+    /// `act(gate · x) * (up · x)`.
+    Gated(GatedAct),
+    /// `act(up · x)`.
+    Ungated(UngatedAct),
+}
+
 /// The weight bundle a router reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RouterBundle {
@@ -816,6 +834,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 bundle,
             } => (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h),
             SubOp::ExpertGatedAct { act } => act.hash(h),
+            SubOp::ExpertAct { act } => act.hash(h),
             SubOp::ExpertCombine { hidden, shared } => (hidden, shared).hash(h),
             SubOp::KvEncode { operand } | SubOp::KvStage { operand } => operand.hash(h),
             SubOp::RotateRows { rows } => rows.hash(h),
@@ -1214,6 +1233,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     },
     /// `act(gate) * up` over the pair rows. `inputs` = `[gate, up]`.
     ExpertGatedAct { act: GatedAct },
+    /// `act(up)` over the pair rows of an ungated expert ([`ExpertBody::Ungated`]). `inputs` =
+    /// `[up]`.
+    ExpertAct { act: UngatedAct },
     /// The pair rows back in token order. `inputs` = `[rows, routing]`.
     ExpertUnsort,
     /// Each token's pair rows summed by its scores, `[m, hidden]`. `inputs` = `[rows, scores]`.
@@ -2378,6 +2400,7 @@ pub fn lower_region(
                 bundle,
             },
             SubOp::ExpertGatedAct { act } => SubOp::ExpertGatedAct { act },
+            SubOp::ExpertAct { act } => SubOp::ExpertAct { act },
             SubOp::ExpertUnsort => SubOp::ExpertUnsort,
             SubOp::ExpertCombine { hidden, shared } => SubOp::ExpertCombine { hidden, shared },
             SubOp::KvEncode { operand } => SubOp::KvEncode { operand },

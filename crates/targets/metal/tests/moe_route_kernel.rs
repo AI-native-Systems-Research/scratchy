@@ -280,24 +280,28 @@ const GEMMA: RouteProgram = RouteProgram {
     scale: Some(Scale(0.018_844_6)),
     post: RoutePost::Softmax,
     expert_scale: Some(LayerId(0)),
+    post_scale: None,
 };
 const TOP_K_SOFTMAX: RouteProgram = RouteProgram {
     pre: RoutePre::None,
     scale: None,
     post: RoutePost::Softmax,
     expert_scale: None,
+    post_scale: None,
 };
 const SHARED: RouteProgram = RouteProgram {
     pre: RoutePre::Softmax,
     scale: None,
     post: RoutePost::Renorm,
     expert_scale: None,
+    post_scale: None,
 };
 const SHARED_UNNORMED: RouteProgram = RouteProgram {
     pre: RoutePre::Softmax,
     scale: None,
     post: RoutePost::None,
     expert_scale: None,
+    post_scale: None,
 };
 /// GLM-4.5's noaux_tc: F32 sigmoid + correction bias ordering the picks, the UNBIASED sigmoids
 /// renormalized as the scores.
@@ -306,7 +310,16 @@ const GLM: RouteProgram = RouteProgram {
     scale: None,
     post: RoutePost::Renorm,
     expert_scale: None,
+    post_scale: None,
 };
+/// Nemotron-H's: GLM's routing, the renormalized scores then times the routed scaling factor —
+/// AFTER the renorm, which a scale before it would cancel.
+const fn nemotron(routed_scaling_factor: f32) -> RouteProgram {
+    RouteProgram {
+        post_scale: Some(Scale(routed_scaling_factor)),
+        ..GLM
+    }
+}
 /// gpt-oss's biased router: the F32 linear bias added to each logit orders the top-4 picks, and
 /// the BIASED values are read back as the scores, softmaxed over the top-4.
 const GPT_OSS: RouteProgram = RouteProgram {
@@ -314,6 +327,7 @@ const GPT_OSS: RouteProgram = RouteProgram {
     scale: None,
     post: RoutePost::Softmax,
     expert_scale: None,
+    post_scale: None,
 };
 
 #[test]
@@ -342,17 +356,18 @@ fn the_routing_kernel_matches_the_kernels_it_replaces() {
     }
 }
 
-/// GLM-4.5's noaux_tc routing against a CPU reference: the picks order on each expert's F32
-/// sigmoid plus its F32 correction bias (ties by index ascending, the stable sort's order), and
-/// the scores are the picks' UNBIASED sigmoids renormalized to sum to one — mlx-lm's
-/// `group_expert_select` at `n_group = 1`.
-#[test]
-fn glm_sigmoid_bias_routing_matches_the_reference() {
+/// A sigmoid + correction-bias routing against a CPU reference: the picks order on each expert's
+/// F32 sigmoid plus its F32 correction bias (ties by index ascending, the stable sort's order), and
+/// the scores are the picks' UNBIASED sigmoids renormalized to sum to one, then times the
+/// program's last scale when it has one — mlx-lm's `group_expert_select` at `n_group = 1`.
+fn sigmoid_bias_routing_matches_the_reference(
+    program: RouteProgram,
+    (e, k, n): (usize, usize, usize),
+) {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let (e, k, n) = (160, 8, 3);
-    let r = Routing::new(&device, GLM, (e, k, n), false);
-    let bias = r.bias.as_ref().expect("the GLM pre reads a bias");
+    let r = Routing::new(&device, program, (e, k, n), false);
+    let bias = r.bias.as_ref().expect("the sigmoid pre reads a bias");
     let bias: Vec<f32> = common::read_slice(bias, e);
     let logits: Vec<bf16> = common::read_slice(&r.fused[0], e * n);
     run(&device, 1, 1, || r.fused());
@@ -372,8 +387,8 @@ fn glm_sigmoid_bias_routing_matches_the_reference() {
                 .then(b.cmp(&a))
         });
         let want_inds: Vec<u32> = order[..k].iter().rev().map(|&i| i as u32).collect();
-        let what = format!("row {row}");
-        assert_eq!(&row_inds[..], &want_inds[..], "{what}: picks");
+        let what = format!("{e} experts top-{k} row {row}");
+        assert_eq!(row_inds, &want_inds[..], "{what}: picks");
         let picks = order[..k].iter().rev();
         // The kernel's chain: the F32 sigmoid rounds to bf16 at the gather, then `renorm_row`
         // loads it back to F32, sums, and multiplies by the reciprocal.
@@ -387,15 +402,36 @@ fn glm_sigmoid_bias_routing_matches_the_reference() {
         for u in &mut unbiased {
             *u *= inv;
         }
+        // The kernel renorms in bf16 (the softmax row's precision); the reference in f32 —
+        // compare as the rounded reference, the same bits mlx's bf16 scores hold. The last
+        // scale multiplies the stored bf16 score in F32 and rounds again.
+        let mut want: Vec<bf16> = unbiased.iter().map(|&f| bf16::from_f32(f)).collect();
+        if let Some(Scale(scale)) = program.post_scale {
+            want = want
+                .iter()
+                .map(|w| bf16::from_f32(w.to_f32() * scale))
+                .collect();
+        }
         let got: Vec<bf16> = scores[row * k..(row + 1) * k]
             .iter()
             .map(|&b| bf16::from_bits(b))
             .collect();
-        let want: Vec<bf16> = unbiased.iter().map(|&f| bf16::from_f32(f)).collect();
-        // The kernel renorms in bf16 (the softmax row's precision); the reference in f32 —
-        // compare as the rounded reference, the same bits mlx's bf16 scores hold.
         assert_eq!(got, want, "{what}: scores");
     }
+}
+
+/// GLM-4.5-Air's 160 experts at top 8.
+#[test]
+fn glm_sigmoid_bias_routing_matches_the_reference() {
+    sigmoid_bias_routing_matches_the_reference(GLM, (160, 8, 3));
+}
+
+/// Nemotron-3-Super's 22 of 512 experts at its routed scaling factor 5.0, and Nemotron-3-Nano's
+/// 6 of 128 at 2.5.
+#[test]
+fn nemotron_sigmoid_bias_routing_matches_the_reference() {
+    sigmoid_bias_routing_matches_the_reference(nemotron(5.0), (512, 22, 3));
+    sigmoid_bias_routing_matches_the_reference(nemotron(2.5), (128, 6, 3));
 }
 
 /// gpt-oss's biased routing against its reference: the picks order on each expert's F32 logit

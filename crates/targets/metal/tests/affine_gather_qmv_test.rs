@@ -1536,6 +1536,7 @@ fn routed_gated_b3_case(num_experts: usize, k: usize, n_out: usize, top_k: usize
             scale: None,
             post: RoutePost::Renorm,
             expert_scale: None,
+            post_scale: None,
         },
     }
     .into();

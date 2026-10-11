@@ -960,9 +960,9 @@ impl SourceRef<'_> {
         use scratchy_layers::layers_moe::{FusedMoELayer as F, SharedFusedMoELayer as Sh};
         let routed = |r: &scratchy_layers::layers_moe::AffineFusedMoELayer| match which {
             T::MoeRouterGate => Some(r.router_gate),
-            T::MoeExpertGateW => Some(r.expert_gate_w),
-            T::MoeExpertGateS => Some(r.expert_gate_scales),
-            T::MoeExpertGateB => Some(r.expert_gate_biases),
+            T::MoeExpertGateW => r.expert_gate_w,
+            T::MoeExpertGateS => r.expert_gate_scales,
+            T::MoeExpertGateB => r.expert_gate_biases,
             T::MoeExpertUpW => Some(r.expert_up_w),
             T::MoeExpertUpS => Some(r.expert_up_scales),
             T::MoeExpertUpB => Some(r.expert_up_biases),

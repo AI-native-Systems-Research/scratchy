@@ -101,6 +101,8 @@ pub struct DenseFusedMoELayer {
 ///   are F16 `[E, intermediate, hidden / group_size]`.
 /// * `expert_down_{w,scales,biases}` — same triple but with
 ///   `out_features = hidden_size`, `in_features = intermediate_size`.
+/// * An ungated bank ([`ExpertBits::Ungated`], Nemotron-H's `switch_mlp.fc1` /
+///   `fc2`) has no gate: its `fc1` is the up triple, its `fc2` the down.
 ///
 /// The packed width follows the ceil law (bits=3 packs 8 elements per
 /// 3 bytes — a continuous bitstream, not `K / (32 / bits)`). Reading
@@ -113,9 +115,10 @@ pub struct AffineFusedMoELayer {
     /// skips linears with out_features below the 1k threshold).
     pub router_gate: GpuTensor,
 
-    pub expert_gate_w: GpuTensor,
-    pub expert_gate_scales: GpuTensor,
-    pub expert_gate_biases: GpuTensor,
+    /// `None` exactly for an ungated bank.
+    pub expert_gate_w: Option<GpuTensor>,
+    pub expert_gate_scales: Option<GpuTensor>,
+    pub expert_gate_biases: Option<GpuTensor>,
 
     pub expert_up_w: GpuTensor,
     pub expert_up_scales: GpuTensor,
@@ -131,7 +134,43 @@ pub struct AffineFusedMoELayer {
     pub hidden_size: usize,
     pub renormalize: bool,
     pub group_size: u32,
-    pub bits: u32,
+    pub bits: ExpertBits,
+}
+
+/// Each routed-expert projection's MLX-affine code width — and with it the bank's form, which
+/// decides the projections it has: a gated bank's three (`act(gate) * up`, then down), or an
+/// ungated bank's two (`fc2(act(fc1))`, mlx's `SwitchMLP`). Mixed-bit checkpoints (OptiQ) set
+/// the projections of one layer apart (Nemotron-3-Super layer 8: `fc1` 4-bit, `fc2` 2-bit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertBits {
+    Gated { gate: u32, up: u32, down: u32 },
+    Ungated { fc1: u32, fc2: u32 },
+}
+
+impl ExpertBits {
+    /// The gate projection's width; `None` for an ungated bank, which has none.
+    pub const fn gate(self) -> Option<u32> {
+        match self {
+            Self::Gated { gate, .. } => Some(gate),
+            Self::Ungated { .. } => None,
+        }
+    }
+
+    /// The width of the projection the activation reads (a gated bank's up, an ungated `fc1`).
+    pub const fn up(self) -> u32 {
+        match self {
+            Self::Gated { up, .. } => up,
+            Self::Ungated { fc1, .. } => fc1,
+        }
+    }
+
+    /// The out-projection's width (a gated bank's down, an ungated `fc2`).
+    pub const fn down(self) -> u32 {
+        match self {
+            Self::Gated { down, .. } => down,
+            Self::Ungated { fc2, .. } => fc2,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ use quote::{format_ident, quote};
 use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
+use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, fold_tape};
 use scratchy_subtile::wave_schedule::wave_order;
@@ -176,8 +177,12 @@ pub struct MetalStepFacts<'a> {
     pub mlp: MlpForm,
     /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own).
     /// `None` altogether for an unquantized model: its MoE bits are never repacked.
-    pub moe_expert_bits: Option<&'a dyn Fn(LayerId) -> [Option<AffineBits>; 3]>,
+    pub moe_expert_bits: Option<&'a MoeExpertBits<'a>>,
 }
+
+/// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own), for the
+/// bank under accessor base `base` at a layer, its projections those of the expert body's form.
+pub type MoeExpertBits<'f> = dyn Fn(&str, LayerId, ExpertBody) -> [Option<AffineBits>; 3] + 'f;
 
 /// Which canonical this is, for the log and the refusals.
 pub struct CanonicalAt<'a> {

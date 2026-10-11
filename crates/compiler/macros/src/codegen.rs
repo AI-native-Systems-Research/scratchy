@@ -375,14 +375,16 @@ enum FieldLoad {
         hidden_size: usize,
         /// `Some((group_size, bits))` when the macro detected
         /// `StorageFormat::Affine` on the MoE source weight — emits
-        /// the Metal `load_affine` call site. `None` → Dense BF16
-        /// path → cuda `load` call site.
-        affine: Option<(u32, u32)>,
+        /// the Metal `load_affine` call site, `bits` each routed-expert
+        /// projection's own width. `None` → Dense BF16 path → cuda
+        /// `load` call site.
+        affine: Option<(u32, crate::quantization::ExpertBits)>,
         /// Bit-width for the router `{prefix}.gate` dequant, resolved
         /// from the affine preset's `bits_overrides` (mlx MoE presets
         /// quantize the router gate at 8-bit while experts stay 4-bit).
-        /// `Some` exactly when `affine` is `Some`; falls back to the
-        /// expert bits when no override matches.
+        /// `None` when `affine` is, or when an MLX per-module map leaves
+        /// the router dense (Nemotron-H); the section default when no
+        /// override matches.
         gate_bits: Option<u32>,
     },
     /// Qwen-MoE-style fused MoE + shared expert. Cuda Dense via
@@ -396,11 +398,11 @@ enum FieldLoad {
         moe_intermediate_size: usize,
         shared_expert_intermediate_size: usize,
         hidden_size: usize,
-        /// `Some((group_size, bits))` when MLX-affine int4 — see
+        /// `Some((group_size, bits))` when MLX-affine — see
         /// [`FieldLoad::FusedMoe::affine`].
-        affine: Option<(u32, u32)>,
+        affine: Option<(u32, crate::quantization::ExpertBits)>,
         /// Router `{prefix}.gate` dequant bit-width — see
-        /// [`FieldLoad::FusedMoe::gate_bits`]. `Some` iff `affine` is `Some`.
+        /// [`FieldLoad::FusedMoe::gate_bits`].
         gate_bits: Option<u32>,
     },
     /// Gemma-4 router bundle (`GemmaMoe` op, base `router`). Dispatches to
@@ -471,8 +473,9 @@ enum FieldLoad {
 /// Only tensors whose width this function can state are listed. Unlisted
 /// tensors are simply not checked.
 ///
-/// ⚠️ RESIDUAL RISK, now scoped: the routed-expert stacks of the SHARED MoE
-/// bundles are NOT listed. `switch_mlp.{gate,up,down}_proj`, Mixtral's
+/// ⚠️ RESIDUAL RISK, now scoped: the GATED routed-expert stacks of the SHARED
+/// MoE bundles are NOT listed (an ungated bank's are — see the arm).
+/// `switch_mlp.{gate,up,down}_proj`, Mixtral's
 /// `w1/w2/w3` and `GemmaSwitchGlu`'s sub-leaves are named inside the backend
 /// loaders, not here, so this function cannot state their on-disk paths
 /// without duplicating that naming — which is the duplication the whole
@@ -517,20 +520,35 @@ fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
             .collect(),
         // MoE router gate: `gate_bits` is what the `load_affine` call receives
         // for `{prefix}.gate`, and it is the role qwen3.5 and qwen3.6 disagree
-        // about. The routed expert stack under the same prefix is omitted (see
-        // the fn doc).
+        // about. A gated routed stack under the same prefix is omitted (see the
+        // fn doc). An UNGATED stack is listed: its loader reads exactly the
+        // pre-stacked `switch_mlp.fc1` / `fc2` (mlx `SwitchMLP` — no per-expert
+        // layout exists for it), so this function can state them, and they are
+        // load-bearing — Nemotron-3-Super's OptiQ map and a uniform 4-bit one
+        // agree on every other width and differ in the experts' alone.
         FieldLoad::FusedMoe {
             prefix,
-            affine: Some((group_size, _)),
-            gate_bits: Some(gate_bits),
+            affine: Some((group_size, bits)),
+            gate_bits,
             ..
         }
         | FieldLoad::SharedFusedMoe {
             prefix,
-            affine: Some((group_size, _)),
-            gate_bits: Some(gate_bits),
+            affine: Some((group_size, bits)),
+            gate_bits,
             ..
-        } => one(&format!("{prefix}.gate"), *gate_bits, *group_size),
+        } => {
+            let mut rows = match gate_bits {
+                Some(b) => one(&format!("{prefix}.gate"), *b, *group_size),
+                None => Vec::new(),
+            };
+            if let crate::quantization::ExpertBits::Ungated { .. } = bits {
+                for (leaf, b) in bits.leaves() {
+                    rows.push((format!("{prefix}.switch_mlp.{leaf}.weight"), b, *group_size));
+                }
+            }
+            rows
+        }
         FieldLoad::GemmaRouter {
             prefix,
             group_size,
@@ -666,6 +684,70 @@ struct DeepSeekMoeCfg {
     use_sigmoid: bool,
     n_expert_group: usize,
     topk_group: usize,
+}
+
+/// A fused-MoE accessor's affine plan: `(group_size, each routed-expert projection's width)`
+/// when its bundle is MLX-affine, and the router gate's own width — `None` when the bundle is
+/// dense, or when an MLX per-module map leaves the router dense. Resolved at the accessor's own
+/// layer (per-layer expert bits under OptiQ), through the ONE per-projection resolver
+/// [`crate::quantization::affine_moe_expert_bits`], in the expert body the config declares.
+fn moe_affine_plan(
+    program: &Program,
+    fuf: &Fuf,
+    model: &ModelParams,
+    prefix: &str,
+    accessor: &WeightAccessor,
+) -> (Option<(u32, crate::quantization::ExpertBits)>, Option<u32>) {
+    use crate::quantization::{ExpertBits, StorageFormat};
+    let (src, idx) = accessor.source_weights[0];
+    let StorageFormat::Affine { group_size, bits } =
+        crate::quantization::storage_format_for_weight(program, fuf, src, idx, model)
+    else {
+        return (None, None);
+    };
+    let body = model.expert_activation.body().unwrap_or_else(|act| {
+        panic!(
+            "{}: the config declares expert activation `{act}`, which no expert body realizes",
+            model.name
+        )
+    });
+    let method = model.quantization.as_ref().map(|qc| &qc.method);
+    let resolved = method
+        .and_then(|m| crate::quantization::affine_moe_expert_bits(program, m, prefix, idx, body));
+    let expert = resolved.unwrap_or(match body {
+        scratchy_subtile::subtile_ir::ExpertBody::Gated(_) => ExpertBits::Gated {
+            gate: bits,
+            up: bits,
+            down: bits,
+        },
+        scratchy_subtile::subtile_ir::ExpertBody::Ungated(_) => ExpertBits::Ungated {
+            fc1: bits,
+            fc2: bits,
+        },
+    });
+    // The mlx MoE presets quantize `{prefix}.gate` at 8-bit while experts stay 4-bit — via
+    // preset `bits_overrides` OR (OptiQ) the per-module map, which `affine_role_bits` honors
+    // both of (a router the map does not list is dense).
+    let gate_path = format!("{prefix}.gate");
+    let gate_bits =
+        method.and_then(|m| crate::quantization::affine_role_bits(program, m, &gate_path, idx));
+    (Some((group_size, expert)), gate_bits)
+}
+
+/// The width of the rows a MoE accessor's experts read: the `moe_block` reading the accessor's
+/// weight, at its output (a latent MoE's expert space). `None` when no such op closes to a shape.
+fn moe_expert_width(fuf: &Fuf, model: &ModelParams, accessor: &WeightAccessor) -> Option<usize> {
+    let (src, _) = accessor.source_weights[0];
+    let node = fuf.nodes.iter().find(|n| {
+        n.op == OpKind::Moe
+            && n.inputs
+                .iter()
+                .any(|i| matches!(i, FufInput::Weight { id, .. } if *id == src))
+    })?;
+    // The row count is the workload's (`num_tokens`); the width is a model bound.
+    let width = node.outputs.first()?.last()?.clone();
+    let dims = crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?;
+    dims.first().map(|&d| d as usize)
 }
 
 fn read_deepseek_moe_cfg(model: &ModelParams) -> DeepSeekMoeCfg {
@@ -1187,45 +1269,10 @@ fn plan_field_load(
         // Same check the `MetalFusedMoeImpl::matches` uses via
         // `affine_gs_bits`. Source weights all share storage format
         // (the macro asserts this elsewhere for AffineQuantLinear).
-        let only_src = accessor.source_weights[0].0;
-        // Resolve at this accessor's layer index — MLX mixed/dynamic quant
+        // Resolved at this accessor's layer index — MLX mixed/dynamic quant
         // (OptiQ) varies expert bits per numbered layer; emit_group_let
         // gathers the per-layer bits across the group.
-        let only_idx = accessor.source_weights[0].1;
-        let affine = match crate::quantization::storage_format_for_weight(
-            program, fuf, only_src, only_idx, model,
-        ) {
-            crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                // The bundle root subtree-matches the router gate first; the
-                // routed experts' own (per-layer, OptiQ) bits live under
-                // switch_mlp / experts. Uniform/preset paths fall back.
-                let expert_bits = model
-                    .quantization
-                    .as_ref()
-                    .and_then(|qc| {
-                        crate::quantization::affine_moe_expert_bits(
-                            program, &qc.method, &prefix, only_idx,
-                        )
-                    })
-                    .unwrap_or(bits);
-                Some((group_size, expert_bits))
-            }
-            _ => None,
-        };
-        // Router gate bit-width: the mlx MoE presets quantize `{prefix}.gate`
-        // at 8-bit while experts stay 4-bit — via preset `bits_overrides`
-        // OR (OptiQ) the per-module map. `affine_role_bits` honors both;
-        // fall back to expert bits.
-        let gate_bits = affine.map(|(_, expert_bits)| {
-            let gate_path = format!("{prefix}.gate");
-            model
-                .quantization
-                .as_ref()
-                .and_then(|qc| {
-                    crate::quantization::affine_role_bits(program, &qc.method, &gate_path, only_idx)
-                })
-                .unwrap_or(expert_bits)
-        });
+        let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
         return FieldLoad::FusedMoe {
             prefix,
             num_experts,
@@ -1248,8 +1295,10 @@ fn plan_field_load(
         let prefix = prefixes.into_iter().next().unwrap();
         let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        // `n_routed_experts` on the sigmoid-routed configs (GLM-4.5, Nemotron-H).
         let num_experts = v
             .get("num_experts")
+            .or_else(|| v.get("n_routed_experts"))
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
             .unwrap_or_else(|| model.bounds.get("num_experts").copied().unwrap_or(60) as usize);
@@ -1286,7 +1335,10 @@ fn plan_field_load(
                     .copied()
                     .unwrap_or(0) as usize
             });
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+        // The experts' own width: the model's hidden size, or a latent MoE's narrower expert space
+        // (the op's output is the experts' input — see `sig_moe`).
+        let hidden_size = moe_expert_width(fuf, model, accessor)
+            .unwrap_or_else(|| model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize);
         let only_src = accessor.source_weights[0].0;
         // Single-owner rule (mirrors `MetalSharedFusedMoeImpl::fan_out`):
         // when the DSL claims `<moe>.shared_expert.*` leaves in the
@@ -1298,39 +1350,7 @@ fn plan_field_load(
             Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
             _ => shared_expert_intermediate_size,
         };
-        // Resolve at this accessor's layer index (per-layer expert bits for
-        // OptiQ). `only_idx` also picks the gate's per-layer entry.
-        let only_idx = accessor.source_weights[0].1;
-        let affine = match crate::quantization::storage_format_for_weight(
-            program, fuf, only_src, only_idx, model,
-        ) {
-            crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                let expert_bits = model
-                    .quantization
-                    .as_ref()
-                    .and_then(|qc| {
-                        crate::quantization::affine_moe_expert_bits(
-                            program, &qc.method, &prefix, only_idx,
-                        )
-                    })
-                    .unwrap_or(bits);
-                Some((group_size, expert_bits))
-            }
-            _ => None,
-        };
-        // Router gate bit-width: see the `FusedMoe` arm — `affine_role_bits`
-        // resolves the gate via preset `bits_overrides` OR (OptiQ) the
-        // per-module map; fall back to expert bits.
-        let gate_bits = affine.map(|(_, expert_bits)| {
-            let gate_path = format!("{prefix}.gate");
-            model
-                .quantization
-                .as_ref()
-                .and_then(|qc| {
-                    crate::quantization::affine_role_bits(program, &qc.method, &gate_path, only_idx)
-                })
-                .unwrap_or(expert_bits)
-        });
+        let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
         return FieldLoad::SharedFusedMoe {
             prefix,
             num_experts,
@@ -2530,6 +2550,18 @@ fn emit_fingerprint_check(
             quote! {}
         }
         Some(crate::quantization::QuantMethod::Ggml) | None => quote! {},
+        // The probe reads the fingerprint leaf's `.scales`, so it runs only where this variant
+        // reads that leaf affine: an MLX per-module map may leave it dense (Nemotron-H's
+        // experts-only parity checkpoint quantizes the routed experts alone), and then the
+        // per-role bit-map gate below probes every tensor the variant does read affine.
+        Some(crate::quantization::QuantMethod::Affine { .. })
+            if !affine_rows.iter().any(|(name, _, _)| {
+                let at = |layer: &str| format!("{dec_root}.layers.{layer}.{fp_leaf}.weight");
+                *name == at(&fp_layer.to_string()) || *name == at("*")
+            }) =>
+        {
+            quote! {}
+        }
         Some(crate::quantization::QuantMethod::Affine { group_size, .. }) => {
             // Group-size discriminator. The packed `.weight` (U32) has
             // the SAME shape for every group_size — 4-bit packs 8 values
@@ -5308,7 +5340,8 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
+                let bits = bits.tokens();
                 quote! {
                     let #name = crate::__gpu::layers_moe::FusedMoELayer::load_affine(
                         gw,
@@ -5352,7 +5385,8 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
+                let bits = bits.tokens();
                 quote! {
                     let #name = crate::__gpu::layers_moe::SharedFusedMoELayer::load_affine(
                         gw,
@@ -5468,21 +5502,39 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
     }
 }
 
-/// The on-disk affine bit-width a layered plan loads with, if any. Used
+/// The affine bits a layered plan's load call takes: one width, or a fused-MoE bank's
+/// per-projection widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanBits {
+    Width(u32),
+    Expert(crate::quantization::ExpertBits),
+}
+
+impl quote::ToTokens for PlanBits {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Self::Width(b) => proc_macro2::Literal::u32_unsuffixed(*b).to_tokens(tokens),
+            Self::Expert(b) => b.tokens().to_tokens(tokens),
+        }
+    }
+}
+
+/// The on-disk affine bits a layered plan loads with, if any. Used
 /// to detect MLX-native mixed/dynamic-quant groups (OptiQ) where numbered
 /// layers differ in bits, so the layered emit can switch to a per-layer
 /// loader. `None` for plans with no single affine bits.
-fn field_load_affine_bits(plan: &FieldLoad) -> Option<u32> {
+fn field_load_affine_bits(plan: &FieldLoad) -> Option<PlanBits> {
     match plan {
         FieldLoad::LinearAffine { bits, .. }
         | FieldLoad::LinearAffineConcat { bits, .. }
-        | FieldLoad::GemmaSwitchGlu { bits, .. } => Some(*bits),
+        | FieldLoad::GemmaSwitchGlu { bits, .. } => Some(PlanBits::Width(*bits)),
         // MoE bundles carry the routed-expert bits in `affine`; the router
         // `gate_bits` is uniform across layers so it stays out of the
         // per-layer gather (the collapsed layer-0 plan supplies it).
-        FieldLoad::FusedMoe { affine, .. }
-        | FieldLoad::SharedFusedMoe { affine, .. }
-        | FieldLoad::GptOssMoe { affine, .. } => affine.map(|(_, b)| b),
+        FieldLoad::FusedMoe { affine, .. } | FieldLoad::SharedFusedMoe { affine, .. } => {
+            affine.map(|(_, b)| PlanBits::Expert(b))
+        }
+        FieldLoad::GptOssMoe { affine, .. } => affine.map(|(_, b)| PlanBits::Width(b)),
         _ => None,
     }
 }
@@ -5552,8 +5604,8 @@ fn emit_group_let(
             // layers ship different bit-widths yields differing plan bits.
             // Gather them; `Some(vec)` only when heterogeneous (uniform
             // groups keep the byte-identical single-bits fast path).
-            let per_layer_bits: Option<Vec<u32>> = {
-                let bits: Vec<Option<u32>> = group
+            let per_layer_bits: Option<Vec<PlanBits>> = {
+                let bits: Vec<Option<PlanBits>> = group
                     .entries
                     .iter()
                     .map(|(_, acc)| {
@@ -5564,7 +5616,7 @@ fn emit_group_let(
                     .collect();
                 match bits.iter().all(Option::is_some) {
                     true => {
-                        let v: Vec<u32> = bits.into_iter().map(Option::unwrap).collect();
+                        let v: Vec<PlanBits> = bits.into_iter().map(Option::unwrap).collect();
                         (v.iter().any(|b| *b != v[0])).then_some(v)
                     }
                     false => None,
@@ -5635,17 +5687,13 @@ fn emit_layered_load_body(
     // `Some(bits per layer)` when this layered group is MLX-native
     // mixed/dynamic quant (OptiQ) with differing per-layer bit-widths;
     // the affine arms then emit the per-layer loader. `None` = uniform.
-    per_layer_bits: Option<&[u32]>,
+    per_layer_bits: Option<&[PlanBits]>,
 ) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
     let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
     // Literal `[b0, b1, ...]` per-layer bits slice for the mixed loaders.
-    let per_layer_bits_lit: Option<TokenStream> = per_layer_bits.map(|bits| {
-        let elems = bits
-            .iter()
-            .map(|b| proc_macro2::Literal::u32_unsuffixed(*b));
-        quote! { &[ #(#elems),* ] }
-    });
+    let per_layer_bits_lit: Option<TokenStream> =
+        per_layer_bits.map(|bits| quote! { &[ #(#bits),* ] });
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
     let sharded = tp_world_size > 1;
     // Build the `<root>.0.` form for `layered_suffix` /
@@ -6262,12 +6310,12 @@ fn emit_layered_load_body(
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
                 // Per-layer routed-expert bits for MLX mixed/dynamic quant
                 // (OptiQ); single width otherwise.
                 let bits_expr: TokenStream = match &per_layer_bits_lit {
                     Some(bits_slice) => quote! { (#bits_slice)[layer as usize] },
-                    None => quote! { #bits },
+                    None => bits.tokens(),
                 };
                 quote! {
                     (0u32..#n_lit)
@@ -6325,10 +6373,10 @@ fn emit_layered_load_body(
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
                 let bits_expr: TokenStream = match &per_layer_bits_lit {
                     Some(bits_slice) => quote! { (#bits_slice)[layer as usize] },
-                    None => quote! { #bits },
+                    None => bits.tokens(),
                 };
                 quote! {
                     (0u32..#n_lit)
@@ -12237,13 +12285,13 @@ pub fn emit_model(
             .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
             .collect();
         let quant = model.quantization.as_ref();
-        let widths = |layer: st::LayerId| {
+        let widths = |base: &str, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
-            ["gate_proj", "up_proj", "down_proj"].map(|p| {
-                let role = format!("mlp.switch_mlp.{p}");
-                let at = Some(UnrollIndex(layer.0 as u64));
-                crate::quantization::affine_role_bits(program, &qc.method, &role, at)
-                    .map(st::AffineBits)
+            let at = Some(UnrollIndex(layer.0 as u64));
+            let bits =
+                crate::quantization::affine_moe_expert_bits(program, &qc.method, base, at, body);
+            bits.map_or([None; 3], |b| {
+                b.projections().map(|w| w.map(st::AffineBits))
             })
         };
         let facts = mc3::MetalStepFacts {
@@ -12256,8 +12304,7 @@ pub fn emit_model(
             } else {
                 mc3::MlpForm::Split
             },
-            moe_expert_bits: quant
-                .map(|_| &widths as &dyn Fn(st::LayerId) -> [Option<st::AffineBits>; 3]),
+            moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
         };
         let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
         let at = mc3::CanonicalAt { stem, m };
@@ -14238,6 +14285,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         }
     }
 
@@ -15214,7 +15262,14 @@ mod fingerprint_tests {
             moe_intermediate_size: 128,
             shared_expert_intermediate_size: 0,
             hidden_size: 128,
-            affine: Some((64, 4)),
+            affine: Some((
+                64,
+                crate::quantization::ExpertBits::Gated {
+                    gate: 4,
+                    up: 4,
+                    down: 4,
+                },
+            )),
             gate_bits: Some(8),
         };
         assert_eq!(
@@ -15222,6 +15277,38 @@ mod fingerprint_tests {
             vec![("model.layers.0.mlp.gate.weight".to_string(), 8, 64)],
             "the router gate must carry `gate_bits` (8), NOT the expert width (4) — they are \
              different tensors at different widths",
+        );
+
+        // Nemotron-3-Super's 4/2 split bundle: its dense router claims no width, and its
+        // pre-stacked ungated experts are listed each at its own — the only rows that separate
+        // the OptiQ variant from a uniform 4-bit one.
+        let ungated = FieldLoad::SharedFusedMoe {
+            prefix: "backbone.layers.8.mixer".to_string(),
+            num_experts: 512,
+            top_k: 22,
+            moe_intermediate_size: 2688,
+            shared_expert_intermediate_size: 0,
+            hidden_size: 1024,
+            affine: Some((
+                64,
+                crate::quantization::ExpertBits::Ungated { fc1: 4, fc2: 2 },
+            )),
+            gate_bits: None,
+        };
+        assert_eq!(
+            affine_tensors_of(&ungated),
+            vec![
+                (
+                    "backbone.layers.8.mixer.switch_mlp.fc1.weight".to_string(),
+                    4,
+                    64
+                ),
+                (
+                    "backbone.layers.8.mixer.switch_mlp.fc2.weight".to_string(),
+                    2,
+                    64
+                ),
+            ],
         );
 
         let router = FieldLoad::GemmaRouter {

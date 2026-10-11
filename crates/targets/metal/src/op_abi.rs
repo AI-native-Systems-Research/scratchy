@@ -158,6 +158,7 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::ExpertSort { .. }
         | L::ExpertMatmul { .. }
         | L::ExpertGatedAct { .. }
+        | L::ExpertAct { .. }
         | L::ExpertUnsort => FRESH.off_arena(),
         // The codec's packed and staged K/V are runtime stores; a rotation turns its rows in place,
         // and the packed twin writes the output of the attention it replaces.
@@ -264,6 +265,7 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
         | L::RouteRenorm
         | L::RouteExpertScale { .. }
         | L::ExpertGatedAct { .. }
+        | L::ExpertAct { .. }
         | L::ExpertUnsort => W::OverOperand(OperandIx(0)),
         L::ExpertSort { .. } => W::Region(R::SortedRows),
         L::ExpertMatmul { proj, .. } => W::Region(match proj {
@@ -343,6 +345,8 @@ pub enum MetalFusion {
     RopeAppendNormed,
     NormAddScalarMul,
     MoeGateUpAct,
+    /// An ungated expert's one in-projection and its activation.
+    MoeUpAct,
     MoeDownCombine,
     MoeRoute,
     /// A KV writer that encodes the rows it writes into the codec's packed store too.
@@ -471,10 +475,15 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     norm: K::RmsNorm,
                     kernel: F::NormAddScalarMul,
                 },
-                FoldPattern::ExpertGated {
+                FoldPattern::ExpertActivation {
                     act: K::ExpertGatedAct,
                     matmul: K::ExpertMatmul,
                     kernel: F::MoeGateUpAct,
+                },
+                FoldPattern::ExpertActivation {
+                    act: K::ExpertAct,
+                    matmul: K::ExpertMatmul,
+                    kernel: F::MoeUpAct,
                 },
                 FoldPattern::ExpertCombined {
                     combine: K::ExpertCombine,
@@ -484,7 +493,8 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                 },
                 // `moe_route.metal`'s program: a softmax over every expert first (Qwen) or the
                 // F32 sigmoid + correction bias GLM-4's noaux_tc routes by, then the scores
-                // scaled, softmaxed or renormalized, and scaled per expert.
+                // scaled, softmaxed or renormalized, scaled per expert, and scaled last
+                // (Nemotron-H's routed scaling factor, after the renorm).
                 FoldPattern::Route {
                     top_k: K::RouteTopK,
                     sort: K::RouteArgsort,
@@ -494,6 +504,7 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                         &[K::RouteScale],
                         &[K::RouteSoftmax, K::RouteRenorm],
                         &[K::RouteExpertScale],
+                        &[K::RouteScale],
                     ],
                     kernel: F::MoeRoute,
                 },

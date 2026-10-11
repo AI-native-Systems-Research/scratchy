@@ -1981,8 +1981,11 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 // ─────────────────────────────────────────────────────────────────
 
 #ifdef SCRATCHY_CONSTANT_3
-// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh), 2 SwiGLU-OAI (gpt-oss's clamped form).
+// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh), 2 SwiGLU-OAI (gpt-oss's clamped form);
+// 3, the gathered kernel only: an UNGATED expert's relu² of its one projection (Nemotron-H's
+// `fc1`), bound as the gate — no up projection is bound or run.
 SCRATCHY_CONSTANT(int, GATED_ACT, 3);
+constant constexpr bool UNGATED = GATED_ACT == 3;
 
 // A dense gated MLP's gate and up projections and its activation, one row:
 // `y = act(gate · x) * (up · x)`, as the two matvecs and `silu_mul` / `gelu_mul` compute it.
@@ -2048,14 +2051,15 @@ SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
 // 13-18 (`MetalFusion::MoeRouted`): the gated kernel routes its token itself, from the router
 // logits, by `moe_route.h`'s program — the experts (13), the pre over them (14: 1 softmax, 2
 // F32 sigmoid + correction bias, 3 F32 logit + linear bias), the scores' scale (15), their last
-// step (16: 1 softmax, 2 renorm) and the per-expert scale (17) — and stores the picks and scores
-// the later kernels read; the F32 router bias reads buffer(13) under 14's value 2 or 3. Unset:
-// they are the routing command's.
+// step (16: 1 softmax, 2 renorm), the per-expert scale (17) and the last scale (20) — and stores
+// the picks and scores the later kernels read; the F32 router bias reads buffer(13) under 14's
+// value 2 or 3. Unset: they are the routing command's.
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_EXPERTS, 13);
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_PRE, 14);
 SCRATCHY_CONSTANT_OPTIONAL(float, ROUTED_SCALE, 15);
 SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_POST, 16);
 SCRATCHY_CONSTANT_OPTIONAL(bool, ROUTED_EXPERT_SCALE, 17);
+SCRATCHY_CONSTANT_OPTIONAL(float, ROUTED_POST_SCALE, 20);
 constant constexpr bool ROUTED = ROUTED_EXPERTS_SET;
 // The experts a routed kernel's top-k reads (a valid shape when unrouted).
 constant constexpr int ROUTED_E = ROUTED ? ROUTED_EXPERTS : 32;
@@ -2143,8 +2147,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 //                                            buffer(14)  = gate/up LINEAR biases, gpt-oss only
 //                                             buffer(15) = the norm's gain, normed
 // Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
-// gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
-// activation to the block's rows. Every gate row is written raw only by the threadgroup that
+// gate matvec's 8-row block tid.y, 2-3 the up matvec's (UNGATED: none), then lanes 0-7 of
+// simdgroup 0 apply the activation to the block's rows. Every gate row is written raw only by the threadgroup that
 // then activates it: an out_vec with a 1-3 row tail block would have qmv_impl redo the previous
 // block's last rows there, raw, so this kernel takes an out_vec that is a multiple of 4. Routed,
 // the threadgroup picks its token's experts first (E <= 512: its 128 threads cover E / 4), and
@@ -2188,8 +2192,9 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     if (tid.y == 0 && nk % uint(GATHER_PER_ROW) == 0) {
       device T_act* row_scores = scores + size_t(n) * GATHER_PER_ROW;
       route_scores<T_act, GATHER_PER_ROW, ROUTED_PRE, ROUTED_SCALE_SET, ROUTED_POST,
-                   ROUTED_EXPERT_SCALE>(row, soft, routed, row_scores, router_bias, expert_scale,
-                                        ROUTED_SCALE, lid, simd_lid, simd_gid, local_a, local_b);
+                   ROUTED_EXPERT_SCALE, ROUTED_POST_SCALE_SET>(
+          row, soft, routed, row_scores, router_bias, expert_scale, ROUTED_SCALE,
+          ROUTED_POST_SCALE, lid, simd_lid, simd_gid, local_a, local_b);
       if (lid < uint(GATHER_PER_ROW)) {
         rhs_indices[size_t(n) * GATHER_PER_ROW + lid] = routed[lid];
       }
@@ -2197,15 +2202,23 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   } else {
     expert = rhs_indices[nk];
   }
-  gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
-      expert, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
-      simd_lid, gain);
+  if (!(UNGATED && up)) {
+    gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
+        up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
+        expert, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
+        simd_lid, gain);
+  }
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 8 + simd_lid;
   if (simd_gid == 0 && simd_lid < 8 && row < uint(OUT_VEC_SIZE)) {
     size_t at = size_t(nk) * size_t(OUT_VEC_SIZE) + row;
     float g = float(gate_y[at]);
+    if (UNGATED) {
+      // relu² of the row the matvec rounded, squared in f32 and rounded once — `relu2`'s bits.
+      float r = max(g, 0.0f);
+      gate_y[at] = static_cast<T_act>(r * r);
+      return;
+    }
     float u = float(up_y[at]);
     if (GATED_LINEAR_BIAS) {
       // gpt-oss: the pair's expert adds its gate and up LINEAR biases before the activation —

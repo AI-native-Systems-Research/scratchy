@@ -97,6 +97,10 @@ mod imp {
         /// `harness.json`'s `dense_moe`: whether the oracle EXECUTED a
         /// dense MoE (a hybrid schedule may declare experts no layer runs).
         dense_moe: bool,
+        /// `harness.json`'s `oracle_quant`: whether the oracle EXECUTED the
+        /// checkpoint's quantization — the dequantized MLX-affine weights
+        /// the checkpoint stores.
+        oracle_quant: bool,
     }
 
     /// Every `goldens/<arch>-<stem>/` dir carrying a checkpoint — the
@@ -133,6 +137,9 @@ mod imp {
                 dense_moe: harness["dense_moe"]
                     .as_bool()
                     .expect("harness dense_moe (regenerate the goldens)"),
+                oracle_quant: harness["oracle_quant"]
+                    .as_bool()
+                    .expect("harness oracle_quant (regenerate the goldens)"),
                 dir,
             });
         }
@@ -208,13 +215,14 @@ mod imp {
         let max_model_len = cfg["max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
 
         // A config carrying a quantization_config names a *quant* variant
-        // (bnb nf4, fp8-block, ...), but the oracle executes the carrier
-        // dense — it has no bitsandbytes emulation. Running it here would
-        // just test the dense variant again under a quant name: a false
-        // green. Quant parity is a separate mechanism, not this gate.
-        if cfg.get("quantization_config").is_some() {
+        // (bnb nf4, fp8-block, ...). The oracle executes a quantization only
+        // when it stores one it computes with exactly — MLX-affine expert
+        // banks, executed dequantized (`oracle_quant`); any other it runs
+        // dense, and running that here would test the dense variant again
+        // under a quant name: a false green.
+        if cfg.get("quantization_config").is_some() && !case.oracle_quant {
             eprintln!(
-                "skip {}/{}: config carries quantization_config — the oracle is dense-only",
+                "skip {}/{}: config carries a quantization_config the oracle did not execute",
                 case.arch, case.stem
             );
             return;

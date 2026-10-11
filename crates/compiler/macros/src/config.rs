@@ -119,6 +119,47 @@ pub struct ModelParams {
     /// is load-bearing for AWQ correctness. `None` when the JSON
     /// omits the field.
     pub torch_dtype: Option<String>,
+    /// The activation a routed expert applies to its in-projection, as the config declares it
+    /// — see [`ExpertActivation`].
+    pub expert_activation: ExpertActivation,
+}
+
+/// The activation a MoE's routed experts apply to their in-projection, as the config declares it:
+/// `mlp_hidden_act` (Nemotron-H's key) else `hidden_act`, else HF's `PretrainedConfig` default,
+/// `"silu"` (DeepSeek-V3's configs omit it). Which expert body a MoE block lowers to is this
+/// fact's — a gated SiLU bank, or Nemotron-H's ungated relu² `SwitchMLP` — so a body the
+/// config does not declare can never be picked silently; an activation no expert body realizes
+/// is refused when a MoE op reads it (a dense model never does).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpertActivation {
+    Silu,
+    Relu2,
+    /// Declared, but no expert body realizes it — the declared name, for the refusal.
+    Unrealized(String),
+}
+
+impl ExpertActivation {
+    /// The expert body this activation is — or, `Err`, the declared name no body realizes.
+    pub fn body(&self) -> Result<scratchy_subtile::subtile_ir::ExpertBody, &str> {
+        use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct, UngatedAct};
+        match self {
+            Self::Silu => Ok(ExpertBody::Gated(GatedAct::Silu)),
+            Self::Relu2 => Ok(ExpertBody::Ungated(UngatedAct::Relu2)),
+            Self::Unrealized(act) => Err(act),
+        }
+    }
+}
+
+fn parse_expert_activation(json: &serde_json::Value) -> ExpertActivation {
+    let act = json
+        .get("mlp_hidden_act")
+        .or_else(|| json.get("hidden_act"))
+        .and_then(|v| v.as_str());
+    match act {
+        None | Some("silu") => ExpertActivation::Silu,
+        Some("relu2") => ExpertActivation::Relu2,
+        Some(other) => ExpertActivation::Unrealized(other.to_string()),
+    }
 }
 
 /// On-disk safetensors layout for a vision tower. Drives
@@ -1436,6 +1477,7 @@ fn model_params_from_json(
     let mrope_section = extract_mrope_section(json);
     let arch = resolve_arch_spec(spec, json, source_stem);
     let torch_dtype = parse_torch_dtype(json);
+    let expert_activation = parse_expert_activation(json);
 
     apply_generic_bound_defaults(&mut bounds);
 
@@ -1455,6 +1497,7 @@ fn model_params_from_json(
         mrope_section,
         arch,
         torch_dtype,
+        expert_activation,
     })
 }
 
@@ -1564,6 +1607,7 @@ fn vision_params_from_json(
     }
 
     let torch_dtype = parse_torch_dtype(json);
+    let expert_activation = parse_expert_activation(json);
     apply_generic_bound_defaults(&mut bounds);
 
     Ok(ModelParams {
@@ -1582,6 +1626,7 @@ fn vision_params_from_json(
         mrope_section: None,
         arch,
         torch_dtype,
+        expert_activation,
     })
 }
 
@@ -2985,6 +3030,11 @@ mod tests {
             );
             assert_eq!(mp.arch.decoder_root(), "backbone");
             assert_eq!(mp.scalars.get("rms_norm_eps"), Some(&1e-5));
+            assert_eq!(
+                mp.expert_activation,
+                ExpertActivation::Relu2,
+                "{stem}: `mlp_hidden_act` declares the ungated relu2 expert body"
+            );
             let (h, p, g, s) = (mamba_heads, 64, 8, 128);
             assert_eq!(mp.bounds["mamba_d_inner"], h * p);
             assert_eq!(mp.bounds["mamba_conv_dim"], h * p + 2 * g * s);
@@ -3413,5 +3463,28 @@ mod tests {
         assert_eq!(configs[0].source_stem, "model");
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The expert body's declared fact: `mlp_hidden_act` (Nemotron-H) wins over `hidden_act`,
+    /// HF's `silu` default stands in for neither, and a name no body realizes is carried for the
+    /// refusal rather than read as SiLU.
+    #[test]
+    fn expert_activation_reads_the_declared_activation() {
+        let act = |v: serde_json::Value| parse_expert_activation(&v);
+        assert_eq!(act(serde_json::json!({})), ExpertActivation::Silu);
+        assert_eq!(
+            act(serde_json::json!({"hidden_act": "silu"})),
+            ExpertActivation::Silu
+        );
+        assert_eq!(
+            act(serde_json::json!({"hidden_act": "silu", "mlp_hidden_act": "relu2"})),
+            ExpertActivation::Relu2
+        );
+        let gelu = act(serde_json::json!({"hidden_act": "gelu_pytorch_tanh"}));
+        assert_eq!(
+            gelu,
+            ExpertActivation::Unrealized("gelu_pytorch_tanh".to_string())
+        );
+        assert_eq!(gelu.body(), Err("gelu_pytorch_tanh"));
     }
 }

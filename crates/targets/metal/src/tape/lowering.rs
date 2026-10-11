@@ -27,10 +27,11 @@ use crate::tape::step::{
     KDim, KvOffsets, KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
     MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
     RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
-    UnaryAct,
+    UnaryAct, UngatedAct,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
+use scratchy_subtile::subtile_ir::ExpertBody;
 
 /// Value passed as `ATTN_BLOCKS_PER_CHUNK` to the attention reader's
 /// pipeline. `0` selects the direct-addressing fast path: the kernel
@@ -3193,7 +3194,7 @@ fn lower_one(
                     n: super::ids::NDimI32(n as i32),
                     codes,
                 },
-                act: *act,
+                act: ExpertBody::Gated(*act),
             };
             // `affine_qmv_fast`'s shape rule, for both matvecs — and the block rows the gated
             // kernel then runs (`gated_tile_rows`).
@@ -6918,7 +6919,7 @@ impl MoeScratch {
         let l = MoeScratchLayout::compute(bucket_m, e, k, i, h, elem, grouping.pad());
         let router_normed = align_256(l.total);
         let total = match b.input {
-            RouterInput::PreNormed => align_256(router_normed + bucket_m * h * elem),
+            RouterInput::PreNormed => align_256(router_normed + bucket_m * b.router_in.0 * elem),
             RouterInput::Raw => l.total,
         };
         *moe_scratch_bytes = (*moe_scratch_bytes).max(total);
@@ -7047,6 +7048,7 @@ fn lower_moe_step(
     let cmd = make_moe_command;
     let s = MoeScratch::of(b, bucket_m, p, moe_scratch_bytes);
     let (e, k, inter, hidden) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
+    let router_in = b.router_in.0;
     let pairs = bucket_m * k;
     let top_k_constants = || MoeTopKConstants {
         experts: b.experts,
@@ -7091,6 +7093,88 @@ fn lower_moe_step(
         }
         Ok::<_, LoweringError>(commands)
     };
+    // Gathered or sorted: one command runs the first projection of every pair — a gated
+    // expert's gate and up, an ungated one's up alone, into its own region — then the
+    // activation over the rows each threadgroup wrote, routing the block's token first when it
+    // can (`routed_here`), else after the routing command.
+    let gated_command = |first: ExpertMatmul,
+                         body: ExpertBody,
+                         routing: Option<super::step::RouteProgram>,
+                         bytes: &mut u32| {
+        let (routed, route) = routed_here(routing, 4 * 128);
+        let mut commands = each_step(route.as_slice(), bytes)?;
+        let (AffineGroupSize(gs), bits) = (first.group_size, first.width.bits().0);
+        let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
+        let mut bindings = expert_weights(first.proj, first.layer, 0)?.to_vec();
+        let (x, norm, gain) = normed_rows(&s, 3, first.rows)?;
+        let region = match first.proj {
+            ExpertProj::Up => R::ExpertUp,
+            ExpertProj::Gate | ExpertProj::Down => R::ExpertGate,
+        };
+        bindings.extend([x, gather_indices(&s, 4), s.at(5, region)]);
+        if let ExpertBody::Gated(_) = body {
+            bindings.extend(expert_weights(ExpertProj::Up, first.layer, 6)?);
+            bindings.push(s.at(9, R::ExpertUp));
+        }
+        bindings.extend(gain);
+        // Full static grid when sorted — a short step's live pairs sit past the m-scaled
+        // edge, on rows the init sentinel-filled.
+        let scaling = match s.grouping {
+            MoeGrouping::Gathered => ms(A::Z),
+            MoeGrouping::Sorted | MoeGrouping::Grouped => None,
+        };
+        let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
+        let gather = AffineGatherQmvConstants {
+            qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
+            rows: rows_read(&s, first.rows),
+        };
+        let mut constants: Vec<ConstantValue> = AffineGatedQmvConstants {
+            qmv: gather,
+            act: body,
+        }
+        .into();
+        constants.extend(norm);
+        if let Some(program) = routed {
+            bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
+            if let Some(l) = program.expert_scale {
+                let scale = WeightTensor::GemmaPerExpertScale;
+                bindings.push(source(router()?, scale, layer(&l), 12));
+            }
+            // The F32 router bias, when the pre reads one: GLM's e_score_correction_bias
+            // (sigmoid + bias) or gpt-oss's linear router bias.
+            if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
+                program.pre
+            {
+                bindings.push(source(
+                    router()?,
+                    WeightTensor::MoeRouterBias,
+                    layer(&l),
+                    13,
+                ));
+            }
+            constants.extend(Vec::from(RoutedConstants {
+                experts: b.experts,
+                program,
+            }));
+        }
+        // gpt-oss experts carry per-expert LINEAR biases on gate and up — the [E, 2·inter]
+        // concat the loader interleaves — bound at 14, with the kernel's switch at slot 4.
+        // Every other bundle leaves both unset, and the kernel const-folds the adds away.
+        if b.bundle == ExpertBundle::GptOss {
+            let bias = WeightTensor::MoeExpertGateUpLinearBias;
+            bindings.push(source(router()?, bias, layer(&first.layer), 14));
+            constants.push(C::boolean(4, true));
+        }
+        commands.push(cmd(
+            kernel,
+            "quantized_qmv",
+            symbol,
+            constants,
+            shape,
+            bindings,
+        ));
+        Ok::<_, LoweringError>(commands)
+    };
     Ok(match step {
         // Plain RMSNorm by the router gain: Gemma's `(1 + w)` offset does not apply to it.
         S::RouterNorm(Slot(x), l, eps) => vec![LoweredCommand {
@@ -7099,14 +7183,14 @@ fn lower_moe_step(
             function: rmsnorm_kernel_static_name(p, scale_dtype),
             constants: super::kernel_constants::RmsNormConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
-                q_size: super::ids::QSize(hidden),
+                q_size: super::ids::QSize(router_in),
                 rms_norm_eps: super::ids::RmsNormEps(eps.0),
                 weight_offset: 0.0,
             }
             .into_baked(),
             dispatch: grid(
                 (bucket_m, 1, 1),
-                (norm_threads(QSize(hidden)), 1, 1),
+                (norm_threads(QSize(router_in)), 1, 1),
                 ms(A::X),
             ),
             bindings: baked(vec![
@@ -7144,7 +7228,7 @@ fn lower_moe_step(
                 ),
                 constants: super::kernel_constants::NormedGemvConstants {
                     n: super::ids::NDim(e),
-                    k: super::ids::KDim(hidden),
+                    k: super::ids::KDim(router_in),
                     eps,
                     offset,
                 }
@@ -7185,7 +7269,7 @@ fn lower_moe_step(
                 gemm_dims: Some(GemmDims {
                     m: bucket_m,
                     n: e,
-                    k: hidden,
+                    k: router_in,
                 }),
             }]
         }
@@ -7461,6 +7545,7 @@ fn lower_moe_step(
                 // activation over the padded rows into `x_pad` first (sentinel rows skipped).
                 let mpad = s.l.mpad_max;
                 let x_pad = scratch_at(3, s.l.grp_x_pad);
+                let down_rows = rows_of(&s, 0, rows)?;
                 let quant = (proj == ExpertProj::Down).then(|| {
                     cmd(
                         KernelId::AffineGatherW4a8Quant,
@@ -7473,7 +7558,7 @@ fn lower_moe_step(
                         ],
                         grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
                         vec![
-                            s.at(0, R::ExpertGate),
+                            down_rows,
                             scratch_at(1, s.l.grp_x_pad),
                             scratch_at(2, s.l.grp_indices_pad),
                         ],
@@ -7611,70 +7696,18 @@ fn lower_moe_step(
             each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
         }
         S::GateUpAct(gate, _, act, routing) => {
-            let (routed, route) = routed_here(routing, 4 * 128);
-            let mut commands = each_step(route.as_slice(), moe_scratch_bytes)?;
-            let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
-            let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
-            let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
-            let (x, norm, gain) = normed_rows(&s, 3, gate.rows)?;
-            bindings.extend([x, gather_indices(&s, 4), s.at(5, R::ExpertGate)]);
-            bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
-            bindings.push(s.at(9, R::ExpertUp));
-            bindings.extend(gain);
-            // Full static grid when sorted — a short step's live pairs sit past the m-scaled
-            // edge, on rows the init sentinel-filled.
-            let scaling = match s.grouping {
-                MoeGrouping::Gathered => ms(A::Z),
-                MoeGrouping::Sorted | MoeGrouping::Grouped => None,
-            };
-            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
-            let gather = AffineGatherQmvConstants {
-                qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
-                rows: rows_read(&s, gate.rows),
-            };
-            let mut constants: Vec<ConstantValue> =
-                AffineGatedQmvConstants { qmv: gather, act }.into();
-            constants.extend(norm);
-            if let Some(program) = routed {
-                bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
-                if let Some(l) = program.expert_scale {
-                    let scale = WeightTensor::GemmaPerExpertScale;
-                    bindings.push(source(router()?, scale, layer(&l), 12));
-                }
-                // The F32 router bias, when the pre reads one: GLM's e_score_correction_bias
-                // (sigmoid + bias) or gpt-oss's linear router bias.
-                if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
-                    program.pre
-                {
-                    bindings.push(source(
-                        router()?,
-                        WeightTensor::MoeRouterBias,
-                        layer(&l),
-                        13,
-                    ));
-                }
-                constants.extend(Vec::from(RoutedConstants {
-                    experts: b.experts,
-                    program,
-                }));
-            }
-            // gpt-oss experts carry per-expert LINEAR biases on gate and up — the [E, 2·inter]
-            // concat the loader interleaves — bound at 14, with the kernel's switch at slot 4.
-            // Every other bundle leaves both unset, and the kernel const-folds the adds away.
-            if b.bundle == ExpertBundle::GptOss {
-                let bias = WeightTensor::MoeExpertGateUpLinearBias;
-                bindings.push(source(router()?, bias, layer(&gate.layer), 14));
-                constants.push(C::boolean(4, true));
-            }
-            commands.push(cmd(
-                kernel,
-                "quantized_qmv",
-                symbol,
-                constants,
-                shape,
-                bindings,
-            ));
-            commands
+            gated_command(gate, ExpertBody::Gated(act), routing, moe_scratch_bytes)?
+        }
+        // A grouped bake, or a width with a 1-3 row tail, runs the projection and the act apart.
+        S::UpAct(up, act, routing)
+            if s.grouping == MoeGrouping::Grouped || !inter.is_multiple_of(4) =>
+        {
+            let route = routing.map(S::Route);
+            let steps = [S::ExpertMatmul(up), S::Act(act)];
+            each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
+        }
+        S::UpAct(up, act, routing) => {
+            gated_command(up, ExpertBody::Ungated(act), routing, moe_scratch_bytes)?
         }
         // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
@@ -7748,6 +7781,27 @@ fn lower_moe_step(
                 constants.extend([C::uint(1, inter), C::uint(2, e)]);
             }
             vec![cmd(kernel, "silu_mul", symbol, constants, shape, bindings)]
+        }
+        // `act(up)` over the up rows, in place; a bake that sorted runs every padded row.
+        S::Act(UngatedAct::Relu2) => {
+            let (rows, m_scaling) = match s.grouping {
+                MoeGrouping::Gathered => (pairs, ms(A::X)),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
+            };
+            let n = rows * inter;
+            let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype);
+            let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
+            let bindings = vec![s.at(0, R::ExpertUp), s.at(1, R::ExpertUp)];
+            let kernel = KernelId::VisionGelu;
+            let constants = gelu_constants(n).to_vec();
+            vec![cmd(
+                kernel,
+                "activation",
+                symbol,
+                constants,
+                shape,
+                bindings,
+            )]
         }
         S::Unsort => vec![],
         // `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]`; a sorted bake's pair rows read where
@@ -10994,13 +11048,14 @@ mod tests {
             top_k: TopK(8),
             inter: IntermediateSize(512),
             hidden: HiddenSize(2048),
+            router_in: HiddenSize(2048),
             router: RouterBundle::SharedFused,
             bundle: ExpertBundle::SharedFused,
             input: RouterInput::Raw,
             quant: ExpertQuant {
                 group_size: AffineGroupSize(64),
                 widths: ExpertWidths {
-                    gate: four,
+                    gate: Some(four),
                     up: four,
                     down: four,
                 },
@@ -11089,6 +11144,105 @@ mod tests {
             sorted_rows(8).0 == MoeGrouping::Sorted,
             "bucket 8 is the sorted bake"
         );
+    }
+
+    /// Nemotron-3-Super's LatentMoE block: an ungated relu² bank of 512 experts at top 22 over a
+    /// 1024-wide latent, its router reading the 4096-wide block input, `fc1` 4-bit, `fc2` 2-bit.
+    fn latent_relu2_block() -> crate::tape::step::MoeBlock {
+        use crate::tape::ids::{
+            AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, NumExperts, TopK,
+        };
+        use crate::tape::step::{ExpertQuant, ExpertWidths, RouterInput};
+        use scratchy_subtile::subtile_ir::{ExpertBundle, RouterBundle};
+        MoeBlock {
+            experts: NumExperts(512),
+            top_k: TopK(22),
+            inter: IntermediateSize(2688),
+            hidden: HiddenSize(1024),
+            router_in: HiddenSize(4096),
+            router: RouterBundle::SharedFused,
+            bundle: ExpertBundle::SharedFused,
+            input: RouterInput::Raw,
+            quant: ExpertQuant {
+                group_size: AffineGroupSize(64),
+                widths: ExpertWidths {
+                    gate: None,
+                    up: AffineBits(4),
+                    down: AffineBits(2),
+                },
+            },
+        }
+    }
+
+    /// An ungated bank runs its one in-projection and relu²: gathered, as the gated command at
+    /// `GATED_ACT = 3`, binding no up projection and writing the up rows; grouped, as the grouped
+    /// GEMM then `relu2` in place over those rows. Its router contracts the block input, not the
+    /// latent the experts read.
+    #[test]
+    fn an_ungated_bank_runs_its_one_projection_then_relu2() {
+        use crate::tape::ids::{AffineBits, AffineGroupSize};
+        use crate::tape::step::{ExpertMatmul, ExpertWidth, MoeRows, MoeStep, UngatedAct};
+        use scratchy_subtile::subtile_ir::ExpertProj;
+        let (block, p) = (latent_relu2_block(), tp());
+        let up = ExpertMatmul {
+            rows: MoeRows::Tokens(Slot(1)),
+            layer: LayerId(0),
+            proj: ExpertProj::Up,
+            group_size: AffineGroupSize(64),
+            width: ExpertWidth::Declared(AffineBits(4)),
+        };
+        let lower = |step, bucket_m| {
+            let at = MoeBake {
+                bucket_m,
+                layer_offset: 0,
+                is_nax: false,
+                f16_compute: false,
+                codes: super::super::kernel_constants::AffineCodesTarget::of(None),
+            };
+            lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a MoE step lowers")
+        };
+        let step = MoeStep::UpAct(up, UngatedAct::Relu2, None);
+        let gathered = lower(step, 1);
+        let [cmd] = gathered.as_slice() else {
+            panic!("gathered: one command, got {}", gathered.len())
+        };
+        assert_eq!(cmd.kernel, KernelId::MoeGateUpAct);
+        let act = cmd.constants.iter().find(|c| c.index == 3);
+        assert_eq!(act.map(|c| c.bits), Some(3), "the ungated relu² epilogue");
+        let bound: Vec<u8> = cmd.bindings.iter().map(binding_index).collect();
+        assert!(
+            !bound.iter().any(|i| (6..=9).contains(i)),
+            "no up projection: {bound:?}"
+        );
+        let scratch = MoeScratch::of(&block, 1, &p, &mut 0);
+        assert!(cmd.bindings.contains(&scratch.at(5, MoeRegion::ExpertUp)));
+        // 2048 rows × 22 picks over 512 experts: 88 per expert, a grouped bake.
+        let grouped = lower(step, 2048);
+        let kernels: Vec<KernelId> = grouped.iter().map(|c| c.kernel).collect();
+        assert_eq!(
+            kernels,
+            [KernelId::AffineGatherQmmT, KernelId::VisionGelu],
+            "the grouped GEMM, then relu2"
+        );
+        let relu2 = &grouped[1];
+        assert_eq!(relu2.function, "relu2_bf16");
+        let up_rows = MoeScratch::of(&block, 2048, &p, &mut 0).at(0, MoeRegion::ExpertUp);
+        assert_eq!(relu2.bindings[0], up_rows, "relu² over the up rows");
+        // The router: `[m, 512]` logits contracting the 4096-wide block input.
+        let router = lower(
+            MoeStep::RouterLogits(MoeRows::Tokens(Slot(2)), LayerId(0), None),
+            8,
+        );
+        assert_eq!(router[0].gemm_dims.map(|g| (g.n, g.k)), Some((512, 4096)));
+    }
+
+    fn binding_index(b: &Binding) -> u8 {
+        match *b {
+            Binding::ArenaSlot { binding_index, .. }
+            | Binding::MoeScratch { binding_index, .. }
+            | Binding::Source { binding_index, .. } => binding_index,
+            _ => u8::MAX,
+        }
     }
 
     /// A router with its block's input norm folded in writes every row's logits: one row runs the

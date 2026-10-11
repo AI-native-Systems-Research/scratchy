@@ -41,8 +41,8 @@ use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts, RopeFormTag,
-    RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,
+    AttnMask, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts,
+    RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,
 };
 
 use crate::assignment::Assignment;
@@ -108,6 +108,8 @@ pub enum BridgeError {
     /// the pool refuses at load), while a bridge gap must stay fatal
     /// or the front-end swap silently drops coverage the solver had.
     NoMetalRealization { tile: TileId, detail: &'static str },
+    /// A MoE's config declares an expert activation no expert body realizes.
+    UnrealizedExpertActivation { tile: TileId, act: String },
 }
 
 impl BridgeError {
@@ -164,6 +166,12 @@ impl std::fmt::Display for BridgeError {
             Self::NoMetalRealization { tile, detail } => {
                 write!(f, "tile {}: {detail}", tile.0)
             }
+            Self::UnrealizedExpertActivation { tile, act } => write!(
+                f,
+                "tile {} moe_block: the config declares expert activation `{act}`, which no \
+                 expert body realizes (a gated `silu` bank or an ungated `relu2` one)",
+                tile.0
+            ),
             Self::UnsupportedWeight { tile, detail } => {
                 write!(
                     f,
@@ -292,7 +300,7 @@ struct Experts {
     hidden: u32,
     quant: ExpertQuant,
     bundle: ExpertBundle,
-    act: GatedAct,
+    body: ExpertBody,
     shared: SharedExpertBound,
 }
 
@@ -327,8 +335,8 @@ impl<'a> Builder<'a> {
     }
 
     /// The expert half: the `(token, expert)` pairs of `x` sorted by expert, projected by
-    /// `bank`, gated, projected back, restored to token order, summed by `scores`. Closes the
-    /// expansion; returns the sum.
+    /// `bank` and activated as the expert body says, projected back, restored to token order,
+    /// summed by `scores`. Closes the expansion; returns the sum.
     fn experts(
         &mut self,
         x: InputRef,
@@ -352,9 +360,17 @@ impl<'a> Builder<'a> {
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
         let rows = |r: usize| vec![InputRef::Op(r), InputRef::Op(pairs), bank];
-        let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs));
-        let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
-        let act = self.push(SubOp::ExpertGatedAct { act: e.act }, &[gate, up]);
+        let act = match e.body {
+            ExpertBody::Gated(act) => {
+                let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs));
+                let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
+                self.push(SubOp::ExpertGatedAct { act }, &[gate, up])
+            }
+            ExpertBody::Ungated(act) => {
+                let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
+                self.push(SubOp::ExpertAct { act }, &[up])
+            }
+        };
         let down = self.push_op(matmul(ExpertProj::Down, e.hidden), rows(act));
         let tokens = self.push(SubOp::ExpertUnsort, &[down, pairs]);
         let (hidden, shared) = (e.hidden, e.shared);
@@ -1192,7 +1208,17 @@ pub fn lower_decode_to_wavefront(
                 result = Some(idx);
             }
             OpKind::Moe => {
+                // The router's rows, and the experts' — a latent MoE's own (`moe_block(x,
+                // latent, moe[layer])`), else the router's.
                 let x = bx.input_at(tile, 0)?;
+                let tiles = node
+                    .inputs
+                    .iter()
+                    .filter(|i| matches!(i, FufInput::Tile { .. }));
+                let expert_x = match tiles.count() {
+                    2 => bx.input_at(tile, 1)?,
+                    _ => x,
+                };
                 // The bundle is a STRUCT weight (`mlp[layer]` — router +
                 // experts + optional shared under one base), not a
                 // tensor: it has no inferred shape, so it gets an opaque
@@ -1245,6 +1271,20 @@ pub fn lower_decode_to_wavefront(
                     .copied()
                     .unwrap_or(0) as u32;
                 let norm_topk = b.get("norm_topk_prob").copied().unwrap_or(0) != 0;
+                // The experts' body is the config's declared activation's: never a default the
+                // checkpoint did not state (a relu² bank read as gated SiLU computes garbage).
+                let body = bx.model.expert_activation.body().map_err(|act| {
+                    let act = act.to_string();
+                    BridgeError::UnrealizedExpertActivation { tile, act }
+                })?;
+                // noaux_tc's `routed_scaling_factor` multiplies the renormalized scores last
+                // (mlx `group_expert_select`); 1.0 (GLM-4.5) is the identity and emits nothing.
+                let routed_scale = bx
+                    .model
+                    .scalars
+                    .get("routed_scaling_factor")
+                    .map(|&f| f as f32)
+                    .filter(|&f| f != 1.0);
                 let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
                     Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
                         (*group_size, *bits)
@@ -1259,9 +1299,9 @@ pub fn lower_decode_to_wavefront(
                 };
                 let (experts, k) = moe_counts(tile, num_experts, top_k)?;
                 // Qwen order: softmax over every expert, then top-k (renormalised when the
-                // config says so); Mixtral: top-k, then softmax over the chosen; GLM-4:
-                // sigmoid+bias keys pick the top-k, the UNBIASED sigmoids gathered and
-                // renormalised (routed_scaling_factor 1.0 — no score scale).
+                // config says so); Mixtral: top-k, then softmax over the chosen; GLM-4 /
+                // Nemotron-H: sigmoid+bias keys pick the top-k, the UNBIASED sigmoids gathered,
+                // renormalised and scaled by the routed scaling factor.
                 let (router, bundle) = match router_flavor {
                     RouterFlavor::QwenShared | RouterFlavor::GlmSigmoid => {
                         (RouterBundle::SharedFused, ExpertBundle::SharedFused)
@@ -1286,10 +1326,13 @@ pub fn lower_decode_to_wavefront(
                     (RouterFlavor::QwenShared, true) => bx.push(SubOp::RouteRenorm, &[scores]),
                     (RouterFlavor::QwenShared, false) => scores,
                     (RouterFlavor::GlmSigmoid, norm) => {
-                        if norm {
-                            bx.push(SubOp::RouteRenorm, &[scores])
-                        } else {
-                            scores
+                        let scores = match norm {
+                            true => bx.push(SubOp::RouteRenorm, &[scores]),
+                            false => scores,
+                        };
+                        match routed_scale {
+                            Some(scale) => bx.push(SubOp::RouteScale { scale }, &[scores]),
+                            None => scores,
                         }
                     }
                     (RouterFlavor::Mixtral, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
@@ -1302,10 +1345,10 @@ pub fn lower_decode_to_wavefront(
                     hidden,
                     quant: ExpertQuant::declared(group_size, bits),
                     bundle,
-                    act: GatedAct::Silu,
+                    body,
                     shared: SharedExpertBound(shared),
                 };
-                let idx = bx.experts(x, indices, scores, w, experts);
+                let idx = bx.experts(expert_x, indices, scores, w, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1459,7 +1502,7 @@ pub fn lower_decode_to_wavefront(
                     hidden,
                     quant: ExpertQuant::declared(group_size, bits),
                     bundle: ExpertBundle::SwitchGlu,
-                    act: GatedAct::Gelu,
+                    body: ExpertBody::Gated(GatedAct::Gelu),
                     shared: SharedExpertBound(None),
                 };
                 let idx = bx.experts(expert_in, indices, scores, bank, experts);
@@ -1559,7 +1602,7 @@ pub fn lower_decode_to_wavefront(
                     hidden,
                     quant: ExpertQuant::declared(group_size, bits),
                     bundle: ExpertBundle::GptOss,
-                    act: GatedAct::SwigluOai,
+                    body: ExpertBody::Gated(GatedAct::SwigluOai),
                     shared: SharedExpertBound(None),
                 };
                 let idx = bx.experts(x, indices, scores, w, experts);

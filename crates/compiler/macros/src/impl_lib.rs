@@ -16661,6 +16661,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let scale = attention_scale_for(&model);
@@ -16709,6 +16710,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16791,6 +16793,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16896,6 +16899,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17434,6 +17438,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {

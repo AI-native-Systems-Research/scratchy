@@ -1008,15 +1008,28 @@ fn sig_gate_scale(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shape
     })
 }
 
-/// `moe_block(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
-/// the second arg is a MoE layer struct (`FusedMoELayer` /
+/// `moe_block(x: [T, H], moe_weight)` → `[T, H]`, or a latent MoE's
+/// `moe_block(router_in: [T, H], expert_in: [T, L], moe_weight)` →
+/// `[T, L]` (Nemotron-3-Super: the router reads the block input, the
+/// experts its latent projection, and their weighted sum stays latent).
+/// The last arg is a MoE layer struct (`FusedMoELayer` /
 /// `SharedFusedMoELayer` / `DeepSeekV2MoELayer` or their quant
 /// flavors) — not a tensor — so it contributes an empty shape.
-/// Output = hidden_states shape.
+/// Output = the experts' input shape.
 fn sig_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::Moe, inputs, 2)?;
+    let expert_in = match inputs.len() {
+        2 => 0,
+        3 => 1,
+        got => {
+            return Err(ShapeError::ArgCount {
+                op: OpKind::Moe,
+                expected: 2,
+                got,
+            });
+        }
+    };
     Ok(OpSig {
-        output: inputs[0].clone(),
+        output: inputs[expert_in].clone(),
     })
 }
 
@@ -2797,6 +2810,29 @@ mod tests {
         assert!(apply_signature(&mut solver, OpKind::Mamba2, &[rank1, vec![]]).is_err());
         assert_eq!(OpKind::from_name("mamba2"), Some(OpKind::Mamba2));
         assert_eq!(OpKind::Mamba2.as_str(), "mamba2");
+    }
+
+    /// `moe_block(x, moe[layer])` keeps `x`'s shape; a LatentMoE's `moe_block(x, latent,
+    /// moe[layer])` gives the experts' (latent) shape — the router reads `x`, the weighted sum
+    /// stays in the experts' space. Any other arity is refused.
+    #[test]
+    fn moe_block_gives_the_experts_input_shape() {
+        let mut solver = Solver::new();
+        let x = vec![bound("num_tokens"), bound("hidden_size")];
+        let latent = vec![bound("num_tokens"), bound("moe_latent_size")];
+        let sig = apply_signature(&mut solver, OpKind::Moe, &[x.clone(), vec![]]).expect("moe");
+        assert_eq!(sig.output, x);
+        let sig = apply_signature(
+            &mut solver,
+            OpKind::Moe,
+            &[x.clone(), latent.clone(), vec![]],
+        )
+        .expect("latent moe");
+        assert_eq!(sig.output, latent);
+        assert!(apply_signature(&mut solver, OpKind::Moe, std::slice::from_ref(&x)).is_err());
+        assert!(
+            apply_signature(&mut solver, OpKind::Moe, &[x.clone(), latent, x, vec![]]).is_err()
+        );
     }
 
     #[test]
