@@ -7510,8 +7510,10 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
 
 /// The layers whose ops read or write the paged KV cache, ascending: every layer of a uniform
 /// decoder, a recurrent hybrid's attention layers only (its Mamba / Gated-DeltaNet layers hold
-/// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors and
-/// the TurboQuant threshold counts their bytes.
+/// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors. The
+/// TurboQuant threshold does NOT count them: its `num_layers` input stays `num_hidden_layers`,
+/// the input it was calibrated against — re-classifying existing models' codec is a policy
+/// change and belongs in its own PR, not a side effect of a new arch.
 pub struct KvCacheLayers(Vec<u32>);
 
 impl KvCacheLayers {
@@ -7563,7 +7565,7 @@ fn kv_codec_for(
         use scratchy_ir::{DenseReason, KvGeometry, codec_for};
         let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
         let geometry = KvGeometry {
-            num_layers: kv_layers.count(),
+            num_layers: bound("num_hidden_layers"),
             num_kv_heads: bound("num_key_value_heads"),
             head_dim,
             global_head_dim,
