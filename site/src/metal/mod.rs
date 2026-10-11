@@ -1727,6 +1727,7 @@ const HIGHLIGHTS: usize = 3;
 
 /// How many of the overview's heat map squares have their factor written in
 /// them: at most one per colour step, spread over the steps the squares use.
+/// A heat map left without one then gets one of its own.
 const HEAT_LABELS: usize = 12;
 
 /// Where an overview heat map square is: machine, model, metric, and its
@@ -1799,7 +1800,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
         }
     }
-    let squares: Vec<(Square, f64)> = grids
+    let squares: BTreeMap<Square, f64> = grids
         .iter()
         .filter_map(|(&(chip, stem, name), g)| Some((chip, stem, name, g.as_ref().ok()?)))
         .flat_map(|(chip, stem, name, g)| {
@@ -1818,20 +1819,47 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // Each colour step's square furthest from ×1; then HEAT_LABELS of those
     // steps, evenly spread from the slowest to the fastest, both always in.
     let mut by_step: BTreeMap<usize, (Square, f64)> = BTreeMap::new();
-    for (at, r) in squares {
+    for (&at, &r) in &squares {
         let kept = by_step.entry(ratio_step(r)).or_insert((at, r));
         if r.log2().abs() > kept.1.log2().abs() {
             *kept = (at, r);
         }
     }
     let used: Vec<Square> = by_step.into_values().map(|(at, _)| at).collect();
-    let highlights: BTreeSet<Square> = if used.len() <= HEAT_LABELS {
+    let mut highlights: BTreeSet<Square> = if used.len() <= HEAT_LABELS {
         used.into_iter().collect()
     } else {
         (0..HEAT_LABELS)
             .map(|k| used[k * (used.len() - 1) / (HEAT_LABELS - 1)])
             .collect()
     };
+    // Then each heat map still without a label gets one: its square furthest
+    // from ×1 in a colour step not yet labelled, or, every step it has taken,
+    // its square furthest from ×1.
+    let mut taken: BTreeSet<usize> = highlights
+        .iter()
+        .map(|at| ratio_step(squares[at]))
+        .collect();
+    for &(chip, stem, metric) in grids.keys() {
+        let mine = || {
+            squares
+                .iter()
+                .filter(move |(at, _)| (at.chip, at.stem, at.metric) == (chip, stem, metric))
+        };
+        if mine().any(|(at, _)| highlights.contains(at)) {
+            continue;
+        }
+        let pick = mine().max_by(|&(_, &a), &(_, &b)| {
+            let fresh = |r: f64| !taken.contains(&ratio_step(r));
+            fresh(a)
+                .cmp(&fresh(b))
+                .then(a.log2().abs().total_cmp(&b.log2().abs()))
+        });
+        if let Some((&at, &r)) = pick {
+            highlights.insert(at);
+            taken.insert(ratio_step(r));
+        }
+    }
     // Likewise every sparkline's steps, each panel's highlights picked from
     // its own: the steps scratchy is furthest ahead and furthest behind at.
     let mut sparks: BTreeMap<SparkAt, Result<Spark, &str>> = BTreeMap::new();
