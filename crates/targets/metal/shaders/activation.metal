@@ -119,3 +119,24 @@ template <typename T>
 
 SCRATCHY_KERNEL(quick_gelu_f16, quick_gelu<half>)
 SCRATCHY_KERNEL(quick_gelu_bf16, quick_gelu<bfloat>)
+
+// ============================================================================
+// relu2: relu(x)^2 — Nemotron-H's non-gated MLP activation (mlx
+// `nn.relu2` = square(relu(x))). The square of a bf16/f16 value is exact
+// in float, so rounding once to T matches mlx's in-dtype square.
+// ============================================================================
+
+template <typename T>
+[[kernel]] void relu2(
+    device T* output [[buffer(0)]],
+    device const T* input [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= ACTIVATION_N) return;
+
+    float x = metal::max(float(input[gid]), 0.0f);
+    output[gid] = T(x * x);
+}
+
+SCRATCHY_KERNEL(relu2_f16, relu2<half>)
+SCRATCHY_KERNEL(relu2_bf16, relu2<bfloat>)

@@ -111,6 +111,8 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
+        | SubOp::Mamba2 { .. }
+        | SubOp::KvAppend { .. }
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Err(format!("{:?} is not a spyre standard tile op", n.op)),
         crate::op_abi::spyre_standard_tile_pat!() => {

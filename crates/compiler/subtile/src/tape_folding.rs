@@ -119,9 +119,10 @@ pub enum FoldPattern<K: 'static> {
         norm: SubOpKind,
         kernel: K,
     },
-    /// `act(gate, up)` over expert rows: the gate and up `matmul`s (the activation's operands 0
-    /// and 1), each read by the activation alone, fold into it.
-    ExpertGated {
+    /// An expert activation over its rows — `act(gate, up)`, or an ungated expert's `act(up)` —
+    /// with the `matmul`s it reads (operands 0 and 1, or 0 alone), each read by the activation
+    /// alone, folded into it.
+    ExpertActivation {
         act: SubOpKind,
         matmul: SubOpKind,
         kernel: K,
@@ -211,7 +212,7 @@ pub enum FoldPattern<K: 'static> {
 }
 
 /// The stages a routing fold's scores may pass through after the gather.
-pub const ROUTE_TAIL_STAGES: usize = 3;
+pub const ROUTE_TAIL_STAGES: usize = 4;
 
 /// A step that normalizes a norm's input as it loads it ([`FoldPattern::NormedMatvecs`]).
 #[derive(Clone, Copy, Debug)]
@@ -242,7 +243,7 @@ impl<K> FoldPattern<K> {
             Self::NormedRope { rope, .. } => *rope,
             Self::NormAddScale { scale, .. } => *scale,
             Self::NormAdd { add, .. } => *add,
-            Self::ExpertGated { act, .. } => *act,
+            Self::ExpertActivation { act, .. } => *act,
             Self::ExpertCombined { combine, .. } => *combine,
             Self::Route { top_k, .. } => *top_k,
             Self::Encoded { writer, .. } => *writer,
@@ -351,6 +352,9 @@ pub enum FusedShape {
     },
     ExpertGated {
         gate: SlotId,
+        up: SlotId,
+    },
+    ExpertUngated {
         up: SlotId,
     },
     ExpertCombined {
@@ -790,10 +794,17 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 add, norm, kernel, ..
             } => self.norm_add_scale(i, add, norm, kernel),
             FoldPattern::NormAdd { norm, kernel, .. } => self.norm_add(i, norm, kernel),
-            FoldPattern::ExpertGated { matmul, kernel, .. } => {
-                let gate = self.sole_producer(i, 0, matmul)?;
+            FoldPattern::ExpertActivation { matmul, kernel, .. } => {
+                let first = self.sole_producer(i, 0, matmul)?;
+                if self.ops.args[i].len() == 1 {
+                    if let Some(u) = first {
+                        let up = self.ops.slot[u];
+                        self.absorb(i, &[u], kernel, FusedShape::ExpertUngated { up });
+                    }
+                    return Ok(());
+                }
                 let up = self.sole_producer(i, 1, matmul)?;
-                if let (Some(g), Some(u)) = (gate, up) {
+                if let (Some(g), Some(u)) = (first, up) {
                     let (gate, up) = (self.ops.slot[g], self.ops.slot[u]);
                     self.absorb(i, &[g, u], kernel, FusedShape::ExpertGated { gate, up });
                 }
@@ -1672,6 +1683,7 @@ mod tests {
         NormedRope,
         NormAddScale,
         ExpertGated,
+        ExpertUngated,
         ExpertCombined,
         Route,
         Encoded,
@@ -1762,10 +1774,15 @@ mod tests {
                     norm: K::RmsNorm,
                     kernel: Kern::NormAddScale,
                 },
-                FoldPattern::ExpertGated {
+                FoldPattern::ExpertActivation {
                     act: K::ExpertGatedAct,
                     matmul: K::ExpertMatmul,
                     kernel: Kern::ExpertGated,
+                },
+                FoldPattern::ExpertActivation {
+                    act: K::ExpertAct,
+                    matmul: K::ExpertMatmul,
+                    kernel: Kern::ExpertUngated,
                 },
                 FoldPattern::ExpertCombined {
                     combine: K::ExpertCombine,
@@ -1782,6 +1799,7 @@ mod tests {
                         &[K::RouteScale],
                         &[K::RouteSoftmax, K::RouteRenorm],
                         &[K::RouteExpertScale],
+                        &[K::RouteScale],
                     ],
                     kernel: Kern::Route,
                 },
@@ -2383,7 +2401,7 @@ mod tests {
                 sort: s[1],
                 pre: None,
                 gather: s[3],
-                tail: [Some(s[4]), Some(s[5]), Some(s[6])],
+                tail: [Some(s[4]), Some(s[5]), Some(s[6]), None],
             },
         };
         assert_eq!(f.role(s[2]), StepRole::Drives(&route));
@@ -2408,7 +2426,7 @@ mod tests {
                 sort: s[2],
                 pre: Some(s[1]),
                 gather: s[4],
-                tail: [None, Some(s[5]), None],
+                tail: [None, Some(s[5]), None, None],
             },
         };
         assert_eq!(f.role(s[3]), StepRole::Drives(&route));
@@ -2484,6 +2502,100 @@ mod tests {
         assert_eq!(f.role(s[1]), StepRole::Kept);
         assert_eq!(f.role(s[2]), StepRole::Kept);
         assert_eq!(f.role(s[5]), StepRole::Drives(&combined));
+    }
+
+    #[test]
+    fn an_ungated_experts_one_projection_folds_into_its_activation() {
+        use crate::lower::ExpertQuant;
+        use crate::subtile_ir::{ExpertBundle, ExpertProj, SharedExpertBound, TopK, UngatedAct};
+        let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
+        let matmul = |proj, n, inputs| {
+            let (quant, bundle) = (ExpertQuant::declared(64, 4), ExpertBundle::SharedFused);
+            op(
+                SubOp::ExpertMatmul {
+                    proj,
+                    n,
+                    k,
+                    quant,
+                    bundle,
+                },
+                1,
+                inputs,
+            )
+        };
+        let ops = |fc1_read_again: bool| {
+            let act = SubOp::ExpertAct {
+                act: UngatedAct::Relu2,
+            };
+            let combine = SubOp::ExpertCombine {
+                hidden: 64,
+                shared: SharedExpertBound(None),
+            };
+            let mut v = vec![
+                matmul(ExpertProj::Up, 32, vec![Ext(0), Ext(1), Ext(2)]),
+                op(act, 1, vec![Op(0)]),
+                matmul(ExpertProj::Down, 64, vec![Op(1), Ext(1), Ext(2)]),
+                op(SubOp::ExpertUnsort, 1, vec![Op(2), Ext(1)]),
+                op(combine, 1, vec![Op(3), Ext(3)]),
+            ];
+            if fc1_read_again {
+                v.push(op(ADD, 1, vec![Op(4), Op(0)]));
+            }
+            v
+        };
+        let src = [(1, 64), (1, 2), (96, 64), (1, 2)];
+        let (s, f) = fold(&src, weights(4), ops(false), &[], &TABLE, SPLIT);
+        let ungated = Fusion {
+            kernel: Kern::ExpertUngated,
+            shape: FusedShape::ExpertUngated { up: s[0] },
+        };
+        assert_eq!(f.role(s[0]), StepRole::Absorbed { into: s[1] });
+        assert_eq!(f.role(s[1]), StepRole::Drives(&ungated));
+        assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[4] });
+        // An fc1 another step reads stays its own step.
+        let (s, f) = fold(&src, weights(4), ops(true), &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+        assert_eq!(f.role(s[1]), StepRole::Kept);
+    }
+
+    /// Nemotron-H's routing: the sigmoid + correction bias pre, the gather, the renorm, then the
+    /// routed scaling factor — a scale AFTER the renorm (before it the renorm would cancel it),
+    /// the tail's last stage.
+    #[test]
+    fn a_scale_after_the_renorm_is_the_routings_last_epilogue() {
+        use crate::subtile_ir::{NumExperts, RouterBundle, TopK};
+        use std::num::NonZeroU32;
+        let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
+        let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
+        let router = RouterBundle::SharedFused;
+        let ops = vec![
+            op(
+                SubOp::RouterLogits { experts, router },
+                1,
+                vec![Ext(0), Ext(1)],
+            ),
+            op(SubOp::RouteSigmoidBias { router }, 1, vec![Op(0), Ext(1)]),
+            op(SubOp::RouteArgsort, 1, vec![Op(1)]),
+            op(SubOp::RouteTopK { k }, 1, vec![Op(2)]),
+            op(SubOp::RouteGatherScores, 1, vec![Op(1), Op(3)]),
+            op(SubOp::RouteRenorm, 1, vec![Op(4)]),
+            op(SubOp::RouteScale { scale: 2.5 }, 1, vec![Op(5)]),
+            op(ADD, 1, vec![Op(6), Op(3)]),
+        ];
+        let (s, f) = fold(&[(1, 64), (16, 64)], weights(2), ops, &[], &TABLE, SPLIT);
+        for e in [4, 5, 6] {
+            assert_eq!(f.role(s[e]), StepRole::Epilogue { of: s[3] }, "step {e}");
+        }
+        let route = Fusion {
+            kernel: Kern::Route,
+            shape: FusedShape::Route {
+                sort: s[2],
+                pre: Some(s[1]),
+                gather: s[4],
+                tail: [None, Some(s[5]), None, Some(s[6])],
+            },
+        };
+        assert_eq!(f.role(s[3]), StepRole::Drives(&route));
     }
 
     #[test]

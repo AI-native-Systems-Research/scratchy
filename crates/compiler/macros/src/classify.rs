@@ -842,7 +842,7 @@ mod tests {
                 Stmt::If { cond, .. } => match cond {
                     BoolPred::In { ivar, members } => {
                         assert_eq!(p.locals.name(*ivar).to_string(), "layer");
-                        assert_eq!(members, &vec![7u64, 15, 23, 31]);
+                        assert_eq!(members, &crate::ast::InSet::Lit(vec![7u64, 15, 23, 31]));
                     }
                     other => panic!("expected In, got {other:?}"),
                 },

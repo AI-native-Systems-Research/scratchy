@@ -1121,9 +1121,12 @@ fn per_module_lookup(
         None => format!(".{role}"),
     };
     let subtree = format!("{candidate}.");
+    // A top-level module's key IS the bare role (`lm_head`, outside the decoder root), which
+    // the dot-anchored candidate cannot match.
+    let top_level = |k: &str| index.is_none() && (k == role || k.starts_with(&format!("{role}.")));
     per_module
         .iter()
-        .find(|(k, _)| k.ends_with(&candidate) || k.contains(&subtree))
+        .find(|(k, _)| k.ends_with(&candidate) || k.contains(&subtree) || top_level(k))
         .map(|&(_, v)| v)
 }
 
@@ -1131,8 +1134,10 @@ fn per_module_lookup(
 /// the MoE codegen to resolve the router `gate` bits (and any other
 /// bundle sub-weight not visible as its own `WeightId`). Honors the same
 /// precedence as `storage_format_for_weight`: MLX-native per-module map
-/// (OptiQ) first, then the preset suffix `bits_overrides`, else the
-/// section default. `None` for non-affine methods.
+/// (OptiQ) first — whose membership is authoritative, so a role it does
+/// not list is DENSE (Nemotron-3-Super's router gate) — then the preset
+/// suffix `bits_overrides`, else the section default. `None` for a
+/// non-affine method or a role the per-module map leaves dense.
 pub fn affine_role_bits(
     program: &Program,
     method: &QuantMethod,
@@ -1147,11 +1152,7 @@ pub fn affine_role_bits(
     } = method
     {
         if !per_module.is_empty() {
-            return Some(
-                per_module_lookup(program, per_module, dotted_role, index)
-                    .map(|(b, _)| b)
-                    .unwrap_or(*bits),
-            );
+            return per_module_lookup(program, per_module, dotted_role, index).map(|(b, _)| b);
         }
         return Some(
             bits_overrides
@@ -1164,45 +1165,146 @@ pub fn affine_role_bits(
     None
 }
 
-/// Routed-expert bit-width for a fused-MoE bundle under an affine method.
-/// The bundle root (`mlp`) subtree-matches its FIRST sub-weight — the router
-/// gate — in the per-module map, so the stacked routed experts must be
-/// resolved explicitly from their infix (`switch_mlp` for Qwen3-MoE,
-/// `experts` for Mixtral). `moe_prefix` may be a layer-templated safetensors
-/// path (`model.layers.0.mlp`). Returns `None` for non-affine methods so the
-/// caller keeps the storage-format bits.
+/// Each routed-expert projection's on-disk affine width, in the bank's own form — the compile-time
+/// twin of the runtime `layers_moe::ExpertBits` the loaders take, which [`Self::tokens`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertBits {
+    /// A gated bank's `gate_proj` / `up_proj` / `down_proj`.
+    Gated { gate: u32, up: u32, down: u32 },
+    /// An ungated bank's `fc1` / `fc2` (Nemotron-H's `SwitchMLP`).
+    Ungated { fc1: u32, fc2: u32 },
+}
+
+impl ExpertBits {
+    /// The widths of the gate, up and down projections, as the expert-step records index them
+    /// (`None`: a projection the bank does not have).
+    pub const fn projections(self) -> [Option<u32>; 3] {
+        match self {
+            Self::Gated { gate, up, down } => [Some(gate), Some(up), Some(down)],
+            Self::Ungated { fc1, fc2 } => [None, Some(fc1), Some(fc2)],
+        }
+    }
+
+    /// The width of the projection the activation reads (a gated bank's up, an ungated `fc1`).
+    pub const fn up(self) -> u32 {
+        match self {
+            Self::Gated { up, .. } => up,
+            Self::Ungated { fc1, .. } => fc1,
+        }
+    }
+
+    /// Each projection's on-disk leaf under the bank, with its width.
+    pub fn leaves(self) -> Vec<(&'static str, u32)> {
+        match self {
+            Self::Gated { gate, up, down } => {
+                vec![("gate_proj", gate), ("up_proj", up), ("down_proj", down)]
+            }
+            Self::Ungated { fc1, fc2 } => vec![("fc1", fc1), ("fc2", fc2)],
+        }
+    }
+
+    /// The runtime value's constructor, as emitted code names it.
+    pub fn tokens(self) -> proc_macro2::TokenStream {
+        let lit = proc_macro2::Literal::u32_unsuffixed;
+        match self {
+            Self::Gated { gate, up, down } => {
+                let (g, u, d) = (lit(gate), lit(up), lit(down));
+                quote::quote! {
+                    crate::__gpu::layers_moe::ExpertBits::Gated { gate: #g, up: #u, down: #d }
+                }
+            }
+            Self::Ungated { fc1, fc2 } => {
+                let (a, b) = (lit(fc1), lit(fc2));
+                quote::quote! { crate::__gpu::layers_moe::ExpertBits::Ungated { fc1: #a, fc2: #b } }
+            }
+        }
+    }
+}
+
+/// Each routed-expert projection's bit-width for a fused-MoE bundle under an affine method — the
+/// ONE resolver the loaders, the dispatch constants and the fingerprint all read. Mixed-bit
+/// checkpoints set one layer's projections apart (Qwen3.5 OptiQ: gate 4 / up 8 / down 8;
+/// Nemotron-3-Super layer 8: `fc1` 4 / `fc2` 2), so each projection is looked up on its own
+/// leaf under the bank's infix — `switch_mlp` (Qwen3-MoE, Nemotron-H), `experts` (Mixtral) —
+/// with the bank's own width (its first sub-leaf, or the section default) where the map names
+/// none (Mixtral's per-expert `experts.{e}.w1`). The bundle root (`mlp`) subtree-matches its
+/// FIRST sub-weight — the router gate — in the per-module map, which is why the experts are
+/// resolved from their infix explicitly. `moe_prefix` may be a layer-templated safetensors path
+/// (`model.layers.0.mlp`). `body` says which projections the bank has. `None` for non-affine
+/// methods, so the caller keeps the storage-format bits.
 pub fn affine_moe_expert_bits(
     program: &Program,
     method: &QuantMethod,
     moe_prefix: &str,
     index: Option<UnrollIndex>,
-) -> Option<u32> {
-    if let QuantMethod::Affine {
+    body: scratchy_subtile::subtile_ir::ExpertBody,
+) -> Option<ExpertBits> {
+    use scratchy_subtile::subtile_ir::ExpertBody;
+    let QuantMethod::Affine {
         bits,
         bits_overrides,
         per_module,
         ..
     } = method
-    {
-        for infix in ["switch_mlp", "experts"] {
-            let role = format!("{moe_prefix}.{infix}");
-            if !per_module.is_empty() {
-                if let Some((b, _)) = per_module_lookup(program, per_module, &role, index) {
-                    return Some(b);
-                }
-            } else if let Some(&(_, b)) = bits_overrides
+    else {
+        return None;
+    };
+    let declared = |role: &str| {
+        if per_module.is_empty() {
+            bits_overrides
                 .iter()
                 .find(|(s, _)| role.ends_with(s.as_str()))
-            {
-                return Some(b);
-            }
+                .map(|&(_, b)| b)
+        } else {
+            per_module_lookup(program, per_module, role, index).map(|(b, _)| b)
         }
-        return Some(*bits);
-    }
-    None
+    };
+    let infixes = ["switch_mlp", "experts"];
+    let bank = infixes
+        .iter()
+        .find_map(|infix| declared(&format!("{moe_prefix}.{infix}")))
+        .unwrap_or(*bits);
+    let proj = |leaf: &str| {
+        infixes
+            .iter()
+            .find_map(|infix| declared(&format!("{moe_prefix}.{infix}.{leaf}")))
+            .unwrap_or(bank)
+    };
+    Some(match body {
+        ExpertBody::Gated(_) => ExpertBits::Gated {
+            gate: proj("gate_proj"),
+            up: proj("up_proj"),
+            down: proj("down_proj"),
+        },
+        ExpertBody::Ungated(_) => ExpertBits::Ungated {
+            fc1: proj("fc1"),
+            fc2: proj("fc2"),
+        },
+    })
 }
 
-/// Effective on-disk bit-width of the quantized `embed_tokens` under an
+/// The DSL role of the embedding table: the weight an `embed(..)` op gathers from
+/// (`embed_tokens` on the llama-style fleet, Nemotron-H's `embeddings`), `embed_tokens` when the
+/// program gathers none. Every embed-specific quant rule keys off this one role.
+pub fn embed_table_role(program: &Program, fuf: &Fuf) -> String {
+    fuf.nodes
+        .iter()
+        .filter(|n| n.op == OpKind::Embed)
+        .flat_map(|n| &n.inputs)
+        .find_map(|i| match i {
+            FufInput::Weight { id, .. } => Some(program.weights.path(*id).join(".")),
+            _ => None,
+        })
+        .unwrap_or_else(|| "embed_tokens".to_string())
+}
+
+/// Whether a per-module key (an exact on-disk path) or a `bits_overrides` suffix names the
+/// embedding table `role`: equal, or one ends with the other at a dotted-segment boundary.
+pub fn names_embed(key: &str, role: &str) -> bool {
+    key == role || key.ends_with(&format!(".{role}")) || role.ends_with(&format!(".{key}"))
+}
+
+/// Effective on-disk bit-width of the quantized embedding table `embed_role` under an
 /// MLX-affine method: the per-module entry when the checkpoint is
 /// mixed/dynamic (OptiQ ships `embed_tokens` at 8-bit while the section
 /// default is 4-bit), else a `bits_overrides` entry naming the embed
@@ -1211,8 +1313,8 @@ pub fn affine_moe_expert_bits(
 /// Used by the embedding-fingerprint packed-shape gate so a mixed
 /// checkpoint isn't rejected for computing `hidden / 8` when its
 /// embed is actually packed at `hidden / 4`. Must mirror the untied
-/// `embed_tokens` arm of [`storage_format_for_weight`].
-pub fn affine_embed_bits(method: &QuantMethod) -> Option<u32> {
+/// embedding-table arm of [`storage_format_for_weight`].
+pub fn affine_embed_bits(method: &QuantMethod, embed_role: &str) -> Option<u32> {
     if let QuantMethod::Affine {
         bits,
         bits_overrides,
@@ -1223,12 +1325,12 @@ pub fn affine_embed_bits(method: &QuantMethod) -> Option<u32> {
         Some(
             per_module
                 .iter()
-                .find(|(k, _)| k.ends_with("embed_tokens"))
+                .find(|(k, _)| names_embed(k, embed_role))
                 .map(|&(_, (b, _))| b)
                 .or_else(|| {
                     bits_overrides
                         .iter()
-                        .find(|(s, _)| s.ends_with("embed_tokens"))
+                        .find(|(s, _)| names_embed(s, embed_role))
                         .map(|&(_, b)| b)
                 })
                 .unwrap_or(*bits),
@@ -1250,6 +1352,7 @@ pub fn storage_format_for_weight(
     };
 
     let dotted: String = program.weights.path(id).join(".");
+    let embed_role = embed_table_role(program, fuf);
     for excl in &qc.modules_to_not_convert {
         if dotted.ends_with(excl) {
             return StorageFormat::Dense;
@@ -1290,7 +1393,7 @@ pub fn storage_format_for_weight(
             // embed's on-disk bits. MLX mixed checkpoints (OptiQ) ship
             // `embed_tokens` at 8-bit while the default is 4-bit.
             if !per_module.is_empty() {
-                return match per_module_lookup(program, per_module, "embed_tokens", None) {
+                return match per_module_lookup(program, per_module, &embed_role, None) {
                     Some((b, g)) => StorageFormat::Affine {
                         bits: b,
                         group_size: g,
@@ -1304,7 +1407,7 @@ pub fn storage_format_for_weight(
             // and implies the buffer IS quantized.
             if let Some(&(_, b)) = bits_overrides
                 .iter()
-                .find(|(s, _)| "embed_tokens".ends_with(s.as_str()))
+                .find(|(s, _)| names_embed(s, &embed_role))
             {
                 return StorageFormat::Affine {
                     bits: b,
@@ -1335,7 +1438,7 @@ pub fn storage_format_for_weight(
     // dotted-name lm_head rule already returns Affine above), so the
     // rule below only fires for untied checkpoints; tied checkpoints
     // ignore `quantize_embed` entirely.
-    if dotted == "embed_tokens"
+    if dotted == embed_role
         && !model.tie_word_embeddings
         && let QuantMethod::Affine {
             bits,
@@ -1350,7 +1453,7 @@ pub fn storage_format_for_weight(
         // bits (OptiQ: 8-bit). Otherwise fall back to the `quant_embed`
         // preset flag (older uniform converts).
         if !per_module.is_empty() {
-            return match per_module_lookup(program, per_module, "embed_tokens", None) {
+            return match per_module_lookup(program, per_module, &embed_role, None) {
                 Some((b, g)) => StorageFormat::Affine {
                     bits: b,
                     group_size: g,
@@ -1365,7 +1468,7 @@ pub fn storage_format_for_weight(
         // then the suffix override, then the default.
         if let Some(&(_, b)) = bits_overrides
             .iter()
-            .find(|(s, _)| "embed_tokens".ends_with(s.as_str()))
+            .find(|(s, _)| names_embed(s, &embed_role))
         {
             return StorageFormat::Affine {
                 bits: b,
@@ -1724,6 +1827,141 @@ mod tests {
         );
     }
 
+    /// Nemotron-3-Super-120B-A12B-OptiQ-2bit's per-module map, the rows of its layers 0
+    /// (Mamba), 1 (a 4/4 bank), 8 (the 4/2 split bundle) and 10 (a 2/2 bank), verbatim from
+    /// the checkpoint's `config.json`. The router gate and the correction bias are dense: the
+    /// map does not list them.
+    const NEMOTRON_SUPER_OPTIQ_SLICE: &str = r#"{
+        "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            "backbone.layers.0.mixer.in_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.0.mixer.out_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.1.mixer.switch_mlp.fc1": { "bits": 4, "group_size": 64 },
+            "backbone.layers.1.mixer.switch_mlp.fc2": { "bits": 4, "group_size": 64 },
+            "backbone.layers.1.mixer.shared_experts.up_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.1.mixer.shared_experts.down_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.1.mixer.fc1_latent_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.1.mixer.fc2_latent_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.8.mixer.switch_mlp.fc1": { "bits": 4, "group_size": 64 },
+            "backbone.layers.8.mixer.switch_mlp.fc2": { "bits": 2, "group_size": 64 },
+            "backbone.layers.8.mixer.shared_experts.up_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.8.mixer.shared_experts.down_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.8.mixer.fc1_latent_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.8.mixer.fc2_latent_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.10.mixer.switch_mlp.fc1": { "bits": 2, "group_size": 64 },
+            "backbone.layers.10.mixer.switch_mlp.fc2": { "bits": 2, "group_size": 64 },
+            "backbone.layers.10.mixer.shared_experts.up_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.10.mixer.shared_experts.down_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.10.mixer.fc1_latent_proj": { "bits": 4, "group_size": 64 },
+            "backbone.layers.10.mixer.fc2_latent_proj": { "bits": 4, "group_size": 64 }
+        }
+    }"#;
+
+    fn method_of(text: &str) -> QuantMethod {
+        QuantizationConfig::parse(&json(text))
+            .unwrap()
+            .expect("a quantization section")
+            .method
+    }
+
+    /// The nemotron-h DSL names the MoE bundle `moe`; on disk it is `mixer`.
+    fn nemotron_program() -> Program {
+        let mut program = Program::default();
+        program.weight_leaf_renames = vec![("moe".to_string(), "mixer".to_string())];
+        program
+    }
+
+    /// ONE resolver gives each routed-expert projection its own width: the 4/2 split bundle of
+    /// layer 8 resolves apart — through the DSL role the step records ask by (`moe`) and the
+    /// layer-0 safetensors prefix the loader plans by alike — and its neighbours resolve whole.
+    #[test]
+    fn affine_moe_expert_bits_resolves_each_projection_of_a_split_bundle() {
+        use scratchy_subtile::subtile_ir::{ExpertBody, UngatedAct};
+        let (method, program) = (method_of(NEMOTRON_SUPER_OPTIQ_SLICE), nemotron_program());
+        let relu2 = ExpertBody::Ungated(UngatedAct::Relu2);
+        let at = |prefix: &str, layer: u64| {
+            affine_moe_expert_bits(&program, &method, prefix, Some(UnrollIndex(layer)), relu2)
+        };
+        for prefix in ["moe", "backbone.layers.0.mixer"] {
+            assert_eq!(at(prefix, 8), Some(ExpertBits::Ungated { fc1: 4, fc2: 2 }));
+            assert_eq!(at(prefix, 10), Some(ExpertBits::Ungated { fc1: 2, fc2: 2 }));
+            assert_eq!(at(prefix, 1), Some(ExpertBits::Ungated { fc1: 4, fc2: 4 }));
+        }
+        assert_eq!(
+            ExpertBits::Ungated { fc1: 4, fc2: 2 }.projections(),
+            [None, Some(4), Some(2)],
+            "an ungated bank has no gate; fc1 is its up projection, fc2 its down"
+        );
+        assert_eq!(
+            ExpertBits::Ungated { fc1: 4, fc2: 2 }.leaves(),
+            vec![("fc1", 4), ("fc2", 2)]
+        );
+    }
+
+    /// A per-module map is authoritative: the router gate it does not list is DENSE, so no
+    /// affine width is claimed for it (the fingerprint would otherwise demand a packed gate the
+    /// checkpoint does not have). The section default is no stand-in.
+    #[test]
+    fn a_router_gate_the_per_module_map_leaves_dense_has_no_affine_width() {
+        let (method, program) = (method_of(NEMOTRON_SUPER_OPTIQ_SLICE), nemotron_program());
+        let gate =
+            |layer| affine_role_bits(&program, &method, "moe.gate", Some(UnrollIndex(layer)));
+        assert_eq!(gate(8), None);
+        assert_eq!(gate(1), None);
+        assert_eq!(
+            affine_role_bits(
+                &program,
+                &method,
+                "moe.shared_experts.up_proj",
+                Some(UnrollIndex(8))
+            ),
+            Some(4)
+        );
+    }
+
+    /// Without a per-module map the gated projections share the bank's width — the section
+    /// default, or a `bits_overrides` suffix naming the bank — exactly as the one width the
+    /// resolver returned before it was per projection.
+    #[test]
+    fn uniform_affine_expert_bits_are_the_banks_one_width() {
+        use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct, UngatedAct};
+        let program = Program::default();
+        let silu = ExpertBody::Gated(GatedAct::Silu);
+        let uniform = method_of(r#"{"quantization": {"group_size": 64, "bits": 4}}"#);
+        assert_eq!(
+            affine_moe_expert_bits(&program, &uniform, "mlp", Some(UnrollIndex(3)), silu),
+            Some(ExpertBits::Gated {
+                gate: 4,
+                up: 4,
+                down: 4
+            })
+        );
+        let relu2 = ExpertBody::Ungated(UngatedAct::Relu2);
+        assert_eq!(
+            affine_moe_expert_bits(&program, &uniform, "moe", None, relu2),
+            Some(ExpertBits::Ungated { fc1: 4, fc2: 4 })
+        );
+        let overridden = method_of(
+            r#"{"quantization": {"group_size": 64, "bits": 4,
+                "bits_overrides": {"mlp.switch_mlp": 8}}}"#,
+        );
+        assert_eq!(
+            affine_moe_expert_bits(&program, &overridden, "mlp", None, silu),
+            Some(ExpertBits::Gated {
+                gate: 8,
+                up: 8,
+                down: 8
+            })
+        );
+        assert_eq!(
+            affine_moe_expert_bits(&program, &QuantMethod::Ggml, "mlp", None, silu),
+            None,
+            "a non-affine method keeps its storage format's bits"
+        );
+    }
+
     /// Opt-in: parse the FULL upstream OptiQ `config.json` and assert
     /// the exact mixed-bit census (247 × 8-bit, 79 × 4-bit, all g64).
     /// Skips unless `SCRATCHY_OPTIQ_CONFIG` points at a downloaded copy,
@@ -1751,6 +1989,158 @@ mod tests {
         let n4 = per_module.iter().filter(|(_, (b, _))| *b == 4).count();
         assert_eq!((n8, n4), (247, 79));
         assert!(per_module.iter().all(|(_, (_, g))| *g == 64));
+    }
+
+    /// `(path under the macro crate, parsed JSON)` of a checked-in file.
+    fn checked_in(rel: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The FULL Nemotron-3-Super-120B-A12B-OptiQ-2bit per-module map, verbatim from the
+    /// checkpoint's `config.json` (`test_fixtures/`), and the per-(stem, preset) drift file the
+    /// build actually compiles: they are the same map, it parses whole, and every MoE layer's
+    /// projections resolve to the widths the checkpoint ships — the 4/2 split bundle on layer 8
+    /// included — with the router gate dense on every one of them.
+    #[test]
+    fn the_full_super_optiq_map_parses_and_resolves_every_expert_projection() {
+        use scratchy_subtile::subtile_ir::{ExpertBody, UngatedAct};
+        let checkpoint = checked_in(
+            "../../models/quantization/test_fixtures/\
+             mlx-community_NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit.config.json",
+        );
+        let drift = checked_in(
+            "../../models/arch/configs/nemotron-h-latent/\
+             nemotron-3-super-120b-a12b-mlx-affine-b4-g64-qembed.overrides.json",
+        );
+        let QuantMethod::Affine {
+            bits,
+            group_size,
+            per_module,
+            ..
+        } = QuantizationConfig::parse(&checkpoint)
+            .unwrap()
+            .expect("some")
+            .method
+        else {
+            panic!("OptiQ is MLX affine");
+        };
+        assert_eq!((bits, group_size), (4, 64));
+        assert_eq!(per_module.len(), 354, "one entry per quantized module");
+        let at = |b: u32| per_module.iter().filter(|(_, (w, _))| *w == b).count();
+        assert_eq!((at(4), at(2)), (291, 63));
+        assert!(per_module.iter().all(|(_, (_, g))| *g == 64));
+
+        // The drift file over the preset is the checkpoint's map, entry for entry.
+        let mut compiled = drift.clone();
+        compiled["quantization_config"]["bits"] = 4.into();
+        compiled["quantization_config"]["group_size"] = 64.into();
+        compiled["quantization_config"]["quant_embed"] = true.into();
+        let method = QuantizationConfig::parse(&compiled)
+            .unwrap()
+            .expect("some")
+            .method;
+        let QuantMethod::Affine {
+            per_module: compiled_map,
+            ..
+        } = &method
+        else {
+            panic!("the compiled variant is MLX affine");
+        };
+        assert_eq!(
+            compiled_map, &per_module,
+            "the drift file drifted from the checkpoint"
+        );
+
+        let program = nemotron_program();
+        let relu2 = ExpertBody::Ungated(UngatedAct::Relu2);
+        let pattern = checkpoint["hybrid_override_pattern"].as_str().unwrap();
+        let moe_layers: Vec<u64> = (0u64..)
+            .zip(pattern.chars())
+            .filter(|&(_, c)| c == 'E')
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(moe_layers.len(), 40);
+        for &layer in &moe_layers {
+            let want = match layer {
+                8 => ExpertBits::Ungated { fc1: 4, fc2: 2 },
+                1 | 3 | 5 | 79 | 81 | 83 | 85 | 87 => ExpertBits::Ungated { fc1: 4, fc2: 4 },
+                _ => ExpertBits::Ungated { fc1: 2, fc2: 2 },
+            };
+            for prefix in ["moe", "backbone.layers.0.mixer"] {
+                assert_eq!(
+                    affine_moe_expert_bits(
+                        &program,
+                        &method,
+                        prefix,
+                        Some(UnrollIndex(layer)),
+                        relu2
+                    ),
+                    Some(want),
+                    "layer {layer} via `{prefix}`",
+                );
+            }
+            assert_eq!(
+                affine_role_bits(&program, &method, "moe.gate", Some(UnrollIndex(layer))),
+                None,
+                "layer {layer}: the router gate is dense"
+            );
+            for role in [
+                "moe.shared_experts.up_proj",
+                "moe.shared_experts.down_proj",
+                "moe.fc1_latent_proj",
+                "moe.fc2_latent_proj",
+            ] {
+                assert_eq!(
+                    affine_role_bits(&program, &method, role, Some(UnrollIndex(layer))),
+                    Some(4),
+                    "layer {layer} {role}"
+                );
+            }
+        }
+        assert_eq!(affine_embed_bits(&method, "embeddings"), Some(4));
+        // `lm_head` sits outside the decoder root: its key is the bare role, which the
+        // dot-anchored layer candidate cannot match — resolving it dense loads the packed U32
+        // as BF16 (the quantized parity-tiny's NaN logits).
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "lm_head", None),
+            Some((4, 64))
+        );
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "embeddings", None),
+            Some((4, 64))
+        );
+        assert_eq!(
+            per_module_lookup(&program, &per_module, "head", None),
+            None,
+            "a top-level match is the whole key, not a suffix"
+        );
+    }
+
+    /// The embedding table is whatever the `embed(..)` op gathers from, by role: a per-module
+    /// map or a `bits_overrides` suffix names Nemotron-H's `backbone.embeddings` the way it names
+    /// the llama fleet's `model.embed_tokens`, and neither name stands in for the other.
+    #[test]
+    fn the_embedding_table_is_named_by_its_role() {
+        assert!(names_embed("backbone.embeddings", "embeddings"));
+        assert!(names_embed("embed_tokens", "embed_tokens"));
+        assert!(names_embed(
+            "language_model.model.embed_tokens",
+            "embed_tokens"
+        ));
+        assert!(names_embed("embeddings", "model.embeddings"));
+        assert!(!names_embed("backbone.embeddings", "embed_tokens"));
+        assert!(!names_embed("model.tok_embeddings", "embeddings"));
+        let method = QuantMethod::Affine {
+            bits: 2,
+            group_size: 64,
+            quantize_embed: false,
+            bits_overrides: Vec::new(),
+            per_module: vec![("backbone.embeddings".to_string(), (8, 64))],
+        };
+        assert_eq!(affine_embed_bits(&method, "embeddings"), Some(8));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(2));
     }
 
     #[test]
@@ -1860,7 +2250,7 @@ mod tests {
             bits_overrides: vec![("embed_tokens".to_string(), 4)],
             per_module: Vec::new(),
         };
-        assert_eq!(affine_embed_bits(&method), Some(4));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(4));
 
         // The per-module map outranks the override (OptiQ precedence).
         let method = QuantMethod::Affine {
@@ -1870,7 +2260,7 @@ mod tests {
             bits_overrides: vec![("embed_tokens".to_string(), 4)],
             per_module: vec![("model.embed_tokens".to_string(), (8, 64))],
         };
-        assert_eq!(affine_embed_bits(&method), Some(8));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(8));
 
         // No override, no per-module entry: the section default.
         let method = QuantMethod::Affine {
@@ -1880,7 +2270,7 @@ mod tests {
             bits_overrides: Vec::new(),
             per_module: Vec::new(),
         };
-        assert_eq!(affine_embed_bits(&method), Some(2));
+        assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(2));
     }
 
     #[test]

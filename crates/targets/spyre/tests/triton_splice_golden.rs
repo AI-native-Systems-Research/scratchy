@@ -263,8 +263,9 @@ fn a_column_chunked_silumul_splices_through_the_door() {
 const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096), (96, 4096)];
 
 /// Every `EwKind` the splice has a row for. The kinds the door refuses
-/// (Gelu/QuickGelu/GeluErf) are absent: they have no descriptor chain, so a
-/// door comparison would pin nothing.
+/// (Gelu/QuickGelu/GeluErf) and the kind the splice itself refuses (Relu2 —
+/// Nemotron-H is not spyre-capable) are absent: they have no descriptor
+/// chain, so a door comparison would pin nothing.
 const EW_KINDS: &[EwKind] = &[
     EwKind::Add,
     EwKind::BiasAdd,
@@ -285,6 +286,10 @@ fn elementwise_stem(kind: EwKind) -> &'static str {
         EwKind::Gelu => "gelu",
         EwKind::QuickGelu => "quickgelu",
         EwKind::GeluErf => "geluerf",
+        // Refused by the splice (no squared-ReLU kernel in the elementwise
+        // family), so it never reaches `elementwise_stem` through `EW_KINDS` —
+        // it is enumerated here only to keep this match exhaustive.
+        EwKind::Relu2 => "relu2",
     }
 }
 

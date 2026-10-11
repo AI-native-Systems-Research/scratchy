@@ -695,12 +695,14 @@ fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
         scale: Some(Scale(0.018_844_6)),
         post: RoutePost::Softmax,
         expert_scale: Some(LayerId(0)),
+        post_scale: None,
     };
     let shared = RouteProgram {
         pre: RoutePre::Softmax,
         scale: None,
         post: RoutePost::Renorm,
         expert_scale: None,
+        post_scale: None,
     };
     for (what, program) in [("gemma", gemma), ("shared", shared)] {
         routed_matches_the_routing_command(&device, &block, program, false)
@@ -927,6 +929,7 @@ fn bench_moe_fused() {
         scale: Some(Scale(0.018_844_6)),
         post: RoutePost::Softmax,
         expert_scale: Some(LayerId(0)),
+        post_scale: None,
     };
     for round in 0..3 {
         let timed = routed_matches_the_routing_command(&device, &block, gemma, true);

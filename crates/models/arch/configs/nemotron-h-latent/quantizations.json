@@ -1,0 +1,6 @@
+{
+  "_comment": "`mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit` declares a 4-bit / g64 affine section default — this preset — plus a per-module map naming every quantized module at its own width (mostly 2-bit routed experts, one 4/2 split bundle on layer 8). That map is per-checkpoint drift, declared in `nemotron-3-super-120b-a12b-mlx-affine-b4-g64-qembed.overrides.json`, not here (#202: an arch-wide map would make any other checkpoint of the arch unloadable). With a per-module map present its membership is authoritative, so the preset's `quant_embed` adds nothing; the map itself lists the embeddings and lm_head at 4-bit.",
+  "quantizations": [
+    "mlx-affine-b4-g64-qembed"
+  ]
+}

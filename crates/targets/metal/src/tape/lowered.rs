@@ -65,6 +65,10 @@ pub enum KernelId {
     /// paged KV cache at the per-request slot. Output: rotated Q
     /// only (K/V are sunk into cache).
     RopeAppend,
+    /// Write a fresh K/V projection, un-rotated, to the paged KV cache
+    /// at the per-request slot (no-RoPE attention). `kv_append_<dtype>`
+    /// in `kv_append.metallib`.
+    KvAppend,
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,
@@ -524,6 +528,7 @@ impl KernelId {
             | Self::NormedGemv
             | Self::FusedGateUpSiluMul
             | Self::RopeAppend
+            | Self::KvAppend
             | Self::AttentionViaCache
             | Self::AttentionPrefillSdpaPaged
             | Self::AttnQConvert
@@ -920,7 +925,7 @@ pub enum SourceRef<'w> {
     /// gpt-oss MoE (biased router + SwiGLU-OAI experts with per-expert
     /// linear biases).
     GptOssMoe(&'w scratchy_layers::layers_moe::GptOssMoELayer),
-    /// Qwen3.5 Gated-DeltaNet per-layer weights.
+    /// Qwen3.5 Gated-DeltaNet / Nemotron-H Mamba-2 per-layer weights.
     GatedDeltaNet(&'w scratchy_layers::GatedDeltaNetLayer),
 }
 
@@ -955,9 +960,9 @@ impl SourceRef<'_> {
         use scratchy_layers::layers_moe::{FusedMoELayer as F, SharedFusedMoELayer as Sh};
         let routed = |r: &scratchy_layers::layers_moe::AffineFusedMoELayer| match which {
             T::MoeRouterGate => Some(r.router_gate),
-            T::MoeExpertGateW => Some(r.expert_gate_w),
-            T::MoeExpertGateS => Some(r.expert_gate_scales),
-            T::MoeExpertGateB => Some(r.expert_gate_biases),
+            T::MoeExpertGateW => r.expert_gate_w,
+            T::MoeExpertGateS => r.expert_gate_scales,
+            T::MoeExpertGateB => r.expert_gate_biases,
             T::MoeExpertUpW => Some(r.expert_up_w),
             T::MoeExpertUpS => Some(r.expert_up_scales),
             T::MoeExpertUpB => Some(r.expert_up_biases),
@@ -988,6 +993,8 @@ impl SourceRef<'_> {
             (Self::GatedDeltaNet(g), T::GdnALog) => Some(g.a_log),
             (Self::GatedDeltaNet(g), T::GdnDtBias) => Some(g.dt_bias),
             (Self::GatedDeltaNet(g), T::GdnNorm) => Some(g.norm),
+            (Self::GatedDeltaNet(g), T::GdnConvBias) => g.conv_bias,
+            (Self::GatedDeltaNet(g), T::GdnSkip) => g.d,
             (Self::GemmaRouter(r), T::GemmaRouterGate) => Some(r.gate),
             (Self::GemmaRouter(r), T::GemmaPerExpertScale) => Some(r.per_expert_scale),
             (Self::GemmaRouter(r), T::GemmaRouterScale) => Some(r.scale),
@@ -1162,8 +1169,12 @@ pub enum WeightTensor {
     GdnALog,
     /// Per-value-head softplus bias `dt_bias` `[num_v_heads]`.
     GdnDtBias,
-    /// Gated-RMSNorm weight `[head_v_dim]`.
+    /// Gated-RMSNorm weight `[head_v_dim]` (Mamba-2: `[d_inner]`).
     GdnNorm,
+    /// Mamba-2 causal conv1d bias `[conv_dim]` (on-disk dtype).
+    GdnConvBias,
+    /// Mamba-2 per-head skip `D` `[num_heads]` (f32).
+    GdnSkip,
 }
 
 /// Categories of buffers the worker rebinds per forward call.
@@ -1960,6 +1971,10 @@ pub enum LoweringError {
     /// offset's norm, not the signal's, set the codec's error: a K bias, with no
     /// rotary table to rotate it to each key (rope-on-read off).
     TurboQuantOffsetUnbound { index: usize },
+    /// A TurboQuant-coded KV writer at tape index `index` that writes its K/V un-rotated
+    /// (`KvAppend`) with an additive offset: the codec's restores rotate a K bias to the key and
+    /// bind the writer's rotary table for either, and such a writer has none.
+    UnrotatedWriterOffset { index: usize },
     /// A step at tape index `index` binds the `slot`-th `kind` weight of its site, and its
     /// site holds no such source — the step records and the opcode lowering disagree.
     NoSource {
@@ -2033,6 +2048,11 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
                  operand's additive offset (no rotary table rotates its K bias)"
+            ),
+            Self::UnrotatedWriterOffset { index } => write!(
+                f,
+                "lowering: the TurboQuant-coded un-rotated KV writer at tape index {index} \
+                 carries a projection bias the codec cannot restore"
             ),
             Self::NoSource { index, kind, slot } => write!(
                 f,

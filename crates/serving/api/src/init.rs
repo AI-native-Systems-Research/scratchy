@@ -1027,8 +1027,9 @@ fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
         a.contains("Qwen3_5")
             || a.contains("Qwen3_6")
             || a.contains("Qwen3Next")
-            // Mamba / SSM families.
+            // Mamba / SSM families (Nemotron-H: Mamba-2 + attention + MoE).
             || a.contains("Mamba")
+            || a.contains("NemotronH")
             || a.contains("Jamba")
             || a.contains("FalconH")
             || a.contains("RecurrentGemma")
@@ -4082,6 +4083,37 @@ mod tests {
         assert_eq!(
             extract_model_name("meta-llama/Llama-3.2-1B"),
             "meta-llama/Llama-3.2-1B"
+        );
+    }
+
+    /// Nemotron-H's Mamba-2 layers carry conv/ssm state no cached KV prefix
+    /// restores, so its architecture string turns prefix caching off.
+    #[test]
+    fn test_nemotron_h_is_a_recurrent_hybrid() {
+        for arch in ["NemotronHForCausalLM", "Qwen3_5MoeForConditionalGeneration"] {
+            assert!(is_recurrent_hybrid_arch(&[arch.to_string()]), "{arch}");
+        }
+        assert!(!is_recurrent_hybrid_arch(&["LlamaForCausalLM".to_string()]));
+    }
+
+    /// The mlx-community Nemotron-3 checkpoints' stop ids: `config.json` says
+    /// 11 (Nano) — the base model's 2 drifted — and `generation_config.json`
+    /// `[2, 11]`; the merge keeps both.
+    #[test]
+    fn test_nemotron_eos_ids_merge_config_and_generation_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"bos_token_id": 1, "eos_token_id": [2, 11], "pad_token_id": 0}"#,
+        )
+        .unwrap();
+        let mut config = HfModelConfig::default();
+        config
+            .extra
+            .insert("eos_token_id".to_string(), serde_json::json!(11));
+        assert_eq!(
+            resolve_eos_token_ids(&config, Some(dir.path()), None),
+            vec![11, 2]
         );
     }
 

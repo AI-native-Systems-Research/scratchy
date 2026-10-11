@@ -8179,6 +8179,7 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         OpKind::Embed
         | OpKind::RopeAppend
         | OpKind::RopeAppendInterleaved
+        | OpKind::KvAppend
         | OpKind::Attention
         | OpKind::SlidingAttention
         | OpKind::VarlenAttention
@@ -8186,6 +8187,7 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::Gelu
         | OpKind::QuickGelu
         | OpKind::GeluErf
+        | OpKind::Relu2
         | OpKind::TanhSoftCap
         | OpKind::ScalarWeightMul
         | OpKind::Add
@@ -8204,6 +8206,7 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::SinkAttention
         | OpKind::SinkSlidingAttention
         | OpKind::GatedDeltaNet
+        | OpKind::Mamba2
         | OpKind::GateSplit
         | OpKind::GateApply
         | OpKind::GateScale
@@ -16648,6 +16651,7 @@ mod tests {
             source_path: std::path::PathBuf::new(),
             bounds,
             scalars,
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16657,6 +16661,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let scale = attention_scale_for(&model);
@@ -16695,6 +16700,7 @@ mod tests {
                 b
             },
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16704,6 +16710,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16776,6 +16783,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect::<std::collections::BTreeMap<_, _>>(),
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16785,6 +16793,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16880,6 +16889,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect::<std::collections::BTreeMap<_, _>>(),
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -16889,6 +16899,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17417,6 +17428,7 @@ mod tests {
             source_path: std::path::PathBuf::new(),
             bounds: std::collections::BTreeMap::new(),
             scalars: std::collections::BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -17426,6 +17438,7 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {

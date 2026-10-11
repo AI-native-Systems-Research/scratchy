@@ -3480,20 +3480,14 @@ pub(crate) fn repack_moe_expert_bits(
         .map(|instr| match instr {
             I::MetalSharedFusedMoe(a, b, layer, d, e, f, g, h, i, bits, k) => {
                 let idx = Some(UnrollIndex(layer as u64));
-                let resolve = |proj: &str| {
-                    crate::quantization::affine_role_bits(
-                        program,
-                        &qc.method,
-                        &format!("mlp.switch_mlp.{proj}"),
-                        idx,
+                let widths = model.expert_activation.body().ok().and_then(|body| {
+                    crate::quantization::affine_moe_expert_bits(
+                        program, &qc.method, "mlp", idx, body,
                     )
-                    .unwrap_or(bits)
-                };
-                let packed = scratchy_forward_compiler::pack_moe_expert_bits(
-                    resolve("gate_proj"),
-                    resolve("up_proj"),
-                    resolve("down_proj"),
-                );
+                });
+                let [gate, up, down] =
+                    widths.map_or([bits; 3], |w| w.projections().map(|p| p.unwrap_or(bits)));
+                let packed = scratchy_forward_compiler::pack_moe_expert_bits(gate, up, down);
                 I::MetalSharedFusedMoe(a, b, layer, d, e, f, g, h, i, packed, k)
             }
             other => other,

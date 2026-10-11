@@ -18,11 +18,14 @@
 //! that fails `fingerprint_matches` for EVERY compiled variant fails
 //! here, not just in production.
 //!
-//! Cosine > 0.99 on the LAST logits row (the lm_head scatter target —
-//! the same convention as the qwen3 gate), mirroring the qwen3.5-VL
-//! green gate's threshold: bf16 accumulation over the whole stack means
-//! a lower value is a real divergence between carrier text and compiled
-//! tape, not noise.
+//! A text carrier runs as the worker runs a sequence: one prefill over the
+//! leading `prefill_tokens`, then one decode step per remaining token over
+//! the same KV pool and recurrent state. Each step's LAST logits row (the
+//! lm_head scatter target — the same convention as the qwen3 gate) must
+//! reach cosine > 0.99 against the oracle's row at that position, mirroring
+//! the qwen3.5-VL green gate's threshold: bf16 accumulation over the whole
+//! stack means a lower value is a real divergence between carrier text and
+//! compiled tape, not noise.
 //!
 //! Regenerate goldens + checkpoints (torch venv):
 //!   python tests/golden_gen_carrier.py --arch qwen3 --stem qwen3-0.6b --tiny
@@ -30,6 +33,10 @@
 //! Run (NO quant features — a preset replaces dense emission):
 //!   cargo test -p scratchy-models --features metal,qwen3-0.6b-parity-tiny \
 //!     --test carrier_parity -- --nocapture
+//!
+//! A `(stem, preset)` variant's golden (`golden_gen_carrier.py --preset P`)
+//! runs in a build selecting that preset
+//! (`--features ...,scratchy-quantizations/P`); every other build skips it.
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -45,12 +52,13 @@ mod imp {
     use scratchy_target_metal::device::Device;
     use scratchy_target_metal::kv_cache::KvCachePool;
     use scratchy_target_metal::{
-        DType, ForwardCtx, GpuDevice, GpuWeights, MetalAllocator, MetalMem,
+        DType, ForwardCtx, GpuDevice, GpuTensor, GpuWeights, MetalAllocator, MetalMem, TensorView,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     const GOLDENS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goldens");
+    const CONFIGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/configs");
     const BLOCK_SIZE: usize = 16; // engine block size (metal worker default)
     const NUM_BLOCKS: usize = 128; // pool size the oracle built its identity layout over
 
@@ -71,6 +79,12 @@ mod imp {
 
     fn load_bin_u32(path: &Path) -> Vec<u32> {
         load_bin_f32(path).into_iter().map(|v| v as u32).collect()
+    }
+
+    /// A ctx input over host memory — what the worker hands the forward,
+    /// which reads every input on the host into its own runtime buffers.
+    fn host_view<'a, T>(v: &'a [T], shape: &[usize], dtype: DType) -> TensorView<'a> {
+        unsafe { TensorView::from_raw(GpuTensor::new(v.as_ptr() as *mut u8, shape, dtype)) }
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -94,6 +108,54 @@ mod imp {
         /// sizes, n_merged. Its presence routes the case to the vision arm.
         #[cfg_attr(not(feature = "vision"), allow(dead_code))]
         vision_grid: Option<serde_json::Value>,
+        /// `harness.json`'s `dense_moe`: whether the oracle EXECUTED a
+        /// dense MoE (a hybrid schedule may declare experts no layer runs).
+        dense_moe: bool,
+        /// `harness.json`'s `oracle_quant`: whether the oracle EXECUTED the
+        /// checkpoint's quantization — the dequantized MLX-affine weights
+        /// the checkpoint stores.
+        oracle_quant: bool,
+        /// `harness.json`'s `prefill_tokens`: the leading tokens the gate
+        /// prefills in one step; every later token is one decode step.
+        prefill_tokens: usize,
+        /// `harness.json`'s `preset`: the quant preset whose `(stem, preset)`
+        /// variant the oracle generated this golden for (`--preset`), or
+        /// `None` for the dense base.
+        preset: Option<String>,
+    }
+
+    impl Case {
+        /// Whether this build emits the `(stem, preset)` variant the golden
+        /// was generated for. A selected preset REPLACES the dense emission
+        /// of every arch whose `quantizations.json` declares it, so a dense
+        /// golden belongs to a build selecting none of its arch's presets,
+        /// and a preset golden to a build selecting that preset.
+        fn emitted_by_this_build(&self) -> bool {
+            let selected = scratchy_quantizations::enabled_presets();
+            match &self.preset {
+                Some(p) => selected.contains(&p.as_str()),
+                None => {
+                    let path = Path::new(CONFIGS)
+                        .join(&self.arch)
+                        .join("quantizations.json");
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        return true;
+                    };
+                    let declared: serde_json::Value =
+                        serde_json::from_str(&text).expect("quantizations.json parses");
+                    // Each entry is a bare preset name or a one-key object.
+                    !declared["quantizations"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| {
+                            e.as_str()
+                                .or_else(|| e.as_object()?.keys().next().map(String::as_str))
+                        })
+                        .any(|p| selected.contains(&p))
+                }
+            }
+        }
     }
 
     /// Every `goldens/<arch>-<stem>/` dir carrying a checkpoint — the
@@ -127,6 +189,17 @@ mod imp {
                 arch: harness["arch"].as_str().expect("harness arch").into(),
                 stem: harness["stem"].as_str().expect("harness stem").into(),
                 vision_grid: harness.get("vision_grid").cloned(),
+                dense_moe: harness["dense_moe"]
+                    .as_bool()
+                    .expect("harness dense_moe (regenerate the goldens)"),
+                oracle_quant: harness["oracle_quant"]
+                    .as_bool()
+                    .expect("harness oracle_quant (regenerate the goldens)"),
+                prefill_tokens: harness["prefill_tokens"]
+                    .as_u64()
+                    .expect("harness prefill_tokens (regenerate the goldens)")
+                    as usize,
+                preset: harness["preset"].as_str().map(String::from),
                 dir,
             });
         }
@@ -172,7 +245,13 @@ mod imp {
         let slot_mapping: Vec<u32> = load_bin_u32(&dir.join("slot_mapping.bin"));
         let golden = load_bin_f32(&dir.join("logits.bin"));
         let n = ids.len();
+        let prefill = case.prefill_tokens;
         assert!(!ids.is_empty(), "{}: empty input_ids", case.stem);
+        assert!(
+            (1..=n).contains(&prefill),
+            "{}: prefill_tokens {prefill} outside 1..={n}",
+            case.stem
+        );
         assert_eq!(pos.len(), n, "{}: positions len", case.stem);
         assert_eq!(slot_mapping.len(), n, "{}: slot_mapping len", case.stem);
         assert_eq!(
@@ -202,13 +281,14 @@ mod imp {
         let max_model_len = cfg["max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
 
         // A config carrying a quantization_config names a *quant* variant
-        // (bnb nf4, fp8-block, ...), but the oracle executes the carrier
-        // dense — it has no bitsandbytes emulation. Running it here would
-        // just test the dense variant again under a quant name: a false
-        // green. Quant parity is a separate mechanism, not this gate.
-        if cfg.get("quantization_config").is_some() {
+        // (bnb nf4, fp8-block, ...). The oracle executes a quantization only
+        // when it stores one it computes with exactly — MLX-affine weights,
+        // executed dequantized (`oracle_quant`); any other it runs dense, and
+        // running that here would test the dense variant again under a quant
+        // name: a false green.
+        if cfg.get("quantization_config").is_some() && !case.oracle_quant {
             eprintln!(
-                "skip {}/{}: config carries quantization_config — the oracle is dense-only",
+                "skip {}/{}: config carries a quantization_config the oracle did not execute",
                 case.arch, case.stem
             );
             return;
@@ -221,13 +301,12 @@ mod imp {
         // construction with `NoRung`. The same refusal fires for the
         // oracle's synthetic checkpoint. Comparing torch vs metal here
         // would compare an execution against a refusal: not parity, a
-        // mechanism gap. Named loudly, not silently passed — the unlock is
-        // either a dense-MoE metal kernel or a quant-emulating oracle,
-        // whichever lands first. Sniffed off config keys (num_local_experts
-        // / n_routed_experts / num_experts — the three vocabularies the
-        // bridge itself reads), not an arch list.
-        let moe_keys = ["num_local_experts", "n_routed_experts", "num_experts"];
-        if moe_keys.iter().any(|k| cfg.get(k).is_some()) {
+        // mechanism gap. Named loudly, not silently passed — such an arch
+        // runs through the golden of its quantized variant instead
+        // (`golden_gen_carrier.py --preset`). Read off what the oracle ran
+        // (a dense MoE shim executed), not an arch list — nor the config's
+        // expert-count keys, which a hybrid schedule may declare for no layer.
+        if case.dense_moe {
             eprintln!(
                 "DEFERRED {}/{}: dense MoE — metal requires affine expert storage; \
                  the oracle is dense-only (same refusal both sides)",
@@ -254,10 +333,21 @@ mod imp {
                     );
                     return;
                 }
-                // The arch IS compiled and every variant still declined, which a
-                // feature scope cannot explain — the synthetic checkpoint and the
-                // compiled variant disagree about shapes or quantization layout.
-                // That is a real failure, not a scope skip.
+                // The arch IS compiled and every variant declined. The build's
+                // quant scope explains that only when the golden was generated
+                // for another (stem, preset) emission than this build makes — a
+                // selected preset REPLACES its arch's dense emission.
+                ArchLoad::NoVariantMatched if !case.emitted_by_this_build() => {
+                    eprintln!(
+                        "skip {}/{}: generated for preset {:?}, which is not the emission \
+                         this build's quant scope makes for {}",
+                        case.arch, case.stem, case.preset, case.arch
+                    );
+                    return;
+                }
+                // Otherwise no feature scope explains it — the synthetic
+                // checkpoint and the compiled variant disagree about shapes or
+                // quantization layout. That is a real failure, not a scope skip.
                 ArchLoad::NoVariantMatched => panic!(
                     "{}/{}: {arch_hint} is compiled, but no compiled variant matches this \
                      checkpoint — its shapes or quantization layout differ from every \
@@ -310,7 +400,16 @@ mod imp {
                 // the pool's default is correct); `None` on the uniform
                 // path too (no per-layer override there).
                 None,
-                hybrid.as_ref().map(|l| l.layer_to_tensor.clone()),
+                // The worker's tensors (`kv_pool_tensors`): the hybrid's
+                // group-shared positions, else a tensor per layer that holds
+                // KV (a recurrent hybrid's attention layers), else per layer.
+                match (hybrid.as_ref(), model.kv_cache_layers()) {
+                    (Some(l), _) => Some(l.layer_to_tensor.clone()),
+                    (None, Some(kv)) => {
+                        Some(scratchy_core_config::compact_kv_layer_to_tensor(layers, kv))
+                    }
+                    (None, None) => None,
+                },
                 DType::BF16,
                 128,        // BLOCKS_PER_CHUNK (metal target const)
                 usize::MAX, // eager: one chunk covers our tokens
@@ -338,81 +437,33 @@ mod imp {
         }
         kv.fill_chunk_tables(|m| m.gpu_address());
 
-        // GDN state pool (qwen3-5-style hybrid arches). One slot for our
-        // single sequence, marked fresh — the oracle zero-inits state.
-        let gdn_pool;
-        let mut gdn_indices_view = None;
-        let mut gdn_fresh_view = None;
-        if let Some(gdn_cfg) = model.gdn_runtime_config() {
-            let num_slots = 1usize;
-            gdn_pool = Some(unsafe {
-                scratchy_target_metal::gdn_state::GdnStatePool::new(
-                    layers,
-                    &gdn_cfg.linear_layers,
-                    num_slots,
-                    gdn_cfg.conv_dim as usize,
-                    gdn_cfg.conv_kernel as usize,
-                    gdn_cfg.num_v_heads as usize,
-                    gdn_cfg.head_v_dim as usize,
-                    gdn_cfg.head_k_dim as usize,
-                    |bytes| {
-                        // f32 conv/ssm state; MUST be StorageModeShared.
-                        Ok(MetalMem::new_pinned(
-                            device_arc,
-                            allocator.residency(),
-                            bytes,
-                        ))
-                    },
-                )
-                .expect("GdnStatePool::new")
-            });
-            // slot 0 for our one sequence, fresh (state zero-init).
-            let idx: [i32; 1] = [0];
-            let fresh: [u32; 1] = [1];
-            let idx_buf = device.alloc_gpu_tensor_from_host(&[1], DType::I32, unsafe {
-                std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4)
-            });
-            let fresh_buf = device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
-                std::slice::from_raw_parts(fresh.as_ptr() as *const u8, 4)
-            });
-            gdn_indices_view = Some(unsafe { idx_buf.as_view() });
-            gdn_fresh_view = Some(unsafe { fresh_buf.as_view() });
-        } else {
-            gdn_pool = None;
-        }
+        // GDN / Mamba-2 state pool (recurrent hybrid arches). One slot for
+        // our single sequence, marked fresh on the prefill step — the oracle
+        // zero-inits state — and carried into every decode step after it.
+        let gdn_pool = model.gdn_runtime_config().map(|gdn_cfg| unsafe {
+            scratchy_target_metal::gdn_state::GdnStatePool::new(
+                layers,
+                &gdn_cfg.linear_layers,
+                1,
+                gdn_cfg.conv_dim as usize,
+                gdn_cfg.conv_kernel as usize,
+                gdn_cfg.num_v_heads as usize,
+                gdn_cfg.head_v_dim as usize,
+                gdn_cfg.head_k_dim as usize,
+                |bytes| {
+                    // f32 conv/ssm state; MUST be StorageModeShared.
+                    Ok(MetalMem::new_pinned(
+                        device_arc,
+                        allocator.residency(),
+                        bytes,
+                    ))
+                },
+            )
+            .expect("GdnStatePool::new")
+        });
 
-        // ── inputs (identity layout, the oracle's convention) ────
-        let cu_seqlens: Vec<u32> = vec![0, n as u32];
-        let seqused_k: Vec<u32> = vec![n as u32];
-        let ids_buf = device.alloc_gpu_tensor_from_host(&[n], DType::U32, unsafe {
-            std::slice::from_raw_parts(ids.as_ptr() as *const u8, n * 4)
-        });
-        let pos_buf = device.alloc_gpu_tensor_from_host(&[n], DType::U32, unsafe {
-            std::slice::from_raw_parts(pos.as_ptr() as *const u8, n * 4)
-        });
-        let sm_buf = device.alloc_gpu_tensor_from_host(&[n], DType::U32, unsafe {
-            std::slice::from_raw_parts(slot_mapping.as_ptr() as *const u8, n * 4)
-        });
-        let cu_buf = device.alloc_gpu_tensor_from_host(&[cu_seqlens.len()], DType::U32, unsafe {
-            std::slice::from_raw_parts(cu_seqlens.as_ptr() as *const u8, cu_seqlens.len() * 4)
-        });
-        let su_buf = device.alloc_gpu_tensor_from_host(&[seqused_k.len()], DType::U32, unsafe {
-            std::slice::from_raw_parts(seqused_k.as_ptr() as *const u8, seqused_k.len() * 4)
-        });
-        // Row stride = NUM_BLOCKS: the pool is built with
-        // `max_blocks_per_seq = NUM_BLOCKS.max(1)`, and the macro bakes the
-        // kernel's MAX_BLOCKS_PER_SEQ from that same pool value — so host
-        // stride == kernel stride by construction (the worker's own rule).
-        let bt_buf = device.alloc_gpu_tensor_from_host(&[1, NUM_BLOCKS], DType::U32, unsafe {
-            std::slice::from_raw_parts(block_table.as_ptr() as *const u8, NUM_BLOCKS * 4)
-        });
-        // The worker ALWAYS passes per-sequence sample rows for prefill —
-        // `None` means 0 and the lm_head slice trio's gather/scatter become
-        // no-ops, leaving only stale arena at the last row.
-        let lti: Vec<u32> = vec![n as u32 - 1];
-        let lti_buf = device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
-            std::slice::from_raw_parts(lti.as_ptr() as *const u8, 4)
-        });
+        // Recurrent-state slot 0 for our one sequence.
+        let gdn_idx: [i32; 1] = [0];
 
         // Sliding KV-cache groups (gemma4 SWA), the worker's encoding: group
         // 0 (full) keeps the dumped slot_mapping/block_table (identity block
@@ -421,9 +472,10 @@ mod imp {
         // just abs_pos); each sliding group gets its OWN block-id range past
         // the full group's (the groups SHARE the pool's physical tensors, so
         // two groups writing the same block id would clobber each other),
-        // encoded with the base BLOCK_SIZE.
-        let mut sliding_sm_views: Vec<scratchy_tensors::TensorView> = Vec::new();
-        let mut sliding_bt_views: Vec<scratchy_tensors::TensorView> = Vec::new();
+        // encoded with the base BLOCK_SIZE. Built over every absolute
+        // position once; each step slices its own tokens.
+        let mut sliding_sm: Vec<Vec<u32>> = Vec::new();
+        let mut sliding_bt: Vec<Vec<u32>> = Vec::new();
         if let Some(layout) = hybrid.as_ref() {
             let full_bs = layout.full_block_size().max(1);
             let full_blocks = n.div_ceil(full_bs);
@@ -432,95 +484,131 @@ mod imp {
                 // This group's block ids: [full_blocks + s*slide_blocks, …).
                 let base = full_blocks + s * slide_blocks;
                 // slot_mapping[t] = block_ids[abs/bs]*bs + abs%bs.
-                let sm: Vec<u32> = (0..n)
-                    .map(|t| ((base + t / BLOCK_SIZE) * BLOCK_SIZE + t % BLOCK_SIZE) as u32)
-                    .collect();
-                let sm_buf = device.alloc_gpu_tensor_from_host(&[n], DType::U32, unsafe {
-                    std::slice::from_raw_parts(sm.as_ptr() as *const u8, n * 4)
-                });
-                sliding_sm_views.push(unsafe { sm_buf.as_view() });
+                sliding_sm.push(
+                    (0..n)
+                        .map(|t| ((base + t / BLOCK_SIZE) * BLOCK_SIZE + t % BLOCK_SIZE) as u32)
+                        .collect(),
+                );
                 // block_table[logical_b] = physical id, same row stride as
                 // the full table (the kernel's MAX_BLOCKS_PER_SEQ).
-                let bt: Vec<u32> = (0..NUM_BLOCKS).map(|b| (base + b) as u32).collect();
-                let bt_buf =
-                    device.alloc_gpu_tensor_from_host(&[1, NUM_BLOCKS], DType::U32, unsafe {
-                        std::slice::from_raw_parts(bt.as_ptr() as *const u8, NUM_BLOCKS * 4)
-                    });
-                sliding_bt_views.push(unsafe { bt_buf.as_view() });
+                sliding_bt.push((0..NUM_BLOCKS).map(|b| (base + b) as u32).collect());
             }
         }
 
-        let ctx = ForwardCtx {
-            input_ids: unsafe { ids_buf.as_view() },
-            positions: unsafe { pos_buf.as_view() },
-            slot_mapping: unsafe { sm_buf.as_view() },
-            cu_seqlens_q: unsafe { cu_buf.as_view() },
-            seqused_k: unsafe { su_buf.as_view() },
-            span_ids: None,
-            block_table: unsafe { bt_buf.as_view() },
-            sliding_slot_mappings: sliding_sm_views,
-            sliding_block_tables: sliding_bt_views,
-            max_seqlen_q: n,
-            max_seqlen_k: n,
-            kv_cache: &kv,
-            gdn_state: gdn_pool.as_ref(),
-            gdn_state_indices: gdn_indices_view,
-            gdn_is_fresh: gdn_fresh_view,
-            has_spec_tokens: false,
-            mm_embeds: None,
-            embed_patches: &[],
-            vision_rope_cos: None,
-            vision_rope_sin: None,
-            vision_rope_freqs: None,
-            pixels: None,
-            pos_embeds: None,
-            vision_cu_seqlens_full: None,
-            vision_cu_seqlens_window: None,
-            vision_max_seqlen_full: None,
-            vision_max_seqlen_window: None,
-            vision_window_index: None,
-            vision_reverse_indices: None,
-            vision_position_ids: None,
-            last_token_indices: Some(unsafe { lti_buf.as_view() }),
-            deferred: None,
-        };
-
-        // ── RUN the compiled forward (the tape from the .py carrier) ──
-        let ctx_h = scratchy_tensors::ForwardCtxHandle::new(&ctx);
-        let dev_h = scratchy_tensors::ForwardDeviceHandle::new(&mut device);
-        let out = unsafe { model.forward(ctx_h, dev_h, n as u64) };
-
-        // ── readback: logits bf16 [n, vocab]; compare the LAST row ──
-        let t = out.as_gpu_tensor();
-        assert_eq!(t.dim(0), n, "{}: logits rows", case.stem);
-        assert_eq!(t.dim(1), vocab, "{}: logits cols", case.stem);
-        let raw = t.raw_ptr() as *const u16;
-        let got_row = (n - 1) * vocab;
-        let got: Vec<f32> = (0..vocab)
-            .map(|i| bf16::from_bits(unsafe { *raw.add(got_row + i) }).to_f32())
-            .collect();
-        let gold_row: Vec<f32> = golden[(n - 1) * vocab..n * vocab].to_vec();
-
-        let cos = cosine(&got, &gold_row);
-        let max_diff = got
-            .iter()
-            .zip(&gold_row)
-            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        // ── steps: ONE prefill over the first `prefill` tokens, then one
+        // decode step per remaining token, each fed the oracle's next id
+        // (teacher forcing). The KV pool and the recurrent state persist
+        // across steps; the oracle ran the whole sequence as one causal
+        // forward, so step (start, len)'s last row must reproduce the
+        // oracle's row at absolute position start + len - 1 — the KV append,
+        // the paged decode attention and the conv/ssm state carry are all in
+        // that comparison.
         eprintln!(
             "──────── {}/{} CARRIER PARITY ────────",
             case.arch, case.stem
         );
-        eprintln!("  n_tokens = {n} (comparing the last-token logits row)");
-        eprintln!("  cosine(logits[last]) = {cos:.6}");
-        eprintln!("  max_abs_diff         = {max_diff:.4}");
+        let steps = std::iter::once((0, prefill)).chain((prefill..n).map(|p| (p, 1)));
+        let mut diverged = Vec::new();
+        for (start, len) in steps {
+            let end = start + len;
+            let (cu, su) = ([0, len as u32], [end as u32]);
+            // The worker ALWAYS passes per-sequence sample rows — `None`
+            // means 0 and the lm_head slice trio's gather/scatter become
+            // no-ops, leaving only stale arena at the last row.
+            let lti = [len as u32 - 1];
+            let fresh = [u32::from(start == 0)];
+            let u32t = DType::U32;
+            let ctx = ForwardCtx {
+                input_ids: host_view(&ids[start..end], &[len], u32t),
+                positions: host_view(&pos[start..end], &[len], u32t),
+                slot_mapping: host_view(&slot_mapping[start..end], &[len], u32t),
+                cu_seqlens_q: host_view(&cu, &[2], u32t),
+                seqused_k: host_view(&su, &[1], u32t),
+                span_ids: None,
+                // Row stride = NUM_BLOCKS: the pool is built with
+                // `max_blocks_per_seq = NUM_BLOCKS.max(1)`, and the macro
+                // bakes the kernel's MAX_BLOCKS_PER_SEQ from that same pool
+                // value — so host stride == kernel stride by construction
+                // (the worker's own rule).
+                block_table: host_view(&block_table, &[1, NUM_BLOCKS], u32t),
+                sliding_slot_mappings: sliding_sm
+                    .iter()
+                    .map(|sm| host_view(&sm[start..end], &[len], u32t))
+                    .collect(),
+                sliding_block_tables: sliding_bt
+                    .iter()
+                    .map(|bt| host_view(bt, &[1, NUM_BLOCKS], u32t))
+                    .collect(),
+                max_seqlen_q: len,
+                max_seqlen_k: end,
+                kv_cache: &kv,
+                gdn_state: gdn_pool.as_ref(),
+                gdn_state_indices: gdn_pool
+                    .as_ref()
+                    .map(|_| host_view(&gdn_idx, &[1], DType::I32)),
+                gdn_is_fresh: gdn_pool.as_ref().map(|_| host_view(&fresh, &[1], u32t)),
+                has_spec_tokens: false,
+                mm_embeds: None,
+                embed_patches: &[],
+                vision_rope_cos: None,
+                vision_rope_sin: None,
+                vision_rope_freqs: None,
+                pixels: None,
+                pos_embeds: None,
+                vision_cu_seqlens_full: None,
+                vision_cu_seqlens_window: None,
+                vision_max_seqlen_full: None,
+                vision_max_seqlen_window: None,
+                vision_window_index: None,
+                vision_reverse_indices: None,
+                vision_position_ids: None,
+                last_token_indices: Some(host_view(&lti, &[1], u32t)),
+                deferred: None,
+            };
 
-        let nan = got.iter().filter(|x| x.is_nan() || x.is_infinite()).count();
-        assert_eq!(nan, 0, "{}: scratchy logits contain NaN/Inf", case.stem);
+            // ── RUN the compiled forward (the tape from the .py carrier) ──
+            let ctx_h = scratchy_tensors::ForwardCtxHandle::new(&ctx);
+            let dev_h = scratchy_tensors::ForwardDeviceHandle::new(&mut device);
+            let out = unsafe { model.forward(ctx_h, dev_h, len as u64) };
+
+            // ── readback: logits bf16 [len, vocab]; compare the LAST row ──
+            let t = out.as_gpu_tensor();
+            assert_eq!(t.dim(0), len, "{}: logits rows", case.stem);
+            assert_eq!(t.dim(1), vocab, "{}: logits cols", case.stem);
+            let raw = t.raw_ptr() as *const u16;
+            let got_row = (len - 1) * vocab;
+            let got: Vec<f32> = (0..vocab)
+                .map(|i| bf16::from_bits(unsafe { *raw.add(got_row + i) }).to_f32())
+                .collect();
+            let gold_row = &golden[(end - 1) * vocab..end * vocab];
+
+            let cos = cosine(&got, gold_row);
+            let max_diff = got
+                .iter()
+                .zip(gold_row)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let step = if start == 0 {
+                format!("prefill {len} tokens")
+            } else {
+                format!("decode @ position {start}")
+            };
+            eprintln!("  {step}: cosine(logits[last]) = {cos:.6}, max_abs_diff = {max_diff:.4}");
+
+            let nan = got.iter().filter(|x| x.is_nan() || x.is_infinite()).count();
+            if nan > 0 {
+                diverged.push(format!("{step}: {nan} NaN/Inf logits"));
+            } else if cos.is_nan() || cos <= 0.99 {
+                diverged.push(format!("{step}: cosine {cos}"));
+            }
+        }
+        // Every step runs before the verdict, so one report shows whether a
+        // divergence starts at the prefill or only once state carries.
         assert!(
-            cos > 0.99,
-            "{}: cosine {cos} <= 0.99 — the compiled tape diverged from \
-             the carrier-as-Python oracle (a real .py↔tape divergence)",
-            case.stem
+            diverged.is_empty(),
+            "{}: cosine <= 0.99 (or non-finite logits) — the compiled tape diverged \
+             from the carrier-as-Python oracle (a real .py↔tape divergence) at: {}",
+            case.stem,
+            diverged.join("; ")
         );
     }
 

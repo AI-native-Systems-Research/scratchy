@@ -405,6 +405,41 @@ impl From<RopeAppendBindingSet> for Vec<Binding> {
     }
 }
 
+/// Bindings for `KernelId::KvAppend` (`kv_append.metal`): the K and V
+/// projections read-only, `layer`'s slot mapping and its K/V caches.
+pub struct KvAppendBindingSet {
+    pub k: ArenaSlotIdx,
+    pub v: ArenaSlotIdx,
+    pub layer: LayerId,
+}
+
+impl From<KvAppendBindingSet> for Vec<Binding> {
+    fn from(s: KvAppendBindingSet) -> Vec<Binding> {
+        vec![
+            Binding::ArenaSlot {
+                slot: s.k.get(),
+                binding_index: 0,
+            },
+            Binding::ArenaSlot {
+                slot: s.v.get(),
+                binding_index: 1,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::SlotMapping { layer: s.layer },
+                binding_index: 2,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::KvCacheK { layer: s.layer },
+                binding_index: 3,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::KvCacheV { layer: s.layer },
+                binding_index: 4,
+            },
+        ]
+    }
+}
+
 // ── RopeAppendNormed (Gemma4 norm-prologue rope) ───────────────────
 
 /// Bindings for `KernelId::RopeAppendNormed`. Slots 0..7 mirror

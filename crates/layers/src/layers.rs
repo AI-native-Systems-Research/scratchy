@@ -667,37 +667,36 @@ impl LayerNormBias {
 // GatedDeltaNetLayer
 // ---------------------------------------------------------------------------
 
-/// Per-layer weight bundle for a Gated-DeltaNet (linear-attention) layer of a
-/// hybrid model (Qwen3.5 / Qwen3-Next). The four non-projection weights the
-/// `Instruction::GatedDeltaNet` eval consumes; the in/out projections are plain
-/// `gemm`s in the DSL (so quantization applies to them normally) and are NOT
-/// part of this bundle.
+/// Per-layer weight bundle for a recurrent mixer of a hybrid model: a
+/// Gated-DeltaNet (linear-attention) layer (Qwen3.5 / Qwen3-Next) or a
+/// Mamba-2 layer (Nemotron-H). The non-projection weights the mixer op
+/// consumes; the in/out projections are plain `gemm`s in the DSL (so
+/// quantization applies to them normally) and are NOT part of this bundle.
 ///
-/// Tensors are kept in their on-disk dtype here; the cuda eval casts them to
-/// f32 at use (the `gdn_*` kernels are f32). This mirrors the
-/// `DeepSeekV2MoELayer` typed-bundle pattern: one DSL weight accessor
-/// (`linear_attn[layer]`) resolves to one of these via `required_weights`.
+/// Both mixers run a causal depthwise conv, a softplus(`dt_bias`)-gated decay
+/// of base `-exp(A_log)` and a gated RMSNorm over the same one-slot-per-
+/// sequence state; Mamba-2 adds the conv bias and the `D` skip.
+///
+/// Tensors are kept in their on-disk dtype unless a kernel binds them `float`
+/// (see [`gated_delta_net_load`]). This mirrors the `DeepSeekV2MoELayer`
+/// typed-bundle pattern: one DSL weight accessor (`linear_attn[layer]`,
+/// `mamba[layer]`) resolves to one of these via `required_weights`.
 pub struct GatedDeltaNetLayer {
     /// Causal depthwise conv1d weight. HF on-disk shape `[conv_dim, 1, kernel]`
-    /// (the singleton dim is dropped at use → `[conv_dim, kernel]`).
+    /// (mlx: `[conv_dim, kernel, 1]` — the same elements in the same order;
+    /// the singleton dim is dropped at use → `[conv_dim, kernel]`).
     pub conv1d: GpuTensor,
+    /// Causal conv1d bias `[conv_dim]` — Mamba-2 (`use_conv_bias`); GDN has none.
+    pub conv_bias: Option<GpuTensor>,
     /// Per-value-head log-decay base `A_log`, shape `[num_v_heads]`.
     pub a_log: GpuTensor,
     /// Per-value-head softplus bias `dt_bias`, shape `[num_v_heads]`.
     pub dt_bias: GpuTensor,
-    /// Gated-RMSNorm weight, shape `[head_v_dim]` (norm is per value-head).
+    /// Per-head skip `D` `[num_heads]` (f32) — Mamba-2; GDN has none.
+    pub d: Option<GpuTensor>,
+    /// Gated-RMSNorm weight: `[head_v_dim]` for GDN (norm per value head),
+    /// `[d_inner]` for Mamba-2 (norm per group of `d_inner / n_groups`).
     pub norm: GpuTensor,
-}
-
-impl GatedDeltaNetLayer {
-    pub fn new(conv1d: GpuTensor, a_log: GpuTensor, dt_bias: GpuTensor, norm: GpuTensor) -> Self {
-        Self {
-            conv1d,
-            a_log,
-            dt_bias,
-            norm,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,23 +814,37 @@ pub fn layer_norm_load<A: DeviceAllocator>(
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
-/// Load a [`GatedDeltaNetLayer`] by linear-attn prefix. `A_log` and
-/// `norm.weight` are upcast to f32 because the `gdn_gating` / `gdn_rms_norm_
-/// gated` kernels bind them as `float*` (Python `.float()`s A_log at use). A
-/// bf16-only repack (mlx OptiQ ships the WHOLE checkpoint bf16, no fp32) would
-/// otherwise have the kernel read 2-byte bf16 as 4-byte f32 → garbage A_log →
-/// `exp()` overflow → NaN gate → NaN'd GDN state. Older fp32-A_log repacks
-/// (e.g. the uniform 4bit checkpoint) round-trip through f32 unchanged.
-/// `dt_bias` keeps its on-disk dtype — its kernel param is model-dtype `T*`.
+/// Load a [`GatedDeltaNetLayer`] by mixer prefix. `A_log`, `D` and
+/// `norm.weight` are upcast to f32 because the kernels bind them as `float*`
+/// (Python `.float()`s A_log at use). A bf16-only repack (mlx OptiQ ships the
+/// WHOLE checkpoint bf16, no fp32) would otherwise have the kernel read 2-byte
+/// bf16 as 4-byte f32 → garbage A_log → `exp()` overflow → NaN gate → NaN'd
+/// state. Older fp32-A_log repacks (e.g. the uniform 4bit checkpoint)
+/// round-trip through f32 unchanged. `dt_bias` and the conv weight/bias keep
+/// their on-disk dtype — their kernel params are model-dtype `T*`. The conv
+/// bias and `D` are present on a Mamba-2 mixer only.
 pub fn gated_delta_net_load<A: DeviceAllocator>(
     weights: &mut GpuWeights<A>,
     prefix: &str,
 ) -> Result<GatedDeltaNetLayer> {
-    let conv1d = weights.take_keep_dtype(&format!("{prefix}.conv1d.weight"))?;
-    let a_log = weights.take_as_f32(&format!("{prefix}.A_log"))?;
-    let dt_bias = weights.take_keep_dtype(&format!("{prefix}.dt_bias"))?;
-    let norm = weights.take_as_f32(&format!("{prefix}.norm.weight"))?;
-    Ok(GatedDeltaNetLayer::new(conv1d, a_log, dt_bias, norm))
+    let conv_bias = format!("{prefix}.conv1d.bias");
+    let d = format!("{prefix}.D");
+    Ok(GatedDeltaNetLayer {
+        conv1d: weights.take_keep_dtype(&format!("{prefix}.conv1d.weight"))?,
+        conv_bias: if weights.contains(&conv_bias) {
+            Some(weights.take_keep_dtype(&conv_bias)?)
+        } else {
+            None
+        },
+        a_log: weights.take_as_f32(&format!("{prefix}.A_log"))?,
+        dt_bias: weights.take_keep_dtype(&format!("{prefix}.dt_bias"))?,
+        d: if weights.contains(&d) {
+            Some(weights.take_as_f32(&d)?)
+        } else {
+            None
+        },
+        norm: weights.take_as_f32(&format!("{prefix}.norm.weight"))?,
+    })
 }
 
 /// Validate a `load_dense_concat_packed` prefix set: synthesize missing

@@ -16,8 +16,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::ast::InSet;
 use crate::classified::{BoolPred, Bound, Expr, LocalId, Program, Stmt};
-use crate::config::ModelParams;
+use crate::config::{LayerSet, ModelParams};
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -103,8 +104,8 @@ pub enum BoolPredResolved {
     },
     /// `ivar < bound`.
     Less { ivar: LocalId, bound: u64 },
-    /// `members.contains(&ivar)` — set membership; resolved members
-    /// are concrete u64 literals. See [`crate::classified::BoolPred::In`].
+    /// `members.contains(&ivar)` — set membership; a named layer set
+    /// resolved to its members. See [`crate::classified::BoolPred::In`].
     In { ivar: LocalId, members: Vec<u64> },
 }
 
@@ -134,6 +135,10 @@ pub enum CfgError {
         name: String,
         available: Vec<String>,
     },
+    UnderivedLayerSet {
+        name: String,
+        available: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for CfgError {
@@ -153,6 +158,13 @@ impl std::fmt::Display for CfgError {
                      Available: {available:?}",
                 )
             }
+            Self::UnderivedLayerSet { name, available } => {
+                write!(
+                    f,
+                    "layer set `{name}` is not derived from this model's config.json \
+                     (a per-layer block schedule derives them). Available: {available:?}",
+                )
+            }
         }
     }
 }
@@ -162,7 +174,7 @@ impl std::error::Error for CfgError {}
 // ── Builder ──────────────────────────────────────────────────────
 
 pub fn build_cfg(program: &Program, params: &ModelParams) -> Result<Cfg, CfgError> {
-    let mut builder = CfgBuilder::new(&params.bounds, &params.scalars);
+    let mut builder = CfgBuilder::new(&params.bounds, &params.scalars, &params.layer_sets);
     let entry = builder.alloc_block();
     let exit = builder.alloc_block();
     builder.lower_stmts(&program.statements, entry, exit)?;
@@ -176,6 +188,7 @@ pub fn build_cfg(program: &Program, params: &ModelParams) -> Result<Cfg, CfgErro
 struct CfgBuilder<'a> {
     bounds: &'a BTreeMap<String, u64>,
     scalars: &'a BTreeMap<String, f64>,
+    layer_sets: &'a BTreeMap<String, LayerSet>,
     blocks: Vec<Block>,
     /// One-per-block open instruction buffer: instrs accumulate
     /// into the indexed block's `instrs` field when we commit.
@@ -183,10 +196,15 @@ struct CfgBuilder<'a> {
 }
 
 impl<'a> CfgBuilder<'a> {
-    fn new(bounds: &'a BTreeMap<String, u64>, scalars: &'a BTreeMap<String, f64>) -> Self {
+    fn new(
+        bounds: &'a BTreeMap<String, u64>,
+        scalars: &'a BTreeMap<String, f64>,
+        layer_sets: &'a BTreeMap<String, LayerSet>,
+    ) -> Self {
         Self {
             bounds,
             scalars,
+            layer_sets,
             blocks: Vec::new(),
             open: BTreeMap::new(),
         }
@@ -400,7 +418,19 @@ impl<'a> CfgBuilder<'a> {
             }),
             BoolPred::In { ivar, members } => Ok(BoolPredResolved::In {
                 ivar: *ivar,
-                members: members.clone(),
+                members: match members {
+                    InSet::Lit(m) => m.clone(),
+                    InSet::Named(ident) => {
+                        let name = ident.to_string();
+                        self.layer_sets
+                            .get(&name)
+                            .map(|set| set.members().to_vec())
+                            .ok_or_else(|| CfgError::UnderivedLayerSet {
+                                name,
+                                available: self.layer_sets.keys().cloned().collect(),
+                            })?
+                    }
+                },
             }),
         }
     }
@@ -648,6 +678,55 @@ mod tests {
             }
             _ => panic!("expected In predicate"),
         }
+    }
+
+    #[test]
+    fn if_in_named_layer_set_resolves_to_members() {
+        let mut params = llama_3_2_1b_params();
+        let json = serde_json::json!({ "hybrid_override_pattern": "M*MEM*" });
+        params.layer_sets =
+            crate::config::derive_layer_sets(&json, &mut BTreeMap::new()).expect("derive");
+        let p = classify_src(
+            "
+            for layer in range(6):
+                if layer in mamba_layers:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
+        );
+        let cfg = build_cfg(&p, &params).expect("build cfg");
+        let condjump = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.term, Terminator::CondJump { .. }))
+            .expect("CondJump block");
+        match &condjump.term {
+            Terminator::CondJump {
+                cond: BoolPredResolved::In { members, .. },
+                ..
+            } => assert_eq!(members, &vec![0u64, 2, 4]),
+            _ => panic!("expected In predicate"),
+        }
+    }
+
+    #[test]
+    fn if_in_unknown_layer_set_is_an_error() {
+        let p = classify_src(
+            "
+            for layer in range(4):
+                if layer in mamba_layers:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
+        );
+        let err = build_cfg(&p, &llama_3_2_1b_params()).unwrap_err();
+        assert!(
+            matches!(err, CfgError::UnderivedLayerSet { ref name, .. } if name == "mamba_layers")
+        );
     }
 
     #[test]

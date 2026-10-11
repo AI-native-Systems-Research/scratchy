@@ -20,8 +20,8 @@ use scratchy_subtile::handoff::{
 use scratchy_subtile::kv_codec::CodecGuard;
 use scratchy_subtile::lower::{GemmWeight, InputRef};
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBundle, ExpertProj, GainConvention, RopeFormTag, RowScale, SubOp,
-    SubtileIR, SubtileId,
+    AttnMask, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention, RopeFormTag, RowScale,
+    SubOp, SubtileIR, SubtileId,
 };
 use scratchy_subtile::subtile_tape::SlotId;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, Residency, TapeColouring};
@@ -37,7 +37,7 @@ use scratchy_target_metal::tape::lowered::{Fence, RuntimeGate};
 use scratchy_target_metal::tape::step::{
     self as st, AffineBits as Bits, AffineGroupSize as Gs, ArenaSlotIdx as Slot, HiddenSize as W,
     IntermediateSize as Inter, LayerId, MetalStep, MoeRegion, MoeRows, MoeStep,
-    RowsPerToken as Rows, StepRow,
+    RowsPerToken as Rows, StepRow, UnaryAct as Act,
 };
 
 use crate::canonical::MetalStepFacts;
@@ -663,18 +663,23 @@ impl Recording<'_> {
         (0..self.l.input.ops.len()).filter(of)
     }
 
-    /// The geometry of the MoE block op `i` is a step of, read off the block's own ops.
+    /// The geometry of the MoE block op `i` is a step of, read off the block's own ops. The up
+    /// projection — the one every expert body has — states the expert width and storage.
     fn block(&self, i: usize) -> Result<st::MoeBlock, StepRefusal> {
         let (mut experts, mut k, mut inter, mut hidden) = (None, None, None, None);
         let (mut router, mut bundle, mut input) = (None, None, st::RouterInput::Raw);
         let (mut group_size, mut gate, mut up, mut down) = (None, None, None, None);
+        let mut router_in = None;
         for j in self.group(i) {
             match *self.op(j) {
                 SubOp::RouterNorm { .. } => input = st::RouterInput::PreNormed,
                 SubOp::RouterLogits {
                     experts: e,
                     router: r,
-                } => (experts, router) = (Some(st::NumExperts(e.get())), Some(r)),
+                } => {
+                    (experts, router) = (Some(st::NumExperts(e.get())), Some(r));
+                    router_in = Some(self.operand_width(j, 0)?);
+                }
                 SubOp::RouteTopK { k: t } => k = Some(st::TopK(t.get())),
                 SubOp::ExpertMatmul {
                     proj,
@@ -685,11 +690,11 @@ impl Recording<'_> {
                 } => {
                     let width = Some(self.expert_matmul(j)?.step.width.bits());
                     match proj {
-                        ExpertProj::Gate => {
+                        ExpertProj::Gate => gate = width,
+                        ExpertProj::Up => {
                             (inter, bundle) = (Some(Inter(n)), Some(b));
-                            (group_size, gate) = (Some(Gs(q.group().get())), width);
+                            (group_size, up) = (Some(Gs(q.group().get())), width);
                         }
-                        ExpertProj::Up => up = width,
                         ExpertProj::Down => down = width,
                     }
                 }
@@ -703,13 +708,14 @@ impl Recording<'_> {
             top_k: k.ok_or_else(no)?,
             inter: inter.ok_or_else(no)?,
             hidden: hidden.ok_or_else(no)?,
+            router_in: router_in.ok_or_else(no)?,
             router: router.ok_or_else(no)?,
             bundle: bundle.ok_or_else(no)?,
             input,
             quant: st::ExpertQuant {
                 group_size: group_size.ok_or_else(no)?,
                 widths: st::ExpertWidths {
-                    gate: gate.ok_or_else(no)?,
+                    gate,
                     up: up.ok_or_else(no)?,
                     down: down.ok_or_else(no)?,
                 },
@@ -717,10 +723,34 @@ impl Recording<'_> {
         })
     }
 
+    /// The width of op `i`'s operand `k` rows: a step's output, or a source's columns.
+    fn operand_width(&self, i: usize, k: u8) -> Result<W, StepRefusal> {
+        match self.arg(i, k)? {
+            InputRef::Op(a) => Ok(W(self.graph.shape(self.graph.op_output[a]).cols)),
+            InputRef::Ext(e) => Ok(W(self.l.input.sources[e].cols)),
+        }
+    }
+
+    /// The expert body of the MoE block op `i` is a step of: its activation's.
+    fn expert_body(&self, i: usize) -> Result<ExpertBody, StepRefusal> {
+        self.group(i)
+            .find_map(|j| match *self.op(j) {
+                SubOp::ExpertGatedAct { act } => Some(ExpertBody::Gated(act)),
+                SubOp::ExpertAct { act } => Some(ExpertBody::Ungated(act)),
+                _ => None,
+            })
+            .ok_or_else(|| self.no(i, Refused::IncompleteMoeBlock))
+    }
+
     /// A KV codec step's writer — the KV writer of `encode`'s construct, `encode` being the
     /// step's `KvEncode` — as the writer's own record states it. Its class is its attention's.
     fn codec_writer(&self, i: usize, encode: usize) -> Result<CodecWriter, StepRefusal> {
-        let rope = |j: &usize| matches!(self.op(*j), SubOp::RopeAppend { .. });
+        let rope = |j: &usize| {
+            matches!(
+                self.op(*j),
+                SubOp::RopeAppend { .. } | SubOp::KvAppend { .. }
+            )
+        };
         let no = || self.no(i, Refused::CodecUnanchored);
         let w = self.group(encode).find(rope).ok_or_else(no)?;
         // The writer's command — its last fold's — whether it runs it or the attention does.
@@ -734,6 +764,8 @@ impl Recording<'_> {
             MetalStep::RopeAppend(.., l, p, c, offsets, _) => (l, p, c, offsets),
             // Normed K/V: a norm adds nothing.
             MetalStep::RopeAppendNormed(.., l, p, c, _) => (l, p, c, st::KvOffsets::CENTERED),
+            // Un-rotated: its cache is read as stored, the attention's convention for it.
+            MetalStep::KvAppend(_, _, l, c, offsets, _) => (l, RopeFormTag::NeoX, c, offsets),
             _ => return Err(no()),
         };
         Ok((layer, pairing, class, offsets, e.sites))
@@ -824,20 +856,23 @@ impl Recording<'_> {
             width,
         };
         let raw = at(st::ExpertWidth::OpUniform(op_bits));
-        // A Qwen-MoE projection's own width, as the quantization declares it per layer.
+        // A shared-fused projection's own width, as the quantization declares it per layer.
         let declared = match bundle {
             ExpertBundle::SharedFused => self.facts.moe_expert_bits,
             ExpertBundle::SwitchGlu | ExpertBundle::Fused | ExpertBundle::GptOss => None,
         };
-        let step = declared.map_or(raw, |w| {
-            let widths = w(layer);
-            let own = match proj {
-                ExpertProj::Gate => widths[0],
-                ExpertProj::Up => widths[1],
-                ExpertProj::Down => widths[2],
-            };
-            at(st::ExpertWidth::Declared(own.unwrap_or(op_bits)))
-        });
+        let step = match declared {
+            None => raw,
+            Some(w) => {
+                let widths = w(&self.base(j, e)?, layer, self.expert_body(j)?);
+                let own = match proj {
+                    ExpertProj::Gate => widths[0],
+                    ExpertProj::Up => widths[1],
+                    ExpertProj::Down => widths[2],
+                };
+                at(st::ExpertWidth::Declared(own.unwrap_or(op_bits)))
+            }
+        };
         Ok(ExpertRecord {
             step,
             raw: declared.map(|_| raw),
@@ -1174,6 +1209,23 @@ impl Recording<'_> {
                 }
                 Ok(e)
             }
+            // An ungated expert's one in-projection and its activation.
+            (F::MoeUpAct, Sh::ExpertUngated { up }) => {
+                let SubOp::ExpertAct { act } = *self.op(i) else {
+                    return Err(self.no(i, Refused::FusionShape));
+                };
+                let u = self.expert_matmul(self.op_at(i, up)?)?;
+                let (routing, router) = self.routing(i)?;
+                let step = MoeStep::UpAct(u.step, act, routing);
+                let mut e = self.moe(i, step, &u.reads, &[], Some(u.weight))?;
+                e.sites.extend(router);
+                e.sites.extend(u.norm);
+                if let Some(raw) = u.raw {
+                    let raw = MoeStep::UpAct(raw, act, routing);
+                    e.raw = Some(MetalStep::Moe(self.block(i)?, raw));
+                }
+                Ok(e)
+            }
             // The down projection, its unsort and the combine into the combine's buffer. The
             // command writes the down rows into the op scratch before it combines them.
             (F::MoeDownCombine, Sh::ExpertCombined { down, .. }) => {
@@ -1276,6 +1328,9 @@ impl Recording<'_> {
                     MetalStep::RopeAppendNormed(q, k, v, qo, ko, vo, l, p, c, _) => {
                         MetalStep::RopeAppendNormed(q, k, v, qo, ko, vo, l, p, c, packed)
                     }
+                    MetalStep::KvAppend(k, v, l, c, o, _) => {
+                        MetalStep::KvAppend(k, v, l, c, o, packed)
+                    }
                     _ => return Err(self.no(i, Refused::FusionShape)),
                 };
                 Ok(e)
@@ -1293,7 +1348,7 @@ impl Recording<'_> {
     ) -> Result<(st::RouteProgram, Vec<(WeightKind, usize)>), StepRefusal> {
         let FusedShape::Route {
             pre,
-            tail: [scale, post, expert_scale],
+            tail: [scale, post, expert_scale, post_scale],
             ..
         } = route
         else {
@@ -1320,11 +1375,12 @@ impl Recording<'_> {
             }
             Some(_) => return Err(self.no(i, Refused::FusionShape)),
         };
-        let scale = match scale.map(op).transpose()? {
-            None => None,
-            Some((_, &SubOp::RouteScale { scale })) => Some(st::Scale(scale)),
-            Some(_) => return Err(self.no(i, Refused::FusionShape)),
+        let scale_of = |s: Option<SlotId>| match s.map(op).transpose()? {
+            None => Ok(None),
+            Some((_, &SubOp::RouteScale { scale })) => Ok(Some(st::Scale(scale))),
+            Some(_) => Err(self.no(i, Refused::FusionShape)),
         };
+        let (scale, post_scale) = (scale_of(scale)?, scale_of(post_scale)?);
         let post = match post.map(op).transpose()? {
             None => st::RoutePost::None,
             Some((_, SubOp::RouteSoftmax)) => st::RoutePost::Softmax,
@@ -1345,6 +1401,7 @@ impl Recording<'_> {
             scale,
             post,
             expert_scale,
+            post_scale,
         };
         Ok((program, weights))
     }
@@ -1784,9 +1841,12 @@ impl Recording<'_> {
             }
             L::LoadPixels { .. } => em(S::LoadPixels(out()?), &[], &[out()?], Vec::new()),
             L::LoadPosEmbeds { .. } => em(S::LoadPosEmbeds(out()?), &[], &[out()?], Vec::new()),
-            L::Elementwise(E::Gelu) => unary(&S::Gelu)?,
-            L::Elementwise(E::QuickGelu) => unary(&S::QuickGelu)?,
-            L::Elementwise(E::GeluErf) => unary(&S::GeluErf)?,
+            L::Elementwise(E::Gelu) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluTanh))?,
+            L::Elementwise(E::QuickGelu) => {
+                unary(&|i, o, w| S::Activation(i, o, w, Act::QuickGelu))?
+            }
+            L::Elementwise(E::GeluErf) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluErf))?,
+            L::Elementwise(E::Relu2) => unary(&|i, o, w| S::Activation(i, o, w, Act::Relu2))?,
             L::TanhSoftCap => unary(&S::TanhSoftCap)?,
             L::RmsNorm { gain, .. } => self.norm(i, gain)?,
             L::MatmulTile { .. } => {
@@ -1799,24 +1859,46 @@ impl Recording<'_> {
             L::SampleRowsScatter => self.matmul(i, Some(st::SampleRowsStep::Scatter))?,
             L::AllRowsMatmul => self.matmul(i, Some(st::SampleRowsStep::AllRows))?,
             L::RopeAppend { .. } => return Err(self.no(i, Refused::NoFoldedRotate)),
+            L::KvAppend { layer, attn, .. } => {
+                let (k, v) = (self.read(i, 0)?, self.read(i, 1)?);
+                let (k_op, v_op) = (self.step_arg(i, 0)?, self.step_arg(i, 1)?);
+                let layer = LayerId(layer);
+                // Each operand's offset, for a codec to remove (`kv_writer_codec` refuses one).
+                let offsets = st::KvOffsets {
+                    k: self.kv_offset(i, k_op, layer)?.0,
+                    v: self.kv_offset(i, v_op, layer)?.0,
+                };
+                let pool = st::KvWrite::Pool;
+                let mut e = em(
+                    S::KvAppend(k, v, layer, attn, offsets, pool),
+                    &[k, v],
+                    &[k],
+                    Vec::new(),
+                );
+                e.sig.kv_w = Some(layer);
+                e
+            }
             L::AttnDecode { mask, .. } => {
                 let out = out()?;
                 let q = self.colour(self.step_arg(i, 0)?)?;
-                // The layer and pairing come from the rope append whose cache it reads.
-                let rope = self.step_arg(i, 3)?;
-                let (layer, pairing) = match *self.op(rope) {
-                    L::RopeAppend { layer, pairing, .. } => (LayerId(layer), pairing),
-                    _ => (LayerId(0), RopeFormTag::NeoX),
+                // The layer and pairing come from the KV writer whose cache it reads; an
+                // un-rotated writer's cache is read as stored, with no rotary table.
+                let writer = self.step_arg(i, 3)?;
+                let (layer, pairing, rotated) = match *self.op(writer) {
+                    L::RopeAppend { layer, pairing, .. } => (LayerId(layer), pairing, true),
+                    L::KvAppend { layer, .. } => (LayerId(layer), RopeFormTag::NeoX, false),
+                    _ => (LayerId(0), RopeFormTag::NeoX, true),
                 };
                 // Prefill runs the paged kernel with K arriving pre-roped: no rotary. Decode's
                 // CosSin is the GLOBAL rotary whatever the class (only the rope uses the local).
                 let neox = RopeFormTag::NeoX;
                 let rotary = || {
                     let base = "rotary".to_string();
-                    vec![WeightSlot {
+                    let site = WeightSlot {
                         kind: WeightKind::CosSin,
                         base,
-                    }]
+                    };
+                    rotated.then_some(site).into_iter().collect::<Vec<_>>()
                 };
                 use AttnMask::{Causal, SlidingWindow as Sliding};
                 let (step, sites) = match (self.l.input.ops[i].m > 1, mask) {
@@ -1852,7 +1934,7 @@ impl Recording<'_> {
                     Ok(InputRef::Op(v)) => self.colour(v).ok(),
                     _ => None,
                 };
-                let reads: Vec<Slot> = [Some(q), self.colour(rope).ok(), v]
+                let reads: Vec<Slot> = [Some(q), self.colour(writer).ok(), v]
                     .into_iter()
                     .flatten()
                     .collect();
@@ -2042,6 +2124,16 @@ impl Recording<'_> {
                 e.sig.op_scratch = Access::Write;
                 e
             }
+            L::Mamba2 { .. } => {
+                let (out, zxbcdt) = (out()?, self.read(i, 0)?);
+                let e = self.weight_of(i)?;
+                let step = S::Mamba2(zxbcdt, out, self.layer(e));
+                let site = self.site(i, WeightKind::GatedDeltaNet, e)?;
+                let mut e = em(step, &[zxbcdt], &[out], site);
+                // Its conv, scan and norm pass their intermediates through the op scratch.
+                e.sig.op_scratch = Access::Write;
+                e
+            }
             L::RouterNorm { eps, router } => {
                 let (x, e) = (self.read(i, 0)?, self.source_arg(i, 1)?);
                 let step = MoeStep::RouterNorm(x, self.layer(e), st::Eps(eps));
@@ -2120,6 +2212,7 @@ impl Recording<'_> {
                 em
             }
             L::ExpertGatedAct { act } => self.moe(i, MoeStep::GatedAct(act), &[], &[], None)?,
+            L::ExpertAct { act } => self.moe(i, MoeStep::Act(act), &[], &[], None)?,
             L::ExpertUnsort => self.moe(i, MoeStep::Unsort, &[], &[], None)?,
             L::ExpertCombine { .. } => {
                 self.shared_expert_owned(i)?;

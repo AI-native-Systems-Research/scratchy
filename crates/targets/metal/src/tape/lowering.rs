@@ -27,9 +27,11 @@ use crate::tape::step::{
     KDim, KvOffsets, KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion,
     MoeRows, MoeScores, MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables,
     RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    UnaryAct, UngatedAct,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
+use scratchy_subtile::subtile_ir::ExpertBody;
 
 /// Value passed as `ATTN_BLOCKS_PER_CHUNK` to the attention reader's
 /// pipeline. `0` selects the direct-addressing fast path: the kernel
@@ -173,7 +175,7 @@ pub fn lower_subtile_tape_to_metal(
     // too ([`ATTN_FOLD`]).
     let encodes = |c: &GatedCommand| {
         let writes = match c.command.kernel {
-            KernelId::RopeAppend | KernelId::RopeAppendNormed => true,
+            KernelId::RopeAppend | KernelId::RopeAppendNormed | KernelId::KvAppend => true,
             KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
                 c.command.constants.iter().any(|k| k.index == ATTN_FOLD.0)
             }
@@ -718,7 +720,7 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
 
 /// A KV writer's folded-in TurboQuant encode ([`KvWrite::PoolAndPacked`]): the codebook, the
 /// layer's packed stores and each operand's offset, as the writer's constants and the bindings it
-/// adds from 16 (`rope.metal`'s `ROPE_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
+/// adds from 16 (`kv_writer.h`'s `KV_WRITER_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
 /// The coded layers are the GLOBAL class (every layer on uniform arches).
 fn kv_writer_codec(
     p: &MetalModelConsts,
@@ -3192,7 +3194,7 @@ fn lower_one(
                     n: super::ids::NDimI32(n as i32),
                     codes,
                 },
-                act: *act,
+                act: ExpertBody::Gated(*act),
             };
             // `affine_qmv_fast`'s shape rule, for both matvecs — and the block rows the gated
             // kernel then runs (`gated_tile_rows`).
@@ -3345,6 +3347,61 @@ fn lower_one(
                         k_out: super::ids::ArenaSlotIdx(*k_out_slot),
                         v_out: super::ids::ArenaSlotIdx(*v_out_slot),
                         cos_sin: w.cos_sin(p)?,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                    })
+                    .into_iter()
+                    .chain(codec.into_iter().flat_map(|(_, b)| b))
+                    .collect(),
+                ),
+                gemm_dims: None,
+            }
+        }
+
+        // ── Un-rotated KV cache append (no-RoPE attention) ─────────
+        //
+        // One threadgroup per (token, kv head), one thread per head
+        // element: K and V copied as projected into the layer's paged
+        // cache page. Same geometry-class selection as `RopeAppend`.
+        I::KvAppend(Slot(k_slot), Slot(v_slot), LayerId(layer), class, offsets, write) => {
+            // Its codec restores no offset: a K bias's restore rotates it to the key, and a V
+            // bias's binds the rotary table the writer has none of.
+            if *write == KvWrite::PoolAndPacked && *offsets != KvOffsets::CENTERED {
+                return Err(LoweringError::UnrotatedWriterOffset { index: w.index });
+            }
+            let codec = kv_writer_codec(p, *write, *offsets, LayerId(*layer), layer_offset, w)?;
+            let (hd, n_kv, bs) = match class {
+                AttnMask::Causal => (
+                    p.global_head_dim,
+                    p.num_global_kv_heads,
+                    p.global_block_size,
+                ),
+                AttnMask::SlidingWindow => (p.head_dim, p.num_kv_heads, p.block_size),
+            };
+            LoweredCommand {
+                kernel: KernelId::KvAppend,
+                library: "kv_append",
+                function: pick_specialized_symbol("kv_append_f16", "kv_append_bf16", p.metal_dtype),
+                constants: super::kernel_constants::KvAppendConstants {
+                    head_dim: super::ids::HeadDim(hd),
+                    num_kv_heads: super::ids::NumKvHeads(n_kv),
+                    block_size: super::ids::BlockSize(bs),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
+                    tq: codec.as_ref().map(|(c, _)| *c),
+                }
+                .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, n_kv, 1),
+                    threads_per_threadgroup: (hd, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(
+                    Vec::from(super::kernel_bindings::KvAppendBindingSet {
+                        k: super::ids::ArenaSlotIdx(*k_slot),
+                        v: super::ids::ArenaSlotIdx(*v_slot),
                         layer: super::ids::LayerId(*layer + layer_offset),
                     })
                     .into_iter()
@@ -4832,220 +4889,109 @@ fn lower_one(
             cmds.extend(decode);
 
             // 1. Causal depthwise conv1d (+SiLU), varlen + stateful.
-            //    grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y), 1).
-            cmds.push(LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_conv1d_varlen",
-                function: gdn_conv1d_varlen_static_name(dtype),
-                constants: baked(vec![
-                    ConstantValue::uint(0, conv_dim),
-                    ConstantValue::uint(1, kernel),
-                ]),
-                dispatch: {
-                    let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
-                    DispatchShape {
-                        threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
-                        threads_per_threadgroup: (1, tg_y, 1),
-                        // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
-                        m_scaling: Some(MScaling {
-                            axis: MScaleAxis::X,
-                            bucket_m: BucketM(1),
-                            seq_axis: Some(MScaleAxis::X),
-                        }),
-                    }
-                },
-                bindings: baked(vec![
-                    Binding::MoeScratch {
-                        binding_index: 0,
-                        byte_offset: layout.conv_out,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *qkv_slot,
-                        binding_index: 1,
-                    },
-                    weight(WeightTensor::GdnConv1d, 2),
-                    runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 3),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, 4),
-                    runtime(RuntimeBindingKind::GdnStateIndices, 5),
-                    runtime(RuntimeBindingKind::GdnIsFresh, 6),
-                ]),
-                gemm_dims: None,
-            });
+            cmds.push(recurrent_conv(
+                dtype,
+                (conv_dim, kernel),
+                arena(qkv_slot, 1),
+                weight(WeightTensor::GdnConv1d, 2),
+                layer_id,
+                layout.conv_out,
+                None,
+            ));
 
-            // head_k a multiple of 32: the gating and the scan run as one
-            // command, mlx-lm's simdgroup-per-value-dim mapping
-            // (`gdn_scan_simd`); then the norm. Used at every other bucket size,
-            // prefill included: the mapping is sequence-serial either way, but
-            // a simdgroup's 32 lanes split head_k (4 state elements per lane,
-            // dots via `simd_sum`) where `gdn_scan_varlen`'s CUDA-faithful
-            // mapping runs SIX serial head_k loops per token in ONE thread —
-            // measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill
-            // forward (64%, ~8 µs/token/layer) on the per-thread kernel.
-            // Non-divisible geometries fall back to the varlen kernel.
-            let scan_state = |first: u8| {
+            // 2. The gating and the delta-rule scan → o (f32 scratch).
+            cmds.extend(recurrent_scan(
+                p,
+                ScanForm::DeltaRule {
+                    a: *a_slot,
+                    b: *b_slot,
+                },
+                bucket_m,
+                (ix, layer_id),
+                layout,
+            ));
+
+            // 3. Gated RMSNorm → core (model-dtype arena out_slot), per value head.
+            cmds.push(recurrent_norm(
+                p,
+                (hv, nv),
+                bucket_m,
                 [
-                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, first),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, first + 1),
-                    runtime(RuntimeBindingKind::GdnStateIndices, first + 2),
-                    runtime(RuntimeBindingKind::GdnIsFresh, first + 3),
-                ]
-            };
-            if simd_scan {
-                let mut bindings = vec![
-                    Binding::MoeScratch {
-                        binding_index: 0,
-                        byte_offset: layout.o,
-                    },
-                    Binding::MoeScratch {
-                        binding_index: 1,
-                        byte_offset: layout.conv_out,
-                    },
-                    arena(a_slot, 2),
-                    arena(b_slot, 3),
-                ];
-                bindings.extend(scan_state(4));
-                bindings.extend([
-                    weight(WeightTensor::GdnALog, 8),
-                    weight(WeightTensor::GdnDtBias, 9),
-                ]);
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::GatedDeltaNet,
-                    library: "gdn_scan_varlen",
-                    function: gdn_scan_simd_static_name(dtype),
-                    constants: baked(scan_constants()),
-                    dispatch: DispatchShape {
-                        threadgroups: (1, nv * hv / 4, 1),
-                        threads_per_threadgroup: (32, 4, 1),
-                        m_scaling: Some(MScaling {
-                            axis: MScaleAxis::Z,
-                            bucket_m: BucketM(1),
-                            seq_axis: Some(MScaleAxis::Z),
-                        }),
-                    },
-                    bindings: baked(bindings),
-                    gemm_dims: None,
-                });
-            } else {
-                // 2. Input-dependent gating → g, beta (f32 scratch).
-                //    1D over [num_tokens · nv]; scales X with num_tokens.
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::GatedDeltaNet,
-                    library: "gdn_gating",
-                    function: gdn_gating_static_name(dtype),
-                    constants: baked(vec![
-                        ConstantValue::uint(0, bucket_m * nv),
-                        ConstantValue::uint(1, nv),
-                    ]),
-                    dispatch: {
-                        let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
-                        d.m_scaling = Some(MScaling {
-                            axis: MScaleAxis::X,
-                            bucket_m: BucketM(bucket_m),
-                            seq_axis: None,
-                        });
-                        d
-                    },
-                    bindings: baked(vec![
-                        Binding::MoeScratch {
-                            binding_index: 0,
-                            byte_offset: layout.g,
-                        },
-                        Binding::MoeScratch {
-                            binding_index: 1,
-                            byte_offset: layout.beta,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *a_slot,
-                            binding_index: 2,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *b_slot,
-                            binding_index: 3,
-                        },
-                        weight(WeightTensor::GdnALog, 4),
-                        weight(WeightTensor::GdnDtBias, 5),
-                    ]),
-                    gemm_dims: None,
-                });
-
-                // 3. Recurrent gated delta-rule scan → o (f32 scratch).
-                //    grid (ceil(hv/tgx), nv, num_seqs[set via seq_axis=Z]).
-                //    Always the _f32 instantiation (all I/O is f32 scratch).
-                cmds.push(LoweredCommand {
-                    kernel: KernelId::GatedDeltaNet,
-                    library: "gdn_scan_varlen",
-                    function: "gdn_scan_varlen_f32",
-                    constants: baked(scan_constants()),
-                    dispatch: {
-                        let tgx = hv.clamp(1, THREADS_PER_GROUP);
-                        DispatchShape {
-                            threadgroups: (hv.div_ceil(tgx), nv, 1),
-                            threads_per_threadgroup: (tgx, 1, 1),
-                            m_scaling: Some(MScaling {
-                                axis: MScaleAxis::Z,
-                                bucket_m: BucketM(1),
-                                seq_axis: Some(MScaleAxis::Z),
-                            }),
-                        }
-                    },
-                    bindings: baked(
-                        [
-                            (0, layout.o),
-                            (1, layout.conv_out),
-                            (2, layout.g),
-                            (3, layout.beta),
-                        ]
-                        .map(|(binding_index, byte_offset)| Binding::MoeScratch {
-                            binding_index,
-                            byte_offset,
-                        })
-                        .into_iter()
-                        .chain(scan_state(4))
-                        .collect(),
-                    ),
-                    gemm_dims: None,
-                });
-            }
-
-            // 4. Gated RMSNorm → core (model-dtype arena out_slot).
-            //    One threadgroup per row [num_tokens · nv], the power of two covering head_v
-            //    (any power of two ≥ head_v sums in the same order); scales X.
-            cmds.push(LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_rms_norm_gated",
-                function: gdn_rms_norm_gated_static_name(dtype),
-                constants: baked(vec![
-                    ConstantValue::uint(0, hv),
-                    ConstantValue::uint(1, bucket_m * nv),
-                    ConstantValue::float(2, p.rms_norm_eps),
-                ]),
-                dispatch: DispatchShape {
-                    threadgroups: (bucket_m * nv, 1, 1),
-                    threads_per_threadgroup: (hv.next_power_of_two().min(THREADS_PER_GROUP), 1, 1),
-                    m_scaling: Some(MScaling {
-                        axis: MScaleAxis::X,
-                        bucket_m: BucketM(bucket_m),
-                        seq_axis: None,
-                    }),
-                },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::MoeScratch {
-                        binding_index: 1,
-                        byte_offset: layout.o,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *z_slot,
-                        binding_index: 2,
-                    },
+                    arena(out_slot, 0),
+                    arena(z_slot, 2),
                     weight(WeightTensor::GdnNorm, 3),
-                ]),
-                gemm_dims: None,
-            });
+                ],
+                layout.o,
+                None,
+            ));
 
+            return Ok(cmds);
+        }
+
+        // ── Nemotron-H Mamba-2: conv1d → selective scan → gate-before-norm ──
+        //
+        // The GDN commands in their Mamba-2 forms (`gdn_*.metal`), over the same op scratch and
+        // the same one-slot-per-sequence conv/ssm state (`W::GDN_*` carry the Mamba-2 geometry:
+        // groups as key heads, heads as value heads, `[head_dim, state]` per head). `zxbcdt` is
+        // the whole in-projection row `z | xBC | dt`: the conv reads its `xBC` columns, the
+        // scan (or the gating ahead of the per-thread scan) its `dt` columns, the norm its `z`
+        // columns. A decode step is the same commands over one row a sequence.
+        I::Mamba2(Slot(zx_slot), Slot(out_slot), LayerId(layer)) => {
+            let layer_id = super::ids::LayerId(*layer + layer_offset);
+            let (groups, heads) = (p.gdn_num_k_heads, p.gdn_num_v_heads);
+            let conv_dim = p.gdn_conv_dim as u32;
+            let d_inner = heads * p.gdn_head_v_dim;
+            // The in-projection row: z [d_inner] | xBC [conv_dim] | dt [heads].
+            let row = d_inner + conv_dim + heads;
+            let ix = w.of(WeightKind::GatedDeltaNet, 0)?;
+            let weight = |which, binding_index| source(ix, which, layer_id, binding_index);
+            let zx = |binding_index| Binding::ArenaSlot {
+                slot: *zx_slot,
+                binding_index,
+            };
+            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, heads, d_inner);
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
+            let mut cmds = vec![recurrent_conv(
+                dequant_dtype_for(p),
+                (conv_dim, p.gdn_conv_kernel),
+                zx(1),
+                weight(WeightTensor::GdnConv1d, 2),
+                layer_id,
+                layout.conv_out,
+                Some((
+                    ColumnSlice {
+                        stride: row,
+                        offset: d_inner,
+                    },
+                    weight(WeightTensor::GdnConvBias, 7),
+                )),
+            )];
+            cmds.extend(recurrent_scan(
+                p,
+                ScanForm::Selective {
+                    zx: *zx_slot,
+                    dt: ColumnSlice {
+                        stride: row,
+                        offset: d_inner + conv_dim,
+                    },
+                },
+                bucket_m,
+                (ix, layer_id),
+                layout,
+            ));
+            // The norm per group of d_inner / n_groups, z the row's leading columns.
+            let out = Binding::ArenaSlot {
+                slot: *out_slot,
+                binding_index: 0,
+            };
+            cmds.push(recurrent_norm(
+                p,
+                (d_inner / groups, groups),
+                bucket_m,
+                [out, zx(2), weight(WeightTensor::GdnNorm, 3)],
+                layout.o,
+                Some(row),
+            ));
             return Ok(cmds);
         }
 
@@ -5151,91 +5097,28 @@ fn lower_one(
             }
         }
 
-        // ── Vision standalone tanh-approx GELU (ViT MLP / merger MLP) ─
+        // ── Standalone elementwise activations (`activation.metal`) ──
         //
-        // Faithful to the cuda `Instruction::Gelu` eval
-        // (`kernels::gelu_tanh_inplace`). Flat token-parallel; `n` =
-        // bucket-level element count `eff_m * width`, so the merger's
-        // post-reshape gelu (`eff_m = bucket_m / vision_merge_factor`,
-        // `width = vision_merge_hidden`) shrinks rows by the merge
-        // factor for free. The `gelu_tanh` kernel guards `gid >= n`, so
-        // the m_scaling tail and any padding rows are no-ops. `n` is
-        // baked (`GeluConstants`).
-        I::Gelu(Slot(in_slot), Slot(out_slot), width) => {
+        // Flat token-parallel; `n` = bucket-level element count
+        // `eff_m * width`, so the vision merger's post-reshape gelu
+        // (`eff_m = bucket_m / vision_merge_factor`, `width =
+        // vision_merge_hidden`) shrinks rows by the merge factor for
+        // free. Every kernel guards `gid >= n`, so the m_scaling tail
+        // and any padding rows are no-ops. `n` is baked
+        // (`GeluConstants`). The flavors coexist in one tape (MoonViT:
+        // tanh GELU in the blocks, erf GELU in the projector).
+        I::Activation(Slot(in_slot), Slot(out_slot), width, act) => {
             let n_elems = eff_m * width.get();
+            let (f16, bf16) = match act {
+                UnaryAct::GeluTanh => ("gelu_tanh_f16", "gelu_tanh_bf16"),
+                UnaryAct::GeluErf => ("gelu_erf_f16", "gelu_erf_bf16"),
+                UnaryAct::QuickGelu => ("quick_gelu_f16", "quick_gelu_bf16"),
+                UnaryAct::Relu2 => ("relu2_f16", "relu2_bf16"),
+            };
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
-                function: gelu_tanh_static_name(p.metal_dtype),
-                constants: gelu_constants(n_elems),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    });
-                    d
-                },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *in_slot,
-                        binding_index: 1,
-                    },
-                ]),
-                gemm_dims: None,
-            }
-        }
-
-        // ── Vision standalone erf-exact GELU (LocateAnything projector) ─
-        //
-        // Same dispatch shape as `I::Gelu` above; only the kernel symbol
-        // differs (`gelu_erf` = exact erf, NOT the tanh approximation —
-        // the two flavors coexist in one model: MoonViT block MLPs use
-        // tanh, the multimodal projector uses erf).
-        I::GeluErf(Slot(in_slot), Slot(out_slot), width) => {
-            let n_elems = eff_m * width.get();
-            LoweredCommand {
-                kernel: KernelId::VisionGelu,
-                library: "activation",
-                function: gelu_erf_static_name(p.metal_dtype),
-                constants: gelu_constants(n_elems),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    });
-                    d
-                },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *in_slot,
-                        binding_index: 1,
-                    },
-                ]),
-                gemm_dims: None,
-            }
-        }
-
-        // Same dispatch shape again; QuickGELU = x·sigmoid(1.702x)
-        // (Qwen2-VL tower blocks — its merger uses `gelu_erf`, so both
-        // flavors appear in one tape).
-        I::QuickGelu(Slot(in_slot), Slot(out_slot), width) => {
-            let n_elems = eff_m * width.get();
-            LoweredCommand {
-                kernel: KernelId::VisionGelu,
-                library: "activation",
-                function: quick_gelu_static_name(p.metal_dtype),
+                function: pick_specialized_symbol(f16, bf16, p.metal_dtype),
                 constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
@@ -5621,13 +5504,12 @@ fn lower_one(
         // which covers text-only batches AND the padding tail past
         // `total_mm`). `slot` is the Embed-output arena tile (in/out —
         // `MmEmbedSpliceImpl` aliases its output onto this input).
-        // `n` = `bucket_m * HIDDEN_SIZE` (safe upper bound: total_mm <=
-        // num_tokens <= bucket_m); m_scaling shrinks the grid to the
-        // live num_tokens. HIDDEN_SIZE is the residual width (matches
-        // the `Embed` arm; mm_embeds rows are HIDDEN_SIZE wide).
+        // Grid (a row's columns, `bucket_m` rows: total_mm <= num_tokens <=
+        // bucket_m), m_scaled to the live rows — no thread reads a padding
+        // row's destination. HIDDEN_SIZE is the residual width (the `Embed`
+        // arm's; mm_embeds rows are HIDDEN_SIZE wide).
         I::SpliceMmEmbeds(Slot(slot)) => {
             let hidden = p.hidden_size as u32;
-            let n_elems = bucket_m * hidden;
             LoweredCommand {
                 kernel: KernelId::MmEmbedSplice,
                 library: "elementwise",
@@ -5636,14 +5518,14 @@ fn lower_one(
                     hidden: HiddenSize(hidden),
                 }
                 .into_baked(),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                dispatch: DispatchShape {
+                    threadgroups: (hidden.div_ceil(THREADS_PER_GROUP), bucket_m, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
+                        axis: crate::tape::lowered::MScaleAxis::Y,
                         bucket_m: super::ids::BucketM(bucket_m),
-                    });
-                    d
+                    }),
                 },
                 bindings: baked(vec![
                     Binding::ArenaSlot {
@@ -5869,40 +5751,6 @@ fn vision_layernorm_static_name(dtype: MetalDtype, scale: ScaleDtype) -> &'stati
 fn gelu_constants(n: u32) -> &'static [ConstantValue] {
     let elements = super::ids::ElementCount(n);
     super::kernel_constants::GeluConstants { elements }.into_baked()
-}
-
-/// `activation.metal` `gelu_tanh` (tanh-approx GELU) host-name picker.
-fn gelu_tanh_static_name(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "gelu_tanh_f16",
-        MetalDtype::Bf16 => "gelu_tanh_bf16",
-        MetalDtype::Int4 => {
-            panic!("gelu_tanh: Int4 unsupported (activations are bf16/f16)")
-        }
-    }
-}
-
-/// `activation.metal` `gelu_erf` host-name picker (erf-exact GELU).
-fn gelu_erf_static_name(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "gelu_erf_f16",
-        MetalDtype::Bf16 => "gelu_erf_bf16",
-        MetalDtype::Int4 => {
-            panic!("gelu_erf: Int4 unsupported (activations are bf16/f16)")
-        }
-    }
-}
-
-/// `activation.metal` `quick_gelu` host-name picker
-/// (x·sigmoid(1.702x) — Qwen2-VL tower blocks).
-fn quick_gelu_static_name(dtype: MetalDtype) -> &'static str {
-    match dtype {
-        MetalDtype::F16 => "quick_gelu_f16",
-        MetalDtype::Bf16 => "quick_gelu_bf16",
-        MetalDtype::Int4 => {
-            panic!("quick_gelu: Int4 unsupported (activations are bf16/f16)")
-        }
-    }
 }
 
 /// `embedding_gather.metal` host-name picker (row gather by a runtime
@@ -6335,6 +6183,293 @@ struct MoeScratchLayout {
 
 fn align_256(n: u32) -> u32 {
     (n + 255) & !255
+}
+
+/// A column slice of a wider activation row — Mamba-2's `xBC` / `dt` within its in-projection
+/// row: the row's stride and the slice's first column, as a recurrent kernel's optional
+/// `(stride, offset)` constant pair at `slot`, `slot + 1`.
+#[derive(Clone, Copy, Debug)]
+struct ColumnSlice {
+    stride: u32,
+    offset: u32,
+}
+
+impl ColumnSlice {
+    fn constants(self, slot: u16) -> [ConstantValue; 2] {
+        [
+            ConstantValue::uint(slot, self.stride),
+            ConstantValue::uint(slot + 1, self.offset),
+        ]
+    }
+}
+
+/// A recurrent mixer's causal depthwise conv1d (+SiLU), varlen + stateful (`gdn_conv1d_varlen`),
+/// into the f32 scratch `conv_out`: over GDN's qkv rows, or over the `xBC` column slice of
+/// Mamba-2's in-projection rows with its conv bias (`sliced`). Grid (num_seqs[set via
+/// seq_axis=X], ceil(conv_dim/tg_y), 1).
+fn recurrent_conv(
+    dtype: DequantDtype,
+    (conv_dim, kernel): (u32, u32),
+    input: Binding,
+    conv_w: Binding,
+    layer: super::ids::LayerId,
+    conv_out: u32,
+    sliced: Option<(ColumnSlice, Binding)>,
+) -> LoweredCommand {
+    use crate::tape::ids::BucketM;
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let runtime = |kind, binding_index| Binding::Runtime {
+        kind,
+        binding_index,
+    };
+    let mut constants = vec![
+        ConstantValue::uint(0, conv_dim),
+        ConstantValue::uint(1, kernel),
+    ];
+    let mut bindings = vec![
+        Binding::MoeScratch {
+            binding_index: 0,
+            byte_offset: conv_out,
+        },
+        input,
+        conv_w,
+        runtime(RuntimeBindingKind::GdnConvState { layer }, 3),
+        runtime(RuntimeBindingKind::CuSeqlensQ, 4),
+        runtime(RuntimeBindingKind::GdnStateIndices, 5),
+        runtime(RuntimeBindingKind::GdnIsFresh, 6),
+    ];
+    if let Some((slice, bias)) = sliced {
+        constants.extend(slice.constants(2));
+        constants.push(ConstantValue::boolean(4, true));
+        bindings.push(bias);
+    }
+    let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
+    LoweredCommand {
+        kernel: KernelId::GatedDeltaNet,
+        library: "gdn_conv1d_varlen",
+        function: gdn_conv1d_varlen_static_name(dtype),
+        constants: baked(constants),
+        dispatch: DispatchShape {
+            threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
+            threads_per_threadgroup: (1, tg_y, 1),
+            // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
+            m_scaling: Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: BucketM(1),
+                seq_axis: Some(MScaleAxis::X),
+            }),
+        },
+        bindings: baked(bindings),
+        gemm_dims: None,
+    }
+}
+
+/// How a recurrent mixer's scan gates and updates its state: GDN's gated delta rule, its gate
+/// inputs `a` / `b` their own `[T, heads]` activations; Mamba-2's selective scan, `dt` a column
+/// slice of its in-projection row `zx`, with the `D` skip.
+#[derive(Clone, Copy, Debug)]
+enum ScanForm {
+    DeltaRule { a: u32, b: u32 },
+    Selective { zx: u32, dt: ColumnSlice },
+}
+
+/// A recurrent mixer's gating and scan of the f32 scratch `conv_out` into the f32 scratch `o`,
+/// over the pool's ssm state. head_k a multiple of 32 (and head_v of 4): one command, mlx-lm's
+/// simdgroup-per-value-dim mapping (`gdn_scan_simd`, the gating inline). The mapping is
+/// sequence-serial either way, but a simdgroup's 32 lanes split head_k (dots via `simd_sum`)
+/// where `gdn_scan_varlen`'s CUDA-faithful mapping runs serial head_k loops per token in ONE
+/// thread — measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill forward (64%,
+/// ~8 µs/token/layer) on the per-thread kernel. Other geometries: the gating into `g` / `beta`
+/// (1-D over `[num_tokens · heads]`, scaling X), then the per-thread scan, always its `_f32`
+/// instantiation (all its I/O is f32 scratch). Both scans: grid Z = num_seqs.
+fn recurrent_scan(
+    p: &MetalModelConsts,
+    form: ScanForm,
+    bucket_m: u32,
+    (ix, layer): (SourceIx, super::ids::LayerId),
+    layout: GdnScratchLayout,
+) -> Vec<LoweredCommand> {
+    use crate::tape::ids::BucketM;
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let (nk, nv) = (p.gdn_num_k_heads, p.gdn_num_v_heads);
+    let (hk, hv) = (p.gdn_head_k_dim, p.gdn_head_v_dim);
+    let dtype = dequant_dtype_for(p);
+    let (a, b, dt) = match form {
+        ScanForm::DeltaRule { a, b } => (a, b, None),
+        ScanForm::Selective { zx, dt } => (zx, zx, Some(dt)),
+    };
+    let weight = |which, binding_index| source(ix, which, layer, binding_index);
+    let arena = |slot, binding_index| Binding::ArenaSlot {
+        slot,
+        binding_index,
+    };
+    let scratch = |binding_index, byte_offset| Binding::MoeScratch {
+        binding_index,
+        byte_offset,
+    };
+    let runtime = |kind, binding_index| Binding::Runtime {
+        kind,
+        binding_index,
+    };
+    // The selective scan's flag; its scale is unread.
+    let mut scan_constants = vec![
+        ConstantValue::uint(0, nk),
+        ConstantValue::uint(1, nv),
+        ConstantValue::uint(2, hk),
+        ConstantValue::uint(3, hv),
+        ConstantValue::float(4, (hk as f32).powf(-0.5)),
+    ];
+    scan_constants.extend(dt.map(|_| ConstantValue::boolean(5, true)));
+    let state = [
+        runtime(RuntimeBindingKind::GdnSsmState { layer }, 4),
+        runtime(RuntimeBindingKind::CuSeqlensQ, 5),
+        runtime(RuntimeBindingKind::GdnStateIndices, 6),
+        runtime(RuntimeBindingKind::GdnIsFresh, 7),
+    ];
+    let seqs = Some(MScaling {
+        axis: MScaleAxis::Z,
+        bucket_m: BucketM(1),
+        seq_axis: Some(MScaleAxis::Z),
+    });
+    // `inputs` at 2 and 3, the ssm state at 4..=7, then `tail`, then (selective) `D` at `skip`.
+    let scan =
+        |function, constants, inputs: [Binding; 2], tail: &[Binding], skip, dispatch: (_, _)| {
+            let mut bindings = vec![scratch(0, layout.o), scratch(1, layout.conv_out)];
+            bindings.extend(inputs.into_iter().chain(state).chain(tail.iter().copied()));
+            bindings.extend(dt.map(|_| weight(WeightTensor::GdnSkip, skip)));
+            LoweredCommand {
+                kernel: KernelId::GatedDeltaNet,
+                library: "gdn_scan_varlen",
+                function,
+                constants: baked(constants),
+                dispatch: DispatchShape {
+                    threadgroups: dispatch.0,
+                    threads_per_threadgroup: dispatch.1,
+                    m_scaling: seqs,
+                },
+                bindings: baked(bindings),
+                gemm_dims: None,
+            }
+        };
+    if hk.is_multiple_of(32) && hv.is_multiple_of(4) {
+        scan_constants.extend(dt.into_iter().flat_map(|dt| dt.constants(6)));
+        let gating = [
+            weight(WeightTensor::GdnALog, 8),
+            weight(WeightTensor::GdnDtBias, 9),
+        ];
+        let function = gdn_scan_simd_static_name(dtype);
+        let dispatch = ((1, nv * hv / 4, 1), (32, 4, 1));
+        let inputs = [arena(a, 2), arena(b, 3)];
+        return vec![scan(
+            function,
+            scan_constants,
+            inputs,
+            &gating,
+            10,
+            dispatch,
+        )];
+    }
+    let mut gating_constants = vec![
+        ConstantValue::uint(0, bucket_m * nv),
+        ConstantValue::uint(1, nv),
+    ];
+    if let Some(dt) = dt {
+        gating_constants.push(ConstantValue::boolean(2, true));
+        gating_constants.extend(dt.constants(3));
+    }
+    let gating = LoweredCommand {
+        kernel: KernelId::GatedDeltaNet,
+        library: "gdn_gating",
+        function: gdn_gating_static_name(dtype),
+        constants: baked(gating_constants),
+        dispatch: {
+            let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
+            d.m_scaling = Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: BucketM(bucket_m),
+                seq_axis: None,
+            });
+            d
+        },
+        bindings: baked(vec![
+            scratch(0, layout.g),
+            scratch(1, layout.beta),
+            arena(a, 2),
+            arena(b, 3),
+            weight(WeightTensor::GdnALog, 4),
+            weight(WeightTensor::GdnDtBias, 5),
+        ]),
+        gemm_dims: None,
+    };
+    let inputs = [scratch(2, layout.g), scratch(3, layout.beta)];
+    let tgx = hv.clamp(1, THREADS_PER_GROUP);
+    let dispatch = ((hv.div_ceil(tgx), nv, 1), (tgx, 1, 1));
+    vec![
+        gating,
+        scan(
+            "gdn_scan_varlen_f32",
+            scan_constants,
+            inputs,
+            &[],
+            8,
+            dispatch,
+        ),
+    ]
+}
+
+/// A recurrent mixer's gated RMSNorm (`gdn_rms_norm_gated`) of the f32 scratch `o` into the
+/// model-dtype `out` (bindings `[out, z, weight]`): rows of `width` (`per_token` a token), one threadgroup a row of the power
+/// of two covering `width` (any power of two ≥ width sums in the same order); scales X. GDN
+/// norms per value head after the gate; Mamba-2 (`z_stride` = its in-projection row, `z` that
+/// row's leading columns) gates first and norms per group, its weight spanning the row.
+fn recurrent_norm(
+    p: &MetalModelConsts,
+    (width, per_token): (u32, u32),
+    bucket_m: u32,
+    [out, z, norm_w]: [Binding; 3],
+    o: u32,
+    z_stride: Option<u32>,
+) -> LoweredCommand {
+    use crate::tape::ids::BucketM;
+    use crate::tape::lowered::{MScaleAxis, MScaling};
+    let rows = bucket_m * per_token;
+    let mut constants = vec![
+        ConstantValue::uint(0, width),
+        ConstantValue::uint(1, rows),
+        ConstantValue::float(2, p.rms_norm_eps),
+    ];
+    if let Some(stride) = z_stride {
+        constants.extend([
+            ConstantValue::uint(3, stride),
+            ConstantValue::uint(4, per_token),
+            ConstantValue::boolean(5, true),
+        ]);
+    }
+    LoweredCommand {
+        kernel: KernelId::GatedDeltaNet,
+        library: "gdn_rms_norm_gated",
+        function: gdn_rms_norm_gated_static_name(dequant_dtype_for(p)),
+        constants: baked(constants),
+        dispatch: DispatchShape {
+            threadgroups: (rows, 1, 1),
+            threads_per_threadgroup: (width.next_power_of_two().min(THREADS_PER_GROUP), 1, 1),
+            m_scaling: Some(MScaling {
+                axis: MScaleAxis::X,
+                bucket_m: BucketM(bucket_m),
+                seq_axis: None,
+            }),
+        },
+        bindings: baked(vec![
+            out,
+            Binding::MoeScratch {
+                binding_index: 1,
+                byte_offset: o,
+            },
+            z,
+            norm_w,
+        ]),
+        gemm_dims: None,
+    }
 }
 
 /// Per-bucket Gated-DeltaNet scratch layout. The four GDN sub-commands
@@ -6783,7 +6918,7 @@ impl MoeScratch {
         let l = MoeScratchLayout::compute(bucket_m, e, k, i, h, elem, grouping.pad());
         let router_normed = align_256(l.total);
         let total = match b.input {
-            RouterInput::PreNormed => align_256(router_normed + bucket_m * h * elem),
+            RouterInput::PreNormed => align_256(router_normed + bucket_m * b.router_in.0 * elem),
             RouterInput::Raw => l.total,
         };
         *moe_scratch_bytes = (*moe_scratch_bytes).max(total);
@@ -6912,6 +7047,7 @@ fn lower_moe_step(
     let cmd = make_moe_command;
     let s = MoeScratch::of(b, bucket_m, p, moe_scratch_bytes);
     let (e, k, inter, hidden) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
+    let router_in = b.router_in.0;
     let pairs = bucket_m * k;
     let top_k_constants = || MoeTopKConstants {
         experts: b.experts,
@@ -7032,6 +7168,88 @@ fn lower_moe_step(
         }
         Ok::<_, LoweringError>(commands)
     };
+    // Gathered or sorted: one command runs the first projection of every pair — a gated
+    // expert's gate and up, an ungated one's up alone, into its own region — then the
+    // activation over the rows each threadgroup wrote, routing the block's token first when it
+    // can (`routed_here`), else after the routing command.
+    let gated_command = |first: ExpertMatmul,
+                         body: ExpertBody,
+                         routing: Option<super::step::RouteProgram>,
+                         bytes: &mut u32| {
+        let (routed, route) = routed_here(routing, 4 * 128);
+        let mut commands = each_step(route.as_slice(), bytes)?;
+        let (AffineGroupSize(gs), bits) = (first.group_size, first.width.bits().0);
+        let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
+        let mut bindings = expert_weights(first.proj, first.layer, 0)?.to_vec();
+        let (x, norm, gain) = normed_rows(&s, 3, first.rows)?;
+        let region = match first.proj {
+            ExpertProj::Up => R::ExpertUp,
+            ExpertProj::Gate | ExpertProj::Down => R::ExpertGate,
+        };
+        bindings.extend([x, gather_indices(&s, 4), s.at(5, region)]);
+        if let ExpertBody::Gated(_) = body {
+            bindings.extend(expert_weights(ExpertProj::Up, first.layer, 6)?);
+            bindings.push(s.at(9, R::ExpertUp));
+        }
+        bindings.extend(gain);
+        // Full static grid when sorted — a short step's live pairs sit past the m-scaled
+        // edge, on rows the init sentinel-filled.
+        let scaling = match s.grouping {
+            MoeGrouping::Gathered => ms(A::Z),
+            MoeGrouping::Sorted | MoeGrouping::Grouped => None,
+        };
+        let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
+        let gather = AffineGatherQmvConstants {
+            qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
+            rows: rows_read(&s, first.rows),
+        };
+        let mut constants: Vec<ConstantValue> = AffineGatedQmvConstants {
+            qmv: gather,
+            act: body,
+        }
+        .into();
+        constants.extend(norm);
+        if let Some(program) = routed {
+            bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
+            if let Some(l) = program.expert_scale {
+                let scale = WeightTensor::GemmaPerExpertScale;
+                bindings.push(source(router()?, scale, layer(&l), 12));
+            }
+            // The F32 router bias, when the pre reads one: GLM's e_score_correction_bias
+            // (sigmoid + bias) or gpt-oss's linear router bias.
+            if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
+                program.pre
+            {
+                bindings.push(source(
+                    router()?,
+                    WeightTensor::MoeRouterBias,
+                    layer(&l),
+                    13,
+                ));
+            }
+            constants.extend(Vec::from(RoutedConstants {
+                experts: b.experts,
+                program,
+            }));
+        }
+        // gpt-oss experts carry per-expert LINEAR biases on gate and up — the [E, 2·inter]
+        // concat the loader interleaves — bound at 14, with the kernel's switch at slot 4.
+        // Every other bundle leaves both unset, and the kernel const-folds the adds away.
+        if b.bundle == ExpertBundle::GptOss {
+            let bias = WeightTensor::MoeExpertGateUpLinearBias;
+            bindings.push(source(router()?, bias, layer(&first.layer), 14));
+            constants.push(C::boolean(4, true));
+        }
+        commands.push(cmd(
+            kernel,
+            "quantized_qmv",
+            symbol,
+            constants,
+            shape,
+            bindings,
+        ));
+        Ok::<_, LoweringError>(commands)
+    };
     Ok(match step {
         // Plain RMSNorm by the router gain: Gemma's `(1 + w)` offset does not apply to it.
         S::RouterNorm(Slot(x), l, eps) => vec![LoweredCommand {
@@ -7040,14 +7258,14 @@ fn lower_moe_step(
             function: rmsnorm_kernel_static_name(p, scale_dtype),
             constants: super::kernel_constants::RmsNormConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
-                q_size: super::ids::QSize(hidden),
+                q_size: super::ids::QSize(router_in),
                 rms_norm_eps: super::ids::RmsNormEps(eps.0),
                 weight_offset: 0.0,
             }
             .into_baked(),
             dispatch: grid(
                 (bucket_m, 1, 1),
-                (norm_threads(QSize(hidden)), 1, 1),
+                (norm_threads(QSize(router_in)), 1, 1),
                 ms(A::X),
             ),
             bindings: baked(vec![
@@ -7085,7 +7303,7 @@ fn lower_moe_step(
                 ),
                 constants: super::kernel_constants::NormedGemvConstants {
                     n: super::ids::NDim(e),
-                    k: super::ids::KDim(hidden),
+                    k: super::ids::KDim(router_in),
                     eps,
                     offset,
                 }
@@ -7126,7 +7344,7 @@ fn lower_moe_step(
                 gemm_dims: Some(GemmDims {
                     m: bucket_m,
                     n: e,
-                    k: hidden,
+                    k: router_in,
                 }),
             }]
         }
@@ -7402,6 +7620,7 @@ fn lower_moe_step(
                 // activation over the padded rows into `x_pad` first (sentinel rows skipped).
                 let mpad = s.l.mpad_max;
                 let x_pad = scratch_at(3, s.l.grp_x_pad);
+                let down_rows = rows_of(&s, 0, rows)?;
                 let quant = (proj == ExpertProj::Down).then(|| {
                     cmd(
                         KernelId::AffineGatherW4a8Quant,
@@ -7414,7 +7633,7 @@ fn lower_moe_step(
                         ],
                         grid(((inter / 64).div_ceil(16), mpad, 1), (128, 1, 1), None),
                         vec![
-                            s.at(0, R::ExpertGate),
+                            down_rows,
                             scratch_at(1, s.l.grp_x_pad),
                             scratch_at(2, s.l.grp_indices_pad),
                         ],
@@ -7556,70 +7775,18 @@ fn lower_moe_step(
             commands
         }
         S::GateUpAct(gate, _, act, routing) => {
-            let (routed, route) = routed_here(routing, 4 * 128);
-            let mut commands = each_step(route.as_slice(), moe_scratch_bytes)?;
-            let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
-            let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
-            let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
-            let (x, norm, gain) = normed_rows(&s, 3, gate.rows)?;
-            bindings.extend([x, gather_indices(&s, 4), s.at(5, R::ExpertGate)]);
-            bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
-            bindings.push(s.at(9, R::ExpertUp));
-            bindings.extend(gain);
-            // Full static grid when sorted — a short step's live pairs sit past the m-scaled
-            // edge, on rows the init sentinel-filled.
-            let scaling = match s.grouping {
-                MoeGrouping::Gathered => ms(A::Z),
-                MoeGrouping::Sorted | MoeGrouping::Grouped => None,
-            };
-            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
-            let gather = AffineGatherQmvConstants {
-                qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
-                rows: rows_read(&s, gate.rows),
-            };
-            let mut constants: Vec<ConstantValue> =
-                AffineGatedQmvConstants { qmv: gather, act }.into();
-            constants.extend(norm);
-            if let Some(program) = routed {
-                bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
-                if let Some(l) = program.expert_scale {
-                    let scale = WeightTensor::GemmaPerExpertScale;
-                    bindings.push(source(router()?, scale, layer(&l), 12));
-                }
-                // The F32 router bias, when the pre reads one: GLM's e_score_correction_bias
-                // (sigmoid + bias) or gpt-oss's linear router bias.
-                if let super::step::RoutePre::SigmoidBias(l) | super::step::RoutePre::Bias(l) =
-                    program.pre
-                {
-                    bindings.push(source(
-                        router()?,
-                        WeightTensor::MoeRouterBias,
-                        layer(&l),
-                        13,
-                    ));
-                }
-                constants.extend(Vec::from(RoutedConstants {
-                    experts: b.experts,
-                    program,
-                }));
-            }
-            // gpt-oss experts carry per-expert LINEAR biases on gate and up — the [E, 2·inter]
-            // concat the loader interleaves — bound at 14, with the kernel's switch at slot 4.
-            // Every other bundle leaves both unset, and the kernel const-folds the adds away.
-            if b.bundle == ExpertBundle::GptOss {
-                let bias = WeightTensor::MoeExpertGateUpLinearBias;
-                bindings.push(source(router()?, bias, layer(&gate.layer), 14));
-                constants.push(C::boolean(4, true));
-            }
-            commands.push(cmd(
-                kernel,
-                "quantized_qmv",
-                symbol,
-                constants,
-                shape,
-                bindings,
-            ));
-            commands
+            gated_command(gate, ExpertBody::Gated(act), routing, moe_scratch_bytes)?
+        }
+        // A grouped bake, or a width with a 1-3 row tail, runs the projection and the act apart.
+        S::UpAct(up, act, routing)
+            if s.grouping == MoeGrouping::Grouped || !inter.is_multiple_of(4) =>
+        {
+            let route = routing.map(S::Route);
+            let steps = [S::ExpertMatmul(up), S::Act(act)];
+            each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
+        }
+        S::UpAct(up, act, routing) => {
+            gated_command(up, ExpertBody::Ungated(act), routing, moe_scratch_bytes)?
         }
         // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
@@ -7685,6 +7852,27 @@ fn lower_moe_step(
                 panic!("a GptOss GatedAct must arrive fused into GateUpAct");
             }
             gated_act_command(act, None)?
+        }
+        // `act(up)` over the up rows, in place; a bake that sorted runs every padded row.
+        S::Act(UngatedAct::Relu2) => {
+            let (rows, m_scaling) = match s.grouping {
+                MoeGrouping::Gathered => (pairs, ms(A::X)),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
+            };
+            let n = rows * inter;
+            let symbol = pick_specialized_symbol("relu2_f16", "relu2_bf16", p.metal_dtype);
+            let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
+            let bindings = vec![s.at(0, R::ExpertUp), s.at(1, R::ExpertUp)];
+            let kernel = KernelId::VisionGelu;
+            let constants = gelu_constants(n).to_vec();
+            vec![cmd(
+                kernel,
+                "activation",
+                symbol,
+                constants,
+                shape,
+                bindings,
+            )]
         }
         S::Unsort => vec![],
         // `out[n, d] = Σ_k rows[n, k, d] · scores[n, k]`; a sorted bake's pair rows read where
@@ -8168,6 +8356,277 @@ mod tests {
         let want = [(conv, None), (simd, None), (norm, None)];
         assert_eq!(shape(&lowered((2, 4, 128, 48), 64)), want);
         assert_eq!(shape(&lowered((2, 4, 64, 48), 64)), want);
+    }
+
+    /// The un-rotated KV writer coded (`KvWrite::PoolAndPacked`, Nemotron-H under TurboQuant):
+    /// its one `kv_append` command carries the rope writer's encode constants (slots 10-14, no
+    /// offset) and binds the codebook and the layer's packed stores at 16-21 — no bias, no
+    /// rotary table. Plain (a dense model), it carries neither. With a projection bias the codec
+    /// cannot restore it refuses. Its layer's packed decode twin lowers after it. Pure-CPU
+    /// lowering checks.
+    #[test]
+    fn a_coded_kv_append_encodes_as_it_writes() {
+        use scratchy_ir::{BiasStorage, KvOffset};
+        let writer = |offsets, write| {
+            MetalStep::KvAppend(Slot(1), Slot(2), LayerId(0), Causal, offsets, write)
+        };
+        let lower = |step: MetalStep| try_lower_tq(&tq_consts(), plain(&[step]), 1);
+        let coded = lower(writer(LLAMA_KV, KvWrite::PoolAndPacked)).expect("lowers");
+        let c = &coded.commands[0].command;
+        assert_eq!((c.library, coded.commands.len()), ("kv_append", 1));
+        let slot = |i: u16| c.constants.iter().find(|k| k.index == i).map(|k| k.bits);
+        let hd = tq_consts().global_head_dim as usize;
+        assert_eq!(
+            (10..15).map(slot).collect::<Vec<_>>(),
+            [
+                Some(TQ_BITS.get()),
+                Some(scratchy_layers::turboquant::vals_per_word(TQ_BITS.get()) as u32),
+                Some(scratchy_layers::turboquant::packed_dim(hd, TQ_BITS.get()) as u32),
+                Some(0),
+                Some(0)
+            ]
+        );
+        let mut tq: Vec<u8> = c
+            .bindings
+            .iter()
+            .map(|b| b.index())
+            .filter(|&i| i >= 16)
+            .collect();
+        tq.sort_unstable();
+        assert_eq!(tq, [16, 17, 18, 19, 20, 21]);
+        // Plain on a dense model (a coded model refuses a writer that encodes nothing).
+        let plain_writer = try_lower_tq(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
+        let plain_writer = plain_writer.expect("lowers");
+        let c = &plain_writer.commands[0].command;
+        assert!(c.constants.iter().all(|k| k.index < 10));
+        assert!(c.bindings.iter().all(|b| b.index() < 16));
+        let k_biased = scratchy_ir::KvOffsets {
+            k: KvOffset::LinearBias(BiasStorage::Dense),
+            v: KvOffset::Centered,
+        };
+        assert!(matches!(
+            lower(writer(k_biased, KvWrite::PoolAndPacked)),
+            Err(LoweringError::UnrotatedWriterOffset { index: 0 })
+        ));
+        // The layer's packed decode twin, after its coded writer. The fixture's geometry
+        // (TurboQuant-4, a whole query-head group of 8 per KV head, head_dim 64) is one
+        // `decode_attention_per_kv_head` serves per KV head (#350), so the twin lowers as
+        // the split pair, not the one-pass `attention_via_cache_v2`.
+        let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
+        let rows = plain(&[writer(LLAMA_KV, KvWrite::PoolAndPacked), twin]);
+        let layer = try_lower_tq(&tq_consts(), rows, 1).expect("the coded layer lowers");
+        let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.command.kernel).collect();
+        assert_eq!(
+            kernels,
+            [
+                KernelId::KvAppend,
+                KernelId::AttentionDecodeGqaTq,
+                KernelId::AttentionDecodeCombine,
+            ]
+        );
+    }
+
+    /// A Mamba-2 layer lowers to the GDN kernels in their Mamba-2 forms, ungated at every
+    /// bucket (a decode step is the same chain over one row a sequence): the conv over the
+    /// in-projection's `xBC` columns with its bias; the gating then the per-thread scan (state
+    /// 16), or the simd scan reading `dt` off the row itself (state 128); the gate-before-norm
+    /// per group. The constants and bindings are the ones `tests/mamba2_test.rs` dispatches
+    /// against its CPU reference. Pure-CPU lowering checks.
+    #[test]
+    fn mamba2_lowers_the_gdn_kernels_in_their_mamba2_forms() {
+        use ConstantValue as C;
+        use WeightTensor as T;
+        let lowered = |(groups, heads, state, head_dim): (u32, u32, u32, u32), bucket_m| {
+            let p = MetalModelConsts {
+                gdn_num_k_heads: groups,
+                gdn_num_v_heads: heads,
+                gdn_head_k_dim: state,
+                gdn_head_v_dim: head_dim,
+                gdn_conv_kernel: 4,
+                gdn_conv_dim: (heads * head_dim + 2 * groups * state) as usize,
+                ..tp()
+            };
+            let step = MetalStep::Mamba2(Slot(0), Slot(1), LayerId(0));
+            lower_tq(&p, plain(&[step]), bucket_m)
+                .commands
+                .iter()
+                .cloned()
+                .collect::<Vec<GatedCommand>>()
+        };
+        // A binding as (index, what it binds), the scratch by its region's order.
+        let binds = |c: &GatedCommand| -> Vec<(u8, String)> {
+            let mut b: Vec<(u8, String)> = c
+                .command
+                .bindings
+                .iter()
+                .map(|b| match *b {
+                    Binding::ArenaSlot {
+                        slot,
+                        binding_index,
+                    } => (binding_index, format!("arena {slot}")),
+                    Binding::MoeScratch {
+                        binding_index,
+                        byte_offset,
+                    } => (binding_index, format!("scratch {byte_offset}")),
+                    Binding::Source {
+                        which,
+                        binding_index,
+                        ..
+                    } => (binding_index, format!("{which:?}")),
+                    Binding::Runtime {
+                        kind,
+                        binding_index,
+                    } => (binding_index, format!("{kind:?}")),
+                    ref other => panic!("unexpected binding {other:?}"),
+                })
+                .collect();
+            b.sort();
+            b
+        };
+        let named = |pairs: &[(u8, &str)]| -> Vec<(u8, String)> {
+            pairs.iter().map(|&(i, s)| (i, s.to_owned())).collect()
+        };
+        let state = [
+            "GdnSsmState { layer: LayerId(0) }",
+            "CuSeqlensQ",
+            "GdnStateIndices",
+            "GdnIsFresh",
+        ];
+        for bucket_m in [1, 64] {
+            // The parity-tiny geometry: in-projection row 128 + 192 + 8 = 328.
+            let tiny = lowered((2, 8, 16, 16), bucket_m);
+            let functions: Vec<_> = tiny.iter().map(|c| (c.command.function, c.gate)).collect();
+            assert_eq!(
+                functions,
+                [
+                    ("gdn_conv1d_varlen_bf16", None),
+                    ("gdn_gating_bf16", None),
+                    ("gdn_scan_varlen_f32", None),
+                    ("gdn_rms_norm_gated_bf16", None),
+                ]
+            );
+            assert_eq!(
+                tiny[0].command.constants,
+                [
+                    C::uint(0, 192),
+                    C::uint(1, 4),
+                    C::uint(2, 328),
+                    C::uint(3, 128),
+                    C::boolean(4, true)
+                ]
+            );
+            let conv_out = "scratch 0".to_owned();
+            let mut want = named(&[
+                (1, "arena 0"),
+                (2, &format!("{:?}", T::GdnConv1d)),
+                (3, "GdnConvState { layer: LayerId(0) }"),
+                (4, "CuSeqlensQ"),
+                (5, "GdnStateIndices"),
+                (6, "GdnIsFresh"),
+                (7, &format!("{:?}", T::GdnConvBias)),
+            ]);
+            want.insert(0, (0, conv_out.clone()));
+            assert_eq!(binds(&tiny[0]), want);
+            assert_eq!(
+                tiny[1].command.constants,
+                [
+                    C::uint(0, bucket_m * 8),
+                    C::uint(1, 8),
+                    C::boolean(2, true),
+                    C::uint(3, 328),
+                    C::uint(4, 320)
+                ]
+            );
+            let gating = binds(&tiny[1]);
+            assert_eq!(
+                gating[2..],
+                named(&[
+                    (2, "arena 0"),
+                    (3, "arena 0"),
+                    (4, "GdnALog"),
+                    (5, "GdnDtBias")
+                ])
+            );
+            let scan_constants = [
+                C::uint(0, 2),
+                C::uint(1, 8),
+                C::uint(2, 16),
+                C::uint(3, 16),
+                C::float(4, 0.25),
+                C::boolean(5, true),
+            ];
+            assert_eq!(tiny[2].command.constants, scan_constants);
+            let scan = binds(&tiny[2]);
+            assert_eq!(scan[1], (1, conv_out.clone()));
+            // The scan reads the gating's g and dt regions.
+            assert_eq!(scan[2], (2, gating[0].1.clone()));
+            assert_eq!(scan[3], (3, gating[1].1.clone()));
+            assert_eq!(
+                scan[4..8],
+                named(&[(4, state[0]), (5, state[1]), (6, state[2]), (7, state[3])])
+            );
+            assert_eq!(scan[8], (8, "GdnSkip".to_owned()));
+            assert_eq!(
+                tiny[3].command.constants,
+                [
+                    C::uint(0, 64),
+                    C::uint(1, bucket_m * 2),
+                    C::float(2, tp().rms_norm_eps),
+                    C::uint(3, 328),
+                    C::uint(4, 2),
+                    C::boolean(5, true)
+                ]
+            );
+            let norm = binds(&tiny[3]);
+            assert_eq!(norm[0], (0, "arena 1".to_owned()));
+            assert_eq!(norm[1], (1, scan[0].1.clone()));
+            assert_eq!(norm[2..], named(&[(2, "arena 0"), (3, "GdnNorm")]));
+
+            // The real checkpoints' state: the simd scan, dt at the row's last 64 columns.
+            let real = lowered((8, 64, 128, 64), bucket_m);
+            let functions: Vec<_> = real.iter().map(|c| (c.command.function, c.gate)).collect();
+            assert_eq!(
+                functions,
+                [
+                    ("gdn_conv1d_varlen_bf16", None),
+                    ("gdn_scan_simd_bf16", None),
+                    ("gdn_rms_norm_gated_bf16", None),
+                ]
+            );
+            let (inner, conv_dim) = (64 * 64, 64 * 64 + 2 * 8 * 128);
+            let row = inner + conv_dim + 64;
+            let simd_constants = [
+                C::uint(0, 8),
+                C::uint(1, 64),
+                C::uint(2, 128),
+                C::uint(3, 64),
+                C::float(4, 128f32.powf(-0.5)),
+                C::boolean(5, true),
+                C::uint(6, row),
+                C::uint(7, inner + conv_dim),
+            ];
+            assert_eq!(real[1].command.constants, simd_constants);
+            let simd = binds(&real[1]);
+            assert_eq!(simd[2..4], named(&[(2, "arena 0"), (3, "arena 0")]));
+            assert_eq!(
+                simd[4..8],
+                named(&[(4, state[0]), (5, state[1]), (6, state[2]), (7, state[3])])
+            );
+            assert_eq!(
+                simd[8..],
+                named(&[(8, "GdnALog"), (9, "GdnDtBias"), (10, "GdnSkip")])
+            );
+            let d = &real[1].command.dispatch;
+            assert_eq!(
+                (d.threadgroups, d.threads_per_threadgroup),
+                ((1, 64 * 64 / 4, 1), (32, 4, 1))
+            );
+            let d = &real[2].command.dispatch;
+            assert_eq!(
+                (d.threadgroups, d.threads_per_threadgroup),
+                ((bucket_m * 8, 1, 1), (256, 1, 1))
+            );
+        }
     }
 
     /// A dense model's tape carries no TurboQuant command and gates nothing on
@@ -10055,8 +10514,8 @@ mod tests {
         );
     }
 
-    /// The writer's encode binds exactly the ABI `rope.metal`'s `ROPE_TQ_BUFFERS` declares, in
-    /// order, and carries its constants slot by slot — written out here, independently of the
+    /// The writer's encode binds exactly the ABI `kv_writer.h`'s `KV_WRITER_TQ_BUFFERS` declares,
+    /// in order, and carries its constants slot by slot — written out here, independently of the
     /// builder, for a centered layer (the offset tail is pinned above).
     #[test]
     fn turboquant_writer_encode_binds_the_kernel_abi() {
@@ -10189,6 +10648,46 @@ mod tests {
             cmd.dispatch.m_scaling.is_some(),
             "ScalarMul carries X-axis m_scaling for the num_tokens rescale"
         );
+    }
+
+    /// `step` lowered alone at `bucket_m` for a model of `p`. Pure-CPU.
+    fn lower_alone(p: &MetalModelConsts, step: &MetalStep, bucket_m: u32) -> Vec<LoweredCommand> {
+        let (mut scratch, mut moe, mut roped_k, mut unfused) = (0u32, 0u32, 0u32, 0u32);
+        lower_one(
+            p,
+            false,
+            step,
+            row(),
+            bucket_m,
+            0,
+            &mut scratch,
+            &mut moe,
+            &mut roped_k,
+            &mut unfused,
+            128,
+            None,
+            1,
+        )
+        .expect("lower")
+    }
+
+    /// The embed splice dispatches whole rows: a grid row per bucket row,
+    /// m_scaled on Y to the live tokens, at a width 256 does not divide —
+    /// a flat grid over `rows · hidden` rounded up to whole threadgroups
+    /// reached a padding row and spliced its destination lane (0) onto row 0.
+    #[test]
+    fn the_embed_splice_dispatches_whole_rows() {
+        let p = MetalModelConsts {
+            hidden_size: 2688,
+            ..tp()
+        };
+        let cmds = lower_alone(&p, &MetalStep::SpliceMmEmbeds(Slot(0)), 8);
+        let d = cmds[0].dispatch;
+        assert_eq!(d.threadgroups, (2688u32.div_ceil(256), 8, 1));
+        assert_eq!(d.threads_per_threadgroup, (256, 1, 1));
+        let scaling = d.m_scaling.expect("row m_scaling");
+        assert!(matches!(scaling.axis, crate::tape::lowered::MScaleAxis::Y));
+        assert!(scaling.seq_axis.is_none());
     }
 
     /// At `bucket_m < vector_limit` we should land in the qmv branch
@@ -10656,13 +11155,14 @@ mod tests {
             top_k: TopK(8),
             inter: IntermediateSize(512),
             hidden: HiddenSize(2048),
+            router_in: HiddenSize(2048),
             router: RouterBundle::SharedFused,
             bundle: ExpertBundle::SharedFused,
             input: RouterInput::Raw,
             quant: ExpertQuant {
                 group_size: AffineGroupSize(64),
                 widths: ExpertWidths {
-                    gate: four,
+                    gate: Some(four),
                     up: four,
                     down: four,
                 },
@@ -10914,6 +11414,105 @@ mod tests {
             sorted_rows(8).0 == MoeGrouping::Sorted,
             "bucket 8 is the sorted bake"
         );
+    }
+
+    /// Nemotron-3-Super's LatentMoE block: an ungated relu² bank of 512 experts at top 22 over a
+    /// 1024-wide latent, its router reading the 4096-wide block input, `fc1` 4-bit, `fc2` 2-bit.
+    fn latent_relu2_block() -> crate::tape::step::MoeBlock {
+        use crate::tape::ids::{
+            AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, NumExperts, TopK,
+        };
+        use crate::tape::step::{ExpertQuant, ExpertWidths, RouterInput};
+        use scratchy_subtile::subtile_ir::{ExpertBundle, RouterBundle};
+        MoeBlock {
+            experts: NumExperts(512),
+            top_k: TopK(22),
+            inter: IntermediateSize(2688),
+            hidden: HiddenSize(1024),
+            router_in: HiddenSize(4096),
+            router: RouterBundle::SharedFused,
+            bundle: ExpertBundle::SharedFused,
+            input: RouterInput::Raw,
+            quant: ExpertQuant {
+                group_size: AffineGroupSize(64),
+                widths: ExpertWidths {
+                    gate: None,
+                    up: AffineBits(4),
+                    down: AffineBits(2),
+                },
+            },
+        }
+    }
+
+    /// An ungated bank runs its one in-projection and relu²: gathered, as the gated command at
+    /// `GATED_ACT = 3`, binding no up projection and writing the up rows; grouped, as the grouped
+    /// GEMM then `relu2` in place over those rows. Its router contracts the block input, not the
+    /// latent the experts read.
+    #[test]
+    fn an_ungated_bank_runs_its_one_projection_then_relu2() {
+        use crate::tape::ids::{AffineBits, AffineGroupSize};
+        use crate::tape::step::{ExpertMatmul, ExpertWidth, MoeRows, MoeStep, UngatedAct};
+        use scratchy_subtile::subtile_ir::ExpertProj;
+        let (block, p) = (latent_relu2_block(), tp());
+        let up = ExpertMatmul {
+            rows: MoeRows::Tokens(Slot(1)),
+            layer: LayerId(0),
+            proj: ExpertProj::Up,
+            group_size: AffineGroupSize(64),
+            width: ExpertWidth::Declared(AffineBits(4)),
+        };
+        let lower = |step, bucket_m| {
+            let at = MoeBake {
+                bucket_m,
+                layer_offset: 0,
+                is_nax: false,
+                f16_compute: false,
+                codes: super::super::kernel_constants::AffineCodesTarget::of(None),
+            };
+            lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a MoE step lowers")
+        };
+        let step = MoeStep::UpAct(up, UngatedAct::Relu2, None);
+        let gathered = lower(step, 1);
+        let [cmd] = gathered.as_slice() else {
+            panic!("gathered: one command, got {}", gathered.len())
+        };
+        assert_eq!(cmd.kernel, KernelId::MoeGateUpAct);
+        let act = cmd.constants.iter().find(|c| c.index == 3);
+        assert_eq!(act.map(|c| c.bits), Some(3), "the ungated relu² epilogue");
+        let bound: Vec<u8> = cmd.bindings.iter().map(binding_index).collect();
+        assert!(
+            !bound.iter().any(|i| (6..=9).contains(i)),
+            "no up projection: {bound:?}"
+        );
+        let scratch = MoeScratch::of(&block, 1, &p, &mut 0);
+        assert!(cmd.bindings.contains(&scratch.at(5, MoeRegion::ExpertUp)));
+        // 2048 rows × 22 picks over 512 experts: 88 per expert, a grouped bake.
+        let grouped = lower(step, 2048);
+        let kernels: Vec<KernelId> = grouped.iter().map(|c| c.kernel).collect();
+        assert_eq!(
+            kernels,
+            [KernelId::AffineGatherQmmT, KernelId::VisionGelu],
+            "the grouped GEMM, then relu2"
+        );
+        let relu2 = &grouped[1];
+        assert_eq!(relu2.function, "relu2_bf16");
+        let up_rows = MoeScratch::of(&block, 2048, &p, &mut 0).at(0, MoeRegion::ExpertUp);
+        assert_eq!(relu2.bindings[0], up_rows, "relu² over the up rows");
+        // The router: `[m, 512]` logits contracting the 4096-wide block input.
+        let router = lower(
+            MoeStep::RouterLogits(MoeRows::Tokens(Slot(2)), LayerId(0), None),
+            8,
+        );
+        assert_eq!(router[0].gemm_dims.map(|g| (g.n, g.k)), Some((512, 4096)));
+    }
+
+    fn binding_index(b: &Binding) -> u8 {
+        match *b {
+            Binding::ArenaSlot { binding_index, .. }
+            | Binding::MoeScratch { binding_index, .. }
+            | Binding::Source { binding_index, .. } => binding_index,
+            _ => u8::MAX,
+        }
     }
 
     /// A router with its block's input norm folded in writes every row's logits: one row runs the

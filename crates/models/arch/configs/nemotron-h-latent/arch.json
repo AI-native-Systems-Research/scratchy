@@ -1,0 +1,12 @@
+{
+  "_comment": "Nemotron-H with LatentMoE (Nemotron-3 Super): the nemotron-h declarations (see configs/nemotron-h/arch.json — `backbone.*` root, per-kind mixer renames onto `mixer`, `layer_norm_epsilon`), plus the latent expert path: `moe.fc1_latent_proj` [hidden → moe_latent_size] feeds the routed experts and `moe.fc2_latent_proj` [moe_latent_size → hidden] projects their weighted sum back. The mlx-community checkpoints ship BF16 norm gains and BF16 affine scales / biases (verified on the Nano-4bit shard header), hence `scale_dtype: bf16`.",
+  "decoder_safetensors_root": "backbone",
+  "scale_dtype": "bf16",
+  "weight_leaf_renames": { "attn": "mixer", "mamba": "mixer", "moe": "mixer", "mlp": "mixer" },
+  "config_aliases": { "rms_norm_eps": "layer_norm_epsilon" },
+  "params": [
+    { "name": "mamba_d_inner", "expr": "mamba_num_heads * mamba_head_dim" },
+    { "name": "mamba_conv_dim", "expr": "mamba_d_inner + 2 * n_groups * ssm_state_size" },
+    { "name": "mamba_in_proj_dim", "expr": "mamba_d_inner + mamba_conv_dim + mamba_num_heads" }
+  ]
+}

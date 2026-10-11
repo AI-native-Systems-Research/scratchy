@@ -54,7 +54,15 @@ pub struct DeclaredArchSpec {
     /// norm. Per-checkpoint repacks override via the JSON
     /// `scale_dtype` drift key.
     pub scale_dtype: Option<String>,
+    /// `decoder_safetensors_prefix`: a namespace WRAPPING the standard
+    /// `model.<...>` decoder tree (Gemma3-MM / mlx-vlm `language_model`
+    /// → `language_model.model.<...>`); a value that itself starts with
+    /// `model` names the root it replaces (`model.language_model.<...>`).
     pub decoder_prefix: Option<String>,
+    /// `decoder_safetensors_root`: the decoder tree's root under ANOTHER
+    /// name, replacing `model` outright (Nemotron-H `backbone.<...>`).
+    /// Exclusive with `decoder_prefix` — enforced where both tiers merge.
+    pub decoder_root: Option<String>,
     pub tie_default: Option<bool>,
     pub bound_defaults: Vec<(String, u64)>,
     /// Float-valued analogue of `bound_defaults` for arch-constant
@@ -109,6 +117,28 @@ pub fn json_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serd
 }
 
 impl DeclaredArchSpec {
+    /// The decoder tree's safetensors root — the ONE resolution of
+    /// `decoder_safetensors_prefix` / `decoder_safetensors_root` every
+    /// key builder reads (`<root>.layers.<L>.<leaf>`, `<root>.<leaf>`;
+    /// `lm_head` always sits at the file's top level).
+    pub fn decoder_root(&self) -> String {
+        match (self.decoder_root.as_deref(), self.decoder_prefix.as_deref()) {
+            (Some(_), Some(_)) => {
+                unreachable!("decoder_safetensors_root and _prefix are exclusive (config parse)")
+            }
+            (Some(root), None) => root.trim_end_matches('.').to_string(),
+            (None, Some(prefix)) => {
+                let prefix = prefix.trim_end_matches('.');
+                if prefix.starts_with("model") {
+                    prefix.to_string()
+                } else {
+                    format!("{prefix}.model")
+                }
+            }
+            (None, None) => "model".to_string(),
+        }
+    }
+
     /// Evaluate the `Params` schema against one verbatim config.json,
     /// inserting each field into `bounds` in declaration order. A
     /// bound already present (the flat `.overrides.json` drift
@@ -261,6 +291,30 @@ fn eval_expr(src: &str, env: &std::collections::BTreeMap<String, u64>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ONE decoder-root resolution every safetensors key builder reads:
+    /// the HF default, a wrapper around `model`, a `model.*` prefix naming
+    /// the root it replaces, and a renamed root (Nemotron-H `backbone`).
+    #[test]
+    fn decoder_root_resolves_every_declaration() {
+        let root = |prefix: Option<&str>, root: Option<&str>| {
+            DeclaredArchSpec {
+                decoder_prefix: prefix.map(str::to_string),
+                decoder_root: root.map(str::to_string),
+                ..Default::default()
+            }
+            .decoder_root()
+        };
+        assert_eq!(root(None, None), "model");
+        assert_eq!(root(Some("language_model"), None), "language_model.model");
+        assert_eq!(root(Some("language_model."), None), "language_model.model");
+        assert_eq!(
+            root(Some("model.language_model"), None),
+            "model.language_model"
+        );
+        assert_eq!(root(None, Some("backbone")), "backbone");
+        assert_eq!(root(None, Some("backbone.")), "backbone");
+    }
 
     #[test]
     fn expr_eval_precedence_and_division() {

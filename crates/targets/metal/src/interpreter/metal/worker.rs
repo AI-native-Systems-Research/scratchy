@@ -920,6 +920,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         }
         K::RopeAppendNormed
         | K::RopeAppend
+        | K::KvAppend
         | K::RopeOnceNax
         | K::RopeOnceSteel
         | K::RopeOnceGqaShared => KernelKind::Rope,

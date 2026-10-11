@@ -623,6 +623,7 @@ mod tests {
             | KernelId::EmbeddingGather
             | KernelId::AvgPool2d
             | KernelId::VisionGelu
+            | KernelId::KvAppend
             | KernelId::VisionLoadPixels
             | KernelId::MmEmbedSplice
             // hd512 unfused attention kernels carry their library/function +
@@ -806,6 +807,7 @@ mod tests {
             | KernelId::EmbeddingGather
             | KernelId::AvgPool2d
             | KernelId::VisionGelu
+            | KernelId::KvAppend
             | KernelId::VisionLoadPixels
             | KernelId::MmEmbedSplice
             | KernelId::AttnGatherKRope

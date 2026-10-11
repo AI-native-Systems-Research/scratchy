@@ -196,6 +196,14 @@ pub trait ScratchyWeights: Send + Sync {
         None
     }
 
+    /// The loaded variant's `CanonicalParams::KV_CACHE_LAYERS`: the layers that
+    /// hold KV when not every layer does (a recurrent hybrid's attention
+    /// layers). The worker's KV pool holds tensors for these only and sizes its
+    /// budget by them. Default `None`: every layer holds KV.
+    fn kv_cache_layers(&self) -> Option<&'static [u32]> {
+        None
+    }
+
     /// Spans / position-independent KV caching (`W::ROPE_ON_READ`). When
     /// true, this arch's paged attention + rope_append kernels mask
     /// block_table / slot_mapping **bit 31** and treat it as the

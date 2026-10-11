@@ -50,6 +50,7 @@ macro_rules! for_each_subop {
             Gelu [SubOp::Elementwise(EwKind::Gelu)] arity = (|n| n == 1), cols = [in0];
             QuickGelu [SubOp::Elementwise(EwKind::QuickGelu)] arity = (|n| n == 1), cols = [in0];
             GeluErf [SubOp::Elementwise(EwKind::GeluErf)] arity = (|n| n == 1), cols = [in0];
+            Relu2 [SubOp::Elementwise(EwKind::Relu2)] arity = (|n| n == 1), cols = [in0];
             Mul [SubOp::Elementwise(EwKind::Mul)] arity = (|n| n == 2), cols = [in0];
             Add [SubOp::Elementwise(EwKind::Add)] arity = (|n| n == 2), cols = [in0];
             Sub [SubOp::Elementwise(EwKind::Sub)] arity = (|n| n == 2), cols = [in0];
@@ -64,6 +65,8 @@ macro_rules! for_each_subop {
             // — the caches are per-layer PrefixK / PrefixV sources used
             // as TMA-store destinations for the new decode token's K/V.
             RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0];
+            // `[K, V, K_cache, V_cache]`: the un-rotated writer.
+            KvAppend [SubOp::KvAppend { .. }] arity = (|n| n == 4), cols = [in0];
             // `[Q, (K_seg, V_seg)...]`, optionally with a trailing
             // `[num_heads]` sinks weight source (gpt-oss attention
             // sinks — a 6th input read as a weight, not a K/V pair).
@@ -84,11 +87,12 @@ macro_rules! for_each_subop {
             VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0];
             EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [q_width geom];
             GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1];
+            Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
-            KvEncode [SubOp::KvEncode { .. }] arity = (|n| n == 2 || n == 3), cols = [one];
+            KvEncode [SubOp::KvEncode { .. }] arity = (|n| (1..=3).contains(&n)), cols = [one];
             KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one];
             RotateRows [SubOp::RotateRows { .. }] arity = (|n| n == 1), cols = [in0];
             // `[q, out, packed_k, packed_v]`, optionally with the attention's
@@ -109,6 +113,7 @@ macro_rules! for_each_subop {
             ExpertSort [SubOp::ExpertSort { .. }] arity = (|n| n == 2), cols = [pairs in0 k];
             ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3), cols = [pairs n k];
             ExpertGatedAct [SubOp::ExpertGatedAct { .. }] arity = (|n| n == 2), cols = [in0];
+            ExpertAct [SubOp::ExpertAct { .. }] arity = (|n| n == 1), cols = [in0];
             ExpertUnsort [SubOp::ExpertUnsort] arity = (|n| n == 2), cols = [in0];
             ExpertCombine [SubOp::ExpertCombine { .. }] arity = (|n| n == 2), cols = [field hidden];
             SampleRowsGather [SubOp::SampleRowsGather] arity = (|n| n == 1), cols = [in0];

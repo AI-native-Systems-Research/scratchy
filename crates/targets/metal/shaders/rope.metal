@@ -111,20 +111,6 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_V_OFFSET, 14);
 constant constexpr uint ROPE_TQ_FLOATS = ROPE_TQ_BITS_SET ? tq_encode_floats(2, ROPE_HEAD_DIM) : 1u;
 constant constexpr uint ROPE_TQ_CODES = ROPE_TQ_BITS_SET ? 2u * ROPE_HEAD_DIM : 1u;
 
-// The packed store a folded-in encode writes, by binding: the codebook (16, 17), K's codes and
-// norms (18, 19), V's (20, 21), and each operand's offset bias (22, 23) with the rotary table a
-// rotated K bias uses (24).
-#define ROPE_TQ_BUFFERS(T)                                                       \
-    device const float* tq_signs      [[buffer(16)]],                            \
-    device const float* tq_boundaries [[buffer(17)]],                            \
-    device       uint*  tq_packed_k   [[buffer(18)]],                            \
-    device       float* tq_norms_k    [[buffer(19)]],                            \
-    device       uint*  tq_packed_v   [[buffer(20)]],                            \
-    device       float* tq_norms_v    [[buffer(21)]],                            \
-    device const T*     tq_k_bias     [[buffer(22)]],                            \
-    device const T*     tq_v_bias     [[buffer(23)]],                            \
-    device const T*     tq_cos_sin    [[buffer(24)]],
-
 // Encode the row pair this owning threadgroup just wrote to the pool — element `d` of K and of V —
 // into the packed store at the token's slot (`kv_writer.h`). Threadgroup-uniform.
 template <typename T>
@@ -150,7 +136,7 @@ kernel void rope_append_f16_specialized(
     device const uint* slot_mapping [[buffer(5)]],
     device const uint64_t* kv_cache_k [[buffer(6)]],
     device const uint64_t* kv_cache_v [[buffer(7)]],
-    ROPE_TQ_BUFFERS(half)
+    KV_WRITER_TQ_BUFFERS(half)
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -274,7 +260,7 @@ kernel void rope_append_bf16_specialized(
     device const uint*   slot_mapping [[buffer(5)]],
     device const uint64_t* kv_cache_k [[buffer(6)]],
     device const uint64_t* kv_cache_v [[buffer(7)]],
-    ROPE_TQ_BUFFERS(bfloat)
+    KV_WRITER_TQ_BUFFERS(bfloat)
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -460,7 +446,7 @@ template <typename T_act, typename T_scale>
     device const uint64_t* kv_cache_v [[buffer(7)]],
     device const T_scale* q_gains    [[buffer(8)]],
     device const T_scale* k_gains    [[buffer(9)]],
-    ROPE_TQ_BUFFERS(T_act)
+    KV_WRITER_TQ_BUFFERS(T_act)
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {

@@ -68,9 +68,9 @@ pub(crate) fn spyre_standard_operands<F: RopeForm>(op: &SubOp<F>) -> Option<Oper
         // is merely FORGOTTEN here does not fail to compile — it silently
         // leaves the class and loses its operand rule. Adding an `EwKind`
         // must therefore touch this table, and the compiler cannot say so.
-        SubOp::Elementwise(EwKind::Silu | EwKind::Gelu | EwKind::QuickGelu | EwKind::GeluErf) => {
-            Operands::Fixed(2)
-        }
+        SubOp::Elementwise(
+            EwKind::Silu | EwKind::Gelu | EwKind::QuickGelu | EwKind::GeluErf | EwKind::Relu2,
+        ) => Operands::Fixed(2),
         SubOp::Elementwise(EwKind::Mul | EwKind::Add | EwKind::Sub | EwKind::BiasAdd)
         | SubOp::SiluMul => Operands::Fixed(3),
         // data + gain + accum + output.

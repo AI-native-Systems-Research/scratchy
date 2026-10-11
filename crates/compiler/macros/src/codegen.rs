@@ -58,7 +58,7 @@ use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(
     program: &Program,
-    decoder_safetensors_prefix: Option<&str>,
+    decoder_root: &str,
     vision_layout: Option<&crate::config::VisionSafetensorsLayout>,
     id: WeightId,
     index: Option<UnrollIndex>,
@@ -121,46 +121,15 @@ fn safetensors_prefix(
             None => format!("{}.{}", layout.default_root, joined),
         };
     }
-    // Multimodal arches that nest the text decoder under
-    // `language_model.<...>` (Gemma3-MM). Variant configs set
-    // `decoder_safetensors_prefix: "language_model"`; we prepend it to
-    // every text-decoder key (lm_head, model.layers.*, model.<...>).
-    // Text-only and Qwen-style VL leave it `None` → byte-equivalent
-    // `model.<...>` / `lm_head` keys.
-    let key = match (index, joined.as_str()) {
+    // The decoder tree sits under `decoder_root`
+    // ([`crate::arch_spec::DeclaredArchSpec::decoder_root`]): `model` for
+    // HF decoders, `language_model.model` for Gemma3-MM-style wrappers,
+    // `backbone` for Nemotron-H. `lm_head` sits beside that tree at the
+    // file's top level in every checkpoint ordering.
+    match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
-        (Some(l), _) => format!("model.layers.{l}.{joined}"),
-        (None, _) => format!("model.{joined}"),
-    };
-    match decoder_safetensors_prefix {
-        None => key,
-        Some(prefix) => {
-            // Tolerate a trailing dot in the config value.
-            let prefix = prefix.trim_end_matches('.');
-            // `lm_head` is always at the safetensors top level — VL repos
-            // (Qwen3.5, Gemma3-MM, ...) don't nest it under the decoder
-            // prefix because it sits beside the `model` namespace, not
-            // inside it. Both checkpoint orderings (the official
-            // `model.language_model.*` and the mlx-community
-            // `language_model.model.*`) keep `lm_head.weight` at the root.
-            if key == "lm_head" {
-                return key;
-            }
-            match key.strip_prefix("model") {
-                // Replace-the-`model`-root form: the prefix already names
-                // the `model` root (e.g. Qwen3.5-VL `model.language_model`),
-                // so the decoder's keys sit DIRECTLY under it —
-                // `model.language_model.embed_tokens`,
-                // `model.language_model.layers.N.*`, `model.language_model.norm`
-                // — NOT nested as `<prefix>.model.<key>`. Splice the prefix
-                // in for the leading `model` segment.
-                Some(rest) if prefix.starts_with("model") => format!("{prefix}{rest}"),
-                // Namespace-wrapper form (Gemma3-MM `language_model`): the
-                // whole standard `model.<key>` / `lm_head` namespace nests
-                // under the prefix → `language_model.model.<key>`.
-                _ => format!("{prefix}.{key}"),
-            }
-        }
+        (Some(l), _) => format!("{decoder_root}.layers.{l}.{joined}"),
+        (None, _) => format!("{decoder_root}.{joined}"),
     }
 }
 
@@ -406,14 +375,16 @@ enum FieldLoad {
         hidden_size: usize,
         /// `Some((group_size, bits))` when the macro detected
         /// `StorageFormat::Affine` on the MoE source weight — emits
-        /// the Metal `load_affine` call site. `None` → Dense BF16
-        /// path → cuda `load` call site.
-        affine: Option<(u32, u32)>,
+        /// the Metal `load_affine` call site, `bits` each routed-expert
+        /// projection's own width. `None` → Dense BF16 path → cuda
+        /// `load` call site.
+        affine: Option<(u32, crate::quantization::ExpertBits)>,
         /// Bit-width for the router `{prefix}.gate` dequant, resolved
         /// from the affine preset's `bits_overrides` (mlx MoE presets
         /// quantize the router gate at 8-bit while experts stay 4-bit).
-        /// `Some` exactly when `affine` is `Some`; falls back to the
-        /// expert bits when no override matches.
+        /// `None` when `affine` is, or when an MLX per-module map leaves
+        /// the router dense (Nemotron-H); the section default when no
+        /// override matches.
         gate_bits: Option<u32>,
     },
     /// Qwen-MoE-style fused MoE + shared expert. Cuda Dense via
@@ -427,11 +398,11 @@ enum FieldLoad {
         moe_intermediate_size: usize,
         shared_expert_intermediate_size: usize,
         hidden_size: usize,
-        /// `Some((group_size, bits))` when MLX-affine int4 — see
+        /// `Some((group_size, bits))` when MLX-affine — see
         /// [`FieldLoad::FusedMoe::affine`].
-        affine: Option<(u32, u32)>,
+        affine: Option<(u32, crate::quantization::ExpertBits)>,
         /// Router `{prefix}.gate` dequant bit-width — see
-        /// [`FieldLoad::FusedMoe::gate_bits`]. `Some` iff `affine` is `Some`.
+        /// [`FieldLoad::FusedMoe::gate_bits`].
         gate_bits: Option<u32>,
     },
     /// Gemma-4 router bundle (`GemmaMoe` op, base `router`). Dispatches to
@@ -502,8 +473,9 @@ enum FieldLoad {
 /// Only tensors whose width this function can state are listed. Unlisted
 /// tensors are simply not checked.
 ///
-/// ⚠️ RESIDUAL RISK, now scoped: the routed-expert stacks of the SHARED MoE
-/// bundles are NOT listed. `switch_mlp.{gate,up,down}_proj`, Mixtral's
+/// ⚠️ RESIDUAL RISK, now scoped: the GATED routed-expert stacks of the SHARED
+/// MoE bundles are NOT listed (an ungated bank's are — see the arm).
+/// `switch_mlp.{gate,up,down}_proj`, Mixtral's
 /// `w1/w2/w3` and `GemmaSwitchGlu`'s sub-leaves are named inside the backend
 /// loaders, not here, so this function cannot state their on-disk paths
 /// without duplicating that naming — which is the duplication the whole
@@ -548,20 +520,35 @@ fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
             .collect(),
         // MoE router gate: `gate_bits` is what the `load_affine` call receives
         // for `{prefix}.gate`, and it is the role qwen3.5 and qwen3.6 disagree
-        // about. The routed expert stack under the same prefix is omitted (see
-        // the fn doc).
+        // about. A gated routed stack under the same prefix is omitted (see the
+        // fn doc). An UNGATED stack is listed: its loader reads exactly the
+        // pre-stacked `switch_mlp.fc1` / `fc2` (mlx `SwitchMLP` — no per-expert
+        // layout exists for it), so this function can state them, and they are
+        // load-bearing — Nemotron-3-Super's OptiQ map and a uniform 4-bit one
+        // agree on every other width and differ in the experts' alone.
         FieldLoad::FusedMoe {
             prefix,
-            affine: Some((group_size, _)),
-            gate_bits: Some(gate_bits),
+            affine: Some((group_size, bits)),
+            gate_bits,
             ..
         }
         | FieldLoad::SharedFusedMoe {
             prefix,
-            affine: Some((group_size, _)),
-            gate_bits: Some(gate_bits),
+            affine: Some((group_size, bits)),
+            gate_bits,
             ..
-        } => one(&format!("{prefix}.gate"), *gate_bits, *group_size),
+        } => {
+            let mut rows = match gate_bits {
+                Some(b) => one(&format!("{prefix}.gate"), *b, *group_size),
+                None => Vec::new(),
+            };
+            if let crate::quantization::ExpertBits::Ungated { .. } = bits {
+                for (leaf, b) in bits.leaves() {
+                    rows.push((format!("{prefix}.switch_mlp.{leaf}.weight"), b, *group_size));
+                }
+            }
+            rows
+        }
         FieldLoad::GemmaRouter {
             prefix,
             group_size,
@@ -697,6 +684,70 @@ struct DeepSeekMoeCfg {
     use_sigmoid: bool,
     n_expert_group: usize,
     topk_group: usize,
+}
+
+/// A fused-MoE accessor's affine plan: `(group_size, each routed-expert projection's width)`
+/// when its bundle is MLX-affine, and the router gate's own width — `None` when the bundle is
+/// dense, or when an MLX per-module map leaves the router dense. Resolved at the accessor's own
+/// layer (per-layer expert bits under OptiQ), through the ONE per-projection resolver
+/// [`crate::quantization::affine_moe_expert_bits`], in the expert body the config declares.
+fn moe_affine_plan(
+    program: &Program,
+    fuf: &Fuf,
+    model: &ModelParams,
+    prefix: &str,
+    accessor: &WeightAccessor,
+) -> (Option<(u32, crate::quantization::ExpertBits)>, Option<u32>) {
+    use crate::quantization::{ExpertBits, StorageFormat};
+    let (src, idx) = accessor.source_weights[0];
+    let StorageFormat::Affine { group_size, bits } =
+        crate::quantization::storage_format_for_weight(program, fuf, src, idx, model)
+    else {
+        return (None, None);
+    };
+    let body = model.expert_activation.body().unwrap_or_else(|act| {
+        panic!(
+            "{}: the config declares expert activation `{act}`, which no expert body realizes",
+            model.name
+        )
+    });
+    let method = model.quantization.as_ref().map(|qc| &qc.method);
+    let resolved = method
+        .and_then(|m| crate::quantization::affine_moe_expert_bits(program, m, prefix, idx, body));
+    let expert = resolved.unwrap_or(match body {
+        scratchy_subtile::subtile_ir::ExpertBody::Gated(_) => ExpertBits::Gated {
+            gate: bits,
+            up: bits,
+            down: bits,
+        },
+        scratchy_subtile::subtile_ir::ExpertBody::Ungated(_) => ExpertBits::Ungated {
+            fc1: bits,
+            fc2: bits,
+        },
+    });
+    // The mlx MoE presets quantize `{prefix}.gate` at 8-bit while experts stay 4-bit — via
+    // preset `bits_overrides` OR (OptiQ) the per-module map, which `affine_role_bits` honors
+    // both of (a router the map does not list is dense).
+    let gate_path = format!("{prefix}.gate");
+    let gate_bits =
+        method.and_then(|m| crate::quantization::affine_role_bits(program, m, &gate_path, idx));
+    (Some((group_size, expert)), gate_bits)
+}
+
+/// The width of the rows a MoE accessor's experts read: the `moe_block` reading the accessor's
+/// weight, at its output (a latent MoE's expert space). `None` when no such op closes to a shape.
+fn moe_expert_width(fuf: &Fuf, model: &ModelParams, accessor: &WeightAccessor) -> Option<usize> {
+    let (src, _) = accessor.source_weights[0];
+    let node = fuf.nodes.iter().find(|n| {
+        n.op == OpKind::Moe
+            && n.inputs
+                .iter()
+                .any(|i| matches!(i, FufInput::Weight { id, .. } if *id == src))
+    })?;
+    // The row count is the workload's (`num_tokens`); the width is a model bound.
+    let width = node.outputs.first()?.last()?.clone();
+    let dims = crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?;
+    dims.first().map(|&d| d as usize)
 }
 
 fn read_deepseek_moe_cfg(model: &ModelParams) -> DeepSeekMoeCfg {
@@ -900,7 +951,7 @@ fn plan_field_load(
         .map(|(id, idx)| {
             safetensors_prefix(
                 program,
-                model.arch.decoder_prefix.as_deref(),
+                &model.arch.decoder_root(),
                 model.arch.safetensors.as_ref(),
                 *id,
                 *idx,
@@ -1218,45 +1269,10 @@ fn plan_field_load(
         // Same check the `MetalFusedMoeImpl::matches` uses via
         // `affine_gs_bits`. Source weights all share storage format
         // (the macro asserts this elsewhere for AffineQuantLinear).
-        let only_src = accessor.source_weights[0].0;
-        // Resolve at this accessor's layer index — MLX mixed/dynamic quant
+        // Resolved at this accessor's layer index — MLX mixed/dynamic quant
         // (OptiQ) varies expert bits per numbered layer; emit_group_let
         // gathers the per-layer bits across the group.
-        let only_idx = accessor.source_weights[0].1;
-        let affine = match crate::quantization::storage_format_for_weight(
-            program, fuf, only_src, only_idx, model,
-        ) {
-            crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                // The bundle root subtree-matches the router gate first; the
-                // routed experts' own (per-layer, OptiQ) bits live under
-                // switch_mlp / experts. Uniform/preset paths fall back.
-                let expert_bits = model
-                    .quantization
-                    .as_ref()
-                    .and_then(|qc| {
-                        crate::quantization::affine_moe_expert_bits(
-                            program, &qc.method, &prefix, only_idx,
-                        )
-                    })
-                    .unwrap_or(bits);
-                Some((group_size, expert_bits))
-            }
-            _ => None,
-        };
-        // Router gate bit-width: the mlx MoE presets quantize `{prefix}.gate`
-        // at 8-bit while experts stay 4-bit — via preset `bits_overrides`
-        // OR (OptiQ) the per-module map. `affine_role_bits` honors both;
-        // fall back to expert bits.
-        let gate_bits = affine.map(|(_, expert_bits)| {
-            let gate_path = format!("{prefix}.gate");
-            model
-                .quantization
-                .as_ref()
-                .and_then(|qc| {
-                    crate::quantization::affine_role_bits(program, &qc.method, &gate_path, only_idx)
-                })
-                .unwrap_or(expert_bits)
-        });
+        let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
         return FieldLoad::FusedMoe {
             prefix,
             num_experts,
@@ -1279,8 +1295,10 @@ fn plan_field_load(
         let prefix = prefixes.into_iter().next().unwrap();
         let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        // `n_routed_experts` on the sigmoid-routed configs (GLM-4.5, Nemotron-H).
         let num_experts = v
             .get("num_experts")
+            .or_else(|| v.get("n_routed_experts"))
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
             .unwrap_or_else(|| model.bounds.get("num_experts").copied().unwrap_or(60) as usize);
@@ -1317,7 +1335,10 @@ fn plan_field_load(
                     .copied()
                     .unwrap_or(0) as usize
             });
-        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+        // The experts' own width: the model's hidden size, or a latent MoE's narrower expert space
+        // (the op's output is the experts' input — see `sig_moe`).
+        let hidden_size = moe_expert_width(fuf, model, accessor)
+            .unwrap_or_else(|| model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize);
         let only_src = accessor.source_weights[0].0;
         // Single-owner rule (mirrors `MetalSharedFusedMoeImpl::fan_out`):
         // when the DSL claims `<moe>.shared_expert.*` leaves in the
@@ -1329,39 +1350,7 @@ fn plan_field_load(
             Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
             _ => shared_expert_intermediate_size,
         };
-        // Resolve at this accessor's layer index (per-layer expert bits for
-        // OptiQ). `only_idx` also picks the gate's per-layer entry.
-        let only_idx = accessor.source_weights[0].1;
-        let affine = match crate::quantization::storage_format_for_weight(
-            program, fuf, only_src, only_idx, model,
-        ) {
-            crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                let expert_bits = model
-                    .quantization
-                    .as_ref()
-                    .and_then(|qc| {
-                        crate::quantization::affine_moe_expert_bits(
-                            program, &qc.method, &prefix, only_idx,
-                        )
-                    })
-                    .unwrap_or(bits);
-                Some((group_size, expert_bits))
-            }
-            _ => None,
-        };
-        // Router gate bit-width: see the `FusedMoe` arm — `affine_role_bits`
-        // resolves the gate via preset `bits_overrides` OR (OptiQ) the
-        // per-module map; fall back to expert bits.
-        let gate_bits = affine.map(|(_, expert_bits)| {
-            let gate_path = format!("{prefix}.gate");
-            model
-                .quantization
-                .as_ref()
-                .and_then(|qc| {
-                    crate::quantization::affine_role_bits(program, &qc.method, &gate_path, only_idx)
-                })
-                .unwrap_or(expert_bits)
-        });
+        let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
         return FieldLoad::SharedFusedMoe {
             prefix,
             num_experts,
@@ -2018,8 +2007,9 @@ pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// Runtime RMSNorm gain offset for zero-centered (Gemma-style) norms.
 /// When the config sets `"rms_norm_zero_centered": true` (Gemma2/3,
 /// Qwen3.5/3.6/Next — input/post/final layernorms + per-head q/k norm
-/// store gains zero-centered, effective gain `1 + weight`), the standard
-/// `RmsNorm` / `FusedAddRmsNorm` metal kernels fold `weight + 1.0`. The
+/// store gains zero-centered, effective gain `1 + weight`), every RMSNorm
+/// op carries it in its gain convention (`to_wavefront`'s `RmsNorm` arm) and
+/// `NORM_WEIGHT_OFFSET` bakes it for the kernels that read no convention. The
 /// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
@@ -2111,6 +2101,73 @@ fn collect_accessors(
     Ok(by_name.into_values().map(|(a, _)| a).collect())
 }
 
+/// The routed experts' input width an ungated bank (the pre-stacked `switch_mlp.fc1`, whose leaf
+/// names the macro states — see [`affine_tensors_of`]) is packed at, probed at the last MoE
+/// layer: the tensor and its expected packed column count. The one shape that tells a LatentMoE
+/// (experts on `moe_latent_size`) from a plain one (experts on `hidden_size`) when both report
+/// one architecture string (Nemotron-H: `NemotronHForCausalLM`) and share every other probed
+/// width — the latent projections only one of them loads are not visible to the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpertInputProbe {
+    tensor: String,
+    packed_cols: usize,
+}
+
+/// [`ExpertInputProbe`] for the model's last ungated `moe_block`: the experts' width is the op's
+/// output (`sig_moe`), stored dense or MLX-affine at `fc1`'s own resolved width. `None` for a
+/// model without an ungated bank.
+fn expert_input_probe(
+    program: &Program,
+    fuf: &Fuf,
+    model: &ModelParams,
+) -> Option<ExpertInputProbe> {
+    use scratchy_subtile::subtile_ir::ExpertBody;
+    let body = model.expert_activation.body().ok()?;
+    if !matches!(body, ExpertBody::Ungated(_)) {
+        return None;
+    }
+    let (node, id, index, storage) = fuf
+        .nodes
+        .iter()
+        .rev()
+        .filter(|n| n.op == OpKind::Moe)
+        .find_map(|n| {
+            n.inputs.iter().find_map(|i| match i {
+                FufInput::Weight { id, index, storage } => Some((n, *id, *index, storage)),
+                _ => None,
+            })
+        })?;
+    let width = node.outputs.first()?.last()?.clone();
+    let k = *crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?.first()? as usize;
+    let prefix = safetensors_prefix(
+        program,
+        &model.arch.decoder_root(),
+        model.arch.safetensors.as_ref(),
+        id,
+        index,
+    );
+    let packed_cols = match storage {
+        crate::quantization::StorageFormat::Dense => k,
+        crate::quantization::StorageFormat::Affine { bits, .. } => {
+            let fc1 = model
+                .quantization
+                .as_ref()
+                .and_then(|qc| {
+                    crate::quantization::affine_moe_expert_bits(
+                        program, &qc.method, &prefix, index, body,
+                    )
+                })
+                .map_or(*bits, |b| b.up());
+            (k * fc1 as usize).div_ceil(32)
+        }
+        _ => return None,
+    };
+    Some(ExpertInputProbe {
+        tensor: format!("{prefix}.switch_mlp.fc1.weight"),
+        packed_cols,
+    })
+}
+
 /// Emit a `fingerprint_matches(gw)` method body — the per-variant
 /// check the arch-level dispatcher uses to auto-detect which
 /// compiled model a runtime `GpuWeights` corresponds to. All values
@@ -2151,11 +2208,14 @@ fn collect_accessors(
 ///    for variants differing solely in that map — qwen3.5 vs
 ///    qwen3.6 35B-A3B, whose gates are 4- vs 8-bit with every other
 ///    axis identical. See the `affine_bit_map_gate` comment.
+/// 8. **Experts' input width** of an ungated bank ([`ExpertInputProbe`]) —
+///    LatentMoE vs plain MoE under one architecture string.
 fn emit_fingerprint_check(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     tp_world_size: u8,
     affine_rows: &[(String, u32, u32)],
+    expert_input: Option<&ExpertInputProbe>,
 ) -> TokenStream {
     let num_hidden_layers = *model
         .bounds
@@ -2210,27 +2270,11 @@ fn emit_fingerprint_check(
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
-    // Per-arch decoder root for fingerprint-tensor names. MUST agree
-    // with [`safetensors_prefix`]'s prefix handling (replace-vs-prepend)
-    // — the fingerprint looks up `{dec_root}.embed_tokens.weight` /
-    // `{dec_root}.layers.N.q_proj.weight`, and if that name doesn't
-    // match what the loader actually reads, every variant rejects and
-    // `try_load` returns `Ok(None)` → `ArchNotSupported`.
-    let dec_root: String = match model.arch.decoder_prefix.as_deref() {
-        None => "model".to_string(),
-        Some(prefix) => {
-            let prefix = prefix.trim_end_matches('.');
-            if prefix.starts_with("model") {
-                // Replace-the-`model`-root form (Qwen3.5-VL
-                // `model.language_model`): decoder root IS the prefix.
-                prefix.to_string()
-            } else {
-                // Namespace-wrapper form (Gemma3-MM `language_model`):
-                // `language_model.model`.
-                format!("{prefix}.model")
-            }
-        }
-    };
+    // Per-arch decoder root for fingerprint-tensor names — the same
+    // resolution [`safetensors_prefix`] keys the loader by, so the
+    // fingerprint's `{dec_root}.embed_tokens.weight` /
+    // `{dec_root}.layers.N.*` lookups name what the loader reads.
+    let dec_root = model.arch.decoder_root();
     // Pick a layered tensor that ACTUALLY EXISTS ON DISK to use as the
     // fingerprint sniff. Packed parents come first (Phi-3 ships
     // `self_attn.qkv_proj.weight` on disk; ModernBERT ships
@@ -2261,19 +2305,43 @@ fn emit_fingerprint_check(
     } else {
         "self_attn.q_proj".to_string()
     };
+    // On disk under the arch's renames (nemotron-h: `attn.q_proj` →
+    // `mixer.q_proj`), sniffed at the LAST layer that has it: a declared
+    // block schedule (`attention_layers`) names it — nemotron-h's last
+    // layer is a MoE block with no attention projection.
+    let fp_leaf_owned =
+        crate::classified::rename_dotted_under(&model.arch.weight_leaf_renames, &fp_leaf_owned);
     let fp_leaf: &str = fp_leaf_owned.as_str();
-    let last_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.{suffix}");
+    let fp_layer = model
+        .layer_sets
+        .get("attention_layers")
+        .and_then(|set| set.members().last().copied())
+        .unwrap_or(last_layer);
+    let last_tensor = format!("{dec_root}.layers.{fp_layer}.{fp_leaf}.{suffix}");
     // MLX-affine `.scales` sibling of `last_tensor`. The affine group-size
     // gate must probe a layer that ACTUALLY HAS `fp_leaf` (= `self_attn.q_proj`).
     // It MUST NOT hardcode `layers.0`: hybrid arches (Qwen3.5 Gated-DeltaNet,
     // Mamba/Jamba) make layer 0 a linear-attention layer with NO `self_attn.q_proj`,
     // so `layers.0.self_attn.q_proj.scales` is absent there and the gate would
-    // reject every variant → `ArchNotSupported`. `last_layer` is the same layer
+    // reject every variant → `ArchNotSupported`. `fp_layer` is the same layer
     // the present-check (`last_tensor`) already requires, so its `.scales`
     // sibling is guaranteed present for the affine checkpoint.
-    let last_scales_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.scales");
+    let last_scales_tensor = format!("{dec_root}.layers.{fp_layer}.{fp_leaf}.scales");
+    // Whether this variant reads `fp_leaf` MLX-affine at all (a per-module map may leave it dense).
+    let fp_leaf_affine = affine_rows.iter().any(|(name, _, _)| {
+        let at = |layer: &str| format!("{dec_root}.layers.{layer}.{fp_leaf}.weight");
+        *name == at(&fp_layer.to_string()) || *name == at("*")
+    });
     let one_past_tensor = format!("{dec_root}.layers.{num_hidden_layers}.{fp_leaf}.{suffix}");
-    let opposite_tensor = format!("{dec_root}.layers.0.{fp_leaf}.{opposite_suffix}");
+    // The format-marker probes below read `fp_leaf`'s siblings at the FIRST layer that has it:
+    // layer 0 on a uniform decoder, the first `attention_layers` member on a hybrid one (layer 0
+    // is a Gated-DeltaNet / Mamba block there, and a probe of an absent leaf is inert).
+    let marker_layer = model
+        .layer_sets
+        .get("attention_layers")
+        .and_then(|set| set.members().first().copied())
+        .unwrap_or(0);
+    let opposite_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.{opposite_suffix}");
     // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
     // (same suffix as dense bf16 weights) with a sibling
     // `.weight.absmax` that's unique to bitsandbytes. Dense + AWQ
@@ -2284,7 +2352,7 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Bnb4 { .. })
     );
-    let bnb4_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight.absmax");
+    let bnb4_marker_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.weight.absmax");
     let bnb4_marker_tensor = bnb4_marker_tensor.as_str();
     // FP8 checkpoints ship `.weight` (FP8E4M3 bytes — same suffix
     // as dense bf16) alongside a sibling `.weight_scale`. Dense /
@@ -2309,7 +2377,7 @@ fn emit_fingerprint_check(
                 ..
             })
     );
-    let fp8_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
+    let fp8_marker_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.weight_scale");
     let fp8_marker_tensor = fp8_marker_tensor.as_str();
     // MLX-affine marker exclusion. `mlx_lm.convert` ships every
     // quantized linear as a `.{weight,scales,biases}` triple. The
@@ -2329,7 +2397,7 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Affine { .. })
     );
-    let mlx_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.scales");
+    let mlx_marker_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.scales");
     let mlx_marker_tensor = mlx_marker_tensor.as_str();
 
     // Each marker exclusion is a compile-time bool, so fold it in HERE rather
@@ -2566,6 +2634,11 @@ fn emit_fingerprint_check(
             quote! {}
         }
         Some(crate::quantization::QuantMethod::Ggml) | None => quote! {},
+        // The probe reads the fingerprint leaf's `.scales`, so it runs only where this variant
+        // reads that leaf affine: an MLX per-module map may leave it dense (Nemotron-H's
+        // experts-only parity checkpoint quantizes the routed experts alone), and then the
+        // per-role bit-map gate below carries the positive affine sniff.
+        Some(crate::quantization::QuantMethod::Affine { .. }) if !fp_leaf_affine => quote! {},
         Some(crate::quantization::QuantMethod::Affine { group_size, .. }) => {
             // Group-size discriminator. The packed `.weight` (U32) has
             // the SAME shape for every group_size — 4-bit packs 8 values
@@ -2636,12 +2709,41 @@ fn emit_fingerprint_check(
             let g = proc_macro2::Literal::u32_unsuffixed(*g);
             quote! { (#name, #b, #g) }
         });
+        // The width check is silent on a listed tensor without `.scales`, so a variant the
+        // group-size probe above does not cover (its `fp_leaf` is dense) must positively see the
+        // checkpoint ship at least one of its affine tensors packed — or a DENSE checkpoint
+        // satisfies an experts-only per-module variant vacuously and dies in its loader.
+        let positive_sniff = if fp_leaf_affine {
+            quote! {}
+        } else {
+            quote! {
+                if !gw.ships_affine_row(__AFFINE_WIDTHS) {
+                    return false;
+                }
+            }
+        };
         quote! {
             const __AFFINE_WIDTHS: &[(&str, u32, u32)] = &[#(#row_toks),*];
+            #positive_sniff
             if !gw.affine_widths_agree(__AFFINE_WIDTHS) {
                 return false;
             }
         }
+    };
+    let expert_input_check: TokenStream = match expert_input {
+        Some(ExpertInputProbe {
+            tensor,
+            packed_cols,
+        }) => {
+            let cols = proc_macro2::Literal::usize_unsuffixed(*packed_cols);
+            quote! {
+                match gw.tensor_info(#tensor) {
+                    Some((shape, _)) if shape.last() == Some(&#cols) => {}
+                    _ => return false,
+                }
+            }
+        }
+        None => quote! {},
     };
 
     // Backing-store reject: every non-Ggml variant must reject a
@@ -2765,8 +2867,8 @@ fn emit_fingerprint_check(
             // MLA archs ship `q_a_proj` instead of `q_proj` — match
             // the leaf the fingerprint already chose above so V3 / K2
             // FP8-block fixtures aren't silently rejected.
-            let inv_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale_inv");
-            let scale_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.weight_scale_inv");
+            let scale_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.weight_scale");
             let inv_tensor = inv_tensor.as_str();
             let scale_tensor = scale_tensor.as_str();
             quote! {
@@ -2787,8 +2889,8 @@ fn emit_fingerprint_check(
         Some(crate::quantization::QuantMethod::Fp8 {
             block_size: None, ..
         }) => {
-            let inv_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale_inv");
-            let scale_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.weight_scale_inv");
+            let scale_tensor = format!("{dec_root}.layers.{marker_layer}.{fp_leaf}.weight_scale");
             let inv_tensor = inv_tensor.as_str();
             let scale_tensor = scale_tensor.as_str();
             quote! {
@@ -2815,7 +2917,7 @@ fn emit_fingerprint_check(
     // fingerprint sniff. Fall back to the llama-style path when no
     // entry matches, preserving the previous behavior for any arch
     // whose manifest predates this generalization.
-    let embed_path: String = manifest
+    let embed_role: &str = manifest
         .entries
         .iter()
         .find(|(_, shape)| {
@@ -2823,8 +2925,8 @@ fn emit_fingerprint_check(
                 && matches!(&shape[0], crate::shape::Dim::Bound(s) if s == "vocab_size")
                 && matches!(&shape[1], crate::shape::Dim::Bound(s) if s == "hidden_size")
         })
-        .map(|(k, _)| format!("{dec_root}.{k}.weight"))
-        .unwrap_or_else(|| format!("{dec_root}.embed_tokens.weight"));
+        .map_or("embed_tokens", |(k, _)| k.as_str());
+    let embed_path = format!("{dec_root}.{embed_role}.weight");
     let embed_path_lit = proc_macro2::Literal::string(embed_path.as_str());
 
     // Hidden-size shape gate for the embedding fingerprint sniff.
@@ -2865,10 +2967,12 @@ fn emit_fingerprint_check(
             // 2/3-bit default) — same agreement, same reason.
             model.tie_word_embeddings
                 || *quantize_embed
-                || per_module.iter().any(|(k, _)| k.ends_with("embed_tokens"))
+                || per_module
+                    .iter()
+                    .any(|(k, _)| crate::quantization::names_embed(k, embed_role))
                 || bits_overrides
                     .iter()
-                    .any(|(s, _)| s.ends_with("embed_tokens"))
+                    .any(|(s, _)| crate::quantization::names_embed(s, embed_role))
         }
         _ => false,
     };
@@ -2879,7 +2983,7 @@ fn emit_fingerprint_check(
             // 8-bit (hidden/4) while the default is 4-bit (hidden/8).
             // Packed width follows the ceil(hidden*bits/32) law — bits=3
             // packs 8 elements per 3 bytes, so it is NOT hidden/(32/bits).
-            let bits = crate::quantization::affine_embed_bits(method).unwrap_or(4);
+            let bits = crate::quantization::affine_embed_bits(method, embed_role).unwrap_or(4);
             let packed = (hidden_size * bits as u64).div_ceil(32) as usize;
             let lit = proc_macro2::Literal::usize_unsuffixed(packed);
             quote! { #lit }
@@ -2940,6 +3044,8 @@ fn emit_fingerprint_check(
             // `per_module` (qwen3.5 vs qwen3.6 35B-A3B). See
             // `emit_fingerprint_check`.
             #affine_bit_map_gate
+            // An ungated bank's experts' input width — LatentMoE vs plain MoE.
+            #expert_input_check
             #is_gguf_gate
             #g_idx_disambiguation
             #input_scale_disambiguation
@@ -3250,14 +3356,8 @@ fn emit_weights_struct(
     let affine_rows = compress_affine_rows(plans.iter().flat_map(affine_tensors_of).collect());
     let fingerprint_rows =
         effective_fingerprint_rows(&mode, &affine_rows, canonical_affine_rows).to_vec();
-    // Per-arch decoder root for embed_tokens probes etc. `model` for
-    // text-only and Qwen-style VL, `<prefix>.model` for arches whose
-    // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
-    // text decoder weights under `language_model.<...>`).
-    let dec_root_for_emit: String = match model.arch.decoder_prefix.as_deref() {
-        Some(prefix) => format!("{prefix}.model"),
-        None => "model".to_string(),
-    };
+    // Per-arch decoder root for embed_tokens probes etc.
+    let dec_root_for_emit = model.arch.decoder_root();
     let embed_tokens_weight_path: String = format!("{dec_root_for_emit}.embed_tokens.weight");
     let any_marlin = plans
         .iter()
@@ -3528,7 +3628,13 @@ fn emit_weights_struct(
     // `hidden_size` / `vocab_size` panics in `emit_fingerprint_check`
     // — vision configs (`vision_*` + `d_model` only) lack those keys.
     let fingerprint_method = if emit_fingerprint {
-        emit_fingerprint_check(model, manifest, tp_world_size, &fingerprint_rows)
+        emit_fingerprint_check(
+            model,
+            manifest,
+            tp_world_size,
+            &fingerprint_rows,
+            expert_input_probe(program, fuf, model).as_ref(),
+        )
     } else {
         TokenStream::new()
     };
@@ -5350,7 +5456,8 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
+                let bits = bits.tokens();
                 quote! {
                     let #name = crate::__gpu::layers_moe::FusedMoELayer::load_affine(
                         gw,
@@ -5394,7 +5501,8 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
+                let bits = bits.tokens();
                 quote! {
                     let #name = crate::__gpu::layers_moe::SharedFusedMoELayer::load_affine(
                         gw,
@@ -5510,21 +5618,39 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
     }
 }
 
-/// The on-disk affine bit-width a layered plan loads with, if any. Used
+/// The affine bits a layered plan's load call takes: one width, or a fused-MoE bank's
+/// per-projection widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanBits {
+    Width(u32),
+    Expert(crate::quantization::ExpertBits),
+}
+
+impl quote::ToTokens for PlanBits {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Self::Width(b) => proc_macro2::Literal::u32_unsuffixed(*b).to_tokens(tokens),
+            Self::Expert(b) => b.tokens().to_tokens(tokens),
+        }
+    }
+}
+
+/// The on-disk affine bits a layered plan loads with, if any. Used
 /// to detect MLX-native mixed/dynamic-quant groups (OptiQ) where numbered
 /// layers differ in bits, so the layered emit can switch to a per-layer
 /// loader. `None` for plans with no single affine bits.
-fn field_load_affine_bits(plan: &FieldLoad) -> Option<u32> {
+fn field_load_affine_bits(plan: &FieldLoad) -> Option<PlanBits> {
     match plan {
         FieldLoad::LinearAffine { bits, .. }
         | FieldLoad::LinearAffineConcat { bits, .. }
-        | FieldLoad::GemmaSwitchGlu { bits, .. } => Some(*bits),
+        | FieldLoad::GemmaSwitchGlu { bits, .. } => Some(PlanBits::Width(*bits)),
         // MoE bundles carry the routed-expert bits in `affine`; the router
         // `gate_bits` is uniform across layers so it stays out of the
         // per-layer gather (the collapsed layer-0 plan supplies it).
-        FieldLoad::FusedMoe { affine, .. }
-        | FieldLoad::SharedFusedMoe { affine, .. }
-        | FieldLoad::GptOssMoe { affine, .. } => affine.map(|(_, b)| b),
+        FieldLoad::FusedMoe { affine, .. } | FieldLoad::SharedFusedMoe { affine, .. } => {
+            affine.map(|(_, b)| PlanBits::Expert(b))
+        }
+        FieldLoad::GptOssMoe { affine, .. } => affine.map(|(_, b)| PlanBits::Width(b)),
         _ => None,
     }
 }
@@ -5594,8 +5720,8 @@ fn emit_group_let(
             // layers ship different bit-widths yields differing plan bits.
             // Gather them; `Some(vec)` only when heterogeneous (uniform
             // groups keep the byte-identical single-bits fast path).
-            let per_layer_bits: Option<Vec<u32>> = {
-                let bits: Vec<Option<u32>> = group
+            let per_layer_bits: Option<Vec<PlanBits>> = {
+                let bits: Vec<Option<PlanBits>> = group
                     .entries
                     .iter()
                     .map(|(_, acc)| {
@@ -5606,7 +5732,7 @@ fn emit_group_let(
                     .collect();
                 match bits.iter().all(Option::is_some) {
                     true => {
-                        let v: Vec<u32> = bits.into_iter().map(Option::unwrap).collect();
+                        let v: Vec<PlanBits> = bits.into_iter().map(Option::unwrap).collect();
                         (v.iter().any(|b| *b != v[0])).then_some(v)
                     }
                     false => None,
@@ -5636,26 +5762,9 @@ fn emit_group_let(
             } else {
                 None
             };
-            // Decoder-side layered root: `model.layers` (text-only) or a
-            // `decoder_safetensors_prefix`-derived root. MUST agree with
-            // [`safetensors_prefix`]'s prefix handling (replace-vs-prepend),
-            // or the L=0 key the loader looks up won't match this root and
-            // the `layered_suffix` invariant fires.
-            let decoder_root_owned: String = match model.arch.decoder_prefix.as_deref() {
-                None => "model.layers".to_string(),
-                Some(prefix) => {
-                    let prefix = prefix.trim_end_matches('.');
-                    if prefix.starts_with("model") {
-                        // Replace-the-`model`-root form (Qwen3.5-VL
-                        // `model.language_model`): `model.language_model.layers`.
-                        format!("{prefix}.layers")
-                    } else {
-                        // Namespace-wrapper form (Gemma3-MM `language_model`):
-                        // `language_model.model.layers`.
-                        format!("{prefix}.model.layers")
-                    }
-                }
-            };
+            // Decoder-side layered root, from the one decoder-root
+            // resolution [`safetensors_prefix`] also keys by.
+            let decoder_root_owned = format!("{}.layers", model.arch.decoder_root());
             let call = emit_layered_load_body(
                 plan,
                 n_layers,
@@ -5694,17 +5803,13 @@ fn emit_layered_load_body(
     // `Some(bits per layer)` when this layered group is MLX-native
     // mixed/dynamic quant (OptiQ) with differing per-layer bit-widths;
     // the affine arms then emit the per-layer loader. `None` = uniform.
-    per_layer_bits: Option<&[u32]>,
+    per_layer_bits: Option<&[PlanBits]>,
 ) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
     let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
     // Literal `[b0, b1, ...]` per-layer bits slice for the mixed loaders.
-    let per_layer_bits_lit: Option<TokenStream> = per_layer_bits.map(|bits| {
-        let elems = bits
-            .iter()
-            .map(|b| proc_macro2::Literal::u32_unsuffixed(*b));
-        quote! { &[ #(#elems),* ] }
-    });
+    let per_layer_bits_lit: Option<TokenStream> =
+        per_layer_bits.map(|bits| quote! { &[ #(#bits),* ] });
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
     let sharded = tp_world_size > 1;
     // Build the `<root>.0.` form for `layered_suffix` /
@@ -6321,12 +6426,12 @@ fn emit_layered_load_body(
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
                 // Per-layer routed-expert bits for MLX mixed/dynamic quant
                 // (OptiQ); single width otherwise.
                 let bits_expr: TokenStream = match &per_layer_bits_lit {
                     Some(bits_slice) => quote! { (#bits_slice)[layer as usize] },
-                    None => quote! { #bits },
+                    None => bits.tokens(),
                 };
                 quote! {
                     (0u32..#n_lit)
@@ -6384,10 +6489,10 @@ fn emit_layered_load_body(
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let gate_bits = gate_bits.unwrap_or(bits);
+                let gate_bits = gate_bits.unwrap_or(bits.up());
                 let bits_expr: TokenStream = match &per_layer_bits_lit {
                     Some(bits_slice) => quote! { (#bits_slice)[layer as usize] },
-                    None => quote! { #bits },
+                    None => bits.tokens(),
                 };
                 quote! {
                     (0u32..#n_lit)
@@ -7403,20 +7508,46 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
     })
 }
 
-/// The model reads or writes a paged KV cache (encoders and vision towers
-/// don't).
-pub fn fuf_uses_kv_cache(fuf: &Fuf) -> bool {
-    fuf.nodes.iter().any(|n| {
-        n.inputs.iter().any(|i| {
-            matches!(
-                i,
+/// The layers whose ops read or write the paged KV cache, ascending: every layer of a uniform
+/// decoder, a recurrent hybrid's attention layers only (its Mamba / Gated-DeltaNet layers hold
+/// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors. The
+/// TurboQuant threshold does NOT count them: its `num_layers` input stays `num_hidden_layers`,
+/// the input it was calibrated against — re-classifying existing models' codec is a policy
+/// change and belongs in its own PR, not a side effect of a new arch.
+pub struct KvCacheLayers(Vec<u32>);
+
+impl KvCacheLayers {
+    /// The layer index of every `kv_cache[layer]` the unrolled graph names.
+    pub fn of(fuf: &Fuf) -> Self {
+        let layers: std::collections::BTreeSet<u32> = fuf
+            .nodes
+            .iter()
+            .flat_map(|n| &n.inputs)
+            .filter_map(|i| match i {
                 crate::fuf::FufInput::Extern {
                     kind: crate::classified::ExternKind::KvCache,
-                    ..
-                }
-            )
-        })
-    })
+                    index,
+                } => Some(index.map_or(0, |l| u32::try_from(l.0).expect("a u32 layer index"))),
+                _ => None,
+            })
+            .collect();
+        Self(layers.into_iter().collect())
+    }
+
+    /// The model reads or writes a paged KV cache at all.
+    pub fn any(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// How many layers hold KV.
+    pub fn count(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The layers, when they are not all `num_hidden_layers` of them (nor none).
+    pub fn proper_subset(&self, num_hidden_layers: usize) -> Option<&[u32]> {
+        (self.any() && self.count() < num_hidden_layers).then_some(self.0.as_slice())
+    }
 }
 
 /// The model's KV codec. TurboQuant under the `turboquant` feature, on metal
@@ -7426,7 +7557,7 @@ fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
-    uses_kv_cache: bool,
+    kv_layers: &KvCacheLayers,
     bits: scratchy_forward_compiler::TqBits,
 ) -> scratchy_forward_compiler::KvCodec {
     #[cfg(all(feature = "turboquant", feature = "metal"))]
@@ -7439,7 +7570,7 @@ fn kv_codec_for(
             head_dim,
             global_head_dim,
             latent: bound("kv_lora_rank") > 0,
-            has_kv_cache: uses_kv_cache,
+            has_kv_cache: kv_layers.any(),
         };
         match codec_for(geometry, bits) {
             Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
@@ -7456,7 +7587,7 @@ fn kv_codec_for(
     }
     #[cfg(not(all(feature = "turboquant", feature = "metal")))]
     {
-        let _ = (model, head_dim, global_head_dim, uses_kv_cache, bits);
+        let _ = (model, head_dim, global_head_dim, kv_layers, bits);
         scratchy_forward_compiler::KvCodec::Dense
     }
 }
@@ -7465,7 +7596,7 @@ fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
     uses_rotary: bool,
-    uses_kv_cache: bool,
+    kv_layers: &KvCacheLayers,
     // Filled with the SAME values the impl's consts are emitted from —
     // one derivation, two consumers (the impl tokens and the macro-side
     // tape bake). Built in this fn so drift is impossible.
@@ -7506,12 +7637,15 @@ fn emit_canonical_params_impl(
     // op-scratch layout; the cuda eval reads them too. Not divided by
     // `tp` — GDN tensor-parallel partitioning is a separate concern and
     // bring-up is TP=1 (where the division is a no-op anyway).
-    let gdn_num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
-    let gdn_num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
-    let gdn_head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
-    let gdn_head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
-    let gdn_conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
-    let gdn_conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as usize;
+    let RecurrentDims {
+        num_k_heads: gdn_num_k_heads,
+        num_v_heads: gdn_num_v_heads,
+        head_k_dim: gdn_head_k_dim,
+        head_v_dim: gdn_head_v_dim,
+        conv_kernel: gdn_conv_kernel,
+        conv_dim,
+    } = RecurrentDims::of(model).unwrap_or_default();
+    let gdn_conv_dim = conv_dim as usize;
 
     // Vision-tower constants. Set in `#[vision_forward]` configs via
     // `vision_num_heads` / `vision_head_dim` bounds; absent in text
@@ -7941,7 +8075,7 @@ fn emit_canonical_params_impl(
             .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
         scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
     };
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, uses_kv_cache, tq_bits);
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
     let kv_codec_tokens = match kv_codec {
         scratchy_forward_compiler::KvCodec::Dense => {
             quote! { ::scratchy_forward_compiler::KvCodec::Dense }
@@ -7954,6 +8088,17 @@ fn emit_canonical_params_impl(
                 )
             }
         }
+    };
+
+    let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or(&0) as usize;
+    let kv_cache_layers_tokens = match kv_layers.proper_subset(num_hidden_layers) {
+        Some(layers) => {
+            let layers = layers
+                .iter()
+                .map(|&l| proc_macro2::Literal::u32_unsuffixed(l));
+            quote! { ::core::option::Option::Some(&[#(#layers),*]) }
+        }
+        None => quote! { ::core::option::Option::None },
     };
 
     #[cfg(feature = "metal")]
@@ -8033,6 +8178,7 @@ fn emit_canonical_params_impl(
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
             const SLIDING_WINDOW: i32 = #sliding_window_lit;
             const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
+            const KV_CACHE_LAYERS: ::core::option::Option<&'static [u32]> = #kv_cache_layers_tokens;
             const KV_LORA_RANK: usize = #kv_lora_rank_lit;
             const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
             const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
@@ -8071,9 +8217,56 @@ fn emit_canonical_params_impl(
     }
 }
 
+/// The one-slot-per-sequence recurrent-state geometry of a hybrid arch's
+/// recurrent mixer, in the GDN state pool's terms — read from the config
+/// once for both the `W::GDN_*` consts and the `GdnRuntimeConfig`.
+///
+/// A Mamba-2 mixer fills the same pool: its conv ring spans `xBC`
+/// (`mamba_conv_dim`), its groups are the key heads (`n_groups`), its heads
+/// the value heads (`mamba_num_heads`), each holding a `[head_dim, state]`
+/// state matrix — `head_v_dim = mamba_head_dim`, `head_k_dim =
+/// ssm_state_size`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecurrentDims {
+    pub num_k_heads: u32,
+    pub num_v_heads: u32,
+    pub head_k_dim: u32,
+    pub head_v_dim: u32,
+    pub conv_kernel: u32,
+    pub conv_dim: u32,
+}
+
+impl RecurrentDims {
+    /// `None` for an arch with no recurrent mixer.
+    pub(crate) fn of(model: &ModelParams) -> Option<Self> {
+        let get = |k: &str| model.bounds.get(k).map(|&v| v as u32);
+        let gdn = || {
+            Some(Self {
+                num_k_heads: get("linear_num_key_heads")?,
+                num_v_heads: get("linear_num_value_heads")?,
+                head_k_dim: get("linear_key_head_dim")?,
+                head_v_dim: get("linear_value_head_dim")?,
+                conv_kernel: get("linear_conv_kernel_dim")?,
+                conv_dim: get("gdn_conv_dim")?,
+            })
+        };
+        let mamba = || {
+            Some(Self {
+                num_k_heads: get("n_groups")?,
+                num_v_heads: get("mamba_num_heads")?,
+                head_k_dim: get("ssm_state_size")?,
+                head_v_dim: get("mamba_head_dim")?,
+                conv_kernel: get("conv_kernel")?,
+                conv_dim: get("mamba_conv_dim")?,
+            })
+        };
+        gdn().or_else(mamba)
+    }
+}
+
 /// Emit a per-variant arm body — the `GdnRuntimeConfig` literal for one
-/// specialization. Returns `None` if the variant has no
-/// `OpKind::GatedDeltaNet` (non-hybrid) — caller emits a `None` arm.
+/// specialization. Returns `None` if the variant has no recurrent mixer
+/// (`OpKind::GatedDeltaNet` / `OpKind::Mamba2`) — caller emits a `None` arm.
 pub fn emit_gdn_runtime_config_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
@@ -8085,7 +8278,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     let mut linear = vec![false; num_hidden_layers];
     let mut is_hybrid = false;
     for node in &fuf.nodes {
-        if node.op != OpKind::GatedDeltaNet {
+        if !matches!(node.op, OpKind::GatedDeltaNet | OpKind::Mamba2) {
             continue;
         }
         is_hybrid = true;
@@ -8101,12 +8294,21 @@ pub fn emit_gdn_runtime_config_arm_body(
     if !is_hybrid {
         return None;
     }
-    let conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as u32;
-    let conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
-    let num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
-    let num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
-    let head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
-    let head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
+    let RecurrentDims {
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        conv_kernel,
+        conv_dim,
+    } = RecurrentDims::of(model).unwrap_or_else(|| {
+        panic!(
+            "model `{}` runs a recurrent mixer but its config declares no GDN \
+             (`linear_*`) or Mamba-2 (`mamba_*`, `n_groups`, `ssm_state_size`, \
+             `conv_kernel`) state geometry",
+            model.source_stem
+        )
+    });
     let bits = linear.iter().copied();
     Some(quote! {
         ::core::option::Option::Some(
@@ -10333,7 +10535,7 @@ fn dump_wavefront_mega(
                                 let is_gemm = gemm_weight.contains(&i);
                                 let disk = safetensors_prefix(
                                     program,
-                                    model.arch.decoder_prefix.as_deref(),
+                                    &model.arch.decoder_root(),
                                     model.arch.safetensors.as_ref(),
                                     WeightId(*id),
                                     *index,
@@ -10379,7 +10581,7 @@ fn dump_wavefront_mega(
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
                                     program,
-                                    model.arch.decoder_prefix.as_deref(),
+                                    &model.arch.decoder_root(),
                                     model.arch.safetensors.as_ref(),
                                     WeightId(*id),
                                     *index,
@@ -12012,7 +12214,7 @@ pub fn emit_model(
         model,
         tp_world_size,
         fuf_uses_rotary(fuf),
-        fuf_uses_kv_cache(fuf),
+        &KvCacheLayers::of(fuf),
         #[cfg(feature = "metal")]
         &mut resolved_metal_consts,
     );
@@ -12237,13 +12439,13 @@ pub fn emit_model(
             .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
             .collect();
         let quant = model.quantization.as_ref();
-        let widths = |layer: st::LayerId| {
+        let widths = |base: &str, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
-            ["gate_proj", "up_proj", "down_proj"].map(|p| {
-                let role = format!("mlp.switch_mlp.{p}");
-                let at = Some(UnrollIndex(layer.0 as u64));
-                crate::quantization::affine_role_bits(program, &qc.method, &role, at)
-                    .map(st::AffineBits)
+            let at = Some(UnrollIndex(layer.0 as u64));
+            let bits =
+                crate::quantization::affine_moe_expert_bits(program, &qc.method, base, at, body);
+            bits.map_or([None; 3], |b| {
+                b.projections().map(|w| w.map(st::AffineBits))
             })
         };
         let facts = mc3::MetalStepFacts {
@@ -12256,8 +12458,7 @@ pub fn emit_model(
             } else {
                 mc3::MlpForm::Split
             },
-            moe_expert_bits: quant
-                .map(|_| &widths as &dyn Fn(st::LayerId) -> [Option<st::AffineBits>; 3]),
+            moe_expert_bits: quant.map(|_| &widths as &mc3::MoeExpertBits<'_>),
         };
         let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
         let at = mc3::CanonicalAt { stem, m };
@@ -12484,7 +12685,7 @@ pub fn emit_model(
         let mc = resolved_metal_consts
             .as_ref()
             .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
-        let max_pos = fuf_uses_kv_cache(fuf).then(|| {
+        let max_pos = KvCacheLayers::of(fuf).any().then(|| {
             let max_pos = model.bounds.get("max_position_embeddings").copied();
             max_pos
                 .and_then(|p| u32::try_from(p).ok())
@@ -13097,13 +13298,17 @@ pub fn emit_model(
                 // GLOBAL geometry; the sliding layers stay fp16.
                 // `is_global[L]` = (group_of(L) == 0): group 0 is always the
                 // full-context group (see `compute_hybrid_kv_layout`); uniform →
-                // all-zero map → all-true.
+                // all-zero map → all-true. A recurrent hybrid's layers that hold
+                // no KV (`KV_CACHE_LAYERS`) get no store.
                 let __tq_nb = ctx.kv_cache.num_blocks;
+                let __tq_kv_layers =
+                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CACHE_LAYERS;
                 let __tq_is_global: ::std::vec::Vec<bool> = ctx
                     .kv_cache
                     .layer_to_group_u32()
                     .iter()
-                    .map(|&g| g == 0)
+                    .zip(0u32..)
+                    .map(|(&g, l)| g == 0 && __tq_kv_layers.is_none_or(|kv| kv.contains(&l)))
                     .collect();
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
                     ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev| {
@@ -14228,6 +14433,7 @@ mod tests {
             source_path: PathBuf::new(),
             bounds,
             scalars: BTreeMap::new(),
+            layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
@@ -14237,7 +14443,14 @@ mod tests {
             mrope_section: None,
             arch: Default::default(),
             torch_dtype: None,
+            expert_activation: crate::config::ExpertActivation::Silu,
         }
+    }
+
+    /// A uniform decoder's KV layers: all of them.
+    fn every_layer(m: &ModelParams) -> KvCacheLayers {
+        let layers = m.bounds.get("num_hidden_layers").copied().unwrap_or(1) as u32;
+        KvCacheLayers((0..layers).collect())
     }
 
     /// `emit_canonical_params_impl` at `tp_world_size = 1` is
@@ -14254,7 +14467,7 @@ mod tests {
             &m,
             1,
             false,
-            true,
+            &every_layer(&m),
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14290,7 +14503,7 @@ mod tests {
             &m,
             2,
             false,
-            true,
+            &every_layer(&m),
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14338,7 +14551,7 @@ mod tests {
             &m,
             8,
             false,
-            true,
+            &every_layer(&m),
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14932,7 +15145,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one V3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
         assert!(
             ts.contains("q_a_proj.weight_scale_inv"),
             "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
@@ -14972,7 +15185,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one deepseek-v3-flat FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "flat-Q MLA FP8-block fingerprint should use q_proj.weight_scale_inv \
@@ -15007,7 +15220,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one Qwen3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",
@@ -15048,7 +15261,7 @@ mod fingerprint_tests {
     fn emitted_rope_theta(model: &crate::config::ModelParams, arch: &str) -> Option<f64> {
         let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
             .expect("load weights manifest");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
         // `quote`'s stringification spaces tokens out: `theta - 100000.0`.
         let tail = ts.split("theta - ").nth(1)?;
         let lit: String = tail
@@ -15200,6 +15413,243 @@ mod fingerprint_tests {
         );
     }
 
+    /// The front end up to the storage-annotated FUF, for one model of one arch — what
+    /// `expert_input_probe` reads in a build.
+    fn fuf_of(arch: &str, model: &crate::config::ModelParams) -> (Program, Fuf) {
+        let dsl = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/arch/dsl")
+            .join(format!("{arch}.py"));
+        let carrier =
+            crate::parse_python::parse_python_file(&std::fs::read_to_string(dsl).unwrap())
+                .expect("carrier parses");
+        let mut program =
+            crate::classify::classify_with(&carrier.ast, crate::classified::Prelude::Decoder)
+                .expect("classify");
+        program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
+        let manifest =
+            crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
+        let inferred = crate::shape::infer(&program, &manifest, &model.bounds).expect("shapes");
+        let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");
+        let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
+        fuf.annotate_storage_formats(&program, model);
+        (program, fuf)
+    }
+
+    /// The emitted body for one Nemotron-H variant, rows as given.
+    fn nemotron_fingerprint(
+        arch: &str,
+        model: &crate::config::ModelParams,
+        rows: &[(String, u32, u32)],
+    ) -> String {
+        let manifest =
+            crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
+        let (program, fuf) = fuf_of(arch, model);
+        let probe = expert_input_probe(&program, &fuf, model);
+        emit_fingerprint_check(model, &manifest, 1, rows, probe.as_ref()).to_string()
+    }
+
+    /// A recurrent hybrid holds KV in its attention layers only: its KV layers are exactly its
+    /// `attention_layers`, a proper subset the pool compacts to (`KV_CACHE_LAYERS`), and the
+    /// TurboQuant threshold reads their bytes — Nano's 6 and Super's 8 attention layers of 2 KV
+    /// heads x 128 are 6 and 8 KiB/token, below `MIN_KV_BYTES_PER_TOKEN`, where every one of
+    /// their 52 / 88 layers would read as 52 / 88 KiB. Layers that all hold KV are no subset.
+    #[test]
+    fn a_recurrent_hybrids_kv_layers_are_its_attention_layers() {
+        use scratchy_ir::{DenseReason, KvGeometry, TqBits, codec_for};
+        let preset = "mlx-affine-b4-g64-qembed";
+        for (arch, stem, kib) in [
+            ("nemotron-h", "nemotron-3-nano-30b-a3b", Some(6)),
+            ("nemotron-h-latent", "nemotron-3-super-120b-a12b", Some(8)),
+            ("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny", None),
+            (
+                "nemotron-h",
+                "nemotron-3-nano-30b-a3b-mamba-parity-tiny",
+                None,
+            ),
+        ] {
+            let model = variant_of(arch, stem, preset);
+            let (_, fuf) = fuf_of(arch, &model);
+            let kv = KvCacheLayers::of(&fuf);
+            let attention: Vec<u32> = model.layer_sets["attention_layers"]
+                .members()
+                .iter()
+                .map(|&l| l as u32)
+                .collect();
+            let layers = model.bounds["num_hidden_layers"] as usize;
+            assert!(!attention.is_empty() && attention.len() < layers, "{stem}");
+            assert_eq!(
+                kv.proper_subset(layers),
+                Some(attention.as_slice()),
+                "{stem}"
+            );
+            if let Some(kib) = kib {
+                let geometry = KvGeometry {
+                    num_layers: kv.count(),
+                    num_kv_heads: model.bounds["num_key_value_heads"] as usize,
+                    head_dim: model.bounds["head_dim"] as u32,
+                    global_head_dim: model.bounds["head_dim"] as u32,
+                    latent: false,
+                    has_kv_cache: kv.any(),
+                };
+                assert_eq!(
+                    codec_for(geometry, TqBits::new(4)),
+                    Err(DenseReason::SmallKv {
+                        bytes_per_token: kib * 1024
+                    }),
+                    "{stem}"
+                );
+            }
+            assert_eq!(
+                kv.proper_subset(kv.count()),
+                None,
+                "{stem}: every layer holds KV"
+            );
+        }
+    }
+
+    /// Nemotron-H (plain) and Nemotron-H with LatentMoE report ONE architecture string, so the
+    /// fingerprint must tell them apart by tensors alone — and at EQUAL hidden size, where the
+    /// embedding shape cannot (the two parity-tiny stems: hidden 128, vocab 512 both). The
+    /// experts' input width does: the latent bank's `fc1` packs `moe_latent_size`, the plain
+    /// one's `hidden_size`. Probed at the last MoE layer, at that layer's resolved `fc1` width.
+    #[test]
+    fn the_latent_and_plain_nemotron_moe_probe_different_expert_input_widths() {
+        let preset = "mlx-affine-b4-g64-qembed";
+        let probe = |arch: &str, stem: &str| {
+            let model = variant_of(arch, stem, preset);
+            let (program, fuf) = fuf_of(arch, &model);
+            let last_moe = *model.layer_sets["moe_layers"].members().last().unwrap();
+            let probe = expert_input_probe(&program, &fuf, &model).expect("an ungated bank");
+            assert_eq!(
+                probe.tensor,
+                format!("backbone.layers.{last_moe}.mixer.switch_mlp.fc1.weight"),
+                "{stem}: probed at the last MoE layer"
+            );
+            (model.bounds["hidden_size"], probe.packed_cols)
+        };
+        let (nano_h, nano) = probe("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny");
+        let (super_h, sup) = probe(
+            "nemotron-h-latent",
+            "nemotron-3-super-120b-a12b-parity-tiny",
+        );
+        assert_eq!(
+            nano_h, super_h,
+            "premise: the tiny pair shares its hidden size"
+        );
+        assert_eq!(nano, 128 * 4 / 32, "plain: hidden 128 at 4-bit");
+        assert_eq!(
+            sup,
+            64 * 4 / 32,
+            "latent: moe_latent_size 64 at layer 7's 4-bit fc1"
+        );
+
+        // The real checkpoints: Nano-4bit is uniform; Super's last MoE layer (87) is a 4/4 bundle
+        // on the 1024-wide latent.
+        assert_eq!(
+            probe("nemotron-h", "nemotron-3-nano-30b-a3b").1,
+            2688 * 4 / 32
+        );
+        assert_eq!(
+            probe("nemotron-h-latent", "nemotron-3-super-120b-a12b").1,
+            1024 * 4 / 32
+        );
+        assert!(
+            expert_input_probe(
+                &layout_test_program(&[]),
+                &Fuf { nodes: Vec::new() },
+                &variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", preset)
+            )
+            .is_none(),
+            "a gated bank's leaf names live in the loaders; no probe is claimed for it",
+        );
+    }
+
+    /// The Super OptiQ variant's fingerprint as emitted: the format-marker probes read a layer
+    /// that HAS the fingerprint leaf (layer 0 is a Mamba block, so a `layers.0` probe was inert),
+    /// the embedding gate expects the table packed at the per-module map's 4 bits (the map names
+    /// `backbone.embeddings`, not `embed_tokens`), and the experts' input width is checked.
+    #[test]
+    fn the_super_optiq_fingerprint_probes_tensors_the_checkpoint_has() {
+        let arch = "nemotron-h-latent";
+        let model = variant_of(
+            arch,
+            "nemotron-3-super-120b-a12b",
+            "mlx-affine-b4-g64-qembed",
+        );
+        let first_attn = *model.layer_sets["attention_layers"]
+            .members()
+            .first()
+            .unwrap();
+        let last_attn = *model.layer_sets["attention_layers"]
+            .members()
+            .last()
+            .unwrap();
+        assert_ne!(first_attn, 0, "premise: layer 0 is not an attention block");
+        let q_rows = vec![("backbone.layers.*.mixer.q_proj.weight".to_string(), 4, 64)];
+        let ts = nemotron_fingerprint(arch, &model, &q_rows);
+        let squash = ts.replace(' ', "");
+        assert!(
+            squash.contains(&format!(
+                "\"backbone.layers.{last_attn}.mixer.q_proj.scales\""
+            )),
+            "the group-size probe reads the last attention layer's q_proj: {ts}"
+        );
+        assert!(
+            squash.contains("\"backbone.embeddings.weight\"")
+                && squash.contains(&format!("shape[1]=={}", 4096 * 4 / 32)),
+            "the embedding table is gated packed at 4 bits: {ts}"
+        );
+        assert!(
+            squash.contains("\"backbone.layers.87.mixer.switch_mlp.fc1.weight\"")
+                && squash.contains(&format!("Some(&{})", 1024 * 4 / 32)),
+            "the experts' input width is gated: {ts}"
+        );
+        assert!(
+            !squash.contains("ships_affine_row"),
+            "q_proj is affine, so its group-size probe is the positive sniff already"
+        );
+
+        // The dense base rejects an MLX checkpoint by the `.scales` marker, at the FIRST layer
+        // that has the leaf.
+        let dense = config_of(arch, "nemotron-3-super-120b-a12b");
+        let manifest =
+            crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
+        let ts = emit_fingerprint_check(&dense, &manifest, 1, &[], None).to_string();
+        let marker = format!("layers.{first_attn}.");
+        assert!(
+            ts.contains("q_proj.scales") && ts.contains(&marker) && !ts.contains("layers.0."),
+            "no format marker may probe the Mamba layer 0: {ts}"
+        );
+    }
+
+    /// An MLX per-module variant whose fingerprint leaf is DENSE (the experts-only parity map)
+    /// skips the group-size probe, and then must positively see one of its affine tensors packed
+    /// — else a dense checkpoint satisfies its width gate vacuously (`NoVariantMatched` is the
+    /// right answer, not a loader failure).
+    #[test]
+    fn an_experts_only_per_module_variant_sniffs_its_affine_tensors_positively() {
+        let arch = "nemotron-h";
+        let model = variant_of(
+            arch,
+            "nemotron-3-nano-30b-a3b-parity-tiny",
+            "mlx-affine-b4-g64-qembed",
+        );
+        let expert_rows = vec![(
+            "backbone.layers.1.mixer.switch_mlp.fc1.weight".to_string(),
+            4,
+            64,
+        )];
+        let squash = nemotron_fingerprint(arch, &model, &expert_rows).replace(' ', "");
+        assert!(
+            squash.contains("ships_affine_row(__AFFINE_WIDTHS)"),
+            "{squash}"
+        );
+        assert!(
+            !squash.contains("mixer.q_proj.scales\")"),
+            "no group-size probe: {squash}"
+        );
+    }
+
     /// `affine_tensors_of` must report the width THE LOAD CALL GETS, so the
     /// fingerprint cannot assert something the loader won't do. The MoE arm's
     /// gate is the #202 role; the Gemma router is the one that used to be
@@ -15213,7 +15663,14 @@ mod fingerprint_tests {
             moe_intermediate_size: 128,
             shared_expert_intermediate_size: 0,
             hidden_size: 128,
-            affine: Some((64, 4)),
+            affine: Some((
+                64,
+                crate::quantization::ExpertBits::Gated {
+                    gate: 4,
+                    up: 4,
+                    down: 4,
+                },
+            )),
             gate_bits: Some(8),
         };
         assert_eq!(
@@ -15221,6 +15678,38 @@ mod fingerprint_tests {
             vec![("model.layers.0.mlp.gate.weight".to_string(), 8, 64)],
             "the router gate must carry `gate_bits` (8), NOT the expert width (4) — they are \
              different tensors at different widths",
+        );
+
+        // Nemotron-3-Super's 4/2 split bundle: its dense router claims no width, and its
+        // pre-stacked ungated experts are listed each at its own — the only rows that separate
+        // the OptiQ variant from a uniform 4-bit one.
+        let ungated = FieldLoad::SharedFusedMoe {
+            prefix: "backbone.layers.8.mixer".to_string(),
+            num_experts: 512,
+            top_k: 22,
+            moe_intermediate_size: 2688,
+            shared_expert_intermediate_size: 0,
+            hidden_size: 1024,
+            affine: Some((
+                64,
+                crate::quantization::ExpertBits::Ungated { fc1: 4, fc2: 2 },
+            )),
+            gate_bits: None,
+        };
+        assert_eq!(
+            affine_tensors_of(&ungated),
+            vec![
+                (
+                    "backbone.layers.8.mixer.switch_mlp.fc1.weight".to_string(),
+                    4,
+                    64
+                ),
+                (
+                    "backbone.layers.8.mixer.switch_mlp.fc2.weight".to_string(),
+                    2,
+                    64
+                ),
+            ],
         );
 
         let router = FieldLoad::GemmaRouter {
@@ -15355,13 +15844,13 @@ mod fingerprint_tests {
             crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
 
         let rows = vec![("model.layers.*.mlp.gate.weight".to_string(), 8, 64)];
-        let ts = emit_fingerprint_check(&model, &manifest, 1, &rows).to_string();
+        let ts = emit_fingerprint_check(&model, &manifest, 1, &rows, None).to_string();
         assert!(
             ts.contains("affine_widths_agree") && ts.contains("model.layers.*.mlp.gate.weight"),
             "the gate must pass the collected rows to the runtime helper, got:\n{ts}",
         );
 
-        let ts_none = emit_fingerprint_check(&model, &manifest, 1, &[]).to_string();
+        let ts_none = emit_fingerprint_check(&model, &manifest, 1, &[], None).to_string();
         assert!(
             !ts_none.contains("affine_widths_agree"),
             "a variant with no affine tensors must emit no width gate",
@@ -15377,7 +15866,7 @@ mod fingerprint_tests {
         let model = config_of("llama", "smollm2-135m");
         let manifest =
             crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
-        let ts = emit_fingerprint_check(&model, &manifest, 1, &[]).to_string();
+        let ts = emit_fingerprint_check(&model, &manifest, 1, &[], None).to_string();
         let gate = ts
             .split("rope_theta")
             .nth(1)
@@ -15398,7 +15887,7 @@ mod fingerprint_tests {
     fn emitted_embed_packed_width(model: &crate::config::ModelParams, arch: &str) -> Option<usize> {
         let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
             .expect("load weights manifest");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
         // `match gw . tensor_shape_any ("model.embed_tokens.weight") { ..
         // shape [0] == 201088usize && shape [1] == 360usize .. }`
         // — anchor on `[1]` so the `>= 2usize` rank check can't be

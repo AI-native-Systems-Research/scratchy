@@ -21,6 +21,8 @@
 //   [the scores × scale]                SCALED, as `scalar_mul` (Gemma's `hidden^-0.5`)
 //   [softmax | renorm over the top-k]   POST 1 | 2, as `softmax.metal`'s kernels
 //   [each score × its expert's scale]   EXPERT_SCALED, as `moe_per_expert_scale`
+//   [the scores × post_scale]           POST_SCALED, as `scalar_mul` (Nemotron-H's
+//                                       `routed_scaling_factor`, after the renorm)
 //
 // The top-k are picked, not sorted: simdgroup 0 takes the max of every expert's packed key k
 // times. The key is the score's 16 bits mapped to an unsigned order (`LessThan`'s: every NaN
@@ -148,10 +150,10 @@ METAL_FUNC void route_top_k(
 // The top-k picks' scores into `scores`, from the scores `route_top_k` picked from (`soft` under
 // PRE 1, else `logits` — under PRE 2 the UNBIASED F32 sigmoid of the raw logit, under PRE 3 the
 // logit plus its F32 `bias`, the value the picks ordered on): each [× scale], [softmaxed |
-// renormed over the k], [× its expert's scale]. Thread `lid` of the threadgroup; every thread
-// returns with the scores in `scores`.
-template <typename T, int K, int PRE, bool SCALED, int POST, bool EXPERT_SCALED, typename PL,
-          typename PS, typename PI, typename PO, typename PB>
+// renormed over the k], [× its expert's scale], [× post_scale]. Thread `lid` of the threadgroup;
+// every thread returns with the scores in `scores`.
+template <typename T, int K, int PRE, bool SCALED, int POST, bool EXPERT_SCALED, bool POST_SCALED,
+          typename PL, typename PS, typename PI, typename PO, typename PB>
 METAL_FUNC void route_scores(
     PL logits,
     PS soft,
@@ -160,6 +162,7 @@ METAL_FUNC void route_scores(
     PB bias,
     const device T* expert_scale,
     float scale,
+    float post_scale,
     uint lid,
     uint simd_lane_id,
     uint simd_group_id,
@@ -189,6 +192,10 @@ METAL_FUNC void route_scores(
     float s = float(expert_scale[inds[lid]]);
     float w = float(scores[lid]);
     scores[lid] = static_cast<T>(w * s);
+  }
+  route_barrier();
+  if (POST_SCALED && lid < uint(K)) {
+    scores[lid] = T(float(scores[lid]) * post_scale);
   }
   route_barrier();
 }

@@ -47,7 +47,7 @@ pub trait FusedMoEOps {
         intermediate_size: usize,
         hidden_size: usize,
         group_size: u32,
-        bits: u32,
+        bits: ExpertBits,
         gate_bits: u32,
     ) -> anyhow::Result<Self>
     where
@@ -79,7 +79,7 @@ impl FusedMoEOps for FusedMoELayer {
         _intermediate_size: usize,
         _hidden_size: usize,
         _group_size: u32,
-        _bits: u32,
+        _bits: ExpertBits,
         _gate_bits: u32,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: FusedMoELayer affine load not yet implemented")
@@ -113,7 +113,7 @@ pub trait SharedFusedMoEOps {
         shared_expert_intermediate_size: usize,
         hidden_size: usize,
         group_size: u32,
-        bits: u32,
+        bits: ExpertBits,
         gate_bits: u32,
     ) -> anyhow::Result<Self>
     where
@@ -147,7 +147,7 @@ impl SharedFusedMoEOps for SharedFusedMoELayer {
         _shared_expert_intermediate_size: usize,
         _hidden_size: usize,
         _group_size: u32,
-        _bits: u32,
+        _bits: ExpertBits,
         _gate_bits: u32,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: SharedFusedMoELayer affine load not yet implemented")

@@ -23,13 +23,22 @@
 
 /// Shaders that consume worker-tagged index tables and write/read the KV cache.
 /// Add new such shaders here.
-const SHADERS: &[(&str, &str)] = &[(
-    "turboquant.metal",
-    include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/shaders/turboquant.metal"
-    )),
-)];
+const SHADERS: &[(&str, &str)] = &[
+    (
+        "turboquant.metal",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/shaders/turboquant.metal"
+        )),
+    ),
+    (
+        "kv_append.metal",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/shaders/kv_append.metal"
+        )),
+    ),
+];
 
 /// Spellings that count as "bit 31 stripped".
 const MASK_TOKENS: &[&str] = &["0x7FFFFFFF", "ATTN_BT_MASK"];

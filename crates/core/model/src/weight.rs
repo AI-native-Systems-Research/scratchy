@@ -240,6 +240,41 @@ impl std::error::Error for DiskSpaceError {}
 // HuggingFace config.json parser
 // ---------------------------------------------------------------------------
 
+/// The non-finite float literals Python's `json.dumps` writes bare.
+const PYTHON_NONFINITE: [&str; 3] = ["-Infinity", "Infinity", "NaN"];
+
+/// `json` with each [`PYTHON_NONFINITE`] literal outside a string quoted into a
+/// JSON string; borrowed unchanged when there is none.
+fn quote_python_nonfinite(json: &str) -> std::borrow::Cow<'_, str> {
+    if !PYTHON_NONFINITE.iter().any(|l| json.contains(l)) {
+        return std::borrow::Cow::Borrowed(json);
+    }
+    let mut out = String::with_capacity(json.len() + 8);
+    let (mut in_string, mut escaped) = (false, false);
+    let mut rest = json;
+    while let Some(c) = rest.chars().next() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if let Some(literal) = PYTHON_NONFINITE.iter().find(|l| rest.starts_with(**l)) {
+            out.push('"');
+            out.push_str(literal);
+            out.push('"');
+            rest = &rest[literal.len()..];
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Minimal HuggingFace model configuration parsed from `config.json`.
 ///
 /// Only includes fields commonly needed by vLLM for model loading.
@@ -312,10 +347,14 @@ pub struct HfModelConfig {
 }
 
 impl HfModelConfig {
-    /// Load from a `config.json` file.
+    /// Load from a `config.json` file. Python's `json` writes a non-finite float
+    /// as a bare `Infinity` / `-Infinity` / `NaN`, which strict JSON rejects —
+    /// mlx-community's Nemotron-3-Nano ships `"time_step_limit": [0.0, Infinity]`
+    /// — so each one outside a string reads as that literal spelled as a JSON
+    /// string ([`quote_python_nonfinite`]): the config parses, the value intact.
     pub fn from_file(path: impl AsRef<Path>) -> ModelResult<Self> {
         let data = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&data)?;
+        let config: Self = serde_json::from_str(&quote_python_nonfinite(&data))?;
         Ok(config)
     }
 
@@ -569,6 +608,41 @@ mod tests {
             Some("model-00002-of-00002.safetensors")
         );
         assert_eq!(index.get_shard("nonexistent"), None);
+    }
+
+    /// mlx-community's Nemotron-3-Nano config writes Python's bare `Infinity`
+    /// (its `time_step_limit`); it parses, with the literal kept as a string,
+    /// and a string that merely contains the word is left alone.
+    #[test]
+    fn test_hf_model_config_parses_python_nonfinite_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "architectures": ["NemotronHForCausalLM"],
+                "eos_token_id": 11,
+                "note": "Infinity, \"NaN\" stay text",
+                "time_step_limit": [0.0, Infinity],
+                "lows": [-Infinity, NaN]
+            }"#,
+        )
+        .unwrap();
+        let config = HfModelConfig::from_file(&path).expect("python-json config parses");
+        assert_eq!(config.architectures, vec!["NemotronHForCausalLM"]);
+        assert_eq!(config.extra["eos_token_id"], serde_json::json!(11));
+        assert_eq!(
+            config.extra["note"],
+            serde_json::json!("Infinity, \"NaN\" stay text")
+        );
+        assert_eq!(
+            config.extra["time_step_limit"],
+            serde_json::json!([0.0, "Infinity"])
+        );
+        assert_eq!(
+            config.extra["lows"],
+            serde_json::json!(["-Infinity", "NaN"])
+        );
     }
 
     #[test]

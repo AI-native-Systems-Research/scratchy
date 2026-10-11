@@ -8,6 +8,7 @@
 //! user's original identifiers (via the tables). Passes below here
 //! work with IDs only.
 
+use crate::ast::InSet;
 use syn::Ident;
 
 /// A local binding. Each assignment statement introduces a fresh
@@ -217,6 +218,11 @@ pub enum OpKind {
     /// rather than a flag on `RopeAppend`. Used by Cohere's CommandR
     /// family.
     RopeAppendInterleaved,
+    /// `(k, v) = kv_append(k, v, kv_cache[layer])` — append K and V to the
+    /// layer's paged KV cache AS PROJECTED: the KV writer of an attention
+    /// with no positional rotation (Nemotron-H). Both outputs are their
+    /// inputs, unchanged; the query never passes through it.
+    KvAppend,
     Attention,
     /// Same signature as `Attention`; picked by the DSL body at
     /// sliding-window attention layers. The distinction is carried
@@ -266,6 +272,10 @@ pub enum OpKind {
     /// elementwise, shape-preserving. Numerically distinct from
     /// tanh-form `Gelu` and `QuickGelu`.
     GeluErf,
+    /// Squared ReLU: `relu(x)^2` (mlx `nn.relu2`). The non-gated MLP
+    /// activation of Nemotron-H's dense, shared-expert and routed-expert
+    /// MLPs. Unary elementwise, shape-preserving.
+    Relu2,
     /// Tanh-based soft-cap: `y = cap * tanh(x / cap)`. Unary
     /// elementwise with an additional scalar argument; shape-
     /// preserving. Used at logit exit for architectures that cap
@@ -439,6 +449,17 @@ pub enum OpKind {
     /// the `layer` carried on the `Instruction`. Output: `[T, value_dim]`
     /// (feeds `out_proj`). Used by Qwen3.5 / Qwen3-Next linear layers.
     GatedDeltaNet,
+    /// Mamba-2 selective state-space mixer (Nemotron-H). One coarse op over
+    /// the WHOLE `in_proj` output: `y = mamba2(zxbcdt, mamba[layer])` where
+    /// `zxbcdt` `[T, mamba_in_proj_dim]` = `z`[d_inner] | `xBC`[conv_dim] |
+    /// `dt`[num_heads]. Causal conv1d (+bias, +SiLU) on `xBC` → split
+    /// `x`|`B`|`C` → `S_h = exp(dt·A)·S_h + dt·x_h⊗B_g`, `y_h = S_h·C_g +
+    /// D_h·x_h` → gate-before-norm grouped RMSNorm `rmsnorm_g(silu(z)·y)·w`.
+    /// `mamba[layer]` resolves to the same recurrent-mixer bundle as GDN
+    /// (`GatedDeltaNetLayer`, with its conv bias and `D`), and the conv/ssm
+    /// state is the same ambient one-slot-per-sequence pool. Output
+    /// `[T, mamba_d_inner]` (feeds `out_proj`).
+    Mamba2,
     /// Qwen3.5 attention output-gate split. Deinterleaves the DOUBLED
     /// `q_proj` output `[T, num_heads*2*head_dim]` (viewed `[T, nh, 2, hd]`)
     /// into `query` (`[:,:,0,:]`) and `gate` (`[:,:,1,:]`), each
@@ -541,6 +562,7 @@ impl OpKind {
             "gemm" => Some(Self::Gemm),
             "rope_append" => Some(Self::RopeAppend),
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
+            "kv_append" => Some(Self::KvAppend),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
             "sink_attention" => Some(Self::SinkAttention),
@@ -558,6 +580,7 @@ impl OpKind {
             "vision_rope" => Some(Self::VisionRope),
             "quick_gelu" => Some(Self::QuickGelu),
             "gelu_erf" => Some(Self::GeluErf),
+            "relu2" => Some(Self::Relu2),
             "silu" => Some(Self::Silu),
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),
@@ -576,6 +599,7 @@ impl OpKind {
             "gemma_moe" => Some(Self::GemmaMoe),
             "gptoss_moe" => Some(Self::GptOssMoe),
             "gated_delta_net" => Some(Self::GatedDeltaNet),
+            "mamba2" => Some(Self::Mamba2),
             "gate_split" => Some(Self::GateSplit),
             "gate_apply" => Some(Self::GateApply),
             "gate_scale" => Some(Self::GateScale),
@@ -594,6 +618,7 @@ impl OpKind {
             Self::Gemm => "gemm",
             Self::RopeAppend => "rope_append",
             Self::RopeAppendInterleaved => "rope_append_interleaved",
+            Self::KvAppend => "kv_append",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
             Self::SinkAttention => "sink_attention",
@@ -603,6 +628,7 @@ impl OpKind {
             Self::Gelu => "gelu",
             Self::QuickGelu => "quick_gelu",
             Self::GeluErf => "gelu_erf",
+            Self::Relu2 => "relu2",
             Self::VisionRope => "vision_rope",
             Self::TanhSoftCap => "tanh_softcap",
             Self::RmsNormUnit => "rmsnorm_unit",
@@ -619,6 +645,7 @@ impl OpKind {
             Self::GemmaMoe => "gemma_moe",
             Self::GptOssMoe => "gptoss_moe",
             Self::GatedDeltaNet => "gated_delta_net",
+            Self::Mamba2 => "mamba2",
             Self::GateSplit => "gate_split",
             Self::GateApply => "gate_apply",
             Self::GateScale => "gate_scale",
@@ -699,33 +726,40 @@ impl Program {
     /// the `_<digit>` leaf warning in lib.rs) mirror this — keep them
     /// in lockstep.
     pub fn rename_dotted(&self, dotted: &str) -> String {
-        let mut pairs: Vec<&(String, String)> = self.weight_leaf_renames.iter().collect();
-        pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-        let mut out = dotted.to_string();
-        for (dsl_leaf, disk_leaf) in pairs {
-            // Whole-segment boundaries only: the char before a match
-            // (if any) and the char after (if any) must be `.`.
-            // Exact match and trailing match both fall out of the
-            // suffix arm; a leading segment run falls out of the
-            // prefix arm; interior occurrences go through the
-            // `.<leaf>.` replace loop.
-            if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str())
-                && (stripped.is_empty() || stripped.ends_with('.'))
-            {
-                out = format!("{stripped}{disk_leaf}");
-                continue;
-            }
-            let pat = format!(".{dsl_leaf}.");
-            let rep = format!(".{disk_leaf}.");
-            while let Some(pos) = out.find(&pat) {
-                out.replace_range(pos..pos + pat.len(), &rep);
-            }
-            if let Some(tail) = out.strip_prefix(&format!("{dsl_leaf}.")) {
-                out = format!("{disk_leaf}.{tail}");
-            }
-        }
-        out
+        rename_dotted_under(&self.weight_leaf_renames, dotted)
     }
+}
+
+/// [`Program::rename_dotted`] under an explicit rename list — for a
+/// caller holding the arch spec's renames rather than a `Program` (the
+/// fingerprint's sniffed tensor names).
+pub fn rename_dotted_under(renames: &[(String, String)], dotted: &str) -> String {
+    let mut pairs: Vec<&(String, String)> = renames.iter().collect();
+    pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    let mut out = dotted.to_string();
+    for (dsl_leaf, disk_leaf) in pairs {
+        // Whole-segment boundaries only: the char before a match
+        // (if any) and the char after (if any) must be `.`.
+        // Exact match and trailing match both fall out of the
+        // suffix arm; a leading segment run falls out of the
+        // prefix arm; interior occurrences go through the
+        // `.<leaf>.` replace loop.
+        if let Some(stripped) = out.strip_suffix(dsl_leaf.as_str())
+            && (stripped.is_empty() || stripped.ends_with('.'))
+        {
+            out = format!("{stripped}{disk_leaf}");
+            continue;
+        }
+        let pat = format!(".{dsl_leaf}.");
+        let rep = format!(".{disk_leaf}.");
+        while let Some(pos) = out.find(&pat) {
+            out.replace_range(pos..pos + pat.len(), &rep);
+        }
+        if let Some(tail) = out.strip_prefix(&format!("{dsl_leaf}.")) {
+            out = format!("{disk_leaf}.{tail}");
+        }
+    }
+    out
 }
 
 /// Side table: `LocalId` → debug ident.
@@ -892,9 +926,9 @@ pub enum BoolPred {
     },
     /// `ivar < bound`.
     Less { ivar: LocalId, bound: Bound },
-    /// `members.contains(&ivar)` — set membership over a closed list
-    /// of integer literals. See [`crate::ast::BoolExpr::In`].
-    In { ivar: LocalId, members: Vec<u64> },
+    /// `ivar in members` — set membership over a literal list or a
+    /// config-derived layer set. See [`crate::ast::BoolExpr::In`].
+    In { ivar: LocalId, members: InSet },
 }
 
 /// A value-producing expression.

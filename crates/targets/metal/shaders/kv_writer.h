@@ -9,6 +9,20 @@
 #include "turboquant_encode.h"
 #include "turboquant_offset.h"
 
+// The packed store a KV writer's folded-in encode writes, by binding: the codebook (16, 17), K's
+// codes and norms (18, 19), V's (20, 21), and each operand's offset bias (22, 23) with the rotary
+// table a rotated K bias uses (24). Every KV writer (rope.metal, kv_append.metal) binds it alike.
+#define KV_WRITER_TQ_BUFFERS(T)                                                  \
+    device const float* tq_signs      [[buffer(16)]],                            \
+    device const float* tq_boundaries [[buffer(17)]],                            \
+    device       uint*  tq_packed_k   [[buffer(18)]],                            \
+    device       float* tq_norms_k    [[buffer(19)]],                            \
+    device       uint*  tq_packed_v   [[buffer(20)]],                            \
+    device       float* tq_norms_v    [[buffer(21)]],                            \
+    device const T*     tq_k_bias     [[buffer(22)]],                            \
+    device const T*     tq_v_bias     [[buffer(23)]],                            \
+    device const T*     tq_cos_sin    [[buffer(24)]],
+
 // One NeoX pair `(x0, x1)` rotated by its position's `(c, s)`: `(x0·c − x1·s, x1·c + x0·s)`.
 inline float2 rope_rotate(float x0, float x1, float c, float s) {
     return float2(x0 * c - x1 * s, x1 * c + x0 * s);

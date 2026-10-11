@@ -392,6 +392,7 @@ pub fn apply_signature_with_geometry(
         // in the picked kernel (interleaved pair vs. NeoX), not in
         // the type signature.
         OpKind::RopeAppendInterleaved => sig_rope_append(solver, inputs),
+        OpKind::KvAppend => sig_kv_append(solver, inputs),
         OpKind::Attention => sig_attention(solver, inputs, op, hybrid_attention_geometry),
         // Same q/k/v constraints as `attention`; the distinction is
         // in the picked kernel (window-masked vs. dense), not in
@@ -413,6 +414,7 @@ pub fn apply_signature_with_geometry(
         // numerical distinction lives in the picked kernel.
         OpKind::QuickGelu => sig_unary_elementwise(solver, inputs, op),
         OpKind::GeluErf => sig_unary_elementwise(solver, inputs, op),
+        OpKind::Relu2 => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         // Shape-preserving; the per-head reduction width is baked by
         // the Impl at fan_out (per attention class), not by the sig.
@@ -471,6 +473,7 @@ pub fn apply_signature_with_geometry(
         OpKind::GemmaMoe => sig_gemma_moe(solver, inputs),
         OpKind::GptOssMoe => sig_gptoss_moe(solver, inputs),
         OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
+        OpKind::Mamba2 => sig_mamba2(solver, inputs),
         OpKind::GateSplit => sig_gate_split(solver, inputs),
         OpKind::GateApply => sig_gate_apply(solver, inputs),
         OpKind::GateScale => sig_gate_scale(solver, inputs),
@@ -673,6 +676,22 @@ fn sig_rope_append(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shap
     // The caller binds the other two targets separately (see
     // `infer::classify_rope_append_tuple`).
     Ok(OpSig { output: q.clone() })
+}
+
+/// `kv_append((k, v, kv_cache))` → `(k, v)`, shape-preserving on both.
+/// Like [`sig_rope_append`] the heads layout is the downstream
+/// attention's to anchor; the caller binds the two targets
+/// (`Stmt::AssignTuple`).
+fn sig_kv_append(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::KvAppend, inputs, 3)?;
+    let k = &inputs[0];
+    if k.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::KvAppend,
+            reason: "k must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: k.clone() })
 }
 
 /// `attention(q, k, v, kv_cache, block_table)` (5-arg, decoder) OR
@@ -901,6 +920,23 @@ fn sig_gated_delta_net(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, 
     })
 }
 
+/// `mamba2(zxbcdt, mamba[layer])` → `[T, mamba_d_inner]`. `zxbcdt` is the
+/// whole `in_proj` output `[T, mamba_in_proj_dim]`; the bundle is a struct
+/// (no tensor-rank assertion, like `gated_delta_net`'s).
+fn sig_mamba2(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::Mamba2, inputs, 2)?;
+    let zxbcdt = &inputs[0];
+    if zxbcdt.len() != 2 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::Mamba2,
+            reason: "zxbcdt must be [T, mamba_in_proj_dim]".into(),
+        });
+    }
+    Ok(OpSig {
+        output: vec![zxbcdt[0].clone(), Dim::Bound("mamba_d_inner".into())],
+    })
+}
+
 /// `gate_split(qg: [T, num_attention_heads*2*head_dim])` → (single-output sig
 /// for `apply_signature` validation; the real 2-tuple `(q, gate)` binding is in
 /// `Stmt::AssignTuple`). Returns `q` shape `[T, attn_q_dim]`
@@ -972,15 +1008,28 @@ fn sig_gate_scale(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shape
     })
 }
 
-/// `moe_block(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
-/// the second arg is a MoE layer struct (`FusedMoELayer` /
+/// `moe_block(x: [T, H], moe_weight)` → `[T, H]`, or a latent MoE's
+/// `moe_block(router_in: [T, H], expert_in: [T, L], moe_weight)` →
+/// `[T, L]` (Nemotron-3-Super: the router reads the block input, the
+/// experts its latent projection, and their weighted sum stays latent).
+/// The last arg is a MoE layer struct (`FusedMoELayer` /
 /// `SharedFusedMoELayer` / `DeepSeekV2MoELayer` or their quant
 /// flavors) — not a tensor — so it contributes an empty shape.
-/// Output = hidden_states shape.
+/// Output = the experts' input shape.
 fn sig_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::Moe, inputs, 2)?;
+    let expert_in = match inputs.len() {
+        2 => 0,
+        3 => 1,
+        got => {
+            return Err(ShapeError::ArgCount {
+                op: OpKind::Moe,
+                expected: 2,
+                got,
+            });
+        }
+    };
     Ok(OpSig {
-        output: inputs[0].clone(),
+        output: inputs[expert_in].clone(),
     })
 }
 
@@ -1095,6 +1144,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gemm => &[(1, 2)],
         OpKind::RopeAppend => &[],
         OpKind::RopeAppendInterleaved => &[],
+        OpKind::KvAppend => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
         // Sink attention: arg 3 is the per-layer `[num_attention_heads]`
@@ -1106,6 +1156,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gelu => &[],
         OpKind::QuickGelu => &[],
         OpKind::GeluErf => &[],
+        OpKind::Relu2 => &[],
         OpKind::VisionRope => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::RmsNormUnit => &[],
@@ -1137,6 +1188,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // GatedDeltaNet's linear_attn[layer] is a GatedDeltaNetLayer struct
         // (not a tensor); like Moe, skip the tensor-rank assertion.
         OpKind::GatedDeltaNet => &[],
+        // Mamba2's mamba[layer] is the same recurrent-mixer bundle struct.
+        OpKind::Mamba2 => &[],
         // GateSplit/GateApply/GateScale take only activation inputs; no tensor weight args.
         OpKind::GateSplit => &[],
         OpKind::GateApply => &[],
@@ -2033,6 +2086,35 @@ impl InferCtx {
                     }
                     Ok(())
                 } else if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::KvAppend)
+                {
+                    // `(k, v) = kv_append(k, v, kv_cache[layer])`: both
+                    // outputs are their inputs.
+                    if targets.len() != 2 {
+                        return Err(ShapeError::BadArgs {
+                            op: *op,
+                            reason: format!(
+                                "kv_append returns 2 values, got {} targets",
+                                targets.len()
+                            ),
+                        });
+                    }
+                    let shapes = [self.expr_shape(&args[0])?, self.expr_shape(&args[1])?];
+                    let all_input_shapes: Vec<Shape> = args
+                        .iter()
+                        .map(|a| self.expr_shape(a))
+                        .collect::<Result<_, _>>()?;
+                    apply_signature_with_geometry(
+                        &mut self.solver,
+                        *op,
+                        &all_input_shapes,
+                        self.hybrid_attention_geometry,
+                    )?;
+                    for (t, s) in targets.iter().zip(shapes) {
+                        self.locals.insert(*t, s);
+                    }
+                    Ok(())
+                } else if let Expr::Call { op, args } = value
                     && matches!(op, OpKind::VisionRope)
                 {
                     // `(q, k) = vision_rope(q, k, cos, sin)`
@@ -2127,7 +2209,10 @@ impl InferCtx {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append, rope_append_interleaved, vision_rope, mla_split, and gate_split return a tuple".into(),
+                        reason:
+                            "only rope_append, rope_append_interleaved, kv_append, vision_rope, \
+                                 mla_split, and gate_split return a tuple"
+                                .into(),
                     })
                 }
             }
@@ -2679,6 +2764,78 @@ mod tests {
     }
 
     #[test]
+    fn relu2_is_shape_preserving_unary() {
+        let mut solver = Solver::new();
+        let x = vec![
+            bound("num_tokens"),
+            bound("moe_shared_expert_intermediate_size"),
+        ];
+        let sig = apply_signature(&mut solver, OpKind::Relu2, std::slice::from_ref(&x))
+            .expect("relu2 sig");
+        assert_eq!(sig.output, x);
+    }
+
+    /// `kv_append(k, v, kv_cache[layer])` is shape-preserving on K (its first output) and takes
+    /// exactly three arguments.
+    #[test]
+    fn kv_append_is_shape_preserving_on_k() {
+        let mut solver = Solver::new();
+        let k = vec![bound("num_tokens"), bound("kv_dim")];
+        let sig = apply_signature(
+            &mut solver,
+            OpKind::KvAppend,
+            &[k.clone(), k.clone(), vec![]],
+        )
+        .expect("kv_append sig");
+        assert_eq!(sig.output, k);
+        assert!(apply_signature(&mut solver, OpKind::KvAppend, &[k.clone(), k]).is_err());
+        assert_eq!(OpKind::from_name("kv_append"), Some(OpKind::KvAppend));
+        assert_eq!(OpKind::KvAppend.as_str(), "kv_append");
+    }
+
+    /// `mamba2(zxbcdt, mamba[layer])` maps the whole in-projection row to `mamba_d_inner`, takes
+    /// exactly two arguments, and wants a rank-2 `zxbcdt`.
+    #[test]
+    fn mamba2_maps_the_in_projection_to_d_inner() {
+        let mut solver = Solver::new();
+        let zx = vec![bound("num_tokens"), bound("mamba_in_proj_dim")];
+        let sig = apply_signature(&mut solver, OpKind::Mamba2, &[zx.clone(), vec![]])
+            .expect("mamba2 sig");
+        assert_eq!(
+            sig.output,
+            vec![bound("num_tokens"), bound("mamba_d_inner")]
+        );
+        assert!(apply_signature(&mut solver, OpKind::Mamba2, std::slice::from_ref(&zx)).is_err());
+        let rank1 = vec![bound("mamba_in_proj_dim")];
+        assert!(apply_signature(&mut solver, OpKind::Mamba2, &[rank1, vec![]]).is_err());
+        assert_eq!(OpKind::from_name("mamba2"), Some(OpKind::Mamba2));
+        assert_eq!(OpKind::Mamba2.as_str(), "mamba2");
+    }
+
+    /// `moe_block(x, moe[layer])` keeps `x`'s shape; a LatentMoE's `moe_block(x, latent,
+    /// moe[layer])` gives the experts' (latent) shape — the router reads `x`, the weighted sum
+    /// stays in the experts' space. Any other arity is refused.
+    #[test]
+    fn moe_block_gives_the_experts_input_shape() {
+        let mut solver = Solver::new();
+        let x = vec![bound("num_tokens"), bound("hidden_size")];
+        let latent = vec![bound("num_tokens"), bound("moe_latent_size")];
+        let sig = apply_signature(&mut solver, OpKind::Moe, &[x.clone(), vec![]]).expect("moe");
+        assert_eq!(sig.output, x);
+        let sig = apply_signature(
+            &mut solver,
+            OpKind::Moe,
+            &[x.clone(), latent.clone(), vec![]],
+        )
+        .expect("latent moe");
+        assert_eq!(sig.output, latent);
+        assert!(apply_signature(&mut solver, OpKind::Moe, std::slice::from_ref(&x)).is_err());
+        assert!(
+            apply_signature(&mut solver, OpKind::Moe, &[x.clone(), latent, x, vec![]]).is_err()
+        );
+    }
+
+    #[test]
     fn gelu_erf_is_shape_preserving_unary() {
         let mut solver = Solver::new();
         let x = vec![bound("total_L"), bound("vision_intermediate_size")];
@@ -2786,6 +2943,8 @@ mod tests {
         assert_eq!(OpKind::from_name("vision_rope"), Some(OpKind::VisionRope));
         assert_eq!(OpKind::from_name("quick_gelu"), Some(OpKind::QuickGelu));
         assert_eq!(OpKind::from_name("gelu_erf"), Some(OpKind::GeluErf));
+        assert_eq!(OpKind::from_name("relu2"), Some(OpKind::Relu2));
+        assert_eq!(OpKind::Relu2.as_str(), "relu2");
     }
 
     #[test]

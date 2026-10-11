@@ -188,7 +188,9 @@ pub fn expand_kv_codec(
     let mut dims: Vec<u32> = ops
         .iter()
         .filter_map(|od| match od.op {
-            SubOp::RopeAppend { head_dim, .. } => Some(head_dim.get()),
+            SubOp::RopeAppend { head_dim, .. } | SubOp::KvAppend { head_dim, .. } => {
+                Some(head_dim.get())
+            }
             SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
             _ => None,
         })
@@ -214,7 +216,9 @@ pub fn expand_kv_codec(
     };
     for (i, od) in ops.iter().enumerate() {
         match od.op {
-            SubOp::RopeAppend { attn, .. } if coded(attn) => x.writer(i, facts)?,
+            SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } if coded(attn) => {
+                x.writer(i, facts)?
+            }
             SubOp::AttnDecode { mask, .. } if coded(mask) => {
                 let around = if od.m == 1 {
                     &facts.decode
@@ -249,6 +253,41 @@ pub fn expand_kv_codec(
             .chain(x.unnamed_reads)
             .collect(),
     })
+}
+
+/// Where a KV writer's operands sit: each operand's value and the cache half it fills, and a
+/// rotating writer's rotary row.
+struct WriterOperands {
+    k: (u8, u8),
+    v: (u8, u8),
+    rotary: Option<u8>,
+}
+
+impl WriterOperands {
+    fn of(op: &ArchOp) -> Self {
+        match op {
+            // `[K, V, K_cache, V_cache]`: written as projected.
+            SubOp::KvAppend { .. } => Self {
+                k: (0, 2),
+                v: (1, 3),
+                rotary: None,
+            },
+            // `[K, cos, sin, V, K_cache, V_cache]`.
+            _ => Self {
+                k: (0, 4),
+                v: (3, 5),
+                rotary: Some(1),
+            },
+        }
+    }
+
+    /// `operand`'s `(value, cache)` operand indices.
+    fn at(&self, operand: KvOperand) -> (u8, u8) {
+        match operand {
+            KvOperand::K => self.k,
+            KvOperand::V => self.v,
+        }
+    }
 }
 
 /// The expanded op list under construction.
@@ -332,8 +371,9 @@ impl Expander<'_> {
         Ok(ExpansionId(self.next - 1))
     }
 
-    /// A coded KV writer, then its encodes: each the cache half it filled, its rotary row, and
-    /// the projection whose bias the operand carries (`kv_operand_bias`).
+    /// A coded KV writer, then its encodes: each the cache half it filled, its rotary row (a
+    /// rotating writer's), and the projection whose bias the operand carries
+    /// (`kv_operand_bias`).
     fn writer(&mut self, i: usize, facts: &KvCodecFacts) -> Result<(), KvCodecError> {
         let id = self.open(i)?;
         let own = Some(Expansion { id, guard: None });
@@ -341,14 +381,14 @@ impl Expander<'_> {
         self.read_as[i] = at;
         let ops = &self.l.input.ops;
         let m = ops[i].m;
+        let operands = WriterOperands::of(&ops[i].op);
         let mut packed = Vec::with_capacity(facts.after_writer.len());
         for g in facts.after_writer {
-            // `[K, cos, sin, V, K_cache, V_cache]`.
-            let (value, cache) = match g.step {
-                KvOperand::K => (0, 4),
-                KvOperand::V => (3, 5),
-            };
-            let mut inputs = vec![self.operand(i, cache)?, self.operand(i, 1)?];
+            let (value, cache) = operands.at(g.step);
+            let mut inputs = vec![self.operand(i, cache)?];
+            if let Some(rotary) = operands.rotary {
+                inputs.push(self.operand(i, rotary)?);
+            }
             if let InputRef::Op(producer) = self.operand(i, value)? {
                 let bias = kv_operand_bias(ops, producer);
                 let bias = bias.map_err(|why| KvCodecError::Offset { op: i, why })?;
@@ -474,6 +514,64 @@ mod tests {
         let guard = |i: usize| l.op_expansion[i].and_then(|e| e.guard);
         let ops = l.input.ops.iter().enumerate();
         ops.map(|(i, od)| (od.op.name(), guard(i))).collect()
+    }
+
+    /// An un-rotated writer (`kv_append`, Nemotron-H) codes like the rope's: its two encodes
+    /// after it, each reading only the cache half it filled (no rotary row to read), the decode
+    /// attention twinned onto them; off decode steps its K and V stage for the attention.
+    #[test]
+    fn an_unrotated_writer_encodes_its_cache_halves_alone() {
+        use crate::model_geometry::HeadDim;
+        use crate::subtile_ir::AttnMask;
+        let unrotated = |m: u32| {
+            let mut input = one_layer_input_shaped(256, 64, 512, 64);
+            // The query as projected; K and V written as projected.
+            input.ops[4] = OpDesc {
+                op: SubOp::ScalarMul { scale: 1.0 },
+                m,
+                inputs: vec![InputRef::Op(1)],
+            };
+            input.ops[5] = OpDesc {
+                op: SubOp::kv_append(HeadDim::new(64), 0, AttnMask::Causal),
+                m,
+                inputs: vec![
+                    InputRef::Op(2),
+                    InputRef::Op(3),
+                    InputRef::Ext(7),
+                    InputRef::Ext(8),
+                ],
+            };
+            input.ops.iter_mut().for_each(|od| od.m = m);
+            expand_kv_codec(&lowered(input), &FACTS).expect("expands")
+        };
+        use InputRef::{Ext, Op};
+        let l = unrotated(1);
+        assert_eq!(
+            shape(&l)[4..11],
+            [
+                ("ScalarMul", None),
+                ("KvAppend", None),
+                ("KvEncode", Some(Codec)),
+                ("KvEncode", Some(Codec)),
+                ("AttnDecode", Some(UnlessCodecDecode)),
+                ("AttnPackedKv", Some(CodecDecode)),
+                ("MatmulTile", None),
+            ]
+        );
+        let ins = |l: &LoweredDecode, i: usize| l.input.ops[i].inputs.clone();
+        assert_eq!(ins(&l, 6), [Ext(7)]);
+        assert_eq!(ins(&l, 7), [Ext(8)]);
+        assert_eq!(ins(&l, 9), [Op(4), Op(8), Op(6), Op(7)]);
+        let l = unrotated(2);
+        assert_eq!(
+            shape(&l)[8..11],
+            [
+                ("KvStage", Some(CodecNotDecode)),
+                ("KvStage", Some(CodecNotDecode)),
+                ("RotateRows", Some(CodecNotDecode)),
+            ]
+        );
+        assert_eq!((ins(&l, 8), ins(&l, 9)), (vec![Op(6)], vec![Op(7)]));
     }
 
     /// Decode: the writer's two encodes after it; the attention under `UnlessCodecDecode`, its

@@ -18,7 +18,8 @@ use scratchy_subtile::handoff::WeightKind;
 /// (`Causal` takes the `GLOBAL_*` consts, `SlidingWindow` the base ones; on uniform arches the two
 /// are equal), and a rope pairs a head's lanes as its [`RopeFormTag`] says — the tape's own types.
 pub use scratchy_subtile::subtile_ir::{
-    AttnMask, ExpertBundle, ExpertProj, GatedAct, KvOperand, RopeFormTag, RotatedRows, RouterBundle,
+    AttnMask, ExpertBundle, ExpertProj, GatedAct, KvOperand, RopeFormTag, RotatedRows,
+    RouterBundle, UngatedAct,
 };
 
 pub use super::lowered::ActivationWidth;
@@ -108,7 +109,11 @@ pub struct MoeBlock {
     pub experts: NumExperts,
     pub top_k: TopK,
     pub inter: IntermediateSize,
+    /// The experts' input and output width — the model's hidden size, or a latent MoE's narrower
+    /// expert space.
     pub hidden: HiddenSize,
+    /// The width of the rows the router reads (the model's hidden size, latent MoE or not).
+    pub router_in: HiddenSize,
     pub router: RouterBundle,
     pub bundle: ExpertBundle,
     pub input: RouterInput,
@@ -125,18 +130,18 @@ pub struct ExpertQuant {
 }
 
 /// The code width each expert projection lowers at — apart when the quantization declares the
-/// roles apart (a mixed-width bank).
+/// roles apart (a mixed-width bank). An ungated bank has no gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpertWidths {
-    pub gate: AffineBits,
+    pub gate: Option<AffineBits>,
     pub up: AffineBits,
     pub down: AffineBits,
 }
 
 impl ExpertWidths {
-    /// The one width all three projections share, if they do.
+    /// The one width every projection the bank has shares, if they do.
     pub fn uniform(self) -> Option<AffineBits> {
-        (self.gate == self.up && self.up == self.down).then_some(self.gate)
+        (self.gate.is_none_or(|g| g == self.up) && self.up == self.down).then_some(self.up)
     }
 }
 
@@ -178,6 +183,19 @@ pub enum CuSeqlens {
     VisionFull,
     /// Qwen2.5-VL windowed layers: per-window boundaries.
     VisionWindow,
+}
+
+/// The elementwise activation a [`MetalStep::Activation`] applies (`activation.metal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryAct {
+    /// GELU, tanh approximation.
+    GeluTanh,
+    /// GELU, exact erf form.
+    GeluErf,
+    /// `x · σ(1.702x)`.
+    QuickGelu,
+    /// `relu(x)²`.
+    Relu2,
 }
 
 /// One command-emitting step. Slot operands are arena colours; `LayerId` is the step's own layer
@@ -235,12 +253,8 @@ pub enum MetalStep {
     SiluMul(Slot, Slot, Slot, IntermediateSize),
     /// `(gate, up, out)`: `gelu(gate) * up`.
     GeluMul(Slot, Slot, Slot),
-    /// `(in, out, width)`: GELU (tanh approximation).
-    Gelu(Slot, Slot, ActivationWidth),
-    /// `(in, out, width)`: GELU (erf form).
-    GeluErf(Slot, Slot, ActivationWidth),
-    /// `(in, out, width)`: quick GELU.
-    QuickGelu(Slot, Slot, ActivationWidth),
+    /// `(in, out, width, act)`: an elementwise activation.
+    Activation(Slot, Slot, ActivationWidth, UnaryAct),
     /// `(in, out, width)`: final logit softcap.
     TanhSoftCap(Slot, Slot, ActivationWidth),
     /// `(delta, residual, width)`: `residual += delta`.
@@ -274,6 +288,9 @@ pub enum MetalStep {
         AttnMask,
         KvWrite,
     ),
+    /// `(k, v, layer, class, offsets, write)`: paged KV write of the un-rotated projections
+    /// (and, coded, their encode into the packed store).
+    KvAppend(Slot, Slot, LayerId, AttnMask, KvOffsets, KvWrite),
     /// `(q, out, layer, pairing)`: decode attention over the paged cache.
     AttentionViaCache(Slot, Slot, LayerId, RopeFormTag),
     /// `(q, out, layer, pairing)`: sliding-window decode attention.
@@ -302,6 +319,8 @@ pub enum MetalStep {
     GateScale(Slot, Slot, Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.
     GatedDeltaNet(Slot, Slot, Slot, Slot, Slot, LayerId),
+    /// `(zxbcdt, out, layer)`: Mamba-2 selective state-space mixer over the whole in-projection.
+    Mamba2(Slot, Slot, LayerId),
     /// One step of a MoE block.
     Moe(MoeBlock, MoeStep),
     /// `(operand, layer, class, offsets)`: the layer's `operand` staged out of its packed store for
@@ -473,6 +492,8 @@ pub enum MoeStep {
     ExpertMatmul(ExpertMatmul),
     /// `act(gate) * up`, in place on the gate rows.
     GatedAct(GatedAct),
+    /// An ungated expert's `act(up)`, in place on the up rows.
+    Act(UngatedAct),
     /// The pair rows back in token order — no command: the combine reads each pair's row where
     /// the projection wrote it, through the sort's `pos` when the bake sorted.
     Unsort,
@@ -482,6 +503,9 @@ pub enum MoeStep {
     /// up reads the gate's rows, layer and group size — routing the block's token first with
     /// `routing` and storing its picks and scores (`MetalFusion::MoeRouted`).
     GateUpAct(ExpertMatmul, ExpertWidth, GatedAct, Option<RouteProgram>),
+    /// `(up, act, routing)`: an ungated expert's one in-projection and `act(up)`, routing the
+    /// block's token first with `routing` as [`Self::GateUpAct`] does.
+    UpAct(ExpertMatmul, UngatedAct, Option<RouteProgram>),
     /// `(down, out, ends)`: the down projection, the unsort and the combine into `out`, and what
     /// it computes as it stores each row.
     DownCombine(ExpertMatmul, Slot, CombineEnds),
@@ -502,6 +526,9 @@ pub struct RouteProgram {
     pub post: RoutePost,
     /// Each score times its expert's learned scale, from layer `l`'s router (Gemma).
     pub expert_scale: Option<LayerId>,
+    /// The scores times a constant last — after the renorm, which a scale before it would cancel
+    /// (Nemotron-H's `routed_scaling_factor`).
+    pub post_scale: Option<Scale>,
 }
 
 /// What a routing's logits go through before the sort.
@@ -593,6 +620,13 @@ impl MetalStep {
                     ..
                 },
                 ..,
+            )
+            | MoeStep::UpAct(
+                ExpertMatmul {
+                    rows: MoeRows::Normed(_, norm),
+                    ..
+                },
+                ..,
             ),
         ) = &mut self
         {
@@ -626,7 +660,9 @@ impl MetalStep {
             | S::NormAdd(_, _, _, RowNorm { layer: l, .. }, _)
             | S::RopeAppend(_, _, _, _, _, _, l, ..)
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
+            | S::KvAppend(_, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)
+            | S::Mamba2(_, _, l)
             | S::KvStage(_, l, ..)
             | S::AttnPackedKv(_, _, l, ..)
             | S::SampleRows(
@@ -640,6 +676,7 @@ impl MetalStep {
                 | MoeStep::ExpertScale(l)
                 | MoeStep::ExpertMatmul(ExpertMatmul { layer: l, .. })
                 | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
+                | MoeStep::UpAct(ExpertMatmul { layer: l, .. }, ..)
                 | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, ..),
             ) => Some(l),
             S::Moe(
@@ -664,9 +701,7 @@ impl MetalStep {
             | S::ScalarMul(..)
             | S::SiluMul(..)
             | S::GeluMul(..)
-            | S::Gelu(..)
-            | S::GeluErf(..)
-            | S::QuickGelu(..)
+            | S::Activation(..)
             | S::TanhSoftCap(..)
             | S::Add(..)
             | S::EncoderAttention(..)

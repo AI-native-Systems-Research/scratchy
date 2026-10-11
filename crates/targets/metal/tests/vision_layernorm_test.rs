@@ -295,16 +295,27 @@ fn vision_embedding_gather_permutes_rows() {
 }
 
 /// `mm_embed_splice`: each projected row lands on its placeholder row; a
-/// `u32::MAX` destination skips; every other text row is untouched.
+/// `u32::MAX` destination skips; every other text row is untouched — at a
+/// width 256 divides (64) and one it does not (96, as Nemotron-3-Nano's
+/// 2688). The live destinations are followed by a zero lane, as a padded
+/// runtime buffer holds past them: dispatched in the lowering's shape (whole
+/// rows, m_scaled to the live count), no thread reads it, so row 0 stays.
 #[test]
 fn mm_embed_splice_scatters_to_placeholder_rows() {
+    for hidden in [64usize, 96] {
+        mm_embed_splice_at(hidden);
+    }
+}
+
+fn mm_embed_splice_at(hidden: usize) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     let device = di.device.clone();
-    let (text_rows, hidden) = (8usize, 64usize);
+    let text_rows = 8usize;
     let dst_rows: Vec<u32> = vec![5, 1, u32::MAX, 6];
+    let padded_dst: Vec<u32> = dst_rows.iter().copied().chain([0]).collect();
     for dtype in DTYPES {
         let symbol = format!("mm_embed_splice_{dtype}");
         let constants = MmEmbedSpliceConstants {
@@ -326,11 +337,22 @@ fn mm_embed_splice_scatters_to_placeholder_rows() {
         );
         let embed = common::shared_slice(&device, &text);
         let mm_buf = common::shared_slice(&device, &mm);
-        let dst_buf = common::shared_slice(&device, &dst_rows);
-        if !dispatch_rounded(
+        let dst_buf = common::shared_slice(&device, &padded_dst);
+        // The lowering's grid: (a row's columns, one grid row per live row).
+        if !common::dispatch_threadgroups(
+            &device,
             &pipeline,
             &[&embed, &mm_buf, &dst_buf],
-            dst_rows.len() * hidden,
+            MTLSize {
+                width: hidden.div_ceil(256),
+                height: dst_rows.len(),
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         ) {
             return;
         }
@@ -343,7 +365,7 @@ fn mm_embed_splice_scatters_to_placeholder_rows() {
             assert_eq!(
                 &got[row * hidden..][..hidden],
                 want,
-                "{symbol} text row {row}"
+                "{symbol} hidden {hidden}: text row {row}"
             );
         }
     }

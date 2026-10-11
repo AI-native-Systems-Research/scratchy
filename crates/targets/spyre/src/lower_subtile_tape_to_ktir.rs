@@ -586,6 +586,8 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
+        | SubOp::Mamba2 { .. }
+        | SubOp::KvAppend { .. }
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ⛔ THE ONE PLACE THAT MUST IMPLEMENT IT, so the refusal lives here
