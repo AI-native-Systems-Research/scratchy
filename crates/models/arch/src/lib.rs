@@ -158,10 +158,7 @@ pub mod qwen3_5_moe;
 #[path = "arch/qwen3_5_mtp.rs"]
 pub mod qwen3_5_mtp;
 
-#[cfg(all(
-    feature = "arch-gemma4-assistant",
-    any(feature = "cuda", feature = "metal")
-))]
+#[cfg(all(feature = "arch-gemma4-assistant", feature = "metal"))]
 #[path = "arch/gemma4_assistant.rs"]
 pub mod gemma4_assistant;
 
