@@ -190,7 +190,9 @@ mod tests {
     use crate::argmax::upload_shared_buffer;
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice};
     use objc2_metal::{MTLBuffer, MTLSize};
-    use scratchy_layers::turboquant::{KvCodec, PolarQuantizer, pack_indices, packed_dim};
+    use scratchy_layers::turboquant::{
+        KvCodec, PolarQuantizer, pack_indices, packed_dim, vals_per_word,
+    };
 
     /// `tq_compress_paged` baked for `kv` with no offset, writing its dequant back into the pool.
     fn compress_pipeline(device: &Device, kv: PagedKv) -> crate::aot::BakedPipeline {
@@ -451,29 +453,63 @@ mod tests {
 
         let pool_out: Vec<u16> = read_slice(&pool, pool_halfs);
         let gpu_packed: Vec<u32> = read_slice(&packed, n_slots * num_kv_heads * cb.pdim);
+        let vpw = vals_per_word(bits);
+        let unpack = |words: &[u32]| {
+            (0..dim)
+                .map(|i| {
+                    let w = i / vpw;
+                    ((words[w] >> (((i % vpw) as u32) * bits)) & ((1u32 << bits) - 1)) as i16
+                })
+                .collect::<Vec<_>>()
+        };
         let mut min_cos = f32::MAX;
-        let mut idx_mismatch = 0;
+        let mut tie_flips = 0usize;
         for slot in 0..n_slots {
             for kvh in 0..num_kv_heads {
                 let b = base(slot, kvh);
                 let (hp, hrec) = cb.host(&f32s(&orig[b..b + dim]));
-                // packed-store codes == host codes
                 let sb = (slot * num_kv_heads + kvh) * cb.pdim;
-                if gpu_packed[sb..sb + cb.pdim] != hp[..] {
-                    idx_mismatch += 1;
+                // The GPU and host quantizers are independent implementations of the same
+                // math: the host norm accumulates in f64, the kernel's in an f32 tree, and
+                // Metal's fast-math compiles the normalize its own way. An element whose
+                // transform lands within rounding distance of a boundary can therefore
+                // digitize one code apart — and which of those elements flips depends on
+                // the GPU family's codegen (this passes as-is on M5, one vector flips on
+                // M1 Max at dim 256). So the property is: every differing element is that
+                // boundary tie (adjacent codes). A real defect — wrong table, stride or
+                // sign application — moves codes arbitrarily far and fails here.
+                for (i, (&g, &h)) in unpack(&gpu_packed[sb..sb + cb.pdim])
+                    .iter()
+                    .zip(&unpack(&hp))
+                    .enumerate()
+                {
+                    if g != h {
+                        assert_eq!(
+                            (g - h).abs(),
+                            1,
+                            "dim {dim} bits {bits}: slot {slot} kvh {kvh} elem {i}: \
+                             gpu code {g} vs host {h} — not a boundary tie"
+                        );
+                        tie_flips += 1;
+                    }
                 }
                 // pool now holds host dequant
                 min_cos = min_cos.min(cosine(&hrec, &f32s(&pool_out[b..b + dim])));
             }
         }
+        let elements = n_slots * num_kv_heads * dim;
         println!(
             "tq_compress_paged dim {dim} bits {bits}: min cosine(pool, host dequant) = {min_cos:.5}, \
-             packed-code mismatches {idx_mismatch}/{}",
-            n_slots * num_kv_heads
+             boundary-tie code flips {tie_flips}/{elements} elements"
         );
-        assert_eq!(
-            idx_mismatch, 0,
-            "dim {dim} bits {bits}: packed store must equal host codes"
+        // Rounding noise flips only elements sitting within ~1e-5 relative of a boundary
+        // (about 1 in 1e5 elements here). A rate three orders above that means the
+        // kernel's arithmetic has drifted from the host math beyond rounding — a
+        // systematic shift that the per-element ±1 tie check alone would let through.
+        assert!(
+            tie_flips * 1000 <= elements,
+            "dim {dim} bits {bits}: {tie_flips}/{elements} codes differ from host — \
+             beyond boundary-tie noise"
         );
         assert!(
             min_cos > 0.99,
