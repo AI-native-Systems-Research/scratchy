@@ -1768,6 +1768,7 @@ mod tests {
                     num_seqs: seqs,
                     has_spec_tokens: has_spec,
                     unrotated_blocks: false,
+                    gdn_plain: true,
                 };
                 let (slice, full) = (
                     gate_matches(Some(OnlyIfNoSpec), s),
@@ -1786,6 +1787,7 @@ mod tests {
             num_seqs: 9,
             has_spec_tokens: false,
             unrotated_blocks: false,
+            gdn_plain: true,
         };
         assert!(!gate_matches(Some(OnlyIfNoSpec), decode_only));
         assert!(gate_matches(Some(OnlyIfSpec), decode_only));
@@ -1795,6 +1797,7 @@ mod tests {
             num_seqs: 9,
             has_spec_tokens: false,
             unrotated_blocks: false,
+            gdn_plain: true,
         };
         assert!(gate_matches(Some(OnlyIfNoSpec), prefill));
         assert!(!gate_matches(Some(OnlyIfSpec), prefill));
@@ -1804,6 +1807,7 @@ mod tests {
             num_seqs: 6,
             has_spec_tokens: true,
             unrotated_blocks: false,
+            gdn_plain: true,
         };
         assert!(!gate_matches(Some(OnlyIfNoSpec), verify));
         assert!(gate_matches(Some(OnlyIfSpec), verify));
