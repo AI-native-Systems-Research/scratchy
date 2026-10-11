@@ -413,6 +413,25 @@ enum Chart<'a> {
         /// The values are log2(ratio): charts.js shows them as "×1.23".
         ratio: bool,
     },
+    /// A sparkline: Carbon's ComboChart, two lines and the fills between them.
+    Combo {
+        data: Vec<SparkPoint>,
+        options: ChartOptions<'a>,
+    },
+}
+
+/// One point of a sparkline. On the two lines, an engine's value; on the
+/// fills, also the band from the lower line to the upper. A None value breaks
+/// the line or fill there.
+#[derive(Serialize)]
+struct SparkPoint {
+    group: &'static str,
+    key: f64,
+    value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upper: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lower: Option<f64>,
 }
 
 /// One measured point of a line. A None value (present but not measured: no
@@ -447,6 +466,10 @@ struct ChartOptions<'a> {
     legend: Option<Enabled>,
     #[serde(skip_serializing_if = "Option::is_none")]
     locale: Option<Locale>,
+    #[serde(rename = "comboChartTypes", skip_serializing_if = "Option::is_none")]
+    combo: Option<Vec<ComboLayer>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bounds: Option<Bounds>,
     // The page is always Carbon's light theme.
     theme: &'static str,
     toolbar: Enabled,
@@ -466,15 +489,44 @@ struct Axis<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     scale_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ticks: Option<Ticks<'a>>,
+    ticks: Option<Ticks>,
     #[serde(skip_serializing_if = "Option::is_none")]
     include_zero: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     visible: Option<bool>,
-    /// A label axis's labels in order; Carbon puts the first at the left of
-    /// a horizontal axis and at the bottom of a vertical one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    domain: Option<Vec<String>>,
+    domain: Option<AxisDomain>,
+}
+
+/// An axis's fixed extent.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AxisDomain {
+    /// A label axis's labels in order; Carbon puts the first at the left of a
+    /// horizontal axis and at the bottom of a vertical one.
+    Labels(Vec<String>),
+    /// A numeric axis's [from, to]. Given, it is not rounded out: Carbon's
+    /// own log range goes to powers of ten (1 to 16 users became 1 to 100,
+    /// the line stopping 60% of the way across).
+    Values([f64; 2]),
+}
+
+/// One layer of a combo chart: a chart type and the series it draws.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComboLayer {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    corresponding_datasets: Vec<&'static str>,
+}
+
+/// Which point fields a bounded area fills between. Carbon draws bounds only
+/// for an area layer holding a single series.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Bounds {
+    upper_bound_maps_to: &'static str,
+    lower_bound_maps_to: &'static str,
 }
 
 /// A grid's heatmap axes, read like a table: answer tokens across, prompt
@@ -487,7 +539,7 @@ fn grid_axes<'a>(ins: &[u32], outs: &[u32], visible: Option<bool>) -> Axes<'a> {
         ticks: None,
         include_zero: None,
         visible,
-        domain: Some(domain),
+        domain: Some(AxisDomain::Labels(domain)),
     };
     Axes {
         bottom: labels(
@@ -505,8 +557,8 @@ fn grid_axes<'a>(ins: &[u32], outs: &[u32], visible: Option<bool>) -> Axes<'a> {
 }
 
 #[derive(Serialize)]
-struct Ticks<'a> {
-    values: &'a [u32],
+struct Ticks {
+    values: Vec<f64>,
 }
 
 /// Carbon Charts' colour options: a colour per series, or the steps of a
@@ -662,7 +714,9 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
                     maps_to: "key",
                     title: "offered concurrent users",
                     scale_type: Some("linear"),
-                    ticks: Some(Ticks { values: xs }),
+                    ticks: Some(Ticks {
+                        values: xs.iter().map(|&x| f64::from(x)).collect(),
+                    }),
                     include_zero: None,
                     visible: None,
                     domain: None,
@@ -688,6 +742,8 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
             width: None,
             legend: None,
             locale: None,
+            combo: None,
+            bounds: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -731,6 +787,8 @@ fn grid_heatmap(
             width: Some(format!("{}px", 140 + 72 * outs.len())),
             legend: ratio.then_some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
+            combo: None,
+            bounds: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -769,6 +827,8 @@ fn mini_heatmap(
             width: Some("100%".to_string()),
             legend: Some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
+            combo: None,
+            bounds: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -1094,6 +1154,331 @@ impl<'a> ShapeGrid<'a> {
     }
 }
 
+/// A dimension a sparkline follows, with the metric it mostly drives.
+#[derive(Clone, Copy, PartialEq)]
+enum Trend {
+    UsersDecode,
+    UsersPrefill,
+    PromptPrefill,
+    AnswerDecode,
+}
+
+impl Trend {
+    /// Prefill on the left, decode on the right, as in the heat maps.
+    const ALL: [Trend; 4] = [
+        Trend::UsersPrefill,
+        Trend::UsersDecode,
+        Trend::PromptPrefill,
+        Trend::AnswerDecode,
+    ];
+
+    fn metric(self) -> Metric {
+        match self {
+            Trend::UsersDecode | Trend::AnswerDecode => Metric::Throughput,
+            Trend::UsersPrefill | Trend::PromptPrefill => Metric::Ttft,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Trend::UsersDecode => "Concurrency scaling — Decode",
+            Trend::UsersPrefill => "Concurrency scaling — Prefill",
+            Trend::PromptPrefill => "Input length scaling — Prefill",
+            Trend::AnswerDecode => "Output length scaling — Decode",
+        }
+    }
+
+    /// The x axis's title: not printed (styles.css), but Carbon's tooltip
+    /// label for the x value.
+    fn along(self) -> &'static str {
+        match self {
+            Trend::UsersDecode | Trend::UsersPrefill => "users at once",
+            Trend::PromptPrefill => "prompt tokens",
+            Trend::AnswerDecode => "answer tokens",
+        }
+    }
+
+    /// What the line runs along, and what is held where.
+    fn axis(self) -> &'static str {
+        match self {
+            Trend::UsersDecode | Trend::UsersPrefill => {
+                "1, 4 and 16 users at once, 512-token prompts and 128-token answers"
+            }
+            Trend::PromptPrefill => {
+                "prompts of 128, 1024 and 4096 tokens, each the geometric mean over its three answer lengths, 8 users"
+            }
+            Trend::AnswerDecode => {
+                "answers of 16, 128 and 512 tokens, each the geometric mean over its three prompt lengths, 8 users"
+            }
+        }
+    }
+
+    /// At each step of the dimension, scratchy's value and its rival's, and
+    /// the rival; None with nothing to compare. Prompt and answer lengths are
+    /// each measured at three lengths of the other: a step's value is the
+    /// geometric mean over those.
+    fn points(self, m: &Model, run: &Run) -> Option<(Engine, Vec<Step>)> {
+        let metric = self.metric();
+        match self {
+            Trend::UsersDecode | Trend::UsersPrefill => {
+                let mine = conc_cells(Engine::Scratchy.cells(m));
+                let rival = Engine::RIVALS
+                    .into_iter()
+                    .find(|e| !conc_cells(e.cells(m)).is_empty())?;
+                let theirs = conc_cells(rival.cells(m));
+                let pts = mine
+                    .iter()
+                    .map(|(n, c)| Step {
+                        x: f64::from(*n),
+                        scratchy: timing(Some(c), metric),
+                        rival: timing(theirs.get(n).copied(), metric),
+                    })
+                    .collect();
+                Some((rival, pts))
+            }
+            Trend::PromptPrefill | Trend::AnswerDecode => {
+                let g = ShapeGrid::of(m, run)?;
+                let rival = g.rival?;
+                let prompt = self == Trend::PromptPrefill;
+                let (along, across) = if prompt {
+                    (g.ins, g.outs)
+                } else {
+                    (g.outs, g.ins)
+                };
+                let pts = along
+                    .iter()
+                    .map(|&a| {
+                        let at = |e: Engine| {
+                            geometric_mean(across.iter().filter_map(|&b| {
+                                timing(g.at(Some(e), if prompt { (a, b) } else { (b, a) }), metric)
+                            }))
+                        };
+                        Step {
+                            x: f64::from(a),
+                            scratchy: at(Engine::Scratchy),
+                            rival: at(rival),
+                        }
+                    })
+                    .collect();
+                Some((rival, pts))
+            }
+        }
+    }
+}
+
+/// One step along a sparkline's dimension: where, and each engine's value.
+#[derive(Clone, Copy)]
+struct Step {
+    x: f64,
+    scratchy: Option<f64>,
+    rival: Option<f64>,
+}
+
+/// The geometric mean, the right average for rates and times; None of nothing.
+fn geometric_mean(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, n) = values.fold((0.0, 0u32), |(s, n), v| (s + v.ln(), n + 1));
+    (n > 0).then(|| (sum / f64::from(n)).exp())
+}
+
+/// The lines' points, and the two fills' points: each fill present where its
+/// engine is ahead, the two meeting where the lines cross (found on the log
+/// x axis, on which the chart draws straight segments).
+fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> {
+    let (scratchy, scratchy_ahead) = (Engine::Scratchy.label(), Engine::Scratchy.ahead());
+    let (rival, rival_ahead) = (rival.label(), rival.ahead());
+    let line = |group, key, value| SparkPoint {
+        group,
+        key,
+        value,
+        upper: None,
+        lower: None,
+    };
+    let band = |group, key, a: f64, b: f64| SparkPoint {
+        group,
+        key,
+        value: Some(a.max(b)),
+        upper: Some(a.max(b)),
+        lower: Some(a.min(b)),
+    };
+    let gap = |group, key| SparkPoint {
+        group,
+        key,
+        value: None,
+        upper: None,
+        lower: None,
+    };
+    // Positive where scratchy is ahead: more tokens a second, or less time.
+    let lead = |s: f64, r: f64| {
+        if metric == Metric::Throughput {
+            s - r
+        } else {
+            r - s
+        }
+    };
+    let mut out: Vec<SparkPoint> = Vec::new();
+    for &Step {
+        x,
+        scratchy: sv,
+        rival: rv,
+    } in pts
+    {
+        out.push(line(scratchy, x, sv));
+        out.push(line(rival, x, rv));
+    }
+    let mut fills: Vec<SparkPoint> = Vec::new();
+    for (
+        k,
+        &Step {
+            x,
+            scratchy: sv,
+            rival: rv,
+        },
+    ) in pts.iter().enumerate()
+    {
+        match (sv, rv) {
+            (Some(sv), Some(rv)) => {
+                let d = lead(sv, rv);
+                fills.push(if d > 0.0 {
+                    band(scratchy_ahead, x, sv, rv)
+                } else {
+                    gap(scratchy_ahead, x)
+                });
+                fills.push(if d < 0.0 {
+                    band(rival_ahead, x, sv, rv)
+                } else {
+                    gap(rival_ahead, x)
+                });
+                // Where the next step's lead has the other sign, the lines
+                // cross between: both fills end there, at no width.
+                if let Some(&Step {
+                    x: x1,
+                    scratchy: Some(s1),
+                    rival: Some(r1),
+                }) = pts.get(k + 1)
+                {
+                    let d1 = lead(s1, r1);
+                    if d * d1 < 0.0 {
+                        let t = d / (d - d1);
+                        let xc = x * (x1 / x).powf(t);
+                        let yc = sv + t * (s1 - sv);
+                        fills.push(band(scratchy_ahead, xc, yc, yc));
+                        fills.push(band(rival_ahead, xc, yc, yc));
+                    }
+                }
+            }
+            _ => {
+                fills.push(gap(scratchy_ahead, x));
+                fills.push(gap(rival_ahead, x));
+            }
+        }
+    }
+    out.extend(fills);
+    out
+}
+
+/// A sparkline: scratchy's and its rival's values along one dimension, the gap
+/// between them filled blue where scratchy is ahead and red where it is behind.
+fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &str) -> Element {
+    let metric = trend.metric();
+    let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
+    let range = match (xs.first(), xs.last()) {
+        (Some(&a), Some(&b)) => Some(AxisDomain::Values([a, b])),
+        _ => None,
+    };
+    // The axes' titles are the tooltip's labels; the hidden one's too.
+    let bottom = Axis {
+        maps_to: "key",
+        title: trend.along(),
+        scale_type: Some("log"),
+        ticks: Some(Ticks { values: xs }),
+        include_zero: Some(false),
+        visible: None,
+        domain: range,
+    };
+    let left = Axis {
+        maps_to: "value",
+        title: if metric == Metric::Ttft {
+            "TTFT ms"
+        } else {
+            metric.unit()
+        },
+        scale_type: None,
+        ticks: None,
+        include_zero: Some(false),
+        visible: Some(false),
+        domain: None,
+    };
+    let spec = Chart::Combo {
+        data: spark_points(pts, metric, rival),
+        options: ChartOptions {
+            title: String::new(),
+            // Users and both lengths double or more per step: on a log axis
+            // the steps sit evenly.
+            axes: Axes { bottom, left },
+            color: Some(Colour::Scale {
+                scale: [
+                    (Engine::Scratchy.label(), colour(Engine::Scratchy.series())),
+                    (rival.label(), colour(rival.series())),
+                    // The heat maps' cyan and red 50.
+                    (Engine::Scratchy.ahead(), "#1192e8"),
+                    (rival.ahead(), "#fa4d56"),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            heatmap: None,
+            height: height.to_string(),
+            width: None,
+            legend: Some(Enabled { enabled: false }),
+            locale: None,
+            // Carbon draws an area's bounds only when the layer holds one series.
+            combo: Some(vec![
+                ComboLayer {
+                    kind: "area",
+                    corresponding_datasets: vec![Engine::Scratchy.ahead()],
+                },
+                ComboLayer {
+                    kind: "area",
+                    corresponding_datasets: vec![rival.ahead()],
+                },
+                ComboLayer {
+                    kind: "line",
+                    corresponding_datasets: vec![Engine::Scratchy.label(), rival.label()],
+                },
+            ]),
+            bounds: Some(Bounds {
+                upper_bound_maps_to: "upper",
+                lower_bound_maps_to: "lower",
+            }),
+            theme: "white",
+            toolbar: Enabled { enabled: false },
+        },
+    };
+    chart(&spec, label, "width: 100%", None)
+}
+
+/// One model's sparkline for one trend on one machine, or why there is none.
+fn trend_spark(
+    machines: &BTreeMap<&str, MachineRuns>,
+    chip: &str,
+    stem: &str,
+    trend: Trend,
+    height: &str,
+) -> Element {
+    let Some(Entry { run, m }) = machines[chip].latest(stem) else {
+        return rsx! { "not run" };
+    };
+    let Some((rival, pts)) = trend.points(m, run) else {
+        return rsx! { "nothing to compare" };
+    };
+    let label = format!(
+        "{stem} on {chip}: {}, scratchy against {}",
+        trend.title(),
+        rival.label()
+    );
+    sparkline(&pts, trend, rival, height, &label)
+}
+
 const GRID_METRICS: [(Metric, &str); 2] = [
     (Metric::Throughput, "throughput"),
     (Metric::Ttft, "time to first token"),
@@ -1399,6 +1784,28 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                         {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
                     }
                 }
+                // Below the heat maps: one panel per trend, each a machine × model
+                // matrix of sparklines.
+                Grid {
+                    for trend in Trend::ALL {
+                        Column { span: Span::HALF,
+                            Tile { style: "height: 100%",
+                                Stack { gap: 3,
+                                    strong { "{trend.title()}" }
+                                    p { style: "font-size: 0.75rem", "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {trend.axis()}: blue fill where scratchy is ahead, red where it is behind." }
+                                    div { style: "display: grid; grid-template-columns: 7rem repeat({stems.len()}, minmax(0, 1fr)); gap: 0.75rem 1rem; align-items: center; font-size: 0.75rem",
+                                        div {}
+                                        for stem in &stems { div { style: "text-align: center", "{stem}" } }
+                                        for chip in machines.keys() {
+                                            div { "{chip}" }
+                                            for stem in &stems { div { {trend_spark(machines, chip, stem, trend, "4.5rem")} } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1546,7 +1953,54 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RATIO_RANGE, RATIO_SPAN, RATIO_STEPS};
+    use super::{Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, spark_points};
+
+    #[test]
+    fn the_fills_switch_where_the_lines_cross() {
+        // Ahead at 1 user (10 tok/s against 5), behind at 4 (5 against 10).
+        let steps = [
+            Step {
+                x: 1.0,
+                scratchy: Some(10.0),
+                rival: Some(5.0),
+            },
+            Step {
+                x: 4.0,
+                scratchy: Some(5.0),
+                rival: Some(10.0),
+            },
+        ];
+        let pts = spark_points(&steps, Metric::Throughput, Engine::MlxLm);
+        let fill = |group| -> Vec<(f64, Option<(f64, f64)>)> {
+            pts.iter()
+                .filter(|p| p.group == group)
+                .map(|p| (p.key, p.lower.zip(p.upper)))
+                .collect()
+        };
+        // Halfway along the lead, halfway along the log axis: x = 2, y = 7.5.
+        assert_eq!(
+            fill(Engine::Scratchy.ahead()),
+            [
+                (1.0, Some((5.0, 10.0))),
+                (2.0, Some((7.5, 7.5))),
+                (4.0, None)
+            ]
+        );
+        assert_eq!(
+            fill(Engine::MlxLm.ahead()),
+            [
+                (1.0, None),
+                (2.0, Some((7.5, 7.5))),
+                (4.0, Some((5.0, 10.0)))
+            ]
+        );
+        // For time, less is ahead: the same numbers swap the fills.
+        let ttft = spark_points(&steps, Metric::Ttft, Engine::MlxLm);
+        assert!(
+            ttft.iter()
+                .any(|p| p.group == Engine::MlxLm.ahead() && p.key == 1.0 && p.upper.is_some())
+        );
+    }
 
     #[test]
     fn ratio_range_is_the_span_either_way() {
