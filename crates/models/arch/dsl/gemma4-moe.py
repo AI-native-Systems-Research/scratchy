@@ -6,7 +6,13 @@ import torch
 import torch.nn.functional as F
 
 
-@forward
+# 16/32 decoder rungs opt in here, on the only arch where they were measured
+# to win: MoE expert kernels pay real dead compute for padded rows, so a
+# 9-15-row batch on the 64 rung wastes ~5x expert work (conc-12 TPOT
+# 140.8 -> 85.1 ms on gemma-4-26b, M1 Max). Dense TQ archs lose low-m
+# utilization instead (granite +8.6%, qwen2.5-7b +26% at batch 12) and stay
+# on the flat 8 -> 64 default ladder.
+@forward(workloads=[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096])
 def gemma4_moe():
     hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size)
     for layer in range(num_hidden_layers):
