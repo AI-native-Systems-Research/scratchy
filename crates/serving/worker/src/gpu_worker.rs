@@ -5463,6 +5463,10 @@ impl Worker for MetalWorker {
             "ScratchyWorker(metal): resident pool built in {:?}",
             t_pool.elapsed()
         );
+        // Map the KV every request starts in (block 0's chunk, the pools' first growth step) now
+        // too. It is GPU work (the new chunks' zero fill), so the GPU is also awake for the first
+        // request instead of waking from idle for it.
+        self.grow_metal_kv_to_cover(0, 0)?;
 
         let compile = self.off_tape_compile.take().ok_or_else(|| {
             ExecutorError::WorkerInit("off-tape pipelines were never compiled".into())
