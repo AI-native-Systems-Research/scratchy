@@ -942,6 +942,14 @@ fn report(reps: &[Rep], poll_ms: u64) -> Vec<String> {
 /// greedy decoding follows argmax, so two different kernel stacks legitimately
 /// split at near-ties deep inside a long open-ended generation, and gating on
 /// that would block on ordinary floating-point noise.
+///
+/// The count prompt stays bare on purpose — no separator instruction. Priming
+/// "separated by commas" makes the token after the final number a near-tie
+/// between that comma and the closing period, and the one char that tie flips
+/// is enough to fail the gate: it cost the apple-m5-max run at 29a7e7da its
+/// granite numbers (#350's accumulation-order change flipped it on that chip
+/// with every correctness test green). The e2e suite's bare "Count from 1 to
+/// N." phrasing is the precedent.
 const PARITY_PROMPTS: &[(&str, &str, usize)] = &[
     (
         "capital",
@@ -953,7 +961,7 @@ const PARITY_PROMPTS: &[(&str, &str, usize)] = &[
         "What is 17 plus 25? Reply with just the number.",
         12,
     ),
-    ("count", "Count from 1 to 10, separated by commas.", 40),
+    ("count", "Count from 1 to 10.", 40),
 ];
 
 fn normalize(s: &str, backend: Backend) -> String {
