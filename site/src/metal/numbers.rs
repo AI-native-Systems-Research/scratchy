@@ -73,6 +73,8 @@ pub enum Startup {
     Ready,
     /// Request sent until its first token.
     FirstToken,
+    /// Launch until the first token: Ready, then FirstToken.
+    Launch,
     PeakRss,
 }
 
@@ -81,6 +83,7 @@ impl Startup {
         match self {
             Startup::Ready => r.t_ready_s,
             Startup::FirstToken => r.ttft_from_send_s,
+            Startup::Launch => r.ttft_exec_s,
             Startup::PeakRss => r.peak_rss_mib,
         }
     }
@@ -123,16 +126,37 @@ impl Metric {
         }
     }
 
-    /// How many times faster scratchy is than another engine at this metric:
-    /// throughput is better higher, time better lower.
+    /// Throughput is better higher, time better lower.
+    pub fn better(self) -> Better {
+        match self {
+            Metric::Throughput => Better::Higher,
+            Metric::Ttft | Metric::Tpot => Better::Lower,
+        }
+    }
+
+    /// How many times faster scratchy is than another engine at this metric.
+    pub fn faster(self, scratchy: Option<f64>, other: Option<f64>) -> Option<f64> {
+        self.better().faster(scratchy, other)
+    }
+}
+
+/// Which way a measurement is better: higher for a rate, lower for a time.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Better {
+    Higher,
+    Lower,
+}
+
+impl Better {
+    /// How many times better scratchy's value is than another engine's.
     pub fn faster(self, scratchy: Option<f64>, other: Option<f64>) -> Option<f64> {
         let (s, o) = (
             scratchy.filter(|v| *v != 0.0)?,
             other.filter(|v| *v != 0.0)?,
         );
         Some(match self {
-            Metric::Throughput => s / o,
-            Metric::Ttft | Metric::Tpot => o / s,
+            Better::Higher => s / o,
+            Better::Lower => o / s,
         })
     }
 }
