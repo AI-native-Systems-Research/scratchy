@@ -32,8 +32,7 @@ spec + plan under docs/superpowers/ before code.
 
 <!--
 See docs/CONTRIBUTING.md. Anything requiring runtime analysis, a mirror type, an
-env-var toggle, ISel on metal/spyre, or net line growth in a target crate needs
-its case made here first.
+env-var toggle, or ISel on metal/spyre needs its case made here first.
 -->
 
 - [ ] Stays within the existing invariants

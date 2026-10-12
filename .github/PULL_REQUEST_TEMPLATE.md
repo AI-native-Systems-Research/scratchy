@@ -57,5 +57,4 @@ cargo build --release -p scratchy-cli --features metal,model/smollm2-135m
 - [ ] No new `#[allow]`, no new env-var behavior toggles
 - [ ] No weakened tests, no relaxed numeric tolerances, no new `#[ignore]`
 - [ ] Compile-time facts asserted at compile time (`const`/types), not at runtime
-- [ ] Target crates: no net line growth (declared-data tables exempt) — delta: 
 - [ ] Per-target change is opcode lowering only; no ISel added to metal/spyre
