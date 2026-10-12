@@ -25,10 +25,10 @@ use crate::carbon::{
     Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
-use data::{At, Cell, Model, Run, Scenario};
+use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
-    served, timing, untimed_note,
+    Better, DASH, Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med,
+    partial, served, timing, untimed_note,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -77,6 +77,12 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
         if name != want && name != format!("{machine}-{}-{sha8}.json", run.generated_utc.date()) {
             errors.push(format!(
                 "{name}: name it {want} (<machine>-<start time>-<sha8>.json)"
+            ));
+        }
+        for m in run.models.iter().filter(|m| m.weights().is_none()) {
+            errors.push(format!(
+                "{name}: no weights size for {}; add it to WEIGHTS in data.rs",
+                m.model_id
             ));
         }
         run.file = f;
@@ -1209,6 +1215,19 @@ impl Trend {
         }
     }
 
+    fn axes(self) -> SparkAxes {
+        let metric = self.metric();
+        SparkAxes {
+            better: metric.better(),
+            along: self.along(),
+            value: if metric == Metric::Ttft {
+                "TTFT ms"
+            } else {
+                metric.unit()
+            },
+        }
+    }
+
     /// At each step of the dimension, scratchy's value and its rival's, and
     /// the rival; None with nothing to compare. Prompt and answer lengths are
     /// each measured at three lengths of the other: a step's value is the
@@ -1284,7 +1303,7 @@ fn geometric_mean(values: impl Iterator<Item = f64>) -> Option<f64> {
 /// The lines' points, and the two fills' points: each fill present where its
 /// engine is ahead, the two meeting where the lines cross (found on the log
 /// x axis, on which the chart draws straight segments).
-fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> {
+fn spark_points(pts: &[Step], better: Better, rival: Engine) -> Vec<SparkPoint> {
     let (scratchy, scratchy_ahead) = (Engine::Scratchy.label(), Engine::Scratchy.ahead());
     let (rival, rival_ahead) = (rival.label(), rival.ahead());
     let line = |group, key, value| SparkPoint {
@@ -1312,12 +1331,9 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
         factor: None,
     };
     // Positive where scratchy is ahead: more tokens a second, or less time.
-    let lead = |s: f64, r: f64| {
-        if metric == Metric::Throughput {
-            s - r
-        } else {
-            r - s
-        }
+    let lead = |s: f64, r: f64| match better {
+        Better::Higher => s - r,
+        Better::Lower => r - s,
     };
     let mut out: Vec<SparkPoint> = Vec::new();
     for &Step {
@@ -1345,7 +1361,7 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
             (Some(sv), Some(rv)) => {
                 let d = lead(sv, rv);
                 let factor = if highlight {
-                    metric.faster(Some(sv), Some(rv))
+                    better.faster(Some(sv), Some(rv))
                 } else {
                     None
                 };
@@ -1394,19 +1410,34 @@ fn spark_points(pts: &[Step], metric: Metric, rival: Engine) -> Vec<SparkPoint> 
     out
 }
 
+/// What a sparkline follows: which way its values are better, and its axes'
+/// titles, which are the tooltip's labels.
+#[derive(Clone, Copy)]
+struct SparkAxes {
+    better: Better,
+    along: &'static str,
+    value: &'static str,
+}
+
 /// A sparkline: scratchy's and its rival's values along one dimension, the gap
 /// between them filled blue where scratchy is ahead and red where it is behind.
-fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &str) -> Element {
-    let metric = trend.metric();
+fn sparkline(pts: &[Step], axes: SparkAxes, rival: Engine, height: &str, label: &str) -> Element {
     let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
+    // From the power of two at or below the first step to the one at or above
+    // the last: users and lengths are powers of two already, so they span the
+    // chart; model sizes sit inside (Carbon misdraws a log axis given the
+    // sizes' own ends, 1.4 to 15.3 GB, and draws 1 to 16 right).
     let range = match (xs.first(), xs.last()) {
-        (Some(&a), Some(&b)) => Some(AxisDomain::Values([a, b])),
+        (Some(&a), Some(&b)) => Some(AxisDomain::Values([
+            a.log2().floor().exp2(),
+            b.log2().ceil().exp2(),
+        ])),
         _ => None,
     };
     // The axes' titles are the tooltip's labels; the hidden one's too.
     let bottom = Axis {
         maps_to: "key",
-        title: trend.along(),
+        title: axes.along,
         scale_type: Some("log"),
         ticks: Some(Ticks { values: xs }),
         include_zero: Some(false),
@@ -1415,11 +1446,7 @@ fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &st
     };
     let left = Axis {
         maps_to: "value",
-        title: if metric == Metric::Ttft {
-            "TTFT ms"
-        } else {
-            metric.unit()
-        },
+        title: axes.value,
         scale_type: None,
         ticks: None,
         include_zero: Some(false),
@@ -1427,11 +1454,11 @@ fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &st
         domain: None,
     };
     let spec = Chart::Combo {
-        data: spark_points(pts, metric, rival),
+        data: spark_points(pts, axes.better, rival),
         options: ChartOptions {
             title: String::new(),
-            // Users and both lengths double or more per step: on a log axis
-            // the steps sit evenly.
+            // Users, both lengths and model sizes grow by a factor per step:
+            // on a log axis the steps sit evenly.
             axes: Axes { bottom, left },
             color: Some(Colour::Scale {
                 scale: [
@@ -1511,7 +1538,7 @@ fn trend_spark(at: SparkAt, spark: &Result<Spark, &str>, height: &str) -> Elemen
         at.trend.title(),
         spark.rival.label()
     );
-    sparkline(&spark.steps, at.trend, spark.rival, height, &label)
+    sparkline(&spark.steps, at.trend.axes(), spark.rival, height, &label)
 }
 
 /// Prefill first, then decode, as in the overview.
@@ -1729,6 +1756,22 @@ fn runs_table(runs: &[&Run]) -> Element {
 /// metric.
 const HIGHLIGHTS: usize = 3;
 
+/// Marks one sparkline panel's highlights, from all its steps in order: the
+/// HIGHLIGHTS where scratchy is furthest ahead and those where it is furthest
+/// behind (or least ahead).
+fn highlight<'s>(steps: impl Iterator<Item = (Better, &'s mut Step)>) {
+    let mut ranked: Vec<(f64, &mut Step)> = steps
+        .filter_map(|(better, st)| Some((better.faster(st.scratchy, st.rival)?, st)))
+        .collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n = ranked.len();
+    for (k, (_, st)) in ranked.iter_mut().enumerate() {
+        if k < HIGHLIGHTS || k + HIGHLIGHTS >= n {
+            st.highlight = true;
+        }
+    }
+}
+
 /// How many of the overview's heat map squares have their factor written in
 /// them: at most one per colour step, spread over the steps the squares use.
 /// A heat map left without one then gets one of its own.
@@ -1878,28 +1921,13 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         }
     }
     for (_, _, trends) in SCALING {
-        let mut ranked: Vec<(SparkAt, usize, f64)> = sparks
-            .iter()
-            .filter(|(at, _)| trends.contains(&at.trend))
-            .filter_map(|(&at, spark)| Some((at, spark.as_ref().ok()?)))
-            .flat_map(|(at, spark)| {
-                spark.steps.iter().enumerate().filter_map(move |(k, st)| {
-                    Some((at, k, at.trend.metric().faster(st.scratchy, st.rival)?))
-                })
-            })
-            .collect();
-        ranked.sort_by(|a, b| a.2.total_cmp(&b.2));
-        let picked: Vec<(SparkAt, usize)> = ranked
-            .iter()
-            .take(HIGHLIGHTS)
-            .chain(ranked.iter().rev().take(HIGHLIGHTS))
-            .map(|&(at, k, _)| (at, k))
-            .collect();
-        for (at, k) in picked {
-            if let Some(Ok(spark)) = sparks.get_mut(&at) {
-                spark.steps[k].highlight = true;
-            }
-        }
+        highlight(
+            sparks
+                .iter_mut()
+                .filter(|(at, _)| trends.contains(&at.trend))
+                .filter_map(|(at, spark)| Some((at.trend.metric().better(), spark.as_mut().ok()?)))
+                .flat_map(|(better, spark)| spark.steps.iter_mut().map(move |st| (better, st))),
+        );
     }
     let spark = |chip: &str, stem: &str, trend: Trend| -> Element {
         let at = SparkAt { chip, stem, trend };
@@ -1971,6 +1999,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             for (title, _, _) in SCALING {
                                 ContentSwitcherItem { target: slug(title), selected: false, "{title}" }
                             }
+                            ContentSwitcherItem { target: slug(STARTUP), selected: false, "{STARTUP}" }
                         }
                         div {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
@@ -2012,7 +2041,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
                                             p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
-                                            div { style: "display: grid; grid-template-columns: 7rem auto repeat({stems.len()}, minmax(0, 1fr)); gap: 0.25rem 2rem; align-items: center",
+                                            div { style: spark_grid(stems.len()),
                                                 div {}
                                                 div {}
                                                 for stem in &stems { div { style: "text-align: center", "{stem}" } }
@@ -2022,6 +2051,304 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                     for stem in &stems { div { {spark(chip, stem, prefill)} } }
                                                     div { "Decode" }
                                                     for stem in &stems { div { {spark(chip, stem, decode)} } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ContentPanel { id: slug(STARTUP), shown: false,
+                                div { style: "contain: inline-size", {startup_panel(machines, stems.len())} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The glance's sparkline grids, every panel's, so every sparkline is one
+/// size: the machine, a row label, then `columns` equal columns. The label
+/// column has a width of its own rather than its labels', so a panel without
+/// row labels gives its sparklines the same width as one with them.
+fn spark_grid(columns: usize) -> String {
+    format!(
+        "display: grid; grid-template-columns: 7rem 4rem repeat({columns}, minmax(0, 1fr)); \
+         gap: 0.25rem 2rem; align-items: center"
+    )
+}
+
+/// The glance's startup panel's name.
+const STARTUP: &str = "Startup by model size";
+
+/// The engines the startup panel compares: scratchy, and mlx-lm, which loads
+/// the same MLX checkpoint.
+const STARTUP_ENGINES: [Engine; 2] = [Engine::Scratchy, Engine::MlxLm];
+
+/// The unit a startup time is shown in.
+#[derive(Clone, Copy)]
+enum TimeUnit {
+    Seconds,
+    Millis,
+}
+
+impl TimeUnit {
+    fn label(self) -> &'static str {
+        match self {
+            TimeUnit::Seconds => "s",
+            TimeUnit::Millis => "ms",
+        }
+    }
+
+    fn per_second(self) -> f64 {
+        match self {
+            TimeUnit::Seconds => 1.0,
+            TimeUnit::Millis => 1000.0,
+        }
+    }
+
+    /// Decimals it is written with in the table.
+    fn decimals(self) -> usize {
+        match self {
+            TimeUnit::Seconds => 2,
+            TimeUnit::Millis => 0,
+        }
+    }
+}
+
+/// One column of the startup panel: its scenario and title, what it times and
+/// in what unit, and its sparklines' axes.
+struct StartupColumn {
+    scenario: Scenario,
+    title: &'static str,
+    what: Startup,
+    unit: TimeUnit,
+    axes: SparkAxes,
+}
+
+/// Frozen and cold time a launch, to the first token rather than to ready;
+/// warm, a request to a server already running.
+const STARTUP_COLUMNS: [StartupColumn; 3] = [
+    StartupColumn {
+        scenario: Scenario::Frozen,
+        title: "Frozen",
+        what: Startup::Launch,
+        unit: TimeUnit::Seconds,
+        axes: SparkAxes {
+            better: Better::Lower,
+            along: "model size, GB",
+            value: "launch to first token, s",
+        },
+    },
+    StartupColumn {
+        scenario: Scenario::Cold,
+        title: "Cold",
+        what: Startup::Launch,
+        unit: TimeUnit::Seconds,
+        axes: SparkAxes {
+            better: Better::Lower,
+            along: "model size, GB",
+            value: "launch to first token, s",
+        },
+    },
+    StartupColumn {
+        scenario: Scenario::Warm,
+        title: "Warm",
+        what: Startup::FirstToken,
+        unit: TimeUnit::Millis,
+        axes: SparkAxes {
+            better: Better::Lower,
+            along: "model size, GB",
+            value: "request to first token, ms",
+        },
+    },
+];
+
+impl StartupColumn {
+    /// An engine's median time for a model, in the column's unit.
+    fn time(&self, e: Engine, m: &Model) -> Option<f64> {
+        med(e.ladder(m), self.scenario, self.what).map(|v| v * self.unit.per_second())
+    }
+
+    /// An engine's time for a model as the table writes it, or why there is
+    /// none; a launch also split into ready, then the first request.
+    fn written(&self, e: Engine, m: &Model) -> String {
+        let (ladder, unit) = (e.ladder(m), self.unit);
+        let write = |what| {
+            lfmt(
+                ladder,
+                self.scenario,
+                what,
+                unit.decimals(),
+                unit.per_second(),
+            )
+        };
+        match self.what {
+            Startup::Launch => format!(
+                "{} ({} + {})",
+                write(Startup::Launch),
+                write(Startup::Ready),
+                write(Startup::FirstToken)
+            ),
+            what => write(what),
+        }
+    }
+}
+
+/// A size as a sparkline's step and tooltip show it: GB to one decimal.
+fn gb1(b: Bytes) -> f64 {
+    (b.gb() * 10.0).round() / 10.0
+}
+
+/// One machine's startup sparkline for one column: one run's models smallest
+/// first, and at each one scratchy's and mlx-lm's median time.
+struct StartupSpark<'a> {
+    models: Vec<(&'a Model, Bytes)>,
+    steps: Vec<Step>,
+}
+
+impl<'a> StartupSpark<'a> {
+    /// From the newest of the machine's runs that timed both engines for the
+    /// most models, so a sparkline's steps share one commit and one set of
+    /// engine versions; or why there is none.
+    fn of(mr: &MachineRuns<'a>, col: &StartupColumn) -> Result<Self, &'static str> {
+        let both = |run: &Run| {
+            run.models
+                .iter()
+                .filter(|m| STARTUP_ENGINES.iter().all(|&e| col.time(e, m).is_some()))
+                .count()
+        };
+        let run = mr
+            .runs
+            .iter()
+            .copied()
+            .filter(|r| both(r) > 0)
+            .max_by(|a, b| {
+                both(a)
+                    .cmp(&both(b))
+                    .then(a.generated_utc.cmp(&b.generated_utc))
+            })
+            .ok_or_else(|| {
+                let timed = mr.runs.iter().any(|r| {
+                    r.models
+                        .iter()
+                        .any(|m| col.time(Engine::Scratchy, m).is_some())
+                });
+                if timed {
+                    "nothing to compare"
+                } else {
+                    "not measured"
+                }
+            })?;
+        let mut models: Vec<(&Model, Bytes)> = run
+            .models
+            .iter()
+            .filter_map(|m| Some((m, m.weights()?)))
+            .collect();
+        models.sort_by_key(|&(_, b)| b);
+        let steps = models
+            .iter()
+            .map(|&(m, b)| Step {
+                x: gb1(b),
+                scratchy: col.time(Engine::Scratchy, m),
+                rival: col.time(Engine::MlxLm, m),
+                highlight: false,
+            })
+            .collect();
+        Ok(StartupSpark { models, steps })
+    }
+}
+
+/// Every machine's startup against model size, scratchy against mlx-lm, in
+/// the scaling panels' grid (`columns` is theirs): a row per machine, frozen,
+/// cold and warm side by side, each sparkline in a cell the size of theirs;
+/// then the numbers behind them as a table.
+fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Element {
+    let mut sparks: BTreeMap<(&str, usize), Result<StartupSpark, &str>> = machines
+        .iter()
+        .flat_map(|(&chip, mr)| {
+            STARTUP_COLUMNS
+                .iter()
+                .enumerate()
+                .map(move |(k, col)| ((chip, k), StartupSpark::of(mr, col)))
+        })
+        .collect();
+    highlight(
+        sparks
+            .iter_mut()
+            .filter_map(|(&(_, k), sp)| Some((k, sp.as_mut().ok()?)))
+            .flat_map(|(k, sp)| {
+                sp.steps
+                    .iter_mut()
+                    .map(move |st| (STARTUP_COLUMNS[k].axes.better, st))
+            }),
+    );
+    // Every model charted, smallest first, for the intro and the table.
+    let mut models: Vec<(&str, Bytes)> = Vec::new();
+    for sp in sparks.values().filter_map(|sp| sp.as_ref().ok()) {
+        for &(m, b) in &sp.models {
+            if !models.iter().any(|(s, _)| *s == m.stem) {
+                models.push((&m.stem, b));
+            }
+        }
+    }
+    models.sort_by_key(|&(_, b)| b);
+    let sizes = models
+        .iter()
+        .map(|&(stem, b)| format!("{stem} {:.1} GB", b.gb()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut table_headers = headers(["machine", "engine", "startup"]);
+    table_headers.extend(
+        models
+            .iter()
+            .map(|&(stem, b)| format!("{stem} ({:.1} GB)", b.gb())),
+    );
+    rsx! {
+        Stack { gap: 5,
+            p {
+                "scratchy against mlx-lm as the model grows ({sizes}, the MLX checkpoint both load). Blue fill \
+                 where scratchy is ahead, red where it is behind. Frozen is the first launch after memory and \
+                 scratchy's weights cache are cleared, cold a normal relaunch: both time launch to the first \
+                 token, not to ready, because mlx-lm reports ready at about the same time whatever the model's \
+                 size and its loading lands in the first request. Warm is a request to a server already running, \
+                 send to first token. Each sparkline is one run: the newest that timed both engines for the most models."
+            }
+            div { style: spark_grid(columns.max(STARTUP_COLUMNS.len())),
+                div {}
+                div {}
+                for col in &STARTUP_COLUMNS { div { style: "text-align: center", "{col.title}" } }
+                for &chip in machines.keys() {
+                    // Column 1 starts a row, past any columns this panel leaves empty.
+                    div { style: "grid-column: 1; align-self: start", "{chip}" }
+                    div {}
+                    for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
+                        div {
+                            match &sparks[&(chip, k)] {
+                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::MlxLm, "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value)),
+                                Err(why) => rsx! { "{why}" },
+                            }
+                        }
+                    }
+                }
+            }
+            Fold { title: "Table view",
+                p { "Frozen and cold: seconds from launch to first token, then in brackets to ready and from there to the first token. Warm: milliseconds from sending a request to its first token." }
+                Table { headers: table_headers,
+                    for (&(chip, k), sp) in &sparks {
+                        if let Ok(sp) = sp {
+                            for e in STARTUP_ENGINES {
+                                TableRow {
+                                    TableCell { "{chip}" }
+                                    TableCell { "{e.label()}" }
+                                    TableCell { "{STARTUP_COLUMNS[k].title.to_lowercase()}, {STARTUP_COLUMNS[k].unit.label()}" }
+                                    for &(stem, _) in &models {
+                                        TableCell {
+                                            {
+                                                match sp.models.iter().find(|(m, _)| m.stem == stem) {
+                                                    None => DASH.to_string(),
+                                                    Some((m, _)) => STARTUP_COLUMNS[k].written(e, m),
                                                 }
                                             }
                                         }
@@ -2217,7 +2544,7 @@ mod tests {
                 highlight: false,
             },
         ];
-        let pts = spark_points(&steps, Metric::Throughput, Engine::MlxLm);
+        let pts = spark_points(&steps, Metric::Throughput.better(), Engine::MlxLm);
         let fill = |group| -> Vec<(f64, Option<(f64, f64)>)> {
             pts.iter()
                 .filter(|p| p.group == group)
@@ -2242,7 +2569,7 @@ mod tests {
             ]
         );
         // For time, less is ahead: the same numbers swap the fills.
-        let ttft = spark_points(&steps, Metric::Ttft, Engine::MlxLm);
+        let ttft = spark_points(&steps, Metric::Ttft.better(), Engine::MlxLm);
         assert!(
             ttft.iter()
                 .any(|p| p.group == Engine::MlxLm.ahead() && p.key == 1.0 && p.upper.is_some())

@@ -211,7 +211,49 @@ pub struct Rep {
     pub scenario: Scenario,
     pub t_ready_s: Option<f64>,
     pub ttft_from_send_s: Option<f64>,
+    /// Launch until the first token: ready, then the first request.
+    pub ttft_exec_s: Option<f64>,
     pub peak_rss_mib: Option<f64>,
+}
+
+/// A size in bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Bytes(pub u64);
+
+impl Bytes {
+    /// In GB (10⁹ bytes), as model cards give sizes.
+    pub fn gb(self) -> f64 {
+        self.0 as f64 / 1e9
+    }
+}
+
+/// Each MLX checkpoint's weights: the `.safetensors` files scratchy and mlx-lm
+/// load, summed from the Hugging Face API (main, 2026-10-12). ollama runs its
+/// own build of the same model, named on its row.
+const WEIGHTS: [(&str, Bytes); 3] = [
+    (
+        "mlx-community/granite-3.3-2b-instruct-4bit",
+        Bytes(1_425_458_043),
+    ),
+    (
+        "mlx-community/Qwen2.5-7B-Instruct-4bit",
+        Bytes(4_284_346_255),
+    ),
+    (
+        "mlx-community/gemma-4-26b-a4b-it-4bit",
+        Bytes(15_341_205_776),
+    ),
+];
+
+impl Model {
+    /// Its checkpoint's weights; every model a run names has them (`load`
+    /// fails the build otherwise).
+    pub fn weights(&self) -> Option<Bytes> {
+        WEIGHTS
+            .iter()
+            .find(|(id, _)| *id == self.model_id)
+            .map(|&(_, b)| b)
+    }
 }
 
 /// Where in the scaling sweep a cell sits.
