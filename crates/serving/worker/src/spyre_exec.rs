@@ -189,6 +189,28 @@ use crate::worker::Worker;
 #[cfg(feature = "spyre-hw")]
 const CORRECT_BATCH_WIDTH: usize = 8;
 
+/// One scheduled token of a cached request is a DECODE step only when the request's
+/// prompt is already fully computed — the token this step runs sits at a GENERATED
+/// position (`num_computed >= prompt_len`). A 1-token slice of an UNFINISHED prompt is
+/// a prefill continuation and must take the per-request path: `run_request_step` runs
+/// it through the token-addressed m=1 forward, which writes its K/V at its own token
+/// position and samples nothing. Sent to batched decode instead, it would
+/// `push_generated` a token the prompt never contained and `record_kv` it at the
+/// SHARED batch slot — a bogus sample, plus a hole between the request's history and
+/// its token positions that the batched chunk loop (whose write slot IS its token
+/// position) can no longer write correctly.
+// The `test` arm makes the fn exist under `spyre-emu`, which compiles this
+// module via the `spyre` feature but has no `spyre-hw`; CI runs the contract
+// test in that shape (the spyre-triton job).
+#[cfg(any(test, feature = "spyre-hw"))]
+pub(crate) fn solo_step_is_decode(
+    num_scheduled: usize,
+    num_computed: usize,
+    prompt_len: usize,
+) -> bool {
+    num_scheduled == 1 && num_computed >= prompt_len
+}
+
 /// CONTINUOUS BATCHING (#45) execute_model for the sendnn PAGED session. Consumes
 /// the scheduler's batched `SchedulerOutput` like the cuda/metal gpu_worker:
 ///   • PREFILL (scheduled_new_reqs + cached chunks with n>1): each request's chunk
@@ -570,9 +592,11 @@ impl Worker for SpyreWorker {
             })
             .collect();
         // ── BATCHED DECODE ────────────────────────────────────────────────────────────────────────
-        // Every cached request scheduled for exactly ONE token is a decode step, and those are the
-        // whole reason the weight set gets streamed over and over: each used to be its own forward.
-        // Run them together on the smallest rung that holds them and the weights move once.
+        // Every cached request scheduled for exactly ONE GENERATED token is a decode step, and those
+        // are the whole reason the weight set gets streamed over and over: each used to be its own
+        // forward. Run them together on the smallest rung that holds them and the weights move once.
+        // A 1-token slice of an UNFINISHED prompt is not one of them (`solo_step_is_decode`): it is
+        // a prefill continuation and stays on the per-request path below.
         //
         // Through `run_prefill_batch` — the SAME path a prompt chunk takes, at B rows instead of
         // N. Decode is not a separate implementation of attention; what a batch needs and a prompt
@@ -592,13 +616,16 @@ impl Worker for SpyreWorker {
                 .iter()
                 .enumerate()
                 .filter(|(i, id)| {
-                    scheduler_output
-                        .num_scheduled_tokens
-                        .get(*id)
-                        .copied()
-                        .unwrap_or(0)
-                        == 1
-                        && cr.num_computed_tokens.get(*i).is_some()
+                    cr.num_computed_tokens.get(*i).is_some()
+                        && solo_step_is_decode(
+                            scheduler_output
+                                .num_scheduled_tokens
+                                .get(*id)
+                                .copied()
+                                .unwrap_or(0),
+                            cr.num_computed_tokens[*i] as usize,
+                            input_batch.prompt_len(id),
+                        )
                 })
                 .map(|(i, id)| (id.clone(), cr.num_computed_tokens[i] as usize))
                 .collect();
@@ -1496,5 +1523,26 @@ impl Worker for SpyreWorker {
 
     fn is_driver_worker(&self) -> bool {
         self.config.is_driver_worker
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::solo_step_is_decode;
+
+    #[test]
+    fn a_one_token_slice_of_an_unfinished_prompt_is_not_a_decode_step() {
+        // Mid-prompt: this step computes the prompt's 2nd token — a continuation.
+        assert!(!solo_step_is_decode(1, 1, 500));
+        // The prompt's LAST token is still a prompt token, not a generated one —
+        // the exact 1-token remainder a ragged budget leaves, and the case the
+        // shared-slot write would corrupt.
+        assert!(!solo_step_is_decode(1, 499, 500));
+        // First generated position: the prompt is fully computed.
+        assert!(solo_step_is_decode(1, 500, 500));
+        // Mid-generation.
+        assert!(solo_step_is_decode(1, 600, 500));
+        // A multi-token slice is a continuation wave, never a decode step.
+        assert!(!solo_step_is_decode(96, 96, 500));
     }
 }
