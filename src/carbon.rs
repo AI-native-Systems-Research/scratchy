@@ -131,11 +131,10 @@ pub fn Button(kind: ButtonKind, #[props(into)] href: String, children: Element) 
 }
 
 /// A `cds-content-switcher` over panels: each item shows the element whose id
-/// is its `target` and Carbon hides the others' (`ContentPanel`). As wide as
-/// its items, not (Carbon's default) its container.
+/// is its `target` and Carbon hides the others' (`ContentPanel`).
 #[component]
 pub fn ContentSwitcher(selected: String, children: Element) -> Element {
-    rsx! { cds-content-switcher { "value": selected, "style": "width: fit-content", {children} } }
+    rsx! { cds-content-switcher { "value": selected, {children} } }
 }
 
 /// One `cds-content-switcher-item`: its label, and the id of the panel it
