@@ -1940,6 +1940,18 @@ impl AsyncEngine {
             )> = None;
             let mut gpu_in_flight: u32 = 0;
             let mut last_progress = Instant::now();
+            // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE): the `[ttft-step]` breakdown lives in
+            // `EngineCore::step` (sync) and `InprocClient::get_output` (pipelined), and this loop
+            // calls neither — without a port of the print here the flag is silently dead on
+            // `scr serve`. `exec_wait` pairs with the step finalized NEXT iteration (it is the
+            // recv round trip that produced that result, resolve included); `sched_next` is the
+            // schedule wall time of the prior iteration, the one between that finalize and the
+            // recv. `finalize` covers `finalize_step` plus routing the outputs to their requests.
+            // Decode-only steps print too when they carry more than one row — tokens==reqs
+            // distinguishes them from prefill steps.
+            let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
+            let mut last_exec_wait = Duration::ZERO;
+            let mut last_sched_wall = Duration::ZERO;
 
             loop {
                 // 0. Drain pending embedding requests.
@@ -1979,6 +1991,9 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
+                    let _t_fin = Instant::now();
+                    let _fin_tokens = prev_sched.total_num_scheduled_tokens;
+                    let _fin_reqs = prev_sched.num_scheduled_tokens.len();
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             route_step_outputs(&requests, outputs).await;
@@ -1993,12 +2008,24 @@ impl AsyncEngine {
                             error!("finalize_step error: {}", e);
                         }
                     }
+                    if ttft_phase && _fin_tokens > 1 {
+                        eprintln!(
+                            "[ttft-step] exec_wait={:.2} finalize={:.2} sched_next={:.2} ms  \
+                             ({} scheduled tokens, {} reqs)",
+                            last_exec_wait.as_secs_f64() * 1e3,
+                            _t_fin.elapsed().as_secs_f64() * 1e3,
+                            last_sched_wall.as_secs_f64() * 1e3,
+                            _fin_tokens,
+                            _fin_reqs
+                        );
+                    }
                     notify.notify_waiters();
                 }
 
                 // 3. Pre-schedule: fill the pipeline up to 2 in-flight
                 //    batches. With placeholder tracking, the scheduler
                 //    correctly accounts for tokens still on the GPU.
+                let _t_sched = Instant::now();
                 while gpu_in_flight < 2 {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
@@ -2018,12 +2045,14 @@ impl AsyncEngine {
                         }
                     }
                 }
+                last_sched_wall = _t_sched.elapsed();
 
                 // 4. Wait for the oldest GPU result. A deferred one is waited
                 //    for here — the batch queued behind it keeps the GPU busy —
                 //    and fails its step like an executor error if its device
                 //    work did.
                 if gpu_in_flight > 0 {
+                    let _t_recv = Instant::now();
                     let received =
                         model_rx
                             .recv()
@@ -2034,6 +2063,7 @@ impl AsyncEngine {
                                     .and_then(|mut output| output.resolve().map(|()| output));
                                 (resolved, sched)
                             });
+                    last_exec_wait = _t_recv.elapsed();
                     match received {
                         Some((Ok(model_output), sched)) => {
                             deferred = Some((sched, model_output));
