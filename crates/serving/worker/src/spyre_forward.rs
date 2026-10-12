@@ -828,18 +828,10 @@ pub(crate) fn superdsc_forward_chunk(
                         .to_string(),
                 )
             })?;
-            // NOTE: there used to be a `if start > 0 { decode.read_seg(2) -> pf.write_seg(2) }`
-            // prefix handoff here, to seed the prefill session with an existing prefix on a
-            // continued-generation request. It was UNREACHABLE and has been deleted. Proof:
-            // `chunk_w` (see the batched-prefill gate below) is `toks.len()` only when `start == 0`
-            // and 1 otherwise, and this whole block is inside `if n > 1`. So start>0 forces
-            // chunk_w=1 forces n==1, and `n > 1` is false -- both directions. Its only effect was to
-            // keep a 188 MB dead landmine primed to fire the day chunked prefill or prefix caching
-            // turns on. (The POST-loop handoff below is the live one.)
             // ⭐⭐⭐ TWO CURSORS, BOTH ABSOLUTE: the KV SLOT this chunk writes at, and the TOKEN position
-            // it reads from. They start equal and advance together, so `chunk_start - tok` is INVARIANT
-            // across the loop — it is the hole this request accumulated before it, and it is zero for a
-            // request that has never shared a batched step.
+            // it reads from. Both start at `start` and advance together, so `chunk_start - tok` is 0 for
+            // the whole loop — the loop cannot represent a hole, and needs none: the request's history
+            // is contiguous on entry (the batched-prefill gate's precondition).
             //
             // 🛑 `tok` USED TO BE `off`, AN OFFSET INTO **THIS STEP'S** TOKEN WINDOW, and that is what made
             // the step-back unrepresentable: `chunk_write_start` moves the write slot BACKWARD to keep a
@@ -1010,8 +1002,12 @@ pub(crate) fn superdsc_forward_chunk(
                 // pages before it writes any K/V, or it writes them into whatever its create-time
                 // map points at.
                 bind_request_pages(pf, req, ctx)?;
-                // Only the LAST chunk's tail feeds the sampler; every earlier one skips the logits D2H.
+                // Only the chunk that FINISHES THE PROMPT feeds the sampler — its folded tail
+                // is the first generated token's distribution. Every other chunk skips the
+                // logits D2H, a mid-prompt wave's last chunk included: its tail belongs to a
+                // later wave, and `run_request_step`'s sample guard returns without reading it.
                 let is_last_chunk = tok + chunk_len == tok_end;
+                let is_prompt_final_chunk = is_last_chunk && tok_end >= tokens.prompt_len(id);
                 // The chunk's tokens, at ABSOLUTE positions. `?` on the bound rather than an index panic:
                 // a chunk past the request's own tokens is a wiring bug and should say so.
                 let chunk_toks: Vec<usize> = (tok..tok + chunk_len)
@@ -1060,7 +1056,7 @@ pub(crate) fn superdsc_forward_chunk(
                     chunk_start,
                     // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
                     // read however many rows this chunk ran at.
-                    if is_last_chunk {
+                    if is_prompt_final_chunk {
                         LogitsWanted::LastRow
                     } else {
                         LogitsWanted::None
@@ -1086,7 +1082,7 @@ pub(crate) fn superdsc_forward_chunk(
                     // readings need `tok_end`, which is the one number the line did not carry.
                     "PREFILL_PATH=batched keys_to={} m_used={chunk_len} prefill_m={rung_m} \
                      rung={} top_m={prefill_top_m} prefix={} start={chunk_start} tok={tok} \
-                     tok_end={tok_end} real_total={real_total} logits={is_last_chunk}",
+                     tok_end={tok_end} real_total={real_total} logits={is_prompt_final_chunk}",
                     // ⛔ THIS WAS `row=`, THE KV ROW — the one identity in scope, and it is gone with the
                     // rows. `ReqState` still carries no id (the id is the map key three frames up), so what
                     // replaces it is the slot its own keys reach: distinct per request in a RAGGED batch,
@@ -1148,15 +1144,23 @@ pub(crate) fn superdsc_forward_chunk(
             // token past the end (measured: `decode batch: req … has no token at 2167`).
             tokens.set_tokens_in_pool(id, tok);
             // The prompt is fully computed AND its next-token logits are in hand, so return them
-            // straight to the sampler. `run_prefill_batch` sets this on the last chunk unconditionally,
-            // so `None` here means the loop never ran — impossible under `n > 1`, but refuse loudly
-            // rather than fall through to a decode path that would now re-forward zero tokens.
-            let row = prefill_logits.ok_or_else(|| {
-                werr(format!(
-                    "superdsc batched prefill: covered {real_total} tokens but produced no logits — \
-                     the final chunk did not run its folded lm-head tail (chunk-loop wiring bug)"
-                ))
-            })?;
+            // straight to the sampler. A mid-prompt wave asks for no logits (see
+            // `is_prompt_final_chunk`), so an empty hand with the prompt unfinished is the
+            // expected shape — `run_request_step`'s sample guard returns before reading it.
+            // `None` with the prompt DONE means the loop never ran — impossible under `n > 1`,
+            // but refuse loudly rather than fall through to a decode path that would now
+            // re-forward zero tokens.
+            let row = match prefill_logits {
+                Some(row) => row,
+                None if tok_end < tokens.prompt_len(id) => return Ok(Vec::new()),
+                None => {
+                    return Err(werr(format!(
+                        "superdsc batched prefill: covered {real_total} tokens but produced no \
+                         logits — the final chunk did not run its folded lm-head tail \
+                         (chunk-loop wiring bug)"
+                    )));
+                }
+            };
             return Ok(vec![row]);
         }
     }
@@ -1759,30 +1763,29 @@ pub(crate) fn run_request_step(
             // are harmless PAST THE PROMPT'S END (decode marks valid only columns below its write slot, and
             // overwrites each padded slot before it ever reaches it), which is exactly where a last chunk's
             // padding lands. Every cold prompt's final chunk already pads that way.
-            // ⛔⛔⛔ AND THE CONTINUATION CLAUSE MUST REQUIRE THIS STEP TO FINISH THE PROMPT.
+            // ⛔⛔⛔ A CONTINUATION BATCHES WHENEVER THE PREFIX-CAPABLE BUNDLE EXISTS — the
+            // cache-hit tail AND the middle waves of a long prompt alike. A mid-prompt wave
+            // is safe on this path because:
             //
-            // MEASURED 2026-08-13: allowing ANY `start > 0` chunk onto the batched path refused 5 of 6
-            // requests in the long ragged gate with `step loop exited`. A long prompt is prefilled over
-            // SEVERAL steps, so its middle continuations are MID-PROMPT chunks — and a mid-prompt chunk
-            // whose length is not the rung's writes K/V rows the history never counts, which is exactly what
-            // `ChunkKvExtent::exact` refuses and exactly the defect that made a padded chunk answer EOS.
+            // - mid-wave chunks are rung-exact — the placement leaves `room >= cap_m`, so
+            //   `chunk_len = (tok_end - tok).min(cap_m).min(room)` is the rung width for
+            //   every chunk but a wave's LAST, and that one is exempt from the extent guard;
+            // - a wave-final chunk's padding stays in the page holding its real tail, is
+            //   never recorded in `kv_hist`, and is overwritten by the next wave's first
+            //   chunk before any row can attend it (`chunk_write_start` is monotone, so the
+            //   next chunk's padded window starts no earlier and covers it) — the same
+            //   write-before-read contract every multi-row chunk already relies on.
             //
-            // Padding is safe only PAST THE PROMPT'S END. So the batched path takes a continuation only when
-            // this step's tokens reach that end — which is the cache-hit case this exists for, and the case
-            // where the tail's padding is self-healing (decode marks valid only columns below its write slot
-            // and overwrites each padded slot before reaching it).
+            // The chunk loop writes K/V at the TOKEN position, so it requires a request whose
+            // history is contiguous (slot == token). `solo_step_is_decode` keeps unfinished
+            // prompts off the shared-slot batched decode — the only writer that can put a
+            // hole in a history — so a request reaching this loop has none.
+            //
+            // The sequential walk below remains only for the missing-bundle case.
             let c_prefill_session = if start == 0 {
                 sb.prefill_top_m() > 1
             } else {
-                // The chunk loop keeps a padded window inside its page either by stepping BACK (contiguous
-                // history: slot == token, so the overlap is re-processable) or by SKIPPING FORWARD to the
-                // page boundary (a history with a hole: no token offset moves). Both are handled there, so
-                // this decision does not need to exclude a request with a hole — excluding it disabled the
-                // batched tail for exactly the requests a cache hit produces.
-                // ⛔ "THE CHUNK THAT FINISHES THE PROMPT" IS A TOKEN-COUNT QUESTION, so it is asked of
-                // the store that holds the tokens. This compared against `ReqState::tokens.len()` when
-                // the worker kept its own copy.
-                sb.prefill_prefix.is_some() && start + toks.len() == tokens.token_count(id)
+                sb.prefill_prefix.is_some()
             };
             if c_prefill_session {
                 toks.len().max(1)

@@ -2841,6 +2841,58 @@ mod tests {
         assert_eq!(output.scheduled_new_reqs.len(), 2);
     }
 
+    // ----- Multi-wave chunked prefill -----
+
+    #[test]
+    fn test_long_prompt_prefills_as_full_budget_continuation_waves() {
+        // The scheduler-worker contract for a prompt longer than one budget:
+        // every wave after the first is a CACHED-request continuation carrying
+        // a full multi-token slice (n > 1) — never a stream of 1-token steps.
+        // A backend that cannot run a mid-prompt continuation wave efficiently
+        // is a backend defect, not a reason to shrink the wave.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 2048,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            ..Default::default()
+        };
+        // 4096 blocks × 16 = 65k tokens of pool: the 5874-token prompt (368
+        // blocks) must never come near the never-fits guard.
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 4096, 16);
+
+        sched.add_request(make_request("r1", 5874));
+
+        // Wave 1: admission, budget-capped.
+        let out = sched.schedule();
+        assert_eq!(out.scheduled_new_reqs.len(), 1);
+        assert_eq!(*out.num_scheduled_tokens.get("r1").unwrap(), 2048);
+        assert!(sched.get_request("r1").unwrap().is_prefill_chunk);
+
+        // Wave 2: the MID-PROMPT continuation — must carry n = 2048, not 1.
+        let out = sched.schedule();
+        assert_eq!(out.scheduled_cached_reqs.num_reqs(), 1);
+        assert_eq!(out.scheduled_cached_reqs.req_ids[0], "r1");
+        assert_eq!(out.scheduled_cached_reqs.num_computed_tokens[0], 2048);
+        assert_eq!(*out.num_scheduled_tokens.get("r1").unwrap(), 2048);
+        assert!(sched.get_request("r1").unwrap().is_prefill_chunk);
+
+        // Wave 3: the remainder finishes the prompt.
+        let out = sched.schedule();
+        assert_eq!(out.scheduled_cached_reqs.num_reqs(), 1);
+        assert_eq!(out.scheduled_cached_reqs.num_computed_tokens[0], 4096);
+        assert_eq!(*out.num_scheduled_tokens.get("r1").unwrap(), 1778);
+        assert!(!sched.get_request("r1").unwrap().is_prefill_chunk);
+
+        // The prompt-final wave samples one token (the engine appends it);
+        // the next step is a 1-token decode from the full context.
+        sched.append_output_tokens("r1", &[42]);
+        let out = sched.schedule();
+        assert_eq!(out.scheduled_cached_reqs.num_reqs(), 1);
+        assert_eq!(out.scheduled_cached_reqs.num_computed_tokens[0], 5874);
+        assert_eq!(*out.num_scheduled_tokens.get("r1").unwrap(), 1);
+    }
+
     // ----- Unschedulable (never-fits) guard -----
 
     #[test]
