@@ -12,7 +12,7 @@
 // still move text, so wait for them too.
 (function () {
   function draw() {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, line: Charts.LineChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
     document.querySelectorAll('[data-chart]').forEach(function (el) {
       var spec = JSON.parse(el.getAttribute('data-chart'));
       if (spec.ratio) {
