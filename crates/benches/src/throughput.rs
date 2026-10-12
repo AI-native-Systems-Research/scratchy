@@ -92,7 +92,7 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
             eprintln!("Loading ShareGPT dataset from {dataset_path}...");
             let samples = datasets::load_sharegpt(
                 Path::new(dataset_path),
-                tokenizer.inner(),
+                tokenizer,
                 args.num_prompts,
                 Some(llm.max_model_len()),
                 args.seed,
@@ -122,7 +122,7 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
                 args.num_prompts
             );
             let samples = datasets::generate_random(
-                tokenizer.inner(),
+                tokenizer,
                 args.num_prompts,
                 args.input_len,
                 args.output_len,

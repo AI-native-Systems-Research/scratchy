@@ -434,6 +434,19 @@ pub fn total_models_emitted() -> usize {
     total_models_emitted_counter().load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide set of the base configs (`configs/<arch>/<stem>.json`) whose model feature this
+/// build enables, across every arch directory processed so far — the scope anything else baked
+/// per model (its tokenizer) follows. Read after every `load_dir`/`load_dir_vision` has run.
+fn selected_configs() -> &'static std::sync::Mutex<std::collections::BTreeSet<PathBuf>> {
+    static SELECTED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SELECTED.get_or_init(Default::default)
+}
+
+pub fn selected_config_paths() -> Vec<PathBuf> {
+    selected_configs().lock().unwrap().iter().cloned().collect()
+}
+
 /// Which macro is consuming the configs — `#[forward]` (Decoder) or
 /// `#[vision_forward]` (Vision). The configs/ files themselves are
 /// VERBATIM HF checkpoint configs either way; the mode selects which
@@ -719,6 +732,7 @@ fn load_dir_mode(
         if !model_feature_enabled(&stem) {
             continue;
         }
+        selected_configs().lock().unwrap().insert(p.clone());
         let (raw, mut json) = read_json_file(p)?;
         // Dense-base drift surface: `<stem>.overrides.json` deep-merges
         // onto the verbatim checkpoint config (same mechanism the

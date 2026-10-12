@@ -10,8 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use tokenizers::Tokenizer;
-use tokenizers::tokenizer::PostProcessor;
+use scratchy_serving_api::Tokenizer;
 
 /// A single benchmark request with pre-computed token lengths.
 #[derive(Debug, Clone)]
@@ -79,8 +78,8 @@ pub fn load_sharegpt(
             .encode(output, false)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
 
-        let prompt_len = prompt_encoding.get_ids().len();
-        let output_len = output_encoding.get_ids().len();
+        let prompt_len = prompt_encoding.len();
+        let output_len = output_encoding.len();
 
         // Filter: matching Python's min thresholds.
         if prompt_len < 4 || output_len < 4 {
@@ -151,14 +150,8 @@ pub fn generate_random(
     );
 
     // Build allowed tokens (exclude special tokens), matching Python.
-    let vocab_size = tokenizer.get_vocab_size(true);
-    let special_ids: std::collections::HashSet<u32> = tokenizer
-        .get_added_vocabulary()
-        .get_added_tokens_decoder()
-        .iter()
-        .filter(|(_, t)| t.special)
-        .map(|(id, _)| *id)
-        .collect();
+    let vocab_size = tokenizer.vocab_size();
+    let special_ids = tokenizer.special_token_ids();
     let allowed_tokens: Vec<u32> = (0..vocab_size as u32)
         .filter(|id| !special_ids.contains(id))
         .collect();
@@ -175,10 +168,7 @@ pub fn generate_random(
     //   real_input_len = max(0, input_len - num_special_tokens_to_add())
     // Python's `num_special_tokens_to_add()` queries the tokenizer's post-processor
     // for how many special tokens it prepends/appends to a single (non-pair) sequence.
-    let num_special = tokenizer
-        .get_post_processor()
-        .map(|pp| pp.added_tokens(false))
-        .unwrap_or(0);
+    let num_special = tokenizer.num_special_tokens_to_add(false);
     let real_input_len = input_len.saturating_sub(num_special);
 
     // Matching Python's `get_sampling_params()` RNG call order:
@@ -268,7 +258,7 @@ fn gen_prompt_to_target_len(
         let encoded = tokenizer
             .encode(prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("Encode failed: {e}"))?;
-        token_ids = encoded.get_ids().to_vec();
+        token_ids = encoded;
 
         if remain <= 0 {
             break;

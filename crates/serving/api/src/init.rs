@@ -303,7 +303,7 @@ const SWA_PREFILL_CHUNK_CAP: usize = 2048;
 fn resolve_eos_token_ids(
     hf_config: &HfModelConfig,
     model_dir: Option<&std::path::Path>,
-    preloaded_tokenizer: Option<&tokenizers::Tokenizer>,
+    preloaded_tokenizer: Option<&Tokenizer>,
 ) -> Vec<u32> {
     fn extract_ids(v: &serde_json::Value) -> Vec<u32> {
         if let Some(id) = v.as_u64() {
@@ -1172,7 +1172,7 @@ fn initialize_core(
             return None;
         }
         Some(std::thread::spawn(move || {
-            tokenizers::Tokenizer::from_file(&tok_path).ok()
+            Tokenizer::from_file(&tok_path).ok()
         }))
     });
 
@@ -1185,6 +1185,7 @@ fn initialize_core(
 
     let preloaded_tokenizer = worker
         .take_preloaded_tokenizer()
+        .map(Tokenizer::from_hf_tokenizer)
         .or_else(|| parallel_tokenizer_handle.and_then(|h| h.join().ok().flatten()));
 
     let max_model_len = config
@@ -1422,19 +1423,17 @@ fn initialize_core(
 
     let client = InprocClient::new(engine_config, Box::new(executor));
 
-    let loaded_tokenizer = preloaded_tokenizer
-        .map(Tokenizer::from_hf_tokenizer)
-        .or_else(|| {
-            model_dir
-                .as_ref()
-                .and_then(|dir| match try_load_tokenizer(dir) {
-                    Ok(tok) => Some(tok),
-                    Err(e) => {
-                        info!("No tokenizer found ({}), running without", e);
-                        None
-                    }
-                })
-        });
+    let loaded_tokenizer = preloaded_tokenizer.or_else(|| {
+        model_dir
+            .as_ref()
+            .and_then(|dir| match try_load_tokenizer(dir) {
+                Ok(tok) => Some(tok),
+                Err(e) => {
+                    info!("No tokenizer found ({}), running without", e);
+                    None
+                }
+            })
+    });
 
     let tokenizer = loaded_tokenizer.map(|mut tok| {
         if let Some(dir) = model_dir.as_ref() {

@@ -50,7 +50,7 @@ mod config;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
-pub use config::{total_models_emitted, unmatched_build_filter_tags};
+pub use config::{selected_config_paths, total_models_emitted, unmatched_build_filter_tags};
 mod assignment;
 #[cfg(feature = "cuda")]
 mod cost;

@@ -382,7 +382,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to resolve model path: {e}"))?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
-        tokenizers::Tokenizer::from_file(&tokenizer_path)
+        scratchy_serving_api::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
     };
 

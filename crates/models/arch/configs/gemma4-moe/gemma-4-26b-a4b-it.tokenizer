@@ -1,0 +1,3 @@
+# tokenizer.json blobs to bake into builds of this model, by Hub blob digest (see
+# scratchy_core_model::baked_tokenizer). mlx-community/gemma-4-26b-a4b-it-4bit:
+cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f
