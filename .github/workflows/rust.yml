@@ -211,9 +211,16 @@ jobs:
   # `scratchy-target-metal` build script compiles shaders against the
   # MetalPerformancePrimitives framework, which ships only in the Xcode 26 /
   # macOS 26 SDK (absent on macos-14/15).
+  #
+  # Two jobs, run in parallel. The whole-catalog clippy is one rustc
+  # invocation over every stem (~13 min), longer than every other step
+  # combined. The two share no build output: clippy writes check metadata,
+  # and every `cargo test` step rebuilds the workspace in the `test` profile
+  # anyway. `macos-arm64 (metal)`, the branch rules' required check, is the
+  # gate job after them.
   # ---------------------------------------------------------------------------
-  macos-metal:
-    name: macos-arm64 (metal)
+  macos-metal-clippy:
+    name: macos-arm64 (metal clippy, all models)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -222,7 +229,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-metal
+          key: macos-metal-clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy + test.
@@ -233,7 +240,20 @@ jobs:
       - name: Clippy
         run: cargo clippy -p scratchy-models --features metal,all,turboquant -- -D warnings
 
-      # `all` is model stems only, so the step above never turns
+  macos-metal-tests:
+    name: macos-arm64 (metal tests)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-metal-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `all` is model stems only, so the macos-metal-clippy job never turns
       # `hf-completions` on and its build-script path (the huggingface.co query
       # in hf_registry_build.rs) would otherwise go entirely unlinted. Scoped to
       # the smallest stem: one arch, one Hub query. Runners have network; a Hub
@@ -437,6 +457,22 @@ jobs:
         run: cargo test -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/llama-3.2-1b
           --test e_long_prompt_metal long_prompt_metal_chunked_matches_single_prefill -- --test-threads=1
+
+  # The required check: the branch rules name `macos-arm64 (metal)`, so this
+  # passes only when both macOS jobs did. `always()` is load-bearing: without
+  # it a failed dependency SKIPS this job, and GitHub counts a skipped
+  # required check as passing.
+  macos-metal:
+    name: macos-arm64 (metal)
+    needs: [macos-metal-clippy, macos-metal-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both macOS jobs passed
+        run: |
+          echo "clippy: ${{ needs.macos-metal-clippy.result }}, tests: ${{ needs.macos-metal-tests.result }}"
+          [ "${{ needs.macos-metal-clippy.result }}" = success ]
+          [ "${{ needs.macos-metal-tests.result }}" = success ]
 
   # ---------------------------------------------------------------------------
   # Linux / amd64 — Spyre emulator, non-Accelerate BLAS backends.
