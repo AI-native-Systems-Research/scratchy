@@ -77,42 +77,53 @@ pub fn cached_digest(tokenizer_json: &Path) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 // The tables. Little-endian u32s, then the string pool:
 //
-//   header   [u32; 8]   MAGIC, ids, pool bytes, vocab slots, merge slots, flags, unk id, 0
+//   header   [u32; 8]   MAGIC, ids, pool bytes, vocab slots, merges, merge slots, flags | unk, id bits
 //   offsets  [u32; ids + 1]       token `i` is pool[offsets[i]..offsets[i + 1]]
 //   bytes    [u32; 256]           byte `b`'s `<0xBB>` fallback token, or EMPTY
-//   vocab    [u32; vocab slots]   open addressing on `str_hash`: a token id, or EMPTY
-//   merges   [[u32; 4]; merge slots]  open addressing on `pair_hash`: (left, right, rank, merged),
-//                                     left EMPTY when free
+//   vocab    [u32; vocab slots]   open addressing on `str_hash`, at most 3/4 full: an id, or EMPTY
+//   merged   [u32; merges]        the token merge `r` (by rank) makes
+//   pairs    [[u32; 2]; merge slots]  open addressing on `pair_hash`, at most 3/4 full: the u64
+//                                     `left | right << id bits | (rank + 1) << 2·id bits`, or 0
+//   unk      [u32; 1]
 //   pool     [u8; pool bytes]
+//
+// Packed so they are read where they lie, nothing decoded at load, and probed as a hash table is:
+// gemma-4's 514,906 merges take 8 bytes a slot plus 4 for what each makes.
 // ---------------------------------------------------------------------------------------------
 
-const MAGIC: u32 = u32::from_le_bytes(*b"TKB1");
+const MAGIC: u32 = u32::from_le_bytes(*b"TKB3");
 const EMPTY: u32 = u32::MAX;
 const HEADER: usize = 8;
 const BYTE_FALLBACK: u32 = 1;
 const FUSE_UNK: u32 = 2;
 const IGNORE_MERGES: u32 = 4;
 
-fn str_hash(s: &[u8]) -> usize {
-    // FNV-1a.
+fn str_hash(s: &[u8]) -> u64 {
+    // FNV-1a, then mixed: `slot_of` reads the high bits, which FNV leaves poorly mixed for the
+    // one-character strings looked up most.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in s {
         h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
     }
-    h as usize
+    pair_hash(h)
 }
 
-fn pair_hash(a: u32, b: u32) -> usize {
+fn pair_hash(key: u64) -> u64 {
     // splitmix64's finalizer.
-    let mut x = ((a as u64) << 32) | b as u64;
+    let mut x = key;
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    (x ^ (x >> 31)) as usize
+    x ^ (x >> 31)
 }
 
-/// Slots for `n` keys: a power of two at most half full, so a probe ends quickly.
+/// `h` onto `0..n` (multiply-shift: no power-of-two table size needed).
+fn slot_of(h: u64, n: usize) -> usize {
+    ((h as u128 * n as u128) >> 64) as usize
+}
+
+/// Slots for `n` keys at most 3/4 full.
 fn slots_for(n: usize) -> usize {
-    (n * 2).max(2).next_power_of_two()
+    n * 4 / 3 + 1
 }
 
 #[derive(Clone, Copy)]
@@ -120,10 +131,12 @@ struct Tables {
     offsets: &'static [u32],
     bytes: &'static [u32],
     vocab: &'static [u32],
-    merges: &'static [[u32; 4]],
+    merged: &'static [u32],
+    pairs: &'static [[u32; 2]],
     pool: &'static [u8],
     flags: u32,
     unk: u32,
+    id_bits: u32,
 }
 
 impl Tables {
@@ -139,16 +152,15 @@ impl Tables {
             ids,
             pool_len,
             vocab_slots,
+            merges,
             merge_slots,
             flags,
-            unk,
-            _,
+            id_bits,
         ] = <[u32; HEADER]>::try_from(&words[..HEADER]).expect("HEADER words");
         if magic != MAGIC {
             return Err("baked tokenizer tables: bad magic".into());
         }
         let (ids, pool_len) = (ids as usize, pool_len as usize);
-        let (vocab_slots, merge_slots) = (vocab_slots as usize, merge_slots as usize);
         let mut at = HEADER;
         let mut take = |n: usize| -> Result<&'static [u32], String> {
             let s = words
@@ -159,11 +171,14 @@ impl Tables {
         };
         let offsets = take(ids + 1)?;
         let bytes = take(256)?;
-        let vocab = take(vocab_slots)?;
-        let merges = take(merge_slots * 4)?;
-        // SAFETY: `[u32; 4]` has the alignment of `u32` and no padding.
-        let merges =
-            unsafe { std::slice::from_raw_parts(merges.as_ptr().cast::<[u32; 4]>(), merge_slots) };
+        let vocab = take(vocab_slots as usize)?;
+        let merged = take(merges as usize)?;
+        let pairs = take(merge_slots as usize * 2)?;
+        // SAFETY: `[u32; 2]` has the alignment of `u32` and no padding.
+        let pairs = unsafe {
+            std::slice::from_raw_parts(pairs.as_ptr().cast::<[u32; 2]>(), merge_slots as usize)
+        };
+        let unk = take(1)?[0];
         let pool = raw
             .get(at * 4..at * 4 + pool_len)
             .ok_or_else(|| "baked tokenizer tables: truncated pool".to_string())?;
@@ -171,10 +186,12 @@ impl Tables {
             offsets,
             bytes,
             vocab,
-            merges,
+            merged,
+            pairs,
             pool,
             flags,
             unk,
+            id_bits,
         })
     }
 
@@ -186,8 +203,8 @@ impl Tables {
     }
 
     fn id(&self, token: &str) -> Option<u32> {
-        let mask = self.vocab.len() - 1;
-        let mut slot = str_hash(token.as_bytes()) & mask;
+        let n = self.vocab.len();
+        let mut slot = slot_of(str_hash(token.as_bytes()), n);
         loop {
             let id = self.vocab[slot];
             if id == EMPTY {
@@ -196,22 +213,27 @@ impl Tables {
             if self.token(id) == Some(token) {
                 return Some(id);
             }
-            slot = (slot + 1) & mask;
+            slot = if slot + 1 == n { 0 } else { slot + 1 };
         }
     }
 
+    /// `(rank, merged)` of the merge of `a` then `b`, if there is one.
     fn merge(&self, a: u32, b: u32) -> Option<(u32, u32)> {
-        let mask = self.merges.len() - 1;
-        let mut slot = pair_hash(a, b) & mask;
+        let key = a as u64 | (b as u64) << self.id_bits;
+        let key_mask = (1u64 << (2 * self.id_bits)) - 1;
+        let n = self.pairs.len();
+        let mut slot = slot_of(pair_hash(key), n);
         loop {
-            let [l, r, rank, merged] = self.merges[slot];
-            if l == EMPTY {
+            let [lo, hi] = self.pairs[slot];
+            let e = lo as u64 | (hi as u64) << 32;
+            if e == 0 {
                 return None;
             }
-            if (l, r) == (a, b) {
-                return Some((rank, merged));
+            if e & key_mask == key {
+                let rank = (e >> (2 * self.id_bits)) as u32 - 1;
+                return Some((rank, self.merged[rank as usize]));
             }
-            slot = (slot + 1) & mask;
+            slot = if slot + 1 == n { 0 } else { slot + 1 };
         }
     }
 }
@@ -562,17 +584,17 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
     let vocab_slots = slots_for(ids);
     let mut table = vec![EMPTY; vocab_slots];
     for (i, t) in by_id.iter().enumerate() {
-        let mut slot = str_hash(t.as_bytes()) & (vocab_slots - 1);
+        let mut slot = slot_of(str_hash(t.as_bytes()), vocab_slots);
         while table[slot] != EMPTY {
-            slot = (slot + 1) & (vocab_slots - 1);
+            slot = if slot + 1 == vocab_slots { 0 } else { slot + 1 };
         }
         table[slot] = i as u32;
     }
     words.extend_from_slice(&table);
     let merges = model["merges"].as_array().ok_or("no merges")?;
-    let merge_slots = slots_for(merges.len());
-    let mut table = vec![[EMPTY; 4]; merge_slots];
-    for (rank, m) in merges.iter().enumerate() {
+    // Each merge by rank: (left, right, merged).
+    let mut by_rank: Vec<(u32, u32, u32)> = Vec::with_capacity(merges.len());
+    for m in merges {
         let (a, b) = match m {
             serde_json::Value::Array(p) if p.len() == 2 => (p[0].as_str(), p[1].as_str()),
             serde_json::Value::String(s) => s
@@ -585,17 +607,30 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
             .zip(id(b))
             .ok_or("a merge of tokens out of the vocab")?;
         let merged = id(&format!("{a}{b}")).ok_or("a merge whose result is out of the vocab")?;
-        let mut slot = pair_hash(ia, ib) & (merge_slots - 1);
-        while table[slot][0] != EMPTY {
-            slot = (slot + 1) & (merge_slots - 1);
-        }
-        table[slot] = [ia, ib, rank as u32, merged];
+        by_rank.push((ia, ib, merged));
     }
-    words.extend(table.iter().flatten());
+    let id_bits = u32::BITS - (ids as u32).saturating_sub(1).leading_zeros();
+    // `rank + 1` (0 marks a free slot) in what the two ids leave.
+    if 2 * id_bits + (u32::BITS - (by_rank.len() as u32).leading_zeros()) > 64 {
+        return Err("ids and merge ranks too wide to pack in 64 bits".into());
+    }
+    words.extend(by_rank.iter().map(|&(_, _, merged)| merged));
+    let merge_slots = slots_for(by_rank.len());
+    let mut pairs = vec![0u64; merge_slots];
+    for (rank, &(a, b, _)) in by_rank.iter().enumerate() {
+        let key = a as u64 | (b as u64) << id_bits;
+        let mut slot = slot_of(pair_hash(key), merge_slots);
+        while pairs[slot] != 0 {
+            slot = if slot + 1 == merge_slots { 0 } else { slot + 1 };
+        }
+        pairs[slot] = key | (rank as u64 + 1) << (2 * id_bits);
+    }
+    words.extend(pairs.iter().flat_map(|&e| [e as u32, (e >> 32) as u32]));
     let unk = match model["unk_token"].as_str() {
         Some(t) => id(t).ok_or("an unk token out of the vocab")?,
         None => EMPTY,
     };
+    words.push(unk);
     let flags = [
         (
             model["byte_fallback"].as_bool() == Some(true),
@@ -615,10 +650,10 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
         ids as u32,
         pool.len() as u32,
         vocab_slots as u32,
+        by_rank.len() as u32,
         merge_slots as u32,
         flags,
-        unk,
-        0,
+        id_bits,
     ]);
     let mut tables: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     tables.extend_from_slice(&pool);
