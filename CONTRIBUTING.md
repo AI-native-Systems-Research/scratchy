@@ -144,8 +144,7 @@ sent back regardless of how well it works:
 - **Metal 4 only.** Classic MTL3 command buffers are banned — enforced by
   `crates/targets/metal/build.rs` (`guard_no_classic_mtl3`) and by
   `disallowed-methods` in `clippy.toml`.
-- No net line growth in target crates (declared-data tables exempt); no new
-  env-var behavior toggles; no `#[allow]`; no weakening tests.
+- No new env-var behavior toggles; no `#[allow]`; no weakening tests.
 
 #### Build — scope to one model
 
@@ -259,8 +258,7 @@ docs(build): document quant preset replacement semantics
 ## Principles
 
 - **Understand before acting.** A PR that doesn't close the issue is wasted work.
-- **Scope is sacred.** Fix the issue, nothing more. No drive-by refactors —
-  especially in target crates, where line growth is itself a review failure.
+- **Scope is sacred.** Fix the issue, nothing more. No drive-by refactors.
 - **Constants over assertions.** If the compiler knows it, prove it at compile
   time. A test is advisory; a type is load-bearing.
 - **Tests prove intent.** Not coverage for coverage's sake — proof that the fix
