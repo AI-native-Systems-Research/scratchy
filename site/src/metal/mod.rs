@@ -2041,7 +2041,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
                                             p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
-                                            div { style: "display: grid; grid-template-columns: 7rem auto repeat({stems.len()}, minmax(0, 1fr)); gap: 0.25rem 2rem; align-items: center",
+                                            div { style: spark_grid(stems.len()),
                                                 div {}
                                                 div {}
                                                 for stem in &stems { div { style: "text-align: center", "{stem}" } }
@@ -2068,12 +2068,16 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     }
 }
 
-/// The startup scenarios charted against model size: each one's row label in
-/// the panel, and its name in the table.
-const STARTUP_SCENARIOS: [(Scenario, &str, &str); 2] = [
-    (Scenario::Frozen, "Frozen", "frozen"),
-    (Scenario::Cold, "Cold", "cold"),
-];
+/// The glance's sparkline grids, every panel's, so every sparkline is one
+/// size: the machine, a row label, then `columns` equal columns. The label
+/// column has a width of its own rather than its labels', so a panel without
+/// row labels gives its sparklines the same width as one with them.
+fn spark_grid(columns: usize) -> String {
+    format!(
+        "display: grid; grid-template-columns: 7rem 4rem repeat({columns}, minmax(0, 1fr)); \
+         gap: 0.25rem 2rem; align-items: center"
+    )
+}
 
 /// The glance's startup panel's name.
 const STARTUP: &str = "Startup by model size";
@@ -2082,21 +2086,124 @@ const STARTUP: &str = "Startup by model size";
 /// the same MLX checkpoint.
 const STARTUP_ENGINES: [Engine; 2] = [Engine::Scratchy, Engine::MlxLm];
 
-/// What a startup sparkline follows: less time is better.
-const STARTUP_AXES: SparkAxes = SparkAxes {
-    better: Better::Lower,
-    along: "model size, GB",
-    value: "launch to first token, s",
-};
+/// The unit a startup time is shown in.
+#[derive(Clone, Copy)]
+enum TimeUnit {
+    Seconds,
+    Millis,
+}
+
+impl TimeUnit {
+    fn label(self) -> &'static str {
+        match self {
+            TimeUnit::Seconds => "s",
+            TimeUnit::Millis => "ms",
+        }
+    }
+
+    fn per_second(self) -> f64 {
+        match self {
+            TimeUnit::Seconds => 1.0,
+            TimeUnit::Millis => 1000.0,
+        }
+    }
+
+    /// Decimals it is written with in the table.
+    fn decimals(self) -> usize {
+        match self {
+            TimeUnit::Seconds => 2,
+            TimeUnit::Millis => 0,
+        }
+    }
+}
+
+/// One column of the startup panel: its scenario and title, what it times and
+/// in what unit, and its sparklines' axes.
+struct StartupColumn {
+    scenario: Scenario,
+    title: &'static str,
+    what: Startup,
+    unit: TimeUnit,
+    axes: SparkAxes,
+}
+
+/// Frozen and cold time a launch, to the first token rather than to ready;
+/// warm, a request to a server already running.
+const STARTUP_COLUMNS: [StartupColumn; 3] = [
+    StartupColumn {
+        scenario: Scenario::Frozen,
+        title: "Frozen",
+        what: Startup::Launch,
+        unit: TimeUnit::Seconds,
+        axes: SparkAxes {
+            better: Better::Lower,
+            along: "model size, GB",
+            value: "launch to first token, s",
+        },
+    },
+    StartupColumn {
+        scenario: Scenario::Cold,
+        title: "Cold",
+        what: Startup::Launch,
+        unit: TimeUnit::Seconds,
+        axes: SparkAxes {
+            better: Better::Lower,
+            along: "model size, GB",
+            value: "launch to first token, s",
+        },
+    },
+    StartupColumn {
+        scenario: Scenario::Warm,
+        title: "Warm",
+        what: Startup::FirstToken,
+        unit: TimeUnit::Millis,
+        axes: SparkAxes {
+            better: Better::Lower,
+            along: "model size, GB",
+            value: "request to first token, ms",
+        },
+    },
+];
+
+impl StartupColumn {
+    /// An engine's median time for a model, in the column's unit.
+    fn time(&self, e: Engine, m: &Model) -> Option<f64> {
+        med(e.ladder(m), self.scenario, self.what).map(|v| v * self.unit.per_second())
+    }
+
+    /// An engine's time for a model as the table writes it, or why there is
+    /// none; a launch also split into ready, then the first request.
+    fn written(&self, e: Engine, m: &Model) -> String {
+        let (ladder, unit) = (e.ladder(m), self.unit);
+        let write = |what| {
+            lfmt(
+                ladder,
+                self.scenario,
+                what,
+                unit.decimals(),
+                unit.per_second(),
+            )
+        };
+        match self.what {
+            Startup::Launch => format!(
+                "{} ({} + {})",
+                write(Startup::Launch),
+                write(Startup::Ready),
+                write(Startup::FirstToken)
+            ),
+            what => write(what),
+        }
+    }
+}
 
 /// A size as a sparkline's step and tooltip show it: GB to one decimal.
 fn gb1(b: Bytes) -> f64 {
     (b.gb() * 10.0).round() / 10.0
 }
 
-/// One machine's startup sparkline for one scenario: the run it comes from,
+/// One machine's startup sparkline for one column: the run it comes from,
 /// that run's models smallest first, and at each one scratchy's and mlx-lm's
-/// median seconds from launch to first token.
+/// median time.
 struct StartupSpark<'a> {
     run: &'a Run,
     models: Vec<(&'a Model, Bytes)>,
@@ -2107,12 +2214,11 @@ impl<'a> StartupSpark<'a> {
     /// From the newest of the machine's runs that timed both engines for the
     /// most models, so a sparkline's steps share one commit and one set of
     /// engine versions; or why there is none.
-    fn of(mr: &MachineRuns<'a>, scenario: Scenario) -> Result<Self, &'static str> {
-        let launch = |e: Engine, m: &Model| med(e.ladder(m), scenario, Startup::Launch);
+    fn of(mr: &MachineRuns<'a>, col: &StartupColumn) -> Result<Self, &'static str> {
         let both = |run: &Run| {
             run.models
                 .iter()
-                .filter(|m| STARTUP_ENGINES.iter().all(|&e| launch(e, m).is_some()))
+                .filter(|m| STARTUP_ENGINES.iter().all(|&e| col.time(e, m).is_some()))
                 .count()
         };
         let run = mr
@@ -2129,7 +2235,7 @@ impl<'a> StartupSpark<'a> {
                 let timed = mr.runs.iter().any(|r| {
                     r.models
                         .iter()
-                        .any(|m| launch(Engine::Scratchy, m).is_some())
+                        .any(|m| col.time(Engine::Scratchy, m).is_some())
                 });
                 if timed {
                     "nothing to compare"
@@ -2147,8 +2253,8 @@ impl<'a> StartupSpark<'a> {
             .iter()
             .map(|&(m, b)| Step {
                 x: gb1(b),
-                scratchy: launch(Engine::Scratchy, m),
-                rival: launch(Engine::MlxLm, m),
+                scratchy: col.time(Engine::Scratchy, m),
+                rival: col.time(Engine::MlxLm, m),
                 highlight: false,
             })
             .collect();
@@ -2156,17 +2262,17 @@ impl<'a> StartupSpark<'a> {
     }
 }
 
-/// Beside a startup sparkline: the run it comes from, then each model an
-/// engine launched but never timed, and why.
-fn startup_caption(sp: &StartupSpark, scenario: Scenario) -> Element {
+/// Under a startup sparkline: the run it comes from, then each model an
+/// engine ran but never timed, and why.
+fn startup_caption(sp: &StartupSpark, col: &StartupColumn) -> Element {
     let missing: Vec<String> = STARTUP_ENGINES
         .iter()
         .flat_map(|&e| {
             sp.models
                 .iter()
-                .filter(move |(m, _)| med(e.ladder(m), scenario, Startup::Launch).is_none())
+                .filter(move |(m, _)| col.time(e, m).is_none())
                 .map(move |(m, _)| {
-                    let why = lfmt(e.ladder(m), scenario, Startup::Launch, 2, 1.0);
+                    let why = col.written(e, m);
                     let why = if why == DASH {
                         "not measured".to_string()
                     } else {
@@ -2189,25 +2295,29 @@ fn startup_caption(sp: &StartupSpark, scenario: Scenario) -> Element {
     }
 }
 
-/// Every machine's startup against model size, scratchy against mlx-lm: laid
-/// out like the scaling panels (`columns` is theirs), a frozen and a cold
-/// sparkline per machine where they have prefill and decode, each in a cell
-/// the size of theirs; then the numbers behind them as a table.
+/// Every machine's startup against model size, scratchy against mlx-lm, in
+/// the scaling panels' grid (`columns` is theirs): a row per machine, frozen,
+/// cold and warm side by side, each sparkline in a cell the size of theirs;
+/// then the numbers behind them as a table.
 fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Element {
     let mut sparks: BTreeMap<(&str, usize), Result<StartupSpark, &str>> = machines
         .iter()
         .flat_map(|(&chip, mr)| {
-            STARTUP_SCENARIOS
+            STARTUP_COLUMNS
                 .iter()
                 .enumerate()
-                .map(move |(k, &(scenario, _, _))| ((chip, k), StartupSpark::of(mr, scenario)))
+                .map(move |(k, col)| ((chip, k), StartupSpark::of(mr, col)))
         })
         .collect();
     highlight(
         sparks
-            .values_mut()
-            .filter_map(|sp| sp.as_mut().ok())
-            .flat_map(|sp| sp.steps.iter_mut().map(|st| (STARTUP_AXES.better, st))),
+            .iter_mut()
+            .filter_map(|(&(_, k), sp)| Some((k, sp.as_mut().ok()?)))
+            .flat_map(|(k, sp)| {
+                sp.steps
+                    .iter_mut()
+                    .map(move |st| (STARTUP_COLUMNS[k].axes.better, st))
+            }),
     );
     // Every model charted, smallest first, for the intro and the table.
     let mut models: Vec<(&str, Bytes)> = Vec::new();
@@ -2233,32 +2343,36 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
     rsx! {
         Stack { gap: 5,
             p {
-                "scratchy against mlx-lm: seconds from launch to the first token as the model grows ({sizes}, the \
-                 MLX checkpoint both load). Blue fill where scratchy is ahead, red where it is behind. Frozen is the \
-                 first launch after memory and scratchy's weights cache are cleared; cold is a normal relaunch. The \
-                 time runs to the first token, not to ready, because mlx-lm reports ready at about the same time \
-                 whatever the model's size: its loading lands in the first request. Each sparkline is one run, \
-                 named beside it."
+                "scratchy against mlx-lm as the model grows ({sizes}, the MLX checkpoint both load). Blue fill \
+                 where scratchy is ahead, red where it is behind. Frozen is the first launch after memory and \
+                 scratchy's weights cache are cleared, cold a normal relaunch: both time launch to the first \
+                 token, not to ready, because mlx-lm reports ready at about the same time whatever the model's \
+                 size and its loading lands in the first request. Warm is a request to a server already running, \
+                 send to first token. Each sparkline is one run, named under it."
             }
-            div { style: "display: grid; grid-template-columns: 7rem auto repeat({columns}, minmax(0, 1fr)); gap: 0.25rem 2rem; align-items: center",
+            div { style: spark_grid(columns.max(STARTUP_COLUMNS.len())),
+                div {}
+                div {}
+                for col in &STARTUP_COLUMNS { div { style: "text-align: center", "{col.title}" } }
                 for &chip in machines.keys() {
-                    div { style: "grid-row: span 2; align-self: start", "{chip}" }
-                    for (k, &(scenario, label, _)) in STARTUP_SCENARIOS.iter().enumerate() {
-                        div { "{label}" }
-                        match &sparks[&(chip, k)] {
-                            Ok(sp) => rsx! {
-                                div {
-                                    {sparkline(&sp.steps, STARTUP_AXES, Engine::MlxLm, "4.5rem", &format!("{chip}, {label}: seconds from launch to first token by model size, scratchy against mlx-lm"))}
-                                }
-                                div { style: "grid-column: 4 / -1", {startup_caption(sp, scenario)} }
-                            },
-                            Err(why) => rsx! { div { style: "grid-column: 3 / -1", "{why}" } },
+                    // Column 1 starts a row, past any columns this panel leaves empty.
+                    div { style: "grid-column: 1; align-self: start", "{chip}" }
+                    div {}
+                    for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
+                        div {
+                            match &sparks[&(chip, k)] {
+                                Ok(sp) => rsx! {
+                                    {sparkline(&sp.steps, col.axes, Engine::MlxLm, "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value))}
+                                    {startup_caption(sp, col)}
+                                },
+                                Err(why) => rsx! { "{why}" },
+                            }
                         }
                     }
                 }
             }
             Fold { title: "Table view",
-                p { "Seconds from launch to first token, then in brackets to ready and from there to the first token." }
+                p { "Frozen and cold: seconds from launch to first token, then in brackets to ready and from there to the first token. Warm: milliseconds from sending a request to its first token." }
                 Table { headers: table_headers,
                     for (&(chip, k), sp) in &sparks {
                         if let Ok(sp) = sp {
@@ -2266,22 +2380,13 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                                 TableRow {
                                     TableCell { "{chip}" }
                                     TableCell { "{e.label()}" }
-                                    TableCell { "{STARTUP_SCENARIOS[k].2}" }
+                                    TableCell { "{STARTUP_COLUMNS[k].title.to_lowercase()}, {STARTUP_COLUMNS[k].unit.label()}" }
                                     for &(stem, _) in &models {
                                         TableCell {
                                             {
-                                                let scenario = STARTUP_SCENARIOS[k].0;
                                                 match sp.models.iter().find(|(m, _)| m.stem == stem) {
                                                     None => DASH.to_string(),
-                                                    Some((m, _)) => {
-                                                        let ladder = e.ladder(m);
-                                                        format!(
-                                                            "{} ({} + {})",
-                                                            lfmt(ladder, scenario, Startup::Launch, 2, 1.0),
-                                                            lfmt(ladder, scenario, Startup::Ready, 2, 1.0),
-                                                            lfmt(ladder, scenario, Startup::FirstToken, 2, 1.0),
-                                                        )
-                                                    }
+                                                    Some((m, _)) => STARTUP_COLUMNS[k].written(e, m),
                                                 }
                                             }
                                         }
