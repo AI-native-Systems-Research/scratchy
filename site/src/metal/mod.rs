@@ -2201,11 +2201,9 @@ fn gb1(b: Bytes) -> f64 {
     (b.gb() * 10.0).round() / 10.0
 }
 
-/// One machine's startup sparkline for one column: the run it comes from,
-/// that run's models smallest first, and at each one scratchy's and mlx-lm's
-/// median time.
+/// One machine's startup sparkline for one column: one run's models smallest
+/// first, and at each one scratchy's and mlx-lm's median time.
 struct StartupSpark<'a> {
-    run: &'a Run,
     models: Vec<(&'a Model, Bytes)>,
     steps: Vec<Step>,
 }
@@ -2258,40 +2256,7 @@ impl<'a> StartupSpark<'a> {
                 highlight: false,
             })
             .collect();
-        Ok(StartupSpark { run, models, steps })
-    }
-}
-
-/// Under a startup sparkline: the run it comes from, then each model an
-/// engine ran but never timed, and why.
-fn startup_caption(sp: &StartupSpark, col: &StartupColumn) -> Element {
-    let missing: Vec<String> = STARTUP_ENGINES
-        .iter()
-        .flat_map(|&e| {
-            sp.models
-                .iter()
-                .filter(move |(m, _)| col.time(e, m).is_none())
-                .map(move |(m, _)| {
-                    let why = col.written(e, m);
-                    let why = if why == DASH {
-                        "not measured".to_string()
-                    } else {
-                        why
-                    };
-                    format!("{}, {}: {why}", e.label(), m.stem)
-                })
-        })
-        .collect();
-    let notes = if missing.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", missing.join("; "))
-    };
-    rsx! {
-        // Carbon's helper text: smaller and quieter than the sparkline it notes.
-        p { style: "font-size: 0.75rem; color: var(--cds-text-secondary)",
-            "run {sp.run.generated_utc.date()} " code { "{sp.run.repo.sha8()}" } "{notes}"
-        }
+        Ok(StartupSpark { models, steps })
     }
 }
 
@@ -2348,7 +2313,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                  scratchy's weights cache are cleared, cold a normal relaunch: both time launch to the first \
                  token, not to ready, because mlx-lm reports ready at about the same time whatever the model's \
                  size and its loading lands in the first request. Warm is a request to a server already running, \
-                 send to first token. Each sparkline is one run, named under it."
+                 send to first token. Each sparkline is one run: the newest that timed both engines for the most models."
             }
             div { style: spark_grid(columns.max(STARTUP_COLUMNS.len())),
                 div {}
@@ -2361,10 +2326,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
-                                Ok(sp) => rsx! {
-                                    {sparkline(&sp.steps, col.axes, Engine::MlxLm, "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value))}
-                                    {startup_caption(sp, col)}
-                                },
+                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::MlxLm, "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value)),
                                 Err(why) => rsx! { "{why}" },
                             }
                         }
