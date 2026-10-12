@@ -13214,29 +13214,32 @@ pub fn emit_model(
             )
         }
 
-        /// The model's resident metal pool, built on its first forward.
+        /// The model's resident metal pool, built by whichever reaches it first: the worker at
+        /// startup (`ScratchyWeights::build_metal_pool`), or else a forward.
         ///
         /// The factory closure captures (a) the metal device handle
         /// for runtime-buffer allocation, (b) `MAX_BLOCKS_PER_SEQ`
         /// from the canonical's `CanonicalParams` (compile-time
         /// const), (c) Arc-handle clones of the per-layer KV
-        /// buffers from `ctx.kv_cache` so worker spawns inherit
+        /// buffers from `kv_cache` so worker spawns inherit
         /// them without re-allocation. The closure is invoked
         /// once per worker spawn — the pool starts at size 1 so
-        /// the first forward triggers the only factory invocation
-        /// in single-worker configs. Every forward entry point
-        /// reaches the pool through here, whichever runs first.
+        /// building it triggers the only factory invocation
+        /// in single-worker configs.
         #[cfg(feature = "metal")]
-        fn resident_metal_pool<'w>(
+        pub(crate) fn resident_metal_pool<'w>(
             wm: &'w Weights,
-            ctx: &crate::__gpu::ForwardCtx,
+            kv_cache: &crate::__gpu::kv_cache::KvCachePool,
+            gdn_state: ::core::option::Option<
+                &crate::__gpu::gdn_state::GdnStatePool<crate::__gpu::PoolMem>,
+            >,
             device: &crate::__gpu::GpuDevice,
         ) -> &'w ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Weights> {
             use ::scratchy_forward_compiler::CanonicalParams as _;
             use ::scratchy_target_metal::interpreter::metal::__re::{Buffer, MTLResourceOptions};
 
             wm.metal_pool.get_or_init(|| {
-                let num_layers = ctx.kv_cache.num_layers;
+                let num_layers = kv_cache.num_layers;
                 // Reactive (chunked) KV pool: bind the per-layer
                 // chunk-address TABLE buffers (device uint64 arrays of
                 // chunk gpuAddresses), not the cache data. The KV
@@ -13245,26 +13248,26 @@ pub fn emit_model(
                 // pool's life (chunk-set growth edits its contents, not
                 // its binding), so baking its gpuAddress once is sound.
                 let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.k_chunk_table_mem(l).buffer().clone())
+                    .map(|l| kv_cache.k_chunk_table_mem(l).buffer().clone())
                     .collect();
                 let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.v_chunk_table_mem(l).buffer().clone())
+                    .map(|l| kv_cache.v_chunk_table_mem(l).buffer().clone())
                     .collect();
                 // KV-cache groups (vLLM hybrid layout). Uniform models have a
                 // single group with an all-zero layer→group map (byte-identical
                 // to the pre-hybrid single block-table path); gemma4 SWA reports
                 // its real group count + per-layer mapping through the pool.
-                let num_kv_groups: usize = ctx.kv_cache.num_kv_groups();
+                let num_kv_groups: usize = kv_cache.num_kv_groups();
                 let kv_layer_to_group: ::std::vec::Vec<u32> =
-                    ctx.kv_cache.layer_to_group_u32();
+                    kv_cache.layer_to_group_u32();
                 // GDN (Gated-DeltaNet) persistent state buffers, captured per
-                // (global) layer from `ctx.gdn_state` for hybrid arches; empty
+                // (global) layer from `gdn_state` for hybrid arches; empty
                 // for non-hybrid. Non-linear layers reuse the first linear
                 // layer's buffer as a never-bound placeholder (the
                 // GatedDeltaNet lowering only emits GdnConvState/GdnSsmState on
                 // linear layers, so the placeholder is never read).
                 let (gdn_conv, gdn_ssm): (::std::vec::Vec<Buffer>, ::std::vec::Vec<Buffer>) =
-                    match ctx.gdn_state {
+                    match gdn_state {
                         ::core::option::Option::Some(gp) => {
                             match (0..gp.num_layers).find(|&l| gp.is_linear(l)) {
                                 ::core::option::Option::Some(f0) => {
@@ -13302,11 +13305,10 @@ pub fn emit_model(
                 // full-context group (see `compute_hybrid_kv_layout`); uniform →
                 // all-zero map → all-true. A recurrent hybrid's layers that hold
                 // no KV (`KV_CACHE_LAYERS`) get no store.
-                let __tq_nb = ctx.kv_cache.num_blocks;
+                let __tq_nb = kv_cache.num_blocks;
                 let __tq_kv_layers =
                     <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CACHE_LAYERS;
-                let __tq_is_global: ::std::vec::Vec<bool> = ctx
-                    .kv_cache
+                let __tq_is_global: ::std::vec::Vec<bool> = kv_cache
                     .layer_to_group_u32()
                     .iter()
                     .zip(0u32..)
@@ -13478,7 +13480,7 @@ pub fn emit_model(
                     device.metal_bucket_max_m,
                     // Runtime per-sequence block-table capacity, read off the KV
                     // pool: it picks the KV cap rung.
-                    ctx.kv_cache.max_blocks_per_seq,
+                    kv_cache.max_blocks_per_seq,
                     device.kv_addressing,
                     // The serving engine's batch, stashed by the worker: the decode split's
                     // partials are reserved for that many rows.
@@ -13526,7 +13528,7 @@ pub fn emit_model(
             num_tokens: u64,
             followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
         ) -> crate::__gpu::OwnedTensor {
-            let pool = resident_metal_pool(wm, ctx, device);
+            let pool = resident_metal_pool(wm, ctx.kv_cache, ctx.gdn_state, device);
 
             // ── Read host-visible input slices off ctx ────────────
             //
@@ -13852,7 +13854,7 @@ pub fn emit_model(
             num_tokens: u64,
             body: ::scratchy_forward_compiler::MetalChainBody<'_>,
         ) -> ::core::result::Result<(), ::std::string::String> {
-            let pool = resident_metal_pool(wm, ctx, device);
+            let pool = resident_metal_pool(wm, ctx.kv_cache, ctx.gdn_state, device);
 
             // Read host-visible iter-0 input slices off ctx (same
             // pattern as `forward_with_metal_followup`).

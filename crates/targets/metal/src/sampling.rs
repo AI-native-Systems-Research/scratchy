@@ -106,8 +106,8 @@ impl SamplerStage {
 /// The sampler pipeline's kernels, built once per worker at model load (like
 /// `ArgmaxKernels`).
 pub struct SamplerKernels {
-    vocab: LogitsWidth,
-    slicing: SliceTarget,
+    /// The logits width the kernels are baked for.
+    pub vocab: LogitsWidth,
     /// One per [`SamplerStage`], in its order.
     stages: Vec<OffTapePipeline>,
 }
@@ -120,16 +120,11 @@ impl SamplerKernels {
         vocab: LogitsWidth,
         stages: &[BakedKernel; SamplerStage::COUNT],
     ) -> Result<Self, MetalStreamError> {
-        let slicing = SliceTarget::of(device)?;
         let stages = stages
             .iter()
             .map(|k| OffTapePipeline::new(device, k))
             .collect::<Result<Vec<_>, _>>()?;
-        let kernels = Self {
-            vocab,
-            slicing,
-            stages,
-        };
+        let kernels = Self { vocab, stages };
 
         // Fence the one runtime assumption the shaders cannot check themselves:
         // the block reductions require a 32-lane simdgroup (see
@@ -456,23 +451,39 @@ impl SamplerArena {
     }
 
     /// Allocate + bind everything the sampler pipeline needs, once. Sizes are
-    /// compile-time facts of the loaded config: the logits width `kernels`
-    /// were baked for, `max_rows` from the worker's `max_num_seqs`, `max_hist`
-    /// from the request-length bounds. All buffers are `StorageModeShared`,
-    /// pinned into the worker's persistent residency set (the one the pool
-    /// commits once), so every forward command buffer sees them resident.
+    /// compile-time facts of the loaded config: the logits width `vocab` the
+    /// kernels are baked for, `max_rows` from the worker's `max_num_seqs`, `max_hist`
+    /// from the request-length bounds — none of them the compiled kernels, so the
+    /// arena is sized and counted while the kernels are still compiling. All buffers are
+    /// `StorageModeShared`, pinned into the worker's persistent residency set (the one the
+    /// pool commits once), so every forward command buffer sees them resident.
     /// Returned behind an `Arc`: the per-step [`PendingSampler`] handle holds a
     /// refcount so it can move freely into the forward followup.
     pub fn new(
         device: &Device,
         residency: &MetalResidencySet,
         max_rows: u32,
-        kernels: &SamplerKernels,
+        vocab: LogitsWidth,
+        max_hist: u32,
+    ) -> Result<std::sync::Arc<Self>, MetalStreamError> {
+        let slicing = SliceTarget::of(device)?;
+        Ok(Self::sized(
+            device, residency, max_rows, vocab, slicing, max_hist,
+        ))
+    }
+
+    /// [`Self::new`], cutting rows into `slicing`'s slices rather than the device's.
+    fn sized(
+        device: &Device,
+        residency: &MetalResidencySet,
+        max_rows: u32,
+        vocab: LogitsWidth,
+        slicing: SliceTarget,
         max_hist: u32,
     ) -> std::sync::Arc<Self> {
         let max_rows = max_rows.max(1);
         let max_hist = max_hist.max(1);
-        let (vocab, slicing) = (kernels.vocab.get(), kernels.slicing);
+        let vocab = vocab.get();
         let sliced_max = slicing.sliced_max(max_rows);
         let n = max_rows as usize;
         let h = max_hist as usize;
@@ -913,7 +924,8 @@ mod tests {
         let (pending, pins) = {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
-            let arena = SamplerArena::new(device, res, njobs, kernels, max_hist);
+            let arena =
+                SamplerArena::new(device, res, njobs, kernels.vocab, max_hist).expect("arena");
             let pending = arena.prepare_step(params, njobs, None);
             (
                 pending,
@@ -1383,7 +1395,8 @@ mod tests {
         let (pending, arena, _logits_pin) = {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
-            let arena = SamplerArena::new(device, res, njobs, &kernels, max_hist);
+            let arena =
+                SamplerArena::new(device, res, njobs, kernels.vocab, max_hist).expect("arena");
             let pending = arena.prepare_step(params, njobs, None);
             (pending, arena, res.pin(logits_buf.clone()))
         };
@@ -1687,10 +1700,11 @@ mod tests {
         token: u32,
     }
 
-    /// One pipeline on `logits` (job j samples row j of it) with `kernels`' slicing.
+    /// One pipeline on `logits` (job j samples row j of it), rows cut into `slicing`'s slices.
     fn run_formed<T: Copy>(
         device: &Device,
         kernels: &SamplerKernels,
+        slicing: SliceTarget,
         params: &scratchy_core_common::GpuSampleParams,
         logits: &[T],
     ) -> Vec<Formed> {
@@ -1702,7 +1716,7 @@ mod tests {
         let batch = Mtl4DispatchBatch::begin(device).expect("an MTL4 queue");
         let res = batch.residency();
         let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
-        let arena = SamplerArena::new(device, res, n as u32, kernels, max_hist);
+        let arena = SamplerArena::sized(device, res, n as u32, kernels.vocab, slicing, max_hist);
         let pending = arena.prepare_step(params, n as u32, None);
         let pins = [res.pin(logits_buf.clone()), res.pin(tokens.clone())];
         pending.encode_into(batch.encoder(), logits_buf.gpuAddress(), &tokens, kernels);
@@ -2024,8 +2038,10 @@ mod tests {
             (248_320, CastDtype::F32),
         ] {
             let kernels = baked(&device, vocab, dtype);
-            let mut wide = baked(&device, vocab, dtype);
-            wide.slicing = SliceTarget(64);
+            let (native, wide) = (
+                SliceTarget::of(&device).expect("GPU cores"),
+                SliceTarget(64),
+            );
             let quant = dtype == CastDtype::Bf16;
             for (k, kind, seed) in (0..7).flat_map(|kind| [(64, kind, 0u64), (20, kind, 1)]) {
                 let logits = reference_row(kind, vocab, k, seed, quant);
@@ -2073,30 +2089,32 @@ mod tests {
                             ..Default::default()
                         }
                     };
-                    let run = |kernels: &SamplerKernels, us: &[f32]| -> Vec<Formed> {
+                    let run = |slicing: SliceTarget, us: &[f32]| -> Vec<Formed> {
                         let rows: Vec<f32> = logits.repeat(us.len());
                         match dtype {
-                            CastDtype::F32 => run_formed(&device, kernels, &params(us), &rows),
+                            CastDtype::F32 => {
+                                run_formed(&device, &kernels, slicing, &params(us), &rows)
+                            }
                             _ => {
                                 let bf: Vec<half::bf16> =
                                     rows.iter().map(|&x| half::bf16::from_f32(x)).collect();
-                                run_formed(&device, kernels, &params(us), &bf)
+                                run_formed(&device, &kernels, slicing, &params(us), &bf)
                             }
                         }
                     };
                     // One row on the device's slices and on 32; then the cumsum
                     // boundaries as a batch (one slice a row) and four rows.
                     let u = rng.unit();
-                    let one = run(&kernels, &[u]).remove(0);
+                    let one = run(native, &[u]).remove(0);
                     check(&one, &logits, exact, d, u, &tag);
                     let u = rng.unit();
-                    check(&run(&wide, &[u]).remove(0), &logits, exact, d, u, &tag);
+                    check(&run(wide, &[u]).remove(0), &logits, exact, d, u, &tag);
                     let us = boundary_uniforms(&one, d);
-                    for (f, &u) in run(&kernels, &us).iter().zip(&us) {
+                    for (f, &u) in run(native, &us).iter().zip(&us) {
                         check(f, &logits, exact, d, u, &tag);
                     }
                     let us: Vec<f32> = (0..4).map(|_| rng.unit()).collect();
-                    for (f, &u) in run(&kernels, &us).iter().zip(&us) {
+                    for (f, &u) in run(native, &us).iter().zip(&us) {
                         check(f, &logits, exact, d, u, &tag);
                     }
                 }

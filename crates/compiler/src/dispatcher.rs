@@ -345,6 +345,19 @@ pub trait ScratchyWeights: Send + Sync {
     #[cfg(feature = "metal")]
     fn metal_dtype(&self) -> scratchy_tensors::MetalDtype;
 
+    /// Build the model's resident Metal pool (arena, runtime buffers, every bucket's baked
+    /// argument tables) if it is not built yet. Every forward needs it, so the worker builds it
+    /// while startup has other work to overlap it with rather than in the first request.
+    /// `kv_cache`, `gdn_state` and `device` are the worker's `KvCachePool`,
+    /// `GdnStatePool<PoolMem>` and `GpuDevice`, typed `Any` (as [`Self::metal_off_tape`]).
+    #[cfg(feature = "metal")]
+    fn build_metal_pool(
+        &self,
+        kv_cache: &dyn core::any::Any,
+        gdn_state: Option<&dyn core::any::Any>,
+        device: &dyn core::any::Any,
+    );
+
     /// Metal forward + caller-supplied follow-on hook chained on
     /// the forward CB's shared event. Used by the executor to
     /// fuse argmax onto the forward CB so there's no host-side

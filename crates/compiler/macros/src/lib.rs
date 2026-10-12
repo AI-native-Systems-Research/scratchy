@@ -2269,6 +2269,20 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant eager builds of each model's resident metal pool.
+    let build_metal_pool_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(w) => {
+                    #model_ident::resident_metal_pool(w, kv_cache, gdn_state, device);
+                }
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_BUCKET_ARENA_COSTS` reads — the `(bucket_m, bytes)`
     // table the worker feeds to `select_prefill_bucket` for target-reactive
     // bucket pruning. Mirrors `metal_arena_peak_arms`.
@@ -2921,6 +2935,28 @@ fn emit_arch_dispatcher(
             ) -> &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync) {
                 match self {
                     #(#metal_rungs_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn build_metal_pool(
+                &self,
+                kv_cache: &dyn ::core::any::Any,
+                gdn_state: ::core::option::Option<&dyn ::core::any::Any>,
+                device: &dyn ::core::any::Any,
+            ) {
+                let kv_cache = kv_cache
+                    .downcast_ref::<crate::__gpu::kv_cache::KvCachePool>()
+                    .expect("build_metal_pool: kv_cache is the worker's KvCachePool");
+                let gdn_state = gdn_state.map(|g| {
+                    g.downcast_ref::<crate::__gpu::gdn_state::GdnStatePool<crate::__gpu::PoolMem>>()
+                        .expect("build_metal_pool: gdn_state is the worker's GdnStatePool")
+                });
+                let device = device
+                    .downcast_ref::<crate::__gpu::GpuDevice>()
+                    .expect("build_metal_pool: device is the worker's GpuDevice");
+                match self {
+                    #(#build_metal_pool_arms)*
                 }
             }
 

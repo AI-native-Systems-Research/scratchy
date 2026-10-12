@@ -267,7 +267,10 @@ pub struct MetalWorker {
     /// device + allocator + command queue as the target). Idle until
     /// the proposer is wired.
     draft_model: Option<Box<dyn scratchy_forward_compiler::ScratchyWeights>>,
-    /// Compiled greedy-sampling pipeline. Cached once at load_model
+    /// The off-tape pipelines, compiling on a thread of their own from `load_model` until
+    /// `compile_or_warm_up_model` installs them (`argmax_kernels`, `sampler_kernels`, ...).
+    off_tape_compile: Option<std::thread::JoinHandle<ExecutorResult<OffTapePipelines>>>,
+    /// Compiled greedy-sampling pipeline. Cached once at startup
     /// to avoid recompiling the MSL kernel each step.
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
     /// The argmax baked for the draft model's logits (its forwards and chain).
@@ -856,6 +859,7 @@ impl MetalWorker {
             draft_model_dir: None,
             draft_hf_config: None,
             draft_kv_cache: None,
+            off_tape_compile: None,
             argmax_kernels: None,
             draft_argmax_kernels: None,
             sampler_kernels: None,
@@ -2941,6 +2945,59 @@ fn free_argmax_slot(
 
 /// A step committed without waiting for it: the tokens its rows sampled are on the device until it is
 /// resolved.
+/// The pipelines of the kernels a model runs on its logits outside its tape.
+#[cfg(feature = "metal")]
+struct OffTapePipelines {
+    argmax: scratchy_target_metal::argmax::ArgmaxKernels,
+    /// The on-GPU token sampler (temperature / top-k / top-p / min-p + penalties), for
+    /// non-greedy requests; greedy decode keeps the fused argmax.
+    sampler: scratchy_target_metal::sampling::SamplerKernels,
+    /// Phase 6 chain advance, so the K-step chain driver never compiles on its first call.
+    chain_advance: scratchy_target_metal::chain_advance::ChainAdvanceKernel,
+    /// Constrained / guided decoding's mask; the parser factory (llguidance, from
+    /// tokenizer.json) is built lazily on the first grammar request (`ensure_grammar_factory`).
+    #[cfg(feature = "guided-decoding")]
+    grammar_mask: scratchy_target_metal::grammar_mask::GrammarMaskKernels,
+}
+
+#[cfg(feature = "metal")]
+impl OffTapePipelines {
+    fn compile(
+        device: &scratchy_target_metal::mtl4_dispatch::Device,
+        off_tape: &scratchy_target_metal::off_tape::OffTapeKernels,
+    ) -> ExecutorResult<Self> {
+        fn failed<E: std::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> ExecutorError {
+            move |e| ExecutorError::WorkerInit(format!("{what} kernel compile: {e:?}"))
+        }
+        let t = std::time::Instant::now();
+        let pipelines = Self {
+            argmax: scratchy_target_metal::argmax::ArgmaxKernels::new(device, off_tape)
+                .map_err(failed("argmax"))?,
+            sampler: scratchy_target_metal::sampling::SamplerKernels::new(
+                device,
+                off_tape.vocab,
+                off_tape.sampler(),
+            )
+            .map_err(failed("sampler"))?,
+            chain_advance: scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
+                device, off_tape,
+            )
+            .map_err(failed("chain_advance"))?,
+            #[cfg(feature = "guided-decoding")]
+            grammar_mask: scratchy_target_metal::grammar_mask::GrammarMaskKernels::new(
+                device,
+                &off_tape.grammar_mask,
+            )
+            .map_err(failed("grammar_mask"))?,
+        };
+        info!(
+            "ScratchyWorker(metal): off-tape pipelines compiled in {:?}",
+            t.elapsed()
+        );
+        Ok(pipelines)
+    }
+}
+
 #[cfg(feature = "metal")]
 struct InFlightStep {
     done: Arc<InFlight>,
@@ -3266,92 +3323,38 @@ impl Worker for MetalWorker {
             );
         }
 
-        // Compile + cache the greedy-sampling pipeline once. Argmax fires
-        // outside the per-bucket ICB, so it owns its own pipeline cache
-        // here on the worker rather than living in the per-canonical
-        // `MetalWorkerPool`.
-        let t_argmax = std::time::Instant::now();
+        // The kernels this model runs on its logits outside the tape (argmax, sampler, chain
+        // advance, grammar mask) are the worker's, not the pool's. Their pipelines need nothing
+        // the rest of startup builds, and the process's first pipeline compile is a slow one, so
+        // they compile on a thread of their own while the sampler arena, the memory budget and
+        // the KV pool are built; `compile_or_warm_up_model` installs them.
         let off_tape = scratchy_target_metal::off_tape::OffTapeKernels::of(model.metal_off_tape())
             .map_err(|e| ExecutorError::WorkerInit(format!("off-tape kernels: {e}")))?;
-        let argmax =
-            scratchy_target_metal::argmax::ArgmaxKernels::new(&gpu_device.device, off_tape)
-                .map_err(|e| ExecutorError::WorkerInit(format!("argmax kernel compile: {e:?}")))?;
-        info!(
-            "ScratchyWorker(metal): ArgmaxKernels::new in {:?}",
-            t_argmax.elapsed()
-        );
-
-        // On-GPU token sampler (temperature / top-k / top-p / min-p +
-        // repetition/frequency/presence penalties). Built once here so the
-        // first non-greedy decode step doesn't pay MSL-compile latency. Only
-        // engaged when a request is non-greedy; greedy decode keeps the fused
-        // argmax fast-path.
-        let t_sampler = std::time::Instant::now();
-        let sampler = scratchy_target_metal::sampling::SamplerKernels::new(
-            &gpu_device.device,
-            off_tape.vocab,
-            off_tape.sampler(),
-        )
-        .map_err(|e| ExecutorError::WorkerInit(format!("sampler kernel compile: {e:?}")))?;
-        info!(
-            "ScratchyWorker(metal): SamplerKernels::new in {:?}",
-            t_sampler.elapsed()
-        );
+        let device = gpu_device.device.clone();
+        self.off_tape_compile = Some(std::thread::spawn(move || {
+            OffTapePipelines::compile(&device, off_tape)
+        }));
 
         // The sampler's persistent arena: every buffer + argument table,
         // sized by the compile-time facts of this config (vocab, resolved
         // max_num_seqs rows, max_model_len history bound) and pinned into the
         // allocator's residency set so every forward command buffer sees it
         // resident. Per-step sampler work is then a pure host memcpy
-        // (`prepare_step`).
+        // (`prepare_step`). Built here, before `determine_available_memory`
+        // counts what this process has allocated.
         let t_arena = std::time::Instant::now();
         let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
             &gpu_device.device,
             gpu_device.allocator.residency(),
             self.resolved_max_num_seqs.unwrap_or(1).max(1) as u32,
-            &sampler,
+            off_tape.vocab,
             max_model_len.max(1) as u32,
-        );
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("sampler arena: {e:?}")))?;
         info!(
             "ScratchyWorker(metal): sampler arena in {:?}",
             t_arena.elapsed()
         );
-
-        // Phase 6 chain-advance pipeline. Tiny kernel — one-time build
-        // alongside argmax so the K-step chain driver never falls into
-        // pipeline-compile latency on the first call.
-        let t_chain = std::time::Instant::now();
-        let chain_advance = scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
-            &gpu_device.device,
-            off_tape,
-        )
-        .map_err(|e| ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}")))?;
-        info!(
-            "ScratchyWorker(metal): ChainAdvanceKernel::new in {:?}",
-            t_chain.elapsed()
-        );
-
-        // Grammar-mask pipeline for constrained / guided decoding. Built
-        // once here (negligible cost, no llguidance dependency) so the
-        // first masked decode step never pays pipeline-compile latency.
-        // The parser factory (llguidance, from tokenizer.json) is built
-        // lazily on the first grammar request — see `ensure_grammar_factory`.
-        #[cfg(feature = "guided-decoding")]
-        {
-            let t_gm = std::time::Instant::now();
-            let grammar_mask = scratchy_target_metal::grammar_mask::GrammarMaskKernels::new(
-                &gpu_device.device,
-                &off_tape.grammar_mask,
-            )
-            .map_err(|e| {
-                ExecutorError::WorkerInit(format!("grammar_mask kernel compile: {e:?}"))
-            })?;
-            info!(
-                "ScratchyWorker(metal): GrammarMaskKernels::new in {:?}",
-                t_gm.elapsed()
-            );
-            self.grammar_mask_kernels = Some(grammar_mask);
-        }
 
         self.gpu_device = Some(gpu_device);
         self.model = Some(model);
@@ -3359,10 +3362,7 @@ impl Worker for MetalWorker {
         {
             self.mm = mm;
         }
-        self.argmax_kernels = Some(argmax);
-        self.sampler_kernels = Some(sampler);
         self.sampler_arena = Some(sampler_arena);
-        self.chain_advance_kernel = Some(chain_advance);
         self.pooling_strategy = scratchy_core_model::embedding::resolve_pooling_strategy(
             &self.config.pooling_strategy,
             &model_dir,
@@ -5432,14 +5432,51 @@ impl Worker for MetalWorker {
     }
 
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
-        // Metal pipelines are JIT-compiled lazily via the MetalWorkerPool's
-        // function-constant cache; no eager warmup needed for Step 2.
-        //
         // Release the aligned-sidecar cache writers: load + KV init are
         // done, so the one-time background build no longer contends
         // with the realign-copy's page-ins (the contention turned an
         // 8-9.5 s miss launch into 18.6 s).
         scratchy_target_metal::metal_allocator::signal_weights_load_complete();
+
+        // Every forward needs the resident pools (arena, runtime buffers, every bucket's baked
+        // argument tables), so build them now, while the off-tape pipelines finish compiling,
+        // rather than in the first request.
+        let t_pool = std::time::Instant::now();
+        let (Some(model), Some(kv_cache), Some(device)) = (
+            self.model.as_deref(),
+            self.kv_cache.as_ref(),
+            self.gpu_device.as_ref(),
+        ) else {
+            return Err(ExecutorError::WorkerInit(
+                "compile_or_warm_up_model before load_model / initialize_cache".into(),
+            ));
+        };
+        let gdn_state = self.gdn_state.as_ref().map(|g| g as &dyn std::any::Any);
+        model.build_metal_pool(kv_cache, gdn_state, device);
+        // The speculative draft: a separate, non-GDN model on its own KV pool.
+        if let (Some(draft), Some(draft_kv)) =
+            (self.draft_model.as_deref(), self.draft_kv_cache.as_ref())
+        {
+            draft.build_metal_pool(draft_kv, None, device);
+        }
+        info!(
+            "ScratchyWorker(metal): resident pool built in {:?}",
+            t_pool.elapsed()
+        );
+
+        let compile = self.off_tape_compile.take().ok_or_else(|| {
+            ExecutorError::WorkerInit("off-tape pipelines were never compiled".into())
+        })?;
+        let pipelines = compile.join().map_err(|_| {
+            ExecutorError::WorkerInit("off-tape pipeline compile panicked".into())
+        })??;
+        self.argmax_kernels = Some(pipelines.argmax);
+        self.sampler_kernels = Some(pipelines.sampler);
+        self.chain_advance_kernel = Some(pipelines.chain_advance);
+        #[cfg(feature = "guided-decoding")]
+        {
+            self.grammar_mask_kernels = Some(pipelines.grammar_mask);
+        }
         Ok(())
     }
 
