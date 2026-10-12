@@ -146,6 +146,15 @@ jobs:
         run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
           --lib -- tcp_store multinode
 
+      # The scheduler is backend-neutral — its tests need no hardware, and no
+      # other step runs them (deps of `-p` test steps don't run transitively,
+      # and the workspace clippy is lib+bins only). Includes the multi-wave
+      # chunked-prefill contract: a prompt longer than one budget must come
+      # back as full-slice continuation waves, which the spyre worker's
+      # batched-prefill gate keys on.
+      - name: Scheduler tests (backend-neutral)
+        run: cargo test -p scratchy-serving-scheduler --lib
+
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
       # invisible to it and no job anywhere compiles them. These three steps
@@ -550,6 +559,15 @@ jobs:
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
+      # The worker's spyre modules compile under no other CI job (the linux-cuda
+      # workspace steps build the worker with default features only), so their
+      # unit tests run here on the emu stack this job already builds — including
+      # the decode-routing predicate that keeps 1-token slices of unfinished
+      # prompts out of batched decode. A model feature must be named (zero-model
+      # is a build-time panic); granite is the one the card builds use.
+      - name: Test (spyre worker unit tests)
+        run: cargo test -p scratchy-serving-worker
+          --features spyre-emu,scratchy-models/granite-3.1-8b-instruct --lib
       - name: Clippy (triton re-host crates, all targets)
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)
