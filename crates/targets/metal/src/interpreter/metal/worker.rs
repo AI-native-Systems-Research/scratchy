@@ -439,7 +439,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // already inserted by the executor that constructs the pool;
         // inserting them again would be a no-op but we skip to keep
         // the loop tight.
-        if let Some(r) = residency {
+        if residency.is_some() {
             // Compile-time residency guard: destructure RuntimeBindings with
             // NO `..` rest so adding a new runtime buffer fails THIS build
             // until its residency is explicitly decided — either pinned here
@@ -557,26 +557,35 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 pin(&t.scratch_k_table);
                 pin(&t.scratch_v_table);
             }
-            r.commit();
         }
 
-        let mut bucket_bakings = Vec::with_capacity(bucket_tapes.len());
-        for (bucket_idx, tape) in bucket_tapes.iter().enumerate() {
-            let baking = bake_bucket::<W>(
-                bucket_idx,
-                tape,
-                &arena,
-                splitk_scratch.as_ref(),
-                moe_scratch.as_ref(),
-                roped_k_scratch.as_ref(),
-                attn_unfused_scratch.as_ref(),
-                pipelines,
-                sources,
-                runtime,
-                device.clone(),
-            )?;
-            bucket_bakings.push(baking);
-        }
+        // Committing the set wires everything pinned above, the arena above all (~30 ms for
+        // granite's 1 GiB on a base M5). The bakes only record those buffers' addresses, so they
+        // run meanwhile.
+        let bucket_bakings = std::thread::scope(|s| {
+            let committed = residency.map(|r| s.spawn(|| r.commit()));
+            let bakings = (bucket_tapes.iter().enumerate())
+                .map(|(bucket_idx, tape)| {
+                    bake_bucket::<W>(
+                        bucket_idx,
+                        tape,
+                        &arena,
+                        splitk_scratch.as_ref(),
+                        moe_scratch.as_ref(),
+                        roped_k_scratch.as_ref(),
+                        attn_unfused_scratch.as_ref(),
+                        pipelines,
+                        sources,
+                        runtime,
+                        device.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>();
+            if let Some(committed) = committed {
+                committed.join().expect("residency commit panicked");
+            }
+            bakings
+        })?;
         // Every codes operand is now stored the way its readers read it.
         crate::metal_allocator::signal_affine_codes_settled();
         if let Some(r) = residency {
