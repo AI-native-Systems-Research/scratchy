@@ -190,6 +190,10 @@ fn executor_bg_loop(
     rx: std::sync::mpsc::Receiver<PipelineMsg>,
     tx: std::sync::mpsc::SyncSender<PipelineResult>,
 ) {
+    // A failure here fails the first step too, which reports it to its requests.
+    if let Err(e) = executor.prepare_execution() {
+        tracing::warn!("executor: preparing the first step failed: {e}");
+    }
     while let Ok(msg) = rx.recv() {
         match msg {
             PipelineMsg::Step(sched) => {

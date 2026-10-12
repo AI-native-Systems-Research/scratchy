@@ -105,6 +105,12 @@ impl Executor for UniProcExecutor {
             .map_err(|e| scratchy_serving_engine::error::EngineError::Executor(e.to_string()))
     }
 
+    fn prepare_execution(&mut self) -> EngineResult<()> {
+        self.worker
+            .prepare_execution()
+            .map_err(|e| scratchy_serving_engine::error::EngineError::Executor(e.to_string()))
+    }
+
     fn spec_decode_backend(
         &mut self,
     ) -> Option<&mut dyn scratchy_serving_engine::spec_decode::SpecDecodeBackend> {

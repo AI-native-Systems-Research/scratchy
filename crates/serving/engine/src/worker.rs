@@ -86,6 +86,14 @@ pub trait Worker: Send {
         Ok(())
     }
 
+    /// Build what every step needs but startup does not, before the first step. The executor
+    /// thread runs it first, so it overlaps whatever comes between ready and the first request
+    /// instead of delaying ready; a step that arrives sooner waits for it. Idempotent: a worker
+    /// also runs it from its first step, for executors that never call it.
+    fn prepare_execution(&mut self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
     /// Largest prefill bucket the device can afford, if the backend prunes a
     /// compiled bucket ladder target-reactively (see `select_prefill_bucket`).
     /// The engine clamps `SchedulerConfig::max_num_batched_tokens` to this so a

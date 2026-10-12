@@ -3631,6 +3631,10 @@ fn executor_thread_loop(
     mut rx: tokio::sync::mpsc::Receiver<ExecutorWork>,
     tx: tokio::sync::mpsc::Sender<ExecutorResult>,
 ) {
+    // A failure here fails the first step too, which reports it to its requests.
+    if let Err(e) = executor.prepare_execution() {
+        tracing::warn!("executor: preparing the first step failed: {e}");
+    }
     while let Some(work) = rx.blocking_recv() {
         match work {
             ExecutorWork::Execute(sched) => {

@@ -4061,6 +4061,8 @@ impl Worker for MetalWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // A no-op once the executor thread has prepared the worker.
+        self.prepare_execution()?;
         // Release wired GPU residency if the forward panics: a worker-thread
         // panic raises no signal under `panic = "unwind"`, so it bypasses the
         // graceful teardown and would otherwise leave the process pinning the
@@ -5437,10 +5439,16 @@ impl Worker for MetalWorker {
         // with the realign-copy's page-ins (the contention turned an
         // 8-9.5 s miss launch into 18.6 s).
         scratchy_target_metal::metal_allocator::signal_weights_load_complete();
+        Ok(())
+    }
 
+    fn prepare_execution(&mut self) -> ExecutorResult<()> {
+        // Prepared once: the off-tape pipelines are installed last.
+        if self.argmax_kernels.is_some() {
+            return Ok(());
+        }
         // Every forward needs the resident pools (arena, runtime buffers, every bucket's baked
-        // argument tables), so build them now, while the off-tape pipelines finish compiling,
-        // rather than in the first request.
+        // argument tables).
         let t_pool = std::time::Instant::now();
         let (Some(model), Some(kv_cache), Some(device)) = (
             self.model.as_deref(),
@@ -5448,7 +5456,7 @@ impl Worker for MetalWorker {
             self.gpu_device.as_ref(),
         ) else {
             return Err(ExecutorError::WorkerInit(
-                "compile_or_warm_up_model before load_model / initialize_cache".into(),
+                "prepare_execution before load_model / initialize_cache".into(),
             ));
         };
         let gdn_state = self.gdn_state.as_ref().map(|g| g as &dyn std::any::Any);
@@ -5463,9 +5471,7 @@ impl Worker for MetalWorker {
             "ScratchyWorker(metal): resident pool built in {:?}",
             t_pool.elapsed()
         );
-        // Map the KV every request starts in (block 0's chunk, the pools' first growth step) now
-        // too. It is GPU work (the new chunks' zero fill), so the GPU is also awake for the first
-        // request instead of waking from idle for it.
+        // And the KV every request starts in (block 0's chunk, the pools' first growth step).
         self.grow_metal_kv_to_cover(0, 0)?;
 
         let compile = self.off_tape_compile.take().ok_or_else(|| {

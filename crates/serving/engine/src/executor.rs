@@ -285,6 +285,12 @@ pub trait Executor: Send {
         scheduler_output: &SchedulerOutput,
     ) -> EngineResult<ModelRunnerOutput>;
 
+    /// Forwarded from [`crate::worker::Worker::prepare_execution`]: run by the executor thread
+    /// before its first step.
+    fn prepare_execution(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
     /// Get the maximum number of concurrent batches.
     ///
     /// Returns > 1 for pipeline parallelism or async scheduling.
