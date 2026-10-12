@@ -20,7 +20,7 @@ use crate::args::ServeArgs;
 /// Uses ANSI colors when stderr is a terminal, monochrome otherwise.
 fn print_banner(version: &str, model: &str) {
     let color = std::io::stderr().is_terminal();
-    // w=white bold, f=rust orange, r=reset
+    // w=white bold, f=rust orange (Ferris and the `scr` in scratchy), r=reset
     let (w, f, r) = if color {
         ("\x1b[97;1m", "\x1b[38;5;202m", "\x1b[0m")
     } else {
@@ -28,14 +28,16 @@ fn print_banner(version: &str, model: &str) {
     };
     eprintln!();
     eprintln!("{f}█ █         █ █{r}");
-    eprintln!("{f}▀█  ▄█████▄  █▀{r}   {w}▄▀▀▀▀ ▄▀▀▀▀ █▀▀▀▄ ▄▀▀▀▄ ▀▀█▀▀ ▄▀▀▀▀ █   █ █   █{r}");
     eprintln!(
-        "{f} ▀▄███▀█▀███▄▀ {r}   {w}▀▄▄▄  █     █▄▄▄▀ █▄▄▄█   █   █     █▄▄▄█  ▀▄▀ {r}  version {w}{version}{r}"
+        "{f}▀█  ▄█████▄  █▀{r}   {f}▄▀▀▀▀ ▄▀▀▀▀ █▀▀▀▄{r} {w}▄▀▀▀▄ ▀▀█▀▀ ▄▀▀▀▀ █   █ █   █{r}"
     );
     eprintln!(
-        "{f} ▄▀███▀▀▀███▀▄ {r}   {w}    █ █     █ ▀▄  █   █   █   █     █   █   █  {r}  model   {w}{model}{r}"
+        "{f} ▀▄███▀█▀███▄▀ {r}   {f}▀▄▄▄  █     █▄▄▄▀{r} {w}█▄▄▄█   █   █     █▄▄▄█  ▀▄▀ {r}  version {w}{version}{r}"
     );
-    eprintln!("{f} █ ▄▀▀▀▀▀▀▀▄ █ {r}   {w}▀▀▀▀   ▀▀▀▀ ▀   ▀ ▀   ▀   ▀    ▀▀▀▀ ▀   ▀   ▀{r}");
+    eprintln!(
+        "{f} ▄▀███▀▀▀███▀▄ {r}   {f}    █ █     █ ▀▄ {r} {w}█   █   █   █     █   █   █  {r}  model   {w}{model}{r}"
+    );
+    eprintln!("{f} █ ▄▀▀▀▀▀▀▀▄ █ {r}   {f}▀▀▀▀   ▀▀▀▀ ▀   ▀{r} {w}▀   ▀   ▀    ▀▀▀▀ ▀   ▀   ▀{r}");
     eprintln!();
 }
 
