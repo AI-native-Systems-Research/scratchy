@@ -312,6 +312,7 @@ mod green_gate {
             tp_group: None,
             device_inputs: &[],
             deferred: None,
+            reads: scratchy_target_metal::ForwardReads::Outputs,
         };
 
         // ── RUN the metal vision tower (forward_m_256 workload bucket) ──

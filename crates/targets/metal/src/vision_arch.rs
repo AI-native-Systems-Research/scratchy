@@ -369,6 +369,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             has_spec_tokens: false,
             device_inputs: &[],
             deferred: None,
+            reads: crate::ForwardReads::Outputs,
         };
 
         let projected = unsafe { self.weights.vision_forward(&ctx, device, total_l as u64) };

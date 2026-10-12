@@ -541,6 +541,7 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         last_token_indices: Some(view(&s.last_token_indices, &[1], u32t)),
         device_inputs: &[],
         deferred: None,
+        reads: scratchy_target_metal::ForwardReads::Outputs,
     };
     let out = match path {
         ExecPath::Dispatch => unsafe {

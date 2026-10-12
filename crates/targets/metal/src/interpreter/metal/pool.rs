@@ -27,7 +27,9 @@ use objc2_metal::{
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
-use super::forward::{Deferral, DeviceInputInto, ForwardError, ForwardInputs, InFlight};
+use super::forward::{
+    Deferral, DeviceInputInto, ForwardError, ForwardInputs, ForwardReads, InFlight,
+};
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
@@ -941,6 +943,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         num_tokens: usize,
         num_seqs: u32,
         has_spec_tokens: bool,
+        reads: ForwardReads,
         tail: Option<F>,
         writes: &InputWrites,
         deferred: Option<&Deferral>,
@@ -1007,6 +1010,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     num_tokens as u32,
                     num_seqs,
                     has_spec_tokens,
+                    reads,
                     enc,
                 )
                 .map_err(ForwardError::Worker)?;
@@ -1314,6 +1318,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             inputs.num_tokens as usize,
             num_seqs,
             has_spec_tokens,
+            inputs.reads,
             tail,
             &writes,
             inputs.deferred,
@@ -1636,6 +1641,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
                 inputs.num_tokens,
                 num_seqs(inputs),
                 inputs.has_spec_tokens,
+                inputs.reads,
                 enc,
             )
             .map_err(ForwardError::Worker)?;
@@ -2292,6 +2298,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            cache_writes_end: 0,
         }
     }
 
@@ -2662,6 +2669,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            reads: ForwardReads::Outputs,
         }
     }
 
@@ -2725,6 +2733,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            reads: ForwardReads::Outputs,
         };
         // Closure runs *while* the worker is checked out — assertion
         // is that we got it (not on numerical correctness; that's
@@ -2822,6 +2831,7 @@ mod tests {
                 target_hidden: None,
                 device_inputs,
                 deferred: Some(&deferral),
+                reads: ForwardReads::Outputs,
             };
             let before = input_ids();
             let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
@@ -2901,6 +2911,7 @@ mod tests {
             target_hidden: None,
             device_inputs: &[],
             deferred: Some(&deferral),
+            reads: ForwardReads::Outputs,
         };
         let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
         let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
@@ -2958,6 +2969,7 @@ mod tests {
             target_hidden: None,
             device_inputs,
             deferred: None,
+            reads: ForwardReads::Outputs,
         };
         let first = [
             DeviceInput::head((*src).clone(), 0, 8, DeviceInputInto::Positions),
@@ -3062,6 +3074,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            reads: ForwardReads::Outputs,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
@@ -3105,6 +3118,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            reads: ForwardReads::Outputs,
         };
         match pool.forward(&inputs, |_, _| ()) {
             Err(ForwardError::NoBucketFits {
@@ -3158,6 +3172,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            reads: ForwardReads::Outputs,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
@@ -3210,6 +3225,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            cache_writes_end: 0,
         };
         let mut v = Vec::new();
         for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {

@@ -13996,6 +13996,7 @@ pub fn emit_model(
                 mrope_cos_sin,
                 device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
+                reads: ctx.reads,
             };
             run(&inputs)
         }
@@ -14261,6 +14262,7 @@ pub fn emit_model(
                                         num_tokens,
                                         num_seqs,
                                         has_spec_tokens,
+                                        ::scratchy_target_metal::interpreter::metal::ForwardReads::Outputs,
                                         encoder,
                                     )
                                     .map_err(|e| format!("run_bucket_mtl4: {e:?}"))

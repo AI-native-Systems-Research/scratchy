@@ -139,6 +139,8 @@ pub struct ForwardCtx<'a> {
     /// `Some`: the host does not wait for this forward
     /// ([`crate::interpreter::metal::Deferral`]).
     pub deferred: Option<&'a crate::interpreter::metal::Deferral>,
+    /// What the caller reads of this forward.
+    pub reads: crate::interpreter::metal::ForwardReads,
 }
 
 // `EmbedPatch` (the multimodal embed-splice descriptor) is a cfg-free type in

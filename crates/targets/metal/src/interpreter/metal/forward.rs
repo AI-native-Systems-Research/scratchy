@@ -152,6 +152,20 @@ pub struct ForwardInputs<'a> {
     pub device_inputs: &'a [DeviceInput],
     /// `Some`: the host does not wait for this forward ([`Deferral`]).
     pub deferred: Option<&'a Deferral>,
+    /// What the caller reads of this forward.
+    pub reads: ForwardReads,
+}
+
+/// What a forward's caller reads of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ForwardReads {
+    /// Its outputs — logits, final hidden states — and its cache writes.
+    #[default]
+    Outputs,
+    /// Its cache writes alone — KV, recurrent state: its tape plays only through its last
+    /// ([`crate::tape::lowered::LoweredMetalTape::cache_writes_end`]), as nothing after that
+    /// feeds one.
+    CacheWrites,
 }
 
 /// A forward the host commits without waiting for it, so the next one is queued while it runs. Its

@@ -369,6 +369,7 @@ pub mod mm_dispatch;
 #[cfg(feature = "vision")]
 pub mod vision_arch;
 pub use forward_ctx::{EmbedPatch, ForwardCtx, HiddenRowsOut};
+pub use interpreter::metal::ForwardReads;
 #[cfg(feature = "vision")]
 pub use mm_dispatch::{MultimodalForward, PixelInput};
 #[cfg(feature = "vision")]

@@ -1890,6 +1890,22 @@ impl LoweredMetalTape {
         out
     }
 
+    /// [`Self::cache_writes_end`] in [`Self::commands_expanded`]'s stream: past the last
+    /// iteration's copy of the last cache-writing command.
+    pub fn cache_writes_end_expanded(&self) -> usize {
+        let Some(last) = (self.cache_writes_end as usize).checked_sub(1) else {
+            return 0;
+        };
+        let (mut at, mut end) = (0, 0);
+        Self::walk(self.loops, 0..self.commands.len(), 0, &mut |pos, _| {
+            at += 1;
+            if pos == last {
+                end = at;
+            }
+        });
+        end
+    }
+
     /// THE ONE WALK. Emitted rows, in order, each with the layer offset every enclosing loop
     /// contributes. Loops are outermost-first and nest by containment of `[start, start+period)`.
     fn walk(
@@ -1992,6 +2008,12 @@ pub struct LoweredMetalTape {
     /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
     /// hd512-unfused attention was lowered.
     pub attn_unfused_scratch_bytes: u32,
+    /// The commands a forward wanting only its cache writes plays
+    /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): `commands[..cache_writes_end]`,
+    /// through the last command writing a KV cache or recurrent state (0: none does). Nothing
+    /// after it feeds a cache write — the lm_head and, past a model's last KV writer, its last
+    /// attention, MLP and norms produce only the outputs such a caller does not read.
+    pub cache_writes_end: u32,
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the

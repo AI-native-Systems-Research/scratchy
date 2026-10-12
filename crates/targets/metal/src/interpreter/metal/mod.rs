@@ -41,7 +41,7 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
 pub use forward::{
-    Deferral, DeviceInput, DeviceInputInto, ForwardError, ForwardInputs, InFlight,
+    Deferral, DeviceInput, DeviceInputInto, ForwardError, ForwardInputs, ForwardReads, InFlight,
     build_mrope_cos_sin_override,
 };
 pub use pool::{

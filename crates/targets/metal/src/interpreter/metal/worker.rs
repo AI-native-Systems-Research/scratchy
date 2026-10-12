@@ -122,6 +122,9 @@ pub struct BucketBaking {
     /// a kernel exceeds the 31-binding argument-table cap (such buckets
     /// have no MTL4 execution path).
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
+    /// The dispatches a forward reading only its cache writes plays, in dispatch order
+    /// ([`LoweredMetalTape::cache_writes_end_expanded`]).
+    pub cache_writes_end: usize,
 }
 
 #[derive(Debug)]
@@ -680,9 +683,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
         num_tokens: u32,
         num_seqs: u32,
         has_spec_tokens: bool,
+        reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, has_spec_tokens, enc, None)
+        self.run_bucket_mtl4_inner(
+            bucket,
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            reads,
+            enc,
+            None,
+        )
     }
 
     /// Activation-dump replay segment: encode only the flat dispatch
@@ -705,6 +717,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             num_tokens,
             num_seqs,
             has_spec_tokens,
+            super::ForwardReads::Outputs,
             enc,
             Some(range),
         )
@@ -716,6 +729,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         num_tokens: u32,
         num_seqs: u32,
         has_spec_tokens: bool,
+        reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: Option<std::ops::Range<usize>>,
     ) -> Result<(), WorkerError> {
@@ -774,6 +788,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
             {
                 let this_idx = flat_idx;
                 flat_idx += 1;
+                // A forward reading only its cache writes stops after the last: nothing past it
+                // feeds one.
+                if reads == super::ForwardReads::CacheWrites && this_idx >= baking.cache_writes_end
+                {
+                    continue;
+                }
                 // The compiler's own hazard-analysis verdict for the tape,
                 // captured before runtime overrides (force/range) mutate it.
                 #[cfg(feature = "forward-telemetry")]
@@ -1226,6 +1246,7 @@ fn bake_bucket<W: CanonicalParams>(
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
+        cache_writes_end: tape.cache_writes_end_expanded(),
     })
 }
 
@@ -2143,6 +2164,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            cache_writes_end: 0,
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2378,6 +2400,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            cache_writes_end: 0,
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2469,6 +2492,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            cache_writes_end: 0,
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2594,6 +2618,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            cache_writes_end: 0,
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],

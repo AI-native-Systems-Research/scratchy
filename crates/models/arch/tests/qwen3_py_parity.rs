@@ -260,6 +260,7 @@ fn qwen3_py_carrier_parity() {
         last_token_indices: Some(unsafe { lti_buf.as_view() }),
         device_inputs: &[],
         deferred: None,
+        reads: scratchy_target_metal::ForwardReads::Outputs,
     };
     let _ = null_view; // completeness placeholder, unused fields are None
 

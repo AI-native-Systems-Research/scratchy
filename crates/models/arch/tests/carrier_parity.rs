@@ -564,6 +564,7 @@ mod imp {
                 last_token_indices: Some(host_view(&lti, &[1], u32t)),
                 device_inputs: &[],
                 deferred: None,
+                reads: scratchy_target_metal::ForwardReads::Outputs,
             };
 
             // ── RUN the compiled forward (the tape from the .py carrier) ──
