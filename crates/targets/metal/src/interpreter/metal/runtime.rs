@@ -45,6 +45,8 @@ pub struct TqRuntimeBuffers {
     pub scratch_v_table: Buffer,
     pub scratch_k_data: Buffer,
     pub scratch_v_data: Buffer,
+    /// How far forwards have reached into the stores ([`Self::reach`]).
+    pub reached: crate::turboquant::TqReach,
 }
 
 pub struct RuntimeBindings {

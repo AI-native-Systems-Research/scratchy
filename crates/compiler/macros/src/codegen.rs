@@ -13313,7 +13313,7 @@ pub fn emit_model(
                     .map(|(&g, l)| g == 0 && __tq_kv_layers.is_none_or(|kv| kv.contains(&l)))
                     .collect();
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
-                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev| {
+                    ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev, residency| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
                         let max_bps =
                             <Weights as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ
@@ -13334,6 +13334,7 @@ pub fn emit_model(
                         let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
                             ::scratchy_target_metal::turboquant::build_tq_provision(
                                 dev,
+                                residency,
                                 &__tq_is_global,
                                 __tq_nb,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE as usize,

@@ -141,6 +141,16 @@ impl SparseKvLayer {
         let buffer = (*self.buffer).clone();
         Ok(MetalMem::from_buffer_with_offset(buffer, offset, bytes))
     }
+
+    /// The whole sparse buffer, for readers that bind it by address.
+    pub fn buffer(&self) -> crate::argmax::Buffer {
+        (*self.buffer).clone()
+    }
+}
+
+/// The granule a [`SparseKvLayer`]'s `chunk_bytes` must be a whole number of.
+pub fn tile_bytes(device: &ProtocolObject<dyn MTLDevice>) -> usize {
+    device.sparseTileSizeInBytesForSparsePageSize(PAGE)
 }
 
 unsafe impl Send for SparseKvLayer {}

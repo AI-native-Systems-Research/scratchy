@@ -6,11 +6,17 @@
 //! `turboquant.metal`); attention reads the packed store itself
 //! (`attention.metal`).
 
-use objc2_metal::MTLDevice;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use objc2_metal::{MTLBuffer, MTLDevice};
 pub use scratchy_layers::turboquant::kv_bytes_per_token;
 use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
 
 use crate::argmax::{Buffer, Device};
+use crate::interpreter::metal::{ForwardError, WorkerError};
+use crate::residency::MetalResidencySet;
+use crate::sparse_kv::{KvMapper, SparseKvLayer};
 
 /// Seed of the production codebook's rotation signs.
 pub const TQ_CODEBOOK_SEED: u64 = 42;
@@ -60,6 +66,7 @@ impl TqCodebook {
 /// (byte-identical to before, when `is_global` was implicitly all-true).
 pub fn build_tq_provision(
     device: &Device,
+    residency: &MetalResidencySet,
     is_global: &[bool],
     num_blocks: usize,
     block_size: usize,
@@ -67,7 +74,7 @@ pub fn build_tq_provision(
     blocks_per_chunk: usize,
     codebook: &TqCodebook,
 ) -> crate::interpreter::metal::runtime::TqRuntimeBuffers {
-    use objc2_metal::{MTLBuffer, MTLResourceOptions};
+    use objc2_metal::MTLResourceOptions;
     let (bits, head_dim) = (codebook.bits.get(), codebook.signs.len());
     let num_layers = is_global.len();
     let n_global = is_global.iter().filter(|&&g| g).count();
@@ -79,13 +86,8 @@ pub fn build_tq_provision(
     );
 
     let alloc = |bytes: usize| {
-        // NB: do NOT touch the pages here. The packed/norms/scratch are sized to
-        // the full pool capacity (num_blocks) but only the ACTIVE context is ever
-        // read/written, so leaving them untouched lets macOS lazily page them in
-        // — RSS grows with the real context, not the capacity. That laziness IS
-        // the memory win (a full eager zero-fill committed all ~3.85 GB upfront).
-        // The prefill's empty-context dequant reads untouched pages, which the OS
-        // zero-fills on first access (=> norm 0 => scratch 0, overwritten by rope).
+        // NB: do NOT touch the pages here; norms and scratch are zeroed as
+        // forwards reach blocks ([`TqRuntimeBuffers::reach`]).
         device
             .newBufferWithLength_options(bytes.max(16), MTLResourceOptions::StorageModeShared)
             .expect("tq alloc")
@@ -93,51 +95,35 @@ pub fn build_tq_provision(
     // Per-layer packed store + norms (canonical cache), at the GLOBAL geometry.
     // The TqPackedK{layer} binding is layer-indexed, so a global layer L's packed
     // store must sit at packed_k[L]; sliding layers (is_global[L]==false) get a
-    // 16-byte placeholder that the tape never binds.
-    let per_tok_words = num_kv_heads * pdim;
-    let packed_bytes = num_blocks * block_size * per_tok_words * 4;
-    let norms_bytes = num_blocks * block_size * num_kv_heads * 4;
-
-    // Per-layer anonymous packed/norms buffers (one per global layer; sliding
-    // layers get a 16-byte placeholder the tape never binds).
-    let (packed_k, packed_v, norms_k, norms_v) = {
-        // `zero_anon` zero-fills NORMS: the per-layer dequant runs BEFORE rope
-        // every forward over the WHOLE active context, so a not-yet-quantized
-        // block's norm slot is otherwise read UNINITIALIZED; `newBufferWithLength`
-        // doesn't zero, and `K = centroid*scale*sign*norm` overflows to Inf -> NaN
-        // logits -> `!!!!` on a continuation prefill. A zero norm dequants to 0,
-        // which rope overwrites with the real new-token K. Packed codes need no
-        // zeroing (a garbage code indexes a bounded centroid; product with norm 0
-        // is 0), and zeroing the large packed buffers would defeat the lazy-page
-        // memory win.
-        let mk_region = |bytes: usize, zero_anon: bool| -> Vec<Buffer> {
-            is_global
-                .iter()
-                .map(|&g| {
-                    if !g {
-                        return alloc(16);
-                    }
-                    let buf = alloc(bytes);
-                    if zero_anon {
-                        unsafe {
-                            std::ptr::write_bytes(
-                                buf.contents().as_ptr() as *mut u8,
-                                0,
-                                bytes.max(16),
-                            );
-                        }
-                    }
-                    buf
-                })
-                .collect()
-        };
-        (
-            mk_region(packed_bytes, false),
-            mk_region(packed_bytes, false),
-            mk_region(norms_bytes, true),
-            mk_region(norms_bytes, true),
-        )
+    // 16-byte placeholder that the tape never binds. Global packed stores are
+    // placement-sparse like the fp16 pool's (`sparse_kv.rs`), mapped as forwards
+    // reach them: wired in full they took 21 GB on a 32 GB M5 (granite-2b).
+    let packed_block_bytes = block_size * num_kv_heads * pdim * 4;
+    let packed_chunk_bytes = (blocks_per_chunk.max(1) * packed_block_bytes)
+        .next_multiple_of(crate::sparse_kv::tile_bytes(device));
+    let max_chunks = (num_blocks * packed_block_bytes).div_ceil(packed_chunk_bytes);
+    let mapper = KvMapper::new(device).expect("TurboQuant KvMapper");
+    let sparse = |_| SparseKvLayer::new(device, residency, &mapper, packed_chunk_bytes, max_chunks);
+    let packed_layers: Vec<SparseKvLayer> = (0..2 * n_global)
+        .map(sparse)
+        .collect::<Result<_, _>>()
+        .expect("TurboQuant packed store");
+    let mut sparse_buffers = packed_layers.iter().map(SparseKvLayer::buffer);
+    let mut packed = |&g: &bool| {
+        if g {
+            sparse_buffers.next().expect("2 per global layer")
+        } else {
+            alloc(16)
+        }
     };
+    let packed_k: Vec<Buffer> = is_global.iter().map(&mut packed).collect();
+    let packed_v: Vec<Buffer> = is_global.iter().map(&mut packed).collect();
+    let norms_bytes = num_blocks * block_size * num_kv_heads * 4;
+    let region = |bytes: usize| -> Vec<Buffer> {
+        let one = |&g: &bool| if g { alloc(bytes) } else { alloc(16) };
+        is_global.iter().map(one).collect()
+    };
+    let (norms_k, norms_v) = (region(norms_bytes), region(norms_bytes));
 
     // Per-worker fp16 scratch: one layer (num_blocks blocks) at the GLOBAL
     // geometry, reused across all global layers (sequential, like the uniform
@@ -149,16 +135,6 @@ pub fn build_tq_provision(
     let chunk_bytes = blocks_per_chunk * per_block_elems * SCRATCH_ELEM_BYTES;
     let build_scratch = || {
         let data = alloc(scratch_bytes);
-        // Zero the scratch so blocks the rope DOESN'T write read back as 0
-        // (finite) rather than uninitialized garbage (Inf/NaN) — the paged
-        // attention can stage blocks just past the active context.
-        unsafe {
-            std::ptr::write_bytes(
-                data.contents().as_ptr() as *mut u8,
-                0,
-                scratch_bytes.max(16),
-            );
-        }
         let base = data.gpuAddress();
         let table_vals: Vec<u64> = (0..n_chunks)
             .map(|c| base + (c * chunk_bytes) as u64)
@@ -181,6 +157,70 @@ pub fn build_tq_provision(
         scratch_v_table,
         scratch_k_data,
         scratch_v_data,
+        reached: TqReach {
+            through: AtomicUsize::new(0),
+            blocks: num_blocks.max(1),
+            blocks_per_chunk: blocks_per_chunk.max(1),
+            packed: Mutex::new(packed_layers),
+            packed_block_bytes,
+            packed_chunk_bytes,
+            mapper,
+            residency: residency.clone(),
+        },
+    }
+}
+
+/// Blocks `0..through` (whole chunks, of `blocks`) have zeroed norms and scratch and mapped codes.
+pub struct TqReach {
+    through: AtomicUsize,
+    blocks: usize,
+    blocks_per_chunk: usize,
+    packed: Mutex<Vec<SparseKvLayer>>,
+    packed_block_bytes: usize,
+    packed_chunk_bytes: usize,
+    mapper: Arc<KvMapper>,
+    residency: MetalResidencySet,
+}
+
+impl crate::interpreter::metal::runtime::TqRuntimeBuffers {
+    /// Back the stores through the chunk of the last block a forward's tables name, the first time
+    /// one does: map the packed codes, and zero the norms and scratch (the dequant reads a not-yet-
+    /// quantized block's norm and attention stages blocks past the rope's writes: garbage there is
+    /// Inf → NaN logits). No forward in flight names a block past `through`: this races none.
+    pub fn reach(&self, block_tables: &[&[u32]]) -> Result<(), ForwardError> {
+        let (r, scratch) = (&self.reached, [&self.scratch_k_data, &self.scratch_v_data]);
+        let c = r.blocks_per_chunk;
+        let named = block_tables.iter().flat_map(|t| t.iter()).max();
+        let to = (named.map_or(1, |&b| b as usize + 1).div_ceil(c) * c).min(r.blocks);
+        let from = r.through.load(Ordering::Acquire);
+        if to <= from {
+            return Ok(());
+        }
+        // Each buffer's bytes per block from its length: 0 for a sliding layer's 16-byte placeholder.
+        for buf in self.norms_k.iter().chain(&self.norms_v).chain(scratch) {
+            let per = buf.length() / r.blocks;
+            let at = buf.contents().as_ptr().cast::<u8>();
+            // SAFETY: `from * per..to * per` lies inside `buf`, which is host-visible.
+            unsafe { at.add(from * per).write_bytes(0, (to - from) * per) };
+        }
+        let chunks = |blocks: usize| (blocks * r.packed_block_bytes).div_ceil(r.packed_chunk_bytes);
+        let (what, bytes) = ("TurboQuant packed chunk", r.packed_chunk_bytes);
+        let refused = |_| {
+            ForwardError::Worker(WorkerError::BufferAlloc {
+                what,
+                bytes: bytes as u64,
+            })
+        };
+        for layer in r.packed.lock().expect("packed stores").iter_mut() {
+            for chunk in chunks(from)..chunks(to) {
+                layer.commit_chunk(chunk, bytes).map_err(refused)?;
+            }
+        }
+        // New chunks are mapped on the mapper's queue: in place, then wired, before a forward reads.
+        r.mapper.wait();
+        r.residency.commit();
+        r.through.store(to, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -356,9 +396,11 @@ mod tests {
             return;
         };
         let (num_layers, num_blocks, block_size, num_kv_heads, head_dim) = (3, 8, 16, 2, 64);
+        let residency = MetalResidencySet::new(&device);
         for bits in [TqBits::new(3), TqBits::new(4)] {
             let tq = build_tq_provision(
                 &device,
+                &residency,
                 &vec![true; num_layers],
                 num_blocks,
                 block_size,
@@ -367,11 +409,16 @@ mod tests {
                 &TqCodebook::compute(head_dim, bits),
             );
             let len = |b: &Buffer| b.length();
-            let allocated: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
+            // The sparse packed stores span whole tiles; what the budget counts is their blocks.
+            let packed = num_blocks * tq.reached.packed_block_bytes;
+            let sparse = tq.packed_k.iter().chain(&tq.packed_v);
+            assert!(sparse.clone().all(|b| len(b) >= packed), "{bits:?}");
+            let allocated: usize = [&tq.norms_k, &tq.norms_v]
                 .into_iter()
                 .flatten()
                 .map(len)
                 .sum::<usize>()
+                + sparse.count() * packed
                 + len(&tq.scratch_k_data)
                 + len(&tq.scratch_v_data);
             assert_eq!(
@@ -388,6 +435,49 @@ mod tests {
                 "{bits:?}"
             );
         }
+    }
+
+    /// `reach` zeroes the norms and scratch as far as the chunk of the last block a forward names,
+    /// and no further: garbage past it stays until a forward names a block there.
+    #[test]
+    fn reach_zeroes_only_the_chunks_forwards_name() {
+        let Some(device) = crate::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let residency = MetalResidencySet::new(&device);
+        let codebook = TqCodebook::compute(64, TqBits::new(4));
+        let tq = build_tq_provision(&device, &residency, &[true, false], 8, 16, 2, 4, &codebook);
+        let all = [
+            &tq.norms_k[0],
+            &tq.norms_v[0],
+            &tq.scratch_k_data,
+            &tq.scratch_v_data,
+        ];
+        let bytes = |b: &Buffer| {
+            // SAFETY: the whole host-visible buffer, read while no forward runs.
+            unsafe {
+                std::slice::from_raw_parts_mut(b.contents().as_ptr().cast::<u8>(), b.length())
+            }
+        };
+        all.iter().for_each(|b| bytes(b).fill(0xff));
+        let zeroed =
+            |b: &Buffer| bytes(b).iter().take_while(|&&x| x == 0).count() / (b.length() / 8);
+        tq.reach(&[&[2, 0, 0]]).expect("reach block 2");
+        assert!(
+            all.iter().all(|b| zeroed(b) == 4),
+            "block 2 reaches its 4-block chunk only"
+        );
+        tq.reach(&[&[1]]).expect("reach block 1");
+        assert!(
+            all.iter().all(|b| zeroed(b) == 4),
+            "an earlier block re-zeroes nothing"
+        );
+        tq.reach(&[&[7]]).expect("reach block 7");
+        assert!(
+            all.iter().all(|b| zeroed(b) == 8),
+            "block 7 reaches the rest"
+        );
     }
 
     /// `tq_compress_paged` in place at every (head_dim, bits) the metal path

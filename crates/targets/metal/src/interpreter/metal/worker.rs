@@ -545,16 +545,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             pin(vision_window_index);
             pin(vision_reverse_indices);
             pin(vision_position_ids);
-            // TurboQuant: the packed code stores + norms + codebook are read by
-            // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
-            // (same lazy-pager hazard). `None` for a dense model → no-op.
+            // TurboQuant: the norms + codebook are read by the dequant/quantize
+            // dispatch commands via baked gpuAddress, so pin them (same lazy-pager
+            // hazard); the packed stores pin themselves, chunk by chunk, as they are
+            // mapped (`TqRuntimeBuffers::reach`). `None` for a dense model → no-op.
             if let Some(t) = tq {
-                for b in &t.packed_k {
-                    pin(b);
-                }
-                for b in &t.packed_v {
-                    pin(b);
-                }
                 for b in &t.norms_k {
                     pin(b);
                 }
