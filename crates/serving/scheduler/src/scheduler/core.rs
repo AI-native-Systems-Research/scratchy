@@ -25,6 +25,20 @@ use super::interface::{PauseState, SchedulerInterface};
 use super::output::{CachedRequestData, NewRequestData, SchedulerOutput};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
 
+/// Prefill tokens a step may admit on top of work it already carries (decode
+/// rows, a continuation, or an earlier admission). A full-width chunk — up to
+/// `max_num_batched_tokens` — makes every co-scheduled decode wait out the
+/// chunk's entire compute: measured on granite-3.3-2b (M5 Max, metal), a
+/// 4096-token chunk stalls riding decodes ~350 ms/step, which showed up as
+/// median TPOT of 96-144 ms at in=4096 / conc 8. One 512-token slice is a
+/// ~50 ms prefill step and a rung of the prefill bucket ladder, so sliced
+/// admissions still hit a compiled bucket. A step with nothing else on it (a
+/// lone request, or the head of a burst before anything decodes) is not
+/// sliced and keeps the full budget; a partially-prefilled request's
+/// continuation also runs full width — its own chunking can't finish sooner
+/// by waiting — but eats the whole slice, so admissions don't stack onto it.
+const PREFILL_SLICE_TOKENS: usize = 512;
+
 // ---------------------------------------------------------------------------
 // KVCacheManagerOps -- trait for KV cache interaction
 // ---------------------------------------------------------------------------
@@ -2159,6 +2173,14 @@ impl SchedulerInterface for Scheduler {
         let mut num_scheduled_tokens: HashMap<String, usize> = HashMap::new();
         let mut token_budget = self.max_num_scheduled_tokens;
         let mut scheduled_spec_decode_tokens: HashMap<String, Vec<u32>> = HashMap::new();
+        // Remaining admission slice for this step (see PREFILL_SLICE_TOKENS):
+        // what waiting prefills may still be admitted on top of the rows the
+        // step already carries — phase-1 work (decode rows or a continuation)
+        // or an earlier admission. Prefill tokens admitted this phase, so the
+        // second and later admissions are sliced even when phase 1 scheduled
+        // nothing (the head of a burst).
+        let mut prefill_slice_remaining = PREFILL_SLICE_TOKENS;
+        let mut admitted_prefill_tokens: usize = 0;
 
         if self.pause_state == PauseState::PausedAll {
             token_budget = 0;
@@ -2213,6 +2235,10 @@ impl SchedulerInterface for Scheduler {
                 num_new_tokens = self.long_prefill_token_threshold;
             }
 
+            // A prefill row (partial prompt still to compute); decode and
+            // spec-decode rows never touch the admission slice.
+            let is_prefill_row = request.num_computed_tokens < request.num_prompt_tokens;
+
             // Respect token budget.
             num_new_tokens = num_new_tokens.min(token_budget);
 
@@ -2265,6 +2291,15 @@ impl SchedulerInterface for Scheduler {
                 req_to_new_blocks.insert(request_id.clone(), blocks);
                 num_scheduled_tokens.insert(request_id, num_new_tokens);
                 token_budget -= num_new_tokens;
+                // A continuation runs full width — its own chunking can't
+                // finish sooner by waiting — but eats the step's admission
+                // slice, so waiting prefills don't stack more prefill compute
+                // onto a step that already carries some (see
+                // PREFILL_SLICE_TOKENS).
+                if is_prefill_row && num_new_tokens > 1 {
+                    prefill_slice_remaining =
+                        prefill_slice_remaining.saturating_sub(num_new_tokens);
+                }
                 req_index += 1;
             } else {
                 // Allocation failed -- preempt the last running request.
@@ -2435,6 +2470,21 @@ impl SchedulerInterface for Scheduler {
                 }
 
                 num_new_tokens = num_new_tokens.min(token_budget);
+
+                // Waiting prefills pack into the step's admission slice: the
+                // first admission of a step with nothing else on it keeps the
+                // full token budget (a lone request, or the head of a burst,
+                // prefills at full width); every admission after that — or
+                // into a step already carrying phase-1 rows — is capped at
+                // what remains of the slice, and once the slice is spent the
+                // rest wait for the next step (see PREFILL_SLICE_TOKENS).
+                // With chunked prefill disabled a prompt is never partially
+                // scheduled, so the slice does not apply.
+                if self.enable_chunked_prefill
+                    && (!scheduled_running_reqs.is_empty() || admitted_prefill_tokens > 0)
+                {
+                    num_new_tokens = num_new_tokens.min(prefill_slice_remaining);
+                }
                 if num_new_tokens == 0 {
                     // Put the request back.
                     self.waiting.prepend_request(request);
@@ -2508,6 +2558,11 @@ impl SchedulerInterface for Scheduler {
                         req_to_new_blocks.insert(request_id.clone(), blocks);
                         num_scheduled_tokens.insert(request_id.clone(), num_new_tokens);
                         token_budget -= num_new_tokens;
+                        if num_new_tokens > 1 {
+                            admitted_prefill_tokens += num_new_tokens;
+                            prefill_slice_remaining =
+                                prefill_slice_remaining.saturating_sub(num_new_tokens);
+                        }
 
                         // Update the requests map.
                         if let Some(r) = self.requests.get_mut(&request_id) {
@@ -2839,6 +2894,171 @@ mod tests {
         // the remaining budget (5), so only r1 and r2 are scheduled.
         assert_eq!(output.total_num_scheduled_tokens, 20);
         assert_eq!(output.scheduled_new_reqs.len(), 2);
+    }
+
+    #[test]
+    fn test_prefill_sliced_when_decode_rows_share_step() {
+        // A prefill sharing the step with other rows draws from the step's
+        // 512-token slice, not the whole budget: r1's decode row rides along,
+        // so r2's 600-token prompt is admitted as a 512-token chunk.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 16,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 16));
+        let out1 = sched.schedule();
+        // Nothing else is running during r1's prefill: it is not sliced
+        // (16 tokens anyway) and starts decoding after this step.
+        assert_eq!(out1.scheduled_new_reqs.len(), 1);
+        assert_eq!(*out1.num_scheduled_tokens.get("r1").unwrap(), 16);
+
+        sched.append_output_tokens("r1", &[99]);
+        sched.add_request(make_request("r2", 600));
+
+        // r1's decode row shares the step with r2's admission: r2 is
+        // capped at the 512-token slice.
+        let out2 = sched.schedule();
+        assert_eq!(out2.scheduled_new_reqs.len(), 1);
+        assert_eq!(*out2.num_scheduled_tokens.get("r2").unwrap(), 512);
+        assert_eq!(*out2.num_scheduled_tokens.get("r1").unwrap(), 1);
+
+        sched.append_output_tokens("r1", &[98]);
+
+        // r2's continuation also draws from the slice; its remaining 88
+        // tokens fit within one, so it finishes here.
+        let out3 = sched.schedule();
+        assert_eq!(out3.scheduled_new_reqs.len(), 0);
+        assert_eq!(*out3.num_scheduled_tokens.get("r2").unwrap(), 88);
+        assert_eq!(*out3.num_scheduled_tokens.get("r1").unwrap(), 1);
+
+        // With r2 fully prefilled, both requests decode together.
+        sched.append_output_tokens("r1", &[97]);
+        sched.append_output_tokens("r2", &[99]);
+        let out4 = sched.schedule();
+        assert_eq!(out4.scheduled_new_reqs.len(), 0);
+        assert_eq!(*out4.num_scheduled_tokens.get("r1").unwrap(), 1);
+        assert_eq!(*out4.num_scheduled_tokens.get("r2").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_prefill_full_width_when_alone() {
+        // A lone request's prefill is never sliced: with nothing else to
+        // share the step with, it gets the whole token budget.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 16,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 600));
+
+        let out1 = sched.schedule();
+        assert_eq!(out1.scheduled_new_reqs.len(), 1);
+        assert_eq!(*out1.num_scheduled_tokens.get("r1").unwrap(), 600);
+    }
+
+    #[test]
+    fn test_prefill_slice_requires_chunked_prefill() {
+        // With chunked prefill disabled the slice does not apply: a prompt
+        // that fits the whole budget is scheduled whole even when a decode
+        // row shares the step.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 16,
+            enable_chunked_prefill: false,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 16));
+        sched.schedule();
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.add_request(make_request("r2", 600));
+        let out2 = sched.schedule();
+        assert_eq!(*out2.num_scheduled_tokens.get("r2").unwrap(), 600);
+        assert_eq!(*out2.num_scheduled_tokens.get("r1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_waiting_prefills_pack_into_slice() {
+        // Waiting prefills share the step's admission slice: r2 fits whole,
+        // r3 is admitted partially into what remains, and finishes as a
+        // full-width continuation next step.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 16,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 16));
+        sched.schedule();
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.add_request(make_request("r2", 300));
+        sched.add_request(make_request("r3", 300));
+
+        // r1's decode row rides along; r2 takes 300 of the 512-token slice
+        // and r3 the remaining 212.
+        let out2 = sched.schedule();
+        assert_eq!(out2.scheduled_new_reqs.len(), 2);
+        assert_eq!(*out2.num_scheduled_tokens.get("r1").unwrap(), 1);
+        assert_eq!(*out2.num_scheduled_tokens.get("r2").unwrap(), 300);
+        assert_eq!(*out2.num_scheduled_tokens.get("r3").unwrap(), 212);
+
+        // Next step: r3's continuation (88 tokens left) runs full width
+        // alongside both decode rows.
+        sched.append_output_tokens("r1", &[98]);
+        sched.append_output_tokens("r2", &[99]);
+        let out3 = sched.schedule();
+        assert_eq!(out3.scheduled_new_reqs.len(), 0);
+        assert_eq!(*out3.num_scheduled_tokens.get("r3").unwrap(), 88);
+
+        // All three decode together once r3 is fully prefilled.
+        sched.append_output_tokens("r1", &[97]);
+        sched.append_output_tokens("r2", &[98]);
+        sched.append_output_tokens("r3", &[99]);
+        let out4 = sched.schedule();
+        assert_eq!(out4.scheduled_new_reqs.len(), 0);
+        assert_eq!(*out4.num_scheduled_tokens.get("r1").unwrap(), 1);
+        assert_eq!(*out4.num_scheduled_tokens.get("r2").unwrap(), 1);
+        assert_eq!(*out4.num_scheduled_tokens.get("r3").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_burst_head_full_width_then_sliced() {
+        // The head of a burst (nothing else on the step) keeps the whole
+        // token budget; the next request waits for the following step and
+        // is then admitted as a slice beside the head's decode row.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4096,
+            max_num_seqs: 16,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 600));
+        sched.add_request(make_request("r2", 600));
+
+        let out1 = sched.schedule();
+        assert_eq!(out1.scheduled_new_reqs.len(), 1);
+        assert_eq!(*out1.num_scheduled_tokens.get("r1").unwrap(), 600);
+
+        sched.append_output_tokens("r1", &[99]);
+
+        let out2 = sched.schedule();
+        assert_eq!(out2.scheduled_new_reqs.len(), 1);
+        assert_eq!(*out2.num_scheduled_tokens.get("r2").unwrap(), 512);
+        assert_eq!(*out2.num_scheduled_tokens.get("r1").unwrap(), 1);
     }
 
     // ----- Unschedulable (never-fits) guard -----
