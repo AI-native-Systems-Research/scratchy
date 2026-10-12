@@ -130,31 +130,34 @@ fn upload_via_gpuweights<W: WeightSource + ?Sized>(
     shape: &[usize],
     dtype: DType,
 ) -> Result<GpuTensor> {
-    let bytes: Vec<u8> = match dtype {
+    // Converted in parallel into one typed buffer, then viewed as bytes. Pushing each element's bytes
+    // onto a growing `Vec<u8>` was ~130 ms of gemma-4-26b's load: its tables run to 262144 positions.
+    let bits: Vec<u16> = match dtype {
         DType::F32 => {
-            let mut v = Vec::with_capacity(cache.len() * 4);
-            for &f in cache {
-                v.extend_from_slice(&f.to_ne_bytes());
-            }
-            v
+            // SAFETY: any initialized `f32` is four initialized bytes, and `u8` has alignment 1.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    cache.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(cache),
+                )
+            };
+            return weights.alloc_packed_from_host(bytes, shape, dtype);
         }
-        DType::F16 => {
-            let mut v = Vec::with_capacity(cache.len() * 2);
-            for &f in cache {
-                v.extend_from_slice(&half::f16::from_f32(f).to_bits().to_ne_bytes());
-            }
-            v
-        }
-        DType::BF16 => {
-            let mut v = Vec::with_capacity(cache.len() * 2);
-            for &f in cache {
-                v.extend_from_slice(&half::bf16::from_f32(f).to_bits().to_ne_bytes());
-            }
-            v
-        }
+        DType::F16 => cache
+            .par_iter()
+            .map(|&f| half::f16::from_f32(f).to_bits())
+            .collect(),
+        DType::BF16 => cache
+            .par_iter()
+            .map(|&f| half::bf16::from_f32(f).to_bits())
+            .collect(),
         _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
     };
-    weights.alloc_packed_from_host(&bytes, shape, dtype)
+    // SAFETY: as above, for `u16`.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(bits.as_ptr().cast::<u8>(), std::mem::size_of_val(&bits[..]))
+    };
+    weights.alloc_packed_from_host(bytes, shape, dtype)
 }
 
 // ---------------------------------------------------------------------------
