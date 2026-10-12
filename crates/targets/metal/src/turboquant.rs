@@ -9,7 +9,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use objc2_metal::{MTLBuffer, MTLDevice};
+use objc2_foundation::NSRange;
+use objc2_metal::{MTL4ComputeCommandEncoder, MTLBuffer, MTLDevice};
 pub use scratchy_layers::turboquant::kv_bytes_per_token;
 use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
 
@@ -85,65 +86,62 @@ pub fn build_tq_provision(
          {num_blocks} blocks, {n_global}/{num_layers} global layers compressed)"
     );
 
-    let alloc = |bytes: usize| {
-        // NB: do NOT touch the pages here; norms and scratch are zeroed as
-        // forwards reach blocks ([`TqRuntimeBuffers::reach`]).
-        device
-            .newBufferWithLength_options(bytes.max(16), MTLResourceOptions::StorageModeShared)
-            .expect("tq alloc")
-    };
     // Per-layer packed store + norms (canonical cache), at the GLOBAL geometry.
     // The TqPackedK{layer} binding is layer-indexed, so a global layer L's packed
     // store must sit at packed_k[L]; sliding layers (is_global[L]==false) get a
-    // 16-byte placeholder that the tape never binds. Global packed stores are
-    // placement-sparse like the fp16 pool's (`sparse_kv.rs`), mapped as forwards
-    // reach them: wired in full they took 21 GB on a 32 GB M5 (granite-2b).
-    let packed_block_bytes = block_size * num_kv_heads * pdim * 4;
-    let packed_chunk_bytes = (blocks_per_chunk.max(1) * packed_block_bytes)
-        .next_multiple_of(crate::sparse_kv::tile_bytes(device));
-    let max_chunks = (num_blocks * packed_block_bytes).div_ceil(packed_chunk_bytes);
+    // 16-byte placeholder that the tape never binds. Every store is placement-sparse
+    // like the fp16 pool's (`sparse_kv.rs`), mapped as forwards reach it: sized to
+    // the capacity and wired, they took 21 GB on a 32 GB M5's first request (granite-2b).
     let mapper = KvMapper::new(device).expect("TurboQuant KvMapper");
-    let sparse = |_| SparseKvLayer::new(device, residency, &mapper, packed_chunk_bytes, max_chunks);
-    let packed_layers: Vec<SparseKvLayer> = (0..2 * n_global)
-        .map(sparse)
-        .collect::<Result<_, _>>()
-        .expect("TurboQuant packed store");
-    let mut sparse_buffers = packed_layers.iter().map(SparseKvLayer::buffer);
-    let mut packed = |&g: &bool| {
-        if g {
-            sparse_buffers.next().expect("2 per global layer")
-        } else {
-            alloc(16)
+    let store = |block_bytes: usize, layers: usize, zeroed: bool| {
+        let chunk_bytes = (blocks_per_chunk.max(1) * block_bytes)
+            .next_multiple_of(crate::sparse_kv::tile_bytes(device));
+        let max_chunks = (num_blocks * block_bytes).div_ceil(chunk_bytes).max(1);
+        let layer = |_| SparseKvLayer::new(device, residency, &mapper, chunk_bytes, max_chunks);
+        let layers = (0..layers).map(layer).collect::<Result<_, _>>();
+        let layers = layers.expect("TurboQuant store");
+        TqStore {
+            layers,
+            block_bytes,
+            chunk_bytes,
+            zeroed,
         }
     };
-    let packed_k: Vec<Buffer> = is_global.iter().map(&mut packed).collect();
-    let packed_v: Vec<Buffer> = is_global.iter().map(&mut packed).collect();
-    let norms_bytes = num_blocks * block_size * num_kv_heads * 4;
-    let region = |bytes: usize| -> Vec<Buffer> {
-        let one = |&g: &bool| if g { alloc(bytes) } else { alloc(16) };
-        is_global.iter().map(one).collect()
-    };
-    let (norms_k, norms_v) = (region(norms_bytes), region(norms_bytes));
-
+    let packed = store(block_size * num_kv_heads * pdim * 4, 2 * n_global, false);
+    let norms = store(block_size * num_kv_heads * 4, 2 * n_global, true);
     // Per-worker fp16 scratch: one layer (num_blocks blocks) at the GLOBAL
     // geometry, reused across all global layers (sequential, like the uniform
     // case — a dedicated scratch, not a pool-shared tensor). Contiguous data +
     // a chunk-table of gpuAddresses at chunk offsets (the kernels deref it).
     let per_block_elems = block_size * num_kv_heads * head_dim;
-    let scratch_bytes = num_blocks * per_block_elems * SCRATCH_ELEM_BYTES;
+    let scratch = store(per_block_elems * SCRATCH_ELEM_BYTES, 2, true);
+    let placeholder = || {
+        let shared = MTLResourceOptions::StorageModeShared;
+        device
+            .newBufferWithLength_options(16, shared)
+            .expect("tq alloc")
+    };
+    // Every layer's K, then its V: a global layer's own store, a sliding layer's placeholder.
+    let by_layer = |s: &TqStore| -> (Vec<Buffer>, Vec<Buffer>) {
+        let mut stores = s.layers.iter().map(SparseKvLayer::buffer);
+        let mut one = |&g: &bool| match g {
+            true => stores.next().expect("K and V per global layer"),
+            false => placeholder(),
+        };
+        let k = is_global.iter().map(&mut one).collect();
+        (k, is_global.iter().map(&mut one).collect())
+    };
+    let ((packed_k, packed_v), (norms_k, norms_v)) = (by_layer(&packed), by_layer(&norms));
+    let (scratch_k_data, scratch_v_data) = (scratch.layers[0].buffer(), scratch.layers[1].buffer());
     let n_chunks = num_blocks.div_ceil(blocks_per_chunk.max(1));
     let chunk_bytes = blocks_per_chunk * per_block_elems * SCRATCH_ELEM_BYTES;
-    let build_scratch = || {
-        let data = alloc(scratch_bytes);
+    let table = |data: &Buffer| {
         let base = data.gpuAddress();
-        let table_vals: Vec<u64> = (0..n_chunks)
+        let vals: Vec<u64> = (0..n_chunks)
             .map(|c| base + (c * chunk_bytes) as u64)
             .collect();
-        let table = crate::argmax::upload_shared_buffer(device, &table_vals);
-        (table, data)
+        crate::argmax::upload_shared_buffer(device, &vals)
     };
-    let (scratch_k_table, scratch_k_data) = build_scratch();
-    let (scratch_v_table, scratch_v_data) = build_scratch();
 
     crate::interpreter::metal::runtime::TqRuntimeBuffers {
         packed_k,
@@ -153,42 +151,47 @@ pub fn build_tq_provision(
         signs: crate::argmax::upload_shared_buffer(device, codebook.signs),
         boundaries: crate::argmax::upload_shared_buffer(device, codebook.boundaries),
         centroids: crate::argmax::upload_shared_buffer(device, codebook.centroids),
-        scratch_k_table,
-        scratch_v_table,
+        scratch_k_table: table(&scratch_k_data),
+        scratch_v_table: table(&scratch_v_data),
         scratch_k_data,
         scratch_v_data,
         reached: TqReach {
             through: AtomicUsize::new(0),
             blocks: num_blocks.max(1),
             blocks_per_chunk: blocks_per_chunk.max(1),
-            packed: Mutex::new(packed_layers),
-            packed_block_bytes,
-            packed_chunk_bytes,
+            stores: Mutex::new([packed, norms, scratch]),
             mapper,
             residency: residency.clone(),
         },
     }
 }
 
-/// Blocks `0..through` (whole chunks, of `blocks`) have zeroed norms and scratch and mapped codes.
+/// One TurboQuant store: a placement-sparse buffer per layer, `block_bytes` a block, mapped
+/// `chunk_bytes` at a time, and whether a block must read zero before anything writes it.
+struct TqStore {
+    layers: Vec<SparseKvLayer>,
+    block_bytes: usize,
+    chunk_bytes: usize,
+    zeroed: bool,
+}
+
+/// Blocks `0..through` (whole chunks, of `blocks`) of every store are mapped, zeroed where needed.
 pub struct TqReach {
     through: AtomicUsize,
     blocks: usize,
     blocks_per_chunk: usize,
-    packed: Mutex<Vec<SparseKvLayer>>,
-    packed_block_bytes: usize,
-    packed_chunk_bytes: usize,
+    stores: Mutex<[TqStore; 3]>,
     mapper: Arc<KvMapper>,
     residency: MetalResidencySet,
 }
 
 impl crate::interpreter::metal::runtime::TqRuntimeBuffers {
     /// Back the stores through the chunk of the last block a forward's tables name, the first time
-    /// one does: map the packed codes, and zero the norms and scratch (the dequant reads a not-yet-
+    /// one does: map the chunks, and zero the norms' and scratch's (the dequant reads a not-yet-
     /// quantized block's norm and attention stages blocks past the rope's writes: garbage there is
     /// Inf → NaN logits). No forward in flight names a block past `through`: this races none.
     pub fn reach(&self, block_tables: &[&[u32]]) -> Result<(), ForwardError> {
-        let (r, scratch) = (&self.reached, [&self.scratch_k_data, &self.scratch_v_data]);
+        let r = &self.reached;
         let c = r.blocks_per_chunk;
         let named = block_tables.iter().flat_map(|t| t.iter()).max();
         let to = (named.map_or(1, |&b| b as usize + 1).div_ceil(c) * c).min(r.blocks);
@@ -196,29 +199,39 @@ impl crate::interpreter::metal::runtime::TqRuntimeBuffers {
         if to <= from {
             return Ok(());
         }
-        // Each buffer's bytes per block from its length: 0 for a sliding layer's 16-byte placeholder.
-        for buf in self.norms_k.iter().chain(&self.norms_v).chain(scratch) {
-            let per = buf.length() / r.blocks;
-            let at = buf.contents().as_ptr().cast::<u8>();
-            // SAFETY: `from * per..to * per` lies inside `buf`, which is host-visible.
-            unsafe { at.add(from * per).write_bytes(0, (to - from) * per) };
-        }
-        let chunks = |blocks: usize| (blocks * r.packed_block_bytes).div_ceil(r.packed_chunk_bytes);
-        let (what, bytes) = ("TurboQuant packed chunk", r.packed_chunk_bytes);
-        let refused = |_| {
-            ForwardError::Worker(WorkerError::BufferAlloc {
-                what,
-                bytes: bytes as u64,
-            })
+        let refused = |what, bytes: usize| WorkerError::BufferAlloc {
+            what,
+            bytes: bytes as u64,
         };
-        for layer in r.packed.lock().expect("packed stores").iter_mut() {
-            for chunk in chunks(from)..chunks(to) {
-                layer.commit_chunk(chunk, bytes).map_err(refused)?;
+        let mut zero = Vec::new();
+        for s in r.stores.lock().expect("TurboQuant stores").iter_mut() {
+            let chunks = |blocks: usize| (blocks * s.block_bytes).div_ceil(s.chunk_bytes);
+            let (first, end) = (chunks(from), chunks(to));
+            for layer in &mut s.layers {
+                for chunk in first..end {
+                    let mapped = layer.commit_chunk(chunk, s.chunk_bytes);
+                    mapped.map_err(|_| refused("TurboQuant chunk", s.chunk_bytes))?;
+                }
+                // A new chunk holds no block reached before, so all of it is zeroed.
+                if s.zeroed && end > first {
+                    zero.push((
+                        layer.buffer(),
+                        first * s.chunk_bytes,
+                        (end - first) * s.chunk_bytes,
+                    ));
+                }
             }
         }
-        // New chunks are mapped on the mapper's queue: in place, then wired, before a forward reads.
-        r.mapper.wait();
+        // The new chunks are mapped on the mapper's queue, wired, zeroed after their mapping, and
+        // in place before a forward reads them.
         r.residency.commit();
+        let zeroed = r.mapper.run(&r.residency, |enc| {
+            for (buffer, offset, bytes) in &zero {
+                // SAFETY: each range is whole chunks of its buffer, mapped by the time this runs.
+                unsafe { enc.fillBuffer_range_value(buffer, NSRange::new(*offset, *bytes), 0) };
+            }
+        });
+        zeroed.map_err(|_| refused("TurboQuant zero fill", 0))?;
         r.through.store(to, Ordering::Release);
         Ok(())
     }
@@ -229,7 +242,8 @@ mod tests {
     use super::*;
     use crate::argmax::upload_shared_buffer;
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice};
-    use objc2_metal::{MTLBuffer, MTLSize};
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLBuffer, MTLResourceOptions, MTLSize};
     use scratchy_layers::turboquant::{
         KvCodec, PolarQuantizer, pack_indices, packed_dim, vals_per_word,
     };
@@ -408,19 +422,16 @@ mod tests {
                 4,
                 &TqCodebook::compute(head_dim, bits),
             );
-            let len = |b: &Buffer| b.length();
-            // The sparse packed stores span whole tiles; what the budget counts is their blocks.
-            let packed = num_blocks * tq.reached.packed_block_bytes;
-            let sparse = tq.packed_k.iter().chain(&tq.packed_v);
-            assert!(sparse.clone().all(|b| len(b) >= packed), "{bits:?}");
-            let allocated: usize = [&tq.norms_k, &tq.norms_v]
-                .into_iter()
-                .flatten()
-                .map(len)
-                .sum::<usize>()
-                + sparse.count() * packed
-                + len(&tq.scratch_k_data)
-                + len(&tq.scratch_v_data);
+            // The sparse stores span whole tiles; what the budget counts is their blocks.
+            let stores = tq.reached.stores.lock().expect("stores");
+            for s in stores.iter() {
+                let spans = |l: &SparseKvLayer| l.buffer().length() >= num_blocks * s.block_bytes;
+                assert!(s.layers.iter().all(spans), "{bits:?}");
+            }
+            let allocated: usize = stores
+                .iter()
+                .map(|s| s.layers.len() * num_blocks * s.block_bytes)
+                .sum();
             assert_eq!(
                 allocated,
                 num_blocks
@@ -437,46 +448,62 @@ mod tests {
         }
     }
 
-    /// `reach` zeroes the norms and scratch as far as the chunk of the last block a forward names,
-    /// and no further: garbage past it stays until a forward names a block there.
+    /// `reach` maps and zeroes the stores as far as the chunk of the last block a forward names,
+    /// once: a block in use keeps what was written to it, and a chunk past it is untouched until
+    /// a forward names a block there.
     #[test]
-    fn reach_zeroes_only_the_chunks_forwards_name() {
+    fn reach_maps_and_zeroes_only_the_chunks_forwards_name() {
         let Some(device) = crate::detect_device().map(|d| d.device) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
         let residency = MetalResidencySet::new(&device);
         let codebook = TqCodebook::compute(64, TqBits::new(4));
-        let tq = build_tq_provision(&device, &residency, &[true, false], 8, 16, 2, 4, &codebook);
-        let all = [
-            &tq.norms_k[0],
-            &tq.norms_v[0],
-            &tq.scratch_k_data,
-            &tq.scratch_v_data,
-        ];
-        let bytes = |b: &Buffer| {
-            // SAFETY: the whole host-visible buffer, read while no forward runs.
-            unsafe {
-                std::slice::from_raw_parts_mut(b.contents().as_ptr().cast::<u8>(), b.length())
-            }
+        // 256 blocks of 128 per chunk: two chunks per store (the norms' are one 64 KB tile each).
+        let tq = build_tq_provision(&device, &residency, &[true], 256, 16, 8, 128, &codebook);
+        let (mapper, norms) = (&tq.reached.mapper, &tq.norms_k[0]);
+        let chunk = norms.length() / 2;
+        let shared = MTLResourceOptions::StorageModeShared;
+        let host = device
+            .newBufferWithLength_options(2 * chunk, shared)
+            .expect("readback");
+        let _pin = residency.pin(host.clone());
+        // `bytes` of the norms from the start, as the GPU sees them.
+        let read = |bytes: usize| {
+            residency.commit();
+            let copy = |e: &ProtocolObject<dyn MTL4ComputeCommandEncoder>| unsafe {
+                e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    norms, 0, &host, 0, bytes,
+                )
+            };
+            mapper.run(&residency, copy).expect("readback");
+            // SAFETY: `host` is host-visible and the copy into it has completed.
+            unsafe { std::slice::from_raw_parts(host.contents().as_ptr().cast::<u8>(), bytes) }
+                .to_vec()
         };
-        all.iter().for_each(|b| bytes(b).fill(0xff));
-        let zeroed =
-            |b: &Buffer| bytes(b).iter().take_while(|&&x| x == 0).count() / (b.length() / 8);
         tq.reach(&[&[2, 0, 0]]).expect("reach block 2");
         assert!(
-            all.iter().all(|b| zeroed(b) == 4),
-            "block 2 reaches its 4-block chunk only"
+            read(chunk).iter().all(|&b| b == 0),
+            "block 2's chunk is mapped and zeroed"
         );
+        let used = |e: &ProtocolObject<dyn MTL4ComputeCommandEncoder>| unsafe {
+            e.fillBuffer_range_value(norms, NSRange::new(0, chunk), 0xab)
+        };
+        mapper.run(&residency, used).expect("write the first chunk");
         tq.reach(&[&[1]]).expect("reach block 1");
         assert!(
-            all.iter().all(|b| zeroed(b) == 4),
-            "an earlier block re-zeroes nothing"
+            read(chunk).iter().all(|&b| b == 0xab),
+            "a reached chunk is never re-zeroed"
         );
-        tq.reach(&[&[7]]).expect("reach block 7");
+        tq.reach(&[&[200]]).expect("reach block 200");
+        let both = read(2 * chunk);
         assert!(
-            all.iter().all(|b| zeroed(b) == 8),
-            "block 7 reaches the rest"
+            both[..chunk].iter().all(|&b| b == 0xab),
+            "the first chunk keeps its writes"
+        );
+        assert!(
+            both[chunk..].iter().all(|&b| b == 0),
+            "block 200's chunk is mapped and zeroed"
         );
     }
 

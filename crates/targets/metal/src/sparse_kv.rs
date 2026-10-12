@@ -13,9 +13,10 @@ use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTL4CommandQueue, MTL4UpdateSparseBufferMappingOperation, MTLDevice, MTLHeap,
-    MTLHeapDescriptor, MTLHeapType, MTLResourceOptions, MTLSharedEvent, MTLSparsePageSize,
-    MTLSparseTextureMappingMode, MTLStorageMode,
+    MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder,
+    MTL4UpdateSparseBufferMappingOperation, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
+    MTLResourceOptions, MTLSharedEvent, MTLSparsePageSize, MTLSparseTextureMappingMode,
+    MTLStorageMode,
 };
 
 use crate::metal_mem::MetalMem;
@@ -49,6 +50,36 @@ impl KvMapper {
         self.queue
             .signalEvent_value(ProtocolObject::from_ref(&*self.event), value);
         crate::mtl4_dispatch::wait_drained(&self.event, value);
+    }
+
+    /// Run what `encode` records in one command buffer after the mappings queued before it, then
+    /// [`Self::wait`] for both: e.g. zeroing new chunks, since a placement heap holds whatever
+    /// memory it was given. `residency` (committed, holding what it touches) is declared to it.
+    pub fn run(
+        &self,
+        residency: &MetalResidencySet,
+        encode: impl FnOnce(&ProtocolObject<dyn MTL4ComputeCommandEncoder>),
+    ) -> Result<(), String> {
+        let device = self.queue.device();
+        let alloc = device
+            .newCommandAllocator()
+            .ok_or("command allocator: nil")?;
+        let cb = device.newCommandBuffer().ok_or("command buffer: nil")?;
+        cb.beginCommandBufferWithAllocator(&alloc);
+        // SAFETY: `cb` is between begin and end, as `useResidencySet:` needs.
+        unsafe { residency.attach_to_mtl4_command_buffer(Retained::as_ptr(&cb) as *mut _) };
+        let enc = cb.computeCommandEncoder().ok_or("compute encoder: nil")?;
+        encode(&enc);
+        enc.endEncoding();
+        cb.endCommandBuffer();
+        let cb: &ProtocolObject<dyn MTL4CommandBuffer> = &cb;
+        // SAFETY: one ended command buffer, kept alive (with `alloc`) until the wait below.
+        unsafe {
+            self.queue
+                .commit_count(NonNull::from(&mut [NonNull::from(cb)][0]), 1)
+        };
+        self.wait();
+        Ok(())
     }
 }
 
