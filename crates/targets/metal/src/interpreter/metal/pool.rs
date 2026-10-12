@@ -1695,6 +1695,19 @@ fn write_runtime_inputs(
             Padding::Zero,
         )?;
     }
+    // TurboQuant's stores hold group 0's blocks, mapped as the pool grows: a block past them is
+    // un-wired, and a GPU read of that hangs past the watchdog rather than faulting.
+    if let Some(tq) = &runtime.tq {
+        let mapped = tq.mapped.load(std::sync::atomic::Ordering::Relaxed);
+        let group0 = inputs.block_tables.first().map_or(&[][..], |t| *t);
+        let named = group0
+            .iter()
+            .map(|&b| b & !crate::UNROTATED_BLOCK_BIT)
+            .max();
+        if let Some(block) = named.filter(|&b| b as usize >= mapped) {
+            return Err(ForwardError::KvNotMapped { block, mapped });
+        }
+    }
     // Tell the gather kernel (used right before lm_head) what the
     // actual num_tokens of this forward is so it can pick the
     // last-token source row.

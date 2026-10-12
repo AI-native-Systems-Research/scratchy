@@ -4,7 +4,8 @@
 //! reaches its blocks, on a worker's [`KvMapper`].
 
 use std::ptr::NonNull;
-use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
@@ -64,8 +65,9 @@ pub struct SparseStores {
     stores: Vec<(Pinned, usize, bool)>,
     /// Steps map a whole number of these blocks: whole tiles of every store.
     unit: usize,
-    /// Blocks mapped so far, and all a store holds (a whole number of `unit`s).
-    mapped: usize,
+    /// Blocks mapped so far (shared with the forwards that bind the stores), and all a store
+    /// holds (a whole number of `unit`s).
+    mapped: Arc<AtomicUsize>,
     capacity: usize,
     heaps: Vec<Pinned<ProtocolObject<dyn MTLHeap>>>,
 }
@@ -102,7 +104,7 @@ impl SparseStores {
             residency: residency.clone(),
             stores: stores.iter().map(sparse).collect::<Result<_, String>>()?,
             unit,
-            mapped: 0,
+            mapped: Arc::default(),
             capacity,
             heaps: Vec::new(),
         })
@@ -113,10 +115,16 @@ impl SparseStores {
         (*self.stores[i].0).clone()
     }
 
+    /// The blocks mapped so far, as each step publishes them.
+    pub fn mapped(&self) -> Arc<AtomicUsize> {
+        self.mapped.clone()
+    }
+
     /// `bytes` of store `i` from block `block` on, for a pool's chunk table.
     pub fn chunk(&self, i: usize, block: usize, bytes: usize) -> Result<MetalMem, String> {
         let (buffer, block_bytes, _) = &self.stores[i];
-        let (offset, mapped) = (block * block_bytes, self.mapped * block_bytes);
+        let mapped = self.mapped.load(Ordering::Relaxed) * block_bytes;
+        let offset = block * block_bytes;
         match offset + bytes <= mapped {
             true => Ok(MetalMem::from_buffer_with_offset(
                 (**buffer).clone(),
@@ -137,10 +145,10 @@ impl SparseStores {
         if blocks > self.capacity {
             return Err(format!("{blocks} blocks, of {}", self.capacity));
         }
-        if blocks <= self.mapped {
+        let from = self.mapped.load(Ordering::Relaxed);
+        if blocks <= from {
             return Ok(false);
         }
-        let from = self.mapped;
         let to = blocks.next_multiple_of(self.unit).max(2 * from);
         let to = to.min(self.capacity);
         let tile = self.device.sparseTileSizeInBytesForSparsePageSize(PAGE);
@@ -184,7 +192,7 @@ impl SparseStores {
             }
             batch.commit(true);
         }
-        self.mapped = to;
+        self.mapped.store(to, Ordering::Relaxed);
         Ok(true)
     }
 }
@@ -282,7 +290,10 @@ mod tests {
         );
         assert!(stores.grow_to(257, &mapper).expect("step 3"));
         assert!(stores.grow_to(600, &mapper).expect("step 4"));
-        assert_eq!((stores.mapped, stores.heaps.len()), (1024, 4));
+        assert_eq!(
+            (stores.mapped().load(Ordering::Relaxed), stores.heaps.len()),
+            (1024, 4)
+        );
         assert!(stores.grow_to(1025, &mapper).is_err(), "past the capacity");
     }
 }

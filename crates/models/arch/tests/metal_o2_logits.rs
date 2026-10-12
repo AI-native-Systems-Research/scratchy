@@ -208,6 +208,8 @@ struct Loaded {
     kv: KvCachePool,
     /// Backing buffers of `kv`'s chunks; must outlive the pool.
     _kv_stores: SparseStores,
+    /// Maps the KV stores as the steps reach them, as `MetalWorker` does.
+    mapper: Arc<KvMapper>,
     gdn: Option<GdnStatePool<PoolMem>>,
     /// Group 0 (full attention) block size — page-unified on hybrid layouts.
     full_block_size: usize,
@@ -400,6 +402,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
         num_groups: kv.num_kv_groups(),
         kv,
         _kv_stores: kv_stores,
+        mapper,
         gdn,
         full_block_size,
         tokenizer,
@@ -482,6 +485,17 @@ fn view<'a, T>(v: &'a [T], shape: &[usize], dtype: DType) -> TensorView<'a> {
 
 /// Run one step; return the terminal slot's `[n, width]` bytes (bf16/f16 raw) and `width`.
 fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) {
+    // TurboQuant's stores hold group 0's blocks: map them through the step's last, as
+    // `MetalWorker::grow_metal_kv_to_cover` does before every forward.
+    let reach = s.block_tables[0]
+        .iter()
+        .max()
+        .map_or(1, |&b| b as usize + 1);
+    let registry = l.gpu.allocator.sparse_kv.lock();
+    let reached = registry
+        .expect("sparse KV registry")
+        .reach(reach, &l.mapper);
+    reached.expect("TurboQuant KV grow");
     let n = s.ids.len();
     let stride = l.kv.max_blocks_per_seq;
     let u32t = DType::U32;

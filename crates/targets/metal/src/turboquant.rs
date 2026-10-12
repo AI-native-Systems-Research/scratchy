@@ -136,6 +136,7 @@ pub fn build_tq_provision(
             .collect();
         crate::argmax::upload_shared_buffer(device, &vals)
     };
+    let mapped = stores.mapped();
     let registry = allocator.sparse_kv.lock();
     let registered = registry.expect("sparse KV registry").register(stores);
     registered.expect("TurboQuant stores mapped as far as the pool reaches");
@@ -152,6 +153,7 @@ pub fn build_tq_provision(
         scratch_v_table: table(&scratch_v_data),
         scratch_k_data,
         scratch_v_data,
+        mapped,
     }
 }
 
