@@ -25,9 +25,9 @@ use crate::carbon::{
     Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
-use data::{At, Cell, Model, Run, Scenario};
+use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
+    DASH, Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med, partial,
     served, timing, untimed_note,
 };
 
@@ -77,6 +77,12 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
         if name != want && name != format!("{machine}-{}-{sha8}.json", run.generated_utc.date()) {
             errors.push(format!(
                 "{name}: name it {want} (<machine>-<start time>-<sha8>.json)"
+            ));
+        }
+        for m in run.models.iter().filter(|m| m.weights().is_none()) {
+            errors.push(format!(
+                "{name}: no weights size for {}; add it to WEIGHTS in data.rs",
+                m.model_id
             ));
         }
         run.file = f;
@@ -421,6 +427,19 @@ enum Chart<'a> {
         data: Vec<SparkPoint>,
         options: ChartOptions<'a>,
     },
+    /// Carbon's LineChart: a line per engine, a dot at each measured point.
+    Line {
+        data: Vec<LinePoint>,
+        options: ChartOptions<'a>,
+    },
+}
+
+/// One point of a line chart. A None value breaks the line there.
+#[derive(Serialize)]
+struct LinePoint {
+    group: &'static str,
+    key: f64,
+    value: Option<f64>,
 }
 
 /// One point of a sparkline. On the two lines, an engine's value; on the
@@ -480,9 +499,17 @@ struct ChartOptions<'a> {
     combo: Option<Vec<ComboLayer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bounds: Option<Bounds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    points: Option<Points>,
     // The page is always Carbon's light theme.
     theme: &'static str,
     toolbar: Enabled,
+}
+
+/// A line chart's dots.
+#[derive(Serialize)]
+struct Points {
+    radius: f64,
 }
 
 #[derive(Serialize)]
@@ -750,6 +777,7 @@ fn bar_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &s
             locale: None,
             combo: None,
             bounds: None,
+            points: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -795,6 +823,7 @@ fn grid_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
+            points: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -839,6 +868,7 @@ fn mini_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
+            points: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -1468,6 +1498,7 @@ fn sparkline(pts: &[Step], trend: Trend, rival: Engine, height: &str, label: &st
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
+            points: None,
             theme: "white",
             toolbar: Enabled { enabled: false },
         },
@@ -1971,6 +2002,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             for (title, _, _) in SCALING {
                                 ContentSwitcherItem { target: slug(title), selected: false, "{title}" }
                             }
+                            ContentSwitcherItem { target: slug(STARTUP), selected: false, "{STARTUP}" }
                         }
                         div {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
@@ -2022,6 +2054,308 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                     for stem in &stems { div { {spark(chip, stem, prefill)} } }
                                                     div { "Decode" }
                                                     for stem in &stems { div { {spark(chip, stem, decode)} } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ContentPanel { id: slug(STARTUP), shown: false,
+                                div { style: "contain: inline-size", {startup_panel(machines)} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The startup scenarios charted against model size, each with its name and
+/// its chart column's title.
+const STARTUP_SCENARIOS: [(Scenario, &str, &str); 2] = [
+    (
+        Scenario::Frozen,
+        "frozen",
+        "Frozen: first launch, nothing cached",
+    ),
+    (Scenario::Cold, "cold", "Cold: a normal relaunch"),
+];
+
+/// The glance's startup panel's name.
+const STARTUP: &str = "Startup by model size";
+
+/// One machine's startup for one scenario: the run it comes from, that run's
+/// models smallest first with their weights, and per engine the median seconds
+/// from launch to first token for each model.
+struct StartupLines<'a> {
+    run: &'a Run,
+    models: Vec<(&'a Model, Bytes)>,
+    lines: Vec<(Engine, Vec<Option<f64>>)>,
+}
+
+impl<'a> StartupLines<'a> {
+    /// From the newest of the machine's runs that timed scratchy's launch to
+    /// first token for the most models, so a chart's points share one commit
+    /// and one set of engine versions; or why there is none.
+    fn of(mr: &MachineRuns<'a>, scenario: Scenario) -> Result<Self, &'static str> {
+        let timed = |run: &Run| {
+            run.models
+                .iter()
+                .filter(|m| med(Engine::Scratchy.ladder(m), scenario, Startup::Launch).is_some())
+                .count()
+        };
+        let run = mr
+            .runs
+            .iter()
+            .copied()
+            .filter(|r| timed(r) > 0)
+            .max_by(|a, b| {
+                timed(a)
+                    .cmp(&timed(b))
+                    .then(a.generated_utc.cmp(&b.generated_utc))
+            })
+            .ok_or("not measured")?;
+        let mut models: Vec<(&Model, Bytes)> = run
+            .models
+            .iter()
+            .filter_map(|m| Some((m, m.weights()?)))
+            .collect();
+        models.sort_by_key(|&(_, b)| b);
+        let lines = Engine::ALL
+            .into_iter()
+            .filter(|e| {
+                models
+                    .iter()
+                    .any(|(m, _)| e.ladder(m).iter().any(|r| r.scenario == scenario))
+            })
+            .map(|e| {
+                let secs = models
+                    .iter()
+                    .map(|(m, _)| med(e.ladder(m), scenario, Startup::Launch))
+                    .collect();
+                (e, secs)
+            })
+            .collect();
+        Ok(StartupLines { run, models, lines })
+    }
+
+    fn max_secs(&self) -> Option<f64> {
+        self.lines
+            .iter()
+            .flat_map(|(_, secs)| secs.iter().flatten().copied())
+            .reduce(f64::max)
+    }
+}
+
+/// A size as the chart's x and tooltip show it: GB to one decimal.
+fn gb1(b: Bytes) -> f64 {
+    (b.gb() * 10.0).round() / 10.0
+}
+
+/// One machine's startup against model size for one scenario: a line per
+/// engine. Every chart of the panel shares its axes' extents, so machines and
+/// scenarios compare by eye.
+fn startup_chart(sl: &StartupLines, (x_max, y_max): (f64, f64), label: &str) -> Element {
+    let data = sl
+        .lines
+        .iter()
+        .flat_map(|(e, secs)| {
+            sl.models
+                .iter()
+                .zip(secs)
+                .map(move |(&(_, b), s)| LinePoint {
+                    group: e.label(),
+                    key: gb1(b),
+                    // Carbon prints values as given: round to what the table shows.
+                    value: s.map(|s| (s * 100.0).round() / 100.0),
+                })
+        })
+        .collect();
+    let spec = Chart::Line {
+        data,
+        options: ChartOptions {
+            title: String::new(),
+            axes: Axes {
+                // A tick at each model's size.
+                bottom: Axis {
+                    maps_to: "key",
+                    title: "model size, GB",
+                    scale_type: Some("linear"),
+                    ticks: Some(Ticks {
+                        values: sl.models.iter().map(|&(_, b)| gb1(b)).collect(),
+                    }),
+                    include_zero: Some(true),
+                    visible: None,
+                    domain: Some(AxisDomain::Values([0.0, x_max])),
+                },
+                left: Axis {
+                    maps_to: "value",
+                    title: "launch to first token, s",
+                    scale_type: None,
+                    ticks: None,
+                    include_zero: Some(true),
+                    visible: None,
+                    domain: Some(AxisDomain::Values([0.0, y_max])),
+                },
+            },
+            color: Some(Colour::Scale {
+                scale: sl
+                    .lines
+                    .iter()
+                    .map(|(e, _)| (e.label(), colour(e.series())))
+                    .collect(),
+            }),
+            heatmap: None,
+            height: "240px".to_string(),
+            width: None,
+            legend: None,
+            locale: None,
+            combo: None,
+            bounds: None,
+            points: Some(Points { radius: 4.0 }),
+            theme: "white",
+            toolbar: Enabled { enabled: false },
+        },
+    };
+    chart(&spec, label, "width: 100%", None)
+}
+
+/// Under a startup chart: the run it comes from, then each point an engine
+/// launched for but never timed, and why.
+fn startup_caption(sl: &StartupLines, scenario: Scenario) -> Element {
+    let missing: Vec<String> = sl
+        .lines
+        .iter()
+        .flat_map(|(e, secs)| {
+            sl.models
+                .iter()
+                .zip(secs)
+                .filter(|(_, s)| s.is_none())
+                .map(move |((m, _), _)| {
+                    let why = lfmt(e.ladder(m), scenario, Startup::Launch, 2, 1.0);
+                    let why = if why == DASH {
+                        "not measured".to_string()
+                    } else {
+                        why
+                    };
+                    format!("{}, {}: {why}", e.label(), m.stem)
+                })
+        })
+        .collect();
+    let notes = if missing.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", missing.join("; "))
+    };
+    rsx! {
+        // Carbon's helper text: smaller and quieter than the charts it notes.
+        p { style: "font-size: 0.75rem; color: var(--cds-text-secondary)",
+            "run {sl.run.generated_utc.date()} " code { "{sl.run.repo.sha8()}" } "{notes}"
+        }
+    }
+}
+
+/// Every machine's startup against model size, frozen and cold side by side,
+/// and the numbers behind them as a table.
+fn startup_panel(machines: &BTreeMap<&str, MachineRuns>) -> Element {
+    let lines: BTreeMap<(&str, usize), Result<StartupLines, &str>> = machines
+        .iter()
+        .flat_map(|(&chip, mr)| {
+            STARTUP_SCENARIOS
+                .iter()
+                .enumerate()
+                .map(move |(k, &(scenario, _, _))| ((chip, k), StartupLines::of(mr, scenario)))
+        })
+        .collect();
+    let charted = || lines.values().filter_map(|l| l.as_ref().ok());
+    // Shared extents, each rounded up to a whole unit: the largest model, and
+    // the slowest launch in either scenario, so frozen and cold compare too.
+    let extent = |v: Option<f64>| v.map_or(1.0, f64::ceil);
+    let x_max = extent(
+        charted()
+            .flat_map(|l| l.models.iter().map(|&(_, b)| b.gb()))
+            .reduce(f64::max),
+    );
+    let y_max = extent(
+        charted()
+            .filter_map(StartupLines::max_secs)
+            .reduce(f64::max),
+    );
+    // Every model charted, smallest first, for the intro and the table.
+    let mut models: Vec<(&str, Bytes)> = Vec::new();
+    for l in charted() {
+        for &(m, b) in &l.models {
+            if !models.iter().any(|(s, _)| *s == m.stem) {
+                models.push((&m.stem, b));
+            }
+        }
+    }
+    models.sort_by_key(|&(_, b)| b);
+    let sizes = models
+        .iter()
+        .map(|&(stem, b)| format!("{stem} {:.1} GB", b.gb()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut table_headers = headers(["machine", "engine", "startup"]);
+    table_headers.extend(
+        models
+            .iter()
+            .map(|&(stem, b)| format!("{stem} ({:.1} GB)", b.gb())),
+    );
+    rsx! {
+        Stack { gap: 5,
+            p {
+                "Seconds from launching each server until it streams its first token, against the size of the model \
+                 it loads: {sizes}. Frozen is the first launch after memory and scratchy's weights cache are \
+                 cleared; cold is a normal relaunch. The time runs to the first token, not to ready, because \
+                 ollama reports ready before it loads the model. Sizes are the MLX checkpoint scratchy and mlx-lm \
+                 load; ollama loads its own build of each model, named in each model's table. Each chart is one \
+                 run, named under it."
+            }
+            div { style: "display: grid; grid-template-columns: 7rem repeat({STARTUP_SCENARIOS.len()}, minmax(0, 1fr)); gap: 1rem 2rem; align-items: start",
+                div {}
+                for (_, _, title) in STARTUP_SCENARIOS { div { strong { "{title}" } } }
+                for &chip in machines.keys() {
+                    div { "{chip}" }
+                    for (k, &(scenario, _, title)) in STARTUP_SCENARIOS.iter().enumerate() {
+                        div {
+                            match &lines[&(chip, k)] {
+                                Ok(l) => rsx! {
+                                    {startup_chart(l, (x_max, y_max), &format!("{chip}, {title}: seconds from launch to first token against model size, per engine"))}
+                                    {startup_caption(l, scenario)}
+                                },
+                                Err(why) => rsx! { "{why}" },
+                            }
+                        }
+                    }
+                }
+            }
+            Fold { title: "Table view",
+                p { "Seconds from launch to first token, then in brackets to ready and from there to the first token." }
+                Table { headers: table_headers,
+                    for (&(chip, k), l) in &lines {
+                        if let Ok(l) = l {
+                            for (e, _) in &l.lines {
+                                TableRow {
+                                    TableCell { "{chip}" }
+                                    TableCell { "{e.label()}" }
+                                    TableCell { "{STARTUP_SCENARIOS[k].1}" }
+                                    for &(stem, _) in &models {
+                                        TableCell {
+                                            {
+                                                let scenario = STARTUP_SCENARIOS[k].0;
+                                                match l.models.iter().find(|(m, _)| m.stem == stem) {
+                                                    None => DASH.to_string(),
+                                                    Some((m, _)) => {
+                                                        let ladder = e.ladder(m);
+                                                        format!(
+                                                            "{} ({} + {})",
+                                                            lfmt(ladder, scenario, Startup::Launch, 2, 1.0),
+                                                            lfmt(ladder, scenario, Startup::Ready, 2, 1.0),
+                                                            lfmt(ladder, scenario, Startup::FirstToken, 2, 1.0),
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }

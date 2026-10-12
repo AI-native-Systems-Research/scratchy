@@ -73,6 +73,8 @@ pub enum Startup {
     Ready,
     /// Request sent until its first token.
     FirstToken,
+    /// Launch until the first token: Ready, then FirstToken.
+    Launch,
     PeakRss,
 }
 
@@ -81,6 +83,7 @@ impl Startup {
         match self {
             Startup::Ready => r.t_ready_s,
             Startup::FirstToken => r.ttft_from_send_s,
+            Startup::Launch => r.ttft_exec_s,
             Startup::PeakRss => r.peak_rss_mib,
         }
     }
