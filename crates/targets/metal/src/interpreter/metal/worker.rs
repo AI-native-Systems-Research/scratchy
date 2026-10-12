@@ -548,7 +548,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // TurboQuant: the codebook and the fp16 scratch's chunk tables are read by
             // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
             // (same lazy-pager hazard); the packed, norms and scratch stores pin
-            // themselves, chunk by chunk, as they are mapped (`TqRuntimeBuffers::reach`).
+            // themselves, and each step of them as it is mapped (`SparseStores`).
             // `None` for a dense model → no-op.
             if let Some(t) = tq {
                 pin(&t.signs);

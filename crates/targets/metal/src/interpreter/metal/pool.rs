@@ -32,7 +32,6 @@ use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
-use crate::residency::MetalResidencySet;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{
     DecodeRows, HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
@@ -201,7 +200,7 @@ impl From<WorkerError> for PoolBuildError {
 #[derive(Clone)]
 pub struct RuntimeFactory(Arc<FactoryFn>);
 
-struct FactoryFn(Box<dyn Fn(&Device, &MetalResidencySet) -> RuntimeBindings>);
+struct FactoryFn(Box<dyn Fn(&Device) -> RuntimeBindings>);
 
 // SAFETY: the boxed closure captures only Metal object handles (objc2
 // `Retained`, thread-safe retain/release) and POD; identical grounds to
@@ -211,14 +210,13 @@ unsafe impl Sync for FactoryFn {}
 
 impl RuntimeFactory {
     /// Wrap a per-worker `RuntimeBindings` builder.
-    pub fn new(f: impl Fn(&Device, &MetalResidencySet) -> RuntimeBindings + 'static) -> Self {
+    pub fn new(f: impl Fn(&Device) -> RuntimeBindings + 'static) -> Self {
         Self(Arc::new(FactoryFn(Box::new(f))))
     }
 
-    /// Build a fresh set of runtime bindings for a worker on `device`, pinning into `residency`
-    /// what it maps as it grows.
-    pub fn build(&self, device: &Device, residency: &MetalResidencySet) -> RuntimeBindings {
-        ((self.0).0)(device, residency)
+    /// Build a fresh set of runtime bindings for a worker on `device`.
+    pub fn build(&self, device: &Device) -> RuntimeBindings {
+        ((self.0).0)(device)
     }
 }
 
@@ -1435,7 +1433,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     }
 
     fn spawn_worker(&self) -> Result<PooledWorker<W>, WorkerError> {
-        let runtime = (self.runtime_factory).build(&self.device, self.allocator.residency());
+        let runtime = self.runtime_factory.build(&self.device);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
@@ -1696,9 +1694,6 @@ fn write_runtime_inputs(
             bytes_of(s),
             Padding::Zero,
         )?;
-    }
-    if let Some(tq) = &runtime.tq {
-        tq.reach(&inputs.block_tables)?;
     }
     // Tell the gather kernel (used right before lm_head) what the
     // actual num_tokens of this forward is so it can pick the
@@ -2031,7 +2026,7 @@ mod tests {
         let (weights, allocator) = build_test_weights(&device);
 
         let arena_layout: ArenaLayout = vec![4096, 4096];
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
 
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,
@@ -2240,7 +2235,7 @@ mod tests {
         let arena_layout: ArenaLayout = vec![slot_bytes, slot_bytes];
         // Per-token runtime arrays sized for max bucket.
         let max_m_bytes = (max_m * 4).max(16);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(move |d, _| RuntimeBindings {
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(move |d| RuntimeBindings {
             input_ids: alloc(d, max_m_bytes),
             positions: alloc(d, max_m_bytes),
             slot_mappings: vec![alloc(d, max_m_bytes)],
@@ -2757,7 +2752,7 @@ mod tests {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
         let (weights, allocator) = build_test_weights(&device);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
         Some(MetalWorkerPool::<TestWeights>::for_buckets(
             device,
             &weights,
@@ -2788,7 +2783,7 @@ mod tests {
             }
         };
         let (weights, allocator) = build_test_weights(&device);
-        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
         let res = MetalWorkerPool::<TestWeights>::for_buckets(
             device,
             &weights,

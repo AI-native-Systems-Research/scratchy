@@ -362,7 +362,7 @@ pub struct MetalWorker {
     /// alternative — one MTLBuffer per chunk — exposed too many distinct VA
     /// ranges to the GPU's UAT, costing ~5% per decode forward via the
     /// kernel's `chunk_table[chunk]` device load).
-    target_kv_layers: Vec<scratchy_target_metal::sparse_kv::SparseKvLayer>,
+    target_kv_stores: Option<scratchy_target_metal::sparse_kv::SparseStores>,
     /// Maps both KV pools' chunks as they grow; waited out before a forward
     /// reads them. Set in `init_cache`.
     kv_mapper: Option<std::sync::Arc<scratchy_target_metal::sparse_kv::KvMapper>>,
@@ -378,11 +378,11 @@ pub struct MetalWorker {
     /// gate and `max_chunks` (`kv_full_block_size` is nonzero on uniform too, so
     /// it can't distinguish them). Set in `init_cache`.
     kv_is_hybrid: bool,
-    /// Same as `target_kv_layers` for the draft pool. Required so
+    /// Same as `target_kv_stores` for the draft pool. Required so
     /// the `AttentionViaCache` pipeline's `chunk_table[0]` always points
     /// at the layer base — both target's and draft's pipelines see the
     /// same kernel function constants (set process-wide by lowering).
-    draft_kv_layers: Vec<scratchy_target_metal::sparse_kv::SparseKvLayer>,
+    draft_kv_stores: Option<scratchy_target_metal::sparse_kv::SparseStores>,
     /// When the target KV batch first went idle (no active requests), or `None`
     /// while a batch is active. The reactive shrink is deferred until the GPU
     /// has been idle for [`KV_SHRINK_IDLE_AFTER`]: dropping grown chunks frees
@@ -881,11 +881,11 @@ impl MetalWorker {
             chain_advance_kernel: None,
             draft_chain_advance_kernel: None,
             draft_queue: None,
-            target_kv_layers: Vec::new(),
+            target_kv_stores: None,
             kv_mapper: None,
             kv_full_block_size: 0,
             kv_is_hybrid: false,
-            draft_kv_layers: Vec::new(),
+            draft_kv_stores: None,
             #[cfg(feature = "metal")]
             kv_idle_since: None,
         }
@@ -1497,12 +1497,41 @@ impl MetalWorker {
     /// target-pool path: StorageModePrivate buffers pinned into the
     /// allocator's shared residency set so attention reads don't race
     /// the Apple pager.
-    /// Reactive KV (2b): grow the chunked target pool so every block id
-    /// `<= max_block` is backed by a resident chunk before a forward
-    /// derefs the chunk-address table. Allocates missing chunks as
-    /// StorageModePrivate (residency-inserted) and commits the residency
-    /// set once if anything grew. No-op for non-chunked pools.
-    fn grow_metal_kv_to_cover(&mut self, max_block: usize) -> ExecutorResult<()> {
+    /// Reactive KV (2b): map the KV stores through every block the step names before a forward
+    /// derefs them — TurboQuant's through group 0's (`max_full_block`), the chunked fp16 pool's
+    /// through every group's (`max_block`) — mapped, wired and zeroed where they must be by
+    /// `SparseStores::grow_to`: on Apple Silicon a GPU read of un-wired device memory does not
+    /// raise a recoverable fault, it hangs the command buffer past the watchdog (a reboot).
+    fn grow_metal_kv_to_cover(
+        &mut self,
+        max_block: usize,
+        max_full_block: usize,
+    ) -> ExecutorResult<()> {
+        let (Some(device), Some(mapper)) = (self.gpu_device.as_ref(), self.kv_mapper.as_ref())
+        else {
+            return Ok(());
+        };
+        let t_grow = std::time::Instant::now();
+        // A grow that failed fails the step: the forward would read what it could not map.
+        let refused = |what: &'static str, block: usize| {
+            move |e: String| {
+                ExecutorError::WorkerExecution(format!("{what} grow to block {block}: {e}"))
+            }
+        };
+        // TurboQuant's stores hold group 0's blocks (`build_tq_provision`), as the scheduler
+        // numbers them (a span block's table entry carries `UNROTATED_BLOCK_BIT`; its ID here
+        // does not).
+        let registry = device.allocator.sparse_kv.lock();
+        let reached = registry
+            .expect("sparse KV registry")
+            .reach(max_full_block + 1, mapper);
+        if reached.map_err(refused("TurboQuant KV", max_full_block))? {
+            info!(
+                "ScratchyWorker(metal): TurboQuant KV mapped through block {max_full_block} in \
+                 {:.1} ms",
+                t_grow.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         // TurboQuant on a UNIFORM model never reads the fp16 KV pool (every layer
         // uses the packed store + the one-layer fp16 scratch, both provisioned by
         // the RuntimeFactory). Skipping growth keeps the pool at its 1-chunk seed
@@ -1527,72 +1556,38 @@ impl MetalWorker {
         {
             return Ok(());
         }
-        let Some(device) = self.gpu_device.as_ref() else {
+        let (Some(kv), Some(stores)) = (self.kv_cache.as_mut(), self.target_kv_stores.as_mut())
+        else {
             return Ok(());
         };
-        // Hold the residency set so we can make the chunk(s) that `grow_to_cover`
-        // is about to allocate GPU-resident. A freshly-allocated MTLBuffer chunk
-        // is NOT resident until it is committed to the residency set, and the GPU
-        // reads it through the bindless chunk-address table on the next dispatch.
-        let residency = device.allocator.residency().clone();
-        // `grow_to_cover` allocates K+V for each PHYSICAL TENSOR (group-shared:
-        // gemma4 has `num_tensors` < `num_layers`), so the slot cycle is
-        // `2 * num_tensors` — matching `target_kv_layers.len()` and the
-        // init-time `alloc_chunk` closure. Using `num_layers` here would index
-        // past the buffer vec on the hybrid pool.
-        let n_slots = self
-            .kv_cache
-            .as_ref()
-            .map(|kv| kv.num_tensors * 2)
-            .unwrap_or(0);
-        if n_slots == 0 {
-            return Ok(());
-        }
-        let kv_layers_ref = &mut self.target_kv_layers;
-        let Some(kv) = self.kv_cache.as_mut() else {
-            return Ok(());
-        };
-        let alloc_chunk_counter = std::cell::Cell::new(0usize);
-        // `grow_to_cover` allocates chunk by chunk, every tensor's K then V in slot
-        // order, from the chunk after the last one the pool holds whole.
+        // `grow_to_cover` allocates chunk by chunk, every PHYSICAL TENSOR's K then V
+        // in slot order (group-shared: gemma4 has `num_tensors` < `num_layers`), from
+        // the chunk after the last one the pool holds whole: views of the stores,
+        // mapped first through the chunk it grows to.
         let bpc = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
-        let first = kv.allocated_blocks().div_ceil(bpc);
-        let t_grow = std::time::Instant::now();
+        let target = kv.growth_target(max_block);
+        let through = ((target.min(kv.num_blocks - 1) / bpc + 1) * bpc).min(kv.num_blocks);
+        stores
+            .grow_to(through, mapper)
+            .map_err(refused("KV pool", max_block))?;
+        let (n_slots, first) = (kv.num_tensors * 2, kv.allocated_blocks().div_ceil(bpc));
+        let alloc_chunk_counter = std::cell::Cell::new(0usize);
         // Returns Ok(n) where n = number of NEW chunks allocated (Ok(0) = the pool
         // already covered it); Err if a chunk's allocation failed, with the pool
         // holding exactly the chunks it held whole before it.
         let grew_result = kv.grow_to_cover(
-            kv.growth_target(max_block),
+            target,
             |bytes| {
                 let c = alloc_chunk_counter.get();
                 alloc_chunk_counter.set(c + 1);
                 let (slot, chunk) = (c % n_slots, first + c / n_slots);
-                kv_layers_ref[slot]
-                    .commit_chunk(chunk, bytes)
-                    .map_err(|e| anyhow::anyhow!("KV grow slot={slot}: {e}"))
+                let mem = stores.chunk(slot, chunk * bpc, bytes);
+                mem.map_err(|e| anyhow::anyhow!("KV grow slot={slot}: {e}"))
             },
             |m| m.gpu_address(),
         );
-        // If we allocated new chunk(s), make their pages GPU-resident before the
-        // next dispatch reads them. WHY THIS MATTERS: on Apple Silicon a GPU read
-        // of un-wired (non-resident) device memory does not raise a recoverable
-        // fault — it silently hangs the command buffer, and the watchdog cannot
-        // reclaim it (requires a reboot). That is the bug this commit fixes:
-        // previously the grow result was discarded and the new chunk was never
-        // committed, so any prompt that crossed a chunk boundary (~128 blocks)
-        // could wedge the GPU.
-        // A grow that failed fails the step: the forward would read the chunk it
-        // could not build. Chunks it did map stay mapped for the retry.
-        let grew = grew_result.map_err(|e| {
-            ExecutorError::WorkerExecution(format!("KV pool grow to block {max_block}: {e}"))
-        })?;
+        let grew = grew_result.map_err(|e| refused("KV pool", max_block)(e.to_string()))?;
         if grew > 0 {
-            // The new chunks' pages are mapped on the mapper's queue: in place before
-            // the forward reads them, then wired.
-            if let Some(mapper) = self.kv_mapper.as_ref() {
-                mapper.wait();
-            }
-            residency.commit();
             info!(
                 "ScratchyWorker(metal): KV pool grew {grew} chunks to {} blocks in {:.1} ms",
                 kv.allocated_blocks(),
@@ -1603,9 +1598,9 @@ impl MetalWorker {
     }
 
     /// Reactive KV (2c): when the batch is fully idle (no live blocks), drop
-    /// the pool back to 1 chunk. The layers keep the dropped chunks mapped
-    /// (`SparseKvLayer::commit_chunk` hands the same ranges back on
-    /// regrowth), so memory stays at its high-water mark. Only call when
+    /// the pool back to 1 chunk. The stores keep the dropped chunks mapped
+    /// (`SparseStores::chunk` hands the same ranges back on regrowth), so
+    /// memory stays at its high-water mark. Only call when
     /// `input_batch.num_active() == 0` so no in-flight forward references a
     /// dropped chunk index.
     fn shrink_metal_kv_idle(&mut self) {
@@ -1619,9 +1614,8 @@ impl MetalWorker {
         let n = freed.len();
         drop(freed);
         info!(
-            "ScratchyWorker(metal): reactive KV shrink — {} chunk handles dropped on {} layers",
+            "ScratchyWorker(metal): reactive KV shrink — {} chunk handles dropped",
             n,
-            self.target_kv_layers.len()
         );
     }
 
@@ -1670,28 +1664,24 @@ impl MetalWorker {
         let per_block_elems_draft = (model.num_key_value_heads() as usize)
             * self.config.block_size
             * (model.head_dim() as usize);
-        let chunk_bytes_logical_draft =
-            blocks_per_chunk * per_block_elems_draft * cache_dtype.size_bytes();
+        let block_bytes_draft = per_block_elems_draft * cache_dtype.size_bytes();
 
         let kv_mapper = self.kv_mapper.clone().ok_or_else(|| {
             ExecutorError::WorkerInit("draft KV pool before the target's KvMapper".into())
         })?;
-        let mut draft_layers: Vec<scratchy_target_metal::sparse_kv::SparseKvLayer> =
-            Vec::with_capacity(num_tensors_draft * 2);
-        for _ in 0..(num_tensors_draft * 2) {
-            let layer = scratchy_target_metal::sparse_kv::SparseKvLayer::new(
-                &mtl_device,
-                &residency,
-                &kv_mapper,
-                chunk_bytes_logical_draft,
-                num_chunks_total_draft,
-            )
-            .map_err(|e| ExecutorError::WorkerInit(format!("draft SparseKvLayer: {e}")))?;
-            draft_layers.push(layer);
-        }
+        let layout = vec![(block_bytes_draft, false); num_tensors_draft * 2];
+        let draft_stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            &mtl_device,
+            &residency,
+            draft_blocks,
+            blocks_per_chunk,
+            &layout,
+        )
+        .and_then(|mut s| s.grow_to(draft_blocks, &kv_mapper).map(|_| s))
+        .map_err(|e| ExecutorError::WorkerInit(format!("draft KV stores: {e}")))?;
         info!(
             "ScratchyWorker(metal): draft KV layer buffers — {} buffers",
-            draft_layers.len()
+            layout.len()
         );
 
         let pool = unsafe {
@@ -1701,7 +1691,6 @@ impl MetalWorker {
             // formula `(c / (2 * chunks_per_layer)) * 2 + c % 2` matches
             // the call sequence L0_K_c0, L0_V_c0, L0_K_c1, L0_V_c1, ...
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
-            let draft_layers_ref = &mut draft_layers;
             let chunks_per_layer = num_chunks_total_draft;
             KvCachePool::new_metal_chunked(
                 num_layers_draft,
@@ -1711,7 +1700,7 @@ impl MetalWorker {
                 model.head_dim() as usize,
                 draft_block_cap,
                 // Draft pool stays uniform (matching the uniform
-                // SparseKvLayer sizing above): spec-decode is not
+                // store sizing above): spec-decode is not
                 // enabled for hybrid-attention-geometry arches (Gemma4).
                 None,
                 // One physical tensor per KV layer (no group sharing on draft).
@@ -1724,17 +1713,15 @@ impl MetalWorker {
                     alloc_chunk_counter.set(c + 1);
                     let kv = c % 2;
                     let tensor = c / (2 * chunks_per_layer);
-                    let slot = tensor * 2 + kv;
-                    draft_layers_ref[slot]
-                        .commit_chunk((c / 2) % chunks_per_layer, bytes)
-                        .map_err(|e| anyhow::anyhow!("draft KV commit slot={slot}: {e}"))
+                    let (slot, chunk) = (tensor * 2 + kv, (c / 2) % chunks_per_layer);
+                    let mem = draft_stores.chunk(slot, chunk * blocks_per_chunk, bytes);
+                    mem.map_err(|e| anyhow::anyhow!("draft KV chunk slot={slot}: {e}"))
                 },
                 |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("draft KvCachePool: {e}")))?;
-        self.draft_kv_layers = draft_layers;
-        kv_mapper.wait();
+        self.draft_kv_stores = Some(draft_stores);
         pool.fill_chunk_tables(|m| m.gpu_address());
         info!(
             "ScratchyWorker(metal): draft KV pool ready in {:?} ({} layers × {} blocks × {} tokens, \
@@ -3517,54 +3504,53 @@ impl Worker for MetalWorker {
             .unwrap_or(self.config.block_size);
         self.kv_is_hybrid = hybrid_layout.is_some();
 
-        let mut kv_layers: Vec<scratchy_target_metal::sparse_kv::SparseKvLayer> =
-            Vec::with_capacity(num_tensors_for_pool * 2);
-        for slot in 0..(num_tensors_for_pool * 2) {
-            // Slot s ↔ tensor s/2 (K at s%2==0, V at s%2==1) — must match the
-            // pool's alloc order T0K, T0V, T1K, … (slot = c % n_slots). All
-            // tensors are page-unified (same bytes) on the hybrid path, so
-            // every slot uses `chunk_bytes_logical`; the uniform path with a
-            // per-layer override (none today) keeps the per-layer sizing.
-            let slot_chunk_bytes = if hybrid_layout.is_some() {
-                chunk_bytes_logical
-            } else {
-                per_layer_block_elems
-                    .as_ref()
-                    .map(|v| blocks_per_chunk * v[slot / 2] * elem_bytes)
-                    .unwrap_or(chunk_bytes_logical)
-            };
-            // UNIFORM TurboQuant: the fp16 pool is never read (tape ops use the
-            // packed store + scratch) and never grown, so reserve only ONE chunk
-            // instead of the full num_chunks_total. That drops the per-layer fp16
-            // VA reservation (~13 GB) to a seed — the packed store (~4.7x smaller)
-            // is the canonical cache.
-            // 🛑 HYBRID SWA (gemma4): only the GLOBAL layers are TurboQuant'd; the
-            // FP16 SLIDING layers DO read this (shared) pool and grow it past the
-            // seed once their blocks cross a chunk boundary (BLOCKS_PER_CHUNK=128,
-            // ~384 tokens for gemma4-12b). A 1-chunk seed makes grow_to_cover fail
-            // (all chunks committed) → the sliding KV in chunk 1+ reads a stale
-            // chunk-address-table entry → garbage. So the hybrid path needs the
-            // full capacity; a chunk's pages are only mapped when the pool grows
-            // into it, so the SWA win (global packed + sliding fp16-windowed) holds.
-            let max_chunks = if kv_codec.is_turboquant() && hybrid_layout.is_none() {
-                1
-            } else {
-                num_chunks_total
-            };
-            let layer = scratchy_target_metal::sparse_kv::SparseKvLayer::new(
-                &mtl_device,
-                &residency,
-                &kv_mapper,
-                slot_chunk_bytes,
-                max_chunks,
-            )
-            .map_err(|e| ExecutorError::WorkerInit(format!("SparseKvLayer: {e}")))?;
-            kv_layers.push(layer);
-        }
+        // Slot s ↔ tensor s/2 (K at s%2==0, V at s%2==1) — must match the
+        // pool's alloc order T0K, T0V, T1K, … (slot = c % n_slots). All
+        // tensors are page-unified (same bytes) on the hybrid path, so
+        // every slot uses `per_block_elems`; the uniform path with a
+        // per-layer override (none today) keeps the per-layer sizing.
+        let slot_block_bytes = |slot: usize| match (&hybrid_layout, &per_layer_block_elems) {
+            (None, Some(v)) => v[slot / 2] * elem_bytes,
+            _ => per_block_elems * elem_bytes,
+        };
+        // UNIFORM TurboQuant: the fp16 pool is never read (tape ops use the
+        // packed store + scratch) and never grown, so reserve only ONE chunk
+        // instead of the full num_chunks_total. That drops the per-layer fp16
+        // VA reservation (~13 GB) to a seed — the packed store (~4.7x smaller)
+        // is the canonical cache.
+        // 🛑 HYBRID SWA (gemma4): only the GLOBAL layers are TurboQuant'd; the
+        // FP16 SLIDING layers DO read this (shared) pool and grow it past the
+        // seed once their blocks cross a chunk boundary (BLOCKS_PER_CHUNK=128,
+        // ~384 tokens for gemma4-12b). A 1-chunk seed makes grow_to_cover fail
+        // (all chunks committed) → the sliding KV in chunk 1+ reads a stale
+        // chunk-address-table entry → garbage. So the hybrid path needs the
+        // full capacity; a chunk's pages are only mapped when the pool grows
+        // into it, so the SWA win (global packed + sliding fp16-windowed) holds.
+        let max_chunks = if kv_codec.is_turboquant() && hybrid_layout.is_none() {
+            1
+        } else {
+            num_chunks_total
+        };
+        let layout: Vec<(usize, bool)> = (0..num_tensors_for_pool * 2)
+            .map(|slot| (slot_block_bytes(slot), false))
+            .collect();
+        let capacity = (max_chunks * blocks_per_chunk).min(num_gpu_blocks);
+        let kv_stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            &mtl_device,
+            &residency,
+            capacity,
+            blocks_per_chunk,
+            &layout,
+        )
+        .and_then(|mut s| {
+            s.grow_to(blocks_per_chunk.min(capacity), &kv_mapper)
+                .map(|_| s)
+        })
+        .map_err(|e| ExecutorError::WorkerInit(format!("KV stores: {e}")))?;
         info!(
             "ScratchyWorker(metal): KV layers — {} tensors × K/V, up to {} chunks of {} bytes \
              each, mapped as the pool grows",
-            kv_layers.len() / 2,
+            layout.len() / 2,
             num_chunks_total,
             chunk_bytes_logical,
         );
@@ -3576,7 +3562,6 @@ impl Worker for MetalWorker {
             // calls, one per slot) and grow (each grow step issues
             // `2*num_layers` calls in slot order, repeated per added chunk).
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
-            let kv_layers_ref = &mut kv_layers;
             let n_slots = num_tensors_for_pool * 2;
             KvCachePool::new_metal_chunked(
                 num_layers_for_pool,
@@ -3606,9 +3591,8 @@ impl Worker for MetalWorker {
                     let c = alloc_chunk_counter.get();
                     alloc_chunk_counter.set(c + 1);
                     let slot = c % n_slots;
-                    kv_layers_ref[slot]
-                        .commit_chunk(c / n_slots, bytes)
-                        .map_err(|e| anyhow::anyhow!("KV chunk commit slot={slot}: {e}"))
+                    let chunk = kv_stores.chunk(slot, c / n_slots * blocks_per_chunk, bytes);
+                    chunk.map_err(|e| anyhow::anyhow!("KV chunk slot={slot}: {e}"))
                 },
                 // Chunk-address table: `StorageModeShared` so the CPU can
                 // write the chunk gpuAddresses (`fill_chunk_tables` below).
@@ -3631,10 +3615,7 @@ impl Worker for MetalWorker {
                 self.kv_full_block_size,
             );
         }
-        self.target_kv_layers = kv_layers;
-        // The first chunk's pages are mapped on the mapper's queue; in place before
-        // anything reads them.
-        kv_mapper.wait();
+        self.target_kv_stores = Some(kv_stores);
         self.kv_mapper = Some(kv_mapper);
         // Commit the residency set NOW (before reading gpuAddresses):
         // the chunk buffers are referenced only by raw address from the
@@ -4311,15 +4292,16 @@ impl Worker for MetalWorker {
             // same shared pool, so a sliding ID can sit in a chunk the full
             // group never reached; an ungrown chunk has a stale address-table
             // entry and would fault on the sliding-layer write.
+            let max_full_block = attn.block_ids.iter().flatten().copied().max();
             let max_block = attn
-                .block_ids
+                .sliding_groups
                 .iter()
-                .chain(attn.sliding_groups.iter().flatten())
-                .flat_map(|b| b.iter())
+                .flatten()
+                .flatten()
                 .copied()
                 .max()
-                .unwrap_or(0);
-            self.grow_metal_kv_to_cover(max_block)?;
+                .max(max_full_block);
+            self.grow_metal_kv_to_cover(max_block.unwrap_or(0), max_full_block.unwrap_or(0))?;
         }
 
         // slot_mapping[t] = block_ids[abs_pos / bs] * bs + (abs_pos % bs)
