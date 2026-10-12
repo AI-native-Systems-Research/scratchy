@@ -547,7 +547,9 @@ pub fn bake(tokenizer_json: &str, digest: &str) -> Result<Bake, String> {
     if model["dropout"].as_f64().is_some_and(|p| p != 0.0) {
         return Err("BPE dropout".into());
     }
-    if !model["continuing_subword_prefix"].is_null() || !model["end_of_word_suffix"].is_null() {
+    // An empty prefix or suffix (Qwen's, granite's `""`) adds nothing: the same as none.
+    let affix = |key: &str| model[key].as_str().is_some_and(|s| !s.is_empty());
+    if affix("continuing_subword_prefix") || affix("end_of_word_suffix") {
         return Err("a continuing-subword prefix or end-of-word suffix".into());
     }
     let vocab: HashMap<&str, u32> = model["vocab"]
@@ -825,6 +827,46 @@ mod tests {
             "encode {n} tokens: from_file's {t_file:?}, baked {:?}",
             t.elapsed()
         );
+    }
+
+    /// Every `tokenizer.json` in the Hub cache: bakes (its self-check passing) or says why not.
+    /// `cargo test -p scratchy-core-model --lib baked_tokenizer -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads every tokenizer in the Hub cache"]
+    fn bakes_every_cached_tokenizer() {
+        let root = hf_hub_downloader::cache::default_root();
+        let mut repos: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        repos.sort();
+        for repo in repos {
+            let Ok(snapshots) = std::fs::read_dir(repo.join("snapshots")) else {
+                continue;
+            };
+            for snapshot in snapshots.flatten() {
+                let path = snapshot.path().join("tokenizer.json");
+                let (Some(digest), Ok(json)) =
+                    (cached_digest(&path), std::fs::read_to_string(&path))
+                else {
+                    continue;
+                };
+                let name = repo
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replacen("models--", "", 1)
+                    .replace("--", "/");
+                match bake(&json, &digest) {
+                    Ok(b) => eprintln!(
+                        "baked   {name}  {digest}  {:.1} MB",
+                        b.tables.len() as f64 / 1e6
+                    ),
+                    Err(why) => eprintln!("refused {name}  {digest}  {why}"),
+                }
+            }
+        }
     }
 
     #[test]

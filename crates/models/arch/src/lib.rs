@@ -26,8 +26,8 @@ pub fn compiled_hf_registry() -> &'static [&'static str] {
     COMPILED_HF_REGISTRY
 }
 
-// The tokenizers of the models this binary compiles, baked by the build script from their
-// `configs/<arch>/<stem>.tokenizer` digests (`scratchy_core_model::baked_tokenizer`).
+// The tokenizers of the models this binary compiles, baked by the build script from the Hub-cache
+// checkpoints of those models (`scratchy_core_model::baked_tokenizer`).
 include!(concat!(env!("OUT_DIR"), "/baked_tokenizers.rs"));
 
 // Every baked metal kernel the arches below name (`crate::__metal_bake::K_<key>`), each once,

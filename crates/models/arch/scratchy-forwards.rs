@@ -213,50 +213,70 @@ const METAL_ONLY: &[&str] = &["glm4-moe", "gpt-oss", "nemotron-h", "nemotron-h-l
 /// is dropped by the `supported` gate below before its configs are read.
 const SPYRE_CAPABLE: &[&str] = &["llama", "granite"];
 
-/// Write `$OUT_DIR/baked_tokenizers.rs`: a `BakedTokenizer` for every tokenizer a selected
-/// config's `<stem>.tokenizer` names (one blob digest per line), baked from that blob in the Hub
-/// cache (`scratchy_core_model::baked_tokenizer`). A digest the cache does not hold, or one `bake`
-/// refuses, is reported and left to load from `tokenizer.json` at runtime as before.
+/// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
+/// vocab size; the text decoder's when `text_config` nests it).
+fn config_shape(path: &Path) -> Option<(String, u64, u64, u64)> {
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let text = cfg
+        .get("text_config")
+        .filter(|t| t.is_object())
+        .unwrap_or(&cfg);
+    let field = |k: &str| {
+        text.get(k)
+            .or_else(|| cfg.get(k))
+            .and_then(serde_json::Value::as_u64)
+    };
+    Some((
+        cfg["architectures"][0].as_str()?.to_string(),
+        field("hidden_size")?,
+        field("num_hidden_layers")?,
+        field("vocab_size")?,
+    ))
+}
+
+/// Write `$OUT_DIR/baked_tokenizers.rs`: a `BakedTokenizer` for the tokenizer of every checkpoint
+/// in the Hub cache that is a model this build compiles — its `config.json` has a selected
+/// config's architecture and shape — baked from its `tokenizer.json`
+/// (`scratchy_core_model::baked_tokenizer`). A tokenizer `bake` refuses is reported and loads
+/// from `tokenizer.json` at runtime as before, as does any checkpoint the cache does not hold.
 fn bake_tokenizers(out_dir: &Path) {
     println!("cargo:rerun-if-env-changed=HF_HUB_CACHE");
     println!("cargo:rerun-if-env-changed=HF_HOME");
-    let mut digests = BTreeSet::new();
-    for config in scratchy_forward_compiler_macro::selected_config_paths() {
-        let sidecar = config.with_extension("tokenizer");
-        // Only watch it if it EXISTS (as `enabled_quants`).
-        if let Ok(text) = std::fs::read_to_string(&sidecar) {
-            println!("cargo:rerun-if-changed={}", sidecar.display());
-            digests.extend(
-                text.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                    .map(str::to_string),
-            );
-        }
-    }
+    let compiled: BTreeSet<_> = scratchy_forward_compiler_macro::selected_config_paths()
+        .iter()
+        .filter_map(|config| config_shape(config))
+        .collect();
     let root = hf_hub_downloader::cache::default_root();
+    if root.is_dir() {
+        // A model pulled after this build bakes on the next.
+        println!("cargo:rerun-if-changed={}", root.display());
+    }
+    let snapshots = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|repo| std::fs::read_dir(repo.path().join("snapshots")).ok())
+        .flatten()
+        .flatten()
+        .map(|snapshot| snapshot.path());
+    let mut baked = BTreeSet::new();
     let mut code = String::new();
-    for digest in &digests {
-        let blob = std::fs::read_dir(&root)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|repo| repo.path().join("blobs").join(digest))
-            .find(|blob| blob.is_file());
-        let Some(blob) = blob else {
-            println!(
-                "cargo:warning=tokenizer {digest} is not in the Hub cache ({}): it is not baked, \
-                 and loads from tokenizer.json at runtime",
-                root.display()
-            );
+    for snapshot in snapshots {
+        let tokenizer = snapshot.join("tokenizer.json");
+        if !config_shape(&snapshot.join("config.json")).is_some_and(|s| compiled.contains(&s)) {
+            continue;
+        }
+        let Some(digest) = scratchy_core_model::baked_tokenizer::cached_digest(&tokenizer) else {
             continue;
         };
-        println!("cargo:rerun-if-changed={}", blob.display());
-        let json = std::fs::read_to_string(&blob).expect("read a cached tokenizer.json");
-        let bake = match scratchy_core_model::baked_tokenizer::bake(&json, digest) {
+        if !baked.insert(digest.clone()) {
+            continue;
+        }
+        let json = std::fs::read_to_string(&tokenizer).expect("read a cached tokenizer.json");
+        let bake = match scratchy_core_model::baked_tokenizer::bake(&json, &digest) {
             Ok(bake) => bake,
             Err(why) => {
-                println!("cargo:warning=tokenizer {digest} is not baked: {why}");
+                println!("cargo:warning={} is not baked: {why}", tokenizer.display());
                 continue;
             }
         };
