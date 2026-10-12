@@ -18,7 +18,8 @@
 //!   absolute off-host CDN `location`.
 //! * The same endpoint answers **307** for git-tracked content, with
 //!   `x-linked-etag` (a git blob SHA-1) and a *relative* `location`.
-//! * Both carry `x-repo-commit`.
+//! * Both carry `x-repo-commit`, and so does the **404** for a file the repo
+//!   does not have.
 //!
 //! That contract is held stable by the entire ecosystem — Python
 //! `huggingface_hub`, `transformers`, llama.cpp, ollama and every `curl` in
@@ -312,9 +313,19 @@ impl Repo<'_> {
     /// Order matters and is the same order Python uses: resolve the cache
     /// without touching the network, then probe, then check whether the blob
     /// is already present under another revision, and only then move bytes.
+    /// A cached answer is an answer either way: a file the Hub already said
+    /// this commit lacks is not asked for again.
     pub fn download(&self, filename: &str, progress: &mut dyn Progress) -> Result<PathBuf> {
-        if let Some(hit) = self.cached(filename) {
-            return Ok(hit);
+        match cache::lookup(&self.client.root, &self.repo_id, &self.revision, filename) {
+            cache::Lookup::Present(hit) => return Ok(hit),
+            cache::Lookup::Absent => {
+                return Err(Error::NotFound {
+                    repo: self.repo_id.clone(),
+                    filename: filename.to_string(),
+                    commit: None,
+                });
+            }
+            cache::Lookup::Unknown => {}
         }
 
         let opts = fetch::Opts {
@@ -330,15 +341,26 @@ impl Repo<'_> {
             flow: limit::Flow(self.client.flows.fetch_add(1, Ordering::Relaxed)),
         };
 
+        let dir = cache::repo_dir(&self.client.root, &self.repo_id);
         let meta = fetch::probe(
             &opts,
             &self.client.endpoint,
             &self.repo_id,
             &self.revision,
             filename,
-        )?;
+        )
+        .inspect_err(|e| {
+            if let Error::NotFound {
+                commit: Some(commit),
+                ..
+            } = e
+            {
+                // Best effort, as in Python: a marker that cannot be written
+                // costs the next run one probe, and the answer is the same.
+                let _ = cache::record_absent(&dir, commit, filename);
+            }
+        })?;
 
-        let dir = cache::repo_dir(&self.client.root, &self.repo_id);
         let blob = cache::blob_path(&dir, &meta.etag);
 
         // Content already on disk under a different revision: link, do not

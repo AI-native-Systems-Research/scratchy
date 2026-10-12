@@ -14,7 +14,12 @@ pub enum Error {
     /// The repo does not contain this file (Hub returned 404). Distinct from
     /// every other variant: this one, and only this one, means "not there".
     #[error("{repo}: no such file `{filename}`")]
-    NotFound { repo: String, filename: String },
+    NotFound {
+        repo: String,
+        filename: String,
+        /// The commit the Hub answered for (its `x-repo-commit`), when it said.
+        commit: Option<String>,
+    },
 
     /// The Hub answered a redirect it will not serve the file for. A
     /// wrongly-cased or renamed repo id is the usual cause.

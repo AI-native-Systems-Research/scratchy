@@ -62,16 +62,63 @@ pub fn ref_path(repo_dir: &Path, revision: &str) -> PathBuf {
     repo_dir.join("refs").join(revision)
 }
 
-/// Network-free lookup: `refs/<revision>` -> commit -> snapshot entry, if the
-/// entry resolves to something that exists.
+/// `<repo>/.no_exist/<commit>/<filename>`: an empty file recording that the
+/// Hub answered 404 for `filename` at `commit`. Python `huggingface_hub` writes
+/// and reads the same marker, so an absence either client learned spares the
+/// other its probe.
+pub fn no_exist_path(repo_dir: &Path, commit: &str, filename: &str) -> PathBuf {
+    repo_dir.join(".no_exist").join(commit).join(filename)
+}
+
+/// What the cache knows about one file, without the network.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// On disk, here.
+    Present(PathBuf),
+    /// The Hub answered that the revision's commit has no such file.
+    Absent,
+    /// Neither on disk nor answered: only the Hub can say.
+    Unknown,
+}
+
+/// Network-free lookup: `refs/<revision>` -> commit -> the snapshot entry, if
+/// it resolves to something that exists, else that commit's `.no_exist`
+/// marker — Python's `try_to_load_from_cache`.
 ///
 /// `Path::exists` follows symlinks, so a snapshot entry whose blob was
 /// evicted correctly reports absent rather than handing back a dangling link.
-pub fn cached_path(root: &Path, repo_id: &str, revision: &str, filename: &str) -> Option<PathBuf> {
+pub fn lookup(root: &Path, repo_id: &str, revision: &str, filename: &str) -> Lookup {
     let dir = repo_dir(root, repo_id);
-    let commit = std::fs::read_to_string(ref_path(&dir, revision)).ok()?;
+    let Ok(commit) = std::fs::read_to_string(ref_path(&dir, revision)) else {
+        return Lookup::Unknown;
+    };
     let path = snapshot_path(&dir, commit.trim(), filename);
-    path.exists().then_some(path)
+    if path.exists() {
+        Lookup::Present(path)
+    } else if no_exist_path(&dir, commit.trim(), filename).is_file() {
+        Lookup::Absent
+    } else {
+        Lookup::Unknown
+    }
+}
+
+/// The snapshot entry for `filename`, if it is on disk.
+pub fn cached_path(root: &Path, repo_id: &str, revision: &str, filename: &str) -> Option<PathBuf> {
+    match lookup(root, repo_id, revision, filename) {
+        Lookup::Present(path) => Some(path),
+        Lookup::Absent | Lookup::Unknown => None,
+    }
+}
+
+/// Record that the Hub has no `filename` at `commit`.
+pub fn record_absent(repo_dir: &Path, commit: &str, filename: &str) -> Result<()> {
+    let marker = no_exist_path(repo_dir, commit, filename);
+    let parent = marker
+        .parent()
+        .expect("a marker always sits in its commit directory");
+    std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    std::fs::File::create(&marker).map_err(|e| Error::io(&marker, e))?;
+    Ok(())
 }
 
 /// Link a snapshot entry at `<repo>/snapshots/<commit>/<filename>` to the
@@ -209,6 +256,24 @@ mod tests {
             cached_path(&dir, "a/b", "main", "config.json").is_none(),
             "an evicted blob must read as absent, not as a usable path"
         );
+    }
+
+    /// A recorded 404 answers for the commit it was recorded at, and only it:
+    /// once `refs/main` moves on, the file is unknown again.
+    #[test]
+    fn a_recorded_absence_answers_for_its_commit_only() {
+        let dir = tempdir();
+        let repo = dir.join("models--a--b");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::write(repo.join("blobs").join("etag1"), b"hello").unwrap();
+        link_into_snapshot(&repo, "commit0", "config.json", "etag1", "main").unwrap();
+        let lookup = || lookup(&dir, "a/b", "main", "chat_template.jinja");
+
+        assert_eq!(lookup(), Lookup::Unknown);
+        record_absent(&repo, "commit0", "chat_template.jinja").unwrap();
+        assert_eq!(lookup(), Lookup::Absent);
+        link_into_snapshot(&repo, "commit1", "config.json", "etag1", "main").unwrap();
+        assert_eq!(lookup(), Lookup::Unknown);
     }
 
     /// Shards of one repo finish together, and each records the same
