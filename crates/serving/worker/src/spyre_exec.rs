@@ -6,12 +6,14 @@
 //! every model-specific decision was resolved at bake and reaches here as generated data.
 
 // ⭐ THE POOL/SLOT VOCABULARY IS CARD-ONLY, so its imports carry the same cfg as the blocks that
-// use it. `PagedKvPool` is the exception — it sizes the resident cache on both paths.
+// use it. `PagedKvPool` used to be the exception — the context hook read its consts on BOTH paths;
+// that hook reads the reach off the loaded bundle now, so even that import is card-only again.
 #[cfg(feature = "spyre-hw")]
 use std::collections::HashMap;
 
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
+#[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::PagedKvPool;
 #[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{RowPages, SlotCount, SlotMap, SlotMapError};
@@ -197,11 +199,11 @@ const CORRECT_BATCH_WIDTH: usize = 8;
 ///     win. Each row attends only its own request's blocks (PROVEN: per-row
 ///     block_table honored; rows don't cross-contaminate).
 impl Worker for SpyreWorker {
-    /// THE CONTEXT THE PREFIX MASK CAN ADDRESS — reported so the ENGINE rejects an over-long prompt at
-    /// admission instead of the worker killing the whole batch mid-forward.
+    /// THE CONTEXT THE POOL CAN ADDRESS, so the ENGINE rejects an over-long prompt at admission
+    /// instead of the worker killing the whole batch mid-forward.
     ///
     /// 🛑 THIS IS THE HOOK I SHOULD HAVE USED FIRST, AND METAL/CUDA ALREADY DO (`gpu_worker.rs:2509`). I
-    /// enforced `MAX_PAGES_PER_ROW` inside `ensure_pages`, which runs INSIDE a forward — so refusing ONE
+    /// enforced the page ceiling inside `ensure_pages`, which runs INSIDE a forward — so refusing ONE
     /// over-deep request failed the whole step with an `Executor error` and took the other three requests
     /// with it. Measured: 4 of 4 requests errored where 3 of 4 had answered. A per-request limit enforced
     /// per-BATCH is a batch-fatal limit.
@@ -210,11 +212,28 @@ impl Worker for SpyreWorker {
     /// value "so an over-long prompt is rejected, not silently truncated by the kernel". One request gets a
     /// clean rejection; the rest of the batch is untouched.
     ///
-    /// The number is the mask's, not the pool's: the prefix mask costs `pages * width^2` blocks against a
-    /// baked segment (`PagedKvPool::decode_mask_bytes`), so the pages a row may hold is bounded by
-    /// `MAX_PAGES_PER_ROW` even though the pool holds far more.
+    /// ⭐ THE NUMBER IS `min(WHAT THE POOL FUNDS, WHAT THE MASK BAKED)` — both read from the load, never
+    /// a const. The affordable term is the MEMORY law: the pool's own budget over its page stride across
+    /// the launch rows (`served_context`, decided at pool sizing), so the served context moves with the
+    /// card, the KV dtype's page stride and the row count the way metal's does with available GPU memory.
+    /// The mask term is the DEVICE law and the safety: every rung's pmask is baked at
+    /// `MAX_SEGMENT_BYTES / page_bytes` blocks, which covers every pool any card can budget for — so it
+    /// can only bind if the worker's page arithmetic ever disagrees with the bake's, and then it is the
+    /// difference between a clean admission refusal and the batch-fatal one above.
     fn kv_max_addressable_tokens(&self) -> Option<usize> {
-        Some(PagedKvPool::MAX_PAGES_PER_ROW as usize * PagedKvPool::PAGE_SLOTS)
+        #[cfg(feature = "spyre-hw")]
+        {
+            let model = self.model.as_ref()?;
+            let SendnnSession::SuperDsc(sb) = &model.session;
+            let mask = sb.mask_reach()?;
+            let mask_tokens = mask.get() as usize * PagedKvPool::PAGE_SLOTS;
+            return Some(model.served_context.min(mask_tokens));
+        }
+        // The emulator grows its KV on the host and sizes no pool, so `served_context`
+        // stays `usize::MAX` there — a cap that never binds, which the engine treats
+        // exactly like the absence of one.
+        #[cfg(not(feature = "spyre-hw"))]
+        self.model.as_ref().map(|m| m.served_context)
     }
 
     fn init_device(&mut self) -> ExecutorResult<()> {

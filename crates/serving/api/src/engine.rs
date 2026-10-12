@@ -2194,7 +2194,8 @@ impl AsyncEngine {
         // file is served normally.
         if num_prompt_tokens as usize > self.max_model_len {
             return Err(crate::error::ServeError::Validation(format!(
-                "prompt is {num_prompt_tokens} tokens but this model serves at most {} — the limit is the                  backend's addressable context, not the pool's size",
+                "prompt is {num_prompt_tokens} tokens but this model serves at most {} — the \
+                 limit is what the backend's KV memory funds and its prefix mask addresses",
                 self.max_model_len
             )));
         }

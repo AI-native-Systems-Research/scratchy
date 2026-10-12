@@ -95,14 +95,24 @@ fn coverage_is_pages_times_page_slots() {
     assert_eq!(RowPages::holding(SlotCount::new(PAGE)).get(), 1);
     assert_eq!(RowPages::holding(SlotCount::new(PAGE + 1)).get(), 2);
     // The mask's ceiling is expressed in the same type, so it cannot be compared with a slot count.
+    // The cap is built through the artifact's own path (`of_placement`) — the ceiling is a bake
+    // fact read from a pmask placement, never a const, so the test derives it the way the worker
+    // does: 16 blocks of one broadcast row, 2 B per slot over PAGE slots.
+    let ceiling = scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
+        16 * PAGE as u64 * 2,
+        1,
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("width 1 is baked"),
+        SlotCount::new(PAGE),
+    )
+    .expect("a 16-block cap from a 16-block placement");
     assert!(
         RowPages::holding(SlotCount::new(16 * PAGE))
-            .within_mask_reach()
+            .within_mask_reach(ceiling)
             .is_some()
     );
     assert!(
         RowPages::holding(SlotCount::new(16 * PAGE + 1))
-            .within_mask_reach()
+            .within_mask_reach(ceiling)
             .is_none()
     );
 }

@@ -98,23 +98,31 @@ pub(crate) fn install_host_blocks(
             PagedKvPool::PAGE_SLOTS,
         )));
     }
-    // ⛔ THE CONTEXT CEILING. `MAX_PAGES_PER_ROW` exists because the prefix mask costs
-    // `pages * width^2 * nqh * 512` bytes against a BAKED segment (`decode_mask_bytes`), so a request
-    // deeper than the ceiling makes the fold read mask blocks the host never staged — zero bytes, VALID in
-    // an additive mask, and the row answers with one EOS token. A loud refusal is a bug report; a collapse
-    // is a wrong answer that reads as fluent.
-    let Some(want) = RowPages::holding(span).within_mask_reach() else {
-        return Err(werr(format!(
-            "superdsc paged: request needs {} slot(s) = {} page(s) but a row may hold at most {} page(s). \
-             That ceiling is the PREFIX MASK's, not the pool's: the mask costs `pages * width^2` blocks \
-             against a baked segment, so at the widest baked rung ({}) only {} page(s) fit. Serve a shorter \
-             context, or make the mask cost one block per PAGE instead of per (row, page).",
-            span.get(),
-            RowPages::holding(span).get(),
-            PagedKvPool::MAX_PAGES_PER_ROW,
-            PagedKvPool::WIDEST_BATCH_RUNG,
-            PagedKvPool::MAX_PAGES_PER_ROW,
-        )));
+    // ⛔ THE CONTEXT CEILING. Every `rows_are_requests` bundle (the decode rungs) bakes its prefix
+    // mask at the DEVICE-DERIVED page ceiling — `MAX_SEGMENT_BYTES / page_bytes`, the most pages one
+    // region of KV can hold, read back from the rung's own placement — so a request deeper than that
+    // makes the fold read mask blocks the host never staged: zero bytes, VALID in an additive mask,
+    // and the row answers with one EOS token. A loud refusal is a bug report; a collapse is a wrong
+    // answer that reads as fluent.
+    let want = match sb.mask_reach() {
+        // `None` (no rung's layout readable) keeps the prior behaviour rather than refusing on a
+        // number we do not have — the per-launch `MaskBlocks::fits` check holds the same `None`
+        // semantics.
+        None => RowPages::holding(span),
+        Some(cap) => RowPages::holding(span).within_mask_reach(cap).ok_or_else(|| {
+            werr(format!(
+                "superdsc paged: request needs {} slot(s) = {} page(s) but a row may hold at most \
+                 {} page(s). That ceiling is the PREFIX MASK's, not the pool's: the rungs bake {} \
+                 mask block(s) — one per page, derived from the device (one region of KV over this \
+                 model's page bytes) — so a deeper row's fold would read mask bytes the host never \
+                 staged. The pool cannot out-run one region; serve a shorter context, fewer launch \
+                 rows, or a denser page (fp8 KV).",
+                span.get(),
+                RowPages::holding(span).get(),
+                cap.get(),
+                cap.get(),
+            ))
+        })?,
     };
     // ⭐ AND THE MAP MUST BE BUILDABLE — the host's blocks at the logical pages this request holds keys in,
     // one shared scratch page for the fully-masked ones. `None` now means only one thing: the host granted

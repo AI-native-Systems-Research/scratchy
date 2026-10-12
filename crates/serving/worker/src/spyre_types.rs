@@ -357,6 +357,19 @@ impl SuperDscBundle {
         self.decode_rungs.iter().position(|r| r.seqs.holds(live))
     }
 
+    /// ⭐ THE CONTEXT CEILING EVERY PMASK IN THIS MODEL BAKED — the least of the decode rungs' own
+    /// reservations, read from their placements.
+    ///
+    /// The bake derives the pmask's block count from the device (`MAX_SEGMENT_BYTES` over the
+    /// model's page bytes — see `compute_bundle_layout`'s pmask arm), one expression feeding the
+    /// rung and broadcast arms alike, so every rung answers the same number and the min is the safe
+    /// read for the day one disagrees. `None` when no rung's layout was readable, which the callers
+    /// treat exactly as the per-launch `MaskBlocks::fits` check treats its own `None`: keep the
+    /// prior behaviour rather than refuse on a number we do not have.
+    pub(crate) fn mask_reach(&self) -> Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks> {
+        self.decode_rungs.iter().filter_map(|r| r.mask_cap).min()
+    }
+
     /// HOW THE POOL IS DIVIDED: one equal, consecutive run of pages per KV row.
     ///
     /// Cut for the WIDEST baked decode rung, not for the requests currently live, so a run does not
@@ -465,6 +478,17 @@ pub(crate) struct Loaded {
     ///
     /// `None` on the paths that never size a paged pool (KTIR emulator, non-paged sessions).
     pub(crate) kv_budget_bytes: Option<u64>,
+    /// ⭐ THE CONTEXT THIS RUN'S POOL CAN ACTUALLY SERVE, in tokens — `min(the declared context, what
+    /// the KV budget funds across the launch rows)`, decided once where budget, page stride and row
+    /// count first meet (the pool sizing in `load_model`).
+    ///
+    /// This is the MEMORY side of the context law: the bake's pmask covers every pool any card can
+    /// express (its block count is `MAX_SEGMENT_BYTES / page_bytes`), so what actually binds a run is
+    /// how many pages its own budget buys — `(budget/stride − reserve) / rows` — and this field is
+    /// that answer. `kv_max_addressable_tokens` reports `min(this, the baked mask reach)` so the
+    /// engine's admission cap is exactly what the pool funds, never more and never a hand-picked
+    /// constant. `usize::MAX` on the paths that never size a paged pool (no budget-derived cap).
+    pub(crate) served_context: usize,
 }
 
 /// Per-request generation state: token history + the growing host KV cache.

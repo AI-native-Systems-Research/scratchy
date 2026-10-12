@@ -24,7 +24,6 @@
 //! notices, because the result is a fluent wrong answer with no fault.
 #![cfg(feature = "spyre")]
 
-use scratchy_subtile::sdsc_abstract::PagedKvPool;
 use std::collections::HashSet;
 
 /// `ensure_pages`' draw rule, verbatim: the lowest page no live request holds and this one does not.
@@ -118,8 +117,12 @@ fn the_uniform_batch_that_passes_on_card_draws_nothing_at_all() {
 
 #[test]
 fn every_raggedness_up_to_the_ceiling_stays_disjoint() {
-    // Not just the one profile: sweep the shapes a 4-wide batch can take, to the mask's page ceiling.
-    let max = PagedKvPool::MAX_PAGES_PER_ROW as usize;
+    // Not just the one profile: sweep the shapes a 4-wide batch can take, to the mask's page
+    // ceiling. The ceiling is no longer a const — it is derived per model at bake (the region cap
+    // over the page bytes) — and this sweep tests the HOST allocator logic, which is
+    // ceiling-agnostic; 32 is the historic ceiling and still the widest worth exhausting
+    // (32^4 shapes, each grown to `want`).
+    let max = 32usize;
     for a in 1..=max {
         for b in 1..=max {
             for c in 1..=max {

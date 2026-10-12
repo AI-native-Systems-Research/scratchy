@@ -197,8 +197,8 @@ pub use ktir_superdsc::reserved_tids::{
 // stayed right here. That is the seam: a third-party producer builds the same struct from its own
 // facts.
 pub use ktir_superdsc::placement::{
-    BundleLayout, MAX_FOLD_PASSES, MAX_PAGES_PER_REQUEST, RetileDescriptor, SegRole, SynthAlloc,
-    TensorPlacement, WEIGHT_SPILL_SEGS, align128, syn, synth_footprint_bytes,
+    BundleLayout, RetileDescriptor, SegRole, SynthAlloc, TensorPlacement, WEIGHT_SPILL_SEGS,
+    align128, syn, synth_footprint_bytes,
 };
 // ⭐⭐⭐ AND THE EMITTER ITSELF NOW LIVES IN `ktir_superdsc::emit` — `emit_sdsc`/`emit_sdsc_tiled`, the
 // whole `assemble_*` family, `pw1`/`pw2`, `ArgBinding`/`EmittedOp`, `bmm_site` and the SFP constant
@@ -1157,21 +1157,17 @@ pub fn compute_bundle_layout<F: RopeForm>(
             }
             if !scale_placed {
                 // Attention MASKS → seg0 (activation, re-bound per step), worker-TILED to [nqh·mq, *]:
-                // pmask=[nqh·mq, cap] (prefix validity), cmask=[nqh·mq, mq_pad] (causal triu). Shared across
-                // layers (same shape every layer). The attention SOFTMAX SCALE is NOT placed here: it flows
-                // through `scalarmul_scales` (config `attention_multiplier`, via `AttnDecode.scale`), placed
-                // below with the other config scales and bound by the worker's scale loop — the emitter
-                // NEVER recomputes 1/sqrt(hd), which would ignore the model's real attention_multiplier.
+                // pmask=[nqh·mq, max_pages] (prefix validity), cmask=[nqh·mq, mq_pad] (causal triu).
+                // Shared across layers (same shape every layer). The attention SOFTMAX SCALE is NOT
+                // placed here: it flows through `scalarmul_scales` (config `attention_multiplier`,
+                // via `AttnDecode.scale`), placed below with the other config scales and bound by the
+                // worker's scale loop — the emitter NEVER recomputes 1/sqrt(hd), which would ignore
+                // the model's real attention_multiplier.
                 //
-                // NOTE (2026-07-28): pmask is OVER-RESERVED. Prefix validity is head- and
-                // query-row-independent, the emitter reads it via In::mb_at (one-row mb-broadcast), and
-                // BOTH workers now stage exactly one `[cap]` row — so `cap*2` would suffice and
-                // [nqh·mq, cap] is ~507 KB of dead seg0 re-H2D'd per prefill forward. Deliberately NOT
-                // shrunk here: pmask is placed for EVERY attention bundle, so resizing it shifts the
-                // seg0 offsets of the DECODE bundle too (verified: all decode hashes move). Decode was
-                // only just made coherent, and 507 KB is 2.7% of the ~19 MB of dead seg0 this pass
-                // removes, so it is not worth perturbing a known-good bundle. Revisit once prefill TTFT
-                // has settled and decode can be re-validated in the same run.
+                // (The 2026-07 note that pmask was "over-reserved" described the pre-windowing
+                // upload: `refill_activations` now sends the BOUND extent as merged aligned runs,
+                // never the reservation, and the host binds only the live blocks — so the tail of a
+                // deep reservation is dead ADDRESS SPACE, not dead H2D.)
                 // PREFIX-VALIDITY MASK stays in the ACTIVATION segment, ONE PAGE wide, describing
                 // the TAIL page — the only page that is partially valid. Its own segment would let a
                 // per-page shift select each page's row, but a bound tensor marks its WHOLE segment
@@ -1185,7 +1181,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // WHOLE segment for re-upload every step. The spare segments carry a couple of
                 // hundred intermediates (~1.6 MB in the decode bundle), which at the preamble's
                 // measured ~2.5 GB/s is ~0.64 ms per token of pure upload — most of the paged decode
-                // regression. The activation segment is 0.04 MB and is uploaded every step anyway,
+                // regression. The activation segment is small and is uploaded every step anyway,
                 // so the mask rides along for free.
                 //
                 // Shifting it per page is safe HERE and nowhere else: dumped from the baked bundle,
@@ -1193,35 +1189,57 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // touches nothing else in the activation segment, so the shift moves nothing it reads.
                 let mseg = SegRole::Activation.segment();
                 let pmoff = seg_bytes[mseg];
+                // ⭐⭐⭐⭐⭐ THE CONTEXT CEILING IS DERIVED FROM THE DEVICE, NOT CHOSEN.
+                //
+                // A row may hold as many pages as ONE POOL can, and a pool is a single flex region
+                // (`bundle::MAX_SEGMENT_BYTES` — the same cap the runtime budget takes from
+                // `card_bytes.max_single_allocation()`, which `fxa_rust_abi` guards equal to it).
+                // The reservation is that cap over the model's own page bytes, so it covers every
+                // pool any card can budget for and MEMORY binds at runtime, exactly as it does on
+                // metal: a bigger budget, a wider card or a denser page (fp8 KV) raises the served
+                // context by arithmetic, not by editing a constant. The number is per-bundle fact —
+                // read back at load as `BakedMaskBlocks` — not a shared const, because the page
+                // stride is a MODEL fact and no model-independent constant can be its ceiling.
+                //
+                // The page bytes are this bundle's own placement facts: `layer_stride` (three planes
+                // of `nkvh · hd · PAGE_SLOTS` elements — the same deltas the runtime derives the
+                // pool stride from) × 2 B × the layer count. The layer count is the roll's trip
+                // count for a re-rolled tape; an unrolled graph states its own, one AttnDecode node
+                // per layer.
+                let layers = if per_layer_ext.is_empty() {
+                    ir.nodes
+                        .iter()
+                        .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
+                        .count()
+                } else {
+                    per_layer_ext.len()
+                }
+                .max(1) as u64;
+                let page_bytes = pool.layer_stride() as u64 * 2 * layers;
+                let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
                 // ONE validity row over the max context, or one PER QUERY ROW when the rows are
                 // separate requests and each carries its own history. The multiplier is the op row
                 // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.
                 // It stays 1 for a prompt chunk — at prefill's mq=96 the widened form would be
-                // ~50 MB of mask re-uploaded every forward, and a prompt does not need it.
+                // tens of MB of mask re-uploaded every forward, and a prompt does not need it.
                 // ONE BLOCK PER FOLD PASS when the rows are requests. A pass reads ONE request's
                 // page, so every other row must be masked off for it — the mask is `[pass][row][page]`
                 // and the runtime steps it by a whole `rows * page` block. A prompt keeps one
                 // broadcast row per page, which is all its rows can need.
-                // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO IT NEEDS `MAX_PAGES_PER_ROW`
-                // BLOCKS AND NOT `MAX_FOLD_PASSES`. A gathered fold's pass IS a page and serves the whole
-                // batch (`MaskBlockForm::PerPage`), so the passes are bounded by the pages ONE ROW can hold
-                // — 16 — where an uncollapsed fold's are bounded by `pages × requests` over the shared pool
-                // (64). That is a 4x SMALLER reservation, and since the host stages only the live blocks it
-                // is also `mq`x less mask uploaded every step: at bs=8 and three pages, 3 blocks instead of
-                // 24.
+                // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO ITS PASSES ARE THE PAGES
+                // ONE ROW CAN HOLD — `max_pages` here — where an uncollapsed fold's are `pages × requests`
+                // over the shared pool. That is a SMALLER reservation per page, and since the host stages
+                // only the live blocks it is also `mq`x less mask uploaded every step: at bs=8 and three
+                // pages, 3 blocks instead of 24.
                 //
                 // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
                 // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
-                // Getting it wrong is silent in the dangerous direction: `MAX_PAGES_PER_ROW` blocks against
-                // an uncollapsed fold is a fold reading mask bytes nobody staged, which read as ZERO and
-                // therefore VALID.
+                // Getting it wrong is silent in the dangerous direction: too few blocks against the fold
+                // is a fold reading mask bytes nobody staged, which read as ZERO and therefore VALID.
                 let (pm_rows, pm_blocks) = if rows_are_requests {
-                    (
-                        nqh * mq,
-                        scratchy_subtile::sdsc_abstract::PagedKvPool::MAX_PAGES_PER_ROW as u64,
-                    )
+                    (nqh * mq, max_pages)
                 } else {
-                    (1, MAX_PAGES_PER_REQUEST)
+                    (1, max_pages)
                 };
                 let pmbytes = pm_rows
                     * pm_blocks
@@ -1396,9 +1414,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     // on some other pass's entries — a clean bake reading real block numbers from the wrong
                     // page. `gather_index_table` takes the SAME value as `pass_stride_entries`.
                     //
-                    // ⛔ AND IT IS THE MASK'S BLOCK COUNT TOO, not `MAX_FOLD_PASSES`: a gathered fold's
-                    // passes are the pages ONE ROW holds. Over-reserving would be inert here, but agreeing
-                    // with the mask's own grid is what keeps the shift meaningful for both tensors.
+                    // ⛔ AND IT IS THE MASK'S BLOCK COUNT TOO — the derived page ceiling, whatever
+                    // it is: a gathered fold's passes are the pages ONE ROW holds. Over-reserving
+                    // would be inert here, but agreeing with the mask's own grid is what keeps the
+                    // shift meaningful for both tensors.
                     let bioff = seg_bytes[a];
                     let bibytes = pmbytes;
                     placements.insert(

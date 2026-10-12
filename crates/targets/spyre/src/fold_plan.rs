@@ -634,20 +634,22 @@ pub fn page_base_bytes(s: &SessionKv, rp: RowPage) -> Bytes {
 /// ⛔⛔⛔ AND THE STRIDE THIS TYPE MEASURES IS **NOT BAKEABLE**, WHICH KILLS THE ROUTE THAT WOULD BAKE
 /// `MAX_PAGES_PER_ROW * layers * layer_stride` AND CHECK IT AGAINST WHAT IS MEASURED HERE. That plan —
 /// "keep reading the pool directly, no gather, ~200 lines, guarded by [`collapsed`]'s equality check" —
-/// rests on the host STRIPING the pool by the const `PagedKvPool::MAX_PAGES_PER_ROW` (16). **It does
+/// rests on the host STRIPING the pool by the const `PagedKvPool::MAX_PAGES_PER_ROW`. **It does
 /// not.** `BlockTable::map_row` walks the row's LOGICAL pages and pushes `PhysPage(id)` for each id the
 /// engine's block manager handed out, in the order it handed them out, aliasing the fully-masked pages
 /// to one shared scratch page. So the stripe below is whatever the free list produced — measured 2 pages
-/// apart at bs=8 with one page per row (the scheduler grants "own pages + 1"), NOT 16 — and it changes
+/// apart at bs=8 with one page per row (the scheduler grants "own pages + 1"), NOT the const — and it
+/// changes
 /// with the allocation. A matmul steps its batch axis by an extent fixed when the bundle was COMPILED,
-/// so a stride that is 2 today and 3 tomorrow cannot be stepped at all, and a bundle baking 16 would
+/// so a stride that is 2 today and 3 tomorrow cannot be stepped at all, and a bundle baking the
+/// const would
 /// simply never satisfy the equality check: the fold would silently never collapse and the only symptom
 /// would be that it is not faster. ⇒ There are exactly two ways to give the device a request axis:
 /// an operand whose per-request pitch THIS COMPILER chose (the gather's contiguous scratch), or a HOST
 /// that stripes the pool by that const so the measured stride equals the baked one by construction. The
 /// second is the smaller change and it also unlocks the cache write and the Kᵗ re-transpose — the other
-/// two per-request launches, which the gather does NOT reach — but it costs capacity (`rows * 16` pages
-/// must fit the pool, so 368 pages caps the ladder at 23 rows) and it re-introduces the per-request row
+/// two per-request launches, which the gather does NOT reach — but it costs capacity (`rows *
+/// MAX_PAGES_PER_ROW` pages must fit the pool) and it re-introduces the per-request row
 /// scarcity that `ensure_pages`'s own note records as deliberately deleted. Neither is written.
 ///
 /// ⛔ AND THE PAGE MAPS ARE NO LONGER WHERE THE ROW LIVES. This used to read the stride out of
