@@ -20,15 +20,14 @@ use serde::Serialize;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, Column, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Grid,
-    Heading, Layer, Section, Span, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile,
-    Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Heading,
+    Layer, Section, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    Better, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cfmt, failed,
-    fmt, lfmt, marks, marks_note, med, partial, served, timing, untimed_note,
+    Better, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed, fmt, lfmt,
+    marks, marks_note, med, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -976,12 +975,28 @@ impl Sweep {
     fn metrics(self) -> [(Metric, &'static str, &'static str); 2] {
         match self {
             Sweep::Users => [
-                (Metric::Throughput, "Throughput (tok/s, higher is better)", "tok/s"),
-                (Metric::Tpot, "Time per output token (ms, lower is better)", "TPOT ms"),
+                (
+                    Metric::Throughput,
+                    "Throughput (tok/s, higher is better)",
+                    "tok/s",
+                ),
+                (
+                    Metric::Tpot,
+                    "Time per output token (ms, lower is better)",
+                    "TPOT ms",
+                ),
             ],
             Sweep::Prompt => [
-                (Metric::Ttft, "Time to first token (ms, lower is better)", "TTFT ms"),
-                (Metric::PeakMem, "Peak memory (MiB, lower is better)", "peak MiB"),
+                (
+                    Metric::Ttft,
+                    "Time to first token (ms, lower is better)",
+                    "TTFT ms",
+                ),
+                (
+                    Metric::PeakMem,
+                    "Peak memory (MiB, lower is better)",
+                    "peak MiB",
+                ),
             ],
         }
     }
@@ -2463,8 +2478,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     p { style: "contain: inline-size",
                                         "Every model's prompt size × answer size grid on every machine: in each cell, the model's \
                                          prefill (time to first token) grid, then its decode (throughput) grid (rows: prompt, short to \
-                                         long; columns: answer, short to long). Colour is how many times faster scratchy is than mlx-lm \
-                                         (ollama where a run has no mlx-lm): blue faster, red slower, the middle step within noise. \
+                                         long; columns: answer, short to long), one user at a time where the grid ran at 1 (the base users count \
+                                         in runs from before). Colour is how many times faster scratchy is than the engine named under the \
+                                         grid: oMLX TurboQuant where the run has it, else the next of oMLX, mlx-lm, vllm-metal, ollama, \
+                                         llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
                                     div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem 2rem",
@@ -2496,7 +2513,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                 ContentPanel { id: slug(title), shown: false,
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
-                                            p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
+                                            p { "scratchy against oMLX TurboQuant (or the next engine a run has, in the order of the heat maps) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
                                             div { style: spark_grid(stems.len()),
                                                 div {}
                                                 div {}
@@ -2538,9 +2555,9 @@ fn spark_grid(columns: usize) -> String {
 /// The glance's startup panel's name.
 const STARTUP: &str = "Startup by model size";
 
-/// The engines the startup panel compares: scratchy, and mlx-lm, which loads
-/// the same MLX checkpoint.
-const STARTUP_ENGINES: [Engine; 2] = [Engine::Scratchy, Engine::MlxLm];
+// The startup panel compares scratchy with the first of Engine::RIVALS a run
+// timed (StartupSpark::rival): oMLX TurboQuant where it has it, mlx-lm (which
+// loads the same MLX checkpoint) in runs from before oMLX.
 
 /// The unit a startup time is shown in.
 #[derive(Clone, Copy)]
@@ -2674,6 +2691,9 @@ fn gb1(b: Bytes) -> f64 {
 struct StartupSpark<'a> {
     models: Vec<(&'a Model, Bytes)>,
     steps: Vec<Step>,
+    /// The engine scratchy is compared with: the first of Engine::RIVALS the
+    /// chosen run timed.
+    rival: Engine,
 }
 
 impl<'a> StartupSpark<'a> {
@@ -2690,11 +2710,21 @@ impl<'a> StartupSpark<'a> {
     /// most models, so a sparkline's steps share one commit and one set of
     /// engine versions; or why there is none.
     fn of(mr: &MachineRuns<'a>, col: &StartupColumn) -> Result<Self, &'static str> {
+        // A run's rival: the first engine it timed alongside scratchy.
+        let rival_of = |run: &Run| {
+            Engine::RIVALS.into_iter().find(|&e| {
+                run.models
+                    .iter()
+                    .any(|m| col.time(Engine::Scratchy, m).is_some() && col.time(e, m).is_some())
+            })
+        };
         let both = |run: &Run| {
-            run.models
-                .iter()
-                .filter(|m| STARTUP_ENGINES.iter().all(|&e| col.time(e, m).is_some()))
-                .count()
+            rival_of(run).map_or(0, |e| {
+                run.models
+                    .iter()
+                    .filter(|m| col.time(Engine::Scratchy, m).is_some() && col.time(e, m).is_some())
+                    .count()
+            })
         };
         let run = mr
             .runs
@@ -2718,6 +2748,7 @@ impl<'a> StartupSpark<'a> {
                     "not measured"
                 }
             })?;
+        let rival = rival_of(run).ok_or("nothing to compare")?;
         let mut models: Vec<(&Model, Bytes)> = run
             .models
             .iter()
@@ -2729,15 +2760,19 @@ impl<'a> StartupSpark<'a> {
             .map(|&(m, b)| Step {
                 x: gb1(b),
                 scratchy: col.time(Engine::Scratchy, m),
-                rival: col.time(Engine::MlxLm, m),
+                rival: col.time(rival, m),
                 highlight: false,
             })
             .collect();
-        Ok(StartupSpark { models, steps })
+        Ok(StartupSpark {
+            models,
+            steps,
+            rival,
+        })
     }
 }
 
-/// Every machine's startup against model size, scratchy against mlx-lm, in
+/// Every machine's startup against model size, scratchy against its rival, in
 /// the scaling panels' grid (`columns` is theirs): a row per machine, frozen,
 /// cold and warm side by side, each sparkline in a cell the size of theirs;
 /// then the numbers behind them as a table.
@@ -2785,7 +2820,8 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
     rsx! {
         Stack { gap: 5,
             p {
-                "scratchy against mlx-lm as the model grows ({sizes}, the MLX checkpoint both load). Blue fill \
+                "scratchy against oMLX TurboQuant (or the next engine a run timed, in the order of the heat maps; \
+                 mlx-lm in runs from before oMLX) as the model grows ({sizes}, the MLX checkpoint they load). Blue fill \
                  where scratchy is ahead, red where it is behind. Frozen is the first launch after memory and \
                  scratchy's weights cache are cleared, cold a normal relaunch: both time launch to the first \
                  token, not to ready, because mlx-lm reports ready at about the same time whatever the model's \
@@ -2803,7 +2839,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
-                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::MlxLm, Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value)),
+                                Ok(sp) => sparkline(&sp.steps, col.axes, sp.rival, Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against {}", col.title, col.axes.value, sp.rival.label())),
                                 Err(why) => rsx! { "{why}" },
                             }
                         }
@@ -2815,7 +2851,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                 Table { headers: table_headers,
                     for (&(chip, k), sp) in &sparks {
                         if let Ok(sp) = sp {
-                            for e in STARTUP_ENGINES {
+                            for e in [Engine::Scratchy, sp.rival] {
                                 TableRow {
                                     TableCell { "{chip}" }
                                     TableCell { "{e.label()}" }
@@ -2848,12 +2884,12 @@ const HEAT_MAPS: &str = "Heat maps";
 const SCALING: [(&str, &str, [Trend; 2]); 2] = [
     (
         "Concurrency scaling",
-        "1, 4 and 16 users at once, with 512-token prompts and 128-token answers",
+        "users at once: 1, 4 and 16 with 512-token prompts and 128-token answers, or, in runs whose grid has its own users (#349), 1 to 16 at the grid's middle cell, 1024-token prompts and 128-token answers",
         [Trend::UsersPrefill, Trend::UsersDecode],
     ),
     (
         "Length scaling",
-        "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, with 8 users at once. Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
+        "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, one user at a time where the grid ran at 1 (8 users at once in runs from before). Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
         [Trend::PromptPrefill, Trend::AnswerDecode],
     ),
 ];
