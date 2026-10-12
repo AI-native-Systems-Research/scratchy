@@ -545,31 +545,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
             pin(vision_window_index);
             pin(vision_reverse_indices);
             pin(vision_position_ids);
-            // TurboQuant: the packed code stores + norms + codebook are read by
+            // TurboQuant: the codebook and the fp16 scratch's chunk tables are read by
             // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
-            // (same lazy-pager hazard). `None` for a dense model → no-op.
+            // (same lazy-pager hazard); the packed, norms and scratch stores pin
+            // themselves, and each step of them as it is mapped (`SparseStores`).
+            // `None` for a dense model → no-op.
             if let Some(t) = tq {
-                for b in &t.packed_k {
-                    pin(b);
-                }
-                for b in &t.packed_v {
-                    pin(b);
-                }
-                for b in &t.norms_k {
-                    pin(b);
-                }
-                for b in &t.norms_v {
-                    pin(b);
-                }
                 pin(&t.signs);
                 pin(&t.boundaries);
                 pin(&t.centroids);
-                // The fp16 scratch (table + backing data) is bound at every
-                // layer's kv_cache slot + dereffed via the table's gpuAddress.
                 pin(&t.scratch_k_table);
                 pin(&t.scratch_v_table);
-                pin(&t.scratch_k_data);
-                pin(&t.scratch_v_data);
             }
             r.commit();
         }

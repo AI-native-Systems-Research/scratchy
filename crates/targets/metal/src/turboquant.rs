@@ -10,7 +10,7 @@ use objc2_metal::MTLDevice;
 pub use scratchy_layers::turboquant::kv_bytes_per_token;
 use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
 
-use crate::argmax::{Buffer, Device};
+use crate::argmax::Buffer;
 
 /// Seed of the production codebook's rotation signs.
 pub const TQ_CODEBOOK_SEED: u64 = 42;
@@ -59,7 +59,7 @@ impl TqCodebook {
 /// the global KV writers). Uniform arches pass all-true → every layer real
 /// (byte-identical to before, when `is_global` was implicitly all-true).
 pub fn build_tq_provision(
-    device: &Device,
+    allocator: &crate::MetalAllocator,
     is_global: &[bool],
     num_blocks: usize,
     block_size: usize,
@@ -68,6 +68,7 @@ pub fn build_tq_provision(
     codebook: &TqCodebook,
 ) -> crate::interpreter::metal::runtime::TqRuntimeBuffers {
     use objc2_metal::{MTLBuffer, MTLResourceOptions};
+    let device = allocator.device();
     let (bits, head_dim) = (codebook.bits.get(), codebook.signs.len());
     let num_layers = is_global.len();
     let n_global = is_global.iter().filter(|&&g| g).count();
@@ -78,96 +79,67 @@ pub fn build_tq_provision(
          {num_blocks} blocks, {n_global}/{num_layers} global layers compressed)"
     );
 
-    let alloc = |bytes: usize| {
-        // NB: do NOT touch the pages here. The packed/norms/scratch are sized to
-        // the full pool capacity (num_blocks) but only the ACTIVE context is ever
-        // read/written, so leaving them untouched lets macOS lazily page them in
-        // — RSS grows with the real context, not the capacity. That laziness IS
-        // the memory win (a full eager zero-fill committed all ~3.85 GB upfront).
-        // The prefill's empty-context dequant reads untouched pages, which the OS
-        // zero-fills on first access (=> norm 0 => scratch 0, overwritten by rope).
-        device
-            .newBufferWithLength_options(bytes.max(16), MTLResourceOptions::StorageModeShared)
-            .expect("tq alloc")
-    };
-    // Per-layer packed store + norms (canonical cache), at the GLOBAL geometry.
-    // The TqPackedK{layer} binding is layer-indexed, so a global layer L's packed
-    // store must sit at packed_k[L]; sliding layers (is_global[L]==false) get a
-    // 16-byte placeholder that the tape never binds.
-    let per_tok_words = num_kv_heads * pdim;
-    let packed_bytes = num_blocks * block_size * per_tok_words * 4;
-    let norms_bytes = num_blocks * block_size * num_kv_heads * 4;
-
-    // Per-layer anonymous packed/norms buffers (one per global layer; sliding
-    // layers get a 16-byte placeholder the tape never binds).
-    let (packed_k, packed_v, norms_k, norms_v) = {
-        // `zero_anon` zero-fills NORMS: the per-layer dequant runs BEFORE rope
-        // every forward over the WHOLE active context, so a not-yet-quantized
-        // block's norm slot is otherwise read UNINITIALIZED; `newBufferWithLength`
-        // doesn't zero, and `K = centroid*scale*sign*norm` overflows to Inf -> NaN
-        // logits -> `!!!!` on a continuation prefill. A zero norm dequants to 0,
-        // which rope overwrites with the real new-token K. Packed codes need no
-        // zeroing (a garbage code indexes a bounded centroid; product with norm 0
-        // is 0), and zeroing the large packed buffers would defeat the lazy-page
-        // memory win.
-        let mk_region = |bytes: usize, zero_anon: bool| -> Vec<Buffer> {
-            is_global
-                .iter()
-                .map(|&g| {
-                    if !g {
-                        return alloc(16);
-                    }
-                    let buf = alloc(bytes);
-                    if zero_anon {
-                        unsafe {
-                            std::ptr::write_bytes(
-                                buf.contents().as_ptr() as *mut u8,
-                                0,
-                                bytes.max(16),
-                            );
-                        }
-                    }
-                    buf
-                })
-                .collect()
-        };
-        (
-            mk_region(packed_bytes, false),
-            mk_region(packed_bytes, false),
-            mk_region(norms_bytes, true),
-            mk_region(norms_bytes, true),
-        )
-    };
-
-    // Per-worker fp16 scratch: one layer (num_blocks blocks) at the GLOBAL
-    // geometry, reused across all global layers (sequential, like the uniform
-    // case — a dedicated scratch, not a pool-shared tensor). Contiguous data +
-    // a chunk-table of gpuAddresses at chunk offsets (the kernels deref it).
+    // Per-layer packed store + norms (canonical cache), at the GLOBAL geometry, then the
+    // per-worker fp16 scratch: one layer (num_blocks blocks) at the GLOBAL geometry, reused
+    // across all global layers (sequential, like the uniform case — a dedicated scratch, not a
+    // pool-shared tensor). All are placement-sparse, mapped as group 0's blocks are reached
+    // (`SparseRegistry`): sized to the capacity and wired, they took 21 GB of a 32 GB M5 on the
+    // first request (granite-2b). The NORMS read zero until written: the per-layer dequant runs
+    // BEFORE rope every forward over the WHOLE active context, so a not-yet-quantized block's
+    // norm slot is read, and `K = centroid*scale*sign*norm` overflows to Inf -> NaN logits ->
+    // `!!!!` on a continuation prefill; a zero norm dequants to 0, which rope overwrites. So does
+    // the scratch: the paged attention can stage blocks just past the active context. Packed
+    // codes need no zeroing (a garbage code indexes a bounded centroid; times norm 0 is 0).
     let per_block_elems = block_size * num_kv_heads * head_dim;
-    let scratch_bytes = num_blocks * per_block_elems * SCRATCH_ELEM_BYTES;
+    let packed = (block_size * num_kv_heads * pdim * 4, false);
+    let norms = (block_size * num_kv_heads * 4, true);
+    let scratch = (per_block_elems * SCRATCH_ELEM_BYTES, true);
+    let layout: Vec<(usize, bool)> = [packed, packed, norms, norms]
+        .into_iter()
+        .flat_map(|store| std::iter::repeat_n(store, n_global))
+        .chain([scratch; 2])
+        .collect();
+    let stores = crate::sparse_kv::SparseStores::new(
+        device,
+        allocator.residency(),
+        num_blocks,
+        blocks_per_chunk,
+        &layout,
+    );
+    let stores = stores.expect("TurboQuant stores");
+    // The TqPackedK{layer} binding is layer-indexed, so a global layer L's store must sit at
+    // index L; sliding layers (is_global[L]==false) get a 16-byte placeholder that the tape
+    // never binds.
+    let mut next = (0..layout.len()).map(|i| stores.buffer(i));
+    let mut by_layer = || -> Vec<Buffer> {
+        let shared = MTLResourceOptions::StorageModeShared;
+        let mut one = |&g: &bool| match g {
+            true => next.next().expect("a store per global layer"),
+            false => device
+                .newBufferWithLength_options(16, shared)
+                .expect("tq alloc"),
+        };
+        is_global.iter().map(&mut one).collect()
+    };
+    let (packed_k, packed_v, norms_k, norms_v) = (by_layer(), by_layer(), by_layer(), by_layer());
+    let (scratch_k_data, scratch_v_data) = (next.next(), next.next());
+    let scratch_k_data = scratch_k_data.expect("K scratch");
+    let scratch_v_data = scratch_v_data.expect("V scratch");
+    // Contiguous scratch data + a chunk-table of gpuAddresses at chunk offsets (the kernels
+    // deref it).
     let n_chunks = num_blocks.div_ceil(blocks_per_chunk.max(1));
-    let chunk_bytes = blocks_per_chunk * per_block_elems * SCRATCH_ELEM_BYTES;
-    let build_scratch = || {
-        let data = alloc(scratch_bytes);
-        // Zero the scratch so blocks the rope DOESN'T write read back as 0
-        // (finite) rather than uninitialized garbage (Inf/NaN) — the paged
-        // attention can stage blocks just past the active context.
-        unsafe {
-            std::ptr::write_bytes(
-                data.contents().as_ptr() as *mut u8,
-                0,
-                scratch_bytes.max(16),
-            );
-        }
+    let chunk_bytes = blocks_per_chunk * scratch.0;
+    let table = |data: &Buffer| {
         let base = data.gpuAddress();
-        let table_vals: Vec<u64> = (0..n_chunks)
+        let vals: Vec<u64> = (0..n_chunks)
             .map(|c| base + (c * chunk_bytes) as u64)
             .collect();
-        let table = crate::argmax::upload_shared_buffer(device, &table_vals);
-        (table, data)
+        crate::argmax::upload_shared_buffer(device, &vals)
     };
-    let (scratch_k_table, scratch_k_data) = build_scratch();
-    let (scratch_v_table, scratch_v_data) = build_scratch();
+    let mapped = stores.mapped();
+    let registry = allocator.sparse_kv.lock();
+    let registered = registry.expect("sparse KV registry").register(stores);
+    registered.expect("TurboQuant stores mapped as far as the pool reaches");
 
     crate::interpreter::metal::runtime::TqRuntimeBuffers {
         packed_k,
@@ -177,17 +149,18 @@ pub fn build_tq_provision(
         signs: crate::argmax::upload_shared_buffer(device, codebook.signs),
         boundaries: crate::argmax::upload_shared_buffer(device, codebook.boundaries),
         centroids: crate::argmax::upload_shared_buffer(device, codebook.centroids),
-        scratch_k_table,
-        scratch_v_table,
+        scratch_k_table: table(&scratch_k_data),
+        scratch_v_table: table(&scratch_v_data),
         scratch_k_data,
         scratch_v_data,
+        mapped,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::argmax::upload_shared_buffer;
+    use crate::argmax::{Device, upload_shared_buffer};
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice};
     use objc2_metal::{MTLBuffer, MTLSize};
     use scratchy_layers::turboquant::{
@@ -348,22 +321,23 @@ mod tests {
     /// The KV budget sizes a TurboQuant pool with `kv_bytes_per_token`; the
     /// buffers `build_tq_provision` sizes per token — every layer's packed
     /// codes and norms, and the K and V scratch — must add up to exactly that,
-    /// or the pool the engine counts is not the pool the GPU holds.
+    /// or the pool the engine counts is not the pool the GPU holds. (Sparse
+    /// stores span whole steps of whole tiles: 128 blocks here, so exactly.)
     #[test]
     fn provision_allocates_kv_bytes_per_token() {
         let Some(device) = crate::detect_device().map(|d| d.device) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
-        let (num_layers, num_blocks, block_size, num_kv_heads, head_dim) = (3, 8, 16, 2, 64);
+        let (num_layers, num_blocks, block_size, num_kv_heads, head_dim) = (3, 256, 16, 8, 64);
         for bits in [TqBits::new(3), TqBits::new(4)] {
             let tq = build_tq_provision(
-                &device,
+                &crate::MetalAllocator::new(device.clone()),
                 &vec![true; num_layers],
                 num_blocks,
                 block_size,
                 num_kv_heads,
-                4,
+                128,
                 &TqCodebook::compute(head_dim, bits),
             );
             let len = |b: &Buffer| b.length();

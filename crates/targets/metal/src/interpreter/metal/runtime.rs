@@ -45,6 +45,8 @@ pub struct TqRuntimeBuffers {
     pub scratch_v_table: Buffer,
     pub scratch_k_data: Buffer,
     pub scratch_v_data: Buffer,
+    /// The group-0 blocks every store above is mapped through (`SparseStores::mapped`).
+    pub mapped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub struct RuntimeBindings {

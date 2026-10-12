@@ -37,7 +37,7 @@ use scratchy_forward_compiler::{
 use scratchy_target_metal::gdn_state::GdnStatePool;
 use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
-use scratchy_target_metal::sparse_kv::{KvMapper, SparseKvLayer};
+use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
 use scratchy_target_metal::weights::GpuWeights;
 use scratchy_target_metal::{
     DType, ForwardCtx, ForwardCtxHandle, ForwardDeviceHandle, GpuDevice, GpuTensor, MetalAllocator,
@@ -207,7 +207,9 @@ struct Loaded {
     gpu: GpuDevice,
     kv: KvCachePool,
     /// Backing buffers of `kv`'s chunks; must outlive the pool.
-    _kv_layers: Vec<SparseKvLayer>,
+    _kv_stores: SparseStores,
+    /// Maps the KV stores as the steps reach them, as `MetalWorker` does.
+    mapper: Arc<KvMapper>,
     gdn: Option<GdnStatePool<PoolMem>>,
     /// Group 0 (full attention) block size — page-unified on hybrid layouts.
     full_block_size: usize,
@@ -287,7 +289,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let per_layer_block_elems: Option<Vec<usize>> = model
         .per_layer_kv_token_elems()
         .map(|v| v.iter().map(|e| e * BLOCK_SIZE).collect());
-    let chunk_bytes = blocks_per_chunk * kv_heads * BLOCK_SIZE * head_dim * elem_bytes;
+    let block_bytes = kv_heads * BLOCK_SIZE * head_dim * elem_bytes;
     // The page-differentiated (gemma-4) case only — the same trigger the scheduler uses.
     let hybrid = model.per_layer_kv_token_elems().and_then(|elems| {
         let max_e = *elems.iter().max()?;
@@ -317,15 +319,23 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
 
     let residency = gpu.allocator.residency().clone();
     let mapper = KvMapper::new(&device).expect("KvMapper");
-    let mut kv_layers: Vec<SparseKvLayer> = (0..num_tensors * 2)
-        .map(|slot| {
-            let bytes = match (&hybrid, &per_layer_block_elems) {
-                (None, Some(v)) => blocks_per_chunk * v[slot / 2] * elem_bytes,
-                _ => chunk_bytes,
-            };
-            SparseKvLayer::new(&device, &residency, &mapper, bytes, 1).expect("SparseKvLayer")
+    let layout: Vec<(usize, bool)> = (0..num_tensors * 2)
+        .map(|slot| match (&hybrid, &per_layer_block_elems) {
+            (None, Some(v)) => (v[slot / 2] * elem_bytes, false),
+            _ => (block_bytes, false),
         })
         .collect();
+    let mut kv_stores = SparseStores::new(
+        &device,
+        &residency,
+        blocks_per_chunk,
+        blocks_per_chunk,
+        &layout,
+    )
+    .expect("SparseStores");
+    kv_stores
+        .grow_to(blocks_per_chunk, &mapper)
+        .expect("the first chunk");
     // The block-table width: the model's KV cap rung for the capacity, as the worker sizes it.
     gpu.metal_bucket_max_m = Some(bucket_cap);
     let rungs = MetalRungs::of(model.metal_rungs()).expect("MetalRungs");
@@ -335,7 +345,6 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let n_slots = num_tensors * 2;
     let calls = std::cell::Cell::new(0usize);
     let mut kv = unsafe {
-        let layers_ref = &mut kv_layers;
         KvCachePool::new_metal_chunked(
             layers,
             NUM_BLOCKS,
@@ -355,15 +364,13 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
             |bytes| {
                 let c = calls.get();
                 calls.set(c + 1);
-                layers_ref[c % n_slots]
-                    .commit_chunk(c / n_slots, bytes)
-                    .map_err(|e| anyhow::anyhow!("KV chunk commit: {e}"))
+                let chunk = kv_stores.chunk(c % n_slots, c / n_slots * blocks_per_chunk, bytes);
+                chunk.map_err(|e| anyhow::anyhow!("KV chunk: {e}"))
             },
             |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
         )
     }
     .expect("KvCachePool::new_metal_chunked");
-    mapper.wait();
     if let Some(h) = hybrid.as_ref() {
         kv.set_kv_group_layout(h.num_groups(), h.layer_to_group_u32());
     }
@@ -394,7 +401,8 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
         gpu,
         num_groups: kv.num_kv_groups(),
         kv,
-        _kv_layers: kv_layers,
+        _kv_stores: kv_stores,
+        mapper,
         gdn,
         full_block_size,
         tokenizer,
@@ -477,6 +485,17 @@ fn view<'a, T>(v: &'a [T], shape: &[usize], dtype: DType) -> TensorView<'a> {
 
 /// Run one step; return the terminal slot's `[n, width]` bytes (bf16/f16 raw) and `width`.
 fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) {
+    // TurboQuant's stores hold group 0's blocks: map them through the step's last, as
+    // `MetalWorker::grow_metal_kv_to_cover` does before every forward.
+    let reach = s.block_tables[0]
+        .iter()
+        .max()
+        .map_or(1, |&b| b as usize + 1);
+    let registry = l.gpu.allocator.sparse_kv.lock();
+    let reached = registry
+        .expect("sparse KV registry")
+        .reach(reach, &l.mapper);
+    reached.expect("TurboQuant KV grow");
     let n = s.ids.len();
     let stride = l.kv.max_blocks_per_seq;
     let u32t = DType::U32;

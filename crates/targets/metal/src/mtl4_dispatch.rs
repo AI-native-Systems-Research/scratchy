@@ -340,6 +340,13 @@ impl Mtl4DispatchBatch {
         &self.res
     }
 
+    /// Declare `set` (committed) to the command buffer as well, for what only it makes resident.
+    pub fn declare(&self, set: &MetalResidencySet) {
+        let cb_ptr = Retained::as_ptr(&self.cb) as *const AnyObject as *mut AnyObject;
+        // SAFETY: the command buffer is between begin and end until `commit`.
+        unsafe { set.attach_to_mtl4_command_buffer(cb_ptr) };
+    }
+
     /// The batch's MTL4 compute encoder, for callers encoding their own
     /// pipeline stages (with their own argument tables) onto the same command
     /// buffer. The encoder is live until [`commit`](Self::commit) ends it.

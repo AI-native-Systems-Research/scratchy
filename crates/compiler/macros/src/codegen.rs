@@ -13312,6 +13312,8 @@ pub fn emit_model(
                     .zip(0u32..)
                     .map(|(&g, l)| g == 0 && __tq_kv_layers.is_none_or(|kv| kv.contains(&l)))
                     .collect();
+                // The stores register with the device's allocator, whose KV growth maps them.
+                let __tq_allocator = device.allocator.clone();
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
                     ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
@@ -13333,7 +13335,7 @@ pub fn emit_model(
                         // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
                         let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
                             ::scratchy_target_metal::turboquant::build_tq_provision(
-                                dev,
+                                &__tq_allocator,
                                 &__tq_is_global,
                                 __tq_nb,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE as usize,

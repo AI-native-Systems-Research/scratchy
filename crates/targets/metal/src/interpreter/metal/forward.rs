@@ -341,6 +341,10 @@ pub enum ForwardError {
         num_seqs: usize,
         rung: MaxBlocksPerSeq,
     },
+    /// A step names group-0 block `block`, past the `mapped` its TurboQuant stores are mapped
+    /// through: its caller grows them first (`SparseRegistry::reach`), or the forward would read
+    /// un-wired memory.
+    KvNotMapped { block: u32, mapped: usize },
 }
 
 impl std::fmt::Display for ForwardError {
@@ -381,6 +385,11 @@ impl std::fmt::Display for ForwardError {
                 "MetalWorkerPool::forward: a block table of {len} entries is not {num_seqs} \
                  rows of the KV cap rung's {} blocks",
                 rung.get()
+            ),
+            Self::KvNotMapped { block, mapped } => write!(
+                f,
+                "MetalWorkerPool::forward: block {block} is past the {mapped} blocks the \
+                 TurboQuant KV stores are mapped through (`SparseRegistry::reach` them first)"
             ),
         }
     }

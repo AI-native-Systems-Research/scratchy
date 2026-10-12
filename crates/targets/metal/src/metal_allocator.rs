@@ -494,6 +494,8 @@ pub struct MetalAllocator {
     /// vs memcpy" breakdown after `try_load` completes. Atomics are
     /// `Relaxed` — these aren't synchronization, just stats.
     load_stats: Arc<LoadStats>,
+    /// The sparse stores the KV pool's growth maps as its blocks are reached (TurboQuant's).
+    pub sparse_kv: Arc<Mutex<crate::sparse_kv::SparseRegistry>>,
 }
 
 /// Histogram of tensor-offset trailing-zero counts. Index `i` counts
@@ -564,6 +566,7 @@ impl Clone for MetalAllocator {
             mmaps: Arc::clone(&self.mmaps),
             affine_codes: Arc::clone(&self.affine_codes),
             load_stats: Arc::clone(&self.load_stats),
+            sparse_kv: Arc::clone(&self.sparse_kv),
         }
     }
 }
@@ -635,6 +638,7 @@ impl MetalAllocator {
             mmaps: Arc::new(Mutex::new(Vec::new())),
             affine_codes: Arc::default(),
             load_stats: Arc::new(LoadStats::default()),
+            sparse_kv: Arc::default(),
         }
     }
 
