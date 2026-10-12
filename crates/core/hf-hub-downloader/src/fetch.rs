@@ -183,6 +183,7 @@ fn classify(e: ureq::Error, url: &str, repo_id: &str, filename: &str, attempts: 
         ureq::Error::StatusCode(404) => Error::NotFound {
             repo: repo_id.to_string(),
             filename: filename.to_string(),
+            commit: None,
         },
         ureq::Error::StatusCode(status) => Error::UnexpectedStatus {
             url: url.to_string(),
@@ -218,7 +219,12 @@ fn probe_once(opts: &Opts<'_>, url: &str, repo_id: &str, filename: &str) -> Resu
     if let Some(token) = opts.token {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
+    // The response itself, error statuses too: a 404's `x-repo-commit` names the
+    // commit the absence holds for, which `classify` alone would discard.
     let res = req
+        .config()
+        .http_status_as_error(false)
+        .build()
         .call()
         .map_err(|e| classify(e, url, repo_id, filename, opts.retries))?;
 
@@ -234,7 +240,17 @@ fn probe_once(opts: &Opts<'_>, url: &str, repo_id: &str, filename: &str) -> Resu
         return Err(Error::NotFound {
             repo: repo_id.to_string(),
             filename: filename.to_string(),
+            commit: header("x-repo-commit"),
         });
+    }
+    if status >= 400 {
+        return Err(classify(
+            ureq::Error::StatusCode(status),
+            url,
+            repo_id,
+            filename,
+            opts.retries,
+        ));
     }
 
     let missing = |header: &'static str| Error::MissingHeader {

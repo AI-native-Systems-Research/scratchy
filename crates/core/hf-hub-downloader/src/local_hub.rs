@@ -47,6 +47,8 @@ struct Seen {
     gets: Vec<&'static str>,
     /// Probes of `/resolve/`; the latest also names the current signature.
     probes: u64,
+    /// Probes for files the repo does not have.
+    missed: u64,
     /// GETs each signature has answered.
     served: HashMap<u64, usize>,
     /// GETs hung up on partway.
@@ -124,7 +126,13 @@ impl Hub {
             .and_then(|t| t.split_once('/'))
             .and_then(|(_revision, file)| self.files.get_key_value(file))
         else {
-            return status(404);
+            // As the Hub does: the 404 names the commit it answered for.
+            self.seen.lock().unwrap().missed += 1;
+            return format!(
+                "HTTP/1.1 404 Not Found\r\nx-repo-commit: {COMMIT}\r\n\
+                 content-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes();
         };
         let signature = {
             let mut seen = self.seen.lock().unwrap();
@@ -382,6 +390,27 @@ fn a_url_refused_from_the_start_fails_instead_of_re_signing() {
         1,
         "re-signed a real refusal"
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A file the repo does not have is asked about once. Every launch looked for
+/// an optional `chat_template.jinja` most repos lack, and paid a TLS round trip
+/// to hear 404 again; the 404 is now recorded and answers the next lookup.
+#[test]
+fn a_file_the_hub_lacks_is_probed_once() {
+    let (hub, endpoint) = Hub::new(&[("config.json", 64)]).serve();
+    let root = scratch("absent");
+    let client = client(&endpoint, &root).build();
+    let repo = client.model(REPO);
+    repo.get("config.json").expect("download failed");
+
+    for _ in 0..3 {
+        let err = repo
+            .get("chat_template.jinja")
+            .expect_err("the repo has no such file");
+        assert!(err.is_not_found(), "wrong error: {err}");
+    }
+    assert_eq!(hub.seen.lock().unwrap().missed, 1, "asked the Hub again");
     let _ = std::fs::remove_dir_all(root);
 }
 

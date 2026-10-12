@@ -139,10 +139,9 @@ pub fn download(
         && let Some(dir) = fully_cached(&repo)
     {
         // Backfills the template for caches pulled before it was part of the
-        // download set: one network fetch, and only while it is absent.
-        if !dir.join(CHAT_TEMPLATE).exists() {
-            let _ = repo.get(CHAT_TEMPLATE);
-        }
+        // download set. One network fetch, ever: after it the cache holds the
+        // file or the Hub's 404 for it, and most repos have no such file.
+        let _ = repo.get(CHAT_TEMPLATE);
         return Ok(dir);
     }
 
