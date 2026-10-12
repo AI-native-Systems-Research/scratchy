@@ -16,36 +16,26 @@ use tracing::info;
 
 use crate::args::ServeArgs;
 
-/// Print the vLLM ASCII art banner with Ferris to stderr.
+/// Print the scratchy ASCII art banner with Ferris to stderr.
 /// Uses ANSI colors when stderr is a terminal, monochrome otherwise.
 fn print_banner(version: &str, model: &str) {
     let color = std::io::stderr().is_terminal();
-    // w=white bold, o=orange, b=blue, f=rust orange, r=reset
-    let (w, o, b, f, r) = if color {
-        (
-            "\x1b[97;1m",
-            "\x1b[93m",
-            "\x1b[94m",
-            "\x1b[38;5;202m",
-            "\x1b[0m",
-        )
+    // w=white bold, f=rust orange, r=reset
+    let (w, f, r) = if color {
+        ("\x1b[97;1m", "\x1b[38;5;202m", "\x1b[0m")
     } else {
-        ("", "", "", "", "")
+        ("", "", "")
     };
     eprintln!();
-    eprintln!("{f}\u{2588} \u{2588}         \u{2588} \u{2588}{r}");
+    eprintln!("{f}█ █         █ █{r}");
+    eprintln!("{f}▀█  ▄█████▄  █▀{r}   {w}▄▀▀▀▀ ▄▀▀▀▀ █▀▀▀▄ ▄▀▀▀▄ ▀▀█▀▀ ▄▀▀▀▀ █   █ █   █{r}");
     eprintln!(
-        "{f}\u{2580}\u{2588}  \u{2584}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2584}  \u{2588}\u{2580}{r}          {w}\u{2588}     \u{2588}     \u{2588}\u{2584}   \u{2584}\u{2588}{r}"
+        "{f} ▀▄███▀█▀███▄▀ {r}   {w}▀▄▄▄  █     █▄▄▄▀ █▄▄▄█   █   █     █▄▄▄█  ▀▄▀ {r}  version {w}{version}{r}"
     );
     eprintln!(
-        "{f} \u{2580}\u{2584}\u{2588}\u{2588}\u{2588}\u{2580}\u{2588}\u{2580}\u{2588}\u{2588}\u{2588}\u{2584}\u{2580} {r}    {o}\u{2584}\u{2584}{r} {b}\u{2584}\u{2588}{r} {w}\u{2588}     \u{2588}     \u{2588} \u{2580}\u{2584}\u{2580} \u{2588}{r}  version {w}{version}{r}"
+        "{f} ▄▀███▀▀▀███▀▄ {r}   {w}    █ █     █ ▀▄  █   █   █   █     █   █   █  {r}  model   {w}{model}{r}"
     );
-    eprintln!(
-        "{f} \u{2584}\u{2580}\u{2588}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{2588}\u{2580}\u{2584} {r}     {o}\u{2588}{r}{b}\u{2584}\u{2588}\u{2580}{r} {w}\u{2588}     \u{2588}     \u{2588}     \u{2588}{r}  model   {w}{model}{r}"
-    );
-    eprintln!(
-        "{f} \u{2588} \u{2584}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2584} \u{2588} {r}      {b}\u{2580}\u{2580}{r}  {w}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580} \u{2580}\u{2580}\u{2580}\u{2580}\u{2580} \u{2580}     \u{2580}{r}"
-    );
+    eprintln!("{f} █ ▄▀▀▀▀▀▀▀▄ █ {r}   {w}▀▀▀▀   ▀▀▀▀ ▀   ▀ ▀   ▀   ▀    ▀▀▀▀ ▀   ▀   ▀{r}");
     eprintln!();
 }
 
