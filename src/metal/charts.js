@@ -12,7 +12,7 @@
 // still move text, so wait for them too.
 (function () {
   function draw() {
-    var charts = { line: Charts.LineChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
     document.querySelectorAll('[data-chart]').forEach(function (el) {
       var spec = JSON.parse(el.getAttribute('data-chart'));
       if (spec.ratio) {
@@ -42,7 +42,8 @@
     });
   }
   // Writes the factor, "×2.4", in each square the build marked a highlight,
-  // to two figures so it fits the overview's small squares. Carbon's heatmap
+  // to two figures so it fits the overview's small squares; a quarter of the
+  // square's width, up to 14px in the machines' larger ones. Carbon's heatmap
   // has no cell labels and empties its container on every draw (resizes too),
   // so this runs after each: the label goes in the square's own group
   // (Carbon's g.cell, d3-bound to {value, index}, index into the data), in
@@ -64,7 +65,7 @@
       text.setAttribute('text-anchor', 'middle');
       text.setAttribute('dominant-baseline', 'central');
       text.setAttribute('pointer-events', 'none');
-      text.style.fontSize = Math.min(10, w / 4) + 'px';
+      text.style.fontSize = Math.min(14, w / 4) + 'px';
       text.style.fontWeight = 'bold';
       text.style.fill = luminance(getComputedStyle(square).fill) > 0.4 ? '#161616' : '#ffffff';
     });

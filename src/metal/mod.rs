@@ -404,8 +404,10 @@ fn colour(class: &str) -> &'static str {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Chart<'a> {
-    Line {
-        data: Vec<LinePoint<'a>>,
+    /// Carbon's GroupedBarChart: a bar per group, side by side, at each key.
+    #[serde(rename = "groupedbar")]
+    GroupedBar {
+        data: Vec<BarPoint<'a>>,
         options: ChartOptions<'a>,
     },
     Heatmap {
@@ -439,12 +441,12 @@ struct SparkPoint {
     factor: Option<f64>,
 }
 
-/// One measured point of a line. A None value (present but not measured: no
-/// stream) leaves a gap.
+/// One measured bar. A None value (present but not measured: no stream)
+/// leaves no bar.
 #[derive(Serialize)]
-struct LinePoint<'a> {
+struct BarPoint<'a> {
     group: &'a str,
-    key: u32,
+    key: String,
     value: Option<f64>,
 }
 
@@ -688,9 +690,6 @@ struct Enabled {
     enabled: bool,
 }
 
-/// A fixed-size chart's box: wider than the screen, it scrolls sideways.
-const FIXED_MOUNT: &str = "max-width: 100%; overflow-x: auto";
-
 /// A chart's mount point, styled by `mount`: charts.js draws `spec` into it.
 /// `scale` is the id of the ratio scale a heatmap's squares highlight on hover.
 fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Element {
@@ -701,15 +700,15 @@ fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Element
     }
 }
 
-/// One line chart: offered users on x, one line per engine.
-fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &str) -> Element {
-    let spec = Chart::Line {
+/// One bar chart: offered users on x, a bar per engine at each.
+fn bar_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &str) -> Element {
+    let spec = Chart::GroupedBar {
         data: series
             .iter()
             .flat_map(|s| {
-                s.pts.iter().map(|&(x, v)| LinePoint {
+                s.pts.iter().map(|&(x, v)| BarPoint {
                     group: &s.label,
-                    key: x,
+                    key: x.to_string(),
                     // Carbon prints values as given: round to what the tables show.
                     value: v.map(|v| (v * 10.0).round() / 10.0),
                 })
@@ -718,16 +717,15 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
         options: ChartOptions {
             title: title.to_string(),
             axes: Axes {
+                // Each user count a category, in the order measured.
                 bottom: Axis {
                     maps_to: "key",
                     title: "offered concurrent users",
-                    scale_type: Some("linear"),
-                    ticks: Some(Ticks {
-                        values: xs.iter().map(|&x| f64::from(x)).collect(),
-                    }),
+                    scale_type: Some("labels"),
+                    ticks: None,
                     include_zero: None,
                     visible: None,
-                    domain: None,
+                    domain: Some(AxisDomain::Labels(xs.iter().map(u32::to_string).collect())),
                 },
                 left: Axis {
                     maps_to: "value",
@@ -756,7 +754,7 @@ fn line_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &
             toolbar: Enabled { enabled: false },
         },
     };
-    chart(&spec, label, FIXED_MOUNT, None)
+    chart(&spec, label, "width: 100%", None)
 }
 
 /// A model's full grid as a heatmap. With a rival, values are how many times
@@ -790,7 +788,7 @@ fn grid_heatmap(
                 color_domain: ratio.then_some(RATIO_RANGE),
             }),
             // Room for the axes (and Carbon's legend when it shows), then
-            // about 64px a cell.
+            // about 64px a cell. Carbon sets its box to this width.
             height: format!("{}px", if ratio { 100 } else { 160 } + 56 * ins.len()),
             width: Some(format!("{}px", 140 + 72 * outs.len())),
             legend: ratio.then_some(Enabled { enabled: false }),
@@ -802,7 +800,11 @@ fn grid_heatmap(
         },
         ratio,
     };
-    chart(&spec, label, FIXED_MOUNT, scale)
+    // Narrower on a narrow screen. Never a scroll box: scrolling one way
+    // makes the other scroll too, and Carbon's tooltip, drawn inside the box,
+    // then grows a scrollbar that resizes the chart under the pointer, over
+    // and over.
+    chart(&spec, label, "max-width: 100%", scale)
 }
 
 /// One small multiple: a model's whole grid as a tiny heatmap, colour only;
@@ -1010,7 +1012,7 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
 
     let mut charts: Vec<Element> = Vec::new();
     if !tput.is_empty() {
-        charts.push(line_chart(
+        charts.push(bar_chart(
             &tput,
             &xs,
             "Throughput (tok/s, higher is better)",
@@ -1027,7 +1029,7 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             .map(|s| s.label.as_str())
             .collect();
         charts.push(rsx! {
-            {line_chart(
+            {bar_chart(
                 &tpot,
                 &xs,
                 "Time per output token (ms, lower is better)",
@@ -1512,9 +1514,10 @@ fn trend_spark(at: SparkAt, spark: &Result<Spark, &str>, height: &str) -> Elemen
     sparkline(&spark.steps, at.trend, spark.rival, height, &label)
 }
 
+/// Prefill first, then decode, as in the overview.
 const GRID_METRICS: [(Metric, &str); 2] = [
-    (Metric::Throughput, "throughput"),
     (Metric::Ttft, "time to first token"),
+    (Metric::Throughput, "throughput"),
 ];
 
 fn mark(metric: Metric, cells: &[Option<&Cell>]) -> &'static str {
@@ -1548,7 +1551,8 @@ fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element 
                 x: o.to_string(),
                 y: i.to_string(),
                 value,
-                highlight: false,
+                // A ratio grid has room for every square's factor.
+                highlight: g.rival.is_some(),
             });
         }
     }
