@@ -1683,6 +1683,24 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Never-scheduled ("fresh") prefill requests admitted into one step.
+    ///
+    /// Staging admission ships first tokens earlier: one giant first step
+    /// makes every queued request wait for the whole batch's prefill, while
+    /// admitting a few requests per step lets the earliest ones start
+    /// decoding while the rest prefill. Measured (M1 Max,
+    /// granite-3.3-2b 4-bit, 12x128-token requests at concurrency 8, budget
+    /// 4096): TTFT p50 608 -> 414 ms at flat tok/s (246.5 -> 246.4), and the
+    /// whole short-prompt column of the serving grid moves from 0.8-0.9x to
+    /// 1.1-1.3x vs mlx-lm. The same probe showed the cost this shape
+    /// avoids: cutting the token budget to 512 instead also chunks long
+    /// prompts, interleaving their chunks with decode for +70% TPOT at
+    /// 1024-token prompts. So staging is per-request, never per-token: a
+    /// prompt too big to share a step (more than a quarter of the budget,
+    /// [`Self::FRESH_PREFILLS_PER_STEP`] of them per step) keeps the vLLM
+    /// chunking path, and a stageable prompt is never split at all.
+    const FRESH_PREFILLS_PER_STEP: usize = 4;
+
     /// Create a new scheduler with a `SchedulerConfig` and a KV cache
     /// manager.
     pub fn new(
@@ -2337,6 +2355,7 @@ impl SchedulerInterface for Scheduler {
         // Phase 2: Schedule WAITING requests
         // ---------------------------------------------------------------
         if preempted_reqs.is_empty() && self.pause_state == PauseState::Unpaused {
+            let mut fresh_prefills_scheduled = 0usize;
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.max_num_running_reqs {
                     break;
@@ -2358,6 +2377,16 @@ impl SchedulerInterface for Scheduler {
                     None => break,
                 };
                 let request_id = request.request_id.clone();
+
+                // Staged admission: a never-scheduled request is fresh, and
+                // at most FRESH_PREFILLS_PER_STEP of them enter this step.
+                // Requests resuming from preemption or continuing a chunk
+                // (num_computed_tokens > 0) are not fresh and never count.
+                let is_fresh = request.num_computed_tokens == 0;
+                if is_fresh && fresh_prefills_scheduled == Self::FRESH_PREFILLS_PER_STEP {
+                    self.waiting.prepend_request(request);
+                    break;
+                }
 
                 // Get computed blocks from prefix cache. `cached_blocks[0]` is
                 // the per-logical-block hit list (usize::MAX for misses) —
@@ -2430,6 +2459,22 @@ impl SchedulerInterface for Scheduler {
                 // doesn't fit in the remaining budget.
                 if !self.enable_chunked_prefill && num_new_tokens > token_budget {
                     // Put the request back.
+                    self.waiting.prepend_request(request);
+                    break;
+                }
+
+                // A prompt small enough to share a step with its staging
+                // peers (a FRESH_PREFILLS_PER_STEP-th of the budget) is
+                // never split: deferring it to the next step keeps its
+                // decode from interleaving with a chain of follow-on
+                // chunks. Bigger prompts keep the chunking path below —
+                // deferring one of those could starve it behind a steady
+                // decode stream that never leaves a whole step free.
+                let stageable = num_new_tokens_raw
+                    <= self.max_num_scheduled_tokens / Self::FRESH_PREFILLS_PER_STEP
+                    && (self.long_prefill_token_threshold == 0
+                        || num_new_tokens_raw <= self.long_prefill_token_threshold);
+                if stageable && num_new_tokens > token_budget {
                     self.waiting.prepend_request(request);
                     break;
                 }
@@ -2508,6 +2553,9 @@ impl SchedulerInterface for Scheduler {
                         req_to_new_blocks.insert(request_id.clone(), blocks);
                         num_scheduled_tokens.insert(request_id.clone(), num_new_tokens);
                         token_budget -= num_new_tokens;
+                        if is_fresh {
+                            fresh_prefills_scheduled += 1;
+                        }
 
                         // Update the requests map.
                         if let Some(r) = self.requests.get_mut(&request_id) {
@@ -2839,6 +2887,92 @@ mod tests {
         // the remaining budget (5), so only r1 and r2 are scheduled.
         assert_eq!(output.total_num_scheduled_tokens, 20);
         assert_eq!(output.scheduled_new_reqs.len(), 2);
+    }
+
+    // ----- Staged admission (FRESH_PREFILLS_PER_STEP) -----
+
+    #[test]
+    fn test_fresh_prefills_staged_per_step() {
+        // Fresh prefill requests enter a step in stages, not all at once:
+        // the first four wait for only four prefills, not eight.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        for i in 0..8 {
+            sched.add_request(make_request(&format!("r{i}"), 16));
+        }
+
+        let output1 = sched.schedule();
+        assert_eq!(
+            output1.scheduled_new_reqs.len(),
+            Scheduler::FRESH_PREFILLS_PER_STEP
+        );
+        // The rest are still waiting, not preempted or finished.
+        assert_eq!(sched.get_request_counts(), (4, 4));
+
+        let output2 = sched.schedule();
+        assert_eq!(
+            output2.scheduled_new_reqs.len(),
+            Scheduler::FRESH_PREFILLS_PER_STEP
+        );
+        assert_eq!(sched.get_request_counts(), (8, 0));
+    }
+
+    #[test]
+    fn test_stageable_prompt_defers_whole() {
+        // A prompt small enough to share a step with its staging peers
+        // (<= budget / FRESH_PREFILLS_PER_STEP = 25 tokens here) is never
+        // split: r4 defers to the next step whole instead of chunking to
+        // the 10 remaining tokens.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 100,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 30));
+        sched.add_request(make_request("r2", 30));
+        sched.add_request(make_request("r3", 30));
+        sched.add_request(make_request("r4", 20));
+
+        let output1 = sched.schedule();
+        assert_eq!(output1.scheduled_new_reqs.len(), 3);
+        assert_eq!(output1.total_num_scheduled_tokens, 90);
+
+        let output2 = sched.schedule();
+        assert_eq!(output2.scheduled_new_reqs.len(), 1);
+        assert_eq!(*output2.num_scheduled_tokens.get("r4").unwrap(), 20);
+    }
+
+    #[test]
+    fn test_stageable_defer_does_not_starve() {
+        // A deferred stageable prompt is admitted on the very next step:
+        // the running rows leave budget, and the deferral ends there.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 100,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 30));
+        sched.add_request(make_request("r2", 30));
+        sched.add_request(make_request("r3", 30));
+        sched.add_request(make_request("r4", 20));
+
+        let _ = sched.schedule();
+        // r1-r3 now decode one token each; r4 still fits beside them.
+        let output2 = sched.schedule();
+        assert!(output2.num_scheduled_tokens.contains_key("r4"));
+        assert_eq!(*output2.num_scheduled_tokens.get("r4").unwrap(), 20);
     }
 
     // ----- Unschedulable (never-fits) guard -----
