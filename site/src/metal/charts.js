@@ -24,10 +24,16 @@
         };
       }
       // A log axis's ticks are the measured steps: print them as they are,
-      // not in d3's SI style (4096 as "4.096k"). Carbon takes a formatter
-      // only as a function, which the JSON cannot carry.
+      // not in d3's SI style (4096 as "4.096k"), or as the build named them
+      // (model sizes as "2b"). Carbon takes a formatter only as a function,
+      // which the JSON cannot carry.
       var bottom = spec.options.axes && spec.options.axes.bottom;
-      if (bottom && bottom.scaleType === 'log' && bottom.ticks) bottom.ticks.formatter = String;
+      if (bottom && bottom.scaleType === 'log' && bottom.ticks) {
+        var at = bottom.ticks.values, names = bottom.ticks.labels;
+        bottom.ticks.formatter = names
+          ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
+          : String;
+      }
       var chart = new charts[spec.kind](el, { data: spec.data, options: spec.options });
       var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
       if (scale) highlightSteps(chart, spec, scale);
