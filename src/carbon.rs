@@ -131,11 +131,18 @@ pub fn Button(kind: ButtonKind, #[props(into)] href: String, children: Element) 
 }
 
 /// A `cds-content-switcher` over panels: each item shows the element whose id
-/// is its `target` and Carbon hides the others' (`ContentPanel`).
+/// is its `target` and Carbon hides the others' (`ContentPanel`). The panel
+/// ids are links: `#<id>` selects one, and choosing one puts it in the
+/// address (switcher.js, run right after it).
 #[component]
 pub fn ContentSwitcher(selected: String, children: Element) -> Element {
-    rsx! { cds-content-switcher { "value": selected, {children} } }
+    rsx! {
+        cds-content-switcher { "value": selected, {children} }
+        script { dangerous_inner_html: SWITCHER_JS }
+    }
 }
+
+const SWITCHER_JS: &str = include_str!("switcher.js");
 
 /// One `cds-content-switcher-item`: its label, and the id of the panel it
 /// shows, which is also its value.
