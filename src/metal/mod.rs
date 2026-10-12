@@ -575,6 +575,10 @@ fn grid_axes<'a>(ins: &[u32], outs: &[u32], visible: Option<bool>) -> Axes<'a> {
 #[derive(Serialize)]
 struct Ticks {
     values: Vec<f64>,
+    /// What to print at each of `values` instead of the number: charts.js
+    /// makes these Carbon's tick formatter, which only a function can be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<Vec<String>>,
 }
 
 /// Carbon Charts' colour options: a colour per series, or the steps of a
@@ -1421,7 +1425,14 @@ struct SparkAxes {
 
 /// A sparkline: scratchy's and its rival's values along one dimension, the gap
 /// between them filled blue where scratchy is ahead and red where it is behind.
-fn sparkline(pts: &[Step], axes: SparkAxes, rival: Engine, height: &str, label: &str) -> Element {
+fn sparkline(
+    pts: &[Step],
+    axes: SparkAxes,
+    rival: Engine,
+    names: Option<Vec<String>>,
+    height: &str,
+    label: &str,
+) -> Element {
     let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
     // From the power of two at or below the first step to the one at or above
     // the last: users and lengths are powers of two already, so they span the
@@ -1439,7 +1450,10 @@ fn sparkline(pts: &[Step], axes: SparkAxes, rival: Engine, height: &str, label: 
         maps_to: "key",
         title: axes.along,
         scale_type: Some("log"),
-        ticks: Some(Ticks { values: xs }),
+        ticks: Some(Ticks {
+            values: xs,
+            labels: names,
+        }),
         include_zero: Some(false),
         visible: None,
         domain: range,
@@ -1538,7 +1552,14 @@ fn trend_spark(at: SparkAt, spark: &Result<Spark, &str>, height: &str) -> Elemen
         at.trend.title(),
         spark.rival.label()
     );
-    sparkline(&spark.steps, at.trend.axes(), spark.rival, height, &label)
+    sparkline(
+        &spark.steps,
+        at.trend.axes(),
+        spark.rival,
+        None,
+        height,
+        &label,
+    )
 }
 
 /// Prefill first, then decode, as in the overview.
@@ -2196,6 +2217,18 @@ impl StartupColumn {
     }
 }
 
+/// A model's parameter size as its name gives it: the first `-`-separated
+/// part that is a number then `b` ("granite-3.3-2b-instruct": "2b"; not
+/// gemma's active "a4b").
+fn size_name(stem: &str) -> Option<String> {
+    stem.split('-')
+        .find(|part| {
+            part.strip_suffix('b')
+                .is_some_and(|n| !n.is_empty() && n.parse::<f64>().is_ok())
+        })
+        .map(str::to_string)
+}
+
 /// A size as a sparkline's step and tooltip show it: GB to one decimal.
 fn gb1(b: Bytes) -> f64 {
     (b.gb() * 10.0).round() / 10.0
@@ -2209,6 +2242,15 @@ struct StartupSpark<'a> {
 }
 
 impl<'a> StartupSpark<'a> {
+    /// Its steps' tick labels: each model's parameter size, as its name gives
+    /// it ("2b"), else its size in GB. The steps stay where the GB put them.
+    fn names(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .map(|&(m, b)| size_name(&m.stem).unwrap_or_else(|| gb1(b).to_string()))
+            .collect()
+    }
+
     /// From the newest of the machine's runs that timed both engines for the
     /// most models, so a sparkline's steps share one commit and one set of
     /// engine versions; or why there is none.
@@ -2326,7 +2368,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
-                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::MlxLm, "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value)),
+                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::MlxLm, Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value)),
                                 Err(why) => rsx! { "{why}" },
                             }
                         }
@@ -2524,7 +2566,8 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, ratio_step, spark_points,
+        Engine, Metric, RATIO_RANGE, RATIO_SPAN, RATIO_STEPS, Step, ratio_step, size_name,
+        spark_points,
     };
 
     #[test]
@@ -2574,6 +2617,14 @@ mod tests {
             ttft.iter()
                 .any(|p| p.group == Engine::MlxLm.ahead() && p.key == 1.0 && p.upper.is_some())
         );
+    }
+
+    #[test]
+    fn a_models_name_gives_its_parameter_size() {
+        assert_eq!(size_name("granite-3.3-2b-instruct").as_deref(), Some("2b"));
+        assert_eq!(size_name("qwen2.5-7b").as_deref(), Some("7b"));
+        assert_eq!(size_name("gemma-4-26b-a4b-it").as_deref(), Some("26b"));
+        assert_eq!(size_name("smollm2-135m"), None);
     }
 
     #[test]
