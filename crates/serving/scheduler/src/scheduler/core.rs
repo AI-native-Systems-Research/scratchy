@@ -1688,14 +1688,13 @@ impl Scheduler {
     /// Staging admission ships first tokens earlier: one giant first step
     /// makes every queued request wait for the whole batch's prefill,
     /// while admitting a few requests per step lets the earliest ones
-    /// start decoding while the rest prefill. Measured on the 3-model
-    /// M1 Max serving matrix (PR #381): 128-token-prompt TTFT p50
-    /// -29..-38% at flat tok/s, TPOT paying only where decode overlaps
-    /// the later prefill waves. Staging is per-request, never per-token:
-    /// a prompt too big to share a step with its staging peers (more
-    /// than a [`Self::STAGEABLE_PROMPT_BUDGET_SHARE`]th of the budget)
-    /// keeps the vLLM chunking path, and a stageable prompt is never
-    /// split at all.
+    /// start decoding while the rest prefill. It trades tail for median:
+    /// TTFT p50 drops, and TTFT p99 plus the TPOT of steps whose decode
+    /// overlaps later prefill waves pay for it (measurements in PR #381).
+    /// Staging is per-request, never per-token: a prompt too big to share
+    /// a step with its staging peers (more than a
+    /// [`Self::STAGEABLE_PROMPT_BUDGET_SHARE`]th of the budget) keeps the
+    /// vLLM chunking path, and a stageable prompt is never split at all.
     const FRESH_PREFILLS_PER_STEP: usize = 4;
 
     /// The no-split threshold is the budget divided by this share: a
@@ -2998,10 +2997,12 @@ mod tests {
     #[test]
     fn test_long_prefill_threshold_overrides_staging() {
         // long_prefill_token_threshold keeps precedence over the staging
-        // rule: with the threshold below the stageable size, r4's prompt
-        // is NOT stageable and chunks to the remaining budget instead of
-        // deferring whole (contrast test_stageable_prompt_defers_whole,
-        // the same shape at threshold 0).
+        // rule: an over-threshold prompt keeps the vLLM chunking path even
+        // when it is stageable by size. r7's 20-token prompt is stageable
+        // (20 <= budget/4 = 25) but over the 15-token threshold, so with 10
+        // budget left it chunks to 10 instead of deferring whole. Delete
+        // the threshold clause in `stageable` and r7 defers (absent from
+        // this step's num_scheduled_tokens) — this test is what pins it.
         let cfg = SchedulerConfig {
             max_num_batched_tokens: 100,
             max_num_seqs: 10,
@@ -3011,21 +3012,23 @@ mod tests {
         };
         let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
 
-        // r1-r3 (10 tokens each) sit under the threshold; r4's 20-token
-        // prompt is over it, so the threshold chunk-caps r4 to 15 even
-        // though it is stageable by size (20 <= budget/4 = 25) and fits
-        // the remaining budget — the threshold overrides the staging
-        // rule (at threshold 0 the same prompt defers whole, see
-        // test_stageable_prompt_defers_whole).
-        sched.add_request(make_request("r1", 10));
-        sched.add_request(make_request("r2", 10));
-        sched.add_request(make_request("r3", 10));
-        sched.add_request(make_request("r4", 20));
+        for id in ["r1", "r2", "r3", "r4"] {
+            sched.add_request(make_request(id, 40));
+        }
+        for id in ["r5", "r6", "r7"] {
+            sched.add_request(make_request(id, 20));
+        }
 
-        let output1 = sched.schedule();
-        assert_eq!(output1.scheduled_new_reqs.len(), 4);
-        // r4 is admitted in step 1, chunk-capped at the threshold.
-        assert_eq!(*output1.num_scheduled_tokens.get("r4").unwrap(), 15);
+        // Step 1: the fresh cap admits r1-r4, threshold-capped to 15 each.
+        let out1 = sched.schedule();
+        assert_eq!(out1.scheduled_new_reqs.len(), 4);
+        assert_eq!(out1.total_num_scheduled_tokens, 60);
+
+        // Step 2: r1-r4 continue at 15 each (60 tokens), r5 and r6 are
+        // admitted at 15 each, and r7 chunks to the 10 remaining tokens —
+        // the threshold overrides the staging defer.
+        let out2 = sched.schedule();
+        assert_eq!(*out2.num_scheduled_tokens.get("r7").unwrap(), 10);
     }
 
     #[test]
