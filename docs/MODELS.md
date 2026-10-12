@@ -162,7 +162,10 @@ the preset is defined but never selectable.
 
 All arches share the one `scratchy-models` crate (`crates/models/arch/`) —
 adding an arch means adding files and feature-gates inside it, not creating a
-new crate.
+new crate. After these steps, work through
+[`crates/models/arch/dsl/CLAUDE.md`](../crates/models/arch/dsl/CLAUDE.md):
+matching checkpoints to configs, quant presets, the baked tokenizer, and
+measuring startup.
 
 ### 1. Add the `arch-<name>` feature
 
