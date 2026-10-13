@@ -445,11 +445,9 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
 ///
 /// `is_nax` should be `crate::tape::targets::is_nax_capable(profile.generation)`.
 ///
-/// gs=32 is excluded from NAX dispatch because the BK=64 NAX shader
-/// violates `BCOLS <= group_size` for gs=32; MLX handles that with a
-/// specialized QuantizedBlockLoader path (different scale-indexing
-/// semantics) which we haven't ported. gs=32 quants fall through to
-/// the Standard qmm_t kernel instead.
+/// gs=32 is excluded from NAX dispatch because the BK=64 NAX shader's
+/// W producer reads one scale per row per K step. gs=32 quants fall
+/// through to the Standard qmm_t kernel instead.
 pub fn pick_qmm_t_kernel(
     m: u32,
     n: u32,
@@ -480,6 +478,11 @@ pub fn pick_qmm_t_kernel(
     QmmTKernel::Standard
 }
 
+/// Threads per threadgroup of the affine NAX qmm kernels (`affine_qmm_t_nax`,
+/// `affine_gather_qmm_t_nax`): the four simdgroups that multiply the 64×64
+/// output tile, plus the one that dequantizes the next W tile meanwhile.
+pub const NAX_QMM_THREADS: (u32, u32, u32) = (32, 5, 1);
+
 /// Threadgroup grid + threads-per-group for a picked qmm_t variant.
 ///
 /// `qmm_t`: bm=bn=32, wm=wn=2 → group (32, 2, 2); grid
@@ -495,18 +498,11 @@ pub fn qmm_t_dispatch_shape(
 ) -> ((u32, u32, u32), (u32, u32, u32)) {
     match kernel {
         QmmTKernel::Nax => {
-            // BM=BN=64 tile, TGP=128 = 4 simdgroups × 32 threads.
-            // Threadgroup geometry is MLX's (32, wn=2, wm=2): the kernel
-            // maps its 2×2 output sub-tile grid purely from
-            // `simdgroup_index_in_threadgroup` (numbered identically in a
-            // flat (128,1,1) and a 3D (32,2,2) group), so the 3D shape is
-            // bit-identical but ~7% faster — the MPP `matmul2d` scheduler
-            // prefers it. Total threads = 32·2·2 = 128 either way, so the
-            // `(n_tiles, m_tiles, b)` threadgroup grid + Y-axis m_scaling
-            // are unchanged.
+            // BM=BN=64 tile; the kernel maps its 2×2 output sub-tile grid
+            // and its producer purely from `simdgroup_index_in_threadgroup`.
             let n_tiles = n.div_ceil(64);
             let m_tiles = m.div_ceil(64);
-            ((n_tiles, m_tiles, b), (32, 2, 2))
+            ((n_tiles, m_tiles, b), NAX_QMM_THREADS)
         }
         _ => {
             let n_tiles = n.div_ceil(32);
@@ -1464,13 +1460,11 @@ mod tests {
         assert_eq!((tx, ty, tz), (64, 2, 4));
         assert_eq!((gx, gy, gz), (32, 2, 2));
 
-        // Nax: grid (ceil(N/64), ceil(M/64), B); group (32, wn=2, wm=2) —
-        // MLX's 3D threadgroup (see `qmm_nax` in mlx quantized.cpp). Tile
-        // mapping is from simdgroup_index, so (32,2,2) is bit-identical to
-        // a flat (128,1,1) but ~7% faster on the MPP matmul2d scheduler.
+        // Nax: grid (ceil(N/64), ceil(M/64), B); group = 4 MMA simdgroups
+        // + 1 dequantizing producer.
         let ((tx, ty, tz), (gx, gy, gz)) = qmm_t_dispatch_shape(QmmTKernel::Nax, 128, 2048, 1);
         assert_eq!((tx, ty, tz), (32, 2, 1));
-        assert_eq!((gx, gy, gz), (32, 2, 2));
+        assert_eq!((gx, gy, gz), (32, 5, 1));
     }
 
     #[test]
