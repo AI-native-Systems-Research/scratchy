@@ -216,17 +216,13 @@ pub trait ScratchyWeights: Send + Sync {
         false
     }
 
-    /// Block-table row stride the metal kernels bake as a function
-    /// constant (`CanonicalParams::MAX_BLOCKS_PER_SEQ`). The metal
-    /// executor MUST pack host-side `block_table` rows at exactly
-    /// this stride — every kernel reads row `seq_idx` at
-    /// `block_table + seq_idx * stride`, so a host stride mismatch
-    /// corrupts every `seq_idx > 0` (single-seq runs mask it).
-    /// Default mirrors the `CanonicalParams` trait default (128);
-    /// the proc-macro emits a per-arch override for arches that
-    /// set the `max_blocks_per_seq` config key (Gemma4: 2048).
-    fn max_blocks_per_seq(&self) -> usize {
-        128
+    /// The loaded variant's `CanonicalParams::KV_ADDRESSABLE_TOKENS`: the most
+    /// tokens one sequence's metal KV can address when its block table, not
+    /// the KV cache, bounds that (Gemma4: 2048 × 16). The metal worker caps
+    /// `max_model_len` at it; the metal load built no RoPE row past it.
+    /// Default `None`.
+    fn kv_addressable_tokens(&self) -> Option<usize> {
+        None
     }
 
     /// # Safety

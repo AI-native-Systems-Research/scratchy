@@ -1119,6 +1119,15 @@ pub trait CanonicalParams: WeightAccessors {
     /// canonical macro impls override for longer-context models.
     const MAX_BLOCKS_PER_SEQ: u32 = 128;
 
+    /// The most tokens one sequence's metal KV can address when its block
+    /// table, not the KV cache, bounds that: a hybrid-geometry arch's
+    /// (Gemma4's) every KV group has a `MAX_BLOCKS_PER_SEQ`-long block-table
+    /// row, so past `MAX_BLOCKS_PER_SEQ × BLOCK_SIZE` tokens (Gemma4:
+    /// 2048 × 16) the sliding class's row overflows. The metal worker caps
+    /// `max_model_len` at it, and the metal load builds no RoPE row past it.
+    /// Default `None`: only the KV cache bounds the context.
+    const KV_ADDRESSABLE_TOKENS: Option<usize> = None;
+
     /// Q-axis tile size for the cuda contiguous-prefill kernel — the
     /// kernel processes this many query tokens per threadgroup.
     /// Metal post-Phase B always emits `Instruction::AttentionPrefillPaged`

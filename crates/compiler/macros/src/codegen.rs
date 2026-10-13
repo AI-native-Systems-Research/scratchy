@@ -3731,11 +3731,6 @@ fn emit_weights_struct(
             .bounds
             .get("head_dim")
             .expect("model must have head_dim for RotaryLocal") as usize;
-        let max_pos = *model
-            .bounds
-            .get("max_position_embeddings")
-            .expect("model must have max_position_embeddings for RotaryLocal")
-            as usize;
         let local_theta = model
             .scalars
             .get("rope_local_base_freq")
@@ -3748,7 +3743,7 @@ fn emit_weights_struct(
             let rotary_local = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
                 gw,
                 #head_dim,
-                #max_pos,
+                ::core::cmp::min(max_model_len, __rope_rows),
                 #local_theta,
                 None,
                 crate::__gpu::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
@@ -4026,16 +4021,36 @@ fn emit_weights_struct(
     // up but the binding type didn't, so cosines/sines were
     // reinterpreted as fp16 and attention never aligned. Fixed by
     // landing the bf16 shader sibling.)
-    let rotary_load_metal: TokenStream = if uses_rotary {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for Rotary") as usize;
+    //
+    // Each table holds `min(max_model_len, __rope_rows)` rows: the runtime
+    // `max_model_len` (a chat context of 4-8K on Llama-3.2's 131072 builds
+    // 16-32× fewer), capped by `__rope_rows`, the most a request can reach.
+    // Each target body binds `__rope_rows` ahead of these loads:
+    // `max_position_embeddings`, and on metal no more than the block table
+    // addresses (`CanonicalParams::KV_ADDRESSABLE_TOKENS`: Gemma4's 32768 of
+    // its 262144).
+    let (metal_rope_rows, spyre_rope_rows) = if uses_rotary || uses_rotary_local {
         let max_pos = *model
             .bounds
             .get("max_position_embeddings")
             .expect("model must have max_position_embeddings for Rotary")
             as usize;
+        (
+            quote! {
+                let __rope_rows: usize =
+                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_ADDRESSABLE_TOKENS
+                        .map_or(#max_pos, |reach| reach.min(#max_pos));
+            },
+            quote! { let __rope_rows: usize = #max_pos; },
+        )
+    } else {
+        (quote! {}, quote! {})
+    };
+    let rotary_load_metal: TokenStream = if uses_rotary {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for Rotary") as usize;
         let rope_theta = model
             .scalars
             .get("rope_theta")
@@ -4053,15 +4068,6 @@ fn emit_weights_struct(
         // arm above applies.
         let yarn_rope_head_dim: Option<usize> =
             model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
-        // Clamp the rotary cache size to the runtime `max_model_len`
-        // rather than the model's compile-time `max_position_embeddings`.
-        // For Llama-3.2 (max_position_embeddings = 131072) under chat
-        // workloads with the default 4-8K context, the unclamped path
-        // precomputed 16-32× more cos/sin pairs than any request can
-        // possibly index — pure waste of CPU + upload bandwidth.
-        // `max_model_len` is the function argument; the .min(...) caps
-        // it at the model's hard limit so a misconfigured larger value
-        // doesn't run past the rope shape.
         // rotary_dim = partial_rotary_factor * head_dim (e.g. Qwen3.5:
         // 0.25 * 256 = 64); `None` ⇒ full rotary (rotary_dim == head_dim).
         let rotary_dim_metal: Option<usize> =
@@ -4096,7 +4102,7 @@ fn emit_weights_struct(
             let g_hd_lit = proc_macro2::Literal::usize_unsuffixed(g_hd);
             let g_rd_lit = proc_macro2::Literal::usize_unsuffixed(g_rd);
             quote! {
-                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                 let rotary =
                     crate::__gpu::rotary::RotaryCache::new_proportional_from_gpuweights(
                         gw,
@@ -4110,7 +4116,7 @@ fn emit_weights_struct(
         } else {
             match (rotary_dim_metal, scaling) {
                 (None, None) => quote! {
-                    let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                    let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                     let rotary = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
                         gw,
                         #head_dim,
@@ -4131,7 +4137,7 @@ fn emit_weights_struct(
                 ) => {
                     let orig = original_max_position_embeddings as usize;
                     quote! {
-                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                         let rotary = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
                             gw,
                             #head_dim,
@@ -4169,7 +4175,7 @@ fn emit_weights_struct(
                     let long: Vec<f64> = long_factor.clone();
                     let (sm, lm) = (short_mscale, long_mscale);
                     quote! {
-                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                         let rotary = crate::__gpu::rotary::RotaryCache::new_longrope_from_gpuweights(
                             gw,
                             #head_dim,
@@ -4211,7 +4217,7 @@ fn emit_weights_struct(
                     let orig = original_max_position_embeddings as usize;
                     let rope_hd = yarn_rope_head_dim.unwrap_or(head_dim);
                     quote! {
-                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                         let rotary = crate::__gpu::rotary::RotaryCache::new_yarn_from_gpuweights(
                             gw,
                             #rope_hd,
@@ -4234,7 +4240,7 @@ fn emit_weights_struct(
                 // cache; `W::ROT_DIM` (= rotary_dim) drives the kernel so the
                 // trailing head_dim-rotary_dim channels pass through unrotated.
                 (Some(rotary_dim), None) => quote! {
-                    let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                    let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                     let rotary = crate::__gpu::rotary::RotaryCache::new_partial_from_gpuweights(
                         gw,
                         #head_dim,
@@ -4257,7 +4263,7 @@ fn emit_weights_struct(
                 ) => {
                     let orig = original_max_position_embeddings as usize;
                     quote! {
-                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rope_max_pos = ::core::cmp::min(max_model_len, __rope_rows);
                         let rotary = crate::__gpu::rotary::RotaryCache::new_partial_from_gpuweights(
                             gw,
                             #head_dim,
@@ -4527,6 +4533,7 @@ fn emit_weights_struct(
                 );
                 #packed_splits_prelude
                 #(#lets)*
+                #metal_rope_rows
                 #rotary_load_metal
                 #rotary_local_load_metal
                 Ok(#weights_ctor {
@@ -4580,6 +4587,7 @@ fn emit_weights_struct(
                 #bnb4_prelude
                 #fp8_prelude
                 #(#lets)*
+                #spyre_rope_rows
                 #rotary_load_metal
                 #rotary_local_load_metal
                 Ok(#weights_ctor {
@@ -7597,6 +7605,7 @@ fn emit_canonical_params_impl(
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
+    kv_reach: KvReach,
     // Filled with the SAME values the impl's consts are emitted from —
     // one derivation, two consumers (the impl tokens and the macro-side
     // tape bake). Built in this fn so drift is impossible.
@@ -7966,6 +7975,18 @@ fn emit_canonical_params_impl(
         }
         None => quote! {},
     };
+    // KV_ADDRESSABLE_TOKENS override — from the very consts the kernels bake,
+    // so the reach the worker caps at and the RoPE rows the load builds cannot
+    // drift from the block table.
+    let kv_addressable_override: proc_macro2::TokenStream = match kv_reach {
+        KvReach::KvCache => quote! {},
+        KvReach::BlockTable => quote! {
+            const KV_ADDRESSABLE_TOKENS: ::core::option::Option<usize> =
+                ::core::option::Option::Some(
+                    Self::MAX_BLOCKS_PER_SEQ as usize * Self::BLOCK_SIZE as usize
+                );
+        },
+    };
     let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
     let attn_softcap_lit = proc_macro2::Literal::f32_unsuffixed(attn_softcap);
     let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
@@ -8202,6 +8223,7 @@ fn emit_canonical_params_impl(
             #rope_proportional_tokens
             #rope_on_read_tokens
             #max_blocks_override
+            #kv_addressable_override
             #global_block_size_override
             const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
             const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
@@ -8323,6 +8345,29 @@ pub fn emit_gdn_runtime_config_arm_body(
             },
         )
     })
+}
+
+/// What bounds the tokens one sequence's metal KV can address
+/// (`CanonicalParams::KV_ADDRESSABLE_TOKENS`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KvReach {
+    /// Only the KV cache: every uniform-geometry variant.
+    KvCache,
+    /// The block table: a hybrid-geometry variant (Gemma4) gives every KV
+    /// group a `MAX_BLOCKS_PER_SEQ`-long row, so it reaches
+    /// `MAX_BLOCKS_PER_SEQ × BLOCK_SIZE` tokens.
+    BlockTable,
+}
+
+impl KvReach {
+    /// A variant's reach: the block table exactly when its KV groups differ
+    /// in geometry (`ScratchyWeights::per_layer_kv_token_elems` is `Some`).
+    fn of(fuf: &Fuf, model: &ModelParams) -> Self {
+        match emit_per_layer_kv_token_elems_arm_body(fuf, model) {
+            Some(_) => Self::BlockTable,
+            None => Self::KvCache,
+        }
+    }
 }
 
 /// Emit the body for the per-arch `ScratchyWeights::per_layer_kv_token_elems`
@@ -12215,6 +12260,7 @@ pub fn emit_model(
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
+        KvReach::of(fuf, model),
         #[cfg(feature = "metal")]
         &mut resolved_metal_consts,
     );
@@ -14475,6 +14521,7 @@ mod tests {
             1,
             false,
             &every_layer(&m),
+            KvReach::KvCache,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14511,6 +14558,7 @@ mod tests {
             2,
             false,
             &every_layer(&m),
+            KvReach::KvCache,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14559,6 +14607,7 @@ mod tests {
             8,
             false,
             &every_layer(&m),
+            KvReach::KvCache,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14577,6 +14626,35 @@ mod tests {
         assert!(
             ts.contains("INTERMEDIATE_SIZE : usize = 1792"),
             "tp=8 must shard INTERMEDIATE_SIZE to 1792; got {ts}"
+        );
+    }
+
+    /// `KV_ADDRESSABLE_TOKENS` is overridden only for a block-table reach,
+    /// and then as the product of the impl's own block consts — never a
+    /// second literal that could drift from what the kernels bake.
+    #[test]
+    fn kv_addressable_tokens_derives_from_the_block_consts() {
+        let m = shard_test_model(32, 8, 128, 14336);
+        let emit = |reach| {
+            emit_canonical_params_impl(
+                &m,
+                1,
+                false,
+                &every_layer(&m),
+                reach,
+                #[cfg(feature = "metal")]
+                &mut None,
+            )
+            .to_string()
+        };
+        assert!(!emit(KvReach::KvCache).contains("KV_ADDRESSABLE_TOKENS"));
+        let ts = emit(KvReach::BlockTable).replace(' ', "");
+        assert!(
+            ts.contains(
+                "constKV_ADDRESSABLE_TOKENS:::core::option::Option<usize>=::core::option::Option::\
+                 Some(Self::MAX_BLOCKS_PER_SEQasusize*Self::BLOCK_SIZEasusize);"
+            ),
+            "a block-table reach must be MAX_BLOCKS_PER_SEQ × BLOCK_SIZE; got {ts}"
         );
     }
 
