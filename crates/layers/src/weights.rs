@@ -464,9 +464,8 @@ impl TensorRefs {
     /// Whether any tensor sits under `prefix` (`<prefix>.<suffix>`): a target checkpoint that holds
     /// its multi-token-prediction head's namespace carries the head.
     pub fn holds(&self, prefix: &str) -> bool {
-        self.0
-            .keys()
-            .any(|name| relocated(name, prefix, "").is_some())
+        (self.0.keys())
+            .any(|name| scratchy_core_model::weight::under_prefix(name, prefix).is_some())
     }
 }
 
@@ -474,7 +473,7 @@ impl TensorRefs {
 /// `<as_prefix>.<suffix>`, or `<suffix>` for the empty `as_prefix` (the top level). `None` when
 /// `name` is not under `from_prefix`.
 fn relocated(name: &str, from_prefix: &str, as_prefix: &str) -> Option<String> {
-    let suffix = name.strip_prefix(from_prefix)?.strip_prefix('.')?;
+    let suffix = scratchy_core_model::weight::under_prefix(name, from_prefix)?;
     Some(match as_prefix {
         "" => suffix.to_string(),
         as_prefix => format!("{as_prefix}.{suffix}"),

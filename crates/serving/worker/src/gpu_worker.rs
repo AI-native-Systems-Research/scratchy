@@ -1116,7 +1116,8 @@ impl MetalWorker {
                 let gdn_per_slot = gdn.as_ref().map(|_| gdn_bytes(1, None));
                 let gdn_lanes = gdn_bytes(
                     0,
-                    gdn.as_ref()
+                    (gdn.as_ref())
+                        .filter(|_| self.config.draft.is_some())
                         .and_then(|cfg| gdn_draft_lanes(arch, cfg, usize::MAX)),
                 );
                 let (budget, allocated) = self
@@ -1333,11 +1334,13 @@ impl MetalWorker {
     }
 
     /// The loaded target's Gated-DeltaNet draft lanes ([`gdn_draft_lanes`]), at the resolved
-    /// width: what its pool allocates and its budget reserves.
+    /// width: what its pool allocates and its budget reserves. None when this worker drafts with
+    /// nothing (no draft configured).
     fn gdn_lanes(
         &self,
         cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
     ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
+        self.config.draft.as_ref()?;
         let arch = self.resolved_architecture.as_deref()?;
         gdn_draft_lanes(arch, cfg, self.max_num_seqs_resolved())
     }
@@ -1543,11 +1546,11 @@ impl MetalWorker {
         Ok((draft_weights, draft_arch, draft_hf_config))
     }
 
-    /// The target's compiled multi-token-prediction head ([`Draft::TargetHead`]): from the target's
-    /// own store when its checkpoint carries the head — tensors under the head's
-    /// `checkpoint_prefix`, lent under the bare names the head binds (the same mmap: nothing
-    /// uploads twice), its config the target's own — else from the repo it is published under,
-    /// named from the target's.
+    /// The target's compiled multi-token-prediction head ([`Draft::TargetHead`]), which its
+    /// checkpoint carries (the server found its tensors before any load; a head published apart
+    /// comes as a [`Draft::Checkpoint`]): the tensors under the head's `checkpoint_prefix`, lent
+    /// from the target's store under the bare names the head binds (the same mmap: nothing uploads
+    /// twice), its config the target's own.
     fn target_head(
         &self,
         allocator: MetalAllocator,
@@ -1567,30 +1570,25 @@ impl MetalWorker {
                 "this build compiled no multi-token-prediction head for {arch} ({model})"
             ))
         })?;
-        if let Some(prefix) = head.checkpoint_prefix.filter(|p| refs.holds(p)) {
-            let mut weights = GpuWeights::empty(allocator);
-            let lent = weights.lend(refs, prefix, "", None).map_err(|e| {
-                ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}"))
+        let prefix = head
+            .checkpoint_prefix
+            .filter(|p| refs.holds(p))
+            .ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "{model}'s checkpoint holds no tensor under its multi-token-prediction head's \
+                 prefix ({:?})",
+                    head.checkpoint_prefix
+                ))
             })?;
-            info!(
-                "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors \
-                 under {prefix})"
-            );
-            return Ok((weights, head.arch.to_string(), target_config.clone()));
-        }
-        let repo = head.repo_of(model).ok_or_else(|| {
-            let inside = match head.checkpoint_prefix {
-                Some(prefix) => format!(" (no tensor under {prefix})"),
-                None => String::new(),
-            };
-            ExecutorError::WorkerInit(format!(
-                "{model}'s checkpoint carries no multi-token-prediction head{inside}, and the repo \
-                 the head is published under cannot be named from {model}; pass \
-                 --speculative-model <head>"
-            ))
-        })?;
-        info!("ScratchyWorker(metal): MTP head published apart from the target, {repo}");
-        self.draft_checkpoint(&repo, allocator)
+        let mut weights = GpuWeights::empty(allocator);
+        let lent = weights
+            .lend(refs, prefix, "", None)
+            .map_err(|e| ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}")))?;
+        info!(
+            "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors under \
+             {prefix})"
+        );
+        Ok((weights, head.arch.to_string(), target_config.clone()))
     }
 
     /// Load the speculative draft model onto the same Metal device +

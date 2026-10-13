@@ -12,9 +12,10 @@ description = "Speculative-decoding build scope: which drafters compile alongsid
 # scratchy-quantizations `quant`. Its features forward to scratchy-models,
 # whose build script compiles the drafters.
 #
-# `mtp`: every selected model whose checkpoint carries a multi-token-prediction
-# head compiles that head too, and serving the model drafts with it —
-# `--features metal,model/qwen3.6-35b-a3b,spec/mtp`.
+# `mtp`: the drafters published as models of their own (Gemma 4's assistant,
+# drafting when `--speculative-model` names it) besides the heads inside their
+# targets' checkpoints, which `metal` already compiles —
+# `--features metal,model/gemma-4-26b-a4b-it,spec/mtp`.
 mtp = ["scratchy-models/mtp"]
 
 [dependencies]

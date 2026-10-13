@@ -42,7 +42,7 @@ profiling = ["cuda"]
 # `commands/model_info.rs`. Backends enable the ENGINE (via scratchy-serving-api/
 # <backend>), not the HTTP server — a backend is only meaningful with local
 # inference.
-metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal", "turboquant"]
+metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal", "turboquant", "mtp-heads"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
@@ -87,6 +87,13 @@ hf-completions = ["model?/hf-completions"]
 # (the build output names them). Off for cuda and spyre. `--kv-cache-dtype`
 # cannot change it at runtime.
 turboquant = ["model?/turboquant"]
+# Multi-token-prediction drafting, on with `metal`: every selected model whose
+# checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and serving the
+# model drafts with it; a checkpoint without the head's tensors serves without
+# drafting. Off for cuda and spyre. `spec/mtp` adds the drafters published as
+# models of their own (Gemma 4's assistant), which draft only when
+# `--speculative-model` names them.
+mtp-heads = ["model?/mtp-heads"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
 # its `scratchy-vision`/`image` deps optional-and-on, forwards
 # `scratchy-forward-compiler/vision` + `scratchy-serving-worker/vision`

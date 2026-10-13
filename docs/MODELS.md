@@ -171,8 +171,8 @@ draft model). What its `arch.json` declares:
   repo carries only `model_type: "qwen3_5_mtp"`. Its config's own
   `architectures` (its target's) name the targets it drafts for.
 - **`checkpoint_of: ["qwen3-5-moe"]`** — the arches whose checkpoints carry
-  it. It has no configs of its own: under `spec/mtp` it compiles on every
-  selected config of those arches that declares its layers
+  it. It has no configs of its own: under `mtp-heads` (on with `metal`) it
+  compiles on every selected config of those arches that declares its layers
   (`mtp_num_hidden_layers` above zero), that config verbatim.
 - **`checkpoint_prefix: "language_model.mtp"`** — where its tensors sit in
   such a checkpoint (MLX's layout). A target checkpoint holding tensors there
@@ -181,8 +181,9 @@ draft model). What its `arch.json` declares:
 - **`drafter_repo_infix: "-MTP"`** — an MLX conversion strips the head's
   tensors from the target and publishes them apart, as the target's repo with
   this before its last `-` token (`mlx-community/Qwen3.6-35B-A3B-4bit` →
-  `mlx-community/Qwen3.6-35B-A3B-MTP-4bit`). The worker loads that repo when
-  the target's checkpoint does not carry the head.
+  `mlx-community/Qwen3.6-35B-A3B-MTP-4bit`). The server drafts with that repo
+  when the target's checkpoint does not carry the head and the repo resolves;
+  with neither it serves without drafting, and says why.
 - **`decoder_safetensors_prefix: ""`** — the drafter stores its tensors bare
   (`fc.*`, `layers.0.*`, `norm.*`, `pre_fc_norm_*`).
 - **`params`** — its configs are the target's verbatim HF config, so
@@ -193,22 +194,23 @@ draft model). What its `arch.json` declares:
 
 The head carries no `embed_tokens` / `lm_head`: the worker lends it the
 target's (the same mmap, nothing uploaded twice), the lm_head cut to the
-head's `vocab_size` rows. `spec/mtp` compiles the head of every selected
-model whose checkpoint carries one, and a build that compiles the head drafts
-with it whenever it serves the target. A target whose config declares MTP
+head's `vocab_size` rows. A metal build compiles the head of every selected
+model whose checkpoint carries one, and drafts with it whenever it serves the
+target and finds the head's tensors. A target whose config declares MTP
 layers that no head arch drafts for (the dense Qwen3.5s) serves without
 drafting, and says so at startup. How many tokens it drafts a step is a
 compile-time constant (`spec_drafts` in the head's `arch.json`, 2): the
 target's verify steps carry exactly that many rows per sequence, and both
-models' kernels bake it. To serve without it, build without `spec/mtp`:
+models' kernels bake it. To serve without it, `--num-speculative-tokens 0`:
 
 ```bash
 cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,\
-spec/mtp,quant/mlx-affine-b4-g64-qembed
+quant/mlx-affine-b4-g64-qembed
 scr serve mlx-community/Qwen3.6-35B-A3B-4bit   # head from mlx-community/Qwen3.6-35B-A3B-MTP-4bit
+scr serve mlx-community/Qwen3.6-35B-A3B-4bit --num-speculative-tokens 0   # no drafting
 
 cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.5-122b-a10b,\
-spec/mtp,quant/mlx-affine-b4-g64-qembed
+quant/mlx-affine-b4-g64-qembed
 scr serve scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp   # head inside the checkpoint
 ```
 

@@ -570,12 +570,15 @@ fn load_dir_mode(
             || std::env::var(feature_env_var(&format!("{arch_name}-{stem}"))).is_ok()
     };
     // A head (an arch registering under an identity of its own, `hf_architectures`) compiles beside
-    // the targets it drafts for under `spec/mtp` (scratchy-models' `mtp` feature): one that ships
-    // inside its targets' checkpoints (`checkpoint_of`) on every selected config of those arches
-    // that carries it — its config is the target's own file; one published as a checkpoint of its
-    // own (`head_targets`) on each of its configs whose target is selected. Either way the target's
-    // verify steps carry the head's drafts (`spec_drafts`, the head's arch.json).
+    // the targets it drafts for: one that ships inside its targets' checkpoints (`checkpoint_of`)
+    // under scratchy-models' `mtp-heads` feature (which `metal` turns on, and `mtp` implies), on
+    // every selected config of those arches that carries it — its config is the target's own
+    // file; one published as a checkpoint of its own (`head_targets`), which drafts only when
+    // `--speculative-model` names it, under `mtp` (`spec/mtp`), on each of its configs whose
+    // target is selected. Either way the target's verify steps carry the head's drafts
+    // (`spec_drafts`, the head's arch.json).
     let mtp = std::env::var(feature_env_var("mtp")).is_ok();
+    let mtp_heads = std::env::var(feature_env_var("mtp-heads")).is_ok();
     let configs_root = dir
         .parent()
         .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
@@ -590,14 +593,14 @@ fn load_dir_mode(
         })
     };
     let head_drafts = |stem: &str, json: &serde_json::Value| -> Result<Option<u64>, ConfigError> {
-        if !mtp || !spec.hf_architectures.is_empty() {
+        if !mtp_heads || !spec.hf_architectures.is_empty() {
             return Ok(None);
         }
         let this = format!("{arch_name}/{stem}");
         for arch_dir in arch_dirs(configs_root)? {
             let head = load_arch_json(&arch_dir)?;
             let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            let heads_this = head.head_targets.iter().any(|(_, t)| *t == this)
+            let heads_this = (mtp && head.head_targets.iter().any(|(_, t)| *t == this))
                 || (head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json));
             if let (true, Some(&(_, drafts))) = (heads_this, drafts) {
                 return Ok(Some(drafts));
@@ -714,7 +717,7 @@ fn load_dir_mode(
 
     // An in-checkpoint head's configs are the selected configs of its target arches that carry it.
     let mut in_checkpoint: Vec<PathBuf> = Vec::new();
-    for target_arch in spec.checkpoint_of.iter().filter(|_| mtp) {
+    for target_arch in spec.checkpoint_of.iter().filter(|_| mtp_heads) {
         for p in model_configs(&configs_root.join(target_arch))? {
             if model_feature_enabled(target_arch, &stem_of(&p)?)
                 && carries_head(spec, &read_json_file(&p)?.1)

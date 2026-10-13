@@ -701,15 +701,18 @@ all = [
 # arch's own quantizations.json (an arch that doesn't declare a preset just
 # ignores it).
 
-# Speculative-decoding drafters. `mtp`: every selected model whose checkpoint
-# carries a multi-token-prediction head compiles that head too (config.rs: a
-# head declares the arches whose checkpoints carry it, `checkpoint_of`, and
-# compiles on each selected config of theirs that declares its layers; a head
-# published as a model of its own names its targets, `head_targets`). Reached
-# as `spec/mtp` from scratchy-cli through scratchy-spec (crates/models/spec),
-# which forwards here: like quant scope, it needs its own crate for its own CLI
-# alias.
-mtp = ["arch-qwen3-5-mtp", "arch-gemma4-assistant"]
+# Speculative-decoding drafters. `mtp-heads`: every selected model whose
+# checkpoint carries a multi-token-prediction head compiles that head too
+# (config.rs: a head declares the arches whose checkpoints carry it,
+# `checkpoint_of`, and compiles on each selected config of theirs that declares
+# its layers), and serving it drafts with the head; scratchy-cli's `metal` turns
+# it on. `mtp` adds the drafters published as models of their own, which name
+# their targets (`head_targets`) and draft only when `--speculative-model` names
+# them. Reached as `spec/mtp` from scratchy-cli through scratchy-spec
+# (crates/models/spec), which forwards here: like quant scope, it needs its own
+# crate for its own CLI alias.
+mtp-heads = ["arch-qwen3-5-mtp"]
+mtp = ["mtp-heads", "arch-gemma4-assistant"]
 
 # Backends — ONE definition each (this is what kills the per-arch duplication).
 # The build-dep pipeline lib gets the backend so its emit matches; the runtime

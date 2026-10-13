@@ -102,8 +102,8 @@ pub enum Draft {
     /// A checkpoint of its own, a local path or Hub repo: a standalone draft model, or a
     /// multi-token-prediction head published apart from its target (its config names its arch).
     Checkpoint(String),
-    /// The target's compiled multi-token-prediction head: loaded from the target's own checkpoint
-    /// when that carries it, else from the repo it is published under, named from the target's.
+    /// The target's compiled multi-token-prediction head, which the target's own checkpoint
+    /// carries: lent from the target's store. (A head published apart is a [`Self::Checkpoint`].)
     TargetHead,
 }
 

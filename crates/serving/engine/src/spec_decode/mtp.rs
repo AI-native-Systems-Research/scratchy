@@ -137,9 +137,10 @@
 //!   layer's KV takes 528 bytes a token beside the target's 7,328 (its target's TurboQuant codes,
 //!   staged through its target's scratch). The prefill bucket stays 2048. Winning the weights'
 //!   share back on a small Mac means shrinking something else there, such as the prefill bucket.
-//! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
-//!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
-//!   optional, and refuse a value that differs from the head's.
+//! - TODO: `--num-speculative-tokens 0` serves without the head; any other count given with a head
+//!   is ignored (the head drafts its compiled count), and `serve`'s flag defaults to 2, so it
+//!   cannot tell a given value from none. Make it optional, and refuse a value that differs from
+//!   the head's.
 
 use std::collections::{HashMap, HashSet};
 

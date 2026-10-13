@@ -169,24 +169,29 @@ No `quant/*` feature named at all = every selected model compiles dense only.
 ## `-Fspec/<...>` — which drafters compile with the selected models
 
 ```bash
-cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,spec/mtp,quant/mlx-affine-b4-g64-qembed
+cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
 # → Qwen3.6-35B-A3B plus its multi-token-prediction head; serving it drafts with the head
+cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec/mtp,quant/mlx-affine-b4-g64
+# → Gemma 4 26B-A4B plus its assistant; serving it drafts with `--speculative-model <assistant>`
 ```
 
-- **`spec/mtp`** — every selected model whose checkpoint carries a
-  multi-token-prediction head compiles that head too. A head that ships inside
-  its target's checkpoint has no config of its own: its `arch.json` names the
-  arches whose checkpoints carry it (`checkpoint_of`), and it compiles on each
+- **`metal`** turns on scratchy-models' **`mtp-heads`**: every selected model
+  whose checkpoint carries a multi-token-prediction head compiles that head
+  too. Such a head has no config of its own: its `arch.json` names the arches
+  whose checkpoints carry it (`checkpoint_of`), and it compiles on each
   selected config of theirs that declares its layers, that config verbatim
-  (`crates/compiler/macros/src/config.rs`). A head published as a model of its
-  own (Gemma 4's assistant) names its targets instead (`head_targets`).
-  Serving loads the head from the target's own checkpoint when that carries
-  it (its weight map holds `language_model.mtp.*`:
-  `scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp`), else from the repo it is
-  published under (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`).
+  (`crates/compiler/macros/src/config.rs`). Serving drafts with the head from
+  the target's own checkpoint when that carries it (its weight map holds
+  `language_model.mtp.*`: `scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp`), else
+  from the repo it is published under when that resolves
+  (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`), else it serves without
+  drafting and says why. `--num-speculative-tokens 0` serves without drafting.
+- **`spec/mtp`** — adds the drafters published as models of their own, which
+  name their targets (`head_targets`) and draft only when
+  `--speculative-model` names them (Gemma 4's assistant).
 
-No `spec/*` feature named = no drafter compiles, and the selected models serve
-without speculative decoding.
+No `spec/*` feature named = only the heads inside their targets' checkpoints
+compile (with `metal`); a cuda or spyre build compiles none.
 
 ## `turboquant` — KV cache compression, fixed at build time
 
