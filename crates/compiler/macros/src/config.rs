@@ -76,6 +76,8 @@ pub struct ModelParams {
     /// How the repo of a head published apart from its target is named from the target's
     /// (`drafter_repo_infix`, arch.json).
     pub drafter_repo_infix: Option<String>,
+    /// Where a head's tensors sit inside its target's checkpoint (`checkpoint_prefix`, arch.json).
+    pub checkpoint_prefix: Option<String>,
     /// Extra JSON files that contributed to this variant's final
     /// config — the quantization preset and per-size override
     /// files that the loader deep-merged onto the dense base.
@@ -567,92 +569,37 @@ fn load_dir_mode(
         std::env::var(feature_env_var(stem)).is_ok()
             || std::env::var(feature_env_var(&format!("{arch_name}-{stem}"))).is_ok()
     };
-    // A head that ships inside its target's checkpoint (`hf_architectures`: an MTP head) also
-    // compiles for every selected target under `spec/mtp` (scratchy-models' `mtp` feature). Its
-    // configs are its targets' checkpoint configs verbatim, so a head and its target are the arches
-    // whose configs are the same file: the head's config is selected when its target's is, and the
-    // target's verify steps carry the head's drafts (`spec_drafts`, the head's arch.json).
+    // A head (an arch registering under an identity of its own, `hf_architectures`) compiles beside
+    // the targets it drafts for under `spec/mtp` (scratchy-models' `mtp` feature): one that ships
+    // inside its targets' checkpoints (`checkpoint_of`) on every selected config of those arches
+    // that carries it — its config is the target's own file; one published as a checkpoint of its
+    // own (`head_targets`) on each of its configs whose target is selected. Either way the target's
+    // verify steps carry the head's drafts (`spec_drafts`, the head's arch.json).
     let mtp = std::env::var(feature_env_var("mtp")).is_ok();
-    let drafts_with_target = !spec.hf_architectures.is_empty() && mtp;
-    let same_file_elsewhere = |path: &Path| -> Result<Vec<(String, PathBuf)>, ConfigError> {
-        let io = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| ConfigError::Io { path, source }
-        };
-        let this = fs::read(path).map_err(io(path))?;
-        let configs = dir
-            .parent()
-            .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
-        let mut same = Vec::new();
-        for arch_dir in fs::read_dir(configs).map_err(io(configs))? {
-            let arch_dir = arch_dir.map_err(io(configs))?.path();
-            let Some(arch) = arch_dir.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if arch == arch_name || !arch_dir.is_dir() {
-                continue;
-            }
-            for config in fs::read_dir(&arch_dir).map_err(io(&arch_dir))? {
-                let config = config.map_err(io(&arch_dir))?.path();
-                let json = config.extension().is_some_and(|e| e == "json");
-                if json && fs::read(&config).map_err(io(&config))? == this {
-                    same.push((arch.to_string(), config));
-                }
-            }
-        }
-        Ok(same)
-    };
-    let target_selected = |head_path: &Path| -> Result<bool, ConfigError> {
+    let configs_root = dir
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
+    let head_target_selected = |head_path: &Path| -> bool {
         let stem = head_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        if let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| s == stem) {
+        mtp && (spec.head_targets.iter().find(|(s, _)| s == stem)).is_some_and(|(_, target)| {
             let (arch, stem) = target.split_once('/').unwrap_or_default();
-            return Ok(model_feature_enabled(arch, stem));
-        }
-        Ok(same_file_elsewhere(head_path)?
-            .iter()
-            .any(|(arch, config)| {
-                (config.file_stem().and_then(|s| s.to_str()))
-                    .is_some_and(|stem| model_feature_enabled(arch, stem))
-            }))
+            model_feature_enabled(arch, stem)
+        })
     };
-    let head_drafts = |target_path: &Path| -> Result<Option<u64>, ConfigError> {
+    let head_drafts = |stem: &str, json: &serde_json::Value| -> Result<Option<u64>, ConfigError> {
         if !mtp || !spec.hf_architectures.is_empty() {
             return Ok(None);
         }
-        for (_, config) in same_file_elsewhere(target_path)? {
-            let head = load_arch_json(config.parent().expect("a config lies in its arch's dir"))?;
-            let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            if let (false, Some(&(_, drafts))) = (head.hf_architectures.is_empty(), drafts) {
-                return Ok(Some(drafts));
-            }
-        }
-        // A head with a config of its own names this one its target (`head_targets`) — when that
-        // head is selected, which it is with its target under `spec/mtp`.
-        let this = format!("{arch_name}/{}", stem_of(target_path)?);
-        let configs = dir
-            .parent()
-            .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
-        for arch_dir in fs::read_dir(configs).map_err(|source| ConfigError::Io {
-            path: configs.to_path_buf(),
-            source,
-        })? {
-            let arch_dir = arch_dir
-                .map_err(|source| ConfigError::Io {
-                    path: configs.to_path_buf(),
-                    source,
-                })?
-                .path();
-            if !arch_dir.is_dir() {
-                continue;
-            }
+        let this = format!("{arch_name}/{stem}");
+        for arch_dir in arch_dirs(configs_root)? {
             let head = load_arch_json(&arch_dir)?;
             let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            if let (true, Some(&(_, drafts))) =
-                (head.head_targets.iter().any(|(_, t)| *t == this), drafts)
-            {
+            let heads_this = head.head_targets.iter().any(|(_, t)| *t == this)
+                || (head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json));
+            if let (true, Some(&(_, drafts))) = (heads_this, drafts) {
                 return Ok(Some(drafts));
             }
         }
@@ -765,34 +712,19 @@ fn load_dir_mode(
         any
     };
 
-    let all_json: Vec<PathBuf> = fs::read_dir(dir)
-        .map_err(|source| ConfigError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
-
-    let is_overrides = |p: &Path| {
-        p.file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.ends_with(".overrides.json"))
-            .unwrap_or(false)
-    };
-
-    let mut base_paths: Vec<PathBuf> = all_json
-        .iter()
-        .filter(|p| {
-            let name = p.file_name().and_then(|s| s.to_str());
-            !matches!(
-                name,
-                Some("weights.json") | Some("quantizations.json") | Some(ARCH_JSON)
-            ) && !is_overrides(p)
-        })
-        .cloned()
-        .collect();
+    // An in-checkpoint head's configs are the selected configs of its target arches that carry it.
+    let mut in_checkpoint: Vec<PathBuf> = Vec::new();
+    for target_arch in spec.checkpoint_of.iter().filter(|_| mtp) {
+        for p in model_configs(&configs_root.join(target_arch))? {
+            if model_feature_enabled(target_arch, &stem_of(&p)?)
+                && carries_head(spec, &read_json_file(&p)?.1)
+            {
+                in_checkpoint.push(p);
+            }
+        }
+    }
+    let mut base_paths = model_configs(dir)?;
+    base_paths.extend(in_checkpoint.iter().cloned());
     base_paths.sort_by(|a, b| {
         a.file_stem()
             .and_then(|s| s.to_str())
@@ -823,18 +755,20 @@ fn load_dir_mode(
         let stem = stem_of(p)?;
         // Per-model gate: skip entirely — never even `read_json_file` —
         // when this base's `<stem>` (or `<arch>-<stem>`) feature isn't enabled
-        // and it isn't the head of a selected target (`target_selected`).
-        // Every quant variant synthesized from this base below shares its
-        // raw JSON via `base_raw`, so skipping here (instead of after
-        // parsing) also means an unselected base contributes no quant
-        // variants, not just no dense emission.
-        if !model_feature_enabled(arch_name, &stem) && !(drafts_with_target && target_selected(p)?)
+        // and it isn't the head of a selected target (`in_checkpoint`,
+        // `head_target_selected`). Every quant variant synthesized from this
+        // base below shares its raw JSON via `base_raw`, so skipping here
+        // (instead of after parsing) also means an unselected base contributes
+        // no quant variants, not just no dense emission.
+        if !in_checkpoint.contains(p)
+            && !model_feature_enabled(arch_name, &stem)
+            && !head_target_selected(p)
         {
             continue;
         }
         selected_configs().lock().unwrap().insert(p.clone());
         let (raw, mut json) = read_json_file(p)?;
-        if let (Some(drafts), Some(obj)) = (head_drafts(p)?, json.as_object_mut()) {
+        if let (Some(drafts), Some(obj)) = (head_drafts(&stem, &json)?, json.as_object_mut()) {
             obj.insert("spec_drafts".to_string(), drafts.into());
         }
         // Dense-base drift surface: `<stem>.overrides.json` deep-merges
@@ -989,6 +923,57 @@ fn load_dir_mode(
     out.sort_by(|a, b| a.source_stem.cmp(&b.source_stem));
 
     Ok(out)
+}
+
+/// An arch dir's model configs: its `*.json` but the arch's own declarations (`arch.json`,
+/// `weights.json`, `quantizations.json`) and the drift files (`*.overrides.json`).
+fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    let io = |source| ConfigError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    let mut configs = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io)? {
+        let path = entry.map_err(io)?.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let declaration = matches!(name, "weights.json" | "quantizations.json" | ARCH_JSON);
+        if name.ends_with(".json") && !declaration && !name.ends_with(".overrides.json") {
+            configs.push(path);
+        }
+    }
+    Ok(configs)
+}
+
+/// Every arch dir under `configs/`.
+fn arch_dirs(configs_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    let io = |source| ConfigError::Io {
+        path: configs_root.to_path_buf(),
+        source,
+    };
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(configs_root).map_err(io)? {
+        let path = entry.map_err(io)?.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    Ok(dirs)
+}
+
+/// Whether a checkpoint config carries the in-checkpoint head `head` (`checkpoint_of`): it declares
+/// the head's layers — the config field the head's `num_hidden_layers` replaces its target's from
+/// (`mtp_num_hidden_layers`) — above zero.
+fn carries_head(head: &crate::arch_spec::DeclaredArchSpec, json: &serde_json::Value) -> bool {
+    let json = normalize_hf_config(json, &head.config_aliases);
+    head.params.iter().any(|f| {
+        let crate::arch_spec::ParamSource::From { path, .. } = &f.source else {
+            return false;
+        };
+        let layers = crate::arch_spec::json_path(&json, path).and_then(|v| v.as_u64());
+        f.name == "num_hidden_layers" && f.replaces && layers.is_some_and(|n| n > 0)
+    })
 }
 
 /// Load a single config.json as a dense-base ModelParams.
@@ -1675,6 +1660,7 @@ fn model_params_from_json(
         architectures,
         drafts_for,
         drafter_repo_infix: spec.drafter_repo_infix.clone(),
+        checkpoint_prefix: spec.checkpoint_prefix.clone(),
         extra_tracked_paths,
         rope_scaling,
         rope_scaling_hash,
@@ -1806,6 +1792,7 @@ fn vision_params_from_json(
         architectures,
         drafts_for: Vec::new(),
         drafter_repo_infix: None,
+        checkpoint_prefix: None,
         extra_tracked_paths,
         rope_scaling: None,
         rope_scaling_hash: None,
@@ -1922,6 +1909,7 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
     spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
+    spec.checkpoint_prefix = as_str("checkpoint_prefix");
     spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
     let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
         json.get(key)
@@ -1937,6 +1925,15 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     };
     spec.borrows = strings("borrows")?;
     spec.top_level_weights = strings("top_level_weights")?.unwrap_or_default();
+    spec.checkpoint_of = strings("checkpoint_of")?.unwrap_or_default();
+    if spec.checkpoint_of.is_empty() != spec.checkpoint_prefix.is_none() {
+        return Err(ConfigError::ArchJson {
+            path: path.clone(),
+            reason: "`checkpoint_of` and `checkpoint_prefix` declare one fact (a head inside its \
+                     target's checkpoint): both or neither"
+                .to_string(),
+        });
+    }
 
     if let Some(s) = as_str("vision_rope_style") {
         check_enum(
@@ -1986,6 +1983,8 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "hf_architectures",
     "drafter_repo_infix",
     "head_targets",
+    "checkpoint_of",
+    "checkpoint_prefix",
     "reads_target_kv",
     "borrows",
     "top_level_weights",
@@ -3325,26 +3324,67 @@ mod tests {
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
     }
 
-    /// Qwen3.6's MTP head reads its target's config verbatim, whose block schedule names the
+    /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the
     /// target's 40 layers; the head's schema makes it 1. The target keeps its sets; the head gets
     /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have).
     #[test]
     fn a_schema_replacing_the_layer_count_leaves_no_layer_sets() {
-        let parse = |arch: &str, stem: &str| {
-            let dir = repo_model_archs(arch);
-            let spec = load_arch_json(&dir).expect("arch.json");
-            let path = dir.join(format!("{stem}.json"));
-            let json: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
-            model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse")
+        let target_path = repo_model_archs("qwen3-5-moe").join("qwen3.6-35b-a3b.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target_path).expect("read")).expect("json");
+        let parse = |arch: &str| {
+            let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
+            model_params_from_json(&json, "qwen3.6-35b-a3b", &target_path, Vec::new(), &spec)
+                .expect("parse")
         };
-        let target = parse("qwen3-5-moe", "qwen3.6-35b-a3b");
+        let target = parse("qwen3-5-moe");
         assert_eq!(target.bounds["num_hidden_layers"], 40);
         let attention = target.layer_sets["attention_layers"].members();
         assert_eq!(attention.last(), Some(&39));
-        let head = parse("qwen3-5-mtp", "qwen3.6-35b-a3b-mtp");
+        let head = parse("qwen3-5-mtp");
         assert_eq!(head.bounds["num_hidden_layers"], 1);
         assert!(head.layer_sets.is_empty(), "{:?}", head.layer_sets);
+        assert_eq!(
+            head.checkpoint_prefix.as_deref(),
+            Some("language_model.mtp")
+        );
+    }
+
+    /// The MTP head compiles on exactly the configs of `checkpoint_of` that declare its layers:
+    /// every Qwen3.5/3.6 MoE checkpoint, the 122B's among them; a MoE checkpoint of another family
+    /// declares none.
+    #[test]
+    fn the_mtp_head_compiles_on_the_moe_configs_that_carry_it() {
+        let head = load_arch_json(&repo_model_archs("qwen3-5-mtp")).expect("arch.json");
+        assert_eq!(head.checkpoint_of, ["qwen3-5-moe"]);
+        let carries = |arch: &str| -> Vec<(String, bool)> {
+            let configs = model_configs(&repo_model_archs(arch)).expect("configs");
+            let mut carried: Vec<_> = configs
+                .iter()
+                .map(|p| {
+                    let (_, json) = read_json_file(p).expect("json");
+                    (stem_of(p).expect("stem"), carries_head(&head, &json))
+                })
+                .collect();
+            carried.sort();
+            carried
+        };
+        for (stem, carried) in carries("qwen3-5-moe") {
+            assert!(carried, "{stem} declares its MTP layers");
+        }
+        assert!(
+            carries("qwen3-5-moe")
+                .iter()
+                .any(|(s, _)| s == "qwen3.5-122b-a10b")
+        );
+        for (stem, carried) in carries("qwen3-moe") {
+            assert!(!carried, "{stem} declares no MTP layers");
+        }
+        assert!(
+            model_configs(&repo_model_archs("qwen3-5-mtp"))
+                .expect("configs")
+                .is_empty()
+        );
     }
 
     /// The parity-tiny configs keep every property the carrier gate

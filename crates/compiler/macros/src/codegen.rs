@@ -14587,6 +14587,7 @@ mod tests {
             architectures: Vec::new(),
             drafts_for: Vec::new(),
             drafter_repo_infix: None,
+            checkpoint_prefix: None,
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,

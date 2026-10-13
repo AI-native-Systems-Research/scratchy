@@ -460,6 +460,27 @@ impl<A: DeviceAllocator> scratchy_tensors::WeightSource for GpuWeights<A> {
 /// tensors after the store's own loader has consumed them (`take` removes what it uploads).
 pub struct TensorRefs(HashMap<String, CpuTensorRef>);
 
+impl TensorRefs {
+    /// Whether any tensor sits under `prefix` (`<prefix>.<suffix>`): a target checkpoint that holds
+    /// its multi-token-prediction head's namespace carries the head.
+    pub fn holds(&self, prefix: &str) -> bool {
+        self.0
+            .keys()
+            .any(|name| relocated(name, prefix, "").is_some())
+    }
+}
+
+/// `name` moved from under `from_prefix` to under `as_prefix`: `<from_prefix>.<suffix>` becomes
+/// `<as_prefix>.<suffix>`, or `<suffix>` for the empty `as_prefix` (the top level). `None` when
+/// `name` is not under `from_prefix`.
+fn relocated(name: &str, from_prefix: &str, as_prefix: &str) -> Option<String> {
+    let suffix = name.strip_prefix(from_prefix)?.strip_prefix('.')?;
+    Some(match as_prefix {
+        "" => suffix.to_string(),
+        as_prefix => format!("{as_prefix}.{suffix}"),
+    })
+}
+
 impl<A: DeviceAllocator> GpuWeights<A> {
     /// Snapshot this store's tensor refs ([`TensorRefs`]).
     pub fn tensor_refs(&self) -> TensorRefs {
@@ -467,11 +488,13 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     }
 
     /// Lend `from`'s tensors under `from_prefix` to this store under `as_prefix`: every
-    /// `<from_prefix>.<suffix>` is placed as `<as_prefix>.<suffix>` — its leading `rows` rows when
-    /// given (a draft head reading a prefix of its target's lm_head). How a multi-token-prediction
-    /// head borrows its target's token embedding and lm_head: the refs share the source's mmap,
-    /// so an allocator that maps registered mmaps zero-copy (metal) uploads nothing new. Errors
-    /// when `from` holds nothing under the prefix, or this store already holds a lent name.
+    /// `<from_prefix>.<suffix>` is placed as `<as_prefix>.<suffix>` (as `<suffix>` for the empty
+    /// prefix, the top level) — its leading `rows` rows when given (a draft head reading a prefix
+    /// of its target's lm_head). How a multi-token-prediction head borrows its target's token
+    /// embedding and lm_head, and loads its own tensors from a target checkpoint that carries
+    /// them: the refs share the source's mmap, so an allocator that maps registered mmaps
+    /// zero-copy (metal) uploads nothing new. Errors when `from` holds nothing under the prefix,
+    /// or this store already holds a lent name.
     pub fn lend(
         &mut self,
         from: &TensorRefs,
@@ -481,13 +504,9 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     ) -> Result<usize> {
         let mut lent = 0;
         for (name, t) in &from.0 {
-            let Some(suffix) = name
-                .strip_prefix(from_prefix)
-                .and_then(|rest| rest.strip_prefix('.'))
-            else {
+            let Some(as_name) = relocated(name, from_prefix, as_prefix) else {
                 continue;
             };
-            let as_name = format!("{as_prefix}.{suffix}");
             anyhow::ensure!(
                 !self.tensors.contains_key(&as_name),
                 "lend: this store already holds `{as_name}`"
@@ -3052,5 +3071,65 @@ mod tests {
         assert_eq!(two.size_bytes, 16);
         assert_eq!(two.data(), (0u8..16).collect::<Vec<_>>());
         assert!(t.leading_rows(4).is_err());
+    }
+
+    /// A lent name keeps its suffix under the new prefix, or stands alone under the empty one (a
+    /// head lent its own tensors out of its target's checkpoint binds them bare); a name only
+    /// sharing the prefix's characters is not under it.
+    #[test]
+    fn relocation_moves_a_namespace_and_nothing_beside_it() {
+        let name = "language_model.mtp.layers.0.mlp.switch_mlp.up_proj.scales";
+        assert_eq!(
+            relocated(name, "language_model.mtp", "").as_deref(),
+            Some("layers.0.mlp.switch_mlp.up_proj.scales")
+        );
+        assert_eq!(
+            relocated(
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.embed_tokens",
+                "embed_tokens"
+            )
+            .as_deref(),
+            Some("embed_tokens.weight")
+        );
+        assert_eq!(
+            relocated("language_model.mtpx.fc.weight", "language_model.mtp", ""),
+            None
+        );
+        assert_eq!(
+            relocated("language_model.mtp", "language_model.mtp", ""),
+            None
+        );
+        assert_eq!(
+            relocated("language_model.model.norm.weight", "language_model.mtp", ""),
+            None
+        );
+    }
+
+    /// A store holds a namespace when a tensor sits under it — what tells a target checkpoint that
+    /// carries its multi-token-prediction head from one an MLX conversion stripped it from.
+    #[test]
+    fn a_store_holds_a_namespace_only_when_a_tensor_sits_under_it() {
+        let tensor = || CpuTensorRef {
+            mmap: None,
+            data_offset: 0,
+            size_bytes: 4,
+            shape: vec![1],
+            dtype: DType::F32,
+            owned: Some(Arc::new(vec![0; 4])),
+        };
+        let refs =
+            |names: &[&str]| TensorRefs(names.iter().map(|n| (n.to_string(), tensor())).collect());
+        let stripped = refs(&[
+            "language_model.model.norm.weight",
+            "language_model.lm_head.weight",
+        ]);
+        assert!(!stripped.holds("language_model.mtp"));
+        let carrying = refs(&[
+            "language_model.model.norm.weight",
+            "language_model.mtp.fc.weight",
+        ]);
+        assert!(carrying.holds("language_model.mtp"));
+        assert!(!refs(&["language_model.mtpx.fc.weight"]).holds("language_model.mtp"));
     }
 }

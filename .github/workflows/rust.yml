@@ -116,8 +116,11 @@ jobs:
       # separate member since it was split out) building as a root, and it
       # depends unconditionally on `scratchy-target-metal`, so `objc2` came
       # back in through the side door.
+      #
+      # `mtp` compiles the multi-token-prediction head of every model in `all`
+      # whose checkpoint carries one (heads have no configs of their own).
       - name: Clippy
-        run: cargo clippy --workspace --features cuda,scratchy-models/all
+        run: cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp
           --exclude scratchy-target-metal
           --exclude scratchy-target-metal-compiler
           -- -D warnings
@@ -246,8 +249,10 @@ jobs:
       # scratchy-models' own (empty) default, so name it: every model then
       # expands with the KV codec users get, and the lowering's check that a
       # TurboQuant model's tape compresses its KV runs across the whole catalog.
+      # `mtp` adds the multi-token-prediction head of every model whose
+      # checkpoint carries one (heads have no configs of their own).
       - name: Clippy
-        run: cargo clippy -p scratchy-models --features metal,all,turboquant -- -D warnings
+        run: cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings
 
   macos-metal-tests:
     name: macos-arm64 (metal tests)

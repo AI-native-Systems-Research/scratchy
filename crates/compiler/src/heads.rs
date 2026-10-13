@@ -9,6 +9,9 @@
 /// expansion).
 #[derive(Clone, Copy, Debug)]
 pub struct HeadRegistration {
+    /// The architecture it registers under (its arch.json `hf_architectures`): what a loader
+    /// dispatches it by, wherever its tensors are found.
+    pub arch: &'static str,
     pub embed_tokens: &'static str,
     /// `None`: the head's logits are its own (Gemma 4's assistant: its tied embedding).
     pub lm_head: Option<&'static str>,
@@ -23,6 +26,10 @@ pub struct HeadRegistration {
     /// head's tensors from the target and publishes them alone): inserted before the target
     /// repo's last `-`-delimited token. `None`: it ships only inside its target's checkpoint.
     pub repo_infix: Option<&'static str>,
+    /// Where its tensors sit inside its target's checkpoint (`language_model.mtp`), for a head
+    /// that ships there: a target checkpoint holding tensors under it carries the head, which
+    /// loads from the target's own store. `None`: it never ships inside its target's checkpoint.
+    pub checkpoint_prefix: Option<&'static str>,
     /// The tokens it drafts each step (`spec_drafts`, its arch.json): its target's verify steps
     /// carry them, as both models' kernels bake them.
     pub drafts: u8,

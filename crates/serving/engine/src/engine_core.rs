@@ -331,10 +331,10 @@ impl EngineCore {
                     }
                     ProposerConfig::Mtp(cfg) => {
                         info!(
-                            "MTP speculative decoding enabled ({}, k={}): the \
-                             worker's head drafts from the target's final hidden states at the end \
-                             of each step it drafts from.",
-                            cfg.model, cfg.num_speculative_tokens,
+                            "MTP speculative decoding enabled (k={}): the worker's head drafts \
+                             from the target's final hidden states at the end of each step it \
+                             drafts from.",
+                            cfg.num_speculative_tokens,
                         );
                         Box::new(MtpProposer::new(cfg))
                     }
@@ -1868,7 +1868,6 @@ mod tests {
             },
             proposer_config: Some(crate::spec_decode::ProposerConfig::Mtp(
                 crate::spec_decode::MtpProposerConfig {
-                    model: "head".into(),
                     num_speculative_tokens: 2,
                     max_seqs: 2,
                     max_model_len: 4096,
@@ -1925,7 +1924,6 @@ mod tests {
             },
             proposer_config: Some(crate::spec_decode::ProposerConfig::Mtp(
                 crate::spec_decode::MtpProposerConfig {
-                    model: "head".into(),
                     num_speculative_tokens: 2,
                     max_seqs: 2,
                     max_model_len: 4096,
