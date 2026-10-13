@@ -8,6 +8,9 @@ on:
       - 'docs/**'
       - 'CONTRIBUTING.md'
       - '.github/workflows/pages.yml'
+  # Every pull request builds the site and checks its links without deploying: the site renders
+  # files from all over the repo (docs/, the DSLs, site data), so any change can break it.
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -15,10 +18,11 @@ permissions:
   pages: write
   id-token: write
 
-# One deploy at a time; let an in-flight run finish rather than cancelling it.
+# One deploy at a time; let an in-flight run finish rather than cancelling it. A pull request's
+# build is its own group, superseded by its next push.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('pages-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -46,13 +50,16 @@ jobs:
       - name: Build site
         run: cargo run --release --manifest-path site/Cargo.toml
 
-      - uses: actions/configure-pages@v6
+      - if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6
 
-      - uses: actions/upload-pages-artifact@v5
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site/_site
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
