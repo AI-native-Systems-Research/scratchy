@@ -131,6 +131,11 @@ pub struct RuntimeBindings {
     /// Per-layer GDN recurrent (ssm) state buffers. Same indexing /
     /// dummy / emptiness contract as [`Self::gdn_state_conv`].
     pub gdn_state_ssm: Vec<Buffer>,
+    /// Per-layer GDN draft lanes' conv checkpoints and ssm records
+    /// (`scratchy_layers::gdn_state::DraftLanes`). Same indexing / dummy contract as
+    /// [`Self::gdn_state_conv`]; empty for a model that drafts nothing (its tapes bind none).
+    pub gdn_lanes_conv: Vec<Buffer>,
+    pub gdn_lanes_ssm: Vec<Buffer>,
     /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence.
     /// Shared storage; the pool overwrites `contents()` each forward.
     pub gdn_state_indices: Buffer,
@@ -358,6 +363,10 @@ impl RuntimeBindings {
                 &self.gdn_state_conv[layer.get() as usize]
             }
             RuntimeBindingKind::GdnSsmState { layer } => &self.gdn_state_ssm[layer.get() as usize],
+            RuntimeBindingKind::GdnConvLanes { layer } => {
+                &self.gdn_lanes_conv[layer.get() as usize]
+            }
+            RuntimeBindingKind::GdnSsmLanes { layer } => &self.gdn_lanes_ssm[layer.get() as usize],
             RuntimeBindingKind::GdnStateIndices => &self.gdn_state_indices,
             RuntimeBindingKind::GdnIsFresh => &self.gdn_is_fresh,
             RuntimeBindingKind::VisionRopeFreqs => &self.vision_rope_freqs,

@@ -445,7 +445,8 @@ mod imp {
                 layers,
                 &gdn_cfg.linear_layers,
                 1,
-                scratchy_target_metal::gdn_state::CheckpointRows::NONE,
+                // A lane for a model that drafts: its tapes bind one, though this one never does.
+                scratchy_target_metal::gdn_state::DraftLanes::new(gdn_cfg.checkpoint_rows(), 1),
                 gdn_cfg.state_dims(),
                 |bytes| {
                     // f32 conv/ssm state; MUST be StorageModeShared.

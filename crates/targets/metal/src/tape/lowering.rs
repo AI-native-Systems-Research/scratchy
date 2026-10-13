@@ -232,7 +232,10 @@ fn writes_cache(c: &GatedCommand) -> bool {
         matches!(
             b,
             Binding::Runtime {
-                kind: RB::GdnConvState { .. } | RB::GdnSsmState { .. },
+                kind: RB::GdnConvState { .. }
+                    | RB::GdnSsmState { .. }
+                    | RB::GdnConvLanes { .. }
+                    | RB::GdnSsmLanes { .. },
                 ..
             }
         )
@@ -1164,13 +1167,14 @@ fn route_gdn(
     let hv = p.gdn_head_v_dim;
     let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
+    // A plain step's scan: the simd scan's geometry (0-4), not its drafts (8) nor their lanes.
     let pipelined = |scan: &LoweredCommand| LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_scan_pipelined",
         function: gdn_scan_pipelined_static_name(dequant_dtype_for(p)),
         constants: baked(
-            scan.constants
-                .iter()
+            (scan.constants.iter())
+                .filter(|c| c.index != GDN_SCAN_DRAFTS_SLOT)
                 .copied()
                 .chain([ConstantValue::uint(5, GDN_PIPE_TB)])
                 .collect(),
@@ -1184,7 +1188,20 @@ fn route_gdn(
                 seq_axis: Some(MScaleAxis::Z),
             }),
         },
-        bindings: scan.bindings,
+        bindings: baked(
+            (scan.bindings.iter())
+                .filter(|b| {
+                    !matches!(
+                        b,
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::GdnSsmLanes { .. },
+                            ..
+                        }
+                    )
+                })
+                .copied()
+                .collect(),
+        ),
         gemm_dims: None,
     };
     let decoded = |d: bool, q: bool| decodes && d && q;
@@ -4974,6 +4991,7 @@ fn lower_one(
                 slot: *slot,
                 binding_index,
             };
+            // A plain step's: the one-command decode keeps no draft state.
             let scan_constants = || {
                 vec![
                     ConstantValue::uint(0, nk),
@@ -4981,7 +4999,6 @@ fn lower_one(
                     ConstantValue::uint(2, hk),
                     ConstantValue::uint(3, hv),
                     ConstantValue::float(4, scale),
-                    ConstantValue::uint(8, p.spec_drafts),
                 ]
             };
             // head_k a multiple of 32: lanes split it (`gdn_scan_simd`, `gdn_decode`).
@@ -6416,6 +6433,10 @@ fn recurrent_conv(
         runtime(RuntimeBindingKind::GdnStateIndices, 5),
         runtime(RuntimeBindingKind::GdnIsFresh, 6),
     ];
+    // A model that drafts checkpoints its verify rows in their sequences' draft lanes.
+    if p.spec_drafts > 0 {
+        bindings.push(runtime(RuntimeBindingKind::GdnConvLanes { layer }, 8));
+    }
     if let Some((slice, bias)) = sliced {
         constants.extend(slice.constants(2));
         constants.push(ConstantValue::boolean(4, true));
@@ -6441,6 +6462,10 @@ fn recurrent_conv(
         gemm_dims: None,
     }
 }
+
+/// The scans' constant slot of the drafts each sequence of a verify step carries
+/// (`GDN_SCAN_DRAFTS`): what a plain step's kernels, which keep no draft state, do not take.
+const GDN_SCAN_DRAFTS_SLOT: u16 = 8;
 
 /// How a recurrent mixer's scan gates and updates its state: GDN's gated delta rule, its gate
 /// inputs `a` / `b` their own `[T, heads]` activations; Mamba-2's selective scan, `dt` a column
@@ -6496,7 +6521,7 @@ fn recurrent_scan(
         ConstantValue::uint(2, hk),
         ConstantValue::uint(3, hv),
         ConstantValue::float(4, (hk as f32).powf(-0.5)),
-        ConstantValue::uint(8, p.spec_drafts),
+        ConstantValue::uint(GDN_SCAN_DRAFTS_SLOT, p.spec_drafts),
     ];
     scan_constants.extend(dt.map(|_| ConstantValue::boolean(5, true)));
     let state = [
@@ -6510,26 +6535,34 @@ fn recurrent_scan(
         bucket_m: BucketM(1),
         seq_axis: Some(MScaleAxis::Z),
     });
-    // `inputs` at 2 and 3, the ssm state at 4..=7, then `tail`, then (selective) `D` at `skip`.
-    let scan =
-        |function, constants, inputs: [Binding; 2], tail: &[Binding], skip, dispatch: (_, _)| {
-            let mut bindings = vec![scratch(0, layout.o), scratch(1, layout.conv_out)];
-            bindings.extend(inputs.into_iter().chain(state).chain(tail.iter().copied()));
-            bindings.extend(dt.map(|_| weight(WeightTensor::GdnSkip, skip)));
-            LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_scan_varlen",
-                function,
-                constants: baked(constants),
-                dispatch: DispatchShape {
-                    threadgroups: dispatch.0,
-                    threads_per_threadgroup: dispatch.1,
-                    m_scaling: seqs,
-                },
-                bindings: baked(bindings),
-                gemm_dims: None,
-            }
-        };
+    // `inputs` at 2 and 3, the ssm state at 4..=7, then `tail`, then (selective) `D` at `skip`,
+    // then — a model that drafts — the draft lanes' records at `skip + 1`.
+    let scan = |function,
+                constants,
+                inputs: [Binding; 2],
+                tail: &[Binding],
+                skip: u8,
+                dispatch: (_, _)| {
+        let mut bindings = vec![scratch(0, layout.o), scratch(1, layout.conv_out)];
+        bindings.extend(inputs.into_iter().chain(state).chain(tail.iter().copied()));
+        bindings.extend(dt.map(|_| weight(WeightTensor::GdnSkip, skip)));
+        if p.spec_drafts > 0 {
+            bindings.push(runtime(RuntimeBindingKind::GdnSsmLanes { layer }, skip + 1));
+        }
+        LoweredCommand {
+            kernel: KernelId::GatedDeltaNet,
+            library: "gdn_scan_varlen",
+            function,
+            constants: baked(constants),
+            dispatch: DispatchShape {
+                threadgroups: dispatch.0,
+                threads_per_threadgroup: dispatch.1,
+                m_scaling: seqs,
+            },
+            bindings: baked(bindings),
+            gemm_dims: None,
+        }
+    };
     if hk.is_multiple_of(32) && hv.is_multiple_of(4) {
         scan_constants.extend(dt.into_iter().flat_map(|dt| dt.constants(6)));
         let gating = [
@@ -8616,20 +8649,53 @@ mod tests {
             (norm, not_plain_decode),
         ];
         assert_eq!(shape(&q27), want);
-        // The kernels share the scan's constants, the drafts (their slot stride) at 8; the decode
-        // command's conv width and eps follow at 5 and 6, the pipelined scan's block at 5.
+        // The kernels share the scan's geometry (0-4); only the simd scan, which replays and
+        // records, takes the drafts (8) and binds the draft lanes' records (11) — the conv their
+        // checkpoints (8). The plain steps' kernels lay a slot out as without drafts: the decode
+        // command's conv width and eps follow the geometry at 5 and 6, the pipelined scan's block
+        // at 5, and the pipelined scan binds the simd scan's buffers but the lanes.
         let constants = |i: usize| q27[i].command.constants;
-        assert!(constants(2).contains(&ConstantValue::uint(8, 2)));
-        assert_eq!(constants(0)[..6], constants(2)[..]);
+        let geometry = &constants(2)[..5];
         assert_eq!(
-            constants(0)[6],
-            ConstantValue::uint(5, tp().gdn_conv_kernel)
+            constants(2)[5],
+            ConstantValue::uint(GDN_SCAN_DRAFTS_SLOT, 2)
+        );
+        assert_eq!(constants(0)[..5], *geometry);
+        assert_eq!(
+            constants(0)[5..],
+            [
+                ConstantValue::uint(5, tp().gdn_conv_kernel),
+                ConstantValue::float(6, tp().rms_norm_eps)
+            ]
         );
         assert_eq!(
             constants(3),
-            [constants(2), &[ConstantValue::uint(5, GDN_PIPE_TB)][..]].concat()
+            [geometry, &[ConstantValue::uint(5, GDN_PIPE_TB)][..]].concat()
         );
-        assert_eq!(q27[2].command.bindings, q27[3].command.bindings);
+        let lanes = |i: usize, kind: fn(LayerId) -> RuntimeBindingKind, index: u8| {
+            let lane = Binding::Runtime {
+                kind: kind(LayerId(0)),
+                binding_index: index,
+            };
+            q27[i].command.bindings.contains(&lane)
+        };
+        let conv_lanes = |layer| RuntimeBindingKind::GdnConvLanes { layer };
+        let ssm_lanes = |layer| RuntimeBindingKind::GdnSsmLanes { layer };
+        assert!(lanes(1, conv_lanes, 8) && lanes(2, ssm_lanes, 11));
+        assert!(!lanes(0, ssm_lanes, 11) && !lanes(3, ssm_lanes, 11));
+        let simd_bindings: Vec<_> = (q27[2].command.bindings.iter())
+            .filter(|b| {
+                !matches!(
+                    b,
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::GdnSsmLanes { .. },
+                        ..
+                    }
+                )
+            })
+            .copied()
+            .collect();
+        assert_eq!(q27[3].command.bindings, simd_bindings);
         let want = [
             (decode, plain),
             (conv, replays),
