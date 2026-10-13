@@ -189,9 +189,11 @@ pub struct SchedulerOutput {
     #[serde(default)]
     pub draft_req_ids: HashSet<String>,
 
-    /// This step is past its drafter's gate: its head's pass 1 primes KV only — no chain, nothing
-    /// read back — so the step behind it needs no outcome of it. Stamped by the engine when it
-    /// plans, not by the scheduler.
+    /// This step's head reads nothing back: it is past its drafter's gate, or every request it
+    /// plans runs a prefill chunk short of its prompt's end, so gets no token to draft from. Its
+    /// head's pass 1 primes KV only — no chain — so the step behind it needs no outcome of it, and
+    /// the worker defers it as a plain step. Stamped by the engine when it plans, not by the
+    /// scheduler.
     #[serde(default)]
     pub primes_only: bool,
 

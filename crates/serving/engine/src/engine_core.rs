@@ -657,11 +657,15 @@ impl EngineCore {
         };
         let scheduler = &self.scheduler;
         sched.draft_req_ids = proposer.plan(sched, &|req_id| takes_drafts(scheduler, req_id));
-        // A step past the gate runs its head's pass 1 KV-only — no chain, nothing read back — so
-        // the step behind it pre-schedules as behind a plain one.
+        // A step whose head reads nothing back runs its pass 1 KV-only — no chain — so the step
+        // behind it pre-schedules as behind a plain one: past the gate, or when every planned
+        // request runs a prefill chunk short of its prompt's end (a long prompt's every chunk but
+        // its last).
+        let chunks = (sched.draft_req_ids.iter())
+            .all(|r| scheduler.get_request(r).is_some_and(|r| r.is_prefill_chunk));
         sched.primes_only = proposer
             .max_seqs()
-            .is_some_and(|gate| sched.num_scheduled_tokens.len() > gate);
+            .is_some_and(|gate| sched.num_scheduled_tokens.len() > gate || chunks);
     }
 
     /// Post-execution processing: update state from model output, process
@@ -1850,6 +1854,61 @@ mod tests {
             enable_prefix_caching: false,
             hybrid_kv: None,
         }
+    }
+
+    /// A prompt past a step's token budget prefills in chunks. Every chunk but its last gets no
+    /// token, so its head only primes KV (`primes_only`): the step is not speculative, and the
+    /// next chunk pre-schedules behind it as behind a plain step. The last chunk drafts.
+    #[test]
+    fn a_prompt_s_chunks_before_its_last_only_prime() {
+        let config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: 16,
+                ..make_spec_decode_config().scheduler_config
+            },
+            proposer_config: Some(crate::spec_decode::ProposerConfig::Mtp(
+                crate::spec_decode::MtpProposerConfig {
+                    model: "head".into(),
+                    num_speculative_tokens: 2,
+                    max_seqs: 2,
+                    max_model_len: 4096,
+                },
+            )),
+            ..make_spec_decode_config()
+        };
+        let mut engine = EngineCore::new(config, Box::new(NoopExecutor::new(1024)));
+        let mut executor = engine.take_executor().expect("an executor");
+        let greedy = SamplingParams {
+            max_tokens: Some(8),
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let prompt: Vec<u32> = (1..=40).collect();
+        engine.add_request(Request::new("a".into(), prompt, greedy, 0.0, 0, 0, None));
+        let steps: Vec<(usize, bool, bool, bool)> = (0..3)
+            .map(|_| {
+                let step = engine.schedule_next().expect("a chunk");
+                let out = executor.execute_model(&step).expect("runs");
+                let _ = engine.finalize_step(&step, &out);
+                (
+                    step.num_scheduled_tokens["a"],
+                    step.draft_req_ids.contains("a"),
+                    step.primes_only,
+                    step.is_speculative(),
+                )
+            })
+            .collect();
+        let chunk = |(rows, drafts, primes, speculative)| (rows == 16, drafts, primes, speculative);
+        assert_eq!(
+            steps[..2].iter().copied().map(chunk).collect::<Vec<_>>(),
+            [(true, true, true, false); 2]
+        );
+        let (_, drafts, primes, speculative) = steps[2];
+        assert_eq!(
+            (drafts, primes, speculative),
+            (true, false, true),
+            "the last chunk drafts"
+        );
     }
 
     /// A greedy verify step that drafts, of an executor that pipelines, leads: the step scheduled

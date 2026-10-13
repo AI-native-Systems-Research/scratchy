@@ -1688,13 +1688,10 @@ impl MetalWorker {
                 || !telemetry
                     && sched.scheduled_spec_decode_tokens.is_empty()
                     // A head runs after the steps it drafts from, so every other step defers; so
-                    // does a step past its gate, which primes KV only — no chain, nothing read
-                    // back.
+                    // does a step whose head only primes KV (`primes_only`) — no chain, nothing
+                    // read back.
                     && match self.mtp_drafter {
-                        Some(drafter) => {
-                            sched.draft_req_ids.is_empty()
-                                || sched.num_scheduled_tokens.len() > drafter.max_seqs
-                        }
+                        Some(_) => sched.draft_req_ids.is_empty() || sched.primes_only,
                         None => self.draft_model.is_none(),
                     }
                     && sched.num_scheduled_tokens.keys().all(|req_id| {
