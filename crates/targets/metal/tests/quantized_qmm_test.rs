@@ -654,11 +654,8 @@ fn affine_qmm_t_splitk_b4_bf16_matches_cpu_reference() {
 /// CPU reference, all four 32×32 output sub-tiles (one per simdgroup).
 ///
 /// History: this was a `#[ignore]` reproducer for an "every-other-column
-/// unwritten" layout bug. The cause was the hand-inlined W-loader paired
-/// with the flat (128,1,1) dispatch; switching to MLX's exact
-/// `QuantizedBlockLoader` + the (32,2,2) threadgroup geometry makes the
-/// output bit-exact (0/1024 mismatch in every simdgroup), so the gate is
-/// now active.
+/// unwritten" layout bug, caused by a hand-inlined W-loader paired with
+/// a flat (128,1,1) dispatch.
 #[test]
 fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
     // Skip on non-M4 hardware (look at the auto-detected device
@@ -861,5 +858,52 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
             wrong > allowed * slack,
             "{kernel:?}: flipped codes read as written must be wrong"
         );
+    }
+}
+
+/// NAX qmm_t over many K steps with M and N tails, at both group sizes and
+/// both code layouts: the producer simdgroup's double-buffered W tiles (a
+/// stale or skipped one is off by whole partial sums), its N-tail rows and
+/// the MMA simdgroups' M tails all land on the CPU reference.
+#[test]
+fn affine_qmm_t_nax_k_steps_and_tails_match_cpu_reference() {
+    let Some(dev) = detect_device() else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    for (m, n, k, gs) in [
+        (96, 160, 1024, 64),
+        (96, 160, 1024, 128),
+        (200, 72, 512, 64),
+    ] {
+        let (packed, scales, biases, x) = make_inputs_bf16(0x7A115, n, k, m, gs);
+        let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
+        let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+        for (codes, packed) in [
+            (AffineCodes::AsWritten, &packed),
+            (AffineCodes::Offset8, &offset8),
+        ] {
+            let got = run_qmm_t_bf16_codes(
+                packed,
+                &scales,
+                &biases,
+                &x,
+                (m, n, k, gs as u32),
+                QmmTKernel::Nax,
+                codes,
+            )
+            .expect("MTL4 queue");
+            let (idx, mv, ev, err, allowed) =
+                worst_abs_error_vs_noise_floor(&got, &expected, k, 0.5);
+            assert!(
+                err <= allowed,
+                "{m}x{n}x{k} gs {gs} {codes:?}: abs_err={err:.5} at {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+        }
     }
 }

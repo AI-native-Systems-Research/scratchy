@@ -3,7 +3,8 @@
 // NAX (Apple9 / M4+) port of MLX's `qmm_t_nax_tgp_impl` /
 // `affine_qmm_t_nax` from `mlx/backend/metal/kernels/quantized_nax.h`.
 //
-// Tile shape: BM=BN=BK=64, WM=WN=2, SK=32, TGP=128 (4 simdgroups).
+// Tile shape: BM=BN=BK=64, WM=WN=2, SK=32, TGP=128 (4 simdgroups), plus
+// one W-dequantizing producer simdgroup on the affine path.
 //   BK=64 matches MLX's production instantiation in
 //   `mlx/backend/metal/kernels/quantized_nax.metal`
 //   (`instantiate_quantized_aligned_batched(affine_qmm_t_nax, ..., 64, 64, 64, 2, 2, ...)`).
@@ -15,10 +16,8 @@
 //     combination. BK=64 with gs=32 → BCOLS_PACKED=32, n_reads=16,
 //     n_groups=2 → 32/16 == 2 ✓ (matches MLX's `quantized_nax.metal`).
 //   - For NAX we currently skip gs=32 entirely (the dispatcher gates
-//     `group_size != 32` for the Nax pick); the general QuantizedBlockLoader
-//     path is inlined here for gs=64 and gs=128. gs=32 would need the
-//     specialized loader with per-thread `group_id` — straightforward
-//     follow-up if production models start shipping gs=32 quants.
+//     `group_size != 32` for the Nax pick): the W producer reads one
+//     scale per row per BK step, so gs=64 and gs=128 only.
 //
 // MLX reference: `mlx/backend/metal/quantized.cpp:695` dispatches NAX
 // when `K % 64 == 0`. Same gate is used Rust-side in
@@ -28,14 +27,16 @@
 //   - K, N, M come from file-scope baked constants (slots 0/1/2)
 //     rather than `const constant int& [[buffer(5/6/7)]]` — required
 //     so the pipeline is recordable into an MTLIndirectComputeCommand.
-//   - W-loader is inlined (QuantizedBlockLoader struct not imported);
-//     general-loader path only (gs ≥ 64).
+//   - Affine W tiles are dequantized by a producer simdgroup into a
+//     double-buffered Ws while the four MMA simdgroups multiply, not by
+//     every simdgroup between two barriers (MLX's QuantizedBlockLoader).
 //   - batched=0 only; no `adjust_matrix_offsets` (B=1).
 //
 // Buffer layout matches the existing quantized_qmm.metal:
 //   w[0], scales[1], biases[2], x[3], y[4]
 //
-// Dispatch: grid = (ceil(N/64), ceil(M/64), 1), tpg = (128, 1, 1).
+// Dispatch: grid = (ceil(N/64), ceil(M/64), 1); tpg = (32, 5, 1) for the
+// affine kernels (`NAX_QMM_THREADS`), 128 threads for NVFP4.
 // Kernel selected only on M4+ (is_nax_capable check in pick_qmm_t_kernel).
 
 #include "metal_nax.h"   // vendors NAXTile + tile_matmad_nax + MPP internals
@@ -112,17 +113,17 @@ inline float nvfp4_decode(uint code) {
 //   group_size affine-quant group size (64 or 128 — gs=32 not
 //              supported here; the dispatcher falls back to Standard
 //              qmm_t for gs=32)
-//   bits       = 4 or 8
+//   bits       = 2, 3, 4 or 8
 //   aligned_N  N % 64 == 0 → skip N-tail handling
 //
 // Tile shape (matches MLX BM=BN=BK=64, WM=WN=2):
 //   SM = SN = BM/WM = BN/WN = 32   (per-simdgroup M/N extent)
 //   SK = 32                          (inner K step; BK/SK = 2 iters)
 //   TM = TN = TK = 2                 (NAXTile row/col counts)
-//   TGP = 128 threads, 4 simdgroups
+//   TGP = 128 threads, 4 MMA simdgroups (+1 W producer, affine only)
 //   BK_padded = BK + 16/sizeof(T)  = 72 for half/bfloat (bank-conflict pad)
 //
-// W-loader (QuantizedBlockLoader equivalent, reduction_dim=1, general):
+// NVFP4 W-loader (every simdgroup loads, reduction_dim=1):
 //   BROWS = BN = 64, BCOLS = BK = 64
 //   BCOLS_PACKED = BK/pack_factor = 32
 //   n_reads = (BCOLS_PACKED * BN) / TGP = (32*64)/128 = 16
@@ -151,13 +152,12 @@ METAL_FUNC void qmm_t_nax_impl(
     uint3 tgid)
 {
     static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 8,
-                  "qmm_t_nax_impl: bits in {2, 3, 4, 8} (the affine path rides "
-                  "the MLX QuantizedBlockLoader, whose index math is "
-                  "bits-exact for every one of these widths; K is a "
-                  "multiple of group_size so the packed byte count "
-                  "K*bytes_per_pack/pack_factor is exact; 8-bit = "
-                  "byte-per-element dequant; the NAX MMA runs on dequantized "
-                  "T_act values either way)");
+                  "qmm_t_nax_impl: bits in {2, 3, 4, 8} (the affine W "
+                  "producer decodes each half row as an LSB-first bitstream "
+                  "of `bits` 32-bit words, exact for every one of these "
+                  "widths; K is a multiple of group_size so the packed byte "
+                  "count K*bytes_per_pack/pack_factor is exact; the NAX MMA "
+                  "runs on dequantized T_act values either way)");
     static_assert(!nvfp4 || bits == 4, "NVFP4 is 4-bit by definition");
     // Affine NAX requires gs ∈ {64,128} (gs ≥ BK=64, one scale per
     // thread). NVFP4 is always gs=16 (< BK), handled by the per-byte
@@ -184,8 +184,7 @@ METAL_FUNC void qmm_t_nax_impl(
     // BK_padded: pad for bank-conflict avoidance (BK + 16/sizeof(T) = 64+8=72)
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
 
-    // Packing law (matches the vendored QuantizedBlockLoader's
-    // get_pack_factor/get_bytes_per_pack): bits=4 → pack_factor=2,
+    // Packing law (MLX's get_pack_factor/get_bytes_per_pack): bits=4 → pack_factor=2,
     // bytes_per_pack=1 (2 nibbles per byte); bits=8 → pack_factor=1,
     // bytes_per_pack=1 (1 code per byte); bits=3 → pack_factor=8,
     // bytes_per_pack=3 (8 codes per 3 bytes, byte-anchored every
@@ -196,15 +195,8 @@ METAL_FUNC void qmm_t_nax_impl(
     constexpr int pack_factor    = (bits == 3) ? 8 : ((bits == 4) ? 2 : ((bits == 2) ? 4 : 1));
     constexpr int bytes_per_pack = (bits == 3) ? 3 : 1;
 
-    // W-loader tile layout
-    //   bits=4: BCOLS_PACKED = 64/2 = 32, N_READS = (32×64)/128 = 16
-    //   bits=8: BCOLS_PACKED = 64/1 = 64, N_READS = (64×64)/128 = 32
-    //   bits=3: BCOLS_PACKED = 64*3/8 = 24, N_READS = (24×64)/128 = 12
-    //   bits=2: BCOLS_PACKED = 64/4 = 16, N_READS = (16×64)/128 = 8
-    // Per-thread dequant element count is N_READS × pack_factor = 32
-    // (bits 4/8), 96 (bits=3, three 3-byte packs) or 32 (bits=2,
-    // eight 1-byte packs); the byte count per thread scales with the
-    // width.
+    // NVFP4 W-loader tile layout: BCOLS_PACKED = 64/2 = 32 bytes per row
+    // step, N_READS = (32×64)/128 = 16 bytes (32 codes) per thread.
     constexpr int BCOLS_PACKED = (BK * bytes_per_pack) / pack_factor;
     constexpr int N_READS      = (BCOLS_PACKED * BN) / TGP;
 
@@ -215,6 +207,8 @@ METAL_FUNC void qmm_t_nax_impl(
     //   simd_gid 3 → tm=32, tn=32
     const int tm = SM * int(simd_gid / WN);
     const int tn = SN * int(simd_gid % WN);
+    // The affine path's fifth simdgroup only dequantizes W (see the K loop).
+    const bool producer = simd_gid == uint(WM * WN);
 
     // ── Tile origin (grid level) ────────────────────────────────────
     const int y_row = int(tgid.y) * BM;
@@ -222,7 +216,7 @@ METAL_FUNC void qmm_t_nax_impl(
     if (y_row >= M || y_col >= N) return;
 
     // ── Valid sub-tile extents for M/N tail handling ────────────────
-    const short sgp_sm = min(short(SM), short(M - (y_row + tm)));
+    const short sgp_sm = producer ? short(SM) : min(short(SM), short(M - (y_row + tm)));
     const bool is_unaligned_sm = (sgp_sm != short(SM));
 
     const short tgp_bn = aligned_N ? short(BN) : short(min(BN, N - y_col));
@@ -263,33 +257,83 @@ METAL_FUNC void qmm_t_nax_impl(
     NAXTile<float, TM, TN> Dtile;
     Dtile.clear();
 
-    // For the affine path we run MLX's exact `QuantizedBlockLoader` over
-    // the K-loop (the hand-inlined W-loader below was numerically
-    // identical but ~1.33x slower at every M=4096 prefill shape — the
-    // struct loader gives the MPP `matmul2d` scheduler the load pattern
-    // it wants). NVFP4 (gs=16 < BK=64) can't use the loader (its
-    // `BCOLS<=group_size` invariant) so it keeps the inlined path.
-    using loader_w_t = mlx::steel::QuantizedBlockLoader<
-        T_act, T_scale, BN, BK, BK_padded, /*reduction_dim=*/1,
-        TGP, group_size, bits, offset8>;
+    constexpr int WS_TILE = BN * BK_padded;
 
     // ── Outer K loop + M/N alignment dispatch ───────────────────────
     dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
         dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
 
           if constexpr (!nvfp4) {
-            // ── Affine: MLX QuantizedBlockLoader-driven K loop ───────
-            loader_w_t loader_w(
-                w_block, s_block, b_block, K, Ws, simd_gid, simd_lid);
+            // ── Affine: a producer simdgroup feeds the four MMA simdgroups ──
+            // Ws holds two W tiles. While the MMA simdgroups multiply step k's,
+            // the producer dequantizes step k+1's into the other, so the
+            // dequant overlaps the multiply instead of stalling it between
+            // two barriers; one barrier per step hands the tiles over.
+            // Each producer lane decodes half rows: 32
+            // codes are one LSB-first bitstream of `bits` words (8 codes per
+            // 3 bytes at 3 bits, offset-8 codes are the plain codes XOR 8),
+            // each code becomes fma(code, scale, bias) in fp32, rounded once,
+            // and leaves in 16-byte stores.
+            auto produce = [&](int k0, threadgroup T_act* tile, int lane, int lanes) {
+                constexpr int HALF_BK = BK / 2;
+                constexpr int WVEC = bits < 4 ? bits : 4;
+                using wvec_t = metal::conditional_t<bits == 3, packed_uint3, vec<uint, WVEC>>;
+                constexpr uint flip = offset8 ? 0x88888888u : 0u;
+                constexpr uint mask = (1u << bits) - 1u;
+                for (int item = lane; item < 2 * BN; item += lanes) {
+                    const int row = item / 2, col = item % 2 * HALF_BK;
+                    threadgroup vec<T_act, 8>* dst =
+                        (threadgroup vec<T_act, 8>*)(tile + row * BK_padded + col);
+                    if (!kAlignedN.value && row >= tgp_bn) {
+                        STEEL_PRAGMA_UNROLL
+                        for (int c = 0; c < HALF_BK / 8; ++c) {
+                            dst[c] = vec<T_act, 8>(0);
+                        }
+                        continue;
+                    }
+                    const device wvec_t* src = (const device wvec_t*)(
+                        w_block + row * K_w + (k0 + col) * bits / 8);
+                    uint words[bits];
+                    STEEL_PRAGMA_UNROLL
+                    for (int i = 0; i < bits / WVEC; ++i) {
+                        const wvec_t v = src[i];
+                        STEEL_PRAGMA_UNROLL
+                        for (int j = 0; j < WVEC; ++j) {
+                            words[i * WVEC + j] = v[j] ^ flip;
+                        }
+                    }
+                    const float scale = float(s_block[row * K_g + k0 / group_size]);
+                    const float bias = float(b_block[row * K_g + k0 / group_size]);
+                    STEEL_PRAGMA_UNROLL
+                    for (int c = 0; c < HALF_BK / 8; ++c) {
+                        vec<T_act, 8> out;
+                        STEEL_PRAGMA_UNROLL
+                        for (int e = 0; e < 8; ++e) {
+                            const int bit = (8 * c + e) * bits;
+                            const int at = bit % 32;
+                            const uint code = at + bits <= 32
+                                ? extract_bits(words[bit / 32], at, bits)
+                                : ((words[bit / 32] >> at) | (words[bit / 32 + 1] << (32 - at))) & mask;
+                            out[e] = T_act(fma(float(code), scale, bias));
+                        }
+                        dst[c] = out;
+                    }
+                }
+            };
 
+            // The first tile has nothing to overlap: all five simdgroups
+            // dequantize it together.
+            produce(0, Ws, int(thread_idx), (WM * WN + 1) * NAX_SIMD_SIZE);
             for (int k = 0; k < K; k += BK) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if constexpr (kAlignedN.value) {
-                    loader_w.load_unsafe();
-                } else {
-                    loader_w.load_safe(short2(BK, tgp_bn));
+                threadgroup T_act* tile = Ws + (k / BK % 2) * WS_TILE;
+                if (producer) {
+                    if (k + BK < K) {
+                        produce(k + BK, Ws + ((k / BK + 1) % 2) * WS_TILE,
+                                int(simd_lid), NAX_SIMD_SIZE);
+                    }
+                    continue;
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 MLX_MTL_PRAGMA_NO_UNROLL
                 for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -303,7 +347,7 @@ METAL_FUNC void qmm_t_nax_impl(
                         Atile.load_safe(x_ptr + kk1, K, short2(SK, sgp_sm));
                     }
                     Btile.template load<T_act, BK_padded, 1>(
-                        Ws + tn * BK_padded + kk1);
+                        tile + tn * BK_padded + kk1);
                     tile_matmad_nax(
                         Dtile,
                         Atile, metal::bool_constant<false>{},
@@ -312,7 +356,6 @@ METAL_FUNC void qmm_t_nax_impl(
                 }
 
                 x_ptr += BK;
-                loader_w.next();
             }
           } else {
             // ── NVFP4: gs=16 < BK, inlined per-byte scale index ──────
@@ -376,6 +419,9 @@ METAL_FUNC void qmm_t_nax_impl(
 
             // ── Epilogue: store float accumulator to device ──────────
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (producer) {
+                return;
+            }
 
             if constexpr (kAlignedM.value && kAlignedN.value) {
                 Dtile.store(y_block + tm * N + tn, N);
@@ -409,7 +455,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BN = 64;
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));  // 72
-    threadgroup T_act Ws[BN * BK_padded];  // 64 × 72 = 4608 elements
+    threadgroup T_act Ws[2 * BN * BK_padded];  // two 64 × 72 W tiles (producer + MMA)
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
@@ -459,7 +505,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     const device T_scale* s_e = scales + size_t(expert) * s_stride;
     const device T_scale* b_e = biases + size_t(expert) * s_stride;
 
-    threadgroup T_act Ws[BN * BK_padded];
+    threadgroup T_act Ws[2 * BN * BK_padded];
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w_e, s_e, b_e, x, y, Ws,
@@ -478,9 +524,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 //   affine_qmm_t_nax_<dtype>_s_<scale_dtype>_gs_<gs>_b_<bits>_alN_<bool>_batch_0
 //
 // gs=32 deliberately not instantiated — the dispatcher routes gs=32
-// to Standard qmm_t (BK=64 violates QuantizedBlockLoader's
-// `BCOLS<=group_size` for gs=32; the gs=32 specialized loader has
-// different scale-indexing semantics and would need a separate path).
+// to Standard qmm_t (the W producer reads one scale per row per
+// BK=64 step).
 // ─────────────────────────────────────────────────────────────────
 
 #define INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
@@ -548,10 +593,9 @@ INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 8)
 
 // 3-bit rows (GLM-4.5-Air-3bit: bf16×bf16 gs=64 in production; f16×f16
 // and gs=128 + cross-dtype rows for symmetry so no (model-dtype, gs)
-// combo hits a nil computeFunction). The loader's index math is
-// bits=3-exact (pack_factor 8, bytes_per_pack 3 — see the static_assert
-// note in qmm_t_nax_impl); the dequantize bits==3 branch is MLX's own
-// qdot shifts, vendored into metal_nax.h.
+// combo hits a nil computeFunction). The W producer decodes 3-bit codes
+// exactly (8 codes per 3 bytes, the LSB-first bitstream of MLX's qdot
+// shifts — see the static_assert note in qmm_t_nax_impl).
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 3)
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 3)
 INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64, 3)
@@ -573,10 +617,8 @@ INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 3)
 
 // 2-bit rows (gpt-oss-120b-mlx-2Bit: bf16×bf16 gs=64 in production;
 // f16×f16 and gs=128 + cross-dtype rows for symmetry so no (model-dtype,
-// gs) combo hits a nil computeFunction). The loader's index math is
-// bits=2-exact (pack_factor 4, bytes_per_pack 1 — 4 codes per byte,
-// none straddling); the dequantize bits==2 branch is MLX's own qdot
-// law, vendored into metal_nax.h.
+// gs) combo hits a nil computeFunction). The W producer decodes 2-bit
+// codes exactly (4 codes per byte, none straddling — MLX's qdot law).
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 2)
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 2)
 INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64, 2)
@@ -619,7 +661,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BN = 64;
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
-    threadgroup T_act Ws[BN * BK_padded];
+    threadgroup T_act Ws[2 * BN * BK_padded];
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
@@ -679,9 +721,9 @@ INST_NVFP4_QMM_T_NAX(bf16, bfloat, f16, half, 16, false, false)
 // ─────────────────────────────────────────────────────────────────
 // PLAIN bf16 NAX GEMM: y[M,N] = x[M,K] @ w[N,K]^T  (no quantization).
 // For the gemma4 hd512 unfused-attention QK^T / PV matmuls. Identical
-// to qmm_t_nax_impl except the int4 QuantizedBlockLoader (dequant W ->
-// Ws) is replaced by a plain mlx::steel::BlockLoader (copy bf16 B ->
-// Ws). Same NAXTile MXU matmul + store. K/N/M ride QMM_K/N/M consts so
+// to qmm_t_nax_impl's NVFP4 path except the W dequant into Ws is
+// replaced by a plain mlx::steel::BlockLoader (copy bf16 B -> Ws). Same
+// NAXTile MXU matmul + store. K/N/M ride QMM_K/N/M consts so
 // it records into an ICB exactly like affine_qmm_t_nax.
 // ─────────────────────────────────────────────────────────────────
 template <typename T>

@@ -110,10 +110,9 @@ fn make_inputs_b3_f32(
 enum Op {
     Qmv,
     QmmT,
-    /// Force the NAX (matrix-unit) qmm_t — the M5+ prefill path. The
-    /// vendored MLX QuantizedBlockLoader's index math is bits=3-exact
-    /// (pack_factor 8, bytes_per_pack 3) and metal_nax.h carries MLX's
-    /// qdot bits==3 dequantize shifts.
+    /// Force the NAX (matrix-unit) qmm_t — the M5+ prefill path. Its W
+    /// producer decodes 3-bit codes exactly (8 codes per 3 bytes, MLX's
+    /// qdot bits==3 shifts).
     QmmTNax,
 }
 
@@ -302,8 +301,8 @@ fn qmm_t_b3_bf16_prefill_intermediate_shape() {
 #[test]
 fn qmm_t_nax_b3_bf16_prefill_shape() {
     // Prefill M=64 through the NAX qmm_t (the GLM-4.5-Air-3bit prefill
-    // path on M5+): the QuantizedBlockLoader stages 3-byte packs and
-    // metal_nax.h's dequantize carries the MLX bits==3 shifts. Skips on
+    // path on M5+): the W producer decodes 3-byte packs by the MLX
+    // bits==3 shifts. Skips on
     // non-NAX-capable hardware.
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");

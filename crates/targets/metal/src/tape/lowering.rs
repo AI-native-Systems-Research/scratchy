@@ -45,11 +45,12 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 }
 use crate::op_abi::GuardRun;
 use crate::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide,
-    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
-    qmm_w4a8_static_name, qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
-    splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
+    DequantDtype, NAX_QMM_THREADS, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype,
+    SmallMTile, W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
+    pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
+    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
+    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
+    w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -2631,9 +2632,8 @@ fn lower_one(
                 // same MMA) — the dominant Gemma4 prefill lever (the
                 // b8 MLP was ~77% of prefill GPU time on the Standard
                 // kernel). 3-bit has `_b_3_` instantiations too (the
-                // QuantizedBlockLoader's index math is bits=3-exact;
-                // MLX's own qdot bits==3 shifts are vendored into
-                // metal_nax.h's dequantize), and 2-bit likewise
+                // W producer's bitstream decode is bits=3-exact: MLX's
+                // own qdot bits==3 shifts), and 2-bit likewise
                 // (`_b_2_`: 4 codes per byte, none straddling).
                 // SplitK stays b4-only, so any non-b4 SplitK pick
                 // downgrades to Standard.
@@ -7892,13 +7892,14 @@ fn lower_moe_step(
                     && n_out.is_multiple_of(64)
                     && matches!(gs, 64 | 128)
                     && matches!(bits, 2 | 3 | 4 | 8);
-                let (kernel, library, symbol, tile) = if use_nax {
+                let (kernel, library, symbol, tile, threads) = if use_nax {
                     let symbol = affine_gather_qmm_t_nax_symbol(dtype, scale_dtype, gs, bits);
                     (
                         KernelId::AffineGatherQmmTNax,
                         "quantized_qmm_nax",
                         symbol,
                         64,
+                        NAX_QMM_THREADS,
                     )
                 } else {
                     let aligned = n_out.is_multiple_of(32);
@@ -7924,7 +7925,13 @@ fn lower_moe_step(
                         aligned,
                         bits,
                     );
-                    (KernelId::AffineGatherQmmT, "quantized_qmm", symbol, 32)
+                    (
+                        KernelId::AffineGatherQmmT,
+                        "quantized_qmm",
+                        symbol,
+                        32,
+                        (32, 2, 2),
+                    )
                 };
                 let mpad = s.l.mpad_max;
                 let mut constants = dims;
@@ -7943,7 +7950,7 @@ fn lower_moe_step(
                     library,
                     symbol,
                     constants,
-                    grid(tiles, (32, 2, 2), None),
+                    grid(tiles, threads, None),
                     bindings,
                 )]
             } else {
