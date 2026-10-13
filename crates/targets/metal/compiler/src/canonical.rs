@@ -24,9 +24,9 @@ use scratchy_subtile::wave_schedule::wave_order;
 use scratchy_target_metal::from_tape::{TapeItem, roll_at};
 use scratchy_target_metal::op_abi::{
     METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS, METAL_WAVE_ORDER_ROWS,
-    metal_colour_rule,
+    metal_colour_rule, metal_guard_gates,
 };
-use scratchy_target_metal::tape::ids::SourceIx;
+use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{
@@ -188,6 +188,8 @@ pub type MoeExpertBits<'f> = dyn Fn(&str, LayerId, ExpertBody) -> [Option<Affine
 pub struct CanonicalAt<'a> {
     pub stem: &'a str,
     pub m: u64,
+    /// The buckets it stands for, `m` among them: each runs its tape, codec guards realized at `m`.
+    pub buckets: &'a [u64],
 }
 
 /// Where the backbone's layer loop was cut.
@@ -207,6 +209,8 @@ pub struct MetalCanonical {
     pub colours: ColourCount,
     /// The colour holding the forward's result.
     pub result: Colour,
+    /// The colour holding every row's final hidden state after the forward ran.
+    pub hidden: ArenaSlotIdx,
     /// `(tile, output)` → colour, what the arena statics are sized from.
     pub arena: SlotMap,
     pub roll: RollOutcome,
@@ -221,6 +225,10 @@ pub enum CanonicalRefusal {
     Fold(FoldError),
     Colour(ColourError),
     Steps(StepRefusal),
+    /// A bucket the canonical stands for realizes its codec guards unlike the canonical's rows.
+    Guards {
+        bucket: u64,
+    },
 }
 
 impl std::fmt::Display for CanonicalRefusal {
@@ -231,6 +239,11 @@ impl std::fmt::Display for CanonicalRefusal {
             Self::Fold(e) => write!(f, "the shared fold pass refused: {e}"),
             Self::Colour(e) => write!(f, "tape colorer refused a DECLARED pilot: {e}"),
             Self::Steps(e) => write!(f, "the step records refused a DECLARED pilot: {e}"),
+            Self::Guards { bucket } => write!(
+                f,
+                "bucket {bucket} realizes its codec guards unlike this canonical's rows, which \
+                 would realize them for it: the bucket folding must key on them"
+            ),
         }
     }
 }
@@ -246,6 +259,7 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
         num_seqs: rows,
         has_spec_tokens: false,
         unrotated_blocks: false,
+        gdn_plain: true,
     };
     let runs = |r: &StepRow| matches!(r, StepRow::Step(_, g) if gate_matches(*g, decode));
     (t.rows.iter().zip(flags))
@@ -263,7 +277,11 @@ pub fn lower_canonical(
     sources: &mut SourceManifest,
 ) -> Result<MetalCanonical, CanonicalRefusal> {
     use CanonicalRefusal::Steps;
-    let CanonicalAt { stem, m } = at;
+    let CanonicalAt { stem, m, buckets } = at;
+    let guards = |m: u64| metal_guard_gates(m as u32);
+    if let Some(&bucket) = buckets.iter().find(|&&b| guards(b) != guards(m)) {
+        return Err(CanonicalRefusal::Guards { bucket });
+    }
     // Metal's TurboQuant: the codec steps its declared facts insert.
     // Only on a model built with it (`MetalModelConsts::kv_codec`): a dense model runs none.
     let coded;
@@ -288,6 +306,7 @@ pub fn lower_canonical(
         matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         matvec_norms: m == 1,
         row_programs: m == 1,
+        hidden_out: consts.spec_drafts > 0,
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
     // A fused command reads what its fold absorbed and writes its epilogues, so the folds the tape
@@ -338,6 +357,7 @@ pub fn lower_canonical(
         facts,
         hidden: HiddenSize(consts.hidden_size as u32),
         intermediate: IntermediateSize(consts.intermediate_size as u32),
+        bucket_m: m as u32,
     }
     .records()
     .map_err(Steps)?;
@@ -360,12 +380,14 @@ pub fn lower_canonical(
         let (flags, _) = b.flags();
         proof(&b, &flags).map(|()| (b, flags))
     };
+    let (rolled_live, unrolled_live) = (rolled.cache_live(), unrolled.cache_live());
     let mut cut = match proof(&rolled, &rolled_flags) {
         Ok(()) => Some((
             RollOutcome::Rolled { peel: 0 },
             rolled.rows,
             rolled_flags,
             rolled.sites,
+            rolled_live,
         )),
         Err(e) => {
             why.push(format!("peel=0: {e}"));
@@ -380,7 +402,8 @@ pub fn lower_canonical(
     if let Some(items) = &tp.layer_rolled {
         match candidate(items) {
             Ok((b, flags)) if cut.as_ref().is_none_or(|c| b.rows.len() < c.1.len()) => {
-                cut = Some((RollOutcome::LayerClasses, b.rows, flags, b.sites));
+                let live = b.cache_live();
+                cut = Some((RollOutcome::LayerClasses, b.rows, flags, b.sites, live));
             }
             Ok(_) => {}
             Err(e) => why.push(format!("layer-class: {e}")),
@@ -395,7 +418,8 @@ pub fn lower_canonical(
             };
             match candidate(&items) {
                 Ok((b, flags)) => {
-                    cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, b.sites));
+                    let live = b.cache_live();
+                    cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, b.sites, live));
                     break;
                 }
                 Err(e) => why.push(format!("peel={peel}: {e}")),
@@ -403,11 +427,12 @@ pub fn lower_canonical(
         }
     }
     let from = unrolled.rows.len();
-    let (roll, backbone, backbone_barriers, backbone_sites) = cut.unwrap_or((
+    let (roll, backbone, backbone_barriers, backbone_sites, backbone_cache_live) = cut.unwrap_or((
         RollOutcome::Unrolled,
         unrolled.rows,
         unrolled_flags,
         unrolled.sites,
+        unrolled_live,
     ));
     match roll {
         RollOutcome::Unrolled => eprintln!(
@@ -420,6 +445,7 @@ pub fn lower_canonical(
         ),
     }
     let (colour_count, result) = (colours.count(), colours.result());
+    let hidden = colours.hidden(l).map_err(Steps)?;
     eprintln!(
         "[m2-flip] {stem} m={m}: TAPE-SCHEDULED stream ACTIVE ({} instr, slots={} final={}, \
          {} barriers a decode step)",
@@ -433,12 +459,14 @@ pub fn lower_canonical(
             backbone,
             backbone_barriers,
             backbone_sources: backbone_sites.iter().map(|s| sources.row(s)).collect(),
+            backbone_cache_live,
             lm_head: rolled.lm_rows,
             lm_head_barriers,
             lm_head_sources: rolled.lm_sites.iter().map(|s| sources.row(s)).collect(),
         },
         colours: colour_count,
         result,
+        hidden,
         arena: colours.arena().clone(),
         roll,
     })

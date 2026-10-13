@@ -1,0 +1,7 @@
+{
+  "_comment": "The MLX presets compile a drafter for an MLX target. b4-g64: the QAT drafter's MLX conversion (mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit), 4-bit throughout, the lent embedding included; Google's bf16 drafter under it keeps its own weights dense (that stem's overrides). b4-g32: Google's drafter converted at 4-bit g32 (that stem's overrides list each module).",
+  "quantizations": [
+    "mlx-affine-b4-g64",
+    "mlx-affine-b4-g32"
+  ]
+}

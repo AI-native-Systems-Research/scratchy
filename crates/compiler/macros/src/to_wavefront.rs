@@ -707,6 +707,8 @@ pub fn lower_decode_to_wavefront(
 
     // The result is the last value-producing op (the lm_head GEMM).
     let mut result: Option<usize> = None;
+    // The op an `export_hidden` names: the hidden state the forward exports.
+    let mut exported: Option<usize> = None;
 
     // Topological walk over `fuf.nodes`. The bridge's resolver looks
     // up each input's producer in `bx.produced`, so a tile must be
@@ -1176,6 +1178,75 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
+            // rope_query(q, positions, rotary): the query's rotation alone — no K, no cache write.
+            OpKind::RopeQuery => {
+                let head_dim = bx
+                    .geom
+                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                    .hd();
+                let q = bx.input_at(tile, 0)?;
+                let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
+                let local_rope = node.inputs.iter().any(|inp| {
+                    matches!(
+                        inp,
+                        FufInput::Extern {
+                            kind: ExternKind::RotaryLocal,
+                            ..
+                        }
+                    )
+                });
+                let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
+                let idx = bx.push_op(
+                    SubOp::rope_rotate(head_dim),
+                    vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
+                );
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // shared_attention(q, kv_cache[layer], block_table): AttnDecode over the cache's
+            // prefix segments alone — the step appends no K/V.
+            OpKind::SharedAttention | OpKind::SharedSlidingAttention => {
+                if bx.scale.is_nan() {
+                    return Err(BridgeError::MissingBound { key: "head_dim" });
+                }
+                let q = bx.input_at(tile, 0)?;
+                let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "shared attention missing kv_cache extern index",
+                })?;
+                let (pk, pv) = bx.prefix_for(layer);
+                let mask = match node.op {
+                    OpKind::SharedSlidingAttention => AttnMask::SlidingWindow,
+                    _ => AttnMask::Causal,
+                };
+                let base_geom = bx
+                    .geom
+                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
+                let geom = match mask {
+                    AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
+                    AttnMask::SlidingWindow => base_geom,
+                };
+                let idx = bx.push_op(
+                    SubOp::attn_decode(geom, bx.scale, bx.prefix_len, mask),
+                    vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],
+                );
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            // export_hidden(x): x itself, named the forward's exported hidden state.
+            OpKind::ExportHidden => {
+                let x = bx.input_at(tile, 0)?;
+                let InputRef::Op(j) = x else {
+                    return Err(BridgeError::MalformedOp {
+                        tile,
+                        op: node.op,
+                        detail: "export_hidden of a source, not an op's output",
+                    });
+                };
+                bx.produced.insert((tile.0, 0), Producer::Op(j));
+                exported = Some(j);
+            }
             OpKind::Silu => {
                 let x = bx.input_at(tile, 0)?;
                 let idx = bx.push_op(SubOp::Elementwise(EwKind::Silu), vec![x]);
@@ -1370,6 +1441,14 @@ pub fn lower_decode_to_wavefront(
                 let attn = bx.input_at(tile, 0)?;
                 let gate = bx.input_at(tile, 1)?;
                 let idx = bx.push_op(SubOp::GateApply, vec![attn, gate]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
+            OpKind::Concat => {
+                let a = bx.input_at(tile, 0)?;
+                let b = bx.input_at(tile, 1)?;
+                let cols = bx.out_cols(tile, 0, "concat cols")?;
+                let idx = bx.push_op(SubOp::Concat { cols }, vec![a, b]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1664,17 +1743,10 @@ pub fn lower_decode_to_wavefront(
                     }
                 }
             }
-            OpKind::LoadPixels => {
-                let cols = bx.out_cols(tile, 0, "pixels cols")?;
-                let idx = bx.push_op(SubOp::LoadPixels { in_features: cols }, vec![]);
-                bx.produced.insert((tile.0, 0), Producer::Op(idx));
-                result = Some(idx);
-            }
-            OpKind::LoadPosEmbeds => {
-                // Same shape as LoadPixels: a synthesized source tile
-                // whose width the FUF already carries.
-                let cols = bx.out_cols(tile, 0, "pos_embeds cols")?;
-                let idx = bx.push_op(SubOp::LoadPosEmbeds { width: cols }, vec![]);
+            OpKind::LoadRows(source) => {
+                // A synthesized source tile whose width the FUF already carries.
+                let width = bx.out_cols(tile, 0, "host-staged rows cols")?;
+                let idx = bx.push_op(SubOp::LoadRows { source, width }, vec![]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1839,6 +1911,7 @@ pub fn lower_decode_to_wavefront(
             sources: bx.sources,
             ops: bx.ops,
             result,
+            exported,
         },
         bindings: bx.bindings,
         op_tiles,

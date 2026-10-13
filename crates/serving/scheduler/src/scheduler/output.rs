@@ -182,9 +182,47 @@ pub struct SchedulerOutput {
 
     /// Request IDs preempted in this step (used by v2 model runner).
     pub preempted_req_ids: Option<HashSet<String>>,
+
+    /// The requests a worker-side draft head runs for once this step's target forward has: their
+    /// rows pass through it, and each that produces a token drafts the next step's. Planned by the
+    /// engine's proposer after scheduling, not by the scheduler.
+    #[serde(default)]
+    pub draft_req_ids: HashSet<String>,
+
+    /// This step's head reads nothing back: it is past its drafter's gate, or every request it
+    /// plans runs a prefill chunk short of its prompt's end, so gets no token to draft from. Its
+    /// head's pass 1 primes KV only — no chain — so the step behind it needs no outcome of it, and
+    /// the worker defers it as a plain step. Stamped by the engine when it plans, not by the
+    /// scheduler.
+    #[serde(default)]
+    pub primes_only: bool,
+
+    /// Where this step stands among speculative steps scheduled ahead of their outcomes.
+    #[serde(default)]
+    pub spec_pipeline: SpecPipeline,
+}
+
+/// A speculative step scheduled ahead (#240): the engine schedules the step after one that drafts
+/// before that one is finalized, and the worker picks what depends on its outcome on the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecPipeline {
+    /// The step after this one may be scheduled before this one is finalized: its one request
+    /// drafts here, and the engine gave its next step placeholder drafts the device fills.
+    pub leads: bool,
+    /// Scheduled while the step before it was in flight: its positions assume every draft that
+    /// step verifies kept, its tokens and drafts are that step's on the device.
+    pub behind: bool,
 }
 
 impl SchedulerOutput {
+    /// Whether the step after this one needs this one's outcome to be scheduled: the drafts it
+    /// makes (`draft_req_ids`; a step past its gate makes none), or how many of the drafts it
+    /// verifies it keeps. A loop that schedules ahead queues nothing behind it.
+    pub fn is_speculative(&self) -> bool {
+        (!self.draft_req_ids.is_empty() && !self.primes_only)
+            || !self.scheduled_spec_decode_tokens.is_empty()
+    }
+
     /// Create an empty `SchedulerOutput` with no scheduled work.
     pub fn make_empty() -> Self {
         Self {
@@ -198,6 +236,9 @@ impl SchedulerOutput {
             finished_req_ids: HashSet::new(),
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
+            draft_req_ids: HashSet::new(),
+            primes_only: false,
+            spec_pipeline: SpecPipeline::default(),
         }
     }
 }
@@ -289,9 +330,31 @@ mod tests {
             finished_req_ids: HashSet::new(),
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
+            draft_req_ids: HashSet::new(),
+            primes_only: false,
+            spec_pipeline: SpecPipeline::default(),
         };
         assert_eq!(so.total_num_scheduled_tokens, 150);
         assert_eq!(so.scheduled_new_reqs.len(), 1);
         assert_eq!(so.scheduled_cached_reqs.num_reqs(), 1);
+    }
+
+    #[test]
+    fn test_scheduler_output_is_speculative() {
+        let mut so = SchedulerOutput::make_empty();
+        assert!(!so.is_speculative());
+
+        // A step that drafts: the step after it needs its drafts.
+        so.draft_req_ids.insert("r1".into());
+        assert!(so.is_speculative());
+
+        // Past the gate the head primes KV only — nothing drafted, nothing read back.
+        so.primes_only = true;
+        assert!(!so.is_speculative());
+
+        // A gated step that still verifies drafts decides what follows it: how many it keeps.
+        so.scheduled_spec_decode_tokens
+            .insert("r1".into(), vec![7, 8]);
+        assert!(so.is_speculative());
     }
 }

@@ -329,6 +329,7 @@ impl Gpu {
                 ConstantValue::uint(2, row as u32),
                 ConstantValue::uint(3, inner as u32),
                 ConstantValue::boolean(4, true),
+                ConstantValue::uint(5, 0),
             ],
         );
         let tg_y = conv_dim.min(THREADS);
@@ -359,6 +360,7 @@ impl Gpu {
                 ConstantValue::uint(3, geo.head_dim as u32),
                 ConstantValue::float(4, (geo.state as f32).powf(-0.5)),
                 ConstantValue::boolean(5, true),
+                ConstantValue::uint(8, 0),
             ]
         };
         if geo.simd() {

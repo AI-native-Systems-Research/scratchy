@@ -313,8 +313,8 @@ u32_newtype!(
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
-    /// The most rows a decode-only step brings — one a sequence, so the serving engine's
-    /// `max_num_seqs` — read at load: the rows the TurboQuant decode split's partials are
+    /// The most rows a decode or verify step brings — one a sequence of the serving engine's
+    /// `max_num_seqs`, a verify step's drafts too — read at load: the rows the TurboQuant decode split's partials are
     /// reserved for ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]).
     DecodeRows,
     /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
@@ -322,6 +322,8 @@ u32_newtype!(
     LogitsWidth,
     /// `u32` words per row of a grammar allow-bitset (one bit per token).
     BitsetWords,
+    /// Drafts a multi-token-prediction head makes a speculative step (its `spec_drafts`).
+    NumDrafts,
 );
 
 impl TqDecodeHeads {

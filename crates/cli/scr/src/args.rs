@@ -148,8 +148,9 @@ pub struct LaunchClaudeArgs {
     #[arg(long)]
     pub speculative_model: Option<String>,
 
-    /// Speculative tokens proposed per step. Unset leaves `serve`'s own default
-    /// (2). Only used with --speculative-model.
+    /// Speculative tokens proposed per step by --speculative-model (n-gram or a
+    /// draft model). Unset leaves `serve`'s own default (2). A compiled
+    /// multi-token-prediction head drafts the count it was compiled to.
     #[arg(long)]
     pub num_speculative_tokens: Option<usize>,
 
@@ -447,8 +448,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub speculative_model: Option<String>,
 
-    /// Number of speculative tokens to propose per step (default: 2).
-    /// Only used when --speculative-model is set.
+    /// Number of speculative tokens to propose per step (default: 2), with
+    /// --speculative-model (n-gram or a draft model). A multi-token-prediction
+    /// head drafts the count it was compiled to (its arch.json `spec_drafts`,
+    /// which its target's kernels bake); a build without `spec/mtp` serves
+    /// without one.
     ///
     /// K=2 is the empirical sweet spot for the realistic draft-model
     /// regime (target much larger than draft, e.g. Llama-3.1-8B

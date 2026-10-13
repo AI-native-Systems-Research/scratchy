@@ -129,7 +129,7 @@ impl From<ScalarMulConstants> for Vec<ConstantValue> {
     }
 }
 
-/// `KernelId::VisionLoadPixels` (`copy_rows_<T>`, `elementwise.metal` slot 4): the elements the
+/// `KernelId::LoadRows` (`copy_rows_<T>`, `elementwise.metal` slot 4): the elements the
 /// staged buffer holds.
 pub struct CopyRowsConstants {
     pub elements: ElementCount,
@@ -138,6 +138,22 @@ pub struct CopyRowsConstants {
 impl From<CopyRowsConstants> for Vec<ConstantValue> {
     fn from(c: CopyRowsConstants) -> Self {
         vec![ConstantValue::uint(ConstSlot(4), c.elements.get())]
+    }
+}
+
+/// `KernelId::ConcatRows` (`concat_rows_<T>`, `elementwise.metal` slots 6 and 7): the elements
+/// the output holds and the width of each operand's rows.
+pub struct ConcatRowsConstants {
+    pub elements: ElementCount,
+    pub width: ActivationWidth,
+}
+
+impl From<ConcatRowsConstants> for Vec<ConstantValue> {
+    fn from(c: ConcatRowsConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(6), c.elements.get()),
+            ConstantValue::uint(ConstSlot(7), c.width.get()),
+        ]
     }
 }
 
@@ -268,6 +284,8 @@ pub struct RopeAppendConstants {
     pub rope_on_read: Option<u32>,
     /// The TurboQuant encode folded in: see [`RopeAppendNormedConstants`].
     pub tq: Option<RopeTqConstants>,
+    /// The query alone (slot 15, `ROPE_Q_ONLY`): no K/V rotation or cache write.
+    pub query_only: bool,
 }
 
 impl From<RopeAppendConstants> for Vec<ConstantValue> {
@@ -285,6 +303,9 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
         RopeTqConstants::push(c.tq, c.head_dim, &mut v);
+        if c.query_only {
+            v.push(ConstantValue::uint(ConstSlot(15), 1));
+        }
         v
     }
 }
@@ -357,6 +378,29 @@ pub struct AttentionViaCacheConstants {
     /// the walk reads each key once for the whole group. The dispatch counts
     /// `num_q_heads / heads` threadgroups.
     pub heads: TqDecodeHeads,
+    /// What a threadgroup row queries (slot 22, `ATTN_ROW_QUERIES`).
+    pub query_rows: QueryRows,
+}
+
+/// What the decode attention's threadgroup rows query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryRows {
+    /// One row per sequence: a decode bucket's single token.
+    PerSequence,
+    /// One row per token, under its sequence's keys up to its own position: a bucket of several
+    /// rows, whose steps run several sequences' tokens (decode), or a few of one sequence's (a
+    /// verify step's last token and drafts, a short chunk) — every row attends as decoding would.
+    PerToken,
+}
+
+impl QueryRows {
+    /// A bucket of `bucket_m` rows' rows.
+    pub fn for_bucket(bucket_m: u32) -> Self {
+        match bucket_m {
+            1 => Self::PerSequence,
+            _ => Self::PerToken,
+        }
+    }
 }
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
@@ -382,6 +426,9 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             AttentionViaCacheTqConstants::HEADS,
             c.heads.get(),
         ));
+        if c.query_rows == QueryRows::PerToken {
+            v.push(ConstantValue::uint(ConstSlot(22), 1));
+        }
         v
     }
 }
@@ -833,7 +880,7 @@ impl From<AffineGatherQmvConstants> for Vec<ConstantValue> {
 }
 
 /// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`, `Q` =
-/// [`AffineGatherQmvConstants`]) and `KernelId::AffineQmvGated` (`affine_qmv_gated[_fast]_*`,
+/// [`GatedGatherQmvConstants`]) and `KernelId::AffineQmvGated` (`affine_qmv_gated[_fast]_*`,
 /// `Q` = [`AffineQmvConstants`]): the gate projection's matvec constants (the up's are the same)
 /// and the activation (slot 3: 0 SiLU, 1 GELU, 2 SwiGLU-OAI, 3 an ungated expert's relu² of its
 /// one projection — the gather form only, binding no up). The gather form additionally takes
@@ -862,6 +909,49 @@ impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<Const
         let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(3), act));
         v
+    }
+}
+
+/// The gated MoE gather's matvec constants: the gather's ([`AffineGatherQmvConstants`]) and where
+/// its pairs that share an expert run (slot 21).
+pub struct GatedGatherQmvConstants {
+    pub gather: AffineGatherQmvConstants,
+    pub shared: SharedExperts,
+}
+
+impl From<GatedGatherQmvConstants> for Vec<ConstantValue> {
+    fn from(c: GatedGatherQmvConstants) -> Self {
+        let mut v: Vec<ConstantValue> = c.gather.into();
+        v.push(c.shared.constant());
+        v
+    }
+}
+
+/// Where the gated MoE gather runs the (row, expert) pairs that share an expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExperts {
+    /// Each pair in its own threadgroup: a bucket of many rows, whose experts take many pairs.
+    Apart,
+    /// An expert's pairs one after another in the threadgroup of its first pair, which reads the
+    /// expert's weights once: a bucket of a speculative verify step's few rows. Each pair scans
+    /// the pairs before it, so the bucket's pairs must be few.
+    InFirstPair,
+}
+
+impl SharedExperts {
+    /// A bucket of `bucket_m` rows' choice: in the first pair at a verify-sized bucket of more than
+    /// one row (`op_abi::{METAL_SHARED_EXPERTS_FROM, METAL_VERIFY_ROWS}`).
+    pub fn for_bucket(bucket_m: u32) -> Self {
+        use crate::op_abi::{METAL_SHARED_EXPERTS_FROM, METAL_VERIFY_ROWS};
+        match (METAL_SHARED_EXPERTS_FROM..=METAL_VERIFY_ROWS).contains(&bucket_m) {
+            true => Self::InFirstPair,
+            false => Self::Apart,
+        }
+    }
+
+    /// Slot 21: 0 apart, 1 in the first pair.
+    pub fn constant(self) -> ConstantValue {
+        ConstantValue::int(ConstSlot(21), i32::from(self == Self::InFirstPair))
     }
 }
 
@@ -1310,6 +1400,25 @@ impl From<SamplerConstants> for Vec<ConstantValue> {
         let vocab = ConstantValue::uint(ConstSlot(0), c.vocab.get());
         let telemetry = c.telemetry.map(|t| ConstantValue::boolean(ConstSlot(1), t));
         std::iter::once(vocab).chain(telemetry).collect()
+    }
+}
+
+/// `mtp_chain.metal`: slot 0 a multi-token-prediction head's hidden width, slot 1 its drafts a
+/// step, slot 2 the width of its rotary cos/sin rows (0: its rope reads positions).
+#[derive(Clone, Copy)]
+pub struct MtpChainConstants {
+    pub hidden: HiddenSize,
+    pub drafts: crate::tape::ids::NumDrafts,
+    pub rope: crate::tape::ids::RotDim,
+}
+
+impl From<MtpChainConstants> for Vec<ConstantValue> {
+    fn from(c: MtpChainConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.hidden.get()),
+            ConstantValue::uint(ConstSlot(1), c.drafts.get()),
+            ConstantValue::uint(ConstSlot(2), c.rope.get()),
+        ]
     }
 }
 

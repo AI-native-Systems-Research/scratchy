@@ -35,6 +35,9 @@ pub enum KvWrite {
     /// The pool, and the KV codec's packed store: the codec's encodes of the rows, folded into the
     /// writer (`MetalFusion::KvEncoded`).
     PoolAndPacked,
+    /// Nothing: the step ropes its query alone (a model that appends no K/V of its own — a drafter
+    /// reading its target's KV). Its K/V operands are the query's slot, unread.
+    None,
 }
 
 /// An `f32` field compared by bit pattern: two rows are equal iff they bake the same constant.
@@ -203,10 +206,10 @@ pub enum UnaryAct {
 /// step writes. Field order per kind: inputs, outputs, layer, shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetalStep {
-    /// `(out)`: token embedding into the hidden.
-    Embed(Slot),
-    /// `(out, group_size, bits)`: MLX-affine quantized token embedding.
-    AffineEmbed(Slot, AffineGroupSize, AffineBits),
+    /// `(out, width)`: token embedding into the hidden.
+    Embed(Slot, ActivationWidth),
+    /// `(out, group_size, bits, width)`: MLX-affine quantized token embedding.
+    AffineEmbed(Slot, AffineGroupSize, AffineBits, ActivationWidth),
     /// `(slot)`: projected vision rows spliced into the embedded hidden, in place.
     SpliceMmEmbeds(Slot),
     /// `(in, out, rows_mult, rows_div)`: a view — no kernel runs; later rows see
@@ -305,16 +308,17 @@ pub enum MetalStep {
     VarlenAttention(Slot, Slot, Slot, Slot, CuSeqlens),
     /// `(q, k, q_out, k_out)`: vision 2-D rope.
     VisionRope(Slot, Slot, Slot, Slot),
-    /// `(out)`: the staged vision pixels.
-    LoadPixels(Slot),
-    /// `(out)`: the staged vision position embeddings.
-    LoadPosEmbeds(Slot),
+    /// `(out, source)`: the host-staged rows of `source` (vision pixels, vision position
+    /// embeddings, a target model's hidden states).
+    LoadRows(Slot, scratchy_ir::RowsExtern),
     /// `(in, out, indices, width)`: row permutation by a runtime index buffer.
     EmbeddingGather(Slot, Slot, GatherIndices, ActivationWidth),
     /// `(qg, q, gate)`: split the doubled q projection into query and gate.
     GateSplit(Slot, Slot, Slot),
     /// `(attn, gate, out)`: `attn * sigmoid(gate)`.
     GateApply(Slot, Slot, Slot),
+    /// `(a, b, out, width)`: `out[t] = a[t] ++ b[t]`, each operand `width` wide.
+    Concat(Slot, Slot, Slot, ActivationWidth),
     /// `(routed, shared, gate, out)`: `routed + shared * sigmoid(gate)`.
     GateScale(Slot, Slot, Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.
@@ -707,11 +711,11 @@ impl MetalStep {
             | S::EncoderAttention(..)
             | S::VarlenAttention(..)
             | S::VisionRope(..)
-            | S::LoadPixels(..)
-            | S::LoadPosEmbeds(..)
+            | S::LoadRows(..)
             | S::EmbeddingGather(..)
             | S::GateSplit(..)
             | S::GateApply(..)
+            | S::Concat(..)
             | S::GateScale(..)
             | S::RotateRows(..)
             | S::SampleRows(..)
@@ -765,6 +769,9 @@ pub struct MetalStepTape {
     pub backbone: Vec<StepRow>,
     pub backbone_barriers: Vec<Fence>,
     pub backbone_sources: Vec<Vec<RowSource>>,
+    /// Per backbone row, whether a forward reading only its cache writes runs it (the metal
+    /// compiler's `cache_live`). The lm_head's rows never do.
+    pub backbone_cache_live: Vec<bool>,
     pub lm_head: Vec<StepRow>,
     pub lm_head_barriers: Vec<Fence>,
     pub lm_head_sources: Vec<Vec<RowSource>>,

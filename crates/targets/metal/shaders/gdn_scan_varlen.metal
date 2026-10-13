@@ -21,8 +21,16 @@
 // math). GVA: the key head is `i_hv / (HV/H)`.
 //
 // `conv_out` is model dtype (`T`); `g`/`beta`/`ssm_state`/`o` are f32.
-// State layout (cuda-symmetric): ssm_state[num_slots, HV, head_v, head_k],
-//   row = ((slot*HV + i_hv)*head_v + i_v)*head_k. is_fresh → S starts at 0.
+// State layout (cuda-symmetric): `state_indices[seq]` is the sequence's slot; a slot is its state
+//   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)), then — when the model
+//   drafts (`scratchy_layers::gdn_state::GdnStateDims::ssm_slot_len`) — two record areas of
+//   `GDN_SCAN_DRAFTS + 1` rows, each row its f32 conv row, then its decay and beta (f32 [HV] each).
+//   `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`:
+//   - a step starts from the slot's state, zero (fresh), or (start = checkpoint r) the slot's state
+//     replayed through the previous verify step's rows 0..=r from the record area its bit 16
+//     names, through the same loop body that first computed them (no output);
+//   - a verify step (drafts) leaves the state it starts from in the slot and records each of its
+//     rows in the other area; any other step writes its last row's state to the slot.
 //
 // Mamba-2 (Nemotron-H, `GDN_SCAN_MAMBA`) runs the same mapping over the same state layout — its
 // heads the value heads, its groups the key heads, a head's `[head_dim, state]` matrix the
@@ -39,7 +47,8 @@
 //   GDN_SCAN_HEAD_K (K), GDN_SCAN_HEAD_V (head_v), GDN_SCAN_SCALE (1/sqrt(K); Mamba-2: unread),
 //   GDN_SCAN_MAMBA (optional: the Mamba-2 recurrence), GDN_SCAN_A_STRIDE / GDN_SCAN_A_OFFSET
 //   (optional, `gdn_scan_simd` only: `a`'s row stride and first column — Mamba-2's `dt` slice of
-//   the in-projection row; unset: `a` is `[T, HV]`).
+//   the in-projection row; unset: `a` is `[T, HV]`), GDN_SCAN_DRAFTS (the drafts each sequence
+//   of a verify step carries: `SPEC_DRAFTS`).
 //
 // Dispatch: grid (ceil(head_v/tg), HV, num_seqs); thread = (value-dim, head, seq).
 
@@ -56,6 +65,7 @@ SCRATCHY_CONSTANT(float, GDN_SCAN_SCALE, 4);
 SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_SCAN_MAMBA, 5);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_SCAN_A_STRIDE, 6);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_SCAN_A_OFFSET, 7);
+SCRATCHY_CONSTANT(uint, GDN_SCAN_DRAFTS, 8);
 
 // The columns of q / k / v (Mamba-2: C / B / x) in a `conv_out` row.
 constant constexpr uint GDN_SCAN_KEY_DIM = GDN_SCAN_NUM_K_HEADS * GDN_SCAN_HEAD_K;
@@ -76,7 +86,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
+    const device uint*  gdn_step      [[buffer(7)]],
     const device float* d_skip        [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
@@ -105,71 +115,119 @@ template <typename T>
   if (seq_len <= 0) {
     return;
   }
-  int slot = state_indices[i_n];
-  if (slot < 0) {
+  int slot_ix = state_indices[i_n];
+  if (slot_ix < 0) {
     return;
   }
-  bool fresh = is_fresh[i_n] != 0u;
+  // A model without drafts (`GDN_SCAN_DRAFTS` 0) neither replays nor records: its scan compiles to
+  // the plain one.
+  uint code = gdn_step[i_n];
+  uint start = code & 0xffu;
+  uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
+  uint area = (code >> 16) & 1u;
 
-  device float* state_row =
-      ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
+  // The slot: its state entry, then (with drafts) two record areas of `GDN_SCAN_DRAFTS + 1` rows,
+  // each row its f32 conv row, then its decay and beta.
+  uint entry_len = HV * Vd * K;
+  uint rec_len = conv_dim + 2u * HV;
+  uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
+  uint slot_len = entry_len + (GDN_SCAN_DRAFTS == 0u ? 0u : 2u * area_len);
+  device float* slot = ssm_state + uint(slot_ix) * slot_len;
+  device float* state_row = slot + (i_hv * Vd + i_v) * K;
+  const device float* kept = slot + entry_len + area * area_len;
+  device float* recorded = slot + entry_len + (1u - area) * area_len;
+  int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
+
   float b_h[GDN_SCAN_KMAX];
   for (uint ki = 0; ki < K; ki++) {
-    b_h[ki] = fresh ? 0.0f : state_row[ki];
+    b_h[ki] = start == 1u ? 0.0f : state_row[ki];
   }
 
-  for (int i_t = 0; i_t < seq_len; i_t++) {
+  // The previous verify step's kept rows (replayed: no output), then this step's.
+  for (int i_t = -replayed; i_t < seq_len; i_t++) {
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step leaves the state it starts from in the slot (a slot start's is already
+      // there).
+      for (uint ki = 0; ki < K; ki++) {
+        state_row[ki] = b_h[ki];
+      }
+    }
     uint t = uint(bos + i_t);
+    const device float* rec = kept + uint(i_t + replayed) * rec_len;
+    const device T* live = conv_out + t * conv_dim;
+    auto x = [&](uint j) -> float { return i_t < 0 ? rec[j] : float(live[j]); };
+    float g_t = i_t < 0 ? rec[conv_dim + i_hv] : g[t * HV + i_hv];
+    float beta_t = i_t < 0 ? rec[conv_dim + HV + i_hv] : beta[t * HV + i_hv];
+    // A verify row, for the replay that keeps it: its conv row split over the sequence's
+    // threads, its decay and beta by value-dim 0.
+    if (drafts > 0u && uint(i_t) <= drafts) {
+      device float* dst = recorded + uint(i_t) * rec_len;
+      for (uint j = i_hv * Vd + i_v; j < conv_dim; j += value_dim) {
+        dst[j] = float(live[j]);
+      }
+      if (i_v == 0u) {
+        dst[conv_dim + i_hv] = g_t;
+        dst[conv_dim + HV + i_hv] = beta_t;
+      }
+    }
     // q from key-head i_h; k from key-head i_h (offset key_dim); v from value-head i_hv.
-    const device T* q_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_Q + i_h * K;
-    const device T* k_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_K + i_h * K;
+    uint q_at = GDN_SCAN_COL_Q + i_h * K;
+    uint k_at = GDN_SCAN_COL_K + i_h * K;
     if (GDN_SCAN_MAMBA) {
-      const float x = float(conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v]);
-      const float decay = exp(g[t * HV + i_hv]);
-      const float x_dt = x * beta[t * HV + i_hv];
+      const float xv = x(GDN_SCAN_COL_V + i_hv * Vd + i_v);
+      const float decay = exp(g_t);
+      const float x_dt = xv * beta_t;
       float y = 0.0f;
       for (uint ki = 0; ki < K; ki++) {
-        b_h[ki] = decay * b_h[ki] + x_dt * float(k_ptr[ki]);
-        y += b_h[ki] * float(q_ptr[ki]);
+        b_h[ki] = decay * b_h[ki] + x_dt * x(k_at + ki);
+        y += b_h[ki] * x(q_at + ki);
       }
-      o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
+      if (i_t >= 0) {
+        o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * xv;
+      }
       continue;
     }
 
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
-      float qf = float(q_ptr[ki]);
-      float kf = float(k_ptr[ki]);
+      float qf = x(q_at + ki);
+      float kf = x(k_at + ki);
       q_sq += qf * qf;
       k_sq += kf * kf;
     }
     float q_inv = rsqrt(q_sq + 1e-6f);
     float k_inv = rsqrt(k_sq + 1e-6f);
 
-    float decay = exp(g[t * HV + i_hv]);
+    float decay = exp(g_t);
     for (uint ki = 0; ki < K; ki++) {
       b_h[ki] *= decay;
     }
 
-    float b_v = float(conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v]);
+    float b_v = x(GDN_SCAN_COL_V + i_hv * Vd + i_v);
     float dot_hk = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
-      dot_hk += b_h[ki] * (float(k_ptr[ki]) * k_inv);
+      dot_hk += b_h[ki] * (x(k_at + ki) * k_inv);
     }
-    b_v = (b_v - dot_hk) * beta[t * HV + i_hv];
+    b_v = (b_v - dot_hk) * beta_t;
 
     float b_o = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
-      float kn = float(k_ptr[ki]) * k_inv;
-      float qn = float(q_ptr[ki]) * q_inv * scale;
+      float kn = x(k_at + ki) * k_inv;
+      float qn = x(q_at + ki) * q_inv * scale;
       b_h[ki] += b_v * kn;
       b_o += b_h[ki] * qn;
+    }
+    if (i_t < 0) {
+      continue;
     }
     o[t * value_dim + i_hv * Vd + i_v] = b_o;
   }
 
-  for (uint ki = 0; ki < K; ki++) {
-    state_row[ki] = b_h[ki];
+  // Any step but a verify step leaves its last row's state in the slot.
+  if (drafts == 0u) {
+    for (uint ki = 0; ki < K; ki++) {
+      state_row[ki] = b_h[ki];
+    }
   }
 }
 
@@ -180,6 +238,9 @@ template <typename T>
 // 0): each lane holds head_k / 32 state elements, and every dot over head_k is a simd_sum — four
 // per token (q's and k's L2 norms, S·k, S·q) instead of the per-thread serial loops above. Every
 // lane computes its head's g and beta as `gdn_gating` does. `o` (f32) feeds `gdn_rms_norm_gated`.
+// Its state entries, draft records and replay are `gdn_scan_varlen`'s (the file header), records
+// as `gdn_scan_varlen_f32` lays them out (the lowering's instantiation: f32 conv rows), so either
+// kernel replays the other's records.
 //
 // Baked constants: the scan's 0-4.
 // Dispatch: grid (1, HV * head_v / 4, num_seqs), threads (32, 4, 1): simdgroup s of threadgroup y
@@ -195,7 +256,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
+    const device uint*  gdn_step      [[buffer(7)]],
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
     const device float* d_skip        [[buffer(10)]],
@@ -221,45 +282,89 @@ template <typename T>
 
   const int bos = cu_seqlens[i_n];
   const int seq_len = cu_seqlens[i_n + 1] - bos;
-  const int slot = state_indices[i_n];
-  if (seq_len <= 0 || slot < 0 || i_v >= Vd) {
+  const int slot_ix = state_indices[i_n];
+  if (seq_len <= 0 || slot_ix < 0 || i_v >= Vd) {
     return;
   }
-  const bool fresh = is_fresh[i_n] != 0u;
+  // A model without drafts (`GDN_SCAN_DRAFTS` 0) neither replays nor records: its scan compiles to
+  // the plain one.
+  const uint code = gdn_step[i_n];
+  const uint start = code & 0xffu;
+  const uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
+  const uint area = (code >> 16) & 1u;
 
-  device float* state_row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K + lane * NPT;
+  // The slot, as `gdn_scan_varlen` lays it out.
+  const uint entry_len = HV * Vd * K;
+  const uint rec_len = conv_dim + 2u * HV;
+  const uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
+  device float* slot =
+      ssm_state + uint(slot_ix) * (entry_len + (GDN_SCAN_DRAFTS == 0u ? 0u : 2u * area_len));
+  device float* state_row = slot + (i_hv * Vd + i_v) * K + lane * NPT;
+  const device float* kept = slot + entry_len + area * area_len;
+  device float* recorded = slot + entry_len + (1u - area) * area_len;
+  const int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
+
   float st[NPT];
   for (uint i = 0; i < NPT; i++) {
-    st[i] = fresh ? 0.0f : state_row[i];
+    st[i] = start == 1u ? 0.0f : state_row[i];
   }
   const float neg_a = -exp(float(a_log[i_hv]));
 
-  for (int i_t = 0; i_t < seq_len; i_t++) {
+  // The previous verify step's kept rows (replayed: no output), then this step's.
+  for (int i_t = -replayed; i_t < seq_len; i_t++) {
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step leaves the state it starts from in the slot (a slot start's is already
+      // there).
+      for (uint i = 0; i < NPT; i++) {
+        state_row[i] = st[i];
+      }
+    }
     const uint t = uint(bos + i_t);
-    // gdn_gating
-    const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
-                                            : t * HV + i_hv;
-    const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
-    const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
-    const float decay = exp(neg_a * sp);
+    const device float* rec = kept + uint(i_t + replayed) * rec_len;
+    const device float* row = i_t < 0 ? rec : conv_out + t * conv_dim;
+    // gdn_gating, or the recorded row's. Mamba-2's beta is its dt.
+    float g_t, beta;
+    if (i_t < 0) {
+      g_t = rec[conv_dim + i_hv];
+      beta = rec[conv_dim + HV + i_hv];
+    } else {
+      const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
+                                              : t * HV + i_hv;
+      const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
+      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+      g_t = neg_a * sp;
+      beta = GDN_SCAN_MAMBA ? sp : 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
+    }
+    const float decay = exp(g_t);
+    // A verify row, for the replay that keeps it: its conv row split over the sequence's lanes,
+    // its decay and beta by value-dim 0's lane 0.
+    if (drafts > 0u && uint(i_t) <= drafts) {
+      device float* dst = recorded + uint(i_t) * rec_len;
+      for (uint j = (i_hv * Vd + i_v) * 32u + lane; j < conv_dim; j += value_dim * 32u) {
+        dst[j] = conv_out[t * conv_dim + j];
+      }
+      if (i_v == 0u && lane == 0u) {
+        dst[conv_dim + i_hv] = g_t;
+        dst[conv_dim + HV + i_hv] = beta;
+      }
+    }
 
-    const device float* q_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
-    const device float* k_ptr = conv_out + t * conv_dim + GDN_SCAN_COL_K + i_h * K + lane * NPT;
+    const device float* q_ptr = row + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
+    const device float* k_ptr = row + GDN_SCAN_COL_K + i_h * K + lane * NPT;
     if (GDN_SCAN_MAMBA) {
-      const float x = conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v];
-      const float x_dt = x * sp;
+      const float x = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
+      const float x_dt = x * beta;
       float y = 0.0f;
       for (uint i = 0; i < NPT; i++) {
         st[i] = decay * st[i] + x_dt * k_ptr[i];
         y += st[i] * q_ptr[i];
       }
       y = simd_sum(y);
-      if (lane == 0u) {
+      if (i_t >= 0 && lane == 0u) {
         o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
       }
       continue;
     }
-    const float beta = 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
     float q[NPT], k[NPT];
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint i = 0; i < NPT; i++) {
@@ -277,7 +382,7 @@ template <typename T>
       kv += st[i] * (k[i] * k_inv);
     }
     kv = simd_sum(kv);
-    const float v = conv_out[t * conv_dim + GDN_SCAN_COL_V + i_hv * Vd + i_v];
+    const float v = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
     const float delta = (v - kv) * beta;
     float out = 0.0f;
     for (uint i = 0; i < NPT; i++) {
@@ -285,13 +390,19 @@ template <typename T>
       out += st[i] * (q[i] * q_inv);
     }
     out = simd_sum(out);
+    if (i_t < 0) {
+      continue;
+    }
     if (lane == 0u) {
       o[t * value_dim + i_hv * Vd + i_v] = out;
     }
   }
 
-  for (uint i = 0; i < NPT; i++) {
-    state_row[i] = st[i];
+  // Any step but a verify step leaves its last row's state in the slot.
+  if (drafts == 0u) {
+    for (uint i = 0; i < NPT; i++) {
+      state_row[i] = st[i];
+    }
   }
 }
 

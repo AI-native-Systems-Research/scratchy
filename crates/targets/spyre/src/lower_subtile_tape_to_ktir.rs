@@ -578,9 +578,9 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::ScalarWeightMul
         | SubOp::GateSplit { .. }
         | SubOp::GateApply
+        | SubOp::Concat { .. }
         | SubOp::GateScale
-        | SubOp::LoadPixels { .. }
-        | SubOp::LoadPosEmbeds { .. }
+        | SubOp::LoadRows { .. }
         | SubOp::EmbeddingGather { .. }
         | SubOp::VisionRope
         | SubOp::VarlenAttention { .. }
@@ -2149,6 +2149,7 @@ mod attn_scale_weight_fold_tests {
             sources,
             ops,
             result: 4,
+            exported: None,
         };
         let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
         scratchy_subtile::subtile_ir::lower_region(&input, nb)
@@ -2259,6 +2260,7 @@ mod attn_scale_weight_fold_tests {
                 },
             ],
             result: 4,
+            exported: None,
         };
         let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
         let ir = scratchy_subtile::subtile_ir::lower_region(&input, nb);

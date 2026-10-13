@@ -51,6 +51,7 @@ impl CodecGuard {
 
 /// A target's realization of each guard, one field per guard: a new guard is a missing field in
 /// every target's table, not a silent default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuardGates<G> {
     pub codec: G,
     pub codec_decode: G,
@@ -239,6 +240,7 @@ pub fn expand_kv_codec(
             sources: l.input.sources.clone(),
             ops: x.ops,
             result: x.read_as[l.input.result],
+            exported: l.input.exported.map(|e| x.read_as[e]),
         },
         bindings: l.bindings.clone(),
         op_tiles: x.tiles,
@@ -412,19 +414,32 @@ impl Expander<'_> {
     /// packed store is its new K's writer's (operand 3).
     fn attention(&mut self, i: usize, around: &CodecAround) -> Result<(), KvCodecError> {
         let name = self.name(i);
-        let writer = match self.operand(i, 3)? {
-            InputRef::Op(w) if self.packed.contains_key(&w) => w,
-            _ => return Err(KvCodecError::NoWriter { op: i, name }),
+        // An attention over a cache it appends nothing to (`q, prefix K, prefix V`: a drafter
+        // reading its target's KV) reads a packed store no writer of this forward encodes: its
+        // prefix sources stand for it.
+        let shared = self.l.input.ops[i].inputs.len() == 3;
+        let packed = match shared {
+            true => vec![
+                (KvOperand::K, self.input(self.operand(i, 1)?)),
+                (KvOperand::V, self.input(self.operand(i, 2)?)),
+            ],
+            false => {
+                let writer = match self.operand(i, 3)? {
+                    InputRef::Op(w) if self.packed.contains_key(&w) => w,
+                    _ => return Err(KvCodecError::NoWriter { op: i, name }),
+                };
+                (self.packed[&writer].iter())
+                    .map(|&(k, e)| (k, InputRef::Op(e)))
+                    .collect()
+            }
         };
-        let packed = self.packed[&writer].clone();
         let packed_of = |operand: KvOperand| {
             let p = packed.iter().find(|(k, _)| *k == operand);
-            p.map(|(_, e)| InputRef::Op(*e))
-                .ok_or(KvCodecError::Unencoded {
-                    op: i,
-                    name,
-                    operand,
-                })
+            p.map(|(_, e)| *e).ok_or(KvCodecError::Unencoded {
+                op: i,
+                name,
+                operand,
+            })
         };
         let (pk, pv) = (packed_of(KvOperand::K)?, packed_of(KvOperand::V)?);
         let id = self.open(i)?;

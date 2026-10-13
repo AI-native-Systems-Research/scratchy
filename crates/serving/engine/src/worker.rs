@@ -268,6 +268,13 @@ pub trait Worker: Send {
         None
     }
 
+    /// Whether the worker runs a speculative step scheduled behind one still in flight
+    /// (`SpecPipeline::behind`): it picks that step's positions, tokens and drafts on the device
+    /// from the outcome of the one before it.
+    fn pipelines_speculative_steps(&self) -> bool {
+        false
+    }
+
     /// Shut down the worker and release all resources.
     fn shutdown(&mut self);
 

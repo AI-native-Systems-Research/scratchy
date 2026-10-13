@@ -748,6 +748,7 @@ mod tests {
         let n_ops = ops.len();
         LoweredDecode {
             input: LoweringInput {
+                exported: None,
                 sources: vec![SourceShape { rows: 1, cols: 8 }; bindings.len()],
                 ops,
                 result: n_ops.saturating_sub(1),

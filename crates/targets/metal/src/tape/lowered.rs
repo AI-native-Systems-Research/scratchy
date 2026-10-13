@@ -457,10 +457,13 @@ pub enum KernelId {
     /// Maps to `gelu_tanh_{f16,bf16}` (and the erf / quick flavours) in
     /// `activation.metal`. Bindings: `(out @ 0, in @ 1)`, `GeluConstants` baked.
     VisionGelu,
-    /// Copy the vision `pixels` runtime extern into an arena slot
-    /// (materialized by `vision_lowering::materialize_pixels`). Maps to
-    /// `copy_rows_{f16,bf16}` in `elementwise.metallib`.
-    VisionLoadPixels,
+    /// Copy a host-staged rows runtime extern (vision pixels, position embeddings, a target's
+    /// hidden states) into an arena slot (materialized by `rows_lowering::materialize_rows`).
+    /// Maps to `copy_rows_{f16,bf16}` in `elementwise.metallib`.
+    LoadRows,
+    /// Row concatenation `out[t] = a[t] ++ b[t]` of two same-width activations (an MTP head's
+    /// input fusion). Maps to `concat_rows_{f16,bf16}` in `elementwise.metallib`.
+    ConcatRows,
     /// Multimodal embed splice — scatter the projected vision embeddings
     /// (`MmEmbeds`) into the text embedding stream at the placeholder
     /// rows (`MmDstRows`). Maps to `mm_embed_splice_{f16,bf16}` in
@@ -591,7 +594,8 @@ impl KernelId {
             | Self::EmbeddingGather
             | Self::AvgPool2d
             | Self::VisionGelu
-            | Self::VisionLoadPixels
+            | Self::LoadRows
+            | Self::ConcatRows
             | Self::MmEmbedSplice
             | Self::TqStageRotated
             | Self::TqRotateRows
@@ -740,8 +744,19 @@ pub enum RuntimeGate {
     /// Run unless the step's block tables hold an unrotated block: the
     /// per-row attention twin that reads the cache's already-roped K as is.
     UnlessUnrotatedBlocks,
+    /// Run only on a step whose every sequence's Gated-DeltaNet step is plain
+    /// (`GdnStep::is_plain`: it neither replays nor records): the one-command
+    /// decode and the pipelined prefill scan, which know only a slot's state
+    /// entry.
+    OnlyIfPlainGdn,
+    /// Run on a step one of whose sequences replays or records its
+    /// Gated-DeltaNet rows (a speculative verify step, the step after one):
+    /// the conv and the simd scan, which replay and record.
+    UnlessPlainGdn,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
+    /// Run when some gate in the list matches.
+    Any(&'static [RuntimeGate]),
 }
 
 impl RuntimeGate {
@@ -890,7 +905,7 @@ pub enum Binding {
     /// (one buffer, serial commands per layer; overwritten each layer).
     AttnUnfusedScratch { offset: u32, binding_index: u8 },
     /// A bound sub-region of the worker's shared MoE scratch buffer
-    /// (`MetalWorker.moe_scratch`, sized to
+    /// (sized to
     /// `LoweredMetalTape::moe_scratch_bytes`). Each lowered MoE
     /// command picks the named region it operates on by passing
     /// `byte_offset` into `setBuffer_offset_atIndex`. Sub-regions are
@@ -1289,15 +1304,19 @@ pub enum RuntimeBindingKind {
     /// forward by the worker. Carried on `ForwardCtx::vision_rope_freqs`.
     VisionRopeFreqs,
     /// `[num_tokens, vision_in_features]` model-dtype — the vision patch
-    /// pixel rows. `Instruction::LoadPixels` copies it into an arena slot.
+    /// pixel rows. `LoadRows(Pixels)` copies it into an arena slot.
     /// Carried on `ForwardCtx::pixels`, written per forward by the worker.
     Pixels,
     /// `[num_tokens, vision_embed_dim]` model-dtype — the Qwen3.5-VL
     /// host-interpolated learned positional embedding.
-    /// `Instruction::LoadPosEmbeds` copies it into an arena slot.
+    /// `LoadRows(PosEmbeds)` copies it into an arena slot.
     /// Carried on `ForwardCtx::pos_embeds`, written per forward by the
     /// worker.
     VisionPosEmbeds,
+    /// `[num_tokens, hidden]` model-dtype — a target model's final hidden states, what an MTP
+    /// head reads. `LoadRows(TargetHidden)` copies it into an arena slot. Carried on
+    /// `ForwardCtx::target_hidden`, written per forward by the worker.
+    TargetHidden,
     /// `[num_tokens, hidden]` model-dtype — the projected vision-encoder
     /// embeddings (`ForwardCtx::mm_embeds`), copied row-blockwise into
     /// the text embedding stream at the image-placeholder rows by
@@ -1688,6 +1707,7 @@ impl RuntimeBindingKind {
             | Self::VisionRopeFreqs
             | Self::Pixels
             | Self::VisionPosEmbeds
+            | Self::TargetHidden
             | Self::MmEmbeds
             | Self::MmDstRows
             | Self::MropeCosSin
@@ -1870,6 +1890,17 @@ impl LoweredMetalTape {
         out
     }
 
+    /// `cache_live`, expanded in lockstep with [`Self::commands_expanded`]: every iteration of a
+    /// loop's body runs whole. A command past the mask runs.
+    pub fn cache_live_expanded(&self) -> Vec<bool> {
+        let mut out = Vec::with_capacity(self.commands.len());
+        let live = self.cache_live;
+        Self::walk(self.loops, 0..self.commands.len(), 0, &mut |pos, _| {
+            out.push(live.get(pos).copied().unwrap_or(true))
+        });
+        out
+    }
+
     /// THE ONE WALK. Emitted rows, in order, each with the layer offset every enclosing loop
     /// contributes. Loops are outermost-first and nest by containment of `[start, start+period)`.
     fn walk(
@@ -1953,9 +1984,10 @@ pub struct LoweredMetalTape {
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
     /// Bytes one row of the TurboQuant decode split's partials takes at the MoE scratch's front
-    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode-only step runs the split —
-    /// one row a sequence — so the buffer holds them for the rows such a step can bring, not for
-    /// the bucket's every row ([`Self::scratch_bytes`]). Zero without the split.
+    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode or verify step runs the split
+    /// — a row a sequence, a verify step's drafts too — so the buffer holds them for the rows such
+    /// a step can bring, not for the bucket's every row ([`Self::scratch_bytes`]). Zero without
+    /// the split.
     pub decode_partials_row_bytes: u32,
     /// Byte size of the shared roped-K scratch buffer the worker
     /// allocates if any spans rope-on-read NAX prefill (`KernelId::
@@ -1971,6 +2003,12 @@ pub struct LoweredMetalTape {
     /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
     /// hd512-unfused attention was lowered.
     pub attn_unfused_scratch_bytes: u32,
+    /// Per command, whether a forward reading only its cache writes plays it
+    /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): what a KV or recurrent-state
+    /// write needs, from the metal compiler's liveness walk over the rows. Off for the lm_head,
+    /// the attention and MLP past a model's last KV writer, and a projection only they read (the
+    /// Q a rope append rotates beside the K and V it writes); on for every cache write.
+    pub cache_live: &'static [bool],
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the
@@ -2007,6 +2045,10 @@ pub enum LoweringError {
     NoRotaryTable { index: usize },
     /// A gated row whose realization already gates its commands: one command, two gates.
     DoubleGate { index: usize },
+    /// A command at tape index `index` writes a cache — KV, a recurrent state — and the row it
+    /// lowers from is not one a cache-only forward runs: the liveness walk and the lowering
+    /// disagree on what writes a cache.
+    CacheWriterSkipped { index: usize },
     /// A command computes batch row 0 only ([`SeqScope::RowZero`]) and its
     /// step has no per-row twin re-roping span blocks, so some step with
     /// several sequences would run no attention, or row 0's for every sequence.
@@ -2089,6 +2131,11 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the row at tape index {index} is gated, and its realization gates a \
                  command of its own"
+            ),
+            Self::CacheWriterSkipped { index } => write!(
+                f,
+                "lowering: a command of the row at tape index {index} writes a cache, and a \
+                 cache-only forward would skip it"
             ),
             Self::RowZeroWithoutPerRowTwin { index, kernel } => write!(
                 f,

@@ -206,7 +206,13 @@ const CUDA_ONLY: &[&str] = &[
 /// claims for their ops). Under a cuda build we must NOT run their pipeline
 /// (the solver would find tile claims missing and panic). Kept in sync with
 /// src/lib.rs gates.
-const METAL_ONLY: &[&str] = &["glm4-moe", "gpt-oss", "nemotron-h", "nemotron-h-latent"];
+const METAL_ONLY: &[&str] = &[
+    "gemma4-assistant",
+    "glm4-moe",
+    "gpt-oss",
+    "nemotron-h",
+    "nemotron-h-latent",
+];
 /// Arches that additionally support the spyre (KTIR) backend.
 ///
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here

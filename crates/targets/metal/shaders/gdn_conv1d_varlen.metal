@@ -20,10 +20,13 @@
 //
 //   out[t,c] = SiLU( Σ_{j} w[c,j] · x_pad[t-(K-1)+j, c] )
 //
-// left-padded from the per-sequence `conv_state` ring (or zero when is_fresh).
+// left-padded from the per-sequence `conv_state` ring (or zero when fresh).
 //
-// State layout (cuda-symmetric): conv_state[num_slots, conv_dim, state_len],
-//   state_len = kernel-1, base = (slot*conv_dim + d)*state_len, oldest-first.
+// State layout (cuda-symmetric): conv_state[entries, conv_dim, state_len], state_len =
+//   kernel-1, base = (entry*conv_dim + d)*state_len, oldest-first. `state_indices[seq]` is the
+//   sequence's slot, `gdn_step[seq]` `scratchy_layers::gdn_state::GdnStep::encode`: a slot's
+//   entry is followed by its checkpoints, one after each of a verify step's rows (the model's
+//   drafts + 1), so slot `s` is entry `s` without drafts and `s * (GDN_CONV_DRAFTS + 2)` with.
 //
 // `x`/`w` are model dtype (`T`), f32-accumulated; `conv_out` + `conv_state`
 // are f32. Per-channel (depthwise) so GVA / head grouping does not apply here.
@@ -38,6 +41,7 @@
 //   GDN_CONV_IN_STRIDE — optional: `x`'s row stride (unset: conv_dim, the qkv row)
 //   GDN_CONV_IN_OFFSET — optional: the first conv channel's column in that row (unset: 0)
 //   GDN_CONV_HAS_BIAS  — optional: add `bias[c]` (buffer 7; unset: no bias, buffer 7 unread)
+//   GDN_CONV_DRAFTS    — the drafts each sequence of a verify step carries (`SPEC_DRAFTS`)
 //
 // Dispatch: grid (num_seqs, ceil(conv_dim/tg), 1); one thread per (seq, channel).
 
@@ -51,6 +55,7 @@ SCRATCHY_CONSTANT(uint, GDN_CONV_KERNEL, 1);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_CONV_IN_STRIDE, 2);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_CONV_IN_OFFSET, 3);
 SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_CONV_HAS_BIAS, 4);
+SCRATCHY_CONSTANT(uint, GDN_CONV_DRAFTS, 5);
 
 constant constexpr uint GDN_CONV_X_STRIDE = GDN_CONV_IN_STRIDE_SET ? GDN_CONV_IN_STRIDE : GDN_CONV_DIM;
 
@@ -66,7 +71,7 @@ template <typename T>
     device       float* conv_state    [[buffer(3)]],
     const device int*   cu_seqlens    [[buffer(4)]],
     const device int*   state_indices [[buffer(5)]],
-    const device uint*  is_fresh      [[buffer(6)]],
+    const device uint*  gdn_step      [[buffer(6)]],
     const device T*     bias          [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
@@ -87,7 +92,14 @@ template <typename T>
     return;
   }
   int slot = state_indices[seq];
-  bool fresh = is_fresh[seq] != 0u;
+  uint code = gdn_step[seq];
+  uint start = code & 0xffu;
+  // A model without drafts (`GDN_CONV_DRAFTS` 0) neither replays nor checkpoints.
+  uint drafts = GDN_CONV_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
+  uint entry = uint(slot) * (GDN_CONV_DRAFTS == 0u ? 1u : GDN_CONV_DRAFTS + 2u);
+  // A verify step checkpoints the window after each of its rows.
+  uint checkpoint_rows = drafts == 0u ? 0u : drafts + 1u;
+  uint entry_len = conv_dim * state_len;
 
   // Load conv weights for this channel.
   float wlocal[GDN_CONV_KMAX];
@@ -95,11 +107,13 @@ template <typename T>
     wlocal[ki] = float(w[d * kernel_size + ki]);
   }
 
-  // Seed the causal window from per-sequence state (zero when fresh).
-  device float* state_ptr = conv_state + (uint(slot) * conv_dim + d) * state_len;
+  // Seed the causal window from the start entry (zero when fresh).
+  device float* state_ptr = conv_state + (entry * conv_dim + d) * state_len;
+  const device float* start_ptr =
+      state_ptr + (GDN_CONV_DRAFTS > 0u && start >= 2u ? (start - 1u) * entry_len : 0u);
   float window[GDN_CONV_KMAX];
   for (uint ki = 0; ki < state_len; ki++) {
-    window[ki] = fresh ? 0.0f : state_ptr[ki];
+    window[ki] = start == 1u ? 0.0f : start_ptr[ki];
   }
 
   // Walk the sequence's tokens; the window slides through registers.
@@ -117,6 +131,9 @@ template <typename T>
     }
     if (state_len > 0) {
       window[state_len - 1] = x_t;
+    }
+    for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
+      state_ptr[(uint(t) + 1u) * entry_len + ki] = window[ki];
     }
   }
 

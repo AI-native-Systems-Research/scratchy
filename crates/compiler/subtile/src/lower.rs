@@ -206,10 +206,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::ScalarWeightMul
             | O::GateSplit { .. }
             | O::GateApply
+            | O::Concat { .. }
             | O::GateScale
-            | O::LoadPixels { .. }
+            | O::LoadRows { .. }
             | O::EmbeddingGather { .. }
-            | O::LoadPosEmbeds { .. }
             | O::VisionRope
             | O::VarlenAttention { .. }
             | O::EncoderAttn { .. }
@@ -309,6 +309,31 @@ pub struct LoweringInput {
     pub ops: Vec<OpDesc>,
     /// Which op's output is the forward's result.
     pub result: usize,
+    /// The op whose output the forward exports as its hidden state, when it names one
+    /// (`export_hidden`): an MTP drafter's next draft reads its projection, not its final norm.
+    pub exported: Option<usize>,
+}
+
+impl LoweringInput {
+    /// The op whose output is every row's final hidden state: the one the forward exports, else
+    /// the one the result's vocabulary projection reads, when the forward ends with one (under a
+    /// logit epilogue — Gemma's softcap — too).
+    pub fn hidden(&self) -> Option<usize> {
+        if let Some(e) = self.exported {
+            return Some(e);
+        }
+        let mut at = self.result;
+        loop {
+            let od = &self.ops[at];
+            match (od.op, od.inputs.first()) {
+                (SubOp::MatmulTile { .. } | SubOp::AllRowsMatmul, Some(&InputRef::Op(j))) => {
+                    return Some(j);
+                }
+                (SubOp::TanhSoftCap, Some(&InputRef::Op(j))) => at = j,
+                _ => return None,
+            }
+        }
+    }
 }
 
 // ── Silu + Mul → SiluMul fusion ─────────────────────────────────────
@@ -421,5 +446,6 @@ pub fn fuse_silu_mul(input: &LoweringInput) -> LoweringInput {
         sources: input.sources.clone(),
         ops,
         result: new_idx[input.result],
+        exported: input.exported.map(|e| new_idx[e]),
     }
 }

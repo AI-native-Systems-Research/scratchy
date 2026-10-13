@@ -3008,6 +3008,7 @@ pub(crate) mod tests {
             ]);
         }
         let input = LoweringInput {
+            exported: None,
             sources: [(1, 64), (64, 64), (1, 1)]
                 .map(|(rows, cols)| SourceShape { rows, cols })
                 .to_vec(),

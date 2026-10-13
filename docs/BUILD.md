@@ -70,9 +70,10 @@ pinned commit while compiling the scaled_mm kernels.
 check`/`clippy` (this is what CI's cuda gate sets). Never set it for anything
 that links a binary.
 
-## There is no default model or quant scope
+## There is no default model, quant or drafter scope
 
-Both `scratchy-models` and `scratchy-quantizations` ship `default = []`.
+`scratchy-models`, `scratchy-quantizations` and `scratchy-spec` all ship
+`default = []`.
 Naming zero models is a **build-time panic**, not a silently-empty binary —
 `scratchy-forwards.rs` checks `total_models_emitted()` after every arch is
 processed and fails loudly, telling you to name at least one. This means
@@ -80,7 +81,7 @@ every build — dev, CI, or deployment — names its own scope explicitly; there
 is no `--no-default-features` dance to first strip away a default you don't
 want.
 
-## Two axes, two crates, two CLI aliases
+## Model, quant and drafter scope: three crates, three CLI aliases
 
 Model *scope* (`crates/models/arch/`, crate `scratchy-models`) and quant
 *scope* (`crates/models/quantization/`, crate `scratchy-quantizations`) are
@@ -90,11 +91,15 @@ JSON file by name": model configs from `configs/<arch>/*.json`, quant
 presets from `quantization/presets/*.json`), but because **Cargo forbids
 aliasing one crate under two different local names**, and
 `crates/cli/scr/Cargo.toml` needs two distinct short aliases reachable from
-the CLI build line: `model` and `quant`.
+the CLI build line: `model` and `quant`. Speculative-decoding drafters are a
+third alias, `spec`, on a third crate (`crates/models/spec/`, crate
+`scratchy-spec`) for the same reason; its features forward to
+`scratchy-models`, whose build script compiles the drafters.
 
 ```toml
 # crates/cli/scr/Cargo.toml
 model = { package = "scratchy-models", ... }
+spec = { package = "scratchy-spec", ... }
 quant = { package = "scratchy-quantizations", ... }
 ```
 
@@ -160,6 +165,23 @@ model never ends up with zero compiled variants.
   dense on every build using that backend).
 
 No `quant/*` feature named at all = every selected model compiles dense only.
+
+## `-Fspec/<...>` — which drafters compile with the selected models
+
+```bash
+cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,spec/mtp,quant/mlx-affine-b4-g64-qembed
+# → Qwen3.6-35B-A3B plus its multi-token-prediction head; serving it drafts with the head
+```
+
+- **`spec/mtp`** — every selected model whose checkpoint carries a
+  multi-token-prediction head compiles that head too. A head's config is its
+  target's checkpoint config verbatim, so a head config is selected when it is
+  the same file as a selected model's config (`target_selected` in
+  `crates/compiler/macros/src/config.rs`); naming the head's own stem
+  (`model/qwen3.6-35b-a3b-mtp`) still works.
+
+No `spec/*` feature named = no drafter compiles, and the selected models serve
+without speculative decoding.
 
 ## `turboquant` — KV cache compression, fixed at build time
 
@@ -293,10 +315,11 @@ no longer necessary; just name that model's feature directly.
 
 ## Direct crate builds
 
-`-p scratchy-cli` reaches `scratchy-models`/`scratchy-quantizations` via
-the `model`/`quant` aliases. Building `-p scratchy-models` or
+`-p scratchy-cli` reaches `scratchy-models`/`scratchy-quantizations`/`scratchy-spec`
+via the `model`/`quant`/`spec` aliases. Building `-p scratchy-models` or
 `-p scratchy-quantizations` directly uses their real crate names instead
-(the aliases only exist on `crates/cli/scr/Cargo.toml`'s dependency edges):
+(the aliases only exist on `crates/cli/scr/Cargo.toml`'s dependency edges);
+`scratchy-models` names the drafters itself (`mtp`, which `spec/mtp` forwards to):
 
 ```bash
 cargo build -p scratchy-models --no-default-features \

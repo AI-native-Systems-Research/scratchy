@@ -290,6 +290,8 @@ mod green_gate {
             vision_rope_freqs: Some(freqs_view),
             pixels: Some(pixels_view),
             pos_embeds: Some(pos_view),
+            target_hidden: None,
+            hidden_out: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,
@@ -308,7 +310,9 @@ mod green_gate {
             gdn_is_fresh: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            device_inputs: &[],
             deferred: None,
+            reads: scratchy_target_metal::ForwardReads::Outputs,
         };
 
         // ── RUN the metal vision tower (forward_m_256 workload bucket) ──

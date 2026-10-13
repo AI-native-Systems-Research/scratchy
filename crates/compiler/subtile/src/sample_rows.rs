@@ -180,6 +180,7 @@ mod tests {
             gain: GainConvention::Scale,
         };
         let input = LoweringInput {
+            exported: None,
             sources: vec![
                 SourceShape { rows: 1, cols: 256 },
                 SourceShape { rows: 1, cols: 256 },

@@ -30,8 +30,8 @@ use scratchy_subtile::tape_folding::{
 };
 use scratchy_target_metal::from_tape::{StepInput, TapeItem};
 use scratchy_target_metal::op_abi::{
-    METAL_ELIDABLE, METAL_GUARD_GATES, MetalFusion, MoeWrite, metal_colour_rule, moe_write,
-    rope_append_weight_site,
+    GuardRun, METAL_ELIDABLE, MetalFusion, MoeWrite, metal_colour_rule, metal_guard_gates,
+    moe_write, rope_append_weight_site,
 };
 use scratchy_target_metal::tape::lowered::{Fence, RuntimeGate};
 use scratchy_target_metal::tape::step::{
@@ -283,6 +283,21 @@ impl OpColours {
     pub fn result(&self) -> Colour {
         self.result
     }
+
+    /// Every row's final hidden state: the vocabulary projection's activation (its sampled rows
+    /// put it back), or the result of a forward that ends without one.
+    pub fn hidden(&self, l: &LoweredDecode) -> Result<Slot, StepRefusal> {
+        match l.input.hidden() {
+            Some(j) => {
+                let why = |why| StepRefusal {
+                    op: Some((j, l.input.ops[j].op.name())),
+                    why,
+                };
+                self.of(l, j).map_err(why)
+            }
+            None => Ok(Slot(self.result.index())),
+        }
+    }
 }
 
 /// A KV codec step's writer: its layer, pairing, class, offsets and weight site.
@@ -301,6 +316,11 @@ pub struct HazardSig {
     writes: Vec<Slot>,
     kv_w: Option<LayerId>,
     kv_r: Option<LayerId>,
+    /// The slots its KV write reads, when narrower than `reads`: a rope append's K and V, not the
+    /// Q it rotates beside them. `None`: every slot it reads.
+    kv_w_reads: Option<Vec<Slot>>,
+    /// It writes a recurrent state its forward outlives (a Gated-DeltaNet or Mamba-2 layer's).
+    state_w: bool,
     /// The op scratch (`moe_scratch`) — ONE location, shared by every MoE step and GDN.
     op_scratch: Access,
     /// The KV codec's staging buffer — ONE location, written by every stage, read by a coded
@@ -356,6 +376,8 @@ fn roped_attention(rope: Emission, attention: Emission) -> Emission {
         writes: [r.writes, a.writes].concat(),
         kv_w: r.kv_w.or(a.kv_w),
         kv_r: a.kv_r.or(r.kv_r),
+        kv_w_reads: r.kv_w_reads.or(a.kv_w_reads),
+        state_w: r.state_w || a.state_w,
         op_scratch: r.op_scratch.max(a.op_scratch),
         codec_staging: r.codec_staging.max(a.codec_staging),
         group: a.group,
@@ -408,6 +430,8 @@ pub struct Recording<'a> {
     pub facts: &'a MetalStepFacts<'a>,
     pub hidden: W,
     pub intermediate: Inter,
+    /// The canonical's rows: its codec guards' realization.
+    pub bucket_m: u32,
 }
 
 impl Recording<'_> {
@@ -744,6 +768,39 @@ impl Recording<'_> {
 
     /// A KV codec step's writer — the KV writer of `encode`'s construct, `encode` being the
     /// step's `KvEncode` — as the writer's own record states it. Its class is its attention's.
+    /// The writer facts of codec step `i`'s packed operand `k`: its writer's, or — read with no
+    /// writer of this forward's (a drafter reading its target's coded KV, its prefix source in
+    /// place of the encode) — the cache's layer, the class of the attention reading it, a centred
+    /// cache, and the rotary site.
+    fn codec_operand(&self, i: usize, k: u8) -> Result<CodecWriter, StepRefusal> {
+        let e = match self.arg(i, k) {
+            Ok(InputRef::Ext(e)) => e,
+            _ => return self.codec_writer(i, self.step_arg(i, k)?),
+        };
+        let no = || self.no(i, Refused::CodecUnanchored);
+        let layer = match self.l.bindings[e] {
+            SourceBinding::PrefixK { layer } | SourceBinding::PrefixV { layer } => layer,
+            _ => return Err(no()),
+        };
+        let reads = |od: &scratchy_subtile::lower::OpDesc| {
+            od.inputs.len() == 3 && od.inputs[1..].contains(&InputRef::Ext(e))
+        };
+        let class = (self.l.input.ops.iter())
+            .find_map(|od| match od.op {
+                SubOp::AttnDecode { mask, .. } if reads(od) => Some(mask),
+                _ => None,
+            })
+            .ok_or_else(no)?;
+        let layer = LayerId(layer as u32);
+        Ok((
+            layer,
+            RopeFormTag::NeoX,
+            class,
+            st::KvOffsets::CENTERED,
+            vec![self.rotary(i)],
+        ))
+    }
+
     fn codec_writer(&self, i: usize, encode: usize) -> Result<CodecWriter, StepRefusal> {
         let rope = |j: &usize| {
             matches!(
@@ -976,17 +1033,19 @@ impl Recording<'_> {
             return Err(canonical_refusal(Refused::NoFirstNorm));
         }
         let embedded = SourceBinding::EmbeddedHidden;
-        if !self.l.bindings.contains(&embedded) {
+        let Some(e) = self.l.bindings.iter().position(|b| *b == embedded) else {
             return Ok((Vec::new(), None));
-        }
+        };
         let zero = Slot(0);
         let base = self.facts.embed_base.to_string();
+        // The embedding table's rows: a drafter reading its target's table writes its target's.
+        let width = st::ActivationWidth::of_cols(self.l.input.sources[e].cols);
         let (embed, kind) = match self.facts.embed_quant {
             Some((gs, bits)) => (
-                MetalStep::AffineEmbed(zero, gs, bits),
+                MetalStep::AffineEmbed(zero, gs, bits, width),
                 WeightKind::AffineQuantEmbedding,
             ),
-            None => (MetalStep::Embed(zero), WeightKind::Embedding),
+            None => (MetalStep::Embed(zero, width), WeightKind::Embedding),
         };
         let mut rows = vec![em(embed, &[], &[zero], vec![WeightSlot { kind, base }])];
         let mut skip = None;
@@ -1023,7 +1082,11 @@ impl Recording<'_> {
             e.lm_head = self.lm_head(i);
             if let Some(x) = self.l.op_expansion[i] {
                 e.sig.group = Some(x.id);
-                e.gate = x.guard.and_then(|g| METAL_GUARD_GATES.gate(g));
+                match x.guard.map(|g| metal_guard_gates(self.bucket_m).gate(g)) {
+                    None => {}
+                    Some(GuardRun::Gated(gate)) => e.gate = gate,
+                    Some(GuardRun::Dropped) => return Ok(None),
+                }
             }
         }
         Ok(e)
@@ -1074,6 +1137,7 @@ impl Recording<'_> {
                     MetalStep::RopeAppendNormed(q, k, v, q, k, v, layer, pairing, class, pool);
                 let mut e = em(step, &[q, k, v], &[q, k, v], sites);
                 e.sig.kv_w = Some(layer);
+                e.sig.kv_w_reads = Some(vec![k, v]);
                 Ok(e)
             }
             (F::MeanSubRmsNorm | F::MeanSubRmsNormBiasAdd, Sh::CentredNorm { sub, bias, .. }) => {
@@ -1561,6 +1625,38 @@ impl Recording<'_> {
         ))
     }
 
+    /// The layer the cache an attention reads belongs to, from its prefix K source.
+    fn prefix_layer(&self, i: usize) -> Option<LayerId> {
+        match self.arg(i, 1).ok()? {
+            InputRef::Ext(e) => match self.l.bindings[e] {
+                SourceBinding::PrefixK { layer } => Some(LayerId(layer as u32)),
+                _ => None,
+            },
+            InputRef::Op(_) => None,
+        }
+    }
+
+    /// A query rotation no K-side writer folds (a model appending no K/V): the layer and class of
+    /// the writer-less attention that reads it, when one does.
+    fn query_only_rotate(&self, i: usize) -> Option<(LayerId, AttnMask)> {
+        let ops = &self.l.input.ops;
+        // The attention reads the rotation directly, or through the codec's query rotation.
+        let reads = |q: Option<&InputRef>| match q {
+            Some(&InputRef::Op(j)) if j == i => true,
+            Some(&InputRef::Op(j)) => {
+                matches!(ops[j].op, SubOp::RotateRows { .. })
+                    && ops[j].inputs.first() == Some(&InputRef::Op(i))
+            }
+            _ => false,
+        };
+        ops.iter().enumerate().find_map(|(j, od)| match od.op {
+            SubOp::AttnDecode { mask, .. } if od.inputs.len() == 3 && reads(od.inputs.first()) => {
+                Some((self.prefix_layer(j)?, mask))
+            }
+            _ => None,
+        })
+    }
+
     fn rope_fields(&self, i: usize) -> Result<(LayerId, RopeFormTag, AttnMask), StepRefusal> {
         match *self.op(i) {
             SubOp::RopeAppend {
@@ -1587,6 +1683,7 @@ impl Recording<'_> {
         let sites = rope_append_weight_site(self.rotary(i), k_linear, v_linear);
         let mut e = em(step, &[q, k, v], &[q, k, v], sites);
         e.sig.kv_w = Some(layer);
+        e.sig.kv_w_reads = Some(vec![k, v]);
         Ok(e)
     }
 
@@ -1778,13 +1875,14 @@ impl Recording<'_> {
                 Some(_) => Err(self.no(i, Refused::SampledNotAffine)),
             };
         };
-        let (reads, writes): (&[Slot], _) = match step {
-            R::Gather => (&[input], [input]),
-            R::Matmul => (&[input], [out]),
-            R::Scatter => (&[out], [out]),
-            R::AllRows => (&[input, out], [out]),
+        // The scatter also puts the gathered activation back.
+        let (reads, writes): (&[Slot], &[Slot]) = match step {
+            R::Gather => (&[input], &[input]),
+            R::Matmul => (&[input], &[out]),
+            R::Scatter => (&[input, out], &[input, out]),
+            R::AllRows => (&[input, out], &[out]),
         };
-        Ok(em(MetalStep::SampleRows(*g, step), reads, &writes, site))
+        Ok(em(MetalStep::SampleRows(*g, step), reads, writes, site))
     }
 
     /// A step no fold touches, lowered on its own.
@@ -1839,8 +1937,14 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
-            L::LoadPixels { .. } => em(S::LoadPixels(out()?), &[], &[out()?], Vec::new()),
-            L::LoadPosEmbeds { .. } => em(S::LoadPosEmbeds(out()?), &[], &[out()?], Vec::new()),
+            L::Concat { cols } => {
+                let (a, b, out) = (self.read(i, 0)?, self.read(i, 1)?, out()?);
+                let width = st::ActivationWidth::of_cols(cols / 2);
+                em(S::Concat(a, b, out, width), &[a, b], &[out], Vec::new())
+            }
+            L::LoadRows { source, .. } => {
+                em(S::LoadRows(out()?, source), &[], &[out()?], Vec::new())
+            }
             L::Elementwise(E::Gelu) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluTanh))?,
             L::Elementwise(E::QuickGelu) => {
                 unary(&|i, o, w| S::Activation(i, o, w, Act::QuickGelu))?
@@ -1878,16 +1982,41 @@ impl Recording<'_> {
                 e.sig.kv_w = Some(layer);
                 e
             }
+            // A query's rotation alone — a model appending no K/V of its own: the rope step with no
+            // write, at the layer and class of the attention that reads it.
+            L::RopeRotate { .. } if self.query_only_rotate(i).is_some() => {
+                let (layer, class) = self.query_only_rotate(i).expect("checked by the guard");
+                let q = self.colour(self.step_arg(i, 0)?)?;
+                let step = S::RopeAppend(
+                    q,
+                    q,
+                    q,
+                    q,
+                    q,
+                    q,
+                    layer,
+                    RopeFormTag::NeoX,
+                    class,
+                    st::KvOffsets::CENTERED,
+                    st::KvWrite::None,
+                );
+                em(step, &[q], &[q], vec![self.rotary(i)])
+            }
             L::AttnDecode { mask, .. } => {
                 let out = out()?;
                 let q = self.colour(self.step_arg(i, 0)?)?;
                 // The layer and pairing come from the KV writer whose cache it reads; an
-                // un-rotated writer's cache is read as stored, with no rotary table.
-                let writer = self.step_arg(i, 3)?;
-                let (layer, pairing, rotated) = match *self.op(writer) {
-                    L::RopeAppend { layer, pairing, .. } => (LayerId(layer), pairing, true),
-                    L::KvAppend { layer, .. } => (LayerId(layer), RopeFormTag::NeoX, false),
-                    _ => (LayerId(0), RopeFormTag::NeoX, true),
+                // un-rotated writer's cache is read as stored, with no rotary table; an attention
+                // appending nothing reads its cache's layer off its prefix K source.
+                let writer = self.step_arg(i, 3).ok();
+                let (layer, pairing, rotated) = match writer.map(|w| *self.op(w)) {
+                    Some(L::RopeAppend { layer, pairing, .. }) => (LayerId(layer), pairing, true),
+                    Some(L::KvAppend { layer, .. }) => (LayerId(layer), RopeFormTag::NeoX, false),
+                    _ => (
+                        self.prefix_layer(i).unwrap_or(LayerId(0)),
+                        RopeFormTag::NeoX,
+                        true,
+                    ),
                 };
                 // Prefill runs the paged kernel with K arriving pre-roped: no rotary. Decode's
                 // CosSin is the GLOBAL rotary whatever the class (only the rope uses the local).
@@ -1934,10 +2063,8 @@ impl Recording<'_> {
                     Ok(InputRef::Op(v)) => self.colour(v).ok(),
                     _ => None,
                 };
-                let reads: Vec<Slot> = [Some(q), self.colour(writer).ok(), v]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let writer = writer.and_then(|w| self.colour(w).ok());
+                let reads: Vec<Slot> = [Some(q), writer, v].into_iter().flatten().collect();
                 let mut e = em(step, &reads, &[out], sites);
                 e.sig.kv_r = Some(layer);
                 // A coded attention reads its K/V staged, off decode steps.
@@ -1949,8 +2076,7 @@ impl Recording<'_> {
             }
             // The KV codec: each step's operands are its writer's, its site the writer's.
             L::KvStage { operand } => {
-                let (layer, _, class, offsets, sites) =
-                    self.codec_writer(i, self.step_arg(i, 0)?)?;
+                let (layer, _, class, offsets, sites) = self.codec_operand(i, 0)?;
                 let mut e = em(S::KvStage(operand, layer, class, offsets), &[], &[], sites);
                 // The layer's packed store in, the staging buffer out.
                 e.sig.kv_r = Some(layer);
@@ -1963,8 +2089,7 @@ impl Recording<'_> {
             }
             L::AttnPackedKv => {
                 // The layer's decode attention: its writer's layer and pairing.
-                let (layer, pairing, class, offsets, mut sites) =
-                    self.codec_writer(i, self.step_arg(i, 2)?)?;
+                let (layer, pairing, class, offsets, mut sites) = self.codec_operand(i, 2)?;
                 let (q, out) = (self.read(i, 0)?, out()?);
                 // gpt-oss attention sinks: the twin's TRAILING weight input (arg 4 —
                 // the attention's 6th operand, carried by the codec expansion) binds the
@@ -2122,6 +2247,7 @@ impl Recording<'_> {
                 let mut e = em(step, &ins, &[out], site);
                 // Its four commands pass their intermediates through the op scratch.
                 e.sig.op_scratch = Access::Write;
+                e.sig.state_w = true;
                 e
             }
             L::Mamba2 { .. } => {
@@ -2132,6 +2258,7 @@ impl Recording<'_> {
                 let mut e = em(step, &[zxbcdt], &[out], site);
                 // Its conv, scan and norm pass their intermediates through the op scratch.
                 e.sig.op_scratch = Access::Write;
+                e.sig.state_w = true;
                 e
             }
             L::RouterNorm { eps, router } => {
@@ -2284,6 +2411,11 @@ pub struct Assembled {
 }
 
 impl Assembled {
+    /// The backbone rows a forward that reads only its cache writes runs ([`cache_live`]).
+    pub fn cache_live(&self) -> Vec<bool> {
+        cache_live(&self.rows, &self.sigs)
+    }
+
     /// The fences of the backbone and the lm_head, walked as ONE stream: the lm_head's
     /// first row fences against what the backbone left pending.
     pub fn flags(&self) -> (Vec<Fence>, Vec<Fence>) {
@@ -2360,6 +2492,60 @@ pub fn assemble(
         }
     }
     Ok(out)
+}
+
+/// THE CACHE-ONLY PLAY: whether each row runs in a forward whose caller reads only its cache
+/// writes (KV, recurrent state) — none of its outputs. Walked backwards from those writes: a row
+/// runs if it writes a cache, or writes a location a running row after it reads before anything
+/// overwrites it. A KV writer needs only what its write reads (`kv_w_reads`: a rope append's K and
+/// V), so the Q it rotates — and the projection, split and norm making it — run only if something
+/// else reads them. The op scratch and the codec staging are one location each; a row writing one
+/// is taken to read it too. A loop's body runs whole: its rows serve every iteration, whose cache
+/// writes the last iteration's dead tail does not tell apart.
+pub fn cache_live(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<bool> {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Loc {
+        Slot(Slot),
+        OpScratch,
+        CodecStaging,
+    }
+    let mut in_loop = vec![false; rows.len()];
+    for (at, row) in rows.iter().enumerate() {
+        if let StepRow::Loop { body, .. } = row {
+            let end = (at + 1 + body.0 as usize).min(rows.len());
+            in_loop[at + 1..end].iter_mut().for_each(|r| *r = true);
+        }
+    }
+    let shared = |a: Access, loc| (a != Access::Untouched).then_some(loc);
+    let mut needed: HashSet<Loc> = HashSet::new();
+    let mut live = vec![false; rows.len()];
+    for i in (0..rows.len()).rev() {
+        let s = &sigs[i];
+        if s.metadata {
+            continue;
+        }
+        let writes: Vec<Loc> = (s.writes.iter().map(|&w| Loc::Slot(w)))
+            .chain((s.op_scratch == Access::Write).then_some(Loc::OpScratch))
+            .chain((s.codec_staging == Access::Write).then_some(Loc::CodecStaging))
+            .collect();
+        let read = writes.iter().any(|w| needed.contains(w));
+        let writes_cache = s.kv_w.is_some() || s.state_w;
+        if !(in_loop[i] || read || writes_cache) {
+            continue;
+        }
+        live[i] = true;
+        writes.iter().for_each(|w| {
+            needed.remove(w);
+        });
+        let reads = match (&s.kv_w_reads, in_loop[i] || read) {
+            (Some(kv), false) => kv.as_slice(),
+            _ => s.reads.as_slice(),
+        };
+        needed.extend(reads.iter().map(|&r| Loc::Slot(r)));
+        needed.extend(shared(s.op_scratch, Loc::OpScratch));
+        needed.extend(shared(s.codec_staging, Loc::CodecStaging));
+    }
+    live
 }
 
 /// THE MTL4 fences: a row fences when it reads a buffer pending a write (RAW), writes one
@@ -2573,6 +2759,66 @@ mod tests {
             hazard_fences(rows.iter()),
             [No, No, Fence::Ordered, Coherent]
         );
+    }
+
+    /// A forward reading only its cache writes runs what they need and no more: the rope append
+    /// writing the KV needs K and V — their projections, the norm and the projection under those —
+    /// but not the Q it rotates beside them, its split, nor the attention and MLP after it. A row
+    /// writing a recurrent state runs, and so do the rows its reads need; a loop's body runs whole.
+    #[test]
+    fn a_cache_only_forward_runs_what_its_cache_writes_need() {
+        let rope = |q, k, v| HazardSig {
+            kv_w: Some(LayerId(0)),
+            kv_w_reads: Some(vec![Slot(k), Slot(v)]),
+            ..sig(&[q, k, v], &[q, k, v], None)
+        };
+        // fc (0 -> 1); norm (1 -> 2); q, k, v projections (2 -> 3, 4, 5); q split (3 -> 6, 7);
+        // the rope append (6, 4, 5); attention (6 -> 8); o projection (8 -> 9); MLP (9 -> 10).
+        let sigs = [
+            sig(&[0], &[1], None),
+            sig(&[1], &[2], None),
+            sig(&[2], &[3], None),
+            sig(&[2], &[4], None),
+            sig(&[2], &[5], None),
+            sig(&[3], &[6, 7], None),
+            rope(6, 4, 5),
+            sig(&[6], &[8], None),
+            sig(&[8], &[9], None),
+            sig(&[9], &[10], None),
+        ];
+        let rows = vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); sigs.len()];
+        let live = cache_live(&rows, &sigs);
+        let want = [
+            true, true, false, true, true, false, true, false, false, false,
+        ];
+        assert_eq!(live, want);
+
+        // A recurrent state's writer runs, with what it reads; a loop's body runs whole.
+        let state = HazardSig {
+            state_w: true,
+            ..sig(&[2], &[3], None)
+        };
+        // Row 0's and row 3's writes are read by nothing that runs; row 5 is a loop's body.
+        let sigs = [
+            sig(&[0], &[9], None),
+            sig(&[1], &[2], None),
+            state,
+            sig(&[7], &[8], None),
+            HazardSig {
+                metadata: true,
+                ..HazardSig::default()
+            },
+            sig(&[4], &[5], None),
+            sig(&[5], &[6], None),
+        ];
+        let mut rows = vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); sigs.len()];
+        rows[4] = StepRow::Loop {
+            iters: st::LoopIters(2),
+            body: st::BodyLen(1),
+            stride: st::LayerStride(1),
+        };
+        let live = cache_live(&rows, &sigs);
+        assert_eq!(live, [false, true, true, false, false, true, false]);
     }
 
     /// The class is the point: a WAW fence orders (Ordered), a RAW fence must

@@ -5,7 +5,8 @@
 // (`affine_gather_qmv_combine` over `fc2`), with `fc1` and `fc2` at their own MLX-affine widths
 // — 4/2 (Nemotron-3-Super's layer 8), 2/2, 4/4 — on both matvec flavours (`_fast` and not).
 // The fused command must also give the split chain's bits (`affine_gather_qmv`, then `relu2`),
-// and routing the token itself (`MetalFusion::MoeRouted`) the routing command's.
+// and routing the token itself (`MetalFusion::MoeRouted`) the routing command's. The gated and
+// combine kernels take their pair / token along X (the plain gather along Z).
 mod common;
 
 use half::bf16;
@@ -462,13 +463,13 @@ fn ungated_relu2_moe_matches_the_cpu_reference() {
                 (
                     &up_act,
                     up,
-                    size(1, inter.div_ceil(8), pairs),
+                    size(pairs, inter.div_ceil(8), 1),
                     size(32, 4, 1),
                 ),
                 (
                     &combine,
                     comb,
-                    size(1, hidden.div_ceil(4), tokens),
+                    size(tokens, hidden.div_ceil(4), 1),
                     size(32, k, 1),
                 ),
             ],
@@ -570,7 +571,7 @@ fn fused_ungated_command_matches_the_split_chain_and_the_routing_command() {
         b.extend([(&blk.x, 3), (&inds, 4), (&fused_y, 5)]);
         run(
             &d,
-            &[(&fused, b, size(1, inter.div_ceil(8), pairs), size(32, 4, 1))],
+            &[(&fused, b, size(pairs, inter.div_ceil(8), 1), size(32, 4, 1))],
         );
         assert_eq!(
             bits16(&fused_y, n_act),
@@ -592,7 +593,7 @@ fn fused_ungated_command_matches_the_split_chain_and_the_routing_command() {
                 &[(
                     &routed,
                     b,
-                    size(1, inter.div_ceil(8), pairs),
+                    size(pairs, inter.div_ceil(8), 1),
                     size(32, 4, 1),
                 )],
             );

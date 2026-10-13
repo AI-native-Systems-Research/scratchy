@@ -1,0 +1,101 @@
+{
+  "_comment": "MLX conversions of Google's drafter at 4-bit g32 (`mlx_lm.convert --q-group-size 32`, e.g. guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit) quantize its 23 linear and embedding modules at 4/32; the embedding its target lends is the target's 4/64. A per-module map is authoritative, so every module is listed.",
+  "quantization_config": {
+    "model.embed_tokens": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.0.mlp.down_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.0.mlp.gate_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.0.mlp.up_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.0.self_attn.o_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.0.self_attn.q_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.1.mlp.down_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.1.mlp.gate_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.1.mlp.up_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.1.self_attn.o_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.1.self_attn.q_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.2.mlp.down_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.2.mlp.gate_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.2.mlp.up_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.2.self_attn.o_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.2.self_attn.q_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.3.mlp.down_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.3.mlp.gate_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.3.mlp.up_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.3.self_attn.o_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.layers.3.self_attn.q_proj": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "post_projection": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "pre_projection": {
+      "bits": 4,
+      "group_size": 32
+    },
+    "model.target_embed_tokens": {
+      "bits": 4,
+      "group_size": 64
+    }
+  }
+}

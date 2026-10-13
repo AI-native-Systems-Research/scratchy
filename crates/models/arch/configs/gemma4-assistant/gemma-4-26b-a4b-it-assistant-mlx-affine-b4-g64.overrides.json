@@ -1,0 +1,6 @@
+{
+  "_comment": "Under the MLX preset the drafter's own weights stay as Google ships them (bf16): only the embedding its target lends it is the target's MLX 4-bit/g64 triple (`mlx-community/gemma-4-26b-a4b-it-4bit` quantizes its embedding). A per-module entry makes the map authoritative — every weight it does not list is dense.",
+  "quantization_config": {
+    "model.target_embed_tokens": { "bits": 4, "group_size": 64 }
+  }
+}

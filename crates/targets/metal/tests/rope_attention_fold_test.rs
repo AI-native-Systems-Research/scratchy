@@ -261,6 +261,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             k_offset,
             v_offset,
         }),
+        query_only: false,
     }
     .into();
     let writer_name: &'static str =

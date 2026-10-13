@@ -212,6 +212,7 @@ fn n_layer_fp8_oproj(n: u32) -> (LoweringInput, HashSet<u32>) {
         LoweringInput {
             sources,
             result: ops.len() - 1,
+            exported: None,
             ops,
         },
         weight_ids,

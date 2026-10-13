@@ -1,0 +1,25 @@
+{
+  "_comment": "Gemma 4's multi-token-prediction drafter (`Gemma4AssistantForCausalLM`, Google's `-it-assistant` repos). Unlike a Qwen3.5 head it ships as its own checkpoint with its own config, so it names its target config (`head_targets`: its stem -> `<arch>/<stem>`), and the target's facts it needs come from its `.overrides.json`: the target's layer count (its KV pool's geometry) and the target layers whose KV it reads. It has NO K/V of its own (`num_kv_shared_layers` = all its layers): its attention reads the target's KV of the target's last sliding and last full layer (`reads_target_kv`). It borrows only its target's embedding (`borrows`), placed under `target_embed_tokens`; its logits are its own tied 262k x 1024 embedding's, read as the `lm_head` linear straight from `model.embed_tokens` (renamed: the drafter never reads its embedding as one). `pre_projection` / `post_projection` sit at the checkpoint's top level (`top_level_weights`). mlx sets the attention `scale = 1.0` for both classes, as the target's. Rope scalars are nested per class under `rope_parameters`, aliased to the flat names as the target's.",
+  "hf_architectures": ["Gemma4AssistantForCausalLM"],
+  "head_targets": {
+    "gemma-4-26b-a4b-it-assistant": "gemma4-moe/gemma-4-26b-a4b-it",
+    "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant": "gemma4-moe/gemma-4-26b-a4b-it"
+  },
+  "reads_target_kv": true,
+  "borrows": ["embed_tokens"],
+  "top_level_weights": ["pre_projection", "post_projection"],
+  "scale_dtype": "bf16",
+  "bound_defaults": { "max_blocks_per_seq": 2048, "spec_drafts": 2, "spec_max_seqs": 1 },
+  "scalar_defaults": { "attention_multiplier": 1.0 },
+  "weight_leaf_renames": {
+    "lm_head": "embed_tokens",
+    "self_attn.o_proj_global": "self_attn.o_proj",
+    "self_attn.q_norm_global": "self_attn.q_norm",
+    "self_attn.q_proj_global": "self_attn.q_proj"
+  },
+  "config_aliases": {
+    "global_partial_rotary_factor": "rope_parameters.full_attention.partial_rotary_factor",
+    "rope_local_base_freq": "rope_parameters.sliding_attention.rope_theta",
+    "rope_theta": "rope_parameters.full_attention.rope_theta"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "_comment": "The target this drafter reads (google/gemma-4-26B-A4B-it, the gemma4-moe `gemma-4-26b-a4b-it` config): 30 layers, the last sliding one 28 and the last full one 29 (`layer_types`, every sixth full). Its KV pool is the target's, so its codec is decided at the target's layer count.",
+  "target_num_hidden_layers": 30,
+  "target_kv_sliding_layer": 28,
+  "target_kv_full_layer": 29
+}

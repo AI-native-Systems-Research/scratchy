@@ -22,7 +22,7 @@
 // allocator-generic + vision-free, so it compiles under spyre too.
 #[cfg(feature = "vision")]
 use crate::mm::MultimodalForward;
-use crate::{HfFingerprint, ScratchyWeights};
+use crate::{HeadRegistration, HfFingerprint, ScratchyWeights};
 use scratchy_tensors::{DeviceAllocator, GpuWeightsHandle, LoadStream};
 
 /// One registration per `#[forward] fn <arch>()`. The macro
@@ -108,6 +108,9 @@ pub struct ScratchyArchRegistration {
     /// hand back the wrong model's bundle. Only READS `gw` (shape sniffing),
     /// leaving every tensor for the worker to stream into the KTIR runner.
     pub ktir_bundle: Option<ArchKtirBundleFn>,
+    /// `Some` for a multi-token-prediction head (its forward reads `target_hidden`): the facts a
+    /// loader needs before the head loads. `None` for every other arch.
+    pub head: Option<HeadRegistration>,
     /// Read-only accessor for this arch's embedded **sendnn** bundle (the
     /// `--target sendnn` silicon path; peer of [`Self::ktir_bundle`]). `Some`
     /// under `-Fspyre`. Returned as a neutral `&dyn Any` the spyre worker

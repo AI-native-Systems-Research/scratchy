@@ -735,6 +735,7 @@ mod tests {
                 .map(|&(rows, cols)| SourceShape { rows, cols })
                 .collect(),
             result: ops.len() - 1,
+            exported: None,
             ops,
         };
         let graph = lower_region(&input, std::num::NonZeroU32::MAX);

@@ -1939,6 +1939,10 @@ impl AsyncEngine {
                 ModelRunnerOutput,
             )> = None;
             let mut gpu_in_flight: u32 = 0;
+            // A step in flight that drafts (the worker's head drafts the next step's tokens) or
+            // verifies (the next step's positions depend on how many drafts it keeps): nothing is
+            // scheduled behind it until it is finalized.
+            let mut awaits_step = false;
             let mut last_progress = Instant::now();
 
             loop {
@@ -1979,6 +1983,8 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
+                    // The last step sent is finalized once none is in flight.
+                    awaits_step &= gpu_in_flight > 0;
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             route_step_outputs(&requests, outputs).await;
@@ -1999,9 +2005,10 @@ impl AsyncEngine {
                 // 3. Pre-schedule: fill the pipeline up to 2 in-flight
                 //    batches. With placeholder tracking, the scheduler
                 //    correctly accounts for tokens still on the GPU.
-                while gpu_in_flight < 2 {
+                while gpu_in_flight < 2 && !awaits_step {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
+                            let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
                             if sched_tx
                                 .send(ExecutorWork::Execute(Box::new(sched)))
                                 .await
@@ -2010,6 +2017,7 @@ impl AsyncEngine {
                                 break; // Executor thread exited.
                             }
                             gpu_in_flight += 1;
+                            awaits_step = speculative;
                         }
                         Ok(None) => break, // Nothing to schedule.
                         Err(e) => {
@@ -2041,6 +2049,7 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
+                            client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
                             let req_ids: Vec<String> =
                                 sched.num_scheduled_tokens.keys().cloned().collect();
@@ -2329,6 +2338,11 @@ impl AsyncEngine {
                     debug!("Output for unknown request {}, ignoring", output.request_id);
                     return None;
                 };
+                // Finished here already (a stop string matched; a non-streaming entry waits to be
+                // collected): what the steps still in flight for it produced is not its output.
+                if req_state.finish_reason.is_some() {
+                    return None;
+                }
 
                 // Track output tokens.
                 #[cfg(feature = "metrics")]
@@ -2480,6 +2494,10 @@ impl AsyncEngine {
                 // Already logged in Phase 1.
                 continue;
             };
+            // Finished here already: dropped in Phase 1.
+            if req_state.finish_reason.is_some() {
+                continue;
+            }
 
             // NOTHING TO PUT BACK — the detokenizer never left. This arm used to reinstall it, and
             // when the state had already been removed it `continue`d above and dropped it forever.
@@ -2826,6 +2844,9 @@ impl AsyncEngine {
             debug!("Output for unknown request {}, ignoring", output.request_id);
             return;
         };
+        if req_state.finish_reason.is_some() {
+            return;
+        }
 
         // Track output tokens.
         #[cfg(feature = "metrics")]
@@ -4377,6 +4398,35 @@ mod tests {
         };
         // Should not panic.
         AsyncEngine::process_output(&mut requests, output);
+    }
+
+    /// An output for a request finished here already — a stop string matched, its non-streaming
+    /// entry waiting to be collected — came from a step still in flight for it: every path drops
+    /// it, the request's tokens as they were.
+    #[test]
+    fn an_output_for_a_finished_request_is_dropped() {
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(None);
+        state.generated_token_ids = vec![10, 11];
+        state.finish_reason = Some(FinishReason::Stop);
+        requests.insert("req-1".to_string(), state);
+        let output = || EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let work = AsyncEngine::process_outputs_phase1(&mut requests, &[output()]);
+        assert!(work.iter().all(Option::is_none), "nothing to detokenize");
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output()], results);
+        AsyncEngine::process_output(&mut requests, output());
+        assert_eq!(requests["req-1"].generated_token_ids, [10, 11]);
     }
 
     #[test]

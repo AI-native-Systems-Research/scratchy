@@ -1381,6 +1381,12 @@ pub fn storage_format_for_weight(
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.
     if dotted == "lm_head" && model.tie_word_embeddings {
+        // The table it shares: the embedding's, unless the arch renames the head onto a table of
+        // its own (Gemma 4's drafter embeds with its target's lent table, its logits its own).
+        let tied_role = match program.rename_dotted("lm_head") {
+            renamed if renamed != "lm_head" => renamed,
+            _ => embed_role.clone(),
+        };
         if let QuantMethod::Affine {
             bits,
             group_size,
@@ -1393,7 +1399,7 @@ pub fn storage_format_for_weight(
             // embed's on-disk bits. MLX mixed checkpoints (OptiQ) ship
             // `embed_tokens` at 8-bit while the default is 4-bit.
             if !per_module.is_empty() {
-                return match per_module_lookup(program, per_module, &embed_role, None) {
+                return match per_module_lookup(program, per_module, &tied_role, None) {
                     Some((b, g)) => StorageFormat::Affine {
                         bits: b,
                         group_size: g,
@@ -1407,7 +1413,7 @@ pub fn storage_format_for_weight(
             // and implies the buffer IS quantized.
             if let Some(&(_, b)) = bits_overrides
                 .iter()
-                .find(|(s, _)| names_embed(s, &embed_role))
+                .find(|(s, _)| names_embed(s, &tied_role))
             {
                 return StorageFormat::Affine {
                     bits: b,
@@ -1959,6 +1965,28 @@ mod tests {
             affine_moe_expert_bits(&program, &QuantMethod::Ggml, "mlp", None, silu),
             None,
             "a non-affine method keeps its storage format's bits"
+        );
+    }
+
+    /// A module at the checkpoint's top level (Gemma 4's drafter's `pre_projection`) is keyed by
+    /// its bare name; a layered role of the same leaf is not, and a bare key names no other module
+    /// it ends.
+    #[test]
+    fn per_module_lookup_matches_a_top_level_module() {
+        let per_module = vec![
+            ("model.target_embed_tokens".to_string(), (4, 64)),
+            ("pre_projection".to_string(), (4, 32)),
+        ];
+        let program = Program::default();
+        let lookup = |role, index| per_module_lookup(&program, &per_module, role, index);
+        assert_eq!(lookup("pre_projection", None), Some((4, 32)));
+        assert_eq!(lookup("pre_projection", Some(UnrollIndex(0))), None);
+        assert_eq!(lookup("post_projection", None), None);
+        assert_eq!(lookup("target_embed_tokens", None), Some((4, 64)));
+        assert_eq!(
+            lookup("embed_tokens", None),
+            None,
+            "`target_embed_tokens` is not the embedding"
         );
     }
 

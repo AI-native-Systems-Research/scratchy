@@ -1794,6 +1794,7 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 attn_op,
             ],
             result: 1,
+            exported: None,
         };
         scratchy_subtile::subtile_ir::lower_region(&input, nb)
     } else {
@@ -1803,6 +1804,7 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
             sources: sources(PREPOP_ROWS),
             ops: vec![attn_op],
             result: 0,
+            exported: None,
         };
         scratchy_subtile::subtile_ir::lower_region(&input, nb)
     }

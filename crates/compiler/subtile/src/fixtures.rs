@@ -63,6 +63,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
     let geom = ModelAttnGeometry::mint(QueryHeads::new(h / hd), KvHeads::new(kv / hd), head_dim)
         .expect("one_layer_input_shaped: h/hd must be a multiple of kv/hd");
     LoweringInput {
+        exported: None,
         sources: vec![
             SourceShape { rows: 1, cols: h },  // 0  x
             SourceShape { rows: 1, cols: h },  // 1  rms_w0
@@ -293,6 +294,7 @@ pub fn mlp_chain_distinct_m(n: u32, h: u32, m: u32) -> LoweringInput {
         });
     }
     LoweringInput {
+        exported: None,
         sources,
         ops,
         result: n as usize * ops_per_layer - 1,
@@ -341,6 +343,7 @@ pub fn n_layer_input(n: u32) -> LoweringInput {
         }
     }
     LoweringInput {
+        exported: None,
         sources: base.sources,
         ops,
         result: n as usize * ops_per_layer - 1,
@@ -420,6 +423,7 @@ pub fn n_layer_input_distinct(n: u32) -> LoweringInput {
         }
     }
     LoweringInput {
+        exported: None,
         sources,
         ops,
         result: n as usize * ops_per_layer - 1,
@@ -444,6 +448,7 @@ pub fn n_layer_input_distinct(n: u32) -> LoweringInput {
 pub fn rmsnorm_only_input() -> LoweringInput {
     let h = 2048u32;
     LoweringInput {
+        exported: None,
         sources: vec![
             SourceShape { rows: 1, cols: h }, // 0  x
             SourceShape { rows: 1, cols: h }, // 1  rms_w
@@ -466,6 +471,7 @@ pub fn rmsnorm_only_input() -> LoweringInput {
 pub fn add_only_input() -> LoweringInput {
     let h = 2048u32;
     LoweringInput {
+        exported: None,
         sources: vec![
             SourceShape { rows: 1, cols: h }, // 0  a
             SourceShape { rows: 1, cols: h }, // 1  b
@@ -486,6 +492,7 @@ pub fn add_only_input() -> LoweringInput {
 pub fn silu_mul_only_input() -> LoweringInput {
     let intermediate = 8192u32;
     LoweringInput {
+        exported: None,
         sources: vec![
             SourceShape {
                 rows: 1,
@@ -513,6 +520,7 @@ pub fn rope_rotate_only_input() -> LoweringInput {
     let num_heads = 32u32;
     let cols = num_heads * head_dim;
     LoweringInput {
+        exported: None,
         sources: vec![
             SourceShape { rows: 1, cols }, // 0  x
             SourceShape {
@@ -541,6 +549,7 @@ pub fn gemm_m1_only_input() -> LoweringInput {
     let k = 2048u32;
     let n = 2048u32;
     LoweringInput {
+        exported: None,
         sources: vec![
             SourceShape { rows: 1, cols: k }, // 0  x
             SourceShape { rows: n, cols: k }, // 1  w
