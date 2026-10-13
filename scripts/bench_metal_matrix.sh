@@ -193,7 +193,9 @@ SEED=""
 MLX_PYTHON=""
 MLX_AUTO=1
 OLLAMA_AUTO=1
-ENGINES=""               # --engines: empty for DEFAULT_ENGINES, all for every installed one
+ENGINES=""               # --engines: unset for DEFAULT_ENGINES, all for every installed one
+ENGINES_GIVEN=0          # --engines was passed (even as "": scratchy alone)
+LEGACY_NO=0              # --no-mlx / --no-ollama was passed
 DEFAULT_ENGINES="omlx,omlx_tq"
 PINS=()
 UNPINNED=0
@@ -232,8 +234,8 @@ while [[ $# -gt 0 ]]; do
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
         --mlx-python)        MLX_PYTHON="$2"; shift 2 ;;
-        --no-mlx)            MLX_AUTO=0; MLX_PYTHON=""; shift ;;
-        --no-ollama)         OLLAMA_AUTO=0; shift ;;
+        --no-mlx)            MLX_AUTO=0; MLX_PYTHON=""; LEGACY_NO=1; shift ;;
+        --no-ollama)         OLLAMA_AUTO=0; LEGACY_NO=1; shift ;;
         --scaling)           SCALING=1; shift ;;
         --no-scaling)        SCALING=0; shift ;;
         --scale-axes)        SCALE_AXES="$2"; shift 2 ;;
@@ -248,7 +250,7 @@ while [[ $# -gt 0 ]]; do
         --scale-base-input)  SCALE_BASE_INPUT="$2"; shift 2 ;;
         --scale-base-output) SCALE_BASE_OUTPUT="$2"; shift 2 ;;
         --scale-base-conc)   SCALE_BASE_CONC="$2"; shift 2 ;;
-        --engines)           ENGINES="$2"; shift 2 ;;
+        --engines)           ENGINES="$2"; ENGINES_GIVEN=1; shift 2 ;;
         --pin)               PINS+=("$2"); shift 2 ;;
         --unpinned)          UNPINNED=1; shift ;;
         --offline)           OFFLINE=1; shift ;;
@@ -301,17 +303,30 @@ ENGINE_ROWS=(
     "mistralrs|mistral.rs|MISTRALRS_BIN"
 )
 # --engines: run exactly these (by label or key), and refuse a name that is
-# unknown or not installed; all, every installed engine; nothing, the default
-# pair, those of it installed. Rows are selected, not their binaries cleared:
-# the two oMLX rows share OMLX_BIN, so clearing it for one would turn off the other.
+# unknown or not installed; all, every installed engine; scratchy, none or ""
+# for scratchy alone. Without --engines: the default pair, those of it
+# installed; or, with --no-mlx / --no-ollama, their old meaning, the mlx-lm
+# and ollama pair minus those named. Rows are selected, not their binaries
+# cleared: the two oMLX rows share OMLX_BIN, so clearing it for one would turn
+# off the other.
 lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 ENGINES_ON=""
-if [[ -z "${ENGINES}" ]]; then
+if (( ! ENGINES_GIVEN && LEGACY_NO )); then
+    for row in "${ENGINE_ROWS[@]}"; do
+        IFS='|' read -r key label binvar <<<"${row}"
+        [[ (${key} == mlx_lm || ${key} == ollama) && -n "${!binvar}" ]] && ENGINES_ON+=",${key}"
+    done
+    ENGINES="mlx_lm,ollama"
+    echo "note: --no-mlx/--no-ollama select from the old mlx-lm and ollama pair;" \
+         "--engines names engines explicitly (--engines scratchy for scratchy alone)" >&2
+elif (( ! ENGINES_GIVEN )); then
     for row in "${ENGINE_ROWS[@]}"; do
         IFS='|' read -r key label binvar <<<"${row}"
         [[ ",${DEFAULT_ENGINES}," == *",${key},"* && -n "${!binvar}" ]] && ENGINES_ON+=",${key}"
     done
     ENGINES="${DEFAULT_ENGINES}"
+elif [[ -z "${ENGINES}" || "$(lower "${ENGINES}")" == none || "$(lower "${ENGINES}")" == scratchy ]]; then
+    ENGINES="scratchy"   # scratchy alone: no comparison engine
 elif [[ "$(lower "${ENGINES}")" == all ]]; then
     for row in "${ENGINE_ROWS[@]}"; do
         IFS='|' read -r key label binvar <<<"${row}"
@@ -320,6 +335,7 @@ elif [[ "$(lower "${ENGINES}")" == all ]]; then
 else
     IFS=',' read -r -a wanted <<<"$(lower "${ENGINES}")"
     for w in "${wanted[@]}"; do
+        [[ "${w}" == scratchy ]] && continue   # always runs
         hit=""
         for row in "${ENGINE_ROWS[@]}"; do
             IFS='|' read -r key label binvar <<<"${row}"
@@ -731,7 +747,7 @@ run_cell() { # prefix axis rung input output conc
         ${cell_tok:+--tokenizer "${cell_tok}"} \
         --num-prompts "${SCALE_NUM_PROMPTS}" --input-len "$4" --output-len "$5" \
         --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
-        --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
+        --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,99 \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
     [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
     [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
@@ -782,11 +798,16 @@ run_scale_cells() { # prefix [axes]
     if [[ "${axes}" == *",grid,"* ]]; then
         IFS=',' read -r -a xs <<<"${SCALE_GRID_INPUT}"
         IFS=',' read -r -a os <<<"${SCALE_GRID_OUTPUT}"
-        local c; local -a cs
+        local c gmax; local -a cs
         IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
+        gmax=$(model_max_ctx "${id}")
         # Fewest users first: the whole 1-user grid is in hand before a larger
         # count can run a server out of memory and end its sweep.
         for c in "${cs[@]}"; do for x in "${xs[@]}"; do for o in "${os[@]}"; do
+            if (( gmax && x + o + 256 > gmax )); then
+                printf '    %-16s skipped: past the model'"'"'s %s-token context\n' "grid=${x}x${o}@${c}" "${gmax}"
+                continue
+            fi
             run_cell "${prefix}" grid "${x}x${o}@${c}" "${x}" "${o}" "${c}"
         done; done; done
     fi
@@ -799,6 +820,7 @@ served_name() { # the first model the running server lists
     curl -fsS -m 10 "http://127.0.0.1:${PORT}/v1/models" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d[0]["id"] if d else "")' 2>/dev/null
 }
+prepare_failed() { serve_down; rm -rf "${RAW}/omlx-home-probe"; return 1; }
 engine_prepare() { # key label model -> prints the name requests carry; fails if it cannot serve
     local key="$1" label="$2" model="$3" log="${RAW}/serve-$1-${stem}.log" name="" snap
     local up; up="$("${key}_cmd" "${model}" 0 0)"
@@ -813,15 +835,15 @@ engine_prepare() { # key label model -> prints the name requests carry; fails if
         ln -s "${snap}/snapshots/$(cat "${snap}/refs/main")" "${RAW}/omlx-models/${model}"
         up="$(omlx_serve "${RAW}/omlx-home-probe" 0)"
     fi
-    serve_up "${log}" "$("${key}_ready")" bash -c "exec ${up}" || { serve_down; return 1; }
+    serve_up "${log}" "$("${key}_ready")" bash -c "exec ${up}" || { prepare_failed; return 1; }
     case "${key}" in
         mlx_lm|vllm_metal) name="${model}" ;;
         ollama)
             show() { curl -fsS -m 10 "http://127.0.0.1:${PORT}/api/show" -d "{\"model\":\"${model}\"}"; }
             if ! show >/dev/null 2>&1; then
-                (( OFFLINE )) && { serve_down; return 1; }
+                (( OFFLINE )) && { prepare_failed; return 1; }
                 echo "    pulling ${model} (first use)" >&2
-                OLLAMA_HOST="127.0.0.1:${PORT}" "${OLLAMA_BIN}" pull "${model}" >>"${log}" 2>&1 || { serve_down; return 1; }
+                OLLAMA_HOST="127.0.0.1:${PORT}" "${OLLAMA_BIN}" pull "${model}" >>"${log}" 2>&1 || { prepare_failed; return 1; }
             fi
             # Its quantization and digest, one per line, in a file: this runs in
             # the subshell that prints the served name, so a variable is lost.
@@ -1120,7 +1142,7 @@ PY
                 --num-prompts "${NUM_PROMPTS}" --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" \
                 --max-concurrency 1 --temperature 0 \
                 --seed "$(printf '%s' "${SCALE_SEED_BASE}:${stem}:warm" | cksum | cut -d' ' -f1)" \
-                --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
+                --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,99 \
                 --output-json "${RAW}/serve-${stem}.json" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1 \
                 && { printf '    '; numbers "${RAW}/serve-${stem}.json"; } \
                 || echo "    bench serve failed (see ${RAW}/cells-${stem}.log)" >&2
@@ -1161,8 +1183,11 @@ PY
 import glob, json, os, re, sys
 js, raw, stem, mid, quant, feats, built, secs, size, parity_ok, mlx_python = sys.argv[1:12]
 env = os.environ
-KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms", "median_itl_ms",
-        "p99_itl_ms", "median_e2el_ms", "output_throughput", "request_throughput",
+# Per-token speed is TPOT, from the server's token count, never ITL: ITL is
+# the gap between stream chunks, and once an engine streams several tokens a
+# chunk (multi-token prediction, speculative decoding) one gap spans several.
+KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms",
+        "median_e2el_ms", "output_throughput", "request_throughput",
         "completed", "failed", "total_output_tokens", "duration", "unstreamed_requests",
         "server_mem_peak_mib", "server_mem_median_mib"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")

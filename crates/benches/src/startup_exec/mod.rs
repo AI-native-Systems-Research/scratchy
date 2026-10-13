@@ -464,6 +464,10 @@ const STDERR_TAIL_BYTES: usize = 2048;
 /// child started and left running can hold the pipe open indefinitely.
 const STDERR_DRAIN: Duration = Duration::from_secs(2);
 
+/// How long the stderr reader waits on the pipe before checking whether it
+/// should stop: its exit comes at most this late after STDERR_DRAIN.
+const STDERR_POLL_MS: libc::c_int = 100;
+
 /// Spawn a one-shot CLI and stop the clock on its first content byte.
 ///
 /// A line cannot be classified as banner or content until it ends, but the
@@ -480,19 +484,46 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
         .spawn()
         .with_context(|| format!("failed to exec {}", argv[0]))?;
 
-    // Drained on its own thread so a chatty child never blocks on a full pipe;
-    // only the end is kept, which is where a traceback or panic lands.
-    // The reader hands its result over a channel, so the wait for it can be
-    // bounded (STDERR_DRAIN); a reader still blocked then is left to finish
-    // on its own when whoever holds the pipe exits.
+    // Drained on its own thread so a chatty child never blocks on a full pipe.
+    // Only the end is kept, a sliding STDERR_TAIL_BYTES, which is where a
+    // traceback or panic lands. The thread waits on the pipe in short polls
+    // and checks `stop` between them, so once the child is reaped and
+    // STDERR_DRAIN has passed it ends within one poll, even when a process the
+    // child started still holds the pipe open.
     let mut stderr = child.stderr.take().expect("piped");
-    let (tail_tx, tail_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut all = Vec::new();
-        let _ = stderr.read_to_end(&mut all);
-        let tail = &all[all.len().saturating_sub(STDERR_TAIL_BYTES)..];
-        let _ = tail_tx.send(String::from_utf8_lossy(tail).trim().to_string());
-    });
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    {
+        let (tail, stop) = (tail.clone(), stop.clone());
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            let mut pfd = libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let mut chunk = [0u8; 4096];
+            while !stop.load(Ordering::SeqCst) {
+                // SAFETY: `pfd` is one initialized pollfd for a descriptor this
+                // thread owns (through `stderr`) for the whole call.
+                let ready = unsafe { libc::poll(&mut pfd, 1, STDERR_POLL_MS) };
+                if ready <= 0 {
+                    continue; // timed out (or interrupted): check `stop` again
+                }
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break, // EOF: every writer has closed it
+                    Ok(n) => {
+                        let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+                        t.extend_from_slice(&chunk[..n]);
+                        let over = t.len().saturating_sub(STDERR_TAIL_BYTES);
+                        t.drain(..over);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+    }
 
     let mut stdout = child.stdout.take().expect("piped");
     let mut t_first: Option<Instant> = None;
@@ -528,9 +559,17 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
     }
 
     let usage = wait4_child(&mut child)?;
-    let tail = tail_rx
-        .recv_timeout(STDERR_DRAIN)
-        .unwrap_or_else(|_| "(stderr still held open by a process the child started)".into());
+    // EOF, or STDERR_DRAIN: then stop the reader and keep what it has.
+    let held = done_rx.recv_timeout(STDERR_DRAIN).is_err();
+    stop.store(true, Ordering::SeqCst);
+    let tail = {
+        let t = tail.lock().unwrap_or_else(|p| p.into_inner());
+        let text = String::from_utf8_lossy(&t).trim().to_string();
+        match (held, text.is_empty()) {
+            (true, true) => "(stderr still held open by a process the child started)".to_string(),
+            _ => text,
+        }
+    };
     let crash = (!usage.ok).then(|| {
         if tail.is_empty() {
             format!("{}, nothing on stderr", usage.status)
@@ -1533,6 +1572,31 @@ mod tests {
             t0.elapsed()
         );
         assert!(rep.crash.expect("exit 1 is a crash").contains("exit 1"));
+    }
+
+    /// A child that floods stderr is reported by its end, not all of it: the
+    /// reader keeps a sliding STDERR_TAIL_BYTES however much it reads.
+    #[test]
+    fn a_flood_of_stderr_keeps_only_its_tail() {
+        let rep = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo partial; head -c 1048576 /dev/zero | tr '\\0' 'x' >&2; echo >&2; echo 'last line' >&2; exit 4".into(),
+            ],
+            Backend::Scratchy,
+        )
+        .expect("the child emitted a token");
+        let crash = rep.crash.expect("exit 4 is a crash");
+        assert!(
+            crash.contains("exit 4") && crash.ends_with("last line"),
+            "{crash}"
+        );
+        assert!(
+            crash.len() < STDERR_TAIL_BYTES + 200,
+            "kept {} bytes",
+            crash.len()
+        );
     }
 
     #[test]

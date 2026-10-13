@@ -1265,18 +1265,25 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
             Sweep::Prompt => sweep_cells(e.cells(mm), sweep),
         }
     };
-    let cells: Vec<(Engine, BTreeMap<u32, &Cell>)> = Engine::ALL
+    // Every engine that ran this model, scratchy first, with its cells at
+    // this sweep's source (empty when it has none there).
+    let ran: Vec<(Engine, BTreeMap<u32, &Cell>)> = Engine::ALL
         .iter()
+        .filter(|&&e| e.ran(m))
         .map(|&e| (e, map_of(m, run, e)))
-        .filter(|(_, cs)| !cs.is_empty())
         .collect();
-    let mine = cells
+    // A sweep no engine has a cell for was not run: no section. Otherwise the
+    // section stays, and says who is missing, rather than vanish.
+    if ran.iter().all(|(_, cs)| cs.is_empty()) {
+        return rsx! {};
+    }
+    let cells: Vec<&(Engine, BTreeMap<u32, &Cell>)> =
+        ran.iter().filter(|(_, cs)| !cs.is_empty()).collect();
+    let empty = BTreeMap::new();
+    let mine = ran
         .iter()
         .find(|(e, _)| *e == Engine::Scratchy)
-        .map(|(_, cs)| cs);
-    let Some(mine) = mine else {
-        return rsx! {};
-    };
+        .map_or(&empty, |(_, cs)| cs);
     let mut xs: Vec<u32> = cells
         .iter()
         .flat_map(|(_, cs)| cs.keys().copied())
@@ -1309,12 +1316,14 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
                 .filter_map(|x| Some((*x, timing(Some(cs.get(x)?), metric))))
                 .collect(),
         };
-    let rivals: Vec<&(Engine, BTreeMap<u32, &Cell>)> = cells
-        .iter()
-        .filter(|(e, _)| *e != Engine::Scratchy)
-        .collect();
+    let rivals: Vec<&(Engine, BTreeMap<u32, &Cell>)> =
+        ran.iter().filter(|(e, _)| *e != Engine::Scratchy).collect();
     let row = |metric: Metric, title: &str, ylabel: &str| -> Element {
-        let charts: Vec<(String, Vec<Series>)> = if rivals.is_empty() {
+        let plotted =
+            |cs: &BTreeMap<u32, &Cell>| cs.values().any(|c| timing(Some(c), metric).is_some());
+        // One chart per engine scratchy is compared with, kept while either
+        // side has a point to draw; scratchy alone when there is none.
+        let pairs: Vec<(String, Vec<Series>)> = if rivals.is_empty() {
             vec![(
                 "scratchy".to_string(),
                 vec![line("scratchy", "s1", mine, metric)],
@@ -1333,24 +1342,28 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
                 })
                 .collect()
         };
-        let charts: Vec<(String, Vec<Series>)> = charts
+        let charts: Vec<(String, Vec<Series>)> = pairs
             .into_iter()
             .map(|(t, mut ss)| {
                 ss.retain(|s| s.pts.iter().any(|p| p.1.is_some()));
                 (t, ss)
             })
-            .filter(|(_, ss)| ss.iter().any(|s| s.class == "s1"))
+            .filter(|(_, ss)| ss.iter().any(|s| s.class != "prev"))
             .collect();
-        // An engine whose line is missing never measured this (no stream).
-        let gone: Vec<&str> = rivals
+        // Who has no line here, and why: no cells at this sweep (failed, or
+        // not measured), or cells that never streamed. Named for the side
+        // that is missing, scratchy included.
+        let (no_cells, no_stream): (Vec<&str>, Vec<&str>) = ran
             .iter()
-            .filter(|(e, _)| {
-                !charts
-                    .iter()
-                    .any(|(_, ss)| ss.iter().any(|s| s.label == e.label()))
-            })
-            .map(|(e, _)| e.label())
-            .collect();
+            .filter(|(_, cs)| !plotted(cs))
+            .fold((Vec::new(), Vec::new()), |(mut nc, mut ns), (e, cs)| {
+                if cs.is_empty() {
+                    nc.push(e.label())
+                } else {
+                    ns.push(e.label())
+                }
+                (nc, ns)
+            });
         rsx! {
             Stack { gap: 2,
                 strong { "{title}" }
@@ -1361,8 +1374,11 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
                         }
                     }
                 }
-                if !gone.is_empty() {
-                    p { "{gone.join(\", \")}: {NO_STREAM}, not plotted." }
+                if !no_stream.is_empty() {
+                    p { "{no_stream.join(\", \")}: {NO_STREAM}, not plotted." }
+                }
+                if !no_cells.is_empty() {
+                    p { "{no_cells.join(\", \")}: no numbers for this sweep (its requests failed or it was not measured; see the run's logs), not plotted." }
                 }
             }
         }
