@@ -362,10 +362,10 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// Per-dispatch GPU timestamp heap (`SCRATCHY_METAL_KERNEL_TIME`).
     /// `None` unless the env var is set at worker build — the probe is
     /// opt-in and costs nothing otherwise. One timestamp is written
-    /// after EVERY dispatched kernel; the pool resolves and prints the
-    /// per-kernel deltas after the forward's host wait (see
-    /// `print_kernel_tape`).
-    pub kernel_time_heap: Option<super::mtl4::KernelTimeHeap>,
+    /// after EVERY dispatched kernel; a command buffer's wait resolves
+    /// and prints the per-kernel deltas of the stamps written up to its
+    /// commit (see `print_new_since`).
+    pub kernel_time_heap: Option<std::sync::Arc<super::mtl4::KernelTimeHeap>>,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -819,7 +819,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
             kernel_time_heap: if std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some() {
-                Some(super::mtl4::KernelTimeHeap::new(&device))
+                Some(super::mtl4::new_registered_kernel_time_heap(&device))
             } else {
                 None
             },

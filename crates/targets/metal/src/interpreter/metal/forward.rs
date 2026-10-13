@@ -288,6 +288,11 @@ pub struct InFlight {
     pub(super) error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// The commit options carrying that handler, kept until the command buffer is done.
     pub(super) _feedback: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
+    /// Every registered kernel-time heap's cursor at this command buffer's
+    /// commit (`SCRATCHY_METAL_KERNEL_TIME`): its stamps up to here belong to
+    /// command buffers this one's wait drains, so the wait prints them. Empty
+    /// without the env var.
+    pub(super) kernel_time: Vec<(std::sync::Arc<super::mtl4::KernelTimeHeap>, u64)>,
 }
 
 // SAFETY: like the pool's (`MetalWorkerPool`), the markers objc2's objects lack: a shared event is
@@ -295,6 +300,11 @@ pub struct InFlight {
 // held, never used, once committed.
 unsafe impl Send for InFlight {}
 unsafe impl Sync for InFlight {}
+
+/// Command buffers waited so far, to label the kernel-time tape of each
+/// (`SCRATCHY_METAL_KERNEL_TIME`): the trace's per-forward lines interleave
+/// with these by order.
+static KERNEL_TIME_CB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl InFlight {
     /// Block until the GPU is done with it. `Err`: the execution error its commit feedback reported
@@ -304,6 +314,12 @@ impl InFlight {
         if let Some(msg) = &*self.error.lock().expect("commit error mutex") {
             eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        }
+        if !self.kernel_time.is_empty() {
+            let cb = KERNEL_TIME_CB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (heap, end) in &self.kernel_time {
+                heap.print_new_since(*end, &format!("cb {cb}"));
+            }
         }
         Ok(())
     }
