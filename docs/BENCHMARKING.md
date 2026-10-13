@@ -143,7 +143,10 @@ bimodal ITL distribution in this repo for a week
    unique per rep. This is not hypothetical — a `bench serve` run against a
    shared-prefix dataset reported a 98% prefix-cache hit rate, which inflated
    throughput 1.84× and understated TTFT 11× before it was caught. Pass
-   `--no-prefix-caching` to the server under test as well.
+   `--no-prefix-caching` to the server under test as well. `scr bench serve`
+   sends its pre-flight and warmup requests throwaway prompts from a seed
+   disjoint from `--seed`, for every dataset, so no measured prompt is cached
+   before it is timed.
 2. **Pin the sampling params.** Every request is greedy (`temperature 0`).
    Leaving temperature *unset* is the trap: the field is omitted, each **server**
    applies its own default, and the backends get timed on different sampling
