@@ -122,9 +122,9 @@ pub struct BucketBaking {
     /// a kernel exceeds the 31-binding argument-table cap (such buckets
     /// have no MTL4 execution path).
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
-    /// The dispatches a forward reading only its cache writes plays, in dispatch order
-    /// ([`LoweredMetalTape::cache_writes_end_expanded`]).
-    pub cache_writes_end: usize,
+    /// Per dispatch, in dispatch order, whether a forward reading only its cache writes plays it
+    /// ([`LoweredMetalTape::cache_live_expanded`]).
+    pub cache_live: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -776,6 +776,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
         };
+        // A skipped dispatch's fence, owed to the next one played.
+        let mut carried = Fence::None;
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -788,10 +790,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             {
                 let this_idx = flat_idx;
                 flat_idx += 1;
-                // A forward reading only its cache writes stops after the last: nothing past it
-                // feeds one.
-                if reads == super::ForwardReads::CacheWrites && this_idx >= baking.cache_writes_end
-                {
+                // A forward reading only its cache writes skips what none of them needs, its fence
+                // passed on to the next dispatch it plays: the fence orders what came before it
+                // against what comes after, whichever dispatch that is.
+                if reads == super::ForwardReads::CacheWrites && !baking.cache_live[this_idx] {
+                    carried = carried.max(*need_barrier);
                     continue;
                 }
                 // The compiler's own hazard-analysis verdict for the tape,
@@ -822,6 +825,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // doesn't run with stale per-dispatch state.
                     continue;
                 }
+                let need_barrier = std::mem::replace(&mut carried, Fence::None).max(need_barrier);
                 if need_barrier != Fence::None {
                     // Visibility from the hazard class: RAW fences are
                     // `Device` (memory-coherent — the reader must observe
@@ -1246,7 +1250,7 @@ fn bake_bucket<W: CanonicalParams>(
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
-        cache_writes_end: tape.cache_writes_end_expanded(),
+        cache_live: tape.cache_live_expanded(),
     })
 }
 
@@ -2164,7 +2168,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            cache_writes_end: 0,
+            cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2400,7 +2404,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            cache_writes_end: 0,
+            cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2492,7 +2496,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            cache_writes_end: 0,
+            cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2618,7 +2622,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            cache_writes_end: 0,
+            cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],

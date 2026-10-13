@@ -316,6 +316,11 @@ pub struct HazardSig {
     writes: Vec<Slot>,
     kv_w: Option<LayerId>,
     kv_r: Option<LayerId>,
+    /// The slots its KV write reads, when narrower than `reads`: a rope append's K and V, not the
+    /// Q it rotates beside them. `None`: every slot it reads.
+    kv_w_reads: Option<Vec<Slot>>,
+    /// It writes a recurrent state its forward outlives (a Gated-DeltaNet or Mamba-2 layer's).
+    state_w: bool,
     /// The op scratch (`moe_scratch`) — ONE location, shared by every MoE step and GDN.
     op_scratch: Access,
     /// The KV codec's staging buffer — ONE location, written by every stage, read by a coded
@@ -371,6 +376,8 @@ fn roped_attention(rope: Emission, attention: Emission) -> Emission {
         writes: [r.writes, a.writes].concat(),
         kv_w: r.kv_w.or(a.kv_w),
         kv_r: a.kv_r.or(r.kv_r),
+        kv_w_reads: r.kv_w_reads.or(a.kv_w_reads),
+        state_w: r.state_w || a.state_w,
         op_scratch: r.op_scratch.max(a.op_scratch),
         codec_staging: r.codec_staging.max(a.codec_staging),
         group: a.group,
@@ -1130,6 +1137,7 @@ impl Recording<'_> {
                     MetalStep::RopeAppendNormed(q, k, v, q, k, v, layer, pairing, class, pool);
                 let mut e = em(step, &[q, k, v], &[q, k, v], sites);
                 e.sig.kv_w = Some(layer);
+                e.sig.kv_w_reads = Some(vec![k, v]);
                 Ok(e)
             }
             (F::MeanSubRmsNorm | F::MeanSubRmsNormBiasAdd, Sh::CentredNorm { sub, bias, .. }) => {
@@ -1675,6 +1683,7 @@ impl Recording<'_> {
         let sites = rope_append_weight_site(self.rotary(i), k_linear, v_linear);
         let mut e = em(step, &[q, k, v], &[q, k, v], sites);
         e.sig.kv_w = Some(layer);
+        e.sig.kv_w_reads = Some(vec![k, v]);
         Ok(e)
     }
 
@@ -2238,6 +2247,7 @@ impl Recording<'_> {
                 let mut e = em(step, &ins, &[out], site);
                 // Its four commands pass their intermediates through the op scratch.
                 e.sig.op_scratch = Access::Write;
+                e.sig.state_w = true;
                 e
             }
             L::Mamba2 { .. } => {
@@ -2248,6 +2258,7 @@ impl Recording<'_> {
                 let mut e = em(step, &[zxbcdt], &[out], site);
                 // Its conv, scan and norm pass their intermediates through the op scratch.
                 e.sig.op_scratch = Access::Write;
+                e.sig.state_w = true;
                 e
             }
             L::RouterNorm { eps, router } => {
@@ -2400,6 +2411,11 @@ pub struct Assembled {
 }
 
 impl Assembled {
+    /// The backbone rows a forward that reads only its cache writes runs ([`cache_live`]).
+    pub fn cache_live(&self) -> Vec<bool> {
+        cache_live(&self.rows, &self.sigs)
+    }
+
     /// The fences of the backbone and the lm_head, walked as ONE stream: the lm_head's
     /// first row fences against what the backbone left pending.
     pub fn flags(&self) -> (Vec<Fence>, Vec<Fence>) {
@@ -2476,6 +2492,60 @@ pub fn assemble(
         }
     }
     Ok(out)
+}
+
+/// THE CACHE-ONLY PLAY: whether each row runs in a forward whose caller reads only its cache
+/// writes (KV, recurrent state) — none of its outputs. Walked backwards from those writes: a row
+/// runs if it writes a cache, or writes a location a running row after it reads before anything
+/// overwrites it. A KV writer needs only what its write reads (`kv_w_reads`: a rope append's K and
+/// V), so the Q it rotates — and the projection, split and norm making it — run only if something
+/// else reads them. The op scratch and the codec staging are one location each; a row writing one
+/// is taken to read it too. A loop's body runs whole: its rows serve every iteration, whose cache
+/// writes the last iteration's dead tail does not tell apart.
+pub fn cache_live(rows: &[StepRow], sigs: &[HazardSig]) -> Vec<bool> {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Loc {
+        Slot(Slot),
+        OpScratch,
+        CodecStaging,
+    }
+    let mut in_loop = vec![false; rows.len()];
+    for (at, row) in rows.iter().enumerate() {
+        if let StepRow::Loop { body, .. } = row {
+            let end = (at + 1 + body.0 as usize).min(rows.len());
+            in_loop[at + 1..end].iter_mut().for_each(|r| *r = true);
+        }
+    }
+    let shared = |a: Access, loc| (a != Access::Untouched).then_some(loc);
+    let mut needed: HashSet<Loc> = HashSet::new();
+    let mut live = vec![false; rows.len()];
+    for i in (0..rows.len()).rev() {
+        let s = &sigs[i];
+        if s.metadata {
+            continue;
+        }
+        let writes: Vec<Loc> = (s.writes.iter().map(|&w| Loc::Slot(w)))
+            .chain((s.op_scratch == Access::Write).then_some(Loc::OpScratch))
+            .chain((s.codec_staging == Access::Write).then_some(Loc::CodecStaging))
+            .collect();
+        let read = writes.iter().any(|w| needed.contains(w));
+        let writes_cache = s.kv_w.is_some() || s.state_w;
+        if !(in_loop[i] || read || writes_cache) {
+            continue;
+        }
+        live[i] = true;
+        writes.iter().for_each(|w| {
+            needed.remove(w);
+        });
+        let reads = match (&s.kv_w_reads, in_loop[i] || read) {
+            (Some(kv), false) => kv.as_slice(),
+            _ => s.reads.as_slice(),
+        };
+        needed.extend(reads.iter().map(|&r| Loc::Slot(r)));
+        needed.extend(shared(s.op_scratch, Loc::OpScratch));
+        needed.extend(shared(s.codec_staging, Loc::CodecStaging));
+    }
+    live
 }
 
 /// THE MTL4 fences: a row fences when it reads a buffer pending a write (RAW), writes one
@@ -2689,6 +2759,66 @@ mod tests {
             hazard_fences(rows.iter()),
             [No, No, Fence::Ordered, Coherent]
         );
+    }
+
+    /// A forward reading only its cache writes runs what they need and no more: the rope append
+    /// writing the KV needs K and V — their projections, the norm and the projection under those —
+    /// but not the Q it rotates beside them, its split, nor the attention and MLP after it. A row
+    /// writing a recurrent state runs, and so do the rows its reads need; a loop's body runs whole.
+    #[test]
+    fn a_cache_only_forward_runs_what_its_cache_writes_need() {
+        let rope = |q, k, v| HazardSig {
+            kv_w: Some(LayerId(0)),
+            kv_w_reads: Some(vec![Slot(k), Slot(v)]),
+            ..sig(&[q, k, v], &[q, k, v], None)
+        };
+        // fc (0 -> 1); norm (1 -> 2); q, k, v projections (2 -> 3, 4, 5); q split (3 -> 6, 7);
+        // the rope append (6, 4, 5); attention (6 -> 8); o projection (8 -> 9); MLP (9 -> 10).
+        let sigs = [
+            sig(&[0], &[1], None),
+            sig(&[1], &[2], None),
+            sig(&[2], &[3], None),
+            sig(&[2], &[4], None),
+            sig(&[2], &[5], None),
+            sig(&[3], &[6, 7], None),
+            rope(6, 4, 5),
+            sig(&[6], &[8], None),
+            sig(&[8], &[9], None),
+            sig(&[9], &[10], None),
+        ];
+        let rows = vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); sigs.len()];
+        let live = cache_live(&rows, &sigs);
+        let want = [
+            true, true, false, true, true, false, true, false, false, false,
+        ];
+        assert_eq!(live, want);
+
+        // A recurrent state's writer runs, with what it reads; a loop's body runs whole.
+        let state = HazardSig {
+            state_w: true,
+            ..sig(&[2], &[3], None)
+        };
+        // Row 0's and row 3's writes are read by nothing that runs; row 5 is a loop's body.
+        let sigs = [
+            sig(&[0], &[9], None),
+            sig(&[1], &[2], None),
+            state,
+            sig(&[7], &[8], None),
+            HazardSig {
+                metadata: true,
+                ..HazardSig::default()
+            },
+            sig(&[4], &[5], None),
+            sig(&[5], &[6], None),
+        ];
+        let mut rows = vec![StepRow::Step(MetalStep::SpliceMmEmbeds(Slot(0)), None); sigs.len()];
+        rows[4] = StepRow::Loop {
+            iters: st::LoopIters(2),
+            body: st::BodyLen(1),
+            stride: st::LayerStride(1),
+        };
+        let live = cache_live(&rows, &sigs);
+        assert_eq!(live, [false, true, true, false, false, true, false]);
     }
 
     /// The class is the point: a WAW fence orders (Ordered), a RAW fence must

@@ -150,16 +150,19 @@ pub fn lower_subtile_tape_to_metal(
     p: &MetalModelConsts,
     at: BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
-    let half = |rows, barriers, sources| lower(p, rows, barriers, sources, &at);
+    let half = |rows, barriers, sources, live| lower(p, rows, barriers, sources, live, &at);
     let bb = half(
         &steps.backbone,
         &steps.backbone_barriers,
         &steps.backbone_sources,
+        &steps.backbone_cache_live,
     )?;
+    // A cache-only forward runs none of the lm_head.
     let lh = half(
         &steps.lm_head,
         &steps.lm_head_barriers,
         &steps.lm_head_sources,
+        &vec![false; steps.lm_head.len()],
     )?;
     let writes_kv_cache = |c: &GatedCommand| {
         writer_binds(c, |k| {
@@ -178,15 +181,11 @@ pub fn lower_subtile_tape_to_metal(
     {
         return Err(LoweringError::TurboQuantCompressesNothing);
     }
-    let cache_writes_end = match lh.cache_writes_end {
-        0 => bb.cache_writes_end,
-        end => bb.commands.len() as u32 + end,
-    };
     let commands = (bb.commands.iter().chain(lh.commands.iter())).copied();
     Ok(LoweredMetalTape {
         bucket_m: at.bucket_m,
         num_arena_slots: at.num_arena_slots,
-        cache_writes_end,
+        cache_live: baked([bb.cache_live, lh.cache_live].concat()),
         commands: baked_commands(commands.collect()).map_err(LoweringError::TooManyCommands)?,
         barrier_before: baked([bb.barrier_before, lh.barrier_before].concat()),
         // The backbone's commands lead this concatenation, so its loop's `start`/`period`
@@ -220,6 +219,7 @@ fn writer_binds(c: &GatedCommand, kind: fn(&RuntimeBindingKind) -> bool) -> bool
 
 /// Whether `c` writes a cache its forward outlives: a KV writer binding the KV pool or its
 /// TurboQuant stores, or a command binding a recurrent state (a Gated-DeltaNet or Mamba-2 layer's).
+/// A cache-only forward must run every such command ([`LoweringError::CacheWriterSkipped`]).
 fn writes_cache(c: &GatedCommand) -> bool {
     use RuntimeBindingKind as RB;
     let kv = |k: &RuntimeBindingKind| {
@@ -1447,6 +1447,7 @@ fn lower(
     rows: &[StepRow],
     barriers_in: &[Fence],
     sources: &[Vec<RowSource>],
+    live_rows: &[bool],
     at: &BakePoint<'_>,
 ) -> Result<LoweredMetalTape, LoweringError> {
     let BakePoint {
@@ -1459,6 +1460,10 @@ fn lower(
     } = *at;
     let mut commands: Vec<GatedCommand> = Vec::with_capacity(rows.len());
     let mut barrier_before: Vec<Fence> = Vec::with_capacity(rows.len());
+    // Per command, whether a cache-only forward runs it: its row's verdict (a row past the walk's
+    // runs), and a pre-pass a running row reuses runs whatever its own row's.
+    let mut cache_live: Vec<bool> = Vec::with_capacity(rows.len());
+    let mut quantized_at: Option<usize> = None;
     // The layer loop, if this tape has one. Set by the `StepRow::Loop` arm below,
     // which records the body instead of unrolling it.
     let mut loops: Vec<super::lowered::TapeLoop> = Vec::new();
@@ -1578,8 +1583,15 @@ fn lower(
                 let mut cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(step, &mut m_divisor);
                 let reuses = cmds.first().is_some_and(|c| Some(*c) == quantized);
+                let live = live_rows.get(i).copied().unwrap_or(true);
+                if !live && cmds.iter().any(writes_cache) {
+                    return Err(LoweringError::CacheWriterSkipped { index: i });
+                }
                 if reuses {
                     cmds.remove(0);
+                    if live && let Some(at) = quantized_at {
+                        cache_live[at] = true;
+                    }
                 } else if !cmds.is_empty() {
                     let gemm = |c: &GatedCommand| {
                         matches!(
@@ -1591,8 +1603,10 @@ fn lower(
                         (first.command.kernel == KernelId::AffineW4a8Quant && rest.iter().all(gemm))
                             .then_some(*first)
                     });
+                    quantized_at = quantized.map(|_| commands.len());
                 }
                 let n_cmds = cmds.len();
+                cache_live.extend(std::iter::repeat_n(live, n_cmds));
                 // The hazard fences track arena slots, not the shared scratch: a command that
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
                 let writes_scratch = if !reuses
@@ -1634,11 +1648,11 @@ fn lower(
     // so an inner loop ahead of its parent would be read as the parent.
     loops.sort_by_key(|l| (l.start, std::cmp::Reverse(l.period)));
     debug_assert_eq!(commands.len(), barrier_before.len());
-    let cache_writes_end = (commands.iter().rposition(writes_cache)).map_or(0, |i| i as u32 + 1);
+    debug_assert_eq!(commands.len(), cache_live.len());
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
-        cache_writes_end,
+        cache_live: baked(cache_live),
         commands: baked_commands(commands).map_err(LoweringError::TooManyCommands)?,
         barrier_before: baked(barrier_before),
         loops: baked(loops),
@@ -8321,45 +8335,41 @@ mod tests {
         rows
     }
 
-    /// A forward reading only its cache writes plays its tape through the last command writing
-    /// one: a coded layer's KV writer ends it, and its attention — the stages, the rotations, the
-    /// attention itself — falls past the end; a tape writing no cache plays nothing. Rolled, the
-    /// end is past the last iteration's copy of the writer.
+    /// A cache-only forward plays the commands of the rows the liveness walk keeps: a coded
+    /// layer's KV writer and not the attention after it — its stages, its rotations, the
+    /// attention itself. A row that writes a cache and is not kept is refused: the walk and the
+    /// lowering would disagree on what writes one. Rolled, every iteration of a body plays alike.
     #[test]
-    fn a_cache_only_forward_ends_at_the_last_cache_write() {
-        let prefill = || attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
-        let tape = lower_tq_layer(prefill(), 64);
-        let commands = tape.commands_expanded();
-        let end = tape.cache_writes_end as usize;
-        assert_eq!(commands[end - 1].command.kernel, KernelId::RopeAppend);
-        assert!(writes_cache(&commands[end - 1]));
-        assert!(!commands[end..].iter().any(writes_cache));
+    fn a_cache_only_forward_plays_the_rows_the_walk_keeps() {
+        let rows = coded(
+            tq_writer(0, Causal, LLAMA_KV),
+            attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
+        );
+        let n = rows.len();
+        let mut tape = row_tape(rows.clone());
+        tape.backbone_cache_live = std::iter::once(true).chain([false].repeat(n - 1)).collect();
+        let lowered =
+            lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(64, None)).expect("lowers");
+        let commands = lowered.commands_expanded();
+        let live = lowered.cache_live_expanded();
+        assert_eq!(commands[0].command.kernel, KernelId::RopeAppend);
+        assert!(live[0] && writes_cache(&commands[0]));
+        let (played, skipped): (Vec<_>, Vec<_>) = commands.iter().zip(&live).partition(|p| *p.1);
+        assert_eq!(played.len(), 1, "the writer alone");
         assert!(
-            (commands[end..].iter())
-                .any(|c| c.command.kernel == KernelId::AttentionPrefillSdpaPaged),
-            "the attention falls past the end"
-        );
-        assert_eq!(tape.cache_writes_end_expanded(), end);
-
-        let plain_layer = lower_tq(
-            &tp(),
-            plain(&[tq_writer(0, Causal, LLAMA_KV), prefill()]),
-            64,
-        );
-        assert_eq!(
-            plain_layer.cache_writes_end, 1,
-            "the writer, then the attention"
-        );
-        let no_cache = lower_tq(&tp(), plain(&[prefill()]), 64);
-        assert_eq!(
-            (
-                no_cache.cache_writes_end,
-                no_cache.cache_writes_end_expanded()
-            ),
-            (0, 0)
+            (skipped.iter()).any(|(c, _)| c.command.kernel == KernelId::AttentionPrefillSdpaPaged),
+            "the attention is skipped"
         );
 
-        let period = tape.commands.len() as u32;
+        let mut refused = row_tape(rows);
+        refused.backbone_cache_live = vec![false; n];
+        let err = lower_subtile_tape_to_metal(&refused, &tq_consts(), bake_point(64, None));
+        assert!(matches!(
+            err,
+            Err(LoweringError::CacheWriterSkipped { index: 0 })
+        ));
+
+        let period = lowered.commands.len() as u32;
         let rolled = LoweredMetalTape {
             loops: Box::leak(Box::new([crate::tape::lowered::TapeLoop {
                 start: 0,
@@ -8367,12 +8377,9 @@ mod tests {
                 iters: 3,
                 layer_stride: 1,
             }])),
-            ..tape
+            ..lowered
         };
-        assert_eq!(
-            rolled.cache_writes_end_expanded(),
-            2 * period as usize + end
-        );
+        assert_eq!(rolled.cache_live_expanded(), live.repeat(3));
     }
 
     /// Lower one coded layer — the KV writer, then its attention — at `bucket_m`.
@@ -10243,7 +10250,8 @@ mod tests {
     /// W4A8 matmuls of one activation in a row share its pre-pass, whatever their widths: the
     /// next one's GEMM reads the scratch as the first left it, behind no barrier of its own
     /// (nothing it reads is in flight). A matmul of another activation quantizes its own, and so
-    /// does the first matmul inside a loop: its previous command is another iteration's.
+    /// does the first matmul inside a loop: its previous command is another iteration's. A
+    /// cache-only forward plays a skipped row's pre-pass when a row it plays reuses it.
     #[test]
     fn w4a8_matmuls_of_one_activation_share_its_pre_pass() {
         use crate::tape::ids::{BodyLen, LayerStride, LoopIters};
@@ -10281,9 +10289,15 @@ mod tests {
         ];
         let mut tape = row_tape(rows);
         tape.backbone_barriers = vec![Fence::None; 6];
+        // A cache-only forward skips the q projection, and plays the pre-pass k and v reuse.
+        tape.backbone_cache_live = vec![false, true, true, false, false, true];
         let tape = lower_subtile_tape_to_metal(&tape, &tp(), bake_point(512, m5)).expect("lowers");
         let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
         assert_eq!(kinds, [Quant, Gemm, Gemm, Gemm, Quant, Gemm, Quant, Gemm]);
+        assert_eq!(
+            tape.cache_live,
+            [true, false, true, true, false, false, true, true]
+        );
         assert_eq!(
             tape.barrier_before,
             [

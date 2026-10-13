@@ -1890,20 +1890,15 @@ impl LoweredMetalTape {
         out
     }
 
-    /// [`Self::cache_writes_end`] in [`Self::commands_expanded`]'s stream: past the last
-    /// iteration's copy of the last cache-writing command.
-    pub fn cache_writes_end_expanded(&self) -> usize {
-        let Some(last) = (self.cache_writes_end as usize).checked_sub(1) else {
-            return 0;
-        };
-        let (mut at, mut end) = (0, 0);
+    /// `cache_live`, expanded in lockstep with [`Self::commands_expanded`]: every iteration of a
+    /// loop's body runs whole. A command past the mask runs.
+    pub fn cache_live_expanded(&self) -> Vec<bool> {
+        let mut out = Vec::with_capacity(self.commands.len());
+        let live = self.cache_live;
         Self::walk(self.loops, 0..self.commands.len(), 0, &mut |pos, _| {
-            at += 1;
-            if pos == last {
-                end = at;
-            }
+            out.push(live.get(pos).copied().unwrap_or(true))
         });
-        end
+        out
     }
 
     /// THE ONE WALK. Emitted rows, in order, each with the layer offset every enclosing loop
@@ -2008,12 +2003,12 @@ pub struct LoweredMetalTape {
     /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
     /// hd512-unfused attention was lowered.
     pub attn_unfused_scratch_bytes: u32,
-    /// The commands a forward wanting only its cache writes plays
-    /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): `commands[..cache_writes_end]`,
-    /// through the last command writing a KV cache or recurrent state (0: none does). Nothing
-    /// after it feeds a cache write — the lm_head and, past a model's last KV writer, its last
-    /// attention, MLP and norms produce only the outputs such a caller does not read.
-    pub cache_writes_end: u32,
+    /// Per command, whether a forward reading only its cache writes plays it
+    /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): what a KV or recurrent-state
+    /// write needs, from the metal compiler's liveness walk over the rows. Off for the lm_head,
+    /// the attention and MLP past a model's last KV writer, and a projection only they read (the
+    /// Q a rope append rotates beside the K and V it writes); on for every cache write.
+    pub cache_live: &'static [bool],
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the
@@ -2050,6 +2045,10 @@ pub enum LoweringError {
     NoRotaryTable { index: usize },
     /// A gated row whose realization already gates its commands: one command, two gates.
     DoubleGate { index: usize },
+    /// A command at tape index `index` writes a cache — KV, a recurrent state — and the row it
+    /// lowers from is not one a cache-only forward runs: the liveness walk and the lowering
+    /// disagree on what writes a cache.
+    CacheWriterSkipped { index: usize },
     /// A command computes batch row 0 only ([`SeqScope::RowZero`]) and its
     /// step has no per-row twin re-roping span blocks, so some step with
     /// several sequences would run no attention, or row 0's for every sequence.
@@ -2132,6 +2131,11 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the row at tape index {index} is gated, and its realization gates a \
                  command of its own"
+            ),
+            Self::CacheWriterSkipped { index } => write!(
+                f,
+                "lowering: a command of the row at tape index {index} writes a cache, and a \
+                 cache-only forward would skip it"
             ),
             Self::RowZeroWithoutPerRowTwin { index, kernel } => write!(
                 f,

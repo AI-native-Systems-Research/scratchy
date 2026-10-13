@@ -162,9 +162,8 @@ pub enum ForwardReads {
     /// Its outputs — logits, final hidden states — and its cache writes.
     #[default]
     Outputs,
-    /// Its cache writes alone — KV, recurrent state: its tape plays only through its last
-    /// ([`crate::tape::lowered::LoweredMetalTape::cache_writes_end`]), as nothing after that
-    /// feeds one.
+    /// Its cache writes alone — KV, recurrent state: its tape plays only the commands they need
+    /// ([`crate::tape::lowered::LoweredMetalTape::cache_live`]).
     CacheWrites,
 }
 

@@ -2298,7 +2298,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            cache_writes_end: 0,
+            cache_live: &[],
         }
     }
 
@@ -3225,7 +3225,7 @@ mod tests {
             decode_partials_row_bytes: 0,
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            cache_writes_end: 0,
+            cache_live: &[],
         };
         let mut v = Vec::new();
         for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {

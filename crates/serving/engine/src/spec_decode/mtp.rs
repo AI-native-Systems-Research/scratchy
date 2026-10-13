@@ -19,10 +19,11 @@
 //!
 //!    A row whose next token the host has — a prompt's, short of its newest — is never a
 //!    sequence's newest, so nothing reads its output, only its KV. Those rows run first, as their
-//!    own forward ([`HeadPasses::prime`]) that plays the head's tape only through its last KV write
-//!    — the compiler's `cache_writes_end`, a constant of each tape — skipping the attention, MLP,
-//!    norm and lm_head after it; the rest run whole ([`Drafting`]), attending the KV the first
-//!    wrote. A head reading its target's KV writes none, so its rows no draft reads run nothing.
+//!    own forward ([`HeadPasses::prime`]) that plays only the commands its KV write needs — the
+//!    compiler's `cache_live`, a constant of each tape from a liveness walk back from the KV
+//!    writes — skipping the q projection the rope append rotates beside K and V, the attention,
+//!    MLP, norm and lm_head; the rest run whole ([`Drafting`]), attending the KV the first wrote.
+//!    A head reading its target's KV writes none, so its rows no draft reads run nothing.
 //! 2. **Passes 2..=k** ([`Chain`]), one row per drafting sequence: the previous draft at the next
 //!    position, with the head's own final hidden state from the pass before. They run in the same
 //!    command buffer: which row is a sequence's newest depends on the drafts the target accepted,
@@ -72,8 +73,8 @@
 //!   default, so every target of `qwen3-5-mtp` shares it, but its cost is the target's: a dense
 //!   target's verify rows cost far less than a MoE's (Llama-3.2-3B: a 4-row step costs 1.27x a
 //!   1-row step), so a dense Qwen3.5/3.6 target would pay at more sequences.
-//! - TODO: priming costs the head's tape through its KV write over every row of every step past
-//!   the gate (Qwen3.6: the embedding, the two norms, `fc` and the q/k/v projections). The
+//! - TODO: priming costs what the head's KV write needs over every row of every step past the
+//!   gate (Qwen3.6: the embedding, the two norms, `fc` and the k/v projections). The
 //!   alternative — keep a stale request's target hidden rows (4 KiB a token at Qwen3.6's
 //!   2048-wide 16-bit hidden) and run them through pass 1 once its steps are back under the
 //!   gate — defers that cost to the requests that resume drafting; not taken.
@@ -107,13 +108,13 @@
 //!   (`gdn_scan_simd_resumes_from_checkpoint`): two loops calling one inlined row lost the
 //!   bit-exactness (the varlen scan's replay 1 ULP off), the compiler contracting each copy apart.
 //!   Without a head both compile to the plain kernels (`GDN_SCAN_DRAFTS`, `GDN_CONV_DRAFTS` 0).
-//! - TODO: time to first token pays the head's prime over the prompt: its tape through its KV
-//!   write over every prompt row, then its newest row whole and the chain, in the prompt step's
-//!   command buffer. Per-dispatch GPU time on a 1566-row prompt chunk (base M5): 9.1 ms, from
-//!   34.2 ms when every row ran the whole head; a 31-row prompt, 2.5 ms from 5.7. The prime still
-//!   runs the q projection (Qwen3.6: 3.0 ms of its 6.6 on that chunk): the rope append that writes
-//!   the KV reads q too, and the cut is a prefix of the tape. Dropping it needs the cut per command
-//!   — a command's liveness by what its cache write reads — not per tape.
+//! - TODO: time to first token pays the head's prime over the prompt — what its KV write needs
+//!   over every prompt row — then its newest row whole and the chain. Per-dispatch GPU time on a
+//!   1588-row prompt chunk (base M5): 5.2 ms (prime 3.1, newest row 1.1, chain 1.0), from 34.2 ms
+//!   when every row ran the whole head; first token on a ~5.6k-token prompt +0.7% against main.
+//!   The prompt's last chunk drafts, so it is not deferred, and waits for the chunk still in
+//!   flight before its own inputs are written (~5 ms idle on the base M5): writing them on the
+//!   device, as a deferred step does, would let it queue behind that chunk.
 //! - TODO: the next step is scheduled once the host has read this one's tokens and drafts (#240:
 //!   pipelined cycles). Its inputs are on the device already.
 //! - TODO: choose `k` per bucket. `spec_drafts` (2) is one constant for every bucket, because the

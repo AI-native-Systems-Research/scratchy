@@ -769,6 +769,9 @@ pub struct MetalStepTape {
     pub backbone: Vec<StepRow>,
     pub backbone_barriers: Vec<Fence>,
     pub backbone_sources: Vec<Vec<RowSource>>,
+    /// Per backbone row, whether a forward reading only its cache writes runs it (the metal
+    /// compiler's `cache_live`). The lm_head's rows never do.
+    pub backbone_cache_live: Vec<bool>,
     pub lm_head: Vec<StepRow>,
     pub lm_head_barriers: Vec<Fence>,
     pub lm_head_sources: Vec<Vec<RowSource>>,
