@@ -78,7 +78,9 @@ impl BenchStats {
         eprintln!("--- bench ---");
         eprintln!("startup     : {:.1} ms", self.startup_ms);
         if let Some(ms) = self.first_token_ms {
-            eprintln!("1st token   : {ms:.1} ms  (from the same start: the cold first request's token)");
+            eprintln!(
+                "1st token   : {ms:.1} ms  (from the same start: the cold first request's token)"
+            );
         }
 
         if let Some(first) = self.first_token {
@@ -282,7 +284,9 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         for (i, message) in prompts.iter().enumerate() {
             conversation.push(ChatMessage::user(message));
 
-            let mut stats = args.bench.then(|| BenchStats::new(startup_ms, first_token_ms));
+            let mut stats = args
+                .bench
+                .then(|| BenchStats::new(startup_ms, first_token_ms));
 
             if prompts.len() > 1 {
                 eprintln!("[turn {}] {}", i + 1, message);
