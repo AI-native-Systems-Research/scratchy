@@ -2722,6 +2722,7 @@ fn emit_arch_dispatcher(
                     #(#kv_cache_layers_arms)*
                 }
             }
+            #[cfg(any(feature = "cuda", feature = "metal"))]
             fn kv_addressable_tokens(&self) -> ::core::option::Option<usize> {
                 match self {
                     #(#kv_addressable_tokens_arms)*
