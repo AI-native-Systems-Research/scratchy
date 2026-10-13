@@ -253,6 +253,28 @@ pub struct Mtl4DispatchBatch {
     zero: u64,
 }
 
+/// Make every allocation `set` holds resident now: one command buffer, on a queue of its own, that
+/// declares it, as a forward's would, so `set` is left as resident as that forward leaves it (an
+/// un-wired set stays pageable: nothing is requested, so nothing is ended). Returns once the GPU
+/// has run it. A forward's first command buffer otherwise does this before its first dispatch:
+/// ~140 ms for gemma-4-26b's 14 GB of weights on a base M5.
+pub fn make_resident(device: &Device, set: &MetalResidencySet) {
+    let Some(batch) = Mtl4DispatchBatch::begin(device) else {
+        return;
+    };
+    batch.declare(set);
+    // A 4-byte fill, so it is a command buffer with work for the GPU to run.
+    let scratch = shared_zeroed(device, 16);
+    let _scratch = batch.residency().pin(scratch.clone());
+    // SAFETY: four bytes of a 16-byte shared buffer pinned in the batch's set.
+    unsafe {
+        batch
+            .encoder()
+            .fillBuffer_range_value(&scratch, objc2_foundation::NSRange::new(0, 4), 0)
+    };
+    batch.commit(true);
+}
+
 impl Mtl4DispatchBatch {
     /// Open a fresh MTL4 command buffer + compute encoder + residency set.
     /// Returns `None` if the host has no MTL4 queue (caller should skip).

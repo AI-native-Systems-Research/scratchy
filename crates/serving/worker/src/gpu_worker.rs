@@ -321,6 +321,11 @@ pub struct MetalWorker {
     spec_tail: Option<SpecTail>,
     /// Steps committed without waiting for them, oldest first.
     in_flight: std::collections::VecDeque<InFlightStep>,
+    /// The weights being made resident (`make_resident`, then `make_regions_resident`), joined at
+    /// shutdown.
+    weights_resident: Vec<std::thread::JoinHandle<()>>,
+    /// Whether the first forward is still to start its weights regions' residency.
+    regions_resident_pending: bool,
     /// Per-request grammar FSM state for constrained / guided decoding
     /// (`guided_grammar` / `response_format`). Keyed by req_id; created
     /// the first time a request with a grammar is scheduled and dropped
@@ -919,6 +924,8 @@ impl MetalWorker {
             spec_tail: None,
             committed: None,
             in_flight: std::collections::VecDeque::new(),
+            weights_resident: Vec::new(),
+            regions_resident_pending: false,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -4549,6 +4556,24 @@ impl Worker for MetalWorker {
             t_from_dir.elapsed(),
             weights.len()
         );
+        // Make the weights resident while the rest of the load runs: the first forward's command
+        // buffer otherwise does it before its first dispatch can start. One command buffer here,
+        // which leaves the engine init's own command buffers room; the first forward then
+        // finishes the job a region at a time in parallel (`execute_model`).
+        let weights_set = weights.metal_allocator().weights_residency().clone();
+        let resident_device = (*device_arc).clone();
+        self.weights_resident.extend(
+            std::thread::Builder::new()
+                .name("weights-resident".into())
+                .spawn(move || {
+                    scratchy_target_metal::mtl4_dispatch::make_resident(
+                        &resident_device,
+                        &weights_set,
+                    )
+                })
+                .ok(),
+        );
+        self.regions_resident_pending = true;
 
         // Metal backend default dtype is bf16 — matches the on-disk
         // `torch_dtype: bfloat16` of every modern HF Llama / Qwen /
@@ -5505,6 +5530,18 @@ impl Worker for MetalWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // The engine is ready and the GPU has nothing to run but this forward, which needs the
+        // weights resident: finish making them so, a region at a time, in parallel.
+        if std::mem::take(&mut self.regions_resident_pending)
+            && let Some(allocator) = self.gpu_device.as_ref().map(|d| d.allocator.clone())
+        {
+            self.weights_resident.extend(
+                std::thread::Builder::new()
+                    .name("weights-regions-resident".into())
+                    .spawn(move || allocator.make_regions_resident())
+                    .ok(),
+            );
+        }
         // Release wired GPU residency if the forward panics: a worker-thread
         // panic raises no signal under `panic = "unwind"`, so it bypasses the
         // graceful teardown and would otherwise leave the process pinning the
@@ -7022,6 +7059,10 @@ impl Worker for MetalWorker {
         // one-time first-run build; warm runs find nothing and return
         // instantly. (regression: c54955a3)
         scratchy_target_metal::metal_allocator::join_sidecar_writers();
+        // Nor a command buffer making the weights resident: a launch can end before it is done.
+        for resident in self.weights_resident.drain(..) {
+            let _ = resident.join();
+        }
         // Deterministically release the GPU residency set (system-wired
         // memory) BEFORE dropping the device. `requestResidency` wires every
         // weight / KV / scratch allocation; on a hard exit the kernel's

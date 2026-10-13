@@ -662,6 +662,39 @@ impl MetalAllocator {
         &self.weights_residency
     }
 
+    /// Make each mapped weights region (a shard's buffer) resident: one command buffer a region,
+    /// each on a queue and thread of its own ([`crate::mtl4_dispatch::make_resident`]), all at
+    /// once; returns once the GPU has run them all. In parallel the driver makes gemma-4-26b's
+    /// three shards resident in ~90 ms, where one command buffer for the whole weights set takes
+    /// ~150 ms on a base M5. But command buffers submitted meanwhile wait for them (the KV pool's
+    /// first chunk delayed engine init 50 ms), so this is for when all that is left to run is a
+    /// forward that needs the weights anyway.
+    pub fn make_regions_resident(&self) {
+        struct Region(Buffer);
+        // SAFETY: a Metal buffer is safe to use from any thread.
+        unsafe impl Send for Region {}
+        impl Region {
+            // Taken by a method so a closure captures the whole (sendable) region, not its field.
+            fn into_buffer(self) -> Buffer {
+                self.0
+            }
+        }
+        let regions: Vec<Region> = (self.mmaps.lock().expect("MetalAllocator mmaps Mutex"))
+            .iter()
+            .map(|r| Region((*r.aligned_buffer).clone()))
+            .collect();
+        std::thread::scope(|s| {
+            for region in regions {
+                s.spawn(move || {
+                    let set = crate::residency::MetalResidencySet::new_unwired(&self.device);
+                    let _region = set.pin(region.into_buffer());
+                    set.commit();
+                    crate::mtl4_dispatch::make_resident(&self.device, &set);
+                });
+            }
+        });
+    }
+
     /// Allocation breakdown for budget diagnostics: (mmap regions
     /// total bytes, arena capacity bytes, arena used bytes).
     pub fn allocation_breakdown(&self) -> (usize, usize, usize) {
