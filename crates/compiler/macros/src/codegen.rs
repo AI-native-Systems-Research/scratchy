@@ -13430,6 +13430,8 @@ pub fn emit_model(
                 // Nor the serving engine's batch: every bucket row's decode partials.
                 None,
                 ::core::default::Default::default(),
+                // Its callers read the logits on the host.
+                ::scratchy_target_metal::interpreter::metal::TerminalReads::Host,
             )
         }
 
@@ -13716,6 +13718,8 @@ pub fn emit_model(
                     // The buffers of a model whose forwards never overlap this one's, which the
                     // worker places its own in (an MTP head, its target's).
                     device.lent.clone(),
+                    // Whether its owner reads the logits on the host (a draft model's seed).
+                    device.terminal_reads,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             })
@@ -14097,8 +14101,11 @@ pub fn emit_model(
                             ::scratchy_target_metal::interpreter::metal::MetalDtype::Int4 =>
                                 ::core::unreachable!("Int4 has no logits dtype"),
                         };
+                        // Null where the logits are a sparse (private) slot the host cannot read:
+                        // the GPU's argmax and sampler bind the buffer, and a pool whose owner
+                        // reads them on the host keeps the slot shared (`TerminalReads::Host`).
                         let inner = crate::__gpu::tensor::GpuTensor::new(
-                            buf.contents().as_ptr() as *mut u8,
+                            ::scratchy_target_metal::sparse_arena::host_ptr(&buf),
                             &shape,
                             dtype,
                         );

@@ -37,6 +37,9 @@ pub struct GpuDevice {
     /// Buffers of a model whose forwards never overlap this device's, which the lazy
     /// `MetalWorkerPool::for_buckets` places its worker's own in (an MTP head's, its target's).
     pub lent: crate::interpreter::metal::LentActivation,
+    /// Whether this device's owner reads its logits on the host (a draft model's verify seed), so
+    /// the lazy `MetalWorkerPool::for_buckets` keeps the terminal slots shared rather than sparse.
+    pub terminal_reads: crate::interpreter::metal::TerminalReads,
 }
 
 impl GpuDevice {
@@ -52,6 +55,7 @@ impl GpuDevice {
             kv_addressing: Default::default(),
             max_decode_rows: None,
             lent: Default::default(),
+            terminal_reads: Default::default(),
         }
     }
 

@@ -265,6 +265,7 @@ pub mod quantized;
 pub mod residency;
 pub mod sampling;
 pub mod shader_cache;
+pub mod sparse_arena;
 pub mod sparse_kv;
 pub mod specialized_pipeline_cache;
 pub mod stream;
