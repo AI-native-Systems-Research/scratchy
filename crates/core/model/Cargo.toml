@@ -18,6 +18,8 @@ serde_json = { workspace = true }
 fs2 = { workspace = true }
 hf-hub-downloader = { workspace = true }
 indicatif = { workspace = true }
+inventory = { workspace = true }
+tokenizers = { workspace = true }
 tracing = { workspace = true }
 llguidance = { workspace = true, optional = true }
 toktrie = { workspace = true, optional = true }

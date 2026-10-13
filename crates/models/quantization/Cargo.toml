@@ -75,6 +75,7 @@ scratchy-core-model = { path = "../../core/model" }
 scratchy-tensors = { path = "../../tensors" }
 anyhow = { workspace = true }
 half = { workspace = true }
+rayon = { workspace = true }
 byteorder = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

@@ -15,6 +15,7 @@
 //! arithmetic that previously lived in `GpuWeights::take_affine_dequant_b4_bytes`.
 
 use anyhow::Result;
+use rayon::prelude::*;
 use scratchy_tensors::DType;
 
 /// CPU-dequantize one MLX-affine int4 weight to dense `[N, K]` bytes.
@@ -115,65 +116,81 @@ pub fn affine_dequant_b4_to_dtype(
         DType::BF16 => out_halves[idx] = half::bf16::from_f32(v).to_bits(),
         _ => unreachable!("dtype_out guarded above"),
     };
-    if bits == 4 {
-        for (offset, &byte) in weight_bytes.iter().enumerate() {
-            let oindex = offset * 2;
-            let gindex = oindex / gs;
-            let scale = decode_half(s_halves[gindex]);
-            let bias = decode_half(b_halves[gindex]);
-            let lo = (byte & 0x0f) as f32;
-            let hi = ((byte >> 4) & 0x0f) as f32;
-            store(out_halves, oindex, scale * lo + bias);
-            store(out_halves, oindex + 1, scale * hi + bias);
-        }
-    } else if bits == 2 {
-        // Continuous LSB-first bitstream: element i's 2 code bits live at
-        // bit offset 2*i of the (little-endian) byte array — 4 codes per
-        // byte, none straddling (2 divides 8). group_size (32/64/128) is a
-        // multiple of 4, so a byte's 4 codes all share one group. Mirrors
-        // MLX's `qdot` bits==2 shifts.
-        for (b, &byte) in weight_bytes.iter().enumerate() {
-            let gindex = (b * 4) / gs;
-            let scale = decode_half(s_halves[gindex]);
-            let bias = decode_half(b_halves[gindex]);
-            for j in 0..4 {
-                let code = ((byte >> (2 * j)) & 0x03) as f32;
-                store(out_halves, b * 4 + j, scale * code + bias);
-            }
-        }
-    } else if bits == 3 {
-        // Continuous LSB-first bitstream: element i's 3 code bits live at
-        // bit offset 3*i of the (little-endian) byte array. 8 elements span
-        // bits [0, 24) — exactly 3 bytes — and since group_size (32/64/128)
-        // is a multiple of 8, every 8-element run starts byte-aligned at
-        // byte 3*(i/8). Mirrors MLX's `qdot` bits==3 shifts so a code that
-        // straddles a byte boundary decodes identically to the metal
-        // kernels.
-        let total = n * k;
-        let (packs, _rem) = weight_bytes.as_chunks::<3>();
-        for (g, chunk) in packs.iter().enumerate() {
-            let triple = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
-            for j in 0..8 {
-                let oindex = g * 8 + j;
-                if oindex >= total {
-                    break;
+    // A run of whole rows: its codes, its groups' scales and biases, its outputs.
+    let dequant =
+        |weight_bytes: &[u8], s_halves: &[u16], b_halves: &[u16], out_halves: &mut [u16]| {
+            if bits == 4 {
+                for (offset, &byte) in weight_bytes.iter().enumerate() {
+                    let oindex = offset * 2;
+                    let gindex = oindex / gs;
+                    let scale = decode_half(s_halves[gindex]);
+                    let bias = decode_half(b_halves[gindex]);
+                    let lo = (byte & 0x0f) as f32;
+                    let hi = ((byte >> 4) & 0x0f) as f32;
+                    store(out_halves, oindex, scale * lo + bias);
+                    store(out_halves, oindex + 1, scale * hi + bias);
                 }
-                let code = ((triple >> (3 * j)) & 0x07) as f32;
-                let gindex = oindex / gs;
-                let scale = decode_half(s_halves[gindex]);
-                let bias = decode_half(b_halves[gindex]);
-                store(out_halves, oindex, scale * code + bias);
+            } else if bits == 2 {
+                // Continuous LSB-first bitstream: element i's 2 code bits live at
+                // bit offset 2*i of the (little-endian) byte array — 4 codes per
+                // byte, none straddling (2 divides 8). group_size (32/64/128) is a
+                // multiple of 4, so a byte's 4 codes all share one group. Mirrors
+                // MLX's `qdot` bits==2 shifts.
+                for (b, &byte) in weight_bytes.iter().enumerate() {
+                    let gindex = (b * 4) / gs;
+                    let scale = decode_half(s_halves[gindex]);
+                    let bias = decode_half(b_halves[gindex]);
+                    for j in 0..4 {
+                        let code = ((byte >> (2 * j)) & 0x03) as f32;
+                        store(out_halves, b * 4 + j, scale * code + bias);
+                    }
+                }
+            } else if bits == 3 {
+                // Continuous LSB-first bitstream: element i's 3 code bits live at
+                // bit offset 3*i of the (little-endian) byte array. 8 elements span
+                // bits [0, 24) — exactly 3 bytes — and since group_size (32/64/128)
+                // is a multiple of 8, every 8-element run starts byte-aligned at
+                // byte 3*(i/8). Mirrors MLX's `qdot` bits==3 shifts so a code that
+                // straddles a byte boundary decodes identically to the metal
+                // kernels.
+                let total = out_halves.len();
+                let (packs, _rem) = weight_bytes.as_chunks::<3>();
+                for (g, chunk) in packs.iter().enumerate() {
+                    let triple =
+                        (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+                    for j in 0..8 {
+                        let oindex = g * 8 + j;
+                        if oindex >= total {
+                            break;
+                        }
+                        let code = ((triple >> (3 * j)) & 0x07) as f32;
+                        let gindex = oindex / gs;
+                        let scale = decode_half(s_halves[gindex]);
+                        let bias = decode_half(b_halves[gindex]);
+                        store(out_halves, oindex, scale * code + bias);
+                    }
+                }
+            } else {
+                // bits == 8: one element per byte, value in 0..=255.
+                for (oindex, &byte) in weight_bytes.iter().enumerate() {
+                    let gindex = oindex / gs;
+                    let scale = decode_half(s_halves[gindex]);
+                    let bias = decode_half(b_halves[gindex]);
+                    store(out_halves, oindex, scale * (byte as f32) + bias);
+                }
             }
-        }
-    } else {
-        // bits == 8: one element per byte, value in 0..=255.
-        for (oindex, &byte) in weight_bytes.iter().enumerate() {
-            let gindex = oindex / gs;
-            let scale = decode_half(s_halves[gindex]);
-            let bias = decode_half(b_halves[gindex]);
-            store(out_halves, oindex, scale * (byte as f32) + bias);
-        }
-    }
+        };
+    // Rows are independent — K is a whole number of groups and of packed bytes (`bits * K` is a
+    // multiple of 8), so no group or byte spans two rows — and dequantize in parallel: serially this
+    // was 31 ms of gemma-4-26b's load (its thirty routers).
+    let rows = (1 << 16) / k + 1;
+    let (row_bytes, row_groups) = (n_packed_bytes / n.max(1), k / gs);
+    out_halves
+        .par_chunks_mut(rows * k)
+        .zip(weight_bytes.par_chunks(rows * row_bytes))
+        .zip(s_halves.par_chunks(rows * row_groups))
+        .zip(b_halves.par_chunks(rows * row_groups))
+        .for_each(|(((out, w), s), b)| dequant(w, s, b, out));
 
     Ok(out_bytes)
 }

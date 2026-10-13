@@ -97,7 +97,6 @@ fn encode_and_trim(text: &str, max_tokens: usize, tokenizer: &Tokenizer) -> Resu
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if ids.len() > max_tokens {
         tokenizer
-            .inner()
             .decode(&ids[..max_tokens], false)
             .map_err(|e| anyhow::anyhow!("{e}"))
     } else {

@@ -213,6 +213,99 @@ const METAL_ONLY: &[&str] = &["glm4-moe", "gpt-oss", "nemotron-h", "nemotron-h-l
 /// is dropped by the `supported` gate below before its configs are read.
 const SPYRE_CAPABLE: &[&str] = &["llama", "granite"];
 
+/// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
+/// vocab size; the text decoder's when `text_config` nests it).
+fn config_shape(path: &Path) -> Option<(String, u64, u64, u64)> {
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let text = cfg
+        .get("text_config")
+        .filter(|t| t.is_object())
+        .unwrap_or(&cfg);
+    let field = |k: &str| {
+        text.get(k)
+            .or_else(|| cfg.get(k))
+            .and_then(serde_json::Value::as_u64)
+    };
+    Some((
+        cfg["architectures"][0].as_str()?.to_string(),
+        field("hidden_size")?,
+        field("num_hidden_layers")?,
+        field("vocab_size")?,
+    ))
+}
+
+/// Write `$OUT_DIR/baked_tokenizers.rs`: a `BakedTokenizer` for the tokenizer of every checkpoint
+/// in the Hub cache that is a model this build compiles — its `config.json` has a selected
+/// config's architecture and shape — baked from its `tokenizer.json`
+/// (`scratchy_core_model::baked_tokenizer`). A tokenizer `bake` refuses is reported and loads
+/// from `tokenizer.json` at runtime as before, as does any checkpoint the cache does not hold.
+fn bake_tokenizers(out_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=HF_HUB_CACHE");
+    println!("cargo:rerun-if-env-changed=HF_HOME");
+    let compiled: BTreeSet<_> = scratchy_forward_compiler_macro::selected_config_paths()
+        .iter()
+        .filter_map(|config| config_shape(config))
+        .collect();
+    let root = hf_hub_downloader::cache::default_root();
+    if root.is_dir() {
+        // A model pulled after this build bakes on the next.
+        println!("cargo:rerun-if-changed={}", root.display());
+    }
+    let snapshots = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|repo| std::fs::read_dir(repo.path().join("snapshots")).ok())
+        .flatten()
+        .flatten()
+        .map(|snapshot| snapshot.path());
+    let mut baked = BTreeSet::new();
+    let mut code = String::new();
+    for snapshot in snapshots {
+        let tokenizer = snapshot.join("tokenizer.json");
+        if !config_shape(&snapshot.join("config.json")).is_some_and(|s| compiled.contains(&s)) {
+            continue;
+        }
+        let Some(digest) = scratchy_core_model::baked_tokenizer::cached_digest(&tokenizer) else {
+            continue;
+        };
+        if !baked.insert(digest.clone()) {
+            continue;
+        }
+        let json = std::fs::read_to_string(&tokenizer).expect("read a cached tokenizer.json");
+        let bake = match scratchy_core_model::baked_tokenizer::bake(&json, &digest) {
+            Ok(bake) => bake,
+            Err(why) => {
+                println!("cargo:warning={} is not baked: {why}", tokenizer.display());
+                continue;
+            }
+        };
+        write_if_changed_bytes(
+            &out_dir.join(format!("tokenizer-{digest}.bin")),
+            &bake.tables,
+        );
+        write_if_changed(
+            &out_dir.join(format!("tokenizer-{digest}.json")),
+            &bake.pipeline,
+        );
+        code += &format!(
+            "::scratchy_forward_compiler::inventory::submit! {{\n    \
+             ::scratchy_core_model::baked_tokenizer::BakedTokenizer {{\n        \
+             digest: \"{digest}\",\n        \
+             tables: &::scratchy_core_model::baked_tokenizer::Aligned(*include_bytes!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.bin\"))),\n        \
+             pipeline: include_str!(concat!(env!(\"OUT_DIR\"), \"/tokenizer-{digest}.json\")),\n    \
+             }}\n}}\n"
+        );
+    }
+    write_if_changed(&out_dir.join("baked_tokenizers.rs"), &code);
+}
+
+fn write_if_changed_bytes(out: &Path, bytes: &[u8]) {
+    if std::fs::read(out).ok().as_deref() != Some(bytes) {
+        std::fs::write(out, bytes).expect("write a baked tokenizer");
+    }
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -326,6 +419,7 @@ fn main() {
         });
     #[cfg(feature = "metal")]
     write_metal_bake(&out_dir);
+    bake_tokenizers(&out_dir);
 
     // Shell-completion registry. Resolving it needs the network, so it happens
     // only under `hf-completions`; WRITING it is unconditional, because

@@ -155,7 +155,6 @@ impl IncrementalDetokenizer {
         if self.stream_prefix.is_empty() && !self.stream_ids.is_empty() {
             match self
                 .tokenizer
-                .inner()
                 .decode(&self.stream_ids, self.skip_special_tokens)
             {
                 Ok(new_prefix) => {
@@ -176,7 +175,6 @@ impl IncrementalDetokenizer {
         // Line 1109: Decode all ids
         let string = match self
             .tokenizer
-            .inner()
             .decode(&self.stream_ids, self.skip_special_tokens)
         {
             Ok(s) => s,
@@ -201,7 +199,6 @@ impl IncrementalDetokenizer {
 
             match self
                 .tokenizer
-                .inner()
                 .decode(&self.stream_ids, self.skip_special_tokens)
             {
                 Ok(new_prefix) => {
@@ -751,7 +748,7 @@ mod tests {
                 let prefix_tokens =
                     &detok.stream_ids[..detok.stream_prefix_index.min(detok.stream_ids.len())];
                 if !prefix_tokens.is_empty()
-                    && let Ok(decoded) = tok.inner().decode(prefix_tokens, false)
+                    && let Ok(decoded) = tok.decode(prefix_tokens, false)
                 {
                     // The decoded prefix tokens should match or be a prefix of stream_prefix
                     assert!(

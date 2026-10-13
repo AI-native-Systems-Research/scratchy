@@ -11,6 +11,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use scratchy_core_model::baked_tokenizer::{self, Baked, BakedTokenizer};
+use tokenizers::tokenizer::PostProcessor as _;
 use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
 use crate::error::{ServeError, ServeResult};
@@ -19,25 +21,62 @@ use crate::error::{ServeError, ServeResult};
 // Tokenizer
 // ---------------------------------------------------------------------------
 
-/// A wrapper around the HuggingFace `tokenizers::Tokenizer` that provides
+/// A wrapper around the HuggingFace `tokenizers` tokenizer that provides
 /// the core encode/decode interface needed by the serving layer.
 pub struct Tokenizer {
-    inner: HfTokenizer,
+    inner: Inner,
     /// Cached set of special token IDs for fast lookup.
     special_ids: HashSet<u32>,
     /// The EOS token ID, if present.
     eos_token_id: Option<u32>,
 }
 
+/// The `tokenizers` tokenizer a [`Tokenizer`] wraps: parsed from a `tokenizer.json`, or compiled
+/// into the binary (`scratchy_core_model::baked_tokenizer`). Both are `tokenizers::TokenizerImpl`s
+/// differing only in their model, so every method is the same call on either.
+enum Inner {
+    File(Box<HfTokenizer>),
+    Baked(Box<Baked>),
+}
+
+/// `$body`, with `$t` bound to whichever tokenizer `$inner` holds.
+macro_rules! with_inner {
+    ($inner:expr, $t:ident => $body:expr) => {
+        match $inner {
+            Inner::File($t) => $body,
+            Inner::Baked($t) => $body,
+        }
+    };
+}
+
 impl Tokenizer {
-    /// Load a tokenizer from a `tokenizer.json` file.
+    /// Load the tokenizer of a `tokenizer.json` file: the one compiled into this binary when the
+    /// build baked it (a Hub-cache file, keyed by its blob digest) — no parse, where gemma-4's
+    /// file takes ~300 ms — else the file's.
     pub fn from_file(path: impl AsRef<Path>) -> ServeResult<Self> {
+        let path = path.as_ref();
+        if let Some(baked) =
+            baked_tokenizer::cached_digest(path).and_then(|digest| BakedTokenizer::find(&digest))
+        {
+            match baked.load() {
+                Ok(tokenizer) => {
+                    tracing::info!("Tokenizer compiled in (tokenizer.json {})", baked.digest);
+                    return Ok(Self::new(Inner::Baked(Box::new(tokenizer))));
+                }
+                Err(e) => tracing::warn!("{e}; loading {} instead", path.display()),
+            }
+        }
         let inner = HfTokenizer::from_file(path)
             .map_err(|e| ServeError::Engine(format!("Failed to load tokenizer: {e}")))?;
         Ok(Self::from_hf_tokenizer(inner))
     }
 
     /// Create a `Tokenizer` from a raw HuggingFace `Tokenizer` instance.
+    pub fn from_hf_tokenizer(inner: HfTokenizer) -> Self {
+        Self::new(Inner::File(Box::new(inner)))
+    }
+
+    /// Every [`Tokenizer`], whatever its source.
     ///
     /// ⛔⛔⛔ TRUNCATION IS DISABLED HERE, AND IT MUST STAY DISABLED. A `tokenizer.json` may carry its
     /// own `truncation` stanza, and the `tokenizers` crate then applies it to every `encode` with no
@@ -54,16 +93,16 @@ impl Tokenizer {
     /// LENGTH IS THE SERVING LAYER'S DECISION, NOT THE TOKENIZER'S: `max_model_len` and the scheduler
     /// budget already bound it, and they can REFUSE. A silent right-truncation cannot — it produces a
     /// fluent answer to a question the user did not ask.
-    pub fn from_hf_tokenizer(inner: HfTokenizer) -> Self {
-        let mut inner = inner;
-        inner
-            .with_truncation(None)
-            .expect("disabling truncation cannot fail");
+    fn new(mut inner: Inner) -> Self {
+        with_inner!(&mut inner, t => {
+            t.with_truncation(None)
+                .expect("disabling truncation cannot fail");
+        });
         let special_ids = Self::collect_special_ids(&inner);
-        let eos_token_id = inner
+        let eos_token_id = with_inner!(&inner, t => t
             .token_to_id("</s>")
-            .or_else(|| inner.token_to_id("<|endoftext|>"))
-            .or_else(|| inner.token_to_id("<|end_of_text|>"));
+            .or_else(|| t.token_to_id("<|endoftext|>"))
+            .or_else(|| t.token_to_id("<|end_of_text|>")));
         Self {
             inner,
             special_ids,
@@ -97,10 +136,10 @@ impl Tokenizer {
                 // Skip entries the tokenizer already treats as
                 // special — re-adding via `add_special_tokens` would
                 // append a fresh ID and break vocabulary alignment.
-                self.inner.token_to_id(c).is_none_or(|id| {
-                    let dec = self.inner.get_added_tokens_decoder();
+                with_inner!(&self.inner, t => t.token_to_id(c).is_none_or(|id| {
+                    let dec = t.get_added_tokens_decoder();
                     !dec.get(&id).map(|t| t.special).unwrap_or(false)
-                })
+                }))
             })
             .map(|c| AddedToken::from(c.clone(), true))
             .collect();
@@ -113,7 +152,8 @@ impl Tokenizer {
             added.len(),
             names
         );
-        if let Err(err) = self.inner.add_special_tokens(added) {
+        let added = with_inner!(&mut self.inner, t => t.add_special_tokens(added).map(|_| ()));
+        if let Err(err) = added {
             tracing::warn!("failed to register additional special tokens: {err}");
             return;
         }
@@ -122,33 +162,40 @@ impl Tokenizer {
 
     /// Encode text into token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> ServeResult<Vec<u32>> {
-        let encoding = self
-            .inner
-            .encode(text, add_special_tokens)
+        let encoding = with_inner!(&self.inner, t => t.encode(text, add_special_tokens))
             .map_err(|e| ServeError::Engine(format!("Tokenization failed: {e}")))?;
         Ok(encoding.get_ids().to_vec())
     }
 
     /// Decode token IDs back into text.
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> ServeResult<String> {
-        self.inner
-            .decode(ids, skip_special_tokens)
+        with_inner!(&self.inner, t => t.decode(ids, skip_special_tokens))
             .map_err(|e| ServeError::Engine(format!("Detokenization failed: {e}")))
     }
 
     /// Get the string representation of a single token ID.
     pub fn id_to_token(&self, id: u32) -> Option<String> {
-        self.inner.id_to_token(id)
+        with_inner!(&self.inner, t => t.id_to_token(id))
     }
 
     /// Get the token ID for a string token.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.inner.token_to_id(token)
+        with_inner!(&self.inner, t => t.token_to_id(token))
     }
 
     /// Get the vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        self.inner.get_vocab_size(true)
+        with_inner!(&self.inner, t => t.get_vocab_size(true))
+    }
+
+    /// How many special tokens encoding a single sequence (`is_pair` false) or a pair adds.
+    pub fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
+        with_inner!(&self.inner, t => t.get_post_processor().map_or(0, |p| p.added_tokens(is_pair)))
+    }
+
+    /// The special token IDs.
+    pub fn special_token_ids(&self) -> &HashSet<u32> {
+        &self.special_ids
     }
 
     /// Get the EOS token ID, if known.
@@ -163,36 +210,13 @@ impl Tokenizer {
 
     /// Get the full vocabulary as a token-to-id mapping.
     pub fn get_vocab(&self) -> std::collections::HashMap<String, u32> {
-        self.inner.get_vocab(true)
-    }
-
-    /// Get a reference to the underlying HuggingFace tokenizer.
-    pub fn inner(&self) -> &HfTokenizer {
-        &self.inner
-    }
-
-    /// Create a DecodeStream for incremental decoding.
-    ///
-    /// The DecodeStream maintains state for streaming decode, allowing efficient
-    /// incremental detokenization as tokens are generated.
-    pub fn decode_stream(
-        &self,
-        skip_special_tokens: bool,
-    ) -> tokenizers::tokenizer::DecodeStream<
-        '_,
-        impl tokenizers::Model,
-        impl tokenizers::Normalizer,
-        impl tokenizers::PreTokenizer,
-        impl tokenizers::PostProcessor,
-        impl tokenizers::Decoder,
-    > {
-        self.inner.decode_stream(skip_special_tokens)
+        with_inner!(&self.inner, t => t.get_vocab(true))
     }
 
     /// Collect all special token IDs from the tokenizer.
-    fn collect_special_ids(tokenizer: &HfTokenizer) -> HashSet<u32> {
+    fn collect_special_ids(tokenizer: &Inner) -> HashSet<u32> {
         let mut ids = HashSet::new();
-        let added = tokenizer.get_added_tokens_decoder();
+        let added = with_inner!(tokenizer, t => t.get_added_tokens_decoder());
         for (&id, token) in &added {
             if token.special {
                 ids.insert(id);
