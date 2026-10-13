@@ -39,9 +39,10 @@ function render() {
   if (!diffing) {
     // Replace the snippet's content outright (not its innerHTML), so the
     // cds-code-snippet sees a slot change and re-measures its "Show more".
-    const lines = document.createElement('span');
-    lines.innerHTML = A[L].html.join('\n');
-    $('code').replaceChildren(lines);
+    // Every architecture's highlighted snippet ships as an inert <template>
+    // that the page itself rendered; cloning its nodes into the pane never
+    // re-parses text as HTML, so the JSON blob stays pure data.
+    $('code').replaceChildren($('tpl-' + L).content.cloneNode(true));
     $('path').textContent = A[L].path;
     $('meta').textContent = A[L].lines + ' lines';
   } else {
