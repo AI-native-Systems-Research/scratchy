@@ -1480,13 +1480,6 @@ mod tests {
         assert!(Backend::MlxLm.rejects_cli_mode().is_none());
     }
 
-    /// Banner-only output must yield NO measurement, not a fast one.
-    ///
-    /// This is the other half of the first-content-byte contract: a child that
-    /// prints only a prelude has not produced a token, so `ttft_exec` must stay
-    /// `None` and the caller must be able to tell. Verified against a real child
-    /// rather than a string, because the byte loop and the classifier have to
-    /// agree — and a run of only such reps exits non-zero (see `run`).
     /// A child that dies after printing part of an answer is a crash, carried
     /// with its exit status and the end of its stderr, so the parity gate can
     /// say so instead of reporting the half answer as a mismatch.
@@ -1564,6 +1557,13 @@ mod tests {
         assert!(!msg.contains("load path"), "reported as a mismatch: {msg}");
     }
 
+    /// Banner-only output must yield NO measurement, not a fast one.
+    ///
+    /// This is the other half of the first-content-byte contract: a child that
+    /// prints only a prelude has not produced a token, so `ttft_exec` must stay
+    /// `None` and the caller must be able to tell. Verified against a real child
+    /// rather than a string, because the byte loop and the classifier have to
+    /// agree — and a run of only such reps exits non-zero (see `run`).
     #[test]
     fn banner_only_child_measures_nothing() {
         let rep = run_cli(

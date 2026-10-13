@@ -532,6 +532,10 @@ serve_up() { # log ready_path cmd...
     done
     return 1
 }
+scratchy_up() { # the scratchy server every scratchy measurement after the ladder uses
+    serve_up "${RAW}/serve-${stem}.log" /v1/models "${model_bin}" serve "${id}" --port "${PORT}" \
+        ${KV_CACHE_DTYPE:+--kv-cache-dtype "${KV_CACHE_DTYPE}"} ${SERVE_ARGS}
+}
 serve_down() {
     [[ -n "${srv}" ]] || return 0
     # stderr off for the whole block: bash's "Terminated" job notice is not a failure.
@@ -1111,8 +1115,7 @@ PY
             "${model_bin} serve ${id} --port ${PORT}${KV_CACHE_DTYPE:+ --kv-cache-dtype ${KV_CACHE_DTYPE}}${SERVE_ARGS:+ ${SERVE_ARGS}}" \
             scratchy "${RAW}/exec-${stem}.json"
         echo "--- scr bench serve (warm steady state, greedy, conc 1)"
-        if serve_up "${RAW}/serve-${stem}.log" /v1/models "${model_bin}" serve "${id}" --port "${PORT}" \
-                ${KV_CACHE_DTYPE:+--kv-cache-dtype "${KV_CACHE_DTYPE}"} ${SERVE_ARGS}; then
+        if scratchy_up; then
             "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${id}" \
                 --num-prompts "${NUM_PROMPTS}" --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" \
                 --max-concurrency 1 --temperature 0 \
@@ -1121,14 +1124,26 @@ PY
                 --output-json "${RAW}/serve-${stem}.json" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1 \
                 && { printf '    '; numbers "${RAW}/serve-${stem}.json"; } \
                 || echo "    bench serve failed (see ${RAW}/cells-${stem}.log)" >&2
+            serve_down
+            # A fresh server per axis, in --scale-axes order, as the rivals get:
+            # a failure that ends one axis's sweep (usually out of memory) must
+            # not cost scratchy the axes after it while the rivals keep theirs.
             if (( SCALING )); then
-                echo "--- scaling sweep, scratchy"
-                run_scale_cells "${RAW}/scale-${stem}"
+                IFS=',' read -r -a scratchy_axes <<<"${SCALE_AXES}"
+                for ax in "${scratchy_axes[@]}"; do
+                    echo "--- scaling sweep, scratchy ${ax}"
+                    if scratchy_up; then
+                        run_scale_cells "${RAW}/scale-${stem}" "${ax}"
+                    else
+                        echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
+                    fi
+                    serve_down
+                done
             fi
         else
             echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
+            serve_down
         fi
-        serve_down
     fi
 
     # ---- comparison engines, in page order; none when the parity gate failed
