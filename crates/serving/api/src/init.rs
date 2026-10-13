@@ -824,7 +824,8 @@ fn resolve_speculative_decoding(config: &VllmConfig) -> Result<Speculation> {
 /// The target's multi-token-prediction head and where its tensors are, when this build compiled
 /// one for the target's checkpoint architecture and the target's config declares MTP layers: the
 /// target's own checkpoint when that holds tensors under the head's `checkpoint_prefix`
-/// ([`Draft::TargetHead`]), else the repo the head is published under, named from the target's
+/// ([`Draft::TargetHead`]) or names the sidecar file an MLX conversion stripped the head into
+/// (`mtp_file`), else the repo the head is published under, named from the target's
 /// (`HeadRegistration::repo_of`), when it resolves ([`Draft::Checkpoint`]). With neither the target
 /// serves without drafting, and says why — a build that compiles the head serves every checkpoint
 /// a build without it does.
@@ -861,7 +862,15 @@ fn target_head(
         .map(|prefix| scratchy_core_model::weight::checkpoint_holds(&target_dir, prefix))
         .transpose()
         .with_context(|| format!("reading {target_dir:?}'s tensor names"))?;
-    if in_checkpoint == Some(true) {
+    // An MLX conversion that strips the head out of the main shards can still publish it as a
+    // sidecar file the checkpoint's config names (`mtp_file`, e.g. Nemotron-3 Super OptiQ's
+    // `optiq/mtp.safetensors`): the shard index does not list its tensors, but the worker loads
+    // the head from that file under the same `checkpoint_prefix`.
+    let sidecar = (target.extra.get("mtp_file"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some_and(|file| target_dir.join(file).is_file());
+    if in_checkpoint == Some(true) || sidecar {
         return Ok(Some((head, Draft::TargetHead)));
     }
     let Some(repo) = head.repo_of(&config.model) else {

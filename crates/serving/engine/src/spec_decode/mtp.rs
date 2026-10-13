@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Multi-token-prediction (MTP) proposer: drafts with a head that ships beside its target model
-//! (Qwen3.5/3.6 `mtp.*`; an MLX drafter repo carries it alone) and reads the target's final
-//! (post-norm) hidden states.
+//! (Qwen3.5/3.6 `mtp.*`; an MLX drafter repo carries it alone; Nemotron-3 Super's OptiQ conversion
+//! publishes it as a sidecar file the checkpoint's config names, `mtp_file`) and reads the
+//! target's final (post-norm) hidden states.
 //!
 //! Per step (prefill, decode or verify):
 //!
@@ -45,8 +46,10 @@
 //!
 //! # TODO
 //!
-//! Measured on Qwen3.6-35B-A3B (`mlx-community/Qwen3.6-35B-A3B-4bit` with its MLX head), the one
-//! target with a head config; "sampled" is the model's default sampling, "greedy" temperature 0.
+//! Measured on Qwen3.6-35B-A3B (`mlx-community/Qwen3.6-35B-A3B-4bit` with its MLX head) and on
+//! Nemotron-3 Super 120B-A12B (`mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit` with
+//! its sidecar head), the two targets with head configs; "sampled" is the model's default
+//! sampling, "greedy" temperature 0.
 //!
 //! **The gate** (`spec_max_seqs`, the head's `arch.json`):
 //!
@@ -124,6 +127,20 @@
 //!   before the fold fix that keeps an exported final hidden written (after a verify step that
 //!   kept no draft, the second draft matched the oracle's 5 times in 23 before it, 28 in 28
 //!   after); k = 3 is not re-measured since.
+//! - Measured on Nemotron-3 Super 120B-A12B (OptiQ-2bit, its sidecar head; M5 Max, one request,
+//!   greedy, `scr chat --bench`, a short prompt): a plain step 15.0 ms, a drafting step 35.8 ms
+//!   (p10-p90 35.06-37.04 — a fixed cost, not routing variance), 2.4 tokens a step, output
+//!   67.7 -> 66.9 tok/s, time to first token 107.5 -> 110.7 ms: flat, and structural rather than
+//!   a tuning gap. A plain step is this target's active stream (12B active at 4-bit, about
+//!   6 GiB — the whole 15 ms at the device's bandwidth), of which the routed experts are the
+//!   largest share (22 active of 512 a layer), and a verify step's 3 rows multiply exactly that
+//!   share: uniform routing draws 66 of 512, about 63 distinct, 2.9x the plain step's 22 — plus
+//!   the Gated-DeltaNet rows and the head's two passes, which the acceptance (2.4 tokens a step)
+//!   meets. By the same arithmetic no depth wins: k = 1's 2 rows draw about 43 distinct (1.9x)
+//!   against 1.79 tokens a step (2.4 at k = 2 solves 1 + p + p², p about 0.79). The head pays
+//!   where the routed experts hold a minority of the plain step's stream (Qwen3.6: 256 experts,
+//!   8 a row) or where KV reads dilute it; not measured past one sequence (the gate is 2) nor at
+//!   depth of context.
 //!
 //! **Measurement, interface, size:**
 //!

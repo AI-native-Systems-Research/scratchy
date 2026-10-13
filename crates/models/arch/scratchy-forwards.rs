@@ -212,6 +212,7 @@ const METAL_ONLY: &[&str] = &[
     "gpt-oss",
     "nemotron-h",
     "nemotron-h-latent",
+    "nemotron-h-mtp",
 ];
 /// Arches that additionally support the spyre (KTIR) backend.
 ///

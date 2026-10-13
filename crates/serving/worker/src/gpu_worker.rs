@@ -1558,7 +1558,9 @@ impl MetalWorker {
     /// checkpoint carries (the server found its tensors before any load; a head published apart
     /// comes as a [`Draft::Checkpoint`]): the tensors under the head's `checkpoint_prefix`, lent
     /// from the target's store under the bare names the head binds (the same mmap: nothing uploads
-    /// twice), its config the target's own.
+    /// twice), its config the target's own. A checkpoint whose config names a sidecar file
+    /// (`mtp_file`) carries the head there instead — an MLX conversion that strips the head out
+    /// of the main shards can still publish it as that file.
     fn target_head(
         &self,
         allocator: MetalAllocator,
@@ -1578,25 +1580,50 @@ impl MetalWorker {
                 "this build compiled no multi-token-prediction head for {arch} ({model})"
             ))
         })?;
-        let prefix = head
-            .checkpoint_prefix
-            .filter(|p| refs.holds(p))
-            .ok_or_else(|| {
-                ExecutorError::WorkerInit(format!(
-                    "{model}'s checkpoint holds no tensor under its multi-token-prediction head's \
-                 prefix ({:?})",
-                    head.checkpoint_prefix
-                ))
+        if let Some(prefix) = head.checkpoint_prefix.filter(|p| refs.holds(p)) {
+            let mut weights = GpuWeights::empty(allocator);
+            let lent = weights.lend(refs, prefix, "", None).map_err(|e| {
+                ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}"))
             })?;
-        let mut weights = GpuWeights::empty(allocator);
-        let lent = weights
-            .lend(refs, prefix, "", None)
-            .map_err(|e| ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}")))?;
-        info!(
-            "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors under \
-             {prefix})"
-        );
-        Ok((weights, head.arch.to_string(), target_config.clone()))
+            info!(
+                "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors under \
+                 {prefix})"
+            );
+            return Ok((weights, head.arch.to_string(), target_config.clone()));
+        }
+        // An MLX conversion that strips the head out of the main shards can still publish it as
+        // a sidecar file the checkpoint's config names (`mtp_file`, e.g. Nemotron-3 Super
+        // OptiQ's `optiq/mtp.safetensors`): its tensors sit under the same `checkpoint_prefix`,
+        // so they lend exactly as the in-shard ones do. Each ref carries its own mmap, so the
+        // sidecar store can drop here without dangling anything.
+        if let Some(file) = target_config
+            .extra
+            .get("mtp_file")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            && let Some(prefix) = head.checkpoint_prefix
+        {
+            let dir = resolve_model_path(model, self.config.hf_token.as_deref(), None, None)?;
+            let path = dir.join(file);
+            let sidecar = GpuWeights::from_single_file(&path, allocator.clone()).map_err(|e| {
+                ExecutorError::WorkerInit(format!("MTP head sidecar {}: {e}", path.display()))
+            })?;
+            let sidecar_refs = sidecar.tensor_refs();
+            let mut weights = GpuWeights::empty(allocator);
+            let lent = weights.lend(&sidecar_refs, prefix, "", None).map_err(|e| {
+                ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}"))
+            })?;
+            info!(
+                "ScratchyWorker(metal): MTP head from the target's sidecar {file} ({lent} tensors \
+                 under {prefix})"
+            );
+            return Ok((weights, head.arch.to_string(), target_config.clone()));
+        }
+        Err(ExecutorError::WorkerInit(format!(
+            "{model}'s checkpoint holds no tensor under its multi-token-prediction head's \
+             prefix ({:?}) and names no sidecar file carrying it",
+            head.checkpoint_prefix
+        )))
     }
 
     /// Load the speculative draft model onto the same Metal device +

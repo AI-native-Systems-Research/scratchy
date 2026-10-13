@@ -1075,6 +1075,29 @@ pub fn load_file_with_preset(
     model_params_from_json(&merged, &variant_stem, config_path, tracked, &spec)
 }
 
+/// Load one in-checkpoint head base — its TARGET's config through the head arch's own spec
+/// and drift tier — the sequence `load_dir_mode`'s base loop performs for an `in_checkpoint`
+/// head, reachable one pair at a time.
+///
+/// Test-only, for the same reasons [`load_file`] is, plus one more: the head's spec and
+/// `.overrides.json` live in the HEAD's configs dir while its base config lives in the
+/// target's, so no single-dir loader can express it. The merge sequence is NOT rebuilt
+/// here — it is the walk's own (read the target's json, deep-merge the head dir's
+/// `<stem>.overrides.json`, parse under the head's `load_arch_json` spec), so a test
+/// asserts against what a real build compiles.
+#[cfg(test)]
+pub fn load_head_file(
+    target_config_path: &Path,
+    head_arch_dir: &Path,
+) -> Result<ModelParams, ConfigError> {
+    let stem = stem_of(target_config_path)?;
+    let (_, mut json) = read_json_file(target_config_path)?;
+    let mut tracked: Vec<PathBuf> = Vec::new();
+    apply_overrides_file(head_arch_dir, &stem, &mut json, &mut tracked)?;
+    let spec = load_arch_json(head_arch_dir)?;
+    model_params_from_json(&json, &stem, target_config_path, tracked, &spec)
+}
+
 /// Read + parse a JSON file, returning the raw string (for
 /// diagnostics) and the parsed `Value`. Centralized so
 /// `ConfigError::{Io, Json}` always carry the right path.

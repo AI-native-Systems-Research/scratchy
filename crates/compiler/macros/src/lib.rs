@@ -1876,7 +1876,7 @@ pub fn compile_carrier(
                         )
                     }),
                     lent: scratchy_forward_compiler::LentWeight::ALL
-                        .map(|w| codegen::lent_weight_prefix(&sm.prog, sm.model, w)),
+                        .map(|w| codegen::lent_weight_prefix(&sm.prog, &sm.fuf, sm.model, w)),
                     lm_head_rows: sm.model.bounds.get("vocab_size").copied().unwrap_or(0),
                     drafts_for: sm.model.drafts_for.clone(),
                     repo_infix: sm.model.drafter_repo_infix.clone(),

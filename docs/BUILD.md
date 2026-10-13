@@ -182,9 +182,11 @@ cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec
   selected config of theirs that declares its layers, that config verbatim
   (`crates/compiler/macros/src/config.rs`). Serving drafts with the head from
   the target's own checkpoint when that carries it (its weight map holds
-  `language_model.mtp.*`: `scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp`), else
-  from the repo it is published under when that resolves
-  (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`), else it serves without
+  `language_model.mtp.*`: `scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp`) or
+  names the sidecar file an MLX conversion stripped it into (`mtp_file`:
+  Nemotron-3 Super OptiQ keeps its head in `optiq/mtp.safetensors`, under the
+  same `mtp.*` prefix), else from the repo it is published under when that
+  resolves (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`), else it serves without
   drafting and says why. `--num-speculative-tokens 0` serves without drafting.
 - **`spec/mtp`** — adds the drafters published as models of their own, which
   name their targets (`head_targets`) and draft only when

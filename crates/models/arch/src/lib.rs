@@ -122,6 +122,10 @@ pub mod nemotron_h;
 #[path = "arch/nemotron_h_latent.rs"]
 pub mod nemotron_h_latent;
 
+#[cfg(all(feature = "arch-nemotron-h-mtp", feature = "metal"))]
+#[path = "arch/nemotron_h_mtp.rs"]
+pub mod nemotron_h_mtp;
+
 #[cfg(all(feature = "arch-phi3", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/phi3.rs"]
 pub mod phi3;

@@ -162,7 +162,9 @@ the preset is defined but never selectable.
 
 A multi-token-prediction (MTP) head drafts tokens for speculative decoding
 from its target model's final hidden states. It is an arch of its own —
-`qwen3-5-mtp` (`dsl/qwen3-5-mtp.py`) for Qwen3.5/3.6 — whose forward reads
+`qwen3-5-mtp` (`dsl/qwen3-5-mtp.py`) for Qwen3.5/3.6, `gemma4-assistant`
+(`dsl/gemma4-assistant.py`) for Gemma 4, `nemotron-h-mtp`
+(`dsl/nemotron-h-mtp.py`) for Nemotron-3 Super — whose forward reads
 the `target_hidden` extern; that alone makes it a head (the macro registers
 it as one, and the serving stack drafts with the MTP proposer instead of a
 draft model). What its `arch.json` declares:
@@ -175,22 +177,33 @@ draft model). What its `arch.json` declares:
   compiles on every selected config of those arches that declares its layers
   (`mtp_num_hidden_layers` above zero), that config verbatim.
 - **`checkpoint_prefix: "language_model.mtp"`** — where its tensors sit in
-  such a checkpoint (MLX's layout). A target checkpoint holding tensors there
-  carries its head, which the worker then loads from the target's own store,
-  under the bare names it binds (the same mmap, nothing uploaded twice).
+  such a checkpoint (MLX's layout; Nemotron-3's is `mtp`). A target checkpoint
+  holding tensors there carries its head, which the worker then loads from
+  the target's own store, under the bare names it binds (the same mmap,
+  nothing uploaded twice). An MLX conversion can also publish the head as a
+  *sidecar file* the checkpoint's config names (`mtp_file`, Nemotron-3 Super
+  OptiQ's `optiq/mtp.safetensors`) instead of in the main shards — the worker
+  loads it from there, under the same prefix.
 - **`drafter_repo_infix: "-MTP"`** — an MLX conversion strips the head's
   tensors from the target and publishes them apart, as the target's repo with
   this before its last `-` token (`mlx-community/Qwen3.6-35B-A3B-4bit` →
   `mlx-community/Qwen3.6-35B-A3B-MTP-4bit`). The server drafts with that repo
   when the target's checkpoint does not carry the head and the repo resolves;
-  with neither it serves without drafting, and says why.
+  with neither it serves without drafting, and says why. A head no repo
+  publishes apart (Nemotron-3) declares no infix: its checkpoints all carry
+  it.
 - **`decoder_safetensors_prefix: ""`** — the drafter stores its tensors bare
   (`fc.*`, `layers.0.*`, `norm.*`, `pre_fc_norm_*`).
 - **`params`** — its configs are the target's verbatim HF config, so
   `num_hidden_layers` *replaces* the target's with `mtp_num_hidden_layers`;
-  `vocab_size` replaces the target's with the head's draft vocabulary (a
-  prefix of the target's token ids, 65536 for Qwen3.6), while
-  `embed_vocab_size` keeps every token for the embedding table.
+  `vocab_size` replaces the target's with the head's draft vocabulary when
+  the head drafts over a prefix of the target's token ids (65536 for
+  Qwen3.6, with `embed_vocab_size` keeping every token for the embedding
+  table) — Nemotron-3's head declares no such param and drafts over the full
+  vocabulary. A hybrid target's head restores its own layer schedule from
+  the config's `mtp_hybrid_override_pattern` (the head dir's per-stem
+  `.overrides.json`, which also carries the head's layer count and preserves
+  the target's as `target_num_hidden_layers` — its KV pool is the target's).
 
 The head carries no `embed_tokens` / `lm_head`: the worker lends it the
 target's (the same mmap, nothing uploaded twice), the lm_head cut to the
