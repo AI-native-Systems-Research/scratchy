@@ -931,19 +931,27 @@ impl From<GatedGatherQmvConstants> for Vec<ConstantValue> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SharedExperts {
     /// Each pair in its own threadgroup: a bucket of many rows, whose experts take many pairs.
+    /// An expert two pairs read costs two reads, but no pair scans the bucket's others.
     Apart,
     /// An expert's pairs one after another in the threadgroup of its first pair, which reads the
-    /// expert's weights once: a bucket of a speculative verify step's few rows. Each pair scans
-    /// the pairs before it, so the bucket's pairs must be few.
+    /// expert's weights once: a bucket of a speculative verify step's few rows. Every threadgroup
+    /// scans the bucket's every other pair for its expert, so the mode's cost grows with the
+    /// square of the pair count while the reads it saves stay the few pairs that share one.
     InFirstPair,
 }
 
 impl SharedExperts {
-    /// A bucket of `bucket_m` rows' choice: in the first pair at a verify-sized bucket of more than
-    /// one row (`op_abi::{METAL_SHARED_EXPERTS_FROM, METAL_VERIFY_ROWS}`).
-    pub fn for_bucket(bucket_m: u32) -> Self {
-        use crate::op_abi::{METAL_SHARED_EXPERTS_FROM, METAL_VERIFY_ROWS};
-        match (METAL_SHARED_EXPERTS_FROM..=METAL_VERIFY_ROWS).contains(&bucket_m) {
+    /// A bucket of `bucket_m` rows baking `pairs` (row, pick) pairs' choice: in the first pair at
+    /// a verify-sized bucket of more than one row
+    /// (`op_abi::METAL_SHARED_EXPERTS_FROM..=METAL_VERIFY_ROWS`) whose pairs are few enough for
+    /// the mode's square-cost scan (`op_abi::METAL_SHARED_EXPERTS_MAX_PAIRS`).
+    pub fn for_pairs(bucket_m: u32, pairs: u32) -> Self {
+        use crate::op_abi::{
+            METAL_SHARED_EXPERTS_FROM, METAL_SHARED_EXPERTS_MAX_PAIRS, METAL_VERIFY_ROWS,
+        };
+        match (METAL_SHARED_EXPERTS_FROM..=METAL_VERIFY_ROWS).contains(&bucket_m)
+            && pairs <= METAL_SHARED_EXPERTS_MAX_PAIRS
+        {
             true => Self::InFirstPair,
             false => Self::Apart,
         }
