@@ -205,7 +205,11 @@ models' kernels bake it. To serve without it, build without `spec/mtp`:
 ```bash
 cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,\
 spec/mtp,quant/mlx-affine-b4-g64-qembed
-scr serve mlx-community/Qwen3.6-35B-A3B-4bit
+scr serve mlx-community/Qwen3.6-35B-A3B-4bit   # head from mlx-community/Qwen3.6-35B-A3B-MTP-4bit
+
+cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.5-122b-a10b,\
+spec/mtp,quant/mlx-affine-b4-g64-qembed
+scr serve scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp   # head inside the checkpoint
 ```
 
 The head drafts only for a step of at most `spec_max_seqs` sequences (its

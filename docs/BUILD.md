@@ -181,7 +181,8 @@ cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,spec/mt
   (`crates/compiler/macros/src/config.rs`). A head published as a model of its
   own (Gemma 4's assistant) names its targets instead (`head_targets`).
   Serving loads the head from the target's own checkpoint when that carries
-  it (its weight map holds `language_model.mtp.*`), else from the repo it is
+  it (its weight map holds `language_model.mtp.*`:
+  `scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp`), else from the repo it is
   published under (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`).
 
 No `spec/*` feature named = no drafter compiles, and the selected models serve
