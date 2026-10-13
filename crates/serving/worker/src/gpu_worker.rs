@@ -56,6 +56,8 @@ use tracing::info;
 #[cfg(feature = "metal")]
 use scratchy_forward_compiler::gdn_slot_allocator::GdnSlotAllocator;
 #[cfg(feature = "metal")]
+use scratchy_serving_engine::worker_factory::VerifySeqs;
+#[cfg(feature = "metal")]
 use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
 use scratchy_target_metal::gdn_state::GdnStatePool;
@@ -647,21 +649,25 @@ fn decode_rows(arch: &str, max_num_seqs: usize) -> scratchy_target_metal::tape::
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
-/// The draft lanes of a hybrid target's Gated-DeltaNet pool (`gdn_state`'s module docs): twice
-/// the sequences a step of `arch`'s compiled head drafts for — a step's drafting sequences hold
-/// one each, and as many again may wait, skipped by the scheduler, to replay theirs; the head
-/// drafts nothing for a sequence that finds every lane held — and no more than `max_num_seqs`.
-/// `None` without a head: the target drafts nothing.
+/// The draft lanes of a hybrid target's Gated-DeltaNet pool (`gdn_state`'s module docs), no more
+/// than `max_num_seqs`: twice a head's gate — a step's drafting sequences hold one each, and as
+/// many again may wait, skipped by the scheduler, to replay theirs; the head drafts nothing for a
+/// sequence that finds every lane held — or one a sequence when an n-gram or draft model drafts
+/// for each. `None` when the run drafts nothing (or the target's kernels keep no draft state).
 #[cfg(feature = "metal")]
 fn gdn_draft_lanes(
-    arch: &str,
+    verify_seqs: VerifySeqs,
     cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
     max_num_seqs: usize,
 ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
-    let head = scratchy_forward_compiler::head_of(arch)?;
-    let count = max_num_seqs.min(2 * usize::from(head.max_seqs));
-    let count = u16::try_from(count).expect("twice a u8 gate fits a u16");
-    scratchy_target_metal::gdn_state::DraftLanes::new(cfg.checkpoint_rows(), count)
+    use scratchy_target_metal::gdn_state::DraftLanes;
+    let count = match verify_seqs {
+        VerifySeqs::Off => return None,
+        VerifySeqs::Gated(gate) => max_num_seqs.min(2 * usize::from(gate)),
+        VerifySeqs::Every => max_num_seqs,
+    };
+    let count = u16::try_from(count.min(usize::from(DraftLanes::MAX))).expect("≤ MAX fits a u16");
+    DraftLanes::new(cfg.checkpoint_rows(), count)
 }
 
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
@@ -1100,8 +1106,8 @@ impl MetalWorker {
                 // arithmetic names, gathered here so the resolver stays
                 // backend-neutral arithmetic (no near-copy can grow in any
                 // target crate).
-                // A slot's GDN state, and its draft lanes: fixed bytes, at most twice the head's
-                // gate whatever the width.
+                // A slot's GDN state, and its draft lanes: under a head's gate fixed bytes (twice
+                // the gate, whatever the width), when every sequence drafts a lane a slot.
                 let gdn = model.gdn_runtime_config();
                 let gdn_bytes = |slots, lanes| {
                     gdn.as_ref().map_or(0, |cfg| {
@@ -1113,13 +1119,18 @@ impl MetalWorker {
                         )
                     })
                 };
-                let gdn_per_slot = gdn.as_ref().map(|_| gdn_bytes(1, None));
-                let gdn_lanes = gdn_bytes(
-                    0,
-                    (gdn.as_ref())
-                        .filter(|_| self.config.draft.is_some())
-                        .and_then(|cfg| gdn_draft_lanes(arch, cfg, usize::MAX)),
-                );
+                let verify_seqs = self.config.verify_seqs;
+                let lanes = |width| {
+                    gdn.as_ref()
+                        .and_then(|c| gdn_draft_lanes(verify_seqs, c, width))
+                };
+                let (gdn_per_slot, gdn_lanes) = match verify_seqs {
+                    VerifySeqs::Every => (gdn.as_ref().map(|_| gdn_bytes(1, lanes(1))), 0),
+                    _ => (
+                        gdn.as_ref().map(|_| gdn_bytes(1, None)),
+                        gdn_bytes(0, lanes(usize::MAX)),
+                    ),
+                };
                 let (budget, allocated) = self
                     .metal_device
                     .as_ref()
@@ -1334,15 +1345,12 @@ impl MetalWorker {
     }
 
     /// The loaded target's Gated-DeltaNet draft lanes ([`gdn_draft_lanes`]), at the resolved
-    /// width: what its pool allocates and its budget reserves. None when this worker drafts with
-    /// nothing (no draft configured).
+    /// width: what its pool allocates and its budget reserves.
     fn gdn_lanes(
         &self,
         cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
     ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
-        self.config.draft.as_ref()?;
-        let arch = self.resolved_architecture.as_deref()?;
-        gdn_draft_lanes(arch, cfg, self.max_num_seqs_resolved())
+        gdn_draft_lanes(self.config.verify_seqs, cfg, self.max_num_seqs_resolved())
     }
 
     /// The KV cap rung `model`'s pool runs on for a capacity of `block_cap` blocks per sequence,

@@ -89,11 +89,25 @@ pub struct WorkerCreateConfig {
     /// What the worker drafts with for speculative decoding: `Some(_)` loads a second model and
     /// its KV pool inside the same worker after the target loads. `None` = no draft.
     pub draft: Option<Draft>,
+    /// The sequences a step may verify drafts for, whatever proposes them: what a hybrid
+    /// target's draft state is sized for.
+    pub verify_seqs: VerifySeqs,
     /// Optional dtype override for the draft model's weights ("auto",
     /// "bfloat16", "float16", …). `None` inherits the target's dtype.
     /// Currently passed through but the metal path always coerces to
     /// bf16 to match the target — accepted for CLI parity with Python.
     pub draft_model_dtype: Option<String>,
+}
+
+/// The sequences a step may verify drafts for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifySeqs {
+    /// None: the run drafts nothing.
+    Off,
+    /// At most this many a step: a multi-token-prediction head's gate (`spec_max_seqs`).
+    Gated(u8),
+    /// Every sequence a step runs: an n-gram or standalone draft model drafts for each.
+    Every,
 }
 
 /// What a worker drafts with, besides its target.

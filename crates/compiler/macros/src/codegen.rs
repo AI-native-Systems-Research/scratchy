@@ -13512,8 +13512,11 @@ pub fn emit_model(
                             (::std::vec::Vec::new(), ::std::vec::Vec::new())
                         }
                     };
-                // Its draft lanes, the same way (`GdnStatePool::lanes`): empty for a pool without
-                // lanes, whose model's tapes bind none.
+                // Its draft lanes, the same way (`GdnStatePool::lanes`). A pool without lanes — a
+                // model that drafts nothing, or one whose run drafts with nothing (no head found,
+                // `--num-speculative-tokens 0`) — runs only plain steps (its slot allocator builds
+                // no other: `GdnStepError::Drafts`), which never touch a lane, so a drafting
+                // model's tapes bind the layer's own state buffers there, never read.
                 let (gdn_lanes_conv, gdn_lanes_ssm): (
                     ::std::vec::Vec<Buffer>,
                     ::std::vec::Vec<Buffer>,
@@ -13531,9 +13534,7 @@ pub fn emit_model(
                                     (c.buffer().clone(), s.buffer().clone())
                                 })
                                 .unzip(),
-                            ::core::option::Option::None => {
-                                (::std::vec::Vec::new(), ::std::vec::Vec::new())
-                            }
+                            ::core::option::Option::None => (gdn_conv.clone(), gdn_ssm.clone()),
                         }
                     }
                     ::core::option::Option::None => {
