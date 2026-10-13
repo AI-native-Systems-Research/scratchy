@@ -1407,6 +1407,8 @@ impl MetalWorker {
             kv_addressing: main.kv_addressing,
             max_decode_rows: main.max_decode_rows,
             lent,
+            // Its argmax runs on the GPU, on the forward's own command buffer.
+            terminal_reads: Default::default(),
         })
     }
 
@@ -6335,6 +6337,9 @@ impl Worker for MetalWorker {
                                 scratchy_target_metal::tape::lowered::KvAddressing::Chunked,
                             // It runs beside the target: nothing of the target's is lent.
                             lent: Default::default(),
+                            // Its verify seed is an argmax the host runs over the logits.
+                            terminal_reads:
+                                scratchy_target_metal::interpreter::metal::TerminalReads::Host,
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread

@@ -33,7 +33,10 @@ use super::forward::{
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
-use super::worker::{ArenaLayout, LentActivation, MetalWorker, ResolvedSources, WorkerError};
+use super::worker::{
+    ArenaLayout, LentActivation, MetalWorker, ResolvedSources, SparsePlan, TerminalReads,
+    WorkerError,
+};
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{
@@ -311,6 +314,9 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     /// Every model tensor the tapes bind, resolved once in [`Self::new`].
     sources: ResolvedSources,
     arena_layout: Arc<ArenaLayout>,
+    /// What its workers map as their buckets reach it rather than allocate in full; `None`
+    /// allocates every activation in full.
+    sparse_plan: Option<SparsePlan>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
     /// The most rows a decode or verify step brings: a worker's MoE scratch holds the decode split's
@@ -608,6 +614,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         max_workers: usize,
         decode_rows: Option<DecodeRows>,
         lent: LentActivation,
+        sparse_plan: Option<SparsePlan>,
     ) -> Result<Self, WorkerError>
     where
         W: ModelSources,
@@ -637,6 +644,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             block_table_stride,
             sources,
             arena_layout: Arc::new(arena_layout),
+            sparse_plan,
             runtime_factory,
             max_workers,
             decode_rows,
@@ -692,6 +700,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // Buffers of a pool whose forwards never overlap this one's, for the first worker to place
         // its own in ([`LentActivation`]).
         lent: LentActivation,
+        // Whether the host reads the logits by pointer, so the terminal slots stay shared.
+        terminal: TerminalReads,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
@@ -725,6 +735,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
+        // Every slot the host reads by pointer stays shared: each bucket's backbone hidden states
+        // (an MTP head's next input; an encoder's output, its terminal too) and, where the host
+        // reads the logits, each terminal slot.
+        let host_slots = (picked.iter())
+            .flat_map(|(spec, _)| {
+                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
+                [Some(spec.backbone_slot), logits]
+            })
+            .flatten()
+            .collect();
+        let sparse_plan = SparsePlan {
+            bucket_arena: picked.iter().map(|(spec, _)| spec.arena_bytes).collect(),
+            host_slots,
+        };
 
         Self::new(
             device,
@@ -738,6 +762,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             max_workers,
             decode_rows,
             lent,
+            Some(sparse_plan),
         )
         .map_err(PoolBuildError::Worker)
     }
@@ -1330,9 +1355,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             for slot in 0..guard.worker.arena.len() {
                 let buf = &guard.worker.arena[slot];
                 let len_bytes = buf.length();
-                let row0 = unsafe {
-                    std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
-                };
+                let ptr = crate::sparse_arena::host_ptr(buf);
+                if ptr.is_null() {
+                    eprintln!(
+                        "[diag-arena] slot={slot:3} bytes={len_bytes} sparse: not host-readable"
+                    );
+                    continue;
+                }
+                // SAFETY: a shared buffer's `len_bytes`, and the forward that wrote it is done.
+                let row0 = unsafe { std::slice::from_raw_parts(ptr as *const u8, len_bytes) };
                 let nonzero_bytes = row0.iter().filter(|&&v| v != 0).count();
                 eprintln!(
                     "[diag-arena] slot={:3} bytes={} nonzero_bytes={}/{}",
@@ -1351,12 +1382,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             for slot in 0..guard.worker.arena.len() {
                 let buf = &guard.worker.arena[slot];
                 let len_bytes = buf.length();
-                if len_bytes < 32 {
+                let ptr = crate::sparse_arena::host_ptr(buf);
+                if len_bytes < 32 || ptr.is_null() {
                     continue;
                 }
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
-                };
+                // SAFETY: a shared buffer's `len_bytes`, and the forward that wrote it is done.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len_bytes) };
                 let head = (0..16)
                     .map(|j| {
                         let off = j * 2;
@@ -1465,6 +1496,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             Some(self.allocator.residency()),
             self.decode_rows,
             lent,
+            self.sparse_plan.as_ref(),
         )?;
         Ok(PooledWorker {
             worker,
@@ -2332,6 +2364,7 @@ mod tests {
             max,
             None,
             LentActivation::default(),
+            None,
         )
         .expect("pool builds");
         Some(pool)
@@ -2574,6 +2607,7 @@ mod tests {
             max_workers,
             None,
             LentActivation::default(),
+            None,
         )
         .expect("pool builds");
         Some(pool)
@@ -3267,6 +3301,7 @@ mod tests {
             KvAddressing::Direct,
             None,
             LentActivation::default(),
+            TerminalReads::Gpu,
         ))
     }
 
@@ -3299,6 +3334,7 @@ mod tests {
             KvAddressing::Direct,
             None,
             LentActivation::default(),
+            TerminalReads::Gpu,
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}

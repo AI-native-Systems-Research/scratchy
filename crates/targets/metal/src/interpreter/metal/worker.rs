@@ -30,6 +30,7 @@ use super::lowered::{Binding, Fence, KernelId, LoweredCommand, LoweredMetalTape,
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
+use crate::sparse_arena::SparseBuffer;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::SourceIx;
 use crate::tape::lowered::ModelSources;
@@ -46,15 +47,53 @@ use std::collections::hash_map::Entry;
 /// for the Phase 5.C smoke test the test sets it explicitly.
 pub type ArenaLayout = Vec<u64>;
 
+/// An activation buffer a worker binds by address: allocated in full, or placement-sparse and mapped
+/// as far as the buckets that bind it reach ([`SparseBuffer`]).
+#[derive(Clone)]
+pub enum Activation {
+    Full(Buffer),
+    Sparse(Arc<SparseBuffer>),
+}
+
+impl Activation {
+    pub fn buffer(&self) -> &Buffer {
+        match self {
+            Self::Full(buffer) => buffer,
+            Self::Sparse(sparse) => sparse.buffer(),
+        }
+    }
+}
+
+/// What a pool's worker maps as its buckets reach it ([`SparseBuffer`]) rather than allocating in
+/// full: each bucket's bytes in each arena slot, in bucket order (`MetalBucketSpec::arena_bytes`),
+/// and the slots the host reads by pointer, which stay allocated in full and shared — every
+/// bucket's backbone hidden states (an MTP head's next input; an encoder's output, which is its
+/// terminal slot too) and, where the pool's owner reads its logits on the host, every terminal slot
+/// ([`TerminalReads`]).
+#[derive(Clone, Default)]
+pub struct SparsePlan {
+    pub bucket_arena: Vec<&'static [u64]>,
+    pub host_slots: Vec<u32>,
+}
+
+/// Who reads a pool's logits (each bucket's terminal slot): only the GPU's argmax and sampler, or
+/// also the host, by pointer — a draft model's verify seed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalReads {
+    #[default]
+    Gpu,
+    Host,
+}
+
 /// A worker's arena slots and scratch, lent to a new worker of a model that never runs at the same
 /// time ([`scratchy_core_common::lend`]): it places its own in them, allocating only what they do
 /// not hold.
 #[derive(Clone, Default)]
 pub struct LentActivation {
-    /// Arena slots: shared storage, as the borrower's arena slots.
-    pub arena: Vec<Buffer>,
+    /// Arena slots, as the borrower's arena slots.
+    pub arena: Vec<Activation>,
     /// Scratch: private storage, as the borrower's scratch.
-    pub scratch: Vec<Buffer>,
+    pub scratch: Vec<Activation>,
     /// A TurboQuant pool's fp16 scratch, staged through by a borrower of the same geometry.
     pub tq_scratch: Option<super::runtime::TqScratch>,
     /// The lender's whole TurboQuant runtime — its packed KV stores, codebook and scratch: a
@@ -183,6 +222,10 @@ pub enum WorkerError {
     },
     /// The device could not allocate the worker's `what` buffer of `bytes`.
     BufferAlloc { what: &'static str, bytes: u64 },
+    /// Mapping what bucket `bucket` binds of the sparse activations failed.
+    SparseMap { bucket: usize, reason: String },
+    /// The queue the sparse activations map on could not be created.
+    SparseMapper { reason: String },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -251,6 +294,18 @@ impl std::fmt::Display for WorkerError {
                     "MetalWorker: the device cannot allocate the {what} ({bytes} bytes)"
                 )
             }
+            Self::SparseMap { bucket, reason } => {
+                write!(
+                    f,
+                    "MetalWorker: bucket {bucket}: mapping its activations: {reason}"
+                )
+            }
+            Self::SparseMapper { reason } => {
+                write!(
+                    f,
+                    "MetalWorker: the sparse activations' mapping queue: {reason}"
+                )
+            }
         }
     }
 }
@@ -276,12 +331,17 @@ pub enum SourceMiss {
 /// references threaded through `new`.
 pub struct MetalWorker<W: CanonicalParams> {
     pub arena: Vec<Buffer>,
+    /// The arena slots as allocated, to lend ([`Self::activation`]).
+    arena_activation: Vec<Activation>,
     /// Residency pins for every buffer the baked dispatches reach by address.
     _pins: Vec<crate::residency::Pinned>,
     pub bucket_bakings: Vec<BucketBaking>,
     /// The scratch buffers the baked dispatches bind by address (split-K, MoE, roped K, hd512
     /// unfused: those some tape needs, see [`Self::new_with_residency`]), held for them.
-    scratch: Vec<Buffer>,
+    scratch: Vec<Activation>,
+    /// The sparse activations and how far each bucket reaches in them; `None` when every
+    /// activation is allocated in full.
+    sparse: Option<SparseActivation>,
     /// Per-forward count of the blocks the step's longest sequence spans
     /// (`live_block_width` in `pool.rs`, set before each forward), for the
     /// `TqStageRotated` and `RopeOnce*` grids: they cover the WHOLE active
@@ -302,10 +362,40 @@ pub struct MetalWorker<W: CanonicalParams> {
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
+/// A worker's sparse activations ([`SparseBuffer`]) and what each bucket needs mapped in them.
+struct SparseActivation {
+    device: Arc<Device>,
+    residency: crate::residency::MetalResidencySet,
+    mapper: Arc<crate::sparse_kv::KvMapper>,
+    /// Every sparse buffer the worker binds.
+    buffers: Vec<Arc<SparseBuffer>>,
+    /// Each bucket's bytes in `buffers`, and whether a forward of it has mapped them: mappings
+    /// stay, so a bucket reached once never looks again.
+    buckets: Vec<(Vec<usize>, std::sync::atomic::AtomicBool)>,
+}
+
+impl SparseActivation {
+    /// Map what `bucket` binds, before its first forward is encoded.
+    fn reach(&self, bucket: usize) -> Result<(), WorkerError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (needs, reached) = &self.buckets[bucket];
+        if reached.load(Relaxed) {
+            return Ok(());
+        }
+        let wants: Vec<(&SparseBuffer, usize)> = (self.buffers.iter().map(|b| &**b))
+            .zip(needs.iter().copied())
+            .collect();
+        crate::sparse_arena::reach(&self.device, &self.residency, &self.mapper, &wants)
+            .map_err(|reason| WorkerError::SparseMap { bucket, reason })?;
+        reached.store(true, Relaxed);
+        Ok(())
+    }
+}
+
 impl<W: CanonicalParams> MetalWorker<W> {
     /// This worker's arena slots and scratch, to lend ([`LentActivation`]).
     pub fn activation(&self) -> LentActivation {
-        let (arena, scratch) = (self.arena.clone(), self.scratch.clone());
+        let (arena, scratch) = (self.arena_activation.clone(), self.scratch.clone());
         LentActivation {
             arena,
             scratch,
@@ -342,6 +432,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             None,
             None,
             &LentActivation::default(),
+            None,
         )
     }
 
@@ -350,7 +441,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// pool to pin every per-worker arena into the wired set so cmdbuf
     /// dispatches don't race against Apple's lazy paging on
     /// Llama-3.2-class working sets. The arena slots and scratch take
-    /// `lent` buffers where they hold them ([`LentActivation`]).
+    /// `lent` buffers where they hold them ([`LentActivation`]); with a
+    /// residency set and a `plan`, the rest are placement-sparse, mapped as
+    /// far as the buckets that run reach ([`SparsePlan`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
@@ -364,6 +457,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // split's partials are reserved for at most these.
         decode_rows: Option<crate::tape::ids::DecodeRows>,
         lent: &LentActivation,
+        plan: Option<&SparsePlan>,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
         // coloring). The shared arena is sized to the MAX colored slot
@@ -393,23 +487,53 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .and_then(|len| device.newBufferWithLength_options(len, mode));
             buf.ok_or(WorkerError::BufferAlloc { what, bytes })
         };
+        // Placement-sparse where the pool plans it: wired with the working set, a sparse buffer takes
+        // only what the buckets that run reach, where one allocated in full is zero-filled and wired
+        // whole on the first forward, whatever its bucket.
+        let plan = plan.filter(|_| residency.is_some());
+        let host_read = |slot: usize| plan.is_none_or(|p| p.host_slots.contains(&(slot as u32)));
+        let make = |bytes: u64, mode, sparse: bool, what| match sparse {
+            true => SparseBuffer::new(&device, bytes)
+                .map(Activation::Sparse)
+                .map_err(|_| WorkerError::BufferAlloc { what, bytes }),
+            false => alloc(bytes, mode, what).map(Activation::Full),
+        };
         // Need `i`'s lent buffer, where one holds it; else it is allocated.
-        fn place<'a>(needs: &[u64], from: &'a [Buffer]) -> impl Fn(usize) -> Option<Buffer> + 'a {
+        fn place<'a>(
+            needs: &[u64],
+            from: &'a [Activation],
+        ) -> impl Fn(usize) -> Option<Activation> + 'a {
             use crate::interpreter::metal::__re::MTLBuffer as _;
-            let lengths: Vec<u64> = from.iter().map(|b| b.length() as u64).collect();
+            let lengths: Vec<u64> = from.iter().map(|a| a.buffer().length() as u64).collect();
             let lent = scratchy_core_common::lend::lend(needs, &lengths);
             move |i| lent[i].map(|j| from[j].clone())
         }
-        // Shared storage so test code can seed/inspect arena contents without staging copies.
-        // dispatch-bound buffers are fine in shared on Apple silicon — the existing
-        // `MetalAllocator` uses the same mode.
+        // Shared storage so test code can seed/inspect arena contents without staging copies, and
+        // so the host can read the slots it reads by pointer; dispatch-bound buffers are fine in
+        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode. A slot the
+        // host reads takes no lent sparse buffer: the host cannot read one.
         let lent_slot = place(arena_layout, &lent.arena);
-        let arena: Vec<Buffer> = (arena_layout.iter().enumerate())
+        let arena_activation: Vec<Activation> = (arena_layout.iter().enumerate())
             .map(|(i, &size)| match lent_slot(i) {
-                Some(buf) => Ok(buf),
-                None => alloc(size, MTLResourceOptions::StorageModeShared, "arena slot"),
+                Some(Activation::Sparse(_)) if host_read(i) => make(
+                    size,
+                    MTLResourceOptions::StorageModeShared,
+                    false,
+                    "arena slot",
+                ),
+                Some(activation) => Ok(activation),
+                None => make(
+                    size,
+                    MTLResourceOptions::StorageModeShared,
+                    !host_read(i),
+                    "arena slot",
+                ),
             })
             .collect::<Result<_, _>>()?;
+        let arena: Vec<Buffer> = arena_activation
+            .iter()
+            .map(|a| a.buffer().clone())
+            .collect();
         arena.iter().for_each(&mut pin);
 
         // A Private scratch buffer (the host never reads scratch back) per scratch the tapes bind
@@ -434,25 +558,75 @@ impl<W: CanonicalParams> MetalWorker<W> {
             max.map_or(0, u64::from)
         });
         let lent_scratch = place(&sizes, &lent.scratch);
+        let private = MTLResourceOptions::StorageModePrivate;
         let scratch = |i: usize, what| match lent_scratch(i) {
-            Some(buf) => Ok(Some(buf)),
+            Some(activation) => Ok(Some(activation)),
             None => (sizes[i] > 0)
-                .then(|| alloc(sizes[i], MTLResourceOptions::StorageModePrivate, what))
+                .then(|| make(sizes[i], private, plan.is_some(), what))
                 .transpose(),
         };
         let splitk_scratch = scratch(0, "splitk scratch")?;
         let moe_scratch = scratch(1, "moe scratch")?;
         let roped_k_scratch = scratch(2, "roped-K scratch")?;
         let attn_unfused_scratch = scratch(3, "attn-unfused scratch")?;
-        [
+        let scratches = [
             &splitk_scratch,
             &moe_scratch,
             &roped_k_scratch,
             &attn_unfused_scratch,
-        ]
-        .into_iter()
-        .flatten()
-        .for_each(&mut pin);
+        ];
+        scratches
+            .into_iter()
+            .flatten()
+            .for_each(|a| pin(a.buffer()));
+
+        // What each bucket binds of every sparse buffer: its arena bytes in a slot, its scratch
+        // bytes of a kind.
+        let sparse = match (plan, residency) {
+            (Some(plan), Some(residency)) => {
+                assert_eq!(
+                    plan.bucket_arena.len(),
+                    bucket_tapes.len(),
+                    "SparsePlan: one arena table per bucket tape"
+                );
+                let arena_needs = |slot: usize| -> Vec<usize> {
+                    let bytes = |t: &&[u64]| t.get(slot).copied().unwrap_or(0) as usize;
+                    plan.bucket_arena.iter().map(bytes).collect()
+                };
+                let scratch_needs = |kind: usize| -> Vec<usize> {
+                    let bytes = |t: &LoweredMetalTape| t.scratch_bytes(decode_rows)[kind] as usize;
+                    bucket_tapes.iter().map(bytes).collect()
+                };
+                let arena_sparse = arena_activation.iter().enumerate();
+                let scratch_sparse = scratches.into_iter().enumerate();
+                let per_buffer: Vec<(Arc<SparseBuffer>, Vec<usize>)> = (arena_sparse)
+                    .filter_map(|(slot, a)| match a {
+                        Activation::Sparse(s) => Some((s.clone(), arena_needs(slot))),
+                        Activation::Full(_) => None,
+                    })
+                    .chain(scratch_sparse.filter_map(|(kind, a)| match a {
+                        Some(Activation::Sparse(s)) => Some((s.clone(), scratch_needs(kind))),
+                        _ => None,
+                    }))
+                    .collect();
+                let buckets = (0..bucket_tapes.len())
+                    .map(|b| {
+                        let needs = per_buffer.iter().map(|(_, n)| n[b]).collect();
+                        (needs, std::sync::atomic::AtomicBool::new(false))
+                    })
+                    .collect();
+                let mapper = crate::sparse_kv::KvMapper::new(&device)
+                    .map_err(|reason| WorkerError::SparseMapper { reason })?;
+                Some(SparseActivation {
+                    device: device.clone(),
+                    residency: residency.clone(),
+                    mapper,
+                    buffers: per_buffer.into_iter().map(|(s, _)| s).collect(),
+                    buckets,
+                })
+            }
+            _ => None,
+        };
 
         // Runtime metadata buffers (`input_ids`, `positions`,
         // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
@@ -600,10 +774,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 bucket_idx,
                 tape,
                 &arena,
-                splitk_scratch.as_ref(),
-                moe_scratch.as_ref(),
-                roped_k_scratch.as_ref(),
-                attn_unfused_scratch.as_ref(),
+                splitk_scratch.as_ref().map(Activation::buffer),
+                moe_scratch.as_ref().map(Activation::buffer),
+                roped_k_scratch.as_ref().map(Activation::buffer),
+                attn_unfused_scratch.as_ref().map(Activation::buffer),
                 pipelines,
                 sources,
                 runtime,
@@ -619,6 +793,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
 
         Ok(Self {
             arena,
+            arena_activation,
             _pins: pins,
             bucket_bakings,
             scratch: [
@@ -630,6 +805,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             .into_iter()
             .flatten()
             .collect(),
+            sparse,
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
@@ -736,6 +912,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         use ::objc2_metal::{
             MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
         };
+        // What this bucket binds of the sparse activations is mapped (and its heap committed to the
+        // residency set) before its command buffer is.
+        if let Some(sparse) = &self.sparse {
+            sparse.reach(bucket)?;
+        }
         let baking = &self.bucket_bakings[bucket];
         let mtl4_steps =
             baking
@@ -2271,6 +2452,7 @@ mod tests {
                 None,
                 None,
                 lent,
+                None,
             )
             .expect("worker builds")
         };

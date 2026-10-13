@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 //! Placement-sparse storage for the metal KV pools ([`SparseStores`]): mapped as the pool
-//! reaches its blocks, on a worker's [`KvMapper`].
+//! reaches its blocks, on a worker's [`KvMapper`]. Its mapping step ([`map_step`]) also maps a
+//! worker's activations as its buckets reach them ([`crate::sparse_arena`]).
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -10,16 +11,16 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4UpdateSparseBufferMappingOperation, MTLDevice,
-    MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLResourceOptions, MTLSharedEvent, MTLSparsePageSize,
-    MTLSparseTextureMappingMode, MTLStorageMode,
+    MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4UpdateSparseBufferMappingOperation, MTLBuffer,
+    MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLResourceOptions, MTLSharedEvent,
+    MTLSparsePageSize, MTLSparseTextureMappingMode, MTLStorageMode,
 };
 
 use crate::metal_mem::MetalMem;
 use crate::mtl4_dispatch::Mtl4DispatchBatch;
 use crate::residency::{MetalResidencySet, Pinned};
 
-const PAGE: MTLSparsePageSize = MTLSparsePageSize::Size64;
+pub(crate) const PAGE: MTLSparsePageSize = MTLSparsePageSize::Size64;
 
 /// The queue a worker's KV mappings run on, and the event that says they have.
 pub struct KvMapper {
@@ -151,50 +152,82 @@ impl SparseStores {
         }
         let to = blocks.next_multiple_of(self.unit).max(2 * from);
         let to = to.min(self.capacity);
-        let tile = self.device.sparseTileSizeInBytesForSparsePageSize(PAGE);
-        let desc = MTLHeapDescriptor::new();
-        desc.setType(MTLHeapType::Placement);
-        desc.setStorageMode(MTLStorageMode::Private);
-        desc.setSize(self.stores.iter().map(|s| (to - from) * s.1).sum());
-        desc.setMaxCompatiblePlacementSparsePageSize(PAGE);
-        let heap = self.device.newHeapWithDescriptor(&desc);
-        let heap = heap.ok_or("placement heap: nil")?;
-        let mut at = 0;
-        for (buffer, bytes, _) in &self.stores {
-            let tiles = (to - from) * bytes / tile;
-            let op = MTL4UpdateSparseBufferMappingOperation {
-                mode: MTLSparseTextureMappingMode::Map,
-                bufferRange: NSRange::new(from * bytes / tile, tiles),
-                heapOffset: at,
-            };
-            // SAFETY: `op` maps whole tiles of this buffer's range from the heap's next `tiles`.
-            unsafe {
-                (mapper.queue).updateBufferMappings_heap_operations_count(
-                    buffer,
-                    Some(&heap),
-                    NonNull::from(&op),
-                    1,
-                )
-            };
-            at += tiles;
-        }
-        self.heaps.push(self.residency.pin(heap));
-        mapper.wait();
-        self.residency.commit();
-        let mut zeroed = self.stores.iter().filter(|s| s.2).peekable();
-        if zeroed.peek().is_some() {
-            let batch = Mtl4DispatchBatch::begin(&self.device).ok_or("zero fill: no MTL4 queue")?;
-            batch.declare(&self.residency);
-            for (buffer, bytes, _) in zeroed {
-                let range = NSRange::new(from * bytes, (to - from) * bytes);
-                // SAFETY: the range is mapped and resident, and nothing else touches it yet.
-                unsafe { batch.encoder().fillBuffer_range_value(buffer, range, 0) };
-            }
-            batch.commit(true);
-        }
+        let ranges: Vec<MapRange<'_>> = (self.stores.iter())
+            .map(|(buffer, bytes, zeroed)| MapRange {
+                buffer,
+                from: from * bytes,
+                to: to * bytes,
+                zeroed: *zeroed,
+            })
+            .collect();
+        let heap = map_step(&self.device, &self.residency, mapper, &ranges)?;
+        self.heaps.push(heap);
         self.mapped.store(to, Ordering::Relaxed);
         Ok(true)
     }
+}
+
+/// One range of a placement-sparse buffer for [`map_step`] to map: bytes `from..to`, whole tiles
+/// of [`PAGE`], and whether they must read zero.
+pub(crate) struct MapRange<'a> {
+    pub buffer: &'a ProtocolObject<dyn MTLBuffer>,
+    pub from: usize,
+    pub to: usize,
+    pub zeroed: bool,
+}
+
+/// Map every range from ONE new placement heap, on `mapper`, wire the heap in `residency`, and zero
+/// the ranges that must read zero: in place when this returns. The heap backs every range it
+/// mapped, so it lives as long as any of them is read. No forward in flight names a byte of a range
+/// not mapped before, so this races none.
+pub(crate) fn map_step(
+    device: &Retained<ProtocolObject<dyn MTLDevice>>,
+    residency: &MetalResidencySet,
+    mapper: &KvMapper,
+    ranges: &[MapRange<'_>],
+) -> Result<Pinned<ProtocolObject<dyn MTLHeap>>, String> {
+    let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+    let desc = MTLHeapDescriptor::new();
+    desc.setType(MTLHeapType::Placement);
+    desc.setStorageMode(MTLStorageMode::Private);
+    desc.setSize(ranges.iter().map(|r| r.to - r.from).sum());
+    desc.setMaxCompatiblePlacementSparsePageSize(PAGE);
+    let heap = device.newHeapWithDescriptor(&desc);
+    let heap = heap.ok_or("placement heap: nil")?;
+    let mut at = 0;
+    for r in ranges {
+        let tiles = (r.to - r.from) / tile;
+        let op = MTL4UpdateSparseBufferMappingOperation {
+            mode: MTLSparseTextureMappingMode::Map,
+            bufferRange: NSRange::new(r.from / tile, tiles),
+            heapOffset: at,
+        };
+        // SAFETY: `op` maps whole tiles of this buffer's range from the heap's next `tiles`.
+        unsafe {
+            (mapper.queue).updateBufferMappings_heap_operations_count(
+                r.buffer,
+                Some(&heap),
+                NonNull::from(&op),
+                1,
+            )
+        };
+        at += tiles;
+    }
+    let heap = residency.pin(heap);
+    mapper.wait();
+    residency.commit();
+    let mut zeroed = ranges.iter().filter(|r| r.zeroed).peekable();
+    if zeroed.peek().is_some() {
+        let batch = Mtl4DispatchBatch::begin(device).ok_or("zero fill: no MTL4 queue")?;
+        batch.declare(residency);
+        for r in zeroed {
+            let range = NSRange::new(r.from, r.to - r.from);
+            // SAFETY: the range is mapped and resident, and nothing else touches it yet.
+            unsafe { batch.encoder().fillBuffer_range_value(r.buffer, range, 0) };
+        }
+        batch.commit(true);
+    }
+    Ok(heap)
 }
 
 /// Every [`SparseStores`] a device's KV pool maps, and how far the pool's blocks reach: the worker
