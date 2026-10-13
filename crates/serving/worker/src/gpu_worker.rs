@@ -321,6 +321,8 @@ pub struct MetalWorker {
     spec_tail: Option<SpecTail>,
     /// Steps committed without waiting for them, oldest first.
     in_flight: std::collections::VecDeque<InFlightStep>,
+    /// The weights being made resident as the load runs (`make_resident`), joined at shutdown.
+    weights_resident: Option<std::thread::JoinHandle<()>>,
     /// Per-request grammar FSM state for constrained / guided decoding
     /// (`guided_grammar` / `response_format`). Keyed by req_id; created
     /// the first time a request with a grammar is scheduled and dropped
@@ -919,6 +921,7 @@ impl MetalWorker {
             spec_tail: None,
             committed: None,
             in_flight: std::collections::VecDeque::new(),
+            weights_resident: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -4549,6 +4552,16 @@ impl Worker for MetalWorker {
             t_from_dir.elapsed(),
             weights.len()
         );
+        // Make the weights resident while the rest of the load runs: the first forward's command
+        // buffer otherwise does it before its first dispatch can start.
+        let weights_set = weights.metal_allocator().weights_residency().clone();
+        let resident_device = (*device_arc).clone();
+        self.weights_resident = std::thread::Builder::new()
+            .name("weights-resident".into())
+            .spawn(move || {
+                scratchy_target_metal::mtl4_dispatch::make_resident(&resident_device, &weights_set)
+            })
+            .ok();
 
         // Metal backend default dtype is bf16 — matches the on-disk
         // `torch_dtype: bfloat16` of every modern HF Llama / Qwen /
@@ -7022,6 +7035,10 @@ impl Worker for MetalWorker {
         // one-time first-run build; warm runs find nothing and return
         // instantly. (regression: c54955a3)
         scratchy_target_metal::metal_allocator::join_sidecar_writers();
+        // Nor a command buffer making the weights resident: a launch can end before it is done.
+        if let Some(resident) = self.weights_resident.take() {
+            let _ = resident.join();
+        }
         // Deterministically release the GPU residency set (system-wired
         // memory) BEFORE dropping the device. `requestResidency` wires every
         // weight / KV / scratch allocation; on a hard exit the kernel's
