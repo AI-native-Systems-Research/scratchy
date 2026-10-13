@@ -37,6 +37,7 @@
 //! first written by a step after the one it is taken in.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use scratchy_layers::gdn_state::{
     CheckpointRows, DraftLane, DraftLanes, GdnStart, GdnStep, RecordArea,
@@ -234,16 +235,17 @@ impl GdnSlotAllocator {
         assigned: &'a mut HashMap<u64, (u32, SlotState)>,
         request_id: u64,
     ) -> Option<(u32, &'a mut SlotState)> {
-        if !assigned.contains_key(&request_id) {
-            let slot = free.pop()?;
-            let fresh = SlotState {
-                start: GdnStart::Fresh,
-                records: RecordArea::First,
-                lane: None,
-            };
-            assigned.insert(request_id, (slot, fresh));
-        }
-        let (slot, state) = assigned.get_mut(&request_id)?;
+        let (slot, state) = match assigned.entry(request_id) {
+            Entry::Occupied(owned) => owned.into_mut(),
+            Entry::Vacant(new) => {
+                let fresh = SlotState {
+                    start: GdnStart::Fresh,
+                    records: RecordArea::First,
+                    lane: None,
+                };
+                new.insert((free.pop()?, fresh))
+            }
+        };
         Some((*slot, state))
     }
 
