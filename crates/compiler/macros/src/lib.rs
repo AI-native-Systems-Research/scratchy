@@ -360,7 +360,7 @@ fn fmt_us(us: f64) -> String {
 /// the 64 rung: granite +8.6%, qwen2.5-7b +26% (TPOT p50, M1 Max) — because
 /// the low-m tapes lose utilization the 64 rung's wider grids keep. So the
 /// rungs are opt-in per arch, on the carrier decorator, only where a win was
-/// measured: `gemma4-moe.py` carries
+/// measured: the MoE arches `gemma4-moe.py` and `qwen3-5-moe.py` carry
 /// `workloads=[1,2,4,8,16,32,64,512,1024,2048,4096]`.
 const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
 

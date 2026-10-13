@@ -6,7 +6,12 @@ import torch
 import torch.nn.functional as F
 
 
-@forward
+# 16/32 decoder rungs, as gemma4-moe takes them: without them a 9-63-row step runs the 64 rung,
+# whose expert matvecs run every padded row's pairs. Qwen3.6-35B-A3B with its MTP head, base M5,
+# greedy batches of N decoding together: N=16 144.6 -> 177.2 output tok/s, N=12 133.5 -> 144.9,
+# N=4 and 8 (rungs they already had) unchanged; a prompt on the 16 rung's first token 62.1 ->
+# 57.9 ms, on the 32 rung 106.4 -> 106.0.
+@forward(workloads=[1, 2, 4, 8, 16, 32, 64, 512, 1024, 2048, 4096])
 def qwen3_5_moe():
     hidden_states = embed(input_ids, embed_tokens)
     for layer in range(num_hidden_layers):
