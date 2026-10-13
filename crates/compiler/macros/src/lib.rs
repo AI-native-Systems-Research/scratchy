@@ -1787,46 +1787,6 @@ pub fn compile_carrier(
                 }
             }
         };
-        // Per-variant `max_blocks_per_seq` arms — the metal block-table
-        // row stride (`CanonicalParams::MAX_BLOCKS_PER_SEQ`). Emitted
-        // only when some variant overrides the trait default (128) via
-        // the `max_blocks_per_seq` config key (Gemma4: 2048); the
-        // executor packs host-side block_table rows at this stride so
-        // multi-seq rows land where the kernels read them.
-        let max_blocks_per_seq_tokens = {
-            let mut per_variant: std::collections::BTreeMap<String, Option<u64>> =
-                std::collections::BTreeMap::new();
-            for sm in &solved {
-                let key = sm.mod_name.clone();
-                per_variant
-                    .entry(key)
-                    .or_insert_with(|| sm.model.bounds.get("max_blocks_per_seq").copied());
-            }
-            if per_variant.values().all(|v| v.is_none() || *v == Some(128)) {
-                proc_macro2::TokenStream::new()
-            } else {
-                let arms: Vec<proc_macro2::TokenStream> = arch_dispatch_arms
-                    .iter()
-                    .map(|a| {
-                        let variant_ident = pascal_case(&a.model_ident);
-                        let v = per_variant
-                            .get(&a.model_ident.to_string())
-                            .copied()
-                            .flatten()
-                            .unwrap_or(128);
-                        let lit = proc_macro2::Literal::usize_unsuffixed(v as usize);
-                        quote! { Weights::#variant_ident(_) => #lit, }
-                    })
-                    .collect();
-                quote! {
-                    fn max_blocks_per_seq(&self) -> usize {
-                        match self {
-                            #(#arms)*
-                        }
-                    }
-                }
-            }
-        };
         // Per-variant `rope_on_read` arms — spans / position-independent KV.
         // Rope-on-read is the universal default for rope-using models; this
         // mirrors the `ROPE_ON_READ` CanonicalParams const (both derive from
@@ -1868,7 +1828,6 @@ pub fn compile_carrier(
         let gdn_runtime_config_tokens = quote! {
             #gdn_runtime_config_tokens
             #per_layer_kv_elems_tokens
-            #max_blocks_per_seq_tokens
             #rope_on_read_tokens
         };
 
@@ -2027,9 +1986,9 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant `ScratchyWeights::kv_codec()` / `kv_cache_layers()` arms: each
-    // reads its own module's `CanonicalParams` const, so the dispatcher keeps no
-    // second record of it.
+    // Per-variant `ScratchyWeights::kv_codec()` / `kv_cache_layers()` /
+    // `kv_addressable_tokens()` arms: each reads its own module's
+    // `CanonicalParams` const, so the dispatcher keeps no second record of it.
     let canonical_const_arms = |konst: proc_macro2::TokenStream| -> Vec<proc_macro2::TokenStream> {
         arms.iter()
             .map(|a| {
@@ -2044,6 +2003,7 @@ fn emit_arch_dispatcher(
     };
     let kv_codec_arms = canonical_const_arms(quote! { KV_CODEC });
     let kv_cache_layers_arms = canonical_const_arms(quote! { KV_CACHE_LAYERS });
+    let kv_addressable_tokens_arms = canonical_const_arms(quote! { KV_ADDRESSABLE_TOKENS });
 
     // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
     // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
@@ -2760,6 +2720,11 @@ fn emit_arch_dispatcher(
             fn kv_cache_layers(&self) -> ::core::option::Option<&'static [u32]> {
                 match self {
                     #(#kv_cache_layers_arms)*
+                }
+            }
+            fn kv_addressable_tokens(&self) -> ::core::option::Option<usize> {
+                match self {
+                    #(#kv_addressable_tokens_arms)*
                 }
             }
 
