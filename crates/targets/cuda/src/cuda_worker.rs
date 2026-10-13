@@ -1854,7 +1854,7 @@ impl CudaWorker {
                         GdnStatePool::<crate::PoolMem>::reserve_bytes(
                             cfg.num_linear_layers(),
                             1,
-                            crate::gdn_state::CheckpointRows::NONE,
+                            None,
                             cfg.state_dims(),
                         )
                     });
@@ -4024,7 +4024,7 @@ impl Worker for CudaWorker {
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
-                    crate::gdn_state::CheckpointRows::NONE,
+                    None,
                     gdn_cfg.state_dims(),
                     |bytes| {
                         // f32 conv/ssm state, GPU-resident across forwards
@@ -4045,10 +4045,7 @@ impl Worker for CudaWorker {
                 t_gdn.elapsed(),
             );
             self.gdn_state = Some(gdn_pool);
-            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(
-                num_slots,
-                crate::gdn_state::CheckpointRows::NONE,
-            ));
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots, None));
         }
 
         Ok(())
@@ -4104,7 +4101,7 @@ impl Worker for CudaWorker {
                     crate::gdn_state::GdnStatePool::<crate::PoolMem>::reserve_bytes(
                         cfg.num_linear_layers(),
                         self.max_num_seqs_resolved(),
-                        crate::gdn_state::CheckpointRows::NONE,
+                        None,
                         cfg.state_dims(),
                     )
                 })

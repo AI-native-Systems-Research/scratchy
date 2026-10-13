@@ -1289,6 +1289,16 @@ pub enum RuntimeBindingKind {
     GdnSsmState {
         layer: LayerId,
     },
+    /// The draft lanes' conv checkpoints for a linear-attention layer of a model that drafts
+    /// (`scratchy_layers::gdn_state::DraftLanes`): a verify step's window after each of its rows.
+    GdnConvLanes {
+        layer: LayerId,
+    },
+    /// The draft lanes' ssm records for a linear-attention layer of a model that drafts: a verify
+    /// step's rows, which the step after it replays.
+    GdnSsmLanes {
+        layer: LayerId,
+    },
     /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence
     /// (cu_seqlens order). Written per forward by the worker.
     GdnStateIndices,
@@ -1680,6 +1690,12 @@ impl RuntimeBindingKind {
                 layer: layer.advance(by),
             },
             Self::GdnSsmState { layer } => Self::GdnSsmState {
+                layer: layer.advance(by),
+            },
+            Self::GdnConvLanes { layer } => Self::GdnConvLanes {
+                layer: layer.advance(by),
+            },
+            Self::GdnSsmLanes { layer } => Self::GdnSsmLanes {
                 layer: layer.advance(by),
             },
             Self::TqPackedK { layer } => Self::TqPackedK {

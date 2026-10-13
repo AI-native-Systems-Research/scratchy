@@ -438,11 +438,16 @@ fn request<'a>(
 impl MtpDrafter {
     /// The head's passes over the rows of `step` that the requests in `plan` run, before the step:
     /// `history` reads each request's tokens so far. `None` when none is planned.
+    ///
+    /// `holds_draft_state` is asked for each request that would draft: whether the target can
+    /// keep what its next step's verify undoes (a Gated-DeltaNet target's draft lane,
+    /// `GdnSlotAllocator::hold_lane`). A request it refuses only primes, as past the gate.
     pub fn passes(
         &self,
         step: &StepRows<'_>,
         history: &dyn Fn(&str) -> Option<Vec<u32>>,
         plan: &HashSet<String>,
+        holds_draft_state: &mut dyn FnMut(&str) -> bool,
     ) -> Option<HeadPasses> {
         let stride = step.block_table_stride;
         let (mut prime, mut one) = (PassOne::empty(stride), PassOne::empty(stride));
@@ -458,6 +463,10 @@ impl MtpDrafter {
             let split = match past_gate {
                 true => rows.end,
                 false => rows.start + rows.clone().take_while(known).count(),
+            };
+            let split = match split < rows.end && !holds_draft_state(&step.req_ids[i]) {
+                true => rows.end,
+                false => split,
             };
             // A head reading its target's KV keeps none of its own: its rows no draft reads run
             // nothing.
@@ -746,6 +755,33 @@ mod tests {
         of.iter().map(|&id| id.to_string()).collect()
     }
 
+    /// A target that keeps every request's draft state.
+    fn any(_: &str) -> bool {
+        true
+    }
+
+    /// A request the target cannot keep draft state for only primes: `a`'s verify rows run
+    /// KV-only beside `b`'s prompt, nothing drafts, and only `a` — the one that would draft — is
+    /// asked.
+    #[test]
+    fn a_request_without_draft_state_only_primes() {
+        let step = TwoSequences::new();
+        let mut asked = Vec::new();
+        let mut refuse = |r: &str| {
+            asked.push(r.to_string());
+            false
+        };
+        let passes = DRAFTER
+            .passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut refuse)
+            .expect("passes");
+        assert_eq!(asked, ["a"]);
+        assert_eq!(passes.drafting, None);
+        let prime = passes.prime.expect("both prime");
+        assert_eq!(prime.positions, [10, 11, 12, 13, 0, 1, 2]);
+        assert_eq!(prime.cu_seqlens_q, [0, 4, 7]);
+        assert_eq!(prime.seqused_k, [14, 3]);
+    }
+
     /// Pass 1 runs every row of each planned sequence, split by whether a draft can read it: the
     /// rows whose next token the host has (`b`'s prompt) prime, for their KV alone; the rest
     /// (`a`'s verify rows, each of which can be its newest) draft, the target's tokens at them.
@@ -756,7 +792,7 @@ mod tests {
     fn pass_one_primes_the_rows_no_draft_reads() {
         let step = TwoSequences::new();
         let history = step.before();
-        let passes = |plan: &[&str]| DRAFTER.passes(&step.rows(), &history, &ids(plan));
+        let passes = |plan: &[&str]| DRAFTER.passes(&step.rows(), &history, &ids(plan), &mut any);
         let both = passes(&["a", "b"]).expect("passes");
         let prime = PassOne {
             input_ids: vec![701, 702, 703],
@@ -808,7 +844,7 @@ mod tests {
             "b" => Some((700..703).collect()),
             _ => step.before()(id),
         };
-        let passes = DRAFTER.passes(&step.rows(), &ends, &ids(&["a", "b"]));
+        let passes = DRAFTER.passes(&step.rows(), &ends, &ids(&["a", "b"]), &mut any);
         let passes = passes.expect("passes");
         let prime = passes.prime.expect("b primes");
         assert_eq!(
@@ -839,7 +875,7 @@ mod tests {
     #[test]
     fn the_chain_lays_out_every_accepted_count() {
         let step = TwoSequences::new();
-        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]));
+        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any);
         let chain = passes.expect("passes").drafting.expect("a drafts").chain;
         let at = |d: u32| -> Vec<u32> {
             (0..=3)
@@ -863,7 +899,7 @@ mod tests {
     #[test]
     fn drafts_are_the_device_s_up_to_the_model_length() {
         let step = TwoSequences::new();
-        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]));
+        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any);
         let chain = passes.expect("passes").drafting.expect("a drafts").chain;
         let picked = [901, 1000, 2000];
         for kept in 0..4u32 {
@@ -907,7 +943,12 @@ mod tests {
     fn a_step_past_the_gate_primes_every_row() {
         let step = ThreeSequences::new();
         let gated = DRAFTER
-            .passes(&step.rows(), &step.before(), &ids(&["a", "b", "c"]))
+            .passes(
+                &step.rows(),
+                &step.before(),
+                &ids(&["a", "b", "c"]),
+                &mut any,
+            )
             .expect("passes");
         assert_eq!(gated.drafting, None);
         assert_eq!(
@@ -930,7 +971,7 @@ mod tests {
 
         let two = TwoSequences::new();
         let within = DRAFTER
-            .passes(&two.rows(), &two.before(), &ids(&["a", "b"]))
+            .passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any)
             .expect("passes");
         within.drafting.expect("a drafts");
     }
@@ -945,18 +986,23 @@ mod tests {
             ..DRAFTER
         };
         let three = ThreeSequences::new();
-        let gated = drafter.passes(&three.rows(), &three.before(), &ids(&["a", "b", "c"]));
+        let gated = drafter.passes(
+            &three.rows(),
+            &three.before(),
+            &ids(&["a", "b", "c"]),
+            &mut any,
+        );
         assert_eq!(gated, None);
 
         let two = TwoSequences::new();
-        let within =
-            (drafter.passes(&two.rows(), &two.before(), &ids(&["a", "b"]))).expect("passes");
+        let within = (drafter.passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any))
+            .expect("passes");
         assert_eq!(within.prime, None);
         let one = within.drafting.expect("a drafts").one;
         assert_eq!(one.positions, [11, 12, 13, 14]);
         assert!(one.slot_mapping.iter().all(|&s| s == u32::MAX));
         assert_eq!(
-            drafter.passes(&two.rows(), &two.before(), &ids(&["b"])),
+            drafter.passes(&two.rows(), &two.before(), &ids(&["b"]), &mut any),
             None
         );
     }

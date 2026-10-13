@@ -383,7 +383,8 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 layers,
                 &cfg.linear_layers,
                 1,
-                scratchy_target_metal::gdn_state::CheckpointRows::NONE,
+                // A lane for a model that drafts: its tapes bind one, though this one never does.
+                scratchy_target_metal::gdn_state::DraftLanes::new(cfg.checkpoint_rows(), 1),
                 cfg.state_dims(),
                 |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
             )

@@ -671,9 +671,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 num_tokens_u32: _,
                 num_sample_rows_u32: _,
                 sample_indices: _,
-                // GDN persistent state pools — pinned by the GdnStatePool owner.
+                // GDN persistent state pools and draft lanes — pinned by the GdnStatePool owner.
                 gdn_state_conv: _,
                 gdn_state_ssm: _,
+                gdn_lanes_conv: _,
+                gdn_lanes_ssm: _,
                 gdn_state_indices,
                 gdn_is_fresh,
                 vision_rope_freqs,
@@ -2239,6 +2241,8 @@ mod tests {
             sample_indices: alloc_buffer(device, 16),
             gdn_state_conv: ::std::vec::Vec::new(),
             gdn_state_ssm: ::std::vec::Vec::new(),
+            gdn_lanes_conv: ::std::vec::Vec::new(),
+            gdn_lanes_ssm: ::std::vec::Vec::new(),
             gdn_state_indices: alloc_buffer(device, 16),
             gdn_is_fresh: alloc_buffer(device, 16),
             vision_rope_freqs: alloc_buffer(device, 16),
