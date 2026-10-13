@@ -45,6 +45,9 @@ fn read_line(prompt: &str) -> Option<String> {
 #[cfg(any(feature = "chat", test))]
 struct BenchStats {
     startup_ms: f64,
+    /// From the same start as `startup_ms` to the process's very first token: the warmup's, so
+    /// it includes everything the first request pays that the timed (warm) request does not.
+    first_token_ms: Option<f64>,
     first_token: Option<std::time::Instant>,
     token_times: Vec<std::time::Instant>,
     gen_start: std::time::Instant,
@@ -52,9 +55,10 @@ struct BenchStats {
 
 #[cfg(any(feature = "chat", test))]
 impl BenchStats {
-    fn new(startup_ms: f64) -> Self {
+    fn new(startup_ms: f64, first_token_ms: Option<f64>) -> Self {
         Self {
             startup_ms,
+            first_token_ms,
             first_token: None,
             token_times: Vec::new(),
             gen_start: std::time::Instant::now(),
@@ -73,6 +77,9 @@ impl BenchStats {
         eprintln!();
         eprintln!("--- bench ---");
         eprintln!("startup     : {:.1} ms", self.startup_ms);
+        if let Some(ms) = self.first_token_ms {
+            eprintln!("1st token   : {ms:.1} ms  (from the same start: the cold first request's token)");
+        }
 
         if let Some(first) = self.first_token {
             let ttft = first.duration_since(self.gen_start).as_secs_f64() * 1000.0;
@@ -250,7 +257,9 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         vec![]
     };
     if !prompts.is_empty() {
-        // In --bench mode, do an untimed warmup first.
+        // In --bench mode, do a warmup first: untimed as a request, but its first token is the
+        // process's first, so `1st token` reports `t0` → that token.
+        let mut first_token_ms = None;
         if args.bench {
             conversation.push(ChatMessage::user(&prompts[0]));
             eprint!("(warmup) ");
@@ -262,8 +271,10 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             // here is the model failing, not a benchmark nicety that can be skipped. Discarding it
             // left the failed request RUNNING and the next prompt unschedulable, which reached the
             // user as a HANG instead of the message the executor had already written.
-            llm.chat_stream(&conversation, Some(warmup_params), |_| {})
-                .context("bench warmup forward failed")?;
+            llm.chat_stream(&conversation, Some(warmup_params), |_| {
+                first_token_ms.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
+            })
+            .context("bench warmup forward failed")?;
             eprintln!("done");
             conversation.pop();
         }
@@ -271,7 +282,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         for (i, message) in prompts.iter().enumerate() {
             conversation.push(ChatMessage::user(message));
 
-            let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
+            let mut stats = args.bench.then(|| BenchStats::new(startup_ms, first_token_ms));
 
             if prompts.len() > 1 {
                 eprintln!("[turn {}] {}", i + 1, message);
@@ -340,7 +351,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         }
         conversation.push(ChatMessage::user(&input));
 
-        let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
+        let mut stats = args.bench.then(|| BenchStats::new(startup_ms, None));
 
         let output = llm.chat_stream(&conversation, params.clone(), |token| {
             print!("{token}");
@@ -599,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_bench_stats_no_tokens() {
-        let stats = BenchStats::new(100.0);
+        let stats = BenchStats::new(100.0, None);
         assert!(stats.first_token.is_none());
         assert!(stats.token_times.is_empty());
         assert!((stats.startup_ms - 100.0).abs() < f64::EPSILON);
@@ -607,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_bench_stats_records_tokens() {
-        let mut stats = BenchStats::new(50.0);
+        let mut stats = BenchStats::new(50.0, None);
         stats.record_token();
         assert!(stats.first_token.is_some());
         assert_eq!(stats.token_times.len(), 1);
@@ -623,11 +634,11 @@ mod tests {
     #[test]
     fn test_bench_stats_print_does_not_panic() {
         // With 0 tokens.
-        let stats = BenchStats::new(10.0);
+        let stats = BenchStats::new(10.0, None);
         stats.print(0);
 
-        // With some tokens.
-        let mut stats = BenchStats::new(10.0);
+        // With some tokens, and a warmup's first token.
+        let mut stats = BenchStats::new(10.0, Some(40.0));
         stats.record_token();
         std::thread::sleep(std::time::Duration::from_millis(1));
         stats.record_token();
