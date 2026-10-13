@@ -151,8 +151,6 @@ use super::proposer::{Proposer, ProposerStepCtx};
 /// Configuration for the MTP proposer, held by [`super::ProposerConfig::Mtp`].
 #[derive(Debug, Clone)]
 pub struct MtpProposerConfig {
-    /// Local path or HuggingFace repo ID of the head's checkpoint.
-    pub model: String,
     /// Drafts per step (`k`): one pass-1 row plus `k - 1` chained passes.
     pub num_speculative_tokens: usize,
     /// The most sequences a step drafts for: the head's compiled `spec_max_seqs`, the engine's
@@ -730,7 +728,6 @@ mod tests {
 
     fn proposer() -> MtpProposer {
         MtpProposer::new(MtpProposerConfig {
-            model: "head".into(),
             num_speculative_tokens: 3,
             max_seqs: 2,
             max_model_len: 4096,

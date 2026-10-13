@@ -75,8 +75,15 @@ pub struct DeclaredArchSpec {
     /// A head published as its own checkpoint, with a config of its own (Gemma 4's assistant):
     /// each config stem's target config, `<arch>/<stem>`. It compiles when that target is selected
     /// under `spec/mtp`, the target's verify steps carry its drafts, and it drafts for the target's
-    /// architectures. Empty for a head whose config is its target's (the same file).
+    /// architectures. Empty for a head that ships inside its target's checkpoint (`checkpoint_of`).
     pub head_targets: Vec<(String, String)>,
+    /// The arches whose checkpoints carry this head (a multi-token-prediction head). It has no
+    /// configs of its own: under `spec/mtp` it compiles on every selected config of these arches
+    /// that declares its layers (the source of its `num_hidden_layers` param, above zero).
+    pub checkpoint_of: Vec<String>,
+    /// Where its tensors sit inside such a checkpoint (`language_model.mtp`): a target checkpoint
+    /// holding tensors under it carries its head, which then loads from the target's own store.
+    pub checkpoint_prefix: Option<String>,
     /// The head's attention reads its target's KV (`num_kv_shared_layers`: every layer of it): it
     /// writes none and has no KV pool of its own; each layer reads the target layer its config's
     /// overrides name for its class (`target_kv_sliding_layer`, `target_kv_full_layer`).

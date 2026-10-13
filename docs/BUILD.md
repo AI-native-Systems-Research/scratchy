@@ -174,11 +174,15 @@ cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,spec/mt
 ```
 
 - **`spec/mtp`** — every selected model whose checkpoint carries a
-  multi-token-prediction head compiles that head too. A head's config is its
-  target's checkpoint config verbatim, so a head config is selected when it is
-  the same file as a selected model's config (`target_selected` in
-  `crates/compiler/macros/src/config.rs`); naming the head's own stem
-  (`model/qwen3.6-35b-a3b-mtp`) still works.
+  multi-token-prediction head compiles that head too. A head that ships inside
+  its target's checkpoint has no config of its own: its `arch.json` names the
+  arches whose checkpoints carry it (`checkpoint_of`), and it compiles on each
+  selected config of theirs that declares its layers, that config verbatim
+  (`crates/compiler/macros/src/config.rs`). A head published as a model of its
+  own (Gemma 4's assistant) names its targets instead (`head_targets`).
+  Serving loads the head from the target's own checkpoint when that carries
+  it (its weight map holds `language_model.mtp.*`), else from the repo it is
+  published under (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`).
 
 No `spec/*` feature named = no drafter compiles, and the selected models serve
 without speculative decoding.

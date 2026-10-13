@@ -1524,13 +1524,6 @@ pub struct CudaWorker {
     gdn_pending: Option<(Vec<i32>, Vec<u32>)>,
     model_dir: Option<PathBuf>,
     hf_config: Option<HfModelConfig>,
-    /// Draft model's resolved snapshot dir, populated when
-    /// `config.draft_model_path` is set.
-    #[allow(dead_code)]
-    draft_model_dir: Option<PathBuf>,
-    /// Draft model's `config.json`, populated alongside `draft_model_dir`.
-    #[allow(dead_code)]
-    draft_hf_config: Option<HfModelConfig>,
     /// Second KV cache pool, sized for the draft model. Lives on the
     /// same `MetalAllocator` / residency set as the target's pool —
     /// one allocator covers all weights + both pools.
@@ -1758,8 +1751,6 @@ impl CudaWorker {
             gdn_pending: None,
             model_dir: None,
             hf_config: None,
-            draft_model_dir: None,
-            draft_hf_config: None,
             draft_kv_cache: None,
             model_dtype: GpuDType::BF16,
             resolved_architecture: None,

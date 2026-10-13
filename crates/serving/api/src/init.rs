@@ -80,9 +80,11 @@ pub struct VllmConfig {
     pub hf_token: Option<String>,
     /// Specific GGUF filename to download from a HuggingFace repo.
     pub gguf_file: Option<String>,
-    /// Speculative model: `"ngram"` selects the n-gram proposer; any other
-    /// value is treated as a draft-model local path or HuggingFace repo ID
-    /// (not yet wired). `None` disables speculative decoding.
+    /// Speculative model: `"ngram"` selects the n-gram proposer; any other value names a draft
+    /// checkpoint (local path or HuggingFace repo ID) — a multi-token-prediction head published
+    /// apart from its target, or a standalone draft model. `None` drafts with the target's
+    /// compiled multi-token-prediction head when the build has one (metal), else disables
+    /// speculative decoding.
     pub speculative_model: Option<String>,
     /// Number of speculative tokens to propose per step.
     pub num_speculative_tokens: usize,
@@ -418,7 +420,7 @@ const TEMPLATE_TURN_TERMINATORS: &[&str] = &[
 // Worker creation result now lives in `scratchy-serving-worker` alongside
 // the `WorkerFactory` trait and `Box<dyn Worker>`/`HfModelConfig` it names.
 use scratchy_serving_worker::worker_factory::{
-    ProgressCallback, WorkerCreationResult, WorkerFactory,
+    Draft, ProgressCallback, WorkerCreationResult, WorkerFactory,
 };
 
 /// Create the appropriate worker via the `WorkerFactory` inventory registry.
@@ -432,6 +434,7 @@ use scratchy_serving_worker::worker_factory::{
 /// Returns `(worker, hf_config, model_dir, dtype)`.
 fn create_worker(
     config: &VllmConfig,
+    speculation: &Speculation,
     model_path: String,
     progress: Option<&Arc<crate::progress::StartupProgress>>,
 ) -> Result<WorkerCreationResult> {
@@ -489,7 +492,7 @@ fn create_worker(
         calculate_kv_scales: config.calculate_kv_scales,
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
-        draft_model_path: spec_decode_draft_model_path(config),
+        draft: speculation.worker_draft(),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -657,62 +660,85 @@ struct InitializedCore {
     hf_config: HfModelConfig,
 }
 
-/// `--speculative-model <repo>` as a draft-model path, or `None` for
-/// the n-gram proposer / no spec-decode case. Threaded into each
-/// `WorkerCreateConfig` construction so the worker can load the draft
-/// alongside the target.
-fn spec_decode_draft_model_path(config: &VllmConfig) -> Option<String> {
-    match config.speculative_model.as_deref() {
-        Some("ngram") | None => None,
-        Some(path) => Some(path.to_string()),
-    }
+/// The speculative decoding a run does: `--speculative-model` and this build's compiled heads,
+/// resolved once per stack ([`resolve_speculative_decoding`]) and read everywhere after.
+#[derive(Debug, Clone)]
+enum Speculation {
+    Off,
+    /// The n-gram proposer (`--speculative-model ngram`).
+    Ngram,
+    /// A standalone draft model (a local path or Hub repo), validated against the target.
+    DraftModel(String),
+    /// A multi-token-prediction head: the target's compiled one ([`Draft::TargetHead`]), or the
+    /// one `--speculative-model` names ([`Draft::Checkpoint`]).
+    Head {
+        head: scratchy_forward_compiler::HeadRegistration,
+        draft: Draft,
+    },
 }
 
-/// Build the speculative-decoding proposer config from a `VllmConfig`.
-///
-/// Three outcomes:
-///   * `speculative_model == None` → `Ok(None)` (spec decode disabled).
-///   * `speculative_model == Some("ngram")` → `Ok(Some(Ngram(...)))`.
-///   * `speculative_model == Some(other)` → `Ok(Some(DraftModel(...)))` —
-///     but [`validate_speculative_decoding`] (called earlier from each
-///     `initialize_stack*` entry point) refuses to start an engine with
-///     this variant until the draft-model proposer is wired.
-///
-/// Today this fn returns `Err` for the draft-model branch as a defense in
-/// depth in case the entry-point validator is bypassed. Phase 4 replaces
-/// that `Err` with the real draft-model wiring.
-fn build_proposer_config(
-    config: &VllmConfig,
-    max_model_len: usize,
-) -> Result<Option<ProposerConfig>> {
-    let Some(spec) = config.speculative_model.as_deref() else {
-        return Ok(None);
-    };
-    if spec == "ngram" {
-        return Ok(Some(ProposerConfig::Ngram(NgramProposerConfig {
-            num_speculative_tokens: config.num_speculative_tokens,
-            max_ngram_size: config.ngram_prompt_lookup_max,
-            min_ngram_size: config.ngram_prompt_lookup_min,
-            max_model_len,
-        })));
+impl Speculation {
+    fn is_on(&self) -> bool {
+        !matches!(self, Self::Off)
     }
-    // Non-"ngram" value: a draft checkpoint (path / HF repo) — a multi-token-prediction head
-    // drafts with the MTP proposer (its compiled drafts, `resolve_speculative_decoding`); anything
-    // else is a standalone draft model.
-    if let Some(head) = draft_head(config, spec)? {
-        return Ok(Some(ProposerConfig::Mtp(MtpProposerConfig {
-            model: spec.to_string(),
-            num_speculative_tokens: config.num_speculative_tokens,
-            max_seqs: usize::from(head.max_seqs),
-            max_model_len,
-        })));
+
+    /// The tokens a step drafts — the scheduler's lookahead. A head drafts what it was compiled to
+    /// (`HeadRegistration::drafts`): its target's verify steps carry exactly those rows, which both
+    /// models' kernels bake, so `--num-speculative-tokens` counts only an n-gram or draft model's.
+    ///
+    /// TODO: a `--num-speculative-tokens` given with a head is ignored, and the flag's default (2)
+    /// cannot be told from a given value: make it optional, and refuse one that is not the head's.
+    fn drafts(&self, config: &VllmConfig) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Ngram | Self::DraftModel(_) => config.num_speculative_tokens,
+            Self::Head { head, .. } => usize::from(head.drafts),
+        }
     }
-    Ok(Some(ProposerConfig::DraftModel(DraftModelProposerConfig {
-        model: spec.to_string(),
-        num_speculative_tokens: config.num_speculative_tokens,
-        dtype: config.draft_model_dtype.clone(),
-        max_model_len,
-    })))
+
+    /// What the worker loads to draft with.
+    fn worker_draft(&self) -> Option<Draft> {
+        match self {
+            Self::Off | Self::Ngram => None,
+            Self::DraftModel(model) => Some(Draft::Checkpoint(model.clone())),
+            Self::Head { draft, .. } => Some(draft.clone()),
+        }
+    }
+
+    /// Mirror Python vLLM (vllm/config/vllm.py:709-721): force-disable async scheduling for
+    /// non-EAGLE spec-decode methods. Both ngram and draft-model paths seed K-step drafts from
+    /// step N's output for step N+1's verify; async's 1-step lookahead skews that to N+2 and
+    /// acceptance collapses to ~0. A multi-token-prediction head drafts in the worker, at the end
+    /// of the step it drafts from, and the async loop waits only on a step that drafts or
+    /// verifies, so it is compatible with async.
+    fn requires_sync(&self) -> bool {
+        matches!(self, Self::Ngram | Self::DraftModel(_))
+    }
+
+    /// The engine's proposer.
+    fn proposer_config(&self, config: &VllmConfig, max_model_len: usize) -> Option<ProposerConfig> {
+        let num_speculative_tokens = self.drafts(config);
+        match self {
+            Self::Off => None,
+            Self::Ngram => Some(ProposerConfig::Ngram(NgramProposerConfig {
+                num_speculative_tokens,
+                max_ngram_size: config.ngram_prompt_lookup_max,
+                min_ngram_size: config.ngram_prompt_lookup_min,
+                max_model_len,
+            })),
+            Self::DraftModel(model) => Some(ProposerConfig::DraftModel(DraftModelProposerConfig {
+                model: model.clone(),
+                num_speculative_tokens,
+                dtype: config.draft_model_dtype.clone(),
+                max_model_len,
+            })),
+            Self::Head { head, .. } => Some(ProposerConfig::Mtp(MtpProposerConfig {
+                num_speculative_tokens,
+                max_seqs: usize::from(head.max_seqs),
+                max_model_len,
+            })),
+        }
+    }
 }
 
 /// The registration of the `--speculative-model` checkpoint's multi-token-prediction head, when
@@ -735,46 +761,61 @@ fn draft_head(
         .and_then(scratchy_forward_compiler::draft_head))
 }
 
-/// The speculative decoding a run does, validated ([`validate_speculative_decoding`]). A build that
-/// compiled the target's multi-token-prediction head drafts with it (no `--speculative-model`):
-/// the head is a fact of the compiled model, its repo the target's as the head's registration
-/// names it. A head drafts what it was compiled to (`HeadRegistration::drafts`) — its target's
-/// verify steps carry exactly those rows, which both models' kernels bake — so
-/// `--num-speculative-tokens` is not a head's: it counts an n-gram or draft model's drafts.
+/// The speculative decoding a run does ([`Speculation`]), validated before any model load. Called
+/// once at the top of each `initialize_stack*` entry.
 ///
-/// TODO: a `--num-speculative-tokens` given with a head is ignored, and the flag's default (2)
-/// cannot be told from a given value: make it optional, and refuse one that is not the head's.
-fn resolve_speculative_decoding(config: &VllmConfig) -> Result<std::borrow::Cow<'_, VllmConfig>> {
-    let head = match config.speculative_model.as_deref() {
-        Some("ngram") => None,
-        Some(spec) => draft_head(config, spec)?.map(|head| (spec.to_string(), head)),
-        None if !cfg!(feature = "metal") => None,
-        None => target_head(config)?,
+/// - `--speculative-model ngram`: the n-gram proposer.
+/// - `--speculative-model <checkpoint>`: a multi-token-prediction head when its config names a
+///   head arch this build compiled — it embeds and decodes through the target's own embedding
+///   and lm_head (the worker lends them), so its token IDs are the target's by construction —
+///   else a standalone draft model, checked against the target (`validate_target_draft_pair`:
+///   vocab/tokenizer alignment, and on metal a rough memory budget).
+/// - none, on metal: the target's compiled multi-token-prediction head, when this build compiled
+///   one for the target ([`target_head`]); the head is a fact of the compiled model.
+fn resolve_speculative_decoding(config: &VllmConfig) -> Result<Speculation> {
+    let speculation = match config.speculative_model.as_deref() {
+        None if !cfg!(feature = "metal") => Speculation::Off,
+        None => match target_head(config)? {
+            Some(head) => Speculation::Head {
+                head,
+                draft: Draft::TargetHead,
+            },
+            None => Speculation::Off,
+        },
+        Some("ngram") => Speculation::Ngram,
+        Some(spec) => match draft_head(config, spec)? {
+            Some(head) => Speculation::Head {
+                head,
+                draft: Draft::Checkpoint(spec.to_string()),
+            },
+            None => {
+                validate_target_draft_pair(config, spec)?;
+                info!(
+                    "spec-decode: draft model {spec:?} accepted; worker-side proposer runs a \
+                     K-step decode chain per step."
+                );
+                Speculation::DraftModel(spec.to_string())
+            }
+        },
     };
-    let config = match head {
-        None => std::borrow::Cow::Borrowed(config),
-        Some((repo, head)) => {
-            info!(
-                "spec-decode: {} drafts {} tokens a step with its compiled multi-token-prediction \
-                 head {repo}.",
-                config.model, head.drafts,
-            );
-            std::borrow::Cow::Owned(VllmConfig {
-                speculative_model: Some(repo),
-                num_speculative_tokens: usize::from(head.drafts),
-                ..config.clone()
-            })
-        }
-    };
-    validate_speculative_decoding(&config)?;
-    Ok(config)
+    if let Speculation::Head { head, draft } = &speculation {
+        let source = match draft {
+            Draft::TargetHead => "its compiled",
+            Draft::Checkpoint(_) => "the --speculative-model",
+        };
+        info!(
+            "spec-decode: {} drafts {} tokens a step with {source} multi-token-prediction head.",
+            config.model, head.drafts,
+        );
+    }
+    Ok(speculation)
 }
 
-/// The repo and registration of the target's multi-token-prediction head, when this build compiled
-/// one for the target's checkpoint architecture and the target's config declares MTP layers.
-fn target_head(
-    config: &VllmConfig,
-) -> Result<Option<(String, scratchy_forward_compiler::HeadRegistration)>> {
+/// The registration of the target's multi-token-prediction head, when this build compiled one for
+/// the target's checkpoint architecture and the target's config declares MTP layers. Where the
+/// head's tensors are (the target's own checkpoint, or the repo it is published under) is the
+/// worker's to find ([`Draft::TargetHead`]).
+fn target_head(config: &VllmConfig) -> Result<Option<scratchy_forward_compiler::HeadRegistration>> {
     let target_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
         &config.model,
         config.hf_token.as_deref(),
@@ -789,70 +830,20 @@ fn target_head(
     let mtp_layers = (target.extra.get("mtp_num_hidden_layers"))
         .or_else(|| text?.get("mtp_num_hidden_layers"))
         .and_then(|v| v.as_u64());
-    let Some(head) = (target.arch_hint())
-        .and_then(scratchy_forward_compiler::head_of)
-        .filter(|_| mtp_layers.is_some_and(|n| n > 0))
-    else {
+    let Some(layers) = mtp_layers.filter(|&n| n > 0) else {
         return Ok(None);
     };
-    let repo = head.repo_of(&config.model).with_context(|| {
-        format!(
-            "this build compiled {:?}'s multi-token-prediction head, but its repo cannot be named \
-             from the target's; pass --speculative-model <head>",
+    let arch = target.arch_hint().unwrap_or_default();
+    let head = scratchy_forward_compiler::head_of(arch);
+    if head.is_none() {
+        info!(
+            "spec-decode: {}'s checkpoint declares {layers} multi-token-prediction layer(s), but \
+             this build compiled no head for {arch} (`spec/mtp` compiles the heads it has an arch \
+             for); serving without drafting.",
             config.model
-        )
-    })?;
-    Ok(Some((repo, head)))
-}
-
-/// Validate `--speculative-model` against the phase guards before any
-/// model load. Called at the top of each `initialize_stack*` entry.
-///
-/// For draft-model speculative decoding (`--speculative-model <path>`):
-///   1. Vocab/tokenizer alignment (`validate_target_draft_pair`).
-///   2. Metal memory budget rough-check (metal feature only).
-///
-/// Once wired, the worker runs a K-step draft
-/// chain after each target step and stashes the drafts on
-/// `ModelRunnerOutput.draft_token_ids`; the engine forwards them to the
-/// scheduler via `set_spec_token_ids`. The metal-side M>1 verify path
-/// is a follow-up — until it lands, drafts are proposed but discarded
-/// by the worker's next prepare_inputs, and the engine reports 0%
-/// acceptance.
-fn validate_speculative_decoding(config: &VllmConfig) -> Result<()> {
-    let Some(spec) = config.speculative_model.as_deref() else {
-        return Ok(());
-    };
-    if spec == "ngram" {
-        return Ok(());
+        );
     }
-    // A head embeds and decodes through the target's own embedding and lm_head (the worker lends
-    // them), so its token IDs are the target's by construction; its repo's tokenizer is unused.
-    if draft_head(config, spec)?.is_some() {
-        info!("spec-decode: {spec:?} is a multi-token-prediction head of the target.");
-        return Ok(());
-    }
-    validate_target_draft_pair(config, spec)?;
-    info!(
-        "spec-decode: draft model {:?} accepted; worker-side proposer runs a K-step \
-         decode chain per step.",
-        spec
-    );
-    Ok(())
-}
-
-/// Mirror Python vLLM (vllm/config/vllm.py:709-721): force-disable async
-/// scheduling for non-EAGLE spec-decode methods. Both ngram and draft-model
-/// paths seed K-step drafts from step N's output for step N+1's verify;
-/// async's 1-step lookahead skews that to N+2 and acceptance collapses to
-/// ~0. A multi-token-prediction head drafts in the worker, at the end of the
-/// step it drafts from, and the async loop waits only on a step that drafts
-/// or verifies, so it is compatible with async.
-fn spec_decode_requires_sync(config: &VllmConfig) -> bool {
-    match config.speculative_model.as_deref() {
-        None => false,
-        Some(spec) => !matches!(draft_head(config, spec), Ok(Some(_))),
-    }
+    Ok(head)
 }
 
 /// Phase-2 guards: vocab/tokenizer match + memory budget for the
@@ -1238,6 +1229,7 @@ fn backend_device_total_bytes_and_name() -> Option<(u64, String)> {
 /// device-aware batched-token default (offline LLM vs online server context).
 fn initialize_core(
     config: &VllmConfig,
+    speculation: &Speculation,
     progress: Option<&Arc<crate::progress::StartupProgress>>,
     is_offline: bool,
 ) -> Result<InitializedCore> {
@@ -1245,7 +1237,7 @@ fn initialize_core(
 
     // TP > 1: multi-GPU path with NCCL.
     if tp_size > 1 {
-        return initialize_core_tp(config);
+        return initialize_core_tp(config, speculation);
     }
 
     let model_path = config.model.clone();
@@ -1284,7 +1276,7 @@ fn initialize_core(
     });
 
     let (mut worker, hf_config, model_dir, model_dtype) =
-        create_worker(config, model_path, progress)?;
+        create_worker(config, speculation, model_path, progress)?;
 
     if let Some(arch) = worker.architecture() {
         info!("Resolved model architecture: {}", arch);
@@ -1377,8 +1369,7 @@ fn initialize_core(
         info!("EOS token IDs: {:?}", eos_token_ids);
     }
 
-    let use_async_scheduling =
-        !config.disable_async_scheduling && !spec_decode_requires_sync(config);
+    let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
     // Recurrent / hybrid arches (Mamba, Gated-DeltaNet — Qwen3.5/3.6/Next, …)
     // carry a sequential conv/ssm state that CANNOT be reconstructed from a
     // cached KV prefix: a prefix-cache hit would feed the sequence only its
@@ -1508,11 +1499,7 @@ fn initialize_core(
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
             async_scheduling: Some(use_async_scheduling),
-            num_lookahead_tokens: if config.speculative_model.is_some() {
-                config.num_speculative_tokens
-            } else {
-                0
-            },
+            num_lookahead_tokens: speculation.drafts(config),
             ..Default::default()
         },
         max_model_len,
@@ -1520,8 +1507,8 @@ fn initialize_core(
         block_size,
         engine_index: 0,
         async_scheduling: use_async_scheduling,
-        use_spec_decode: config.speculative_model.is_some(),
-        proposer_config: build_proposer_config(config, max_model_len)?,
+        use_spec_decode: speculation.is_on(),
+        proposer_config: speculation.proposer_config(config, max_model_len),
         eos_token_ids,
         is_pooling: config.runner == "pooling",
         enable_prefix_caching,
@@ -1563,10 +1550,10 @@ fn initialize_core(
 /// TP variant of `initialize_core`: spawns one worker per GPU, sets up NCCL,
 /// profiles memory, warms up, and returns an `InitializedCore` with a
 /// `ThreadPoolExecutor`-backed `InprocClient`.
-fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
+fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<InitializedCore> {
     #[cfg(not(feature = "nccl"))]
     {
-        let _ = config;
+        let _ = (config, speculation);
         anyhow::bail!(
             "Tensor parallelism requires the `nccl` feature; \
              rebuild with --features nccl"
@@ -1625,7 +1612,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                     .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
-                draft_model_path: spec_decode_draft_model_path(config),
+                draft: speculation.worker_draft(),
                 draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
@@ -1786,8 +1773,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
         let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
         let executor = ThreadPoolExecutor::new(workers, parallel_config);
 
-        let use_async_scheduling =
-            !config.disable_async_scheduling && !spec_decode_requires_sync(config);
+        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
         let enable_prefix_caching = config.enable_prefix_caching;
 
         let eos_token_ids: Vec<u32> = hf_config
@@ -1816,11 +1802,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: if config.speculative_model.is_some() {
-                    config.num_speculative_tokens
-                } else {
-                    0
-                },
+                num_lookahead_tokens: speculation.drafts(config),
                 ..Default::default()
             },
             max_model_len,
@@ -1828,7 +1810,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
             block_size: config.block_size,
             engine_index: 0,
             async_scheduling: use_async_scheduling,
-            use_spec_decode: config.speculative_model.is_some(),
+            use_spec_decode: speculation.is_on(),
             proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
@@ -1888,8 +1870,7 @@ fn load_generation_defaults(
 }
 
 pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
-    let resolved = resolve_speculative_decoding(config)?;
-    let config = &*resolved;
+    let speculation = resolve_speculative_decoding(config)?;
     let init_start = Instant::now();
 
     // Create progress bar if logging is below INFO level
@@ -1899,7 +1880,7 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
     };
 
     // Offline LLM/throughput context → device-aware offline batch defaults.
-    let core = initialize_core(config, Some(&progress), true)?;
+    let core = initialize_core(config, &speculation, Some(&progress), true)?;
     progress.finish();
     info!(
         "init engine (load model, create kv cache) took {:.2} seconds",
@@ -1982,8 +1963,7 @@ pub fn initialize_stack(
     config: &VllmConfig,
     progress: Option<Arc<crate::progress::StartupProgress>>,
 ) -> Result<InitializedStack> {
-    let resolved = resolve_speculative_decoding(config)?;
-    let config = &*resolved;
+    let speculation = resolve_speculative_decoding(config)?;
     let init_start = Instant::now();
 
     // Create progress bar if not provided and logging is below INFO level
@@ -1998,7 +1978,7 @@ pub fn initialize_stack(
 
     // External launcher: each process is a separate rank with its own GPU.
     if config.distributed_executor_backend == "external_launcher" {
-        return initialize_stack_external(config, model_name, init_start);
+        return initialize_stack_external(config, &speculation, model_name, init_start);
     }
 
     // Multi-node TP ("mp" backend): leader runs engine+scheduler, followers
@@ -2007,25 +1987,25 @@ pub fn initialize_stack(
     if (config.num_nodes > 1 || config.distributed_executor_backend == "mp")
         && config.node_rank == 0
     {
-        return initialize_stack_multinode(config, model_name, init_start);
+        return initialize_stack_multinode(config, &speculation, model_name, init_start);
     }
 
     let pp_size = config.pipeline_parallel_size;
 
     // TP+PP or PP-only: multi-GPU path with NCCL P2P for PP and all-reduce for TP.
     if pp_size > 1 {
-        return initialize_stack_tp_pp(config, model_name, init_start);
+        return initialize_stack_tp_pp(config, &speculation, model_name, init_start);
     }
 
     // TP > 1: multi-GPU path with NCCL (in-process, thread-per-GPU).
     if tp_size > 1 {
-        return initialize_stack_tp(config, model_name, init_start);
+        return initialize_stack_tp(config, &speculation, model_name, init_start);
     }
 
     // TP=1: single-GPU path.
     progress.set_stage("Initializing backend");
     // Online-server context → keep the (smaller) server batch defaults.
-    let core = initialize_core(config, Some(&progress), false)?;
+    let core = initialize_core(config, &speculation, Some(&progress), false)?;
 
     progress.set_stage("Creating engine");
 
@@ -2060,7 +2040,7 @@ pub fn initialize_stack(
 
     let mut engine = engine;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
-    if !config.disable_async_scheduling && !spec_decode_requires_sync(config) {
+    if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);
     }
     if config.runner == "pooling" {
@@ -2116,12 +2096,13 @@ pub fn initialize_stack(
 /// - Follower (node_rank>0): Handled by [`initialize_and_run_follower`].
 fn initialize_stack_multinode(
     config: &VllmConfig,
+    speculation: &Speculation,
     model_name: String,
     init_start: Instant,
 ) -> Result<InitializedStack> {
     #[cfg(not(feature = "nccl"))]
     {
-        let _ = (config, model_name, init_start);
+        let _ = (config, speculation, model_name, init_start);
         anyhow::bail!(
             "Multi-node TP requires the `nccl` feature; \
              rebuild with --features nccl"
@@ -2199,7 +2180,7 @@ fn initialize_stack_multinode(
                 .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
-            draft_model_path: spec_decode_draft_model_path(config),
+            draft: speculation.worker_draft(),
             draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
@@ -2360,8 +2341,7 @@ fn initialize_stack_multinode(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling =
-            !config.disable_async_scheduling && !spec_decode_requires_sync(config);
+        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -2371,11 +2351,7 @@ fn initialize_stack_multinode(
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: if config.speculative_model.is_some() {
-                    config.num_speculative_tokens
-                } else {
-                    0
-                },
+                num_lookahead_tokens: speculation.drafts(config),
                 ..Default::default()
             },
             max_model_len,
@@ -2383,7 +2359,7 @@ fn initialize_stack_multinode(
             block_size: config.block_size,
             engine_index: 0,
             async_scheduling: use_async_scheduling,
-            use_spec_decode: config.speculative_model.is_some(),
+            use_spec_decode: speculation.is_on(),
             proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
@@ -2426,7 +2402,7 @@ fn initialize_stack_multinode(
             AsyncEngine::new(client, model_name.clone(), max_model_len)
         };
 
-        if !config.disable_async_scheduling && !spec_decode_requires_sync(config) {
+        if !config.disable_async_scheduling && !speculation.requires_sync() {
             engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
             engine.set_async_scheduling(true);
         }
@@ -2461,7 +2437,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
     use scratchy_serving_worker::gpu_worker::CudaWorker;
     use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
 
-    validate_speculative_decoding(config)?;
+    let speculation = resolve_speculative_decoding(config)?;
 
     let tp_size = config.tensor_parallel_size;
     let node_rank = config.node_rank;
@@ -2516,7 +2492,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
             .unwrap_or(CudaGraphMode::Auto),
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
-        draft_model_path: spec_decode_draft_model_path(config),
+        draft: speculation.worker_draft(),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -2618,10 +2594,11 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
 /// NCCL comm. Workers load only their PP stage's layers.
 fn initialize_stack_tp_pp(
     config: &VllmConfig,
+    speculation: &Speculation,
     model_name: String,
     init_start: Instant,
 ) -> Result<InitializedStack> {
-    let _ = (config, model_name, init_start);
+    let _ = (config, speculation, model_name, init_start);
     anyhow::bail!(
         "Pipeline parallelism is not supported on the scratchy-forward-compiler forwards \
          (the previous PP path lived in `scratchy_target_cuda::model::*` and has been \
@@ -2631,7 +2608,7 @@ fn initialize_stack_tp_pp(
     {
         #[cfg(not(feature = "nccl"))]
         {
-            let _ = (config, model_name, init_start);
+            let _ = (config, speculation, model_name, init_start);
             anyhow::bail!(
                 "Pipeline parallelism requires the `nccl` feature; \
              rebuild with --features nccl"
@@ -2710,7 +2687,7 @@ fn initialize_stack_tp_pp(
                             .unwrap_or(CudaGraphMode::Auto),
                         eos_token_ids: vec![],
                         max_model_len: config.max_model_len,
-                        draft_model_path: spec_decode_draft_model_path(config),
+                        draft: speculation.worker_draft(),
                         draft_model_dtype: config.draft_model_dtype.clone(),
                     }
                 })
@@ -2947,11 +2924,7 @@ fn initialize_stack_tp_pp(
                     policy: SchedulerPolicy::Fcfs,
                     enable_chunked_prefill: true,
                     async_scheduling: Some(use_async_scheduling),
-                    num_lookahead_tokens: if config.speculative_model.is_some() {
-                        config.num_speculative_tokens
-                    } else {
-                        0
-                    },
+                    num_lookahead_tokens: speculation.drafts(config),
                     use_pp: true,
                     ..Default::default()
                 },
@@ -2960,7 +2933,7 @@ fn initialize_stack_tp_pp(
                 block_size: config.block_size,
                 engine_index: 0,
                 async_scheduling: use_async_scheduling,
-                use_spec_decode: config.speculative_model.is_some(),
+                use_spec_decode: speculation.is_on(),
                 proposer_config: None,
                 eos_token_ids,
                 is_pooling: config.runner == "pooling",
@@ -3042,12 +3015,13 @@ fn initialize_stack_tp_pp(
 /// TODO: Port to CudaWorker.
 fn initialize_stack_tp(
     config: &VllmConfig,
+    speculation: &Speculation,
     model_name: String,
     init_start: Instant,
 ) -> Result<InitializedStack> {
     #[cfg(not(feature = "nccl"))]
     {
-        let _ = (config, model_name, init_start);
+        let _ = (config, speculation, model_name, init_start);
         anyhow::bail!(
             "Tensor parallelism requires the `nccl` feature; \
              rebuild with --features nccl"
@@ -3107,7 +3081,7 @@ fn initialize_stack_tp(
                     .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
-                draft_model_path: spec_decode_draft_model_path(config),
+                draft: speculation.worker_draft(),
                 draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
@@ -3290,8 +3264,7 @@ fn initialize_stack_tp(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling =
-            !config.disable_async_scheduling && !spec_decode_requires_sync(config);
+        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -3303,11 +3276,7 @@ fn initialize_stack_tp(
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: if config.speculative_model.is_some() {
-                    config.num_speculative_tokens
-                } else {
-                    0
-                },
+                num_lookahead_tokens: speculation.drafts(config),
                 ..Default::default()
             },
             max_model_len,
@@ -3315,7 +3284,7 @@ fn initialize_stack_tp(
             block_size: config.block_size,
             engine_index: 0,
             async_scheduling: use_async_scheduling,
-            use_spec_decode: config.speculative_model.is_some(),
+            use_spec_decode: speculation.is_on(),
             proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
@@ -3366,7 +3335,7 @@ fn initialize_stack_tp(
             AsyncEngine::new(client, model_name.clone(), max_model_len)
         };
 
-        if !config.disable_async_scheduling && !spec_decode_requires_sync(config) {
+        if !config.disable_async_scheduling && !speculation.requires_sync() {
             engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
             engine.set_async_scheduling(true);
         }
@@ -3481,12 +3450,13 @@ impl ExternalLauncherEnv {
 /// Each process runs its own HTTP server on a different port (set via --port).
 fn initialize_stack_external(
     config: &VllmConfig,
+    speculation: &Speculation,
     model_name: String,
     init_start: Instant,
 ) -> Result<InitializedStack> {
     #[cfg(not(feature = "nccl"))]
     {
-        let _ = (config, model_name, init_start);
+        let _ = (config, speculation, model_name, init_start);
         anyhow::bail!(
             "External launcher requires the `nccl` feature; \
              rebuild with --features nccl"
@@ -3560,7 +3530,7 @@ fn initialize_stack_external(
                 .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
-            draft_model_path: spec_decode_draft_model_path(config),
+            draft: speculation.worker_draft(),
             draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
@@ -3686,8 +3656,7 @@ fn initialize_stack_external(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling =
-            !config.disable_async_scheduling && !spec_decode_requires_sync(config);
+        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -3699,11 +3668,7 @@ fn initialize_stack_external(
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: if config.speculative_model.is_some() {
-                    config.num_speculative_tokens
-                } else {
-                    0
-                },
+                num_lookahead_tokens: speculation.drafts(config),
                 ..Default::default()
             },
             max_model_len,
@@ -3711,7 +3676,7 @@ fn initialize_stack_external(
             block_size: config.block_size,
             engine_index: 0,
             async_scheduling: use_async_scheduling,
-            use_spec_decode: config.speculative_model.is_some(),
+            use_spec_decode: speculation.is_on(),
             proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
@@ -3754,7 +3719,7 @@ fn initialize_stack_external(
             AsyncEngine::new(client, model_name.clone(), max_model_len)
         };
 
-        if !config.disable_async_scheduling && !spec_decode_requires_sync(config) {
+        if !config.disable_async_scheduling && !speculation.requires_sync() {
             engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
             engine.set_async_scheduling(true);
         }

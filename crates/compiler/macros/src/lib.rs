@@ -1845,60 +1845,59 @@ pub fn compile_carrier(
                 }
             }
         };
-        // A multi-token-prediction head's facts, per variant: whether its forward reads
-        // `target_hidden`, the on-disk prefixes of the weights a target lends it (every arch
-        // reports its own, so a TARGET's can be read off the loaded model) and its logits' width
-        // (the lent lm_head's rows it reads). The registry carries the arch-wide head facts, so a
-        // loader can place a target's tensors under the head's names before the head loads —
-        // every head variant must agree on them.
-        // The target architectures it drafts for, and how its repo is named from the target's.
-        type HeadFacts = (
-            bool,
-            [Option<String>; 2],
-            u64,
-            Vec<String>,
-            Option<String>,
-            [u64; 2],
-            bool,
-        );
+        // A variant's multi-token-prediction head facts. The registry carries the arch-wide ones
+        // (every head variant must agree), so a loader knows them before the head loads.
+        #[derive(Debug, PartialEq)]
+        struct HeadFacts {
+            /// Its forward reads `target_hidden`: it is a head.
+            reads_target_hidden: bool,
+            /// The on-disk prefixes of the weights a target lends it — every arch reports its own,
+            /// so a TARGET's can be read off the loaded model.
+            lent: [Option<String>; 2],
+            /// Its logits' width: the lent lm_head's rows it reads.
+            lm_head_rows: u64,
+            /// The target architectures it drafts for.
+            drafts_for: Vec<String>,
+            /// How its repo is named from the target's when it is published apart.
+            repo_infix: Option<String>,
+            /// Where its tensors sit inside its target's checkpoint when it ships there.
+            checkpoint_prefix: Option<String>,
+            /// Its `spec_drafts` and `spec_max_seqs`.
+            spec: [u64; 2],
+            reads_target_kv: bool,
+        }
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
             .map(|sm| {
-                let reads = sm.fuf.nodes.iter().any(|n| {
-                    n.op == classified::OpKind::LoadRows(
-                        scratchy_forward_compiler::RowsExtern::TargetHidden,
-                    )
-                });
-                let lent = scratchy_forward_compiler::LentWeight::ALL
-                    .map(|w| codegen::lent_weight_prefix(&sm.prog, sm.model, w));
-                let vocab = sm.model.bounds.get("vocab_size").copied().unwrap_or(0);
-                let (drafts_for, infix) = (&sm.model.drafts_for, &sm.model.drafter_repo_infix);
-                let spec = ["spec_drafts", "spec_max_seqs"]
-                    .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0));
-                (
-                    sm.mod_name.clone(),
-                    (
-                        reads,
-                        lent,
-                        vocab,
-                        drafts_for.clone(),
-                        infix.clone(),
-                        spec,
-                        sm.model.arch.reads_target_kv,
-                    ),
-                )
+                let facts = HeadFacts {
+                    reads_target_hidden: sm.fuf.nodes.iter().any(|n| {
+                        n.op == classified::OpKind::LoadRows(
+                            scratchy_forward_compiler::RowsExtern::TargetHidden,
+                        )
+                    }),
+                    lent: scratchy_forward_compiler::LentWeight::ALL
+                        .map(|w| codegen::lent_weight_prefix(&sm.prog, sm.model, w)),
+                    lm_head_rows: sm.model.bounds.get("vocab_size").copied().unwrap_or(0),
+                    drafts_for: sm.model.drafts_for.clone(),
+                    repo_infix: sm.model.drafter_repo_infix.clone(),
+                    checkpoint_prefix: sm.model.checkpoint_prefix.clone(),
+                    spec: ["spec_drafts", "spec_max_seqs"]
+                        .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0)),
+                    reads_target_kv: sm.model.arch.reads_target_kv,
+                };
+                (sm.mod_name.clone(), facts)
             })
             .collect();
         let head_tokens = {
             let fact = |a: &DispatchArm| &head_facts[&a.model_ident.to_string()];
             let reads_arms = arch_dispatch_arms.iter().map(|a| {
                 let variant_ident = pascal_case(&a.model_ident);
-                let reads = fact(a).0;
+                let reads = fact(a).reads_target_hidden;
                 quote! { Weights::#variant_ident(_) => #reads, }
             });
             let lent_arms = arch_dispatch_arms.iter().flat_map(|a| {
                 let variant_ident = pascal_case(&a.model_ident);
-                let lent = &fact(a).1;
+                let lent = &fact(a).lent;
                 scratchy_forward_compiler::LentWeight::ALL
                     .into_iter()
                     .zip(lent)
@@ -1929,20 +1928,9 @@ pub fn compile_carrier(
             }
         };
         let head_registration = {
-            type Head<'a> = (
-                &'a [Option<String>; 2],
-                u64,
-                &'a [String],
-                &'a Option<String>,
-                [u64; 2],
-                bool,
-            );
-            let heads: Vec<Head<'_>> = head_facts
+            let heads: Vec<&HeadFacts> = head_facts
                 .values()
-                .filter(|(reads, ..)| *reads)
-                .map(|(_, lent, vocab, drafts_for, infix, spec, kv)| {
-                    (lent, *vocab, &drafts_for[..], infix, *spec, *kv)
-                })
+                .filter(|facts| facts.reads_target_hidden)
                 .collect();
             match heads.first() {
                 None => quote! { ::core::option::Option::None },
@@ -1950,35 +1938,48 @@ pub fn compile_carrier(
                     assert!(
                         heads.iter().all(|head| head == first),
                         "{arch_ident}: its head variants disagree on where they load lent weights, \
-                         how many lm_head rows they read, whose head they are or how many tokens \
-                         they draft ({heads:?}); a loader must know them before the head loads"
+                         how many lm_head rows they read, whose head they are, where they ship or \
+                         how many tokens they draft ({heads:?}); a loader must know them before \
+                         the head loads"
                     );
-                    let ([Some(embed_tokens), lm_head], vocab, drafts_for, infix, spec, kv) = first
+                    let [arch] = &hf_arches[..] else {
+                        panic!("{arch_ident}: a head registers under one identity ({hf_arches:?})");
+                    };
+                    let HeadFacts {
+                        lent: [Some(embed_tokens), lm_head],
+                        lm_head_rows,
+                        drafts_for,
+                        repo_infix,
+                        checkpoint_prefix,
+                        spec,
+                        reads_target_kv,
+                        ..
+                    } = first
                     else {
                         panic!(
                             "{arch_ident}: a head reading `target_hidden` must name embed_tokens \
                              (it has {first:?})"
                         );
                     };
-                    let lm_head = match lm_head {
-                        Some(lm_head) => quote! { ::core::option::Option::Some(#lm_head) },
+                    let some = |v: &Option<String>| match v {
+                        Some(v) => quote! { ::core::option::Option::Some(#v) },
                         None => quote! { ::core::option::Option::None },
                     };
-                    let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*vocab as u32);
+                    let (lm_head, repo_infix, checkpoint_prefix) =
+                        (some(lm_head), some(repo_infix), some(checkpoint_prefix));
+                    let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
                     let [drafts, max_seqs] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
-                    let infix = match infix {
-                        Some(infix) => quote! { ::core::option::Option::Some(#infix) },
-                        None => quote! { ::core::option::Option::None },
-                    };
                     quote! {
                         ::core::option::Option::Some(::scratchy_forward_compiler::HeadRegistration {
+                            arch: #arch,
                             embed_tokens: #embed_tokens,
                             lm_head: #lm_head,
                             lm_head_rows: #lm_head_rows,
-                            reads_target_kv: #kv,
+                            reads_target_kv: #reads_target_kv,
                             drafts_for: &[#(#drafts_for),*],
-                            repo_infix: #infix,
+                            repo_infix: #repo_infix,
+                            checkpoint_prefix: #checkpoint_prefix,
                             drafts: #drafts,
                             max_seqs: #max_seqs,
                         })

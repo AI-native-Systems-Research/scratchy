@@ -86,15 +86,25 @@ pub struct WorkerCreateConfig {
     /// decide `use_long_rope = max_model_len > original_max_pos`
     /// the same way Python vLLM does at init time.
     pub max_model_len: Option<usize>,
-    /// Optional draft-model path / HF repo ID for speculative decoding.
-    /// `Some(_)` triggers a second model + KV pool load inside the same
-    /// worker after the target loads. `None` = no draft.
-    pub draft_model_path: Option<String>,
+    /// What the worker drafts with for speculative decoding: `Some(_)` loads a second model and
+    /// its KV pool inside the same worker after the target loads. `None` = no draft.
+    pub draft: Option<Draft>,
     /// Optional dtype override for the draft model's weights ("auto",
     /// "bfloat16", "float16", …). `None` inherits the target's dtype.
     /// Currently passed through but the metal path always coerces to
     /// bf16 to match the target — accepted for CLI parity with Python.
     pub draft_model_dtype: Option<String>,
+}
+
+/// What a worker drafts with, besides its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Draft {
+    /// A checkpoint of its own, a local path or Hub repo: a standalone draft model, or a
+    /// multi-token-prediction head published apart from its target (its config names its arch).
+    Checkpoint(String),
+    /// The target's compiled multi-token-prediction head: loaded from the target's own checkpoint
+    /// when that carries it, else from the repo it is published under, named from the target's.
+    TargetHead,
 }
 
 /// Result of worker creation: the worker plus metadata needed for init.

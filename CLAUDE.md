@@ -65,14 +65,16 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
 
 ## Verify like CI before opening a build / deps / codegen PR
 `.github/workflows/rust.yml`: the **linux-cuda** job runs
-`cargo clippy --workspace --features cuda,scratchy-models/all
+`cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp
 --exclude scratchy-target-metal --exclude scratchy-target-metal-compiler
 -- -D warnings` (both depend unconditionally on Apple-only `objc2` — the
 compiler crate via its own edge to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
 one of the two still drags `objc2` onto Linux); the **macOS** job
-runs `cargo clippy -p scratchy-models --features metal,all,turboquant -- -D warnings`
-+ kernel tests. It sets `SCRATCHY_GPU=h100`, `CUDA_COMPUTE_CAP=90`,
+runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
++ kernel tests (`mtp` adds the multi-token-prediction head of every model whose
+checkpoint carries one: heads have no configs of their own, so `all` alone
+compiles none). It sets `SCRATCHY_GPU=h100`, `CUDA_COMPUTE_CAP=90`,
 `SCRATCHY_SKIP_CUDA_KERNELS=1` (so `scratchy-builder-cuda`'s build script doesn't
 need a GPU/nvcc). Both `all` runs are the full-scope case —
 expect it to be slow (every config, every arch) and RAM-heavy; that's expected
@@ -88,7 +90,7 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
     apt-get update -qq && apt-get install -y -qq curl git pkg-config libssl-dev ca-certificates >/dev/null 2>&1
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy >/dev/null 2>&1
     export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
-    cargo clippy --workspace --features cuda,scratchy-models/all \
+    cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp \
       --exclude scratchy-target-metal \
       --exclude scratchy-target-metal-compiler -- -D warnings'
 ```

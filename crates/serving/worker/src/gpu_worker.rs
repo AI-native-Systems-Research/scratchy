@@ -100,6 +100,8 @@ use crate::input_batch::InputBatch;
 use crate::input_batch::PreparedInputs;
 #[cfg(feature = "metal")]
 use crate::worker::Worker;
+#[cfg(feature = "metal")]
+use crate::worker_factory::Draft;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -189,13 +191,6 @@ pub struct MetalWorker {
     /// (`"auto"` consults the model's `1_Pooling/config.json`); read
     /// only on the `config.is_pooling` path.
     pooling_strategy: scratchy_core_model::embedding::PoolingStrategy,
-    /// Draft model's resolved snapshot dir, populated when
-    /// `config.draft_model_path` is set.
-    #[allow(dead_code)]
-    draft_model_dir: Option<PathBuf>,
-    /// Draft model's `config.json`, populated alongside `draft_model_dir`.
-    #[allow(dead_code)]
-    draft_hf_config: Option<HfModelConfig>,
     /// Second KV cache pool, sized for the draft model. Lives on the
     /// same `MetalAllocator` / residency set as the target's pool —
     /// one allocator covers all weights + both pools.
@@ -909,8 +904,6 @@ impl MetalWorker {
             mm: None,
             mm_pending: None,
             draft_model: None,
-            draft_model_dir: None,
-            draft_hf_config: None,
             draft_kv_cache: None,
             argmax_kernels: None,
             draft_argmax_kernels: None,
@@ -1470,6 +1463,89 @@ impl MetalWorker {
         Some((out, patches))
     }
 
+    /// A draft checkpoint of its own ([`Draft::Checkpoint`]): its weight store, the architecture its
+    /// config registers under, and the config.
+    fn draft_checkpoint(
+        &self,
+        path: &str,
+        allocator: MetalAllocator,
+    ) -> ExecutorResult<(GpuWeights, String, HfModelConfig)> {
+        let t_resolve = std::time::Instant::now();
+        let draft_dir = resolve_model_path(path, self.config.hf_token.as_deref(), None, None)?;
+        info!(
+            "ScratchyWorker(metal): resolved draft model dir in {:?} ({})",
+            t_resolve.elapsed(),
+            draft_dir.display()
+        );
+        if draft_dir.is_file() && draft_dir.extension().is_some_and(|e| e == "gguf") {
+            return Err(ExecutorError::WorkerInit(
+                "draft GGUF not supported on metal (safetensors only)".into(),
+            ));
+        }
+        let draft_hf_config = HfModelConfig::from_path(&draft_dir)
+            .map_err(|e| ExecutorError::WorkerInit(format!("draft config parse failed: {e}")))?;
+        let draft_arch = draft_hf_config.arch_hint().unwrap_or_default().to_string();
+        let t_from_dir = std::time::Instant::now();
+        let draft_weights = GpuWeights::from_dir(&draft_dir, allocator)
+            .map_err(|e| ExecutorError::WorkerInit(format!("draft weight load failed: {e}")))?;
+        info!(
+            "ScratchyWorker(metal): draft GpuWeights::from_dir in {:?} ({} tensors)",
+            t_from_dir.elapsed(),
+            draft_weights.len()
+        );
+        Ok((draft_weights, draft_arch, draft_hf_config))
+    }
+
+    /// The target's compiled multi-token-prediction head ([`Draft::TargetHead`]): from the target's
+    /// own store when its checkpoint carries the head — tensors under the head's
+    /// `checkpoint_prefix`, lent under the bare names the head binds (the same mmap: nothing
+    /// uploads twice), its config the target's own — else from the repo it is published under,
+    /// named from the target's.
+    fn target_head(
+        &self,
+        allocator: MetalAllocator,
+    ) -> ExecutorResult<(GpuWeights, String, HfModelConfig)> {
+        let (Some(arch), Some(refs), Some(target_config)) = (
+            self.resolved_architecture.as_deref(),
+            self.target_tensor_refs.as_ref(),
+            self.hf_config.as_ref(),
+        ) else {
+            return Err(ExecutorError::WorkerInit(
+                "MTP head: the target must load first (its checkpoint is the head's)".into(),
+            ));
+        };
+        let model = &self.config.model_path;
+        let head = scratchy_forward_compiler::head_of(arch).ok_or_else(|| {
+            ExecutorError::WorkerInit(format!(
+                "this build compiled no multi-token-prediction head for {arch} ({model})"
+            ))
+        })?;
+        if let Some(prefix) = head.checkpoint_prefix.filter(|p| refs.holds(p)) {
+            let mut weights = GpuWeights::empty(allocator);
+            let lent = weights.lend(refs, prefix, "", None).map_err(|e| {
+                ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}"))
+            })?;
+            info!(
+                "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors \
+                 under {prefix})"
+            );
+            return Ok((weights, head.arch.to_string(), target_config.clone()));
+        }
+        let repo = head.repo_of(model).ok_or_else(|| {
+            let inside = match head.checkpoint_prefix {
+                Some(prefix) => format!(" (no tensor under {prefix})"),
+                None => String::new(),
+            };
+            ExecutorError::WorkerInit(format!(
+                "{model}'s checkpoint carries no multi-token-prediction head{inside}, and the repo \
+                 the head is published under cannot be named from {model}; pass \
+                 --speculative-model <head>"
+            ))
+        })?;
+        info!("ScratchyWorker(metal): MTP head published apart from the target, {repo}");
+        self.draft_checkpoint(&repo, allocator)
+    }
+
     /// Load the speculative draft model onto the same Metal device +
     /// allocator + command queue as the target. Called from
     /// `load_model` after the target is fully loaded.
@@ -1483,30 +1559,9 @@ impl MetalWorker {
     /// keys include the library name and each model's synthesized
     /// libraries are derived from its own per-arch macro expansion.
     fn load_draft_model_metal(&mut self) -> ExecutorResult<()> {
-        let path = self.config.draft_model_path.as_deref().ok_or_else(|| {
-            ExecutorError::WorkerInit(
-                "load_draft_model_metal called without draft_model_path".into(),
-            )
+        let draft = self.config.draft.clone().ok_or_else(|| {
+            ExecutorError::WorkerInit("load_draft_model_metal called without a draft".into())
         })?;
-
-        let t_resolve = std::time::Instant::now();
-        let draft_dir = resolve_model_path(path, self.config.hf_token.as_deref(), None, None)?;
-        info!(
-            "ScratchyWorker(metal): resolved draft model dir in {:?} ({})",
-            t_resolve.elapsed(),
-            draft_dir.display()
-        );
-
-        if draft_dir.is_file() && draft_dir.extension().is_some_and(|e| e == "gguf") {
-            return Err(ExecutorError::WorkerInit(
-                "draft GGUF not supported on metal (safetensors only)".into(),
-            ));
-        }
-
-        let draft_hf_config = HfModelConfig::from_path(&draft_dir)
-            .map_err(|e| ExecutorError::WorkerInit(format!("draft config parse failed: {e}")))?;
-        let draft_arch = draft_hf_config.arch_hint().unwrap_or_default().to_string();
-
         // Reuse the target's gpu_device — its allocator owns the
         // residency set the target weights live in, and the draft must
         // share that set or attention reads will race the Apple pager.
@@ -1520,14 +1575,10 @@ impl MetalWorker {
         })?;
         let allocator = (*gpu_device.allocator).clone();
 
-        let t_from_dir = std::time::Instant::now();
-        let mut draft_weights = GpuWeights::from_dir(&draft_dir, allocator)
-            .map_err(|e| ExecutorError::WorkerInit(format!("draft weight load failed: {e}")))?;
-        info!(
-            "ScratchyWorker(metal): draft GpuWeights::from_dir in {:?} ({} tensors)",
-            t_from_dir.elapsed(),
-            draft_weights.len()
-        );
+        let (mut draft_weights, draft_arch, draft_hf_config) = match draft {
+            Draft::Checkpoint(path) => self.draft_checkpoint(&path, allocator)?,
+            Draft::TargetHead => self.target_head(allocator)?,
+        };
         draft_weights.set_target_dtype(GpuDType::BF16);
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
@@ -1631,8 +1682,6 @@ impl MetalWorker {
         )
         .map_err(|e| ExecutorError::WorkerInit(format!("MTP chain compile: {e:?}")))?;
         self.draft_model = Some(draft_model);
-        self.draft_model_dir = Some(draft_dir);
-        self.draft_hf_config = Some(draft_hf_config);
         // Spec-decode runs the chunked-addressing tape rung: the direct (BPC=0) path has an
         // unresolved interaction with the draft K-step chain on 3B-class+ models (out-of-vocab
         // draft tokens). Every pool picks its rung by this device field.
@@ -4536,12 +4585,9 @@ impl Worker for MetalWorker {
         // `Weights::load` body ignores the stream parameter (uploads go
         // through the allocator inside `GpuWeights`).
         // A configured draft may be a multi-token-prediction head, lent the target's embedding and
-        // lm_head: snapshot the refs before the target's load consumes them.
-        self.target_tensor_refs = self
-            .config
-            .draft_model_path
-            .is_some()
-            .then(|| weights.tensor_refs());
+        // lm_head (and its own tensors, when the target's checkpoint carries them): snapshot the
+        // refs before the target's load consumes them.
+        self.target_tensor_refs = self.config.draft.is_some().then(|| weights.tensor_refs());
         let t_try_load = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(
             &mut weights,
@@ -4769,7 +4815,7 @@ impl Worker for MetalWorker {
         // draft model onto the same gpu_device (shared allocator +
         // residency set + command queue). KV pool for the draft is
         // allocated separately in `initialize_cache`.
-        if self.config.draft_model_path.is_some() {
+        if self.config.draft.is_some() {
             self.load_draft_model_metal()?;
         }
 
