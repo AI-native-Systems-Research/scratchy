@@ -69,9 +69,10 @@ pub enum QmvKernel {
     /// whole 512-value blocks; ours finishes the row's last partial block too.
     Fast,
     /// `affine_qmv_fast_*_t8_*` — [`QmvKernel::Fast`] at MLX's 8-row threadgroups
-    /// ([`QMV_FAST_FOLD_TILE_ROWS`]), the pick for the m≥2 buckets a pre-gen-15 GPU decodes
-    /// with: the small-M wide band that would take them needs gen-15+ (`wide_ok`, gated at
-    /// M5 here). The fold streams each matrix's weights once per row at either tile, and
+    /// ([`QMV_FAST_FOLD_TILE_ROWS`]), the pick for the m≥2 buckets a pre-gen-15 GPU
+    /// decodes with: the small-M wide band that would take them needs gen-15+
+    /// ([`affine_qmv_wide_ok`](crate::targets::affine_qmv_wide_ok): M3+). The fold
+    /// streams each matrix's weights once per row at either tile, and
     /// there the 4-row tile only doubles the threadgroup count — #312 cost a third of
     /// granite c4 decode TPOT on an M1 Max this way — so it keeps MLX's tile. One-row
     /// buckets keep [`QmvKernel::Fast`]: #312's measured single-stream win.
@@ -98,8 +99,9 @@ pub enum QmvKernel {
 }
 
 /// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
-/// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+,
-/// which maps to our `is_nax_capable` boundary — M5), then fast/generic.
+/// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+ —
+/// M3 and later, [`affine_qmv_wide_ok`](crate::targets::affine_qmv_wide_ok)),
+/// then fast/generic.
 ///
 /// ```text
 /// if ((K == 128 || K == 64) && is_power_of_2(bits)) → qmv_quad(d=K)
