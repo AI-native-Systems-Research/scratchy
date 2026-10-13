@@ -1,0 +1,4 @@
+{
+  "_comment": "The quantized matmuls keep their activations native: int8 activations (W4A8) gave 17 of ~5000 teacher-forced tokens an argmax fp32 puts >2 nats below its own (bf16: 0), on mlx-community/Qwen2.5-3B-Instruct-4bit (issue #368's screen). Qwen2.5-0.5B screened clean.",
+  "matmul_activations": "native"
+}

@@ -8196,6 +8196,16 @@ fn emit_canonical_params_impl(
         scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
     };
     let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
+    // What the quantized matmuls may round their activations to: the arch's declaration.
+    let matmul_activations = model.arch.matmul_activations.unwrap_or_default();
+    let matmul_activations_tokens = match matmul_activations {
+        scratchy_forward_compiler::MatmulActivations::Int8 => {
+            quote! { ::scratchy_forward_compiler::MatmulActivations::Int8 }
+        }
+        scratchy_forward_compiler::MatmulActivations::Native => {
+            quote! { ::scratchy_forward_compiler::MatmulActivations::Native }
+        }
+    };
     let kv_codec_tokens = match kv_codec {
         scratchy_forward_compiler::KvCodec::Dense => {
             quote! { ::scratchy_forward_compiler::KvCodec::Dense }
@@ -8260,6 +8270,7 @@ fn emit_canonical_params_impl(
                 .map(|&v| v as u32)
                 .unwrap_or(128),
             kv_codec,
+            matmul_activations,
             vision_num_heads,
             vision_head_dim,
             vision_q_size,
@@ -8299,6 +8310,8 @@ fn emit_canonical_params_impl(
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
             const SLIDING_WINDOW: i32 = #sliding_window_lit;
             const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
+            const MATMUL_ACTIVATIONS: ::scratchy_forward_compiler::MatmulActivations =
+                #matmul_activations_tokens;
             const KV_CACHE_LAYERS: ::core::option::Option<&'static [u32]> = #kv_cache_layers_tokens;
             const KV_LORA_RANK: usize = #kv_lora_rank_lit;
             const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;

@@ -1546,6 +1546,14 @@ fn resolve_arch_spec(
         );
         a.scale_dtype = Some(s.to_string());
     }
+    if let Some(s) = json.get("matmul_activations").and_then(|v| v.as_str()) {
+        use scratchy_forward_compiler::MatmulActivations as A;
+        a.matmul_activations = Some(match s {
+            "int8" => A::Int8,
+            "native" => A::Native,
+            _ => panic!("config `{source_stem}`: unknown matmul_activations `{s}` (int8|native)"),
+        });
+    }
     if let Some(m) = json.get("weight_leaf_renames").and_then(|v| v.as_object()) {
         let mut v: Vec<(String, String)> = m
             .iter()
@@ -1952,6 +1960,11 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
         check_enum(&path, "scale_dtype", &s, &["f16", "bf16"])?;
         spec.scale_dtype = Some(s);
     }
+    if let Some(s) = as_str("matmul_activations") {
+        use scratchy_forward_compiler::MatmulActivations as A;
+        check_enum(&path, "matmul_activations", &s, &["int8", "native"])?;
+        spec.matmul_activations = Some(if s == "native" { A::Native } else { A::Int8 });
+    }
 
     spec.bound_defaults = str_u64_pairs(&path, &json, "bound_defaults")?;
     spec.scalar_defaults = str_f64_pairs(&path, &json, "scalar_defaults")?;
@@ -1989,6 +2002,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "borrows",
     "top_level_weights",
     "scale_dtype",
+    "matmul_activations",
     "tie_default",
     "bound_defaults",
     "scalar_defaults",

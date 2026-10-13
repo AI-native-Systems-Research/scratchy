@@ -974,6 +974,20 @@ pub const fn unpack_moe_expert_bits(packed: u32) -> (u32, u32, u32) {
     (packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff)
 }
 
+/// What a quantized matmul may round its activations to, fixed per arch (`arch.json`
+/// `matmul_activations`). An int8 lane (metal's W4A8) takes one scale per (row, 64-chunk),
+/// so an arch whose activations run far past it — measured against fp32, per arch — keeps
+/// its own dtype: gemma-4's attention inputs reach 700x their rms, and int8 left its
+/// projections 2-12x bf16's error and its greedy decode emitting junk tokens (issue #368).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MatmulActivations {
+    /// int8 per (row, 64-chunk), where the shapes fit the int8 lane.
+    #[default]
+    Int8,
+    /// The model's own activation dtype, never quantized.
+    Native,
+}
+
 /// Per-canonical model parameters. Implemented by each canonical's
 /// `Weights` so the universal `Instruction::eval` body can read
 /// model constants without storing them on every variant instance.
@@ -1012,6 +1026,8 @@ pub trait CanonicalParams: WeightAccessors {
     /// the packed stores, and the worker sizes and grows the KV pool, all from
     /// this one value — so the tape, its buffers and the pool always agree.
     const KV_CODEC: KvCodec = KvCodec::Dense;
+    /// What this model's quantized matmuls may round their activations to.
+    const MATMUL_ACTIVATIONS: MatmulActivations = MatmulActivations::Int8;
     /// The layers that hold KV, ascending, when not every layer does: a
     /// recurrent hybrid's attention layers (its Mamba / Gated-DeltaNet layers
     /// keep recurrent state instead). The KV pool holds tensors for these

@@ -29,7 +29,7 @@ use crate::tape::step::{
     RotatedRows, RouterInput, RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
     UnaryAct, UngatedAct,
 };
-use scratchy_ir::{KvCodec, TqBits};
+use scratchy_ir::{KvCodec, MatmulActivations, TqBits};
 use scratchy_subtile::handoff::WeightKind;
 use scratchy_subtile::subtile_ir::ExpertBody;
 
@@ -2656,10 +2656,12 @@ fn lower_one(
                 };
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
-                // then the GEMM multiplies them against the offset-8 codes.
+                // then the GEMM multiplies them against the offset-8 codes —
+                // where the model's activations may round to int8.
                 let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
-                    matches!(kernel, QmmTKernel::Nax)
+                    p.matmul_activations == MatmulActivations::Int8
+                        && matches!(kernel, QmmTKernel::Nax)
                         && codes == super::kernel_constants::AffineCodes::Offset8
                         // Offset8 already implies b4 (`for_bits`), but state
                         // it: the W4A8 GEMM multiplies int4 codes on the
@@ -4925,6 +4927,7 @@ fn lower_one(
                 f16_compute: profile
                     .is_some_and(|p| crate::targets::bf16_simdgroup_is_slow_path(p.generation)),
                 codes: super::kernel_constants::AffineCodesTarget::of(profile),
+                activations: p.matmul_activations,
             };
             return lower_moe_step(p, block, *step, w, at, moe_scratch_bytes);
         }
@@ -7007,15 +7010,18 @@ struct MoeBake {
     f16_compute: bool,
     /// How this target stores the experts' codes.
     codes: super::kernel_constants::AffineCodesTarget,
+    /// What the model's quantized matmuls may round their activations to.
+    activations: MatmulActivations,
 }
 
-/// Whether a grouped bake's expert GEMMs run W4A8 on the matrix unit's int8 lane: the experts'
-/// codes are stored offset-8 and the shapes fit its tiles. Every expert's run starts on a 64-row
-/// boundary, so each 32-row tile is one expert's. A function of the block and the bake only, so
-/// every step of the block agrees.
+/// Whether a grouped bake's expert GEMMs run W4A8 on the matrix unit's int8 lane: the model's
+/// activations may round to int8, the experts' codes are stored offset-8 and the shapes fit its
+/// tiles. Every expert's run starts on a 64-row boundary, so each 32-row tile is one expert's.
+/// A function of the block and the bake only, so every step of the block agrees.
 fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
     let (hidden, inter) = (b.hidden.0, b.inter.0);
     s.grouping == MoeGrouping::Grouped
+        && at.activations == MatmulActivations::Int8
         && at.is_nax
         && b.quant.widths.uniform().is_some_and(|w| {
             at.codes.for_bits(w.0) == super::kernel_constants::AffineCodes::Offset8
@@ -11592,6 +11598,7 @@ mod tests {
             layer_offset: 0,
             is_nax: true,
             f16_compute: false,
+            activations: MatmulActivations::Int8,
             codes: super::super::kernel_constants::AffineCodesTarget::of(None),
         };
         let lower = |step| {
@@ -11712,6 +11719,7 @@ mod tests {
                 layer_offset: 0,
                 is_nax: false,
                 f16_compute: false,
+                activations: MatmulActivations::Int8,
                 codes: super::super::kernel_constants::AffineCodesTarget::of(None),
             };
             let lower = |step| {
@@ -11799,6 +11807,7 @@ mod tests {
                 layer_offset: 0,
                 is_nax: false,
                 f16_compute: false,
+                activations: MatmulActivations::Int8,
                 codes: super::super::kernel_constants::AffineCodesTarget::of(None),
             };
             lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a MoE step lowers")
@@ -11866,6 +11875,7 @@ mod tests {
                 layer_offset: 0,
                 is_nax: false,
                 f16_compute: false,
+                activations: MatmulActivations::Int8,
                 codes: super::super::kernel_constants::AffineCodesTarget::of(None),
             };
             let router = lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("lowers");

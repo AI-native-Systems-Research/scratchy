@@ -54,6 +54,9 @@ pub struct DeclaredArchSpec {
     /// norm. Per-checkpoint repacks override via the JSON
     /// `scale_dtype` drift key.
     pub scale_dtype: Option<String>,
+    /// `matmul_activations`: `"int8"` (default) / `"native"` — what the quantized matmuls may
+    /// round their activations to (`scratchy_forward_compiler::MatmulActivations`).
+    pub matmul_activations: Option<scratchy_forward_compiler::MatmulActivations>,
     /// `decoder_safetensors_prefix`: a namespace WRAPPING the standard
     /// `model.<...>` decoder tree (Gemma3-MM / mlx-vlm `language_model`
     /// → `language_model.model.<...>`); a value that itself starts with
