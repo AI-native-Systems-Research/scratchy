@@ -528,3 +528,11 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  scripts:
+    name: Python scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Standard library only (scripts/cc_trace.py and its tests): no install step.
+      - run: python3 -m unittest discover -s scripts/tests -v
