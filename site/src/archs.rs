@@ -31,7 +31,6 @@ const BASELINE: &str = "llama";
 struct Arch {
     path: String,
     raw: Vec<String>,
-    html: Vec<String>,
     lines: usize,
     del: usize,
     add: usize,
@@ -49,6 +48,14 @@ struct Data<'a> {
     left: &'a str,
     right: &'a str,
     prism_python_url: &'a str,
+}
+
+/// JSON for embedding in the `<script id="archdata">` element. serde_json
+/// leaves `<` alone, and `<` can only ever appear inside a JSON string value
+/// — where the escape is inert — so this keeps DSL content from breaking out
+/// of the element (`</script>`) no matter what a `.py` file contains.
+fn script_json(data: String) -> String {
+    data.replace('<', "\\u003c")
 }
 
 /// Every carrier names its entry point after itself, `def llama():`. That's a
@@ -118,10 +125,6 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             .ok_or_else(|| format!("{}: bad name", f.display()))?;
         let text = fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
         let raw: Vec<String> = text.lines().map(|l| normalize_entry_fn(stem, l)).collect();
-        let html = raw
-            .iter()
-            .map(|l| dioxus_ssr::render_element(highlight::line(l)))
-            .collect();
         let path = f
             .strip_prefix(&site.repo)
             .unwrap_or(f)
@@ -133,7 +136,6 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                 path,
                 lines: raw.len(),
                 raw,
-                html,
                 del: 0,
                 add: 0,
                 distance: 0,
@@ -157,15 +159,17 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     order.sort_by(|x, y| archs[x].distance.cmp(&archs[y].distance).then(x.cmp(y)));
     let total: usize = archs.values().map(|a| a.lines).sum();
 
-    let data = serde_json::to_string(&Data {
-        base: &base,
-        order: &order,
-        archs: &archs,
-        left: &base,
-        right: "",
-        prism_python_url: PRISM_PYTHON,
-    })
-    .map_err(|e| e.to_string())?;
+    let data = script_json(
+        serde_json::to_string(&Data {
+            base: &base,
+            order: &order,
+            archs: &archs,
+            left: &base,
+            right: "",
+            prism_python_url: PRISM_PYTHON,
+        })
+        .map_err(|e| e.to_string())?,
+    );
 
     let page = page(&archs, &order, &base, total, &data, assets)?;
     let out = site.out.join("architectures.html");
@@ -239,6 +243,13 @@ fn page(
             }
         }
 
+        // One inert template per architecture, holding the same highlighted
+        // snippet the pane above renders for the baseline. The script clones
+        // the chosen one into `#code` as nodes, so nothing the page carries
+        // as text is ever re-parsed as HTML.
+        for n in order {
+            template { id: "tpl-{n}", {highlight::block(&archs[n].raw.join("\n"))} }
+        }
         script { r#type: "application/json", id: "archdata", dangerous_inner_html: data }
         script { dangerous_inner_html: SCRIPT }
     };
@@ -280,5 +291,11 @@ mod tests {
             "def forward():"
         );
         assert_eq!(normalize_entry_fn("llama", "    llama()"), "    llama()");
+    }
+
+    #[test]
+    fn embedded_json_cannot_close_its_script_element() {
+        let json = script_json(r#"{"raw":["</script><img src=x onerror=alert(1)>"]}"#.into());
+        assert!(!json.contains('<'));
     }
 }
