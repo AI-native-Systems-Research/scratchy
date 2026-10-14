@@ -2102,7 +2102,7 @@ mod tests {
                     cmd.function,
                     cmd.constants.to_vec(),
                 );
-                let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
+                let pso = crate::aot::test_pipelines::baked_build(&cache, &key).expect("pipeline");
                 let (grid, threads) = mtl_size_pair(cmd, TEST_VARIANT);
                 let grid = scale_tg_for_num_tokens(
                     grid,

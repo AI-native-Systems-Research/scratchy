@@ -3,14 +3,14 @@
 //! each (token, slot) gather should yield the same result as a
 //! plain `qmm_t` over the gathered expert's weight slab.
 
-mod common;
+pub mod common;
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use common::baked_pipeline;
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{
     affine_qmm_t_b8_bf16_s_bf16, affine_qmv_b2_bf16_s_bf16, affine_qmv_b3_bf16_s_bf16,
     affine_qmv_b4_bf16, affine_qmv_b4_bf16_s_bf16,

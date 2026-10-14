@@ -6,15 +6,15 @@
 //! stride derived from the live kv_len. Uses the f16 COPY variant (V-gather);
 //! the rope (K) variant reuses the same gather + the production rope math.
 
-mod common;
+pub mod common;
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use common::baked_pipeline;
 use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 

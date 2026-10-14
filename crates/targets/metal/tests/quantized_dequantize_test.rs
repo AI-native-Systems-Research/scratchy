@@ -7,10 +7,10 @@
 // `scratchy_forward_compiler::cpu_golden`) so the test file stays free of a cycle
 // against scratchy-target-metal' own dev-deps.
 
-mod common;
+pub mod common;
 
+use common::baked_pipeline;
 use objc2_metal::{MTLComputePipelineState, MTLSize};
-use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
 

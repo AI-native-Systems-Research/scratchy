@@ -859,7 +859,8 @@ mod tests {
             let (library, function) = kernel_msl_names(kernel, bucket_m, dtype)?;
             let constants = constants_for::<W>(kernel, bucket_m)?;
             let key = PipelineKey::new(library, function, constants);
-            crate::aot::baked_build(&self.cache, &key).map_err(PipelineLookupError::Build)
+            crate::aot::test_pipelines::baked_build(&self.cache, &key)
+                .map_err(PipelineLookupError::Build)
         }
     }
 
@@ -4193,8 +4194,8 @@ mod tests {
                 ConstantValue::boolean(10, false),
             ],
         );
-        let pipeline =
-            crate::aot::baked_build(&cache, &key).expect("fused_mlp steel pipeline build");
+        let pipeline = crate::aot::test_pipelines::baked_build(&cache, &key)
+            .expect("fused_mlp steel pipeline build");
 
         // Synthetic deterministic input + packed [gate; up] weight.
         let input_data: Vec<f32> = (0..m * k)
@@ -4412,7 +4413,8 @@ mod tests {
                     ConstantValue::float(6, 0.0),     // GEMV_NORM_W_OFFSET
                 ],
             );
-            let pipeline = crate::aot::baked_build(&cache, &key).expect("rows gemv pipeline");
+            let pipeline =
+                crate::aot::test_pipelines::baked_build(&cache, &key).expect("rows gemv pipeline");
 
             let input_data: Vec<f32> = (0..m * k)
                 .map(|i| ((i as f32) * 0.011).sin() * 0.5 + (i % 7) as f32 * 0.001)

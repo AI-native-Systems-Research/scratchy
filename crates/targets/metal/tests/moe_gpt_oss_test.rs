@@ -8,11 +8,11 @@
 // bits; and the whole block must match the CPU reference (`cpu_reference.rs`'s b2 matvec, the
 // bias adds, `swiglu_oai`, the weighted combine) — the only independent oracle for the
 // activation's ±7 clamps and the biases' positions.
-mod common;
+pub mod common;
 
+use common::{BakedPipeline, baked_pipeline};
 use half::bf16;
 use objc2_metal::MTLSize;
-use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::cpu_reference::affine_qmv_b2_bf16_s_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};

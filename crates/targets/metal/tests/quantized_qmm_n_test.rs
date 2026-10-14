@@ -14,10 +14,10 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use common::{BakedPipeline, baked_pipeline};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::cpu_reference::affine_qmm_n_b4_bf16 as cpu_qmm_n_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
@@ -25,7 +25,7 @@ use scratchy_target_metal::quantized::{
 };
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
-mod common;
+pub mod common;
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;

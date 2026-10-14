@@ -12,10 +12,10 @@
 
 #![cfg(target_os = "macos")]
 
-mod common;
+pub mod common;
 
+use common::baked_build;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
     CheckpointRows, DraftLane, DraftLanes, GdnStart, GdnStep, RecordArea,

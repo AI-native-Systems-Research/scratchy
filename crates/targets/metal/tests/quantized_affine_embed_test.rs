@@ -12,10 +12,10 @@
 // dtype), matching the GPU FMA — same convention as
 // `quantized_dequantize_test.rs`.
 
-mod common;
+pub mod common;
 
+use common::baked_pipeline;
 use objc2_metal::{MTLComputePipelineState, MTLSize};
-use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;

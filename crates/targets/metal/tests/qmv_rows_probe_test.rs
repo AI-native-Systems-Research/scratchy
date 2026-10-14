@@ -11,11 +11,11 @@
 //! Run: cargo test -p scratchy-target-metal --release --test qmv_rows_probe_test -- \
 //!     --ignored --nocapture
 
-mod common;
+pub mod common;
 
+use common::baked_build;
 use half::bf16;
 use objc2_metal::MTLSize;
-use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shared_zeroed};
 use scratchy_target_metal::specialized_pipeline_cache::{

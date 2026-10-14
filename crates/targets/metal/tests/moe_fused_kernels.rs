@@ -4,13 +4,13 @@
 //   affine_gather_qmv_combine = down gather-qmv, moe_weighted_sum
 // and each routing its token itself (`MetalFusion::MoeRouted`) = the routing command, then it.
 // Each must give the same bits. `bench_moe_fused` times both chains (`BENCH` lines).
-mod common;
+pub mod common;
 
 use std::time::Instant;
 
+use common::{BakedPipeline, baked_pipeline};
 use half::bf16;
 use objc2_metal::MTLSize;
-use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, NumExperts, TopK};

@@ -11,11 +11,12 @@
 //! Run: cargo test -p scratchy-target-metal --release --test gemm_crossover_probe_test -- \
 //!     --ignored --nocapture
 
-mod common;
+pub mod common;
 
+use common::baked_build;
 use half::bf16;
 use objc2_metal::MTLSize;
-use scratchy_target_metal::aot::{baked_build, baked_kernels};
+use scratchy_target_metal::aot::baked_kernels;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::interpreter::metal::pipelines::{GemmBody, gemm_pipeline};
 use scratchy_target_metal::interpreter::metal::{GemmDims, MetalDtype};

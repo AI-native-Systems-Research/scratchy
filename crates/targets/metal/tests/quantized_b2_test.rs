@@ -20,10 +20,10 @@
 //!
 //! GPU tests — run with `--test-threads=1`.
 
-mod common;
+pub mod common;
 
+use common::baked_pipeline;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b2_bf16_s_bf16, affine_qmm_t_b2_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{

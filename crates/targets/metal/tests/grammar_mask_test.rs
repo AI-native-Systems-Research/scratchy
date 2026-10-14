@@ -7,7 +7,7 @@
 //! Dispatches on the production MTL4 path (see
 //! `common::dispatch_threadgroups`).
 
-mod common;
+pub mod common;
 
 use half::{bf16, f16};
 use objc2_metal::MTLSize;

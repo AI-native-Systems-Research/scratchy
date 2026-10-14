@@ -2896,7 +2896,7 @@ mod tests {
             &[],
         )
         .expect("pipeline cache");
-        let select = crate::aot::baked_build(
+        let select = crate::aot::test_pipelines::baked_build(
             &cache,
             &crate::specialized_pipeline_cache::PipelineKey::new(
                 "select_rows",
