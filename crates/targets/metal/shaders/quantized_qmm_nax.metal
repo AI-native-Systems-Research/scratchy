@@ -3,8 +3,8 @@
 // NAX (Apple9 / M4+) port of MLX's `qmm_t_nax_tgp_impl` /
 // `affine_qmm_t_nax` from `mlx/backend/metal/kernels/quantized_nax.h`.
 //
-// Tile shape: BM=BN=BK=64, WM=WN=2, SK=32, TGP=128 (4 simdgroups), plus
-// one W-dequantizing producer simdgroup on the affine path.
+// Tile shape: BM=BN=BK=64, WM=WN=2, SK=32, TGP=128 (4 simdgroups); the
+// affine producer variant adds a fifth that only dequantizes W.
 //   BK=64 matches MLX's production instantiation in
 //   `mlx/backend/metal/kernels/quantized_nax.metal`
 //   (`instantiate_quantized_aligned_batched(affine_qmm_t_nax, ..., 64, 64, 64, 2, 2, ...)`).
@@ -16,7 +16,7 @@
 //     combination. BK=64 with gs=32 → BCOLS_PACKED=32, n_reads=16,
 //     n_groups=2 → 32/16 == 2 ✓ (matches MLX's `quantized_nax.metal`).
 //   - For NAX we currently skip gs=32 entirely (the dispatcher gates
-//     `group_size != 32` for the Nax pick): the W producer reads one
+//     `group_size != 32` for the Nax pick): the W dequant reads one
 //     scale per row per BK step, so gs=64 and gs=128 only.
 //
 // MLX reference: `mlx/backend/metal/quantized.cpp:695` dispatches NAX
@@ -27,16 +27,18 @@
 //   - K, N, M come from file-scope baked constants (slots 0/1/2)
 //     rather than `const constant int& [[buffer(5/6/7)]]` — required
 //     so the pipeline is recordable into an MTLIndirectComputeCommand.
-//   - Affine W tiles are dequantized by a producer simdgroup into a
-//     double-buffered Ws while the four MMA simdgroups multiply, not by
-//     every simdgroup between two barriers (MLX's QuantizedBlockLoader).
+//   - Affine W is dequantized a row's half at a time from vector reads,
+//     in fp32 rounded once, into vector stores (MLX's QuantizedBlockLoader
+//     reads and stores per byte and per element): by every simdgroup
+//     between two barriers, or by a producer simdgroup a step ahead into
+//     a second tile (`affine_*qmm_t_nax_producer_*`).
 //   - batched=0 only; no `adjust_matrix_offsets` (B=1).
 //
 // Buffer layout matches the existing quantized_qmm.metal:
 //   w[0], scales[1], biases[2], x[3], y[4]
 //
-// Dispatch: grid = (ceil(N/64), ceil(M/64), 1); tpg = (32, 5, 1) for the
-// affine kernels (`NAX_QMM_THREADS`), 128 threads for NVFP4.
+// Dispatch: grid = (ceil(N/64), ceil(M/64), 1); tpg = (32, 2, 2), or
+// (32, 5, 1) for the producer variant (`NaxDequant::threads`).
 // Kernel selected only on M4+ (is_nax_capable check in pick_qmm_t_kernel).
 
 #include "metal_nax.h"   // vendors NAXTile + tile_matmad_nax + MPP internals
@@ -120,7 +122,7 @@ inline float nvfp4_decode(uint code) {
 //   SM = SN = BM/WM = BN/WN = 32   (per-simdgroup M/N extent)
 //   SK = 32                          (inner K step; BK/SK = 2 iters)
 //   TM = TN = TK = 2                 (NAXTile row/col counts)
-//   TGP = 128 threads, 4 MMA simdgroups (+1 W producer, affine only)
+//   TGP = 128 threads, 4 simdgroups (+1 W producer in the producer variant)
 //   BK_padded = BK + 16/sizeof(T)  = 72 for half/bfloat (bank-conflict pad)
 //
 // NVFP4 W-loader (every simdgroup loads, reduction_dim=1):
@@ -136,7 +138,7 @@ inline float nvfp4_decode(uint code) {
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N,
-          bool nvfp4 = false, bool offset8 = false>
+          bool nvfp4 = false, bool offset8 = false, bool producer = false>
 METAL_FUNC void qmm_t_nax_impl(
     const device uint32_t*  w,
     const device T_scale*   scales,
@@ -153,12 +155,13 @@ METAL_FUNC void qmm_t_nax_impl(
 {
     static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 8,
                   "qmm_t_nax_impl: bits in {2, 3, 4, 8} (the affine W "
-                  "producer decodes each half row as an LSB-first bitstream "
+                  "dequant decodes each half row as an LSB-first bitstream "
                   "of `bits` 32-bit words, exact for every one of these "
                   "widths; K is a multiple of group_size so the packed byte "
                   "count K*bytes_per_pack/pack_factor is exact; the NAX MMA "
                   "runs on dequantized T_act values either way)");
     static_assert(!nvfp4 || bits == 4, "NVFP4 is 4-bit by definition");
+    static_assert(!(nvfp4 && producer), "NVFP4 keeps every simdgroup loading W");
     // Affine NAX requires gs ∈ {64,128} (gs ≥ BK=64, one scale per
     // thread). NVFP4 is always gs=16 (< BK), handled by the per-byte
     // general scale index in the W-loader below.
@@ -207,8 +210,8 @@ METAL_FUNC void qmm_t_nax_impl(
     //   simd_gid 3 → tm=32, tn=32
     const int tm = SM * int(simd_gid / WN);
     const int tn = SN * int(simd_gid % WN);
-    // The affine path's fifth simdgroup only dequantizes W (see the K loop).
-    const bool producer = simd_gid == uint(WM * WN);
+    // The producer variant's fifth simdgroup only dequantizes W (see the K loop).
+    const bool is_producer = producer && simd_gid == uint(WM * WN);
 
     // ── Tile origin (grid level) ────────────────────────────────────
     const int y_row = int(tgid.y) * BM;
@@ -216,7 +219,7 @@ METAL_FUNC void qmm_t_nax_impl(
     if (y_row >= M || y_col >= N) return;
 
     // ── Valid sub-tile extents for M/N tail handling ────────────────
-    const short sgp_sm = producer ? short(SM) : min(short(SM), short(M - (y_row + tm)));
+    const short sgp_sm = is_producer ? short(SM) : min(short(SM), short(M - (y_row + tm)));
     const bool is_unaligned_sm = (sgp_sm != short(SM));
 
     const short tgp_bn = aligned_N ? short(BN) : short(min(BN, N - y_col));
@@ -257,105 +260,123 @@ METAL_FUNC void qmm_t_nax_impl(
     NAXTile<float, TM, TN> Dtile;
     Dtile.clear();
 
-    constexpr int WS_TILE = BN * BK_padded;
-
     // ── Outer K loop + M/N alignment dispatch ───────────────────────
     dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
         dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
 
+          // This simdgroup's MMA over one BK step, against the W tile at `tile`.
+          auto multiply = [&](threadgroup T_act* tile) {
+              MLX_MTL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                  NAXTile<T_act, TM, TK> Atile;
+                  NAXTile<T_act, TN, TK> Btile;
+                  volatile int compiler_barrier;
+
+                  if constexpr (kAlignedM.value) {
+                      Atile.load(x_ptr + kk1, K);
+                  } else {
+                      Atile.load_safe(x_ptr + kk1, K, short2(SK, sgp_sm));
+                  }
+                  Btile.template load<T_act, BK_padded, 1>(
+                      tile + tn * BK_padded + kk1);
+                  tile_matmad_nax(
+                      Dtile,
+                      Atile, metal::bool_constant<false>{},
+                      Btile, metal::bool_constant<true>{});
+                  (void)compiler_barrier;
+              }
+              x_ptr += BK;
+          };
+
           if constexpr (!nvfp4) {
-            // ── Affine: a producer simdgroup feeds the four MMA simdgroups ──
-            // Ws holds two W tiles. While the MMA simdgroups multiply step k's,
-            // the producer dequantizes step k+1's into the other, so the
-            // dequant overlaps the multiply instead of stalling it between
-            // two barriers; one barrier per step hands the tiles over.
-            // Each producer lane decodes half rows: 32
-            // codes are one LSB-first bitstream of `bits` words (8 codes per
-            // 3 bytes at 3 bits, offset-8 codes are the plain codes XOR 8),
+            // One W row's half of a BK step into `tile`: SK codes are one
+            // LSB-first bitstream of `bits` words read as one vector (8 codes
+            // per 3 bytes at 3 bits, offset-8 codes are the plain codes XOR 8),
             // each code becomes fma(code, scale, bias) in fp32, rounded once,
             // and leaves in 16-byte stores.
-            auto produce = [&](int k0, threadgroup T_act* tile, int lane, int lanes) {
-                constexpr int HALF_BK = BK / 2;
+            static_assert(BK == 2 * SK, "a W row's BK step is two SK halves");
+            auto dequantize_half_row = [&](int k0, int row, int col, threadgroup T_act* tile) {
                 constexpr int WVEC = bits < 4 ? bits : 4;
                 using wvec_t = metal::conditional_t<bits == 3, packed_uint3, vec<uint, WVEC>>;
                 constexpr uint flip = offset8 ? 0x88888888u : 0u;
                 constexpr uint mask = (1u << bits) - 1u;
-                for (int item = lane; item < 2 * BN; item += lanes) {
-                    const int row = item / 2, col = item % 2 * HALF_BK;
-                    threadgroup vec<T_act, 8>* dst =
-                        (threadgroup vec<T_act, 8>*)(tile + row * BK_padded + col);
-                    if (!kAlignedN.value && row >= tgp_bn) {
-                        STEEL_PRAGMA_UNROLL
-                        for (int c = 0; c < HALF_BK / 8; ++c) {
-                            dst[c] = vec<T_act, 8>(0);
-                        }
-                        continue;
-                    }
-                    const device wvec_t* src = (const device wvec_t*)(
-                        w_block + row * K_w + (k0 + col) * bits / 8);
-                    uint words[bits];
+                threadgroup vec<T_act, 8>* dst =
+                    (threadgroup vec<T_act, 8>*)(tile + row * BK_padded + col);
+                if (!kAlignedN.value && row >= tgp_bn) {
                     STEEL_PRAGMA_UNROLL
-                    for (int i = 0; i < bits / WVEC; ++i) {
-                        const wvec_t v = src[i];
-                        STEEL_PRAGMA_UNROLL
-                        for (int j = 0; j < WVEC; ++j) {
-                            words[i * WVEC + j] = v[j] ^ flip;
-                        }
+                    for (int c = 0; c < SK / 8; ++c) {
+                        dst[c] = vec<T_act, 8>(0);
                     }
-                    const float scale = float(s_block[row * K_g + k0 / group_size]);
-                    const float bias = float(b_block[row * K_g + k0 / group_size]);
+                    return;
+                }
+                const device wvec_t* src = (const device wvec_t*)(
+                    w_block + row * K_w + (k0 + col) * bits / 8);
+                uint words[bits];
+                STEEL_PRAGMA_UNROLL
+                for (int i = 0; i < bits / WVEC; ++i) {
+                    const wvec_t v = src[i];
                     STEEL_PRAGMA_UNROLL
-                    for (int c = 0; c < HALF_BK / 8; ++c) {
-                        vec<T_act, 8> out;
-                        STEEL_PRAGMA_UNROLL
-                        for (int e = 0; e < 8; ++e) {
-                            const int bit = (8 * c + e) * bits;
-                            const int at = bit % 32;
-                            const uint code = at + bits <= 32
-                                ? extract_bits(words[bit / 32], at, bits)
-                                : ((words[bit / 32] >> at) | (words[bit / 32 + 1] << (32 - at))) & mask;
-                            out[e] = T_act(fma(float(code), scale, bias));
-                        }
-                        dst[c] = out;
+                    for (int j = 0; j < WVEC; ++j) {
+                        words[i * WVEC + j] = v[j] ^ flip;
                     }
+                }
+                const float scale = float(s_block[row * K_g + k0 / group_size]);
+                const float bias = float(b_block[row * K_g + k0 / group_size]);
+                STEEL_PRAGMA_UNROLL
+                for (int c = 0; c < SK / 8; ++c) {
+                    vec<T_act, 8> out;
+                    STEEL_PRAGMA_UNROLL
+                    for (int e = 0; e < 8; ++e) {
+                        const int bit = (8 * c + e) * bits;
+                        const int at = bit % 32;
+                        const uint code = at + bits <= 32
+                            ? extract_bits(words[bit / 32], at, bits)
+                            : ((words[bit / 32] >> at) | (words[bit / 32 + 1] << (32 - at))) & mask;
+                        out[e] = T_act(fma(float(code), scale, bias));
+                    }
+                    dst[c] = out;
                 }
             };
 
-            // The first tile has nothing to overlap: all five simdgroups
-            // dequantize it together.
-            produce(0, Ws, int(thread_idx), (WM * WN + 1) * NAX_SIMD_SIZE);
-            for (int k = 0; k < K; k += BK) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                threadgroup T_act* tile = Ws + (k / BK % 2) * WS_TILE;
-                if (producer) {
-                    if (k + BK < K) {
-                        produce(k + BK, Ws + ((k / BK + 1) % 2) * WS_TILE,
-                                int(simd_lid), NAX_SIMD_SIZE);
-                    }
-                    continue;
-                }
-
-                MLX_MTL_PRAGMA_NO_UNROLL
-                for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-                    NAXTile<T_act, TM, TK> Atile;
-                    NAXTile<T_act, TN, TK> Btile;
-                    volatile int compiler_barrier;
-
-                    if constexpr (kAlignedM.value) {
-                        Atile.load(x_ptr + kk1, K);
-                    } else {
-                        Atile.load_safe(x_ptr + kk1, K, short2(SK, sgp_sm));
-                    }
-                    Btile.template load<T_act, BK_padded, 1>(
-                        tile + tn * BK_padded + kk1);
-                    tile_matmad_nax(
-                        Dtile,
-                        Atile, metal::bool_constant<false>{},
-                        Btile, metal::bool_constant<true>{});
-                    (void)compiler_barrier;
-                }
-
-                x_ptr += BK;
+            if constexpr (producer) {
+              // ── A producer simdgroup feeds the four MMA simdgroups ──────
+              // Ws holds two W tiles. While the MMA simdgroups multiply step
+              // k's, the producer dequantizes step k+1's into the other, and
+              // one barrier per step hands the tiles over. The second tile and
+              // the fifth simdgroup fit fewer threadgroups on a core, which a
+              // narrow matmul (few threadgroups sharing each activation block)
+              // pays for; `NaxDequant` picks per matmul.
+              constexpr int WS_TILE = BN * BK_padded;
+              auto produce = [&](int k0, threadgroup T_act* tile, int lane, int lanes) {
+                  for (int item = lane; item < 2 * BN; item += lanes) {
+                      dequantize_half_row(k0, item / 2, item % 2 * SK, tile);
+                  }
+              };
+              // The first tile has nothing to overlap: all five simdgroups
+              // dequantize it together.
+              produce(0, Ws, int(thread_idx), (WM * WN + 1) * NAX_SIMD_SIZE);
+              for (int k = 0; k < K; k += BK) {
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                  if (is_producer) {
+                      if (k + BK < K) {
+                          produce(k + BK, Ws + ((k / BK + 1) % 2) * WS_TILE,
+                                  int(simd_lid), NAX_SIMD_SIZE);
+                      }
+                      continue;
+                  }
+                  multiply(Ws + (k / BK % 2) * WS_TILE);
+              }
+            } else {
+              // ── Every simdgroup dequantizes its share of the one W tile ──
+              // Thread i decodes row i/2's half i%2, between the step's two
+              // barriers: MLX's 128 threads and one tile.
+              static_assert(2 * BN == TGP, "one row's half per thread");
+              for (int k = 0; k < K; k += BK) {
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                  dequantize_half_row(k, int(thread_idx) / 2, int(thread_idx) % 2 * SK, Ws);
+                  threadgroup_barrier(mem_flags::mem_threadgroup);
+                  multiply(Ws);
+              }
             }
           } else {
             // ── NVFP4: gs=16 < BK, inlined per-byte scale index ──────
@@ -391,35 +412,14 @@ METAL_FUNC void qmm_t_nax_impl(
                 }
 
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                MLX_MTL_PRAGMA_NO_UNROLL
-                for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-                    NAXTile<T_act, TM, TK> Atile;
-                    NAXTile<T_act, TN, TK> Btile;
-                    volatile int compiler_barrier;
-
-                    if constexpr (kAlignedM.value) {
-                        Atile.load(x_ptr + kk1, K);
-                    } else {
-                        Atile.load_safe(x_ptr + kk1, K, short2(SK, sgp_sm));
-                    }
-                    Btile.template load<T_act, BK_padded, 1>(
-                        Ws + tn * BK_padded + kk1);
-                    tile_matmad_nax(
-                        Dtile,
-                        Atile, metal::bool_constant<false>{},
-                        Btile, metal::bool_constant<true>{});
-                    (void)compiler_barrier;
-                }
-
-                x_ptr += BK;
+                multiply(Ws);
                 W_src += BCOLS_PACKED * bytes_per_pack;  // 32 bytes
             }
           }
 
             // ── Epilogue: store float accumulator to device ──────────
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (producer) {
+            if (is_producer) {
                 return;
             }
 
@@ -439,7 +439,8 @@ METAL_FUNC void qmm_t_nax_impl(
 // affine_qmm_t_nax kernel wrapper — batched=0 only
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N,
+          bool producer>
 [[kernel]] void affine_qmm_t_nax_kernel(
     const device uint32_t*  w        [[buffer(0)]],
     const device T_scale*   scales   [[buffer(1)]],
@@ -455,9 +456,10 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BN = 64;
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));  // 72
-    threadgroup T_act Ws[2 * BN * BK_padded];  // two 64 × 72 W tiles (producer + MMA)
+    // 64 × 72 = 4608 elements; the producer variant double-buffers it.
+    threadgroup T_act Ws[(producer ? 2 : 1) * BN * BK_padded];
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value, producer>(
         w, scales, biases, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
         simd_gid, simd_lid, tgid);
@@ -474,7 +476,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 // (affine_gather_qmm_t) for the MoE prefill on M5+/A19+.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N,
+          bool producer>
 [[kernel]] void affine_gather_qmm_t_nax_kernel(
     const device uint32_t*  w        [[buffer(0)]],
     const device T_scale*   scales   [[buffer(1)]],
@@ -505,9 +508,9 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     const device T_scale* s_e = scales + size_t(expert) * s_stride;
     const device T_scale* b_e = biases + size_t(expert) * s_stride;
 
-    threadgroup T_act Ws[2 * BN * BK_padded];
+    threadgroup T_act Ws[(producer ? 2 : 1) * BN * BK_padded];
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value, producer>(
         w_e, s_e, b_e, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
         simd_gid, simd_lid, tgid);
@@ -515,7 +518,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 }
 
 #define INST_GATHER_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
-  SCRATCHY_KERNEL(affine_gather_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_gather_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>)
+  SCRATCHY_KERNEL(affine_gather_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_gather_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val, false>) \
+  SCRATCHY_KERNEL(affine_gather_qmm_t_nax_producer_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_gather_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val, true>)
 
 // ─────────────────────────────────────────────────────────────────
 // Instantiations — one symbol per (dtype, group_size, aligned_N).
@@ -524,12 +528,13 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 //   affine_qmm_t_nax_<dtype>_s_<scale_dtype>_gs_<gs>_b_<bits>_alN_<bool>_batch_0
 //
 // gs=32 deliberately not instantiated — the dispatcher routes gs=32
-// to Standard qmm_t (the W producer reads one scale per row per
+// to Standard qmm_t (the W dequant reads one scale per row per
 // BK=64 step).
 // ─────────────────────────────────────────────────────────────────
 
 #define INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
-  SCRATCHY_KERNEL(affine_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>)
+  SCRATCHY_KERNEL(affine_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val, false>) \
+  SCRATCHY_KERNEL(affine_qmm_t_nax_producer_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val, true>)
 
 #define INST_QMM_T_NAX_ALL(act_tag, act_type, scale_tag, scale_type, gs, bits) \
     INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, true,  true)  \
@@ -593,7 +598,7 @@ INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 8)
 
 // 3-bit rows (GLM-4.5-Air-3bit: bf16×bf16 gs=64 in production; f16×f16
 // and gs=128 + cross-dtype rows for symmetry so no (model-dtype, gs)
-// combo hits a nil computeFunction). The W producer decodes 3-bit codes
+// combo hits a nil computeFunction). The W dequant decodes 3-bit codes
 // exactly (8 codes per 3 bytes, the LSB-first bitstream of MLX's qdot
 // shifts — see the static_assert note in qmm_t_nax_impl).
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 3)
@@ -617,7 +622,7 @@ INST_GATHER_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 3)
 
 // 2-bit rows (gpt-oss-120b-mlx-2Bit: bf16×bf16 gs=64 in production;
 // f16×f16 and gs=128 + cross-dtype rows for symmetry so no (model-dtype,
-// gs) combo hits a nil computeFunction). The W producer decodes 2-bit
+// gs) combo hits a nil computeFunction). The W dequant decodes 2-bit
 // codes exactly (4 codes per byte, none straddling — MLX's qdot law).
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 2)
 INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 2)
@@ -661,7 +666,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BN = 64;
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
-    threadgroup T_act Ws[2 * BN * BK_padded];
+    threadgroup T_act Ws[BN * BK_padded];
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,

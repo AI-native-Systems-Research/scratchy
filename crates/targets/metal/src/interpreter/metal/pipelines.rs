@@ -255,7 +255,7 @@ pub fn gemm_pipeline(
     // The NAX body's own library and constants: the quantized_qmm_nax kernels read K, N, M as
     // int slots 0 / 1 / 2 — not the gemm library's M, N, K as uint — and dispatch MLX's 3D
     // threadgroup (32, 2, 2), which the MPP matmul2d scheduler prefers ~7% over a flat
-    // (128, 1, 1).
+    // (128, 1, 1) (`qmm_t_dispatch_shape`).
     if matches!(
         (dtype, body, gemv),
         (MetalDtype::Bf16, GemmBody::Nax, false)

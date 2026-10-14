@@ -45,12 +45,11 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 }
 use crate::op_abi::GuardRun;
 use crate::quantized::{
-    DequantDtype, NAX_QMM_THREADS, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype,
-    SmallMTile, W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel,
-    pick_qmv_kernel_wide, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
-    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
-    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
-    w4a8_quant_static_name, w4a8_scratch_bytes,
+    DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
+    W4A8_GROUPED_TILE, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide,
+    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
+    qmm_w4a8_static_name, qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
+    splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -2632,7 +2631,7 @@ fn lower_one(
                 // same MMA) — the dominant Gemma4 prefill lever (the
                 // b8 MLP was ~77% of prefill GPU time on the Standard
                 // kernel). 3-bit has `_b_3_` instantiations too (the
-                // W producer's bitstream decode is bits=3-exact: MLX's
+                // W dequant's bitstream decode is bits=3-exact: MLX's
                 // own qdot bits==3 shifts), and 2-bit likewise
                 // (`_b_2_`: 4 codes per byte, none straddling).
                 // SplitK stays b4-only, so any non-b4 SplitK pick
@@ -2643,7 +2642,7 @@ fn lower_one(
                 };
                 // NAX tile is 64×64 so align check uses 64; Standard/SplitK use 32.
                 let aligned_n = match kernel {
-                    QmmTKernel::Nax => n_v.is_multiple_of(64),
+                    QmmTKernel::Nax(_) => n_v.is_multiple_of(64),
                     _ => n_v.is_multiple_of(32),
                 };
                 // M1 fast-path: bf16 simdgroup MMA is software emulation
@@ -2658,7 +2657,7 @@ fn lower_one(
                     .map(|p| bf16_simdgroup_is_slow_path(p.generation))
                     .unwrap_or(false)
                     && matches!(dtype, DequantDtype::Bf16)
-                    && !matches!(kernel, QmmTKernel::Nax)
+                    && !matches!(kernel, QmmTKernel::Nax(_))
                     // The mixed-compute (`_c_f16_`) qmm_t kernels (INST_QMM_T_C)
                     // are instantiated for bits=4 ONLY. Applying the M1 f16
                     // flip to an 8-bit weight would mis-resolve to a b4 symbol
@@ -2677,7 +2676,7 @@ fn lower_one(
                 // then the GEMM multiplies them against the offset-8 codes.
                 let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
-                    matches!(kernel, QmmTKernel::Nax)
+                    matches!(kernel, QmmTKernel::Nax(_))
                         && codes == super::kernel_constants::AffineCodes::Offset8
                         // Offset8 already implies b4 (`for_bits`), but state
                         // it: the W4A8 GEMM multiplies int4 codes on the
@@ -2774,7 +2773,7 @@ fn lower_one(
                     return Ok(vec![quant, gemm]);
                 }
                 match kernel {
-                    QmmTKernel::Nax => {
+                    QmmTKernel::Nax(_) => {
                         let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         LoweredCommand {
                             kernel: KernelId::AffineQmmTNax,
@@ -6975,6 +6974,7 @@ fn affine_gather_qmm_t_symbol(
 /// Only the aligned_N=true variants — NAX is dispatched only when
 /// N % 64 == 0. gs ∈ {64, 128} (NAX has no gs=32).
 fn affine_gather_qmm_t_nax_symbol(
+    dequant: NaxDequant,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
     group_size: u32,
@@ -6989,8 +6989,9 @@ fn affine_gather_qmm_t_nax_symbol(
         "affine_gather_qmm_t_nax_symbol: unsupported bits={bits} — only 2/3/4/8 instantiated"
     );
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
+    let stem = dequant.symbol_stem();
     leak_symbol(format!(
-        "affine_gather_qmm_t_nax_{d}_s_{s}_gs_{group_size}_b_{bits}_alN_true_batch_0"
+        "affine_gather_{stem}_{d}_s_{s}_gs_{group_size}_b_{bits}_alN_true_batch_0"
     ))
 }
 
@@ -7885,21 +7886,25 @@ fn lower_moe_step(
             }
             if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
-                // bits=3 rides NAX like 4/8: the loader's index math is
-                // bits=3-exact and metal_nax.h carries the dequantize
-                // branch; bits=2 likewise (4 codes per byte).
+                // bits=3 rides NAX like 4/8: the W dequant's bitstream
+                // decode is bits=3-exact; bits=2 likewise (4 codes per
+                // byte).
                 let use_nax = at.is_nax
                     && n_out.is_multiple_of(64)
                     && matches!(gs, 64 | 128)
                     && matches!(bits, 2 | 3 | 4 | 8);
                 let (kernel, library, symbol, tile, threads) = if use_nax {
-                    let symbol = affine_gather_qmm_t_nax_symbol(dtype, scale_dtype, gs, bits);
+                    // Rows the experts multiply: the bucket's token × expert pairs.
+                    let pairs = at.bucket_m * b.top_k.0;
+                    let dequant = NaxDequant::for_shape(pairs, n_out, k_in);
+                    let symbol =
+                        affine_gather_qmm_t_nax_symbol(dequant, dtype, scale_dtype, gs, bits);
                     (
                         KernelId::AffineGatherQmmTNax,
                         "quantized_qmm_nax",
                         symbol,
                         64,
-                        NAX_QMM_THREADS,
+                        dequant.threads(),
                     )
                 } else {
                     let aligned = n_out.is_multiple_of(32);

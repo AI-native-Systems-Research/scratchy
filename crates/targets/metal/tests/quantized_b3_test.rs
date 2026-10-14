@@ -19,8 +19,8 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b3_bf16_s_bf16, affine_qmm_t_b3_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape,
-    qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
+    DequantDtype, NaxDequant, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
+    qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{ComputePipelineState, ConstantValue};
 
@@ -111,9 +111,9 @@ enum Op {
     Qmv,
     QmmT,
     /// Force the NAX (matrix-unit) qmm_t — the M5+ prefill path. Its W
-    /// producer decodes 3-bit codes exactly (8 codes per 3 bytes, MLX's
+    /// dequant decodes 3-bit codes exactly (8 codes per 3 bytes, MLX's
     /// qdot bits==3 shifts).
-    QmmTNax,
+    QmmTNax(NaxDequant),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,8 +216,8 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
             let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
             (ComputePipelineState::clone(p), tg, tpg)
         }
-        Op::QmmTNax => {
-            let kernel = QmmTKernel::Nax;
+        Op::QmmTNax(dequant) => {
+            let kernel = QmmTKernel::Nax(dequant);
             let aligned_n = (n as u32).is_multiple_of(64);
             let name = qmm_t_kernel_name(
                 kernel,
@@ -301,7 +301,7 @@ fn qmm_t_b3_bf16_prefill_intermediate_shape() {
 #[test]
 fn qmm_t_nax_b3_bf16_prefill_shape() {
     // Prefill M=64 through the NAX qmm_t (the GLM-4.5-Air-3bit prefill
-    // path on M5+): the W producer decodes 3-byte packs by the MLX
+    // path on M5+): the W dequant decodes 3-byte packs by the MLX
     // bits==3 shifts. Skips on
     // non-NAX-capable hardware.
     let Some(di) = detect_device() else {
@@ -315,12 +315,20 @@ fn qmm_t_nax_b3_bf16_prefill_shape() {
         );
         return;
     }
-    run_case_bf16(Op::QmmTNax, 64, 256, 4096, 64, 29, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 4096, 64, 29, 0.08);
+    }
     // Unaligned-N tail + K=moe_intermediate.
-    run_case_bf16(Op::QmmTNax, 64, 224, 4096, 64, 31, 0.08);
-    run_case_bf16(Op::QmmTNax, 64, 512, 1408, 64, 37, 0.05);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 224, 4096, 64, 31, 0.08);
+    }
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 512, 1408, 64, 37, 0.05);
+    }
     // gs=128 instantiation.
-    run_case_bf16(Op::QmmTNax, 64, 256, 4096, 128, 43, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 4096, 128, 43, 0.08);
+    }
 }
 
 #[test]

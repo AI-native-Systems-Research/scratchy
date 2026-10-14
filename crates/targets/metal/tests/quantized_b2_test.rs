@@ -27,8 +27,8 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b2_bf16_s_bf16, affine_qmm_t_b2_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
-    qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
+    DequantDtype, NaxDequant, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel,
+    pick_qmv_kernel, qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{ComputePipelineState, ConstantValue};
 
@@ -119,9 +119,9 @@ enum Op {
     Qmv,
     QmmT,
     /// Force the NAX (matrix-unit) qmm_t — the M5+ prefill path. Its W
-    /// producer decodes 2-bit codes exactly (4 codes per byte, MLX's qdot
+    /// dequant decodes 2-bit codes exactly (4 codes per byte, MLX's qdot
     /// bits==2 law).
-    QmmTNax,
+    QmmTNax(NaxDequant),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,8 +218,8 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
             let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
             (ComputePipelineState::clone(p), tg, tpg)
         }
-        Op::QmmTNax => {
-            let kernel = QmmTKernel::Nax;
+        Op::QmmTNax(dequant) => {
+            let kernel = QmmTKernel::Nax(dequant);
             let aligned_n = (n as u32).is_multiple_of(64);
             let name = qmm_t_kernel_name(
                 kernel,
@@ -324,7 +324,7 @@ fn qmm_t_b2_bf16_prefill_oproj_shape() {
 #[test]
 fn qmm_t_nax_b2_bf16_prefill_shape() {
     // Prefill M=64 through the NAX qmm_t (the gpt-oss-2bit prefill path
-    // on M5+): the W producer decodes 1-byte packs (4 codes each) by the
+    // on M5+): the W dequant decodes 1-byte packs (4 codes each) by the
     // MLX bits==2 law.
     // Skips on non-NAX-capable hardware.
     let Some(di) = detect_device() else {
@@ -338,15 +338,23 @@ fn qmm_t_nax_b2_bf16_prefill_shape() {
         );
         return;
     }
-    run_case_bf16(Op::QmmTNax, 64, 256, 2880, 64, 37, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 2880, 64, 37, 0.08);
+    }
     // Unaligned-N tail.
-    run_case_bf16(Op::QmmTNax, 64, 224, 2880, 64, 41, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 224, 2880, 64, 41, 0.08);
+    }
     // K=4096 (o_proj width).
-    run_case_bf16(Op::QmmTNax, 64, 512, 4096, 64, 43, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 512, 4096, 64, 43, 0.08);
+    }
     // gs=128 instantiation (K=4096 — 2880 is NOT a multiple of 128, so
     // gs=128 never occurs at the gpt-oss Ks; the instantiation is still
     // pinned for the general law).
-    run_case_bf16(Op::QmmTNax, 64, 256, 4096, 128, 47, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 4096, 128, 47, 0.08);
+    }
 }
 
 #[test]
