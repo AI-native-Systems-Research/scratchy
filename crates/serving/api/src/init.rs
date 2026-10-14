@@ -599,21 +599,6 @@ fn init_cache(
         (bytes, gpu_memory_utilization)
     };
 
-    // Cap `max_model_len` to the longest context the backend's paged-attention
-    // kernels can address (hybrid SWA arches: the sliding class's block table
-    // is baked at a fixed row stride). Beyond it the kernel would index past
-    // the block table; capping here means an over-long prompt is rejected by
-    // the scheduler instead.
-    let effective_max_model_len = match worker.kv_max_addressable_tokens() {
-        Some(cap) if cap < max_model_len => {
-            info!(
-                "Capping max_model_len {} → {} (paged-attention addressable limit)",
-                max_model_len, cap
-            );
-            cap
-        }
-        _ => max_model_len,
-    };
     let (mut num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
         kv_cache_bytes,
         block_size,
@@ -641,6 +626,33 @@ fn init_cache(
     worker
         .initialize_cache(num_gpu_blocks, 0)
         .context("failed to initialize cache")?;
+    // Cap `max_model_len` to the longest context the cache just built serves.
+    // The scheduler admits a prompt only if its blocks fit the whole pool
+    // (`num_gpu_blocks × block_size` tokens), and the backend's kernels address
+    // no further than `kv_max_addressable_tokens` (metal hybrid SWA: the sliding
+    // class's block-table row; spyre: what its pool funds and its mask baked).
+    // A longer `max_model_len` advertises a window no request can use: past the
+    // pool a prompt is finished unscheduled, past the kernels' reach it would
+    // index past the block table. Capped, an over-long prompt is rejected as
+    // too long up front.
+    let pool_tokens = num_gpu_blocks * block_size;
+    let effective_max_model_len = match worker.kv_max_addressable_tokens() {
+        Some(reach) if reach < max_model_len.min(pool_tokens) => {
+            info!(
+                "Capping max_model_len {} → {} (paged-attention addressable limit)",
+                max_model_len, reach
+            );
+            reach
+        }
+        _ if pool_tokens < max_model_len => {
+            info!(
+                "Capping max_model_len {} → {} (KV cache: {} blocks × {} tokens)",
+                max_model_len, pool_tokens, num_gpu_blocks, block_size
+            );
+            pool_tokens
+        }
+        _ => max_model_len,
+    };
     Ok((
         worker,
         available_memory,

@@ -97,17 +97,13 @@ pub trait Worker: Send {
     }
 
     /// Maximum sequence length (tokens) this backend's paged-attention kernels
-    /// can ADDRESS, if smaller than the model's `max_position_embeddings`. The
-    /// per-sequence block table is baked at a fixed row stride
-    /// (`MAX_BLOCKS_PER_SEQ`); the smallest-block-size KV group (the sliding
-    /// class on a hybrid SWA arch) binds the limit at
-    /// `MAX_BLOCKS_PER_SEQ × block_size`. The engine caps `max_model_len` to
-    /// this (so an over-long prompt is rejected, not silently truncated by the
-    /// kernel) AND sizes the KV pool to it instead of the full memory budget —
-    /// the hybrid pool is lazy + window-bounded, so reserving the whole budget
-    /// of residency-attached VA just starves the activation arena. `None` = no
-    /// limit (the model's full context fits the kernel). Valid after
-    /// `load_model`.
+    /// can ADDRESS with the cache [`Self::initialize_cache`] built, when that
+    /// binds before the pool's own `num_gpu_blocks × block_size` (spyre: what
+    /// the pool funds per request and the prefix mask baked). The engine caps
+    /// `max_model_len` to the smaller of the two, so an over-long prompt is
+    /// rejected, not silently truncated by the kernel. `None` = the pool binds
+    /// first (metal sizes each block-table row to hold it). Valid after
+    /// `initialize_cache`.
     fn kv_max_addressable_tokens(&self) -> Option<usize> {
         None
     }

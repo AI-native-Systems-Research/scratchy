@@ -3795,8 +3795,10 @@ fn emit_weights_struct(
     };
     let _rope_dtype: TokenStream = quote! { __rope_dtype };
 
+    // The RoPE tables are `OnceLock`s: cuda and spyre build them at load, metal when its pool is
+    // built (`build_rope_tables`), for the positions the KV cache's block table reaches.
     let rotary_local_field: TokenStream = if uses_rotary_local {
-        quote! { pub rotary_local: crate::__gpu::rotary::RotaryCache, }
+        quote! { pub rotary_local: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
     } else {
         quote! {}
     };
@@ -3863,7 +3865,7 @@ fn emit_weights_struct(
     };
 
     let rotary_local_init: TokenStream = if uses_rotary_local {
-        quote! { rotary_local, }
+        quote! { rotary_local: ::std::sync::OnceLock::from(rotary_local), }
     } else {
         quote! {}
     };
@@ -3888,7 +3890,7 @@ fn emit_weights_struct(
     });
 
     let rotary_field: TokenStream = if uses_rotary {
-        quote! { pub rotary: crate::__gpu::rotary::RotaryCache, }
+        quote! { pub rotary: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
     } else {
         quote! {}
     };
@@ -4133,27 +4135,19 @@ fn emit_weights_struct(
     //
     // Each table holds `min(max_model_len, __rope_rows)` rows: the runtime
     // `max_model_len` (a chat context of 4-8K on Llama-3.2's 131072 builds
-    // 16-32× fewer), capped by `__rope_rows`, the most a request can reach.
-    // Each target body binds `__rope_rows` ahead of these loads:
-    // `max_position_embeddings`, and on metal no more than the block table
-    // addresses (`CanonicalParams::KV_ADDRESSABLE_TOKENS`: Gemma4's 32768 of
-    // its 262144).
-    let (metal_rope_rows, spyre_rope_rows) = if uses_rotary || uses_rotary_local {
+    // 16-32× fewer), capped by `__rope_rows`, the most a request can reach:
+    // `max_position_embeddings`. Whatever builds the tables binds `__rope_rows`
+    // ahead of these loads: spyre's `load`, and metal's `build_rope_tables`,
+    // whose `max_model_len` is also capped at the block table's reach.
+    let rope_rows: TokenStream = if uses_rotary || uses_rotary_local {
         let max_pos = *model
             .bounds
             .get("max_position_embeddings")
             .expect("model must have max_position_embeddings for Rotary")
             as usize;
-        (
-            quote! {
-                let __rope_rows: usize =
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_ADDRESSABLE_TOKENS
-                        .map_or(#max_pos, |reach| reach.min(#max_pos));
-            },
-            quote! { let __rope_rows: usize = #max_pos; },
-        )
+        quote! { let __rope_rows: usize = #max_pos; }
     } else {
-        (quote! {}, quote! {})
+        quote! {}
     };
     let rotary_load_metal: TokenStream = if uses_rotary {
         let head_dim = *model
@@ -4396,9 +4390,86 @@ fn emit_weights_struct(
     };
 
     let rotary_init: TokenStream = if uses_rotary {
-        quote! { rotary, }
+        quote! { rotary: ::std::sync::OnceLock::from(rotary), }
     } else {
         quote! {}
+    };
+    // Metal's tables wait for its pool; the context `load` was asked for bounds them.
+    let uses_rope = uses_rotary || uses_rotary_local;
+    let rope_context_field: TokenStream = if uses_rope {
+        quote! {
+            /// The context `load` was asked for: with the block table's reach it bounds the
+            /// rows of the RoPE tables the metal pool builds.
+            pub max_model_len: usize,
+        }
+    } else {
+        quote! {}
+    };
+    let rope_context_init: TokenStream = if uses_rope {
+        quote! { max_model_len, }
+    } else {
+        quote! {}
+    };
+    let rotary_deferred_init: TokenStream = [
+        (
+            uses_rotary,
+            quote! { rotary: ::std::sync::OnceLock::new(), },
+        ),
+        (
+            uses_rotary_local,
+            quote! { rotary_local: ::std::sync::OnceLock::new(), },
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(used, init)| used.then_some(init))
+    .collect();
+    // `Weights::build_rope_tables`: the metal pool builds the RoPE tables before it binds them,
+    // once the KV cache is sized, for the positions its block table reaches — the KV cap rung the
+    // pool runs on, picked from `max_model_len` and the blocks the memory budget funds — rather
+    // than at load for every position the checkpoint names. A launch whose KV cache holds less
+    // than `max_position_embeddings` builds only the rows it can serve.
+    let build_rope_tables: TokenStream = {
+        let set_rotary = uses_rotary.then(|| {
+            quote! {
+                if self.rotary.set(rotary).is_err() {
+                    ::anyhow::bail!("RoPE table built twice");
+                }
+            }
+        });
+        let set_rotary_local = uses_rotary_local.then(|| {
+            quote! {
+                if self.rotary_local.set(rotary_local).is_err() {
+                    ::anyhow::bail!("local RoPE table built twice");
+                }
+            }
+        });
+        let body = if uses_rope {
+            quote! {
+                let reach = ctx.kv_cache.max_blocks_per_seq * ctx.kv_cache.block_size;
+                let max_model_len = ::core::cmp::min(self.max_model_len, reach);
+                let gw = &mut crate::__gpu::weights::GpuWeights::empty((*device.allocator).clone());
+                #rope_rows
+                #rotary_load_metal
+                #rotary_local_load_metal
+                #set_rotary
+                #set_rotary_local
+            }
+        } else {
+            quote! { let _ = (ctx, device); }
+        };
+        quote! {
+            impl Weights {
+                #[cfg(feature = "metal")]
+                pub fn build_rope_tables(
+                    &self,
+                    ctx: &crate::__gpu::ForwardCtx,
+                    device: &crate::__gpu::GpuDevice,
+                ) -> ::anyhow::Result<()> {
+                    #body
+                    Ok(())
+                }
+            }
+        }
     };
 
     // Per-arch accessor methods on `Weights`. Group accessor field
@@ -4436,7 +4507,7 @@ fn emit_weights_struct(
                     pub fn rotary_cos_sin(&self, _layer: u32)
                         -> crate::__gpu::tensor::GpuTensor
                     {
-                        self.rotary.cos_sin_cache
+                        self.rotary.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache
                     }
                 }
             } else {
@@ -4449,7 +4520,7 @@ fn emit_weights_struct(
                     pub fn rotary_local_cos_sin(&self, _layer: u32)
                         -> crate::__gpu::tensor::GpuTensor
                     {
-                        self.rotary_local.cos_sin_cache
+                        self.rotary_local.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache
                     }
                 }
             } else {
@@ -4488,6 +4559,7 @@ fn emit_weights_struct(
                 #(#fields)*
                 #rotary_field
                 #rotary_local_field
+                #rope_context_field
                 /// Lazy-initialized `MetalWorkerPool<Self>` used by
                 /// the metal `forward` body. Constructed on the
                 /// first call (caller-passed `ctx.kv_cache` provides
@@ -4530,6 +4602,8 @@ fn emit_weights_struct(
             #accessor_methods
 
             #rotary_cos_sin_methods
+
+            #build_rope_tables
 
             #fingerprint_method
 
@@ -4581,6 +4655,7 @@ fn emit_weights_struct(
                     #(#field_shorthand,)*
                     #rotary_init
                     #rotary_local_init
+                    #rope_context_init
                     #[cfg(feature = "metal")]
                     metal_pool: ::std::sync::OnceLock::new(),
                 })
@@ -4605,8 +4680,9 @@ fn emit_weights_struct(
             /// for `()` under metal (`scratchy_target_cuda::CUstream`)
             /// and is unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
-            /// through `LinearLayer::load_dense_concat_packed` and
-            /// the rotary load uses `RotaryCache::new_from_gpuweights`.
+            /// through `LinearLayer::load_dense_concat_packed`. The
+            /// RoPE tables are not built here but with the pool
+            /// (`build_rope_tables`), once the KV cache is sized.
             #[cfg(feature = "metal")]
             #[allow(clippy::too_many_lines, unused_variables)]
             pub fn load(
@@ -4642,13 +4718,10 @@ fn emit_weights_struct(
                 );
                 #packed_splits_prelude
                 #(#lets)*
-                #metal_rope_rows
-                #rotary_load_metal
-                #rotary_local_load_metal
                 Ok(#weights_ctor {
                     #(#field_shorthand,)*
-                    #rotary_init
-                    #rotary_local_init
+                    #rotary_deferred_init
+                    #rope_context_init
                     #[cfg(feature = "metal")]
                     metal_pool: ::std::sync::OnceLock::new(),
                 })
@@ -4696,13 +4769,14 @@ fn emit_weights_struct(
                 #bnb4_prelude
                 #fp8_prelude
                 #(#lets)*
-                #spyre_rope_rows
+                #rope_rows
                 #rotary_load_metal
                 #rotary_local_load_metal
                 Ok(#weights_ctor {
                     #(#field_shorthand,)*
                     #rotary_init
                     #rotary_local_init
+                    #rope_context_init
                 })
             }
         },
@@ -6988,7 +7062,9 @@ fn emit_weight_accessors_impl(
                     // so reading the field copies the handle directly — no
                     // `.clone()` needed (it would just be a redundant copy).
                     let arm_body = match slot.kind {
-                        WeightKind::CosSin => quote! { self.#base.cos_sin_cache },
+                        WeightKind::CosSin => quote! {
+                            self.#base.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache
+                        },
                         // The layered sinks accessor hands back a
                         // borrow; the trait hands the `Copy` handle
                         // by value.
@@ -7740,7 +7816,6 @@ fn emit_canonical_params_impl(
     tp_world_size: u8,
     uses_rotary: bool,
     kv_layers: &KvCacheLayers,
-    kv_reach: KvReach,
     // Filled with the SAME values the impl's consts are emitted from —
     // one derivation, two consumers (the impl tokens and the macro-side
     // tape bake). Built in this fn so drift is impossible.
@@ -8099,31 +8174,6 @@ fn emit_canonical_params_impl(
             model.source_stem, sliding_per_token, global_per_token,
         );
     };
-    // MAX_BLOCKS_PER_SEQ override — block-table row stride. The trait
-    // default (128 ≈ 2k tokens at block_size 16) silently truncates
-    // long-context serving; long-context arches set the explicit
-    // `max_blocks_per_seq` config key (Gemma4 bring-up: 2048 = 32k).
-    // Emitted conditionally so every existing arch keeps the default.
-    let max_blocks_override: proc_macro2::TokenStream = match model.bounds.get("max_blocks_per_seq")
-    {
-        Some(&v) => {
-            let lit = proc_macro2::Literal::u32_unsuffixed(v as u32);
-            quote! { const MAX_BLOCKS_PER_SEQ: u32 = #lit; }
-        }
-        None => quote! {},
-    };
-    // KV_ADDRESSABLE_TOKENS override — from the very consts the kernels bake,
-    // so the reach the worker caps at and the RoPE rows the load builds cannot
-    // drift from the block table.
-    let kv_addressable_override: proc_macro2::TokenStream = match kv_reach {
-        KvReach::KvCache => quote! {},
-        KvReach::BlockTable => quote! {
-            const KV_ADDRESSABLE_TOKENS: ::core::option::Option<usize> =
-                ::core::option::Option::Some(
-                    Self::MAX_BLOCKS_PER_SEQ as usize * Self::BLOCK_SIZE as usize
-                );
-        },
-    };
     let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
     let attn_softcap_lit = proc_macro2::Literal::f32_unsuffixed(attn_softcap);
     let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
@@ -8292,11 +8342,6 @@ fn emit_canonical_params_impl(
             rope_on_read: uses_rotary,
             rope_proportional,
             mrope: model.mrope_section.is_some(),
-            max_blocks_per_seq: model
-                .bounds
-                .get("max_blocks_per_seq")
-                .map(|&v| v as u32)
-                .unwrap_or(128),
             kv_codec,
             vision_num_heads,
             vision_head_dim,
@@ -8361,8 +8406,6 @@ fn emit_canonical_params_impl(
             const GLOBAL_Q_SIZE: usize = #global_q_size_lit;
             #rope_proportional_tokens
             #rope_on_read_tokens
-            #max_blocks_override
-            #kv_addressable_override
             #global_block_size_override
             const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
             const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
@@ -8487,29 +8530,6 @@ pub fn emit_gdn_runtime_config_arm_body(
             },
         )
     })
-}
-
-/// What bounds the tokens one sequence's metal KV can address
-/// (`CanonicalParams::KV_ADDRESSABLE_TOKENS`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum KvReach {
-    /// Only the KV cache: every uniform-geometry variant.
-    KvCache,
-    /// The block table: a hybrid-geometry variant (Gemma4) gives every KV
-    /// group a `MAX_BLOCKS_PER_SEQ`-long row, so it reaches
-    /// `MAX_BLOCKS_PER_SEQ × BLOCK_SIZE` tokens.
-    BlockTable,
-}
-
-impl KvReach {
-    /// A variant's reach: the block table exactly when its KV groups differ
-    /// in geometry (`ScratchyWeights::per_layer_kv_token_elems` is `Some`).
-    fn of(fuf: &Fuf, model: &ModelParams) -> Self {
-        match emit_per_layer_kv_token_elems_arm_body(fuf, model) {
-            Some(_) => Self::BlockTable,
-            None => Self::KvCache,
-        }
-    }
 }
 
 /// Emit the body for the per-arch `ScratchyWeights::per_layer_kv_token_elems`
@@ -12400,7 +12420,6 @@ pub fn emit_model(
         tp_world_size,
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
-        KvReach::of(fuf, model),
         #[cfg(feature = "metal")]
         &mut resolved_metal_consts,
     );
@@ -13349,8 +13368,7 @@ pub fn emit_model(
         /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
         /// metal forward body's `RuntimeFactory` allocates per-worker
         /// runtime buffers (input_ids/positions/slot_mapping/...) at
-        /// `METAL_MAX_BUCKET_M * sizeof(u32)`; block_table at
-        /// `METAL_MAX_BUCKET_M * MAX_BLOCKS_PER_SEQ * sizeof(u32)`.
+        /// `METAL_MAX_BUCKET_M * sizeof(u32)`.
         #[cfg(feature = "metal")]
         pub const METAL_MAX_BUCKET_M: u32 = #max_bucket_m_lit;
 
@@ -13476,9 +13494,9 @@ pub fn emit_model(
         /// The model's resident metal pool, built on its first forward.
         ///
         /// The factory closure captures (a) the metal device handle
-        /// for runtime-buffer allocation, (b) `MAX_BLOCKS_PER_SEQ`
-        /// from the canonical's `CanonicalParams` (compile-time
-        /// const), (c) Arc-handle clones of the per-layer KV
+        /// for runtime-buffer allocation, (b) the KV pool's block-table
+        /// row stride and the serving batch, which size the block tables,
+        /// (c) Arc-handle clones of the per-layer KV
         /// buffers from `ctx.kv_cache` so worker spawns inherit
         /// them without re-allocation. The closure is invoked
         /// once per worker spawn — the pool starts at size 1 so
@@ -13495,6 +13513,10 @@ pub fn emit_model(
             use ::scratchy_target_metal::interpreter::metal::__re::{Buffer, MTLResourceOptions};
 
             wm.metal_pool.get_or_init(|| {
+                // The RoPE tables the pool binds, for the positions this KV cache's block table
+                // reaches.
+                wm.build_rope_tables(ctx, device)
+                    .expect("Weights::build_rope_tables: RoPE table build failed");
                 let num_layers = ctx.kv_cache.num_layers;
                 // Reactive (chunked) KV pool: bind the per-layer
                 // chunk-address TABLE buffers (device uint64 arrays of
@@ -13602,12 +13624,17 @@ pub fn emit_model(
                     .collect();
                 // The stores register with the device's allocator, whose KV growth maps them.
                 let __tq_allocator = device.allocator.clone();
+                // A step's block tables: a row per sequence, at most the serving batch (every
+                // row of the largest bucket when the worker has not stashed one), each the KV
+                // pool's row stride — the KV cap rung it runs on, which the host pads every row
+                // to.
+                let __bt_stride = ctx.kv_cache.max_blocks_per_seq as u64;
+                let __bt_rows = device.max_decode_rows.map_or(METAL_MAX_BUCKET_M, |r| {
+                    r.get().min(METAL_MAX_BUCKET_M)
+                }) as u64;
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
                     ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev, lent| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
-                        let max_bps =
-                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ
-                                as u64;
                         let alloc = |bytes: u64| {
                             use ::scratchy_target_metal::interpreter::metal::__re::MTLDevice as _;
                             dev.newBufferWithLength_options(
@@ -13655,19 +13682,19 @@ pub fn emit_model(
                             slot_mappings: (0..num_kv_groups).map(|_| alloc(max_m * 4)).collect(),
                             cu_seqlens_q: alloc((max_m + 1) * 4),
                             seq_used_k: alloc(max_m * 4),
-                            // Per-block span label for block-diagonal span
-                            // attention: one u32 per logical block, zero-padded to
-                            // the block-table stride. The kernel indexes span_ids
-                            // by BLOCK (pos/block_size), not token, and the runtime
-                            // stride (max_model_len-derived max_blocks_per_seq) is
-                            // NOT a macro constant — so size it exactly like ONE
-                            // block_tables group (max_m * max_bps), which the
-                            // runtime stride always fits. (max_m alone undersized
-                            // it: the span_ids BufferTooSmall bug.) All-zero unless
-                            // the request carries Relocatable spans.
-                            span_ids: alloc(max_m * max_bps * 4),
+                            // Per-token span label for block-diagonal span
+                            // attention, for a step of one sequence: as many as
+                            // its full-attention row reaches, the stride's blocks of
+                            // `GLOBAL_BLOCK_SIZE` tokens. All-zero unless the
+                            // request carries Relocatable spans.
+                            span_ids: alloc(
+                                __bt_stride
+                                    * <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE
+                                        as u64
+                                    * 4,
+                            ),
                             block_tables: (0..num_kv_groups)
-                                .map(|_| alloc(max_m * max_bps * 4))
+                                .map(|_| alloc(__bt_rows * __bt_stride * 4))
                                 .collect(),
                             layer_to_group: kv_layer_to_group.clone(),
                             // TurboQuant: when provisioned, the GLOBAL (group-0)
@@ -14695,7 +14722,6 @@ mod tests {
             1,
             false,
             &every_layer(&m),
-            KvReach::KvCache,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14732,7 +14758,6 @@ mod tests {
             2,
             false,
             &every_layer(&m),
-            KvReach::KvCache,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14781,7 +14806,6 @@ mod tests {
             8,
             false,
             &every_layer(&m),
-            KvReach::KvCache,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14800,35 +14824,6 @@ mod tests {
         assert!(
             ts.contains("INTERMEDIATE_SIZE : usize = 1792"),
             "tp=8 must shard INTERMEDIATE_SIZE to 1792; got {ts}"
-        );
-    }
-
-    /// `KV_ADDRESSABLE_TOKENS` is overridden only for a block-table reach,
-    /// and then as the product of the impl's own block consts — never a
-    /// second literal that could drift from what the kernels bake.
-    #[test]
-    fn kv_addressable_tokens_derives_from_the_block_consts() {
-        let m = shard_test_model(32, 8, 128, 14336);
-        let emit = |reach| {
-            emit_canonical_params_impl(
-                &m,
-                1,
-                false,
-                &every_layer(&m),
-                reach,
-                #[cfg(feature = "metal")]
-                &mut None,
-            )
-            .to_string()
-        };
-        assert!(!emit(KvReach::KvCache).contains("KV_ADDRESSABLE_TOKENS"));
-        let ts = emit(KvReach::BlockTable).replace(' ', "");
-        assert!(
-            ts.contains(
-                "constKV_ADDRESSABLE_TOKENS:::core::option::Option<usize>=::core::option::Option::\
-                 Some(Self::MAX_BLOCKS_PER_SEQasusize*Self::BLOCK_SIZEasusize);"
-            ),
-            "a block-table reach must be MAX_BLOCKS_PER_SEQ × BLOCK_SIZE; got {ts}"
         );
     }
 

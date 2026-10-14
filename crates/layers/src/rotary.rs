@@ -11,9 +11,10 @@
 //! The cuda-only stream-based upload constructors (`*_from_stream`)
 //! live in `scratchy-target-cuda`'s `CudaRotaryExt` extension trait.
 
+use crate::weights::GpuWeights;
 use anyhow::Result;
 use rayon::prelude::*;
-use scratchy_tensors::{DType, GpuTensor, WeightSource};
+use scratchy_tensors::{DType, DeviceAllocator, GpuTensor, WeightSource};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -160,6 +161,107 @@ fn upload_via_gpuweights<W: WeightSource + ?Sized>(
     weights.alloc_packed_from_host(bytes, shape, dtype)
 }
 
+/// Rows per angle-addition block in [`write_cos_sin`].
+const ROPE_BLOCK_ROWS: usize = 64;
+
+/// The `[max_pos, rotary_dim]` cos|sin cache of `pos · inv_freqs[i]` in `dtype`, what every rope
+/// kernel reads: cos in `[0, half)` of each row, sin in `[half, 2·half)`. Built straight in
+/// `dtype`, with no f32 table in between, and in place where the device memory is host-visible
+/// ([`GpuWeights::alloc_packed_with`]): a model's table covers every position it serves (gemma-4:
+/// 262144 rows, 192 MiB of bf16) and is on every launch's critical path, where copying it up
+/// costs as much as building it.
+fn upload_cos_sin<A: DeviceAllocator>(
+    weights: &mut GpuWeights<A>,
+    inv_freqs: &[f64],
+    max_pos: usize,
+    rotary_dim: usize,
+    dtype: DType,
+) -> Result<GpuTensor> {
+    weights.alloc_packed_with(&[max_pos, rotary_dim], dtype, |table| {
+        write_cos_sin(table, inv_freqs, rotary_dim, dtype)
+    })
+}
+
+/// Fill `table`, whole `rotary_dim`-wide rows of `dtype`, with [`upload_cos_sin`]'s cache.
+///
+/// By angle addition rather than a cos and a sin per entry. Row `p0 + k` of a
+/// [`ROPE_BLOCK_ROWS`]-row block composes the block's first angle `a = p0·θ` with the offset
+/// `b = k·θ`: `cos(a + b) = cos a·cos b − sin a·sin b`, `sin(a + b) = sin a·cos b + cos a·sin b`.
+/// The trig is one pair per block and frequency, and an entry is four products. In f64 the composed
+/// value is within ~3e-11 of the per-entry `cos(pos·θ)`, the order of that product's own rounding:
+/// about one f32 in 10⁴ lands an ulp away, and rounding to bf16 removes even that — the bf16 tables
+/// of gemma-4, Llama-3.2 and Qwen3.6 match the per-entry build bit for bit, every row.
+fn write_cos_sin(
+    table: &mut [u8],
+    inv_freqs: &[f64],
+    rotary_dim: usize,
+    dtype: DType,
+) -> Result<()> {
+    match dtype {
+        DType::F32 => cos_sin_rows(table, inv_freqs, rotary_dim, f32::to_ne_bytes),
+        DType::F16 => cos_sin_rows(table, inv_freqs, rotary_dim, |x| {
+            half::f16::from_f32(x).to_bits().to_ne_bytes()
+        }),
+        DType::BF16 => cos_sin_rows(table, inv_freqs, rotary_dim, |x| bf16_bits(x).to_ne_bytes()),
+        _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
+    }
+    Ok(())
+}
+
+/// `x`'s bf16 bits, rounded to nearest, ties to even: `half::bf16::from_f32` for every finite `x`
+/// (a cos or sin always is), without its NaN branch, so the fill loop vectorizes.
+fn bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// [`write_cos_sin`] for an `N`-byte element `cast` from f32. The angles are kept as planes, sin
+/// apart from cos, and each row's cos half is written before its sin half, so the loops vectorize.
+fn cos_sin_rows<const N: usize>(
+    table: &mut [u8],
+    inv_freqs: &[f64],
+    rotary_dim: usize,
+    cast: impl Fn(f32) -> [u8; N] + Sync,
+) {
+    let half = inv_freqs.len();
+    let row_bytes = rotary_dim * N;
+    // sin and cos of each in-block offset's angle: `ROPE_BLOCK_ROWS` rows of `half`.
+    let (offset_sin, offset_cos): (Vec<f64>, Vec<f64>) = (0..ROPE_BLOCK_ROWS)
+        .flat_map(|k| inv_freqs.iter().map(move |&t| (k as f64 * t).sin_cos()))
+        .unzip();
+    table
+        .par_chunks_mut(ROPE_BLOCK_ROWS * row_bytes)
+        .enumerate()
+        .for_each(|(block, rows)| {
+            let p0 = (block * ROPE_BLOCK_ROWS) as f64;
+            let (sin_a, cos_a): (Vec<f64>, Vec<f64>) =
+                inv_freqs.iter().map(|&t| (p0 * t).sin_cos()).unzip();
+            let rows = rows.chunks_exact_mut(row_bytes);
+            let offsets = offset_sin
+                .chunks_exact(half)
+                .zip(offset_cos.chunks_exact(half));
+            for (row, (sin_b, cos_b)) in rows.zip(offsets) {
+                let (cos, sin) = row.split_at_mut(half * N);
+                let a = sin_a.iter().zip(&cos_a);
+                let b = sin_b.iter().zip(cos_b);
+                for ((out, (&sa, &ca)), (&sb, &cb)) in cos
+                    .as_chunks_mut::<N>()
+                    .0
+                    .iter_mut()
+                    .zip(a.clone())
+                    .zip(b.clone())
+                {
+                    *out = cast((ca * cb - sa * sb) as f32);
+                }
+                for ((out, (&sa, &ca)), (&sb, &cb)) in
+                    sin.as_chunks_mut::<N>().0.iter_mut().zip(a).zip(b)
+                {
+                    *out = cast((sa * cb + ca * sb) as f32);
+                }
+            }
+        });
+}
+
 // ---------------------------------------------------------------------------
 // YaRN host math (shared with the cuda `new_yarn_from_stream`)
 // ---------------------------------------------------------------------------
@@ -283,8 +385,8 @@ pub fn yarn_cos_sin_table(
 impl RotaryCache {
     /// Backend-neutral, stream-free counterpart to the cuda
     /// `new_from_stream`. Computes the cos/sin tables on CPU (identical
-    /// math) and uploads them via the [`WeightSource`] active allocator.
-    /// Single `alloc_packed_from_host` call per cache (combined / cos / sin).
+    /// math) and uploads them through `weights`' allocator
+    /// ([`GpuWeights::alloc_packed_with`]), one table per cache.
     ///
     /// Currently covers the basic case: full rotary
     /// (`rotary_dim == head_dim`), no scaling or Llama3 scaling. The
@@ -292,8 +394,8 @@ impl RotaryCache {
     /// [`Self::new_partial_from_gpuweights`] (partial rotary),
     /// [`Self::new_longrope_from_gpuweights`], and
     /// [`Self::new_yarn_from_gpuweights`].
-    pub fn new_from_gpuweights<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    pub fn new_from_gpuweights<A: DeviceAllocator>(
+        weights: &mut GpuWeights<A>,
         head_dim: usize,
         max_pos: usize,
         rope_theta: f64,
@@ -313,7 +415,7 @@ impl RotaryCache {
     }
 
     /// Partial-rotary (and full, when `rotary_dim == head_dim`) cos/sin
-    /// cache, built on CPU and uploaded via the [`WeightSource`] — the
+    /// cache, built on CPU and uploaded through `weights`' allocator — the
     /// backend-neutral, stream-free counterpart to the cuda
     /// `new_partial_from_stream`. Builds a `[max_pos, rotary_dim]`
     /// cache where `rotary_dim = partial_rotary_factor * head_dim` (e.g.
@@ -322,8 +424,8 @@ impl RotaryCache {
     /// `head_dim - rotary_dim` channels through unrotated. Covers
     /// no-scaling and Llama3 scaling; LongRoPE and YaRN have their own
     /// `*_from_gpuweights` constructors.
-    pub fn new_partial_from_gpuweights<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    pub fn new_partial_from_gpuweights<A: DeviceAllocator>(
+        weights: &mut GpuWeights<A>,
         head_dim: usize,
         rotary_dim: usize,
         max_pos: usize,
@@ -356,25 +458,7 @@ impl RotaryCache {
             })
             .collect();
 
-        // Parallel cos/sin fill — `max_pos × rotary_dim` is millions of
-        // trig calls for long-context models (Llama-3.2 ships
-        // max_position_embeddings = 131072). Rayon par_chunks_mut over
-        // rows is safe (each pos writes its own row) and turns ~80ms of
-        // single-threaded math into ~10ms on a typical M-series core
-        // count.
-        let mut cache = vec![0f32; max_pos * rotary_dim];
-        cache
-            .par_chunks_mut(rotary_dim)
-            .enumerate()
-            .for_each(|(pos, row)| {
-                for i in 0..half {
-                    let angle = pos as f64 * inv_freqs[i];
-                    row[i] = angle.cos() as f32;
-                    row[half + i] = angle.sin() as f32;
-                }
-            });
-
-        let cos_sin_cache = upload_via_gpuweights(weights, &cache, &[max_pos, rotary_dim], dtype)?;
+        let cos_sin_cache = upload_cos_sin(weights, &inv_freqs, max_pos, rotary_dim, dtype)?;
 
         // Split `cos_cache` / `sin_cache` are wgpu-only — every cuda
         // and metal kernel reads the unified `cos_sin_cache` above.
@@ -529,8 +613,8 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Same as `new_partial_from_gpuweights`.
-    pub fn new_proportional_from_gpuweights<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    pub fn new_proportional_from_gpuweights<A: DeviceAllocator>(
+        weights: &mut GpuWeights<A>,
         head_dim: usize,
         rotary_dim: usize,
         max_pos: usize,
@@ -548,19 +632,7 @@ impl RotaryCache {
             .map(|i| 1.0 / rope_theta.powf(2.0 * i as f64 / head_dim as f64))
             .collect();
 
-        let mut cache = vec![0f32; max_pos * rotary_dim];
-        cache
-            .par_chunks_mut(rotary_dim)
-            .enumerate()
-            .for_each(|(pos, row)| {
-                for i in 0..half {
-                    let angle = pos as f64 * inv_freqs[i];
-                    row[i] = angle.cos() as f32;
-                    row[half + i] = angle.sin() as f32;
-                }
-            });
-
-        let cos_sin_cache = upload_via_gpuweights(weights, &cache, &[max_pos, rotary_dim], dtype)?;
+        let cos_sin_cache = upload_cos_sin(weights, &inv_freqs, max_pos, rotary_dim, dtype)?;
         let (cos_cache, sin_cache) = (
             unsafe { GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
             unsafe { GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
@@ -713,5 +785,100 @@ mod yarn_tests {
         yarn.mscale_all_dim = 0.0;
         let table = yarn_cos_sin_table(GPT_OSS_HEAD_DIM, 64, GPT_OSS_THETA, &yarn);
         assert_eq!(table[0], yarn_get_mscale(32.0, 1.0) as f32);
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// `1 / θ^(2i / denom)` for `half` frequencies.
+    fn inv_freqs(theta: f64, half: usize, denom: usize) -> Vec<f64> {
+        (0..half)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f64 / denom as f64))
+            .collect()
+    }
+
+    /// [`write_cos_sin`] into a host buffer: `max_pos` full-rotary rows of `dtype`.
+    fn table(inv: &[f64], max_pos: usize, dtype: DType) -> Result<Vec<u8>> {
+        let rotary_dim = 2 * inv.len();
+        let mut table = vec![0u8; max_pos * rotary_dim * dtype.size_bytes()];
+        write_cos_sin(&mut table, inv, rotary_dim, dtype)?;
+        Ok(table)
+    }
+
+    /// The angle-addition table is the per-entry `cos/sin(pos·θ)` table in bf16, bit for bit, at
+    /// the frequencies of gemma-4's sliding (θ 1e4, 256 dims) and global (proportional: 128 of 512
+    /// dims, θ 1e6) tables, Llama-3.2's (θ 5e5, 64) and Qwen3.6's (θ 1e7, 64 of 256), across their
+    /// longest context: every row of the first two blocks and of the last, and every 97th row
+    /// (prime stride, so the sampled offsets cover each in-block position). The full tables were
+    /// also compared, every row: no bf16 entry differs.
+    #[test]
+    fn angle_addition_matches_per_entry_trig_in_bf16() {
+        let bf16 = |x: f64| half::bf16::from_f32(x as f32).to_bits().to_ne_bytes();
+        for (inv, max_pos) in [
+            (inv_freqs(10_000.0, 128, 256), 262_144),
+            (inv_freqs(1_000_000.0, 64, 512), 262_144),
+            (inv_freqs(500_000.0, 32, 64), 131_072),
+            (inv_freqs(10_000_000.0, 32, 64), 262_144),
+        ] {
+            let table = table(&inv, max_pos, DType::BF16).expect("bf16 table");
+            let half = inv.len();
+            let row_bytes = 2 * half * 2;
+            assert_eq!(table.len(), max_pos * row_bytes);
+            let edges = (0..2 * ROPE_BLOCK_ROWS).chain(max_pos - ROPE_BLOCK_ROWS..max_pos);
+            for pos in edges.chain((0..max_pos).step_by(97)) {
+                let row = &table[pos * row_bytes..(pos + 1) * row_bytes];
+                for (i, &t) in inv.iter().enumerate() {
+                    let angle = pos as f64 * t;
+                    assert_eq!(
+                        row[2 * i..2 * i + 2],
+                        bf16(angle.cos()),
+                        "cos pos {pos} freq {i}"
+                    );
+                    let sin = 2 * (half + i);
+                    assert_eq!(
+                        row[sin..sin + 2],
+                        bf16(angle.sin()),
+                        "sin pos {pos} freq {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `bf16_bits` is `half::bf16::from_f32` over every magnitude a cos or sin takes: a strided
+    /// sweep of [-1, 1]'s bit patterns, and every pattern whose low half is a tie, with the kept
+    /// bit odd and even.
+    #[test]
+    fn bf16_bits_rounds_as_half_does() {
+        let one = 1.0f32.to_bits();
+        let ties = (0..one >> 16).map(|hi| (hi << 16) | 0x8000);
+        for bits in (0..=one).step_by(1009).chain(ties) {
+            for x in [f32::from_bits(bits), -f32::from_bits(bits)] {
+                assert_eq!(bf16_bits(x), half::bf16::from_f32(x).to_bits(), "{x:e}");
+            }
+        }
+    }
+
+    /// Each dtype's bytes are the f32 value's cast: position 0 is cos 1 / sin 0 in every dtype, and
+    /// an unsupported dtype is an error, not a table.
+    #[test]
+    fn write_cos_sin_casts_to_each_dtype() {
+        let inv = inv_freqs(10_000.0, 4, 8);
+        let f32_table = table(&inv, 3, DType::F32).expect("f32");
+        assert_eq!(f32_table.len(), 3 * 8 * 4);
+        assert_eq!(f32_table[..4], 1.0f32.to_ne_bytes());
+        assert_eq!(f32_table[16..20], 0.0f32.to_ne_bytes());
+        let f16_table = table(&inv, 3, DType::F16).expect("f16");
+        assert_eq!(f16_table[..2], half::f16::ONE.to_bits().to_ne_bytes());
+        let row1 = 8 * 4;
+        let cos1 = f32::from_ne_bytes(f32_table[row1..row1 + 4].try_into().expect("4 bytes"));
+        assert_eq!(
+            f16_table[8 * 2..8 * 2 + 2],
+            half::f16::from_f32(cos1).to_bits().to_ne_bytes()
+        );
+        let mut i32_table = vec![0u8; 3 * 8 * 4];
+        assert!(write_cos_sin(&mut i32_table, &inv, 8, DType::I32).is_err());
     }
 }

@@ -3694,9 +3694,9 @@ fn rotary_cos_sin_tokens(fuf: &Fuf, claimed: &[TileId]) -> TokenStream {
         })
     });
     if uses_local {
-        quote! { wm.rotary_local.cos_sin_cache }
+        quote! { wm.rotary_local.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache }
     } else {
-        quote! { wm.rotary.cos_sin_cache }
+        quote! { wm.rotary.get().expect("RoPE tables are built at load, or with the metal pool (`build_rope_tables`)").cos_sin_cache }
     }
 }
 

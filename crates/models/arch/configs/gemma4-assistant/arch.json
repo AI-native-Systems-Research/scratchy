@@ -9,7 +9,7 @@
   "borrows": ["embed_tokens"],
   "top_level_weights": ["pre_projection", "post_projection"],
   "scale_dtype": "bf16",
-  "bound_defaults": { "max_blocks_per_seq": 2048, "spec_drafts": 2, "spec_max_seqs": 1 },
+  "bound_defaults": { "spec_drafts": 2, "spec_max_seqs": 1 },
   "scalar_defaults": { "attention_multiplier": 1.0 },
   "weight_leaf_renames": {
     "lm_head": "embed_tokens",

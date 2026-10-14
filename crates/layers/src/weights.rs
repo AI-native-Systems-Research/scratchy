@@ -1217,6 +1217,34 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
     }
 
+    /// A `shape`/`dtype` device tensor whose packed bytes `fill` writes: in place where the
+    /// allocator's memory is host-visible ([`DeviceAllocator::alloc_host_writable`]: metal's
+    /// unified memory), else into host memory then copied up as [`Self::alloc_packed_from_host`].
+    /// For a table built on the host, which then has no host copy to make.
+    pub fn alloc_packed_with(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<GpuTensor> {
+        let bytes = shape.iter().product::<usize>() * dtype.size_bytes();
+        // SAFETY: `fill` writes the tensor's bytes before the tensor exists, so no kernel reads
+        // one unwritten.
+        match unsafe { self.allocator.alloc_host_writable(bytes)? } {
+            Some(ptr) => {
+                // SAFETY: the allocator hands out `bytes` host-writable bytes at `ptr`, which no
+                // other reference covers until the tensor below is built over them.
+                fill(unsafe { std::slice::from_raw_parts_mut(ptr, bytes) })?;
+                Ok(unsafe { GpuTensor::new(ptr, shape, dtype) })
+            }
+            None => {
+                let mut host = vec![0u8; bytes];
+                fill(&mut host)?;
+                self.alloc_packed_from_host(&host, shape, dtype)
+            }
+        }
+    }
+
     /// Take a tensor and upload it to GPU as **F32**, upcasting F16/BF16
     /// on the CPU first. Use for kernel bindings that are typed
     /// `const device float*` but whose on-disk dtype varies across

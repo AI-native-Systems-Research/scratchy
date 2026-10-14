@@ -2161,9 +2161,9 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant `ScratchyWeights::kv_codec()` / `kv_cache_layers()` /
-    // `kv_addressable_tokens()` arms: each reads its own module's
-    // `CanonicalParams` const, so the dispatcher keeps no second record of it.
+    // Per-variant `ScratchyWeights::kv_codec()` / `kv_cache_layers()` arms:
+    // each reads its own module's `CanonicalParams` const, so the dispatcher
+    // keeps no second record of it.
     let canonical_const_arms = |konst: proc_macro2::TokenStream| -> Vec<proc_macro2::TokenStream> {
         arms.iter()
             .map(|a| {
@@ -2178,7 +2178,6 @@ fn emit_arch_dispatcher(
     };
     let kv_codec_arms = canonical_const_arms(quote! { KV_CODEC });
     let kv_cache_layers_arms = canonical_const_arms(quote! { KV_CACHE_LAYERS });
-    let kv_addressable_tokens_arms = canonical_const_arms(quote! { KV_ADDRESSABLE_TOKENS });
 
     // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
     // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
@@ -2957,12 +2956,6 @@ fn emit_arch_dispatcher(
             fn kv_cache_layers(&self) -> ::core::option::Option<&'static [u32]> {
                 match self {
                     #(#kv_cache_layers_arms)*
-                }
-            }
-            #[cfg(any(feature = "cuda", feature = "metal"))]
-            fn kv_addressable_tokens(&self) -> ::core::option::Option<usize> {
-                match self {
-                    #(#kv_addressable_tokens_arms)*
                 }
             }
 
