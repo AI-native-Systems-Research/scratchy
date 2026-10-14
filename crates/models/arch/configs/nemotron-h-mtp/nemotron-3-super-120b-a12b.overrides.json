@@ -1,0 +1,6 @@
+{
+  "_comment": "The head's own layer schedule, from the checkpoint's `mtp_hybrid_override_pattern`: an attention layer then a LatentMoE one (`*E`). The base config carries the TARGET's schedule — `hybrid_override_pattern`, 88 layers — and the target's `num_hidden_layers`, both present, and config aliases fill absent keys only, so all three of the head's facts restore here: its schedule, its layer count (a schedule's length must equal a present `num_hidden_layers` when the block sets derive), and the target's count preserved as `target_num_hidden_layers` (the head's KV pool is the target's, so its codec is decided at the target's layer count).",
+  "hybrid_override_pattern": "*E",
+  "num_hidden_layers": 2,
+  "target_num_hidden_layers": 88
+}

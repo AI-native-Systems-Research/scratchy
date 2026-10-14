@@ -76,7 +76,8 @@ pub mod __re {
     pub use ::objc2_metal::{
         MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
         MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap, MTL4CounterHeapDescriptor,
-        MTL4CounterHeapType, MTL4TimestampGranularity, MTLEvent, MTLSharedEvent,
+        MTL4CounterHeapType, MTL4TimestampGranularity, MTL4TimestampHeapEntry, MTLEvent,
+        MTLSharedEvent,
     };
     pub type Mtl4CounterHeap = Retained<ProtocolObject<dyn MTL4CounterHeap>>;
     pub type Mtl4Queue = Retained<ProtocolObject<dyn MTL4CommandQueue>>;

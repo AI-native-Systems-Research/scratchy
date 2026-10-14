@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Multi-token-prediction (MTP) proposer: drafts with a head that ships beside its target model
-//! (Qwen3.5/3.6 `mtp.*`; an MLX drafter repo carries it alone) and reads the target's final
-//! (post-norm) hidden states.
+//! (Qwen3.5/3.6 `mtp.*`; an MLX drafter repo carries it alone; Nemotron-3 Super's OptiQ conversion
+//! publishes it as a sidecar file the checkpoint's config names, `mtp_file`) and reads the
+//! target's final (post-norm) hidden states.
 //!
 //! Per step (prefill, decode or verify):
 //!
@@ -45,8 +46,10 @@
 //!
 //! # TODO
 //!
-//! Measured on Qwen3.6-35B-A3B (`mlx-community/Qwen3.6-35B-A3B-4bit` with its MLX head), the one
-//! target with a head config; "sampled" is the model's default sampling, "greedy" temperature 0.
+//! Measured on Qwen3.6-35B-A3B (`mlx-community/Qwen3.6-35B-A3B-4bit` with its MLX head) and on
+//! Nemotron-3 Super 120B-A12B (`mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit` with
+//! its sidecar head), the two targets with head configs; "sampled" is the model's default
+//! sampling, "greedy" temperature 0.
 //!
 //! **The gate** (`spec_max_seqs`, the head's `arch.json`):
 //!
@@ -124,6 +127,29 @@
 //!   before the fold fix that keeps an exported final hidden written (after a verify step that
 //!   kept no draft, the second draft matched the oracle's 5 times in 23 before it, 28 in 28
 //!   after); k = 3 is not re-measured since.
+//! - Measured on Nemotron-3 Super 120B-A12B (OptiQ-2bit, its sidecar head; M5 Max, one request,
+//!   greedy, `scr chat --bench`, a short prompt): a plain step 15.0 ms, a drafting step 25.3 ms
+//!   (p10-p90 23.8-27.0), 2.31 tokens a step, output 67.7 -> 91.4 tok/s (+35%), time to first
+//!   token 107.5 -> 110.8 ms. Before the shared-experts fix it was flat (66.9 tok/s, a 35.8 ms
+//!   drafting step) — and the flatness was a kernel mode, not structure. The verify-sized
+//!   gathered MoE bucket ran its pairs that share an expert in the first pair's threadgroup
+//!   (`SharedExperts::InFirstPair`), whose every threadgroup scans the bucket's every other
+//!   pair: a cost quadratic in the pair count, and this target routes 22 of 512 experts a row,
+//!   so a 3-row verify's 66 live pairs blow past the mode's few-pairs precondition while its
+//!   saved reads stay the ~3 pairs that share an expert. Per-dispatch GPU time
+//!   (`SCRATCHY_METAL_KERNEL_TIME`, probe-inflated): the drafting step was 38.3 ms of verify
+//!   plus 2.7 of head passes — the head is under 7% of it, innocent — and the verify's
+//!   `MoeGateUpAct` alone ran 17.3 ms against the plain step's 3.6, 4.8x for 3x the pairs where
+//!   the dense projections scaled 1.2x, while the same kernel at the prefill bucket's 594 pairs
+//!   runs 1.6 µs a pair against the verify bucket's 6.6. Running a gathered bake's pairs apart
+//!   past 64 baked pairs (`METAL_SHARED_EXPERTS_MAX_PAIRS`) took `MoeGateUpAct` to 4.7 ms —
+//!   1.8 µs a pair, the prefill bucket's efficiency, 1.3x the plain step's cost for the ~63
+//!   distinct experts 3 rows draw (uniform routing; the plain step's 22) — and the step to
+//!   25.3 ms. The acceptance (2.31 tokens a step) clears it: those tokens' plain steps cost
+//!   34.7 ms. The head pays where the routed experts hold a minority of the plain step's stream
+//!   (Qwen3.6: 256 experts, 8 a row — 32 baked pairs at the verify bucket, under the cap, the
+//!   mode unchanged there) or where KV reads dilute it; not measured past one sequence (the
+//!   gate is 2) nor at depth of context.
 //!
 //! **Measurement, interface, size:**
 //!

@@ -1182,6 +1182,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     value: mtl4.signal_counter,
                     error,
                     _feedback: feedback,
+                    kernel_time: super::mtl4::kernel_time_cursors(),
                 },
             )
         };
@@ -2808,6 +2809,7 @@ mod tests {
                 value,
                 _feedback: commit_options(&error),
                 error,
+                kernel_time: Vec::new(),
             }
         };
         let (first, second) = (failed(1), failed(2));

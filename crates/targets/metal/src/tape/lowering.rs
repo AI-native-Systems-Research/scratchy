@@ -7421,7 +7421,7 @@ fn lower_moe_step(
         // A sorted bake's same-expert pairs are adjacent already, their repeat reads cache hits.
         // A routed command's pairs know their own token's picks only, not the pairs before.
         let shared = match (s.grouping, routed.is_some()) {
-            (MoeGrouping::Gathered, false) => SharedExperts::for_bucket(bucket_m),
+            (MoeGrouping::Gathered, false) => SharedExperts::for_pairs(bucket_m, pairs),
             _ => SharedExperts::Apart,
         };
         let qmv = GatedGatherQmvConstants { gather, shared };

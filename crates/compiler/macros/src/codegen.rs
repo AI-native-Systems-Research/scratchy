@@ -151,6 +151,7 @@ pub(crate) fn under_root(root: &str, rest: &str) -> String {
 /// A tied lm_head loads from the embedding table. `None` when the program has no such weight.
 pub(crate) fn lent_weight_prefix(
     program: &Program,
+    fuf: &crate::fuf::Fuf,
     model: &crate::config::ModelParams,
     w: scratchy_forward_compiler::LentWeight,
 ) -> Option<String> {
@@ -158,17 +159,28 @@ pub(crate) fn lent_weight_prefix(
     // A head borrowing a subset (`borrows`, arch.json) reports none of the rest.
     let borrowed =
         |name: &str| (model.arch.borrows.as_ref()).is_none_or(|b| b.iter().any(|n| n == name));
-    let name = match w {
-        LentWeight::LmHead if !borrowed("lm_head") => return None,
-        LentWeight::LmHead if !model.tie_word_embeddings => "lm_head",
+    // The embedding table's prefix, wherever this arch keeps it: the table its Embed op reads,
+    // named as the arch names it (Llama `embed_tokens`, Nemotron `embeddings`) — not a hardcoded
+    // name, or a target naming it apart could not lend it. A tied lm_head shares that buffer.
+    let embed_prefix = || {
+        let role = crate::quantization::embed_table_role(program, fuf);
+        let segs: Vec<&str> = role.split('.').collect();
+        let id = program.weights.find(&segs)?;
+        Some(safetensors_prefix(program, &model.arch, id, None))
+    };
+    match w {
+        LentWeight::LmHead if !borrowed("lm_head") => None,
+        LentWeight::LmHead if !model.tie_word_embeddings => {
+            let id = program.weights.find(&["lm_head"])?;
+            Some(safetensors_prefix(program, &model.arch, id, None))
+        }
         // A head with an embedding of its own names its target's apart.
         LentWeight::EmbedTokens if program.weights.find(&["target_embed_tokens"]).is_some() => {
-            "target_embed_tokens"
+            let id = program.weights.find(&["target_embed_tokens"])?;
+            Some(safetensors_prefix(program, &model.arch, id, None))
         }
-        LentWeight::EmbedTokens | LentWeight::LmHead => "embed_tokens",
-    };
-    let id = program.weights.find(&[name])?;
-    Some(safetensors_prefix(program, &model.arch, id, None))
+        LentWeight::EmbedTokens | LentWeight::LmHead => embed_prefix(),
+    }
 }
 
 /// Translate trailing `_<digits>` in a DSL path segment back to
@@ -2131,15 +2143,19 @@ fn collect_accessors(
     Ok(by_name.into_values().map(|(a, _)| a).collect())
 }
 
-/// The routed experts' input width an ungated bank (the pre-stacked `switch_mlp.fc1`, whose leaf
-/// names the macro states — see [`affine_tensors_of`]) is packed at, probed at the last MoE
-/// layer: the tensor and its expected packed column count. The one shape that tells a LatentMoE
-/// (experts on `moe_latent_size`) from a plain one (experts on `hidden_size`) when both report
-/// one architecture string (Nemotron-H: `NemotronHForCausalLM`) and share every other probed
-/// width — the latent projections only one of them loads are not visible to the other.
+/// The routed experts' input width an ungated bank is packed at, probed at the last MoE
+/// layer: the tensor spellings that may carry it, and the packed column count expected of
+/// each. The one shape that tells a LatentMoE (experts on `moe_latent_size`) from a plain
+/// one (experts on `hidden_size`) when both report one architecture string (Nemotron-H:
+/// `NemotronHForCausalLM`) and share every other probed width — the latent projections only
+/// one of them loads are not visible to the other.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExpertInputProbe {
-    tensor: String,
+    /// The spellings of the width-carrying tensor, in probe order: the pre-stacked
+    /// `switch_mlp.fc1` (mlx `SwitchMLP`'s own), then the per-expert names a conversion
+    /// keeping nvidia's per-expert layout owns (`experts.0.fc1`, `experts.0.up_proj`) —
+    /// the same chain `load_expert_projection` resolves. A checkpoint ships exactly one.
+    tensors: Vec<String>,
     packed_cols: usize,
 }
 
@@ -2187,7 +2203,11 @@ fn expert_input_probe(
         _ => return None,
     };
     Some(ExpertInputProbe {
-        tensor: format!("{prefix}.switch_mlp.fc1.weight"),
+        tensors: vec![
+            format!("{prefix}.switch_mlp.fc1.weight"),
+            format!("{prefix}.experts.0.fc1.weight"),
+            format!("{prefix}.experts.0.up_proj.weight"),
+        ],
         packed_cols,
     })
 }
@@ -2233,7 +2253,9 @@ fn expert_input_probe(
 ///    qwen3.6 35B-A3B, whose gates are 4- vs 8-bit with every other
 ///    axis identical. See the `affine_bit_map_gate` comment.
 /// 8. **Experts' input width** of an ungated bank ([`ExpertInputProbe`]) —
-///    LatentMoE vs plain MoE under one architecture string.
+///    LatentMoE vs plain MoE under one architecture string, probed at
+///    whichever spelling of the width-carrying tensor the checkpoint ships
+///    (pre-stacked `switch_mlp.fc1` or a per-expert name).
 fn emit_fingerprint_check(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
@@ -2784,14 +2806,30 @@ fn emit_fingerprint_check(
     };
     let expert_input_check: TokenStream = match expert_input {
         Some(ExpertInputProbe {
-            tensor,
+            tensors,
             packed_cols,
         }) => {
             let cols = proc_macro2::Literal::usize_unsuffixed(*packed_cols);
+            // The width is the bank's, however the checkpoint spells its tensor: each
+            // candidate present must carry it, and at least one must be present (a layout
+            // the loaders resolve but the fingerprint never saw would otherwise refuse the
+            // very checkpoint it was compiled for).
+            let probes = tensors.iter().map(|tensor| {
+                let tensor = proc_macro2::Literal::string(tensor);
+                quote! {
+                    if let Some((shape, _)) = gw.tensor_info(#tensor) {
+                        if shape.last() != Some(&#cols) {
+                            return false;
+                        }
+                        __EXPERT_INPUT_SEEN = true;
+                    }
+                }
+            });
             quote! {
-                match gw.tensor_info(#tensor) {
-                    Some((shape, _)) if shape.last() == Some(&#cols) => {}
-                    _ => return false,
+                let mut __EXPERT_INPUT_SEEN = false;
+                #(#probes)*
+                if !__EXPERT_INPUT_SEEN {
+                    return false;
                 }
             }
         }
@@ -15742,9 +15780,13 @@ mod fingerprint_tests {
             let last_moe = *model.layer_sets["moe_layers"].members().last().unwrap();
             let probe = expert_input_probe(&program, &fuf, &model).expect("an ungated bank");
             assert_eq!(
-                probe.tensor,
-                format!("backbone.layers.{last_moe}.mixer.switch_mlp.fc1.weight"),
-                "{stem}: probed at the last MoE layer"
+                probe.tensors,
+                vec![
+                    format!("backbone.layers.{last_moe}.mixer.switch_mlp.fc1.weight"),
+                    format!("backbone.layers.{last_moe}.mixer.experts.0.fc1.weight"),
+                    format!("backbone.layers.{last_moe}.mixer.experts.0.up_proj.weight"),
+                ],
+                "{stem}: probed at the last MoE layer, in the loaders' spelling order"
             );
             (model.bounds["hidden_size"], probe.packed_cols)
         };
@@ -15826,6 +15868,12 @@ mod fingerprint_tests {
             "the experts' input width is gated: {ts}"
         );
         assert!(
+            squash.contains("\"backbone.layers.87.mixer.experts.0.up_proj.weight\"")
+                && squash.contains("__EXPERT_INPUT_SEEN"),
+            "the width gate falls through to the per-expert spellings (Nemotron-3 Super's MTP \
+             sidecar ships `experts.<e>.up_proj`, no pre-stacked `switch_mlp`): {ts}"
+        );
+        assert!(
             !squash.contains("ships_affine_row"),
             "q_proj is affine, so its group-size probe is the positive sniff already"
         );
@@ -15840,6 +15888,56 @@ mod fingerprint_tests {
         assert!(
             ts.contains("q_proj.scales") && ts.contains(&marker) && !ts.contains("layers.0."),
             "no format marker may probe the Mamba layer 0: {ts}"
+        );
+    }
+
+    /// The Nemotron-3 Super head's config is its target's verbatim, so its own block schedule
+    /// restores through its dir's per-stem override, all three facts at once: the target's
+    /// `hybrid_override_pattern` replaced by the checkpoint's `mtp_hybrid_override_pattern`
+    /// (`*E`, an attention layer then a LatentMoE one), the head's layer count as
+    /// `num_hidden_layers` — the schedule's length must equal it while the sets derive, and
+    /// the schema's replacing param reads the same value back from `mtp_num_hidden_layers`,
+    /// so the post-schema comparison KEEPS the derived sets instead of dropping them as
+    /// another model's — and the target's count preserved as `target_num_hidden_layers`
+    /// (the head's KV pool is the target's; the gemma4-assistant override carries its
+    /// target's the same way). Its probe then names the sidecar's own layout: bare
+    /// per-layer names (the worker lends `mtp.*` under them), per-expert spelling included.
+    ///
+    /// The 120B is the head's one target: its lm_head read spans the target's own vocabulary
+    /// (no qwen-style prefix constant), so a second target of a different vocabulary cannot
+    /// share the head arch — the head-facts registration refuses variants that disagree on
+    /// `lm_head_rows` — which is why the parity-tiny (512 tokens) declares no
+    /// `mtp_num_hidden_layers` and compiles no head.
+    #[test]
+    fn the_nemotron_head_restores_its_own_schedule_through_its_override() {
+        let stem = "nemotron-3-super-120b-a12b";
+        let model = crate::config::load_head_file(
+            &arch_configs("nemotron-h-latent").join(format!("{stem}.json")),
+            &arch_configs("nemotron-h-mtp"),
+        )
+        .unwrap_or_else(|e| panic!("load {stem} as a head: {e}"));
+        assert_eq!(model.bounds["num_hidden_layers"], 2);
+        assert_eq!(model.bounds["target_num_hidden_layers"], 88);
+        assert_eq!(
+            model.layer_sets["attention_layers"].members(),
+            &[0u64],
+            "the head's schedule is `*E`"
+        );
+        assert_eq!(model.layer_sets["moe_layers"].members(), &[1u64]);
+        assert!(
+            model.layer_sets["mamba_layers"].members().is_empty()
+                && model.layer_sets["mlp_layers"].members().is_empty()
+        );
+        let (program, fuf) = fuf_of("nemotron-h-mtp", &model);
+        let probe = expert_input_probe(&program, &fuf, &model).expect("an ungated bank");
+        assert_eq!(
+            probe.tensors,
+            vec![
+                "layers.1.mixer.switch_mlp.fc1.weight",
+                "layers.1.mixer.experts.0.fc1.weight",
+                "layers.1.mixer.experts.0.up_proj.weight",
+            ],
+            "the head's MoE layer is layer 1, its tensors bare post-lend"
         );
     }
 

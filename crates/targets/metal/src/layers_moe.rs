@@ -270,6 +270,19 @@ fn load_expert_projection(
         let b = at(gw.take_keep_dtype(&stacked("biases"))?, "biases", groups)?;
         return Ok([w, s, b]);
     }
+    // Per-expert naming: mlx `SwitchMLP`'s own `fc1`/`fc2`, but a conversion that keeps nvidia's
+    // per-expert names spells them `up_proj`/`down_proj` (Nemotron-3 Super's OptiQ MTP sidecar —
+    // its main shards' pre-stacked `switch_mlp.*` tensors use fc1/fc2, and the two layouts never
+    // mix in one file). Probe expert 0 for whichever this store holds.
+    let proj = if gw.contains(&format!("{prefix}.experts.0.{proj}.scales")) {
+        proj
+    } else {
+        match proj {
+            "fc1" => "up_proj",
+            "fc2" => "down_proj",
+            _ => proj,
+        }
+    };
     let name = |e: usize, kind: &str| format!("{prefix}.experts.{e}.{proj}.{kind}");
     let (_, scales_dtype) = gw
         .tensor_info(&name(0, "scales"))

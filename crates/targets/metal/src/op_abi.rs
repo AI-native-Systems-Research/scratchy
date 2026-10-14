@@ -220,7 +220,8 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
 /// token and its drafts (an MTP head's: `spec_max_seqs * (spec_drafts + 1)`, 3). Such a bucket's
 /// steps are decode-shaped — a few query rows over a whole context — and run decode-shaped
 /// kernels: its paged attention is the decode kernel's, one query row per token; a gathered MoE
-/// block runs the pairs that share an expert once ([`METAL_SHARED_EXPERTS_FROM`]). Larger buckets
+/// block runs the pairs that share an expert once ([`METAL_SHARED_EXPERTS_FROM`]) while its baked
+/// pairs stay few ([`METAL_SHARED_EXPERTS_MAX_PAIRS`]). Larger buckets
 /// keep prefill-shaped kernels: a 31-token prompt took 20% longer to its first token at a 32-row
 /// verify-sized bucket than at the 64-row prefill one (Qwen3.6-35B-A3B, base M5: 176 vs 147 ms).
 ///
@@ -350,6 +351,17 @@ pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
 /// one row's picks are distinct experts.
 pub const METAL_SHARED_EXPERTS_FROM: u32 = 2;
+
+/// The baked (row, pick) pairs at and above which even a verify-sized gathered bake runs its
+/// pairs apart: `InFirstPair`'s every threadgroup scans the bucket's every other pair for its
+/// expert, so the mode's cost grows with the square of the pair count, while the reads it saves
+/// stay the pairs that share an expert — expected `pairs² / (2 · experts)` of them, near none
+/// once experts run past pairs. Measured on Nemotron-3 Super 120B (22 of 512 experts per row:
+/// 88 baked, 66 live pairs at the 3-row verify bucket) the scan dominates: `MoeGateUpAct`
+/// 17.3 ms per step in the first pair vs 10.2 ms apart — apart is the 1-row bucket's cost times
+/// the 3× pairs' union, the mode added 7 ms a step. 8-of-256 routing (32 baked pairs at the
+/// same bucket) stays under.
+pub const METAL_SHARED_EXPERTS_MAX_PAIRS: u32 = 64;
 
 /// The steps whose commands a bake may drop: a gathered block's sort, the unsort (the combine
 /// reads through it), and an unsliced bake's sampled rows around its matmul.
