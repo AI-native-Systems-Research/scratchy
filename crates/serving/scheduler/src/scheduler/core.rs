@@ -637,7 +637,11 @@ impl SimpleBlockTracker {
             // Lazy eviction: if this recycled block was still hash-mapped, drop
             // both directions so it can't be handed out as a stale cache hit
             // (mirrors `allocate_fresh_blocks` / Python `_maybe_evict_cached_block`).
-            if let Some(key) = self.hybrid_id_to_key.remove(&id) {
+            // The key's mapping goes only if it still points at THIS block: a later
+            // request that computed the same key into a block of its own moved it.
+            if let Some(key) = self.hybrid_id_to_key.remove(&id)
+                && self.hybrid_hash_to_id.get(&key) == Some(&id)
+            {
                 self.hybrid_hash_to_id.remove(&key);
             }
             ids.push(id);
@@ -5747,5 +5751,38 @@ mod tests {
         let b3 = t.allocate_slots(&other, 32, 0, &[]).unwrap()[0].clone();
         assert_eq!(b3, b1.iter().rev().copied().collect::<Vec<_>>());
         assert_eq!(hit(&t), b2);
+    }
+
+    #[test]
+    fn evicting_an_older_copy_of_a_hybrid_block_keeps_the_newer_ones_mapping() {
+        // The same scenario on the hybrid (SWA) path: two requests fill the
+        // same tokens into blocks of their own, the second registration moves
+        // the mapping, and recycling the FIRST copy must not delete it.
+        let mut t = caching_hybrid(64, 1024); // big window: nothing out-of-window
+        let r1 = hybrid_req("r1", 32);
+        let r2 = hybrid_req("r2", 32);
+        t.allocate_slots(&r1, 32, 0, &[]).unwrap();
+        t.allocate_slots(&r2, 32, 0, &[]).unwrap();
+        let hit = |t: &SimpleBlockTracker| {
+            let (p, tables) = t.get_computed_blocks(&hybrid_req("q", 32));
+            (p, tables[0].clone())
+        };
+        let (p0, t0) = hit(&t);
+        assert!(p0 > 0, "expected a hit before any eviction");
+        t.free("r1");
+        t.free("r2");
+        // r1 holds the lowest IDs; the lowest-free-first heap recycles them first.
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let other = Request::new("r3".into(), (900..932).collect(), params, 1.0, 0, 0, None);
+        t.allocate_slots(&other, 32, 0, &[]).unwrap();
+        let (p1, t1) = hit(&t);
+        assert!(
+            p1 > 0,
+            "the newer copy's mapping must survive recycling the older copy"
+        );
+        assert_eq!(t1, t0);
     }
 }
