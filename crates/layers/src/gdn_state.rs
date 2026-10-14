@@ -45,7 +45,8 @@
 //!
 //! **Draft lanes.** Only a sequence that drafts needs those checkpoints and records, from the step
 //! it drafts in through the step that replays its verify step's kept rows — and a step drafts for
-//! at most its head's `max_seqs` sequences. So they live apart from the slots, in [`DraftLanes`]:
+//! only as many sequences as its head's budget drafts for. So they live apart from the slots, in
+//! [`DraftLanes`]:
 //! per layer a conv buffer of `k + 1` entries a lane and an ssm buffer of two record areas a lane
 //! (`GdnStateDims::ssm_lane_len`). A slot is the same entry with drafts as without, and a step that
 //! replays or records names its sequence's lane in its code ([`GdnStep::lane`]). The host hands

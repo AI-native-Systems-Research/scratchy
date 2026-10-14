@@ -30,17 +30,19 @@ pub struct HeadRegistration {
     /// that ships there: a target checkpoint holding tensors under it carries the head, which
     /// loads from the target's own store. `None`: it never ships inside its target's checkpoint.
     pub checkpoint_prefix: Option<&'static str>,
-    /// The tokens it drafts each step (`spec_drafts`, its arch.json): its target's verify steps
-    /// carry them, as both models' kernels bake them.
+    /// The most tokens it drafts a sequence each step (`spec_drafts`, its arch.json): its target's
+    /// verify steps carry up to them, as both models' kernels bake them.
     pub drafts: u8,
-    /// The most sequences a step drafts for (`spec_max_seqs`, its arch.json): a step of more runs
-    /// as its target alone, its head's pass 1 priming KV only.
+    /// The most rows a verify step of its target holds (`spec_verify_rows`, its arch.json): each
+    /// sequence's token and its drafts, which a step of more sequences shrinks to fit, drafting
+    /// nothing once one draft a sequence does not (`scratchy_serving_engine::spec_decode::
+    /// DraftBudget`).
     ///
-    /// TODO: one gate per declared device profile and target, computed at expansion from the
+    /// TODO: one budget per declared device profile and target, computed at expansion from the
     /// verify and plain tapes' costs, in place of one count for every GPU and every target of the
     /// arch (`scratchy_serving_engine::spec_decode::mtp`'s module docs: what it is measured at,
     /// and what blocks it).
-    pub max_seqs: u8,
+    pub verify_rows: u8,
 }
 
 impl HeadRegistration {

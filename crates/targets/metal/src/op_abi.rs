@@ -217,7 +217,7 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
 };
 
 /// The most rows a verify-sized bucket holds: a speculative verify step's, each sequence's last
-/// token and its drafts (an MTP head's: `spec_max_seqs * (spec_drafts + 1)`, 3). Such a bucket's
+/// token and its drafts (an MTP head's: within its `spec_verify_rows`). Such a bucket's
 /// steps are decode-shaped — a few query rows over a whole context — and run decode-shaped
 /// kernels: its paged attention is the decode kernel's, one query row per token; a gathered MoE
 /// block runs the pairs that share an expert once ([`METAL_SHARED_EXPERTS_FROM`]) while its baked
@@ -226,8 +226,8 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
 /// verify-sized bucket than at the 64-row prefill one (Qwen3.6-35B-A3B, base M5: 176 vs 147 ms).
 ///
 /// TODO: derive it, and the decoder ladder's verify-sized rungs, from the compiled heads'
-/// `spec_max_seqs * (spec_drafts + 1)`: a gate above 2 sequences puts verify steps past 8 rows,
-/// onto the 64-row prefill-shaped tape.
+/// `spec_verify_rows`: a head budget past 8 rows puts verify steps onto the 64-row
+/// prefill-shaped tape.
 pub const METAL_VERIFY_ROWS: u32 = 8;
 
 /// Whether a guarded codec step runs at a bake, and under which runtime gate.

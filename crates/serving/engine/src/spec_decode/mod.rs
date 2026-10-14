@@ -26,7 +26,8 @@ pub use backend::{
     BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle, SpecDecodeBackend,
 };
 pub use mtp::{
-    Chain, Drafting, HeadPasses, MtpDrafter, MtpProposer, MtpProposerConfig, PassOne, StepRows,
+    Chain, DraftBudget, Drafting, HeadPasses, MtpDrafter, MtpProposer, MtpProposerConfig, PassOne,
+    StepRows,
 };
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};

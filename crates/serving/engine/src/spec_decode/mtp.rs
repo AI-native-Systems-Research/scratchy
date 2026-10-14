@@ -39,10 +39,12 @@
 //! The worker that ran the step runs the passes ([`MtpDrafter`]) for the requests the engine
 //! planned when it scheduled the step ([`MtpProposer`]'s `plan`), and returns their drafts with
 //! the step's output — so the engine schedules asynchronously, waiting only on a step that drafts
-//! or verifies. A step of more than the head's `max_seqs` sequences (its compiled
-//! `spec_max_seqs`) costs what its target alone does, so it drafts nothing — but every row still
-//! primes, keeping every sequence's head KV current: no request ever goes stale, and drafting
-//! resumes as soon as a step is back within the gate.
+//! or verifies. Each sequence of a step drafts as many tokens as keep the step's verify rows within
+//! the head's compiled `spec_verify_rows`, at most its `spec_drafts` ([`DraftBudget`]), so a step
+//! of more sequences drafts each fewer. A step of more sequences than one draft each still fits
+//! ([`DraftBudget::max_seqs`]) costs what its target alone does, so it drafts nothing — but every
+//! row still primes, keeping every sequence's head KV current: no request ever goes stale, and
+//! drafting resumes as soon as a step is back within the budget.
 //!
 //! # TODO
 //!
@@ -51,36 +53,37 @@
 //! its sidecar head), the two targets with head configs; "sampled" is the model's default
 //! sampling, "greedy" temperature 0.
 //!
-//! **The gate** (`spec_max_seqs`, the head's `arch.json`):
+//! **The budget** (`spec_drafts` and `spec_verify_rows`, the head's `arch.json`):
 //!
-//! - TODO: derive the gate per device, at expansion. It is 2 sequences on every GPU: a verify
-//!   step of two runs six rows, within the eight-row verify-sized bucket, and one request pays on
+//! - TODO: derive the budget per device, at expansion. It is 8 verify rows on every GPU, the
+//!   verify-sized bucket: 2 drafts a sequence at 1-2 sequences (3 and 6 rows), 1 at 3-4 (6 and 8),
+//!   none past 4. Before, a fixed gate of 2 sequences drafted 2 each or none. One request pays on
 //!   both GPUs measured (base M5 output tok/s 1.36-1.38x sampled; M5 Max, at this head, TPOT
 //!   1.33x on the code prompt and 1.51x on a long one, greedy) — on the base M5, before the gate
 //!   came down to 1, sampled output tok/s was 1.07-1.18x at 2 sequences and 1.03-1.17x at 4,
 //!   greedy 0.96-1.06x at 4 (two rounds each); the M5 Max was not measured past one request.
-//!   Past 2 the gate does not rise until the verify-sized rungs do: a verify step of 3 sequences
-//!   runs 9 rows, past the 8-row bucket onto the 64-row prefill-shaped tape
-//!   (`METAL_VERIFY_ROWS`' TODO: derive the rungs from the gate). A verify step
+//!   Past 8 rows the budget does not rise until the verify-sized rungs do: a verify step of 3
+//!   sequences at 2 drafts runs 9 rows, past the 8-row bucket onto the 64-row prefill-shaped tape
+//!   (`METAL_VERIFY_ROWS`' TODO: derive the rungs from the budget). A verify step
 //!   of `B` sequences runs `B * (k + 1)` rows, and a MoE target reads every distinct expert those
 //!   rows pick (Qwen3.6: 256 experts, 8 a row; at 8 sequences the verify step's 24 rows pick about
 //!   135, the plain step's 8 about 57, under uniform routing). So on the base M5 a verify step
 //!   costs 1.6 / 2.0 / 2.2 / 2.65 plain steps at 1 / 2 / 4 / 8 sequences, against about 2.3 tokens
-//!   a verify step. The gate wanted is the largest `B` whose verify step and head passes cost less
-//!   than the plain steps of the tokens they produce. That is a comparison of two compiled tapes'
-//!   costs on a device, so it belongs at expansion: one gate per declared device profile
+//!   a verify step. The budget wanted is, at each `B`, the drafts whose verify step and head passes
+//!   cost less than the plain steps of the tokens they produce. That is a comparison of two compiled
+//!   tapes' costs on a device, so it belongs at expansion: one budget per declared device profile
 //!   (`MetalTargetProfile`: bandwidth, fp16 peak), the worker picking its device's as it picks
 //!   kernels by GPU generation. Blocked on a metal tape cost model: a roofline from the profile
 //!   alone predicts 2.0x at 8 sequences against the measured 2.65x.
-//! - TODO: key the gate on the target, not the head arch. `spec_max_seqs` is the head arch's bound
-//!   default, so every target of `qwen3-5-mtp` shares it, but its cost is the target's: a dense
+//! - TODO: key the budget on the target, not the head arch. `spec_verify_rows` is the head arch's
+//!   bound default, so every target of `qwen3-5-mtp` shares it, but its cost is the target's: a dense
 //!   target's verify rows cost far less than a MoE's (Llama-3.2-3B: a 4-row step costs 1.27x a
 //!   1-row step), so a dense Qwen3.5/3.6 target would pay at more sequences.
 //! - TODO: priming costs what the head's KV write needs over every row of every step past the
-//!   gate (Qwen3.6: the embedding, the two norms, `fc` and the k/v projections). The
+//!   budget (Qwen3.6: the embedding, the two norms, `fc` and the k/v projections). The
 //!   alternative — keep a stale request's target hidden rows (4 KiB a token at Qwen3.6's
-//!   2048-wide 16-bit hidden) and run them through pass 1 once its steps are back under the
-//!   gate — defers that cost to the requests that resume drafting; not taken.
+//!   2048-wide 16-bit hidden) and run them through pass 1 once its steps are back within the
+//!   budget — defers that cost to the requests that resume drafting; not taken.
 //! - TODO: a prefix-cache hit can still reuse head KV that was never written: the head's KV
 //!   lives in the target's blocks, so a request that hits cached blocks reuses their head KV
 //!   too, and blocks written by a request that takes no drafts (its sampling reads its token
@@ -89,16 +92,16 @@
 //!
 //! **Cost:**
 //!
-//! - TODO: a verify step's cost past one sequence, which is what holds the gate down. Base M5, 8
+//! - TODO: a verify step's cost past one sequence, which is what holds the budget down. Base M5, 8
 //!   sequences: a plain step is 38.4 ms and a verify step yields about 2.3 tokens, so the verify
 //!   step must fit in about 87 ms to break even. The experts take about 60 ms of it, the
 //!   memory-bandwidth floor for the experts 24 rows pick (uniform routing), so the rest must fit in
 //!   about 27 ms; it takes about 44 (dense projections 25 ms against about 13 at 8 rows; the
 //!   Gated-DeltaNet scan 10-12 ms, each sequence's rows and the kept rows it replays one after
 //!   another; attention 3; the rest about 6) plus the head's about 5, measured with 16- and
-//!   32-row verify-sized rungs. Those rungs cost short prompts their first token, and the gate of
-//!   1 keeps verify steps at 3 rows, so they are gone (`METAL_VERIFY_ROWS`, 8): past 2 sequences
-//!   a verify step runs the 64-row prefill-shaped tape until the rungs derive from the gate.
+//!   32-row verify-sized rungs. Those rungs cost short prompts their first token, and the budget
+//!   keeps verify steps within 8 rows, so they are gone (`METAL_VERIFY_ROWS`, 8): past 8 rows a
+//!   verify step runs the 64-row prefill-shaped tape until the rungs derive from the budget.
 //! - TODO: a build with a head runs the steps that replay or record — a verify step and the step
 //!   after one — on Gated-DeltaNet kernels that cost more per row. A plain step runs what it runs
 //!   without the head (Qwen3.6's geometry: a decode step #265's one-command decode, a prefill #263's
@@ -148,8 +151,9 @@
 //!   25.3 ms. The acceptance (2.31 tokens a step) clears it: those tokens' plain steps cost
 //!   34.7 ms. The head pays where the routed experts hold a minority of the plain step's stream
 //!   (Qwen3.6: 256 experts, 8 a row — 32 baked pairs at the verify bucket, under the cap, the
-//!   mode unchanged there) or where KV reads dilute it; not measured past one sequence (the
-//!   gate is 2) nor at depth of context.
+//!   mode unchanged there) or where KV reads dilute it; not measured past one sequence (its
+//!   budget is Qwen3.6's, drafting through 4 sequences: an 8-row verify step's 176 baked pairs
+//!   run apart) nor at depth of context.
 //!
 //! **Measurement, interface, size:**
 //!
@@ -175,14 +179,49 @@ use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 use super::backend::ForwardArgmaxRequest;
 use super::proposer::{Proposer, ProposerStepCtx};
 
+/// How many tokens a head drafts each sequence of a step: as many as keep the step's verify rows —
+/// each sequence's token and its drafts — within `verify_rows` (the head's compiled
+/// `spec_verify_rows`, the rows its target's verify-shaped bucket holds), at most `drafts` (its
+/// `spec_drafts`). A step of few sequences drafts the most, a larger one fewer, and one past
+/// [`Self::max_seqs`] none: its verify step would leave the verify-shaped bucket for a
+/// prefill-shaped one, where a verify row costs what a prompt row does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftBudget {
+    pub drafts: usize,
+    pub verify_rows: usize,
+}
+
+impl DraftBudget {
+    /// The drafts each of a step's `seqs` sequences gets.
+    pub fn drafts_at(self, seqs: usize) -> usize {
+        (self.verify_rows / seqs.max(1))
+            .saturating_sub(1)
+            .min(self.drafts)
+    }
+
+    /// The most sequences a step drafts for: one draft each still fits.
+    pub fn max_seqs(self) -> usize {
+        match self.drafts {
+            0 => 0,
+            _ => self.verify_rows / 2,
+        }
+    }
+
+    /// The most draft rows a step of at most `width` sequences carries beside its sequences' own.
+    pub fn draft_rows(self, width: usize) -> usize {
+        let seqs = 1..=self.max_seqs().min(width);
+        seqs.map(|c| c * self.drafts_at(c)).max().unwrap_or(0)
+    }
+}
+
 /// Configuration for the MTP proposer, held by [`super::ProposerConfig::Mtp`].
 #[derive(Debug, Clone)]
 pub struct MtpProposerConfig {
-    /// Drafts per step (`k`): one pass-1 row plus `k - 1` chained passes.
+    /// Drafts per step (`k`, the most): one pass-1 row plus `k - 1` chained passes.
     pub num_speculative_tokens: usize,
-    /// The most sequences a step drafts for: the head's compiled `spec_max_seqs`, the engine's
-    /// copy of the gate the worker's `MtpDrafter.max_seqs` carries (both derive from the head's
-    /// registration, so they cannot disagree).
+    /// The most sequences a step drafts for (`DraftBudget::max_seqs`), the engine's copy of the
+    /// gate the worker's `MtpDrafter.budget` carries (both derive from the head's registration,
+    /// so they cannot disagree).
     pub max_seqs: usize,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
@@ -207,11 +246,10 @@ impl MtpProposer {
 /// The head's passes over one step (module docs), run by the worker that ran it.
 #[derive(Clone, Copy, Debug)]
 pub struct MtpDrafter {
-    /// Drafts per step (`k`, the head's compiled `spec_drafts`).
-    pub drafts: usize,
-    /// The most sequences a step drafts for (the head's compiled `spec_max_seqs`): a step of more
-    /// runs as its target alone, its pass 1 priming KV only (module docs).
-    pub max_seqs: usize,
+    /// The drafts each sequence of a step gets, by the step's sequences: a step past its
+    /// [`DraftBudget::max_seqs`] runs as its target alone, its pass 1 priming KV only (module
+    /// docs).
+    pub budget: DraftBudget,
     /// Maximum model context length: no draft lands past it.
     pub max_model_len: usize,
     /// The head reads its target's KV and writes none (Gemma 4's assistant): row `r`'s query sits
@@ -261,11 +299,11 @@ impl StepRows<'_> {
 pub struct HeadPasses {
     /// Pass 1 over the rows no draft reads, for their KV alone: each planned sequence's rows whose
     /// next token the host has (a prompt's, short of its newest), or every row past the head's
-    /// `max_seqs`. `None` when there are none, or the head keeps no KV of its own.
+    /// [`DraftBudget::max_seqs`]. `None` when there are none, or the head keeps no KV of its own.
     pub prime: Option<PassOne>,
     /// Pass 1 over the rows a draft can read, and the passes chained after it. `None` when no
     /// planned sequence gets a token from the step (prefill chunks short of their prompt's end),
-    /// or the step is past the head's `max_seqs`: nothing drafts.
+    /// or the step is past the head's [`DraftBudget::max_seqs`]: nothing drafts.
     pub drafting: Option<Drafting>,
 }
 
@@ -314,8 +352,9 @@ pub struct Chain {
     pub seqs: Vec<[u32; 3]>,
     /// Per step row, the token the row after it reads — the draft it verifies within a sequence.
     pub drafted: Vec<u32>,
-    /// After each pass 1..=k: per drafting sequence and accepted count `0..=k`, the next pass's
-    /// position, slot and used KV length (zeros after the last pass, which has none).
+    /// After each of its passes: per drafting sequence and accepted count `0..=k` (`k` the head's
+    /// most drafts, [`Self::drafts`]), the next pass's position, slot and used KV length (zeros
+    /// after the last pass, which has none).
     pub next: Vec<Vec<u32>>,
     /// Each chained pass's host inputs, one row per drafting sequence. The token, position, slot
     /// and used KV length are placeholders the device overwrites: the position and used length the
@@ -330,6 +369,7 @@ pub struct Chain {
     pub last_rows: Vec<u32>,
     /// Each drafting sequence's index in the step.
     steps: Vec<usize>,
+    drafts: usize,
 }
 
 impl PassOne {
@@ -424,6 +464,19 @@ impl Chain {
         self.steps.len()
     }
 
+    /// The head's passes over the step's drafting sequences — pass 1 and the chained ones — the
+    /// drafts each gets.
+    pub fn passes(&self) -> usize {
+        self.next.len()
+    }
+
+    /// The head's most drafts a sequence, whatever this chain's passes: the room a sequence takes
+    /// in [`Self::next`]'s accepted counts and in the drafts read back, as the chain kernel bakes
+    /// it.
+    pub fn drafts(&self) -> usize {
+        self.drafts
+    }
+
     /// Each drafting sequence's index in the step.
     pub fn steps(&self) -> &[usize] {
         &self.steps
@@ -482,7 +535,9 @@ impl MtpDrafter {
         let mut drafting: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
         // Past the gate every row primes; within it, a sequence's rows from the first whose next
         // token the host does not have draft — each can be its newest — and those before prime.
-        let past_gate = step.req_ids.len() > self.max_seqs;
+        // The step's sequences each draft what its verify rows leave room for.
+        let passes = self.budget.drafts_at(step.req_ids.len());
+        let past_gate = passes == 0;
         for i in (0..step.req_ids.len()).filter(|&i| plan.contains(&step.req_ids[i])) {
             let tokens = history(&step.req_ids[i]).unwrap_or_default();
             let rows = step.cu_seqlens_q[i] as usize..step.cu_seqlens_q[i + 1] as usize;
@@ -518,21 +573,23 @@ impl MtpDrafter {
         one.has_spec_tokens = drafting.iter().any(|(_, tokens)| tokens.len() > 1);
         let (prime, one) = (prime.of(step), one.of(step));
         let drafting = one.map(|one| Drafting {
-            chain: self.chain(step, &one, &drafting),
+            chain: self.chain(step, &one, &drafting, passes),
             one,
         });
         (prime.is_some() || drafting.is_some()).then_some(HeadPasses { prime, drafting })
     }
 
-    /// Passes 2..=k after `one` for the `drafting` sequences (each its index in the step and its
-    /// span of `one`'s token rows).
+    /// Passes 2..=`passes` after `one` for the `drafting` sequences (each its index in the step and
+    /// its span of `one`'s token rows): `passes` drafts each. A sequence's accepted count — what the
+    /// step's verify kept of the drafts it verified — runs to the head's most drafts.
     fn chain(
         &self,
         step: &StepRows<'_>,
         one: &PassOne,
         drafting: &[(usize, std::ops::Range<usize>)],
+        passes: usize,
     ) -> Chain {
-        let k = self.drafts;
+        let k = self.budget.drafts;
         let n = drafting.len();
         let steps: Vec<usize> = drafting.iter().map(|&(i, _)| i).collect();
         let seqs: Vec<[u32; 3]> = (drafting.iter())
@@ -548,12 +605,12 @@ impl MtpDrafter {
         // newest row's position plus `d` — or, reading the target's KV, at `first + a + 1` for
         // every pass, attending the target's KV through `first + a`, writing none.
         let target_kv = self.reads_target_kv;
-        let next = (1..=k)
+        let next = (1..=passes)
             .map(|d| {
                 (drafting.iter().zip(&seqs))
                     .flat_map(|(&(i, _), &[step_row, ..])| {
                         let first = step.positions[step_row as usize] as usize;
-                        (0..=k).flat_map(move |a| match (d < k, target_kv) {
+                        (0..=k).flat_map(move |a| match (d < passes, target_kv) {
                             (true, false) => {
                                 let p = first + a + d;
                                 [p as u32, step.slot(i, p), p as u32 + 1]
@@ -574,7 +631,7 @@ impl MtpDrafter {
                 let newest = step.positions[step_row as usize] + rows - 1;
                 match target_kv {
                     true => newest + 1,
-                    false => newest + k as u32 - 1,
+                    false => newest + passes as u32 - 1,
                 }
             })
             .collect();
@@ -591,13 +648,14 @@ impl MtpDrafter {
             block_table_stride: step.block_table_stride,
             last_rows: (0..n as u32).collect(),
             steps,
+            drafts: k,
         }
     }
 
-    /// The drafts after `chain` ran: `picked`, its `k` drafts per drafting sequence, read back,
-    /// for the requests of `step` that produced `produced` (per request, in step order) and whose
-    /// token histories `history` reads, the step's tokens appended. No draft lands past the
-    /// maximum model length.
+    /// The drafts after `chain` ran: `picked`, the head's most drafts' room per drafting sequence,
+    /// read back — the chain's passes filled the first of each — for the requests of `step` that
+    /// produced `produced` (per request, in step order) and whose token histories `history` reads,
+    /// the step's tokens appended. No draft lands past the maximum model length.
     pub fn drafts(
         &self,
         chain: &Chain,
@@ -606,7 +664,7 @@ impl MtpDrafter {
         produced: &[Vec<u32>],
         history: &dyn Fn(&str) -> Option<Vec<u32>>,
     ) -> HashMap<String, Vec<u32>> {
-        let k = self.drafts;
+        let (k, passes) = (chain.drafts(), chain.passes());
         // Each sequence's newest row: the position before its newest token.
         let newest: Vec<Option<usize>> = (chain.steps.iter())
             .map(|&i| {
@@ -621,7 +679,7 @@ impl MtpDrafter {
                 .flatten()
                 .all(|&p| p + d + 2 < self.max_model_len)
         };
-        let depth = 1 + (1..k).take_while(|&d| fits(d)).count();
+        let depth = 1 + (1..passes).take_while(|&d| fits(d)).count();
         (chain.steps.iter().zip(&newest).enumerate())
             .filter_map(|(s, (&i, newest))| {
                 let d = picked[s * k..][..depth].to_vec();
@@ -644,7 +702,7 @@ impl Proposer for MtpProposer {
         takes_drafts: &dyn Fn(&str) -> bool,
     ) -> HashSet<String> {
         // Every request `takes_drafts` admits is planned, gated or not: a step within the head's
-        // `max_seqs` chains for them, and a step past it runs pass 1 KV-only over their rows
+        // budget chains for them, and a step past it runs pass 1 KV-only over their rows
         // (module docs), so head KV never has a hole.
         (sched.num_scheduled_tokens.keys())
             .filter(|r| takes_drafts(r))
@@ -770,13 +828,67 @@ mod tests {
         })
     }
 
-    /// The head's compiled gate is two sequences: [`TwoSequences`] chains, three primes.
+    /// Three drafts a sequence while they fit an 8-row verify step (1–2 sequences), one at 3–4:
+    /// [`TwoSequences`] chains three passes, [`ThreeSequences`] one.
     const DRAFTER: MtpDrafter = MtpDrafter {
-        drafts: 3,
-        max_seqs: 2,
+        budget: DraftBudget {
+            drafts: 3,
+            verify_rows: 8,
+        },
         max_model_len: 4096,
         reads_target_kv: false,
     };
+
+    /// A step's sequences each draft what its verify rows leave room for, at most the head's
+    /// drafts, and nothing once one draft a sequence does not fit: Qwen3.6's head (2 drafts,
+    /// 8 rows) drafts 2 at 1–2 sequences, 1 at 3–4, none past 4; Gemma 4's assistant (2 drafts,
+    /// 3 rows) 2 at one sequence, none past it.
+    #[test]
+    fn a_step_drafts_what_its_verify_rows_leave_room_for() {
+        let qwen = DraftBudget {
+            drafts: 2,
+            verify_rows: 8,
+        };
+        let at = |b: DraftBudget| (1..=6).map(|c| b.drafts_at(c)).collect::<Vec<_>>();
+        assert_eq!(at(qwen), [2, 2, 1, 1, 0, 0]);
+        assert_eq!((qwen.max_seqs(), qwen.draft_rows(usize::MAX)), (4, 4));
+        assert_eq!(qwen.draft_rows(1), 2, "a width of one drafts one sequence");
+        let gemma = DraftBudget {
+            drafts: 2,
+            verify_rows: 3,
+        };
+        assert_eq!(at(gemma), [2, 0, 0, 0, 0, 0]);
+        assert_eq!((gemma.max_seqs(), gemma.draft_rows(usize::MAX)), (1, 2));
+        for b in [qwen, gemma] {
+            for c in 1..=8 {
+                assert!(c * (1 + b.drafts_at(c)) <= b.verify_rows || b.drafts_at(c) == 0);
+                assert_eq!(b.drafts_at(c) > 0, c <= b.max_seqs(), "{b:?} at {c}");
+            }
+        }
+    }
+
+    /// Three sequences at a budget that drafts one each chain one pass: pass 1 drafts, and the
+    /// drafts read back are one a sequence.
+    #[test]
+    fn a_step_of_more_sequences_chains_fewer_passes() {
+        let step = ThreeSequences::new();
+        let passes = DRAFTER
+            .passes(
+                &step.rows(),
+                &step.before(),
+                &ids(&["a", "b", "c"]),
+                &mut any,
+            )
+            .expect("passes");
+        let drafting = passes.drafting.expect("a and c draft");
+        assert_eq!(drafting.chain.passes(), 1);
+        assert_eq!(drafting.chain.next.len(), 1);
+        let two = TwoSequences::new();
+        let passes = DRAFTER
+            .passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any)
+            .expect("passes");
+        assert_eq!(passes.drafting.expect("a drafts").chain.passes(), 3);
+    }
 
     fn ids(of: &[&str]) -> HashSet<String> {
         of.iter().map(|&id| id.to_string()).collect()
@@ -941,10 +1053,8 @@ mod tests {
         }
         // Kept all three: the newest row is at 13, so pass 2 runs at 14 and its draft lands at 16.
         let near = |max_model_len| MtpDrafter {
-            drafts: 3,
-            max_seqs: 2,
             max_model_len,
-            reads_target_kv: false,
+            ..DRAFTER
         };
         let produced = vec![vec![0, 1, 2, 3], Vec::new()];
         let drafts = |max_model_len| {
@@ -963,13 +1073,22 @@ mod tests {
         assert_eq!(drafts(15), picked[..1], "draft 1 is pass 1's, never cut");
     }
 
+    /// Two sequences' one draft each fits five verify rows; three sequences' does not.
+    const GATED: MtpDrafter = MtpDrafter {
+        budget: DraftBudget {
+            drafts: 3,
+            verify_rows: 5,
+        },
+        ..DRAFTER
+    };
+
     /// A step past the gate (three sequences at a two-sequence head) primes every planned row: the
     /// head's layer reads the target's tokens and hidden states as ever, so its KV misses no row,
     /// but nothing drafts. Back within the gate the same two sequences chain again.
     #[test]
     fn a_step_past_the_gate_primes_every_row() {
         let step = ThreeSequences::new();
-        let gated = DRAFTER
+        let gated = GATED
             .passes(
                 &step.rows(),
                 &step.before(),
@@ -997,7 +1116,7 @@ mod tests {
         );
 
         let two = TwoSequences::new();
-        let within = DRAFTER
+        let within = GATED
             .passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any)
             .expect("passes");
         within.drafting.expect("a drafts");
@@ -1010,7 +1129,7 @@ mod tests {
     fn a_head_reading_its_target_kv_runs_only_the_rows_a_draft_reads() {
         let drafter = MtpDrafter {
             reads_target_kv: true,
-            ..DRAFTER
+            ..GATED
         };
         let three = ThreeSequences::new();
         let gated = drafter.passes(

@@ -28,7 +28,7 @@ use scratchy_serving_engine::core_client::InprocClient;
 use scratchy_serving_engine::engine_core::{EngineCoreConfig, HybridKvConfig};
 use scratchy_serving_engine::gpu_budget::{MaxNumSeqsFacts, resolve_default_max_num_seqs};
 use scratchy_serving_engine::spec_decode::{
-    DraftModelProposerConfig, MtpProposerConfig, NgramProposerConfig, ProposerConfig,
+    DraftBudget, DraftModelProposerConfig, MtpProposerConfig, NgramProposerConfig, ProposerConfig,
 };
 use scratchy_serving_worker::uniproc::UniProcExecutor;
 use scratchy_serving_worker::worker::Worker;
@@ -695,9 +695,11 @@ impl Speculation {
         !matches!(self, Self::Off)
     }
 
-    /// The tokens a step drafts — the scheduler's lookahead. A head drafts what it was compiled to
-    /// (`HeadRegistration::drafts`): its target's verify steps carry exactly those rows, which both
-    /// models' kernels bake, so `--num-speculative-tokens` counts only an n-gram or draft model's.
+    /// The tokens a step drafts a sequence at most — the scheduler's lookahead. A head drafts what
+    /// it was compiled to (`HeadRegistration::drafts`, fewer in a step of more sequences:
+    /// [`Self::verify_seqs`]'s budget): its target's verify steps carry at most those rows, which
+    /// both models' kernels bake, so `--num-speculative-tokens` counts only an n-gram or draft
+    /// model's.
     ///
     /// `--num-speculative-tokens 0` serves without the head ([`resolve_speculative_decoding`]).
     /// TODO: any other count given with a head is ignored, and the flag's default (2) cannot be
@@ -719,13 +721,21 @@ impl Speculation {
         }
     }
 
-    /// The sequences a step may verify drafts for: a head drafts for at most its gate, an
-    /// n-gram or draft model for every sequence the engine schedules.
+    /// The sequences a step may verify drafts for: a head drafts for as many as its budget does,
+    /// an n-gram or draft model for every sequence the engine schedules.
     fn verify_seqs(&self) -> VerifySeqs {
         match self {
             Self::Off => VerifySeqs::Off,
-            Self::Head { head, .. } => VerifySeqs::Gated(head.max_seqs),
+            Self::Head { head, .. } => VerifySeqs::Head(Self::budget(head)),
             Self::Ngram | Self::DraftModel(_) => VerifySeqs::Every,
+        }
+    }
+
+    /// The drafts `head` makes a step's sequences: its compiled counts.
+    fn budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudget {
+        DraftBudget {
+            drafts: usize::from(head.drafts),
+            verify_rows: usize::from(head.verify_rows),
         }
     }
 
@@ -758,7 +768,7 @@ impl Speculation {
             })),
             Self::Head { head, .. } => Some(ProposerConfig::Mtp(MtpProposerConfig {
                 num_speculative_tokens,
-                max_seqs: usize::from(head.max_seqs),
+                max_seqs: Self::budget(head).max_seqs(),
                 max_model_len,
             })),
         }
