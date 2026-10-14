@@ -211,6 +211,21 @@ jobs:
       - name: OpenTelemetry export tests
         run: cargo test -p scratchy-core-common --features otel
 
+      # The grammar guide behind structured output (JSON schema, regex, EBNF,
+      # structural tags) is linted above, since scratchy-e2e turns
+      # `guided-decoding` on by default, but that clippy has no
+      # `--all-targets`: its tests never compile, and no step runs them. They
+      # are what an llguidance bump breaks without breaking the build: a
+      # release changes which tokens a grammar allows, not the API. No backend
+      # feature: the guide masks token ids on the CPU, and the tests build
+      # their tokenizer inline. `guided-decoding` only adds code, so this is a
+      # superset of the featureless run.
+      - name: Clippy (guided-decoding test targets)
+        run: cargo clippy -p scratchy-core-model --all-targets --features guided-decoding -- -D warnings
+
+      - name: Guided-decoding grammar tests
+        run: cargo test -p scratchy-core-model --features guided-decoding
+
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.
   #
