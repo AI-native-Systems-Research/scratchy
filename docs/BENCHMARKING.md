@@ -179,7 +179,17 @@ bimodal ITL distribution in this repo for a week
    defaults it off and prefills an empty thought channel — so the matrix gives
    the mlx-lm side a per-model `--chat-template-config`
    (`mlx_parity_config` in `scripts/bench_metal_matrix.sh`) wherever the two
-   disagree.
+   disagree. The two sides also run **different KV caches by design** on
+   metal: scratchy's build carries TurboQuant 4-bit KV, the reference fp16.
+   That difference is real quantization noise, not a load-path error — on
+   GLM-4.5-Air-3bit it flips a 0.25-logit near-tie inside the model's own
+   thought preamble (a no-TurboQuant build is byte-identical to mlx-lm on the
+   same 40 tokens), so that model gates on prompts chosen so the noise cannot
+   reach the argmax: its set swaps the count prompt, whose procedural
+   preamble ties at 0.0–0.5 logits at 3 bits, for a third short factual one
+   with a 1.25-logit minimum margin (`parity_prompts` in
+   `crates/benches/src/startup_exec/mod.rs`). Every model keeps the exact-match
+   comparison; only the questions are chosen per model.
 4. **Same weights, matching preset.** scratchy must be built with the preset
    matching the checkpoint's `config.json`.
 5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
