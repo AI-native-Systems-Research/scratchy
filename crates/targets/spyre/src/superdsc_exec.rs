@@ -1879,9 +1879,14 @@ impl Executor {
                 return Ok(ListSel::Rung(i));
             }
         }
-        // ⚠️ THE FALLBACK, VISIBLE. A `valid_len` past the top rung takes the ceiling; silently,
-        // this looked identical to a correct choice.
-        let top = self.body_rungs.len() - 1;
+        // ⚠️ THE FALLBACK, VISIBLE. A `valid_len` past every rung's sweep takes the widest rung that
+        // FOLDS (`fold_plan::past_every_sweep`); silently, this looked identical to a correct choice.
+        let folds: Vec<bool> = self
+            .body_rungs
+            .iter()
+            .map(|(_, ops)| ops.iter().any(|op| op.kv.page_fold))
+            .collect();
+        let top = fold_plan::past_every_sweep(&folds);
         let cap = self.body_rungs[top].0.get() as i64;
         self.trace_body("split-CEILING", valid_len, -1, reqs, cap, false);
         Ok(ListSel::Rung(top))

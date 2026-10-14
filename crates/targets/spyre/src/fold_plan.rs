@@ -736,6 +736,22 @@ pub fn fold_requests(s: &SessionKv) -> i64 {
     s.fold_requests.max(1)
 }
 
+/// ⛔⛔⛔ THE RUNG A CONTEXT PAST EVERY SWEEP TAKES — the widest one that FOLDS, and the top only when
+/// none does. `folds[i]` says whether ladder rung `i` (ascending) carries a page-fold group.
+///
+/// A folding body re-launches once per resident page, so it serves any length the pool holds. A
+/// split-KV chunk body does not fold: it attends exactly its `pages * PAGE_SLOTS`, and the one-request
+/// ladder's TOP is its widest chunk. Taking the top past it handed a 21,945-token granite-2b decode the
+/// 64-page chunk, and the worker refused the step ("the chunk ladder's top rung (64 pages) is below
+/// this context") where the per-page fold had served it. Every ladder without a chunk folds on every
+/// rung, so there this is the top, as before.
+pub fn past_every_sweep(folds: &[bool]) -> usize {
+    folds
+        .iter()
+        .rposition(|&f| f)
+        .unwrap_or(folds.len().saturating_sub(1))
+}
+
 /// How many times this op's group is launched: once per resident page PER REQUEST for the fold,
 /// else once.
 ///
@@ -1081,6 +1097,19 @@ mod tests {
     // file's own history records ~100 commits of "the proofs hold" that were VACUOUS for exactly that reason, and
     // a test appended into it a moment ago reported "0 passed; 19 filtered out" rather than failing. A test that
     // cannot run is worse than no test: it reads as coverage.
+
+    /// ⛔ A CONTEXT PAST EVERY SWEEP NEVER LANDS ON A CHUNK. The one-request ladder is the per-page sweep
+    /// rungs (64, 128, the 256 page body — all folding) then the chunks (2..64 pages, none folding): past
+    /// the widest chunk the step must take the 256 page body, which re-launches per page. A ladder that
+    /// folds on every rung (head dim 128, the batched bakes) keeps its top.
+    #[test]
+    fn a_context_past_every_sweep_takes_the_widest_folding_rung() {
+        use super::past_every_sweep;
+        let one_request = [true, true, true, false, false, false, false, false, false];
+        assert_eq!(past_every_sweep(&one_request), 2);
+        assert_eq!(past_every_sweep(&[true, true, true]), 2);
+        assert_eq!(past_every_sweep(&[false, false]), 1);
+    }
     use super::*;
 
     /// A paged session with two requests holding distinct physical pages.
