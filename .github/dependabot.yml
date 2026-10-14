@@ -21,6 +21,14 @@ updates:
         patterns:
           - "opentelemetry*"
           - "tracing-opentelemetry"
+      # One repo releases all three at one version, and the grammar guide
+      # runs llguidance's parser over the token trie toktrie_hf_tokenizers
+      # builds: bumped apart, llguidance pulls toktrie along but leaves
+      # toktrie_hf_tokenizers behind, pairing releases never shipped together.
+      llguidance:
+        patterns:
+          - "llguidance"
+          - "toktrie*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
