@@ -2631,8 +2631,9 @@ fn lower_one(
                 // same MMA) — the dominant Gemma4 prefill lever (the
                 // b8 MLP was ~77% of prefill GPU time on the Standard
                 // kernel). 3-bit has `_b_3_` instantiations too (the
-                // W dequant's bitstream decode is bits=3-exact: MLX's
-                // own qdot bits==3 shifts), and 2-bit likewise
+                // QuantizedBlockLoader's index math is bits=3-exact;
+                // MLX's own qdot bits==3 shifts are vendored into
+                // metal_nax.h's dequantize), and 2-bit likewise
                 // (`_b_2_`: 4 codes per byte, none straddling).
                 // SplitK stays b4-only, so any non-b4 SplitK pick
                 // downgrades to Standard.
@@ -7886,9 +7887,9 @@ fn lower_moe_step(
             }
             if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
-                // bits=3 rides NAX like 4/8: the W dequant's bitstream
-                // decode is bits=3-exact; bits=2 likewise (4 codes per
-                // byte).
+                // bits=3 rides NAX like 4/8: the loader's index math is
+                // bits=3-exact and metal_nax.h carries the dequantize
+                // branch; bits=2 likewise (4 codes per byte).
                 let use_nax = at.is_nax
                     && n_out.is_multiple_of(64)
                     && matches!(gs, 64 | 128)

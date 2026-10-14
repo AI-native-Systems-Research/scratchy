@@ -395,9 +395,9 @@ pub fn get_qmv_batch_limit(k: u32, n: u32, arch_gen: crate::tape::targets::Apple
 /// How a NAX qmm_t threadgroup dequantizes its W tiles (`qmm_t_nax_impl`'s `producer`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NaxDequant {
-    /// Every simdgroup fills its share of the one W tile between two barriers per K
-    /// step: MLX's 128 threads and one 64 × 72 tile per threadgroup.
-    Shared,
+    /// MLX's `QuantizedBlockLoader`: every simdgroup fills its share of the one W tile
+    /// between two barriers per K step, 128 threads and one 64 × 72 tile per threadgroup.
+    Loader,
     /// A fifth simdgroup dequantizes the next K step's W tile into a second one while
     /// the four multiply, so the dequant overlaps the matrix unit — at 160 threads and
     /// two tiles per threadgroup, which fits fewer threadgroups on a core.
@@ -406,23 +406,24 @@ pub enum NaxDequant {
 
 impl NaxDequant {
     /// Both schedules (the golden tests run each).
-    pub const ALL: [Self; 2] = [Self::Shared, Self::Producer];
+    pub const ALL: [Self; 2] = [Self::Loader, Self::Producer];
 
-    /// Output tiles (64 wide) from which `Producer` beats `Shared`. Narrower, the matmul
+    /// Output tiles (64 wide) from which `Producer` beats `Loader`. Narrower, the matmul
     /// is bound on streaming its activations, each block shared by few threadgroups,
-    /// and the producer's fewer resident threadgroups cost more than its overlap saves
-    /// (base M5, both alternated in one process: ≤ 2 tiles +3..+29%, ≥ 6 tiles −3..−7%).
+    /// and the producer's fewer resident threadgroups cost more than its overlap saves.
+    /// Base M5, both alternated in one process at 2048 / 8192 rows: ≤ 2 tiles +3..+10%;
+    /// ≥ 6 tiles −1..−10%, the producer faster in every cell.
     pub const PRODUCER_MIN_N_TILES: u32 = 6;
     /// K steps (64 deep) from which the overlap pays for the first tile, which nothing
-    /// overlaps (K = 704, 11 steps: parity; K = 1024, 16 steps: −1..−5%).
-    pub const PRODUCER_MIN_K_STEPS: u32 = 16;
+    /// overlaps: K = 704 (11 steps, the shortest measured) −2..−4%.
+    pub const PRODUCER_MIN_K_STEPS: u32 = 11;
     /// Rows from which the producer is measured to win: below, the kernels run tens of
-    /// microseconds and no ordering of the two separates from the noise.
+    /// microseconds and no ordering of the two separates from the noise, so the loader
+    /// runs there.
     pub const PRODUCER_MIN_M: u32 = 2048;
 
     /// The schedule for an `m × k` by `k × n` matmul: `Producer` only where it is
-    /// measured to win, `Shared` (at or below MLX's loader at every measured shape)
-    /// everywhere else.
+    /// measured to beat MLX's loader, which runs everywhere else.
     pub const fn for_shape(m: u32, n: u32, k: u32) -> Self {
         if m >= Self::PRODUCER_MIN_M
             && n.div_ceil(64) >= Self::PRODUCER_MIN_N_TILES
@@ -430,16 +431,16 @@ impl NaxDequant {
         {
             Self::Producer
         } else {
-            Self::Shared
+            Self::Loader
         }
     }
 
-    /// Threads per threadgroup. `Shared` is MLX's 3D (32, wn=2, wm=2) — the kernel maps
+    /// Threads per threadgroup. `Loader` is MLX's 3D (32, wn=2, wm=2) — the kernel maps
     /// its 2×2 output sub-tile grid from `simdgroup_index_in_threadgroup` alone, and the
     /// MPP `matmul2d` scheduler runs the 3D shape ~7% faster than a flat (128, 1, 1).
     pub const fn threads(self) -> (u32, u32, u32) {
         match self {
-            Self::Shared => (32, 2, 2),
+            Self::Loader => (32, 2, 2),
             Self::Producer => (32, 5, 1),
         }
     }
@@ -447,7 +448,7 @@ impl NaxDequant {
     /// The symbol stem after `affine_` / `affine_gather_`: `qmm_t_nax` / `qmm_t_nax_producer`.
     pub const fn symbol_stem(self) -> &'static str {
         match self {
-            Self::Shared => "qmm_t_nax",
+            Self::Loader => "qmm_t_nax",
             Self::Producer => "qmm_t_nax_producer",
         }
     }
@@ -508,9 +509,11 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
 ///
 /// `is_nax` should be `crate::tape::targets::is_nax_capable(profile.generation)`.
 ///
-/// gs=32 is excluded from NAX dispatch because the BK=64 NAX shader's
-/// W dequant reads one scale per row per K step. gs=32 quants fall
-/// through to the Standard qmm_t kernel instead.
+/// gs=32 is excluded from NAX dispatch because the BK=64 NAX shader
+/// violates `BCOLS <= group_size` for gs=32; MLX handles that with a
+/// specialized QuantizedBlockLoader path (different scale-indexing
+/// semantics) which we haven't ported. gs=32 quants fall through to
+/// the Standard qmm_t kernel instead.
 pub fn pick_qmm_t_kernel(
     m: u32,
     n: u32,
@@ -1529,7 +1532,7 @@ mod tests {
         // mapping is from simdgroup_index, so (32,2,2) is bit-identical to
         // a flat (128,1,1) but ~7% faster on the MPP matmul2d scheduler.
         // The producer schedule adds a fifth simdgroup.
-        let shared = QmmTKernel::Nax(NaxDequant::Shared);
+        let shared = QmmTKernel::Nax(NaxDequant::Loader);
         let ((tx, ty, tz), (gx, gy, gz)) = qmm_t_dispatch_shape(shared, 128, 2048, 1);
         assert_eq!((tx, ty, tz), (32, 2, 1));
         assert_eq!((gx, gy, gz), (32, 2, 2));
@@ -1548,17 +1551,17 @@ mod tests {
             64 * NaxDequant::PRODUCER_MIN_K_STEPS,
         );
         assert_eq!(NaxDequant::for_shape(m, n, k), NaxDequant::Producer);
-        assert_eq!(NaxDequant::for_shape(m - 64, n, k), NaxDequant::Shared);
-        assert_eq!(NaxDequant::for_shape(m, n - 64, k), NaxDequant::Shared);
-        assert_eq!(NaxDequant::for_shape(m, n, k - 64), NaxDequant::Shared);
+        assert_eq!(NaxDequant::for_shape(m - 64, n, k), NaxDequant::Loader);
+        assert_eq!(NaxDequant::for_shape(m, n - 64, k), NaxDequant::Loader);
+        assert_eq!(NaxDequant::for_shape(m, n, k - 64), NaxDequant::Loader);
         assert_eq!(
             pick_qmm_t_kernel(m, n, k, 1, 64, true),
             QmmTKernel::Nax(NaxDequant::Producer)
         );
-        // Gemma 4's router (128 outputs) stays Shared at any length.
+        // Gemma 4's router (128 outputs) stays on the loader at any length.
         assert_eq!(
             pick_qmm_t_kernel(8192, 128, 2816, 1, 64, true),
-            QmmTKernel::Nax(NaxDequant::Shared)
+            QmmTKernel::Nax(NaxDequant::Loader)
         );
     }
 

@@ -654,8 +654,11 @@ fn affine_qmm_t_splitk_b4_bf16_matches_cpu_reference() {
 /// CPU reference, all four 32×32 output sub-tiles (one per simdgroup).
 ///
 /// History: this was a `#[ignore]` reproducer for an "every-other-column
-/// unwritten" layout bug, caused by a hand-inlined W-loader paired with
-/// a flat (128,1,1) dispatch.
+/// unwritten" layout bug. The cause was the hand-inlined W-loader paired
+/// with the flat (128,1,1) dispatch; switching to MLX's exact
+/// `QuantizedBlockLoader` + the (32,2,2) threadgroup geometry makes the
+/// output bit-exact (0/1024 mismatch in every simdgroup), so the gate is
+/// now active.
 #[test]
 fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
     // Skip on non-M4 hardware (look at the auto-detected device
