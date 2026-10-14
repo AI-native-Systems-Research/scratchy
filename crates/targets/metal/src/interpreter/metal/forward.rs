@@ -317,11 +317,11 @@ impl InFlight {
 /// byte-identical to a single row of the static
 /// `scratchy_target_cuda::rotary::RotaryCache` cos/sin cache, so binding it
 /// in place of that cache (with `positions[t] = t`) is a no-op for the
-/// kernel math. The angle math mirrors
-/// `RotaryCache::new_partial_from_gpuweights` exactly
+/// kernel math. The angle math is
+/// `RotaryCache::new_partial_from_gpuweights`'s
 /// (`inv_freq[i] = θ^(-2i/rot_dim)`, `angle = pos·inv_freq[i]`, cos/sin in
-/// `f32`, then cast), so the 1D (text) case matches the legacy path to the
-/// bit.
+/// `f32`, then cast; that builder's angle addition lands on the same bf16),
+/// so the 1D (text) case matches the static table to the bit.
 ///
 /// `positions` is either `[n_tokens]` (1D — every band uses the same
 /// position, e.g. pure-text / decode) or `[3·n_tokens]` (MRoPE: rows

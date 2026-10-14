@@ -40,7 +40,6 @@ pub struct MetalModelConsts {
     pub rope_proportional: bool,
     /// `MROPE_SECTION.is_some()`: the rope reads the per-forward band-split cos/sin table.
     pub mrope: bool,
-    pub max_blocks_per_seq: u32,
     pub kv_codec: scratchy_ir::KvCodec,
     pub vision_num_heads: u32,
     pub vision_head_dim: u32,
@@ -88,7 +87,6 @@ impl MetalModelConsts {
             rope_on_read: W::ROPE_ON_READ,
             rope_proportional: W::ROPE_PROPORTIONAL,
             mrope: W::MROPE_SECTION.is_some(),
-            max_blocks_per_seq: W::MAX_BLOCKS_PER_SEQ,
             kv_codec: W::KV_CODEC,
             vision_num_heads: W::VISION_NUM_HEADS,
             vision_head_dim: W::VISION_HEAD_DIM,

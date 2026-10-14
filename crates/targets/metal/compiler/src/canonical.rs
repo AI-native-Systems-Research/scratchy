@@ -92,7 +92,10 @@ impl SourceManifest {
             let (ix, base) = (Literal::u32_unsuffixed(ix), format_ident!("{}", f.base));
             use WeightKind as K;
             let bundle = match f.kind {
-                K::CosSin => return Ok(quote!(#ix => Some(#r::CosSin(self.#base.cos_sin_cache)),)),
+                // Unbound until the pool builds the table (`Weights::build_rope_tables`).
+                K::CosSin => {
+                    return Ok(quote!(#ix => Some(#r::CosSin(self.#base.get()?.cos_sin_cache)),));
+                }
                 K::Embedding => quote!(Embedding),
                 K::AffineQuantEmbedding => quote!(AffineQuantEmbedding),
                 K::RmsNorm => quote!(RmsNorm),

@@ -4467,14 +4467,6 @@ impl Worker for MetalWorker {
         }
     }
 
-    fn kv_max_addressable_tokens(&self) -> Option<usize> {
-        // Hybrid SWA arches (gemma4): every KV group's block table is baked at
-        // the `MAX_BLOCKS_PER_SEQ` row stride, so the kernels address at most
-        // `MAX_BLOCKS_PER_SEQ × BLOCK_SIZE` tokens (gemma4: 2048×16 = 32768);
-        // the load built no RoPE row past it either. Uniform models report none.
-        self.model.as_ref()?.kv_addressable_tokens()
-    }
-
     fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
         // A uniform TurboQuant model's blocks are packed codes, and a hybrid
         // model's are group-shared pages plus its TurboQuant global store — not
@@ -5961,11 +5953,10 @@ impl Worker for MetalWorker {
             }
             let mut bt: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
             for (i, blocks) in sliding.iter().enumerate() {
-                // Clamp to the kernel's baked MAX_BLOCKS_PER_SEQ row stride: a
-                // request whose sliding block count exceeds it is past the
-                // addressable context (gemma4: 2048×16 = 32768 tokens). Clamp
-                // rather than panic; the scheduler caps admission at
-                // max_model_len so this only guards the boundary.
+                // Clamp to the row stride, the KV cap rung picked to hold
+                // `min(max_model_len, pool)` (`kv_block_cap`): the engine caps
+                // max_model_len at the pool's tokens and the scheduler admits no
+                // longer sequence, so this only guards the boundary.
                 for (j, &bid) in blocks.iter().take(max_blocks_eff).enumerate() {
                     bt[i * max_blocks_eff + j] = bid as u32;
                 }

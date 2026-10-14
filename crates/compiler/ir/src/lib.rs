@@ -1118,22 +1118,11 @@ pub trait CanonicalParams: WeightAccessors {
     /// arch.json), and the target's whose head this build compiles. 0 without one.
     const SPEC_DRAFTS: u32 = 0;
 
-    /// Block-table row stride (in u32s), equal to
-    /// `ceil(MAX_SEQ_LEN / BLOCK_SIZE)`. Baked into
-    /// `attention_via_cache_*_specialized` so the kernel can index
-    /// `block_table[seq * MAX_BLOCKS_PER_SEQ + logical_block]`
-    /// without a runtime divide. Default sized for ~2k tokens; per-
-    /// canonical macro impls override for longer-context models.
+    /// A block-table row stride (in u32s) for callers with no KV pool to read
+    /// one from: kernel tests, and the metal TurboQuant dequant grid before a
+    /// step has set its width. A served model's stride is its KV pool's
+    /// (`KvCachePool::max_blocks_per_seq`, the KV cap rung it runs on).
     const MAX_BLOCKS_PER_SEQ: u32 = 128;
-
-    /// The most tokens one sequence's metal KV can address when its block
-    /// table, not the KV cache, bounds that: a hybrid-geometry arch's
-    /// (Gemma4's) every KV group has a `MAX_BLOCKS_PER_SEQ`-long block-table
-    /// row, so past `MAX_BLOCKS_PER_SEQ × BLOCK_SIZE` tokens (Gemma4:
-    /// 2048 × 16) the sliding class's row overflows. The metal worker caps
-    /// `max_model_len` at it, and the metal load builds no RoPE row past it.
-    /// Default `None`: only the KV cache bounds the context.
-    const KV_ADDRESSABLE_TOKENS: Option<usize> = None;
 
     /// Q-axis tile size for the cuda contiguous-prefill kernel — the
     /// kernel processes this many query tokens per threadgroup.

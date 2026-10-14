@@ -243,15 +243,6 @@ pub trait ScratchyWeights: Send + Sync {
         false
     }
 
-    /// The loaded variant's `CanonicalParams::KV_ADDRESSABLE_TOKENS`: the most
-    /// tokens one sequence's metal KV can address when its block table, not
-    /// the KV cache, bounds that (Gemma4: 2048 × 16). The metal worker caps
-    /// `max_model_len` at it; the metal load built no RoPE row past it.
-    /// Default `None`.
-    fn kv_addressable_tokens(&self) -> Option<usize> {
-        None
-    }
-
     /// The drafts each sequence of a speculative verify step carries (`CanonicalParams::
     /// SPEC_DRAFTS`): an MTP head's, and its target's when this build compiles the head. 0 for a
     /// model without one.

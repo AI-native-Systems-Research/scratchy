@@ -1853,6 +1853,14 @@ impl DeviceAllocator for MetalAllocator {
         unsafe { self.alloc_and_copy_host_aligned(src_host, bytes, Self::MIN_BIND_ALIGN) }
     }
 
+    /// Where the weight-memcpy fallback below copies to — the weight-arena pool in
+    /// `weights_residency` — without the copy: unified memory, so the host's writes are the
+    /// GPU's bytes.
+    unsafe fn alloc_host_writable(&mut self, bytes: usize) -> Result<Option<*mut u8>> {
+        self.alloc_uninit_in(&self.weight_arenas, &self.weights_residency, bytes)
+            .map(Some)
+    }
+
     unsafe fn alloc_and_copy_host_aligned(
         &mut self,
         src_host: *const u8,

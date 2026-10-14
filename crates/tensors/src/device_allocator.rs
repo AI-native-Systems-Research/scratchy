@@ -98,6 +98,20 @@ pub trait DeviceAllocator: Send + Sync {
         unsafe { self.alloc_and_copy_host(src_host, bytes) }
     }
 
+    /// `bytes` of device memory the host writes in place, from where
+    /// [`alloc_and_copy_host`] would copy to: `None` when the device's
+    /// memory is not host-visible (cuda, spyre), so a caller fills host
+    /// memory and copies it instead. Metal's unified memory is.
+    ///
+    /// # Safety
+    ///
+    /// No kernel may read the memory before the host has written it.
+    ///
+    /// [`alloc_and_copy_host`]: Self::alloc_and_copy_host
+    unsafe fn alloc_host_writable(&mut self, _bytes: usize) -> Result<Option<*mut u8>> {
+        Ok(None)
+    }
+
     // ---- Backend-specific surface that generic `GpuWeights<A>` / pools need ----
     //
     // These let the shared containers stay backend-neutral: they name only

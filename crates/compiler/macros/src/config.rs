@@ -3621,7 +3621,7 @@ mod tests {
     fn gemma4_carrier_spec() -> crate::arch_spec::DeclaredArchSpec {
         crate::arch_spec::DeclaredArchSpec {
             decoder_prefix: Some("language_model".into()),
-            bound_defaults: vec![("max_blocks_per_seq".into(), 2048)],
+            bound_defaults: Vec::new(),
             scalar_defaults: vec![("attention_multiplier".into(), 1.0)],
             config_aliases: vec![
                 (
@@ -3669,8 +3669,9 @@ mod tests {
         // then 1 full).
         assert_eq!(mp.bounds.get("sliding_window_pattern"), Some(&6));
         assert_eq!(mp.bounds.get("sliding_window_global_remainder"), Some(&5));
-        // Family deployment default.
-        assert_eq!(mp.bounds.get("max_blocks_per_seq"), Some(&2048));
+        // No config caps the context: the block table's width is the KV
+        // pool's, picked at load from `--max-model-len` and the memory budget.
+        assert_eq!(mp.bounds.get("max_blocks_per_seq"), None);
         // Rope scalars hoisted from nested rope_parameters.
         assert_eq!(mp.scalars.get("rope_theta"), Some(&1_000_000.0));
         assert_eq!(mp.scalars.get("rope_local_base_freq"), Some(&10_000.0));
