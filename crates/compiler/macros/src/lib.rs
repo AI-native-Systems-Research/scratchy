@@ -1970,6 +1970,14 @@ pub fn compile_carrier(
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
                     let [drafts, verify_rows] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
+                    // An absent fact reads 0, and a head that fits no draft in a verify step
+                    // would compile and never draft.
+                    assert!(
+                        drafts >= 1 && verify_rows >= 2,
+                        "{arch_ident}: a head declares `spec_drafts` (at least 1) and \
+                         `spec_verify_rows` (at least 2: a sequence's token and one draft) in its \
+                         arch.json's bound_defaults (it has {drafts} and {verify_rows})"
+                    );
                     quote! {
                         ::core::option::Option::Some(::scratchy_forward_compiler::HeadRegistration {
                             arch: #arch,
