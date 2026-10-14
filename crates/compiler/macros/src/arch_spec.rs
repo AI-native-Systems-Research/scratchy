@@ -34,6 +34,22 @@ use crate::config::{VisionDModelFingerprint, VisionPatchEmbedFlatten, VisionSafe
 /// The arch's declarations, token-parsed into plain data. One per
 /// `#[forward]` / `#[vision_forward]` invocation; per-checkpoint JSON
 /// drift merges on top in `config::resolve_arch_spec`.
+/// One `published_as` entry (arch.json): a compiled variant of the `head_targets` config its
+/// target drafts with by default, and the Hub repo it loads from (Gemma 4 26B-A4B's QAT assistant
+/// at `mlx-affine-b4-g64`: `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit`). The config
+/// compiles beside its selected target under `mtp-heads` (which `metal` turns on), and a checkpoint
+/// of that target's shape served with no `--speculative-model` loads the repo of the variant the
+/// build compiled. At most one config a target; a config no entry names compiles only under
+/// `spec/mtp`, and a variant none names drafts only when `--speculative-model` names a checkpoint.
+#[derive(Clone, Debug)]
+pub struct PublishedAs {
+    /// The `head_targets` config.
+    pub config: String,
+    /// Its compiled variant: the config's own stem (dense), or `<config>-<preset>`.
+    pub variant: String,
+    pub repo: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeclaredArchSpec {
     pub safetensors: Option<VisionSafetensorsLayout>,
@@ -74,16 +90,14 @@ pub struct DeclaredArchSpec {
     pub drafter_repo_infix: Option<String>,
     /// A head published as its own checkpoint, with a config of its own (Gemma 4's assistant):
     /// each config stem's target config, `<arch>/<stem>`. It compiles when that target is selected
-    /// under `spec/mtp` (under `mtp-heads` too, for the stem `published_as` names), the target's
+    /// under `spec/mtp` (under `mtp-heads` too, for the config `published_as` names), the target's
     /// verify steps carry its drafts, and it drafts for the target's architectures. Empty for a
     /// head that ships inside its target's checkpoint (`checkpoint_of`).
     pub head_targets: Vec<(String, String)>,
-    /// The Hub repo of the `head_targets` config its target drafts with by default (Gemma 4
-    /// 26B-A4B's: `google/gemma-4-26B-A4B-it-assistant`): it compiles beside its selected target
-    /// under `mtp-heads` (which `metal` turns on), and a checkpoint of that target's shape served
-    /// with no `--speculative-model` loads it from there. At most one per target; a config it
-    /// omits compiles only under `spec/mtp`, and drafts only when `--speculative-model` names it.
-    pub published_as: Vec<(String, String)>,
+    /// The Hub repos the `head_targets` config its target drafts with by default is published
+    /// as, one a compiled variant of it (a drafter checkpoint loads only into the variant of its
+    /// own precision).
+    pub published_as: Vec<PublishedAs>,
     /// The arches whose checkpoints carry this head (a multi-token-prediction head). It has no
     /// configs of its own: under `spec/mtp` it compiles on every selected config of these arches
     /// that declares its layers (the source of its `num_hidden_layers` param, above zero).

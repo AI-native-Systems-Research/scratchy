@@ -54,7 +54,7 @@ pub struct HeadRegistration {
 /// own), so the compiled drafter names the repo it loads from.
 #[derive(Clone, Copy, Debug)]
 pub struct PublishedDrafter {
-    /// The Hub repo it loads from (`google/gemma-4-26B-A4B-it-assistant`).
+    /// The Hub repo it loads from (`mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit`).
     pub repo: &'static str,
     /// The shape of the target config it compiled against.
     pub target: TargetShape,
@@ -162,7 +162,7 @@ mod tests {
             repo_infix: None,
             checkpoint_prefix: None,
             published: &[PublishedDrafter {
-                repo: "google/gemma-4-26B-A4B-it-assistant",
+                repo: "mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit",
                 target: GEMMA_26B,
             }],
             drafts: 2,
@@ -170,7 +170,7 @@ mod tests {
         };
         assert_eq!(
             head.published_for(GEMMA_26B),
-            Some("google/gemma-4-26B-A4B-it-assistant")
+            Some("mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit")
         );
         let gemma_31b = TargetShape {
             hidden_size: 5376,

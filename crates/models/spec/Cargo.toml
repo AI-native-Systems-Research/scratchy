@@ -12,10 +12,10 @@ description = "Speculative-decoding build scope: which drafters compile alongsid
 # scratchy-quantizations `quant`. Its features forward to scratchy-models,
 # whose build script compiles the drafters.
 #
-# `mtp`: every drafter published as a model of its own (Gemma 4's QAT
+# `mtp`: every drafter published as a model of its own (Google's bf16 Gemma 4
 # assistant, drafting when `--speculative-model` names it), besides the heads
 # inside their targets' checkpoints and each target's default published
-# drafter (Gemma 4 26B-A4B's assistant), which `metal` already compiles —
+# drafter (Gemma 4 26B-A4B's QAT assistant), which `metal` already compiles —
 # `--features metal,model/gemma-4-26b-a4b-it,spec/mtp`.
 mtp = ["scratchy-models/mtp"]
 

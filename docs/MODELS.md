@@ -231,19 +231,22 @@ Gemma 4's drafter (`gemma4-assistant`) never ships inside its target's
 checkpoint: Google publishes it only as a model of its own, with a config of
 its own, which its model card loads by name. So its `arch.json` names each
 config's target config (**`head_targets`**, `<arch>/<stem>`) and, for the one
-its target drafts with by default, the repo it is published as
-(**`published_as`**: `google/gemma-4-26B-A4B-it-assistant`, at most one a
-target). A metal build compiles that one beside its selected target, and
-serving a checkpoint of the target's shape (`hidden_size` +
-`num_hidden_layers`, which tell it apart from Gemma 4 31B, the same
-architecture) drafts with it, downloading it on first use. The others (the
-QAT assistant) compile under `spec/mtp` and draft when `--speculative-model`
-names them:
+its target drafts with by default, the repo each compiled variant of it is
+published as (**`published_as`**, at most one config a target; a drafter
+checkpoint loads only into the variant of its own precision). 26B-A4B's is the
+QAT assistant at MLX 4-bit, `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit`:
+Google's bf16 assistant accepts as many drafts, but reads every draft's
+262k-row lm_head at bf16, and on prose decodes slower than the target alone. A
+metal build compiles the default one beside its selected target, and serving a
+checkpoint of the target's shape (`hidden_size` + `num_hidden_layers`, which
+tell it apart from Gemma 4 31B, the same architecture) drafts with it,
+downloading it on first use. The others compile under `spec/mtp` and draft
+when `--speculative-model` names them:
 
 ```bash
 cargo build --release -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,\
 quant/mlx-affine-b4-g64
-scr serve mlx-community/gemma-4-26b-a4b-it-4bit   # drafter from google/gemma-4-26B-A4B-it-assistant
+scr serve mlx-community/gemma-4-26b-a4b-it-4bit   # drafter: mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit
 ```
 
 The head drafts each sequence of a step as many tokens as keep the step's
