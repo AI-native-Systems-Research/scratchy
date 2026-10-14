@@ -744,12 +744,48 @@ pub fn fold_requests(s: &SessionKv) -> i64 {
 /// ladder's TOP is its widest chunk. Taking the top past it handed a 21,945-token granite-2b decode the
 /// 64-page chunk, and the worker refused the step ("the chunk ladder's top rung (64 pages) is below
 /// this context") where the per-page fold had served it. Every ladder without a chunk folds on every
-/// rung, so there this is the top, as before.
+/// rung, so there this is the top, as before. Applied ONCE, at bake, by
+/// [`the_fallback_serves_any_length`]; the runtime reads the index it baked (`RerollMeta::fallback_rung`).
 pub fn past_every_sweep(folds: &[bool]) -> usize {
     folds
         .iter()
         .rposition(|&f| f)
         .unwrap_or(folds.len().saturating_sub(1))
+}
+
+/// What a baked decode-ladder rung can serve past its own sweep — the two bake facts
+/// [`the_fallback_serves_any_length`] needs, read off the rung's emitted ops by the macro.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RungReach {
+    /// The body carries a page-fold group: it re-launches per resident page, so it serves any length.
+    /// The same fact the runtime reads (`KvShifts::page_fold`, stamped from each op's `kv_page_fold`).
+    pub folds: bool,
+    /// The body is a split-KV chunk: it attends exactly its own pages and nothing past them.
+    pub chunk: bool,
+}
+
+/// ⛔⛔⛔ THE BAKE'S HALF OF [`past_every_sweep`] — and why a ladder that cannot serve the pool DOES NOT
+/// COMPILE. `rungs` ascending, exactly as the runtime holds them.
+///
+/// Returns the rung a context past every sweep will run, or `Err` when that rung is a split-KV CHUNK:
+/// such a step attends a prefix that stops at the chunk's last page, and the worker refuses it at its
+/// first decode step — what #438 shipped for every granite-2b context past 16,384 tokens, because the
+/// ladder's fallback was its widest chunk. The macro panics on the `Err`, so the ladder that fails this
+/// way is a build failure, and the `Ok` index is baked as `RerollMeta::fallback_rung`, which the
+/// runtime reads instead of choosing — so it cannot run another.
+pub fn the_fallback_serves_any_length(rungs: &[RungReach]) -> Result<usize, String> {
+    let folds: Vec<bool> = rungs.iter().map(|r| r.folds).collect();
+    let at = past_every_sweep(&folds);
+    match rungs.get(at) {
+        Some(r) if r.chunk => Err(format!(
+            "a context past every sweep falls back to rung {at} of {}, a split-KV CHUNK — it attends \
+             only its own pages, so the first decode step past it is refused. The ladder must bake a \
+             rung that FOLDS (the per-page body) for every context the pool holds past its widest \
+             chunk.",
+            rungs.len()
+        )),
+        _ => Ok(at),
+    }
 }
 
 /// How many times this op's group is launched: once per resident page PER REQUEST for the fold,
@@ -1109,6 +1145,34 @@ mod tests {
         assert_eq!(past_every_sweep(&one_request), 2);
         assert_eq!(past_every_sweep(&[true, true, true]), 2);
         assert_eq!(past_every_sweep(&[false, false]), 1);
+    }
+
+    /// ⛔ A LADDER WHOSE FALLBACK IS A CHUNK IS REFUSED — the bake panics on this `Err`. Chunks alone
+    /// are the refused shape; the one-request ladder (sweep rungs and the page body, all folding, then
+    /// chunks) falls back to the page body; a ladder of folds alone (head dim 128) keeps its top; and an
+    /// unpaged ladder that neither folds nor chunks keeps its whole-cap top.
+    #[test]
+    fn a_ladder_that_falls_back_to_a_chunk_is_refused() {
+        use super::{RungReach, the_fallback_serves_any_length};
+        let fold = RungReach {
+            folds: true,
+            chunk: false,
+        };
+        let chunk = RungReach {
+            folds: false,
+            chunk: true,
+        };
+        let whole = RungReach {
+            folds: false,
+            chunk: false,
+        };
+        assert!(the_fallback_serves_any_length(&[chunk, chunk, chunk]).is_err());
+        assert_eq!(
+            the_fallback_serves_any_length(&[fold, fold, fold, chunk, chunk, chunk]),
+            Ok(2)
+        );
+        assert_eq!(the_fallback_serves_any_length(&[fold, fold, fold]), Ok(2));
+        assert_eq!(the_fallback_serves_any_length(&[whole, whole]), Ok(1));
     }
     use super::*;
 

@@ -1879,14 +1879,24 @@ impl Executor {
                 return Ok(ListSel::Rung(i));
             }
         }
-        // ⚠️ THE FALLBACK, VISIBLE. A `valid_len` past every rung's sweep takes the widest rung that
-        // FOLDS (`fold_plan::past_every_sweep`); silently, this looked identical to a correct choice.
-        let folds: Vec<bool> = self
-            .body_rungs
-            .iter()
-            .map(|(_, ops)| ops.iter().any(|op| op.kv.page_fold))
-            .collect();
-        let top = fold_plan::past_every_sweep(&folds);
+        // ⚠️ THE FALLBACK, VISIBLE — AND BAKED. A `valid_len` past every rung's sweep runs the rung the
+        // bake PROVED serves any length (`RerollMeta::fallback_rung`, never a split-KV chunk — see
+        // `fold_plan::the_fallback_serves_any_length`). Chosen here, it was the top, which #438 made the
+        // widest chunk, and every granite-2b step past 16,384 tokens was refused.
+        let top = self
+            .code
+            .reroll
+            .as_ref()
+            .map(|m| m.fallback_rung as usize)
+            .filter(|&at| at < self.body_rungs.len())
+            .ok_or_else(|| {
+                anyhow!(
+                    "bundle {}: no baked fallback rung inside its {}-rung ladder — the bake proves one \
+                     for every ladder it emits, so this artifact is not one it emitted",
+                    self.code.fp,
+                    self.body_rungs.len()
+                )
+            })?;
         let cap = self.body_rungs[top].0.get() as i64;
         self.trace_body("split-CEILING", valid_len, -1, reqs, cap, false);
         Ok(ListSel::Rung(top))
