@@ -6665,7 +6665,12 @@ impl ChunkScratch {
     /// one stick's granularity, which a whole-page chunk cannot, and they gather nothing. A one-page
     /// chunk is expressible and correct, and on card it LOST the canonical short chat — 27.63 vs
     /// 25.97 ms ITL p50 (granite-2b fp8) — so it is not a rung.
-    pub const LADDER: [u32; 6] = [2, 4, 8, 16, 32, Self::PAGES_MAX];
+    ///
+    /// ⭐ AND IT STEPS BY AT MOST 1.5× PAST 16 PAGES (24, 48). Every padded page costs a real page's
+    /// gather and attention, so a power-of-two ladder pays up to half its rung in dead pages: a
+    /// 10,300-token context (41 pages) ran the 64-page rung, 23 of them padding. 48 pages is 12,288
+    /// tokens — the reference's own top kv bucket.
+    pub const LADDER: [u32; 8] = [2, 4, 8, 16, 24, 32, 48, Self::PAGES_MAX];
 
     /// THE ONE DOOR. `None` on a geometry the chunk gather cannot express — and the emitter raises a
     /// `None` as a build failure, so it is never a silently ungathered bundle.
