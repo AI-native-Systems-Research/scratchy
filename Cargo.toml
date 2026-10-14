@@ -134,7 +134,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig", "
 
 # Template engine (for HuggingFace chat templates)
 minijinja = { version = "2", features = ["builtins", "json", "loader"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
 
 # Structured output / constrained decoding
 llguidance = { version = "1.6" }
