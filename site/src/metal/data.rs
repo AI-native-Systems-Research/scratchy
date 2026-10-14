@@ -260,6 +260,11 @@ pub struct Model {
     /// quantization, and the files' revision.
     #[serde(default)]
     pub engine_models: Option<BTreeMap<String, Served>>,
+    /// Per engine key, why its own memory guard declined this model outright
+    /// (oMLX refusing the load), in the engine's words. Engines here never
+    /// served, so their cells are absent by refusal, not by omission.
+    #[serde(default)]
+    pub engine_declined: Option<BTreeMap<String, NonEmpty>>,
     /// The revision of the MLX checkpoint scratchy (and the MLX engines) ran.
     #[serde(default)]
     pub model_files: Option<Files>,

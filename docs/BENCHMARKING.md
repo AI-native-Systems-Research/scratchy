@@ -232,7 +232,18 @@ These favour one side or the other and must travel with any published number.
   rejects a prompt it estimates will not fit. The guard is not raised:
   requests it refuses inside a cell count as failed (‡ on the page, and the
   cell's numbers cover only the rest), and a cell it refuses outright has no
-  numbers. `--engines all` adds mlx-lm,
+  numbers. The guard can also refuse the *model* itself, before any weights
+  move: each load is planned against a dynamic ceiling derived from
+  system-reclaimable memory minus a reserve — not the Metal cap, so raising
+  `iogpu.wired_limit_mb` does not move it — and a model near the size of the
+  Mac's memory is admitted only on a near-idle machine. Measured on
+  GLM-4.5-Air-3bit (45.75 GB) on a 64 GB M5 Max with normal residents: HTTP
+  507, "does not fit under the dynamic memory ceiling" (43.2 GB at the
+  time). A refusal like that is not a cell failure: preparing the engine
+  sends one tiny request first, and a refusal is recorded as
+  `engine_declined` with the engine's own message and that engine's cells
+  skipped for the model — the page says "Declined before serving" instead of
+  ‡'d cells that never ran. `--engines all` adds mlx-lm,
   vllm-metal, ollama, llama.cpp and mistral.rs.
 - **Not every engine serves the same files.** oMLX, mlx-lm and vllm-metal load
   the same mlx-community checkpoint as scratchy; ollama's `-mlx` tags are

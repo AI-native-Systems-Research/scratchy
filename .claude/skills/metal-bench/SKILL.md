@@ -132,7 +132,17 @@ lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 - **64 GB Macs:** GLM's longest cells need about 53 GB, above the GPU's
   default limit (about 48 GB). Ask the user to raise it to the agreed value
   with `sudo sysctl iogpu.wired_limit_mb=<MB>` (it resets on reboot); the
-  run records it as `machine.gpu_wired_limit_mb`.
+  run records it as `machine.gpu_wired_limit_mb`. That raise covers scratchy
+  only — oMLX's own guard doesn't care about it (next bullet).
+- **oMLX's memory guard:** oMLX loads a model only when the Mac can free the
+  model's size plus ~8 GB of reserve and overhead, out of what is reclaimable
+  right now (its dynamic ceiling — nothing the runner sets moves it). So a
+  model within ~20 GB of the Mac's RAM — glm-4.5-air on 64 GB this round, a
+  nemotron-super or gpt-oss-120b on whatever Mac a later round sizes for it —
+  needs the Mac near idle as well: ask the user to quit the other apps and
+  sessions, or oMLX declines the model at load and the run records it as
+  declined instead of timing it. A model within ~8 GB of the Mac's RAM never
+  passes the guard at all: expect it declined on every run, however idle.
 - **First run on this Mac:** it downloads the HF weights and ollama's models,
   so it needs internet.
 
@@ -200,6 +210,16 @@ act on each one as it appears:
   remaining cells`: that engine ran out of memory (or errored) at that size.
   The run carries on, and the page marks the cell with ‡. Note which engine
   and cell for the user; it's a finding, not a broken run.
+- `<engine> declined <model> — its own memory guard refused it: ...`: oMLX's
+  admission guard refused to load the model outright (its dynamic ceiling
+  from system-reclaimable memory — not the Metal cap, so the wired-limit
+  raise doesn't fix it). Expected for any model within ~20 GB of the Mac's
+  RAM unless it is near idle, and for any model within ~8 GB of the Mac's
+  RAM on every run — not a glm-4.5-air quirk; the next nemotron-super or
+  gpt-oss-120b round hits the same band. Also a finding, not a broken run:
+  the engine's cells are skipped, the JSON records `engine_declined` with
+  the engine's message, and the page shows "Declined before serving" on the
+  model's section.
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
 - `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or

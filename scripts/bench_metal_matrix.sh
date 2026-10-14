@@ -855,6 +855,26 @@ print(next((m["digest"] for m in json.load(sys.stdin)["models"] if m["name"]==t)
             name="${model}" ;;
         *)  name="$(served_name)" ;;
     esac
+    if [[ "${key}" == omlx || "${key}" == omlx_tq ]]; then
+        # /v1/models naming the model proves nothing: oMLX loads lazily, so its
+        # memory guard has not been asked yet. One tiny request makes it try,
+        # against this throwaway home, so a model the guard will not admit is
+        # caught here instead of failing the ladder's rungs and every cell
+        # (measured: glm-4.5-air-3bit on a 64 GB Mac with other apps resident —
+        # "does not fit under the dynamic memory ceiling", HTTP 507, before any
+        # weights move). The probe loads the model once, which the ladder's
+        # rungs each do anyway; any other answer, or a timeout, changes nothing.
+        local probe status
+        probe="$(curl -sS -m 600 -w '\n%{http_code}' "http://127.0.0.1:${PORT}/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"${name}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}],\"max_tokens\":1,\"temperature\":0}" 2>&1 || true)"
+        status="${probe##*$'\n'}"
+        if [[ "${status}" == 507 ]] || grep -q -e 'does not fit under the dynamic memory ceiling' -e 'prefill_memory_exceeded' <<<"${probe}"; then
+            printf '%s\n' "$(python3 -c 'import json,sys; print(json.load(sys.stdin)["error"]["message"])' <<<"${probe%$'\n'*}" 2>/dev/null \
+                || echo "its memory guard refused the model (HTTP ${status})")" >"${RAW}/declined-${key}-${stem}"
+            prepare_failed; return 1
+        fi
+    fi
     serve_down
     rm -rf "${RAW}/omlx-home-probe"
     [[ "${key}" == omlx_tq && -n "${name}" ]] && omlx_turboquant "${name}"
@@ -866,8 +886,13 @@ run_engine() { # key label
     [[ -n "${model}" ]] || { echo "--- ${label}: nothing to serve for ${stem}, skipped"; return 0; }
     echo "--- ${label}: ${model}"
     if ! name="$(engine_prepare "${key}" "${label}" "${model}")"; then
-        echo "    ${label} cannot serve ${model} (offline, a failed download, or it would not start) — skipped;" \
-             "see ${RAW}/serve-${key}-${stem}.log" >&2
+        if [[ -f "${RAW}/declined-${key}-${stem}" ]]; then
+            echo "    ${label} declined ${model} — its own memory guard refused it:" \
+                 "$(cat "${RAW}/declined-${key}-${stem}")" >&2
+        else
+            echo "    ${label} cannot serve ${model} (offline, a failed download, or it would not start) — skipped;" \
+                 "see ${RAW}/serve-${key}-${stem}.log" >&2
+        fi
         return 0
     fi
     printf -v "M_${key}" '%s' "${model}"; export "M_${key}"
@@ -1235,6 +1260,10 @@ def files(k, model):
 served = {k: {"model": env[f"M_{k}"], "quantization": env.get(f"Q_{k}") or None,
               "files": files(k, env[f"M_{k}"])}
           for k in keys if env.get(f"M_{k}")}
+# Engines whose own memory guard refused the model outright (oMLX declining a
+# load), with the engine's message; their cells are absent by refusal.
+declined = {k: open(os.path.join(raw, f"declined-{k}-{stem}")).read().strip()
+            for k in keys if os.path.exists(os.path.join(raw, f"declined-{k}-{stem}"))}
 d["models"].append({
     "stem": stem, "model_id": mid, "model_files": revision(mid), "quant": quant or None, "features": feats,
     "built": built == "1",
@@ -1248,6 +1277,8 @@ d["models"].append({
     "warm_serving": metrics(load(f"serve-{stem}.json")),
     "scaling": scaling(""),
     "engine_models": served,
+    # null = no engine declined; else per engine key, why it refused the model.
+    "engine_declined": declined or None,
     # The shape this model ran at, when a limit made it differ from config.scaling.
     "scaling_limits": None if (env["BASE_CONC"] == env["SCALE_BASE_CONC"] and env["CONC_LIST"] == env["SCALE_CONC"])
                       else {"base_conc": int(env["BASE_CONC"]),

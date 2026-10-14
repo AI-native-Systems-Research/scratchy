@@ -2975,6 +2975,19 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                                             }
                                         }
                                     }
+                                    {
+                                        // An engine whose own memory guard refused the model
+                                        // outright: its columns are dashes because it never
+                                        // served. This says why, in the engine's words.
+                                        let declined: Vec<String> = Engine::ALL.iter()
+                                            .filter_map(|e| m.engine_declined.as_ref()
+                                                .and_then(|d| d.get(e.key()))
+                                                .map(|r| format!("{} — {}", e.label(), r.as_str())))
+                                            .collect();
+                                        rsx! { if !declined.is_empty() {
+                                            p { "Declined before serving: {declined.join(\"; \")}." }
+                                        } }
+                                    }
                                     {summary_table(m, run, prev)}
                                     {sweep_part(m, run, prev, Sweep::Users)}
                                     {grid_maps(m, &mid, run)}
