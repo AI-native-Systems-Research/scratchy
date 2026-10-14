@@ -184,16 +184,24 @@ impl SpecializedPipelineCache {
                 .newCompilerWithDescriptor_error(&cdesc)
                 .expect("newCompilerWithDescriptor")
         });
-        let pipeline = compiler
-            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "MTL4 build pipeline `{}` (lib `{}`, {} constants): {e:?}",
-                    key.kernel_name,
-                    key.library_name,
-                    key.constants.len(),
-                ))
-            })?;
+        // One pipeline build at a time, process-wide: concurrent builds — even through separate
+        // caches, each with its own `MTL4Compiler` — corrupt the heap inside AGX's compiler
+        // (`ReflectionKey::initGPUCompilerSPIOptionsHash`, M4 Max, macOS 26.6) (#288). A
+        // pipeline is built once per key, so the lock is off the hot path.
+        static BUILD: Mutex<()> = Mutex::new(());
+        let built = {
+            let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
+            compiler
+                .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
+        };
+        let pipeline = built.map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!(
+                "MTL4 build pipeline `{}` (lib `{}`, {} constants): {e:?}",
+                key.kernel_name,
+                key.library_name,
+                key.constants.len(),
+            ))
+        })?;
 
         // GUARD (threadgroup-overflow class): a kernel whose total threadgroup
         // memory exceeds the device limit faults at GPU exec with a cryptic
