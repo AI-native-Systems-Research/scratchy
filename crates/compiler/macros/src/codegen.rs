@@ -13512,6 +13512,35 @@ pub fn emit_model(
                             (::std::vec::Vec::new(), ::std::vec::Vec::new())
                         }
                     };
+                // Its draft lanes, the same way (`GdnStatePool::lanes`). A pool without lanes — a
+                // model that drafts nothing, or one whose run drafts with nothing (no head found,
+                // `--num-speculative-tokens 0`) — runs only plain steps (its slot allocator builds
+                // no other: `GdnStepError::Drafts`), which never touch a lane, so a drafting
+                // model's tapes bind the layer's own state buffers there, never read.
+                let (gdn_lanes_conv, gdn_lanes_ssm): (
+                    ::std::vec::Vec<Buffer>,
+                    ::std::vec::Vec<Buffer>,
+                ) = match ctx.gdn_state {
+                    ::core::option::Option::Some(gp) => {
+                        let first = (0..gp.num_layers)
+                            .find_map(|l| gp.conv_lanes_mem(l).zip(gp.ssm_lanes_mem(l)));
+                        match first {
+                            ::core::option::Option::Some((fc, fs)) => (0..gp.num_layers)
+                                .map(|l| {
+                                    let (c, s) = gp
+                                        .conv_lanes_mem(l)
+                                        .zip(gp.ssm_lanes_mem(l))
+                                        .unwrap_or((fc, fs));
+                                    (c.buffer().clone(), s.buffer().clone())
+                                })
+                                .unzip(),
+                            ::core::option::Option::None => (gdn_conv.clone(), gdn_ssm.clone()),
+                        }
+                    }
+                    ::core::option::Option::None => {
+                        (::std::vec::Vec::new(), ::std::vec::Vec::new())
+                    }
+                };
                 // TurboQuant: captured (Copy) so the 'static factory closure can
                 // provision the packed stores + scratch per worker for a model
                 // whose `KV_CODEC` is TurboQuant. UNIFORM arches (num_kv_groups
@@ -13663,6 +13692,8 @@ pub fn emit_model(
                             // (num_seqs <= num_tokens <= max_m).
                             gdn_state_conv: gdn_conv.clone(),
                             gdn_state_ssm: gdn_ssm.clone(),
+                            gdn_lanes_conv: gdn_lanes_conv.clone(),
+                            gdn_lanes_ssm: gdn_lanes_ssm.clone(),
                             gdn_state_indices: alloc(max_m * 4),
                             gdn_is_fresh: alloc(max_m * 4),
                             // Vision externs: sized from the baked

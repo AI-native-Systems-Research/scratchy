@@ -29,8 +29,10 @@ All model architectures compile into ONE crate, **`scratchy-models`**
 because Cargo won't alias one crate under two names, and `scratchy-cli`
 needs both `model` and `quant` as short CLI aliases. Speculative-decoding
 drafters are a third alias on a third crate, **`scratchy-spec`**
-(`crates/models/spec/`): `spec/mtp` also compiles the MTP head of every
-selected model that has one. None has a default scope: naming zero models is
+(`crates/models/spec/`): `metal` already compiles the MTP head of every
+selected model whose checkpoint carries one (`mtp-heads`), and `spec/mtp` adds
+the drafters published as models of their own (Gemma 4's assistant). None has
+a default scope: naming zero models is
 a **build-time panic**, not a silent empty binary. Every checked-in `configs/<arch>/<stem>.json` gets its own `<stem>`
 feature (`model/<stem>` from the CLI, `model/<arch>`/`model/all` to widen);
 every quant preset gets its own `<preset>` feature (`quant/<preset>`,

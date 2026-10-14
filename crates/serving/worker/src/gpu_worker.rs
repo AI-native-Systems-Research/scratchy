@@ -56,6 +56,8 @@ use tracing::info;
 #[cfg(feature = "metal")]
 use scratchy_forward_compiler::gdn_slot_allocator::GdnSlotAllocator;
 #[cfg(feature = "metal")]
+use scratchy_serving_engine::worker_factory::VerifySeqs;
+#[cfg(feature = "metal")]
 use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
 use scratchy_target_metal::gdn_state::GdnStatePool;
@@ -647,6 +649,27 @@ fn decode_rows(arch: &str, max_num_seqs: usize) -> scratchy_target_metal::tape::
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
+/// The draft lanes of a hybrid target's Gated-DeltaNet pool (`gdn_state`'s module docs), no more
+/// than `max_num_seqs`: twice a head's gate — a step's drafting sequences hold one each, and as
+/// many again may wait, skipped by the scheduler, to replay theirs; the head drafts nothing for a
+/// sequence that finds every lane held — or one a sequence when an n-gram or draft model drafts
+/// for each. `None` when the run drafts nothing (or the target's kernels keep no draft state).
+#[cfg(feature = "metal")]
+fn gdn_draft_lanes(
+    verify_seqs: VerifySeqs,
+    cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
+    max_num_seqs: usize,
+) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
+    use scratchy_target_metal::gdn_state::DraftLanes;
+    let count = match verify_seqs {
+        VerifySeqs::Off => return None,
+        VerifySeqs::Gated(gate) => max_num_seqs.min(2 * usize::from(gate)),
+        VerifySeqs::Every => max_num_seqs,
+    };
+    let count = u16::try_from(count.min(usize::from(DraftLanes::MAX))).expect("≤ MAX fits a u16");
+    DraftLanes::new(cfg.checkpoint_rows(), count)
+}
+
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
 /// × [`METAL_KV_ELEM_BYTES`].
 #[cfg(feature = "metal")]
@@ -1083,14 +1106,31 @@ impl MetalWorker {
                 // arithmetic names, gathered here so the resolver stays
                 // backend-neutral arithmetic (no near-copy can grow in any
                 // target crate).
-                let gdn_per_slot = model.gdn_runtime_config().map(|cfg| {
-                    GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
-                        cfg.num_linear_layers(),
-                        1,
-                        cfg.checkpoint_rows(),
-                        cfg.state_dims(),
-                    )
-                });
+                // A slot's GDN state, and its draft lanes: under a head's gate fixed bytes (twice
+                // the gate, whatever the width), when every sequence drafts a lane a slot.
+                let gdn = model.gdn_runtime_config();
+                let gdn_bytes = |slots, lanes| {
+                    gdn.as_ref().map_or(0, |cfg| {
+                        GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
+                            cfg.num_linear_layers(),
+                            slots,
+                            lanes,
+                            cfg.state_dims(),
+                        )
+                    })
+                };
+                let verify_seqs = self.config.verify_seqs;
+                let lanes = |width| {
+                    gdn.as_ref()
+                        .and_then(|c| gdn_draft_lanes(verify_seqs, c, width))
+                };
+                let (gdn_per_slot, gdn_lanes) = match verify_seqs {
+                    VerifySeqs::Every => (gdn.as_ref().map(|_| gdn_bytes(1, lanes(1))), 0),
+                    _ => (
+                        gdn.as_ref().map(|_| gdn_bytes(1, None)),
+                        gdn_bytes(0, lanes(usize::MAX)),
+                    ),
+                };
                 let (budget, allocated) = self
                     .metal_device
                     .as_ref()
@@ -1145,7 +1185,7 @@ impl MetalWorker {
                     device_total_bytes: None,
                     device_name: None,
                     device_budget_bytes: budget,
-                    allocated_bytes: allocated + draft_rows * sampler_row,
+                    allocated_bytes: allocated + draft_rows * sampler_row + gdn_lanes,
                     peak_activation_bytes: peak,
                     gdn_per_slot_bytes: gdn_per_slot,
                     sampler_bytes_per_row: sampler_row,
@@ -1302,6 +1342,15 @@ impl MetalWorker {
     /// error messages can speak about what the caller asked.
     fn max_num_seqs_resolved(&self) -> usize {
         self.resolved_max_num_seqs.unwrap_or(1).max(1)
+    }
+
+    /// The loaded target's Gated-DeltaNet draft lanes ([`gdn_draft_lanes`]), at the resolved
+    /// width: what its pool allocates and its budget reserves.
+    fn gdn_lanes(
+        &self,
+        cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
+    ) -> Option<scratchy_target_metal::gdn_state::DraftLanes> {
+        gdn_draft_lanes(self.config.verify_seqs, cfg, self.max_num_seqs_resolved())
     }
 
     /// The KV cap rung `model`'s pool runs on for a capacity of `block_cap` blocks per sequence,
@@ -1505,11 +1554,11 @@ impl MetalWorker {
         Ok((draft_weights, draft_arch, draft_hf_config))
     }
 
-    /// The target's compiled multi-token-prediction head ([`Draft::TargetHead`]): from the target's
-    /// own store when its checkpoint carries the head — tensors under the head's
-    /// `checkpoint_prefix`, lent under the bare names the head binds (the same mmap: nothing
-    /// uploads twice), its config the target's own — else from the repo it is published under,
-    /// named from the target's.
+    /// The target's compiled multi-token-prediction head ([`Draft::TargetHead`]), which its
+    /// checkpoint carries (the server found its tensors before any load; a head published apart
+    /// comes as a [`Draft::Checkpoint`]): the tensors under the head's `checkpoint_prefix`, lent
+    /// from the target's store under the bare names the head binds (the same mmap: nothing uploads
+    /// twice), its config the target's own.
     fn target_head(
         &self,
         allocator: MetalAllocator,
@@ -1529,30 +1578,25 @@ impl MetalWorker {
                 "this build compiled no multi-token-prediction head for {arch} ({model})"
             ))
         })?;
-        if let Some(prefix) = head.checkpoint_prefix.filter(|p| refs.holds(p)) {
-            let mut weights = GpuWeights::empty(allocator);
-            let lent = weights.lend(refs, prefix, "", None).map_err(|e| {
-                ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}"))
+        let prefix = head
+            .checkpoint_prefix
+            .filter(|p| refs.holds(p))
+            .ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "{model}'s checkpoint holds no tensor under its multi-token-prediction head's \
+                 prefix ({:?})",
+                    head.checkpoint_prefix
+                ))
             })?;
-            info!(
-                "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors \
-                 under {prefix})"
-            );
-            return Ok((weights, head.arch.to_string(), target_config.clone()));
-        }
-        let repo = head.repo_of(model).ok_or_else(|| {
-            let inside = match head.checkpoint_prefix {
-                Some(prefix) => format!(" (no tensor under {prefix})"),
-                None => String::new(),
-            };
-            ExecutorError::WorkerInit(format!(
-                "{model}'s checkpoint carries no multi-token-prediction head{inside}, and the repo \
-                 the head is published under cannot be named from {model}; pass \
-                 --speculative-model <head>"
-            ))
-        })?;
-        info!("ScratchyWorker(metal): MTP head published apart from the target, {repo}");
-        self.draft_checkpoint(&repo, allocator)
+        let mut weights = GpuWeights::empty(allocator);
+        let lent = weights
+            .lend(refs, prefix, "", None)
+            .map_err(|e| ExecutorError::WorkerInit(format!("MTP head: lending {prefix}.*: {e}")))?;
+        info!(
+            "ScratchyWorker(metal): MTP head from the target's checkpoint ({lent} tensors under \
+             {prefix})"
+        );
+        Ok((weights, head.arch.to_string(), target_config.clone()))
     }
 
     /// Load the speculative draft model onto the same Metal device +
@@ -5128,14 +5172,14 @@ impl Worker for MetalWorker {
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
             let num_slots = self.max_num_seqs_resolved();
             let num_layers = model.num_hidden_layers() as usize;
-            let checkpoint_rows = gdn_cfg.checkpoint_rows();
+            let lanes = self.gdn_lanes(&gdn_cfg);
             let t_gdn = std::time::Instant::now();
             let gdn_pool = unsafe {
                 scratchy_target_metal::gdn_state::GdnStatePool::new(
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
-                    checkpoint_rows,
+                    lanes,
                     gdn_cfg.state_dims(),
                     // f32 conv/ssm state. Every per-layer conv/ssm pointer
                     // derives from the CPU base of this StorageModeShared
@@ -5154,7 +5198,7 @@ impl Worker for MetalWorker {
                 t_gdn.elapsed(),
             );
             self.gdn_state = Some(gdn_pool);
-            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots, checkpoint_rows));
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots, lanes));
         }
 
         // Allocate the draft model's
@@ -5225,7 +5269,7 @@ impl Worker for MetalWorker {
         // NOT yet in `currentAllocatedSize`; fold it into the non-KV
         // overhead here so the engine doesn't hand back KV blocks that
         // leave no room for it. Persistent f32 state, one slot per
-        // resident seq (and its checkpoints) — sized identically to the pool
+        // resident seq and the draft lanes — sized identically to the pool
         // built later. Zero for non-hybrid arches.
         let gdn_reserve = self
             .model
@@ -5235,7 +5279,7 @@ impl Worker for MetalWorker {
                 scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
                     self.max_num_seqs_resolved(),
-                    cfg.checkpoint_rows(),
+                    self.gdn_lanes(&cfg),
                     cfg.state_dims(),
                 )
             })
@@ -6185,7 +6229,18 @@ impl Worker for MetalWorker {
                     let (prompt, generated) = self.input_batch.history(r);
                     Some([prompt, generated].concat())
                 };
-                drafter.passes(&step_rows, &history, &scheduler_output.draft_req_ids)
+                // A hybrid target keeps a drafting sequence's verify rows in a draft lane, held
+                // from here through the step that replays them.
+                let mut holds_draft_state = |r: &str| match self.gdn_slot_allocator.as_mut() {
+                    Some(alloc) => alloc.hold_lane(gdn_slot_key(r)),
+                    None => true,
+                };
+                drafter.passes(
+                    &step_rows,
+                    &history,
+                    &scheduler_output.draft_req_ids,
+                    &mut holds_draft_state,
+                )
             }
             _ => None,
         };

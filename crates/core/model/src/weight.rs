@@ -38,6 +38,35 @@ pub struct SafeTensorsIndex {
     pub weight_map: HashMap<String, String>,
 }
 
+/// `name`'s suffix under `prefix` — `<prefix>.<suffix>` — or `None` when `name` is not under it.
+pub fn under_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    name.strip_prefix(prefix)?.strip_prefix('.')
+}
+
+/// Whether the safetensors checkpoint in `dir` holds a tensor under `prefix` ([`under_prefix`]),
+/// read from its shard index's weight map or its single file's header — no tensor is read.
+pub fn checkpoint_holds(dir: &Path, prefix: &str) -> ModelResult<bool> {
+    let index = dir.join("model.safetensors.index.json");
+    if index.exists() {
+        let index = SafeTensorsIndex::from_file(index)?;
+        return Ok(index
+            .weight_map
+            .keys()
+            .any(|n| under_prefix(n, prefix).is_some()));
+    }
+    // A single file opens with its header's length (u64, little-endian), then the header: a JSON
+    // object of the tensors by name, beside `__metadata__`.
+    use std::io::Read;
+    let mut file = std::fs::File::open(dir.join("model.safetensors"))?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len)?;
+    let len = usize::try_from(u64::from_le_bytes(len)).unwrap_or(usize::MAX);
+    let mut header = Vec::new();
+    file.take(len as u64).read_to_end(&mut header)?;
+    let header: HashMap<String, serde_json::Value> = serde_json::from_slice(&header)?;
+    Ok(header.keys().any(|n| under_prefix(n, prefix).is_some()))
+}
+
 impl SafeTensorsIndex {
     /// Load from a JSON file.
     pub fn from_file(path: impl AsRef<Path>) -> ModelResult<Self> {
@@ -586,6 +615,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkpoint holds a prefix when a tensor sits under it — in its shard index or its single
+    /// file's header — and a name that merely starts with the prefix's text does not count.
+    #[test]
+    fn a_checkpoint_holds_the_tensors_under_a_prefix() {
+        let head = "language_model.mtp";
+        let sharded = tempfile::tempdir().unwrap();
+        let index = r#"{"metadata": {}, "weight_map": {
+            "language_model.mtp.fc.weight": "model-mtp.safetensors",
+            "language_model.model.embed_tokens.weight": "model-00001.safetensors"}}"#;
+        std::fs::write(sharded.path().join("model.safetensors.index.json"), index).unwrap();
+        assert!(checkpoint_holds(sharded.path(), head).unwrap());
+        assert!(!checkpoint_holds(sharded.path(), "language_model.vision").unwrap());
+
+        let single = tempfile::tempdir().unwrap();
+        let header =
+            br#"{"__metadata__": {}, "language_model.mtpx.weight": {}, "lm_head.weight": {}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header);
+        std::fs::write(single.path().join("model.safetensors"), file).unwrap();
+        assert!(!checkpoint_holds(single.path(), head).unwrap());
+        assert!(checkpoint_holds(single.path(), "lm_head").unwrap());
+        assert_eq!(
+            under_prefix("language_model.mtp.fc.weight", head),
+            Some("fc.weight")
+        );
+    }
 
     #[test]
     fn test_safetensors_index_parse() {

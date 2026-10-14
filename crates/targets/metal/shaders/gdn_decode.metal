@@ -21,14 +21,14 @@
 // One token a sequence: the one-row decode bucket. q/k/v come straight from the model-dtype
 // `qkv` row, the output goes to the model-dtype `out` row; no scratch.
 //
-// The state is laid out as `gdn_conv1d_varlen` and `gdn_scan_varlen` lay a slot out: with drafts,
-// a conv slot is its entry and `GDN_DEC_DRAFTS + 1` checkpoints, an ssm slot its entry and two
-// record areas. This kernel runs only a plain step (`scratchy_layers::gdn_state::GdnStep::
-// is_plain`: `gdn_step[seq]` starts from the slot or from zero and carries no drafts), so it reads
-// and writes the entries alone; a step that replays runs the three commands.
+// The state is laid out as `gdn_conv1d_varlen` and `gdn_scan_varlen` lay a slot out: its conv
+// entry and its ssm entry, a model's drafts kept apart in their draft lanes. This kernel runs only
+// a plain step (`scratchy_layers::gdn_state::GdnStep::is_plain`: `gdn_step[seq]` starts from the
+// slot or from zero and carries no drafts), so it reads and writes the entries alone; a step that
+// replays runs the three commands.
 //
-// Baked constants: 0-4 and 8 the scan's (num_k_heads, num_v_heads, head_k, head_v, scale; the
-// model's drafts), 5 the conv kernel width, 6 the norm's eps.
+// Baked constants: 0-4 the scan's (num_k_heads, num_v_heads, head_k, head_v, scale), 5 the conv
+// kernel width, 6 the norm's eps.
 // Dispatch: grid (1, num_k_heads, num_seqs), threads (1024, 1, 1).
 
 #include <metal_stdlib>
@@ -43,7 +43,6 @@ SCRATCHY_CONSTANT(uint, GDN_DEC_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_DEC_SCALE, 4);
 SCRATCHY_CONSTANT(uint, GDN_DEC_CONV_KERNEL, 5);
 SCRATCHY_CONSTANT(float, GDN_DEC_EPS, 6);
-SCRATCHY_CONSTANT(uint, GDN_DEC_DRAFTS, 8);
 
 constant constexpr uint H = GDN_DEC_NUM_K_HEADS;
 constant constexpr uint HV = GDN_DEC_NUM_V_HEADS;
@@ -61,10 +60,8 @@ constant constexpr uint THREADS = 1024u;
 constant constexpr uint SIMDGROUPS = THREADS / 32u;
 constant constexpr uint NPT = K / 32u;
 constant constexpr uint STATE_LEN = GDN_DEC_CONV_KERNEL - 1u;
-// A slot's conv entries and ssm floats, as the conv and the scan lay them out.
-constant constexpr uint CONV_ENTRIES = GDN_DEC_DRAFTS == 0u ? 1u : GDN_DEC_DRAFTS + 2u;
-constant constexpr uint SSM_SLOT_LEN =
-    HV * Vd * K + (GDN_DEC_DRAFTS == 0u ? 0u : 2u * (GDN_DEC_DRAFTS + 1u) * (CONV_DIM + 2u * HV));
+// A slot's ssm floats, as the scan lays them out.
+constant constexpr uint SSM_SLOT_LEN = HV * Vd * K;
 // Value dims a simdgroup scans, and how many it holds the state rows of at once.
 constant constexpr uint DIMS = RV / SIMDGROUPS;
 constant constexpr uint BATCH = 4u;
@@ -123,7 +120,7 @@ template <typename T>
     for (uint ki = 0; ki <= STATE_LEN; ki++) {
       wlocal[ki] = float(conv_w[c * GDN_DEC_CONV_KERNEL + ki]);
     }
-    device float* state = conv_state + (uint(slot) * CONV_ENTRIES * CONV_DIM + c) * STATE_LEN;
+    device float* state = conv_state + (uint(slot) * CONV_DIM + c) * STATE_LEN;
     for (uint ki = 0; ki < STATE_LEN; ki++) {
       window[ki] = fresh ? 0.0f : state[ki];
     }

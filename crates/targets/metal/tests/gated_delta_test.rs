@@ -17,7 +17,9 @@ mod common;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::{CheckpointRows, GdnStart, GdnStep, RecordArea};
+use scratchy_target_metal::gdn_state::{
+    CheckpointRows, DraftLane, DraftLanes, GdnStart, GdnStep, RecordArea,
+};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -171,7 +173,8 @@ fn split_conv(
 }
 
 /// Dispatch `gdn_scan_varlen_f32` for one varlen batch; returns `o` [T, value_dim].
-/// `state_buf` is mutated in place (shared across calls for continuity tests).
+/// `state_buf` is mutated in place (shared across calls for continuity tests); so is a drafting
+/// model's `(drafts, lanes)` buffer of draft lanes (buffer 9).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_scan(
     device: &Device,
@@ -188,7 +191,7 @@ fn dispatch_scan(
     hk: usize,
     hv: usize,
     num_tokens: usize,
-    drafts: u8,
+    drafts: Option<(u8, &Buffer)>,
 ) -> Option<Vec<f32>> {
     let value_dim = nv * hv;
     let scale = (hk as f32).powf(-0.5);
@@ -201,7 +204,7 @@ fn dispatch_scan(
             ConstantValue::uint(2, hk as u32),
             ConstantValue::uint(3, hv as u32),
             ConstantValue::float(4, scale),
-            ConstantValue::uint(8, u32::from(drafts)),
+            ConstantValue::uint(8, drafts.map_or(0, |(k, _)| u32::from(k))),
         ],
     );
     let pipeline = baked_build(cache, &key).expect("gdn_scan_varlen pipeline");
@@ -213,15 +216,21 @@ fn dispatch_scan(
     let cu_buf = buf_i32(device, cu);
     let si_buf = buf_i32(device, si);
     let fresh_buf = buf_u32(device, fresh);
+    // Mamba-2's `D` (buffer 8), unread by the delta rule.
+    let unread = buf_zero_f32(device, 1);
 
     let num_seqs = cu.len() - 1;
     let tgx = hv.min(256);
+    let mut bufs = vec![
+        &o_buf, &conv_buf, &g_buf, &beta_buf, state_buf, &cu_buf, &si_buf, &fresh_buf,
+    ];
+    if let Some((_, lanes)) = drafts {
+        bufs.extend([&unread, lanes]);
+    }
     if !common::dispatch_threadgroups(
         device,
         &pipeline,
-        &[
-            &o_buf, &conv_buf, &g_buf, &beta_buf, state_buf, &cu_buf, &si_buf, &fresh_buf,
-        ],
+        &bufs,
         MTLSize {
             width: hv.div_ceil(tgx),
             height: nv,
@@ -684,7 +693,7 @@ fn gdn_scan_varlen_matches_reference() {
         hk,
         hv,
         t,
-        0,
+        None,
     ) else {
         return;
     };
@@ -739,7 +748,7 @@ fn gdn_scan_varlen_production_head_dim() {
         hk,
         hv,
         t,
-        0,
+        None,
     ) else {
         return;
     };
@@ -799,7 +808,7 @@ fn gdn_scan_varlen_continuity() {
         hk,
         hv,
         5,
-        0,
+        None,
     ) else {
         return;
     };
@@ -819,7 +828,7 @@ fn gdn_scan_varlen_continuity() {
         hk,
         hv,
         1,
-        0,
+        None,
     ) else {
         return;
     };
@@ -1107,10 +1116,10 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
     }
 }
 
-/// `gdn_scan_pipelined_f32` in a drafting model's pool: slots of a state entry and two record
-/// areas. A plain prefill (fresh, or from the slot) into slot 1 of two, and two sequences into
+/// `gdn_scan_pipelined_f32` in a drafting model's pool: slots of a state entry, its draft lanes
+/// apart. A plain prefill (fresh, or from the slot) into slot 1 of two, and two sequences into
 /// both slots, leave what `gdn_scan_simd` of the same drafts leaves — the entries to f32
-/// rounding, slot 0's when untouched and every record area as they were.
+/// rounding, slot 0's when untouched — and the simd scan leaves every lane as it was.
 #[test]
 fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
     let Some(di) = detect_device() else {
@@ -1126,11 +1135,12 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
     let scale = (hk as f32).powf(-0.5);
     let rows = CheckpointRows(2);
     let entry_len = nv * hv * hk;
-    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
+    let lane_len = 2 * rows.rows() * (conv_dim + 2 * nv);
     let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
     let (a_log, dt_bias) = (fill(nv), shifted(nv, 5));
     let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
-    let pool0 = shifted(2 * slot_len, 11);
+    let pool0 = shifted(2 * entry_len, 11);
+    let lanes0 = shifted(2 * lane_len, 13);
     let scan_consts = vec![
         ConstantValue::uint(0, nk as u32),
         ConstantValue::uint(1, nv as u32),
@@ -1139,7 +1149,8 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
         ConstantValue::float(4, scale),
         ConstantValue::uint(8, u32::from(rows.0)),
     ];
-    let pipe_consts = [scan_consts.clone(), vec![ConstantValue::uint(5, 12)]].concat();
+    // A plain step's scan takes the geometry, not the drafts (the lowering's twin).
+    let pipe_consts = [scan_consts[..5].to_vec(), vec![ConstantValue::uint(5, 12)]].concat();
     let simd = baked_build(
         &cache,
         &PipelineKey::new("gdn_scan_varlen", "gdn_scan_simd_f32", scan_consts),
@@ -1155,6 +1166,7 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
             start,
             checkpoint_rows: CheckpointRows::NONE,
             records: RecordArea::Second,
+            lane: None,
         }
         .encode()
     };
@@ -1186,21 +1198,28 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
             buf_i32(&device, &slots),
             buf_u32(&device, &codes),
         );
-        let run = |kernel, grid, threads| {
+        // The simd scan binds the lanes (11, past the unread `D` at 10); the pipelined one none.
+        let run = |kernel, grid, threads, binds_lanes: bool| {
             let (o, state) = (
                 buf_zero_f32(&device, t * value_dim),
                 buf_f32(&device, &pool0),
             );
-            let bufs = [
+            let (unread, lanes) = (buf_zero_f32(&device, 1), buf_f32(&device, &lanes0));
+            let mut bufs = vec![
                 &o, &conv_buf, &a_buf, &b_buf, &state, &cu_buf, &slot_buf, &code_buf, &alog_buf,
                 &dt_buf,
             ];
-            common::dispatch_threadgroups(&device, kernel, &bufs, grid, threads)
-                .then(|| (read_f32(&o, t * value_dim), read_f32(&state, pool0.len())))
+            if binds_lanes {
+                bufs.extend([&unread, &lanes]);
+            }
+            common::dispatch_threadgroups(&device, kernel, &bufs, grid, threads).then(|| {
+                assert_eq!(read_f32(&lanes, lanes0.len()), lanes0, "the lanes moved");
+                (read_f32(&o, t * value_dim), read_f32(&state, pool0.len()))
+            })
         };
         let (Some((simd_o, simd_pool)), Some((pipe_o, pipe_pool))) = (
-            run(&simd, size(1, value_dim / 4, seqs), size(32, 4, 1)),
-            run(&pipe, size(value_dim / 32, 1, seqs), size(128, 1, 1)),
+            run(&simd, size(1, value_dim / 4, seqs), size(32, 4, 1), true),
+            run(&pipe, size(value_dim / 32, 1, seqs), size(128, 1, 1), false),
         ) else {
             return;
         };
@@ -1216,8 +1235,7 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
         };
         close("o", &pipe_o, &simd_o);
         for slot in 0..2 {
-            let entry = slot * slot_len..slot * slot_len + entry_len;
-            let records = entry.end..(slot + 1) * slot_len;
+            let entry = slot * entry_len..(slot + 1) * entry_len;
             close(
                 &format!("slot {slot} entry"),
                 &pipe_pool[entry.clone()],
@@ -1227,11 +1245,6 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
                 pipe_pool[entry.clone()] != pool0[entry],
                 slots.contains(&(slot as i32)),
                 "{what}: slot {slot}'s entry moved only if a sequence runs in it"
-            );
-            assert_eq!(
-                pipe_pool[records.clone()],
-                pool0[records],
-                "{what}: slot {slot}'s record areas"
             );
         }
     }
@@ -1243,10 +1256,10 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
 /// heads a key head; two sequences of a token each, a continued one and a fresh one, in permuted
 /// state slots. The conv state, a copy of inputs, agrees exactly; the output and the scan state are
 /// the chain's statements in its order, which the shader compiler contracts and reassociates per
-/// kernel under fast math, so they agree to f32 rounding. A drafting model's pools too (2 drafts:
-/// conv checkpoints and ssm record areas in every slot), on plain steps whose record area is the
-/// second (code bit 16): the chain of the same drafts leaves what the one command leaves, the
-/// checkpoints and record areas as they were.
+/// kernel under fast math, so they agree to f32 rounding. A drafting model's too (2 drafts: its
+/// conv checkpoints and ssm records in draft lanes apart from the slots), on plain steps whose
+/// record area is the second (code bit 16): the chain of the same drafts leaves what the one
+/// command leaves, and the lanes as they were.
 #[test]
 fn gdn_decode_is_the_conv_scan_norm() {
     let Some(di) = detect_device() else {
@@ -1277,12 +1290,10 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let conv_dim = 2 * key_dim + value_dim;
         let (t, slots) = (2usize, 2usize);
         let rows = CheckpointRows(drafts);
-        let conv_slot = conv_dim * (kernel - 1) * rows.conv_entries_per_slot();
-        let ssm_slot = nv * hv * hk
-            + match drafts {
-                0 => 0,
-                k => 2 * (usize::from(k) + 1) * (conv_dim + 2 * nv),
-            };
+        let (conv_slot, ssm_slot) = (conv_dim * (kernel - 1), nv * hv * hk);
+        // Two lanes of the drafts' conv checkpoints and ssm records.
+        let conv_lanes0 = shifted(2 * rows.rows() * conv_slot, 29);
+        let ssm_lanes0 = shifted(2 * 2 * rows.rows() * (conv_dim + 2 * nv), 31);
         let records = match drafts {
             0 => RecordArea::First,
             _ => RecordArea::Second,
@@ -1292,6 +1303,7 @@ fn gdn_decode_is_the_conv_scan_norm() {
                 start,
                 checkpoint_rows: CheckpointRows::NONE,
                 records,
+                lane: None,
             }
             .encode()
         });
@@ -1305,6 +1317,8 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let build = |lib: &'static str, name: &'static str, c: Vec<ConstantValue>| {
             baked_build(&cache, &PipelineKey::new(lib, name, c)).expect(name)
         };
+        // The geometry; the scan of a model that drafts takes its drafts too (slot 8), the one
+        // command, which runs only plain steps, does not.
         let scan_consts = || {
             vec![
                 ConstantValue::uint(0, nk as u32),
@@ -1312,9 +1326,13 @@ fn gdn_decode_is_the_conv_scan_norm() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
-                ConstantValue::uint(8, u32::from(drafts)),
             ]
         };
+        let (unread, conv_lanes, ssm_lanes) = (
+            buf_zero_f32(&device, 1),
+            buf_f32(&device, &conv_lanes0),
+            buf_f32(&device, &ssm_lanes0),
+        );
         let (cu, si) = (buf_i32(&device, &[0, 1, 2]), buf_i32(&device, &[1, 0]));
         let fresh = buf_u32(&device, &fresh);
         let (qkv_buf, z_buf, w_buf) = (
@@ -1338,16 +1356,27 @@ fn gdn_decode_is_the_conv_scan_norm() {
         let conv = build("gdn_conv1d_varlen", "gdn_conv1d_varlen_f32", conv_consts);
         let conv_out = buf_zero_f32(&device, t * conv_dim);
         let (chain_conv, chain_ssm) = (buf_f32(&device, &conv0), buf_f32(&device, &ssm0));
-        let bufs = [&conv_out, &qkv_buf, &w_buf, &chain_conv, &cu, &si, &fresh];
+        let mut bufs = vec![&conv_out, &qkv_buf, &w_buf, &chain_conv, &cu, &si, &fresh];
+        if drafts > 0 {
+            bufs.extend([&unread, &conv_lanes]);
+        }
         let grid = size(t, conv_dim.div_ceil(256), 1);
         if !common::dispatch_threadgroups(&device, &conv, &bufs, grid, size(1, 256, 1)) {
             return;
         }
-        let scan = build("gdn_scan_varlen", "gdn_scan_simd_f32", scan_consts());
+        let drafted = [
+            vec![ConstantValue::uint(8, u32::from(drafts))],
+            scan_consts(),
+        ]
+        .concat();
+        let scan = build("gdn_scan_varlen", "gdn_scan_simd_f32", drafted);
         let o = buf_zero_f32(&device, t * value_dim);
-        let bufs = [
+        let mut bufs = vec![
             &o, &conv_out, &a_buf, &b_buf, &chain_ssm, &cu, &si, &fresh, &alog_buf, &dt_buf,
         ];
+        if drafts > 0 {
+            bufs.extend([&unread, &ssm_lanes]);
+        }
         let grid = size(1, nv * hv / 4, t);
         if !common::dispatch_threadgroups(&device, &scan, &bufs, grid, size(32, 4, 1)) {
             return;
@@ -1414,6 +1443,16 @@ fn gdn_decode_is_the_conv_scan_norm() {
         );
         close("ssm state", &ssm, &chain_ssm, ssm0.len());
         close("out", &out, &chain_out, t * value_dim);
+        assert_eq!(
+            read_f32(&conv_lanes, conv_lanes0.len()),
+            conv_lanes0,
+            "{geometry}"
+        );
+        assert_eq!(
+            read_f32(&ssm_lanes, ssm_lanes0.len()),
+            ssm_lanes0,
+            "{geometry}"
+        );
         // The step moved both states and wrote every output: agreeing on untouched buffers
         // would pass the comparisons above by accident.
         assert_ne!(read_f32(&ssm, ssm0.len()), ssm0, "{geometry}");
@@ -1433,6 +1472,23 @@ fn assert_close(got: &[f32], want: &[f32], what: &str) {
     }
 }
 
+/// A step's code, its sequence's draft `lane` named unless the step is plain ([`GdnStep::lane`]).
+fn code(
+    start: GdnStart,
+    checkpoint_rows: CheckpointRows,
+    records: RecordArea,
+    lane: Option<DraftLane>,
+) -> u32 {
+    let mut step = GdnStep {
+        start,
+        checkpoint_rows,
+        records,
+        lane: None,
+    };
+    step.lane = lane.filter(|_| !step.is_plain());
+    step.encode()
+}
+
 /// Inputs for a verify step's rejected drafts: unlike anything `fill` produces.
 fn rejected(n: usize) -> Vec<f32> {
     (0..n).map(|i| (i as f32 * 0.37).cos() * 0.5).collect()
@@ -1440,8 +1496,9 @@ fn rejected(n: usize) -> Vec<f32> {
 
 /// A verify step's checkpoints, conv ring: 3 tokens, then a verify step of the next token, a kept
 /// draft and two rejected drafts, then one token resuming from the kept row's checkpoint — equals
-/// the sequence that never saw the rejected drafts. In slot 1 of a 2-slot pool keeping 3
-/// checkpoints, so the entries are offset and slot 0's must stay untouched.
+/// the sequence that never saw the rejected drafts. In slot 1 of a 2-slot pool, its checkpoints in
+/// lane 1 of 2 keeping 3 drafts, so the entries are offset and slot 0's and lane 0's must stay
+/// untouched.
 #[test]
 fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let Some(di) = detect_device() else {
@@ -1455,7 +1512,8 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let (conv_dim, kernel) = (32usize, 4usize);
     let entry_len = conv_dim * (kernel - 1);
     let rows = CheckpointRows(3);
-    let slot_entries = rows.conv_entries_per_slot();
+    let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
+    let lane_entries = rows.rows();
     let t_full = 6usize;
     let x_full = fill(t_full * conv_dim);
     let w = fill(conv_dim * kernel);
@@ -1477,7 +1535,9 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     );
     let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
     let w_buf = buf_f32(&device, &w);
-    let state_buf = buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let state_buf = buf_zero_f32(&device, 2 * entry_len);
+    let lanes_buf = buf_zero_f32(&device, 2 * lane_entries * entry_len);
+    let unread_bias = buf_zero_f32(&device, 1);
     let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
         let num_tokens = x.len() / conv_dim;
         let out_buf = buf_zero_f32(&device, x.len());
@@ -1486,17 +1546,22 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         let si = buf_i32(&device, &[1]);
         let step = buf_u32(
             &device,
-            &[GdnStep {
-                start,
-                checkpoint_rows,
-                records: RecordArea::First,
-            }
-            .encode()],
+            &[code(start, checkpoint_rows, RecordArea::First, lane)],
         );
         common::dispatch_threadgroups(
             &device,
             &pipeline,
-            &[&out_buf, &x_buf, &w_buf, &state_buf, &cu, &si, &step],
+            &[
+                &out_buf,
+                &x_buf,
+                &w_buf,
+                &state_buf,
+                &cu,
+                &si,
+                &step,
+                &unread_bias,
+                &lanes_buf,
+            ],
             MTLSize {
                 width: 1,
                 height: 1,
@@ -1534,10 +1599,15 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         return;
     };
     assert_close(&next, &out_full[5 * conv_dim..], "resumed row");
-    let slot0 = read_f32(&state_buf, slot_entries * entry_len);
+    let slot0 = read_f32(&state_buf, entry_len);
     assert!(
         slot0.iter().all(|&v| v == 0.0),
-        "slot 0's entries were written"
+        "slot 0's entry was written"
+    );
+    let lane0 = read_f32(&lanes_buf, lane_entries * entry_len);
+    assert!(
+        lane0.iter().all(|&v| v == 0.0),
+        "lane 0's checkpoints were written"
     );
 }
 
@@ -1556,7 +1626,8 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
     let conv_dim = 2 * nk * hk + nv * hv;
     let entry_len = nv * hv * hk;
     let rows = CheckpointRows(3);
-    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
+    let lane_len = 2 * rows.rows() * (conv_dim + 2 * nv);
+    let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
     // Rows 0..3 the prompt, 3..7 the verify step (its token and three kept drafts), 7 the next.
     let t_full = 8usize;
     let (conv, g, beta) = (
@@ -1566,15 +1637,8 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
     );
     let at = |x: &[f32], w: usize, r: std::ops::Range<usize>| x[r.start * w..r.end * w].to_vec();
     let entry = [1];
-    let code = |start, checkpoint_rows, records| {
-        [GdnStep {
-            start,
-            checkpoint_rows,
-            records,
-        }
-        .encode()]
-    };
-    let run = |state: &Buffer, r: std::ops::Range<usize>, step: [u32; 1]| {
+    let code = |start, checkpoint_rows, records| [code(start, checkpoint_rows, records, lane)];
+    let run = |(state, lanes): (&Buffer, &Buffer), r: std::ops::Range<usize>, step: [u32; 1]| {
         let n = r.len();
         dispatch_scan(
             &device,
@@ -1591,24 +1655,32 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
             hk,
             hv,
             n,
-            rows.0,
+            Some((rows.0, lanes)),
         )
     };
     let none = CheckpointRows::NONE;
     let (r0, r1) = (RecordArea::First, RecordArea::Second);
-    let state = buf_zero_f32(&device, 2 * slot_len);
+    let pool = || {
+        (
+            buf_zero_f32(&device, 2 * entry_len),
+            buf_zero_f32(&device, 2 * lane_len),
+        )
+    };
+    let (state, lanes) = pool();
+    let drafting = (&state, &lanes);
     let (Some(_), Some(_), Some(o_next)) = (
-        run(&state, 0..3, code(GdnStart::Fresh, none, r0)),
-        run(&state, 3..7, code(GdnStart::Slot, rows, r0)),
-        run(&state, 7..8, code(GdnStart::Checkpoint(3), none, r1)),
+        run(drafting, 0..3, code(GdnStart::Fresh, none, r0)),
+        run(drafting, 3..7, code(GdnStart::Slot, rows, r0)),
+        run(drafting, 7..8, code(GdnStart::Checkpoint(3), none, r1)),
     ) else {
         return;
     };
-    let plain = buf_zero_f32(&device, 2 * slot_len);
+    let (plain, plain_lanes) = pool();
+    let plain = (&plain, &plain_lanes);
     let (Some(_), Some(_), Some(o_plain)) = (
-        run(&plain, 0..3, code(GdnStart::Fresh, none, r0)),
-        run(&plain, 3..7, code(GdnStart::Slot, none, r0)),
-        run(&plain, 7..8, code(GdnStart::Slot, none, r0)),
+        run(plain, 0..3, code(GdnStart::Fresh, none, r0)),
+        run(plain, 3..7, code(GdnStart::Slot, none, r0)),
+        run(plain, 7..8, code(GdnStart::Slot, none, r0)),
     ) else {
         return;
     };
@@ -1619,7 +1691,7 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
         "the replayed rows' state differs"
     );
     // Not the replay: the slot as it stands is the verify step's start state.
-    let Some(o_slot) = run(&state, 7..8, code(GdnStart::Slot, none, r1)) else {
+    let Some(o_slot) = run(drafting, 7..8, code(GdnStart::Slot, none, r1)) else {
         return;
     };
     assert_ne!(
@@ -1632,7 +1704,7 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
 /// [`gdn_conv1d_varlen_resumes_from_checkpoint`] for the recurrent (ssm) state, whose verify
 /// step records its draft rows and whose next step replays the kept ones from its base entry
 /// (`gdn_state` module docs): the resumed row is bit for bit the one a step that never saw the
-/// rejected drafts computes. Each step's code carries the slot's entry and record area as the
+/// rejected drafts computes. Each step's code carries the slot's draft lane and record area as the
 /// slot allocator tracks them ([`GdnStep::after`]).
 #[test]
 fn gdn_scan_varlen_resumes_from_checkpoint() {
@@ -1651,7 +1723,8 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
     let scale = (hk as f32).powf(-0.5);
     let entry_len = nv * hv * hk;
     let rows = CheckpointRows(3);
-    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
+    let lane_len = 2 * rows.rows() * (conv_dim + 2 * nv);
+    let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
     let t_full = 6usize;
 
     let conv_full = fill(t_full * conv_dim);
@@ -1666,9 +1739,15 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         [&full[3 * width..5 * width], &rejected(2 * width)[..]].concat()
     };
 
-    // Slot 1 of a two-slot pool; its steps' codes chained as the allocator chains them.
+    // Slot 1 of a two-slot pool, lane 1 of two; its steps' codes chained as the allocator chains
+    // them.
     let entry = [1];
-    let pool = || buf_zero_f32(&device, 2 * slot_len);
+    let pool = || {
+        (
+            buf_zero_f32(&device, 2 * entry_len),
+            buf_zero_f32(&device, 2 * lane_len),
+        )
+    };
     let slot = std::cell::Cell::new(RecordArea::First);
     let step = |start, checkpoint_rows| {
         let records = slot.get();
@@ -1676,11 +1755,16 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
             start,
             checkpoint_rows,
             records,
+            lane: None,
         };
         slot.set(step.after());
-        [step.encode()]
+        [code(start, checkpoint_rows, records, lane)]
     };
-    let run = |state: &Buffer, conv: &[f32], g: &[f32], beta: &[f32], step: [u32; 1]| {
+    let run = |(state, lanes): (&Buffer, &Buffer),
+               conv: &[f32],
+               g: &[f32],
+               beta: &[f32],
+               step: [u32; 1]| {
         let num_tokens = g.len() / nv;
         dispatch_scan(
             &device,
@@ -1697,28 +1781,29 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
             hk,
             hv,
             num_tokens,
-            rows.0,
+            Some((rows.0, lanes)),
         )
     };
 
-    let state = pool();
+    let (state, lanes) = pool();
+    let drafting = (&state, &lanes);
     let rows_of = |full: &[f32], width: usize, r: std::ops::Range<usize>| {
         full[r.start * width..r.end * width].to_vec()
     };
-    let prompt = |state: &Buffer, fresh| {
+    let prompt = |pool, fresh| {
         run(
-            state,
+            pool,
             &rows_of(&conv_full, conv_dim, 0..3),
             &rows_of(&g_full, nv, 0..3),
             &rows_of(&beta_full, nv, 0..3),
             fresh,
         )
     };
-    let Some(_) = prompt(&state, step(GdnStart::Fresh, CheckpointRows::NONE)) else {
+    let Some(_) = prompt(drafting, step(GdnStart::Fresh, CheckpointRows::NONE)) else {
         return;
     };
     let Some(o_verify) = run(
-        &state,
+        drafting,
         &verify(&conv_full, conv_dim),
         &verify(&g_full, nv),
         &verify(&beta_full, nv),
@@ -1731,38 +1816,40 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         &o_full[3 * value_dim..5 * value_dim],
         "verify kept rows",
     );
-    let next = |state: &Buffer, code| {
+    let next = |pool, code| {
         run(
-            state,
+            pool,
             &conv_full[5 * conv_dim..],
             &g_full[5 * nv..],
             &beta_full[5 * nv..],
             code,
         )
     };
-    let Some(o_next) = next(&state, step(GdnStart::Checkpoint(1), CheckpointRows::NONE)) else {
+    let Some(o_next) = next(
+        drafting,
+        step(GdnStart::Checkpoint(1), CheckpointRows::NONE),
+    ) else {
         return;
     };
     assert_close(&o_next, &o_full[5 * value_dim..], "resumed row");
-    let slot0 = read_f32(&state, slot_len);
+    let slot0 = read_f32(&state, entry_len);
     assert!(
         slot0.iter().all(|&v| v == 0.0),
-        "slot 0's entries were written"
+        "slot 0's entry was written"
+    );
+    let lane0 = read_f32(&lanes, lane_len);
+    assert!(
+        lane0.iter().all(|&v| v == 0.0),
+        "lane 0's records were written"
     );
 
     // The same rows without drafts: prompt, the kept rows, the next row.
-    let plain_code = |start| {
-        [GdnStep {
-            start,
-            checkpoint_rows: CheckpointRows::NONE,
-            records: RecordArea::First,
-        }
-        .encode()]
-    };
-    let plain = pool();
-    let kept = |state: &Buffer| {
+    let plain_code = |start| [code(start, CheckpointRows::NONE, RecordArea::First, None)];
+    let (plain, plain_lanes) = pool();
+    let plain = (&plain, &plain_lanes);
+    let kept = |pool| {
         run(
-            state,
+            pool,
             &rows_of(&conv_full, conv_dim, 3..5),
             &rows_of(&g_full, nv, 3..5),
             &rows_of(&beta_full, nv, 3..5),
@@ -1770,9 +1857,9 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         )
     };
     let (Some(_), Some(_), Some(o_plain)) = (
-        prompt(&plain, plain_code(GdnStart::Fresh)),
-        kept(&plain),
-        next(&plain, plain_code(GdnStart::Slot)),
+        prompt(plain, plain_code(GdnStart::Fresh)),
+        kept(plain),
+        next(plain, plain_code(GdnStart::Slot)),
     ) else {
         return;
     };
@@ -1810,7 +1897,8 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
     let entry_len = nv * hv * hk;
     let scale = (hk as f32).powf(-0.5);
     let rows = CheckpointRows(3);
-    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
+    let lane_len = 2 * rows.rows() * (conv_dim + 2 * nv);
+    let lane = DraftLanes::new(rows, 2).and_then(|l| l.lanes().nth(1));
     let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
     let (a_log, dt_bias) = (fill(nv), shifted(nv, 5));
     // Rows 0..3 the prompt, 3..5 the kept ones, 5 the next; a verify step's rejected drafts follow
@@ -1838,9 +1926,10 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
     )
     .expect("gdn_scan_simd_f32");
     let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
-    // Slot 1 of a two-slot pool.
+    // Slot 1 of a two-slot pool, lane 1 of two.
     let entry = [1];
     let entry_buf = buf_i32(&device, &entry);
+    let unread_skip = buf_zero_f32(&device, 1);
     // `gdn_gating`'s g and beta, for the serial scan.
     let gating = |a: &[f32], b: &[f32]| {
         let g: Vec<f32> = (a.iter().enumerate())
@@ -1853,88 +1942,113 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
         let beta: Vec<f32> = b.iter().map(|&b| 1.0 / (1.0 + (-b).exp())).collect();
         (g, beta)
     };
-    let run = |scan: Scan, state: &Buffer, conv: &[f32], a: &[f32], b: &[f32], code: [u32; 1]| {
-        let t = a.len() / nv;
-        match scan {
-            Scan::Serial => {
-                let (g, beta) = gating(a, b);
-                let cu = [0, t as i32];
-                dispatch_scan(
-                    &device, &cache, conv, &g, &beta, state, &cu, &entry, &code, nk, nv, hk, hv, t,
-                    rows.0,
-                )
+    // A pool: its slots' state entries and its draft lanes.
+    type Pool<'a> = (&'a Buffer, &'a Buffer);
+    let run =
+        |scan: Scan, (state, lanes): Pool, conv: &[f32], a: &[f32], b: &[f32], code: [u32; 1]| {
+            let t = a.len() / nv;
+            match scan {
+                Scan::Serial => {
+                    let (g, beta) = gating(a, b);
+                    let cu = [0, t as i32];
+                    dispatch_scan(
+                        &device,
+                        &cache,
+                        conv,
+                        &g,
+                        &beta,
+                        state,
+                        &cu,
+                        &entry,
+                        &code,
+                        nk,
+                        nv,
+                        hk,
+                        hv,
+                        t,
+                        Some((rows.0, lanes)),
+                    )
+                }
+                Scan::Simd => {
+                    let o = buf_zero_f32(&device, t * value_dim);
+                    let (conv_buf, a_buf, b_buf) = (
+                        buf_f32(&device, conv),
+                        buf_f32(&device, a),
+                        buf_f32(&device, b),
+                    );
+                    let (cu_buf, code_buf) =
+                        (buf_i32(&device, &[0, t as i32]), buf_u32(&device, &code));
+                    let bufs = [
+                        &o,
+                        &conv_buf,
+                        &a_buf,
+                        &b_buf,
+                        state,
+                        &cu_buf,
+                        &entry_buf,
+                        &code_buf,
+                        &alog_buf,
+                        &dt_buf,
+                        &unread_skip,
+                        lanes,
+                    ];
+                    let grid = MTLSize {
+                        width: 1,
+                        height: value_dim / 4,
+                        depth: 1,
+                    };
+                    let threads = MTLSize {
+                        width: 32,
+                        height: 4,
+                        depth: 1,
+                    };
+                    common::dispatch_threadgroups(&device, &simd, &bufs, grid, threads)
+                        .then(|| read_f32(&o, t * value_dim))
+                }
             }
-            Scan::Simd => {
-                let o = buf_zero_f32(&device, t * value_dim);
-                let (conv_buf, a_buf, b_buf) = (
-                    buf_f32(&device, conv),
-                    buf_f32(&device, a),
-                    buf_f32(&device, b),
-                );
-                let (cu_buf, code_buf) =
-                    (buf_i32(&device, &[0, t as i32]), buf_u32(&device, &code));
-                let bufs = [
-                    &o, &conv_buf, &a_buf, &b_buf, state, &cu_buf, &entry_buf, &code_buf,
-                    &alog_buf, &dt_buf,
-                ];
-                let grid = MTLSize {
-                    width: 1,
-                    height: value_dim / 4,
-                    depth: 1,
-                };
-                let threads = MTLSize {
-                    width: 32,
-                    height: 4,
-                    depth: 1,
-                };
-                common::dispatch_threadgroups(&device, &simd, &bufs, grid, threads)
-                    .then(|| read_f32(&o, t * value_dim))
-            }
-        }
+        };
+    let pool = || {
+        (
+            buf_zero_f32(&device, 2 * entry_len),
+            buf_zero_f32(&device, 2 * lane_len),
+        )
     };
-    let pool = || buf_zero_f32(&device, 2 * slot_len);
-    let prompt = |scan, state: &Buffer, code| {
+    let prompt = |scan, pool: Pool, code| {
         run(
             scan,
-            state,
+            pool,
             &at(&conv, conv_dim, 0..3),
             &at(&a, nv, 0..3),
             &at(&b, nv, 0..3),
             code,
         )
     };
-    let next = |scan, state: &Buffer, code| {
+    let next = |scan, pool: Pool, code| {
         run(
             scan,
-            state,
+            pool,
             &at(&conv, conv_dim, 5..6),
             &at(&a, nv, 5..6),
             &at(&b, nv, 5..6),
             code,
         )
     };
-    let plain_code = |start| {
-        [GdnStep {
-            start,
-            checkpoint_rows: CheckpointRows::NONE,
-            records: RecordArea::First,
-        }
-        .encode()]
-    };
+    let plain_code = |start| [code(start, CheckpointRows::NONE, RecordArea::First, None)];
 
     // The simd scan's rows without drafts: prompt, the kept rows, the next row.
-    let plain = pool();
+    let (plain, plain_lanes) = pool();
+    let plain = (&plain, &plain_lanes);
     let (Some(_), Some(o_kept), Some(o_plain)) = (
-        prompt(Scan::Simd, &plain, plain_code(GdnStart::Fresh)),
+        prompt(Scan::Simd, plain, plain_code(GdnStart::Fresh)),
         run(
             Scan::Simd,
-            &plain,
+            plain,
             &at(&conv, conv_dim, 3..5),
             &at(&a, nv, 3..5),
             &at(&b, nv, 3..5),
             plain_code(GdnStart::Slot),
         ),
-        next(Scan::Simd, &plain, plain_code(GdnStart::Slot)),
+        next(Scan::Simd, plain, plain_code(GdnStart::Slot)),
     ) else {
         return;
     };
@@ -1956,25 +2070,27 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
                 start,
                 checkpoint_rows,
                 records,
+                lane: None,
             };
             slot.set(step.after());
-            [step.encode()]
+            [code(start, checkpoint_rows, records, lane)]
         };
-        let state = pool();
+        let (state, lanes) = pool();
+        let drafting = (&state, &lanes);
         prompt(
             verifier,
-            &state,
+            drafting,
             step(GdnStart::Fresh, CheckpointRows::NONE),
         )?;
         let o_verify = run(
             verifier,
-            &state,
+            drafting,
             &verify(&conv, conv_dim),
             &verify(&a, nv),
             &verify(&b, nv),
             step(GdnStart::Slot, rows),
         )?;
-        let o_next = next(resumer, &state, step(start, CheckpointRows::NONE))?;
+        let o_next = next(resumer, drafting, step(start, CheckpointRows::NONE))?;
         Some((o_verify[..2 * value_dim].to_vec(), o_next))
     };
 

@@ -420,7 +420,7 @@ const TEMPLATE_TURN_TERMINATORS: &[&str] = &[
 // Worker creation result now lives in `scratchy-serving-worker` alongside
 // the `WorkerFactory` trait and `Box<dyn Worker>`/`HfModelConfig` it names.
 use scratchy_serving_worker::worker_factory::{
-    Draft, ProgressCallback, WorkerCreationResult, WorkerFactory,
+    Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, WorkerFactory,
 };
 
 /// Create the appropriate worker via the `WorkerFactory` inventory registry.
@@ -493,6 +493,7 @@ fn create_worker(
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
         draft: speculation.worker_draft(),
+        verify_seqs: speculation.verify_seqs(),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -686,8 +687,9 @@ impl Speculation {
     /// (`HeadRegistration::drafts`): its target's verify steps carry exactly those rows, which both
     /// models' kernels bake, so `--num-speculative-tokens` counts only an n-gram or draft model's.
     ///
-    /// TODO: a `--num-speculative-tokens` given with a head is ignored, and the flag's default (2)
-    /// cannot be told from a given value: make it optional, and refuse one that is not the head's.
+    /// `--num-speculative-tokens 0` serves without the head ([`resolve_speculative_decoding`]).
+    /// TODO: any other count given with a head is ignored, and the flag's default (2) cannot be
+    /// told from a given value: make it optional, and refuse one that is not the head's.
     fn drafts(&self, config: &VllmConfig) -> usize {
         match self {
             Self::Off => 0,
@@ -702,6 +704,16 @@ impl Speculation {
             Self::Off | Self::Ngram => None,
             Self::DraftModel(model) => Some(Draft::Checkpoint(model.clone())),
             Self::Head { draft, .. } => Some(draft.clone()),
+        }
+    }
+
+    /// The sequences a step may verify drafts for: a head drafts for at most its gate, an
+    /// n-gram or draft model for every sequence the engine schedules.
+    fn verify_seqs(&self) -> VerifySeqs {
+        match self {
+            Self::Off => VerifySeqs::Off,
+            Self::Head { head, .. } => VerifySeqs::Gated(head.max_seqs),
+            Self::Ngram | Self::DraftModel(_) => VerifySeqs::Every,
         }
     }
 
@@ -771,15 +783,13 @@ fn draft_head(
 ///   else a standalone draft model, checked against the target (`validate_target_draft_pair`:
 ///   vocab/tokenizer alignment, and on metal a rough memory budget).
 /// - none, on metal: the target's compiled multi-token-prediction head, when this build compiled
-///   one for the target ([`target_head`]); the head is a fact of the compiled model.
+///   one for the target and its tensors are found ([`target_head`]); the head is a fact of the
+///   compiled model. `--num-speculative-tokens 0` turns it off.
 fn resolve_speculative_decoding(config: &VllmConfig) -> Result<Speculation> {
     let speculation = match config.speculative_model.as_deref() {
-        None if !cfg!(feature = "metal") => Speculation::Off,
+        None if !cfg!(feature = "metal") || config.num_speculative_tokens == 0 => Speculation::Off,
         None => match target_head(config)? {
-            Some(head) => Speculation::Head {
-                head,
-                draft: Draft::TargetHead,
-            },
+            Some((head, draft)) => Speculation::Head { head, draft },
             None => Speculation::Off,
         },
         Some("ngram") => Speculation::Ngram,
@@ -800,22 +810,27 @@ fn resolve_speculative_decoding(config: &VllmConfig) -> Result<Speculation> {
     };
     if let Speculation::Head { head, draft } = &speculation {
         let source = match draft {
-            Draft::TargetHead => "its compiled",
-            Draft::Checkpoint(_) => "the --speculative-model",
+            Draft::TargetHead => "the multi-token-prediction head in its checkpoint".to_string(),
+            Draft::Checkpoint(head) => format!("the multi-token-prediction head {head}"),
         };
         info!(
-            "spec-decode: {} drafts {} tokens a step with {source} multi-token-prediction head.",
+            "spec-decode: {} drafts {} tokens a step with {source}.",
             config.model, head.drafts,
         );
     }
     Ok(speculation)
 }
 
-/// The registration of the target's multi-token-prediction head, when this build compiled one for
-/// the target's checkpoint architecture and the target's config declares MTP layers. Where the
-/// head's tensors are (the target's own checkpoint, or the repo it is published under) is the
-/// worker's to find ([`Draft::TargetHead`]).
-fn target_head(config: &VllmConfig) -> Result<Option<scratchy_forward_compiler::HeadRegistration>> {
+/// The target's multi-token-prediction head and where its tensors are, when this build compiled
+/// one for the target's checkpoint architecture and the target's config declares MTP layers: the
+/// target's own checkpoint when that holds tensors under the head's `checkpoint_prefix`
+/// ([`Draft::TargetHead`]), else the repo the head is published under, named from the target's
+/// (`HeadRegistration::repo_of`), when it resolves ([`Draft::Checkpoint`]). With neither the target
+/// serves without drafting, and says why — a build that compiles the head serves every checkpoint
+/// a build without it does.
+fn target_head(
+    config: &VllmConfig,
+) -> Result<Option<(scratchy_forward_compiler::HeadRegistration, Draft)>> {
     let target_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
         &config.model,
         config.hf_token.as_deref(),
@@ -834,16 +849,48 @@ fn target_head(config: &VllmConfig) -> Result<Option<scratchy_forward_compiler::
         return Ok(None);
     };
     let arch = target.arch_hint().unwrap_or_default();
-    let head = scratchy_forward_compiler::head_of(arch);
-    if head.is_none() {
+    let Some(head) = scratchy_forward_compiler::head_of(arch) else {
         info!(
             "spec-decode: {}'s checkpoint declares {layers} multi-token-prediction layer(s), but \
-             this build compiled no head for {arch} (`spec/mtp` compiles the heads it has an arch \
-             for); serving without drafting.",
+             this build compiled no head for {arch}; serving without drafting.",
             config.model
         );
+        return Ok(None);
+    };
+    let in_checkpoint = (head.checkpoint_prefix)
+        .map(|prefix| scratchy_core_model::weight::checkpoint_holds(&target_dir, prefix))
+        .transpose()
+        .with_context(|| format!("reading {target_dir:?}'s tensor names"))?;
+    if in_checkpoint == Some(true) {
+        return Ok(Some((head, Draft::TargetHead)));
     }
-    Ok(head)
+    let Some(repo) = head.repo_of(&config.model) else {
+        info!(
+            "spec-decode: {}'s checkpoint carries no multi-token-prediction head and names no \
+             repo one is published under; serving without drafting (`--speculative-model <head>` \
+             names one).",
+            config.model
+        );
+        return Ok(None);
+    };
+    let published = scratchy_serving_worker::worker_factory::resolve_model_path(
+        &repo,
+        config.hf_token.as_deref(),
+        None,
+        None,
+    );
+    match published {
+        Ok(_) => Ok(Some((head, Draft::Checkpoint(repo)))),
+        Err(e) => {
+            info!(
+                "spec-decode: {}'s checkpoint carries no multi-token-prediction head, and {repo} \
+                 does not resolve ({e:#}); serving without drafting (`--speculative-model <head>` \
+                 names one).",
+                config.model
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Phase-2 guards: vocab/tokenizer match + memory budget for the
@@ -1613,6 +1660,7 @@ fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
                 draft: speculation.worker_draft(),
+                verify_seqs: speculation.verify_seqs(),
                 draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
@@ -2181,6 +2229,7 @@ fn initialize_stack_multinode(
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
             draft: speculation.worker_draft(),
+            verify_seqs: speculation.verify_seqs(),
             draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
@@ -2493,6 +2542,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
         draft: speculation.worker_draft(),
+        verify_seqs: speculation.verify_seqs(),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -2688,6 +2738,7 @@ fn initialize_stack_tp_pp(
                         eos_token_ids: vec![],
                         max_model_len: config.max_model_len,
                         draft: speculation.worker_draft(),
+                        verify_seqs: speculation.verify_seqs(),
                         draft_model_dtype: config.draft_model_dtype.clone(),
                     }
                 })
@@ -3082,6 +3133,7 @@ fn initialize_stack_tp(
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
                 draft: speculation.worker_draft(),
+                verify_seqs: speculation.verify_seqs(),
                 draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
@@ -3531,6 +3583,7 @@ fn initialize_stack_external(
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
             draft: speculation.worker_draft(),
+            verify_seqs: speculation.verify_seqs(),
             draft_model_dtype: config.draft_model_dtype.clone(),
         };
 

@@ -451,8 +451,7 @@ pub struct ServeArgs {
     /// Number of speculative tokens to propose per step (default: 2), with
     /// --speculative-model (n-gram or a draft model). A multi-token-prediction
     /// head drafts the count it was compiled to (its arch.json `spec_drafts`,
-    /// which its target's kernels bake); a build without `spec/mtp` serves
-    /// without one.
+    /// which its target's kernels bake); 0 serves without it.
     ///
     /// K=2 is the empirical sweet spot for the realistic draft-model
     /// regime (target much larger than draft, e.g. Llama-3.1-8B

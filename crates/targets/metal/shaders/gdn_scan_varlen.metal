@@ -22,15 +22,16 @@
 //
 // `conv_out` is model dtype (`T`); `g`/`beta`/`ssm_state`/`o` are f32.
 // State layout (cuda-symmetric): `state_indices[seq]` is the sequence's slot; a slot is its state
-//   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)), then — when the model
-//   drafts (`scratchy_layers::gdn_state::GdnStateDims::ssm_slot_len`) — two record areas of
-//   `GDN_SCAN_DRAFTS + 1` rows, each row its f32 conv row, then its decay and beta (f32 [HV] each).
+//   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)). When the model drafts, the
+//   sequence's draft lane (the step code's bits 17-31) is two record areas of `GDN_SCAN_DRAFTS + 1`
+//   rows in `ssm_lanes` (`scratchy_layers::gdn_state::GdnStateDims::ssm_lane_len`), each row its
+//   f32 conv row, then its decay and beta (f32 [HV] each).
 //   `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`:
 //   - a step starts from the slot's state, zero (fresh), or (start = checkpoint r) the slot's state
-//     replayed through the previous verify step's rows 0..=r from the record area its bit 16
+//     replayed through the previous verify step's rows 0..=r from the lane's record area its bit 16
 //     names, through the same loop body that first computed them (no output);
 //   - a verify step (drafts) leaves the state it starts from in the slot and records each of its
-//     rows in the other area; any other step writes its last row's state to the slot.
+//     rows in the lane's other area; any other step writes its last row's state to the slot.
 //
 // Mamba-2 (Nemotron-H, `GDN_SCAN_MAMBA`) runs the same mapping over the same state layout — its
 // heads the value heads, its groups the key heads, a head's `[head_dim, state]` matrix the
@@ -48,7 +49,7 @@
 //   GDN_SCAN_MAMBA (optional: the Mamba-2 recurrence), GDN_SCAN_A_STRIDE / GDN_SCAN_A_OFFSET
 //   (optional, `gdn_scan_simd` only: `a`'s row stride and first column — Mamba-2's `dt` slice of
 //   the in-projection row; unset: `a` is `[T, HV]`), GDN_SCAN_DRAFTS (the drafts each sequence
-//   of a verify step carries: `SPEC_DRAFTS`).
+//   of a verify step carries: `SPEC_DRAFTS`; 0: `ssm_lanes` unread).
 //
 // Dispatch: grid (ceil(head_v/tg), HV, num_seqs); thread = (value-dim, head, seq).
 
@@ -88,6 +89,7 @@ template <typename T>
     const device int*   state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
     const device float* d_skip        [[buffer(8)]],
+    device       float* ssm_lanes     [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
 {
@@ -126,16 +128,15 @@ template <typename T>
   uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   uint area = (code >> 16) & 1u;
 
-  // The slot: its state entry, then (with drafts) two record areas of `GDN_SCAN_DRAFTS + 1` rows,
-  // each row its f32 conv row, then its decay and beta.
+  // The slot's state entry, and the lane's two record areas of `GDN_SCAN_DRAFTS + 1` rows, each
+  // row its f32 conv row, then its decay and beta.
   uint entry_len = HV * Vd * K;
   uint rec_len = conv_dim + 2u * HV;
   uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
-  uint slot_len = entry_len + (GDN_SCAN_DRAFTS == 0u ? 0u : 2u * area_len);
-  device float* slot = ssm_state + uint(slot_ix) * slot_len;
-  device float* state_row = slot + (i_hv * Vd + i_v) * K;
-  const device float* kept = slot + entry_len + area * area_len;
-  device float* recorded = slot + entry_len + (1u - area) * area_len;
+  device float* state_row = ssm_state + uint(slot_ix) * entry_len + (i_hv * Vd + i_v) * K;
+  device float* lane = ssm_lanes + (code >> 17) * 2u * area_len;
+  const device float* kept = lane + area * area_len;
+  device float* recorded = lane + (1u - area) * area_len;
   int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
 
   float b_h[GDN_SCAN_KMAX];
@@ -238,9 +239,9 @@ template <typename T>
 // 0): each lane holds head_k / 32 state elements, and every dot over head_k is a simd_sum — four
 // per token (q's and k's L2 norms, S·k, S·q) instead of the per-thread serial loops above. Every
 // lane computes its head's g and beta as `gdn_gating` does. `o` (f32) feeds `gdn_rms_norm_gated`.
-// Its state entries, draft records and replay are `gdn_scan_varlen`'s (the file header), records
+// Its state entries, draft lanes and replay are `gdn_scan_varlen`'s (the file header), records
 // as `gdn_scan_varlen_f32` lays them out (the lowering's instantiation: f32 conv rows), so either
-// kernel replays the other's records.
+// kernel replays the other's records. `ssm_lanes` is buffer 11.
 //
 // Baked constants: the scan's 0-4.
 // Dispatch: grid (1, HV * head_v / 4, num_seqs), threads (32, 4, 1): simdgroup s of threadgroup y
@@ -260,6 +261,7 @@ template <typename T>
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
     const device float* d_skip        [[buffer(10)]],
+    device       float* ssm_lanes     [[buffer(11)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  lane     [[thread_index_in_simdgroup]])
@@ -293,15 +295,14 @@ template <typename T>
   const uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   const uint area = (code >> 16) & 1u;
 
-  // The slot, as `gdn_scan_varlen` lays it out.
+  // The slot and the lane, as `gdn_scan_varlen` lays them out.
   const uint entry_len = HV * Vd * K;
   const uint rec_len = conv_dim + 2u * HV;
   const uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
-  device float* slot =
-      ssm_state + uint(slot_ix) * (entry_len + (GDN_SCAN_DRAFTS == 0u ? 0u : 2u * area_len));
-  device float* state_row = slot + (i_hv * Vd + i_v) * K + lane * NPT;
-  const device float* kept = slot + entry_len + area * area_len;
-  device float* recorded = slot + entry_len + (1u - area) * area_len;
+  device float* state_row = ssm_state + uint(slot_ix) * entry_len + (i_hv * Vd + i_v) * K + lane * NPT;
+  device float* draft_lane = ssm_lanes + (code >> 17) * 2u * area_len;
+  const device float* kept = draft_lane + area * area_len;
+  device float* recorded = draft_lane + (1u - area) * area_len;
   const int replayed = GDN_SCAN_DRAFTS > 0u && start >= 2u ? int(start - 1u) : 0;
 
   float st[NPT];
