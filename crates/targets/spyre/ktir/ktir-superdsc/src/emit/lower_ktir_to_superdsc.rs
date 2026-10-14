@@ -1709,6 +1709,15 @@ pub struct AttnAt<'a> {
     /// emulator does not model at all — the attention/rope programs never receive it and
     /// emit the same ops either way.
     pub rows_are_requests: bool,
+    /// Whether this bundle's attention reads the paged KV through an index — the caller-side twin of
+    /// the spyre door's `BundleAttnParams::gathers_kv` (the batched rungs' per-page gather, or the
+    /// one-request rung's split-KV chunk). Decides the `KV_BLOCK_INDEX_TID` admission below; the
+    /// placement reserves under the SAME fact — one predicate, both halves of the gather.
+    pub gathers_kv: bool,
+    /// The split-KV chunk's page count — the caller-side twin of `BundleAttnParams::chunk_pages`.
+    /// `Some` lowers the prefix through [`crate::sdsc_abstract::ChunkScratch`] (every resident page in
+    /// one pass); `None` keeps the per-page fold.
+    pub chunk_pages: Option<u32>,
     /// Whether this bundle's attention scale was folded into `W_q`/`W_k` — the caller-side twin of
     /// the spyre door's `BundleAttnParams::scale_folded`. The fold removes the score mulf from the
     /// program, so a folded program states NO multiplier; this fact is what tells the door that
@@ -2912,6 +2921,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         k,
         r,
         rows_are_requests,
+        gathers_kv,
+        chunk_pages,
         scale_folded,
         headmajor_handoff,
         sym_id_base,
@@ -3367,11 +3378,12 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
 
     // ⭐ THE GATHER'S INDEX TENSOR, NAMED BY ITS RESERVED TID'S OWN SPELLING — `act_name` is what the
     // placement, the bind and the descriptor all resolve through, so the tensor the descriptor gathers
-    // from is the tensor the worker fills. Under the SAME `rows_are_requests` that places it: a prompt
-    // chunk and a solo decode share one resident history across every row, so there is nothing per-row
-    // for an index to select and their emission stays byte-identical.
+    // from is the tensor the worker fills. Under the SAME `gathers_kv` that places it: the reference
+    // gathers its pages on every decode, so the one-request rung gathers alongside the batched rungs,
+    // while prefill — rows are positions sharing one resident history, nothing per-row for an index
+    // to select — keeps the sweep and its byte-identical emission.
     //
-    // ⛔⛔⛔ AND UNDER THE **GEOMETRY** TOO, WHICH IS THE OTHER HALF OF THE ONE RULE. `rows_are_requests`
+    // ⛔⛔⛔ AND UNDER THE **GEOMETRY** TOO, WHICH IS THE OTHER HALF OF THE ONE RULE. `gathers_kv`
     // alone named a tensor that `assemble_attn` may then decline (`GatherScratch::of_fold_pass` refuses a
     // head dim its flat copy cannot express) — so an 8b bundle reserved the index activation and carried a
     // `KvBlockIndex` forward step for a gather that appears in no descriptor. Asking
@@ -3395,12 +3407,39 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // count is cut to fit both the IBR stick and the LX chunk (`PageScratch::entries_per_op`) — so this
     // panic is unreachable rather than enforced, which is the only shape a panic in the emitter may have.
     //
-    // ⛔ THE `KV_BLOCK_INDEX_TID` PLACEMENT RESERVES ON `rows_are_requests` ALONE (see
+    // ⛔ THE `KV_BLOCK_INDEX_TID` PLACEMENT RESERVES ON `gathers_kv` ALONE (see
     // `lower_subtile_tape_to_superdsc` for the measured reason it is not narrowed), and with the door
     // now total under that same predicate the two halves are the SAME set of bundles — the hd=128
     // asymmetry that had three doors giving two answers is gone.
-    let kv_block_index: Option<String> = rows_are_requests.then(|| {
+    // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK, minted here so a chunk width this geometry cannot express is a BUILD
+    // failure naming the quantity — `ChunkScratch::of_chunk` refuses more than one feature slab, more
+    // than `PAGES_MAX` pages, or a footprint past `u32`. A chunk is a gathered read, so it demands the
+    // same `gathers_kv` the placement reserved the index under: a chunk without it would gather through
+    // an index no placement holds.
+    let chunk: Option<crate::sdsc_abstract::ChunkScratch> = chunk_pages.map(|pages| {
+        assert!(
+            gathers_kv && !rows_are_requests,
+            "attention {_name}: a split-KV chunk of {pages} page(s) is a one-request gathered read — it \
+             needs `gathers_kv` (the index placement) and a single-row body; gathers_kv={gathers_kv}, \
+             rows_are_requests={rows_are_requests}"
+        );
         let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+        crate::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).unwrap_or_else(|| {
+            panic!(
+                "attention {_name}: a split-KV chunk of {pages} page(s) at nkvh={nkvh}, hd={hd} is not \
+                 expressible — `ChunkScratch::of_chunk` refuses more than one {stick}-element feature \
+                 slab, more than {max} pages, or a footprint past a u32 descriptor extent",
+                stick = crate::sdsc_abstract::POOL_STICK,
+                max = crate::sdsc_abstract::ChunkScratch::PAGES_MAX,
+            )
+        })
+    });
+    let kv_block_index: Option<String> = gathers_kv.then(|| {
+        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+        // A chunk's own door was asked above; the per-page door is the batched rungs'.
+        if chunk.is_some() {
+            return crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID);
+        }
         crate::sdsc_abstract::PageScratch::of_pass(
             pool,
             crate::sdsc_abstract::QueryRowCount::of_mq(mq),
@@ -3440,12 +3479,13 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // ⭐⭐⭐⭐⭐ THE GATHER, ON — the prefix score leg's Kᵗ operand takes its KV base from this index
         // tensor instead of from the runtime's per-launch page shift.
         //
-        // ⛔ GATED ON `rows_are_requests`, WHICH IS THE SAME CONDITION THE PLACEMENT USES. Both halves
+        // ⛔ GATED ON `gathers_kv`, WHICH IS THE SAME CONDITION THE PLACEMENT USES. Both halves
         // of a gather have to be decided once: `compute_bundle_layout` places `KV_BLOCK_INDEX_TID`
         // under this predicate, `BakeFacts::gathers_kv` reads that placement, and the forward tape's
-        // `KvBlockIndex` step comes from that. A prompt chunk and a solo decode share ONE resident
-        // history across every row, so there is nothing per-row for an index to select and their
-        // emission stays byte-identical to before this existed.
+        // `KvBlockIndex` step comes from that. The reference gathers on every decode — batched and
+        // one-request alike — while prefill shares ONE resident history across every row, so there is
+        // nothing per-row for an index to select and its emission stays byte-identical to before this
+        // existed.
         //
         // ⛔ AND THE NAME IS THE RESERVED TID'S OWN SPELLING, not a synthetic. `act_name` is what the
         // placement, the bind and the descriptor all resolve through, so the tensor the descriptor
@@ -3501,6 +3541,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // apart and a flat block copy would relayout it. That bundle emits exactly what it emits today
         // rather than a copy that bakes and scrambles the value leg.
         kv_block_index.as_deref(),
+        chunk,
         attn_id,
         rows_are_requests,
         // The head-major o_proj handoff — the bundle fact the finalize above and the o matmul's

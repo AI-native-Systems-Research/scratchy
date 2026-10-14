@@ -153,6 +153,7 @@ fn no_kind_fuses_across_requests() {
         GroupKind::PageFold { gathered: true },
         GroupKind::PageFold { gathered: false },
         GroupKind::SlotSolo,
+        GroupKind::Gathered,
     ] {
         let trips = vec![
             Trip::new(kind, TripRequest(0)),

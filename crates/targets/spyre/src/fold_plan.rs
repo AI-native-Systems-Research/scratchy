@@ -987,8 +987,12 @@ pub fn slot_write_delta(op: &OpKv, pos: SlotPos) -> Bytes {
 ///
 /// A tagged op resolves its OWN request's page; an untagged one keeps the base the caller computed,
 /// so an unbatched launch is unchanged down to the zero-base early-out.
+///
+/// ⛔ A GATHERED op takes NONE — the same law as [`fold_delta`]'s gathered arm. Its index entries are
+/// absolute stick-block numbers that already carry every page, so the write cursor's page base on top
+/// composes two bases and gathers another page's keys with a clean bake.
 pub fn nonfold_page_delta(op: &OpKv, s: &SessionKv, pos: SlotPos, caller_base: Bytes) -> Bytes {
-    if !s.paged || is_paged_fold(op, s) {
+    if !s.paged || is_paged_fold(op, s) || op.gathered {
         return Bytes(0);
     }
     if op.request > 0 {
@@ -1579,6 +1583,15 @@ mod tests {
             nonfold_page_delta(&fold, &s, SlotPos::of_launch(300), Bytes(4242)),
             Bytes(0),
             "a fold op takes its page from the fold pass, not from here"
+        );
+        let gathered = OpKv {
+            gathered: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            nonfold_page_delta(&gathered, &s, SlotPos::of_launch(300), Bytes(4242)),
+            Bytes(0),
+            "a gathered op's entries are absolute — the write page's base on top lands in neither"
         );
     }
 

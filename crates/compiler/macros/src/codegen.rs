@@ -9447,6 +9447,9 @@ fn synth_role_tokens(
         R::Xn => quote! { #b::Xn },
         R::GatherKt => quote! { #b::GatherKt },
         R::GatherV => quote! { #b::GatherV },
+        R::ChunkSc => quote! { #b::ChunkSc },
+        R::ChunkESub => quote! { #b::ChunkESub },
+        R::ChunkExp => quote! { #b::ChunkExp },
         R::NewKt => quote! { #b::NewKt },
         R::Sc => quote! { #b::Sc },
         R::BMax => quote! { #b::BMax },
@@ -10162,6 +10165,20 @@ fn dump_wavefront_mega(
                     // layers (per_layer weight/KV/hidden ivar threading).
                     use scratchy_subtile::subtile_ir::ValidatedGraph;
                     use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
+                    // ⭐⭐⭐⭐⭐ THE ONE-REQUEST RUNG ATTENDS ITS WHOLE CONTEXT IN ONE PASS — a split-KV
+                    // chunk (`ChunkScratch`), the reference's decode structure, instead of the
+                    // per-page fold that relaunched once per resident page at ~108 ops a page. The
+                    // ceiling body is the WIDEST chunk; the ladder below bakes the narrower ones.
+                    // Asked of the graph's own geometry (`admitted_chunk`): a model the chunk cannot
+                    // express (hd above one slab) keeps its per-page fold AND its sweep ladder.
+                    let chunk_ceiling: Option<u32> = if one_request {
+                        scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk(
+                            &krg,
+                            Some(ktir_superdsc::sdsc_abstract::ChunkScratch::PAGES_MAX),
+                        )
+                    } else {
+                        None
+                    };
                     match ValidatedGraph::new(&krg) {
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
@@ -10177,6 +10194,7 @@ fn dump_wavefront_mega(
                                 // a single row.
                                 !is_prefill && decode_rows > 1,
                                 one_request,
+                                chunk_ceiling,
                             ) {
                                 Ok(rolled) => {
                                     eprintln!(
@@ -10342,96 +10360,170 @@ fn dump_wavefront_mega(
                                             let mut decode_rungs: Vec<
                                                 superdsc::bundle::LadderRung<'static>,
                                             > = vec![superdsc::bundle::LadderRung {
-                                                active_cap: superdsc::bundle::SweptCols::new(cap),
+                                                // A chunk body sweeps its whole chunk, so its rung
+                                                // is the chunk's slots — what `select_body` compares
+                                                // the live context against.
+                                                active_cap: superdsc::bundle::SweptCols::new(
+                                                    chunk_ceiling.map_or(cap, |pages| {
+                                                        pages
+                                                            * ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS
+                                                                as u32
+                                                    }),
+                                                ),
                                                 body: sib(Some(bfp.clone())),
                                                 body_fused: sib(bod_fused.clone()),
                                             }];
+                                            // The per-page sweep rungs below one page — every decode
+                                            // bake's ladder.
+                                            let sweep = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap)
+                                                .into_iter()
+                                                .map(|r| (r, None, r.get()));
+                                            // ⭐ PAST ONE PAGE, THE ONE-REQUEST LADDER IS CHUNK WIDTHS:
+                                            // every chunk rung lowers the program at its one-page sweep
+                                            // (`FULL`) and differs only in the chunk it attends, so its
+                                            // swept extent is `pages * PAGE_SLOTS`. Within one page it
+                                            // keeps the sweep rungs AND the per-page body at the page
+                                            // itself (`FULL`, no chunk, `cap` slots) — the canonical
+                                            // short chat's bodies, byte for byte (`ChunkScratch::LADDER`
+                                            // says why the chunk starts at two pages).
+                                            let ladder: Vec<(
+                                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+                                                Option<u32>,
+                                                u32,
+                                            )> = if chunk_ceiling.is_some() {
+                                                sweep
+                                                    .chain(std::iter::once((
+                                                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                                        None,
+                                                        cap,
+                                                    )))
+                                                    .chain(
+                                                        ktir_superdsc::sdsc_abstract::ChunkScratch::LADDER
+                                                            .iter()
+                                                            .copied()
+                                                            .filter(|&pages| Some(pages) != chunk_ceiling)
+                                                            .map(|pages| {
+                                                                (
+                                                                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                                                    Some(pages),
+                                                                    pages
+                                                                        * ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS
+                                                                            as u32,
+                                                                )
+                                                            }),
+                                                    )
+                                                    .collect()
+                                            } else {
+                                                sweep.collect()
+                                            };
                                             if !is_prefill {
-                                                for rung in scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap) {
-                                                match superdsc::lower_subtile_tape_to_superdsc(
-                                                    &tape_rolled,
-                                                    &krg,
-                                                    &weight_ids,
-                                                    rung,
-                                                    !is_prefill && decode_rows > 1,
-                                                    one_request,
-                                                ) {
-                                                    // Same device split as the ceiling rung above: the
-                                                    // card bakes the ROLLED body, the emulator the
-                                                    // unrolled one. Without this each of the three
-                                                    // interior rungs pays the same 40x.
-                                                    Ok(rr) => {
-                                                        let rung_unrolled = if card {
-                                                            Vec::new()
-                                                        } else {
-                                                            superdsc::unroll_layers(&rr)
-                                                        };
-                                                        // ⛔ THE UNROLLED TWIN CANNOT STATE THE
-                                                        // HANDOFF — same law as the ceiling rung's
-                                                        // `bod` above, stated at this rung's own
-                                                        // params.
-                                                        let rung_params = rr.attn_params.map(
-                                                            |mut p| {
-                                                                p.headmajor_handoff = false;
-                                                                p
-                                                            },
-                                                        );
-                                                        match superdsc::emit_bundle(
-                                                        if card { &rr.body } else { &rung_unrolled },
-                                                        Some(&rr.layout),
-                                                        superdsc::FoldGrouping::Split,
-                                                        // THIS rung's own params — `rr` was lowered at
-                                                        // `rung`, so its swept extent is `rung`'s and
-                                                        // not the ceiling bundle's.
-                                                        if card { rr.attn_params } else { rung_params },
+                                                for (rung, rung_chunk, rung_swept) in ladder {
+                                                    match superdsc::lower_subtile_tape_to_superdsc(
+                                                        &tape_rolled,
+                                                        &krg,
+                                                        &weight_ids,
+                                                        rung,
+                                                        !is_prefill && decode_rows > 1,
+                                                        one_request,
+                                                        rung_chunk,
                                                     ) {
-                                                        Ok(rfp) => {
-                                                            // Each rung also gets a fold-fused
-                                                            // variant: the rung bounds the sweep,
-                                                            // this bounds the launch count, and a
-                                                            // short context needs BOTH.
-                                                            // ⭐ ON THE CARD, for the ceiling twin's
-                                                            // reason above — and here it also keeps
-                                                            // the twin's NAME lawful. `bundle_fp`
-                                                            // says a twin is `<split fp>f`, so it
-                                                            // must hash the ops the split hashed;
-                                                            // off-card the split is
-                                                            // `&rung_unrolled` while this is
-                                                            // `&rr.body`, so the "twin" was named
-                                                            // after a bundle nothing else emitted.
-                                                            let rfused = if card {
-                                                                superdsc::emit_bundle(
+                                                        // Same device split as the ceiling rung above: the
+                                                        // card bakes the ROLLED body, the emulator the
+                                                        // unrolled one. Without this each of the three
+                                                        // interior rungs pays the same 40x.
+                                                        Ok(rr) => {
+                                                            // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung
+                                                            // reading a staged input from elsewhere is a
+                                                            // build failure, never a wrong constant.
+                                                            if let Err(e) =
+                                                                superdsc::ladder_stages_one_layout(
+                                                                    &rolled.layout,
+                                                                    &rr.layout,
+                                                                )
+                                                            {
+                                                                panic!(
+                                                                    "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?}: {e}",
+                                                                    rung.get()
+                                                                );
+                                                            }
+                                                            let rung_unrolled = if card {
+                                                                Vec::new()
+                                                            } else {
+                                                                superdsc::unroll_layers(&rr)
+                                                            };
+                                                            // ⛔ THE UNROLLED TWIN CANNOT STATE THE
+                                                            // HANDOFF — same law as the ceiling rung's
+                                                            // `bod` above, stated at this rung's own
+                                                            // params.
+                                                            let rung_params =
+                                                                rr.attn_params.map(|mut p| {
+                                                                    p.headmajor_handoff = false;
+                                                                    p
+                                                                });
+                                                            match superdsc::emit_bundle(
+                                                                if card {
+                                                                    &rr.body
+                                                                } else {
+                                                                    &rung_unrolled
+                                                                },
+                                                                Some(&rr.layout),
+                                                                superdsc::FoldGrouping::Split,
+                                                                // THIS rung's own params — `rr` was lowered at
+                                                                // `rung`, so its swept extent is `rung`'s and
+                                                                // not the ceiling bundle's.
+                                                                if card {
+                                                                    rr.attn_params
+                                                                } else {
+                                                                    rung_params
+                                                                },
+                                                            ) {
+                                                                Ok(rfp) => {
+                                                                    // Each rung also gets a fold-fused
+                                                                    // variant: the rung bounds the sweep,
+                                                                    // this bounds the launch count, and a
+                                                                    // short context needs BOTH.
+                                                                    // ⭐ ON THE CARD, for the ceiling twin's
+                                                                    // reason above — and here it also keeps
+                                                                    // the twin's NAME lawful. `bundle_fp`
+                                                                    // says a twin is `<split fp>f`, so it
+                                                                    // must hash the ops the split hashed;
+                                                                    // off-card the split is
+                                                                    // `&rung_unrolled` while this is
+                                                                    // `&rr.body`, so the "twin" was named
+                                                                    // after a bundle nothing else emitted.
+                                                                    let rfused = if card {
+                                                                        superdsc::emit_bundle(
                                                                     &rr.body,
                                                                     Some(&rr.layout),
                                                                     superdsc::FoldGrouping::Fused,
                                                                     rr.attn_params,
                                                                 )
                                                                 .ok()
-                                                            } else {
-                                                                None
-                                                            };
-                                                            eprintln!(
-                                                                "[spyre-superdsc] {base}: ladder rung active_cap={} → body {rfp}",
-                                                                rung.get()
-                                                            );
-                                                            decode_rungs.push(superdsc::bundle::LadderRung {
-                                                                active_cap: superdsc::bundle::SweptCols::new(rung.get()),
+                                                                    } else {
+                                                                        None
+                                                                    };
+                                                                    eprintln!(
+                                                                        "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?} → body {rfp}",
+                                                                        rung.get()
+                                                                    );
+                                                                    decode_rungs.push(superdsc::bundle::LadderRung {
+                                                                active_cap: superdsc::bundle::SweptCols::new(rung_swept),
                                                                 body: sib(Some(rfp)),
                                                                 body_fused: sib(rfused),
                                                             });
+                                                                }
+                                                                Err(e) => eprintln!(
+                                                                    "[spyre-superdsc] {base}: ladder rung {} body emit failed: {e}",
+                                                                    rung.get()
+                                                                ),
+                                                            }
                                                         }
                                                         Err(e) => eprintln!(
-                                                            "[spyre-superdsc] {base}: ladder rung {} body emit failed: {e}",
+                                                            "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
                                                             rung.get()
                                                         ),
                                                     }
-                                                    },
-                                                    Err(e) => eprintln!(
-                                                        "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
-                                                        rung.get()
-                                                    ),
                                                 }
-                                            }
                                             }
                                             decode_rungs.sort_by_key(|r| r.active_cap);
                                             // ⭐ THE LAYER LOOP, ATTACHED TO THE BODY IT DESCRIBES.
