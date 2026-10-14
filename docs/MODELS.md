@@ -253,9 +253,13 @@ scr serve mlx-community/gemma-4-26b-a4b-it-4bit   # drafter: guardiangate1775/ge
 
 The head drafts each sequence of a step as many tokens as keep the step's
 verify rows — each sequence's token and its drafts — within
-`spec_verify_rows` (its `arch.json`, 8: the verify-sized bucket), at most
-`spec_drafts` (2): two drafts at 1-2 sequences, one at 3-4, none past 4,
-where a step runs as its target alone, at the target's cost. The budget
+`spec_verify_rows` (its `arch.json`, 3: the verify-sized bucket), at most
+`spec_drafts` (1): one draft at one sequence, none past it, where a step
+runs as its target alone, at the target's cost. One draft because the
+first's prose acceptance is a coin flip (0.42-0.69 across the M5 Max chat
+battery's rungs), so the second draft's head forward and verify row cost
+more than they return: drafting two lost 1-13% tokens/s on every chat
+cell, its only win single-request patterned serve. The budget
 exists because on a MoE target a verify step's rows read more distinct
 experts: on the base M5, Qwen3.6-35B-A3B's verify step costs 1.6 plain
 steps at 1 sequence and 2.65 at 8, against about 2.3 tokens a verify step;
