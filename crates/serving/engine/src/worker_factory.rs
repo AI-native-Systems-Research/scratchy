@@ -104,8 +104,9 @@ pub struct WorkerCreateConfig {
 pub enum VerifySeqs {
     /// None: the run drafts nothing.
     Off,
-    /// At most this many a step: a multi-token-prediction head's gate (`spec_max_seqs`).
-    Gated(u8),
+    /// As many a step as a multi-token-prediction head's budget drafts for
+    /// ([`crate::spec_decode::DraftBudget::max_seqs`]).
+    Head(crate::spec_decode::DraftBudget),
     /// Every sequence a step runs: an n-gram or standalone draft model drafts for each.
     Every,
 }

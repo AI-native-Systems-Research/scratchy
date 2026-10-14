@@ -227,19 +227,20 @@ quant/mlx-affine-b4-g64-qembed
 scr serve scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp   # head inside the checkpoint
 ```
 
-The head drafts only for a step of at most `spec_max_seqs` sequences (its
-`arch.json`, 1); a larger step runs as its target alone, at the target's
-cost. The gate exists because a verify step carries `spec_drafts + 1` rows
-a sequence, and on a MoE target those rows read more distinct experts: on
-the base M5, Qwen3.6-35B-A3B's verify step costs 1.6 plain steps at 1
-sequence and 2.65 at 8, against about 2.3 tokens a verify step. One
-sequence is the point measured to pay on both GPUs measured (base M5, M5
-Max); the base M5 also paid at up to 4.
+The head drafts each sequence of a step as many tokens as keep the step's
+verify rows — each sequence's token and its drafts — within
+`spec_verify_rows` (its `arch.json`, 8: the verify-sized bucket), at most
+`spec_drafts` (2): two drafts at 1-2 sequences, one at 3-4, none past 4,
+where a step runs as its target alone, at the target's cost. The budget
+exists because on a MoE target a verify step's rows read more distinct
+experts: on the base M5, Qwen3.6-35B-A3B's verify step costs 1.6 plain
+steps at 1 sequence and 2.65 at 8, against about 2.3 tokens a verify step;
+and past 8 rows a verify step runs the 64-row prefill-shaped tape.
 
 Open work (each item, with its measurements, in the module docs of
 `crates/serving/engine/src/spec_decode/mtp.rs`):
 
-- **A gate per device and target**, derived at expansion from the verify
+- **A budget per device and target**, derived at expansion from the verify
   and plain tapes' costs on each declared device profile, in place of one
   count for every GPU and every target of the head arch. Blocked on a metal
   tape cost model.
@@ -248,9 +249,9 @@ Open work (each item, with its measurements, in the module docs of
   the rest of its life — at a gate of 1, once a second request arrives,
   neither drafts again. A prefix-cache hit on such blocks reuses head KV
   that was never written (fewer drafts accepted, output unaffected).
-- **Verify cost past one sequence**: the experts its rows pick, and, past 2
-  sequences, the 64-row prefill-shaped tape (verify-sized rungs should
-  derive from the gate).
+- **Verify cost past one sequence**: the experts its rows pick, and, past 8
+  rows, the 64-row prefill-shaped tape (verify-sized rungs should derive
+  from the budget).
 - **The scan's replay at prefill**: a build with a head runs its
   Gated-DeltaNet scan 24% slower per prompt token, the price of a bit-exact
   replay in one loop body; without a head it compiles out.

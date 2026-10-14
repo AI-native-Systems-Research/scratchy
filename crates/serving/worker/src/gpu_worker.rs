@@ -44,7 +44,7 @@ use scratchy_core_model::weight::HfModelConfig;
 #[cfg(feature = "metal")]
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 #[cfg(feature = "metal")]
-use scratchy_serving_engine::spec_decode::Drafting;
+use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
 #[cfg(feature = "metal")]
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 #[cfg(feature = "metal")]
@@ -635,25 +635,34 @@ impl StepSlotMapping {
 const METAL_KV_ELEM_BYTES: usize = 2;
 
 /// A decode step's most rows, as the metal device carries it: a row for each of `max_num_seqs`
-/// sequences, plus the drafts of the ones that draft — at most `arch`'s compiled head's
-/// `max_seqs`, beside sequences that run plain in the same step. The rows the TurboQuant decode
-/// split's partials and the sampler hold.
+/// sequences, plus the drafts of the ones that draft — the most `arch`'s compiled head's budget
+/// drafts a step ([`DraftBudget::draft_rows`]), beside sequences that run plain in the same step.
+/// The rows the TurboQuant decode split's partials and the sampler hold.
 #[cfg(feature = "metal")]
 fn decode_rows(arch: &str, max_num_seqs: usize) -> scratchy_target_metal::tape::ids::DecodeRows {
     let rows = match scratchy_forward_compiler::head_of(arch) {
-        Some(head) => {
-            max_num_seqs + max_num_seqs.min(usize::from(head.max_seqs)) * usize::from(head.drafts)
-        }
+        Some(head) => max_num_seqs + draft_budget(&head).draft_rows(max_num_seqs),
         None => max_num_seqs,
     };
     scratchy_target_metal::tape::ids::DecodeRows(u32::try_from(rows).unwrap_or(u32::MAX))
 }
 
+/// The drafts a compiled head makes a step's sequences ([`DraftBudget`]): its registration's
+/// counts.
+#[cfg(feature = "metal")]
+fn draft_budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudget {
+    DraftBudget {
+        drafts: usize::from(head.drafts),
+        verify_rows: usize::from(head.verify_rows),
+    }
+}
+
 /// The draft lanes of a hybrid target's Gated-DeltaNet pool (`gdn_state`'s module docs), no more
-/// than `max_num_seqs`: twice a head's gate — a step's drafting sequences hold one each, and as
-/// many again may wait, skipped by the scheduler, to replay theirs; the head drafts nothing for a
-/// sequence that finds every lane held — or one a sequence when an n-gram or draft model drafts
-/// for each. `None` when the run drafts nothing (or the target's kernels keep no draft state).
+/// than `max_num_seqs`: twice the sequences a head's budget drafts for — a step's drafting
+/// sequences hold one each, and as many again may wait, skipped by the scheduler, to replay
+/// theirs; the head drafts nothing for a sequence that finds every lane held — or one a sequence
+/// when an n-gram or draft model drafts for each. `None` when the run drafts nothing (or the
+/// target's kernels keep no draft state).
 #[cfg(feature = "metal")]
 fn gdn_draft_lanes(
     verify_seqs: VerifySeqs,
@@ -663,7 +672,7 @@ fn gdn_draft_lanes(
     use scratchy_target_metal::gdn_state::DraftLanes;
     let count = match verify_seqs {
         VerifySeqs::Off => return None,
-        VerifySeqs::Gated(gate) => max_num_seqs.min(2 * usize::from(gate)),
+        VerifySeqs::Head(budget) => max_num_seqs.min(2 * budget.max_seqs()),
         VerifySeqs::Every => max_num_seqs,
     };
     let count = u16::try_from(count.min(usize::from(DraftLanes::MAX))).expect("≤ MAX fits a u16");
@@ -1176,9 +1185,10 @@ impl MetalWorker {
                     u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
                 );
                 // The arena's rows beyond one a sequence are the drafts of the sequences that
-                // draft, at most the compiled head's `max_seqs` whatever the width: fixed bytes.
+                // draft, the most the compiled head's budget drafts a step whatever the width:
+                // fixed bytes.
                 let draft_rows = scratchy_forward_compiler::head_of(arch)
-                    .map_or(0, |h| usize::from(h.max_seqs) * usize::from(h.drafts));
+                    .map_or(0, |h| draft_budget(&h).draft_rows(usize::MAX));
                 let facts = MaxNumSeqsFacts {
                     // Metal reports no device facts — the base constant, the
                     // SAME default as before the resolver existed.
@@ -1664,8 +1674,7 @@ impl MetalWorker {
         // from the target store's refs (same mmap → no second upload).
         if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
             self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
-                drafts: usize::from(head.drafts),
-                max_seqs: usize::from(head.max_seqs),
+                budget: draft_budget(&head),
                 max_model_len: self.max_model_len(),
                 reads_target_kv: head.reads_target_kv,
             });
@@ -3712,8 +3721,10 @@ fn retained(
 struct ChainLayout {
     /// Drafting sequences.
     n: usize,
-    /// Drafts each.
+    /// The head's most drafts each: a sequence's room in the next-pass tables and the drafts.
     k: usize,
+    /// Head passes: the drafts each gets.
+    passes: usize,
     hidden_bytes: usize,
     /// An MRoPE head's rotary cos/sin row (0: its rope reads positions).
     rope_bytes: usize,
@@ -3758,9 +3769,9 @@ impl ChainLayout {
         let token_rows = drafting.map_or(&[][..], |d| &d.one.token_rows);
         let rows = token_rows.iter().map(|&(row, _)| row);
         let window = rows.clone().min().unwrap_or(0)..rows.max().map_or(0, |r| r + 1);
-        let (n, drafted, k) = match drafting.map(|d| &d.chain) {
-            Some(c) => (c.num_seqs(), c.drafted.len(), c.next.len()),
-            None => (0, 0, 0),
+        let (n, drafted, k, passes) = match drafting.map(|d| &d.chain) {
+            Some(c) => (c.num_seqs(), c.drafted.len(), c.drafts(), c.passes()),
+            None => (0, 0, 0, 0),
         };
         let hidden_bytes = hidden * 2;
         let (rows, seqs) =
@@ -3769,8 +3780,8 @@ impl ChainLayout {
         let sizes = [
             u32s(3 * n),
             u32s(drafted),
-            u32s(k * n * (k + 1) * 3),
-            u32s(2 * k + 1),
+            u32s(passes * n * (k + 1) * 3),
+            u32s(2 * passes + 1),
             u32s((window.len()).max(n)),
             u32s(n),
             u32s(n),
@@ -3779,7 +3790,7 @@ impl ChainLayout {
             u32s(n),
             n * hidden_bytes,
             u32s(n * k),
-            k * n * (k + 1) * rope_bytes,
+            passes * n * (k + 1) * rope_bytes,
             n * rope_bytes,
             u32s(rows),
             u32s(rows),
@@ -3795,6 +3806,7 @@ impl ChainLayout {
         Self {
             n,
             k,
+            passes,
             hidden_bytes,
             rope_bytes,
             window,
@@ -3838,9 +3850,9 @@ impl ChainLayout {
                 put_bytes(self.at[Self::ROPE] + d * table, &rows);
             }
         }
-        let batches =
-            std::iter::once(self.window.len() as u32).chain((1..self.k).map(|_| self.n as u32));
-        let depths = 1..=self.k as u32;
+        let batches = std::iter::once(self.window.len() as u32)
+            .chain((1..self.passes).map(|_| self.n as u32));
+        let depths = 1..=self.passes as u32;
         let consts: Vec<u32> = batches.chain(depths).chain([self.window.start]).collect();
         put(Self::CONSTS, &consts);
     }
@@ -3964,7 +3976,7 @@ impl<'a> HeadPassesEncoder<'a> {
                 Into::TargetHidden,
             ),
         ];
-        for depth in 1..=layout.k {
+        for depth in 1..=layout.passes {
             if depth > 1 {
                 let ctx = head_ctx(self.kv_cache, &creq, &inputs, false, Reads::Outputs);
                 // SAFETY: as pass 1's.
@@ -4009,8 +4021,8 @@ impl<'a> HeadPassesEncoder<'a> {
                 at(ChainLayout::USED),
                 at(ChainLayout::HIDDEN),
                 at(ChainLayout::DRAFTS),
-                consts(layout.k + depth - 1),
-                consts(2 * layout.k),
+                consts(layout.passes + depth - 1),
+                consts(2 * layout.passes),
                 rope,
                 at(ChainLayout::NEXT_ROPE),
             ];

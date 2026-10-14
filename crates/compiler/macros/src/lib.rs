@@ -1862,7 +1862,7 @@ pub fn compile_carrier(
             repo_infix: Option<String>,
             /// Where its tensors sit inside its target's checkpoint when it ships there.
             checkpoint_prefix: Option<String>,
-            /// Its `spec_drafts` and `spec_max_seqs`.
+            /// Its `spec_drafts` and `spec_verify_rows`.
             spec: [u64; 2],
             reads_target_kv: bool,
         }
@@ -1881,7 +1881,7 @@ pub fn compile_carrier(
                     drafts_for: sm.model.drafts_for.clone(),
                     repo_infix: sm.model.drafter_repo_infix.clone(),
                     checkpoint_prefix: sm.model.checkpoint_prefix.clone(),
-                    spec: ["spec_drafts", "spec_max_seqs"]
+                    spec: ["spec_drafts", "spec_verify_rows"]
                         .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0)),
                     reads_target_kv: sm.model.arch.reads_target_kv,
                 };
@@ -1968,8 +1968,16 @@ pub fn compile_carrier(
                     let (lm_head, repo_infix, checkpoint_prefix) =
                         (some(lm_head), some(repo_infix), some(checkpoint_prefix));
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
-                    let [drafts, max_seqs] =
+                    let [drafts, verify_rows] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
+                    // An absent fact reads 0, and a head that fits no draft in a verify step
+                    // would compile and never draft.
+                    assert!(
+                        drafts >= 1 && verify_rows >= 2,
+                        "{arch_ident}: a head declares `spec_drafts` (at least 1) and \
+                         `spec_verify_rows` (at least 2: a sequence's token and one draft) in its \
+                         arch.json's bound_defaults (it has {drafts} and {verify_rows})"
+                    );
                     quote! {
                         ::core::option::Option::Some(::scratchy_forward_compiler::HeadRegistration {
                             arch: #arch,
@@ -1981,7 +1989,7 @@ pub fn compile_carrier(
                             repo_infix: #repo_infix,
                             checkpoint_prefix: #checkpoint_prefix,
                             drafts: #drafts,
-                            max_seqs: #max_seqs,
+                            verify_rows: #verify_rows,
                         })
                     }
                 }
