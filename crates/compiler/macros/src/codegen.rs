@@ -10517,7 +10517,16 @@ fn dump_wavefront_mega(
                                                                     // `&rung_unrolled` while this is
                                                                     // `&rr.body`, so the "twin" was named
                                                                     // after a bundle nothing else emitted.
-                                                                    let rfused = if card {
+                                                                    // ⛔ NOT FOR A CHUNK RUNG: a chunk body
+                                                                    // has no fold group, so its "fused" twin
+                                                                    // is the same program under a second
+                                                                    // name — a whole extra bake per rung —
+                                                                    // and the selector reaches a fused twin
+                                                                    // only within one page, where no chunk
+                                                                    // rung is ever chosen.
+                                                                    let rfused = if card
+                                                                        && rung_chunk.is_none()
+                                                                    {
                                                                         superdsc::emit_bundle(
                                                                     &rr.body,
                                                                     Some(&rr.layout),
