@@ -1087,12 +1087,34 @@ const PARITY_PROMPTS_GLM_4_5_AIR_3BIT: &[(&str, &str, usize)] = &[
     ),
 ];
 
+/// Qwen3.6-35B-A3B swaps capital and arith for two prompts with measured
+/// headroom. Its template prefills the open think tag (`simd\n`), so the
+/// 12-token budgets of the default set die inside the thinking preamble
+/// before any deterministic answer exists — and the first preamble token is
+/// a near-tie ('Here' 25.75 vs 'Thinking' 25.25 on capital, a 0.5-logit gap
+/// that mlx-lm 0.32.0 and scratchy land on opposite sides of; both prompts
+/// also pass the load path — `count` agrees on all 40 tokens). `week` holds
+/// a 2.125 top-2 margin and `colors` a 2.75, and both agree with mlx-lm
+/// exactly on all 40 tokens. The same measurement rule as GLM-4.5-Air-3bit
+/// applies: per-step top-2 gaps along the greedy path, both sides.
+const PARITY_PROMPTS_QWEN3_6_35B_A3B: &[(&str, &str, usize)] = &[
+    (
+        "week",
+        "How many days are in a week? Answer with just the number.",
+        40,
+    ),
+    ("colors", "List the primary colors.", 40),
+    ("count", "Count from 1 to 10.", 40),
+];
+
 /// The gate's prompts for a model, by the `--model` id it was resolved from.
 /// Models that cannot honestly pass the default set get their own, chosen by
 /// measurement — never by loosening the comparison, which stays exact-match.
 fn parity_prompts(model: &str) -> &'static [(&'static str, &'static str, usize)] {
     if model.contains("GLM-4.5-Air-3bit") {
         PARITY_PROMPTS_GLM_4_5_AIR_3BIT
+    } else if model.contains("Qwen3.6-35B-A3B") {
+        PARITY_PROMPTS_QWEN3_6_35B_A3B
     } else {
         PARITY_PROMPTS
     }
@@ -1671,8 +1693,9 @@ mod tests {
         assert!(!msg.contains("load path"), "reported as a mismatch: {msg}");
     }
 
-    /// The gate asks GLM-4.5-Air-3bit a question its default KV codec cannot
-    /// flip, and every other model keeps the stronger 40-token count check.
+    /// The gate asks GLM-4.5-Air-3bit and Qwen3.6-35B-A3B questions their
+    /// near-tied thought preambles cannot flip, and every other model keeps
+    /// the stronger default set.
     #[test]
     fn glm_3bit_gates_on_sky_not_count() {
         let names = |p: &'static [(&'static str, &'static str, usize)]| -> Vec<&'static str> {
@@ -1680,9 +1703,13 @@ mod tests {
         };
         let glm = parity_prompts("mlx-community/GLM-4.5-Air-3bit");
         assert_eq!(names(glm), vec!["capital", "arith", "sky"]);
+        assert_eq!(
+            names(parity_prompts("mlx-community/Qwen3.6-35B-A3B-4bit")),
+            vec!["week", "colors", "count"]
+        );
         for other in [
-            "mlx-community/Qwen3.6-35B-A3B-4bit",
             "mlx-community/gemma-4-26b-a4b-it",
+            "mlx-community/qwen3.6-27b-4bit",
         ] {
             assert_eq!(
                 names(parity_prompts(other)),
