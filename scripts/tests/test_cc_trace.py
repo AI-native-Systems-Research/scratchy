@@ -8,6 +8,7 @@
 
 import http.client
 import http.server
+import importlib.util
 import json
 import sys
 import tempfile
@@ -316,6 +317,325 @@ class RecordTest(unittest.TestCase):
             self.assertEqual(resp.status, 502)
             [row] = [json.loads(x) for x in (Path(d) / "c" / "index.jsonl").read_text().splitlines()]
             self.assertTrue(row["error"].startswith("upstream:"))
+
+
+REPO = Path(__file__).resolve().parents[2]
+VALIDATOR = REPO / "site" / "build_leaderboard.py"
+BOARD = REPO / "site" / "data" / "leaderboard" / "board.json"
+TTFT_GAP = 0.25
+
+
+def _ev(kind, **fields):
+    data = json.dumps({"type": kind, **fields}).encode()
+    return b"event: %s\ndata: %s\n\n" % (kind.encode(), data)
+
+
+def _stream(output_tokens=3, input_tokens=100, cache_read=0):
+    """(delay before, event) pairs for one Anthropic SSE reply."""
+    usage = {"input_tokens": input_tokens, "cache_read_input_tokens": cache_read}
+    return [
+        (0, _ev("message_start", message={"usage": {**usage, "output_tokens": 1}})),
+        (0, _ev("content_block_start", index=0, content_block={"type": "text", "text": ""})),
+        (0, _ev("ping")),
+        # Framing with no content in it: not a first token.
+        (TTFT_GAP, _ev("content_block_delta", index=0, delta={"type": "text_delta", "text": ""})),
+        (TTFT_GAP, _ev("content_block_delta", index=0, delta={"type": "text_delta", "text": "Hi"})),
+        (0.05, _ev("content_block_delta", index=0, delta={"type": "text_delta", "text": " more"})),
+        (0, _ev("content_block_stop", index=0)),
+        (0, _ev("message_delta", delta={"stop_reason": "end_turn"},
+                usage={**usage, "output_tokens": output_tokens})),
+        (0, _ev("message_stop")),
+    ]
+
+
+class FakeAnthropic(http.server.BaseHTTPRequestHandler):
+    """A scratchy-shaped /v1/messages engine that counts requests like scratchy does.
+
+    Class attributes steer it: `reply(body)` returns the stream (or an HTTP
+    status to fail with), and `counting = False` leaves /v1/messages out of
+    `requests_served` — what a replay that reached some other server looks like
+    from here.
+    """
+
+    protocol_version = "HTTP/1.1"
+    served = 0
+    counting = True
+    seen = []
+    reply = staticmethod(lambda body: _stream())
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path != "/server_info":
+            FakeAnthropic.served += 1
+        if self.path == "/server_info":
+            self._send(200, {"requests_served": FakeAnthropic.served,
+                             "system_env": {"vllm_version": "0.1.0"}})
+        elif self.path == "/v1/models":
+            self._send(200, {"data": [{"id": "gemma", "max_model_len": 32768}]})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+        if FakeAnthropic.counting or not self.path.startswith("/v1/messages"):
+            FakeAnthropic.served += 1
+        if self.path == "/reset_prefix_cache":
+            self._send(200, {})
+            return
+        FakeAnthropic.seen.append((self.path, self.headers.items(), body))
+        reply = FakeAnthropic.reply(body)
+        if isinstance(reply, int):
+            self._send(reply, {"type": "error", "error": {"message": "prompt is too long"}})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for delay, ev in reply:
+            time.sleep(delay)
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(ev), ev))
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+
+
+def _user(text):
+    return {"role": "user", "content": [{"type": "text", "text": text}]}
+
+
+def _assistant(*blocks):
+    return {"role": "assistant", "content": list(blocks)}
+
+
+def _tool(name, tid):
+    return {"type": "tool_use", "id": tid, "name": name, "input": {}}
+
+
+def _result(tid):
+    return {"role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tid, "content": "ok"}]}
+
+
+def _cached(messages):
+    """`messages` with a cache_control breakpoint on the last block, as Claude Code sends."""
+    out = json.loads(json.dumps(messages))
+    out[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+    return out
+
+
+def conversation():
+    """Request bodies for a 4-turn session with an unrelated side request second.
+
+    After turn 1 the assistant called Bash, after turn 2 Write, after turn 3 it
+    answered in short text; nothing records what turn 4 produced.
+    """
+    m1 = [_user("fix the bug")]
+    m2 = m1 + [_assistant(_tool("Bash", "t1")), _result("t1")]
+    m3 = m2 + [_assistant({"type": "text", "text": "writing"}, _tool("Write", "t2")), _result("t2")]
+    m4 = m3 + [_assistant({"type": "text", "text": "done"}), _user("thanks")]
+    side = [_user("summarize this conversation in 5 words")]
+    return [{"model": "gemma", "max_tokens": 32000, "temperature": 1, "stream": True,
+             "tools": [{"name": "Bash"}], "messages": _cached(m)} for m in (m1, side, m2, m3, m4)]
+
+
+def write_corpus(root, recorded_output_tokens=5):
+    """A corpus as `record` lays it out, with a GET and a count_tokens call mixed in."""
+    root = Path(root)
+    (root / "requests").mkdir(parents=True)
+    (root / "responses").mkdir()
+    (root / "manifest.json").write_text(json.dumps(
+        {"format": 1, "agent": "claude-code", "agent_version": "2.1.295",
+         "engine": {"name": "scratchy", "version": "0.1.0"}, "engine_sha": "abc123"}))
+    bodies = conversation()
+    plan = [("POST", "/v1/messages", bodies[0]), ("GET", "/v1/models", None),
+            ("POST", "/v1/messages/count_tokens", {"messages": []})]
+    plan += [("POST", "/v1/messages", b) for b in bodies[1:]]
+    rows = []
+    for seq, (method, path, body) in enumerate(plan, 1):
+        if body is not None:
+            (root / "requests" / f"{seq:06d}.json").write_text(json.dumps(
+                {"seq": seq, "method": method, "path": path, "query": "beta=true",
+                 "headers": [["x-api-key", "<redacted>"], ["anthropic-version", "2023-06-01"],
+                             ["Accept-Encoding", "gzip"], ["Content-Type", "application/json"]],
+                 "t_start": 0.0, "body": body}))
+        if path == "/v1/messages":
+            (root / "responses" / f"{seq:06d}.body").write_bytes(
+                b"".join(ev for _, ev in _stream(output_tokens=recorded_output_tokens)))
+        rows.append({"seq": seq, "method": method, "path": path, "status": 200, "t_start": 0.0,
+                     "t_end": 0.0, "in_flight": 1 if seq == 4 else 0, "req_bytes": 0,
+                     "resp_bytes": 0, "stream": True, "error": None})
+    (root / "index.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return root
+
+
+PER_ENGINE = {
+    "kv_cache_dtype": {"scratchy": "bf16", "ollama": "f16"},
+    "quantization": {"scratchy": "mlx-affine-b4-g64", "ollama": "Q4_K_M"},
+    "checkpoint_revision": {"scratchy": "mlx-community/gemma@0000000",
+                            "ollama": "gemma@sha256:0000000"},
+}
+
+
+class ReplayTest(unittest.TestCase):
+    def setUp(self):
+        FakeAnthropic.served = 0
+        FakeAnthropic.counting = True
+        FakeAnthropic.seen = []
+        FakeAnthropic.reply = staticmethod(lambda body: _stream())
+        self.engine = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeAnthropic)
+        self.engine.daemon_threads = True
+        self.url = f"http://127.0.0.1:{_serve(self.engine)}"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.corpus = write_corpus(Path(self.tmp.name) / "corpus")
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.engine.server_close()
+        self.tmp.cleanup()
+
+    def _replay(self, **kw):
+        args = dict(engine="scratchy", model="gemma-4-12b-it", machine="m5max-64", rung="R1",
+                    repeat=1, scratchy_sha="abc123", ollama_version="0.40.0",
+                    run_id="test-laneA", log=lambda msg: None, **PER_ENGINE)
+        args.update(kw)
+        return cc_trace.replay(self.corpus, self.url, **args)
+
+    def _meas(self, run, metric, facet=None):
+        return [m for m in run["measurements"] if m["metric"] == metric and m.get("facet") == facet]
+
+    def test_replays_turns_in_seq_order_and_counts_the_rest(self):
+        run, detail = self._replay(repeat=2, reset_cache_url=self.url + "/reset_prefix_cache")
+        self.assertEqual(run["status"], "published", run.get("void"))
+        tc = run["provenance"]["trace_corpus"]
+        self.assertEqual((tc["turns"], tc["skipped"], tc["skipped_by_reason"]),
+                         (5, 2, {"not a turn": 2}))
+        self.assertEqual((tc["turns_recorded_in_flight"], tc["max_in_flight"]), (1, 1))
+        self.assertEqual([t["seq"] for t in detail["turns"]], [1, 4, 5, 6, 7] * 2)
+        # 10 turns plus 2 resets, every one counted by the engine.
+        self.assertEqual((detail["sent"], len(FakeAnthropic.seen)), (12, 10))
+        path, headers, first = FakeAnthropic.seen[0]
+        self.assertEqual(path, "/v1/messages?beta=true")
+        names = {k.lower() for k, _ in headers}
+        self.assertNotIn("x-api-key", names)
+        self.assertNotIn("accept-encoding", names)
+        self.assertIn("anthropic-version", names)
+        # Only temperature and stream change; the work is sent as recorded.
+        self.assertEqual(first, dict(conversation()[0], temperature=0.0, stream=True))
+
+    def test_ttft_is_the_first_delta_with_content(self):
+        run, detail = self._replay()
+        t = detail["turns"][0]
+        # message_start and an empty delta came earlier; neither counts.
+        self.assertGreaterEqual(t["ttft_ms"], 2 * TTFT_GAP * 1000)
+        self.assertLess(t["ttft_ms"], t["turn_e2e_ms"])
+        # Two content deltas 50 ms apart over 3 output tokens.
+        self.assertAlmostEqual(t["tpot_ms"], 25, delta=20)
+        [itl] = self._meas(run, "itl_p99_ms", {"granularity": "chunk"})
+        self.assertEqual(itl["n"], 1)
+        self.assertEqual(self._meas(run, "itl_p99_ms"), [])
+        self.assertEqual({g["metric"]: g["state"] for g in run["gaps"]},
+                         {"itl_p99_ms": "blocked", "spec_accept_rate": "not-run"})
+        # E2E* takes the recorded output length (5), not the replayed one (3).
+        self.assertAlmostEqual(self._meas(run, "e2e_star_ms")[0]["series"]["points"][0][1],
+                               t["ttft_ms"] + 4 * t["tpot_ms"], places=2)
+
+    def test_reprefill_ratio(self):
+        self.assertEqual(cc_trace.reprefill_ratio(100, 0), 1.0)
+        self.assertEqual(cc_trace.reprefill_ratio(1, 166), 1 / 167)
+        self.assertEqual(cc_trace.reprefill_ratio(10, 80, 10), 0.2)
+        self.assertIsNone(cc_trace.reprefill_ratio(0, 0))
+        FakeAnthropic.reply = staticmethod(lambda body: _stream(input_tokens=25, cache_read=75))
+        run, _ = self._replay()
+        [m] = self._meas(run, "reprefill_ratio")
+        self.assertEqual(m["stat"]["median"], 0.25)
+
+    def test_turn_class_comes_from_the_next_turn_not_the_reply(self):
+        def tool_reply(body):
+            # Whatever this engine says, the class must not follow it.
+            ev = _ev("content_block_delta", index=0,
+                     delta={"type": "input_json_delta", "partial_json": "{}"})
+            return [(0, _ev("message_start", message={"usage": {"input_tokens": 9}})),
+                    (0, ev), (0, ev),
+                    (0, _ev("message_delta", usage={"output_tokens": 2})), (0, _ev("message_stop"))]
+
+        for reply in (lambda body: _stream(), tool_reply):
+            FakeAnthropic.reply = staticmethod(reply)
+            run, detail = self._replay()
+            self.assertEqual([t["turn_class"] for t in detail["turns"]],
+                             ["tool-call", None, "file-write", None, None])
+            self.assertEqual(run["provenance"]["trace_corpus"]["turn_classes"],
+                             {"tool-call": 1, "file-write": 1})
+            self.assertEqual(len(self._meas(run, "ttft_ms", {"turn_class": "tool-call"})), 1)
+        long_text = {"role": "assistant", "content": "x" * cc_trace.LONG_TEXT_CHARS}
+        self.assertEqual(cc_trace.reply_class(long_text), "file-write")
+        self.assertIsNone(cc_trace.reply_class({"role": "assistant", "content": "short"}))
+
+    def test_counter_disagreeing_with_what_was_sent_voids_the_run(self):
+        FakeAnthropic.counting = False
+        run, detail = self._replay()
+        self.assertEqual(run["status"], "void")
+        self.assertIn("requests_served", run["void"])
+        self.assertEqual(run["measurements"], [])
+        self.assertEqual(detail["sent"], 5)
+
+    def test_zero_tokens_and_4xx_void_the_run(self):
+        cases = {
+            "zero output tokens": lambda body: [
+                (0, _ev("message_start", message={"usage": {"input_tokens": 9}})),
+                (0, _ev("message_delta", usage={"output_tokens": 0})), (0, _ev("message_stop"))],
+            "HTTP 400": lambda body: 400 if len(body["messages"]) > 3 else _stream(),
+        }
+        for want, reply in cases.items():
+            with self.subTest(want):
+                FakeAnthropic.reply = staticmethod(reply)
+                run, detail = self._replay(repeat=3)
+                self.assertEqual(run["status"], "void")
+                self.assertIn(want, run["void"])
+                self.assertEqual(run["measurements"], [])
+        # The 4xx run stopped at its first bad turn (seq 6) rather than averaging past it.
+        self.assertEqual([t["seq"] for t in detail["turns"]], [1, 4, 5])
+
+    def test_wrong_engine_and_missing_provenance_fail_before_sending(self):
+        with self.assertRaises(SystemExit):
+            self._replay(engine="ollama")
+        with self.assertRaises(SystemExit):
+            cc_trace.parse_per_engine("--quantization", "scratchy=mlx-affine-b4-g64")
+        self.assertEqual(cc_trace.parse_per_engine("--x", "scratchy=a, ollama=b@c"),
+                         {"scratchy": "a", "ollama": "b@c"})
+        self.assertEqual(FakeAnthropic.seen, [])
+
+    @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
+                         "site/build_leaderboard.py is not in this checkout (#176)")
+    def test_output_passes_the_leaderboard_validator(self):
+        sys.path.insert(0, str(VALIDATOR.parent))  # it imports its sibling charts.py
+        spec =importlib.util.spec_from_file_location("build_leaderboard", VALIDATOR)
+        lb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lb)
+
+        def problems(run):
+            board = json.loads(BOARD.read_text())
+            board["runs"] = [run]
+            lb.index(board)
+            # Coverage of the other cells is the whole board's concern, not one run's.
+            return [p for p in lb.validate(board) if p.startswith(run["run_id"])]
+
+        run, _ = self._replay(repeat=3)
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual(problems(run), [])
+        broken = json.loads(json.dumps(run))
+        del broken["provenance"]["checkpoint_revision"]
+        self.assertTrue(any("'checkpoint_revision'" in p for p in problems(broken)))
+        void = dict(run, status="void", void="test")
+        self.assertTrue(problems(void))
 
 
 class HelperTest(unittest.TestCase):
