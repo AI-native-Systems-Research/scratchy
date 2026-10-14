@@ -588,8 +588,12 @@ impl SimpleBlockTracker {
             self.num_free_blocks -= 1;
 
             // Lazy eviction: remove hash mapping if this block was cached.
-            // Matches Python's `_maybe_evict_cached_block`.
-            if let Some(hash) = self.block_id_to_hash.remove(&block_id) {
+            // Matches Python's `_maybe_evict_cached_block`. Only the mapping that points at THIS
+            // block: a later request that computed the same hash into a block of its own moved
+            // the mapping there, and evicting the older copy must not take it along.
+            if let Some(hash) = self.block_id_to_hash.remove(&block_id)
+                && self.block_hash_to_id.get(&hash) == Some(&block_id)
+            {
                 self.block_hash_to_id.remove(&hash);
             }
 
@@ -5713,5 +5717,35 @@ mod tests {
                 "r{i} must emit all its tokens"
             );
         }
+    }
+
+    #[test]
+    fn evicting_an_older_copy_of_a_block_keeps_the_newer_ones_mapping() {
+        // Two requests compute the same prefix into blocks of their own; the second's
+        // registration moves the mapping. Recycling the FIRST copy must not delete it.
+        let mut t = SimpleBlockTracker::with_caching(4, 16);
+        let b1 = t
+            .allocate_slots(&make_request("r1", 32), 32, 0, &[])
+            .unwrap()[0]
+            .clone();
+        let b2 = t
+            .allocate_slots(&make_request("r2", 32), 32, 0, &[])
+            .unwrap()[0]
+            .clone();
+        assert_ne!(b1, b2);
+        let hit =
+            |t: &SimpleBlockTracker| t.get_computed_blocks(&make_request("q", 32)).1[0].clone();
+        assert_eq!(hit(&t), b2, "the latest registration stands");
+        t.free("r1");
+        t.free("r2");
+        // r1's blocks were freed first, so they are recycled first.
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let other = Request::new("r3".into(), (900..932).collect(), params, 1.0, 0, 0, None);
+        let b3 = t.allocate_slots(&other, 32, 0, &[]).unwrap()[0].clone();
+        assert_eq!(b3, b1.iter().rev().copied().collect::<Vec<_>>());
+        assert_eq!(hit(&t), b2);
     }
 }
