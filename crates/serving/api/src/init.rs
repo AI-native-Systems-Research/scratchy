@@ -635,19 +635,31 @@ fn init_cache(
     // pool a prompt is finished unscheduled, past the kernels' reach it would
     // index past the block table. Capped, an over-long prompt is rejected as
     // too long up front.
+    //
+    // A warning, not an info line: the server now serves a shorter context than
+    // it was asked for, and a client sized to the ask (`scr launch claude`'s
+    // Claude Code) fails mid-session when it finds out.
     let pool_tokens = num_gpu_blocks * block_size;
     let effective_max_model_len = match worker.kv_max_addressable_tokens() {
         Some(reach) if reach < max_model_len.min(pool_tokens) => {
-            info!(
-                "Capping max_model_len {} → {} (paged-attention addressable limit)",
-                max_model_len, reach
+            tracing::warn!(
+                "Capping max_model_len {} → {} (paged-attention addressable limit): \
+                 a prompt longer than {} tokens will be rejected",
+                max_model_len,
+                reach,
+                reach
             );
             reach
         }
         _ if pool_tokens < max_model_len => {
-            info!(
-                "Capping max_model_len {} → {} (KV cache: {} blocks × {} tokens)",
-                max_model_len, pool_tokens, num_gpu_blocks, block_size
+            tracing::warn!(
+                "Capping max_model_len {} → {} (KV cache: {} blocks × {} tokens): \
+                 a prompt longer than {} tokens will be rejected",
+                max_model_len,
+                pool_tokens,
+                num_gpu_blocks,
+                block_size,
+                pool_tokens
             );
             pool_tokens
         }

@@ -76,7 +76,7 @@ file carries only what is specific to a run.
 ### Exact commands
 
 **scratchy — identical on both rungs**, because a rung changes only what ollama
-loads. `serve_argv` (`crates/cli/scr/src/commands/launch.rs:226-295`) is what
+loads. `serve_argv` (`crates/cli/scr/src/commands/launch.rs:549-618`) is what
 turns these into the spawned server's argv, so what is written here is what the
 server gets:
 
@@ -240,11 +240,30 @@ still appear on every published row:
    | `gemma-4-26b-a4b-it` | 30 | 5 full-attention, 25 windowed |
    | `qwen3.6-35b-a3b` | 40 | 10 full-attention; the other 30 hold recurrent conv/ssm state, not KV |
 
-2. **Context length.** `scr launch claude` emits `--max-model-len 65536`
-   (`crates/cli/scr/src/commands/launch.rs:215`), well under these checkpoints'
-   262144 ceiling. The matched-context rule requires ollama's
-   `OLLAMA_CONTEXT_LENGTH` set to the same value and **no truncation on either
+2. **Context length.** `scr launch claude` asks for `--max-model-len 65536`
+   (`crates/cli/scr/src/commands/launch.rs:538`), well under these checkpoints'
+   262144. What a run gets is **the `max_model_len` scratchy's `/v1/models`
+   reports**, which launch prints on its `Launching …` line. On metal the
+   server lowers the ask to what that machine's KV cache holds, with a
+   `Capping max_model_len` warning in its log, so the number depends on the
+   machine as well as the model. That printed number is the context length a
+   row discloses and the one the matched-context rule matches. The rule needs
+   ollama's `OLLAMA_CONTEXT_LENGTH` set to it, and **no truncation on either
    side, proven** by per-turn token accounting — T0.4 for the ollama number.
+
+   Claude Code's own idea of the window has to match as well, because it
+   decides when a session compacts. For a model name it does not recognise —
+   every model either engine serves — it assumes a far larger window (200000
+   for `gemma-4-12b-it`). It then grows the conversation past the server's
+   window, and the session dies on a `maximum context length` 400.
+   `scr launch claude` therefore passes the window from `/v1/models` to Claude
+   Code as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, and warns when it is less than
+   was asked. A smaller value already set in launch's environment is kept and
+   named on the same line. The ollama arm needs the same variable set to the
+   same number, or its sessions compact at a different point and the
+   per-session comparison is not like-for-like. The same goes for
+   `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, whose reservation also moves the point
+   where a session compacts (#428).
 
 3. **Which binary.** Per-tool relocatable spans are a Cargo feature, off by
    default (`crates/serving/api/Cargo.toml:47`, forwarded at

@@ -30,6 +30,11 @@ const SERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// server must not hold the CLI open.
 const PROVENANCE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long to wait on the `/v1/models` read that sizes Claude Code's context
+/// window. Short: the server has just answered `/health`, so a slow reply means
+/// something is wrong, and launch carries on without the number.
+const CONTEXT_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The variables that point Claude Code at the server under test.
 ///
 /// One list, consumed twice — written into the child's process environment *and*
@@ -44,7 +49,12 @@ const PROVENANCE_TIMEOUT: Duration = Duration::from_secs(5);
 ///   set. Verified against `claude` 2.1.292: with a marker variable in
 ///   `.claude/settings.local.json`, the file wins over an exported value, and
 ///   `--settings` wins over the file.
-fn launch_env(base_url: &str, auth_token: &str, model: &str) -> Vec<(&'static str, String)> {
+fn launch_env(
+    base_url: &str,
+    auth_token: &str,
+    model: &str,
+    context_window: Option<usize>,
+) -> Vec<(&'static str, String)> {
     vec![
         ("ANTHROPIC_BASE_URL", base_url.to_string()),
         ("ANTHROPIC_AUTH_TOKEN", auth_token.to_string()),
@@ -62,6 +72,19 @@ fn launch_env(base_url: &str, auth_token: &str, model: &str) -> Vec<(&'static st
         ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
     ]
     .into_iter()
+    .chain(
+        // The window Claude Code is told (`claude_code_window`): the one the
+        // server serves, or a smaller one the user asked for themselves.
+        // Claude Code compacts the conversation at the window it assumes for
+        // the model ID, and for an ID it does not recognise — every model we
+        // serve — that assumption is far past what a local server holds
+        // (200000 for `gemma-4-12b-it`, measured on claude 2.1.293), so without
+        // this it grows the conversation until the server rejects it as too
+        // long. The variable applies directly to an ID that does not start
+        // with `claude-`. Left out when the server could not say, so a value
+        // the user set themselves still reaches Claude Code.
+        context_window.map(|n| ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", n.to_string())),
+    )
     .chain(
         // Provider selection, blanked. These do not go through
         // `ANTHROPIC_BASE_URL` at all: each provider has its own endpoint
@@ -121,6 +144,92 @@ fn requests_served(base_url: &str, auth_token: &str) -> Option<u64> {
     let client = crate::http::RemoteClient::with_timeout(auth_token, PROVENANCE_TIMEOUT);
     let info = client.get_json(&format!("{base_url}/server_info")).ok()?;
     info.get("requests_served")?.as_u64()
+}
+
+/// The context window the server really serves, or `None` when it cannot say.
+///
+/// Read back rather than taken from `--max-model-len`, because the two differ
+/// exactly when it matters: the engine lowers the ask to what this machine's KV
+/// cache holds, or what the backend's paged attention can address (`Capping
+/// max_model_len` in the server log), and `/v1/models` reports the lowered
+/// value. With `--server-url` it is the only source there is.
+fn served_context_window(base_url: &str, auth_token: &str) -> Option<usize> {
+    let client = crate::http::RemoteClient::with_timeout(auth_token, CONTEXT_WINDOW_TIMEOUT);
+    let models = client.get_json(&format!("{base_url}/v1/models")).ok()?;
+    context_window_from_models(&models)
+}
+
+/// `max_model_len` from a `GET /v1/models` body. A scratchy server lists its one
+/// served model.
+fn context_window_from_models(models: &serde_json::Value) -> Option<usize> {
+    let cards = models.get("data")?.as_array()?;
+    let len = cards
+        .iter()
+        .find_map(|card| card.get("max_model_len")?.as_u64())?;
+    usize::try_from(len).ok()
+}
+
+/// The window Claude Code is told, and how the `Launching …` line names it.
+///
+/// The served window, unless the user's own `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+/// asks for less: set on purpose to compact earlier, which launch's
+/// `--settings` would otherwise override. A larger value is the very
+/// assumption that kills a session, so it loses to the served window, and the
+/// line says so. `None` when the server could not say: launch then sets
+/// nothing, and the user's value reaches Claude Code untouched.
+///
+/// `user` is launch's own environment. A value in a Claude Code settings file
+/// is not seen here, and `--settings` outranks it.
+fn claude_code_window(served: Option<usize>, user: Option<&str>) -> (Option<usize>, String) {
+    let Some(served) = served else {
+        return (None, String::new());
+    };
+    let user = user.map(str::trim).filter(|raw| !raw.is_empty());
+    match user.map(|raw| (raw, raw.parse::<usize>().ok())) {
+        Some((_, Some(n))) if n > 0 && n < served => (
+            Some(n),
+            format!(
+                ", context window: {n} tokens from CLAUDE_CODE_MAX_CONTEXT_TOKENS (the server \
+                 serves {served})"
+            ),
+        ),
+        Some((raw, n)) if n != Some(served) => (
+            Some(served),
+            format!(
+                ", context window: {served} tokens (CLAUDE_CODE_MAX_CONTEXT_TOKENS={raw} not \
+                 used: only a window smaller than the server's is kept)"
+            ),
+        ),
+        _ => (Some(served), format!(", context window: {served} tokens")),
+    }
+}
+
+/// What to tell the user about the window Claude Code is about to be given, when
+/// there is something to say. `asked` is the `--max-model-len` a spawned server
+/// was started with, `None` with `--server-url` (launch asked for nothing).
+///
+/// Pure, so each case is unit-testable without a server.
+fn context_window_warning(asked: Option<usize>, served: Option<usize>) -> Option<String> {
+    match (asked, served) {
+        // Said out loud, because the server's own record of it is one line in a
+        // log file nobody watches while Claude Code's TUI has the terminal.
+        (Some(asked), Some(served)) if served < asked => Some(format!(
+            "Warning: the server serves a {served}-token context window, not the {asked} launch \
+             asked for: that is all this machine's KV cache holds, or all the backend can \
+             address, for this model (`Capping max_model_len` in the server log says which). \
+             Claude Code is told {served}, so it compacts before the server would reject a \
+             request, but the session has less room than asked. Pass --max-model-len {served} \
+             to ask for what is served."
+        )),
+        (_, None) => Some(
+            "Warning: could not read the server's context window from /v1/models, so Claude Code \
+             will assume its own for this model and can grow the conversation past what the \
+             server accepts. Set CLAUDE_CODE_MAX_CONTEXT_TOKENS to the server's max_model_len \
+             to prevent that."
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// Whether the forwarded `-- …` args put Claude Code in non-interactive mode.
@@ -318,15 +427,30 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         }
     };
 
+    // The window Claude Code compacts against has to be no larger than the one
+    // the server serves, or the session dies the first time the conversation
+    // outgrows it.
+    let served_window = served_context_window(&base_url, &args.auth_token);
+    if let Some(warning) =
+        context_window_warning(server.as_ref().and_then(|s| s.max_model_len), served_window)
+    {
+        eprintln!("{warning}");
+    }
+    let user_window = std::env::var("CLAUDE_CODE_MAX_CONTEXT_TOKENS").ok();
+    let (context_window, window_label) = claude_code_window(served_window, user_window.as_deref());
+
     // Where the session's traffic should go, read before it starts so the count
     // afterwards is a delta: with --server-url the server may already have
-    // served requests that are none of our business.
+    // served requests that are none of our business. After the window read,
+    // never before it: `/v1/models` is a counted route, so launch's own request
+    // would land in the delta, and a print-mode run whose traffic went to a
+    // different endpoint would read as served.
     let served_before = requests_served(&base_url, &args.auth_token);
 
     // Point Claude Code at our server, twice over: in the process environment,
     // and again through `--settings`, which outranks the settings files whose
     // `env` block would otherwise overwrite it. See `launch_env`.
-    let env = launch_env(&base_url, &args.auth_token, &model);
+    let env = launch_env(&base_url, &args.auth_token, &model, context_window);
     let mut cmd = std::process::Command::new(&args.claude_bin);
     for (key, value) in &env {
         cmd.env(key, value);
@@ -351,7 +475,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     cmd.args(&args.claude_args);
 
     eprintln!(
-        "Launching `{}` against {base_url} (model: {model})",
+        "Launching `{}` against {base_url} (model: {model}{window_label})",
         args.claude_bin
     );
 
@@ -493,6 +617,19 @@ fn serve_argv(
     Ok(argv)
 }
 
+/// The `--max-model-len` a [`serve_argv`] asks for, whether launch's default or
+/// the `--serve-arg` passthrough put it there.
+fn asked_max_model_len(argv: &[String]) -> Option<usize> {
+    let i = argv
+        .iter()
+        .rposition(|a| a == "--max-model-len" || a.starts_with("--max-model-len="))?;
+    let value = match argv[i].split_once('=') {
+        Some((_, v)) => v,
+        None => argv.get(i + 1)?,
+    };
+    value.parse().ok()
+}
+
 /// The serving flags that only reach a server `launch` starts itself, named so
 /// `--server-url` can say out loud which ones it is dropping. A silently ignored
 /// ablation flag is worse than a missing one: the run still produces numbers, and
@@ -520,6 +657,9 @@ fn ignored_with_server_url(args: &LaunchClaudeArgs) -> Vec<&'static str> {
 struct ServerProcess {
     child: std::process::Child,
     port: u16,
+    /// The `--max-model-len` it was started with, to check the window it
+    /// reports against.
+    max_model_len: Option<usize>,
 }
 
 impl ServerProcess {
@@ -544,8 +684,10 @@ impl ServerProcess {
             .try_clone()
             .context("failed to clone the server log file handle")?;
 
+        let argv = serve_argv(model, port, args, tool_parser)?;
+        let max_model_len = asked_max_model_len(&argv);
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(serve_argv(model, port, args, tool_parser)?)
+        cmd.args(&argv)
             .stdout(std::process::Stdio::from(log_file))
             .stderr(std::process::Stdio::from(log_file2));
 
@@ -607,7 +749,11 @@ impl ServerProcess {
             "Server healthy on port {port} ({}s).",
             start.elapsed().as_secs()
         );
-        Ok(Self { child, port })
+        Ok(Self {
+            child,
+            port,
+            max_model_len,
+        })
     }
 }
 
@@ -761,9 +907,11 @@ fn gen_uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject, claude_settings_json,
-        gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env, provenance_report,
-        resolve_session_inject, serve_argv, session_id_from_args, settings_flag_in_args,
+        LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject, asked_max_model_len,
+        claude_code_window, claude_settings_json, context_window_from_models,
+        context_window_warning, gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env,
+        provenance_report, resolve_session_inject, serve_argv, session_id_from_args,
+        settings_flag_in_args,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1021,7 +1169,7 @@ mod tests {
     /// rendering rather than guarding against drift.
     #[test]
     fn settings_payload_carries_every_launch_env_key() {
-        let env = launch_env("http://127.0.0.1:8000", "tok", "my-model");
+        let env = launch_env("http://127.0.0.1:8000", "tok", "my-model", Some(32768));
         let json: serde_json::Value =
             serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
         let block = json["env"].as_object().expect("an env object");
@@ -1044,7 +1192,7 @@ mod tests {
     /// somewhere else entirely.
     #[test]
     fn launch_env_fans_the_model_out_to_every_tier() {
-        let env = launch_env("http://x", "tok", "m");
+        let env = launch_env("http://x", "tok", "m", None);
         for key in [
             "ANTHROPIC_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -1054,6 +1202,127 @@ mod tests {
         ] {
             let got = env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str());
             assert_eq!(got, Some("m"), "{key}");
+        }
+    }
+
+    /// Claude Code compacts at the window it is told, so the window the server
+    /// reported has to reach it — through `--settings` too, or a settings file
+    /// can put a larger one back.
+    #[test]
+    fn launch_env_tells_claude_code_the_served_window() {
+        let env = launch_env("http://x", "tok", "m", Some(32768));
+        let json: serde_json::Value =
+            serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
+        let in_env = env
+            .iter()
+            .find(|(k, _)| *k == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(in_env, Some("32768"));
+        assert_eq!(
+            json["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].as_str(),
+            Some("32768")
+        );
+
+        // Unknown: left out, not blanked, so a value the user set still applies.
+        let env = launch_env("http://x", "tok", "m", None);
+        assert!(
+            !env.iter()
+                .any(|(k, _)| *k == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        );
+    }
+
+    #[test]
+    fn context_window_is_read_from_v1_models() {
+        let models = serde_json::json!({
+            "object": "list",
+            "data": [{ "id": "m", "object": "model", "max_model_len": 32768 }],
+        });
+        assert_eq!(context_window_from_models(&models), Some(32768));
+        // A card without the field, or no list at all: the server cannot say.
+        let bare = serde_json::json!({ "object": "list", "data": [{ "id": "m" }] });
+        assert_eq!(context_window_from_models(&bare), None);
+        assert_eq!(context_window_from_models(&serde_json::json!({})), None);
+    }
+
+    /// The ask is read from the argv the server is started with, so a
+    /// passthrough override is what gets checked, not launch's default.
+    #[test]
+    fn asked_max_model_len_follows_the_spawned_argv() {
+        let ask = |extra: &[&str]| {
+            asked_max_model_len(&serve_argv("m", 1, &launch_args(extra), None).unwrap())
+        };
+        assert_eq!(ask(&[]), Some(super::DEFAULT_MAX_MODEL_LEN));
+        assert_eq!(ask(&["--max-model-len", "16384"]), Some(16384));
+        assert_eq!(
+            ask(&["--serve-arg", "--max-model-len", "--serve-arg", "8192"]),
+            Some(8192)
+        );
+        assert_eq!(ask(&["--serve-arg", "--max-model-len=4096"]), Some(4096));
+    }
+
+    /// A smaller window the user set on purpose (to compact earlier) survives
+    /// launch's `--settings`; a larger one is the assumption that kills a
+    /// session, so the served window wins — and the line says which happened.
+    #[test]
+    fn claude_code_window_keeps_only_a_smaller_user_window() {
+        // Nothing set: the served window.
+        let (told, label) = claude_code_window(Some(65536), None);
+        assert_eq!(told, Some(65536));
+        assert_eq!(label, ", context window: 65536 tokens");
+
+        // Smaller: kept, and both numbers named.
+        let (told, label) = claude_code_window(Some(65536), Some("40000"));
+        assert_eq!(told, Some(40000));
+        assert!(
+            label.contains("40000 tokens from CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            "{label}"
+        );
+        assert!(label.contains("serves 65536"), "{label}");
+
+        // Larger, zero, or not a number: the served window, and the value named.
+        for raw in ["200000", "0", "lots"] {
+            let (told, label) = claude_code_window(Some(65536), Some(raw));
+            assert_eq!(told, Some(65536), "{raw}");
+            assert!(label.contains(&format!("={raw} not used")), "{label}");
+        }
+
+        // Equal, or blank: nothing to explain.
+        for raw in ["65536", " "] {
+            let (told, label) = claude_code_window(Some(65536), Some(raw));
+            assert_eq!(told, Some(65536), "{raw:?}");
+            assert_eq!(label, ", context window: 65536 tokens", "{raw:?}");
+        }
+
+        // The server could not say: launch sets nothing, so the user's value
+        // reaches Claude Code untouched.
+        for user in [None, Some("40000")] {
+            assert_eq!(claude_code_window(None, user), (None, String::new()));
+        }
+    }
+
+    #[test]
+    fn context_window_warning_names_a_cap_and_an_unknown_window() {
+        // Served what was asked: nothing to say.
+        assert_eq!(context_window_warning(Some(65536), Some(65536)), None);
+        // --server-url: launch asked for nothing, so no window is "less".
+        assert_eq!(context_window_warning(None, Some(32768)), None);
+
+        // Capped: both numbers, and the way to ask for what is served.
+        let capped = context_window_warning(Some(65536), Some(32768)).expect("a warning");
+        assert!(capped.starts_with("Warning:"), "{capped}");
+        assert!(
+            capped.contains("32768-token") && capped.contains("65536"),
+            "{capped}"
+        );
+        assert!(capped.contains("--max-model-len 32768"), "{capped}");
+
+        // Unknown, spawned or not: Claude Code falls back to its own guess.
+        for asked in [Some(65536), None] {
+            let unknown = context_window_warning(asked, None).expect("a warning");
+            assert!(
+                unknown.contains("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+                "{unknown}"
+            );
         }
     }
 
@@ -1072,7 +1341,7 @@ mod tests {
     /// be blanked, and the blank must reach the `--settings` payload too.
     #[test]
     fn provider_selection_is_blanked_everywhere() {
-        let env = launch_env("http://127.0.0.1:8000", "tok", "m");
+        let env = launch_env("http://127.0.0.1:8000", "tok", "m", None);
         let json: serde_json::Value =
             serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
         let block = json["env"].as_object().expect("an env object");
