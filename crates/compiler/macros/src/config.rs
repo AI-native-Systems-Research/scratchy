@@ -3509,20 +3509,20 @@ mod tests {
     }
 
     /// Gemma 4 26B-A4B's assistants draft for their target's architecture in every variant — a
-    /// quant variant's stem carries its preset, so its target is its base config's. The QAT one is
-    /// the target's default drafter: its MLX 4-bit variant names the repo it loads from, with its
-    /// target's shape, which Gemma 4 31B (the same architecture) does not share; its dense variant,
-    /// which that repo does not load into, names none. Google's bf16 one names none: only
+    /// quant variant's stem carries its preset, so its target is its base config's. Google's is
+    /// the target's default drafter: its MLX 4-bit g32 variant names the repo it loads from, with
+    /// its target's shape, which Gemma 4 31B (the same architecture) does not share; its other
+    /// variants, which that repo does not load into, name none. The QAT one names none: only
     /// `spec/mtp` compiles it.
     #[test]
-    fn the_gemma_qat_assistant_is_its_targets_default_drafter_at_mlx_4_bit() {
+    fn the_gemma_assistant_is_its_targets_default_drafter_at_mlx_4_bit_g32() {
         let dir = repo_model_archs("gemma4-assistant");
         let spec = load_arch_json(&dir).expect("arch.json");
-        let qat = "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant";
+        let google = "gemma-4-26b-a4b-it-assistant";
         let by_default: Vec<_> = compiled_head_targets(&spec, false)
             .map(|(stem, _)| stem.as_str())
             .collect();
-        assert_eq!(by_default, [qat]);
+        assert_eq!(by_default, [google]);
         assert_eq!(
             compiled_head_targets(&spec, true).count(),
             spec.head_targets.len()
@@ -3533,18 +3533,25 @@ mod tests {
             apply_overrides_file(&dir, base, &mut json, &mut Vec::new()).expect("overrides");
             model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse")
         };
-        let mlx = format!("{qat}-mlx-affine-b4-g64");
-        let bf16 = "gemma-4-26b-a4b-it-assistant";
-        let bf16_mlx = format!("{bf16}-mlx-affine-b4-g64");
-        for (base, stem) in [(qat, qat), (qat, &mlx), (bf16, bf16), (bf16, &bf16_mlx)] {
+        let g32 = format!("{google}-mlx-affine-b4-g32");
+        let g64 = format!("{google}-mlx-affine-b4-g64");
+        let qat = "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant";
+        let qat_g64 = format!("{qat}-mlx-affine-b4-g64");
+        let variants = [
+            (google, google),
+            (google, &g32),
+            (google, &g64),
+            (qat, &qat_g64),
+        ];
+        for (base, stem) in variants {
             let head = parse(base, stem);
             assert_eq!(
                 head.drafts_for,
                 ["Gemma4ForConditionalGeneration"],
                 "{stem}"
             );
-            let published = (stem == mlx).then(|| PublishedDrafter {
-                repo: "mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit".to_string(),
+            let published = (stem == g32).then(|| PublishedDrafter {
+                repo: "guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit".to_string(),
                 target_hidden_size: 2816,
                 target_num_hidden_layers: 30,
             });

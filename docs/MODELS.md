@@ -233,20 +233,22 @@ its own, which its model card loads by name. So its `arch.json` names each
 config's target config (**`head_targets`**, `<arch>/<stem>`) and, for the one
 its target drafts with by default, the repo each compiled variant of it is
 published as (**`published_as`**, at most one config a target; a drafter
-checkpoint loads only into the variant of its own precision). 26B-A4B's is the
-QAT assistant at MLX 4-bit, `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit`:
-Google's bf16 assistant accepts as many drafts, but reads every draft's
-262k-row lm_head at bf16, and on prose decodes slower than the target alone. A
-metal build compiles the default one beside its selected target, and serving a
-checkpoint of the target's shape (`hidden_size` + `num_hidden_layers`, which
-tell it apart from Gemma 4 31B, the same architecture) drafts with it,
-downloading it on first use. The others compile under `spec/mtp` and draft
-when `--speculative-model` names them:
+checkpoint loads only into the variant of its own precision). 26B-A4B's is
+Google's assistant at MLX 4-bit g32,
+`guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit` (its variant compiles
+under `mlx-affine-b4-g32`, which `quant/mlx` selects). Google's bf16 assistant
+accepts as many drafts but reads every draft's 262k-row lm_head at bf16, and
+on prose decodes slower than the target alone; the QAT assistant pairs with
+the QAT target, and on this one accepts fewer drafts — none on a repetitive
+reply. A metal build compiles the default one beside its selected target, and
+serving a checkpoint of the target's shape (`hidden_size` +
+`num_hidden_layers`, which tell it apart from Gemma 4 31B, the same
+architecture) drafts with it, downloading it on first use. The others compile
+under `spec/mtp` and draft when `--speculative-model` names them:
 
 ```bash
-cargo build --release -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,\
-quant/mlx-affine-b4-g64
-scr serve mlx-community/gemma-4-26b-a4b-it-4bit   # drafter: mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit
+cargo build --release -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,quant/mlx
+scr serve mlx-community/gemma-4-26b-a4b-it-4bit   # drafter: guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit
 ```
 
 The head drafts each sequence of a step as many tokens as keep the step's

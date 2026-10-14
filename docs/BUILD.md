@@ -171,11 +171,11 @@ No `quant/*` feature named at all = every selected model compiles dense only.
 ```bash
 cargo build -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,quant/mlx-affine-b4-g64-qembed
 # → Qwen3.6-35B-A3B plus its multi-token-prediction head; serving it drafts with the head
-cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,quant/mlx-affine-b4-g64
-# → Gemma 4 26B-A4B plus its QAT assistant; serving it drafts with
-#   mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit
-cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec/mtp,quant/mlx-affine-b4-g64
-# → also Google's bf16 assistant; serving drafts with it when `--speculative-model` names it
+cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,quant/mlx
+# → Gemma 4 26B-A4B plus its assistant at MLX 4-bit g32 (`quant/mlx` selects mlx-affine-b4-g32);
+#   serving it drafts with guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit
+cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec/mtp,quant/mlx
+# → also the bf16 and QAT assistants; serving drafts with one when `--speculative-model` names it
 ```
 
 - **`metal`** turns on scratchy-models' **`mtp-heads`**: every selected model
@@ -196,16 +196,17 @@ cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec
   (`head_targets`), and the one its target drafts with by default names the
   repo each compiled variant of it is published as (`published_as`; a drafter
   checkpoint loads only into the variant of its own precision) — Gemma 4
-  26B-A4B's QAT assistant at MLX 4-bit,
-  `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit` (Google ships no
+  26B-A4B's assistant at MLX 4-bit g32,
+  `guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit` (Google ships no
   Gemma 4 checkpoint that carries its drafter). Serving a checkpoint of that
   target's shape (`hidden_size` + `num_hidden_layers`) drafts with it when the
   repo resolves (downloading it on first use), else serves without drafting
-  and says why. A variant no repo is named for (a dense build's) drafts only
-  when `--speculative-model` names one.
+  and says why. A build that compiles no variant a repo is named for (one
+  without `mlx-affine-b4-g32`, which `quant/mlx` selects) drafts only when
+  `--speculative-model` names one.
 - **`spec/mtp`** — adds the other drafters published as models of their own,
-  which draft only when `--speculative-model` names them (Google's bf16
-  assistant).
+  which draft only when `--speculative-model` names them (Gemma 4's bf16 and
+  QAT assistants).
 
 No `spec/*` feature named = only the heads inside their targets' checkpoints
 and the targets' default published drafters compile (with `metal`); a cuda or

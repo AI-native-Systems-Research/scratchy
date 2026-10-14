@@ -35,8 +35,8 @@ use crate::config::{VisionDModelFingerprint, VisionPatchEmbedFlatten, VisionSafe
 /// `#[forward]` / `#[vision_forward]` invocation; per-checkpoint JSON
 /// drift merges on top in `config::resolve_arch_spec`.
 /// One `published_as` entry (arch.json): a compiled variant of the `head_targets` config its
-/// target drafts with by default, and the Hub repo it loads from (Gemma 4 26B-A4B's QAT assistant
-/// at `mlx-affine-b4-g64`: `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit`). The config
+/// target drafts with by default, and the Hub repo it loads from (Gemma 4 26B-A4B's assistant at
+/// `mlx-affine-b4-g32`: `guardiangate1775/gemma-4-26B-A4B-it-assistant-4bit`). The config
 /// compiles beside its selected target under `mtp-heads` (which `metal` turns on), and a checkpoint
 /// of that target's shape served with no `--speculative-model` loads the repo of the variant the
 /// build compiled. At most one config a target; a config no entry names compiles only under
