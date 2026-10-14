@@ -3653,6 +3653,19 @@ pub fn attach_reroll(fp: &str, meta: bundle::RerollMeta<'static>) {
     }
 }
 
+/// Whether the EMITTED bundle `fp` carries a page-fold launch group — the very `KvShifts::page_fold`
+/// the runtime loads. Asked of the emitted bundle, not of the program it was emitted from: the
+/// attention expands inside [`emit_bundle`], and the fold flag is set by that expansion. `None` when
+/// no bundle by that fingerprint was emitted.
+pub fn emitted_bundle_folds(fp: &str) -> Option<bool> {
+    let c = emitted().lock().ok()?;
+    let (b, _) = c.get(fp)?;
+    Some(match &b.groups {
+        PendingGroups::Ready(groups) => groups.iter().any(|g| g.kv.page_fold),
+        PendingGroups::Staged(groups) => groups.iter().any(|(kv, _)| kv.page_fold),
+    })
+}
+
 /// EVERY BUNDLE THIS EMIT PRODUCED, by fingerprint — the channel the macro drains.
 ///
 /// ⛔ A REGISTRATION, NOT A SEARCH. A bundle is in here because [`emit_bundle`] put it here, so

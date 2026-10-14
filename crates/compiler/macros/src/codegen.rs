@@ -9727,6 +9727,7 @@ fn reroll_tokens(
         suffix,
         body_fused,
         rungs,
+        fallback_rung,
         iters,
         weight_stride,
         kv_stride,
@@ -9734,6 +9735,7 @@ fn reroll_tokens(
         prefix_weight_bank,
         suffix_weight_bank,
     } = m;
+    let fallback_rung = proc_macro2::Literal::u32_unsuffixed(*fallback_rung);
     let sib = |s: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::SiblingFp<'_>| {
         let inner = cow_str(s.as_str());
         quote! { ::scratchy_target_spyre::bundle_code::SiblingFp(#inner) }
@@ -9771,6 +9773,7 @@ fn reroll_tokens(
             suffix: #suffix,
             body_fused: #body_fused,
             rungs: ::std::borrow::Cow::Borrowed(&[#(#rungs),*]),
+            fallback_rung: #fallback_rung,
             iters: #iters,
             weight_stride: #ws,
             kv_stride: #ks,
@@ -10373,6 +10376,29 @@ fn dump_wavefront_mega(
                                                 body: sib(Some(bfp.clone())),
                                                 body_fused: sib(bod_fused.clone()),
                                             }];
+                                            // ⛔ WHAT EACH BAKED RUNG SERVES PAST ITS OWN SWEEP, beside
+                                            // `decode_rungs` and pushed exactly where it is — read off
+                                            // the EMITTED bundle's launch groups, the `page_fold` the
+                                            // runtime loads (the program it was emitted from carries no
+                                            // fold flag: the attention expands inside `emit_bundle`).
+                                            // Proven below.
+                                            let folds_of = |fp: &str| {
+                                                superdsc::emitted_bundle_folds(fp).unwrap_or_else(|| {
+                                                    panic!(
+                                                        "[spyre-superdsc] {base}: ladder body {fp} was named but never emitted"
+                                                    )
+                                                })
+                                            };
+                                            let mut rung_reach: Vec<(
+                                                superdsc::bundle::SweptCols,
+                                                scratchy_target_spyre::fold_plan::RungReach,
+                                            )> = vec![(
+                                                decode_rungs[0].active_cap,
+                                                scratchy_target_spyre::fold_plan::RungReach {
+                                                    folds: folds_of(&bfp),
+                                                    chunk: chunk_ceiling.is_some(),
+                                                },
+                                            )];
                                             // The per-page sweep rungs below one page — every decode
                                             // bake's ladder.
                                             let sweep = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap)
@@ -10506,11 +10532,19 @@ fn dump_wavefront_mega(
                                                                         "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?} → body {rfp}",
                                                                         rung.get()
                                                                     );
+                                                                    let rung_folds = folds_of(&rfp);
                                                                     decode_rungs.push(superdsc::bundle::LadderRung {
                                                                 active_cap: superdsc::bundle::SweptCols::new(rung_swept),
                                                                 body: sib(Some(rfp)),
                                                                 body_fused: sib(rfused),
                                                             });
+                                                                    rung_reach.push((
+                                                                        superdsc::bundle::SweptCols::new(rung_swept),
+                                                                        scratchy_target_spyre::fold_plan::RungReach {
+                                                                            folds: rung_folds,
+                                                                            chunk: rung_chunk.is_some(),
+                                                                        },
+                                                                    ));
                                                                 }
                                                                 Err(e) => eprintln!(
                                                                     "[spyre-superdsc] {base}: ladder rung {} body emit failed: {e}",
@@ -10526,6 +10560,25 @@ fn dump_wavefront_mega(
                                                 }
                                             }
                                             decode_rungs.sort_by_key(|r| r.active_cap);
+                                            rung_reach.sort_by_key(|(cap, _)| *cap);
+                                            // ⛔⛔⛔ A LADDER THAT CANNOT SERVE EVERY LENGTH DOES NOT
+                                            // COMPILE. Past every rung's sweep a step runs ONE rung,
+                                            // and if that rung is a split-KV chunk it attends a prefix
+                                            // that stops at its last page — the worker refuses the
+                                            // step. #438 shipped exactly that for granite-2b past
+                                            // 16,384 tokens. The bake proves the fallback here and the
+                                            // runtime reads the index it proved
+                                            // (`RerollMeta::fallback_rung`).
+                                            let reach: Vec<
+                                                scratchy_target_spyre::fold_plan::RungReach,
+                                            > = rung_reach.iter().map(|(_, r)| *r).collect();
+                                            let fallback_rung =
+                                                match scratchy_target_spyre::fold_plan::the_fallback_serves_any_length(
+                                                    &reach,
+                                                ) {
+                                                    Ok(at) => at as u32,
+                                                    Err(e) => panic!("[spyre-superdsc] {base}: {e}"),
+                                                };
                                             // ⭐ THE LAYER LOOP, ATTACHED TO THE BODY IT DESCRIBES.
                                             // Every fingerprint in it is a sibling the registry
                                             // resolves at load, and `RerollMeta::siblings` walks the
@@ -10544,6 +10597,7 @@ fn dump_wavefront_mega(
                                                     // baked for a 64-column sweep because four requests are
                                                     // live.
                                                     rungs: std::borrow::Cow::Owned(decode_rungs),
+                                                    fallback_rung,
                                                     // ⛔⛔⛔ THE ITERATION COUNT IS THE BODY'S, AND
                                                     // WHICH BODY THAT IS DEPENDS ON `card`.
                                                     //

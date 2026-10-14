@@ -516,6 +516,11 @@ pub struct RerollMeta<'a> {
     pub body_fused: SiblingFp<'a>,
     /// The sk_bucket ladder, ASCENDING by `active_cap`; the top rung is this body itself.
     pub rungs: Cow<'a, [LadderRung<'a>]>,
+    /// ⛔ THE RUNG A CONTEXT PAST EVERY RUNG'S SWEEP RUNS — an index into [`Self::rungs`], decided and
+    /// PROVEN at bake (`fold_plan::the_fallback_serves_any_length`: never a split-KV chunk, which
+    /// attends only its own pages). The runtime reads it rather than choosing, so it cannot run a rung
+    /// the bake did not prove serves any length.
+    pub fallback_rung: u32,
     /// How many times the body runs — the layer count.
     pub iters: u32,
     /// Byte stride between one layer's weights and the next (seg1).
@@ -774,6 +779,7 @@ mod tests {
                     body_fused: SiblingFp::none(),
                 },
             ]),
+            fallback_rung: 1,
             iters: 40,
             weight_stride: 60872704,
             kv_stride: 786432,
