@@ -1052,7 +1052,9 @@ PY
     model_bin="${RAW}/scr-${stem}"
     (( built )) && cp "${BIN}" "${model_bin}"
 
-    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}"/scale*-"${stem}".*.json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}"
+    # Every per-model file an earlier run into this directory left, a declined
+    # engine's included: a decline is this run's finding, not a sticky one.
+    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}"/scale*-"${stem}".*.json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}"
     cell_model=""; cell_tok=""
     for row in "${ENGINE_ROWS[@]}"; do IFS='|' read -r key _ _ <<<"${row}"; unset "M_${key}" "Q_${key}" "R_${key}"; done
 
