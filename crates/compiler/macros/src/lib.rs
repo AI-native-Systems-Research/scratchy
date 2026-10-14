@@ -1978,6 +1978,35 @@ pub fn compile_carrier(
                          `spec_verify_rows` (at least 2: a sequence's token and one draft) in its \
                          arch.json's bound_defaults (it has {drafts} and {verify_rows})"
                     );
+                    // Each config's own fact, which its quant variants share: one a target.
+                    let published: std::collections::BTreeSet<&config::PublishedDrafter> = solved
+                        .iter()
+                        .filter_map(|sm| sm.model.published.as_ref())
+                        .collect();
+                    let shapes: std::collections::BTreeSet<_> = (published.iter())
+                        .map(|p| (p.target_hidden_size, p.target_num_hidden_layers))
+                        .collect();
+                    assert_eq!(
+                        shapes.len(),
+                        published.len(),
+                        "{arch_ident}: a target shape drafts with one published drafter by \
+                         default ({published:?})"
+                    );
+                    let published = published.iter().map(|p| {
+                        let repo = &p.repo;
+                        let [hidden_size, num_hidden_layers] =
+                            [p.target_hidden_size, p.target_num_hidden_layers]
+                                .map(|v| proc_macro2::Literal::usize_unsuffixed(v as usize));
+                        quote! {
+                            ::scratchy_forward_compiler::PublishedDrafter {
+                                repo: #repo,
+                                target: ::scratchy_forward_compiler::TargetShape {
+                                    hidden_size: #hidden_size,
+                                    num_hidden_layers: #num_hidden_layers,
+                                },
+                            }
+                        }
+                    });
                     quote! {
                         ::core::option::Option::Some(::scratchy_forward_compiler::HeadRegistration {
                             arch: #arch,
@@ -1988,6 +2017,7 @@ pub fn compile_carrier(
                             drafts_for: &[#(#drafts_for),*],
                             repo_infix: #repo_infix,
                             checkpoint_prefix: #checkpoint_prefix,
+                            published: &[#(#published),*],
                             drafts: #drafts,
                             verify_rows: #verify_rows,
                         })

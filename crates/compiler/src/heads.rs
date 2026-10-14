@@ -30,6 +30,10 @@ pub struct HeadRegistration {
     /// that ships there: a target checkpoint holding tensors under it carries the head, which
     /// loads from the target's own store. `None`: it never ships inside its target's checkpoint.
     pub checkpoint_prefix: Option<&'static str>,
+    /// The drafters of the arch published as checkpoints of their own that their targets draft
+    /// with by default (Gemma 4's assistant: `published_as`, its arch.json), one a target shape.
+    /// Empty for a head that ships inside its target's checkpoint.
+    pub published: &'static [PublishedDrafter],
     /// The most tokens it drafts a sequence each step (`spec_drafts`, its arch.json): its target's
     /// verify steps carry up to them, as both models' kernels bake them.
     pub drafts: u8,
@@ -43,6 +47,26 @@ pub struct HeadRegistration {
     /// arch (`scratchy_serving_engine::spec_decode::mtp`'s module docs: what it is measured at,
     /// and what blocks it).
     pub verify_rows: u8,
+}
+
+/// A drafter published as a checkpoint of its own that its target drafts with by default: no
+/// checkpoint of the target carries it (Google ships Gemma 4's assistant only as a repo of its
+/// own), so the compiled drafter names the repo it loads from.
+#[derive(Clone, Copy, Debug)]
+pub struct PublishedDrafter {
+    /// The Hub repo it loads from (`google/gemma-4-26B-A4B-it-assistant`).
+    pub repo: &'static str,
+    /// The shape of the target config it compiled against.
+    pub target: TargetShape,
+}
+
+/// What tells a target's checkpoints apart from the others of its architecture before a load
+/// (Gemma 4's 26B-A4B and 31B are both `Gemma4ForConditionalGeneration`): its text backbone's
+/// width and depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetShape {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
 }
 
 impl HeadRegistration {
@@ -105,5 +129,53 @@ impl HeadRegistration {
     pub fn repo_of(&self, target_repo: &str) -> Option<String> {
         let (name, last) = target_repo.rsplit_once('-')?;
         Some(format!("{name}{}-{last}", self.repo_infix?))
+    }
+
+    /// The repo of the drafter a target of `shape` drafts with by default, when this build
+    /// compiled one ([`Self::published`]).
+    pub fn published_for(&self, shape: TargetShape) -> Option<&'static str> {
+        (self.published.iter())
+            .find(|drafter| drafter.target == shape)
+            .map(|drafter| drafter.repo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gemma 4's assistant drafts by default only for the target shape it compiled against: 31B
+    /// shares 26B-A4B's architecture, not its shape.
+    #[test]
+    fn a_published_drafter_drafts_only_for_its_targets_shape() {
+        const GEMMA_26B: TargetShape = TargetShape {
+            hidden_size: 2816,
+            num_hidden_layers: 30,
+        };
+        let head = HeadRegistration {
+            arch: "Gemma4AssistantForCausalLM",
+            embed_tokens: "model.target_embed_tokens",
+            lm_head: None,
+            lm_head_rows: 262_144,
+            reads_target_kv: true,
+            drafts_for: &["Gemma4ForConditionalGeneration"],
+            repo_infix: None,
+            checkpoint_prefix: None,
+            published: &[PublishedDrafter {
+                repo: "google/gemma-4-26B-A4B-it-assistant",
+                target: GEMMA_26B,
+            }],
+            drafts: 2,
+            verify_rows: 3,
+        };
+        assert_eq!(
+            head.published_for(GEMMA_26B),
+            Some("google/gemma-4-26B-A4B-it-assistant")
+        );
+        let gemma_31b = TargetShape {
+            hidden_size: 5376,
+            num_hidden_layers: 60,
+        };
+        assert_eq!(head.published_for(gemma_31b), None);
     }
 }

@@ -78,6 +78,9 @@ pub struct ModelParams {
     pub drafter_repo_infix: Option<String>,
     /// Where a head's tensors sit inside its target's checkpoint (`checkpoint_prefix`, arch.json).
     pub checkpoint_prefix: Option<String>,
+    /// The drafter its target drafts with by default: where it is published, and its target's
+    /// shape (`published_as`, arch.json). `None` for every other model.
+    pub published: Option<PublishedDrafter>,
     /// Extra JSON files that contributed to this variant's final
     /// config — the quantization preset and per-size override
     /// files that the loader deep-merged onto the dense base.
@@ -573,10 +576,11 @@ fn load_dir_mode(
     // the targets it drafts for: one that ships inside its targets' checkpoints (`checkpoint_of`)
     // under scratchy-models' `mtp-heads` feature (which `metal` turns on, and `mtp` implies), on
     // every selected config of those arches that carries it — its config is the target's own
-    // file; one published as a checkpoint of its own (`head_targets`), which drafts only when
-    // `--speculative-model` names it, under `mtp` (`spec/mtp`), on each of its configs whose
-    // target is selected. Either way the target's verify steps carry the head's drafts
-    // (`spec_drafts`, the head's arch.json).
+    // file; one published as a checkpoint of its own (`head_targets`), on each of its configs
+    // whose target is selected ([`compiled_head_targets`]): under `mtp-heads` the one its target
+    // drafts with by default (`published_as`), under `mtp` (`spec/mtp`) every one, which drafts
+    // when `--speculative-model` names it. Either way the target's verify steps carry the head's
+    // drafts (`spec_drafts`, the head's arch.json).
     let mtp = std::env::var(feature_env_var("mtp")).is_ok();
     let mtp_heads = std::env::var(feature_env_var("mtp-heads")).is_ok();
     let configs_root = dir
@@ -587,10 +591,12 @@ fn load_dir_mode(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        mtp && (spec.head_targets.iter().find(|(s, _)| s == stem)).is_some_and(|(_, target)| {
-            let (arch, stem) = target.split_once('/').unwrap_or_default();
-            model_feature_enabled(arch, stem)
-        })
+        let target = compiled_head_targets(spec, mtp).find(|(s, _)| s == stem);
+        mtp_heads
+            && target.is_some_and(|(_, target)| {
+                let (arch, stem) = target.split_once('/').unwrap_or_default();
+                model_feature_enabled(arch, stem)
+            })
     };
     let head_drafts = |stem: &str, json: &serde_json::Value| -> Result<Option<u64>, ConfigError> {
         if !mtp_heads || !spec.hf_architectures.is_empty() {
@@ -600,7 +606,7 @@ fn load_dir_mode(
         for arch_dir in arch_dirs(configs_root)? {
             let head = load_arch_json(&arch_dir)?;
             let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
-            let heads_this = (mtp && head.head_targets.iter().any(|(_, t)| *t == this))
+            let heads_this = compiled_head_targets(&head, mtp).any(|(_, t)| *t == this)
                 || (head.checkpoint_of.iter().any(|a| a == arch_name) && carries_head(&head, json));
             if let (true, Some(&(_, drafts))) = (heads_this, drafts) {
                 return Ok(Some(drafts));
@@ -1451,22 +1457,68 @@ fn parse_name(source_stem: &str, source_path: &Path) -> Result<String, ConfigErr
     })
 }
 
-/// The architectures a head drafts for: its target config's, named by its arch's `head_targets`
-/// when it has a config of its own; else its config's own (it is its target's, verbatim).
-fn head_drafts_for(
+/// The `head_targets` configs of `head` that compile when their target is selected, under
+/// `mtp-heads`: every one under `mtp` (`spec/mtp`); else the one its target drafts with by default
+/// (`published_as`).
+fn compiled_head_targets(
+    head: &crate::arch_spec::DeclaredArchSpec,
+    mtp: bool,
+) -> impl Iterator<Item = &(String, String)> {
+    (head.head_targets.iter())
+        .filter(move |(stem, _)| mtp || head.published_as.iter().any(|(s, _)| s == stem))
+}
+
+/// A drafter published as a checkpoint of its own that its target drafts with by default
+/// (`published_as`, arch.json): the Hub repo it loads from, and the shape of the target config it
+/// compiled against — what tells that target's checkpoints apart from the others of its
+/// architecture before a load (Gemma 4's 26B-A4B and 31B are both
+/// `Gemma4ForConditionalGeneration`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PublishedDrafter {
+    pub repo: String,
+    pub target_hidden_size: u64,
+    pub target_num_hidden_layers: u64,
+}
+
+/// What a head knows of its target: the architectures it drafts for — its target config's, named
+/// by its arch's `head_targets` when it has a config of its own (`source_path`'s stem: a quant
+/// variant's base, whose own stem carries its preset); else its config's own (it is its target's,
+/// verbatim) — and, for the drafter its target drafts with by default (`published_as`), where it
+/// is published and its target's shape.
+fn head_target(
     spec: &crate::arch_spec::DeclaredArchSpec,
     json: &serde_json::Value,
-    source_stem: &str,
     source_path: &Path,
-) -> Result<Vec<String>, ConfigError> {
-    let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| s == source_stem) else {
-        return Ok(parse_architectures(json));
+) -> Result<(Vec<String>, Option<PublishedDrafter>), ConfigError> {
+    let stem = stem_of(source_path)?;
+    let Some((_, target)) = spec.head_targets.iter().find(|(s, _)| *s == stem) else {
+        return Ok((parse_architectures(json), None));
     };
     let configs = (source_path.parent().and_then(Path::parent))
         .ok_or_else(|| ConfigError::NotADirectory(source_path.to_path_buf()))?;
     let path = configs.join(format!("{target}.json"));
     let (_, target_json) = read_json_file(&path)?;
-    Ok(parse_architectures(&target_json))
+    // A composite checkpoint config (gemma4's) nests its text backbone's fields under
+    // `text_config`.
+    let backbone = |key: &str| {
+        (target_json.get(key))
+            .or_else(|| target_json.get("text_config")?.get(key))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| ConfigError::ArchJson {
+                path: path.clone(),
+                reason: format!("the target of `{stem}` declares no `{key}`"),
+            })
+    };
+    let published = (spec.published_as.iter().find(|(s, _)| *s == stem))
+        .map(|(_, repo)| -> Result<_, ConfigError> {
+            Ok(PublishedDrafter {
+                repo: repo.clone(),
+                target_hidden_size: backbone("hidden_size")?,
+                target_num_hidden_layers: backbone("num_hidden_layers")?,
+            })
+        })
+        .transpose()?;
+    Ok((parse_architectures(&target_json), published))
 }
 
 fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
@@ -1658,11 +1710,11 @@ fn model_params_from_json(
         .unwrap_or(false);
     // An arch that is a part of another model's checkpoint (an MTP head) registers under the
     // identity it declares, not the architecture its (the whole checkpoint's) config names.
-    let (architectures, drafts_for) = match spec.hf_architectures.is_empty() {
-        true => (parse_architectures(json), Vec::new()),
+    let (architectures, (drafts_for, published)) = match spec.hf_architectures.is_empty() {
+        true => (parse_architectures(json), (Vec::new(), None)),
         false => (
             spec.hf_architectures.clone(),
-            head_drafts_for(spec, json, source_stem, source_path)?,
+            head_target(spec, json, source_path)?,
         ),
     };
     let rope_scaling = extract_rope_scaling(json);
@@ -1687,6 +1739,7 @@ fn model_params_from_json(
         drafts_for,
         drafter_repo_infix: spec.drafter_repo_infix.clone(),
         checkpoint_prefix: spec.checkpoint_prefix.clone(),
+        published,
         extra_tracked_paths,
         rope_scaling,
         rope_scaling_hash,
@@ -1819,6 +1872,7 @@ fn vision_params_from_json(
         drafts_for: Vec::new(),
         drafter_repo_infix: None,
         checkpoint_prefix: None,
+        published: None,
         extra_tracked_paths,
         rope_scaling: None,
         rope_scaling_hash: None,
@@ -1935,6 +1989,33 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
     spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
+    spec.published_as = str_str_pairs(&path, &json, "published_as")?;
+    let target_of = |stem: &str| {
+        spec.head_targets
+            .iter()
+            .find(|(s, _)| s == stem)
+            .map(|(_, t)| t)
+    };
+    for (stem, _) in &spec.published_as {
+        let Some(target) = target_of(stem) else {
+            return Err(ConfigError::ArchJson {
+                path: path.clone(),
+                reason: format!("`published_as` names `{stem}`, which `head_targets` does not"),
+            });
+        };
+        let defaults = (spec.published_as.iter())
+            .filter(|(s, _)| target_of(s) == Some(target))
+            .count();
+        if defaults > 1 {
+            return Err(ConfigError::ArchJson {
+                path: path.clone(),
+                reason: format!(
+                    "`published_as` names {defaults} drafters of `{target}`: a target drafts with \
+                     one by default"
+                ),
+            });
+        }
+    }
     spec.checkpoint_prefix = as_str("checkpoint_prefix");
     spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
     let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
@@ -2009,6 +2090,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "hf_architectures",
     "drafter_repo_infix",
     "head_targets",
+    "published_as",
     "checkpoint_of",
     "checkpoint_prefix",
     "reads_target_kv",
@@ -3411,6 +3493,56 @@ mod tests {
                 .expect("configs")
                 .is_empty()
         );
+    }
+
+    /// Gemma 4 26B-A4B's assistant drafts for its target's architecture in every variant — a quant
+    /// variant's stem carries its preset, so its target is its base config's — and names the repo
+    /// it is published as with its target's shape, which Gemma 4 31B (the same architecture) does
+    /// not share. The QAT assistant names none: only `spec/mtp` compiles it.
+    #[test]
+    fn the_gemma_assistant_is_its_targets_default_drafter_in_every_variant() {
+        let dir = repo_model_archs("gemma4-assistant");
+        let spec = load_arch_json(&dir).expect("arch.json");
+        let by_default: Vec<_> = compiled_head_targets(&spec, false)
+            .map(|(stem, _)| stem.as_str())
+            .collect();
+        assert_eq!(by_default, ["gemma-4-26b-a4b-it-assistant"]);
+        assert_eq!(
+            compiled_head_targets(&spec, true).count(),
+            spec.head_targets.len()
+        );
+        let parse = |base: &str, stem: &str| {
+            let path = dir.join(format!("{base}.json"));
+            let (_, mut json) = read_json_file(&path).expect("json");
+            apply_overrides_file(&dir, base, &mut json, &mut Vec::new()).expect("overrides");
+            model_params_from_json(&json, stem, &path, Vec::new(), &spec).expect("parse")
+        };
+        let base = "gemma-4-26b-a4b-it-assistant";
+        for stem in [base, "gemma-4-26b-a4b-it-assistant-mlx-affine-b4-g64"] {
+            let head = parse(base, stem);
+            assert_eq!(
+                head.drafts_for,
+                ["Gemma4ForConditionalGeneration"],
+                "{stem}"
+            );
+            assert_eq!(
+                head.published,
+                Some(PublishedDrafter {
+                    repo: "google/gemma-4-26B-A4B-it-assistant".to_string(),
+                    target_hidden_size: 2816,
+                    target_num_hidden_layers: 30,
+                }),
+                "{stem}"
+            );
+        }
+        let qat = "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant";
+        let head = parse(qat, &format!("{qat}-mlx-affine-b4-g64"));
+        assert_eq!(head.drafts_for, ["Gemma4ForConditionalGeneration"]);
+        assert_eq!(head.published, None);
+        let (_, big) =
+            read_json_file(&repo_model_archs("gemma4").join("gemma-4-31b-it.json")).expect("json");
+        assert_eq!(big["architectures"][0], "Gemma4ForConditionalGeneration");
+        assert_ne!(big["text_config"]["hidden_size"], 2816);
     }
 
     /// The parity-tiny configs keep every property the carrier gate

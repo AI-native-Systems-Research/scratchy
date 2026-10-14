@@ -74,9 +74,16 @@ pub struct DeclaredArchSpec {
     pub drafter_repo_infix: Option<String>,
     /// A head published as its own checkpoint, with a config of its own (Gemma 4's assistant):
     /// each config stem's target config, `<arch>/<stem>`. It compiles when that target is selected
-    /// under `spec/mtp`, the target's verify steps carry its drafts, and it drafts for the target's
-    /// architectures. Empty for a head that ships inside its target's checkpoint (`checkpoint_of`).
+    /// under `spec/mtp` (under `mtp-heads` too, for the stem `published_as` names), the target's
+    /// verify steps carry its drafts, and it drafts for the target's architectures. Empty for a
+    /// head that ships inside its target's checkpoint (`checkpoint_of`).
     pub head_targets: Vec<(String, String)>,
+    /// The Hub repo of the `head_targets` config its target drafts with by default (Gemma 4
+    /// 26B-A4B's: `google/gemma-4-26B-A4B-it-assistant`): it compiles beside its selected target
+    /// under `mtp-heads` (which `metal` turns on), and a checkpoint of that target's shape served
+    /// with no `--speculative-model` loads it from there. At most one per target; a config it
+    /// omits compiles only under `spec/mtp`, and drafts only when `--speculative-model` names it.
+    pub published_as: Vec<(String, String)>,
     /// The arches whose checkpoints carry this head (a multi-token-prediction head). It has no
     /// configs of its own: under `spec/mtp` it compiles on every selected config of these arches
     /// that declares its layers (the source of its `num_hidden_layers` param, above zero).

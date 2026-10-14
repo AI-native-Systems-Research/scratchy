@@ -87,9 +87,11 @@ Note the convention for selecting models and quants:
 - `quant/<preset>` — compiles that quantization instead of dense/bf16
   (e.g. `quant/mlx` for every MLX affine int4 preset at once).
 - Multi-token prediction is **on with `metal`**: every selected model whose
-  checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and serving the
-  model drafts with it (`--num-speculative-tokens 0` serves without).
-  `spec/mtp` adds the drafters published as models of their own (Gemma 4's
+  checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
+  selected model whose drafter is published as a model of its own (Gemma 4
+  26B-A4B's assistant, downloaded from `google/gemma-4-26B-A4B-it-assistant`);
+  serving the model drafts with it (`--num-speculative-tokens 0` serves
+  without). `spec/mtp` adds the other published drafters (Gemma 4's QAT
   assistant, which drafts when `--speculative-model` names it).
 - `hf-completions` — shell tab completion over the real HuggingFace ids this
   build can actually run (`scr completions zsh --install`). **On by default**;
