@@ -2584,10 +2584,11 @@ fn lower_one(
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
                 let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
-                // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539); our
-                // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
+                // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
+                // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
+                // that boundary; M1/M2 keep the fold twin.
                 let wide_ok =
-                    profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
+                    profile.is_some_and(|pr| crate::targets::affine_qmv_wide_ok(pr.generation));
                 // Every matvec-band kernel takes the folded ends (`qmv_fast_impl`,
                 // `qmv_impl` and `qmv_quad_impl` since #242, `qmv_wide_impl` since the
                 // wide gained them) — at any row count the bucket dispatches it.
@@ -10052,6 +10053,50 @@ mod tests {
                 "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
             );
         }
+    }
+
+    /// The small-M wide band follows MLX's gen-15 boundary
+    /// (`affine_qmv_wide_ok`): every production bake profile from the M3 on —
+    /// the Mid class bakes against an M4 profile, the M5 class its own —
+    /// lowers an m≥2 matvec-band bucket to `affine_qmv_wide`, where the M1
+    /// class keeps the fast kernel's fold twin. MLX dispatches the same way
+    /// (`use_qmv_wide`, quantized.cpp:537): its own comment says the affine
+    /// wide kernel only beats the plain qmv from gen 15 on.
+    #[test]
+    fn qmv_wide_band_follows_the_gen_15_boundary() {
+        fn lower_at(
+            profile: &crate::targets::MetalTargetProfile,
+        ) -> crate::tape::lowered::LoweredMetalTape {
+            lower_subtile_tape_to_metal(
+                &row_tape(plain(&[MetalStep::AffineQmm(q_proj())])),
+                &tp(),
+                bake_point(/*bucket_m=*/ 8, Some(profile)),
+            )
+            .expect("lower_subtile_tape_to_metal")
+        }
+        for profile in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
+            let command = &lower_at(profile).commands[0].command;
+            assert_eq!(
+                command.kernel,
+                KernelId::AffineQmvWide,
+                "the {:?} class bakes the wide band",
+                profile.generation
+            );
+            assert_eq!(
+                command.function,
+                "affine_qmv_wide_bf16_s_f16_gs_64_b_4_nv_4_kl_8_batch_0"
+            );
+        }
+        let command = &lower_at(&crate::targets::M1_MAX).commands[0].command;
+        assert_eq!(
+            command.kernel,
+            KernelId::AffineQmvFast,
+            "the M1 class keeps the fold twin"
+        );
+        assert_eq!(
+            command.function,
+            "affine_qmv_fast_bf16_s_f16_gs_64_b_4_t8_batch_0"
+        );
     }
 
     /// Llama-1B's `q_proj` shape (N=K=2048, gs=64, 4-bit, qmv batch limit 18), slot 7 into slot 11

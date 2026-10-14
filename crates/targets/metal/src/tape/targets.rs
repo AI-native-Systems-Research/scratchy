@@ -132,6 +132,22 @@ pub fn is_nax_capable(g: AppleSiliconGen) -> bool {
     matches!(g, AppleSiliconGen::M5)
 }
 
+/// Returns `true` when the small-M `qmv_wide` band beats the plain qmv kernels
+/// for MLX-affine weights — MLX's `use_qmv_wide` gate
+/// (`quantized.cpp:537`): `mode != "affine" || arch_gen >= 15`. Gen 15 is the
+/// M3 (M4 is 16, M5 is 17 — see [`is_nax_capable`]), so M3 and later take the
+/// wide band; MLX's own comment: "affine qmv_wide only beats qmv on gen-15+".
+///
+/// M2 (gen 14) is inside [`GenClass::Mid`](crate::tape::lowered::GenClass),
+/// whose tapes bake against an M4 profile — so an M2 device runs the wide
+/// kernel where MLX would not, the one place this gate and MLX's disagree.
+pub fn affine_qmv_wide_ok(g: AppleSiliconGen) -> bool {
+    matches!(
+        g,
+        AppleSiliconGen::M3 | AppleSiliconGen::M4 | AppleSiliconGen::M5
+    )
+}
+
 /// Returns `true` when the GPU's bf16 simdgroup MMA path is slow
 /// enough that loading bf16 from memory and running the MMA in fp16
 /// is a perf win — the M1 generation only.
@@ -162,5 +178,20 @@ mod tests {
     fn test_profile_constants() {
         assert_eq!(M1_8CORE.generation, AppleSiliconGen::M1);
         assert!(M3_10CORE.peak_tflops_fp16 > M2_10CORE.peak_tflops_fp16);
+    }
+
+    /// The wide band's boundary is MLX's `arch_gen >= 15`: every generation from
+    /// the M3 on, not the NAX boundary two generations later.
+    #[test]
+    fn affine_qmv_wide_ok_follows_arch_gen_15() {
+        for (g, wide) in [
+            (AppleSiliconGen::M1, false),
+            (AppleSiliconGen::M2, false),
+            (AppleSiliconGen::M3, true),
+            (AppleSiliconGen::M4, true),
+            (AppleSiliconGen::M5, true),
+        ] {
+            assert_eq!(affine_qmv_wide_ok(g), wide, "{g:?}");
+        }
     }
 }
