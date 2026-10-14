@@ -14,7 +14,6 @@ use scratchy_serving_api::Tokenizer;
 
 /// A single benchmark request with pre-computed token lengths.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SampleRequest {
     /// The prompt text to send.
     pub prompt: String,
@@ -278,4 +277,28 @@ fn gen_prompt_to_target_len(
         remain -= 1;
     }
     Ok((prompt, token_ids))
+}
+
+/// The seed of the throwaway prompts `scr bench serve` sends as its
+/// pre-flight and warmup requests, for a run seeded `seed`.
+///
+/// Sent a measured prompt, they would leave it in the server's prefix cache
+/// before it is timed. The high-bit mask keeps these seeds clear of the small
+/// consecutive ones sweeps hand out per cell (`bench_serve_compare.sh` uses
+/// base + index), so one cell's warmups are never a later cell's prompts.
+pub fn throwaway_seed(seed: u64) -> u64 {
+    seed ^ 0xA5A5_0000_0000_0000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throwaway_seeds_are_never_a_sweep_cells_seed() {
+        // bench_serve_compare.sh seeds its cells base + index.
+        for base in [0, 1000] {
+            assert!((base..base + 1000).all(|s| throwaway_seed(base) != s));
+        }
+    }
 }

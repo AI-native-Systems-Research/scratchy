@@ -10,15 +10,16 @@
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use rand_distr::Gamma;
+use scratchy_serving_api::Tokenizer;
 
-use crate::args::BenchServeArgs;
+use crate::args::{BenchServeArgs, ServeDataset};
 use crate::datasets;
 use crate::http::{Agent, Semaphore};
 
@@ -39,6 +40,77 @@ struct RequestResult {
     success: bool,
 }
 
+impl RequestResult {
+    fn failed(start_time: f64, e2el: f64) -> Self {
+        RequestResult {
+            ttft: 0.0,
+            itl: vec![],
+            e2el,
+            output_tokens: 0,
+            chunks: 0,
+            start_time,
+            success: false,
+        }
+    }
+}
+
+/// What a run measured.
+struct Run {
+    /// Every request sent.
+    results: Vec<RequestResult>,
+    /// Prompt tokens over the successful requests.
+    total_input_tokens: usize,
+    /// Wall time of the measured requests (seconds).
+    total_time: f64,
+}
+
+/// What every request of a run shares: where it goes and how it samples.
+struct Client {
+    agent: Agent,
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+    ignore_eos: bool,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<i32>,
+}
+
+impl Client {
+    /// Add the sampling knobs to a request body. Unset ones are left out
+    /// rather than sent as null, so the server applies its own default.
+    fn sampling(&self, body: &mut serde_json::Value) {
+        if self.ignore_eos {
+            body["ignore_eos"] = serde_json::json!(true);
+        }
+        if let Some(t) = self.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(p) = self.top_p {
+            body["top_p"] = serde_json::json!(p);
+        }
+        if let Some(k) = self.top_k {
+            body["top_k"] = serde_json::json!(k);
+        }
+    }
+
+    fn post(
+        &self,
+        body: &serde_json::Value,
+        request_id: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let mut req = self
+            .agent
+            .post(&self.api_url)
+            .header("content-type", "application/json")
+            .header("x-request-id", request_id);
+        if let Some(key) = &self.api_key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        req.send(body.to_string().as_str())
+    }
+}
+
 /// Fetch the first model name from the server's /v1/models endpoint.
 fn get_model_from_server(agent: &Agent, base_url: &str) -> Result<String> {
     let url = format!("{base_url}/v1/models");
@@ -51,18 +123,10 @@ fn get_model_from_server(agent: &Agent, base_url: &str) -> Result<String> {
 }
 
 /// Send a single streaming completions request and measure timing.
-#[allow(clippy::too_many_arguments)]
 fn send_request(
-    agent: &Agent,
-    api_url: &str,
-    model: &str,
+    client: &Client,
     prompt: &str,
     output_len: usize,
-    ignore_eos: bool,
-    temperature: Option<f64>,
-    top_p: Option<f64>,
-    top_k: Option<i32>,
-    api_key: Option<&str>,
     request_id: &str,
     bench_start: Instant,
 ) -> RequestResult {
@@ -71,26 +135,14 @@ fn send_request(
     // (mlx_lm.server, in particular, rejects `logprobs: null` because
     // it only accepts a bool). vLLM tolerates either.
     let mut body = serde_json::json!({
-        "model": model,
+        "model": client.model,
         "prompt": prompt,
         "max_tokens": output_len,
         "stream": true,
         "stream_options": {"include_usage": true},
         "repetition_penalty": 1.0,
     });
-
-    if ignore_eos {
-        body["ignore_eos"] = serde_json::json!(true);
-    }
-    if let Some(t) = temperature {
-        body["temperature"] = serde_json::json!(t);
-    }
-    if let Some(p) = top_p {
-        body["top_p"] = serde_json::json!(p);
-    }
-    if let Some(k) = top_k {
-        body["top_k"] = serde_json::json!(k);
-    }
+    client.sampling(&mut body);
 
     let request_start = Instant::now();
     let start_time = request_start.duration_since(bench_start).as_secs_f64();
@@ -99,27 +151,11 @@ fn send_request(
     let mut itl = Vec::new();
     let mut output_tokens = 0usize;
 
-    let mut req = agent
-        .post(api_url)
-        .header("content-type", "application/json")
-        .header("x-request-id", request_id);
-    if let Some(key) = api_key {
-        req = req.header("authorization", format!("Bearer {key}"));
-    }
-
-    let resp = match req.send(body.to_string().as_str()) {
+    let resp = match client.post(&body, request_id) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Request failed: {e}");
-            return RequestResult {
-                ttft: 0.0,
-                itl: vec![],
-                e2el: request_start.elapsed().as_secs_f64(),
-                output_tokens: 0,
-                chunks: 0,
-                start_time,
-                success: false,
-            };
+            return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
         }
     };
 
@@ -129,15 +165,7 @@ fn send_request(
         let status = resp.status();
         let body_text = resp.into_body().read_to_string().unwrap_or_default();
         eprintln!("Request failed with status {status}: {body_text}");
-        return RequestResult {
-            ttft: 0.0,
-            itl: vec![],
-            e2el: request_start.elapsed().as_secs_f64(),
-            output_tokens: 0,
-            chunks: 0,
-            start_time,
-            success: false,
-        };
+        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
     }
 
     // Parse SSE stream. Reading straight off the body reader keeps the
@@ -386,225 +414,30 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
     };
 
-    // Generate or load prompts.
-    struct PromptEntry {
-        text: String,
-        output_len: usize,
-    }
-
-    let prompt_entries: Vec<PromptEntry> = match args.dataset_name.as_str() {
-        "sharegpt" => {
-            let dataset_path = args.dataset_path.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("--dataset-path is required for sharegpt dataset")
-            })?;
-            eprintln!("Loading ShareGPT dataset from {dataset_path}...");
-            let samples = datasets::load_sharegpt(
-                Path::new(dataset_path),
-                &tokenizer,
-                args.num_prompts,
-                None,
-                args.seed,
-            )?;
-            eprintln!("Loaded {} samples from ShareGPT dataset", samples.len());
-            samples
-                .into_iter()
-                .map(|s| PromptEntry {
-                    text: s.prompt,
-                    output_len: s.expected_output_len,
-                })
-                .collect()
-        }
-        _ => {
-            eprintln!(
-                "Generating {} random prompts (matching Python RandomDataset)...",
-                args.num_prompts
-            );
-            let samples = datasets::generate_random(
-                &tokenizer,
-                args.num_prompts,
-                args.input_len,
-                args.output_len,
-                args.random_range_ratio,
-                args.random_prefix_len,
-                args.seed,
-            )?;
-            samples
-                .into_iter()
-                .map(|s| PromptEntry {
-                    text: s.prompt,
-                    output_len: s.expected_output_len,
-                })
-                .collect()
-        }
-    };
-
-    let num_prompts = prompt_entries.len();
-
-    // Pre-flight check: send one request to verify connectivity.
-    eprintln!("Sending pre-flight request to verify connectivity...");
-    {
-        let result = send_request(
-            &agent,
-            &api_url,
-            &model,
-            &prompt_entries[0].text,
-            prompt_entries[0].output_len.min(args.output_len),
-            args.ignore_eos,
-            args.temperature,
-            args.top_p,
-            args.top_k,
-            args.api_key.as_deref(),
-            "preflight",
-            Instant::now(),
-        );
-        if !result.success {
-            anyhow::bail!("Pre-flight request failed. Check server connectivity and model name.");
-        }
-        eprintln!("Pre-flight request succeeded.");
-    }
-
-    // Warmup requests.
-    if args.num_warmups > 0 {
-        eprintln!("Sending {} warmup request(s)...", args.num_warmups);
-        let warmup_pb = ProgressBar::new(args.num_warmups as u64);
-        warmup_pb.set_style(
-            ProgressStyle::with_template(
-                "Warmup {wide_bar:.yellow/blue} {pos}/{len} [{elapsed}<{eta}]",
-            )
-            .unwrap(),
-        );
-        for i in 0..args.num_warmups {
-            let idx = i % num_prompts;
-            send_request(
-                &agent,
-                &api_url,
-                &model,
-                &prompt_entries[idx].text,
-                prompt_entries[idx].output_len.min(args.output_len),
-                args.ignore_eos,
-                args.temperature,
-                args.top_p,
-                args.top_k,
-                args.api_key.as_deref(),
-                &format!("warmup-{i}"),
-                Instant::now(),
-            );
-            warmup_pb.inc(1);
-        }
-        warmup_pb.finish_and_clear();
-        eprintln!("Warmup complete.");
-    }
-
-    // Progress bar.
-    let pb = if !args.disable_tqdm {
-        let pb = ProgressBar::new(num_prompts as u64);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "Benchmarking {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
-            )
-            .unwrap()
-            .with_key("per_sec", crate::fmt_tqdm_rate),
-        );
-        Some(pb)
-    } else {
-        None
-    };
-
-    let completed = Arc::new(AtomicUsize::new(0));
-    let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
-
-    // Generate request schedule using gamma distribution delays.
-    let cumulative_delays = generate_request_delays(
-        num_prompts,
-        args.request_rate,
-        args.burstiness,
-        args.seed.wrapping_add(42),
-    );
-
-    let benchmark_start = Instant::now();
-    let mut handles = Vec::with_capacity(num_prompts);
-
-    for (i, entry) in prompt_entries.into_iter().enumerate() {
-        // Wait until the scheduled time for this request.
-        let target_time = Duration::from_secs_f64(cumulative_delays[i]);
-        let elapsed = benchmark_start.elapsed();
-        if target_time > elapsed {
-            std::thread::sleep(target_time - elapsed);
-        }
-
-        let agent = agent.clone();
-        let api_url = api_url.clone();
-        let model = model.clone();
-        let completed = completed.clone();
-        let pb = pb.clone();
-        let sem = semaphore.clone();
-        let request_id = format!("bench-{i}");
-        let ignore_eos = args.ignore_eos;
-        let temperature = args.temperature;
-        let top_p = args.top_p;
-        let top_k = args.top_k;
-        let api_key = args.api_key.clone();
-        let output_len = entry.output_len;
-        let bench_start = benchmark_start;
-
-        // A thread per in-flight request. `--max-concurrency` bounds how many
-        // exist at once, and the permit is acquired HERE rather than inside
-        // the thread so the pacing loop blocks instead of running ahead and
-        // spawning threads that would only queue — the same back-pressure the
-        // async version got from awaiting the permit before spawning.
-        let permit = sem.as_ref().map(|s| s.acquire_owned());
-        handles.push(std::thread::spawn(move || {
-            // Held for the request's lifetime; returned on drop, including on
-            // unwind, so a failed request cannot shrink the concurrency bound.
-            let _permit = permit;
-            let result = send_request(
-                &agent,
-                &api_url,
-                &model,
-                &entry.text,
-                output_len,
-                ignore_eos,
-                temperature,
-                top_p,
-                top_k,
-                api_key.as_deref(),
-                &request_id,
-                bench_start,
-            );
-            completed.fetch_add(1, Ordering::Relaxed);
-            if let Some(ref pb) = pb {
-                pb.inc(1);
-            }
-            result
-        }));
-    }
-
-    // Collect results.
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        results.push(
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("benchmark request thread panicked"))?,
-        );
-    }
-
-    let total_time = benchmark_start.elapsed().as_secs_f64();
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
-    }
+    let client = Arc::new(Client {
+        agent,
+        api_url,
+        model: model.clone(),
+        api_key: args.api_key.clone(),
+        ignore_eos: args.ignore_eos,
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+    });
+    let run = run_prompts(&args, &client, &tokenizer)?;
+    let total_time = run.total_time;
 
     // Compute metrics.
-    let successful: Vec<&RequestResult> = results.iter().filter(|r| r.success).collect();
+    let successful: Vec<&RequestResult> = run.results.iter().filter(|r| r.success).collect();
     let num_success = successful.len();
-    let num_fail = results.len() - num_success;
+    let num_fail = run.results.len() - num_success;
 
     if num_success == 0 {
         anyhow::bail!("All {num_fail} requests failed. Check server connectivity and model name.");
     }
 
     let total_output_tokens: usize = successful.iter().map(|r| r.output_tokens).sum();
-    let total_input_tokens: usize = num_success * args.input_len;
+    let total_input_tokens = run.total_input_tokens;
 
     // TTFT/TPOT/ITL come only from requests the stream actually timed.
     let timed: Vec<&RequestResult> = successful
@@ -811,6 +644,191 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `random` / `sharegpt`: one streamed completion per prompt, open loop.
+fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenizer) -> Result<Run> {
+    let prompt_entries = if args.dataset_name == ServeDataset::Sharegpt {
+        let dataset_path = args
+            .dataset_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--dataset-path is required for sharegpt dataset"))?;
+        eprintln!("Loading ShareGPT dataset from {dataset_path}...");
+        let samples = datasets::load_sharegpt(
+            Path::new(dataset_path),
+            tokenizer,
+            args.num_prompts,
+            None,
+            args.seed,
+        )?;
+        eprintln!("Loaded {} samples from ShareGPT dataset", samples.len());
+        samples
+    } else {
+        eprintln!(
+            "Generating {} random prompts (matching Python RandomDataset)...",
+            args.num_prompts
+        );
+        datasets::generate_random(
+            tokenizer,
+            args.num_prompts,
+            args.input_len,
+            args.output_len,
+            args.random_range_ratio,
+            args.random_prefix_len,
+            args.seed,
+        )?
+    };
+
+    // Random-token throwaways for ShareGPT too: any other sample of the file
+    // could be one of the measured ones.
+    let throwaway = datasets::generate_random(
+        tokenizer,
+        1 + args.num_warmups,
+        args.input_len,
+        args.output_len,
+        args.random_range_ratio,
+        args.random_prefix_len,
+        datasets::throwaway_seed(args.seed),
+    )?;
+    let send_throwaway = |i: usize, request_id: &str| {
+        let p = &throwaway[i];
+        let output_len = p.expected_output_len.min(args.output_len);
+        send_request(client, &p.prompt, output_len, request_id, Instant::now())
+    };
+    preflight(|| send_throwaway(0, "preflight"))?;
+    warm_up(args.num_warmups, |i| {
+        send_throwaway(1 + i, &format!("warmup-{i}"));
+    });
+
+    let num_prompts = prompt_entries.len();
+    let prompt_lens: Vec<usize> = prompt_entries.iter().map(|p| p.prompt_len).collect();
+    let pb = progress_bar(args, num_prompts);
+    let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+
+    // Generate request schedule using gamma distribution delays.
+    let cumulative_delays = generate_request_delays(
+        num_prompts,
+        args.request_rate,
+        args.burstiness,
+        args.seed.wrapping_add(42),
+    );
+
+    let benchmark_start = Instant::now();
+    let mut handles = Vec::with_capacity(num_prompts);
+
+    for (i, entry) in prompt_entries.into_iter().enumerate() {
+        wait_until(benchmark_start, cumulative_delays[i]);
+
+        let client = client.clone();
+        let pb = pb.clone();
+        let request_id = format!("bench-{i}");
+
+        // A thread per in-flight request. `--max-concurrency` bounds how many
+        // exist at once, and the permit is acquired HERE rather than inside
+        // the thread so the pacing loop blocks instead of running ahead and
+        // spawning threads that would only queue — the same back-pressure the
+        // async version got from awaiting the permit before spawning.
+        let permit = semaphore.as_ref().map(|s| s.acquire_owned());
+        handles.push(std::thread::spawn(move || {
+            // Held for the request's lifetime; returned on drop, including on
+            // unwind, so a failed request cannot shrink the concurrency bound.
+            let _permit = permit;
+            let result = send_request(
+                &client,
+                &entry.prompt,
+                entry.expected_output_len,
+                &request_id,
+                benchmark_start,
+            );
+            if let Some(ref pb) = pb {
+                pb.inc(1);
+            }
+            result
+        }));
+    }
+
+    let results = join_all(handles)?;
+    let total_time = benchmark_start.elapsed().as_secs_f64();
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    let total_input_tokens = results
+        .iter()
+        .zip(&prompt_lens)
+        .filter(|(r, _)| r.success)
+        .map(|(_, &len)| len)
+        .sum();
+    Ok(Run {
+        results,
+        total_input_tokens,
+        total_time,
+    })
+}
+
+/// Send one request to verify connectivity, and fail fast if it does not land.
+fn preflight(send: impl FnOnce() -> RequestResult) -> Result<()> {
+    eprintln!("Sending pre-flight request to verify connectivity...");
+    if !send().success {
+        anyhow::bail!("Pre-flight request failed. Check server connectivity and model name.");
+    }
+    eprintln!("Pre-flight request succeeded.");
+    Ok(())
+}
+
+/// Send `n` untimed warmup requests, `send(i)` sending the i-th.
+fn warm_up(n: usize, mut send: impl FnMut(usize)) {
+    if n == 0 {
+        return;
+    }
+    eprintln!("Sending {n} warmup request(s)...");
+    let warmup_pb = ProgressBar::new(n as u64);
+    warmup_pb.set_style(
+        ProgressStyle::with_template(
+            "Warmup {wide_bar:.yellow/blue} {pos}/{len} [{elapsed}<{eta}]",
+        )
+        .unwrap(),
+    );
+    for i in 0..n {
+        send(i);
+        warmup_pb.inc(1);
+    }
+    warmup_pb.finish_and_clear();
+    eprintln!("Warmup complete.");
+}
+
+fn progress_bar(args: &BenchServeArgs, len: usize) -> Option<ProgressBar> {
+    if args.disable_tqdm {
+        return None;
+    }
+    let pb = ProgressBar::new(len as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "Benchmarking {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
+        )
+        .unwrap()
+        .with_key("per_sec", crate::fmt_tqdm_rate),
+    );
+    Some(pb)
+}
+
+/// Sleep until `at` seconds after `start`: the schedule's next send time.
+fn wait_until(start: Instant, at: f64) {
+    let target = Duration::from_secs_f64(at);
+    let elapsed = start.elapsed();
+    if target > elapsed {
+        std::thread::sleep(target - elapsed);
+    }
+}
+
+fn join_all<T>(handles: Vec<JoinHandle<T>>) -> Result<Vec<T>> {
+    handles
+        .into_iter()
+        .map(|h| {
+            h.join()
+                .map_err(|_| anyhow::anyhow!("benchmark request thread panicked"))
+        })
+        .collect()
 }
 
 /// Compute peak output tokens/s by bucketing tokens into 1-second intervals.

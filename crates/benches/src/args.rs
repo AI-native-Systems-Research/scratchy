@@ -206,7 +206,7 @@ pub struct BenchThroughputArgs {
     pub dtype: String,
 
     /// Dataset name: "random" (default) or "sharegpt".
-    #[arg(long, default_value = "random")]
+    #[arg(long, default_value = "random", value_parser = ["random", "sharegpt"])]
     pub dataset_name: String,
 
     /// Path to dataset file (required for sharegpt).
@@ -389,13 +389,15 @@ pub struct BenchServeArgs {
     #[arg(long, default_value_t = 1.0)]
     pub burstiness: f64,
 
-    /// Number of warmup requests to send before timing.
+    /// Number of warmup requests to send before timing. They and the
+    /// pre-flight request use throwaway prompts from a seed disjoint from
+    /// `--seed`, so no measured prompt is in a prefix cache before it is timed.
     #[arg(long, default_value_t = 0)]
     pub num_warmups: usize,
 
-    /// Dataset name: "random" (default) or "sharegpt".
-    #[arg(long, default_value = "random")]
-    pub dataset_name: String,
+    /// Which prompts to send.
+    #[arg(long, value_enum, default_value_t = ServeDataset::Random)]
+    pub dataset_name: ServeDataset,
 
     /// Path to dataset file (required for sharegpt).
     #[arg(long)]
@@ -453,6 +455,18 @@ pub struct BenchServeArgs {
     /// Label for this benchmark run (used in auto-generated filenames).
     #[arg(long)]
     pub label: Option<String>,
+}
+
+/// The prompts `scr bench serve` sends.
+///
+/// A closed set because a typo used to fall through to `random` silently,
+/// benchmarking a workload nobody asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ServeDataset {
+    /// Seeded random-token prompts of `--input-len` tokens, streamed.
+    Random,
+    /// The first human turn of each ShareGPT conversation (`--dataset-path`).
+    Sharegpt,
 }
 
 /// Arguments for `scr bench startup`.
@@ -1528,5 +1542,32 @@ impl BenchLongbenchArgs {
                 Err("model is required: provide as positional arg or --model flag".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_serve_dataset_names_are_refused() {
+        let parse = |name| BenchServeArgs::try_parse_from(["serve", "--dataset-name", name]);
+        assert!(parse("shareGPT").is_err());
+        assert!(parse("randon").is_err());
+        assert_eq!(
+            parse("sharegpt").unwrap().dataset_name,
+            ServeDataset::Sharegpt
+        );
+        let a = BenchServeArgs::try_parse_from(["serve"]).unwrap();
+        assert_eq!(a.dataset_name, ServeDataset::Random);
+    }
+
+    #[test]
+    fn unknown_throughput_dataset_names_are_refused() {
+        let parse = |name| BenchThroughputArgs::try_parse_from(["t", "--dataset-name", name]);
+        assert!(parse("shareGPT").is_err());
+        assert_eq!(parse("sharegpt").unwrap().dataset_name, "sharegpt");
+        let a = BenchThroughputArgs::try_parse_from(["t"]).unwrap();
+        assert_eq!(a.dataset_name, "random");
     }
 }
