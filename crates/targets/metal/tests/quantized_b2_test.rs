@@ -27,8 +27,8 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b2_bf16_s_bf16, affine_qmm_t_b2_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
-    qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
+    DequantDtype, NaxDequant, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel,
+    pick_qmv_kernel, qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{ComputePipelineState, ConstantValue};
 
@@ -118,11 +118,12 @@ fn make_inputs_b2_f32(
 enum Op {
     Qmv,
     QmmT,
-    /// Force the NAX (matrix-unit) qmm_t — the M5+ prefill path. The
-    /// vendored MLX QuantizedBlockLoader's index math is bits=2-exact
-    /// (pack_factor 4, bytes_per_pack 1) and metal_nax.h carries MLX's
-    /// qdot bits==2 dequantize law.
-    QmmTNax,
+    /// Force the NAX (matrix-unit) qmm_t — the M5+ prefill path, under the
+    /// given W-dequant schedule. The vendored MLX QuantizedBlockLoader's
+    /// index math is bits=2-exact (pack_factor 4, bytes_per_pack 1) and
+    /// metal_nax.h carries MLX's qdot bits==2 dequantize law; the producer
+    /// decodes the same codes as an LSB-first bitstream.
+    QmmTNax(NaxDequant),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -219,8 +220,8 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
             let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
             (ComputePipelineState::clone(p), tg, tpg)
         }
-        Op::QmmTNax => {
-            let kernel = QmmTKernel::Nax;
+        Op::QmmTNax(dequant) => {
+            let kernel = QmmTKernel::Nax(dequant);
             let aligned_n = (n as u32).is_multiple_of(64);
             let name = qmm_t_kernel_name(
                 kernel,
@@ -339,15 +340,23 @@ fn qmm_t_nax_b2_bf16_prefill_shape() {
         );
         return;
     }
-    run_case_bf16(Op::QmmTNax, 64, 256, 2880, 64, 37, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 2880, 64, 37, 0.08);
+    }
     // Unaligned-N tail.
-    run_case_bf16(Op::QmmTNax, 64, 224, 2880, 64, 41, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 224, 2880, 64, 41, 0.08);
+    }
     // K=4096 (o_proj width).
-    run_case_bf16(Op::QmmTNax, 64, 512, 4096, 64, 43, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 512, 4096, 64, 43, 0.08);
+    }
     // gs=128 instantiation (K=4096 — 2880 is NOT a multiple of 128, so
     // gs=128 never occurs at the gpt-oss Ks; the instantiation is still
     // pinned for the general law).
-    run_case_bf16(Op::QmmTNax, 64, 256, 4096, 128, 47, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 4096, 128, 47, 0.08);
+    }
 }
 
 #[test]
