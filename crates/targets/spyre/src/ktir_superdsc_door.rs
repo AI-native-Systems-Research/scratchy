@@ -67,6 +67,23 @@ pub struct BundleAttnParams {
     pub geom: ktir_superdsc::head_counts::ModelAttnGeometry,
     /// main's `lower_one_node(.., rows_are_requests, ..)`.
     pub rows_are_requests: bool,
+    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION READS THE PAGED KV THROUGH AN INDEX — the batched rungs'
+    /// per-page gather (`rows_are_requests`) or the one-request rung's split-KV chunk
+    /// ([`Self::chunk_pages`]). Prefill does not gather: its rows are consecutive positions of one
+    /// sequence sharing one resident history, so there is nothing per-row for an index to select.
+    ///
+    /// ⛔ IT IS `rows_are_requests || chunk_pages.is_some()` AND NOTHING WIDER. A one-request body that
+    /// took the PER-PAGE gather would read its mask per row (the gathered score arm has no broadcast
+    /// arm) while placing and staging the broadcast row — measured on card as garbage from the first
+    /// decode token. So a one-request body gathers only as a chunk, whose read IS the broadcast row
+    /// over the chunk's logical slots. The placement reserves `KV_BLOCK_INDEX_TID` under this fact and
+    /// the emitter names the index under it — one predicate, both halves.
+    pub gathers_kv: bool,
+    /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — how many resident pages this one-request decode body attends in ONE
+    /// pass (`ktir_superdsc::sdsc_abstract::ChunkScratch`). A ladder rung's own bake fact: the attention
+    /// PROGRAM sweeps one page whatever the rung, so the chunk width cannot be read back from it, and it
+    /// is folded into the bundle fingerprint for exactly that reason. `None` = the per-page fold.
+    pub chunk_pages: Option<u32>,
     /// ⭐ WHETHER THIS BUNDLE'S ATTENTION SCALE WAS FOLDED INTO `W_q`/`W_k` — and it is here because
     /// the fold makes the program UNABLE to state the one fact that remains.
     ///
@@ -230,6 +247,8 @@ fn attn(
             k,
             r,
             rows_are_requests: p.rows_are_requests,
+            gathers_kv: p.gathers_kv,
+            chunk_pages: p.chunk_pages,
             scale_folded: p.scale_folded,
             headmajor_handoff: p.headmajor_handoff,
             sym_id_base,

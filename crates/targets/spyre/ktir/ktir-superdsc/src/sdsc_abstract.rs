@@ -4005,6 +4005,12 @@ impl BlockCols {
     pub const fn of_slot_window(slots: WindowSlots) -> BlockCols {
         BlockCols(slots.n())
     }
+    /// A whole split-KV CHUNK's slots — the one score/exp sweep of [`ChunkScratch`], `pages *
+    /// PAGE_SLOTS` wide. Demands the scratch itself, so a chunk width cannot be confused with a 64-slot
+    /// window or a page.
+    pub const fn of_chunk(chunk: ChunkScratch) -> BlockCols {
+        BlockCols(chunk.slots())
+    }
     /// One head-dim SLAB of features — quantity (4), [`FeatIdx::SLAB_FEATS`], demanded by type: the
     /// width a per-slab op writes. Distinct in meaning from one stick of lanes even though a slab
     /// is one stick of lanes by definition.
@@ -6613,6 +6619,250 @@ impl PageScratch {
             })
         })
     }
+}
+
+/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK SCRATCH — ONE request's `pages` resident pages, gathered **kv-head-major**
+/// so that each kv head's slice of the scratch IS a whole-chunk matmul kernel.
+///
+/// This is the reference's decode structure (`spyre_inference`'s `batched_decode_head_major_kernel`:
+/// `k_pages[page_ids]` over a CHUNK of pages, then ONE score and ONE value matmul over the whole chunk),
+/// mapped onto THIS pool's planes. Where [`PageScratch`] puts one page plane per row — `[page][kvh]` — and
+/// leaves the fold to walk it one page per launch, this puts one KV HEAD per row — `[kvh][page]`:
+///
+/// * a kv head's Kᵗ block in one page is RowBlocked `[hd, PAGE_SLOTS]` (slot sticks outermost, so
+///   `(s/64)*(hd*64) + d*64 + s%64`), and its `pages` blocks laid end to end are RowBlocked
+///   `[hd, pages * PAGE_SLOTS]` — the plain 2-D kernel a single score matmul reads, `n` = the whole chunk;
+/// * a kv head's V block is RowBlocked `[PAGE_SLOTS, hd]` at ONE feature slab, and end to end it is
+///   `[pages * PAGE_SLOTS, hd]` — the kernel a single value matmul contracts over the whole chunk.
+///
+/// ⛔ ONE SLAB ONLY, AND THAT IS A REFUSAL, NOT A FALLBACK. Above one feature slab the V block is
+/// `[slab][slot][stick]`, so pages laid end to end interleave slabs and stop being `[slots, hd]`; the fix
+/// is a slab-major destination order, which is a different row law. Refused here so a head dim this
+/// cannot express is a BUILD failure.
+///
+/// ⭐ THE COPY OP IS [`PageScratch`]'s, UNCHANGED — a one-stick-block entry, one index stick per op, `mb`
+/// counted in sub-rows. Only the row law and the source block an entry names differ, so the descriptor
+/// form is the card-proven one (`PageScratch::copies`' card record).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkScratch {
+    plane: PagePlaneExtent,
+    pages: u32,
+}
+
+impl ChunkScratch {
+    /// The most pages one chunk may hold — the top of [`Self::LADDER`]. 64 pages of 256 slots is 16384
+    /// tokens, so one launch attends every context the shipped `--max-model-len` serves; the reference
+    /// reaches the same depth with a chunk of 32 smaller pages walked over several in-program trips.
+    pub const PAGES_MAX: u32 = 64;
+
+    /// ⭐ THE ONE-REQUEST DECODE LADDER — one baked body per chunk width, in pages, ascending. The
+    /// runtime picks the smallest rung covering the live context (`select_body`'s own law over each
+    /// rung's swept `pages * PAGE_SLOTS`), and the chunk's tail pages repeat the last real page under a
+    /// fully masked validity row — the reference's power-of-two kv buckets with `_pad_num_blocks`.
+    ///
+    /// ⛔ IT STARTS AT TWO PAGES. A context within ONE page keeps the per-page body and its sweep
+    /// rungs below the page (`ActiveCap::decode_ladder`): those bound the sweep to the live length at
+    /// one stick's granularity, which a whole-page chunk cannot, and they gather nothing. A one-page
+    /// chunk is expressible and correct, and on card it LOST the canonical short chat — 27.63 vs
+    /// 25.97 ms ITL p50 (granite-2b fp8) — so it is not a rung.
+    pub const LADDER: [u32; 6] = [2, 4, 8, 16, 32, Self::PAGES_MAX];
+
+    /// THE ONE DOOR. `None` on a geometry the chunk gather cannot express — and the emitter raises a
+    /// `None` as a build failure, so it is never a silently ungathered bundle.
+    pub const fn of_chunk(pool: PagedKvPool, pages: u32) -> Option<ChunkScratch> {
+        let Some(plane) = PagePlaneExtent::of_pool(pool) else {
+            return None;
+        };
+        if pages == 0 || pages > Self::PAGES_MAX || plane.slabs() != 1 {
+            return None;
+        }
+        // ⛔ EVERY COPY NAMES EXACTLY ONE FULL INDEX STICK, so one op's entries must fit LX and the
+        // whole chunk must be a whole number of sticks — see [`Self::copies`] for the dxp refusal a
+        // short run produces.
+        if plane.lx_entries_per_op() < CopyDims::ENTRIES_PER_OP as u64 {
+            return None;
+        }
+        let s = ChunkScratch { plane, pages };
+        if !s.entries().is_multiple_of(CopyDims::ENTRIES_PER_OP) {
+            return None;
+        }
+        // The descriptor's extents are `u32`; a footprint past one is refused here rather than truncated.
+        if s.head_chunk_elems() > u32::MAX as u64 || s.sub_rows() > u32::MAX as u64 {
+            return None;
+        }
+        Some(s)
+    }
+
+    pub const fn plane(self) -> PagePlaneExtent {
+        self.plane
+    }
+    /// The chunk's resident pages — every one is gathered, padding included (a padded page repeats the
+    /// last real page and the mask silences it, as the reference's `_pad_num_blocks` does).
+    pub const fn pages(self) -> u32 {
+        self.pages
+    }
+    pub const fn nkvh(self) -> u32 {
+        self.plane.nkvh()
+    }
+    /// Slots the chunk spans — `pages * PAGE_SLOTS`, the score width of the one score matmul and the
+    /// contraction of the one value matmul.
+    pub const fn slots(self) -> u32 {
+        self.pages * PagedKvPool::PAGE_SLOTS as u32
+    }
+
+    /// Stick-block entries in ONE (page, kv head) block — `hd * PAGE_SLOTS / entry_elems`, i.e.
+    /// `PAGE_SLOTS / POOL_STICK`. Heads abut inside a plane, so a head's entries are consecutive.
+    pub const fn entries_per_head_page(self) -> u32 {
+        (self.plane.head_block_elems() / self.plane.entry_elems()) as u32
+    }
+
+    /// Entries one ROW (one kv head) holds — every page's block for that head.
+    pub const fn entries_per_row(self) -> u32 {
+        self.pages * self.entries_per_head_page()
+    }
+
+    /// Every entry of the chunk, all kv heads end to end — the destination's flat entry space, in which
+    /// kv head `kvh`'s row occupies `[kvh * entries_per_row, (kvh+1) * entries_per_row)`.
+    pub const fn entries(self) -> u32 {
+        self.nkvh() * self.entries_per_row()
+    }
+
+    /// Copy ops — one per full index stick of [`Self::entries`]. Also the index STICKS the host stages:
+    /// the table's size and the emitter's op count are this one number.
+    pub const fn index_sticks(self) -> u32 {
+        self.entries() / CopyDims::ENTRIES_PER_OP
+    }
+
+    /// The `(kv head, page, block-of-head)` flat entry `e` names — the one decomposition both the copy
+    /// ops' destinations and the host table's sources read.
+    pub const fn entry_coord(self, e: u32) -> (u32, u32, u32) {
+        let (per_row, eph) = (self.entries_per_row(), self.entries_per_head_page());
+        let (kvh, r) = (e / per_row, e % per_row);
+        (kvh, r / eph, r % eph)
+    }
+
+    /// Elements of ONE kv head's whole-chunk block — the matmul kernel's footprint.
+    pub const fn head_chunk_elems(self) -> u64 {
+        self.pages as u64 * self.plane.head_block_elems()
+    }
+
+    /// Element offset of kv head `kvh`'s whole-chunk block — the kernel base both legs take. `None` past
+    /// the head count.
+    pub const fn head_off(self, kvh: u32) -> Option<u64> {
+        if kvh >= self.nkvh() {
+            return None;
+        }
+        Some(kvh as u64 * self.head_chunk_elems())
+    }
+
+    /// The scratch's whole `mb` extent in one-stick sub-rows.
+    pub const fn sub_rows(self) -> u64 {
+        self.nkvh() as u64 * self.head_chunk_elems() / POOL_STICK as u64
+    }
+
+    /// The reservation's shape — `[nkvh, head_chunk_elems]`, one value (see
+    /// [`PageScratch::footprint_dims`] for why it is not two numbers).
+    pub const fn footprint_dims(self) -> [u32; 2] {
+        [self.nkvh(), self.head_chunk_elems() as u32]
+    }
+
+    /// ⭐ THE GATHER SCRATCH'S KERNEL CORNER for kv head `kvh` — where its whole-chunk Kᵗ/V block starts,
+    /// the kernel base both legs take. `None` past the head count or off the `u32` an address carries.
+    pub const fn kernel_corner(self, kvh: u32) -> Option<ChunkCorner> {
+        let Some(off) = self.head_off(kvh) else {
+            return None;
+        };
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
+    }
+
+    /// ⭐ A PER-HEAD WIDE INTERMEDIATE'S CORNER — kv head `kvh`'s `[rows_per_head, slots]` block of a
+    /// buffer laid out `[nkvh][rows_per_head][slots]`, i.e. `kvh * rows_per_head * slots`.
+    ///
+    /// ⛔ WHY EACH KV HEAD GETS A WHOLE BLOCK AND NOT A ROW SLICE OF ONE `[nqh, slots]` BUFFER: dxp
+    /// rebuilds a stick-blocked operand's stick-GROUP stride from the op's own `N_` (the windowed
+    /// matmul's card measurement, `assemble_matmul_windowed`), so a 4-row op over a 32-row RowBlocked
+    /// buffer strides its slabs `4*64` apart where the buffer's are `32*64` — incoherent on card at more
+    /// than one slab. A block that IS `[rows_per_head, slots]` has nothing to disagree about.
+    pub const fn rows_corner(self, kvh: u32, rows_per_head: u32) -> Option<ChunkCorner> {
+        if kvh >= self.nkvh() {
+            return None;
+        }
+        let off = kvh as u64 * rows_per_head as u64 * self.slots() as u64;
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
+    }
+
+    /// The SOURCE block inside one page plane that entry `q` of kv head `kvh`'s block names — heads abut,
+    /// so it is `kvh * entries_per_head_page + q`. `None` outside the head or the block.
+    pub const fn source_block(self, kvh: u32, q: u32) -> Option<u32> {
+        if kvh >= self.nkvh() || q >= self.entries_per_head_page() {
+            return None;
+        }
+        Some(kvh * self.entries_per_head_page() + q)
+    }
+
+    /// The copy ops — ONE PER FULL INDEX STICK of the flat entry space: op `j` is stick `j` and lands
+    /// destination entries `[32j, 32j+32)`, crossing kv-head rows freely (the rows abut).
+    ///
+    /// ⛔⛔⛔ A RUN SHORTER THAN ONE STICK IS REFUSED BY dxp, WHICH IS WHY THE CUT IS FLAT AND NOT PER
+    /// ROW. Cut per kv head, a one-page chunk names 4 entries per op, and the index operand's
+    /// element-arrangement fold is `entries / 32` — `dim_prop_attr[3].factor_ = 0`, `Must be >= 1`
+    /// (`dxp_standalone` on granite-3.1-2b fp8's `c1` rung, `attn_cgkt_*`). [`PageScratch::copies`]
+    /// never hit it because a request's page plane is exactly one stick of entries. Flat, every op is
+    /// that same full stick, and [`Self::of_chunk`] refuses a chunk that is not a whole number of them.
+    pub fn copies(self) -> impl Iterator<Item = GatherCopy> {
+        let page = self.plane.entry_sub_rows() as u32;
+        let stick = CopyDims::ENTRIES_PER_OP;
+        (0..self.index_sticks()).map(move |j| GatherCopy {
+            stick: j,
+            dest_entry: j * stick,
+            dims: CopyDims {
+                mb: stick * page,
+                out: POOL_STICK,
+                page: crate::superdsc_opspec::PageExtent::of_positions(page),
+            },
+        })
+    }
+}
+
+/// A device element corner inside a split-KV chunk tensor — minted ONLY by [`ChunkScratch`]'s own laws
+/// ([`ChunkScratch::kernel_corner`], [`ChunkScratch::rows_corner`]) and spent only through
+/// `addr::DevOff::of_chunk_corner`, so a per-head base cannot be written as caller arithmetic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkCorner(u32);
+
+impl ChunkCorner {
+    pub const fn elems(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE CHUNK GATHER'S INDEX TABLE — the flat entry space in [`ChunkScratch::copies`]' order: word
+/// `e` names entry `e`'s `(kv head, page, block)` source, so stick `j` is exactly copy op `j`'s run.
+///
+/// `pages` is the request's own physical page list in LOGICAL order (the map the launch installed). A
+/// chunk wider than the list repeats the LAST real page for its tail — never page 0, which is another
+/// request's keys; the mask silences the repeat (the reference's `_pad_num_blocks` law).
+///
+/// `None` on an empty page list or an entry that leaves `i32`.
+pub fn chunk_gather_index_table(
+    scratch: ChunkScratch,
+    pages: &[i64],
+    per_page: EntriesPerPage,
+) -> Option<Vec<GatherEntry>> {
+    let last = *pages.last()?;
+    (0..scratch.entries())
+        .map(|e| {
+            let (kvh, page, q) = scratch.entry_coord(e);
+            let phys = *pages.get(page as usize).unwrap_or(&last);
+            GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

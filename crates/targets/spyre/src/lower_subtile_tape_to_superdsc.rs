@@ -394,6 +394,41 @@ fn audit_layout_addresses(
     }
 }
 
+/// ⛔⛔⛔ ONE SESSION STAGES ONE LAYOUT — every ladder rung must place every host-staged ACTIVATION
+/// exactly where the ceiling does, the gather's own index excepted.
+///
+/// A decode session's host binds each step at the CEILING bundle's placements, whichever rung body it
+/// then launches, while that body's descriptors were emitted against its OWN layout. A tensor the two
+/// place apart is read by the body from bytes the host never wrote there — a clean bake, no fault, a
+/// wrong constant. The one tensor allowed to differ is [`KV_BLOCK_INDEX_TID`]: only a gathering body
+/// places it, only a gathering step stages it, and [`compute_bundle_layout`] places it LAST so it moves
+/// nothing else. The macro calls this on every rung it bakes, so a disagreement is a build failure.
+pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> Result<(), String> {
+    let staged = |l: &BundleLayout| -> Vec<(u32, usize, u64, u64)> {
+        l.placements
+            .values()
+            .filter(|p| matches!(p.role, SegRole::Activation) && p.tid != KV_BLOCK_INDEX_TID)
+            .map(|p| (p.tid, p.segment, p.offset, p.size))
+            .collect()
+    };
+    let (c, r) = (staged(ceiling), staged(rung));
+    if c == r {
+        return Ok(());
+    }
+    let first = c
+        .iter()
+        .zip(&r)
+        .find(|(a, b)| a != b)
+        .map(|(a, b)| {
+            format!("first difference (tid, seg, offset, size): ceiling {a:?} vs rung {b:?}")
+        })
+        .unwrap_or_else(|| format!("{} vs {} staged activation(s)", c.len(), r.len()));
+    Err(format!(
+        "a ladder rung places a host-staged activation apart from its ceiling — the host stages the \
+         ceiling's placements, so the rung would read bytes nobody wrote: {first}"
+    ))
+}
+
 /// Build the GLOBAL [`BundleLayout`] for one fused SuperDSC bundle (task #55).
 ///
 /// Classification by liveness over `ir.nodes` (already a valid eval order):
@@ -417,6 +452,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // and so does the attention pad's door: a decode width must be a baked ladder rung
     // (`PaddedMq::of_bundle`), which is the `Err` this returns.
     rows_are_requests: bool,
+    // ⭐ TRUE when this bundle's attention reads the paged KV through the page index — the
+    // reference's law: every DECODE gathers its pages (batched rungs and the one-request rung
+    // alike), prefill sweeps. Decides the `KV_BLOCK_INDEX_TID` placement alone; every other
+    // `rows_are_requests` consumer above keeps its own fact. Same value the emitter admits the
+    // gather under — one predicate, both halves.
+    gathers_kv: bool,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
     // see [`bank_weight_segment`]. From [`per_layer_external_tids`], a pre-pass over the re-rolled
     // tape; EMPTY for an unrolled bundle, which has no layer boundary and therefore cannot bank.
@@ -1016,6 +1057,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // synthesizes `1/sqrt(hd)`). Placed LAST so it overrides any earlier source/
     // intermediate classification of the cache ids.
     let mut scale_placed = false;
+    // The KV block index's bytes when this bundle gathers — sized below beside the mask whose pass
+    // grid it shares, PLACED after every other activation (see the placement after the scale
+    // registry).
+    let mut kv_block_index_bytes: Option<u64> = None;
     for node in &ir.nodes {
         if let SubOp::AttnDecode {
             geom, layout: kv, ..
@@ -1290,13 +1335,16 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // that emit no gather at all — and the one condition that must govern both halves would
                 // have had to be re-derived somewhere else.
                 //
-                // `rows_are_requests` is that condition, and it is the SAME parameter
-                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. A prompt chunk
-                // and a solo decode share ONE resident history across every row, so there is nothing for
-                // an index to distinguish and their emission stays byte-identical.
+                // ⭐⭐⭐ `gathers_kv` is that condition, and it is the SAME fact
+                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. The
+                // reference gathers its pages on EVERY decode — batched and one-request alike — so
+                // both rungs place the index; prefill's rows are consecutive positions of one
+                // sequence sharing ONE resident history, so there is nothing for an index to
+                // distinguish and its emission stays byte-identical.
                 //
-                // ⛔⛔⛔⛔⛔ AND IT IS **STILL** `rows_are_requests` ALONE, AGAINST THE OBVIOUS FIX, BECAUSE
-                // THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON THE CARD.
+                // ⛔⛔⛔⛔⛔ AND IT IS **STILL** THE BARE ROW-KIND-ADJACENT PREDICATE, ALONE, AGAINST THE
+                // OBVIOUS FIX, BECAUSE THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON
+                // THE CARD.
                 //
                 // The split is real and it is stated on [`GatherScratch::admits`]: `assemble_attn` may
                 // DECLINE the gather on the geometry (`of_fold_pass` refuses a head dim its flat copy
@@ -1363,7 +1411,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // non-observable (`assemble_attn`'s `kv_block_index.zip(of_fold_pass(..))` is already `None`
                 // at hd=128 whichever way the name goes), so the coupling is stated where it costs no
                 // addresses and this placement keeps every byte it had.
-                if rows_are_requests {
+                if gathers_kv {
                     // ⛔⛔⛔ SIZE = THE ENTRIES THE **DESCRIPTOR DECLARES**, NOT THE ENTRIES THE HOST
                     // MEANS TO FILL. This was `WIDEST_BATCH_RUNG * MAX_PAGES_PER_ROW` — 32 x 16 = 512
                     // entries, "one per (launch row, logical page), the same shape as the host's
@@ -1418,20 +1466,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     // it is: a gathered fold's passes are the pages ONE ROW holds. Over-reserving
                     // would be inert here, but agreeing with the mask's own grid is what keeps the
                     // shift meaningful for both tensors.
-                    let bioff = seg_bytes[a];
-                    let bibytes = pmbytes;
-                    placements.insert(
-                        KV_BLOCK_INDEX_TID,
-                        TensorPlacement {
-                            tid: KV_BLOCK_INDEX_TID,
-                            bank: 0,
-                            role: SegRole::Activation,
-                            segment: a,
-                            offset: bioff,
-                            size: bibytes,
-                        },
-                    );
-                    seg_bytes[a] = align128(bioff + bibytes);
+                    kv_block_index_bytes = Some(pmbytes);
                 }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
                 // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split
@@ -1580,6 +1615,31 @@ pub fn compute_bundle_layout<F: RopeForm>(
             },
         );
         seg_bytes[a] = align128(off + 2);
+    }
+
+    // ⛔⛔⛔ THE KV BLOCK INDEX IS THE LAST ACTIVATION, SO ITS PRESENCE MOVES NOTHING ELSE. One session
+    // runs bodies that gather and bodies that do not — the one-request ladder's per-page bodies within
+    // one page under a split-KV chunk ceiling — and the host stages every input at the CEILING's
+    // placements, while each body's descriptors read its OWN layout. Placed where it was, beside the
+    // mask, it pushed the scale registry above down by its size: a non-gathering body read the
+    // RMSNorm epsilon out of the index's bytes (zero, or the previous long request's block numbers)
+    // and paid a separate DMA run every step for the scales the host staged out of reach. Last, the
+    // two layouts agree on every other tensor — which `ladder_stages_one_layout` holds the macro to.
+    if let Some(bibytes) = kv_block_index_bytes {
+        let a = SegRole::Activation.segment();
+        let bioff = seg_bytes[a];
+        placements.insert(
+            KV_BLOCK_INDEX_TID,
+            TensorPlacement {
+                tid: KV_BLOCK_INDEX_TID,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: a,
+                offset: bioff,
+                size: bibytes,
+            },
+        );
+        seg_bytes[a] = align128(bioff + bibytes);
     }
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
@@ -2239,6 +2299,13 @@ pub enum GroupKind {
     /// its stride (STICK_BYTES·stick = 8192) ≠ the cachewr's `slot_stride_bytes` (128), so fusing the two
     /// would trip the per-group uniform-stride assert (mixed-stride group → wrong base shift).
     Slab,
+    /// A GATHERED read outside any fold — the split-KV chunk's copies (`attn.rs`'s
+    /// `assemble_attn_chunk`), which pull every resident page through the index ONCE per launch.
+    /// Consecutive `Gathered` trips FUSE, but never with anything else: the group's `KvShifts::gathered`
+    /// is what zeroes its KV page shift (the entries are absolute) and what tells the host this body
+    /// needs its index staged, so a `Pure` op swept in would lose its page base, and a copy swept into
+    /// a `Pure` group would gain one.
+    Gathered,
 }
 
 /// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
@@ -2280,6 +2347,7 @@ impl GroupKind {
         match (self, other) {
             (GroupKind::Pure, GroupKind::Pure) => true,
             (GroupKind::Slab, GroupKind::Slab) => true,
+            (GroupKind::Gathered, GroupKind::Gathered) => true,
             // AND THE SAME GATHER STATE. They move together in today's emitter (one `gather` decision
             // serves a whole attention block), so this arm is `true` in practice — but a group takes
             // its SIZE CAP from its first trip's kind, so a run mixing the two would silently give one
@@ -2731,6 +2799,8 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                 GroupKind::PageFold {
                     gathered: e.kv_gathered,
                 }
+            } else if e.kv_gathered {
+                GroupKind::Gathered
             } else if e.slab_write {
                 // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
                 // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
@@ -3094,9 +3164,10 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // carry the request axis.
             batched_requests: fold_group && e.kv_batched_requests,
             // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
-            // and what sends the fold's KV shift to zero. Same `fold_group` gate as the axis: a non-fold
-            // group has no pass to gather for.
-            gathered: fold_group && e.kv_gathered,
+            // and what sends the fold's KV shift to zero. A non-fold group gathers only as a `Gathered`
+            // run (the split-KV chunk's copies), which takes the same zero shift and the same staged index.
+            gathered: (fold_group && e.kv_gathered)
+                || matches!(kinds[r.start].kind, GroupKind::Gathered),
             fold_rows: match e.kv_fold_rows {
                 scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
                     bundle::FoldRows::PerRequest
@@ -3526,7 +3597,7 @@ pub fn emit_bundle(
     audit_op_work(ops, "<bundle>");
     // Content-addressed: the same ops at the same grouping ARE the same bundle, so the second emit has
     // nothing to do. The ladder's ceiling rung IS the body, so this fires on every rolled model.
-    let fp = bundle_fp(ops, fold);
+    let fp = bundle_fp(ops, fold, attn_params);
     if emitted().lock().is_ok_and(|c| c.contains_key(&fp)) {
         return Ok(fp);
     }
@@ -3546,8 +3617,24 @@ pub fn emit_bundle(
 /// ⛔ THE FUSED TWIN'S NAME KEYS OFF THE UNFILTERED OPS. The runtime finds a body's fused twin as
 /// `<split fp>f`, so the base hash must be the split body's, computed before `ops_for_grouping` drops
 /// anything. Hashing the trimmed list is what made the twin unfindable.
-fn bundle_fp(ops: &[EmittedOp], fold: FoldGrouping) -> String {
-    let base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
+///
+/// ⛔⛔⛔ AND IT HASHES THE SPLIT-KV CHUNK, BECAUSE THE OPS CANNOT. `ops` are the pre-expansion programs,
+/// and a chunk rung's programs are BIT-IDENTICAL to every other rung's — the attention program sweeps one
+/// page, and the chunk width is a bake fact (`BundleAttnParams::chunk_pages`) the door expands. Hashed
+/// without it, every rung of the chunk ladder fingerprints alike, the content-addressed early-out in
+/// [`emit_bundle`] returns the FIRST rung's body for all of them, and a 16-page context runs a 1-page
+/// chunk: clean bake, no fault, every key past slot 256 silently unread. Appended only when present, so
+/// every bundle without a chunk keeps its fingerprint byte for byte.
+fn bundle_fp(
+    ops: &[EmittedOp],
+    fold: FoldGrouping,
+    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+) -> String {
+    let split = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
+    let base = match attn_params.and_then(|p| p.chunk_pages) {
+        Some(pages) => format!("{split}c{pages}"),
+        None => split,
+    };
     match fold {
         FoldGrouping::Split => base,
         FoldGrouping::Fused => format!("{base}f"),
@@ -3615,7 +3702,7 @@ fn emit_bundle_inner(
         )));
     }
 
-    let fp = bundle_fp(ops, fold);
+    let fp = bundle_fp(ops, fold, attn_params);
     let kept: Vec<&EmittedOp> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp>;
     let ops: &[EmittedOp] = if kept.len() == ops.len() {
@@ -4382,6 +4469,8 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     active_cap: ActiveCap,
     rows_are_requests: bool,
     one_request_decode: bool,
+    // The split-KV chunk a one-request ladder rung bakes — see `BundleAttnParams::chunk_pages`.
+    chunk_pages: Option<u32>,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -4390,6 +4479,7 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         active_cap,
         rows_are_requests,
         one_request_decode,
+        chunk_pages,
     )
 }
 
@@ -4715,7 +4805,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
@@ -5084,7 +5174,7 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
             .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");

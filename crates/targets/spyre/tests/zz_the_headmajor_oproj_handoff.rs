@@ -238,6 +238,8 @@ fn walk_at_8b() -> (RolledSuperDsc, SubtileIR<NeoX>, HashSet<u32>) {
         ActiveCap::FULL,
         false,
         true,
+        // The handoff is a property of the per-page body; no chunk here.
+        None,
     )
     .expect("the 8b-shaped two-layer graph lowers with the head-major handoff");
     (rolled, rg, weight_ids)
@@ -417,7 +419,7 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
     // bundle's row count, because every bundle of a model shares ONE staged weight
     // segment. (The empty per-layer map is the wiring pass's own production call shape —
     // `graph_wiring` mints unbanked.)
-    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, &BTreeMap::new())
+    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, false, &BTreeMap::new())
         .expect("the mint runs for the prefill row kind");
     assert_eq!(
         layout_prefill.weight_copies,

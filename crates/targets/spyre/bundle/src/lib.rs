@@ -310,11 +310,12 @@ pub struct KvShifts {
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
     /// (request, page).
     pub batched_requests: bool,
-    /// ⭐ That axis walks a GATHERED scratch, so each row's PAGE came from the index the host stages
-    /// rather than from a segment shift. Two consequences the runtime must know: the pool needs no single
-    /// stride for the passes to collapse, and the fold's KV shift must be ZERO (an absolute entry plus a
-    /// per-pass page base composes two bases and lands inside neither). Meaningful only with
-    /// [`Self::batched_requests`].
+    /// ⭐ This group reads the pool through the GATHER — each page came from the index the host stages
+    /// rather than from a segment shift. Two consequences the runtime must know: the group's KV shift
+    /// must be ZERO (an absolute entry plus a page base composes two bases and lands inside neither),
+    /// and the host must stage the index table for any body carrying such a group. On a fold group it
+    /// also lets the passes collapse with no single pool stride (with [`Self::batched_requests`]); on a
+    /// non-fold group it is the split-KV chunk's gather copies, launched once.
     pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
