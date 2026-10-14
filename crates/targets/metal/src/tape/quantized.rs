@@ -415,8 +415,9 @@ impl NaxDequant {
     /// ≥ 6 tiles −1..−10%, the producer faster in every cell.
     pub const PRODUCER_MIN_N_TILES: u32 = 6;
     /// K steps (64 deep) from which the overlap pays for the first tile, which nothing
-    /// overlaps: K = 704 (11 steps, the shortest measured) −2..−4%.
-    pub const PRODUCER_MIN_K_STEPS: u32 = 11;
+    /// overlaps: K = 1024 (16 steps) −0..−3% in every run; K = 704 (11 steps) swung
+    /// between −3% and +1.2% across runs, so the loader keeps it.
+    pub const PRODUCER_MIN_K_STEPS: u32 = 16;
     /// Rows from which the producer is measured to win: below, the kernels run tens of
     /// microseconds and no ordering of the two separates from the noise, so the loader
     /// runs there.
