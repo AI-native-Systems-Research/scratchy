@@ -20,15 +20,14 @@ use serde::Serialize;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, Column, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Grid,
-    Heading, Layer, Section, Span, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile,
-    Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Heading,
+    Layer, Section, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab, Theme};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    Better, DASH, Engine, Metric, NO_STREAM, NOISE, PARTIAL, Startup, cell, cfmt, fmt, lfmt, med,
-    partial, served, timing, untimed_note,
+    Better, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed, fmt, lfmt,
+    marks, marks_note, med, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -133,7 +132,21 @@ impl<'a> MachineRuns<'a> {
     }
 }
 
-/// Per machine, by chip name. Newer runs win, so a model shows its newest numbers.
+/// The models the runner measured as current when this run was made: its
+/// full set, or the default list the first runs to record one kept; None for
+/// runs older than that.
+fn current_models(run: &Run) -> Option<&Vec<String>> {
+    run.config
+        .current_models
+        .as_ref()
+        .or(run.config.default_models.as_ref())
+        .filter(|v| !v.is_empty())
+}
+
+/// Per machine, by chip name. Newer runs win, so a model shows its newest
+/// numbers. A model is retired once the newest run that recorded the
+/// runner's current models leaves it out and ran it no later, so a --models
+/// subset hides nothing; runs before that record keep every model.
 fn index(runs: &[Run]) -> BTreeMap<&str, MachineRuns<'_>> {
     let mut by_time: Vec<&Run> = runs.iter().collect();
     by_time.sort_by(|a, b| a.generated_utc.cmp(&b.generated_utc));
@@ -153,6 +166,16 @@ fn index(runs: &[Run]) -> BTreeMap<&str, MachineRuns<'_>> {
                 None => mr.models.push((&m.stem, vec![e])),
             }
         }
+    }
+    for mr in machines.values_mut() {
+        let Some(newest) = mr.runs.iter().rev().find(|r| current_models(r).is_some()) else {
+            continue;
+        };
+        let keep = current_models(newest).cloned().unwrap_or_default();
+        let when = &newest.generated_utc;
+        mr.models.retain(|(stem, es)| {
+            keep.iter().any(|k| k == stem) || es.last().is_some_and(|e| &e.run.generated_utc > when)
+        });
     }
     machines
 }
@@ -184,9 +207,9 @@ fn delta(new: Option<f64>, old: Option<f64>, higher_better: bool) -> Element {
 
 /// The summary row's numbers, unformatted, for comparing two runs, each with
 /// whether higher is better (only tok/s is; every time and memory is lower).
-fn summary_raw(m: &Model) -> [(Option<f64>, bool); 8] {
+fn summary_raw(m: &Model, run: &Run) -> [(Option<f64>, bool); 8] {
     let ladder = Engine::Scratchy.ladder(m);
-    let one = cell(Engine::Scratchy.cells(m), At::Conc(1));
+    let one = by_users(m, run, Engine::Scratchy).get(&1).copied();
     [
         (med(ladder, Scenario::Frozen, Startup::Ready), false),
         (med(ladder, Scenario::Cold, Startup::Ready), false),
@@ -223,6 +246,216 @@ fn settings_changed(run: &Run, prev: &Run) -> String {
         .join("; ")
 }
 
+/// A model's base shape: the run's, with the users count the runner lowered
+/// for a model whose KV cache would not fit more (GLM-4.5-Air).
+fn base_of(run: &Run, m: &Model) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let b = run.config.base();
+    let conc = m
+        .scaling_limits
+        .as_ref()
+        .and_then(|l| l.base_conc)
+        .or(b.and_then(|b| b.conc));
+    (b.and_then(|b| b.input), b.and_then(|b| b.output), conc)
+}
+
+/// Where a model's users numbers come from: the separate users sweep at the
+/// base shape (older runs, or `--scale-axes conc`), else the grid's own users
+/// dimension at its middle cell (#349).
+#[derive(Clone, Copy, PartialEq)]
+enum UsersFrom {
+    Sweep,
+    Grid { input: u32, output: u32 },
+}
+
+fn users_from(m: &Model, run: &Run) -> UsersFrom {
+    if Engine::Scratchy
+        .cells(m)
+        .iter()
+        .any(|c| matches!(c.at, At::Conc(_)))
+    {
+        return UsersFrom::Sweep;
+    }
+    let sc = run.config.scaling.as_ref();
+    let mid = |v: Option<&Vec<u32>>| v.filter(|v| !v.is_empty()).map(|v| v[v.len() / 2]);
+    match (
+        mid(sc.and_then(|s| s.grid_input.as_ref())),
+        mid(sc.and_then(|s| s.grid_output.as_ref())),
+    ) {
+        (Some(input), Some(output)) => UsersFrom::Grid { input, output },
+        _ => UsersFrom::Sweep,
+    }
+}
+
+/// One engine's cells by users count, from wherever this model's come from.
+fn by_users<'a>(m: &'a Model, run: &Run, e: Engine) -> BTreeMap<u32, &'a Cell> {
+    let base = base_of(run, m).2.unwrap_or(0);
+    match users_from(m, run) {
+        UsersFrom::Sweep => e
+            .cells(m)
+            .iter()
+            .filter_map(|c| match c.at {
+                At::Conc(n) => Some((n, c)),
+                _ => None,
+            })
+            .collect(),
+        UsersFrom::Grid { input, output } => e
+            .cells(m)
+            .iter()
+            .filter(|c| c.at == At::Grid { input, output })
+            .map(|c| (c.users.unwrap_or(base), c))
+            .collect(),
+    }
+}
+
+/// The prompt and answer sizes a model's users numbers were measured at.
+fn users_shape(m: &Model, run: &Run) -> (Option<u32>, Option<u32>) {
+    match users_from(m, run) {
+        UsersFrom::Sweep => {
+            let (i, o, _) = base_of(run, m);
+            (i, o)
+        }
+        UsersFrom::Grid { input, output } => (Some(input), Some(output)),
+    }
+}
+
+/// The comparison engines' releases as the runner recorded them: every engine
+/// from `config.engines`, else the mlx-lm/ollama pair older runs kept.
+fn engine_versions(run: &Run) -> String {
+    let c = &run.config;
+    let parts: Vec<String> = match &c.engines {
+        Some(es) => es
+            .iter()
+            .filter(|e| e.key != "scratchy" && e.installed == Some(true))
+            .filter_map(|e| {
+                Some(format!(
+                    "{} {}",
+                    e.label,
+                    e.version.as_deref().filter(|v| !v.is_empty())?
+                ))
+            })
+            .collect(),
+        None => c
+            .engine_versions
+            .iter()
+            .flatten()
+            .filter_map(|(k, v)| {
+                let label = Engine::ALL.into_iter().find(|e| e.key() == k)?.label();
+                Some(format!("{label} {}", v.as_deref()?))
+            })
+            .collect(),
+    };
+    if parts.is_empty() {
+        "not recorded".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Whether the run was an agreed, fully pinned one.
+fn pinned(run: &Run) -> String {
+    match run.config.pinned {
+        None => "not recorded".to_string(),
+        Some(true) => "yes".to_string(),
+        Some(false) => match run.config.pin_problems.as_deref() {
+            Some(ps) if !ps.is_empty() => format!("no: {}", ps.join("; ")),
+            _ => "no".to_string(),
+        },
+    }
+}
+
+/// Everything else that can move a run-to-run number besides scratchy's own
+/// code: the base shape, the other engines' releases, whether the run was
+/// pinned, macOS, and the model files. Unrecorded on either side never counts
+/// as a change, so runs from before a field existed do not all warn.
+fn conditions(run: &Run, m: &Model) -> [(&'static str, String); 5] {
+    let (i, o, c) = base_of(run, m);
+    let shape = if run.config.base().is_some() {
+        format!("{}/{}/{}", opt(i), opt(o), opt(c))
+    } else {
+        "not recorded".to_string()
+    };
+    let files = m
+        .model_files
+        .as_ref()
+        .and_then(|f| f.revision.as_deref())
+        .map_or("not recorded".to_string(), |r| {
+            r[..r.len().min(8)].to_string()
+        });
+    let pin = pinned(run);
+    [
+        ("base shape (in/out/users)", shape),
+        ("engine versions", engine_versions(run)),
+        (
+            "pinned",
+            pin.split(':').next().unwrap_or_default().to_string(),
+        ),
+        ("macOS", run.machine.macos.to_string()),
+        ("model files", files),
+    ]
+}
+
+fn conditions_changed(run: &Run, m: &Model, prev: Entry) -> String {
+    conditions(run, m)
+        .into_iter()
+        .zip(conditions(prev.run, prev.m))
+        .filter(|((_, now), (_, then))| {
+            now != then && now != "not recorded" && then != "not recorded"
+        })
+        .map(|((k, now), (_, then))| format!("{k} {then} then, {now} now"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What an engine served for this model, for its row: the ollama tag or GGUF
+/// file it loaded, with its quantization when it reported one. Runs from
+/// before `engine_models` kept only ollama's.
+fn served_as(m: &Model, e: Engine) -> Option<String> {
+    let (model, quant) = match m.engine_models.as_ref().and_then(|em| em.get(e.key())) {
+        Some(s) => (s.model.clone(), s.quantization.clone()),
+        None if e == Engine::Ollama => {
+            let o = m.ollama.as_ref()?;
+            (o.tag.clone(), o.quantization.clone())
+        }
+        None => return None,
+    };
+    // The MLX engines serve scratchy's own checkpoint: nothing to add.
+    let model = match e {
+        Engine::Ollama => model,
+        Engine::LlamaCpp | Engine::Mistralrs => {
+            model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string())
+        }
+        _ => None,
+    };
+    let parts: Vec<String> = [model, quant]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// The parity gate's verdict for the model line: scratchy and mlx-lm must
+/// give the same greedy answers before anything is timed. None for runs from
+/// before the gate.
+fn parity(m: &Model) -> Option<&'static str> {
+    m.parity_mlx_lm.map(|p| match p {
+        Some(true) => "output matches mlx-lm",
+        Some(false) => "output does not match mlx-lm",
+        None => "output not checked (no mlx-lm)",
+    })
+}
+
+fn parity_info() -> Element {
+    info(
+        "",
+        rsx! {
+            "Before anything is timed, scratchy and mlx-lm answer the same short prompts with greedy decoding, \
+             and the answers must match exactly. A mismatch points at a wrong load path (quant preset, group \
+             size, dequant), so that model is not timed at all."
+        },
+    )
+}
+
 fn info(label: &str, body: Element) -> Element {
     rsx! { Toggletip { label, alignment: Alignment::Bottom, {body} } }
 }
@@ -245,8 +478,10 @@ fn timing_info() -> Element {
         "",
         rsx! {
             strong { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
-            strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). mlx-lm and \
-                       ollama can stop answers early, which flatters tok/s."
+            strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). "
+            strong { "{FAILED}" } ": some requests failed (an error or a timeout, usually the engine running out of \
+                       memory), so every number in that cell covers only the rest. mlx-lm and ollama can stop \
+                       answers early, which flatters tok/s."
         },
     )
 }
@@ -269,9 +504,11 @@ fn about() -> Element {
     info(
         "About these numbers",
         rsx! {
-            "Prompts are made up, a fixed size, and unique per request so no cache can answer them, with \
-             greedy decoding (temperature 0) on every engine. mlx-lm runs the same MLX checkpoint as scratchy; \
-             ollama runs its own GGUF quantization, named on its row. scratchy's build time is shown per model \
+            "Prompts are made up, a fixed size, and unique per request so no cache can answer them (warmups use \
+             prompts of their own), with greedy decoding (temperature 0) on every engine. oMLX (as shipped, and \
+             with 4-bit TurboQuant KV), mlx-lm and vllm-metal run the same MLX checkpoint as scratchy; ollama, \
+             llama.cpp and mistral.rs run their own quantizations, named on their rows. Engine versions, and \
+             whether a run was pinned, are in each machine's runs table. scratchy's build time is shown per model \
              and is never part of startup. The (i) buttons next to a column explain it."
         },
     )
@@ -299,17 +536,20 @@ fn part(heading: &str, intro: Element, body: Element) -> Element {
 }
 
 fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
-    let shape = run
-        .config
-        .base()
-        .map(|b| format!("{} in / {} out", opt(b.input), opt(b.output)));
+    let (si, so) = users_shape(m, run);
+    let shape = (si.is_some() || so.is_some()).then(|| format!("{} in / {} out", opt(si), opt(so)));
+    // Badges only against a run whose one-user numbers are at the same shape:
+    // a change of shape is not a speedup.
+    let same_shape = prev.is_some_and(|p| users_shape(p.m, p.run) == (si, so));
     let rows = Engine::ALL.into_iter().filter_map(|e| {
-        let (ladder, one) = (e.ladder(m), cell(e.cells(m), At::Conc(1)));
+        let (ladder, one) = (e.ladder(m), by_users(m, run, e).get(&1).copied());
         if e == Engine::Scratchy && !served(m) {
-            let why = if m.built {
-                "the server never served"
-            } else {
+            let why = if !m.built {
                 "build failed"
+            } else if m.parity_mlx_lm == Some(Some(false)) {
+                "its answers did not match mlx-lm's, so no engine was timed"
+            } else {
+                "the server never served"
             };
             return Some(rsx! {
                 TableRow {
@@ -318,7 +558,7 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
                 }
             });
         }
-        if e != Engine::Scratchy && ladder.is_empty() && e.cells(m).is_empty() {
+        if e != Engine::Scratchy && !e.ran(m) {
             return None; // that engine was not part of this run
         }
         let vals = [
@@ -328,23 +568,17 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             lfmt(ladder, Scenario::Warm, Startup::FirstToken, 0, 1000.0),
             cfmt(one, Metric::Ttft),
             cfmt(one, Metric::Tpot),
-            fmt(timing(one, Metric::Throughput), 1),
+            fmt(timing(one, Metric::Throughput), 1) + if failed(one) > 0 { FAILED } else { "" },
             fmt(med(ladder, Scenario::Cold, Startup::PeakRss), 0),
         ];
-        let now = summary_raw(m);
+        let now = summary_raw(m, run);
         let then = prev
-            .filter(|_| e == Engine::Scratchy)
-            .map(|p| summary_raw(p.m));
-        // ollama runs its own GGUF: name it on its row.
-        let name = match m.ollama.as_ref().filter(|_| e == Engine::Ollama) {
+            .filter(|_| e == Engine::Scratchy && same_shape)
+            .map(|p| summary_raw(p.m, p.run));
+        // An engine with its own quantization says which on its row.
+        let name = match served_as(m, e) {
             None => e.label().to_string(),
-            Some(o) => {
-                let tag = o.tag.as_deref().unwrap_or_default();
-                match o.quantization.as_deref().filter(|q| !q.is_empty()) {
-                    Some(q) => format!("{} ({tag}, {q})", e.label()),
-                    None => format!("{} ({tag})", e.label()),
-                }
-            }
+            Some(s) => format!("{} ({s})", e.label()),
         };
         Some(rsx! {
             TableRow {
@@ -360,6 +594,9 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
     let changed = prev
         .map(|p| settings_changed(run, p.run))
         .unwrap_or_default();
+    let around = prev
+        .map(|p| conditions_changed(run, m, p))
+        .unwrap_or_default();
     part(
         "Startup and single-user speed",
         rsx! {
@@ -370,6 +607,9 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
                 "); ≈ is within 3%."
                 if !changed.is_empty() {
                     " " strong { "Settings differ from that run" } " ({changed}), so a change is not the code alone."
+                }
+                if !around.is_empty() {
+                    " " strong { "Also different" } ": {around}."
                 }
             }
             " What the columns mean: startup " {startup_info()} " one user " {timing_info()} " peak RSS " {rss_info()}
@@ -710,8 +950,68 @@ fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Element
     }
 }
 
-/// One bar chart: offered users on x, a bar per engine at each.
-fn bar_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &str) -> Element {
+/// What a sweep's charts put on x.
+#[derive(Clone, Copy, PartialEq)]
+enum Sweep {
+    /// Offered concurrent users, at the base shape (or the grid's middle cell).
+    Users,
+    /// Prompt tokens, at the base answer size and users.
+    Prompt,
+}
+
+impl Sweep {
+    fn at(self, c: &Cell) -> Option<u32> {
+        match (self, c.at) {
+            (Sweep::Users, At::Conc(n)) | (Sweep::Prompt, At::Input(n)) => Some(n),
+            _ => None,
+        }
+    }
+    fn xlabel(self) -> &'static str {
+        match self {
+            Sweep::Users => "offered concurrent users",
+            Sweep::Prompt => "prompt tokens",
+        }
+    }
+    fn metrics(self) -> [(Metric, &'static str, &'static str); 2] {
+        match self {
+            Sweep::Users => [
+                (
+                    Metric::Throughput,
+                    "Throughput (tok/s, higher is better)",
+                    "tok/s",
+                ),
+                (
+                    Metric::Tpot,
+                    "Time per output token (ms, lower is better)",
+                    "TPOT ms",
+                ),
+            ],
+            Sweep::Prompt => [
+                (
+                    Metric::Ttft,
+                    "Time to first token (ms, lower is better)",
+                    "TTFT ms",
+                ),
+                (
+                    Metric::PeakMem,
+                    "Peak memory (MiB, lower is better)",
+                    "peak MiB",
+                ),
+            ],
+        }
+    }
+}
+
+/// One bar chart: the sweep's points on x, each a category in the order
+/// measured, a bar per series at each.
+fn bar_chart(
+    series: &[Series],
+    xs: &[u32],
+    (title, ylabel): (&str, &str),
+    sweep: Sweep,
+    height: &str,
+    label: &str,
+) -> Element {
     let spec = Chart::GroupedBar {
         data: series
             .iter()
@@ -730,7 +1030,7 @@ fn bar_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &s
                 // Each user count a category, in the order measured.
                 bottom: Axis {
                     maps_to: "key",
-                    title: "offered concurrent users",
+                    title: sweep.xlabel(),
                     scale_type: Some("labels"),
                     ticks: None,
                     include_zero: None,
@@ -754,7 +1054,7 @@ fn bar_chart(series: &[Series], xs: &[u32], title: &str, ylabel: &str, label: &s
                     .collect(),
             }),
             heatmap: None,
-            height: "280px".to_string(),
+            height: height.to_string(),
             width: None,
             legend: None,
             locale: None,
@@ -893,7 +1193,7 @@ fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
             }
             div { style: "grid-column: 2; grid-row: 1; align-self: start",
                 Definition { alignment: Alignment::Left,
-                    definition: "scratchy at least {RATIO_SPAN} times as fast as mlx-lm (ollama where a run has no mlx-lm); anything faster takes this colour too.",
+                    definition: "scratchy at least {RATIO_SPAN} times as fast as the engine the map compares it with; anything faster takes this colour too.",
                     strong { "×{RATIO_SPAN}" }
                 }
             }
@@ -905,7 +1205,7 @@ fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
             }
             div { style: "grid-column: 2; grid-row: {rows}; align-self: end",
                 Definition { alignment: Alignment::Left,
-                    definition: "scratchy at most a quarter as fast as mlx-lm (ollama where a run has no mlx-lm), {RATIO_SPAN} times slower; anything slower takes this colour too.",
+                    definition: "scratchy at most a quarter as fast as the engine the map compares it with, {RATIO_SPAN} times slower; anything slower takes this colour too.",
                     strong { "×{1.0 / RATIO_SPAN}" }
                 }
             }
@@ -936,49 +1236,65 @@ fn ratio_step(r: f64) -> usize {
     ((at.max(0.0) * n as f64) as usize).min(n - 1)
 }
 
-/// A cell's value for a table view, with how many requests went untimed when
-/// the timing is partial.
+/// A cell's value for a table view, with what its marks mean: how many
+/// requests went untimed, or failed.
 fn table_value(c: Option<&Cell>, metric: Metric) -> String {
-    if partial(c, metric) {
-        format!("{} ({})", cfmt(c, metric), untimed_note(c))
-    } else {
+    let note = marks_note(c, metric);
+    if note.is_empty() {
         cfmt(c, metric)
+    } else {
+        format!("{} ({note})", cfmt(c, metric))
     }
 }
 
-fn conc_cells(cells: &[Cell]) -> BTreeMap<u32, &Cell> {
+fn sweep_cells(cells: &[Cell], sweep: Sweep) -> BTreeMap<u32, &Cell> {
     cells
         .iter()
-        .filter_map(|c| {
-            if let At::Conc(n) = c.at {
-                Some((n, c))
-            } else {
-                None
-            }
-        })
+        .filter_map(|c| Some((sweep.at(c)?, c)))
         .collect()
 }
 
-/// Throughput and time per output token against offered users, side by side:
-/// two measures, so two charts on one x axis rather than two y axes.
-fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
-    let cells: Vec<(Engine, BTreeMap<u32, &Cell>)> = Engine::ALL
+/// A sweep as small multiples: per metric, one small chart per engine scratchy
+/// is compared with, each scratchy (blue) against that one engine (orange)
+/// with scratchy's previous run in grey behind, so however many engines a run
+/// has, no chart holds more than three lines.
+fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep) -> Element {
+    let map_of = |mm: &'a Model, rr: &Run, e: Engine| -> BTreeMap<u32, &'a Cell> {
+        match sweep {
+            Sweep::Users => by_users(mm, rr, e),
+            Sweep::Prompt => sweep_cells(e.cells(mm), sweep),
+        }
+    };
+    // Every engine that ran this model, scratchy first, with its cells at
+    // this sweep's source (empty when it has none there).
+    let ran: Vec<(Engine, BTreeMap<u32, &Cell>)> = Engine::ALL
         .iter()
-        .map(|&e| (e, conc_cells(e.cells(m))))
+        .filter(|&&e| e.ran(m))
+        .map(|&e| (e, map_of(m, run, e)))
         .collect();
+    // A sweep no engine has a cell for was not run: no section. Otherwise the
+    // section stays, and says who is missing, rather than vanish.
+    if ran.iter().all(|(_, cs)| cs.is_empty()) {
+        return rsx! {};
+    }
+    let cells: Vec<&(Engine, BTreeMap<u32, &Cell>)> =
+        ran.iter().filter(|(_, cs)| !cs.is_empty()).collect();
+    let empty = BTreeMap::new();
+    let mine = ran
+        .iter()
+        .find(|(e, _)| *e == Engine::Scratchy)
+        .map_or(&empty, |(_, cs)| cs);
     let mut xs: Vec<u32> = cells
         .iter()
         .flat_map(|(_, cs)| cs.keys().copied())
         .collect();
     xs.sort_unstable();
     xs.dedup();
-    let Some(&last) = xs.last() else {
-        return rsx! {};
-    };
 
     // The previous run's scratchy line, drawn first so it sits behind.
     let pcs = prev
-        .map(|p| conc_cells(Engine::Scratchy.cells(p.m)))
+        .filter(|p| sweep == Sweep::Prompt || users_shape(p.m, p.run) == users_shape(m, run))
+        .map(|p| map_of(p.m, p.run, Engine::Scratchy))
         .unwrap_or_default();
     let plabel = prev.map_or(String::new(), |p| {
         let differ = if settings_changed(run, p.run).is_empty() {
@@ -991,67 +1307,83 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             p.run.generated_utc.month_day()
         )
     });
-    let series = |metric: Metric| -> Vec<Series> {
-        let mut out = Vec::new();
-        if !pcs.is_empty() {
-            out.push(Series {
-                label: plabel.clone(),
-                class: "prev",
-                pts: xs
-                    .iter()
-                    .filter_map(|x| Some((*x, timing(Some(pcs.get(x)?), metric))))
-                    .collect(),
-            });
-        }
-        for (e, cs) in &cells {
-            if !cs.is_empty() {
-                out.push(Series {
-                    label: e.label().to_string(),
-                    class: e.series(),
-                    pts: xs
-                        .iter()
-                        .filter_map(|x| Some((*x, timing(Some(cs.get(x)?), metric))))
-                        .collect(),
-                });
-            }
-        }
-        out.retain(|s| s.pts.iter().any(|p| p.1.is_some()));
-        out
-    };
-    let (tput, tpot) = (series(Metric::Throughput), series(Metric::Tpot));
-
-    let mut charts: Vec<Element> = Vec::new();
-    if !tput.is_empty() {
-        charts.push(bar_chart(
-            &tput,
-            &xs,
-            "Throughput (tok/s, higher is better)",
-            "tok/s",
-            "Output tokens per second against offered concurrent users, per engine",
-        ));
-    }
-    if !tpot.is_empty() {
-        // An engine that never streamed has no TPOT; say so rather than let
-        // its line silently vanish from this chart.
-        let gone: Vec<&str> = tput
-            .iter()
-            .filter(|s| s.class != "prev" && !tpot.iter().any(|t| t.label == s.label))
-            .map(|s| s.label.as_str())
+    let line =
+        |label: &str, class: &'static str, cs: &BTreeMap<u32, &Cell>, metric: Metric| Series {
+            label: label.to_string(),
+            class,
+            pts: xs
+                .iter()
+                .filter_map(|x| Some((*x, timing(Some(cs.get(x)?), metric))))
+                .collect(),
+        };
+    let rivals: Vec<&(Engine, BTreeMap<u32, &Cell>)> =
+        ran.iter().filter(|(e, _)| *e != Engine::Scratchy).collect();
+    let row = |metric: Metric, title: &str, ylabel: &str| -> Element {
+        let plotted =
+            |cs: &BTreeMap<u32, &Cell>| cs.values().any(|c| timing(Some(c), metric).is_some());
+        // One chart per engine scratchy is compared with, kept while either
+        // side has a point to draw; scratchy alone when there is none.
+        let pairs: Vec<(String, Vec<Series>)> = if rivals.is_empty() {
+            vec![(
+                "scratchy".to_string(),
+                vec![line("scratchy", "s1", mine, metric)],
+            )]
+        } else {
+            rivals
+                .iter()
+                .map(|(e, cs)| {
+                    let mut ss = Vec::new();
+                    if !pcs.is_empty() {
+                        ss.push(line(&plabel, "prev", &pcs, metric));
+                    }
+                    ss.push(line("scratchy", "s1", mine, metric));
+                    ss.push(line(e.label(), "s2", cs, metric));
+                    (format!("vs {}", e.label()), ss)
+                })
+                .collect()
+        };
+        let charts: Vec<(String, Vec<Series>)> = pairs
+            .into_iter()
+            .map(|(t, mut ss)| {
+                ss.retain(|s| s.pts.iter().any(|p| p.1.is_some()));
+                (t, ss)
+            })
+            .filter(|(_, ss)| ss.iter().any(|s| s.class != "prev"))
             .collect();
-        charts.push(rsx! {
-            {bar_chart(
-                &tpot,
-                &xs,
-                "Time per output token (ms, lower is better)",
-                "TPOT ms",
-                "Median time per output token against offered concurrent users, per engine",
-            )}
-            if !gone.is_empty() {
-                p { "{gone.join(\", \")}: {NO_STREAM}, not plotted." }
+        // Who has no line here, and why: no cells at this sweep (failed, or
+        // not measured), or cells that never streamed. Named for the side
+        // that is missing, scratchy included.
+        let (no_cells, no_stream): (Vec<&str>, Vec<&str>) = ran
+            .iter()
+            .filter(|(_, cs)| !plotted(cs))
+            .fold((Vec::new(), Vec::new()), |(mut nc, mut ns), (e, cs)| {
+                if cs.is_empty() {
+                    nc.push(e.label())
+                } else {
+                    ns.push(e.label())
+                }
+                (nc, ns)
+            });
+        rsx! {
+            Stack { gap: 2,
+                strong { "{title}" }
+                div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem",
+                    for (t, ss) in &charts {
+                        div { style: "flex: 1 1 16rem; min-width: 16rem; max-width: 24rem",
+                            {bar_chart(ss, &xs, (t.as_str(), ylabel), sweep, "200px", &format!("{title}, scratchy {t}"))}
+                        }
+                    }
+                }
+                if !no_stream.is_empty() {
+                    p { "{no_stream.join(\", \")}: {NO_STREAM}, not plotted." }
+                }
+                if !no_cells.is_empty() {
+                    p { "{no_cells.join(\", \")}: no numbers for this sweep (its requests failed or it was not measured; see the run's logs), not plotted." }
+                }
             }
-        });
-    }
-    let users = match xs.split_last() {
+        }
+    };
+    let xs_text = match xs.split_last() {
         Some((l, rest)) if !rest.is_empty() => format!(
             "{} and {l}",
             rest.iter()
@@ -1059,32 +1391,65 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        _ => last.to_string(),
+        Some((l, _)) => l.to_string(),
+        None => String::new(),
     };
-    let base = run.config.base();
-    let (input, output) = (
-        opt(base.and_then(|b| b.input)),
-        opt(base.and_then(|b| b.output)),
-    );
-    let mut table_headers = vec!["offered users".to_string()];
+    let (_, output, conc) = base_of(run, m);
+    let (ui, uo) = users_shape(m, run);
+    let from_grid = if matches!(users_from(m, run), UsersFrom::Grid { .. }) {
+        ", the grid's middle cell"
+    } else {
+        ""
+    };
+    let (heading, intro) = match sweep {
+        Sweep::Users => (
+            "As users are added",
+            rsx! {
+                "Throughput and time per output token with {xs_text} users at once " {users_info()}
+                "; {opt(ui)}-token prompts, {opt(uo)}-token answers{from_grid}. One small chart per engine, each scratchy \
+                 against that engine, scratchy's previous run in grey. A line that rises in the second row means \
+                 each user's answer slows down as more share the engine."
+            },
+        ),
+        Sweep::Prompt => (
+            "As prompts get longer",
+            rsx! {
+                "Time to first token and the server's peak memory with {xs_text}-token prompts; {opt(output)}-token \
+                 answers, {opt(conc)} users at once. One small chart per engine, each scratchy against that engine. \
+                 Prompts past a model's own context are left out."
+            },
+        ),
+    };
+    let mut table_headers = vec![sweep.xlabel().to_string()];
     table_headers.extend(xs.iter().map(u32::to_string));
+    let table_metrics: &[(Metric, &str)] = match sweep {
+        Sweep::Users => &[
+            (Metric::Throughput, "tok/s"),
+            (Metric::Ttft, "TTFT ms"),
+            (Metric::Tpot, "TPOT ms"),
+        ],
+        Sweep::Prompt => &[
+            (Metric::Ttft, "TTFT ms"),
+            (Metric::Throughput, "tok/s"),
+            (Metric::PeakMem, "peak MiB"),
+        ],
+    };
+    let [(m1, t1, y1), (m2, t2, y2)] = sweep.metrics();
     part(
-        "As users are added",
+        heading,
+        intro,
         rsx! {
-            "Throughput and time per output token with {users} users at once " {users_info()}
-            "; {input}-token prompts, {output}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine."
-        },
-        rsx! {
-            Grid {
-                for c in charts { Column { span: Span::HALF, {c} } }
+            Stack { gap: 5,
+                {row(m1, t1, y1)}
+                {row(m2, t2, y2)}
             }
             Fold { title: "Table view",
                 Table { headers: table_headers,
-                    for (e, cs) in cells.iter().filter(|(_, cs)| !cs.is_empty()) {
-                        for (metric, name) in [(Metric::Throughput, "tok/s"), (Metric::Ttft, "TTFT ms"), (Metric::Tpot, "TPOT ms")] {
+                    for (e, cs) in &cells {
+                        for (metric, name) in table_metrics {
                             TableRow {
                                 TableCell { "{e.label()} · {name}" }
-                                for x in &xs { TableCell { {table_value(cs.get(x).copied(), metric)} } }
+                                for x in &xs { TableCell { {table_value(cs.get(x).copied(), *metric)} } }
                             }
                         }
                     }
@@ -1097,21 +1462,58 @@ fn conc_chart(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
 /// One engine's grid cells, by (prompt, answer) tokens.
 type ByShape<'a> = BTreeMap<(u32, u32), &'a Cell>;
 
-/// A model's prompt-by-answer grid: the axes, each engine's cells, and the
-/// engines scratchy is compared against.
+/// A model's prompt-by-answer grid at one users count: the axes, each
+/// engine's cells, and the engines scratchy is compared against.
 struct ShapeGrid<'a> {
     ins: &'a [u32],
     outs: &'a [u32],
+    users: u32,
     have: Vec<(Engine, ByShape<'a>)>,
-    /// mlx-lm, which runs the same MLX checkpoint; failing that ollama.
+    /// The headline comparison: the first of Engine::RIVALS the run has.
     rival: Option<Engine>,
-    /// The other of the two, when the run has both.
-    other: Option<Engine>,
+    /// Every engine the run has a grid for, the rival first.
+    present: Vec<Engine>,
+}
+
+/// The users counts a model's grid ran at, fewest first. Cells from before
+/// the grid had its own count ran at the base count.
+fn grid_users(m: &Model, run: &Run) -> Vec<u32> {
+    let base = base_of(run, m).2.unwrap_or(0);
+    let mut us: Vec<u32> = Engine::Scratchy
+        .cells(m)
+        .iter()
+        .filter(|c| matches!(c.at, At::Grid { .. }))
+        .map(|c| c.users.unwrap_or(base))
+        .collect();
+    us.sort_unstable();
+    us.dedup();
+    us
+}
+
+/// The users count the overview shows a model's grid at: one user at a time
+/// when its grid ran at 1 (#349), else the count it ran at (the base count,
+/// in runs from before the grid had its own).
+fn glance_users(m: &Model, run: &Run) -> u32 {
+    let us = grid_users(m, run);
+    if us.contains(&1) {
+        1
+    } else {
+        us.first().copied().unwrap_or(0)
+    }
+}
+
+fn users_text(n: u32) -> String {
+    if n == 1 {
+        "1 user at a time".to_string()
+    } else {
+        format!("{n} users at once")
+    }
 }
 
 impl<'a> ShapeGrid<'a> {
-    /// None when scratchy has no grid.
-    fn of(m: &'a Model, run: &'a Run) -> Option<Self> {
+    /// None when scratchy has no grid at that users count.
+    fn of(m: &'a Model, run: &'a Run, users: u32) -> Option<Self> {
+        let base = base_of(run, m).2.unwrap_or(0);
         let sc = run.config.scaling.as_ref()?;
         let (ins, outs) = (
             sc.grid_input.as_deref().unwrap_or_default(),
@@ -1123,6 +1525,7 @@ impl<'a> ShapeGrid<'a> {
                 let cs = e
                     .cells(m)
                     .iter()
+                    .filter(|c| c.users.unwrap_or(base) == users)
                     .filter_map(|c| {
                         if let At::Grid { input, output } = c.at {
                             Some(((input, output), c))
@@ -1137,9 +1540,10 @@ impl<'a> ShapeGrid<'a> {
         let g = ShapeGrid {
             ins,
             outs,
+            users,
             have,
             rival: None,
-            other: None,
+            present: Vec::new(),
         };
         if g.cells(Engine::Scratchy).is_empty() || ins.is_empty() || outs.is_empty() {
             return None;
@@ -1150,7 +1554,7 @@ impl<'a> ShapeGrid<'a> {
             .collect();
         Some(ShapeGrid {
             rival: present.first().copied(),
-            other: present.get(1).copied(),
+            present,
             ..g
         })
     }
@@ -1240,11 +1644,11 @@ impl Trend {
         let metric = self.metric();
         match self {
             Trend::UsersDecode | Trend::UsersPrefill => {
-                let mine = conc_cells(Engine::Scratchy.cells(m));
+                let mine = by_users(m, run, Engine::Scratchy);
                 let rival = Engine::RIVALS
                     .into_iter()
-                    .find(|e| !conc_cells(e.cells(m)).is_empty())?;
-                let theirs = conc_cells(rival.cells(m));
+                    .find(|&e| !by_users(m, run, e).is_empty())?;
+                let theirs = by_users(m, run, rival);
                 let pts = mine
                     .iter()
                     .map(|(n, c)| Step {
@@ -1257,7 +1661,7 @@ impl Trend {
                 Some((rival, pts))
             }
             Trend::PromptPrefill | Trend::AnswerDecode => {
-                let g = ShapeGrid::of(m, run)?;
+                let g = ShapeGrid::of(m, run, glance_users(m, run))?;
                 let rival = g.rival?;
                 let prompt = self == Trend::PromptPrefill;
                 let (along, across) = if prompt {
@@ -1568,12 +1972,18 @@ const GRID_METRICS: [(Metric, &str); 2] = [
     (Metric::Throughput, "throughput"),
 ];
 
-fn mark(metric: Metric, cells: &[Option<&Cell>]) -> &'static str {
-    if cells.iter().any(|c| partial(*c, metric)) {
-        PARTIAL
-    } else {
-        ""
+/// The marks any of these cells carries, each once.
+fn mark(metric: Metric, cells: &[Option<&Cell>]) -> String {
+    let mut out = String::new();
+    for ch in cells
+        .iter()
+        .flat_map(|c| marks(*c, metric).chars().collect::<Vec<_>>())
+    {
+        if !out.contains(ch) {
+            out.push(ch);
+        }
     }
+    out
 }
 
 /// Why a cell has no ratio.
@@ -1625,29 +2035,37 @@ fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element 
     )
 }
 
-/// The grid's numbers for one metric: per cell the ratio against the rival,
-/// then against the other engine; just scratchy's value with neither.
+/// The grid's numbers for one metric, dense: per prompt size one row per
+/// engine scratchy is compared with, each cell the ratio and its marks; just
+/// scratchy's values with none.
 fn heat_table(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
     let mut cols = vec![format!("{title}: prompt ↓ / answer →")];
     cols.extend(g.outs.iter().map(u32::to_string));
     rsx! {
         Table { headers: cols,
             for &i in g.ins {
-                TableRow {
-                    TableCell { "{i}" }
-                    for &o in g.outs {
-                        {
-                            let text = match g.rival {
-                                None => cfmt(g.at(Some(Engine::Scratchy), (i, o)), metric),
-                                Some(rival) => {
-                                    let mut t = g.versus(metric, (i, o), rival).1;
-                                    if let Some(other) = g.other {
-                                        t += &format!(" (vs {} {})", other.label(), g.versus(metric, (i, o), other).1);
-                                    }
-                                    t
-                                }
-                            };
-                            rsx! { TableCell { "{text}" } }
+                if g.present.is_empty() {
+                    TableRow {
+                        TableCell { "{i}" }
+                        for &o in g.outs { TableCell { {table_value(g.at(Some(Engine::Scratchy), (i, o)), metric)} } }
+                    }
+                }
+                for &e in &g.present {
+                    TableRow {
+                        TableCell { "{i} · vs {e.label()}" }
+                        for &o in g.outs {
+                            {
+                                // The ratio, then what its marks mean, side by side.
+                                let notes: Vec<String> = [(Engine::Scratchy, "scratchy"), (e, e.label())]
+                                    .into_iter()
+                                    .filter_map(|(who, name)| {
+                                        let n = marks_note(g.at(Some(who), (i, o)), metric);
+                                        (!n.is_empty()).then(|| format!("{name}: {n}"))
+                                    })
+                                    .collect();
+                                let text = g.versus(metric, (i, o), e).1;
+                                rsx! { TableCell { if notes.is_empty() { "{text}" } else { "{text} ({notes.join(\"; \")})" } } }
+                            }
                         }
                     }
                 }
@@ -1656,46 +2074,92 @@ fn heat_table(g: &ShapeGrid, metric: Metric, title: &str) -> Element {
     }
 }
 
-fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
-    let scale = format!("scale-{mid}");
-    let Some(g) = ShapeGrid::of(m, run) else {
-        return rsx! {};
-    };
-    let conc = opt(run.config.base().and_then(|b| b.conc));
-    let note = match g.rival {
-        None => {
-            "scratchy's own values; this run has no mlx-lm or ollama to compare against".to_string()
+/// scratchy against one engine as a tiny ratio map, named under it: the
+/// small multiples beside the full maps, one per other engine.
+fn versus_mini(g: &ShapeGrid, metric: Metric, e: Engine, label: &str) -> Element {
+    let mut data = Vec::new();
+    for &i in g.ins {
+        for &o in g.outs {
+            data.push(HeatPoint {
+                x: o.to_string(),
+                y: i.to_string(),
+                value: g.versus(metric, (i, o), e).0.map(log2_ratio),
+                highlight: false,
+            });
         }
-        Some(rival) => {
-            let missing = Engine::RIVALS.into_iter().find(|&e| g.cells(e).is_empty());
-            format!(
-                "prompt size down the side, answer size across the bottom. Colour is how many times faster scratchy is than {}{}: blue is faster, red is slower, the middle step is within noise. Hover a cell for its ratio; the table view has every cell's ratio{}",
+    }
+    rsx! {
+        div { style: "flex: 0 0 7rem; width: 7rem",
+            Stack { gap: 1,
+                {mini_heatmap((g.ins, g.outs), data, format!("scratchy/{}", e.label()), label)}
+                div { style: "text-align: center; font-size: 0.75rem", "vs {e.label()}" }
+            }
+        }
+    }
+}
+
+fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
+    let grids: Vec<ShapeGrid> = grid_users(m, run)
+        .into_iter()
+        .filter_map(|u| ShapeGrid::of(m, run, u))
+        .collect();
+    if grids.is_empty() {
+        return rsx! {};
+    }
+    let counts = grids
+        .iter()
+        .map(|g| users_text(g.users))
+        .collect::<Vec<_>>()
+        .join(", then ");
+    let one = |g: &ShapeGrid| -> Element {
+        let note = match g.rival {
+            None => {
+                "scratchy's own values; this run has no other engine to compare against".to_string()
+            }
+            Some(rival) => format!(
+                "Colour is how many times faster scratchy is than {}: blue is faster, red is slower, the middle \
+                 step is within noise. Hover a cell for its ratio{}; the table view has every cell against every engine",
                 rival.label(),
-                missing.map_or(String::new(), |e| format!(
-                    " (this run has no {})",
-                    e.label()
-                )),
-                g.other.map_or(String::new(), |o| format!(
-                    " and the same against {}",
-                    o.label()
-                )),
-            )
+                if g.present.len() > 1 {
+                    ". The small maps below compare with each other engine"
+                } else {
+                    ""
+                },
+            ),
+        };
+        let others: Vec<Engine> = g.present.iter().copied().skip(1).collect();
+        rsx! {
+            Stack { gap: 3,
+                strong { "{users_text(g.users)}" }
+                p { "{note}." }
+                div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
+                    for (metric, title) in GRID_METRICS { {heat_map(g, metric, title, &format!("scale-{mid}-{}", g.users))} }
+                    if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &format!("scale-{mid}-{}", g.users))} }
+                }
+                if !others.is_empty() {
+                    for (metric, title) in GRID_METRICS {
+                        Stack { gap: 1,
+                            span { "{title}, vs every engine" }
+                            div { style: "display: flex; flex-wrap: wrap; gap: 1rem",
+                                for e in &others { {versus_mini(g, metric, *e, &format!("{title}, scratchy vs {}, {}", e.label(), users_text(g.users)))} }
+                            }
+                        }
+                    }
+                }
+                Fold { title: "Table view, {users_text(g.users)}",
+                    Stack { gap: 4,
+                        for (metric, title) in GRID_METRICS { {heat_table(g, metric, title)} }
+                    }
+                }
+            }
         }
     };
     part(
         "Prompt size × answer size",
-        rsx! { "{conc} users at once; {note}." },
+        rsx! { "Prompt size down the side, answer size across the bottom, measured at {counts}." },
         rsx! {
-            // Side by side while they fit; wrapped onto new lines on a
-            // narrow screen.
-            div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
-                for (metric, title) in GRID_METRICS { {heat_map(&g, metric, title, &scale)} }
-                if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &scale)} }
-            }
-            Fold { title: "Table view",
-                Stack { gap: 4,
-                    for (metric, title) in GRID_METRICS { {heat_table(&g, metric, title)} }
-                }
+            Stack { gap: 6,
+                for g in &grids { {one(g)} }
             }
         },
     )
@@ -1720,10 +2184,10 @@ fn history(entries: &[Entry]) -> Element {
                         TableCell { "{m.quant.as_deref().unwrap_or_default()}" }
                         if served(m) {
                             {
-                                let (ladder, cells) = (Engine::Scratchy.ladder(m), Engine::Scratchy.cells(m));
-                                let one = cell(cells, At::Conc(1));
-                                let top = cells.iter().filter_map(|c| if let At::Conc(n) = c.at { Some(n) } else { None }).max().filter(|&n| n != 0);
-                                let many = top.and_then(|n| cell(cells, At::Conc(n)));
+                                let ladder = Engine::Scratchy.ladder(m);
+                                let us = by_users(m, run, Engine::Scratchy);
+                                let one = us.get(&1).copied();
+                                let many = us.keys().max().filter(|&&n| n != 0).and_then(|n| us.get(n).copied());
                                 let vals = [
                                     fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
                                     fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
@@ -1748,7 +2212,7 @@ fn runs_table(runs: &[&Run]) -> Element {
     rsx! {
         Fold { title: "Runs on this machine ({runs.len()})",
             Table {
-                headers: headers(["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "data"]),
+                headers: headers(["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "engine versions", "pinned", "data"]),
                 for run in runs.iter().rev() {
                     {
                         let [(_, flags), (_, kv)] = settings(run);
@@ -1761,6 +2225,8 @@ fn runs_table(runs: &[&Run]) -> Element {
                                 TableCell { {run.config.cold_priming_launches.map_or("not recorded".to_string(), |n| n.to_string())} }
                                 TableCell { "{kv}" }
                                 TableCell { code { "{flags}" } }
+                                TableCell { "{engine_versions(run)}" }
+                                TableCell { "{pinned(run)}" }
                                 TableCell { a { href: "{DATA}/{file}", "json" } }
                             }
                         }
@@ -1822,7 +2288,7 @@ impl<'a> GlanceGrid<'a> {
     /// A model's grid at a metric on a machine's latest run, or why none.
     fn of(mr: &'a MachineRuns, stem: &str, metric: Metric) -> Result<Self, &'static str> {
         let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
-        let g = ShapeGrid::of(m, run).ok_or("no grid")?;
+        let g = ShapeGrid::of(m, run, glance_users(m, run)).ok_or("no grid")?;
         let rival = g.rival.ok_or("nothing to compare")?;
         let cells = g
             .ins
@@ -2028,8 +2494,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     p { style: "contain: inline-size",
                                         "Every model's prompt size × answer size grid on every machine: in each cell, the model's \
                                          prefill (time to first token) grid, then its decode (throughput) grid (rows: prompt, short to \
-                                         long; columns: answer, short to long). Colour is how many times faster scratchy is than mlx-lm \
-                                         (ollama where a run has no mlx-lm): blue faster, red slower, the middle step within noise. \
+                                         long; columns: answer, short to long), one user at a time where the grid ran at 1 (the base users count \
+                                         in runs from before). Colour is how many times faster scratchy is than the engine named under the \
+                                         grid: oMLX TurboQuant where the run has it, else the next of oMLX, mlx-lm, vllm-metal, ollama, \
+                                         llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
                                     div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem 2rem",
@@ -2061,7 +2529,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                 ContentPanel { id: slug(title), shown: false,
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
-                                            p { "scratchy against mlx-lm (ollama where a run has no mlx-lm) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
+                                            p { "scratchy against oMLX TurboQuant (or the next engine a run has, in the order of the heat maps) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
                                             div { style: spark_grid(stems.len()),
                                                 div {}
                                                 div {}
@@ -2103,9 +2571,9 @@ fn spark_grid(columns: usize) -> String {
 /// The glance's startup panel's name.
 const STARTUP: &str = "Startup by model size";
 
-/// The engines the startup panel compares: scratchy, and mlx-lm, which loads
-/// the same MLX checkpoint.
-const STARTUP_ENGINES: [Engine; 2] = [Engine::Scratchy, Engine::MlxLm];
+// The startup panel compares scratchy with the first of Engine::RIVALS a run
+// timed (StartupSpark::rival): oMLX TurboQuant where it has it, mlx-lm (which
+// loads the same MLX checkpoint) in runs from before oMLX.
 
 /// The unit a startup time is shown in.
 #[derive(Clone, Copy)]
@@ -2239,6 +2707,9 @@ fn gb1(b: Bytes) -> f64 {
 struct StartupSpark<'a> {
     models: Vec<(&'a Model, Bytes)>,
     steps: Vec<Step>,
+    /// The engine scratchy is compared with: the first of Engine::RIVALS the
+    /// chosen run timed.
+    rival: Engine,
 }
 
 impl<'a> StartupSpark<'a> {
@@ -2255,11 +2726,21 @@ impl<'a> StartupSpark<'a> {
     /// most models, so a sparkline's steps share one commit and one set of
     /// engine versions; or why there is none.
     fn of(mr: &MachineRuns<'a>, col: &StartupColumn) -> Result<Self, &'static str> {
+        // A run's rival: the first engine it timed alongside scratchy.
+        let rival_of = |run: &Run| {
+            Engine::RIVALS.into_iter().find(|&e| {
+                run.models
+                    .iter()
+                    .any(|m| col.time(Engine::Scratchy, m).is_some() && col.time(e, m).is_some())
+            })
+        };
         let both = |run: &Run| {
-            run.models
-                .iter()
-                .filter(|m| STARTUP_ENGINES.iter().all(|&e| col.time(e, m).is_some()))
-                .count()
+            rival_of(run).map_or(0, |e| {
+                run.models
+                    .iter()
+                    .filter(|m| col.time(Engine::Scratchy, m).is_some() && col.time(e, m).is_some())
+                    .count()
+            })
         };
         let run = mr
             .runs
@@ -2283,6 +2764,7 @@ impl<'a> StartupSpark<'a> {
                     "not measured"
                 }
             })?;
+        let rival = rival_of(run).ok_or("nothing to compare")?;
         let mut models: Vec<(&Model, Bytes)> = run
             .models
             .iter()
@@ -2294,15 +2776,19 @@ impl<'a> StartupSpark<'a> {
             .map(|&(m, b)| Step {
                 x: gb1(b),
                 scratchy: col.time(Engine::Scratchy, m),
-                rival: col.time(Engine::MlxLm, m),
+                rival: col.time(rival, m),
                 highlight: false,
             })
             .collect();
-        Ok(StartupSpark { models, steps })
+        Ok(StartupSpark {
+            models,
+            steps,
+            rival,
+        })
     }
 }
 
-/// Every machine's startup against model size, scratchy against mlx-lm, in
+/// Every machine's startup against model size, scratchy against its rival, in
 /// the scaling panels' grid (`columns` is theirs): a row per machine, frozen,
 /// cold and warm side by side, each sparkline in a cell the size of theirs;
 /// then the numbers behind them as a table.
@@ -2350,7 +2836,8 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
     rsx! {
         Stack { gap: 5,
             p {
-                "scratchy against mlx-lm as the model grows ({sizes}, the MLX checkpoint both load). Blue fill \
+                "scratchy against oMLX TurboQuant (or the next engine a run timed, in the order of the heat maps; \
+                 mlx-lm in runs from before oMLX) as the model grows ({sizes}, the MLX checkpoint they load). Blue fill \
                  where scratchy is ahead, red where it is behind. Frozen is the first launch after memory and \
                  scratchy's weights cache are cleared, cold a normal relaunch: both time launch to the first \
                  token, not to ready, because mlx-lm reports ready at about the same time whatever the model's \
@@ -2368,7 +2855,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
-                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::MlxLm, Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against mlx-lm", col.title, col.axes.value)),
+                                Ok(sp) => sparkline(&sp.steps, col.axes, sp.rival, Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against {}", col.title, col.axes.value, sp.rival.label())),
                                 Err(why) => rsx! { "{why}" },
                             }
                         }
@@ -2380,7 +2867,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                 Table { headers: table_headers,
                     for (&(chip, k), sp) in &sparks {
                         if let Ok(sp) = sp {
-                            for e in STARTUP_ENGINES {
+                            for e in [Engine::Scratchy, sp.rival] {
                                 TableRow {
                                     TableCell { "{chip}" }
                                     TableCell { "{e.label()}" }
@@ -2413,12 +2900,12 @@ const HEAT_MAPS: &str = "Heat maps";
 const SCALING: [(&str, &str, [Trend; 2]); 2] = [
     (
         "Concurrency scaling",
-        "1, 4 and 16 users at once, with 512-token prompts and 128-token answers",
+        "users at once: 1, 4 and 16 with 512-token prompts and 128-token answers, or, in runs whose grid has its own users (#349), 1 to 16 at the grid's middle cell, 1024-token prompts and 128-token answers",
         [Trend::UsersPrefill, Trend::UsersDecode],
     ),
     (
         "Length scaling",
-        "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, with 8 users at once. Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
+        "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, one user at a time where the grid ran at 1 (8 users at once in runs from before). Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
         [Trend::PromptPrefill, Trend::AnswerDecode],
     ),
 ];
@@ -2443,6 +2930,15 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                   Layer { level: 1,
                     Stack { gap: 5,
                 {runs_table(&mr.runs)}
+                {
+                    // Models the newest run left out here, and why: memory, so far.
+                    let newest = mr.runs[mr.runs.len() - 1];
+                    let skipped: Vec<String> = newest.skipped_models.iter().flatten()
+                        .filter(|x| mr.latest(&x.stem).is_none())
+                        .map(|x| format!("{} ({})", x.stem, x.reason.as_deref().unwrap_or("skipped")))
+                        .collect();
+                    rsx! { if !skipped.is_empty() { p { "Not run on this machine: {skipped.join(\"; \")}." } } }
+                }
                 for (stem, seen) in &mr.models {
                     {
                         let Entry { run, m } = seen[seen.len() - 1];
@@ -2467,13 +2963,35 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                                         Heading { "{stem} on {chip}" }
                                         p {
                                             a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
-                                            " · {m.quant.as_deref().unwrap_or(\"default\")}{build} · run {run.generated_utc.date()}, "
+                                            " · {m.quant.as_deref().unwrap_or(\"default\")}"
+                                            if let Some(rev) = m.model_files.as_ref().and_then(|f| f.revision.as_deref()) {
+                                                " · files "
+                                                a { href: "https://huggingface.co/{m.model_id}/tree/{rev}", code { "{&rev[..rev.len().min(8)]}" } }
+                                            }
+                                            "{build} · run {run.generated_utc.date()}, "
                                             code { "{run.repo.sha8()}" }
+                                            if let Some(verdict) = parity(m) {
+                                                " · {verdict} " {parity_info()}
+                                            }
                                         }
                                     }
+                                    {
+                                        // An engine whose own memory guard refused the model
+                                        // outright: its columns are dashes because it never
+                                        // served. This says why, in the engine's words.
+                                        let declined: Vec<String> = Engine::ALL.iter()
+                                            .filter_map(|e| m.engine_declined.as_ref()
+                                                .and_then(|d| d.get(e.key()))
+                                                .map(|r| format!("{} — {}", e.label(), r.as_str())))
+                                            .collect();
+                                        rsx! { if !declined.is_empty() {
+                                            p { "Declined before serving: {declined.join(\"; \")}." }
+                                        } }
+                                    }
                                     {summary_table(m, run, prev)}
-                                    {conc_chart(m, run, prev)}
+                                    {sweep_part(m, run, prev, Sweep::Users)}
                                     {grid_maps(m, &mid, run)}
+                                    {sweep_part(m, run, prev, Sweep::Prompt)}
                                     {history(seen)}
                                 }
                               }
@@ -2519,8 +3037,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                 Stack { gap: 4,
                     Heading { "Metal performance" }
                     p {
-                        "scratchy against mlx-lm and ollama on Apple silicon: how long each takes to start, how \
-                         fast it answers one user, and how it holds up as prompts, answers and users grow. \
+                        "scratchy against oMLX, mlx-lm, vllm-metal, ollama, llama.cpp and mistral.rs on Apple \
+                         silicon: how long each takes to start, how fast it answers one user, and how it holds up as \
+                         prompts, answers and users grow. \
                          {count} runs on {n_machines} machines, every number measured by "
                         a { href: "{REPO}/blob/main/scripts/bench_metal_matrix.sh", code { "scripts/bench_metal_matrix.sh" } }
                         "."
@@ -2538,7 +3057,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             assets,
             title: "Metal performance — scratchy",
             description: Some(
-                "scratchy against mlx-lm and ollama on Apple silicon: startup, single-user speed, and scaling, per machine.",
+                "scratchy against oMLX, mlx-lm, vllm-metal, ollama, llama.cpp and mistral.rs on Apple silicon: startup, single-user speed, and scaling, per machine.",
             ),
             og: None,
             root: Root(0),
