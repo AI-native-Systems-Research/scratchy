@@ -365,6 +365,10 @@ pub fn tape_pipelines(
 
 /// `key`'s pipeline from `cache`, its kernel baked first — for kernel tests that build several
 /// pipelines through one cache.
+///
+/// One build at a time, process-wide: parallel tests each build through their own cache (and
+/// `MTL4Compiler`), and AGX's compiler corrupts the heap when those builds overlap (#288). The
+/// serving pool builds on one thread, so production's `get_or_build` takes no lock.
 pub fn baked_build(
     cache: &SpecializedPipelineCache,
     key: &PipelineKey,
@@ -372,6 +376,8 @@ pub fn baked_build(
     if baked_library(key.library_name).is_some() {
         cache.register_baked(&baked_kernels(std::slice::from_ref(key)));
     }
+    static BUILD: Mutex<()> = Mutex::new(());
+    let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     cache.get_or_build(key)
 }
 
