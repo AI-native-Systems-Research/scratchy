@@ -73,7 +73,8 @@ fn launch_env(
     ]
     .into_iter()
     .chain(
-        // The window the server really serves (`served_context_window`).
+        // The window Claude Code is told (`claude_code_window`): the one the
+        // server serves, or a smaller one the user asked for themselves.
         // Claude Code compacts the conversation at the window it assumes for
         // the model ID, and for an ID it does not recognise — every model we
         // serve — that assumption is far past what a local server holds
@@ -166,6 +167,41 @@ fn context_window_from_models(models: &serde_json::Value) -> Option<usize> {
         .iter()
         .find_map(|card| card.get("max_model_len")?.as_u64())?;
     usize::try_from(len).ok()
+}
+
+/// The window Claude Code is told, and how the `Launching …` line names it.
+///
+/// The served window, unless the user's own `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+/// asks for less: set on purpose to compact earlier, which launch's
+/// `--settings` would otherwise override. A larger value is the very
+/// assumption that kills a session, so it loses to the served window, and the
+/// line says so. `None` when the server could not say: launch then sets
+/// nothing, and the user's value reaches Claude Code untouched.
+///
+/// `user` is launch's own environment. A value in a Claude Code settings file
+/// is not seen here, and `--settings` outranks it.
+fn claude_code_window(served: Option<usize>, user: Option<&str>) -> (Option<usize>, String) {
+    let Some(served) = served else {
+        return (None, String::new());
+    };
+    let user = user.map(str::trim).filter(|raw| !raw.is_empty());
+    match user.map(|raw| (raw, raw.parse::<usize>().ok())) {
+        Some((_, Some(n))) if n > 0 && n < served => (
+            Some(n),
+            format!(
+                ", context window: {n} tokens from CLAUDE_CODE_MAX_CONTEXT_TOKENS (the server \
+                 serves {served})"
+            ),
+        ),
+        Some((raw, n)) if n != Some(served) => (
+            Some(served),
+            format!(
+                ", context window: {served} tokens (CLAUDE_CODE_MAX_CONTEXT_TOKENS={raw} not \
+                 used: only a window smaller than the server's is kept)"
+            ),
+        ),
+        _ => (Some(served), format!(", context window: {served} tokens")),
+    }
 }
 
 /// What to tell the user about the window Claude Code is about to be given, when
@@ -391,15 +427,17 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         }
     };
 
-    // The window Claude Code compacts against has to be the one the server
-    // serves, or the session dies the first time the conversation outgrows it.
-    let context_window = served_context_window(&base_url, &args.auth_token);
-    if let Some(warning) = context_window_warning(
-        server.as_ref().and_then(|s| s.max_model_len),
-        context_window,
-    ) {
+    // The window Claude Code compacts against has to be no larger than the one
+    // the server serves, or the session dies the first time the conversation
+    // outgrows it.
+    let served_window = served_context_window(&base_url, &args.auth_token);
+    if let Some(warning) =
+        context_window_warning(server.as_ref().and_then(|s| s.max_model_len), served_window)
+    {
         eprintln!("{warning}");
     }
+    let user_window = std::env::var("CLAUDE_CODE_MAX_CONTEXT_TOKENS").ok();
+    let (context_window, window_label) = claude_code_window(served_window, user_window.as_deref());
 
     // Where the session's traffic should go, read before it starts so the count
     // afterwards is a delta: with --server-url the server may already have
@@ -436,11 +474,8 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     }
     cmd.args(&args.claude_args);
 
-    let window = context_window
-        .map(|n| format!(", context window: {n} tokens"))
-        .unwrap_or_default();
     eprintln!(
-        "Launching `{}` against {base_url} (model: {model}{window})",
+        "Launching `{}` against {base_url} (model: {model}{window_label})",
         args.claude_bin
     );
 
@@ -873,9 +908,10 @@ fn gen_uuid_v4() -> String {
 mod tests {
     use super::{
         LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject, asked_max_model_len,
-        claude_settings_json, context_window_from_models, context_window_warning, gen_uuid_v4,
-        ignored_with_server_url, is_print_mode, launch_env, provenance_report,
-        resolve_session_inject, serve_argv, session_id_from_args, settings_flag_in_args,
+        claude_code_window, claude_settings_json, context_window_from_models,
+        context_window_warning, gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env,
+        provenance_report, resolve_session_inject, serve_argv, session_id_from_args,
+        settings_flag_in_args,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1222,6 +1258,46 @@ mod tests {
             Some(8192)
         );
         assert_eq!(ask(&["--serve-arg", "--max-model-len=4096"]), Some(4096));
+    }
+
+    /// A smaller window the user set on purpose (to compact earlier) survives
+    /// launch's `--settings`; a larger one is the assumption that kills a
+    /// session, so the served window wins — and the line says which happened.
+    #[test]
+    fn claude_code_window_keeps_only_a_smaller_user_window() {
+        // Nothing set: the served window.
+        let (told, label) = claude_code_window(Some(65536), None);
+        assert_eq!(told, Some(65536));
+        assert_eq!(label, ", context window: 65536 tokens");
+
+        // Smaller: kept, and both numbers named.
+        let (told, label) = claude_code_window(Some(65536), Some("40000"));
+        assert_eq!(told, Some(40000));
+        assert!(
+            label.contains("40000 tokens from CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            "{label}"
+        );
+        assert!(label.contains("serves 65536"), "{label}");
+
+        // Larger, zero, or not a number: the served window, and the value named.
+        for raw in ["200000", "0", "lots"] {
+            let (told, label) = claude_code_window(Some(65536), Some(raw));
+            assert_eq!(told, Some(65536), "{raw}");
+            assert!(label.contains(&format!("={raw} not used")), "{label}");
+        }
+
+        // Equal, or blank: nothing to explain.
+        for raw in ["65536", " "] {
+            let (told, label) = claude_code_window(Some(65536), Some(raw));
+            assert_eq!(told, Some(65536), "{raw:?}");
+            assert_eq!(label, ", context window: 65536 tokens", "{raw:?}");
+        }
+
+        // The server could not say: launch sets nothing, so the user's value
+        // reaches Claude Code untouched.
+        for user in [None, Some("40000")] {
+            assert_eq!(claude_code_window(None, user), (None, String::new()));
+        }
     }
 
     #[test]
