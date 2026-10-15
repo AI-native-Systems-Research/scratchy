@@ -14,6 +14,8 @@
 use std::path::Path;
 
 use minijinja::Environment;
+use minijinja::syntax::SyntaxConfig;
+use minijinja::value::Serde;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServeError;
@@ -68,8 +70,13 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     // is token 529 in the trained tokenization but lands as 29966 once a
     // stray `\n` runs precede it; the model has effectively never seen
     // that input, so generation produces nonsense fragments.
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
+    env.set_syntax(
+        SyntaxConfig::builder()
+            .trim_blocks(true)
+            .lstrip_blocks(true)
+            .build()
+            .map_err(|e| ServeError::Internal(format!("chat template syntax config: {e}")))?,
+    );
 
     // Enable Python string/dict/list methods (startswith, endswith, etc.)
     // that HuggingFace Jinja2 chat templates commonly use.
@@ -270,10 +277,7 @@ impl ChatTemplate {
 
         // Build the base context.
         let mut ctx_map = std::collections::BTreeMap::<String, minijinja::Value>::new();
-        ctx_map.insert(
-            "messages".into(),
-            minijinja::Value::from_serialize(messages),
-        );
+        ctx_map.insert("messages".into(), minijinja::Value::from(Serde(messages)));
         ctx_map.insert(
             "add_generation_prompt".into(),
             minijinja::Value::from(add_generation_prompt),
@@ -287,18 +291,18 @@ impl ChatTemplate {
             minijinja::Value::from(self.eos_token.as_deref().unwrap_or("")),
         );
         if let Some(tools) = tools {
-            ctx_map.insert("tools".into(), minijinja::Value::from_serialize(tools));
+            ctx_map.insert("tools".into(), minijinja::Value::from(Serde(tools)));
         }
         ctx_map.insert("date_string".into(), minijinja::Value::from(date_string));
 
         // Merge extra kwargs (e.g. enable_thinking, reasoning_effort).
         if let Some(kwargs) = extra_kwargs {
             for (key, value) in kwargs {
-                ctx_map.insert(key.clone(), minijinja::Value::from_serialize(value));
+                ctx_map.insert(key.clone(), minijinja::Value::from(Serde(value)));
             }
         }
 
-        let ctx = minijinja::Value::from_serialize(&ctx_map);
+        let ctx = minijinja::Value::from(Serde(&ctx_map));
 
         let rendered = tmpl
             .render(ctx)
@@ -741,6 +745,36 @@ mod tests {
         let result = tpl.apply(&messages, false, Some(&tools)).unwrap();
         assert!(result.contains("TOOLS:"));
         assert!(result.contains("get_weather"));
+    }
+
+    /// `tools | tojson` must render byte-for-byte what HuggingFace's
+    /// `apply_chat_template` renders: its `tojson` is `json.dumps(x,
+    /// ensure_ascii=False)`, whose `", "` / `": "` separators are part of the
+    /// prompt the model was trained on. The expected string is transformers'
+    /// own render of this template and these tools.
+    #[test]
+    fn test_tools_tojson_matches_huggingface_bytes() {
+        let tpl =
+            ChatTemplate::new("{% if tools %}TOOLS:{{ tools | tojson }}{% endif %}".to_string())
+                .unwrap();
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        }]);
+
+        let result = tpl.apply(&[], false, Some(&tools)).unwrap();
+        assert_eq!(
+            result,
+            r#"TOOLS:[{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]"#
+        );
     }
 
     /// An assistant message whose arguments the template will try to iterate.

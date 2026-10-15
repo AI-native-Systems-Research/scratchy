@@ -74,7 +74,9 @@ rustls-pemfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# Chat templates iterate and `tojson` request JSON (tools, messages) in the
+# order the client sent it, as HuggingFace's Python dicts do.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }
