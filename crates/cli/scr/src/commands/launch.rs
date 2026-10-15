@@ -35,6 +35,15 @@ const PROVENANCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// something is wrong, and launch carries on without the number.
 const CONTEXT_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The token limits launch hands Claude Code: the window it compacts against,
+/// and the reply reserve launch pins — `None` for a limit launch leaves to
+/// Claude Code itself. Grouped, because they are two counts of the same thing
+/// that a bare parameter list would let a caller swap without a compile error.
+struct ClaudeCodeLimits {
+    context_window: Option<usize>,
+    output_budget: Option<u32>,
+}
+
 /// The variables that point Claude Code at the server under test.
 ///
 /// One list, consumed twice — written into the child's process environment *and*
@@ -49,11 +58,15 @@ const CONTEXT_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
 ///   set. Verified against `claude` 2.1.292: with a marker variable in
 ///   `.claude/settings.local.json`, the file wins over an exported value, and
 ///   `--settings` wins over the file.
+///
+/// The one deliberate exception is the reply budget, which travels through the
+/// process environment only — see [`claude_settings_json`] for why the user's
+/// settings file has to be able to outrank it.
 fn launch_env(
     base_url: &str,
     auth_token: &str,
     model: &str,
-    context_window: Option<usize>,
+    limits: &ClaudeCodeLimits,
 ) -> Vec<(&'static str, String)> {
     vec![
         ("ANTHROPIC_BASE_URL", base_url.to_string()),
@@ -83,7 +96,19 @@ fn launch_env(
         // long. The variable applies directly to an ID that does not start
         // with `claude-`. Left out when the server could not say, so a value
         // the user set themselves still reaches Claude Code.
-        context_window.map(|n| ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", n.to_string())),
+        limits
+            .context_window
+            .map(|n| ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", n.to_string())),
+    )
+    .chain(
+        // The reply budget Claude Code is told (`claude_code_output_budget`),
+        // only when launch pins one — a window that fits Claude Code's own
+        // 32000 default gets nothing, so replies are not capped. Env-only:
+        // this is the channel a settings file's `env` block outranks, so a
+        // budget the user put in a settings file still wins.
+        limits
+            .output_budget
+            .map(|n| ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", n.to_string())),
     )
     .chain(
         // Provider selection, blanked. These do not go through
@@ -120,10 +145,16 @@ const PROVIDER_SELECTION_VARS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 
-/// [`launch_env`] as a `claude --settings` payload.
+/// [`launch_env`] as a `claude --settings` payload — minus the reply budget,
+/// deliberately. A budget in a settings file is one the user put there; the
+/// process environment is the channel a settings file's `env` block outranks
+/// (verified on `claude` 2.1.292), so sending the budget through the
+/// environment alone is what lets the user's file still win. Every other key
+/// has to reach both channels, or a settings file could overwrite it.
 fn claude_settings_json(env: &[(&'static str, String)]) -> String {
     let map: serde_json::Map<String, serde_json::Value> = env
         .iter()
+        .filter(|(key, _)| *key != "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
         .map(|(k, v)| ((*k).to_string(), serde_json::Value::String(v.clone())))
         .collect();
     serde_json::json!({ "env": map }).to_string()
@@ -204,9 +235,206 @@ fn claude_code_window(served: Option<usize>, user: Option<&str>) -> (Option<usiz
     }
 }
 
+/// The reply budget Claude Code falls back to for a model ID it does not
+/// recognise — every model scratchy serves (Claude Code's env-vars docs,
+/// 32000). Launch leaves this alone on a window that fits it with room to
+/// spare, and pins a smaller budget on one that does not
+/// ([`pinned_output_budget`]).
+const CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE: u32 = 32_000;
+
+/// The reply budget launch pins when the window needs one, as
+/// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+///
+/// Claude Code keeps this much of the context window free for its reply before
+/// the session may grow further, and compacts when it cannot. For a model ID it
+/// does not recognise — every model scratchy serves — that budget defaults to
+/// 32000, because an Anthropic-API server rejects a request whose
+/// `input + max_tokens` passes the window. Scratchy never makes that rejection:
+/// the engine clamps the completion budget to the window's remainder
+/// (`resolve_max_tokens`, crates/serving/api/src/engine.rs), so an overflowing
+/// request stops early at its cap instead of failing. Against scratchy the
+/// reservation's only effect is to shrink the window the session may use —
+/// 65536 − 32000 left less room than Claude Code's own startup prompt, which
+/// is the #428 failure.
+///
+/// 8192: measured sufficient for real work (the #428 chained-file run
+/// completed, one compaction, at this budget), four times a long single reply,
+/// and a reply that outgrows it degrades — Claude Code continues from "Output
+/// token limit hit" — rather than fails. The cap counts thinking tokens too
+/// (launch passes no `enable_thinking`, and Qwen-style templates think by
+/// default), which is one reason launch pins only as much as the window needs.
+const DEFAULT_OUTPUT_BUDGET: u32 = 8192;
+
+/// The budget launch pins on a `window` Claude Code is told, or `None` where
+/// Claude Code's own 32000 fits with room to spare.
+///
+/// Below the window where the 32000 first fits — [`claude_code_fixed_costs`] of
+/// it, 95000 — the pin is [`DEFAULT_OUTPUT_BUDGET`]. Past it the pin grows
+/// one-for-one with the window until it reaches 32000, where launch stops
+/// pinning. A step from 8192 straight to "nothing" would shrink a session's
+/// room as its window grows: a 94999-token window pinned at 8192 compacts at
+/// 73807, while a 95000-token one left at 32000 compacts at 50000 — exactly the
+/// startup baseline, no room for a conversation. Growing the pin instead holds
+/// the compaction line at 73808 across 95000..118808 and lets it rise from
+/// there, so a larger window never compacts earlier.
+fn pinned_output_budget(window: usize) -> Option<u32> {
+    let past = window.saturating_sub(claude_code_fixed_costs(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE));
+    let budget = u32::try_from(past).map_or(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE, |past| {
+        past.saturating_add(DEFAULT_OUTPUT_BUDGET)
+    });
+    (budget < CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE).then_some(budget)
+}
+
+/// The `CLAUDE_CODE_MAX_OUTPUT_TOKENS` Claude Code is given, if launch gives
+/// one at all, and how the `Launching …` line names it.
+///
+/// The user's own value always wins, in either direction — unlike the window,
+/// no value of it can make the server reject a request: a larger one only
+/// compacts earlier, a smaller one only shortens replies.
+///
+/// When the environment has none, launch pins a smaller budget **only as far
+/// as the window needs it** ([`pinned_output_budget`]): a session survives only
+/// while the window clears startup prompt + reserve + 13000, so on a window
+/// that fits Claude Code's own 32000 with room to spare, launch sets nothing —
+/// a pin would cap every reply to buy room the window already has. An unknown
+/// window pins 8192, moving the compact line as far up as the budget allows.
+///
+/// `window` is the window Claude Code is told (`claude_code_window`), the one
+/// it compacts against. A value the user set in a Claude Code settings file is
+/// not seen here, which is why the pin travels through the process
+/// environment only: a settings file's `env` block outranks that channel, so
+/// the user's file still wins.
+fn claude_code_output_budget(user: Option<&str>, window: Option<usize>) -> (Option<u32>, String) {
+    let user = user.map(str::trim).filter(|raw| !raw.is_empty());
+    // The user's own value always wins, in either direction — when it is a
+    // budget at all: zero does not parse as one.
+    if let Some(n) = user.and_then(|raw| raw.parse::<std::num::NonZeroU32>().ok()) {
+        let n = n.get();
+        return (
+            Some(n),
+            format!(", reply budget: {n} tokens from CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        );
+    }
+    // An unknown window conservatively pins the smallest budget: the pin's
+    // cost is capped replies, the no-pin cost is a session that never clears
+    // its compact line.
+    let (value, mut label) = match window.map(pinned_output_budget) {
+        None => (
+            Some(DEFAULT_OUTPUT_BUDGET),
+            format!(", reply budget: {DEFAULT_OUTPUT_BUDGET} tokens"),
+        ),
+        Some(Some(pin)) => (
+            Some(pin),
+            format!(
+                ", reply budget: {pin} tokens (the window can't spare Claude Code's \
+                 {CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE} default)"
+            ),
+        ),
+        // A value that failed to parse must not reach Claude Code as-is, so
+        // launch pins the default it was going to leave alone.
+        Some(None) if user.is_some() => (
+            Some(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE),
+            format!(", reply budget: {CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE} tokens"),
+        ),
+        Some(None) => (None, String::new()),
+    };
+    if let Some(raw) = user {
+        // Not a positive number: launch's own choice, with the value named.
+        label.push_str(&format!(
+            " (CLAUDE_CODE_MAX_OUTPUT_TOKENS={raw} not used: only a positive number is)"
+        ));
+    }
+    (value, label)
+}
+
+/// Claude Code's startup prompt — system prompt, tool schemas, the first user
+/// message — measured at 46099 tokens in this repository on claude 2.1.296.
+/// Rounded up: it grows with Claude Code releases, and the floor computed from
+/// it only needs to be approximately right to speak.
+const CLAUDE_CODE_PROMPT_BASELINE: usize = 50_000;
+
+/// The summary buffer Claude Code holds below its auto-compact trigger,
+/// measured at 13000 tokens on claude 2.1.282 (anthropics/claude-code#97568).
+const CLAUDE_CODE_SUMMARY_BUFFER: usize = 13_000;
+
+/// The window a session needs before its first turn: Claude Code's startup
+/// prompt plus the reply reserve it holds back plus the summary buffer it
+/// keeps below its compact trigger. Below this, a session starting near the
+/// baseline is over its compact line from the first turn.
+fn claude_code_fixed_costs(reserve: u32) -> usize {
+    CLAUDE_CODE_PROMPT_BASELINE + reserve as usize + CLAUDE_CODE_SUMMARY_BUFFER
+}
+
+/// Who set the window Claude Code is told — the levers that can widen it
+/// differ. [`SmallWindowOrigin::Native`] covers both a model whose native
+/// context is small and a window this machine's KV cache capped.
+enum SmallWindowOrigin {
+    /// The user's own `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, smaller than what the
+    /// server serves.
+    UserEnv { served: usize },
+    /// Launch's own `--max-model-len` ask, served as asked.
+    Asked,
+    /// A server launch did not start (`--server-url`), with its own window.
+    ExternalServer,
+    /// No one asked: the model's native context, or the machine's KV cap.
+    Native,
+}
+
+/// Whether the window Claude Code is told clears Claude Code's fixed costs,
+/// and what to say when it does not.
+///
+/// The window it is *told*, not the one the server serves — the two differ
+/// exactly when the user's own `CLAUDE_CODE_MAX_CONTEXT_TOKENS` asks for less,
+/// and that is a case that thrashes. A session outgrows its first turn only if
+/// the window exceeds the startup prompt plus the reply reserve plus the
+/// summary buffer; below that floor, a session starting near the baseline is
+/// over its compact line from the first turn — it compacts on its second
+/// prompt, and again after every compaction that lands over the line. That is
+/// not certain death: a smaller startup prompt can clear the line, and #428's
+/// own chained-file run completed on a 65536 window at the pinned budget. The
+/// warning names the arithmetic, the smaller-startup levers, and the
+/// window-level lever that matches who set the window.
+fn claude_code_floor_warning(
+    told: usize,
+    reserve: u32,
+    origin: &SmallWindowOrigin,
+) -> Option<String> {
+    let floor = claude_code_fixed_costs(reserve);
+    (told < floor).then(|| {
+        let lever = match origin {
+            SmallWindowOrigin::UserEnv { served } => format!(
+                " The window is your own CLAUDE_CODE_MAX_CONTEXT_TOKENS; the server serves \
+                 {served} — unset it, or raise it to {served}, for the room the server has."
+            ),
+            SmallWindowOrigin::Asked => " You asked for this window with --max-model-len; \
+                 dropping it lets the server serve the model's native context, capped only by \
+                 this machine's KV cache."
+                .to_string(),
+            SmallWindowOrigin::ExternalServer => " The window comes from the server at \
+                 --server-url: that server's --max-model-len, its model's native context, or \
+                 its machine's KV cache sets it."
+                .to_string(),
+            SmallWindowOrigin::Native => " The window levers are a bigger-context model or \
+                 more KV memory (--kv-cache-dtype fp8_e4m3) — not --max-model-len, which only \
+                 shrinks."
+                .to_string(),
+        };
+        format!(
+            "Warning: Claude Code is told a {told}-token context window, but its startup prompt \
+             is ~{} tokens and it holds back {reserve} for its reply plus {} to summarize into \
+             ({floor} together), so a session starting near that baseline is over its compact \
+             line from the first turn: it compacts on its second prompt, and again after every \
+             compaction that lands over the line. A smaller startup prompt — fewer tools, a \
+             smaller CLAUDE.md, less memory — can clear it.{lever}",
+            CLAUDE_CODE_PROMPT_BASELINE, CLAUDE_CODE_SUMMARY_BUFFER
+        )
+    })
+}
+
 /// What to tell the user about the window Claude Code is about to be given, when
 /// there is something to say. `asked` is the `--max-model-len` a spawned server
-/// was started with, `None` with `--server-url` (launch asked for nothing).
+/// was started with — the user's own ask; launch has no default — or `None` when
+/// launch asked for nothing (`--server-url`, or no flag passed).
 ///
 /// Pure, so each case is unit-testable without a server.
 fn context_window_warning(asked: Option<usize>, served: Option<usize>) -> Option<String> {
@@ -431,13 +659,35 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // the server serves, or the session dies the first time the conversation
     // outgrows it.
     let served_window = served_context_window(&base_url, &args.auth_token);
-    if let Some(warning) =
-        context_window_warning(server.as_ref().and_then(|s| s.max_model_len), served_window)
-    {
+    // The `--max-model-len` launch asked the spawned server for, if it did —
+    // also who to name when the window comes out too small to lift `asked`.
+    let asked = server.as_ref().and_then(|s| s.max_model_len);
+    if let Some(warning) = context_window_warning(asked, served_window) {
         eprintln!("{warning}");
     }
     let user_window = std::env::var("CLAUDE_CODE_MAX_CONTEXT_TOKENS").ok();
     let (context_window, window_label) = claude_code_window(served_window, user_window.as_deref());
+    let user_budget = std::env::var("CLAUDE_CODE_MAX_OUTPUT_TOKENS").ok();
+    let (output_budget, budget_label) =
+        claude_code_output_budget(user_budget.as_deref(), context_window);
+    // The floor warning speaks about the window Claude Code is told — that is
+    // the one it compacts against — and names the lever that matches who set
+    // it: the user's own env var, launch's own --max-model-len ask, an
+    // existing --server-url server, or nobody (native context / KV cap).
+    let small_window_origin = match (context_window, served_window) {
+        (Some(told), Some(served)) if told < served => SmallWindowOrigin::UserEnv { served },
+        (Some(told), _) if asked == Some(told) => SmallWindowOrigin::Asked,
+        _ if args.server_url.is_some() => SmallWindowOrigin::ExternalServer,
+        _ => SmallWindowOrigin::Native,
+    };
+    if let Some(told) = context_window {
+        // The reserve actually held back: launch's pin, or Claude Code's own
+        // 32000 when launch set none.
+        let reserve = output_budget.unwrap_or(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE);
+        if let Some(warning) = claude_code_floor_warning(told, reserve, &small_window_origin) {
+            eprintln!("{warning}");
+        }
+    }
 
     // Where the session's traffic should go, read before it starts so the count
     // afterwards is a delta: with --server-url the server may already have
@@ -449,8 +699,18 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
 
     // Point Claude Code at our server, twice over: in the process environment,
     // and again through `--settings`, which outranks the settings files whose
-    // `env` block would otherwise overwrite it. See `launch_env`.
-    let env = launch_env(&base_url, &args.auth_token, &model, context_window);
+    // `env` block would otherwise overwrite it — except the reply budget, which
+    // travels through the environment only so a value the user put in a
+    // settings file still wins. See `launch_env` and `claude_settings_json`.
+    let env = launch_env(
+        &base_url,
+        &args.auth_token,
+        &model,
+        &ClaudeCodeLimits {
+            context_window,
+            output_budget,
+        },
+    );
     let mut cmd = std::process::Command::new(&args.claude_bin);
     for (key, value) in &env {
         cmd.env(key, value);
@@ -475,7 +735,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     cmd.args(&args.claude_args);
 
     eprintln!(
-        "Launching `{}` against {base_url} (model: {model}{window_label})",
+        "Launching `{}` against {base_url} (model: {model}{window_label}{budget_label})",
         args.claude_bin
     );
 
@@ -532,11 +792,6 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Context window the spawned server gets when `--max-model-len` is unset. Big
-/// enough for Claude Code's own system prompt + tool schemas plus a real session,
-/// and under the ceiling of every model we launch.
-const DEFAULT_MAX_MODEL_LEN: usize = 65536;
-
 /// The `serve` argv for the server we spawn — everything from the subcommand name
 /// on. Pure, so the whole forwarding surface is unit-testable: a serving knob is
 /// reachable from `launch claude` exactly when it shows up in this vector.
@@ -592,12 +847,18 @@ fn serve_argv(
     // already been lost once to a refactor (added in d555fd53, dropped, restored) —
     // it OOMs a 32 GiB box when it goes missing, so keep it emitted here.
     pair(&mut argv, &taken, "--max-num-seqs", args.max_num_seqs);
-    pair(
-        &mut argv,
-        &taken,
-        "--max-model-len",
-        args.max_model_len.unwrap_or(DEFAULT_MAX_MODEL_LEN),
-    );
+    // The context window is the server's to answer, not launch's to guess:
+    // unset means `serve`'s own default (the model's native context), which the
+    // engine caps to what this machine's KV cache holds, and launch reads the
+    // served number back from `/v1/models` to hand Claude Code. A fixed ask
+    // here was the #428 bug in its extreme form: 65536 minus Claude Code's
+    // 32000 reply reservation left less room than Claude Code's own startup
+    // prompt (46099 tokens, measured on claude 2.1.296), so every session
+    // compacted on its second prompt. The flag remains the deliberate shrink —
+    // e.g. matching another engine's window for a benchmark (#161 rule 3).
+    if let Some(len) = args.max_model_len {
+        pair(&mut argv, &taken, "--max-model-len", len);
+    }
     if let Some(parser) = tool_parser {
         pair(&mut argv, &taken, "--tool-call-parser", parser);
     }
@@ -617,8 +878,9 @@ fn serve_argv(
     Ok(argv)
 }
 
-/// The `--max-model-len` a [`serve_argv`] asks for, whether launch's default or
-/// the `--serve-arg` passthrough put it there.
+/// The `--max-model-len` a [`serve_argv`] asks for — the user's own flag, or
+/// the `--serve-arg` passthrough. `None` when launch asked for nothing, which
+/// is the default: the server resolves the window itself.
 fn asked_max_model_len(argv: &[String]) -> Option<usize> {
     let i = argv
         .iter()
@@ -907,11 +1169,12 @@ fn gen_uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject, asked_max_model_len,
-        claude_code_window, claude_settings_json, context_window_from_models,
-        context_window_warning, gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env,
-        provenance_report, resolve_session_inject, serve_argv, session_id_from_args,
-        settings_flag_in_args,
+        ClaudeCodeLimits, LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject,
+        SmallWindowOrigin, asked_max_model_len, claude_code_floor_warning,
+        claude_code_output_budget, claude_code_window, claude_settings_json,
+        context_window_from_models, context_window_warning, gen_uuid_v4, ignored_with_server_url,
+        is_print_mode, launch_env, provenance_report, resolve_session_inject, serve_argv,
+        session_id_from_args, settings_flag_in_args,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -943,10 +1206,12 @@ mod tests {
         assert_eq!(last_val(&argv, "--port"), Some("1234"));
         // The batch-1 memory rationale survives as the default…
         assert_eq!(last_val(&argv, "--max-num-seqs"), Some("1"));
-        assert_eq!(last_val(&argv, "--max-model-len"), Some("65536"));
         // …while an unset knob is left to `serve`'s own default instead of being
-        // restated (and skewed) here.
+        // restated (and skewed) here — including the window, which is the
+        // server's to answer (the model's native context, capped by this
+        // machine's KV), not launch's to guess.
         for flag in [
+            "--max-model-len",
             "--kv-cache-dtype",
             "--speculative-model",
             "--num-speculative-tokens",
@@ -1037,7 +1302,8 @@ mod tests {
         assert_eq!(serve.host, "127.0.0.1");
         assert_eq!(serve.port, 9999);
         assert_eq!(serve.max_num_seqs, Some(4));
-        assert_eq!(serve.max_model_len, Some(super::DEFAULT_MAX_MODEL_LEN));
+        // The window is left to the server: launch asked for none.
+        assert_eq!(serve.max_model_len, None);
         assert_eq!(serve.kv_cache_dtype, "fp8_e4m3");
         assert_eq!(serve.speculative_model.as_deref(), Some("ngram"));
         assert_eq!(serve.num_speculative_tokens, 3);
@@ -1163,21 +1429,38 @@ mod tests {
         assert_eq!(session_id_from_args(&s(&["-p", "hello"])), None);
     }
 
-    /// The `--settings` payload and the process environment have to carry the
-    /// same keys — a key in one and not the other is a key a settings file can
-    /// still overwrite. They are built from one list, so this asserts the
-    /// rendering rather than guarding against drift.
+    /// The `--settings` payload and the process environment are built from one
+    /// list, so this asserts the rendering — with one deliberate exception:
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` reaches the process environment only.
+    /// A budget in a settings file is one the user put there, and the process
+    /// environment is the channel a settings file's `env` block outranks, so
+    /// that is the channel that lets the user's file still win.
     #[test]
-    fn settings_payload_carries_every_launch_env_key() {
-        let env = launch_env("http://127.0.0.1:8000", "tok", "my-model", Some(32768));
+    fn settings_payload_carries_every_launch_env_key_except_the_budget() {
+        let env = launch_env(
+            "http://127.0.0.1:8000",
+            "tok",
+            "my-model",
+            &ClaudeCodeLimits {
+                context_window: Some(32768),
+                output_budget: Some(8192),
+            },
+        );
         let json: serde_json::Value =
             serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
         let block = json["env"].as_object().expect("an env object");
 
-        assert_eq!(block.len(), env.len());
         for (key, value) in &env {
-            assert_eq!(block[*key].as_str(), Some(value.as_str()), "{key}");
+            let expected = if *key == "CLAUDE_CODE_MAX_OUTPUT_TOKENS" {
+                None
+            } else {
+                Some(value.as_str())
+            };
+            // Value indexing (not `block[*key]`, which panics on the absent
+            // budget key) so the missing key reads as None.
+            assert_eq!(json["env"][*key].as_str(), expected, "{key}");
         }
+        assert_eq!(block.len(), env.len() - 1);
         // The three that decide which engine gets measured.
         assert_eq!(
             block["ANTHROPIC_BASE_URL"].as_str(),
@@ -1192,7 +1475,15 @@ mod tests {
     /// somewhere else entirely.
     #[test]
     fn launch_env_fans_the_model_out_to_every_tier() {
-        let env = launch_env("http://x", "tok", "m", None);
+        let env = launch_env(
+            "http://x",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: None,
+                output_budget: None,
+            },
+        );
         for key in [
             "ANTHROPIC_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -1210,7 +1501,15 @@ mod tests {
     /// can put a larger one back.
     #[test]
     fn launch_env_tells_claude_code_the_served_window() {
-        let env = launch_env("http://x", "tok", "m", Some(32768));
+        let env = launch_env(
+            "http://x",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: Some(32768),
+                output_budget: None,
+            },
+        );
         let json: serde_json::Value =
             serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
         let in_env = env
@@ -1224,11 +1523,223 @@ mod tests {
         );
 
         // Unknown: left out, not blanked, so a value the user set still applies.
-        let env = launch_env("http://x", "tok", "m", None);
+        let env = launch_env(
+            "http://x",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: None,
+                output_budget: None,
+            },
+        );
         assert!(
             !env.iter()
                 .any(|(k, _)| *k == "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
         );
+    }
+
+    /// The reply budget reaches Claude Code through the process environment,
+    /// and only there: a settings file's value is the user's and must be able
+    /// to win, which the environment channel allows (a file outranks it) and
+    /// `--settings` would not.
+    #[test]
+    fn launch_env_tells_claude_code_the_reply_budget_through_the_environment_only() {
+        let env = launch_env(
+            "http://x",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: None,
+                output_budget: Some(8192),
+            },
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| *k == "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+                .map(|(_, v)| v.as_str()),
+            Some("8192")
+        );
+        assert!(json["env"].get("CLAUDE_CODE_MAX_OUTPUT_TOKENS").is_none());
+
+        // No pin (the window fits Claude Code's own 32000): nothing set, so
+        // the value a user left anywhere is what applies.
+        let env = launch_env(
+            "http://x",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: Some(262_144),
+                output_budget: None,
+            },
+        );
+        assert!(
+            !env.iter()
+                .any(|(k, _)| *k == "CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        );
+    }
+
+    /// The user's own budget always wins, in either direction — no value of it
+    /// can make the server reject a request. Not a positive number: launch's
+    /// own choice, named. Blank: unset, nothing to explain.
+    #[test]
+    fn output_budget_user_value_always_wins() {
+        for raw in ["4096", "128000"] {
+            let (told, label) = claude_code_output_budget(Some(raw), Some(262_144));
+            assert_eq!(told, raw.parse::<u32>().ok(), "{raw}");
+            assert!(
+                label.contains("from CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+                "{label}"
+            );
+        }
+
+        // Not a positive number, on a window that fits the 32000 default: the
+        // bad value must not reach Claude Code as-is, so launch pins the
+        // default it was going to leave alone, named.
+        for raw in ["0", "lots"] {
+            let (told, label) = claude_code_output_budget(Some(raw), Some(262_144));
+            assert_eq!(told, Some(32_000), "{raw}");
+            assert!(label.contains("not used"), "{label}");
+            assert!(label.contains(raw), "{label}");
+        }
+
+        // Blank reads as unset: the conditional default, nothing to explain.
+        let (told, label) = claude_code_output_budget(Some(" "), Some(262_144));
+        assert_eq!((told, label.as_str()), (None, ""));
+    }
+
+    /// The pin exists to rescue windows that cannot fit Claude Code's own
+    /// 32000 reservation — startup prompt + 32000 + 13000 — and it costs every
+    /// reply (thinking counts against the cap), so it is only as large a cut as
+    /// the window needs: 8192 below that floor, growing one-for-one with the
+    /// window past it, and nothing once it reaches 32000.
+    #[test]
+    fn output_budget_pinned_only_as_far_as_the_window_needs_it() {
+        let fits = 50_000 + 32_000 + 13_000;
+        let (told, label) = claude_code_output_budget(None, Some(fits - 1));
+        assert_eq!(told, Some(8192));
+        assert!(label.contains("8192"), "{label}");
+        assert!(label.contains("32000"), "{label}");
+
+        // Past the floor the pin grows with the window, holding the compact
+        // line where 8192 left it — e.g. Gemma 4 31B on a 64 GB M5 Max, whose
+        // KV cache serves 115648 tokens (#431).
+        for (window, pin) in [
+            (fits, 8_192),
+            (100_000, 13_192),
+            (115_648, 28_840),
+            (fits + 23_807, 31_999),
+        ] {
+            let (told, label) = claude_code_output_budget(None, Some(window));
+            assert_eq!(told, Some(pin), "{window}");
+            assert!(label.contains(&pin.to_string()), "{label}");
+        }
+
+        // Where the pin would reach Claude Code's own 32000: nothing set.
+        for window in [fits + 23_808, 131_072, 262_144] {
+            assert_eq!(
+                claude_code_output_budget(None, Some(window)),
+                (None, String::new()),
+                "{window}"
+            );
+        }
+
+        // The window Claude Code is told decides, not the one the server
+        // serves: a user pinning a small CLAUDE_CODE_MAX_CONTEXT_TOKENS
+        // against a large server still gets the rescue.
+        let (told, _) = claude_code_output_budget(None, Some(40_000));
+        assert_eq!(told, Some(8192));
+
+        // Unknown window: pin — the conservative rescue.
+        let (told, label) = claude_code_output_budget(None, None);
+        assert_eq!(told, Some(8192));
+        assert_eq!(label, ", reply budget: 8192 tokens");
+    }
+
+    /// A larger window never compacts earlier. Claude Code compacts at
+    /// min(92% × (window − reserve), window − reserve − 13000)
+    /// (anthropics/claude-code#97568); a reserve that jumped from 8192 straight
+    /// to 32000 at one window would drop that line by 23808 tokens there.
+    #[test]
+    fn compact_line_never_falls_as_the_window_grows() {
+        let compact_line = |window: usize| {
+            let (pin, _) = claude_code_output_budget(None, Some(window));
+            let usable = window - pin.unwrap_or(32_000) as usize;
+            (usable * 92 / 100).min(usable - 13_000)
+        };
+        let mut previous = compact_line(60_000);
+        for window in 60_001..=300_000 {
+            let line = compact_line(window);
+            assert!(line >= previous, "{window}: {line} < {previous}");
+            previous = line;
+        }
+    }
+
+    /// The case this fix exists for: a window below Claude Code's fixed costs
+    /// must be spoken at launch, with the arithmetic named and the lever that
+    /// matches who set the window. The constants are pinned here as literals
+    /// on purpose — they are measured facts about Claude Code, not derived
+    /// from anything in this repo.
+    #[test]
+    fn floor_warning_names_a_window_below_claude_codes_fixed_costs() {
+        // 50000 startup prompt + 8192 reply budget + 13000 summary buffer.
+        let floor = 50_000 + 8_192 + 13_000;
+        let warn = claude_code_floor_warning(65_536, 8_192, &SmallWindowOrigin::Native)
+            .expect("65536 is below the floor");
+        assert!(warn.starts_with("Warning:"), "{warn}");
+        assert!(warn.contains("65536-token"), "{warn}");
+        assert!(warn.contains("50000"), "{warn}");
+        assert!(warn.contains("8192"), "{warn}");
+        assert!(warn.contains("13000"), "{warn}");
+        assert!(warn.contains("compact line"), "{warn}");
+        assert!(warn.contains("second prompt"), "{warn}");
+        // Not certain death — #428's own run completed below the floor — so
+        // the smaller-startup levers are named, and the claim is the
+        // arithmetic, not "regardless of what you do".
+        assert!(warn.contains("CLAUDE.md"), "{warn}");
+        assert!(!warn.contains("regardless of what you do"), "{warn}");
+        // The native-context levers, without pointing at --max-model-len as
+        // if shrinking further could help.
+        assert!(warn.contains("bigger-context model"), "{warn}");
+        assert!(warn.contains("only shrinks"), "{warn}");
+
+        // The lever matches who set the window.
+        let warn = claude_code_floor_warning(65_536, 8_192, &SmallWindowOrigin::Asked)
+            .expect("below the floor");
+        assert!(warn.contains("--max-model-len"), "{warn}");
+        assert!(warn.contains("dropping it"), "{warn}");
+        assert!(!warn.contains("only shrinks"), "{warn}");
+
+        let warn = claude_code_floor_warning(
+            40_000,
+            8_192,
+            &SmallWindowOrigin::UserEnv { served: 262_144 },
+        )
+        .expect("below the floor");
+        assert!(warn.contains("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), "{warn}");
+        assert!(warn.contains("262144"), "{warn}");
+
+        let warn = claude_code_floor_warning(65_536, 8_192, &SmallWindowOrigin::ExternalServer)
+            .expect("below the floor");
+        assert!(warn.contains("--server-url"), "{warn}");
+
+        // At or above the floor: nothing to say. The floor moves with the
+        // reserve actually held back — launch's pin, or Claude Code's own
+        // 32000 when launch pinned nothing.
+        assert_eq!(
+            claude_code_floor_warning(floor, 8_192, &SmallWindowOrigin::Native),
+            None
+        );
+        assert_eq!(
+            claude_code_floor_warning(131_072, 8_192, &SmallWindowOrigin::Native),
+            None
+        );
+        assert_eq!(
+            claude_code_floor_warning(95_000, 32_000, &SmallWindowOrigin::Native),
+            None
+        );
+        assert!(claude_code_floor_warning(94_999, 32_000, &SmallWindowOrigin::Native).is_some());
     }
 
     #[test]
@@ -1251,7 +1762,8 @@ mod tests {
         let ask = |extra: &[&str]| {
             asked_max_model_len(&serve_argv("m", 1, &launch_args(extra), None).unwrap())
         };
-        assert_eq!(ask(&[]), Some(super::DEFAULT_MAX_MODEL_LEN));
+        // launch asks for no window by default: the server resolves it.
+        assert_eq!(ask(&[]), None);
         assert_eq!(ask(&["--max-model-len", "16384"]), Some(16384));
         assert_eq!(
             ask(&["--serve-arg", "--max-model-len", "--serve-arg", "8192"]),
@@ -1341,7 +1853,15 @@ mod tests {
     /// be blanked, and the blank must reach the `--settings` payload too.
     #[test]
     fn provider_selection_is_blanked_everywhere() {
-        let env = launch_env("http://127.0.0.1:8000", "tok", "m", None);
+        let env = launch_env(
+            "http://127.0.0.1:8000",
+            "tok",
+            "m",
+            &ClaudeCodeLimits {
+                context_window: None,
+                output_budget: None,
+            },
+        );
         let json: serde_json::Value =
             serde_json::from_str(&claude_settings_json(&env)).expect("valid JSON");
         let block = json["env"].as_object().expect("an env object");

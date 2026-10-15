@@ -240,16 +240,17 @@ still appear on every published row:
    | `gemma-4-26b-a4b-it` | 30 | 5 full-attention, 25 windowed |
    | `qwen3.6-35b-a3b` | 40 | 10 full-attention; the other 30 hold recurrent conv/ssm state, not KV |
 
-2. **Context length.** `scr launch claude` asks for `--max-model-len 65536`
-   (`crates/cli/scr/src/commands/launch.rs:538`), well under these checkpoints'
-   262144. What a run gets is **the `max_model_len` scratchy's `/v1/models`
-   reports**, which launch prints on its `Launching …` line. On metal the
-   server lowers the ask to what that machine's KV cache holds, with a
-   `Capping max_model_len` warning in its log, so the number depends on the
-   machine as well as the model. That printed number is the context length a
-   row discloses and the one the matched-context rule matches. The rule needs
-   ollama's `OLLAMA_CONTEXT_LENGTH` set to it, and **no truncation on either
-   side, proven** by per-turn token accounting — T0.4 for the ollama number.
+2. **Context length.** `scr launch claude` asks for no window of its own:
+   unset `--max-model-len` means `serve`'s default — the model's native
+   context (262144 for these checkpoints) — which the engine caps to what
+   that machine's KV cache holds, with a `Capping max_model_len` warning in
+   its log, so the number depends on the machine as well as the model. What a
+   run gets is **the `max_model_len` scratchy's `/v1/models` reports**, which
+   launch prints on its `Launching …` line. That printed number is the context
+   length a row discloses and the one the matched-context rule matches. The
+   rule needs ollama's `OLLAMA_CONTEXT_LENGTH` set to it, and **no truncation
+   on either side, proven** by per-turn token accounting — T0.4 for the
+   ollama number.
 
    Claude Code's own idea of the window has to match as well, because it
    decides when a session compacts. For a model name it does not recognise —
@@ -262,8 +263,13 @@ still appear on every published row:
    named on the same line. The ollama arm needs the same variable set to the
    same number, or its sessions compact at a different point and the
    per-session comparison is not like-for-like. The same goes for
-   `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, whose reservation also moves the point
-   where a session compacts (#428).
+   `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, whose reservation moves the same point
+   (#428): `scr launch claude` pins it to 8192 below ~95k tokens, grows the
+   pin one-for-one with the window from there, and sets nothing from ~119k up,
+   where the pin would reach Claude Code's own 32000 — so the ollama arm
+   matches the `Launching …` line: pin the budget launch named when it named
+   one, leave the variable unset when it named none — or the value a run
+   overrides it with, matched on both sides.
 
 3. **Which binary.** Per-tool relocatable spans are a Cargo feature, off by
    default (`crates/serving/api/Cargo.toml:47`, forwarded at
