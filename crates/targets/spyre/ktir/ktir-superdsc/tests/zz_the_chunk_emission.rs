@@ -205,6 +205,38 @@ fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
     }
 }
 
+/// ⛔ A 256-ROW PROMPT CHUNK EMITS AT EVERY WIDTH, its probabilities in slot parts. At 1024 query rows per
+/// kv head a 64-page chunk's `esub` is time-tiled whole, and a time-tiled op with a broadcast operand (the
+/// row max) is the builder's own refusal. Cut into equal parts that each run untiled, every width emits,
+/// and the parts cover each kv head's chunk exactly once, one `exp` per `esub`.
+#[test]
+fn a_wide_prompt_chunk_cuts_its_probabilities_into_untiled_parts() {
+    const MQ: u32 = 256;
+    for &j in &ChunkScratch::LADDER {
+        let ops = named(emit_chunk_ops_at(j, MQ));
+        let esub: Vec<&(String, serde_json::Value)> = ops
+            .iter()
+            .filter(|(n, _)| n.starts_with("attn_cesub_g"))
+            .collect();
+        let covered: u64 = esub
+            .iter()
+            .map(|(name, v)| v["dscs_"][0][name]["N_"]["out_"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(
+            covered,
+            u64::from(NKVH * j * 256),
+            "{j} page(s): the esub parts cover {covered} slots across the kv heads"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|(n, _)| n.starts_with("attn_cexp_g"))
+                .count(),
+            esub.len(),
+            "{j} page(s): one exp per esub part"
+        );
+    }
+}
+
 /// ⛔ EXACTLY THE GATHER COPIES ARE DECLARED GATHERED, AND NOTHING IS A FOLD OP. A gathered op groups on
 /// its own (`GroupKind::Gathered`): its launch takes no KV page shift — the entries are absolute — and its
 /// body is the one the host stages the index for. An unmarked copy lands in an ordinary group, whose

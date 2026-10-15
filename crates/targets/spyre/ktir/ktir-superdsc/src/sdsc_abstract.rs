@@ -6838,12 +6838,18 @@ impl ChunkScratch {
     /// is 512 KB, which fits whole, so no part takes the repair. The one-request decode's 4-row PV bakes
     /// at every width and stays ONE part, byte for byte.
     pub fn value_parts(self, cut: bool) -> impl Iterator<Item = ChunkPart> {
-        let total = self.slots();
-        let per = if cut {
-            Self::VALUE_PART_PAGES * PagedKvPool::PAGE_SLOTS as u32
+        self.slot_parts(if cut {
+            Self::VALUE_PART_PAGES
         } else {
-            total
-        };
+            self.pages
+        })
+    }
+
+    /// The chunk's slots in runs of `pages_per_part` pages (the last one short), as [`ChunkPart`]s —
+    /// whole stick-columns of every per-head `[rows, slots]` block, so a part is itself a block.
+    pub fn slot_parts(self, pages_per_part: u32) -> impl Iterator<Item = ChunkPart> {
+        let total = self.slots();
+        let per = pages_per_part.clamp(1, self.pages) * PagedKvPool::PAGE_SLOTS as u32;
         (0..total.div_ceil(per)).map(move |i| ChunkPart {
             chunk: self,
             first_slot: i * per,

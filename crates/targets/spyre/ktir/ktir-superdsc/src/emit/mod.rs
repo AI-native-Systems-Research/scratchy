@@ -502,6 +502,41 @@ pub(crate) fn pointwise_broadcast_opspec(
     )
 }
 
+/// Whether a `[rows, cols]` fp16 pointwise op over `n_inputs` operands runs WITHOUT time-tiling — the
+/// very tile op and tiler [`pointwise_broadcast_opspec_df`] builds, asked before the op is. A caller
+/// cuts an op this answers `false` for, because a time-tiled op with a broadcast operand is refused
+/// (`concrete_trips` would advance the broadcast operand per trip).
+pub fn pointwise_fits_untiled(rows: u32, cols: u32, n_inputs: u32) -> bool {
+    let Ok(stick) = StickExtent::<Fp16>::new(cols) else {
+        return false;
+    };
+    let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df: Df::Fp16,
+    };
+    let tile_op = crate::ir::island::tile_op::TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+            n_operands: n_inputs + 1,
+        },
+        dims: vec![
+            dim("mb", rows, false),
+            dim("out", stick.elems(), true),
+            dim("y", 1, false),
+        ],
+        df: Df::Fp16,
+    };
+    tile_op
+        .tile(
+            crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
+            crate::work::distribute_cores,
+            "out",
+        )
+        .is_ok_and(|t| t.time_tile.is_none())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pointwise_broadcast_opspec_df(
     op: OpFunc,
