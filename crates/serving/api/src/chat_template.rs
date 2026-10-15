@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::ServeError;
 use crate::protocol;
 
+mod tojson;
+
 // ---------------------------------------------------------------------------
 // ChatTemplate
 // ---------------------------------------------------------------------------
@@ -88,6 +90,10 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     // Add `strftime_now` — used by HuggingFace transformers chat templates
     // (e.g. granite, llama4) to inject the current date/time.
     env.add_function("strftime_now", strftime_now);
+
+    // HuggingFace's `tojson` (a plain `json.dumps`), not Jinja's HTML-safe one:
+    // tool schemas and tool-call arguments reach the prompt through it.
+    env.add_filter("tojson", tojson::tojson);
 
     env.add_template_owned("chat", template_str.to_owned())
         .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;

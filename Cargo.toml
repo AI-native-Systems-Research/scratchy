@@ -139,7 +139,8 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # Template engine (for HuggingFace chat templates)
 # `preserve_order`: template maps keep insertion order like the Python dicts
 # HuggingFace renders with, so `tojson` and `.items()` match its prompt bytes.
-minijinja = { version = "3", features = ["builtins", "json", "preserve_order", "serde"] }
+# No `json`: the chat template registers HuggingFace's own `tojson`.
+minijinja = { version = "3", features = ["builtins", "preserve_order", "serde"] }
 minijinja-contrib = { version = "3", features = ["pycompat"] }
 
 # Structured output / constrained decoding
