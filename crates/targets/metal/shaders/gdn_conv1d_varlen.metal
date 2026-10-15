@@ -129,34 +129,44 @@ template <typename T>
     window[ki] = start == 1u ? 0.0f : start_ptr[ki];
   }
 
-  // Walk the sequence's tokens; the window slides through registers — in stretches, a save's
-  // store of the window after each but the last (`gdn_state.h`).
+  // Walk the sequence's tokens; the window slides through registers.
   const float b = GDN_CONV_HAS_BIAS ? float(bias[d]) : 0.0f;
-  int t = 0;
-  for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-    for (const int stop = gdn_stretch_end(saves_through, stretch, seqlen); t < stop; t++) {
-      float x_t = float(x[(uint(base + t)) * GDN_CONV_X_STRIDE + GDN_CONV_IN_OFFSET + d]);
-      float sum = b + x_t * wlocal[state_len];
-      for (uint ki = 0; ki < state_len; ki++) {
-        sum += window[ki] * wlocal[ki];
-      }
-      conv_out[(uint(base + t)) * conv_dim + d] = sum / (1.0f + exp(-sum));  // SiLU
-      // Shift window left, insert the new input.
-      for (uint ki = 0; ki + 1 < state_len; ki++) {
-        window[ki] = window[ki + 1];
-      }
-      if (state_len > 0) {
-        window[state_len - 1] = x_t;
-      }
-      for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
-        lane_ptr[uint(t) * entry_len + ki] = window[ki];
-      }
+  auto conv_row = [&](int t) {
+    float x_t = float(x[(uint(base + t)) * GDN_CONV_X_STRIDE + GDN_CONV_IN_OFFSET + d]);
+    float sum = b + x_t * wlocal[state_len];
+    for (uint ki = 0; ki < state_len; ki++) {
+      sum += window[ki] * wlocal[ki];
     }
-    const int sv = gdn_stretch_save(saves_through, stretch, seqlen);
-    if (sv >= 0) {
-      device float* snap = ring(state_indices[seq].saves[sv].y);
-      for (uint ki = 0; ki < state_len; ki++) {
-        snap[ki] = window[ki];
+    conv_out[(uint(base + t)) * conv_dim + d] = sum / (1.0f + exp(-sum));  // SiLU
+    // Shift window left, insert the new input.
+    for (uint ki = 0; ki + 1 < state_len; ki++) {
+      window[ki] = window[ki + 1];
+    }
+    if (state_len > 0) {
+      window[state_len - 1] = x_t;
+    }
+    for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
+      lane_ptr[uint(t) * entry_len + ki] = window[ki];
+    }
+  };
+  // A step that saves nothing runs its rows in one loop; one that saves, in stretches, a save's
+  // store of the window after each but the last (`gdn_state.h`).
+  int t = 0;
+  if (!gdn_saves_any(saves_through)) {
+    for (; t < seqlen; t++) {
+      conv_row(t);
+    }
+  } else {
+    for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
+      for (const int stop = gdn_stretch_end(saves_through, stretch, seqlen); t < stop; t++) {
+        conv_row(t);
+      }
+      const int sv = gdn_stretch_save(saves_through, stretch, seqlen);
+      if (sv >= 0) {
+        device float* snap = ring(state_indices[seq].saves[sv].y);
+        for (uint ki = 0; ki < state_len; ki++) {
+          snap[ki] = window[ki];
+        }
       }
     }
   }

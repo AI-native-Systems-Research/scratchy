@@ -47,10 +47,19 @@ inline bool gdn_saves_after(int2 through, uint j, int row) {
   return row >= 0 && through[j] == row + 1;
 }
 
-// A scan whose rows run one at a time runs a step's in `GDN_SAVES + 1` stretches instead, a save's
-// store after each but the last, so its per-row loop carries no save: stretch `k` ends at the row
-// its `k`-th save stores after (saves in row order, one of `0` rows last), the last at the step's
-// end.
+// Whether a step stores any snapshot. The same for every thread of a sequence, so a kernel branches
+// on it once, at entry: a step that saves nothing — every decode step, and every prefill chunk
+// that reaches no save point — runs its rows in the plain kernel's one loop, never a stretch's.
+// Both loops inline one row body, which must round alike in each (`#pragma clang fp
+// reassociate(off)` where fast math rounds the copies apart: the scans), or a snapshot would not
+// be the state a plain step carries — the kernel tests check it bit for bit.
+inline bool gdn_saves_any(int2 through) {
+  return metal::any(through > 0);
+}
+
+// A step that saves runs its rows in `GDN_SAVES + 1` stretches instead, a save's store after each
+// but the last, so its per-row loop carries no save: stretch `k` ends at the row its `k`-th save
+// stores after (saves in row order, one of `0` rows last), the last at the step's end.
 
 // The save a scan reaches `k`-th.
 inline uint gdn_save_at(int2 through, uint k) {

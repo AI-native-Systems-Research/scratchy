@@ -44,7 +44,7 @@
 // records runs `gdn_scan_simd`. `state_indices[seq]` is the sequence's
 // `GdnSeqSlots` (`gdn_state.h`): a slot start reads a restore's snapshot entry
 // when it has one, and a save stores the state after its row into its
-// snapshot's entry as the block loop passes the row.
+// snapshot's entry.
 //
 // Baked constants (every compile sets every one; slots 0–4 are the scan's):
 //   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
@@ -130,8 +130,6 @@ template <typename T>
   const uint entry_len = HV * Vd * K;
   // The thread's first state row in slot `s`'s entry (the second sits RS rows below).
   auto row_in = [&](int s) { return ssm_state + uint(s) * entry_len + (i_hv * Vd + i_v) * K; };
-  device float* state_row0 = row_in(slot);
-  device float* state_row1 = state_row0 + RS * K;
   // State fragments in registers, a row each: channels 4*(seg + 8*i) .. +3, i = 0..3 — from the
   // slot, or a restore's snapshot.
   float4 st0[4], st1[4];
@@ -146,9 +144,6 @@ template <typename T>
       st1[i] = fresh ? 0.0f : S1[8u * i];
     }
   }
-
-  // The rows a save stores the state after (`gdn_state.h`).
-  const int2 saves_through = gdn_saves_through(seq_slots);
 
   // ── Block staging ──────────────────────────────────────────────────
   // k/q: this key head's head_k channels per token (4 float4s per lane).
@@ -224,89 +219,91 @@ template <typename T>
     }                                                                     \
   }
 
+  // The blocks, in stretches (`gdn_state.h`; the threadgroup's one sequence's, so uniform): a
+  // stretch's blocks end at its save's row, the state after them is stored into the save's
+  // snapshot, and the last stretch's into the slot — the one store the plain kernel makes, so a
+  // step that saves nothing runs it, its row loop untouched.
+  const int2 saves_through = gdn_saves_through(seq_slots);
   int t0 = 0;
-  while (t0 < seq_len) {
-    const uint tt = uint(min((int)TB, seq_len - t0));
-    GDN_PIPE_FETCH(t0, (int)tt)
-    // Store the prefetch into threadgroup memory (cooperative).
-    _Pragma("unroll")
-    for (uint j = 0; j < NKQ; j++) {
-      const uint p = tid + j * NT;
-      if (p < tt * KR * 4) {
-        const uint t = p / (KR * 4);
-        const uint lane = (p % (KR * 4)) / 4;
-        const uint i = p % 4;
-        k_s[t][lane][i] = pk[j];
-        q_s[t][lane][i] = pq[j];
+  for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
+    const int stop = gdn_stretch_end(saves_through, stretch, seq_len);
+    while (t0 < stop) {
+      const uint tt = uint(min((int)TB, stop - t0));
+      GDN_PIPE_FETCH(t0, (int)tt)
+      // Store the prefetch into threadgroup memory (cooperative).
+      _Pragma("unroll")
+      for (uint j = 0; j < NKQ; j++) {
+        const uint p = tid + j * NT;
+        if (p < tt * KR * 4) {
+          const uint t = p / (KR * 4);
+          const uint lane = (p % (KR * 4)) / 4;
+          const uint i = p % 4;
+          k_s[t][lane][i] = pk[j];
+          q_s[t][lane][i] = pq[j];
+        }
       }
-    }
-    _Pragma("unroll")
-    for (uint j = 0; j < NV; j++) {
-      const uint p = tid + j * NT;
-      if (p < tt * DB) {
-        const uint t = p / DB, r = p % DB;
-        v_s[t][r] = pv[j];
+      _Pragma("unroll")
+      for (uint j = 0; j < NV; j++) {
+        const uint p = tid + j * NT;
+        if (p < tt * DB) {
+          const uint t = p / DB, r = p % DB;
+          v_s[t][r] = pv[j];
+        }
       }
-    }
-    if (tid < tt) {
-      g_s[tid] = pg;
-      b_s[tid] = pb;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Prefetch the NEXT block into registers while this one runs.
-    if (t0 + (int)TB < seq_len) {
-      const int tn = t0 + (int)TB;
-      GDN_PIPE_FETCH(tn, seq_len - tn)
-    }
+      if (tid < tt) {
+        g_s[tid] = pg;
+        b_s[tid] = pb;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Prefetch the NEXT block into registers while this one runs.
+      if (t0 + (int)tt < seq_len) {
+        const int tn = t0 + (int)tt;
+        GDN_PIPE_FETCH(tn, seq_len - tn)
+      }
 
-    // ── The block's prep: a token's norms by 8 lanes (the channel split and
-    // butterfly the rows' lanes would use), q scaled in place, and its gating.
-    for (uint w = tid; w < tt * KR; w += NT) {
-      const uint t = w / KR, l = w % KR;
-      float4 kc[4], qc[4];
-      _Pragma("unroll")
-      for (uint i = 0; i < 4; i++) {
-        kc[i] = k_s[t][l][i];
-        qc[i] = q_s[t][l][i];
+      // ── The block's prep: a token's norms by 8 lanes (the channel split and
+      // butterfly the rows' lanes would use), q scaled in place, and its gating.
+      for (uint w = tid; w < tt * KR; w += NT) {
+        const uint t = w / KR, l = w % KR;
+        float4 kc[4], qc[4];
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          kc[i] = k_s[t][l][i];
+          qc[i] = q_s[t][l][i];
+        }
+        float q_sq = 0.0f, k_sq = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          q_sq += dot(qc[i], qc[i]);
+          k_sq += dot(kc[i], kc[i]);
+        }
+        float qs = q_sq, ks = k_sq;
+        _Pragma("unroll")
+        for (uint m = 4; m >= 1; m /= 2) {
+          qs += simd_shuffle_xor(qs, m);
+          ks += simd_shuffle_xor(ks, m);
+        }
+        const float q_inv = rsqrt(qs + 1e-6f) * scale;
+        const float k_inv = rsqrt(ks + 1e-6f);
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          q_s[t][l][i] = qc[i] * q_inv;
+        }
+        kinv_s[t][l] = k_inv;
       }
-      float q_sq = 0.0f, k_sq = 0.0f;
-      _Pragma("unroll")
-      for (uint i = 0; i < 4; i++) {
-        q_sq += dot(qc[i], qc[i]);
-        k_sq += dot(kc[i], kc[i]);
+      if (tid < tt) {
+        const float av = g_s[tid] + dtb;
+        const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+        dec_s[tid] = exp(sp * neg_a);
+        den_s[tid] = exp(-b_s[tid]) + 1.0f;
       }
-      float qs = q_sq, ks = k_sq;
-      _Pragma("unroll")
-      for (uint m = 4; m >= 1; m /= 2) {
-        qs += simd_shuffle_xor(qs, m);
-        ks += simd_shuffle_xor(ks, m);
-      }
-      const float q_inv = rsqrt(qs + 1e-6f) * scale;
-      const float k_inv = rsqrt(ks + 1e-6f);
-      _Pragma("unroll")
-      for (uint i = 0; i < 4; i++) {
-        q_s[t][l][i] = qc[i] * q_inv;
-      }
-      kinv_s[t][l] = k_inv;
-    }
-    if (tid < tt) {
-      const float av = g_s[tid] + dtb;
-      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
-      dec_s[tid] = exp(sp * neg_a);
-      den_s[tid] = exp(-b_s[tid]) + 1.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── The steps. Each lane reads its own k/q fragments (threadgroup
-    // memory; lane seg touches columns 4*seg..4*seg+3 only) and runs both
-    // rows' recurrences. The butterflies reduce across a row's 8 lanes
-    // (xor 4, 2, 1). In stretches: a save's store after each but the last
-    // when its row is this block's (`gdn_state.h`; the threadgroup's one
-    // sequence's, so uniform) — both rows' fragments, into its snapshot.
-    uint t = 0;
-    for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-      const int end = gdn_stretch_end(saves_through, stretch, seq_len) - t0;
-      for (const uint stop = uint(clamp(end, int(t), int(tt))); t < stop; t++) {
+      // ── The steps. Each lane reads its own k/q fragments (threadgroup
+      // memory; lane seg touches columns 4*seg..4*seg+3 only) and runs both
+      // rows' recurrences. The butterflies reduce across a row's 8 lanes
+      // (xor 4, 2, 1).
+      for (uint t = 0; t < tt; t++) {
         const float decay = dec_s[t];
         const float den = den_s[t];
         float4 kc[4], qn[4];
@@ -375,30 +372,23 @@ template <typename T>
           o[(uint(bos) + t0 + t) * value_dim + vr + RS] = out1;
         }
       }
-      const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
-      if (sv >= 0 && end > 0 && end <= int(tt)) {
-        device float* snap = row_in(state_indices[i_n].saves[sv].y) + 4u * seg;
-        for (uint i = 0; i < 4; i++) {
-          ((device float4*)snap)[8u * i] = st0[i];
-          ((device float4*)(snap + RS * K))[8u * i] = st1[i];
-        }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      t0 += (int)tt;
+    }
+    const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
+    if (stretch == GDN_SAVES || sv >= 0) {
+      device float* dst0 = row_in(stretch == GDN_SAVES ? slot : seq_slots.saves[sv].y);
+      device float4* S0 = (device float4*)(dst0 + 4u * seg);
+      device float4* S1 = (device float4*)(dst0 + RS * K + 4u * seg);
+      for (uint i = 0; i < 4; i++) {
+        S0[8u * i] = st0[i];
+      }
+      for (uint i = 0; i < 4; i++) {
+        S1[8u * i] = st1[i];
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    t0 += (int)TB;
   }
 #undef GDN_PIPE_FETCH
-
-  {
-    device float4* S0 = (device float4*)(state_row0 + 4u * seg);
-    device float4* S1 = (device float4*)(state_row1 + 4u * seg);
-    for (uint i = 0; i < 4; i++) {
-      S0[8u * i] = st0[i];
-    }
-    for (uint i = 0; i < 4; i++) {
-      S1[8u * i] = st1[i];
-    }
-  }
 }
 
 #define INST_GDN_SCAN_PIPELINED(dtype_tag, mtl_type) \

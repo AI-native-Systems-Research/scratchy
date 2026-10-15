@@ -153,95 +153,110 @@ template <typename T>
     b_h[ki] = start == 1u ? 0.0f : start_row[ki];
   }
 
-  // The previous verify step's kept rows (replayed: no output), then this step's: in
-  // stretches, a save's store after each but the last (`gdn_state.h`).
+  // One row of the step: the previous verify step's kept rows first (replayed, `i_t < 0`:
+  // no output), then this step's. Both loops below inline it, and a step that saves must round
+  // every row as one that does not, so its sums run in source order: fast math reassociates
+  // each inlined copy its own way.
+  auto scan_row = [&](int i_t) {
+#pragma clang fp reassociate(off)
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step leaves the state it starts from in the slot (a slot start's is already
+      // there).
+      for (uint ki = 0; ki < K; ki++) {
+        state_row[ki] = b_h[ki];
+      }
+    }
+    uint t = uint(bos + i_t);
+    const device float* rec = kept + uint(i_t + replayed) * rec_len;
+    const device T* live = conv_out + t * conv_dim;
+    auto x = [&](uint j) -> float { return i_t < 0 ? rec[j] : float(live[j]); };
+    float g_t = i_t < 0 ? rec[conv_dim + i_hv] : g[t * HV + i_hv];
+    float beta_t = i_t < 0 ? rec[conv_dim + HV + i_hv] : beta[t * HV + i_hv];
+    // A verify row, for the replay that keeps it: its conv row split over the sequence's
+    // threads, its decay and beta by value-dim 0.
+    if (drafts > 0u && uint(i_t) <= drafts) {
+      device float* dst = recorded + uint(i_t) * rec_len;
+      for (uint j = i_hv * Vd + i_v; j < conv_dim; j += value_dim) {
+        dst[j] = float(live[j]);
+      }
+      if (i_v == 0u) {
+        dst[conv_dim + i_hv] = g_t;
+        dst[conv_dim + HV + i_hv] = beta_t;
+      }
+    }
+    // q from key-head i_h; k from key-head i_h (offset key_dim); v from value-head i_hv.
+    uint q_at = GDN_SCAN_COL_Q + i_h * K;
+    uint k_at = GDN_SCAN_COL_K + i_h * K;
+    if (GDN_SCAN_MAMBA) {
+      const float xv = x(GDN_SCAN_COL_V + i_hv * Vd + i_v);
+      const float decay = exp(g_t);
+      const float x_dt = xv * beta_t;
+      float y = 0.0f;
+      for (uint ki = 0; ki < K; ki++) {
+        b_h[ki] = decay * b_h[ki] + x_dt * x(k_at + ki);
+        y += b_h[ki] * x(q_at + ki);
+      }
+      if (i_t >= 0) {
+        o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * xv;
+      }
+      return;
+    }
+
+    float q_sq = 0.0f, k_sq = 0.0f;
+    for (uint ki = 0; ki < K; ki++) {
+      float qf = x(q_at + ki);
+      float kf = x(k_at + ki);
+      q_sq += qf * qf;
+      k_sq += kf * kf;
+    }
+    float q_inv = rsqrt(q_sq + 1e-6f);
+    float k_inv = rsqrt(k_sq + 1e-6f);
+
+    float decay = exp(g_t);
+    for (uint ki = 0; ki < K; ki++) {
+      b_h[ki] *= decay;
+    }
+
+    float b_v = x(GDN_SCAN_COL_V + i_hv * Vd + i_v);
+    float dot_hk = 0.0f;
+    for (uint ki = 0; ki < K; ki++) {
+      dot_hk += b_h[ki] * (x(k_at + ki) * k_inv);
+    }
+    b_v = (b_v - dot_hk) * beta_t;
+
+    float b_o = 0.0f;
+    for (uint ki = 0; ki < K; ki++) {
+      float kn = x(k_at + ki) * k_inv;
+      float qn = x(q_at + ki) * q_inv * scale;
+      b_h[ki] += b_v * kn;
+      b_o += b_h[ki] * qn;
+    }
+    if (i_t < 0) {
+      return;
+    }
+    o[t * value_dim + i_hv * Vd + i_v] = b_o;
+  };
+  // A step that saves nothing runs its rows in one loop; one that saves, in stretches, a
+  // save's store after each but the last (`gdn_state.h`).
   const int2 saves_through = gdn_saves_through(seq_slots);
   int i_t = -replayed;
-  for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-    for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop; i_t++) {
-      if (i_t == 0 && drafts > 0u && start != 0u) {
-        // A verify step leaves the state it starts from in the slot (a slot start's is already
-        // there).
-        for (uint ki = 0; ki < K; ki++) {
-          state_row[ki] = b_h[ki];
-        }
-      }
-      uint t = uint(bos + i_t);
-      const device float* rec = kept + uint(i_t + replayed) * rec_len;
-      const device T* live = conv_out + t * conv_dim;
-      auto x = [&](uint j) -> float { return i_t < 0 ? rec[j] : float(live[j]); };
-      float g_t = i_t < 0 ? rec[conv_dim + i_hv] : g[t * HV + i_hv];
-      float beta_t = i_t < 0 ? rec[conv_dim + HV + i_hv] : beta[t * HV + i_hv];
-      // A verify row, for the replay that keeps it: its conv row split over the sequence's
-      // threads, its decay and beta by value-dim 0.
-      if (drafts > 0u && uint(i_t) <= drafts) {
-        device float* dst = recorded + uint(i_t) * rec_len;
-        for (uint j = i_hv * Vd + i_v; j < conv_dim; j += value_dim) {
-          dst[j] = float(live[j]);
-        }
-        if (i_v == 0u) {
-          dst[conv_dim + i_hv] = g_t;
-          dst[conv_dim + HV + i_hv] = beta_t;
-        }
-      }
-      // q from key-head i_h; k from key-head i_h (offset key_dim); v from value-head i_hv.
-      uint q_at = GDN_SCAN_COL_Q + i_h * K;
-      uint k_at = GDN_SCAN_COL_K + i_h * K;
-      if (GDN_SCAN_MAMBA) {
-        const float xv = x(GDN_SCAN_COL_V + i_hv * Vd + i_v);
-        const float decay = exp(g_t);
-        const float x_dt = xv * beta_t;
-        float y = 0.0f;
-        for (uint ki = 0; ki < K; ki++) {
-          b_h[ki] = decay * b_h[ki] + x_dt * x(k_at + ki);
-          y += b_h[ki] * x(q_at + ki);
-        }
-        if (i_t >= 0) {
-          o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * xv;
-        }
-        continue;
-      }
-
-      float q_sq = 0.0f, k_sq = 0.0f;
-      for (uint ki = 0; ki < K; ki++) {
-        float qf = x(q_at + ki);
-        float kf = x(k_at + ki);
-        q_sq += qf * qf;
-        k_sq += kf * kf;
-      }
-      float q_inv = rsqrt(q_sq + 1e-6f);
-      float k_inv = rsqrt(k_sq + 1e-6f);
-
-      float decay = exp(g_t);
-      for (uint ki = 0; ki < K; ki++) {
-        b_h[ki] *= decay;
-      }
-
-      float b_v = x(GDN_SCAN_COL_V + i_hv * Vd + i_v);
-      float dot_hk = 0.0f;
-      for (uint ki = 0; ki < K; ki++) {
-        dot_hk += b_h[ki] * (x(k_at + ki) * k_inv);
-      }
-      b_v = (b_v - dot_hk) * beta_t;
-
-      float b_o = 0.0f;
-      for (uint ki = 0; ki < K; ki++) {
-        float kn = x(k_at + ki) * k_inv;
-        float qn = x(q_at + ki) * q_inv * scale;
-        b_h[ki] += b_v * kn;
-        b_o += b_h[ki] * qn;
-      }
-      if (i_t < 0) {
-        continue;
-      }
-      o[t * value_dim + i_hv * Vd + i_v] = b_o;
+  if (!gdn_saves_any(saves_through)) {
+    for (; i_t < seq_len; i_t++) {
+      scan_row(i_t);
     }
-    const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
-    if (sv >= 0) {
-      device float* snap =
-          ssm_state + uint(state_indices[i_n].saves[sv].y) * entry_len + (i_hv * Vd + i_v) * K;
-      for (uint ki = 0; ki < K; ki++) {
-        snap[ki] = b_h[ki];
+  } else {
+    for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
+      for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop;
+           i_t++) {
+        scan_row(i_t);
+      }
+      const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
+      if (sv >= 0) {
+        device float* snap =
+            ssm_state + uint(state_indices[i_n].saves[sv].y) * entry_len + (i_hv * Vd + i_v) * K;
+        for (uint ki = 0; ki < K; ki++) {
+          snap[ki] = b_h[ki];
+        }
       }
     }
   }
@@ -340,102 +355,118 @@ template <typename T>
   }
   const float neg_a = -exp(float(a_log[i_hv]));
 
-  // The previous verify step's kept rows (replayed: no output), then this step's: in
-  // stretches, a save's store after each but the last (`gdn_state.h`).
-  const int2 saves_through = gdn_saves_through(seq_slots);
-  int i_t = -replayed;
-  for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-    for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop; i_t++) {
-      if (i_t == 0 && drafts > 0u && start != 0u) {
-        // A verify step leaves the state it starts from in the slot (a slot start's is already
-        // there).
-        for (uint i = 0; i < NPT; i++) {
-          state_row[i] = st[i];
-        }
-      }
-      const uint t = uint(bos + i_t);
-      const device float* rec = kept + uint(i_t + replayed) * rec_len;
-      const device float* row = i_t < 0 ? rec : conv_out + t * conv_dim;
-      // gdn_gating, or the recorded row's. Mamba-2's beta is its dt.
-      float g_t, beta;
-      if (i_t < 0) {
-        g_t = rec[conv_dim + i_hv];
-        beta = rec[conv_dim + HV + i_hv];
-      } else {
-        const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
-                                                : t * HV + i_hv;
-        const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
-        const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
-        g_t = neg_a * sp;
-        beta = GDN_SCAN_MAMBA ? sp : 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
-      }
-      const float decay = exp(g_t);
-      // A verify row, for the replay that keeps it: its conv row split over the sequence's lanes,
-      // its decay and beta by value-dim 0's lane 0.
-      if (drafts > 0u && uint(i_t) <= drafts) {
-        device float* dst = recorded + uint(i_t) * rec_len;
-        for (uint j = (i_hv * Vd + i_v) * 32u + lane; j < conv_dim; j += value_dim * 32u) {
-          dst[j] = conv_out[t * conv_dim + j];
-        }
-        if (i_v == 0u && lane == 0u) {
-          dst[conv_dim + i_hv] = g_t;
-          dst[conv_dim + HV + i_hv] = beta;
-        }
-      }
-
-      const device float* q_ptr = row + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
-      const device float* k_ptr = row + GDN_SCAN_COL_K + i_h * K + lane * NPT;
-      if (GDN_SCAN_MAMBA) {
-        const float x = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
-        const float x_dt = x * beta;
-        float y = 0.0f;
-        for (uint i = 0; i < NPT; i++) {
-          st[i] = decay * st[i] + x_dt * k_ptr[i];
-          y += st[i] * q_ptr[i];
-        }
-        y = simd_sum(y);
-        if (i_t >= 0 && lane == 0u) {
-          o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
-        }
-        continue;
-      }
-      float q[NPT], k[NPT];
-      float q_sq = 0.0f, k_sq = 0.0f;
+  // One row of the step: the previous verify step's kept rows first (replayed, `i_t < 0`:
+  // no output), then this step's. Both loops below inline it, and a step that saves must round
+  // every row as one that does not, so its sums run in source order: fast math reassociates
+  // each inlined copy its own way.
+  auto scan_row = [&](int i_t) {
+#pragma clang fp reassociate(off)
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step leaves the state it starts from in the slot (a slot start's is already
+      // there).
       for (uint i = 0; i < NPT; i++) {
-        q[i] = q_ptr[i];
-        k[i] = k_ptr[i];
-        q_sq += q[i] * q[i];
-        k_sq += k[i] * k[i];
-      }
-      const float q_inv = rsqrt(simd_sum(q_sq) + 1e-6f) * GDN_SCAN_SCALE;
-      const float k_inv = rsqrt(simd_sum(k_sq) + 1e-6f);
-
-      float kv = 0.0f;
-      for (uint i = 0; i < NPT; i++) {
-        st[i] *= decay;
-        kv += st[i] * (k[i] * k_inv);
-      }
-      kv = simd_sum(kv);
-      const float v = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
-      const float delta = (v - kv) * beta;
-      float out = 0.0f;
-      for (uint i = 0; i < NPT; i++) {
-        st[i] += (k[i] * k_inv) * delta;
-        out += st[i] * (q[i] * q_inv);
-      }
-      out = simd_sum(out);
-      if (i_t < 0) {
-        continue;
-      }
-      if (lane == 0u) {
-        o[t * value_dim + i_hv * Vd + i_v] = out;
+        state_row[i] = st[i];
       }
     }
-    const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
-    if (sv >= 0) {
-      device float* snap = row_in(state_indices[i_n].saves[sv].y);
+    const uint t = uint(bos + i_t);
+    const device float* rec = kept + uint(i_t + replayed) * rec_len;
+    const device float* row = i_t < 0 ? rec : conv_out + t * conv_dim;
+    // gdn_gating, or the recorded row's. Mamba-2's beta is its dt.
+    float g_t, beta;
+    if (i_t < 0) {
+      g_t = rec[conv_dim + i_hv];
+      beta = rec[conv_dim + HV + i_hv];
+    } else {
+      const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
+                                              : t * HV + i_hv;
+      const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
+      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+      g_t = neg_a * sp;
+      beta = GDN_SCAN_MAMBA ? sp : 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
+    }
+    const float decay = exp(g_t);
+    // A verify row, for the replay that keeps it: its conv row split over the sequence's lanes,
+    // its decay and beta by value-dim 0's lane 0.
+    if (drafts > 0u && uint(i_t) <= drafts) {
+      device float* dst = recorded + uint(i_t) * rec_len;
+      for (uint j = (i_hv * Vd + i_v) * 32u + lane; j < conv_dim; j += value_dim * 32u) {
+        dst[j] = conv_out[t * conv_dim + j];
+      }
+      if (i_v == 0u && lane == 0u) {
+        dst[conv_dim + i_hv] = g_t;
+        dst[conv_dim + HV + i_hv] = beta;
+      }
+    }
+
+    const device float* q_ptr = row + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
+    const device float* k_ptr = row + GDN_SCAN_COL_K + i_h * K + lane * NPT;
+    if (GDN_SCAN_MAMBA) {
+      const float x = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
+      const float x_dt = x * beta;
+      float y = 0.0f;
       for (uint i = 0; i < NPT; i++) {
-        snap[i] = st[i];
+        st[i] = decay * st[i] + x_dt * k_ptr[i];
+        y += st[i] * q_ptr[i];
+      }
+      y = simd_sum(y);
+      if (i_t >= 0 && lane == 0u) {
+        o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
+      }
+      return;
+    }
+    float q[NPT], k[NPT];
+    float q_sq = 0.0f, k_sq = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      q[i] = q_ptr[i];
+      k[i] = k_ptr[i];
+      q_sq += q[i] * q[i];
+      k_sq += k[i] * k[i];
+    }
+    const float q_inv = rsqrt(simd_sum(q_sq) + 1e-6f) * GDN_SCAN_SCALE;
+    const float k_inv = rsqrt(simd_sum(k_sq) + 1e-6f);
+
+    // The norms scale the sums, not their terms.
+    float kv = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      st[i] *= decay;
+      kv += st[i] * k[i];
+    }
+    kv = simd_sum(kv) * k_inv;
+    const float v = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
+    const float dk = (v - kv) * beta * k_inv;
+    float out = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      st[i] += k[i] * dk;
+      out += st[i] * q[i];
+    }
+    out = simd_sum(out) * q_inv;
+    if (i_t < 0) {
+      return;
+    }
+    if (lane == 0u) {
+      o[t * value_dim + i_hv * Vd + i_v] = out;
+    }
+  };
+  // A step that saves nothing runs its rows in one loop; one that saves, in stretches, a
+  // save's store after each but the last (`gdn_state.h`).
+  const int2 saves_through = gdn_saves_through(seq_slots);
+  int i_t = -replayed;
+  if (!gdn_saves_any(saves_through)) {
+    for (; i_t < seq_len; i_t++) {
+      scan_row(i_t);
+    }
+  } else {
+    for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
+      for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop;
+           i_t++) {
+        scan_row(i_t);
+      }
+      const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
+      if (sv >= 0) {
+        device float* snap = row_in(state_indices[i_n].saves[sv].y);
+        for (uint i = 0; i < NPT; i++) {
+          snap[i] = st[i];
+        }
       }
     }
   }
