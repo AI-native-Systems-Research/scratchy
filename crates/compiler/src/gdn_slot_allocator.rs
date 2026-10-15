@@ -41,6 +41,7 @@ use std::collections::hash_map::Entry;
 
 use scratchy_layers::gdn_state::{
     CheckpointRows, DraftLane, DraftLanes, GdnSeqSlots, GdnStart, GdnStep, RecordArea,
+    SnapshotSave, SnapshotSlot,
 };
 
 /// Why a step's GDN inputs could not be built.
@@ -105,10 +106,10 @@ pub struct GdnRow {
     pub drafts: usize,
     /// Its tokens computed before this step (`num_computed_tokens`).
     pub tokens_before: u32,
-    /// The absolute slot of the snapshot a prefix-cache hit resumes from.
-    pub restore: Option<i32>,
-    /// Snapshot stores this step, as [`GdnSeqSlots::saves`].
-    pub saves: [[i32; 2]; 2],
+    /// The snapshot a prefix-cache hit resumes from.
+    pub restore: Option<SnapshotSlot>,
+    /// Snapshot stores this step ([`GdnSeqSlots::saving`]).
+    pub saves: [Option<SnapshotSave>; 2],
     /// The step that admitted it was refused before it ran (`InputBatch::refused`), and the
     /// engine is aborting it: its state never existed here.
     pub refused: bool,
@@ -172,7 +173,7 @@ impl GdnSlotAllocator {
     ///
     /// ⭐ WHERE A SEQUENCE'S STATE STARTS COMES FROM WHERE IT STANDS, not from whether this
     /// allocator has seen the id before:
-    /// * a restore starts from its snapshot ([`GdnSeqSlots::source`]);
+    /// * a restore starts from its snapshot ([`GdnSeqSlots::restoring`]);
     /// * token 0 starts from zero, whatever the slot held — a recycled slot's new owner (the
     ///   degeneration guard), and a preempted request whose release never reached the worker;
     /// * a sequence that owns its slot continues as the slot says (a later chunk, a decode, the
@@ -209,7 +210,7 @@ impl GdnSlotAllocator {
                     drafts,
                     checkpoint_rows: lane_rows,
                 })?;
-            let snapshots = row.restore.is_some() || row.saves != [[0; 2]; 2];
+            let snapshots = row.restore.is_some() || row.saves.iter().any(Option::is_some);
             if snapshots && drafts > 0 {
                 return Err(GdnStepError::SnapshotInVerify);
             }
@@ -250,11 +251,10 @@ impl GdnSlotAllocator {
             };
             entries.push(match (row.refused, row.restore) {
                 (true, _) => GdnSeqSlots::plain(slot),
-                (false, restore) => GdnSeqSlots {
-                    slot,
-                    source: restore.map_or(0, |source| source + 1),
-                    saves: row.saves,
-                },
+                (false, None) => GdnSeqSlots::plain(slot).saving(row.saves),
+                (false, Some(snapshot)) => GdnSeqSlots::plain(slot)
+                    .restoring(snapshot)
+                    .saving(row.saves),
             });
             let step = GdnStep {
                 start,
@@ -366,7 +366,7 @@ mod tests {
         tokens_before: u32,
     ) -> Option<(u32, GdnStart)> {
         let (entries, codes) = a.step([GdnRow::new(request_id, 0, tokens_before)]).ok()?;
-        Some((entries[0].slot as u32, GdnStep::decode(codes[0]).start))
+        Some((entries[0].slot() as u32, GdnStep::decode(codes[0]).start))
     }
 
     /// A sequence's row past its first token, drafting `drafts`.
@@ -494,23 +494,28 @@ mod tests {
         assert_eq!(take_start(&mut a, 1, 0), Some((s, GdnStart::Fresh)));
     }
 
+    /// A store of the state after `rows` rows into snapshot slot `slot`.
+    fn save(rows: u32, slot: usize) -> Option<SnapshotSave> {
+        Some(SnapshotSave {
+            rows: std::num::NonZeroU32::new(rows).unwrap(),
+            slot: SnapshotSlot::new(slot).unwrap(),
+        })
+    }
+
     #[test]
     fn a_restore_reads_its_snapshot_and_writes_its_own_slot() {
         let mut a = GdnSlotAllocator::new(2, None);
-        let saves = [[96, 9], [0, 0]];
+        let (snapshot, saves) = (SnapshotSlot::new(7).unwrap(), [save(96, 9), None]);
         let row = GdnRow {
-            restore: Some(7),
+            restore: Some(snapshot),
             saves,
             ..GdnRow::new(5, 0, 512)
         };
         let (entries, codes) = a.step([row]).unwrap();
+        assert_eq!(entries[0].words(), [0, 8, 96, 9, 0, 0]);
         assert_eq!(
             entries,
-            vec![GdnSeqSlots {
-                slot: 0,
-                source: 8,
-                saves
-            }]
+            vec![GdnSeqSlots::plain(0).restoring(snapshot).saving(saves)]
         );
         assert_eq!(GdnStep::decode(codes[0]).start, GdnStart::Slot);
         // Its next step continues in its own slot.
@@ -532,8 +537,8 @@ mod tests {
         let mut a = GdnSlotAllocator::new(2, None);
         let row = GdnRow {
             refused: true,
-            restore: Some(3),
-            saves: [[16, 4], [0, 0]],
+            restore: SnapshotSlot::new(3),
+            saves: [save(16, 4), None],
             ..GdnRow::new(5, 0, 256)
         };
         let (entries, codes) = a.step([row]).unwrap();
@@ -546,7 +551,7 @@ mod tests {
         let mut a = GdnSlotAllocator::new(2, DraftLanes::new(CheckpointRows(2), 2));
         take_start(&mut a, 5, 0).unwrap();
         let row = GdnRow {
-            saves: [[1, 4], [0, 0]],
+            saves: [save(1, 4), None],
             ..at(5, 2)
         };
         assert_eq!(a.step([row]), Err(GdnStepError::SnapshotInVerify));

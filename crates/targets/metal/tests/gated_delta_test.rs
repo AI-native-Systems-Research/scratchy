@@ -18,7 +18,8 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
-    CheckpointRows, DraftLane, DraftLanes, GdnSeqSlots, GdnStart, GdnStateDims, GdnStep, RecordArea,
+    CheckpointRows, DraftLane, DraftLanes, GdnSeqSlots, GdnStart, GdnStateDims, GdnStep,
+    RecordArea, SnapshotSave, SnapshotSlot,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -2151,13 +2152,24 @@ const POOL_SLOTS: usize = 4;
 const LIVE: i32 = 1;
 const SNAPS: [i32; 2] = [2, 3];
 
+/// Pool slot `s`, as a snapshot.
+const fn snap(s: i32) -> SnapshotSlot {
+    SnapshotSlot::new(s as usize).unwrap()
+}
+
+/// A store of the state after `rows` rows into slot `s`.
+const fn save(rows: usize, s: i32) -> Option<SnapshotSave> {
+    Some(SnapshotSave {
+        rows: std::num::NonZeroU32::new(rows as u32).unwrap(),
+        slot: snap(s),
+    })
+}
+
 /// The record of [`second_of_two`]'s first sequence, which has no rows: a kernel that ran it would
 /// restore from the last snapshot and save into slot 0.
-const IDLE: GdnSeqSlots = GdnSeqSlots {
-    slot: 0,
-    source: SNAPS[1] + 1,
-    saves: [[1, 0], [1, 0]],
-};
+const IDLE: GdnSeqSlots = GdnSeqSlots::plain(0)
+    .restoring(snap(SNAPS[1]))
+    .saving([save(1, 0), save(1, 0)]);
 
 /// A pool's slots, for [`check_snapshots`]: `len` f32s a slot, its state entry (a drafting
 /// model's checkpoints and records live in its draft lanes, apart).
@@ -2261,7 +2273,7 @@ fn assert_bits(got: &[f32], want: &[f32], what: &str) {
 /// * a save stores into its snapshot what the live slot holds after a step of just the rows it
 ///   runs through, the step's output and live slot as without it — mid-step, at its last row, two
 ///   at once, two in either order;
-/// * a restore (`source`) computes what the same step does on a live slot holding the snapshot,
+/// * a restore (`GdnSeqSlots::restoring`) computes what the same step does on a live slot holding the snapshot,
 ///   the snapshot untouched; a fresh start ignores its source; a restore saves like a step
 ///   on that slot;
 /// * slot 0, which no sequence with rows names, stays as it was.
@@ -2324,10 +2336,11 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
         &[(1, s1), (mid, s0)],
     ] {
         let case = format!("saves {saves:?}");
-        let mut seq = plain;
+        let mut stores = [None; 2];
         for (j, &(through, snap)) in saves.iter().enumerate() {
-            seq.saves[j] = [through as i32, snap];
+            stores[j] = save(through, snap);
         }
+        let seq = plain.saving(stores);
         let Some((out, after)) = step(&pools, 0..t, seq, GdnStart::Slot) else {
             return;
         };
@@ -2344,10 +2357,7 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
     }
 
     // A restore: the step on `pools` with the live slot's entries the snapshot's.
-    let restore = GdnSeqSlots {
-        source: s0 + 1,
-        ..plain
-    };
+    let restore = plain.restoring(snap(s0));
     let mut copied = pools.clone();
     for (p, l) in layouts.iter().enumerate() {
         let from = s0 as usize * l.len;
@@ -2381,10 +2391,7 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
     }
 
     // A restore that saves.
-    let seq = GdnSeqSlots {
-        saves: [[mid as i32, s1], [0, 0]],
-        ..restore
-    };
+    let seq = restore.saving([save(mid, s1), None]);
     let (Some((out_rs, after_rs)), Some(want)) = (
         step(&pools, 0..t, seq, GdnStart::Slot),
         live_after(&copied, mid),

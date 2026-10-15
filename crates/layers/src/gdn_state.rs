@@ -53,7 +53,7 @@
 //! lanes out ([`DraftLane`]): a sequence takes one when it drafts and gives it back after the step
 //! that no longer needs it.
 
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use anyhow::Result;
 use scratchy_tensors::{DType, GpuTensor, PoolMemory, TensorView};
@@ -237,23 +237,50 @@ impl GdnStep {
 /// The prefix cache keeps snapshots of the state in slots past the live ones, in the same
 /// buffers, so a kernel reaches them by index alone:
 /// * a restore — a request resuming at a cached prefix — reads its start state from the
-///   snapshot (`source`) and writes the step's state to its own `slot`, with no copy;
+///   snapshot ([`Self::restoring`]) and writes the step's state to its own `slot`, with no copy;
 /// * a save stores the state after a given row into a snapshot slot as the scan passes that row,
 ///   inside the forward that runs it.
 ///
-/// All zeros is a plain step on slot 0: a zeroed buffer tail is a no-op (`runtime.rs`).
+/// Built from [`Self::plain`] with [`Self::restoring`] and [`Self::saving`]; the kernels' encoding
+/// of "none" stays in here. All zeros is a plain step on slot 0: a zeroed buffer tail is a no-op
+/// (`runtime.rs`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GdnSeqSlots {
     /// The sequence's own slot: where the step's state lands.
-    pub slot: i32,
+    slot: i32,
     /// `0`: a [`GdnStart::Slot`] start reads `slot`. `s + 1`: it reads slot `s` instead — the
     /// snapshot a restore resumes from. Ignored by every other start.
-    pub source: i32,
+    source: i32,
     /// Up to two snapshot stores, as `[rows_through, slot]`: once the sequence's first
     /// `rows_through` rows of this step have run, store its state into `slot` too. `0` rows
     /// through = no store.
-    pub saves: [[i32; 2]; 2],
+    saves: [[i32; 2]; 2],
+}
+
+/// A prefix-cache snapshot's slot: an absolute index into the GDN state pool, past its live
+/// slots, in the same per-layer buffers ([`GdnSeqSlots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SnapshotSlot(i32);
+
+impl SnapshotSlot {
+    /// Slot `index`, or `None` past what the kernels' `i32` index (and a restore's `index + 1`)
+    /// reaches.
+    pub const fn new(index: usize) -> Option<Self> {
+        if index < i32::MAX as usize {
+            Some(Self(index as i32))
+        } else {
+            None
+        }
+    }
+}
+
+/// One snapshot store of a step: once the sequence's first `rows` rows of the step have run (its
+/// own rows, never a replayed one), its state is also stored into `slot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotSave {
+    pub rows: NonZeroU32,
+    pub slot: SnapshotSlot,
 }
 
 impl GdnSeqSlots {
@@ -261,11 +288,43 @@ impl GdnSeqSlots {
     pub const WORDS: usize = 6;
 
     /// A step on `slot` with no snapshot work — what every sequence was before snapshots.
-    pub fn plain(slot: i32) -> Self {
+    pub const fn plain(slot: i32) -> Self {
         Self {
             slot,
-            ..Self::default()
+            source: 0,
+            saves: [[0; 2]; 2],
         }
+    }
+
+    /// This step, restoring: a [`GdnStart::Slot`] start reads its state from `snapshot`, not the
+    /// sequence's slot. Every other start ignores it.
+    pub const fn restoring(self, snapshot: SnapshotSlot) -> Self {
+        Self {
+            source: snapshot.0 + 1,
+            ..self
+        }
+    }
+
+    /// This step, also storing its state into each of `saves`' snapshots, in any order.
+    pub const fn saving(self, saves: [Option<SnapshotSave>; 2]) -> Self {
+        const fn word(save: Option<SnapshotSave>) -> [i32; 2] {
+            match save {
+                Some(SnapshotSave { rows, slot }) => {
+                    assert!(rows.get() <= i32::MAX as u32, "a step's rows fit an i32");
+                    [rows.get() as i32, slot.0]
+                }
+                None => [0; 2],
+            }
+        }
+        Self {
+            saves: [word(saves[0]), word(saves[1])],
+            ..self
+        }
+    }
+
+    /// The sequence's own slot.
+    pub const fn slot(self) -> i32 {
+        self.slot
     }
 
     /// The record as the kernels read it.

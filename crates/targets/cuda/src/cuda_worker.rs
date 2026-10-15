@@ -5626,7 +5626,7 @@ impl CudaWorker {
             })
             .transpose()
             .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?
-            .map(|(entries, codes)| (entries.iter().map(|e| e.slot).collect(), codes));
+            .map(|(entries, codes)| (entries.iter().map(|e| e.slot()).collect(), codes));
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.

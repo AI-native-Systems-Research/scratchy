@@ -60,7 +60,7 @@ use scratchy_serving_engine::worker_factory::VerifySeqs;
 #[cfg(feature = "metal")]
 use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
-use scratchy_target_metal::gdn_state::GdnStatePool;
+use scratchy_target_metal::gdn_state::{GdnStatePool, SnapshotSave, SnapshotSlot};
 #[cfg(feature = "metal")]
 use scratchy_target_metal::kv_cache::KvCachePool;
 
@@ -2252,12 +2252,9 @@ impl MetalWorker {
         let live = self.max_num_seqs_resolved();
         let bad = |what: String| ExecutorError::WorkerExecution(format!("state snapshot: {what}"));
         let cap = self.gdn_snapshot_cap;
-        let slot = |op: &StateSnapshotOp| match op.slot < cap {
-            true => Ok((live + op.slot) as i32),
-            false => Err(bad(format!(
-                "{} names slot {} of {cap}",
-                op.req_id, op.slot
-            ))),
+        let slot = |op: &StateSnapshotOp| {
+            (SnapshotSlot::new(live + op.slot).filter(|_| op.slot < cap))
+                .ok_or_else(|| bad(format!("{} names slot {} of {cap}", op.req_id, op.slot)))
         };
         let mut rows = Vec::with_capacity(attn.num_reqs);
         let mut saved: Vec<(usize, u64)> = Vec::new();
@@ -2292,8 +2289,8 @@ impl MetalWorker {
             let saves = ops.saves.iter().filter(|op| op.req_id == *req_id);
             for (n, op) in saves.enumerate() {
                 let at = op.position;
-                let through = at.checked_sub(before).filter(|r| (1..=q_len).contains(r));
-                let Some(through) = through else {
+                let through = at.checked_sub(before).filter(|&r| r <= q_len);
+                let Some(rows) = through.and_then(std::num::NonZeroU32::new) else {
                     return Err(bad(format!(
                         "{req_id} saves {at} from {q_len} rows at {before}"
                     )));
@@ -2303,7 +2300,10 @@ impl MetalWorker {
                         "{req_id} saves more than two snapshots in a step"
                     )));
                 };
-                *save = [through as i32, slot(op)?];
+                *save = Some(SnapshotSave {
+                    rows,
+                    slot: slot(op)?,
+                });
                 saved.push((op.slot, op.key));
                 reach = reach.max(op.slot + 1);
             }

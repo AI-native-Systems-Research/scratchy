@@ -17,7 +17,7 @@ use half::bf16;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::GdnSeqSlots;
+use scratchy_target_metal::gdn_state::{GdnSeqSlots, SnapshotSave, SnapshotSlot};
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -705,10 +705,13 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
 
     // The prefill, saving, beside its neighbour.
     gpu.load(&conv0, &ssm0);
-    let prefill = GdnSeqSlots {
-        saves: [[junction as i32, 3], [t as i32, 4]],
-        ..GdnSeqSlots::plain(1)
+    let save = |rows: usize, slot: usize| {
+        Some(SnapshotSave {
+            rows: std::num::NonZeroU32::new(rows as u32).unwrap(),
+            slot: SnapshotSlot::new(slot).unwrap(),
+        })
     };
+    let prefill = GdnSeqSlots::plain(1).saving([save(junction, 3), save(t, 4)]);
     let cu = [0, t as i32, (t + neighbour) as i32];
     let seqs = [prefill, GdnSeqSlots::plain(2)];
     let Some(out) = gpu.step(&zx, &cu, &seqs, &[0, 1]) else {
@@ -721,10 +724,7 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
     same(slot(&after, 0), slot(&start, 0), "slot 0");
 
     // The junction restored on slot 0, running the prefill's rows past it.
-    let restore = GdnSeqSlots {
-        source: 3 + 1,
-        ..GdnSeqSlots::plain(0)
-    };
+    let restore = GdnSeqSlots::plain(0).restoring(SnapshotSlot::new(3).unwrap());
     let rest = &zx[junction * row..t * row];
     let Some(resumed) = gpu.step(rest, &[0, (t - junction) as i32], &[restore], &[0]) else {
         return;

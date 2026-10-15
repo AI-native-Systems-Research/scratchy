@@ -41,7 +41,7 @@ use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue}
 pub const GENERATION_PROMPT_ALLOWANCE: usize = 8;
 
 /// The most snapshots one request's chunk takes in a step: the record the worker hands the
-/// recurrent kernels carries two (`GdnSeqSlots::saves`), and a prompt has two save points.
+/// recurrent kernels carries two (`GdnSeqSlots::saving`), and a prompt has two save points.
 pub const MAX_STATE_SAVES_PER_STEP: usize = 2;
 
 /// Where a request with recurrent state resumes on admission — see
