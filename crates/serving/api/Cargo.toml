@@ -74,9 +74,11 @@ rustls-pemfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { workspace = true }
 serde = { workspace = true }
-# Chat templates iterate and `tojson` request JSON (tools, messages) in the
-# order the client sent it, as HuggingFace's Python dicts do.
-serde_json = { workspace = true, features = ["preserve_order"] }
+# No `preserve_order`: chat templates get the client's key order from
+# minijinja's maps instead (`protocol::OrderedJson`, `ChatTemplate::render_chat`).
+# A serde_json feature on only the binary's side of the build makes every
+# release build compile the crates the build scripts share with it twice.
+serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }

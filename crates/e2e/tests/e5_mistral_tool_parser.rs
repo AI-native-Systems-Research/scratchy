@@ -68,7 +68,7 @@ fn weather_tool() -> ChatCompletionToolsParam {
                     "city": {"type": "string"}
                 },
                 "required": ["city"]
-            })),
+            }).into()),
         },
     }
 }

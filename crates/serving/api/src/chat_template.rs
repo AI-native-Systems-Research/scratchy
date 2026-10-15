@@ -251,11 +251,32 @@ impl ChatTemplate {
     ///
     /// `extra_kwargs` are merged into the Jinja context so the template can
     /// access them (e.g. `enable_thinking`, `reasoning_effort`).
+    ///
+    /// Objects arrive as `serde_json::Value`, so their keys reach the template
+    /// in serde_json's order. Requests render through [`Self::render_chat`],
+    /// which keeps the client's order.
     pub fn apply_with_kwargs(
         &self,
         messages: &[serde_json::Value],
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
+        extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> Result<String, ServeError> {
+        self.render_values(
+            minijinja::Value::from(Serde(messages)),
+            add_generation_prompt,
+            tools.map(|t| minijinja::Value::from(Serde(t))),
+            extra_kwargs,
+        )
+    }
+
+    /// Render the template over values already in minijinja's form, whose
+    /// maps keep insertion order.
+    fn render_values(
+        &self,
+        messages: minijinja::Value,
+        add_generation_prompt: bool,
+        tools: Option<minijinja::Value>,
         extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> Result<String, ServeError> {
         let tmpl = self
@@ -283,7 +304,7 @@ impl ChatTemplate {
 
         // Build the base context.
         let mut ctx_map = std::collections::BTreeMap::<String, minijinja::Value>::new();
-        ctx_map.insert("messages".into(), minijinja::Value::from(Serde(messages)));
+        ctx_map.insert("messages".into(), messages);
         ctx_map.insert(
             "add_generation_prompt".into(),
             minijinja::Value::from(add_generation_prompt),
@@ -297,7 +318,7 @@ impl ChatTemplate {
             minijinja::Value::from(self.eos_token.as_deref().unwrap_or("")),
         );
         if let Some(tools) = tools {
-            ctx_map.insert("tools".into(), minijinja::Value::from(Serde(tools)));
+            ctx_map.insert("tools".into(), tools);
         }
         ctx_map.insert("date_string".into(), minijinja::Value::from(date_string));
 
@@ -342,8 +363,14 @@ impl ChatTemplate {
     /// The single entry point for every caller holding
     /// `ChatCompletionMessageParam`s — the engine's prompt build and the
     /// `/tokenize` handler. Both need the message normalization
-    /// [`message_to_template_value`] does and the same `tool_choice`-aware
+    /// [`TemplateMessageView`] does and the same `tool_choice`-aware
     /// tools rendering, so both get it from here rather than from a copy.
+    ///
+    /// Messages and tools serialize straight into minijinja, never through a
+    /// `serde_json::Value`: struct fields arrive in declaration order (what
+    /// Hugging Face renders: `type` before `function`, `name` before
+    /// `parameters`) and client-written JSON ([`protocol::OrderedJson`],
+    /// parsed tool-call arguments) in the client's order.
     pub(crate) fn render_chat(
         &self,
         messages: &[protocol::ChatCompletionMessageParam],
@@ -352,29 +379,28 @@ impl ChatTemplate {
         extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
         add_generation_prompt: bool,
     ) -> Result<String, ServeError> {
-        let message_values: Vec<serde_json::Value> =
-            messages.iter().map(message_to_template_value).collect();
+        let views: Vec<TemplateMessageView<'_>> =
+            messages.iter().map(TemplateMessageView::new).collect();
 
         // `tool_choice: "none"` means "do not tell the model about the tools",
         // so the template must not see them at all.
-        let tools_value = match tool_choice {
+        let tools = match tool_choice {
             Some(tc) if tc.as_str() == Some("none") => None,
-            _ => tools.and_then(|t| serde_json::to_value(t).ok()),
+            _ => tools.map(|t| minijinja::Value::from(Serde(t))),
         };
 
-        self.apply_with_kwargs(
-            &message_values,
+        self.render_values(
+            minijinja::Value::from(Serde(&views)),
             add_generation_prompt,
-            tools_value.as_ref(),
+            tools,
             extra_kwargs,
         )
     }
 }
 
-/// Turn one `ChatCompletionMessageParam` into the value a template expects.
+/// One `ChatCompletionMessageParam` as a template expects to see it.
 ///
-/// [`ChatTemplate::apply_with_kwargs`] takes raw JSON, and plain
-/// `serde_json::to_value` is never what a template wants:
+/// Plain serialization of the wire message is never what a template wants:
 ///
 /// 1. **`content` may be missing entirely.** The field is
 ///    `skip_serializing_if = "Option::is_none"`, so an assistant message
@@ -385,55 +411,86 @@ impl ChatTemplate {
 ///    expect a string, so supply the empty one. The wire format keeps `content`
 ///    optional, which is correct per the OpenAI schema; only this view changes.
 /// 2. **`tool_calls[].function.arguments` is a JSON *string*** on the wire.
-///    Parsed into an object so templates using `| items` work.
+///    Parsed into an object so templates using `| items` work, and parsed
+///    into a `minijinja::Value` so `| tojson` writes the keys in the order
+///    the client sent them.
 /// 3. **Image parts arrive as `type: "image_url"`.** Renamed to `"image"`:
 ///    Gemma3's template only checks `== "image"`, Qwen2-VL accepts either, and
 ///    renaming universally keeps this arch-agnostic — scratchy-serving-api
 ///    never names an arch.
-fn message_to_template_value(msg: &protocol::ChatCompletionMessageParam) -> serde_json::Value {
-    let mut val = serde_json::to_value(msg).unwrap_or_default();
+#[derive(Serialize)]
+struct TemplateMessageView<'a> {
+    role: &'a str,
+    content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<TemplateToolCallView<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
 
-    if let Some(obj) = val.as_object_mut()
-        && !obj.contains_key("content")
+#[derive(Serialize)]
+struct TemplateToolCallView<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    call_type: &'a str,
+    function: TemplateFunctionCallView<'a>,
+}
+
+#[derive(Serialize)]
+struct TemplateFunctionCallView<'a> {
+    name: &'a str,
+    /// The parsed arguments, or the wire string when it is not JSON.
+    arguments: minijinja::Value,
+}
+
+impl<'a> TemplateMessageView<'a> {
+    fn new(msg: &'a protocol::ChatCompletionMessageParam) -> Self {
+        let content = match &msg.content {
+            None => serde_json::Value::String(String::new()),
+            Some(serde_json::Value::Array(parts)) => {
+                serde_json::Value::Array(parts.iter().map(image_url_part_as_image).collect())
+            }
+            Some(content) => content.clone(),
+        };
+        let tool_calls = msg.tool_calls.as_ref().map(|calls| {
+            calls
+                .iter()
+                .map(|call| TemplateToolCallView {
+                    id: &call.id,
+                    call_type: &call.call_type,
+                    function: TemplateFunctionCallView {
+                        name: &call.function.name,
+                        arguments: serde_json::from_str(&call.function.arguments)
+                            .unwrap_or_else(|_| {
+                                minijinja::Value::from(call.function.arguments.as_str())
+                            }),
+                    },
+                })
+                .collect()
+        });
+        Self {
+            role: &msg.role,
+            content,
+            name: msg.name.as_deref(),
+            tool_calls,
+            tool_call_id: msg.tool_call_id.as_deref(),
+        }
+    }
+}
+
+fn image_url_part_as_image(part: &serde_json::Value) -> serde_json::Value {
+    let mut part = part.clone();
+    if let Some(obj) = part.as_object_mut()
+        && obj.get("type").and_then(|t| t.as_str()) == Some("image_url")
     {
         obj.insert(
-            "content".to_string(),
-            serde_json::Value::String(String::new()),
+            "type".to_string(),
+            serde_json::Value::String("image".to_string()),
         );
     }
-
-    if let Some(tool_calls) = val.get_mut("tool_calls")
-        && let Some(arr) = tool_calls.as_array_mut()
-    {
-        for tc in arr.iter_mut() {
-            if let Some(func) = tc.get_mut("function")
-                && let Some(args) = func.get("arguments")
-                && let Some(args_str) = args.as_str()
-                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args_str)
-            {
-                func.as_object_mut()
-                    .unwrap()
-                    .insert("arguments".to_string(), parsed);
-            }
-        }
-    }
-
-    if let Some(content) = val.get_mut("content")
-        && let Some(parts) = content.as_array_mut()
-    {
-        for part in parts.iter_mut() {
-            if let Some(obj) = part.as_object_mut()
-                && obj.get("type").and_then(|t| t.as_str()) == Some("image_url")
-            {
-                obj.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("image".to_string()),
-                );
-            }
-        }
-    }
-
-    val
+    part
 }
 
 /// Extract a token string from the `bos_token` / `eos_token` field in
@@ -758,25 +815,34 @@ mod tests {
     /// ensure_ascii=False)`, whose `", "` / `": "` separators are part of the
     /// prompt the model was trained on. The expected string is transformers'
     /// own render of this template and these tools.
+    ///
+    /// The tools come in as a client sends them, JSON text parsed into the
+    /// request type, and render through `render_chat` like a request does. Key
+    /// order is client order, which is not sorted order (`type` before
+    /// `function`, `type` before `properties`), so a sorted map anywhere on
+    /// that path fails this, whatever serde_json's features are.
     #[test]
     fn test_tools_tojson_matches_huggingface_bytes() {
         let tpl =
             ChatTemplate::new("{% if tools %}TOOLS:{{ tools | tojson }}{% endif %}".to_string())
                 .unwrap();
-        let tools = serde_json::json!([{
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"]
+        let tools: Vec<protocol::ChatCompletionToolsParam> = serde_json::from_str(
+            r#"[{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
                 }
-            }
-        }]);
+            }]"#,
+        )
+        .unwrap();
 
-        let result = tpl.apply(&[], false, Some(&tools)).unwrap();
+        let result = tpl.render_chat(&[], Some(&tools), None, None, false).unwrap();
         assert_eq!(
             result,
             r#"TOOLS:[{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]"#
@@ -852,6 +918,23 @@ mod tests {
         assert_eq!(out, "ls");
     }
 
+    /// Parsed tool-call arguments must `tojson` in the order the client wrote
+    /// them, as Hugging Face's `json.loads` + `json.dumps` do. The keys are
+    /// out of sorted order, so a sorted map on the way fails this.
+    #[test]
+    fn test_render_chat_keeps_tool_call_argument_order() {
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.tool_calls[0].function.arguments | tojson }}{% endfor %}"
+                .to_string(),
+        )
+        .unwrap();
+        let mut msg = tool_call_turn();
+        msg.tool_calls.as_mut().unwrap()[0].function.arguments =
+            r#"{"path":"/tmp","command":"ls","args":{"z":1,"a":2}}"#.to_string();
+        let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
+        assert_eq!(out, r#"{"path": "/tmp", "command": "ls", "args": {"z": 1, "a": 2}}"#);
+    }
+
     /// Normalization must not overwrite content a message actually has.
     #[test]
     fn test_render_chat_leaves_present_content_alone() {
@@ -887,7 +970,7 @@ mod tests {
             function: protocol::FunctionDefinition {
                 name: "Bash".to_string(),
                 description: None,
-                parameters: Some(serde_json::json!({"type": "object"})),
+                parameters: Some(serde_json::json!({"type": "object"}).into()),
             },
         }];
 
