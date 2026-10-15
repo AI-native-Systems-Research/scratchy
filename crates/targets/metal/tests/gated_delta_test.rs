@@ -2525,9 +2525,32 @@ fn gdn_scan_varlen_saves_and_restores_snapshots() {
     }
 }
 
+/// A step's buffers as [`second_of_two`] builds them, but the second sequence's step code `code`.
+fn second_of_two_coded(device: &Device, n: usize, seq: GdnSeqSlots, code: u32) -> [Buffer; 3] {
+    [
+        buf_i32(device, &[0, 0, n as i32]),
+        buf_seqs(device, &[idle(), seq]),
+        buf_u32(device, &[plain_code(GdnStart::Slot), code]),
+    ]
+}
+
+/// A verify step's code: from the slot, `drafts` drafts recorded in lane 0.
+fn verify_code(drafts: u8) -> u32 {
+    GdnStep {
+        start: GdnStart::Slot,
+        checkpoint_rows: CheckpointRows(drafts),
+        records: RecordArea::First,
+        lane: DraftLanes::new(CheckpointRows(drafts), 1).and_then(|l| l.lanes().next()),
+    }
+    .encode()
+}
+
 /// [`check_snapshots`] for `gdn_scan_simd_f32`, lanes splitting head_k (two state elements a
 /// lane), in its GDN form and its Mamba-2 one, without drafts and compiled for a drafting model
-/// (its draft lanes bound, a plain step never reading them).
+/// (its draft lanes bound, a plain step never reading them) — and compiled as a geometry the
+/// pipelined scan covers (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): there a plain step of more than one row
+/// is the pipelined scan's, which this scan leaves untouched, and every save it takes is of a
+/// one-row step's row, the contract checked over one row.
 #[test]
 fn gdn_scan_simd_saves_and_restores_snapshots() {
     let Some(di) = detect_device() else {
@@ -2547,8 +2570,11 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
         buf_f32(&device, &shifted(nv, 5)),
         buf_f32(&device, &shifted(nv, 9)),
     );
-    let unread_lanes = buf_zero_f32(&device, 1);
-    for (mamba, drafts) in [(false, 0u8), (false, 2), (true, 0), (true, 2)] {
+    // One draft lane — two record areas of `drafts + 1` rows (`GdnStateDims::ssm_lane_len`) — for
+    // the verify step below; a plain step never reads it.
+    let unread_lanes = buf_zero_f32(&device, 2 * 3 * (conv_dim + 2 * nv));
+    let cases = [(false, 0u8), (false, 2), (true, 0), (true, 2)];
+    for ((mamba, drafts), pipelined) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
         let mut constants = vec![
             ConstantValue::uint(0, nk as u32),
             ConstantValue::uint(1, nv as u32),
@@ -2558,9 +2584,10 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
             ConstantValue::uint(8, u32::from(drafts)),
         ];
         constants.extend(mamba.then(|| ConstantValue::boolean(5, true)));
+        constants.extend(pipelined.then(|| ConstantValue::boolean(9, true)));
         let key = PipelineKey::new("gdn_scan_varlen", "gdn_scan_simd_f32", constants);
         let pipeline = baked_build(&cache, &key).expect("gdn_scan_simd pipeline");
-        let step = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, start| {
+        let coded = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, code| {
             let n = r.len();
             let o = buf_zero_f32(&device, n * value_dim);
             let (conv_buf, a_buf, b_buf) = (
@@ -2569,7 +2596,7 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
                 buf_f32(&device, &row_range(&b, nv, r)),
             );
             let state = buf_f32(&device, &pools[0]);
-            let [cu, si, code] = second_of_two(&device, n, seq, start);
+            let [cu, si, code] = second_of_two_coded(&device, n, seq, code);
             let mut bufs = vec![
                 &o, &conv_buf, &a_buf, &b_buf, &state, &cu, &si, &code, &alog_buf, &dt_buf, &d_buf,
             ];
@@ -2580,15 +2607,44 @@ fn gdn_scan_simd_saves_and_restores_snapshots() {
                 (read_f32(&o, n * value_dim), after)
             })
         };
-        let what = format!("gdn_scan_simd, mamba {mamba}, drafts {drafts}");
-        check_snapshots(&what, &[Slots::ssm(nk, nv, hk, hv)], t, 3, &step);
+        let step = |pools: &[Vec<f32>], r, seq, start| coded(pools, r, seq, plain_code(start));
+        let what = format!("gdn_scan_simd, mamba {mamba}, drafts {drafts}, pipelined {pipelined}");
+        let slots = [Slots::ssm(nk, nv, hk, hv)];
+        if !pipelined {
+            check_snapshots(&what, &slots, t, 3, &step);
+            continue;
+        }
+        check_snapshots(&what, &slots, 1, 1, &step);
+        // A plain step of more than one row is the pipelined scan's: no output, no state.
+        let pools = vec![fill(POOL_SLOTS * slots[0].len)];
+        let live = GdnSeqSlots::plain(GdnSlot::new(LIVE as usize));
+        let Some((out, after)) = step(&pools, 0..t, live, GdnStart::Slot) else {
+            return;
+        };
+        assert!(
+            out.iter().all(|&o| o == 0.0),
+            "{what}: a plain prefill chunk"
+        );
+        assert_bits(
+            &after[0],
+            &pools[0],
+            &format!("{what}: a plain prefill chunk"),
+        );
+        // A verify step's rows are this scan's.
+        if drafts > 0 {
+            let Some((out, _)) = coded(&pools, 0..3, live, verify_code(2)) else {
+                return;
+            };
+            assert!(out.iter().any(|&o| o != 0.0), "{what}: a verify step");
+        }
     }
 }
 
 /// [`check_snapshots`] for `gdn_scan_pipelined_f32` (head_k 128, 12-token blocks), over 25 rows —
 /// two whole blocks and a row — saving mid-step after row 12 (a whole block's last), 13 (the next
 /// block's first) or 18 (inside it), and after rows 1 and 25 (the first and the partial block's
-/// one).
+/// one). Its twin beside the simd scan (`GDN_PIPE_BESIDE_SIMD`) keeps the contract on a prefill
+/// chunk, and leaves a verify step's rows and a one-row step's to the simd scan.
 #[test]
 fn gdn_scan_pipelined_saves_and_restores_snapshots() {
     let Some(di) = detect_device() else {
@@ -2607,38 +2663,76 @@ fn gdn_scan_pipelined_saves_and_restores_snapshots() {
         buf_f32(&device, &fill(nv)),
         buf_f32(&device, &shifted(nv, 5)),
     );
-    let constants = vec![
-        ConstantValue::uint(0, nk as u32),
-        ConstantValue::uint(1, nv as u32),
-        ConstantValue::uint(2, hk as u32),
-        ConstantValue::uint(3, hv as u32),
-        ConstantValue::float(4, (hk as f32).powf(-0.5)),
-        ConstantValue::uint(5, 12),
-    ];
-    let key = PipelineKey::new("gdn_scan_pipelined", "gdn_scan_pipelined_f32", constants);
-    let pipeline = baked_build(&cache, &key).expect("gdn_scan_pipelined pipeline");
-    let step = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, start| {
-        let n = r.len();
-        let o = buf_zero_f32(&device, n * value_dim);
-        let (conv_buf, a_buf, b_buf) = (
-            buf_f32(&device, &row_range(&conv, conv_dim, r.clone())),
-            buf_f32(&device, &row_range(&a, nv, r.clone())),
-            buf_f32(&device, &row_range(&b, nv, r)),
-        );
-        let state = buf_f32(&device, &pools[0]);
-        let [cu, si, code] = second_of_two(&device, n, seq, start);
-        let bufs = [
-            &o, &conv_buf, &a_buf, &b_buf, &state, &cu, &si, &code, &alog_buf, &dt_buf,
+    let mut plain_twin: Vec<(Vec<f32>, Vec<Vec<f32>>)> = Vec::new();
+    for beside in [false, true] {
+        let mut constants = vec![
+            ConstantValue::uint(0, nk as u32),
+            ConstantValue::uint(1, nv as u32),
+            ConstantValue::uint(2, hk as u32),
+            ConstantValue::uint(3, hv as u32),
+            ConstantValue::float(4, (hk as f32).powf(-0.5)),
+            ConstantValue::uint(5, 12),
         ];
-        let (grid, threads) = (dims(value_dim / 32, 1, 2), dims(128, 1, 1));
-        common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
-            let after = vec![read_f32(&state, pools[0].len())];
-            (read_f32(&o, n * value_dim), after)
-        })
-    };
-    for mid in [12, 13, 18] {
-        let what = format!("gdn_scan_pipelined, mid {mid}");
-        check_snapshots(&what, &[Slots::ssm(nk, nv, hk, hv)], t, mid, &step);
+        constants.extend(beside.then(|| ConstantValue::boolean(6, true)));
+        let key = PipelineKey::new("gdn_scan_pipelined", "gdn_scan_pipelined_f32", constants);
+        let pipeline = baked_build(&cache, &key).expect("gdn_scan_pipelined pipeline");
+        let coded = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, code| {
+            let n = r.len();
+            let o = buf_zero_f32(&device, n * value_dim);
+            let (conv_buf, a_buf, b_buf) = (
+                buf_f32(&device, &row_range(&conv, conv_dim, r.clone())),
+                buf_f32(&device, &row_range(&a, nv, r.clone())),
+                buf_f32(&device, &row_range(&b, nv, r)),
+            );
+            let state = buf_f32(&device, &pools[0]);
+            let [cu, si, code] = second_of_two_coded(&device, n, seq, code);
+            let bufs = [
+                &o, &conv_buf, &a_buf, &b_buf, &state, &cu, &si, &code, &alog_buf, &dt_buf,
+            ];
+            let (grid, threads) = (dims(value_dim / 32, 1, 2), dims(128, 1, 1));
+            common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
+                let after = vec![read_f32(&state, pools[0].len())];
+                (read_f32(&o, n * value_dim), after)
+            })
+        };
+        let step = |pools: &[Vec<f32>], r, seq, start| coded(pools, r, seq, plain_code(start));
+        let slots = [Slots::ssm(nk, nv, hk, hv)];
+        let pools = vec![fill(POOL_SLOTS * slots[0].len)];
+        let live = GdnSeqSlots::plain(GdnSlot::new(LIVE as usize));
+        // A prefill chunk restoring a snapshot and saving mid-block and at its end: the beside
+        // twin's output, live slot and snapshots are the plain twin's, bit for bit.
+        let chunk = live
+            .restoring(GdnSlot::new(SNAPS[0] as usize))
+            .saving([save(18, SNAPS[1]), save(t, 0)]);
+        let Some(run) = step(&pools, 0..t, chunk, GdnStart::Slot) else {
+            return;
+        };
+        if !beside {
+            for mid in [12, 13, 18] {
+                let what = format!("gdn_scan_pipelined, mid {mid}");
+                check_snapshots(&what, &slots, t, mid, &step);
+            }
+            plain_twin.push(run);
+            continue;
+        }
+        let (out, after) = (&run.0, &run.1[0]);
+        assert_bits(out, &plain_twin[0].0, "beside: a prefill chunk's output");
+        assert_bits(
+            after,
+            &plain_twin[0].1[0],
+            "beside: a prefill chunk's slots",
+        );
+        // A verify step's rows and a one-row step's are the simd scan's: no output, no state.
+        for (rows, code, what) in [
+            (3, verify_code(2), "a verify step"),
+            (1, plain_code(GdnStart::Slot), "a one-row step"),
+        ] {
+            let Some((out, after)) = coded(&pools, 0..rows, live, code) else {
+                return;
+            };
+            assert!(out.iter().all(|&o| o == 0.0), "beside: {what}");
+            assert_bits(&after[0], &pools[0], &format!("beside: {what}"));
+        }
     }
 }
 

@@ -69,6 +69,10 @@ SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_PIPE_SCALE, 4);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 5);
+// Set on the twin that runs beside the simd scan, in a step that also replays or records
+// (`route_gdn`): it takes only a plain sequence of more than one row — a prefill chunk — and
+// leaves the rest, a verify step's or a decode's row, to the simd scan.
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_PIPE_BESIDE_SIMD, 6);
 
 template <typename T>
 [[kernel]] void gdn_scan_pipelined(
@@ -117,6 +121,9 @@ template <typename T>
   const GdnSeqSlots seq_slots = state_indices[i_n];
   const int slot = seq_slots.slot;
   if (seq_len <= 0 || slot < 0) {
+    return;
+  }
+  if (GDN_PIPE_BESIDE_SIMD && !(gdn_step_plain(gdn_step[i_n]) && seq_len > 1)) {
     return;
   }
   const uint start = gdn_step[i_n] & 0xffu;

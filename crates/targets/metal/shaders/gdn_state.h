@@ -47,6 +47,12 @@ inline bool gdn_saves_after(int2 through, uint j, int row) {
   return row >= 0 && through[j] == row + 1;
 }
 
+// Whether a step code (`scratchy_layers::gdn_state::GdnStep::encode`) is a plain step — from the
+// slot or from zero, with no drafts — as `GdnStep::is_plain` reads it.
+inline bool gdn_step_plain(uint code) {
+  return (code & 0xffu) < 2u && ((code >> 8) & 0xffu) == 0u;
+}
+
 // Where a block of rows starting at `t0` and running to `t1` ends instead: at the first save's
 // row inside it, so the state is stored between blocks and the per-token loop carries no save
 // (`gdn_scan_pipelined`).

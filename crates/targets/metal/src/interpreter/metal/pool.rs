@@ -1837,12 +1837,23 @@ fn begin_step<W: CanonicalParams>(
         step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
         Relaxed,
     );
+    let plain = |c: &u32| crate::gdn_state::GdnStep::decode(*c).is_plain();
     worker.worker.gdn_plain.store(
-        inputs.gdn_is_fresh.is_none_or(|codes| {
-            codes
-                .iter()
-                .all(|&c| crate::gdn_state::GdnStep::decode(c).is_plain())
-        }),
+        inputs
+            .gdn_is_fresh
+            .is_none_or(|codes| codes.iter().all(plain)),
+        Relaxed,
+    );
+    // A plain sequence over more than one row: a prefill chunk, which the pipelined scan runs.
+    let rows = |i: usize| {
+        (inputs.cu_seqlens_q)
+            .and_then(|cu| Some(cu.get(i + 1)?.saturating_sub(*cu.get(i)?)))
+            .unwrap_or(0)
+    };
+    worker.worker.gdn_plain_rows.store(
+        inputs
+            .gdn_is_fresh
+            .is_none_or(|codes| (codes.iter().enumerate()).any(|(i, c)| plain(c) && rows(i) > 1)),
         Relaxed,
     );
     Ok(writes)

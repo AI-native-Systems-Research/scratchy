@@ -72,6 +72,12 @@ SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_SCAN_MAMBA, 5);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_SCAN_A_STRIDE, 6);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_SCAN_A_OFFSET, 7);
 SCRATCHY_CONSTANT(uint, GDN_SCAN_DRAFTS, 8);
+// `gdn_scan_simd` beside the pipelined scan (`route_gdn`, a geometry it covers): the pipelined scan
+// runs every plain sequence of more than one row, so this scan skips them, and every save it takes
+// — a plain step's, of one row — is of its last row: stored after its row loop, which stays the
+// plain one. Without it (a Mamba-2 model, a geometry the pipelined scan does not cover) this scan
+// runs every sequence, saving mid-step in stretches.
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_SCAN_PLAIN_ROWS_PIPELINED, 9);
 
 // The columns of q / k / v (Mamba-2: C / B / x) in a `conv_out` row.
 constant constexpr uint GDN_SCAN_KEY_DIM = GDN_SCAN_NUM_K_HEADS * GDN_SCAN_HEAD_K;
@@ -314,6 +320,9 @@ template <typename T>
   // A model without drafts (`GDN_SCAN_DRAFTS` 0) neither replays nor records: its scan compiles to
   // the plain one.
   const uint code = gdn_step[i_n];
+  if (GDN_SCAN_PLAIN_ROWS_PIPELINED && gdn_step_plain(code) && seq_len > 1) {
+    return;
+  }
   const uint start = code & 0xffu;
   const uint drafts = GDN_SCAN_DRAFTS == 0u ? 0u : (code >> 8) & 0xffu;
   const uint area = (code >> 16) & 1u;
@@ -340,102 +349,120 @@ template <typename T>
   }
   const float neg_a = -exp(float(a_log[i_hv]));
 
-  // The previous verify step's kept rows (replayed: no output), then this step's: in
-  // stretches, a save's store after each but the last (`gdn_state.h`).
-  const int2 saves_through = gdn_saves_through(seq_slots);
-  int i_t = -replayed;
-  for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-    for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop; i_t++) {
-      if (i_t == 0 && drafts > 0u && start != 0u) {
-        // A verify step leaves the state it starts from in the slot (a slot start's is already
-        // there).
-        for (uint i = 0; i < NPT; i++) {
-          state_row[i] = st[i];
-        }
-      }
-      const uint t = uint(bos + i_t);
-      const device float* rec = kept + uint(i_t + replayed) * rec_len;
-      const device float* row = i_t < 0 ? rec : conv_out + t * conv_dim;
-      // gdn_gating, or the recorded row's. Mamba-2's beta is its dt.
-      float g_t, beta;
-      if (i_t < 0) {
-        g_t = rec[conv_dim + i_hv];
-        beta = rec[conv_dim + HV + i_hv];
-      } else {
-        const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
-                                                : t * HV + i_hv;
-        const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
-        const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
-        g_t = neg_a * sp;
-        beta = GDN_SCAN_MAMBA ? sp : 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
-      }
-      const float decay = exp(g_t);
-      // A verify row, for the replay that keeps it: its conv row split over the sequence's lanes,
-      // its decay and beta by value-dim 0's lane 0.
-      if (drafts > 0u && uint(i_t) <= drafts) {
-        device float* dst = recorded + uint(i_t) * rec_len;
-        for (uint j = (i_hv * Vd + i_v) * 32u + lane; j < conv_dim; j += value_dim * 32u) {
-          dst[j] = conv_out[t * conv_dim + j];
-        }
-        if (i_v == 0u && lane == 0u) {
-          dst[conv_dim + i_hv] = g_t;
-          dst[conv_dim + HV + i_hv] = beta;
-        }
-      }
-
-      const device float* q_ptr = row + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
-      const device float* k_ptr = row + GDN_SCAN_COL_K + i_h * K + lane * NPT;
-      if (GDN_SCAN_MAMBA) {
-        const float x = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
-        const float x_dt = x * beta;
-        float y = 0.0f;
-        for (uint i = 0; i < NPT; i++) {
-          st[i] = decay * st[i] + x_dt * k_ptr[i];
-          y += st[i] * q_ptr[i];
-        }
-        y = simd_sum(y);
-        if (i_t >= 0 && lane == 0u) {
-          o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
-        }
-        continue;
-      }
-      float q[NPT], k[NPT];
-      float q_sq = 0.0f, k_sq = 0.0f;
+  // One row of the scan: a kept row the previous verify step recorded (`i_t < 0`, replayed: no
+  // output), or this step's row `i_t`.
+  auto scan_row = [&](int i_t) {
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step leaves the state it starts from in the slot (a slot start's is already
+      // there).
       for (uint i = 0; i < NPT; i++) {
-        q[i] = q_ptr[i];
-        k[i] = k_ptr[i];
-        q_sq += q[i] * q[i];
-        k_sq += k[i] * k[i];
-      }
-      const float q_inv = rsqrt(simd_sum(q_sq) + 1e-6f) * GDN_SCAN_SCALE;
-      const float k_inv = rsqrt(simd_sum(k_sq) + 1e-6f);
-
-      float kv = 0.0f;
-      for (uint i = 0; i < NPT; i++) {
-        st[i] *= decay;
-        kv += st[i] * (k[i] * k_inv);
-      }
-      kv = simd_sum(kv);
-      const float v = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
-      const float delta = (v - kv) * beta;
-      float out = 0.0f;
-      for (uint i = 0; i < NPT; i++) {
-        st[i] += (k[i] * k_inv) * delta;
-        out += st[i] * (q[i] * q_inv);
-      }
-      out = simd_sum(out);
-      if (i_t < 0) {
-        continue;
-      }
-      if (lane == 0u) {
-        o[t * value_dim + i_hv * Vd + i_v] = out;
+        state_row[i] = st[i];
       }
     }
-    const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
-    if (sv >= 0) {
-      device float* snap = row_in(state_indices[i_n].saves[sv].y);
+    const uint t = uint(bos + i_t);
+    const device float* rec = kept + uint(i_t + replayed) * rec_len;
+    const device float* row = i_t < 0 ? rec : conv_out + t * conv_dim;
+    // gdn_gating, or the recorded row's. Mamba-2's beta is its dt.
+    float g_t, beta;
+    if (i_t < 0) {
+      g_t = rec[conv_dim + i_hv];
+      beta = rec[conv_dim + HV + i_hv];
+    } else {
+      const uint a_ix = GDN_SCAN_A_STRIDE_SET ? t * GDN_SCAN_A_STRIDE + GDN_SCAN_A_OFFSET + i_hv
+                                              : t * HV + i_hv;
+      const float av = float(a[a_ix]) + float(dt_bias[i_hv]);
+      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+      g_t = neg_a * sp;
+      beta = GDN_SCAN_MAMBA ? sp : 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
+    }
+    const float decay = exp(g_t);
+    // A verify row, for the replay that keeps it: its conv row split over the sequence's lanes,
+    // its decay and beta by value-dim 0's lane 0.
+    if (drafts > 0u && uint(i_t) <= drafts) {
+      device float* dst = recorded + uint(i_t) * rec_len;
+      for (uint j = (i_hv * Vd + i_v) * 32u + lane; j < conv_dim; j += value_dim * 32u) {
+        dst[j] = conv_out[t * conv_dim + j];
+      }
+      if (i_v == 0u && lane == 0u) {
+        dst[conv_dim + i_hv] = g_t;
+        dst[conv_dim + HV + i_hv] = beta;
+      }
+    }
+
+    const device float* q_ptr = row + GDN_SCAN_COL_Q + i_h * K + lane * NPT;
+    const device float* k_ptr = row + GDN_SCAN_COL_K + i_h * K + lane * NPT;
+    if (GDN_SCAN_MAMBA) {
+      const float x = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
+      const float x_dt = x * beta;
+      float y = 0.0f;
       for (uint i = 0; i < NPT; i++) {
-        snap[i] = st[i];
+        st[i] = decay * st[i] + x_dt * k_ptr[i];
+        y += st[i] * q_ptr[i];
+      }
+      y = simd_sum(y);
+      if (i_t >= 0 && lane == 0u) {
+        o[t * value_dim + i_hv * Vd + i_v] = y + d_skip[i_hv] * x;
+      }
+      return;
+    }
+    float q[NPT], k[NPT];
+    float q_sq = 0.0f, k_sq = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      q[i] = q_ptr[i];
+      k[i] = k_ptr[i];
+      q_sq += q[i] * q[i];
+      k_sq += k[i] * k[i];
+    }
+    const float q_inv = rsqrt(simd_sum(q_sq) + 1e-6f) * GDN_SCAN_SCALE;
+    const float k_inv = rsqrt(simd_sum(k_sq) + 1e-6f);
+
+    float kv = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      st[i] *= decay;
+      kv += st[i] * (k[i] * k_inv);
+    }
+    kv = simd_sum(kv);
+    const float v = row[GDN_SCAN_COL_V + i_hv * Vd + i_v];
+    const float delta = (v - kv) * beta;
+    float out = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      st[i] += (k[i] * k_inv) * delta;
+      out += st[i] * (q[i] * q_inv);
+    }
+    out = simd_sum(out);
+    if (i_t >= 0 && lane == 0u) {
+      o[t * value_dim + i_hv * Vd + i_v] = out;
+    }
+  };
+
+  // The previous verify step's kept rows (replayed: no output), then this step's.
+  const int2 saves_through = gdn_saves_through(seq_slots);
+  if (GDN_SCAN_PLAIN_ROWS_PIPELINED) {
+    // The plain step's loop, a save — of a plain step's one row — stored after it.
+    for (int i_t = -replayed; i_t < seq_len; i_t++) {
+      scan_row(i_t);
+    }
+    for (uint j = 0; j < GDN_SAVES; j++) {
+      if (saves_through[j] == seq_len) {
+        device float* snap = row_in(seq_slots.saves[j].y);
+        for (uint i = 0; i < NPT; i++) {
+          snap[i] = st[i];
+        }
+      }
+    }
+  } else {
+    // In stretches, a save's store after each but the last (`gdn_state.h`).
+    int i_t = -replayed;
+    for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
+      for (const int stop = gdn_stretch_end(saves_through, stretch, seq_len); i_t < stop; i_t++) {
+        scan_row(i_t);
+      }
+      const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
+      if (sv >= 0) {
+        device float* snap = row_in(seq_slots.saves[sv].y);
+        for (uint i = 0; i < NPT; i++) {
+          snap[i] = st[i];
+        }
       }
     }
   }

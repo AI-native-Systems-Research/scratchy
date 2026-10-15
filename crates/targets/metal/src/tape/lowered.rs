@@ -753,6 +753,11 @@ pub enum RuntimeGate {
     /// Gated-DeltaNet rows (a speculative verify step, the step after one):
     /// the conv and the simd scan, which replay and record.
     UnlessPlainGdn,
+    /// Run on a step one of whose sequences takes a plain Gated-DeltaNet step
+    /// over more than one row — a prefill chunk: the pipelined scan's twin for
+    /// a step that also replays or records, which runs those sequences and
+    /// leaves the rest to the simd scan.
+    OnlyIfPlainGdnRows,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
     /// Run when some gate in the list matches.

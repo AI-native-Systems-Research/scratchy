@@ -359,6 +359,11 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// Only such a step runs the one-command decode and the pipelined prefill
     /// scan (`RuntimeGate::OnlyIfPlainGdn`).
     pub gdn_plain: std::sync::atomic::AtomicBool,
+    /// Whether some sequence of the step about to run takes a plain
+    /// Gated-DeltaNet step over more than one row, set with `gdn_plain`: in a
+    /// step that also replays or records, the pipelined scan's twin runs those
+    /// sequences (`RuntimeGate::OnlyIfPlainGdnRows`).
+    pub gdn_plain_rows: std::sync::atomic::AtomicBool,
     /// Per-dispatch GPU timestamp heap (`SCRATCHY_METAL_KERNEL_TIME`).
     /// `None` unless the env var is set at worker build — the probe is
     /// opt-in and costs nothing otherwise. One timestamp is written
@@ -818,6 +823,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
+            gdn_plain_rows: std::sync::atomic::AtomicBool::new(true),
             kernel_time_heap: if std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some() {
                 Some(super::mtl4::new_registered_kernel_time_heap(&device))
             } else {
@@ -970,6 +976,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
+            gdn_plain_rows: (self.gdn_plain_rows).load(std::sync::atomic::Ordering::Relaxed),
         };
         // A skipped dispatch's fence, owed to the next one played.
         let mut carried = Fence::None;
@@ -1722,6 +1729,7 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         has_spec_tokens,
         unrotated_blocks,
         gdn_plain,
+        gdn_plain_rows,
     } = step;
     // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
     // tokens to drop (prefill / chunked-prefill / mixed batches);
@@ -1760,6 +1768,7 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         Some(super::lowered::RuntimeGate::UnlessUnrotatedBlocks) => !unrotated_blocks,
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdn) => gdn_plain,
         Some(super::lowered::RuntimeGate::UnlessPlainGdn) => !gdn_plain,
+        Some(super::lowered::RuntimeGate::OnlyIfPlainGdnRows) => gdn_plain_rows,
         Some(super::lowered::RuntimeGate::All(gates)) => {
             gates.iter().all(|g| gate_matches(Some(*g), step))
         }
@@ -1779,6 +1788,8 @@ pub struct StepFacts {
     pub unrotated_blocks: bool,
     /// Every sequence's Gated-DeltaNet step is plain: no replay, no records.
     pub gdn_plain: bool,
+    /// Some sequence takes a plain Gated-DeltaNet step over more than one row.
+    pub gdn_plain_rows: bool,
 }
 
 fn scale_tg_for_num_tokens(
@@ -1921,6 +1932,7 @@ mod tests {
             has_spec_tokens: false,
             unrotated_blocks,
             gdn_plain: true,
+            gdn_plain_rows: true,
         };
         for (tokens, seqs, decode) in [
             (1, 1, true),
@@ -1964,6 +1976,22 @@ mod tests {
             assert_eq!(gate_matches(Some(decode), s), decodes);
             assert_eq!(gate_matches(Some(conv), s), !decodes);
         }
+        // The pipelined twin's gate follows whether some plain sequence runs more than one row: a
+        // verify step beside a prefill chunk runs it, one beside only verifies or decodes does not.
+        for gdn_plain_rows in [false, true] {
+            let s = StepFacts {
+                gdn_plain: false,
+                gdn_plain_rows,
+                ..step(18, 2, false)
+            };
+            assert_eq!(
+                gate_matches(
+                    Some(super::super::lowered::RuntimeGate::OnlyIfPlainGdnRows),
+                    s
+                ),
+                gdn_plain_rows
+            );
+        }
         let plain = All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
         assert!(gate_matches(Some(plain), step(512, 2, false)));
         assert!(!gate_matches(Some(plain), step(512, 2, true)));
@@ -1997,6 +2025,7 @@ mod tests {
                     has_spec_tokens: has_spec,
                     unrotated_blocks: false,
                     gdn_plain: true,
+                    gdn_plain_rows: true,
                 };
                 let (slice, full) = (
                     gate_matches(Some(OnlyIfNoSpec), s),
@@ -2016,6 +2045,7 @@ mod tests {
             has_spec_tokens: false,
             unrotated_blocks: false,
             gdn_plain: true,
+            gdn_plain_rows: true,
         };
         assert!(!gate_matches(Some(OnlyIfNoSpec), decode_only));
         assert!(gate_matches(Some(OnlyIfSpec), decode_only));
@@ -2026,6 +2056,7 @@ mod tests {
             has_spec_tokens: false,
             unrotated_blocks: false,
             gdn_plain: true,
+            gdn_plain_rows: true,
         };
         assert!(gate_matches(Some(OnlyIfNoSpec), prefill));
         assert!(!gate_matches(Some(OnlyIfSpec), prefill));
@@ -2036,6 +2067,7 @@ mod tests {
             has_spec_tokens: true,
             unrotated_blocks: false,
             gdn_plain: true,
+            gdn_plain_rows: true,
         };
         assert!(!gate_matches(Some(OnlyIfNoSpec), verify));
         assert!(gate_matches(Some(OnlyIfSpec), verify));
