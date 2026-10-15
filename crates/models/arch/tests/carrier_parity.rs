@@ -461,7 +461,10 @@ mod imp {
         });
 
         // Recurrent-state slot 0 for our one sequence: its `state_indices` record.
-        let gdn_idx = scratchy_target_metal::gdn_state::GdnSeqSlots::plain(0).words();
+        let gdn_idx = scratchy_target_metal::gdn_state::GdnSeqSlots::plain(
+            scratchy_target_metal::gdn_state::GdnSlot::new(0),
+        )
+        .words();
 
         // Sliding KV-cache groups (gemma4 SWA), the worker's encoding: group
         // 0 (full) keeps the dumped slot_mapping/block_table (identity block

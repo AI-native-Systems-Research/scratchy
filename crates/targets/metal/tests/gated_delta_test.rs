@@ -18,7 +18,8 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::{
-    CheckpointRows, DraftLane, DraftLanes, GdnSeqSlots, GdnStart, GdnStateDims, GdnStep, RecordArea,
+    CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
+    GdnStateDims, GdnStep, RecordArea,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -83,7 +84,10 @@ fn buf_seqs(device: &Device, seqs: &[GdnSeqSlots]) -> Buffer {
 
 /// `state_indices` of plain steps on `slots`, a sequence each.
 fn buf_slots(device: &Device, slots: &[i32]) -> Buffer {
-    let seqs: Vec<GdnSeqSlots> = slots.iter().map(|&s| GdnSeqSlots::plain(s)).collect();
+    let seqs: Vec<GdnSeqSlots> = slots
+        .iter()
+        .map(|&s| GdnSeqSlots::plain(GdnSlot::new(s as usize)))
+        .collect();
     buf_seqs(device, &seqs)
 }
 
@@ -698,7 +702,7 @@ fn gdn_scan_varlen_matches_reference() {
         &beta,
         &state_buf,
         &[0, t as i32],
-        &[GdnSeqSlots::plain(0)],
+        &[GdnSeqSlots::plain(GdnSlot::new(0))],
         &[1],
         nk,
         nv,
@@ -753,7 +757,7 @@ fn gdn_scan_varlen_production_head_dim() {
         &beta,
         &state_buf,
         &[0, t as i32],
-        &[GdnSeqSlots::plain(0)],
+        &[GdnSeqSlots::plain(GdnSlot::new(0))],
         &[1],
         nk,
         nv,
@@ -813,7 +817,7 @@ fn gdn_scan_varlen_continuity() {
         &beta_full[..5 * nv],
         &state_buf,
         &[0, 5],
-        &[GdnSeqSlots::plain(0)],
+        &[GdnSeqSlots::plain(GdnSlot::new(0))],
         &[1],
         nk,
         nv,
@@ -833,7 +837,7 @@ fn gdn_scan_varlen_continuity() {
         &beta_full[5 * nv..],
         &state_buf,
         &[0, 1],
-        &[GdnSeqSlots::plain(0)],
+        &[GdnSeqSlots::plain(GdnSlot::new(0))],
         &[0],
         nk,
         nv,
@@ -1648,7 +1652,7 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
         fill(t_full * nv),
     );
     let at = |x: &[f32], w: usize, r: std::ops::Range<usize>| x[r.start * w..r.end * w].to_vec();
-    let entry = [GdnSeqSlots::plain(1)];
+    let entry = [GdnSeqSlots::plain(GdnSlot::new(1))];
     let code = |start, checkpoint_rows, records| [code(start, checkpoint_rows, records, lane)];
     let run = |(state, lanes): (&Buffer, &Buffer), r: std::ops::Range<usize>, step: [u32; 1]| {
         let n = r.len();
@@ -1753,7 +1757,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
 
     // Slot 1 of a two-slot pool, lane 1 of two; its steps' codes chained as the allocator chains
     // them.
-    let entry = [GdnSeqSlots::plain(1)];
+    let entry = [GdnSeqSlots::plain(GdnSlot::new(1))];
     let pool = || {
         (
             buf_zero_f32(&device, 2 * entry_len),
@@ -1939,7 +1943,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
     .expect("gdn_scan_simd_f32");
     let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
     // Slot 1 of a two-slot pool, lane 1 of two.
-    let entry = [GdnSeqSlots::plain(1)];
+    let entry = [GdnSeqSlots::plain(GdnSlot::new(1))];
     let entry_buf = buf_seqs(&device, &entry);
     let unread_skip = buf_zero_f32(&device, 1);
     // `gdn_gating`'s g and beta, for the serial scan.
@@ -2153,11 +2157,19 @@ const SNAPS: [i32; 2] = [2, 3];
 
 /// The record of [`second_of_two`]'s first sequence, which has no rows: a kernel that ran it would
 /// restore from the last snapshot and save into slot 0.
-const IDLE: GdnSeqSlots = GdnSeqSlots {
-    slot: 0,
-    source: SNAPS[1] + 1,
-    saves: [[1, 0], [1, 0]],
-};
+fn idle() -> GdnSeqSlots {
+    GdnSeqSlots::plain(GdnSlot::new(0))
+        .restoring(GdnSlot::new(SNAPS[1] as usize))
+        .saving([save(1, 0), save(1, 0)])
+}
+
+/// A save into slot `snapshot` after `rows` rows.
+fn save(rows: usize, snapshot: i32) -> Option<GdnSave> {
+    Some(GdnSave {
+        rows_through: std::num::NonZeroU32::new(rows as u32).expect("rows"),
+        snapshot: GdnSlot::new(snapshot as usize),
+    })
+}
 
 /// A pool's slots, for [`check_snapshots`]: `len` f32s a slot, its state entry (a drafting
 /// model's checkpoints and records live in its draft lanes, apart).
@@ -2218,12 +2230,12 @@ fn plain_code(start: GdnStart) -> u32 {
 }
 
 /// `cu_seqlens`, `state_indices` and step codes of a step of `n` rows whose one sequence with rows
-/// is its second — `seq`, from `start`. The first has none and the record [`IDLE`]: every check
+/// is its second — `seq`, from `start`. The first has none and the record [`idle`]: every check
 /// reads the second record, at its stride, past one no kernel may act on.
 fn second_of_two(device: &Device, n: usize, seq: GdnSeqSlots, start: GdnStart) -> [Buffer; 3] {
     [
         buf_i32(device, &[0, 0, n as i32]),
-        buf_seqs(device, &[IDLE, seq]),
+        buf_seqs(device, &[idle(), seq]),
         buf_u32(device, &[plain_code(GdnStart::Slot), plain_code(start)]),
     ]
 }
@@ -2279,7 +2291,7 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
     let entries = |pools: &[Vec<f32>], s: i32| -> Vec<Vec<f32>> {
         (0..layouts.len()).map(|p| slot(pools, p, s)).collect()
     };
-    let plain = GdnSeqSlots::plain(LIVE);
+    let plain = GdnSeqSlots::plain(GdnSlot::new(LIVE as usize));
     // The live slot's entries after a plain step of the first `rows` rows on `pools`.
     let live_after = |pools: &[Vec<f32>], rows: usize| {
         step(pools, 0..rows, plain, GdnStart::Slot).map(|(_, after)| entries(&after, LIVE))
@@ -2324,10 +2336,11 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
         &[(1, s1), (mid, s0)],
     ] {
         let case = format!("saves {saves:?}");
-        let mut seq = plain;
+        let mut stores = [None; GDN_SAVES];
         for (j, &(through, snap)) in saves.iter().enumerate() {
-            seq.saves[j] = [through as i32, snap];
+            stores[j] = save(through, snap);
         }
+        let seq = plain.saving(stores);
         let Some((out, after)) = step(&pools, 0..t, seq, GdnStart::Slot) else {
             return;
         };
@@ -2344,10 +2357,7 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
     }
 
     // A restore: the step on `pools` with the live slot's entries the snapshot's.
-    let restore = GdnSeqSlots {
-        source: s0 + 1,
-        ..plain
-    };
+    let restore = plain.restoring(GdnSlot::new(s0 as usize));
     let mut copied = pools.clone();
     for (p, l) in layouts.iter().enumerate() {
         let from = s0 as usize * l.len;
@@ -2381,10 +2391,7 @@ fn check_snapshots(what: &str, layouts: &[Slots], t: usize, mid: usize, step: Sn
     }
 
     // A restore that saves.
-    let seq = GdnSeqSlots {
-        saves: [[mid as i32, s1], [0, 0]],
-        ..restore
-    };
+    let seq = restore.saving([save(mid, s1), None]);
     let (Some((out_rs, after_rs)), Some(want)) = (
         step(&pools, 0..t, seq, GdnStart::Slot),
         live_after(&copied, mid),

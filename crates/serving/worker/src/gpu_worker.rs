@@ -60,7 +60,7 @@ use scratchy_serving_engine::worker_factory::VerifySeqs;
 #[cfg(feature = "metal")]
 use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
-use scratchy_target_metal::gdn_state::GdnStatePool;
+use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
 #[cfg(feature = "metal")]
 use scratchy_target_metal::kv_cache::KvCachePool;
 
@@ -2253,7 +2253,7 @@ impl MetalWorker {
         let bad = |what: String| ExecutorError::WorkerExecution(format!("state snapshot: {what}"));
         let cap = self.gdn_snapshot_cap;
         let slot = |op: &StateSnapshotOp| match op.slot < cap {
-            true => Ok((live + op.slot) as i32),
+            true => Ok(GdnSlot::new(live + op.slot)),
             false => Err(bad(format!(
                 "{} names slot {} of {cap}",
                 op.req_id, op.slot
@@ -2292,8 +2292,10 @@ impl MetalWorker {
             let saves = ops.saves.iter().filter(|op| op.req_id == *req_id);
             for (n, op) in saves.enumerate() {
                 let at = op.position;
-                let through = at.checked_sub(before).filter(|r| (1..=q_len).contains(r));
-                let Some(through) = through else {
+                let through = (at.checked_sub(before))
+                    .filter(|r| *r <= q_len)
+                    .and_then(std::num::NonZeroU32::new);
+                let Some(rows_through) = through else {
                     return Err(bad(format!(
                         "{req_id} saves {at} from {q_len} rows at {before}"
                     )));
@@ -2303,7 +2305,10 @@ impl MetalWorker {
                         "{req_id} saves more than two snapshots in a step"
                     )));
                 };
-                *save = [through as i32, slot(op)?];
+                *save = Some(GdnSave {
+                    rows_through,
+                    snapshot: slot(op)?,
+                });
                 saved.push((op.slot, op.key));
                 reach = reach.max(op.slot + 1);
             }

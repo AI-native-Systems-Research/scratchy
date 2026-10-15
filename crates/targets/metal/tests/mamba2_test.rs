@@ -17,7 +17,7 @@ use half::bf16;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::GdnSeqSlots;
+use scratchy_target_metal::gdn_state::{GdnSave, GdnSeqSlots, GdnSlot};
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -550,7 +550,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step]) {
         }
         let seqs: Vec<GdnSeqSlots> = step
             .iter()
-            .map(|s| GdnSeqSlots::plain(s.0 as i32))
+            .map(|s| GdnSeqSlots::plain(GdnSlot::new(s.0)))
             .collect();
         let fresh: Vec<u32> = step.iter().map(|s| u32::from(s.2)).collect();
         let Some(got) = gpu.step(&zx, &cu, &seqs, &fresh) else {
@@ -694,7 +694,7 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
     let prefix = gpu.step(
         &zx[..junction * row],
         &[0, junction as i32],
-        &[GdnSeqSlots::plain(1)],
+        &[GdnSeqSlots::plain(GdnSlot::new(1))],
         &[0],
     );
     let Some(_) = prefix else {
@@ -705,12 +705,15 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
 
     // The prefill, saving, beside its neighbour.
     gpu.load(&conv0, &ssm0);
-    let prefill = GdnSeqSlots {
-        saves: [[junction as i32, 3], [t as i32, 4]],
-        ..GdnSeqSlots::plain(1)
+    let save = |rows: usize, snapshot: usize| {
+        Some(GdnSave {
+            rows_through: std::num::NonZeroU32::new(rows as u32).expect("rows"),
+            snapshot: GdnSlot::new(snapshot),
+        })
     };
+    let prefill = GdnSeqSlots::plain(GdnSlot::new(1)).saving([save(junction, 3), save(t, 4)]);
     let cu = [0, t as i32, (t + neighbour) as i32];
-    let seqs = [prefill, GdnSeqSlots::plain(2)];
+    let seqs = [prefill, GdnSeqSlots::plain(GdnSlot::new(2))];
     let Some(out) = gpu.step(&zx, &cu, &seqs, &[0, 1]) else {
         return;
     };
@@ -721,10 +724,7 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
     same(slot(&after, 0), slot(&start, 0), "slot 0");
 
     // The junction restored on slot 0, running the prefill's rows past it.
-    let restore = GdnSeqSlots {
-        source: 3 + 1,
-        ..GdnSeqSlots::plain(0)
-    };
+    let restore = GdnSeqSlots::plain(GdnSlot::new(0)).restoring(GdnSlot::new(3));
     let rest = &zx[junction * row..t * row];
     let Some(resumed) = gpu.step(rest, &[0, (t - junction) as i32], &[restore], &[0]) else {
         return;
