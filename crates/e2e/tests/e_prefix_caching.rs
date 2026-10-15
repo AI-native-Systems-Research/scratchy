@@ -605,8 +605,10 @@ mod gdn {
         }
     }
     /// Four conversations interleaved on one server: each turn 2 resumes at its own turn 1's
-    /// snapshot, which takes one slot per conversation while the turn 2s run (a 32 GB Mac has a
-    /// handful).
+    /// snapshot, which takes one slot per conversation while the turn 2s run — at least four
+    /// snapshot slots. A 64 GB Mac has dozens beside Qwen3.6-35B-A3B; a 32 GB one, whose KV budget
+    /// is about 1 GiB there, has one (the server's `state_snapshots=` line), and this test cannot
+    /// pass on it.
     async fn concurrent_conversations_each_resume_at_their_turn_1_snapshot(model: &str) {
         let (server, _client) = start(model).await;
         let conversation = |i: usize| {

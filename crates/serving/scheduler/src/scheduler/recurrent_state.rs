@@ -42,6 +42,12 @@ struct Snapshot {
     /// written; pinning it too let one long conversation fill the pool with its own ancestors,
     /// after which every turn's save found no slot to take.
     pinned: u64,
+    /// The one request that read it in step `pinned` (its restore), `None` when the pin is a
+    /// reservation's or more than one request read it. That request's own save may take the
+    /// slot over in the same step: every recurrent kernel reads a restored row at the start of
+    /// its row loop and stores a saved one later, in the same thread, so the read sees the old
+    /// state — and the conversation's newer snapshot replaces its older one.
+    reader: Option<String>,
 }
 
 /// Snapshot slot index: prefix hash → slot, readiness, and LRU over a fixed slot count.
@@ -89,34 +95,43 @@ impl StateSnapshots {
         }
     }
 
-    /// Mark a slot read this step (a restore): used, and not reused before the step runs.
-    pub(crate) fn pin(&mut self, slot: usize) {
+    /// Mark a slot read this step by `reader` (a restore): used, and not reused before the step
+    /// runs — but by `reader`'s own save, when no other request read it too.
+    pub(crate) fn pin(&mut self, slot: usize, reader: &str) {
+        let step = self.step;
         if let Some(c) = self.slots[slot].as_mut() {
-            c.last_used = self.step;
-            c.pinned = self.step;
+            c.reader = match (c.pinned == step, c.reader.take()) {
+                (false, _) => Some(reader.to_owned()),
+                (true, Some(r)) if r == reader => Some(r),
+                (true, _) => None,
+            };
+            c.last_used = step;
+            c.pinned = step;
         }
     }
 
     /// Reserve a slot for `key` at `position`, written by `writer`'s step. `None` when `key`
-    /// already has a snapshot, or when every slot is read or written this step.
+    /// already has a snapshot, or when every slot is read or written this step — save the one
+    /// `writer` alone restores this step, taken over when nothing else can be.
     pub(crate) fn reserve(&mut self, key: u64, position: u32, writer: &str) -> Option<usize> {
         if self.contains(key) {
             return None;
         }
+        let step = self.step;
         let slot = match self.slots.iter().position(Option::is_none) {
             Some(free) => free,
             None => {
-                let (victim, _) = self
-                    .slots
-                    .iter()
-                    .enumerate()
+                let held = |c: &Snapshot| c.pinned < step;
+                let own = |c: &Snapshot| c.pinned == step && c.reader.as_deref() == Some(writer);
+                let (victim, _) = (self.slots.iter().enumerate())
                     .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-                    .filter(|(_, c)| c.pinned < self.step)
-                    // Oldest first; among equals a pending snapshot before a ready one (the only
-                    // kind a request can use), then the DEEPEST: an agent loop resumes from the
-                    // oldest snapshot of its chain once the next user message re-renders the
-                    // loop's turns, and the newest one is pinned by the restore that read it.
-                    .min_by_key(|(_, c)| (c.last_used, c.ready, Reverse(c.position)))?;
+                    .filter(|(_, c)| held(c) || own(c))
+                    // Unpinned first, oldest first; among equals a pending snapshot before a ready
+                    // one (the only kind a request can use), then the DEEPEST: an agent loop
+                    // resumes from the oldest snapshot of its chain once the next user message
+                    // re-renders the loop's turns, and the newest one is pinned by the restore
+                    // that read it.
+                    .min_by_key(|(_, c)| (own(c), c.last_used, c.ready, Reverse(c.position)))?;
                 self.evict(victim);
                 victim
             }
@@ -126,8 +141,9 @@ impl StateSnapshots {
             position,
             ready: false,
             writer: Some(writer.to_owned()),
-            last_used: self.step,
-            pinned: self.step,
+            last_used: step,
+            pinned: step,
+            reader: None,
         });
         self.by_key.insert(key, slot);
         Some(slot)
@@ -294,13 +310,45 @@ mod tests {
         snaps.commit(new, 2, "t2");
         snaps.tick();
         snaps.touch(old);
-        snaps.pin(new);
+        snaps.pin(new, "t3");
         assert_eq!(snaps.reserve(3, 1376, "t3"), Some(old));
         assert_eq!(
             snaps.ready_slot(2),
             Some(new),
             "the restored slot survives its step"
         );
+    }
+
+    /// One slot — a 32 GB Mac's lot beside Qwen3.6-35B-A3B: each turn restores the snapshot the
+    /// turn before saved and saves its own into the same slot in the same step, so a conversation
+    /// keeps resuming at its latest turn.
+    #[test]
+    fn a_turn_takes_over_the_slot_it_alone_restores() {
+        let mut snaps = StateSnapshots::new(1);
+        let slot = snaps.reserve(1, 1024, "t1").unwrap();
+        snaps.commit(slot, 1, "t1");
+        snaps.tick();
+        snaps.pin(slot, "t2");
+        assert_eq!(snaps.reserve(2, 2048, "t2"), Some(slot));
+        assert!(!snaps.contains(1), "the older snapshot is replaced");
+        snaps.commit(slot, 2, "t2");
+        assert_eq!(snaps.ready_slot(2), Some(slot));
+    }
+
+    /// A slot two requests restore in one step, or another request restores, is not taken over:
+    /// the other reader could read it after the save wrote it.
+    #[test]
+    fn a_slot_another_request_restores_is_not_taken_over() {
+        let mut snaps = StateSnapshots::new(1);
+        let slot = snaps.reserve(1, 1024, "t1").unwrap();
+        snaps.commit(slot, 1, "t1");
+        snaps.tick();
+        snaps.pin(slot, "a");
+        assert_eq!(snaps.reserve(2, 2048, "b"), None, "read by another");
+        snaps.pin(slot, "b");
+        assert_eq!(snaps.reserve(2, 2048, "a"), None, "read by two");
+        assert_eq!(snaps.reserve(2, 2048, "b"), None, "read by two");
+        assert_eq!(snaps.ready_slot(1), Some(slot));
     }
 
     #[test]

@@ -2092,7 +2092,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             rec.snapshots.touch(slot);
         }
         if let Some((slot, _)) = plan.restore {
-            rec.snapshots.pin(slot);
+            rec.snapshots.pin(slot, request_id);
         }
         if plan.save_points.is_empty() {
             rec.save_points.remove(request_id);
