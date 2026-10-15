@@ -288,6 +288,9 @@ struct BlockSpace {
     high_water: usize,
     /// IDs in use (`ref_cnt > 0`), the null block excluded.
     used: usize,
+    /// `hybrid_kept` entries in this space. Only these can keep an allocation
+    /// in this space below its high-water mark.
+    kept: usize,
 }
 
 impl BlockSpace {
@@ -877,6 +880,7 @@ impl SimpleBlockTracker {
         }
         self.free_hybrid_blocks(grp.space, &removed);
         if !kept.is_empty() {
+            self.hybrid_spaces[grp.space].kept += kept.len();
             let slots: Vec<usize> = (kept.into_iter())
                 .map(|b| self.space_slot(grp.space, b))
                 .collect();
@@ -898,6 +902,7 @@ impl SimpleBlockTracker {
     fn free_kept(&mut self, slots: Vec<usize>) {
         for slot in slots {
             let (space, id) = self.slot_block(slot);
+            self.hybrid_spaces[space].kept -= 1;
             self.free_hybrid_blocks(space, &[id]);
         }
     }
@@ -926,16 +931,17 @@ impl SimpleBlockTracker {
     fn make_hybrid_room(&mut self, demand: &[usize], reuses: &[usize]) -> bool {
         let total: usize = demand.iter().sum();
         let failing = total > self.num_free_blocks;
-        let crossing: Vec<usize> = (0..demand.len())
-            .filter(|&s| demand[s] > self.hybrid_spaces[s].free_below_high_water())
-            .collect();
-        if !failing && crossing.is_empty() {
+        // A space's growth matters here only if kept blocks live in it.
+        let crossing_kept = |s: usize| {
+            let space = &self.hybrid_spaces[s];
+            space.kept > 0 && demand[s] > space.free_below_high_water()
+        };
+        if !failing && !(0..demand.len()).any(crossing_kept) {
             return true;
         }
         let released = self.releasable_kept();
-        let spaces_released =
-            |s: &usize| released.iter().any(|&slot| self.slot_block(slot).0 == *s);
-        if !failing && !crossing.iter().any(spaces_released) {
+        let spaces_released = |s: usize| released.iter().any(|&slot| self.slot_block(slot).0 == s);
+        if !failing && !(0..demand.len()).any(|s| crossing_kept(s) && spaces_released(s)) {
             return true;
         }
         let revived = reuses.iter().filter(|slot| released.contains(slot)).count();
@@ -1041,7 +1047,7 @@ impl SimpleBlockTracker {
         // Register full-block hashes (group-namespaced) for any NEWLY full,
         // in-window blocks so subsequent requests can hit them. Sliding NULL
         // slots are skipped, so an out-of-window block is never registered.
-        self.register_hybrid_hashes(request, &groups, &tables_clone);
+        self.register_hybrid_hashes(request);
         Some(tables_clone)
     }
 
@@ -1122,7 +1128,7 @@ impl SimpleBlockTracker {
         // Register fresh FULL-block hashes (group-namespaced) so later requests
         // can hit them. Sliding groups register only in-window blocks: a NULL
         // (out-of-window) slot is skipped, so no stale hash is recorded.
-        self.register_hybrid_hashes(request, groups, &tables);
+        self.register_hybrid_hashes(request);
 
         Some(tables)
     }
@@ -1171,21 +1177,27 @@ impl SimpleBlockTracker {
     /// tables. Each block is hashed once, when the request's tokens fill it,
     /// and registered once, when it is also allocated, as the uniform path's
     /// `seal` does: full groups register every full block; sliding groups only
-    /// blocks still in-window (NULL slots skipped).
-    fn register_hybrid_hashes(
-        &mut self,
-        request: &Request,
-        groups: &[SwaGroup],
-        tables: &[Vec<usize>],
-    ) {
+    /// blocks still in-window (NULL slots skipped). The tables are read in
+    /// place, so a step that fills no block costs a few lookups.
+    fn register_hybrid_hashes(&mut self, request: &Request) {
         if !self.enable_caching {
             return;
         }
+        let id = &request.request_id;
+        let (Some(groups), Some((tables, _))) =
+            (self.swa_groups.as_deref(), self.allocations.get(id))
+        else {
+            return;
+        };
         let all_tokens = &request.all_token_ids;
         let annotations = request.block_annotations.as_ref();
         let mm = request.mm_data.as_ref();
-        let mut req_hashes = (self.hybrid_req_hashes.remove(&request.request_id))
-            .unwrap_or_else(|| vec![GroupHashes::default(); groups.len()]);
+        let mut req_hashes = (self.hybrid_req_hashes.get_mut(id))
+            .map(std::mem::take)
+            .unwrap_or_default();
+        req_hashes.resize_with(groups.len(), GroupHashes::default);
+        // `(key, block, space_slot)` of each block to register.
+        let mut new_keys = Vec::new();
         for (g, grp) in groups.iter().enumerate() {
             let group = &mut req_hashes[g];
             self.extend_block_hashes(
@@ -1202,15 +1214,20 @@ impl SimpleBlockTracker {
                 if bid == Self::NULL_BLOCK {
                     continue; // out-of-window: never register (KV is gone)
                 }
-                let key = (g as u32, hash);
-                self.hybrid_hash_to_id.insert(key, bid);
-                let slot = self.space_slot(grp.space, bid);
-                self.hybrid_id_to_key.insert(slot, key);
+                new_keys.push(((g as u32, hash), bid, self.space_slot(grp.space, bid)));
             }
             group.registered = group.registered.max(ready);
         }
-        self.hybrid_req_hashes
-            .insert(request.request_id.clone(), req_hashes);
+        for (key, bid, slot) in new_keys {
+            self.hybrid_hash_to_id.insert(key, bid);
+            self.hybrid_id_to_key.insert(slot, key);
+        }
+        match self.hybrid_req_hashes.get_mut(id) {
+            Some(kept) => *kept = req_hashes,
+            None => {
+                self.hybrid_req_hashes.insert(id.clone(), req_hashes);
+            }
+        }
     }
 
     /// Hybrid prefix-cache lookup. Returns `(num_computed_tokens, per_group
@@ -1646,12 +1663,8 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // Hybrid: register group-namespaced hashes for every group's CURRENT
         // (in-window, non-null) full blocks. Out-of-window slots are NULL, so
         // they are never registered (their KV has been overwritten/freed).
-        if let Some(groups) = self.swa_groups.clone() {
-            let tables = match self.allocations.get(&request.request_id) {
-                Some((t, _)) => t.clone(),
-                None => return,
-            };
-            self.register_hybrid_hashes(request, &groups, &tables);
+        if self.swa_groups.is_some() {
+            self.register_hybrid_hashes(request);
             return;
         }
 
