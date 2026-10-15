@@ -2470,7 +2470,7 @@ fn gemma4_parse_one_call(text: &str, start: usize) -> Option<(String, String, us
 /// instead of the real special-token id, e.g. `< |channel>` for `<|channel>`.
 /// Newlines are excluded so an ordinary `<`…`>` span in prose or code split
 /// across a line break is never mistaken for a control token.
-fn gemma4_inline_ws(c: char) -> bool {
+pub(crate) fn gemma4_inline_ws(c: char) -> bool {
     c == ' ' || c == '\t'
 }
 
@@ -2481,7 +2481,14 @@ fn gemma4_inline_ws(c: char) -> bool {
 /// This recovers the whitespace variants the model emits when it writes a
 /// special token as text (`< |channel>`, `< channel|>`) rather than the exact
 /// token string, which a plain `find` / `replace` misses.
-fn gemma4_tolerant_find(text: &str, atoms: &[&str], from: usize) -> Option<(usize, usize)> {
+///
+/// Shared with the Gemma 4 reasoning parser, whose channel markers
+/// (`<|channel>` / `<channel|>`) are the same class of control token.
+pub(crate) fn gemma4_tolerant_find(
+    text: &str,
+    atoms: &[&str],
+    from: usize,
+) -> Option<(usize, usize)> {
     let first = atoms[0];
     let mut search = from;
     while let Some(rel) = text[search..].find(first) {

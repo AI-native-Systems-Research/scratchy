@@ -61,6 +61,7 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn user_msg_with_image(text: &str, image_base64: &str) -> ChatCompletionMessageP
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }
 }
 

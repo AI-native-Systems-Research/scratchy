@@ -284,6 +284,7 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }
 }
 

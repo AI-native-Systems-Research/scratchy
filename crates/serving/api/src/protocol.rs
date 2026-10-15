@@ -242,6 +242,12 @@ pub struct ChatCompletionMessageParam {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// The assistant's reasoning/thinking for this turn, when the client
+    /// round-trips what the server streamed (Anthropic `thinking` blocks) or
+    /// sends OpenAI-style `reasoning`/`reasoning_content`. Chat templates that
+    /// re-render thought (Gemma 4's channels) read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Chat completion request.

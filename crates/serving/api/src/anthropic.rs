@@ -45,6 +45,15 @@ pub enum ContentBlock {
     },
     #[serde(rename = "image")]
     Image { source: Value },
+    /// An extended-thinking block echoed back by the client (clients round-trip
+    /// what the server streamed). Mapped to the assistant message's `reasoning`
+    /// so the chat template re-renders it in the model's native thought format.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -154,6 +163,13 @@ pub struct MessagesRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub metadata: Option<Value>,
+    /// Anthropic thinking control. `{"type": "adaptive"}` (what Claude Code
+    /// sends) and `{"type": "enabled", …}` leave reasoning streamed back as
+    /// thinking blocks; only an explicit `{"type": "disabled"}` suppresses
+    /// them (the model still thinks server-side; its channels just stop
+    /// being surfaced).
+    #[serde(default)]
+    pub thinking: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +195,11 @@ pub struct MessagesResponse {
 pub enum ResponseContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    /// Extended thinking. The signature is synthetic (empty): a local model
+    /// has no cryptographic signature to carry, but the field is emitted
+    /// because clients round-trip thinking blocks verbatim.
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -273,6 +294,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         });
     }
 
@@ -289,10 +311,12 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning: None,
                 });
             }
             MessageContent::Blocks(blocks) => {
                 let mut text_parts = Vec::new();
+                let mut thinking_parts = Vec::new();
                 let mut tool_calls = Vec::new();
                 let mut tool_results: Vec<(String, String)> = Vec::new();
 
@@ -300,6 +324,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                     match block {
                         ContentBlock::Text { text, .. } => text_parts.push(text),
                         ContentBlock::Image { .. } => {}
+                        ContentBlock::Thinking { thinking, .. } => thinking_parts.push(thinking),
                         ContentBlock::ToolUse { id, name, input } => {
                             tool_calls.push(protocol::ToolCall {
                                 id,
@@ -339,6 +364,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                         name: None,
                         tool_calls: None,
                         tool_call_id: Some(tool_use_id),
+                        reasoning: None,
                     });
                 }
 
@@ -360,6 +386,7 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
                         name: None,
                         tool_calls: tc,
                         tool_call_id: None,
+                        reasoning: (!thinking_parts.is_empty()).then(|| thinking_parts.join("\n")),
                     });
                 }
             }
@@ -439,7 +466,12 @@ fn convert_request(req: MessagesRequest) -> protocol::ChatCompletionRequest {
         allowed_token_ids: None,
         bad_words: None,
         truncate_prompt_tokens: None,
-        include_reasoning: true,
+        include_reasoning: !req
+            .thinking
+            .as_ref()
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t == "disabled"),
         chat_template_kwargs: None,
     }
 }
@@ -466,6 +498,14 @@ fn convert_response(resp: protocol::ChatCompletionResponse) -> MessagesResponse 
     let (content, stop_reason) = match choice {
         Some(c) => {
             let mut blocks = Vec::new();
+
+            // Thinking comes first, mirroring the streamed block order.
+            if let Some(thinking) = c.message.reasoning.filter(|t| !t.is_empty()) {
+                blocks.push(ResponseContentBlock::Thinking {
+                    thinking,
+                    signature: String::new(),
+                });
+            }
 
             if let Some(text) = c.message.content.filter(|t| !t.is_empty()) {
                 blocks.push(ResponseContentBlock::Text { text });
@@ -901,6 +941,10 @@ pub async fn messages(
 #[derive(Clone, Copy)]
 enum BlockKind {
     Text,
+    /// An extended-thinking block. The signature is synthetic (empty): the
+    /// model is not Anthropic's, so there is no cryptographic signature to
+    /// carry — the field exists because clients round-trip it.
+    Thinking,
     /// A `tool_use` block, tagged with the originating OpenAI tool-call index so
     /// later argument fragments for the same call route to the same block.
     Tool {
@@ -956,6 +1000,18 @@ impl AnthropicSseEncoder {
     /// Close whatever block is currently open, if any.
     fn close_open(&mut self, events: &mut Vec<(&'static str, Value)>) {
         if let Some(b) = self.open.take() {
+            // A thinking block ends with its (here synthetic, empty)
+            // signature delta before the stop event.
+            if matches!(b.kind, BlockKind::Thinking) {
+                events.push((
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": b.index,
+                        "delta": { "type": "signature_delta", "signature": "" }
+                    }),
+                ));
+            }
             events.push((
                 "content_block_stop",
                 serde_json::json!({ "type": "content_block_stop", "index": b.index }),
@@ -1002,6 +1058,41 @@ impl AnthropicSseEncoder {
                 }),
             ));
             events.push(("ping", serde_json::json!({ "type": "ping" })));
+        }
+
+        // Reasoning rides on the same StreamDelta as the content split out of
+        // it, so handle it before (and independently of) the text/tool arms:
+        // a thinking block opened here is closed by whichever arm runs next.
+        if let Some(reasoning) = delta.reasoning.as_ref().filter(|r| !r.is_empty()) {
+            if !matches!(
+                self.open.as_ref().map(|b| b.kind),
+                Some(BlockKind::Thinking)
+            ) {
+                self.close_open(&mut events);
+                let bidx = self.next_index;
+                self.next_index += 1;
+                events.push((
+                    "content_block_start",
+                    serde_json::json!({
+                        "type": "content_block_start",
+                        "index": bidx,
+                        "content_block": { "type": "thinking", "thinking": "", "signature": "" }
+                    }),
+                ));
+                self.open = Some(OpenBlock {
+                    index: bidx,
+                    kind: BlockKind::Thinking,
+                });
+            }
+            let bidx = self.open.as_ref().map(|b| b.index).unwrap_or(0);
+            events.push((
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": bidx,
+                    "delta": { "type": "thinking_delta", "thinking": reasoning }
+                }),
+            ));
         }
 
         // Tool-call deltas and text deltas never arrive in the same `StreamDelta`
@@ -1312,6 +1403,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         assert_eq!(chat.messages.len(), 1);
@@ -1363,6 +1455,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         assert_eq!(chat.messages.len(), 2);
@@ -1391,6 +1484,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         match chat.stop.unwrap() {
@@ -1423,6 +1517,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         assert_eq!(chat.messages.len(), 1);
@@ -1453,6 +1548,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         assert_eq!(chat.messages.len(), 1);
@@ -1483,6 +1579,7 @@ mod tests {
             }]),
             tool_choice: None,
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         let tools = chat.tools.unwrap();
@@ -1509,6 +1606,7 @@ mod tests {
             tools: None,
             tool_choice: Some(Value::String("any".into())),
             metadata: None,
+            thinking: None,
         };
         let chat = convert_request(req);
         assert_eq!(chat.tool_choice, Some(Value::String("required".into())));

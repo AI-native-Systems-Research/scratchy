@@ -31,6 +31,7 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }
 }
 
@@ -155,6 +156,7 @@ async fn test_cuda_fp8_moe_multi_turn() {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     };
     let req2 = ChatCompletionRequest {
         messages: vec![user_msg("Hello"), assistant_msg, user_msg("How are you?")],

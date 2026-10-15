@@ -227,6 +227,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         });
     }
 
@@ -239,6 +240,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             });
         }
         ResponsesInput::Items(items) => {
@@ -262,6 +264,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
                             name: None,
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning: None,
                         });
                     }
                     InputItem::FunctionCall {
@@ -283,6 +286,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
                                 },
                             }]),
                             tool_call_id: None,
+                            reasoning: None,
                         });
                     }
                     InputItem::FunctionCallOutput { call_id, output } => {
@@ -292,6 +296,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
                             name: None,
                             tool_calls: None,
                             tool_call_id: Some(call_id.clone()),
+                            reasoning: None,
                         });
                     }
                 }

@@ -33,6 +33,7 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     }
 }
 
@@ -209,6 +210,7 @@ async fn test_cuda_fp8_qwen2_multi_turn() {
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning: None,
     };
     let req2 = ChatCompletionRequest {
         messages: vec![

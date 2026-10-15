@@ -428,6 +428,11 @@ struct TemplateMessageView<'a> {
     tool_calls: Option<Vec<TemplateToolCallView<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    /// The assistant's reasoning/thinking for the turn. Gemma 4's template
+    /// re-renders it as a thought channel (`message.get('reasoning')`), so
+    /// round-tripped thinking reaches the model in its native format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -475,6 +480,7 @@ impl<'a> TemplateMessageView<'a> {
             name: msg.name.as_deref(),
             tool_calls,
             tool_call_id: msg.tool_call_id.as_deref(),
+            reasoning: msg.reasoning.as_deref(),
         }
     }
 }
@@ -865,6 +871,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -952,6 +959,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         };
         let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
         assert_eq!(out, "[Hello]");
@@ -968,6 +976,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         };
         let tools = vec![protocol::ChatCompletionToolsParam {
             tool_type: "function".to_string(),
