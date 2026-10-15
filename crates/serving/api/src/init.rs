@@ -856,13 +856,16 @@ fn resolve_speculative_decoding(config: &VllmConfig) -> Result<Speculation> {
 }
 
 /// The target's multi-token-prediction head and where its tensors are, when this build compiled
-/// one for the target's checkpoint architecture and the target's config declares MTP layers: the
-/// target's own checkpoint when that holds tensors under the head's `checkpoint_prefix`
+/// one for the target's checkpoint architecture. The drafter a target drafts with by default when
+/// no checkpoint of the target carries it (Gemma 4's assistant, which Google ships only as a repo
+/// of its own) loads from the repo it is published as for the target's shape
+/// (`HeadRegistration::published_for`). A head the target's config declares MTP layers for loads
+/// from the target's own checkpoint when that holds tensors under the head's `checkpoint_prefix`
 /// ([`Draft::TargetHead`]) or names the sidecar file an MLX conversion stripped the head into
-/// (`mtp_file`), else the repo the head is published under, named from the target's
-/// (`HeadRegistration::repo_of`), when it resolves ([`Draft::Checkpoint`]). With neither the target
-/// serves without drafting, and says why — a build that compiles the head serves every checkpoint
-/// a build without it does.
+/// (`mtp_file`), else from the repo it is published under, named from the target's
+/// (`HeadRegistration::repo_of`). A published head drafts when its repo resolves
+/// ([`Draft::Checkpoint`]). With none the target serves without drafting, and says why — a build
+/// that compiles the head serves every checkpoint a build without it does.
 fn target_head(
     config: &VllmConfig,
 ) -> Result<Option<(scratchy_forward_compiler::HeadRegistration, Draft)>> {
@@ -875,6 +878,19 @@ fn target_head(
     .with_context(|| format!("resolving model path {:?}", config.model))?;
     let target = HfModelConfig::from_dir(&target_dir)
         .with_context(|| format!("reading config.json at {target_dir:?}"))?;
+    let arch = target.arch_hint().unwrap_or_default();
+    let head = scratchy_forward_compiler::head_of(arch);
+    let shape = (target.hidden_size().zip(target.num_hidden_layers())).map(
+        |(hidden_size, num_hidden_layers)| scratchy_forward_compiler::TargetShape {
+            hidden_size,
+            num_hidden_layers,
+        },
+    );
+    if let Some(head) = head
+        && let Some(repo) = shape.and_then(|shape| head.published_for(shape))
+    {
+        return Ok(published_head(config, head, repo.to_string()));
+    }
     // A multimodal checkpoint nests its language model's fields under `text_config`.
     let text = target.extra.get("text_config");
     let mtp_layers = (target.extra.get("mtp_num_hidden_layers"))
@@ -883,8 +899,7 @@ fn target_head(
     let Some(layers) = mtp_layers.filter(|&n| n > 0) else {
         return Ok(None);
     };
-    let arch = target.arch_hint().unwrap_or_default();
-    let Some(head) = scratchy_forward_compiler::head_of(arch) else {
+    let Some(head) = head else {
         info!(
             "spec-decode: {}'s checkpoint declares {layers} multi-token-prediction layer(s), but \
              this build compiled no head for {arch}; serving without drafting.",
@@ -916,6 +931,16 @@ fn target_head(
         );
         return Ok(None);
     };
+    Ok(published_head(config, head, repo))
+}
+
+/// `head` drafting from `repo`, the checkpoint it is published as apart from its target's, when
+/// that resolves; else none, and why.
+fn published_head(
+    config: &VllmConfig,
+    head: scratchy_forward_compiler::HeadRegistration,
+    repo: String,
+) -> Option<(scratchy_forward_compiler::HeadRegistration, Draft)> {
     let published = scratchy_serving_worker::worker_factory::resolve_model_path(
         &repo,
         config.hf_token.as_deref(),
@@ -923,7 +948,7 @@ fn target_head(
         None,
     );
     match published {
-        Ok(_) => Ok(Some((head, Draft::Checkpoint(repo)))),
+        Ok(_) => Some((head, Draft::Checkpoint(repo))),
         Err(e) => {
             info!(
                 "spec-decode: {}'s checkpoint carries no multi-token-prediction head, and {repo} \
@@ -931,7 +956,7 @@ fn target_head(
                  names one).",
                 config.model
             );
-            Ok(None)
+            None
         }
     }
 }

@@ -463,6 +463,20 @@ impl HfModelConfig {
             .or_else(|| self.text_config_usize("max_position_embeddings"))
     }
 
+    /// The text backbone's hidden size, falling through to nested `text_config` for composite
+    /// configs (gemma-4-26b keeps `hidden_size: 2816` only there).
+    pub fn hidden_size(&self) -> Option<usize> {
+        self.hidden_size
+            .or_else(|| self.text_config_usize("hidden_size"))
+    }
+
+    /// The text backbone's layer count, falling through to nested `text_config` for composite
+    /// configs (gemma-4-26b keeps `num_hidden_layers: 30` only there).
+    pub fn num_hidden_layers(&self) -> Option<usize> {
+        self.num_hidden_layers
+            .or_else(|| self.text_config_usize("num_hidden_layers"))
+    }
+
     /// Sliding-window size for SWA models (gemma2/3/4), falling through to
     /// nested `text_config` for composite configs (gemma-4-26b keeps
     /// `sliding_window: 1024` only there). `None` for full-attention models.

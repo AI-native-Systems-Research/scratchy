@@ -123,11 +123,16 @@
 //!   device, as a deferred step does, would let it queue behind that chunk.
 //! - TODO: the next step is scheduled once the host has read this one's tokens and drafts (#240:
 //!   pipelined cycles). Its inputs are on the device already.
-//! - TODO: choose `k` per bucket. `spec_drafts` (2) is one constant for every bucket, because the
+//! - TODO: choose `k` per bucket. `spec_drafts` is one constant for every bucket, because the
 //!   target's verify rows a sequence and its Gated-DeltaNet record areas are baked from it; a
-//!   bucket-specific `k` needs both sized to the largest. Greedy tokens a verify step at
-//!   k = 1 / 2 / 3 were 1.77 / 2.20 / 2.36 against the MLX oracle's 1.80 / 2.43 / 2.82, measured
-//!   before the fold fix that keeps an exported final hidden written (after a verify step that
+//!   bucket-specific `k` needs both sized to the largest. Gemma 4's assistant bakes 1, the
+//!   wall-clock winner despite the lower acceptance: its first draft's prose acceptance is a
+//!   coin flip (p1 0.42-0.69 across the M5 Max battery's chat rungs), so the second draft's
+//!   head forward and verify row cost more than they return — k = 2 lost 1-13% tokens/s on
+//!   every chat cell, its only win single-request patterned serve (+10%, on replies whose p1
+//!   is 0.92). Greedy tokens a verify step at k = 1 / 2 / 3 were 1.77 / 2.20 / 2.36 against
+//!   the MLX oracle's 1.80 / 2.43 / 2.82, measured before the fold fix that keeps an exported
+//!   final hidden written (after a verify step that
 //!   kept no draft, the second draft matched the oracle's 5 times in 23 before it, 28 in 28
 //!   after); k = 3 is not re-measured since.
 //! - Measured on Nemotron-3 Super 120B-A12B (OptiQ-2bit, its sidecar head; M5 Max, one request,
@@ -841,8 +846,8 @@ mod tests {
 
     /// A step's sequences each draft what its verify rows leave room for, at most the head's
     /// drafts, and nothing once one draft a sequence does not fit: Qwen3.6's head (2 drafts,
-    /// 8 rows) drafts 2 at 1–2 sequences, 1 at 3–4, none past 4; Gemma 4's assistant (2 drafts,
-    /// 3 rows) 2 at one sequence, none past it.
+    /// 8 rows) drafts 2 at 1–2 sequences, 1 at 3–4, none past 4; Gemma 4's assistant (1 draft,
+    /// 3 rows) 1 at one sequence, none past it.
     #[test]
     fn a_step_drafts_what_its_verify_rows_leave_room_for() {
         let qwen = DraftBudget {
@@ -854,11 +859,11 @@ mod tests {
         assert_eq!((qwen.max_seqs(), qwen.draft_rows(usize::MAX)), (4, 4));
         assert_eq!(qwen.draft_rows(1), 2, "a width of one drafts one sequence");
         let gemma = DraftBudget {
-            drafts: 2,
+            drafts: 1,
             verify_rows: 3,
         };
-        assert_eq!(at(gemma), [2, 0, 0, 0, 0, 0]);
-        assert_eq!((gemma.max_seqs(), gemma.draft_rows(usize::MAX)), (1, 2));
+        assert_eq!(at(gemma), [1, 0, 0, 0, 0, 0]);
+        assert_eq!((gemma.max_seqs(), gemma.draft_rows(usize::MAX)), (1, 1));
         for b in [qwen, gemma] {
             for c in 1..=8 {
                 assert!(c * (1 + b.drafts_at(c)) <= b.verify_rows || b.drafts_at(c) == 0);
