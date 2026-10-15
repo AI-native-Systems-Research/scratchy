@@ -450,6 +450,14 @@ impl SimpleBlockTracker {
             .unwrap_or(0)
     }
 
+    /// Free blocks in block space `space`. Every space holds the pool's
+    /// `total_blocks` (block 0 its null block): the worker sizes each store to
+    /// it, and one block of every store fits the KV budget, so a block of one
+    /// store never counts against another's.
+    fn space_free(&self, space: usize) -> usize {
+        self.total_blocks - 1 - self.hybrid_spaces[space].used
+    }
+
     /// Where block `id` of block space `space` keeps its per-block state
     /// (`ref_cnt`, `hybrid_id_to_key`).
     fn space_slot(&self, space: usize, id: usize) -> usize {
@@ -760,10 +768,10 @@ impl SimpleBlockTracker {
     }
 
     /// Pop `count` lowest free block IDs of block space `space` (hybrid path).
-    /// Returns `None` if the shared pool can't satisfy the request (callers
+    /// Returns `None` if the space can't satisfy the request (callers
     /// capacity-check first; this is the defensive guard).
     fn alloc_hybrid_fresh(&mut self, space: usize, count: usize) -> Option<Vec<usize>> {
-        if self.num_free_blocks < count {
+        if self.space_free(space) < count {
             return None;
         }
         let mut ids = Vec::with_capacity(count);
@@ -777,7 +785,6 @@ impl SimpleBlockTracker {
                 continue;
             }
             self.ref_cnt[slot] = 1;
-            self.num_free_blocks -= 1;
             let space_state = &mut self.hybrid_spaces[space];
             space_state.high_water = space_state.high_water.max(id);
             space_state.used += 1;
@@ -796,7 +803,7 @@ impl SimpleBlockTracker {
         Some(ids)
     }
 
-    /// Return `blocks` of block space `space` to the shared pool (hybrid path),
+    /// Return `blocks` of block space `space` to that space (hybrid path),
     /// skipping the null block. Freed IDs go back into the space's
     /// lowest-free-first heap so a sliding group reuses its own low IDs
     /// immediately — the bound on the max block ID.
@@ -809,7 +816,6 @@ impl SimpleBlockTracker {
             debug_assert!(self.ref_cnt[slot] > 0, "double-free of block {b}");
             self.ref_cnt[slot] -= 1;
             if self.ref_cnt[slot] == 0 {
-                self.num_free_blocks += 1;
                 let space_state = &mut self.hybrid_spaces[space];
                 space_state.used -= 1;
                 space_state.free_min.push(Reverse(b));
@@ -923,29 +929,39 @@ impl SimpleBlockTracker {
 
     /// The capacity check of both hybrid allocation paths: may an allocation
     /// take `demand[s]` free blocks of each block space `s`, `reuses` being the
-    /// `space_slot`s of the cached blocks it takes over? The kept windows are
-    /// released first when the allocation would otherwise fail, or reach past
-    /// the high-water mark of a space they hold blocks of, and releasing them
-    /// lets it fit. A reused block that only kept windows hold is a revival
-    /// once they are released, so it then counts against the pool too.
+    /// `space_slot`s of the cached blocks it takes over? Each space fits on its
+    /// own. The kept windows are released first when the allocation would
+    /// otherwise fail, or reach past the high-water mark of a space they hold
+    /// blocks of, and releasing them lets it fit. A reused block that only kept
+    /// windows hold is a revival once they are released, so it then counts
+    /// against its space too.
     fn make_hybrid_room(&mut self, demand: &[usize], reuses: &[usize]) -> bool {
-        let total: usize = demand.iter().sum();
-        let failing = total > self.num_free_blocks;
+        let spaces = 0..demand.len();
+        let failing = spaces.clone().any(|s| demand[s] > self.space_free(s));
         // A space's growth matters here only if kept blocks live in it.
         let crossing_kept = |s: usize| {
             let space = &self.hybrid_spaces[s];
             space.kept > 0 && demand[s] > space.free_below_high_water()
         };
-        if !failing && !(0..demand.len()).any(crossing_kept) {
+        if !failing && !spaces.clone().any(crossing_kept) {
             return true;
         }
         let released = self.releasable_kept();
-        let spaces_released = |s: usize| released.iter().any(|&slot| self.slot_block(slot).0 == s);
-        if !failing && !(0..demand.len()).any(|s| crossing_kept(s) && spaces_released(s)) {
+        // Per space: the blocks a release frees, and the reuses it turns into revivals.
+        let (mut freed, mut revived) = (vec![0usize; demand.len()], vec![0usize; demand.len()]);
+        for &slot in &released {
+            freed[self.slot_block(slot).0] += 1;
+        }
+        for &slot in reuses.iter().filter(|slot| released.contains(slot)) {
+            revived[self.slot_block(slot).0] += 1;
+        }
+        if !failing && !spaces.clone().any(|s| crossing_kept(s) && freed[s] > 0) {
             return true;
         }
-        let revived = reuses.iter().filter(|slot| released.contains(slot)).count();
-        if total + revived > self.num_free_blocks + released.len() {
+        if spaces
+            .clone()
+            .any(|s| demand[s] + revived[s] > self.space_free(s) + freed[s])
+        {
             return false;
         }
         self.release_kept_windows();
@@ -1167,7 +1183,6 @@ impl SimpleBlockTracker {
     fn touch_hybrid_block(&mut self, space: usize, block_id: usize) {
         let slot = self.space_slot(space, block_id);
         if self.ref_cnt[slot] == 0 {
-            self.num_free_blocks -= 1;
             self.hybrid_spaces[space].used += 1;
         }
         self.ref_cnt[slot] += 1;
@@ -1845,7 +1860,15 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         true
     }
 
+    /// On the hybrid path, the tightest block space's: it is the one that
+    /// limits what fits.
     fn num_free_blocks(&self) -> usize {
+        if self.swa_groups.is_some() {
+            return (0..self.hybrid_spaces.len())
+                .map(|s| self.space_free(s))
+                .min()
+                .unwrap_or(0);
+        }
         self.num_free_blocks
     }
 
@@ -1861,7 +1884,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if self.total_blocks == 0 {
             return 0.0;
         }
-        1.0 - self.num_free_blocks as f64 / self.total_blocks as f64
+        1.0 - KVCacheManagerOps::num_free_blocks(self) as f64 / self.total_blocks as f64
     }
 
     fn num_cached_blocks(&self) -> usize {
@@ -4298,23 +4321,29 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_global_apart_shares_one_budget() {
-        // Both stores draw on the one budget: a 128-token request takes 4 + 8 blocks of 63.
+    fn test_hybrid_global_apart_gives_each_store_the_pool() {
+        // Each store holds the pool's 63 blocks, and a block of one never counts against the
+        // other: a 128-token request takes 4 global + 8 sliding blocks, so 7 fit (56 sliding,
+        // 28 global) where one shared count of 63 fit 5. The 8th doesn't fit the sliding store.
         let mut t = caching_hybrid_apart(64, 1024);
-        for i in 0..5u32 {
+        let request = |i: u32| {
             let mut r = hybrid_req(&format!("r{i}"), 128);
             r.prompt_token_ids
                 .iter_mut()
                 .for_each(|tok| *tok += i * 1000);
             r.all_token_ids = r.prompt_token_ids.clone();
-            assert!(t.allocate_slots(&r, 128, 0, &[]).is_some());
+            r
+        };
+        for i in 0..7u32 {
+            assert!(t.allocate_slots(&request(i), 128, 0, &[]).is_some(), "r{i}");
         }
-        assert_eq!(t.num_free_blocks(), 3);
-        assert!(
-            t.allocate_slots(&hybrid_req("r5", 128), 128, 0, &[])
-                .is_none()
-        );
-        assert_eq!(t.num_free_blocks(), 3, "the failed allocation took nothing");
+        assert_eq!(t.num_free_blocks(), 63 - 56, "the sliding store's");
+        assert!(t.allocate_slots(&request(7), 128, 0, &[]).is_none());
+        assert_eq!(t.num_free_blocks(), 7, "the failed allocation took nothing");
+        for i in 0..7u32 {
+            t.free(&format!("r{i}"));
+        }
+        assert_eq!(t.num_free_blocks(), 63, "no leak/double-free");
     }
 
     #[test]
@@ -6238,7 +6267,13 @@ mod tests {
             async_scheduling: Some(true),
             ..Default::default()
         };
-        let pool = 2634usize;
+        // Shared, 12 requests' 20 global + 200 sliding blocks outgrow 2,633. Apart, each store
+        // holds the pool, so the sliding store alone must outgrow it: 12 × 160 fit at admission,
+        // 12 × 200 don't by the end of the replies.
+        let pool = match stores {
+            HybridKvStores::Shared => 2634usize,
+            HybridKvStores::GlobalApart => 2300,
+        };
         let mut tracker = SimpleBlockTracker::new(pool, 16);
         let mut groups = vec![(false, 0usize, 32usize)];
         groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
@@ -6598,6 +6633,28 @@ mod tests {
                 "{stores:?}: {computed} tokens for an ideal {ideal}"
             );
         }
+    }
+
+    #[test]
+    fn test_hybrid_global_apart_serves_long_contexts_without_preempting() {
+        // 4 users × 16,384/512 on the 32 GB box's pool. Counted against one shared pool, a
+        // request's 528 global blocks and its sliding groups' window plus a prefill chunk overran
+        // it: 94 preemptions, 2.36× the tokens recomputed. Each store holding the pool on its own,
+        // all four run together.
+        let cell = Cell {
+            users: 4,
+            prompts: 8,
+            prompt_len: 16_384,
+            reply_len: 512,
+        };
+        let run = run_317_cell(HybridKvStores::GlobalApart, true, 3406, cell);
+        let ideal = (cell.prompts * (cell.prompt_len + cell.reply_len - 1)) as usize;
+        assert_eq!(run.preemptions, 0);
+        assert!(
+            run.computed <= ideal,
+            "{} for an ideal {ideal}",
+            run.computed
+        );
     }
 
     #[test]
