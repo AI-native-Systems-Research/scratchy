@@ -15,9 +15,6 @@ use std::borrow::Cow;
 use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{Error, ErrorKind};
 
-#[cfg(test)]
-mod hf_renders;
-
 /// HuggingFace's parameters after the value, in positional order.
 const PARAMS: [&str; 4] = ["ensure_ascii", "indent", "separators", "sort_keys"];
 
@@ -349,8 +346,8 @@ fn type_error(detail: impl Into<Cow<'static, str>>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::hf_renders::{HF_TOJSON_ERRORS, HF_TOJSON_RENDERS};
     use crate::chat_template::ChatTemplate;
+    use crate::chat_template::hf_renders::{HF_TOJSON_ERRORS, HF_TOJSON_RENDERS};
 
     fn render(template: &str, tools: &str) -> Result<String, crate::error::ServeError> {
         // Parsed as a request's tool schema is, so the input keeps the key

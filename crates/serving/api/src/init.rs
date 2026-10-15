@@ -2005,7 +2005,9 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
     let chat_template = core
         .model_dir
         .as_deref()
-        .and_then(|dir| resolve_chat_template(config.chat_template.as_deref(), dir));
+        .map(|dir| resolve_chat_template(config.chat_template.as_deref(), dir))
+        .transpose()?
+        .flatten();
     let generation_defaults = load_generation_defaults(core.model_dir.as_deref());
     Ok(InitializedSyncStack {
         client: core.client,
@@ -2130,31 +2132,14 @@ pub fn initialize_stack(
     let model_name = core.model_name;
     let max_model_len = core.max_model_len;
 
-    let engine = if let Some(tokenizer) = core.tokenizer {
-        {
-            let chat_template = core
-                .model_dir
-                .as_ref()
-                .and_then(|dir| resolve_chat_template(config.chat_template.as_deref(), dir));
-            if let Some(tpl) = chat_template {
-                info!("Chat template loaded from tokenizer_config.json");
-                AsyncEngine::with_tokenizer_and_template(
-                    client,
-                    model_name.clone(),
-                    max_model_len,
-                    tokenizer,
-                    Arc::new(tpl),
-                )
-            } else {
-                info!("No chat template found, using plain concatenation");
-                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
-            }
-        }
-    } else {
-        AsyncEngine::new(client, model_name.clone(), max_model_len)
-    };
-
-    let mut engine = engine;
+    let mut engine = build_engine(
+        client,
+        model_name.clone(),
+        max_model_len,
+        core.tokenizer,
+        core.model_dir.as_deref(),
+        config.chat_template.as_deref(),
+    )?;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
     if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);
@@ -2492,32 +2477,14 @@ fn initialize_stack_multinode(
             .as_ref()
             .and_then(|dir| try_load_tokenizer(dir).ok());
 
-        let mut engine = if let Some(tok) = tokenizer {
-            let tokenizer = Arc::new(tok);
-            if let Some(ref dir) = model_dir {
-                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
-                    info!("Chat template loaded from tokenizer_config.json");
-                    AsyncEngine::with_tokenizer_and_template(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                        Arc::new(ct),
-                    )
-                } else {
-                    AsyncEngine::with_tokenizer(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                    )
-                }
-            } else {
-                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
-            }
-        } else {
-            AsyncEngine::new(client, model_name.clone(), max_model_len)
-        };
+        let mut engine = build_engine(
+            client,
+            model_name.clone(),
+            max_model_len,
+            tokenizer.map(Arc::new),
+            model_dir.as_deref(),
+            config.chat_template.as_deref(),
+        )?;
 
         if !config.disable_async_scheduling && !speculation.requires_sync() {
             engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
@@ -3068,37 +3035,14 @@ fn initialize_stack_tp_pp(
                 .as_ref()
                 .and_then(|dir| try_load_tokenizer(dir).ok());
 
-            let mut engine = if let Some(tok) = tokenizer {
-                let tokenizer = Arc::new(tok);
-                if let Some(ref dir) = model_dir {
-                    if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
-                        info!("Chat template loaded from tokenizer_config.json");
-                        AsyncEngine::with_tokenizer_and_template(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                            Arc::new(ct),
-                        )
-                    } else {
-                        AsyncEngine::with_tokenizer(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                        )
-                    }
-                } else {
-                    AsyncEngine::with_tokenizer(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                    )
-                }
-            } else {
-                AsyncEngine::new(client, model_name.clone(), max_model_len)
-            };
+            let mut engine = build_engine(
+                client,
+                model_name.clone(),
+                max_model_len,
+                tokenizer.map(Arc::new),
+                model_dir.as_deref(),
+                config.chat_template.as_deref(),
+            )?;
 
             if false {
                 // PP: sync scheduling forced
@@ -3428,32 +3372,14 @@ fn initialize_stack_tp(
             })
         });
 
-        let mut engine = if let Some(tok) = tokenizer {
-            let tokenizer = Arc::new(tok);
-            if let Some(ref dir) = model_dir {
-                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
-                    info!("Chat template loaded from tokenizer_config.json");
-                    AsyncEngine::with_tokenizer_and_template(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                        Arc::new(ct),
-                    )
-                } else {
-                    AsyncEngine::with_tokenizer(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                    )
-                }
-            } else {
-                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
-            }
-        } else {
-            AsyncEngine::new(client, model_name.clone(), max_model_len)
-        };
+        let mut engine = build_engine(
+            client,
+            model_name.clone(),
+            max_model_len,
+            tokenizer.map(Arc::new),
+            model_dir.as_deref(),
+            config.chat_template.as_deref(),
+        )?;
 
         if !config.disable_async_scheduling && !speculation.requires_sync() {
             engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
@@ -3813,32 +3739,14 @@ fn initialize_stack_external(
             .as_ref()
             .and_then(|dir| try_load_tokenizer(dir).ok());
 
-        let mut engine = if let Some(tok) = tokenizer {
-            let tokenizer = Arc::new(tok);
-            if let Some(ref dir) = model_dir {
-                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
-                    info!("Chat template loaded from tokenizer_config.json");
-                    AsyncEngine::with_tokenizer_and_template(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                        Arc::new(ct),
-                    )
-                } else {
-                    AsyncEngine::with_tokenizer(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                    )
-                }
-            } else {
-                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
-            }
-        } else {
-            AsyncEngine::new(client, model_name.clone(), max_model_len)
-        };
+        let mut engine = build_engine(
+            client,
+            model_name.clone(),
+            max_model_len,
+            tokenizer.map(Arc::new),
+            model_dir.as_deref(),
+            config.chat_template.as_deref(),
+        )?;
 
         if !config.disable_async_scheduling && !speculation.requires_sync() {
             engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
@@ -3918,55 +3826,83 @@ fn patch_additional_special_tokens(tok: &mut Tokenizer, model_dir: &Path) {
 /// names a readable file; otherwise treated as inline Jinja. This
 /// covers `--chat-template /path/to/tokenizer_config.json` as well
 /// as raw template strings.
+///
+/// `Ok(None)` only when there is no template to use. A template that is
+/// there but fails to load — the override or the model's own — is an
+/// error: serving on without it would render every prompt by plain
+/// concatenation, a format the model was never trained on.
 pub(crate) fn resolve_chat_template(
     override_str: Option<&str>,
     model_dir: &Path,
-) -> Option<ChatTemplate> {
-    if let Some(s) = override_str {
-        let trimmed = s.trim();
-        let from_path = std::path::Path::new(trimmed);
-        let raw: Option<String> = if from_path.is_file() {
-            // Either a .jinja template or a tokenizer_config.json. If
-            // the file parses as JSON with a `chat_template` field,
-            // use that; otherwise treat the file body as raw Jinja.
-            std::fs::read_to_string(from_path).ok().map(|body| {
-                match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(v) => v
-                        .get("chat_template")
-                        .and_then(|x| x.as_str().map(String::from))
-                        .unwrap_or(body),
-                    Err(_) => body,
-                }
-            })
-        } else {
-            Some(trimmed.to_string())
-        };
-        if let Some(template_str) = raw {
-            match ChatTemplate::new(template_str) {
-                Ok(mut tpl) => {
-                    // GGUFs almost always lack bos/eos at the
-                    // template-string level — the original
-                    // tokenizer_config.json renders them via
-                    // `{{- bos_token }}` / `{{ eos_token }}`. When the
-                    // override is paired with a GGUF, pull bos/eos
-                    // from the file's metadata (same path the
-                    // auto-detect branch uses) so an operator-supplied
-                    // template still gets the right special tokens.
-                    if let Some(gguf_path) = gguf_in_or_under(model_dir)
-                        && let Ok(gguf) = scratchy_quantizations::gguf::GgufFile::open(&gguf_path)
-                    {
-                        tpl = apply_gguf_special_tokens(&gguf, tpl);
-                    }
-                    info!("Chat template loaded from --chat-template override");
-                    return Some(tpl);
-                }
-                Err(e) => {
-                    info!("Failed to parse --chat-template override: {e}");
-                }
-            }
+) -> Result<Option<ChatTemplate>> {
+    let Some(s) = override_str else {
+        return try_load_chat_template(model_dir);
+    };
+    let trimmed = s.trim();
+    let from_path = std::path::Path::new(trimmed);
+    let template_str = if from_path.is_file() {
+        // Either a .jinja template or a tokenizer_config.json. If
+        // the file parses as JSON with a `chat_template` field,
+        // use that; otherwise treat the file body as raw Jinja.
+        let body = std::fs::read_to_string(from_path)
+            .with_context(|| format!("reading --chat-template {}", from_path.display()))?;
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => v
+                .get("chat_template")
+                .and_then(|x| x.as_str().map(String::from))
+                .unwrap_or(body),
+            Err(_) => body,
         }
+    } else {
+        trimmed.to_string()
+    };
+    let mut tpl = ChatTemplate::new(template_str).context("the --chat-template override")?;
+    // GGUFs almost always lack bos/eos at the template-string level —
+    // the original tokenizer_config.json renders them via
+    // `{{- bos_token }}` / `{{ eos_token }}`. When the override is paired
+    // with a GGUF, pull bos/eos from the file's metadata (same path the
+    // auto-detect branch uses) so an operator-supplied template still
+    // gets the right special tokens.
+    if let Some(gguf_path) = gguf_in_or_under(model_dir)
+        && let Ok(gguf) = scratchy_quantizations::gguf::GgufFile::open(&gguf_path)
+    {
+        tpl = apply_gguf_special_tokens(&gguf, tpl);
     }
-    try_load_chat_template(model_dir)
+    info!("Chat template loaded from --chat-template override");
+    Ok(Some(tpl))
+}
+
+/// The serving engine over `client`: with the model's tokenizer when it has
+/// one, and then with its chat template ([`resolve_chat_template`]) when it
+/// has one of those too.
+fn build_engine(
+    client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send>,
+    model_name: String,
+    max_model_len: usize,
+    tokenizer: Option<Arc<Tokenizer>>,
+    model_dir: Option<&Path>,
+    chat_template_override: Option<&str>,
+) -> Result<AsyncEngine> {
+    let Some(tokenizer) = tokenizer else {
+        return Ok(AsyncEngine::new(client, model_name, max_model_len));
+    };
+    let chat_template = model_dir
+        .map(|dir| resolve_chat_template(chat_template_override, dir))
+        .transpose()?
+        .flatten();
+    Ok(match chat_template {
+        Some(template) => AsyncEngine::with_tokenizer_and_template(
+            client,
+            model_name,
+            max_model_len,
+            tokenizer,
+            Arc::new(template),
+        ),
+        None => {
+            info!("No chat template found, using plain concatenation");
+            AsyncEngine::with_tokenizer(client, model_name, max_model_len, tokenizer)
+        }
+    })
 }
 
 /// Helper used by both `resolve_chat_template` and `try_load_chat_template`:
@@ -4012,29 +3948,26 @@ fn apply_gguf_special_tokens(
     tpl
 }
 
-/// Try to load a chat template. Sources tried, in order:
-/// 1. `model_dir/tokenizer_config.json` (HF convention).
-/// 2. `model_dir/chat_template.jinja` (some quantized repos).
-/// 3. `tokenizer.chat_template` metadata in a `.gguf` file —
+/// Load the chat template the model ships. Sources tried, in order:
+/// 1. `tokenizer.chat_template` metadata in a `.gguf` file —
 ///    handles both `model_dir` being a `.gguf` file directly and
 ///    a directory containing one.
-fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
+/// 2. `tokenizer_config.json` (HF convention), or the
+///    `chat_template.jinja` beside it (Gemma 4, some quantized repos).
+///
+/// `Ok(None)` when no source carries a template; one that fails to load
+/// is an error.
+fn try_load_chat_template(model_dir: &Path) -> Result<Option<ChatTemplate>> {
     // GGUF: read from metadata. Try direct file, then look for any
     // .gguf file in the directory.
     if let Some(gguf_path) = gguf_in_or_under(model_dir)
         && let Ok(gguf) = scratchy_quantizations::gguf::GgufFile::open(&gguf_path)
         && let Some(template_str) = scratchy_quantizations::gguf::gguf_chat_template(&gguf)
     {
-        match ChatTemplate::new(template_str) {
-            Ok(tpl) => {
-                let tpl = apply_gguf_special_tokens(&gguf, tpl);
-                info!("Chat template loaded from GGUF metadata");
-                return Some(tpl);
-            }
-            Err(e) => {
-                info!("Failed to parse GGUF chat_template: {e}");
-            }
-        }
+        let tpl = ChatTemplate::new(template_str)
+            .with_context(|| format!("the chat template in {}", gguf_path.display()))?;
+        info!("Chat template loaded from GGUF metadata");
+        return Ok(Some(apply_gguf_special_tokens(&gguf, tpl)));
     }
 
     // Bare .gguf file path with no template in metadata: fall through to
@@ -4047,39 +3980,12 @@ fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     };
     let model_dir = probe_dir.as_ref();
 
-    let config_path = model_dir.join("tokenizer_config.json");
-    match ChatTemplate::from_tokenizer_config(&config_path) {
-        Ok(Some(tpl)) => Some(tpl),
-        Ok(None) => {
-            // Fallback: some models (e.g. AWQ quantized) store the template in a
-            // separate Jinja file instead of embedding it in tokenizer_config.json.
-            let jinja_path = model_dir.join("chat_template.jinja");
-            if jinja_path.exists() {
-                match std::fs::read_to_string(&jinja_path) {
-                    Ok(template_str) => match ChatTemplate::new(template_str) {
-                        Ok(tpl) => {
-                            info!("Chat template loaded from chat_template.jinja");
-                            Some(tpl)
-                        }
-                        Err(e) => {
-                            info!("Failed to parse chat_template.jinja: {e}");
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        info!("Failed to read chat_template.jinja: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-        Err(e) => {
-            info!("Failed to parse chat template: {e}");
-            None
-        }
+    let tpl = ChatTemplate::from_tokenizer_config(&model_dir.join("tokenizer_config.json"))
+        .with_context(|| format!("the chat template in {}", model_dir.display()))?;
+    if tpl.is_some() {
+        info!("Chat template loaded from {}", model_dir.display());
     }
+    Ok(tpl)
 }
 
 /// Compute the number of KV cache blocks from available memory.
@@ -4689,5 +4595,51 @@ mod tests {
                 assert_eq!(env.world_size, 1);
             },
         );
+    }
+
+    /// A template that will not compile, in each place one comes from.
+    const BROKEN_TEMPLATE: &str = "{% for m in messages %}{{ m.content }}";
+
+    /// No template anywhere is the one case that serves by plain
+    /// concatenation; a model that ships a template it cannot load does not
+    /// start on it silently.
+    #[test]
+    fn test_resolve_chat_template_refuses_a_template_that_fails_to_load() {
+        let none = tempfile::tempdir().unwrap();
+        assert!(resolve_chat_template(None, none.path()).unwrap().is_none());
+
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("tokenizer_config.json"),
+            serde_json::json!({ "chat_template": BROKEN_TEMPLATE }).to_string(),
+        )
+        .unwrap();
+        assert!(resolve_chat_template(None, config.path()).is_err());
+
+        let jinja = tempfile::tempdir().unwrap();
+        std::fs::write(jinja.path().join("chat_template.jinja"), BROKEN_TEMPLATE).unwrap();
+        assert!(resolve_chat_template(None, jinja.path()).is_err());
+
+        assert!(resolve_chat_template(Some(BROKEN_TEMPLATE), none.path()).is_err());
+    }
+
+    /// An empty embedded `chat_template` falls through to the
+    /// `chat_template.jinja` beside it, as a missing one does.
+    #[test]
+    fn test_resolve_chat_template_reads_the_jinja_beside_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "", "bos_token": "<s>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+        let template = resolve_chat_template(None, dir.path()).unwrap().unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+        assert_eq!(template.apply(&messages, false, None).unwrap(), "<s>hi");
     }
 }
