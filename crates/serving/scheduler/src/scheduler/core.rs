@@ -1058,9 +1058,10 @@ impl SimpleBlockTracker {
         for &slot in reuses.iter().filter(|&&slot| self.kept_only(slot)) {
             revived[self.slot_block(slot).0] += 1;
         }
-        if spaces.clone().any(|s| {
-            demand[s] + revived[s] > self.space_free(s) + self.hybrid_spaces[s].kept_only
-        }) {
+        if spaces
+            .clone()
+            .any(|s| demand[s] + revived[s] > self.space_free(s) + self.hybrid_spaces[s].kept_only)
+        {
             return false;
         }
         self.release_kept_windows();
@@ -4805,7 +4806,10 @@ mod tests {
                 "{stores:?} test setup: caching keeps the prompt's window in the tightest store"
             );
             for (i, (c, u)) in cached.iter().zip(&uncached).enumerate() {
-                assert_eq!(c.0, u.0, "{stores:?} free blocks reported at reply token {i}");
+                assert_eq!(
+                    c.0, u.0,
+                    "{stores:?} free blocks reported at reply token {i}"
+                );
             }
         }
     }
