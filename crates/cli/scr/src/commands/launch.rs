@@ -306,8 +306,10 @@ fn pinned_output_budget(window: usize) -> Option<u32> {
 /// the user's file still wins.
 fn claude_code_output_budget(user: Option<&str>, window: Option<usize>) -> (Option<u32>, String) {
     let user = user.map(str::trim).filter(|raw| !raw.is_empty());
-    // The user's own value always wins, in either direction.
-    if let Some(n) = user.and_then(|raw| raw.parse::<u32>().ok().filter(|n| *n > 0)) {
+    // The user's own value always wins, in either direction — when it is a
+    // budget at all: zero does not parse as one.
+    if let Some(n) = user.and_then(|raw| raw.parse::<std::num::NonZeroU32>().ok()) {
+        let n = n.get();
         return (
             Some(n),
             format!(", reply budget: {n} tokens from CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
