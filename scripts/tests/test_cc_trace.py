@@ -657,11 +657,22 @@ class ReplayTest(unittest.TestCase):
         # 5 turns plus the reset, which the engine did count.
         self.assertEqual(detail["sent"], 6)
 
-    def test_zero_tokens_and_4xx_void_the_run(self):
+    def test_empty_turns_and_4xx_void_the_run(self):
         cases = {
             "zero output tokens": lambda body: [
                 (0, _ev("message_start", message={"usage": {"input_tokens": 9}})),
                 (0, _ev("message_delta", usage={"output_tokens": 0})), (0, _ev("message_stop"))],
+            # Tokens reported, nothing delivered: the empty tool call of #498.
+            "no content: the engine reported 1 output tokens": lambda body: [
+                (0, _ev("message_start", message={"usage": {"input_tokens": 100}})),
+                (0, _ev("content_block_start", index=0, content_block={
+                    "type": "tool_use", "id": "call_1", "name": "", "input": {}})),
+                (0, _ev("content_block_delta", index=0,
+                        delta={"type": "input_json_delta", "partial_json": ""})),
+                (0, _ev("content_block_stop", index=0)),
+                (0, _ev("message_delta", delta={"stop_reason": "tool_use"},
+                        usage={"output_tokens": 1})),
+                (0, _ev("message_stop"))],
             "HTTP 400": lambda body: 400 if len(body["messages"]) > 3 else _stream(),
         }
         for want, reply in cases.items():

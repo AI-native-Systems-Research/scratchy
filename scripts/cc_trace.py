@@ -45,8 +45,9 @@ job, not this tool's. A run that cannot be trusted is written with
 `status: "void"` and the reason, and exits non-zero. That covers a session
 too long for the engine's context window, a request counter that disagrees
 with what was sent, a prefix cache that survived its reset, and a turn that
-returned no tokens, timed out, answered 4xx, was cut short at max_tokens, or
-counted a prompt shorter than the recording's by more than the tolerance.
+returned no tokens or no content, timed out, answered 4xx, was cut short at
+max_tokens, or counted a prompt shorter than the recording's by more than the
+tolerance.
 Standard library only.
 """
 
@@ -609,9 +610,14 @@ def time_stream(lines, t_sent):
     if t_stop is None:
         raise TurnFailed("stream ended without message_stop")
     out = usage.get("output_tokens") or 0
-    if out <= 0 or not deltas:
+    if out <= 0:
         # A dead worker behind a live HTTP layer looks exactly like this (#413).
         raise TurnFailed(f"zero output tokens (output_tokens={out}, {len(deltas)} content deltas)")
+    if not deltas:
+        # Tokens were reported but nothing reached the client: an empty reply,
+        # or a tool call streamed with no name and no arguments (#498).
+        raise TurnFailed(f"no content: the engine reported {out} output tokens but streamed no "
+                         "text, tool arguments or thinking")
     # A reply that arrives in one delta has no decode interval to measure. Its
     # TPOT would read as 0 and flatter an engine that buffers its output, so it
     # has none, the way bench_serve_compare.sh leaves unstreamed requests out.
