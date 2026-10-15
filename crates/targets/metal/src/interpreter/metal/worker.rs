@@ -510,29 +510,26 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .map_err(|_| WorkerError::BufferAlloc { what, bytes }),
             false => alloc(bytes, mode, what).map(Activation::Full),
         };
-        // Need `i`'s lent buffer, where one holds it; else it is allocated.
+        // Need `i`'s lent buffer, where one holds it and, for a need the host reads (`host`), the
+        // host can read it too (`lend_readable`: no sparse one); else it is allocated. The budget
+        // prices a borrower by the same rule.
         fn place<'a>(
             needs: &[u64],
             from: &'a [Activation],
+            host: impl Fn(usize) -> bool,
         ) -> impl Fn(usize) -> Option<Activation> + 'a {
             use crate::interpreter::metal::__re::MTLBuffer as _;
             let lengths: Vec<u64> = from.iter().map(|a| a.buffer().length() as u64).collect();
-            let lent = scratchy_core_common::lend::lend(needs, &lengths);
+            let readable = |j: usize| matches!(from[j], Activation::Full(_));
+            let lent = scratchy_core_common::lend::lend_readable(needs, &lengths, host, readable);
             move |i| lent[i].map(|j| from[j].clone())
         }
         // Shared storage so test code can seed/inspect arena contents without staging copies, and
         // so the host can read the slots it reads by pointer; dispatch-bound buffers are fine in
-        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode. A slot the
-        // host reads takes no lent sparse buffer: the host cannot read one.
-        let lent_slot = place(arena_layout, &lent.arena);
+        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode.
+        let lent_slot = place(arena_layout, &lent.arena, host_read);
         let arena_activation: Vec<Activation> = (arena_layout.iter().enumerate())
             .map(|(i, &size)| match lent_slot(i) {
-                Some(Activation::Sparse(_)) if host_read(i) => make(
-                    size,
-                    MTLResourceOptions::StorageModeShared,
-                    false,
-                    "arena slot",
-                ),
                 Some(activation) => Ok(activation),
                 None => make(
                     size,
@@ -569,7 +566,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .max();
             max.map_or(0, u64::from)
         });
-        let lent_scratch = place(&sizes, &lent.scratch);
+        let lent_scratch = place(&sizes, &lent.scratch, |_| false);
         let private = MTLResourceOptions::StorageModePrivate;
         let scratch = |i: usize, what| match lent_scratch(i) {
             Some(activation) => Ok(Some(activation)),
