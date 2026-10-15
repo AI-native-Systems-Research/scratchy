@@ -113,6 +113,23 @@ impl KvAddressing {
     }
 }
 
+/// WHERE A HYBRID SLIDING-WINDOW MODEL'S GLOBAL GROUP KEEPS ITS KV — declared by the worker, asked once
+/// when the engine builds the block tracker.
+///
+/// A worker maps each KV store's memory through the highest block ID that store is addressed with, and
+/// keeps it mapped. Groups whose blocks live in one store must share one ID space; a group whose KV lives
+/// in a store of its own gets an ID space of its own, or each store maps the IDs only the other uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum HybridKvStores {
+    /// Every group's blocks are pages of one shared pool. The default.
+    #[default]
+    Shared,
+    /// The global (full-attention) group's KV lives in a store of its own — metal's TurboQuant store,
+    /// mapped through the global group's highest block — and the sliding groups' in the shared pool,
+    /// mapped through theirs.
+    GlobalApart,
+}
+
 /// ⭐⭐⭐ SLOTS APPENDED SINCE THE REPORT WAS MADE — how far a [`KvExtent`] has aged.
 ///
 /// 🛑 **A REPORT IS A MEASUREMENT OF A PAST STEP, AND UNDER ASYNC SCHEDULING THE STEP BEING SCHEDULED IS

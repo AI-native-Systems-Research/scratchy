@@ -5841,19 +5841,24 @@ impl Worker for MetalWorker {
         // borrow of `attn` is held across the `&mut self` grow call.
         #[cfg(feature = "metal")]
         {
-            // Cover BOTH groups' block IDs — the sliding ring draws from the
-            // same shared pool, so a sliding ID can sit in a chunk the full
-            // group never reached; an ungrown chunk has a stale address-table
-            // entry and would fault on the sliding-layer write.
+            // Cover every block ID the shared pool is addressed with: the
+            // sliding groups', and the full group's unless its KV lives in a
+            // store of its own (`hybrid_kv_stores`). An ungrown chunk has a
+            // stale address-table entry and would fault on the write.
             let max_full_block = attn.block_ids.iter().flatten().copied().max();
-            let max_block = attn
+            let max_sliding_block = attn
                 .sliding_groups
                 .iter()
                 .flatten()
                 .flatten()
                 .copied()
-                .max()
-                .max(max_full_block);
+                .max();
+            let max_block = match self.hybrid_kv_stores() {
+                scratchy_core_common::HybridKvStores::Shared => {
+                    max_sliding_block.max(max_full_block)
+                }
+                scratchy_core_common::HybridKvStores::GlobalApart => max_sliding_block,
+            };
             self.grow_metal_kv_to_cover(max_block.unwrap_or(0), max_full_block.unwrap_or(0))?;
         }
 
@@ -7210,6 +7215,24 @@ impl Worker for MetalWorker {
 
     fn pipelines_speculative_steps(&self) -> bool {
         self.mtp_drafter.is_some() && self.select_rows_kernel.is_some()
+    }
+
+    /// TurboQuant codes a hybrid model's global layers into stores of their own: packed codes, norms
+    /// and an fp16 scratch, bound at each global layer's `kv_cache_k/v` and mapped through group 0's
+    /// blocks (`build_tq_provision`). The shared pool then backs the sliding layers alone — unless a
+    /// head reading its target's KV is not TurboQuant itself, and so reads the target's global layer
+    /// from the shared pool at group 0's blocks (a coded one binds its target's stores).
+    fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
+        let coded =
+            |m: &dyn scratchy_forward_compiler::ScratchyWeights| m.kv_codec().is_turboquant();
+        let target_coded = self.model.as_deref().is_some_and(coded);
+        let head_coded =
+            !self.head_reads_target_kv() || self.draft_model.as_deref().is_some_and(coded);
+        if self.kv_is_hybrid && target_coded && head_coded {
+            scratchy_core_common::HybridKvStores::GlobalApart
+        } else {
+            scratchy_core_common::HybridKvStores::Shared
+        }
     }
 }
 

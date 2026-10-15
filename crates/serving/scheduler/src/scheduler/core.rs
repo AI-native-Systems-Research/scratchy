@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use scratchy_core_common::multimodal::MultimodalData;
-use scratchy_core_common::{BlockKind, Request, RequestStatus};
+use scratchy_core_common::{BlockKind, HybridKvStores, Request, RequestStatus};
 use scratchy_core_config::{SchedulerConfig, SchedulerPolicy, SpansConfig};
 use tracing::warn;
 
@@ -213,8 +213,11 @@ pub struct SimpleBlockTracker {
     /// load-bearing adaptation to scratchy's substrate: lockstep
     /// `grow_to_cover` residency is keyed on the max block ID, so an unbounded
     /// (FIFO, free-to-back) ID would commit the whole pool resident and
-    /// re-create the OOM this project exists to fix. Empty on the non-SWA path.
-    free_min: BinaryHeap<Reverse<usize>>,
+    /// re-create the OOM this project exists to fix. One heap per block space
+    /// (`SwaGroup::space`), each numbering its own blocks; empty on the non-SWA
+    /// path. Per-block state (`ref_cnt`, `hybrid_id_to_key`) is indexed by
+    /// `space_slot`.
+    free_min: Vec<BinaryHeap<Reverse<usize>>>,
 
     /// Hybrid prefix cache: namespaced per group. `(group_id, block_hash) ->
     /// block_id`. A full group and a sliding group with identical token content
@@ -223,7 +226,7 @@ pub struct SimpleBlockTracker {
     /// Only used on the hybrid path; empty otherwise.
     hybrid_hash_to_id: HashMap<(u32, u64), usize>,
 
-    /// Reverse map for lazy eviction on the hybrid path: `block_id ->
+    /// Reverse map for lazy eviction on the hybrid path: `space_slot ->
     /// (group_id, block_hash)`. A block belongs to exactly one group's table at
     /// a time, so a single reverse entry suffices.
     hybrid_id_to_key: HashMap<usize, (u32, u64)>,
@@ -246,6 +249,16 @@ struct SwaGroup {
     /// group = 32, sliding groups = 16) so every group draws from the one
     /// shared pool.
     block_size: usize,
+    /// The block space this group's IDs number: the store its KV lives in
+    /// (`HybridKvStores`). Groups in one store share a space.
+    space: usize,
+}
+
+impl SwaGroup {
+    /// The global group — the (first) full group, else group 0.
+    fn global_index(groups: &[SwaGroup]) -> usize {
+        groups.iter().position(|g| !g.is_sliding).unwrap_or(0)
+    }
 }
 
 impl SimpleBlockTracker {
@@ -268,7 +281,7 @@ impl SimpleBlockTracker {
             req_to_hashes: HashMap::new(),
             spans_config: SpansConfig::from_env(),
             swa_groups: None,
-            free_min: BinaryHeap::new(),
+            free_min: Vec::new(),
             hybrid_hash_to_id: HashMap::new(),
             hybrid_id_to_key: HashMap::new(),
             hybrid_req_hashes: HashMap::new(),
@@ -294,7 +307,18 @@ impl SimpleBlockTracker {
     /// (full group fully cached + each sliding group's in-window suffix cached,
     /// min P across groups), and relocatable spans store K/V unrotated so a
     /// sliding group's reuse is valid (re-rope on read at the kernel).
-    pub fn enable_hybrid(&mut self, num_blocks: usize, groups: Vec<(bool, usize, usize)>) {
+    ///
+    /// `stores` says which groups' KV shares memory: under
+    /// [`HybridKvStores::GlobalApart`] the global group numbers its blocks in a
+    /// space of its own, so neither store is mapped for the other's blocks. The
+    /// spaces share the one `num_blocks` budget; each reserves its own block 0
+    /// as its null block.
+    pub fn enable_hybrid(
+        &mut self,
+        num_blocks: usize,
+        groups: Vec<(bool, usize, usize)>,
+        stores: HybridKvStores,
+    ) {
         assert!(
             num_blocks >= 2,
             "enable_hybrid: need >= 2 blocks (null + data)"
@@ -307,22 +331,30 @@ impl SimpleBlockTracker {
                 "enable_hybrid: sliding group needs window > 0"
             );
         }
+        let mut groups: Vec<SwaGroup> = groups
+            .into_iter()
+            .map(|(is_sliding, window, block_size)| SwaGroup {
+                is_sliding,
+                window,
+                block_size,
+                space: 0,
+            })
+            .collect();
+        if stores == HybridKvStores::GlobalApart {
+            let global = SwaGroup::global_index(&groups);
+            groups[global].space = 1;
+        }
+        let num_spaces = groups.iter().map(|g| g.space + 1).max().unwrap_or(1);
         self.total_blocks = num_blocks;
-        self.ref_cnt = vec![0; num_blocks];
-        // Block 0 = null (held out of the free set); data blocks are 1..num_blocks.
-        self.free_min = (1..num_blocks).map(Reverse).collect();
+        self.ref_cnt = vec![0; num_spaces * num_blocks];
+        // Block 0 of each space = null (held out of the free set); data blocks
+        // are 1..num_blocks.
+        self.free_min = (0..num_spaces)
+            .map(|_| (1..num_blocks).map(Reverse).collect())
+            .collect();
         self.num_free_blocks = num_blocks - 1;
         self.free_queue.clear();
-        self.swa_groups = Some(
-            groups
-                .into_iter()
-                .map(|(is_sliding, window, block_size)| SwaGroup {
-                    is_sliding,
-                    window,
-                    block_size,
-                })
-                .collect(),
-        );
+        self.swa_groups = Some(groups);
         // NB: prefix caching is HONORED on the hybrid path (do NOT force off).
         // `with_caching` sets `enable_caching`; the hybrid get_computed_blocks /
         // allocate_slots compute a per-group, joint-P-correct cached prefix
@@ -331,15 +363,22 @@ impl SimpleBlockTracker {
         // fresh), preserving the prior force-off behavior.
     }
 
-    /// Highest currently-allocated (`ref_cnt > 0`) block ID, or 0 if none.
-    /// The hybrid residency invariant: after any number of decode steps of a
-    /// sliding-only sequence this must stay near the window, so lockstep
-    /// `grow_to_cover` (keyed on the max block ID) never commits the pool.
-    pub fn max_allocated_block_id(&self) -> usize {
+    /// Highest currently-allocated (`ref_cnt > 0`) block ID in `space`, or 0
+    /// if none. The hybrid residency invariant: after any number of decode
+    /// steps of a sliding-only sequence this must stay near the window, so
+    /// lockstep `grow_to_cover` (keyed on the max block ID) never commits the
+    /// pool.
+    pub fn max_allocated_block_id(&self, space: usize) -> usize {
         (1..self.total_blocks)
             .rev()
-            .find(|&i| self.ref_cnt[i] > 0)
+            .find(|&i| self.ref_cnt[self.space_slot(space, i)] > 0)
             .unwrap_or(0)
+    }
+
+    /// Where block `id` of block space `space` keeps its per-block state
+    /// (`ref_cnt`, `hybrid_id_to_key`).
+    fn space_slot(&self, space: usize, id: usize) -> usize {
+        space * self.total_blocks + id
     }
 
     /// Create a new block tracker with prefix caching enabled.
@@ -616,30 +655,31 @@ impl SimpleBlockTracker {
         self.ref_cnt[block_id] += 1;
     }
 
-    /// Pop `count` lowest free block IDs (hybrid path). Returns `None` if the
-    /// shared pool can't satisfy the request (callers capacity-check first; this
-    /// is the defensive guard).
-    fn alloc_hybrid_fresh(&mut self, count: usize) -> Option<Vec<usize>> {
+    /// Pop `count` lowest free block IDs of block space `space` (hybrid path).
+    /// Returns `None` if the shared pool can't satisfy the request (callers
+    /// capacity-check first; this is the defensive guard).
+    fn alloc_hybrid_fresh(&mut self, space: usize, count: usize) -> Option<Vec<usize>> {
         if self.num_free_blocks < count {
             return None;
         }
         let mut ids = Vec::with_capacity(count);
         while ids.len() < count {
-            let Reverse(id) = self.free_min.pop()?;
+            let Reverse(id) = self.free_min[space].pop()?;
+            let slot = self.space_slot(space, id);
             // Skip STALE heap entries: a block touched for cache reuse
             // (`touch_hybrid_block`) keeps its old heap slot but has ref_cnt > 0.
             // Mirrors `allocate_fresh_blocks`'s lazy free-queue skip.
-            if self.ref_cnt[id] > 0 {
+            if self.ref_cnt[slot] > 0 {
                 continue;
             }
-            self.ref_cnt[id] = 1;
+            self.ref_cnt[slot] = 1;
             self.num_free_blocks -= 1;
             // Lazy eviction: if this recycled block was still hash-mapped, drop
             // both directions so it can't be handed out as a stale cache hit
             // (mirrors `allocate_fresh_blocks` / Python `_maybe_evict_cached_block`).
             // The key's mapping goes only if it still points at THIS block: a later
             // request that computed the same key into a block of its own moved it.
-            if let Some(key) = self.hybrid_id_to_key.remove(&id)
+            if let Some(key) = self.hybrid_id_to_key.remove(&slot)
                 && self.hybrid_hash_to_id.get(&key) == Some(&id)
             {
                 self.hybrid_hash_to_id.remove(&key);
@@ -649,19 +689,21 @@ impl SimpleBlockTracker {
         Some(ids)
     }
 
-    /// Return `blocks` to the shared pool (hybrid path), skipping the null
-    /// block. Freed IDs go back into the lowest-free-first heap so a sliding
-    /// group reuses its own low IDs immediately — the bound on the max block ID.
-    fn free_hybrid_blocks(&mut self, blocks: &[usize]) {
+    /// Return `blocks` of block space `space` to the shared pool (hybrid path),
+    /// skipping the null block. Freed IDs go back into the space's
+    /// lowest-free-first heap so a sliding group reuses its own low IDs
+    /// immediately — the bound on the max block ID.
+    fn free_hybrid_blocks(&mut self, space: usize, blocks: &[usize]) {
         for &b in blocks {
             if b == Self::NULL_BLOCK {
                 continue;
             }
-            debug_assert!(self.ref_cnt[b] > 0, "double-free of block {b}");
-            self.ref_cnt[b] -= 1;
-            if self.ref_cnt[b] == 0 {
+            let slot = self.space_slot(space, b);
+            debug_assert!(self.ref_cnt[slot] > 0, "double-free of block {b}");
+            self.ref_cnt[slot] -= 1;
+            if self.ref_cnt[slot] == 0 {
                 self.num_free_blocks += 1;
-                self.free_min.push(Reverse(b));
+                self.free_min[space].push(Reverse(b));
             }
         }
     }
@@ -707,7 +749,7 @@ impl SimpleBlockTracker {
                 blocks[i] = Self::NULL_BLOCK;
             }
         }
-        self.free_hybrid_blocks(&removed);
+        self.free_hybrid_blocks(grp.space, &removed);
     }
 
     /// vLLM hybrid allocation: one null-padded block table per group over the
@@ -786,7 +828,7 @@ impl SimpleBlockTracker {
         // 3. Allocate + append at the tail (lowest-free-first).
         for (g, &n) in new_per_group.iter().enumerate() {
             if n > 0 {
-                let fresh = self.alloc_hybrid_fresh(n)?;
+                let fresh = self.alloc_hybrid_fresh(groups[g].space, n)?;
                 self.allocations
                     .get_mut(&request.request_id)
                     .expect("entry just inserted")
@@ -847,7 +889,7 @@ impl SimpleBlockTracker {
                 match plan.get(i).copied() {
                     Some(b) if b == Self::NULL_BLOCK => {}
                     Some(b) if b != usize::MAX => {
-                        if self.ref_cnt[b] == 0 {
+                        if self.ref_cnt[self.space_slot(groups[g].space, b)] == 0 {
                             demand += 1; // reviving a cached (free) block
                         }
                     }
@@ -868,7 +910,7 @@ impl SimpleBlockTracker {
                     && b != usize::MAX
                     && b != Self::NULL_BLOCK
                 {
-                    self.touch_hybrid_block(b);
+                    self.touch_hybrid_block(groups[g].space, b);
                 }
             }
         }
@@ -883,7 +925,7 @@ impl SimpleBlockTracker {
                     Some(b) if b == Self::NULL_BLOCK => table.push(Self::NULL_BLOCK),
                     Some(b) if b != usize::MAX => table.push(b), // already touched
                     _ => {
-                        let fresh = self.alloc_hybrid_fresh(1)?;
+                        let fresh = self.alloc_hybrid_fresh(groups[g].space, 1)?;
                         table.push(fresh[0]);
                     }
                 }
@@ -903,14 +945,15 @@ impl SimpleBlockTracker {
         Some(tables)
     }
 
-    /// Touch a hybrid block (ref-count), accounting for free-pool membership.
-    /// The block leaves the lowest-free-first heap lazily (stale heap entries
-    /// are skipped on pop since ref_cnt > 0).
-    fn touch_hybrid_block(&mut self, block_id: usize) {
-        if self.ref_cnt[block_id] == 0 {
+    /// Touch block `block_id` of block space `space` (ref-count), accounting for
+    /// free-pool membership. The block leaves the lowest-free-first heap lazily
+    /// (stale heap entries are skipped on pop since ref_cnt > 0).
+    fn touch_hybrid_block(&mut self, space: usize, block_id: usize) {
+        let slot = self.space_slot(space, block_id);
+        if self.ref_cnt[slot] == 0 {
             self.num_free_blocks -= 1;
         }
-        self.ref_cnt[block_id] += 1;
+        self.ref_cnt[slot] += 1;
     }
 
     /// Register group-namespaced full-block hashes for the request's current
@@ -944,7 +987,8 @@ impl SimpleBlockTracker {
                 }
                 let key = (g as u32, hashes[i]);
                 self.hybrid_hash_to_id.insert(key, bid);
-                self.hybrid_id_to_key.insert(bid, key);
+                let slot = self.space_slot(grp.space, bid);
+                self.hybrid_id_to_key.insert(slot, key);
             }
             req_group_hashes[g] = hashes.into_iter().take(num_full).collect();
         }
@@ -988,7 +1032,7 @@ impl SimpleBlockTracker {
         // Global group = the (first) non-sliding group; its contiguous hit
         // prefix block-aligns the candidate P. If all groups are sliding, use
         // group 0's block size for alignment.
-        let global_g = groups.iter().position(|g| !g.is_sliding).unwrap_or(0);
+        let global_g = SwaGroup::global_index(&groups);
         let global_bs = groups[global_g].block_size;
         let global_hits = &group_hits[global_g];
         let global_contig = global_hits.iter().take_while(|h| h.is_some()).count();
@@ -1371,9 +1415,10 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             // Hybrid path: return each group's (non-null) blocks to the shared
             // pool via the lowest-free-first heap. The null block is filtered.
             // Group-namespaced hash mappings persist (lazy eviction on realloc).
-            if self.swa_groups.is_some() {
-                for group in &block_ids_groups {
-                    self.free_hybrid_blocks(group);
+            if let Some(groups) = &self.swa_groups {
+                let spaces: Vec<usize> = groups.iter().map(|g| g.space).collect();
+                for (space, group) in spaces.into_iter().zip(&block_ids_groups) {
+                    self.free_hybrid_blocks(space, group);
                 }
                 return;
             }
@@ -1467,18 +1512,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn free_volatile(&mut self, request_id: &str) {
+        // The lowest-free-first heap has no front to free to.
+        if self.swa_groups.is_some() {
+            return self.free(request_id);
+        }
         if let Some((block_ids_groups, _num_blocks)) = self.allocations.remove(request_id) {
             self.req_to_hashes.remove(request_id);
             self.hybrid_req_hashes.remove(request_id);
-
-            // Hybrid path: return to the shared pool (front-eviction not
-            // applicable to the lowest-free-first heap; treat as a normal free).
-            if self.swa_groups.is_some() {
-                for group in &block_ids_groups {
-                    self.free_hybrid_blocks(group);
-                }
-                return;
-            }
 
             // Free blocks and push to the FRONT of the free queue so they
             // are evicted first (before non-volatile blocks).
@@ -3985,7 +4025,11 @@ mod tests {
     // gemma4-shaped tracker WITH caching: 1 full (bs 32) + 1 sliding (W=64, bs 16).
     fn caching_hybrid(pool: usize, window: usize) -> SimpleBlockTracker {
         let mut t = SimpleBlockTracker::with_caching(pool, 16);
-        t.enable_hybrid(pool, vec![(false, 0, 32), (true, window, 16)]);
+        t.enable_hybrid(
+            pool,
+            vec![(false, 0, 32), (true, window, 16)],
+            HybridKvStores::Shared,
+        );
         t
     }
 
@@ -4016,6 +4060,79 @@ mod tests {
             "sliding out-of-window head nulled"
         );
         assert!(tables[1].iter().any(|&b| b != 0), "in-window suffix cached");
+    }
+
+    // `caching_hybrid`, the global group's KV in a store of its own.
+    fn caching_hybrid_apart(pool: usize, window: usize) -> SimpleBlockTracker {
+        let mut t = SimpleBlockTracker::with_caching(pool, 16);
+        t.enable_hybrid(
+            pool,
+            vec![(false, 0, 32), (true, window, 16)],
+            HybridKvStores::GlobalApart,
+        );
+        t
+    }
+
+    #[test]
+    fn test_hybrid_global_apart_numbers_each_store_from_one() {
+        // Each store numbers its blocks densely from 1, so neither is addressed with the other's.
+        let mut t = caching_hybrid_apart(64, 1024);
+        let tables = t
+            .allocate_slots(&hybrid_req("r1", 128), 128, 0, &[])
+            .unwrap();
+        assert_eq!(tables[0], vec![1, 2, 3, 4]);
+        assert_eq!(tables[1], (1..=8).collect::<Vec<_>>());
+        assert_eq!(t.max_allocated_block_id(1), 4);
+        assert_eq!(t.max_allocated_block_id(0), 8);
+        t.free("r1");
+        assert_eq!(t.num_free_blocks(), 63, "no leak/double-free");
+    }
+
+    #[test]
+    fn test_hybrid_global_apart_shares_one_budget() {
+        // Both stores draw on the one budget: a 128-token request takes 4 + 8 blocks of 63.
+        let mut t = caching_hybrid_apart(64, 1024);
+        for i in 0..5u32 {
+            let mut r = hybrid_req(&format!("r{i}"), 128);
+            r.prompt_token_ids
+                .iter_mut()
+                .for_each(|tok| *tok += i * 1000);
+            r.all_token_ids = r.prompt_token_ids.clone();
+            assert!(t.allocate_slots(&r, 128, 0, &[]).is_some());
+        }
+        assert_eq!(t.num_free_blocks(), 3);
+        assert!(
+            t.allocate_slots(&hybrid_req("r5", 128), 128, 0, &[])
+                .is_none()
+        );
+        assert_eq!(t.num_free_blocks(), 3, "the failed allocation took nothing");
+    }
+
+    #[test]
+    fn test_hybrid_global_apart_reuses_a_cached_prefix() {
+        // The same prompt + a bit more reuses the global group's prefix and the sliding group's
+        // in-window suffix, each from its own store, and every block comes back once.
+        let mut t = caching_hybrid_apart(512, 64);
+        let mut r1 = hybrid_req("r1", 128);
+        t.allocate_slots(&r1, 128, 0, &[]).unwrap();
+        r1.num_computed_tokens = 128;
+        t.seal(&r1);
+        let r1_tables = t.get_blocks("r1");
+
+        let mut r2 = hybrid_req("r2", 129);
+        let (p, matched) = t.get_computed_blocks(&r2);
+        assert_eq!(p, 128);
+        assert_eq!(matched[0], r1_tables[0], "the global group's blocks");
+        assert_eq!(
+            matched[1][(128 - 64) / 16..],
+            r1_tables[1][(128 - 64) / 16..]
+        );
+        r2.num_computed_tokens = p;
+        let tables = t.allocate_slots(&r2, 1, 0, &matched).unwrap();
+        assert_eq!(tables[0][..4], r1_tables[0][..]);
+        t.free("r1");
+        t.free("r2");
+        assert_eq!(t.num_free_blocks(), 511, "no leak/double-free");
     }
 
     #[test]
@@ -4091,7 +4208,7 @@ mod tests {
         let win_blocks = window.div_ceil(bs); // 4
         let pool = 4096usize; // a big pool: FIFO would climb toward 4096
         let mut tracker = SimpleBlockTracker::new(pool, bs);
-        tracker.enable_hybrid(pool, vec![(true, window, bs)]); // one sliding group
+        tracker.enable_hybrid(pool, vec![(true, window, bs)], HybridKvStores::Shared); // one sliding group
 
         let mut r = swa_test_request("r1", bs);
         let mut max_seen = 0usize;
@@ -4105,7 +4222,7 @@ mod tests {
                 live <= win_blocks + 2,
                 "live sliding blocks {live} exceed window+slack at tok {tok}",
             );
-            max_seen = max_seen.max(tracker.max_allocated_block_id());
+            max_seen = max_seen.max(tracker.max_allocated_block_id(0));
         }
         assert!(
             max_seen <= win_blocks + 4,
@@ -4128,7 +4245,11 @@ mod tests {
         // distinct in-window physical blocks (no aliasing), full never frees.
         let pool = 256usize;
         let mut t = SimpleBlockTracker::new(pool, 16);
-        t.enable_hybrid(pool, vec![(false, 0, 32), (true, 64, 16), (true, 64, 16)]);
+        t.enable_hybrid(
+            pool,
+            vec![(false, 0, 32), (true, 64, 16), (true, 64, 16)],
+            HybridKvStores::Shared,
+        );
 
         let mut r = swa_test_request("r1", 16);
         r.num_computed_tokens = 0;
@@ -4195,7 +4316,7 @@ mod tests {
 
         // Pool = demand + 1 (the held null block) fits exactly.
         let mut t = SimpleBlockTracker::new(demand + 1, 16);
-        t.enable_hybrid(demand + 1, groups.clone());
+        t.enable_hybrid(demand + 1, groups.clone(), HybridKvStores::Shared);
         let mut r = swa_test_request("r1", 16);
         r.num_computed_tokens = 0;
         assert!(
@@ -4206,7 +4327,7 @@ mod tests {
 
         // One block short → reject (atomic cross-group check, no partial alloc).
         let mut t2 = SimpleBlockTracker::new(demand, 16);
-        t2.enable_hybrid(demand, groups);
+        t2.enable_hybrid(demand, groups, HybridKvStores::Shared);
         let mut r2 = swa_test_request("r2", 16);
         r2.num_computed_tokens = 0;
         assert!(
@@ -5632,9 +5753,16 @@ mod tests {
     /// full group (bs 32) + five sliding groups (window 1024, bs 16) over the 2634-block pool its
     /// server sized, 12 concurrent 512-token prompts × 128 tokens — which overflows near the end, so
     /// the tail request is preempted mid-decode. The worker is modelled the way `InputBatch` runs: a
-    /// request samples when its chunk reaches the end of the history the WORKER holds.
+    /// request samples when its chunk reaches the end of the history the WORKER holds. Both store
+    /// layouts share the one budget, so both overflow.
     #[test]
     fn test_hybrid_preempted_mid_decode_resumes_under_async_scheduling() {
+        for stores in [HybridKvStores::Shared, HybridKvStores::GlobalApart] {
+            preempted_mid_decode_resumes(stores);
+        }
+    }
+
+    fn preempted_mid_decode_resumes(stores: HybridKvStores) {
         let cfg = SchedulerConfig {
             max_num_batched_tokens: 2048,
             max_num_seqs: 16,
@@ -5646,7 +5774,7 @@ mod tests {
         let mut tracker = SimpleBlockTracker::new(pool, 16);
         let mut groups = vec![(false, 0usize, 32usize)];
         groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
-        tracker.enable_hybrid(pool, groups);
+        tracker.enable_hybrid(pool, groups, stores);
         let mut sched = Scheduler::new(&cfg, 32768, Box::new(tracker));
         let (num_reqs, prompt_len, max_tokens) = (12usize, 512u32, 128u32);
         for i in 0..num_reqs {
@@ -5706,21 +5834,105 @@ mod tests {
 
         assert!(
             preempted_mid_decode,
-            "the pool must overflow mid-decode, or this test does not exercise the resume"
+            "{stores:?}: the pool must overflow mid-decode, or this test does not exercise the resume"
         );
         let unfinished = sched.get_unfinished_request_ids();
         assert!(
             unfinished.is_empty(),
-            "requests stuck after a mid-decode preemption: {unfinished:?}"
+            "{stores:?}: requests stuck after a mid-decode preemption: {unfinished:?}"
         );
         for i in 0..num_reqs {
             let r = sched.get_request(&format!("r{i}")).unwrap();
             assert_eq!(
                 r.num_output_tokens(),
                 max_tokens as usize,
-                "r{i} must emit all its tokens"
+                "{stores:?}: r{i} must emit all its tokens"
             );
         }
+    }
+
+    /// #317's 8 users × 4096/512 cell (12 distinct prompts) on the gemma-4-26b layout over a roomy
+    /// pool. Returns the highest block each store is addressed with, as the worker maps them: the
+    /// global group's store through group 0's blocks, the shared pool through every group whose KV
+    /// lives in it.
+    fn store_reaches(stores: HybridKvStores) -> (usize, usize) {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 2048,
+            max_num_seqs: 256,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let pool = 27_000usize;
+        let mut tracker = SimpleBlockTracker::new(pool, 16);
+        let mut groups = vec![(false, 0usize, 32usize)];
+        groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
+        tracker.enable_hybrid(pool, groups, stores);
+        let mut sched = Scheduler::new(&cfg, 32768, Box::new(tracker));
+        let (num_prompts, conc, prompt_len, max_tokens) = (12u32, 8u32, 4096u32, 512u32);
+        let request = |i: u32| {
+            let first = (i + 1) * 100_000;
+            Request::new(
+                format!("r{i}"),
+                (first..first + prompt_len).collect(),
+                SamplingParams {
+                    max_tokens: Some(max_tokens),
+                    ..Default::default()
+                },
+                i as f64,
+                0,
+                0,
+                None,
+            )
+        };
+        let mut next = 0u32;
+        while next < conc {
+            sched.add_request(request(next));
+            next += 1;
+        }
+        let (mut global_reach, mut pool_reach) = (0usize, 0usize);
+        while sched.has_unfinished_requests() {
+            let out = sched.schedule();
+            let tables = (out.scheduled_new_reqs.iter())
+                .map(|r| &r.block_ids)
+                .chain(out.scheduled_cached_reqs.new_block_ids.iter().flatten());
+            for table in tables {
+                for (g, ids) in table.iter().enumerate() {
+                    let highest = ids.iter().copied().max().unwrap_or(0);
+                    if g == 0 {
+                        global_reach = global_reach.max(highest);
+                    }
+                    if g != 0 || stores == HybridKvStores::Shared {
+                        pool_reach = pool_reach.max(highest);
+                    }
+                }
+            }
+            for id in out.num_scheduled_tokens.keys() {
+                let r = sched.get_request(id).unwrap();
+                if r.num_computed_tokens as usize >= r.num_tokens() {
+                    sched.append_output_tokens(id, &[7]);
+                    if sched.get_request(id).unwrap().num_output_tokens() >= max_tokens as usize {
+                        sched.finish_requests(&[id.as_str()], RequestStatus::FinishedLengthCapped);
+                        if next < num_prompts {
+                            sched.add_request(request(next));
+                            next += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (global_reach, pool_reach)
+    }
+
+    #[test]
+    fn test_hybrid_global_apart_maps_each_store_for_its_own_blocks() {
+        // Sharing one space, the global group's blocks interleave with the sliding groups', so its
+        // store is addressed far past the blocks it holds, and the shared pool past the sliding
+        // groups'. Apart, the global store's highest block is exactly the global group's peak: 8
+        // requests of 4,608 tokens hold 144 blocks of 32 each.
+        let (global, pool) = store_reaches(HybridKvStores::Shared);
+        let (global_apart, pool_apart) = store_reaches(HybridKvStores::GlobalApart);
+        assert_eq!(global_apart, 8 * (4096 + 512usize).div_ceil(32));
+        assert_eq!((global, pool, pool_apart), (3153, 4376, 3240));
     }
 
     #[test]
