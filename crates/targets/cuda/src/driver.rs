@@ -357,7 +357,7 @@ pub unsafe fn graph_instantiate(graph: sys::CUgraph) -> Result<sys::CUgraphExec>
     check(sys::cuGraphInstantiateWithFlags(
         &mut exec,
         graph,
-        sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH as u64,
+        u64::from(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH.0),
     ))?;
     Ok(exec)
 }
