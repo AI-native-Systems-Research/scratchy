@@ -117,6 +117,15 @@ impl StateSnapshots {
                     // oldest snapshot of its chain once the next user message re-renders the
                     // loop's turns, and the newest one is pinned by the restore that read it.
                     .min_by_key(|(_, c)| (c.last_used, c.ready, Reverse(c.position)))?;
+                if let Some(c) = &self.slots[victim] {
+                    tracing::debug!(
+                        "recurrent-state snapshot evicted: slot {victim}, position {}, ready {}, \
+                         idle {} steps (for position {position})",
+                        c.position,
+                        c.ready,
+                        self.step - c.last_used,
+                    );
+                }
                 self.evict(victim);
                 victim
             }
