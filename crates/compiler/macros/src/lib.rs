@@ -364,6 +364,30 @@ fn fmt_us(us: f64) -> String {
 /// `workloads=[1,2,4,8,16,32,64,512,1024,2048,4096]`.
 const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
 
+/// The bucket ladder `model` compiles: the carrier's `ladder`, except that a multi-token-prediction
+/// head reading its target's KV stops at the first rung that holds its `spec_verify_rows`. Such a
+/// head keeps no KV of its own, so it runs no pass over prompt rows, and its draft budget
+/// (`scratchy_serving_engine::spec_decode::DraftBudget`) fits each step's drafting sequences —
+/// every one's token and drafts — within the verify step's rows: its forward never brings more,
+/// and a wider rung would be baked, and built into its pool, to never run.
+fn model_workloads(ladder: &[u64], model: &config::ModelParams) -> Vec<u64> {
+    let verify_rows =
+        (model.bounds.get("spec_verify_rows").copied()).filter(|_| model.arch.reads_target_kv);
+    rungs_holding(ladder, verify_rows)
+}
+
+/// `ladder`'s rungs up to the first that holds `rows`; every rung when there is no bound (or no rung
+/// holds it).
+fn rungs_holding(ladder: &[u64], rows: Option<u64>) -> Vec<u64> {
+    let Some(rows) = rows else {
+        return ladder.to_vec();
+    };
+    let top = (ladder.iter().copied())
+        .find(|&m| m >= rows)
+        .unwrap_or(u64::MAX);
+    ladder.iter().copied().filter(|&m| m <= top).collect()
+}
+
 /// Default KV-cache-span (`sk_bucket`) ladder. Every `#[forward]` arch that
 /// does not explicitly override `sk_buckets` solves at THESE spans; all
 /// current decoder archs share this list. Override with an explicit list, or
@@ -1118,6 +1142,7 @@ pub fn compile_carrier(
             let tape_pilot = true;
             #[cfg(not(any(feature = "metal", feature = "spyre")))]
             let tape_pilot = false;
+            let workloads = model_workloads(&args.workloads, model);
             let sfufs = if tape_pilot {
                 let sk_eff: Vec<u64> = if args.sk_buckets.is_empty() {
                     vec![0]
@@ -1125,7 +1150,7 @@ pub fn compile_carrier(
                     args.sk_buckets.clone()
                 };
                 let mut per_workload = std::collections::BTreeMap::new();
-                for m in &args.workloads {
+                for m in &workloads {
                     for sk in &sk_eff {
                         per_workload.insert(
                             crate::assignment::WorkloadPoint {
@@ -1151,7 +1176,7 @@ pub fn compile_carrier(
                         Some((&model_prog, model)),
                         &model_inferred,
                         &solve_bounds,
-                        &args.workloads,
+                        &workloads,
                         &args.sk_buckets,
                         tp_world_size,
                     )
@@ -3294,6 +3319,19 @@ fn emit_model_stub_items(
 mod tests {
     use super::*;
     use crate::quantization::{BnbQuantType, Fp8ActivationScheme, GptqLayout, QuantMethod};
+
+    /// A head reading its target's KV compiles the rungs up to the first holding its verify rows —
+    /// Gemma 4's assistant at 3 rows: 1, 2 and 4 of the default ladder; at 8 rows, through 8 — and
+    /// every other model the whole ladder.
+    #[test]
+    fn a_target_kv_head_compiles_the_rungs_its_verify_rows_reach() {
+        let ladder = DEFAULT_DECODER_WORKLOADS;
+        assert_eq!(rungs_holding(ladder, Some(3)), [1, 2, 4]);
+        assert_eq!(rungs_holding(ladder, Some(4)), [1, 2, 4]);
+        assert_eq!(rungs_holding(ladder, Some(8)), [1, 2, 4, 8]);
+        assert_eq!(rungs_holding(ladder, None), ladder);
+        assert_eq!(rungs_holding(&[1, 2], Some(3)), [1, 2]);
+    }
 
     /// `dedup_quant_sig` must keep FP8 block and per-tensor / per-
     /// channel variants on separate canonicals — the load_with body
