@@ -192,9 +192,12 @@ pub struct MetalWorker {
     /// The prefix hash each snapshot slot was last saved under. A restore whose key differs is a
     /// scheduler/worker disagreement, refused rather than run on another prefix's state.
     gdn_snapshot_keys: Vec<Option<u64>>,
-    /// The GDN state buffers' placement-sparse pages: the live slots are mapped at init, the
-    /// snapshot slots past them only as saves reach them.
+    /// The GDN state buffers' placement-sparse pages: a live slot mapped once a sequence first
+    /// takes it, a snapshot slot (from `gdn_snapshots_from`) once a save first reaches it.
     gdn_state_stores: Option<scratchy_target_metal::sparse_kv::SparseStores>,
+    /// The first snapshot slot: past the live ones, at the first slot every GDN state buffer
+    /// starts on a whole sparse tile (`SparseStores::with_tail`).
+    gdn_snapshots_from: usize,
     /// Requests resumed short of their KV hit (`CachedKvOp`): the position below which their KV
     /// is the cached blocks', which their steps leave unwritten.
     kv_cached_through: HashMap<String, usize>,
@@ -928,6 +931,7 @@ impl MetalWorker {
             gdn_snapshot_cap: 0,
             gdn_snapshot_keys: Vec::new(),
             gdn_state_stores: None,
+            gdn_snapshots_from: 0,
             kv_cached_through: HashMap::new(),
             model_dir: None,
             hf_config: None,
@@ -2249,11 +2253,11 @@ impl MetalWorker {
     ) -> ExecutorResult<(Vec<i32>, Vec<u32>)> {
         let ops = &scheduler_output.recurrent_state;
         let attn = &prepared.attn_meta;
-        let live = self.max_num_seqs_resolved();
+        let snapshots_from = self.gdn_snapshots_from;
         let bad = |what: String| ExecutorError::WorkerExecution(format!("state snapshot: {what}"));
         let cap = self.gdn_snapshot_cap;
         let slot = |op: &StateSnapshotOp| match op.slot < cap {
-            true => Ok(GdnSlot::new(live + op.slot)),
+            true => Ok(GdnSlot::new(snapshots_from + op.slot)),
             false => Err(bad(format!(
                 "{} names slot {} of {cap}",
                 op.req_id, op.slot
@@ -2314,26 +2318,39 @@ impl MetalWorker {
             }
             rows.push(row);
         }
-        if reach > 0 {
-            let stores = self.gdn_state_stores.as_mut();
-            let (Some(stores), Some(mapper)) = (stores, self.kv_mapper.as_ref()) else {
-                return Err(bad("this worker keeps no snapshot slots".into()));
-            };
-            let t_grow = std::time::Instant::now();
-            let grew = (stores.grow_to(live + reach, mapper))
-                .map_err(|e| bad(format!("mapping slots through {}: {e}", live + reach)))?;
-            if grew {
-                let mapped = stores.mapped().load(std::sync::atomic::Ordering::Relaxed);
-                info!(
-                    "ScratchyWorker(metal): {} of {cap} state snapshot slots mapped in {:.1} ms",
-                    mapped - live,
-                    t_grow.elapsed().as_secs_f64() * 1e3,
-                );
-            }
-        }
         let alloc = (self.gdn_slot_allocator.as_mut()).expect("a recurrent model's allocator");
         let (entries, codes) =
             (alloc.step(rows)).map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+        // Map every slot this step's forward reads or writes before it runs: the live slots its
+        // sequences took (the lowest free, so through the most ever resident at once) and the
+        // snapshot slots its restores and saves name.
+        let live_reach = (entries.iter().map(|e| e.slot().index() + 1).max()).unwrap_or(0);
+        let live = self.max_num_seqs_resolved();
+        let (Some(stores), Some(mapper)) =
+            (self.gdn_state_stores.as_mut(), self.kv_mapper.as_ref())
+        else {
+            return Err(bad("this worker keeps no GDN state stores".into()));
+        };
+        let t_grow = std::time::Instant::now();
+        if (stores.grow_to(live_reach, mapper))
+            .map_err(|e| bad(format!("mapping live slots through {live_reach}: {e}")))?
+        {
+            let mapped = stores.mapped().load(std::sync::atomic::Ordering::Relaxed);
+            info!(
+                "ScratchyWorker(metal): {mapped} of {live} live GDN state slots mapped in {:.1} ms",
+                t_grow.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        let t_grow = std::time::Instant::now();
+        if (stores.grow_tail_to(reach, mapper))
+            .map_err(|e| bad(format!("mapping snapshot slots through {reach}: {e}")))?
+        {
+            info!(
+                "ScratchyWorker(metal): state snapshot slots through {reach} of {cap} mapped in \
+                 {:.1} ms",
+                t_grow.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         for (s, key) in saved {
             self.gdn_snapshot_keys[s] = Some(key);
         }
@@ -5353,20 +5370,23 @@ impl Worker for MetalWorker {
         // cache's snapshot slots (`determine_available_memory`).
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
             let live = self.max_num_seqs_resolved();
-            let num_slots = live + self.gdn_snapshot_cap;
             let num_layers = model.num_hidden_layers() as usize;
             let lanes = self.gdn_lanes(&gdn_cfg);
             let dims = gdn_cfg.state_dims();
             let t_gdn = std::time::Instant::now();
             // f32 conv/ssm state, placement-sparse like the KV pool: one store per linear layer's
             // conv and ssm buffer, a block per slot, pinned in the KV pool's set so the lazy pager
-            // can't drop it mid-scan. The live slots are mapped now, a snapshot slot only once a
-            // save reaches it — an unused one costs nothing. The forwards bind these buffers whole
-            // and never read them from the host, so Private storage serves. Nothing reads a slot
-            // before writing it — a live slot's first step starts from zero (`GdnSlotAllocator`),
-            // a snapshot is saved before it is restored — so a newly mapped one is not zeroed.
-            // A model that drafts keeps its draft lanes apart, in plain buffers: as many as the
-            // sequences that draft at once, and every lane in use while they do.
+            // can't drop it mid-scan. A live slot is mapped once a sequence first takes it
+            // (`gdn_step`; the allocator hands out the lowest free slot, so what is mapped is the
+            // most sequences ever resident at once), a snapshot slot once a save first reaches it
+            // — an unused one costs nothing. Slot 0 is mapped now: a forward run without a step's
+            // records (the warmups) reads zeroed ones, a plain step on slot 0. The forwards bind
+            // these buffers whole and never read them from the host, so Private storage serves.
+            // Nothing reads a slot before writing it — a live slot's first step starts from zero
+            // (`GdnSlotAllocator`), a snapshot is saved before it is restored — so a newly mapped
+            // one is not zeroed. A model that drafts keeps its draft lanes apart, in plain
+            // buffers: as many as the sequences that draft at once, and every lane in use while
+            // they do.
             let (conv_slot, ssm_slot) = dims.slot_bytes();
             let layout: Vec<(usize, bool)> = (0..gdn_cfg.num_linear_layers())
                 .flat_map(|_| [(conv_slot, false), (ssm_slot, false)])
@@ -5374,15 +5394,17 @@ impl Worker for MetalWorker {
             let mapper = self.kv_mapper.clone().ok_or_else(|| {
                 ExecutorError::WorkerInit("GDN state pool before the KvMapper".into())
             })?;
-            let stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            let stores = scratchy_target_metal::sparse_kv::SparseStores::with_tail(
                 &mtl_device,
                 &residency,
-                num_slots,
-                1,
+                live,
+                self.gdn_snapshot_cap,
                 &layout,
             )
-            .and_then(|mut s| s.grow_to(live, &mapper).map(|_| s))
+            .and_then(|mut s| s.grow_to(1, &mapper).map(|_| s))
             .map_err(|e| ExecutorError::WorkerInit(format!("GDN state stores: {e}")))?;
+            let snapshots_from = stores.tail_start().expect("the snapshot slots' run");
+            let num_slots = snapshots_from + self.gdn_snapshot_cap;
             let next = std::cell::Cell::new(0usize);
             let gdn_pool = unsafe {
                 scratchy_target_metal::gdn_state::GdnStatePool::new(
@@ -5420,6 +5442,7 @@ impl Worker for MetalWorker {
             );
             self.gdn_state = Some(gdn_pool);
             self.gdn_state_stores = Some(stores);
+            self.gdn_snapshots_from = snapshots_from;
             self.gdn_snapshot_keys = vec![None; self.gdn_snapshot_cap];
             self.gdn_slot_allocator = Some(GdnSlotAllocator::new(live, lanes));
         }
