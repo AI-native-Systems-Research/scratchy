@@ -4728,7 +4728,8 @@ impl fmt::Display for ThroughputStat {
 /// `FLEX_DEVICE` setting in this crate's simplified single-process model, so
 /// `device_kind` folds both steps into the one three-way
 /// [`crate::flex_config::DeviceKind`] this crate already uses everywhere
-/// else backend choice matters (e.g. `fxa_rust_abi.rs`, which this factory
+/// else backend choice matters (e.g. scratchy-target-spyre's `runtime.rs`,
+/// which this factory
 /// exists to stop hardcoding `Backend::Pf` unconditionally).
 pub enum SchedulerBackendConfig {
     Real(

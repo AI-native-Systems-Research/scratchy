@@ -29,11 +29,6 @@ pub mod bundle_run;
 /// arithmetic, lifted out of C++. No SDK dependency and no feature gate — it is arithmetic, so it
 /// builds and is tested on any host, including one with no Spyre toolchain.
 pub mod fold_plan;
-/// The real `fxa_*` C-ABI entrypoints, natively over `flex-rs`. `csrc/spyre_sdk_abi.cpp`
-/// only still provides the two deeptools functions out of flex-rs's scope; this module
-/// provides every other `fxa_*` symbol `sdk_abi.rs` declares.
-#[cfg(feature = "spyre-hw")]
-pub mod fxa_rust_abi;
 pub mod ir;
 /// THE MODEL-GEOMETRY DOOR — all that is left of KTIR → SuperDSC on this side, and it is NOT the
 /// lowering. `lower()`'s name-keyed dispatch (our naming convention, so ours to read), the two arms
@@ -72,10 +67,12 @@ pub mod manifest;
 /// (it links the emulator). Emit/weight-load paths use [`manifest`] alone.
 #[cfg(feature = "spyre-emu")]
 pub mod runner;
-/// The ONE C-ABI seam to the IBM Spyre SDK (flex device runtime + the deeptools host functions) —
-/// everything above it is Rust. Behind `sendnn` (it links the SDK via `build.rs`).
+/// The typed card surface over flex-rs: streams, device addresses, launches, and the card's
+/// memory capacity — `Arc<RuntimeContext>`-backed handles, no C ABI. This is what the deleted
+/// `sdk_abi.rs`/`fxa_rust_abi.rs` pair used to be (see the module doc for what the collapse
+/// bought). Behind `spyre-hw` (it links the SDK via flex-rs's cxx-shim).
 #[cfg(feature = "spyre-hw")]
-pub mod sdk_abi;
+pub mod runtime;
 /// The worker-facing session wrapper over [`superdsc_exec`] (f32 in, f32 logits out).
 #[cfg(feature = "spyre-hw")]
 pub mod sdsc_runner;

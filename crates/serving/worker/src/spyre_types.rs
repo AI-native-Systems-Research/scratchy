@@ -313,7 +313,7 @@ pub(crate) struct SuperDscBundle {
     // reach and a wrong answer a reader can reach.
     //
     // If deferred rung building is ever wanted again, it must be built where the OTHER sessions are (at
-    // load, serialized — see `sdk_abi::Stream::create`), not from inside a forward.
+    // load, serialized — see `runtime::Stream::create`), not from inside a forward.
     /// `(mq, session)` for the ONE prefill bundle baked with a full resident-prefix sweep — the bundle
     /// a CONTINUATION chunk (`start > 0`) must run on, because it has resident KV to attend.
     ///

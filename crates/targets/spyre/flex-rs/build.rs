@@ -1,17 +1,20 @@
 //! Compiles and links `cxx-shim/senlib_ffi.cpp` — the real C++ senlib FFI
 //! binding (see its own file header). Unconditional by default — flex-rs is
-//! the only fxa_* path, so its shim must build whenever anything in this
-//! workspace actually links against real senlib, with no separate opt-in.
+//! the only senlib path in the workspace, so its shim must build whenever
+//! anything actually links against real senlib, with no separate opt-in.
+//! (This is now the ONLY build script in the spyre tree: the old
+//! `scratchy-target-spyre/build.rs` was a vestige of the deleted
+//! `spyre_sdk_abi.cpp` C++ seam — it compiled nothing and linked nothing,
+//! because the `sendnn` feature it gated on no longer existed.)
 //!
 //! This links ONLY against `senlib` (+ its own transitive deps: flightlog,
 //! boost). It does NOT link `libflex.so` or any `sendnn_*` library — this
 //! crate has no `flex::` dependency at all, by design.
 //!
 //! `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile (cargo check/clippy only —
-//! a link will fail): the SAME escape hatch `scratchy-target-spyre`'s own
-//! `build.rs` already uses for `spyre_sdk_abi.cpp`, so a laptop with no
-//! Spyre SDK headers/libs stays checkable without a second, flex-rs-specific
-//! toggle to remember.
+//! a link will fail): the same escape hatch the old C++ seam's build script
+//! used, so a laptop with no Spyre SDK headers/libs stays checkable without a
+//! second, flex-rs-specific toggle to remember.
 
 use std::env;
 use std::path::PathBuf;

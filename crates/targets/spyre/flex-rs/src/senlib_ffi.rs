@@ -25,7 +25,8 @@
 //! UPDATE (2026-08-15): `flex_senlib_query_topology` was never implemented in
 //! `cxx-shim/flex_shim.cpp` (no such symbol exists in the real SDK either —
 //! see the "REAL LINK-TARGET AUDIT" below) and real-hardware testing hit a
-//! `FlexAllocator` OOM traced to `fxa_rust_abi.rs::build_runtime()` sizing its
+//! `FlexAllocator` OOM traced to scratchy's runtime bring-up (then
+//! `fxa_rust_abi.rs::build_runtime()`, now `runtime.rs`) sizing its
 //! single domain off a 32 GiB placeholder instead of the card's real HBM
 //! capacity. It is replaced below by `flex_senlib_device_memory_size`, a
 //! one-line real call (`DeviceHandle::GetDmpaSize()`) matching exactly what

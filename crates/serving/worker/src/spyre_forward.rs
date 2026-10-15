@@ -1237,7 +1237,7 @@ pub(crate) fn superdsc_forward_chunk(
                 // DOC described the opposite of what the binary did.
                 //
                 // ⭐ AND IT WAS NOT HARMLESS: creating a session mid-run is exactly what `fxa_stream_create`
-                // aborts on when it races (see `sdk_abi::Stream::create`), so a state that cannot occur was
+                // aborts on when it races (see `runtime::Stream::create`), so a state that cannot occur was
                 // also the state a reader would blame for that abort — which is precisely what I did for an
                 // hour. A dead path is a lie about what the program can do.
             }
