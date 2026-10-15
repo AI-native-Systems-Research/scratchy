@@ -4011,6 +4011,10 @@ impl BlockCols {
     pub const fn of_chunk(chunk: ChunkScratch) -> BlockCols {
         BlockCols(chunk.slots())
     }
+    /// ONE K-part of a chunk's value leg ([`ChunkScratch::value_parts`]) — the part's own slots.
+    pub const fn of_chunk_part(part: ChunkPart) -> BlockCols {
+        BlockCols(part.slots())
+    }
     /// One head-dim SLAB of features — quantity (4), [`FeatIdx::SLAB_FEATS`], demanded by type: the
     /// width a per-slab op writes. Distinct in meaning from one stick of lanes even though a slab
     /// is one stick of lanes by definition.
@@ -6821,6 +6825,32 @@ impl ChunkScratch {
         Some(ChunkCorner(off as u32))
     }
 
+    /// ⭐ PAGES ONE VALUE-LEG PART COVERS when a chunk's PV is cut along K — see [`Self::value_parts`].
+    pub const VALUE_PART_PAGES: u32 = 16;
+
+    /// ⭐⭐⭐ THE VALUE LEG'S K-PARTS — the whole chunk as ONE part unless `cut`, else runs of
+    /// [`Self::VALUE_PART_PAGES`] (the last one short).
+    ///
+    /// ⛔ WHY A PROMPT CHUNK CUTS IT — a refusal by the card's own compiler: dxp refused granite-2b's
+    /// 64-page prompt-chunk PV (M = 384 query rows, K = 16384 slots) at PROGRAM VERIFICATION, `PC target
+    /// label 'if-label-2-end' not found in unit: lxlu0` on every core — the K-time-tiled program the LX
+    /// repair builds once a core's V slice (2 MB at 16384 × 64 fp16) exceeds LX. A 16-page part's slice
+    /// is 512 KB, which fits whole, so no part takes the repair. The one-request decode's 4-row PV bakes
+    /// at every width and stays ONE part, byte for byte.
+    pub fn value_parts(self, cut: bool) -> impl Iterator<Item = ChunkPart> {
+        let total = self.slots();
+        let per = if cut {
+            Self::VALUE_PART_PAGES * PagedKvPool::PAGE_SLOTS as u32
+        } else {
+            total
+        };
+        (0..total.div_ceil(per)).map(move |i| ChunkPart {
+            chunk: self,
+            first_slot: i * per,
+            slots: per.min(total - i * per),
+        })
+    }
+
     /// The SOURCE block inside one page plane that entry `q` of kv head `kvh`'s block names — heads abut,
     /// so it is `kvh * entries_per_head_page + q`. `None` outside the head or the block.
     pub const fn source_block(self, kvh: u32, q: u32) -> Option<u32> {
@@ -6863,6 +6893,52 @@ pub struct ChunkCorner(u32);
 impl ChunkCorner {
     pub const fn elems(self) -> u32 {
         self.0
+    }
+}
+
+/// One K-part of a chunk's value leg — a run of its slots, minted only by
+/// [`ChunkScratch::value_parts`], so a part's corners come from the chunk's own laws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkPart {
+    chunk: ChunkScratch,
+    first_slot: u32,
+    slots: u32,
+}
+
+impl ChunkPart {
+    /// The part's slots — its contraction extent.
+    pub const fn slots(self) -> u32 {
+        self.slots
+    }
+
+    /// kv head `kvh`'s probabilities for this part: stick-columns `[first_slot, first_slot + slots)` of
+    /// its RowBlocked `[rows_per_head, chunk slots]` block, whose columns are OUTERMOST
+    /// (`(c/64)*(rows*64) + r*64 + c%64`) — so the part starts `first_slot · rows_per_head` in, and its
+    /// rows keep the block's pitch.
+    pub const fn probs_corner(self, kvh: u32, rows_per_head: u32) -> Option<ChunkCorner> {
+        let Some(base) = self.chunk.rows_corner(kvh, rows_per_head) else {
+            return None;
+        };
+        let off = base.0 as u64 + self.first_slot as u64 * rows_per_head as u64;
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
+    }
+
+    /// kv head `kvh`'s V rows for this part: rows `[first_slot, first_slot + slots)` of its
+    /// `[chunk slots, hd]` block — ONE feature slab ([`ChunkScratch::of_chunk`] refuses more), so
+    /// row-major, `first_slot · hd` in.
+    pub const fn value_corner(self, kvh: u32) -> Option<ChunkCorner> {
+        let Some(base) = self.chunk.kernel_corner(kvh) else {
+            return None;
+        };
+        let hd = self.chunk.head_chunk_elems() / self.chunk.slots() as u64;
+        let off = base.0 as u64 + self.first_slot as u64 * hd;
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
     }
 }
 

@@ -728,6 +728,96 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
 // Invisible under `-Fsendnn`; it broke the KTIR-only build, which is exactly what `8bd5c755b` had
 // just repaired.
 #[cfg(feature = "spyre-hw")]
+/// What a chunk body attends, for [`chunk_index_table`]: the keys resident before it (positions
+/// `0..resident`, which the chunk must hold) and the slots whose pages its table names.
+///
+/// ⛔ EACH ITEM CARRIES ITS OWN `#[cfg]` — see the note above: an item inserted under another's
+/// attribute takes it, and the item it guarded is left ungated.
+struct ChunkKeys {
+    resident: usize,
+    mapped: u32,
+}
+
+#[cfg(feature = "spyre-hw")]
+/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX TABLE — for the two bodies whose rows share ONE resident
+/// history: the one-request decode and a prompt chunk's prefix. The body that will RUN (`step`) names
+/// its chunk by its swept extent (`pages * PAGE_SLOTS`, the rung the macro recorded), so the table is
+/// built for exactly that chunk — a table for another width names blocks the copies do not read and
+/// leaves the ones they do at zero. `None` when the body gathers nothing.
+///
+/// The keys (see [`ChunkKeys`]) must all lie inside the chunk: `select_body` chose the smallest rung
+/// covering them, so a shortfall means the ladder stopped below this context — attending a prefix that
+/// ends early — and it refuses.
+///
+/// The pages are `req.page_map(ctx, want)` — the very map the launch installed, holes served from the
+/// pool's reserved range included — so the table the card reads and the map the cache write used are one
+/// derivation. A chunk wider than the map repeats the LAST real page; the broadcast validity row (over
+/// logical slots, exactly the order the chunk gathers) silences those slots, the reference's pad-up law.
+///
+/// ⛔ EVERY FAILURE REFUSES, never a zero table: an unstaged entry reads ZERO, and zero is a VALID block
+/// — page 0's keys, fluently wrong.
+fn chunk_index_table(
+    what: &str,
+    sh: &Shared<'_>,
+    session: &SuperDscSession,
+    step: scratchy_target_spyre::superdsc_exec::StepBody,
+    req: &ReqState,
+    ctx: PageMapCtx<'_>,
+    keys: ChunkKeys,
+) -> ExecutorResult<Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>>> {
+    let ChunkKeys { resident, mapped } = keys;
+    if !step.gathers().get() {
+        return Ok(None);
+    }
+    const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let swept = step.swept().get();
+    let chunk_pages = swept / PER_PAGE;
+    if !swept.is_multiple_of(PER_PAGE) || (chunk_pages as usize) * (PER_PAGE as usize) < resident {
+        return Err(werr(format!(
+            "{what}: the chunk body sweeps {swept} slot(s) — not a whole number of {PER_PAGE}-slot \
+             pages, or fewer slots than the {resident} resident key(s). The chunk ladder's top rung \
+             ({} pages) is below this context.",
+            scratchy_subtile::sdsc_abstract::ChunkScratch::PAGES_MAX
+        )));
+    }
+    // The pool geometry the entry factor needs — `kv_dim / head_dim`, `head_dim`, the same two numbers
+    // the batched site reads off the model.
+    let pool =
+        scratchy_subtile::sdsc_abstract::PagedKvPool::new(sh.kv_dim / sh.head_dim, sh.head_dim);
+    let per_page = session.gather_entries_per_page(pool).ok_or_else(|| {
+        werr(format!(
+            "{what}: this bundle emits a GATHERED KV read, but a physical page is not a whole number \
+             of STICK BLOCKS — no integer index can name a page boundary"
+        ))
+    })?;
+    let scratch = scratchy_subtile::sdsc_abstract::ChunkScratch::of_chunk(pool, chunk_pages)
+        .ok_or_else(|| {
+            werr(format!(
+                "{what}: a {chunk_pages}-page chunk is not expressible at this geometry, but the bake \
+                 emitted one — the bake and the host disagree about the chunk"
+            ))
+        })?;
+    let want = scratchy_subtile::sdsc_abstract::RowPages::holding(
+        scratchy_subtile::sdsc_abstract::SlotCount::new(mapped),
+    );
+    let map = req.page_map(ctx, want).ok_or_else(|| {
+        werr(format!(
+            "{what}: cannot map {want:?} page(s): the host granted {} block(s) — every page holding a \
+             key must be a host block",
+            ctx.host.len(),
+        ))
+    })?;
+    scratchy_subtile::sdsc_abstract::chunk_gather_index_table(scratch, &map.as_i64(), per_page)
+        .map(Some)
+        .ok_or_else(|| {
+            werr(format!(
+                "{what}: could not build the chunk gather's index table from this request's page map \
+                 — the map is empty or an entry overflows int32"
+            ))
+        })
+}
+
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
     session: &mut SuperDscSession,
@@ -1022,18 +1112,38 @@ pub(crate) fn superdsc_forward_chunk(
                         })
                     })
                     .collect::<ExecutorResult<Vec<usize>>>()?;
+                // ⭐⭐⭐⭐⭐ THE BODY THIS CHUNK RUNS, ASKED BEFORE THE LAUNCH. Past one page of prefix the
+                // prompt chunk's body is a split-KV chunk — every resident page attended in ONE launch —
+                // so the index table and the gather answer must be the RUNNING body's, the solo decode's
+                // own law. `step_body(start)` is the selection the launch makes (`valid_len = start + 1`),
+                // and the chunk must hold the `start` resident keys; this chunk's own rows, written
+                // before attention, sit at slots `>= start`, which the broadcast validity row masks.
+                let step = pf.step_body(chunk_start).map_err(|e| {
+                    werr(format!(
+                        "prompt chunk at {chunk_start}: the session could not say which body runs: {e}"
+                    ))
+                })?;
+                let kv_blocks = chunk_index_table(
+                    "prompt chunk",
+                    sh,
+                    pf,
+                    step,
+                    req,
+                    ctx,
+                    ChunkKeys {
+                        resident: chunk_start,
+                        mapped: chunk_start as u32,
+                    },
+                )?;
                 prefill_logits = run_prefill_batch(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
                     // that statement — there are no per-request rows, so the chunk laws are the only
                     // ones reachable.
                     None,
-                    // ⛔ AND NO INDEX TABLE, for the same reason: a prompt chunk's rows share ONE
-                    // resident history, so there is nothing per-row for an index to distinguish, and
-                    // `compute_bundle_layout` places no index tensor for a bundle whose rows are not
-                    // requests. If one ever did, `kernel_values` refuses here rather than gathering
-                    // through an unstaged (zero, and therefore valid) index.
-                    None,
+                    // The chunk's index table — `None` for a body that gathers nothing (no prefix, or
+                    // a prefix within one page on the per-page body).
+                    kv_blocks.as_deref(),
                     sh,
                     pf,
                     pmeta,
@@ -1049,10 +1159,10 @@ pub(crate) fn superdsc_forward_chunk(
                                     .to_string(),
                             )
                         })?,
-                    // ⭐ THE PREFILL META'S OWN FACTS, which here IS the bundle being run — a prompt
-                    // chunk launches `pf` under `pmeta`, so unlike the batched rung the borrowed-meta
-                    // divergence does not arise and the artifact answer is the meta's.
-                    scratchy_target_spyre::wiring::GathersKv::of(&pmeta.facts),
+                    // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
+                    // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
+                    // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
+                    step.gathers(),
                     chunk_start,
                     // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
                     // read however many rows this chunk ran at.
@@ -1291,87 +1401,20 @@ pub(crate) fn superdsc_forward_chunk(
             }
         }
         // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
-        // pass through a kv-head-major gather (`ChunkScratch`), so its table names each (page, kv
-        // head) block of THIS request's page map. Asked of the body that will RUN (`step`, above): its
-        // swept extent IS the chunk — `pages * PAGE_SLOTS`, the rung the macro recorded. A table built
-        // for another chunk width names blocks the copies do not read and leaves the ones they do at
-        // zero.
-        //
-        // The pages are `req.page_map(ctx, want)` — the very map `bind_request_pages_at` handed
-        // `set_block_table`, holes served from the pool's reserved range included — so the table the
-        // card reads and the map the cache write used are one derivation. A chunk wider than the map
-        // repeats the LAST real page; the broadcast validity row (`prefix_src`, over logical slots,
-        // exactly the order the chunk gathers) silences those slots, the reference's pad-up law.
-        //
-        // ⛔ EVERY FAILURE REFUSES, never a zero table: an unstaged entry reads ZERO, and zero is a
-        // VALID block — page 0's keys, fluently wrong.
-        let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> = if step
-            .gathers()
-            .get()
-        {
-            const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-            let swept = step.swept().get();
-            let chunk_pages = swept / PER_PAGE;
-            // The chunk must hold every key this step attends: positions `0..p` are resident and
-            // `select_body` chose the smallest rung covering `p + 1`, so a shortfall means the ladder
-            // stopped below this context — attending a prefix that ends early, so it refuses.
-            if !swept.is_multiple_of(PER_PAGE) || (chunk_pages as usize) * (PER_PAGE as usize) < p {
-                return Err(werr(format!(
-                    "solo decode: the chunk body for pos {p} sweeps {swept} slot(s) — not a whole \
-                     number of {PER_PAGE}-slot pages, or fewer slots than the {p} resident key(s). \
-                     The chunk ladder's top rung ({} pages) is below this context.",
-                    scratchy_subtile::sdsc_abstract::ChunkScratch::PAGES_MAX
-                )));
-            }
-            // The pool geometry the entry factor needs — `kv_dim / head_dim`, `head_dim`, the same
-            // two numbers the batched site reads off the model.
-            let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
-                sh.kv_dim / sh.head_dim,
-                sh.head_dim,
-            );
-            let per_page = session.gather_entries_per_page(pool).ok_or_else(|| {
-                werr(
-                    "solo decode: this bundle emits a GATHERED KV read, but a physical page is not \
-                     a whole number of STICK BLOCKS — no integer index can name a page boundary"
-                        .to_string(),
-                )
-            })?;
-            let scratch = scratchy_subtile::sdsc_abstract::ChunkScratch::of_chunk(
-                pool,
-                chunk_pages,
-            )
-            .ok_or_else(|| {
-                werr(format!(
-                    "solo decode: a {chunk_pages}-page chunk is not expressible at this geometry, \
-                         but the bake emitted one — the bake and the host disagree about the chunk"
-                ))
-            })?;
-            let want = scratchy_subtile::sdsc_abstract::RowPages::holding(
-                scratchy_subtile::sdsc_abstract::SlotCount::new(p as u32 + 1),
-            );
-            let map = req.page_map(ctx, want).ok_or_else(|| {
-                werr(format!(
-                    "solo decode: cannot map {want:?} page(s): the host granted {} block(s) — every \
-                     page holding a key must be a host block",
-                    ctx.host.len(),
-                ))
-            })?;
-            let table = scratchy_subtile::sdsc_abstract::chunk_gather_index_table(
-                scratch,
-                &map.as_i64(),
-                per_page,
-            )
-            .ok_or_else(|| {
-                werr(
-                    "solo decode: could not build the chunk gather's index table from this \
-                     request's page map — the map is empty or an entry overflows int32"
-                        .to_string(),
-                )
-            })?;
-            Some(table)
-        } else {
-            None
-        };
+        // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
+        // token's page too.
+        let kv_blocks = chunk_index_table(
+            "solo decode",
+            sh,
+            session,
+            step,
+            req,
+            ctx,
+            ChunkKeys {
+                resident: p,
+                mapped: p as u32 + 1,
+            },
+        )?;
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
             head_dim: hd,

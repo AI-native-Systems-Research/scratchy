@@ -10059,6 +10059,13 @@ fn dump_wavefront_mega(
                 // one-request rung (it gates the batched-decode emission, and the single-row bake
                 // keeps the shipped values) and is true of rungs the handoff cannot apply to.
                 let one_request = !is_prefill && decode_rows == 1 && seq_sym.is_none();
+                // ⭐ THE PREFIX-CAPABLE PROMPT CHUNK — ONE request's consecutive positions over that
+                // request's resident prefix, the other bake whose rows share ONE history, so its prefix
+                // takes the split-KV chunk too. `FULL` is the continuation bundle; a start==0 rung bakes
+                // `NONE` and has no prefix to attend.
+                let prompt_chunk_prefix = is_prefill
+                    && active_cap
+                        == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
@@ -10174,7 +10181,7 @@ fn dump_wavefront_mega(
                     // ceiling body is the WIDEST chunk; the ladder below bakes the narrower ones.
                     // Asked of the graph's own geometry (`admitted_chunk`): a model the chunk cannot
                     // express (hd above one slab) keeps its per-page fold AND its sweep ladder.
-                    let chunk_ceiling: Option<u32> = if one_request {
+                    let chunk_ceiling: Option<u32> = if one_request || prompt_chunk_prefix {
                         scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk(
                             &krg,
                             Some(ktir_superdsc::sdsc_abstract::ChunkScratch::PAGES_MAX),
@@ -10400,10 +10407,15 @@ fn dump_wavefront_mega(
                                                 },
                                             )];
                                             // The per-page sweep rungs below one page — every decode
-                                            // bake's ladder.
-                                            let sweep = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap)
-                                                .into_iter()
-                                                .map(|r| (r, None, r.get()));
+                                            // bake's ladder. A prompt chunk never had them (its
+                                            // prefix bundle sweeps whole pages), so it keeps none.
+                                            let sweep = if is_prefill {
+                                                Vec::new()
+                                            } else {
+                                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap)
+                                            }
+                                            .into_iter()
+                                            .map(|r| (r, None, r.get()));
                                             // ⭐ PAST ONE PAGE, THE ONE-REQUEST LADDER IS CHUNK WIDTHS:
                                             // every chunk rung lowers the program at its one-page sweep
                                             // (`FULL`) and differs only in the chunk it attends, so its
@@ -10442,7 +10454,10 @@ fn dump_wavefront_mega(
                                             } else {
                                                 sweep.collect()
                                             };
-                                            if !is_prefill {
+                                            // A prompt chunk's ladder is its chunk rungs (and the
+                                            // per-page body under them); every other prefill bake
+                                            // keeps its single body.
+                                            if !is_prefill || chunk_ceiling.is_some() {
                                                 for (rung, rung_chunk, rung_swept) in ladder {
                                                     match superdsc::lower_subtile_tape_to_superdsc(
                                                         &tape_rolled,
