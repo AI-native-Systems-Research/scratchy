@@ -124,7 +124,7 @@ pub struct AnthropicTool {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    pub input_schema: Value,
+    pub input_schema: crate::protocol::OrderedJson,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<Value>,
 }
@@ -1478,7 +1478,7 @@ mod tests {
             tools: Some(vec![AnthropicTool {
                 name: "search".into(),
                 description: Some("Search the web".into()),
-                input_schema: serde_json::json!({"type": "object"}),
+                input_schema: serde_json::json!({"type": "object"}).into(),
                 cache_control: None,
             }]),
             tool_choice: None,

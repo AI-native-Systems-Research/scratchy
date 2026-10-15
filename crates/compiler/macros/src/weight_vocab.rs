@@ -117,7 +117,7 @@ pub fn kv_cache_extern_layer(claimed_tiles: &[TileId], fuf: &Fuf) -> Option<u32>
 /// Every Impl-driven variant is named here, by exactly one Impl.
 /// Two Impls declaring the same variant ident must agree on field
 /// shape — codegen panics on mismatch.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpcodeShape {
     /// PascalCase ident the per-arch enum uses for this variant.
     pub name: syn::Ident,

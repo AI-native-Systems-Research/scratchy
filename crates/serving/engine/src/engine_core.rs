@@ -262,14 +262,17 @@ impl EngineCore {
             // caching off (sliding groups can't be rebuilt from a cached prefix).
             if let Some((num_blocks, groups)) = config.hybrid_kv.clone() {
                 let n_sliding = groups.iter().filter(|g| g.0).count();
+                let stores = executor.hybrid_kv_stores();
                 info!(
                     "Hybrid SWA KV enabled: {} shared blocks, {} groups ({} sliding), \
-                     lowest-free-first (sliding groups recycle low IDs → bounded residency)",
+                     lowest-free-first (sliding groups recycle low IDs → bounded residency), \
+                     stores {:?}",
                     num_blocks,
                     groups.len(),
-                    n_sliding
+                    n_sliding,
+                    stores
                 );
-                tracker.enable_hybrid(num_blocks, groups);
+                tracker.enable_hybrid(num_blocks, groups, stores);
             }
             Box::new(tracker)
         };

@@ -1531,6 +1531,24 @@ impl MetalWorker {
         Some((out, patches))
     }
 
+    /// The configured draft's weight store, the architecture its config registers under, and the
+    /// config, for a target of architecture `arch` and config `target_config`: a checkpoint of its
+    /// own ([`Self::draft_checkpoint`]) or the target's head ([`Self::target_head`]). Built before
+    /// the weights set's residency declare starts (`load_model`): a weight file it maps commits to
+    /// that set, which waits for a declare in flight.
+    fn draft_store(
+        &self,
+        arch: &str,
+        target_config: &HfModelConfig,
+        allocator: MetalAllocator,
+    ) -> ExecutorResult<(GpuWeights, String, HfModelConfig)> {
+        match &self.config.draft {
+            Some(Draft::Checkpoint(path)) => self.draft_checkpoint(path, allocator),
+            Some(Draft::TargetHead) => self.target_head(arch, target_config, allocator),
+            None => Err(ExecutorError::WorkerInit("no draft is configured".into())),
+        }
+    }
+
     /// A draft checkpoint of its own ([`Draft::Checkpoint`]): its weight store, the architecture its
     /// config registers under, and the config.
     fn draft_checkpoint(
@@ -1573,13 +1591,11 @@ impl MetalWorker {
     /// of the main shards can still publish it as that file.
     fn target_head(
         &self,
+        arch: &str,
+        target_config: &HfModelConfig,
         allocator: MetalAllocator,
     ) -> ExecutorResult<(GpuWeights, String, HfModelConfig)> {
-        let (Some(arch), Some(refs), Some(target_config)) = (
-            self.resolved_architecture.as_deref(),
-            self.target_tensor_refs.as_ref(),
-            self.hf_config.as_ref(),
-        ) else {
+        let Some(refs) = self.target_tensor_refs.as_ref() else {
             return Err(ExecutorError::WorkerInit(
                 "MTP head: the target must load first (its checkpoint is the head's)".into(),
             ));
@@ -1636,9 +1652,9 @@ impl MetalWorker {
         )))
     }
 
-    /// Load the speculative draft model onto the same Metal device +
-    /// allocator + command queue as the target. Called from
-    /// `load_model` after the target is fully loaded.
+    /// Load the speculative draft model, from its weight store ([`Self::draft_store`]), onto the
+    /// same Metal device + allocator + command queue as the target. Called from `load_model` after
+    /// the target is fully loaded.
     ///
     /// Skips the metal device setup (reuses `self.gpu_device`), the
     /// argmax kernel compile (per-device, not per-model — `self.argmax_*`
@@ -1648,27 +1664,15 @@ impl MetalWorker {
     /// same device → two pipeline caches; that's fine because cache
     /// keys include the library name and each model's synthesized
     /// libraries are derived from its own per-arch macro expansion.
-    fn load_draft_model_metal(&mut self) -> ExecutorResult<()> {
-        let draft = self.config.draft.clone().ok_or_else(|| {
-            ExecutorError::WorkerInit("load_draft_model_metal called without a draft".into())
-        })?;
-        // Reuse the target's gpu_device — its allocator owns the
-        // residency set the target weights live in, and the draft must
-        // share that set or attention reads will race the Apple pager.
-        // `MetalAllocator::clone` shares the underlying arena via
-        // Arc<Mutex<…>>, so a weight allocated through the draft clone
-        // is reachable via the target's clone too.
+    fn load_draft_model_metal(
+        &mut self,
+        (mut draft_weights, draft_arch, draft_hf_config): (GpuWeights, String, HfModelConfig),
+    ) -> ExecutorResult<()> {
         let gpu_device = self.gpu_device.as_ref().ok_or_else(|| {
             ExecutorError::WorkerInit(
                 "gpu_device not initialized — draft load must run after target load".into(),
             )
         })?;
-        let allocator = (*gpu_device.allocator).clone();
-
-        let (mut draft_weights, draft_arch, draft_hf_config) = match draft {
-            Draft::Checkpoint(path) => self.draft_checkpoint(&path, allocator)?,
-            Draft::TargetHead => self.target_head(allocator)?,
-        };
         draft_weights.set_target_dtype(GpuDType::BF16);
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
@@ -2968,9 +2972,23 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // path + dtype from `self.config`. Phase 5.4 will tighten this
         // when `DraftModelProposer` takes ownership of the lifecycle and
         // pushes the path/dtype through the trait surface directly.
-        self.load_draft_model_metal().map_err(|e| {
+        let (Some(arch), Some(target_config), Some(gpu_device)) = (
+            self.resolved_architecture.as_deref(),
+            self.hf_config.as_ref(),
+            self.gpu_device.as_ref(),
+        ) else {
+            return Err(
+                ::scratchy_serving_engine::spec_decode::BackendError::Backend(
+                    "the target must load before its draft".into(),
+                ),
+            );
+        };
+        let backend = |e: ExecutorError| {
             ::scratchy_serving_engine::spec_decode::BackendError::Backend(e.to_string())
-        })?;
+        };
+        let store = (self.draft_store(arch, target_config, (*gpu_device.allocator).clone()))
+            .map_err(backend)?;
+        self.load_draft_model_metal(store).map_err(backend)?;
         Ok(::scratchy_serving_engine::spec_decode::ModelHandle(1))
     }
 
@@ -4631,6 +4649,19 @@ impl Worker for MetalWorker {
             t_from_dir.elapsed(),
             weights.len()
         );
+        // A configured draft may be a multi-token-prediction head, lent the target's embedding and
+        // lm_head (and its own tensors, when the target's checkpoint carries them): snapshot the
+        // refs before the target's load consumes them.
+        self.target_tensor_refs = self.config.draft.is_some().then(|| weights.tensor_refs());
+        // The draft's weight files (its checkpoint, or the target's sidecar) map into the target's
+        // weights set — it must share that set, or attention reads race the Apple pager — and so
+        // before that set's residency declare below starts: a commit to the set waits for a
+        // declare in flight (gemma-4-26b's assistant waited out the target's ~230 ms on a base
+        // M5), where this way the one declare covers both.
+        let draft = (self.config.draft.is_some())
+            .then(|| self.draft_store(&arch, &hf_config, (*gpu_device.allocator).clone()))
+            .transpose()?;
+
         // Make the weights resident while the rest of the load runs: the first forward's command
         // buffer otherwise does it before its first dispatch can start. One command buffer here,
         // which leaves the engine init's own command buffers room; the first forward then
@@ -4686,10 +4717,6 @@ impl Worker for MetalWorker {
         // Under cfg(metal), `CUstream = ()`; the per-canonical
         // `Weights::load` body ignores the stream parameter (uploads go
         // through the allocator inside `GpuWeights`).
-        // A configured draft may be a multi-token-prediction head, lent the target's embedding and
-        // lm_head (and its own tensors, when the target's checkpoint carries them): snapshot the
-        // refs before the target's load consumes them.
-        self.target_tensor_refs = self.config.draft.is_some().then(|| weights.tensor_refs());
         let t_try_load = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(
             &mut weights,
@@ -4917,8 +4944,8 @@ impl Worker for MetalWorker {
         // draft model onto the same gpu_device (shared allocator +
         // residency set + command queue). KV pool for the draft is
         // allocated separately in `initialize_cache`.
-        if self.config.draft.is_some() {
-            self.load_draft_model_metal()?;
+        if let Some(draft) = draft {
+            self.load_draft_model_metal(draft)?;
         }
 
         Ok(())
@@ -5841,19 +5868,24 @@ impl Worker for MetalWorker {
         // borrow of `attn` is held across the `&mut self` grow call.
         #[cfg(feature = "metal")]
         {
-            // Cover BOTH groups' block IDs — the sliding ring draws from the
-            // same shared pool, so a sliding ID can sit in a chunk the full
-            // group never reached; an ungrown chunk has a stale address-table
-            // entry and would fault on the sliding-layer write.
+            // Cover every block ID the shared pool is addressed with: the
+            // sliding groups', and the full group's unless its KV lives in a
+            // store of its own (`hybrid_kv_stores`). An ungrown chunk has a
+            // stale address-table entry and would fault on the write.
             let max_full_block = attn.block_ids.iter().flatten().copied().max();
-            let max_block = attn
+            let max_sliding_block = attn
                 .sliding_groups
                 .iter()
                 .flatten()
                 .flatten()
                 .copied()
-                .max()
-                .max(max_full_block);
+                .max();
+            let max_block = match self.hybrid_kv_stores() {
+                scratchy_core_common::HybridKvStores::Shared => {
+                    max_sliding_block.max(max_full_block)
+                }
+                scratchy_core_common::HybridKvStores::GlobalApart => max_sliding_block,
+            };
             self.grow_metal_kv_to_cover(max_block.unwrap_or(0), max_full_block.unwrap_or(0))?;
         }
 
@@ -7210,6 +7242,24 @@ impl Worker for MetalWorker {
 
     fn pipelines_speculative_steps(&self) -> bool {
         self.mtp_drafter.is_some() && self.select_rows_kernel.is_some()
+    }
+
+    /// TurboQuant codes a hybrid model's global layers into stores of their own: packed codes, norms
+    /// and an fp16 scratch, bound at each global layer's `kv_cache_k/v` and mapped through group 0's
+    /// blocks (`build_tq_provision`). The shared pool then backs the sliding layers alone — unless a
+    /// head reading its target's KV is not TurboQuant itself, and so reads the target's global layer
+    /// from the shared pool at group 0's blocks (a coded one binds its target's stores).
+    fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
+        let coded =
+            |m: &dyn scratchy_forward_compiler::ScratchyWeights| m.kv_codec().is_turboquant();
+        let target_coded = self.model.as_deref().is_some_and(coded);
+        let head_coded =
+            !self.head_reads_target_kv() || self.draft_model.as_deref().is_some_and(coded);
+        if self.kv_is_hybrid && target_coded && head_coded {
+            scratchy_core_common::HybridKvStores::GlobalApart
+        } else {
+            scratchy_core_common::HybridKvStores::Shared
+        }
     }
 }
 

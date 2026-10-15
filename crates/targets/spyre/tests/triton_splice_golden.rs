@@ -45,7 +45,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node. Every width is
@@ -126,7 +126,7 @@ fn spliced_silumul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node, at EVERY rung: a
@@ -214,7 +214,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&chunked, &weight_ids, false, &Default::default())
+    let layout = compute_bundle_layout(&chunked, &weight_ids, false, false, &Default::default())
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
@@ -301,7 +301,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+            let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
             // The splice — the row compiles the kernel for this node at every
@@ -396,7 +396,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The layout the tape walk computes for this graph (`rows_are_requests:
         // true` is the decode/batched shape).
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
@@ -741,7 +741,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles `scalarmul.py` for this node.
@@ -792,7 +792,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+    let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
         .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
@@ -1016,7 +1016,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
+    let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &Default::default())
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
@@ -1067,7 +1067,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
@@ -1130,7 +1130,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &Default::default())
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
@@ -1410,6 +1410,7 @@ fn spliced_rope_lowers_through_the_door() {
                 &ir,
                 &weight_ids,
                 rows_are_requests,
+                rows_are_requests,
                 &Default::default(),
             )
             .unwrap_or_else(|e| {
@@ -1444,6 +1445,10 @@ fn spliced_rope_lowers_through_the_door() {
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 geom,
                 rows_are_requests,
+                // The production mint's value for a batched-shape fixture with no one-request
+                // rung to widen it: the gather follows the row kind here.
+                gathers_kv: rows_are_requests,
+                chunk_pages: None,
                 // No fold: this fixture's q/k are Ext sources with no projection matmuls, so the
                 // program states its real scale and the door emits the score multiplies.
                 scale_folded: false,
@@ -1819,6 +1824,61 @@ fn attn_geometry(geom: (u32, u32, u32)) -> Option<ktir_superdsc::head_counts::Mo
     )
 }
 
+/// ⛔ ONE SESSION STAGES ONE LAYOUT — placing the KV block index moves no other staged activation.
+///
+/// The one-request ladder runs per-page bodies that gather nothing under a split-KV chunk ceiling that
+/// gathers, and the host stages every step at the CEILING's placements. Each fixture's attention
+/// registers its scale (and √scale) after the attention's own placements — exactly the tail an index
+/// placed beside the mask used to push down, so that a non-gathering body read its constants out of the
+/// index's bytes. The macro holds every baked rung to `ladder_stages_one_layout`; this holds the layout.
+#[test]
+fn the_kv_block_index_moves_no_other_staged_activation() {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
+        KV_BLOCK_INDEX_TID, ladder_stages_one_layout,
+    };
+    for s in ATTN_SHAPES.iter().filter(|s| s.mq == 1) {
+        let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
+        let ir = attn_ir(*s, scale);
+        let weight_ids: HashSet<u32> = HashSet::new();
+        // The one-request rows (`rows_are_requests = false`) at both gather facts: the chunk ceiling's
+        // call and the per-page body's.
+        let layout = |gathers_kv: bool| {
+            compute_bundle_layout(&ir, &weight_ids, false, gathers_kv, &Default::default())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "layout minted geom={:?} gathers_kv={gathers_kv}: {e}",
+                        s.geom
+                    )
+                })
+        };
+        let (plain, gathering) = (layout(false), layout(true));
+        assert!(
+            !plain.placements.contains_key(&KV_BLOCK_INDEX_TID),
+            "geom={:?}: a bundle that does not gather placed the index",
+            s.geom
+        );
+        let index = *gathering
+            .placements
+            .get(&KV_BLOCK_INDEX_TID)
+            .unwrap_or_else(|| panic!("geom={:?}: a gathering bundle placed no index", s.geom));
+        ladder_stages_one_layout(&gathering, &plain)
+            .unwrap_or_else(|e| panic!("geom={:?}: {e}", s.geom));
+        let behind: Vec<u32> = gathering
+            .placements
+            .values()
+            .filter(|p| p.segment == index.segment && p.tid != KV_BLOCK_INDEX_TID)
+            .filter(|p| p.role == index.role && p.offset >= index.offset)
+            .map(|p| p.tid)
+            .collect();
+        assert!(
+            behind.is_empty(),
+            "geom={:?}: tensor(s) {behind:?} sit behind the index in its segment — the index must be \
+             the LAST activation, or its presence moves them",
+            s.geom
+        );
+    }
+}
+
 #[test]
 fn spliced_attn_lowers_through_the_door() {
     for &s in ATTN_SHAPES {
@@ -1841,6 +1901,7 @@ fn spliced_attn_lowers_through_the_door() {
             let layout = compute_bundle_layout(
                 &ir,
                 &weight_ids,
+                rows_are_requests,
                 rows_are_requests,
                 &Default::default(),
             )
@@ -1904,6 +1965,10 @@ fn spliced_attn_lowers_through_the_door() {
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 geom: attn_geometry(s.geom).expect("granite's geometry mints"),
                 rows_are_requests,
+                // The production mint's value for a batched-shape fixture with no one-request
+                // rung to widen it: the gather follows the row kind here.
+                gathers_kv: rows_are_requests,
+                chunk_pages: None,
                 // No fold: same as the rope door's fixture — the program states its real scale.
                 scale_folded: false,
                 // No handoff: this fixture's attention output is the graph RESULT (no o matmul

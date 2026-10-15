@@ -292,6 +292,7 @@ fn assemble_attn_threads_the_form_to_every_gform_op() {
             "pmask",
             "cmask",
             None,
+            None,
             scratchy_target_spyre::bundle_code::PlaceId::Act(7),
             rar,
             false,

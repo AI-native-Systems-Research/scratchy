@@ -1733,6 +1733,389 @@ fn assemble_attn_block(
     Ok(())
 }
 
+/// The split-KV chunk's own buffer NAMES — the gather scratches and the per-kv-head wide blocks.
+struct ChunkBufs {
+    gkt: String,
+    gv: String,
+    csc: String,
+    cesub: String,
+    cexp: String,
+}
+
+/// What one layer's split-KV chunk attends with: its geometry, the pool planes and index it gathers
+/// through, the query and mask it scores, and the buffers it writes.
+struct ChunkAttn<'a> {
+    t: u32,
+    nqh: u32,
+    hd: u32,
+    gqa: u32,
+    // Query rows per head: 1 at decode, the prompt chunk's width at prefill.
+    mq: u32,
+    chunk: crate::sdsc_abstract::ChunkScratch,
+    index: &'a str,
+    kct: &'a str,
+    vc: &'a str,
+    qs: &'a str,
+    pmask: &'a str,
+    bmm_form: SharedKernelBmmForm,
+    bufs: &'a BlockBufs,
+    cb: &'a ChunkBufs,
+}
+
+/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — EVERY resident page of ONE request attended in ONE pass, folded onto the
+/// new-token seed: the reference's decode structure (`spyre_inference`'s
+/// `batched_decode_head_major_kernel`: gather the chunk's pages, ONE score and ONE value matmul over the
+/// whole chunk, then reduce the row max and the denominators across the pages).
+///
+/// ⛔ WHAT IT REPLACES: the per-page fold, `SlotWindow::sweep(active_cap)` re-launched once per resident
+/// page, each launch 4 windows × (8 per-kv-head score matmuls + 11 softmax ops + 8 per-kv-head value
+/// matmuls) = 108 ops. Per resident page per layer that is ~80 µs of serialized op glue on granite-2b
+/// (the decode slope this exists to remove). Here a chunk of up to [`ChunkScratch::PAGES_MAX`] pages costs:
+///
+/// * gather: `2 * nkvh * ops_per_row` copies (the card-proven copy op, [`ChunkScratch::copies`]);
+/// * per kv head (`nkvh`): score, row max, sub, exp, row sum, value — 6;
+/// * shared over every head: the fold block's own merge ops (`newm`, `corrsub`, `corre`, `mset`, `ocorr`,
+///   `lcorr`, `ladd`).
+///
+/// The same count at every chunk width — the slope is in the gather's copies and the ops' own widths.
+///
+/// ⛔ EACH KV HEAD'S WIDE DATA IS A WHOLE `[gqa, slots]` BLOCK ([`ChunkScratch::rows_corner`]), never a
+/// row slice of a taller multi-stick buffer — dxp rebuilds a stick-blocked operand's group stride from the
+/// op's own `N_`. The narrow running stats stay in the shared `[nqh, stick]` buffers, whose row slices are
+/// flat at one stick and therefore exact.
+///
+/// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
+/// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
+fn assemble_attn_chunk(
+    ops: &mut Vec<EmittedOp>,
+    a: ChunkAttn<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let ChunkAttn {
+        t,
+        nqh,
+        hd,
+        gqa,
+        mq,
+        chunk,
+        index,
+        kct,
+        vc,
+        qs,
+        pmask,
+        bmm_form,
+        bufs,
+        cb,
+    } = a;
+    use crate::addr::DevOff;
+    use crate::superdsc_opspec::{EpilogueOpFunc, Scale};
+    let stick = BlockCols::of_one_stick(Lanes::FP16);
+    let width = BlockCols::of_chunk(chunk);
+    let slots = width.get();
+    // ⭐ ROWS, NOT HEADS. A head's rows are `mq` consecutive positions of the head-major token stream
+    // (row `h·mq + r`): one at decode, the prompt chunk's width at prefill. So kv head `kvh`'s query rows
+    // are the contiguous `[kvh·gqa·mq, (kvh+1)·gqa·mq)`, and every per-head block, base and extent below
+    // is in those rows; at `mq == 1` each is the decode body's, byte for byte.
+    let (g_rows, q_rows) = (gqa * mq, nqh * mq);
+    let all_rows = RowCount::of_head_major_rows(q_rows);
+    let grp_rows = RowCount::of_head_major_rows(g_rows);
+    let nkvh = chunk.nkvh();
+    if nkvh * gqa != nqh {
+        return Err(SuperDscError(format!(
+            "attention chunk o{t}: {nkvh} kv heads × {gqa} query heads per group is not the {nqh} \
+             query heads the bundle carries"
+        )));
+    }
+    // A one-stick row offset in a `[rows, stick]` buffer (or in `qs`, whose head dim is one stick here —
+    // `ChunkScratch::of_chunk` refuses more than one feature slab) is a single-stick view step.
+    let row_step = |h: u32| DevOff::from_view_step(h * stick.get());
+    let corner = |c: Option<crate::sdsc_abstract::ChunkCorner>, what: &str| {
+        c.map(DevOff::of_chunk_corner).ok_or_else(|| {
+            SuperDscError(format!(
+                "attention chunk o{t}: {what} lies outside the {}-page chunk scratch",
+                chunk.pages()
+            ))
+        })
+    };
+
+    // ── (1) THE GATHER: every page's Kᵗ and V blocks, kv-head-major, into the two scratches ──
+    for (name, src, dst) in [
+        (format!("attn_cgkt_o{t}"), kct, cb.gkt.as_str()),
+        (format!("attn_cgv_o{t}"), vc, cb.gv.as_str()),
+    ] {
+        for cp in chunk.copies() {
+            let mut op = crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                &format!("{name}_s{}", cp.stick()),
+                src,
+                dst,
+                cp,
+                index,
+                sym_id_base,
+                layout,
+            );
+            // ⭐ DECLARED ON THE COPY ITSELF: it groups as `GroupKind::Gathered`, whose launch takes no
+            // KV page shift (the entries are absolute) and whose body the host stages the index for.
+            op.kv_gathered = true;
+            ops.push(op);
+        }
+    }
+
+    // ── (2) SCORE per kv head, then each head GROUP's max over its whole chunk ──
+    let mask_h = hm(pmask);
+    for kvh in 0..nkvh {
+        let h0 = kvh * g_rows;
+        let kc = corner(chunk.kernel_corner(kvh), "a kv head's kernel block")?;
+        let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
+        // `sc_g = Q_g · Kᵗ_g + mask` — the mask is the broadcast prefix-validity row over the chunk's
+        // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue.
+        ops.push(assemble_matmul_off_with_epilogue(
+            &format!("attn_csc_g{kvh}_o{t}"),
+            MatM::of_head_major_rows(g_rows),
+            MatN::of_kv_window(width),
+            MatK::of_head_dim(hd),
+            MatY::unbatched(),
+            bmm_form,
+            &rb(qs, q_rows, hd),
+            row_step(h0),
+            &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
+            kc,
+            &rb(&cb.csc, g_rows, slots),
+            rc,
+            &mask_h,
+            DevOff::ZERO,
+            EpilogueOpFunc::StridedAdd,
+            &[("mb", Scale::RedNonStick)],
+            true,
+            sym_id_base,
+            layout,
+        ));
+    }
+    // ⭐ THE STABILIZER IS EACH ROW's OWN MAX, ONE OP PER KV HEAD — the stick-major `[gqa, slots]` max,
+    // the same form as the denominators' sum below (both card-verified per row by reading the chunk's
+    // own buffers back after layer 0 and recomputing each op on the host).
+    //
+    // ⛔⛔⛔ IT MUST BE THE ROW's MAX, NOT THE HEAD GROUP's. A group max is a valid upper bound, and at
+    // layer 0 it gave the per-page fold's attention output to the 4th digit (granite-3.1-2b fp8, A/B'd
+    // against the fold binary) — but it scales a row's `o` and `l` by `exp(row_max - group_max)`, which is
+    // `0.0117` for row 31 already at layer 0; once a later layer's gap passes fp16's range both underflow,
+    // `o / l` is NaN, and the residual stream is `inf` by the last layer (measured). The softmax is
+    // invariant to the stabilizer only in exact arithmetic.
+    //
+    // ⛔ AND NOT A PAGE-AXIS REDUCE: every per-lane page-axis form tried over these HBM blocks —
+    // `maxnonstick`, and an elementwise slab fold — walked only part of each core's rows on card. Those used
+    // row-major operands with a declared walk; this op's operands are stick-blocked (dxp reconstructs).
+    for kvh in 0..nkvh {
+        let h0 = kvh * g_rows;
+        let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
+        ops.push(assemble_reduce_off(
+            &format!("attn_cbmax_g{kvh}_o{t}"),
+            "max",
+            grp_rows,
+            width,
+            &rb(&cb.csc, g_rows, slots),
+            rc,
+            &hm(&bufs.bmax),
+            row_step(h0),
+            sym_id_base,
+            layout,
+        ));
+    }
+
+    // ── (3) THE ONLINE MERGE ONTO THE SEED — the fold block's own four ops, in its order ──
+    for (op_name, func, ins, out) in [
+        ("newm", "maximum", [&bufs.run_m, &bufs.bmax], &bufs.newm),
+        (
+            "corrsub",
+            "subtract",
+            [&bufs.run_m, &bufs.newm],
+            &bufs.corrsubt,
+        ),
+    ] {
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_c{op_name}_o{t}"),
+            func,
+            all_rows,
+            stick,
+            &[In::full(&hm(ins[0])).ew(), In::full(&hm(ins[1])).ew()],
+            &hm(out),
+            DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+    }
+    for (op_name, func, inp, out) in [
+        ("corre", "exp", &bufs.corrsubt, &bufs.corr),
+        ("mset", "identity", &bufs.newm, &bufs.run_m),
+    ] {
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_c{op_name}_o{t}"),
+            func,
+            all_rows,
+            stick,
+            &[In::full(&hm(inp)).ew()],
+            &hm(out),
+            DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+    }
+
+    // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
+    for kvh in 0..nkvh {
+        let h0 = kvh * g_rows;
+        let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
+        // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_cesub_g{kvh}_o{t}"),
+            "subtract",
+            grp_rows,
+            width,
+            &[
+                In::sliced(&rb(&cb.csc, g_rows, slots), rc).ew(),
+                In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+            ],
+            &rb(&cb.cesub, g_rows, slots),
+            rc,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_cexp_g{kvh}_o{t}"),
+            "exp",
+            grp_rows,
+            width,
+            &[In::sliced(&rb(&cb.cesub, g_rows, slots), rc).ew()],
+            &rb(&cb.cexp, g_rows, slots),
+            rc,
+            sym_id_base,
+            layout,
+        ));
+        // ⭐ EACH ROW's SUM OVER THE WHOLE CHUNK, straight into `bsum` — the stick-major `sum` over
+        // `rows > 1 × cols > one stick`, the cell `Sum` combines correctly (prefill's RMS sums run it).
+        ops.push(assemble_reduce_off(
+            &format!("attn_cbsum_g{kvh}_o{t}"),
+            "sum",
+            grp_rows,
+            width,
+            &rb(&cb.cexp, g_rows, slots),
+            rc,
+            &hm(&bufs.bsum),
+            row_step(h0),
+            sym_id_base,
+            layout,
+        ));
+    }
+
+    // ── (5) RESCALE THE SEED'S OUTPUT, THEN THE VALUE LEG FOLDS ONTO IT ──
+    // `ocorr` reads the PRE-update `run_o`, so it precedes every value matmul (the fold block's order).
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_cocorr_o{t}"),
+        "multiply",
+        all_rows,
+        BlockCols::of_head_dim(hd),
+        &[
+            In::full(&hm(&bufs.run_o)).ew(),
+            In::col(&hm(&bufs.corr)).ew(),
+        ],
+        &hm(&bufs.otmp),
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
+    // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
+    // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
+    // the buffer it writes: part `p` writes `run_o` when `p` is even. An even part count leaves the sum
+    // in `otmp`, and one copy brings it home below.
+    let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.value_parts(mq > 1).collect();
+    for kvh in 0..nkvh {
+        let h0 = kvh * g_rows;
+        for (p, part) in parts.iter().enumerate() {
+            let kc = corner(part.value_corner(kvh), "a kv head's value block")?;
+            let rc = corner(
+                part.probs_corner(kvh, g_rows),
+                "a kv head's probability block",
+            )?;
+            let (out, addend) = if p % 2 == 0 {
+                (&bufs.run_o, &otmp_h)
+            } else {
+                (&bufs.otmp, &run_o_h)
+            };
+            let name = if parts.len() == 1 {
+                format!("attn_cov_g{kvh}_o{t}")
+            } else {
+                format!("attn_cov_g{kvh}_k{p}_o{t}")
+            };
+            // `run_o_g = P_g · V_g + otmp_g` — the `stridedadd` epilogue is the online-softmax update.
+            ops.push(assemble_matmul_off_maybe_epilogue(
+                &name,
+                MatM::of_head_major_rows(g_rows),
+                MatN::of_head_dim(hd),
+                MatK::of_kv_window(BlockCols::of_chunk_part(*part)),
+                MatY::unbatched(),
+                bmm_form,
+                &rb(&cb.cexp, g_rows, slots),
+                rc,
+                &Stk::<KernelTag>::kernel(part.slots() as usize, hd as usize, &cb.gv),
+                kc,
+                &rb(out, q_rows, hd),
+                row_step(h0),
+                Some((addend, row_step(h0))),
+                EpilogueOpFunc::StridedAdd,
+                &[],
+                false,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    if parts.len().is_multiple_of(2) {
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_covsum_o{t}"),
+            "identity",
+            all_rows,
+            BlockCols::of_head_dim(hd),
+            &[In::full(&otmp_h).ew()],
+            &run_o_h,
+            DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+    }
+    // run_l = run_l*corr + bsum — the fold block's own pair.
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_clcorr_o{t}"),
+        "multiply",
+        all_rows,
+        stick,
+        &[
+            In::full(&hm(&bufs.run_l)).ew(),
+            In::full(&hm(&bufs.corr)).ew(),
+        ],
+        &hm(&bufs.ltmp),
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_cladd_o{t}"),
+        "add",
+        all_rows,
+        stick,
+        &[
+            In::full(&hm(&bufs.ltmp)).ew(),
+            In::full(&hm(&bufs.bsum)).ew(),
+        ],
+        &hm(&bufs.run_l),
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    Ok(())
+}
+
 /// Assemble the full AttnDecode node: ONE algorithm for any `mq`. `qs` is Q ALREADY multiplied by
 /// sqrt_scale (the caller resolves that constant from the BundleLayout registry before calling
 /// this). `new_k_scaled` is this step's roped new-K, ALSO already ·sqrt_scale (torch-spyre's
@@ -1785,6 +2168,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the emitter cannot gather unless a caller has a tensor to name, which is the same caller that
     // must fill it. There is no arrangement in which one is present and the other is not.
     kv_block_index: Option<&str>,
+    // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — `Some` attends every resident page in ONE pass through a kv-head-major
+    // gather ([`assemble_attn_chunk`]) instead of the per-page fold; the index tensor above is then the
+    // CHUNK's table. `None` emits exactly the per-page fold this bundle emitted before.
+    chunk: Option<crate::sdsc_abstract::ChunkScratch>,
     out_id: crate::place::PlaceId,
     // TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
     // one resident history, requests each have their own.
@@ -2312,7 +2699,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     //
     // A head dim above one stick is no longer a refusal either — a whole page plane is contiguous at every
     // stick-multiple `hd` (`zz_a_whole_page_plane_is_contiguous_at_every_head_dim`), so hd=128 gathers.
-    let gather = kv_block_index.zip(crate::sdsc_abstract::PageScratch::of_pass(pool, width.mq()));
+    // A chunked body takes its own gather (`ChunkScratch`), never the per-page one.
+    let gather = if chunk.is_some() {
+        None
+    } else {
+        kv_block_index.zip(crate::sdsc_abstract::PageScratch::of_pass(pool, width.mq()))
+    };
     // The two scratches' spellings, and their FULL footprints declared up front — the same discipline as
     // every other synthetic here: a name that reaches its first access undeclared is a build panic, and a
     // shape declared smaller than the ops write aliases whatever the allocator handed out next.
@@ -2462,6 +2854,56 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // It broke multi-page coherence and it was chasing a cost that is not there: the mask's segment
     // is ~1.6 MB in the DECODE bundle (the ~150 MB figure is the PREFILL bundle, where mq=96 scales
     // every intermediate, and prefill runs once per request).
+    //
+    // ⭐⭐⭐⭐⭐ UNLESS THE BODY IS CHUNKED: then every resident page is attended HERE, in this launch, and
+    // the per-page fold below sweeps nothing (`gather` is `None` and the sweep extent is zero), so it emits
+    // no op and marks no fold. The chunk ops are NOT fold ops — the body launches once.
+    if let Some(chunk) = chunk {
+        let index = kv_block_index.ok_or_else(|| {
+            SuperDscError(format!(
+                "attention o{t}: a chunked body gathers its pages, but no index tensor was named — a \
+                 gather with no staged index reads block 0 for every page"
+            ))
+        })?;
+        let cb = ChunkBufs {
+            gkt: syn(R::GatherKt),
+            gv: syn(R::GatherV),
+            csc: syn(R::ChunkSc),
+            cesub: syn(R::ChunkESub),
+            cexp: syn(R::ChunkExp),
+        };
+        if let Some(l) = layout {
+            for r in [R::GatherKt, R::GatherV] {
+                l.synth(out_id.synth(r), &chunk.footprint_dims());
+            }
+            // Every query ROW's scores over the chunk — `nqh·mq` rows, the token stream's own.
+            for r in [R::ChunkSc, R::ChunkESub, R::ChunkExp] {
+                l.synth(out_id.synth(r), &[nqh * mq, chunk.slots()]);
+            }
+        }
+        assemble_attn_chunk(
+            &mut ops,
+            ChunkAttn {
+                t,
+                nqh,
+                hd,
+                gqa: nqh / nkvh,
+                mq,
+                chunk,
+                index,
+                kct,
+                vc,
+                qs,
+                pmask,
+                bmm_form,
+                bufs: &bufs,
+                cb: &cb,
+            },
+            sym_id_base,
+            layout,
+        )?;
+    }
+    let sweep_cap = if chunk.is_some() { 0 } else { active_cap };
     let fold_from = ops.len();
     // ⭐⭐⭐⭐⭐ THE GATHER ITSELF — TWO KERNEL-LESS COPIES, FIRST IN THE FOLD GROUP.
     //
@@ -2538,7 +2980,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // additional LAUNCHES of this same group, never a wider sweep. The `active_cap / 64` lives in
     // `SlotWindow::count_in`, where the 64 is the window's SLOT count — quantity (2), the reduce's
     // one-stick column budget — not the lane count it used to be spelled as.
-    for w in SlotWindow::sweep(crate::sdsc_abstract::SlotCount::new(active_cap)) {
+    for w in SlotWindow::sweep(crate::sdsc_abstract::SlotCount::new(sweep_cap)) {
         let b = w.index();
         // PER-BLOCK OFFSETS, PRINTED (`SCRATCHY_SDSC_FOLD_TRACE`). Blocks 0-1 of a 4-block sweep are correct
         // and blocks 2-3 are not, and every candidate cause has been checked correct by reading — so the

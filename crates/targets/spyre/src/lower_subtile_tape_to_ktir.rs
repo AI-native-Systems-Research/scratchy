@@ -420,6 +420,27 @@ pub(crate) fn oproj_edges<F: RopeForm>(ir: &SubtileIR<F>) -> Result<OprojEdges, 
     })
 }
 
+/// ⭐ THE SPLIT-KV CHUNK THIS GRAPH'S ATTENTION GEOMETRY CAN EXPRESS — `requested` when
+/// `ChunkScratch::of_chunk` admits it at the model's own `(nkvh, hd)`, `None` otherwise.
+///
+/// ⛔ `None` IS THE PER-PAGE FOLD, WHICH IS THE SHIPPED AND CORRECT DECODE — not a silently degraded
+/// one. The chunk is refused above one feature slab (hd > 64: the V block stops concatenating into
+/// `[slots, hd]`, a different row law not yet written), and a model there keeps exactly the emission it
+/// had. Asked of the GRAPH, so a third-party producer's geometry decides for itself; a graph with no
+/// attention node has nothing to chunk.
+pub fn admitted_chunk<F: RopeForm>(ir: &SubtileIR<F>, requested: Option<u32>) -> Option<u32> {
+    let pages = requested?;
+    let geom = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::AttnDecode { geom, .. } => Some(*geom),
+        _ => None,
+    })?;
+    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        geom.nkvh().get() as usize,
+        geom.hd().get() as usize,
+    );
+    ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).map(|_| pages)
+}
+
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
 ///
 /// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `SubOp::AttnDecode`'s
@@ -447,7 +468,21 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // (`!is_prefill && decode_rows == 1 && seq_sym.is_none()` in the `#[forward]` emission):
     // a CONCRETE single-row decode, never a symbolic batch template and never a prefill chunk.
     one_request_decode: bool,
+    // The split-KV chunk this rung bakes — the ladder's own bake fact, `Some` ONLY on a ONE-REQUEST body:
+    // the one-request decode rung, or a prompt chunk's prefix (see `BundleAttnParams::chunk_pages`).
+    chunk_pages: Option<u32>,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
+    // ⛔ A CHUNK ATTENDS ONE REQUEST'S PAGES, so a body whose rows are REQUESTS cannot carry it. A
+    // prompt chunk's rows are one request's consecutive positions sharing ONE resident history — the
+    // same single page map the one-request decode gathers — so both take it.
+    if let Some(pages) = chunk_pages
+        && rows_are_requests
+    {
+        return Err(SuperDscError(format!(
+            "a split-KV chunk of {pages} page(s) was asked of a bake whose rows are requests — a chunk \
+             attends ONE request's pages, so a batched body cannot carry it"
+        )));
+    }
     // The fold's node set, taken once: a node is folded iff the attention-fold recognition named
     // it (which is also why the door's `scale_folded` is a fact about the program, not a
     // restatement of one of its values — see `BundleAttnParams::scale_folded`).
@@ -539,6 +574,11 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     Ok(Some(crate::ktir_superdsc_door::BundleAttnParams {
         geom,
         rows_are_requests,
+        // ⭐ GATHERED AT THE BATCHED RUNGS (per page) AND AT A CHUNKED ONE-REQUEST RUNG — never a
+        // one-request body on the per-page gather, whose per-row mask read the broadcast staging
+        // cannot feed (see `BundleAttnParams::gathers_kv`).
+        gathers_kv: rows_are_requests || chunk_pages.is_some(),
+        chunk_pages,
         scale_folded: first_folded.unwrap_or(false),
         headmajor_handoff,
         // The CANONICAL o_proj — the first edge's weight, the rolled body's layer-0
@@ -750,8 +790,13 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, &Default::default())?;
+    let bundle_layout = compute_bundle_layout(
+        ir,
+        weight_ids,
+        rows_are_requests,
+        rows_are_requests,
+        &Default::default(),
+    )?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
@@ -822,7 +867,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // restructure is a rolled-body fact — see the codegen's `unrolled_params`, the same seal on the
     // bake's cardless arm. `one_request_decode` is false for the same reason: the unrolled body is
     // never the bake the fact names.
-    let mut attn_params = attn_bundle_params(ir, rows_are_requests, false)?;
+    let mut attn_params = attn_bundle_params(ir, rows_are_requests, false, None)?;
     if let Some(p) = attn_params.as_mut() {
         p.headmajor_handoff = false;
     }
@@ -945,7 +990,7 @@ pub fn graph_wiring<F: RopeForm>(
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ NO LAYER CLASSES, for the same reason [`lower_graph_to_superdsc`] passes none: this walks
     // the UNROLLED graph, which has no layer loop and so no boundary a weight BANK may fall on.
-    let layout = compute_bundle_layout(ir, weight_ids, false, &Default::default())?;
+    let layout = compute_bundle_layout(ir, weight_ids, false, false, &Default::default())?;
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
     for node in &ir.nodes {
@@ -1040,8 +1085,14 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The decode ladder's ONE-REQUEST rung — see [`attn_bundle_params`]. The `#[forward]`
     // emission states it as `!is_prefill && decode_rows == 1 && seq_sym.is_none()`.
     one_request_decode: bool,
+    // The split-KV chunk this one-request rung bakes — see `BundleAttnParams::chunk_pages`.
+    chunk_pages: Option<u32>,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
+    // ⭐ THE CHUNK THIS GEOMETRY CAN EXPRESS, decided ONCE for both of its consumers — the index
+    // placement (`compute_bundle_layout`'s `gathers_kv`) and the door's `BundleAttnParams` — so an index
+    // is reserved exactly where a chunk gathers through it.
+    let chunk_pages = admitted_chunk(ir, chunk_pages);
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
     // so the matmul splitter would not need the fact in its signature. That made the kind ambient: no
@@ -1069,8 +1120,16 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // on a LAYER boundary, and `compute_bundle_layout` is where the weight segment is packed. Same
     // tape, same `ComputeInput::External::per_layer` the walk below reads — collected once, here.
     let per_layer_ext = per_layer_external_tids(tape);
-    let mut bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, &per_layer_ext)?;
+    let mut bundle_layout = compute_bundle_layout(
+        ir,
+        weight_ids,
+        rows_are_requests,
+        // The SAME fact `attn_bundle_params` mints `BundleAttnParams::gathers_kv` from — the batched
+        // rungs' per-page gather, or a chunked one-request rung — so the index placement and the
+        // emitter's admission are one predicate.
+        rows_are_requests || chunk_pages.is_some(),
+        &per_layer_ext,
+    )?;
     // ON-CARD RESIDUAL (unconditional): thread the loop-carried hidden IN-PLACE, no copy. Pre-scan the
     // loop body for hidden_in (first body node input[0]) + hidden_out (last body node output) and ALIAS
     // hidden_out's placement to hidden_in's → every iteration reads+writes ONE resident buffer, so the
@@ -1339,7 +1398,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // throwaways because only the layout is wanted; the descriptors are dropped.
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
     // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
-    let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode)?;
+    let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode, chunk_pages)?;
     for ops in [&prefix, &body, &suffix] {
         let mut declare_syms: i64 = 0;
         let mut declare_fp8: std::collections::HashSet<String> = std::collections::HashSet::new();

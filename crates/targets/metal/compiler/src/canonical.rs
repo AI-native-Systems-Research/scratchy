@@ -304,11 +304,19 @@ pub fn lower_canonical(
     // matmul band, qmm_t, to lower one) but take their input's norm only on the one-row bucket:
     // the fast kernel re-loads the norm's gain per row, so past it the fold costs more L2 than
     // the dispatch it saves.
+    //
+    // The row programs take the whole band, not the one-row bucket alone: a bucket's row-wise
+    // steps dispatch the same whether it holds one row or several, and the program that groups
+    // them runs the row work the separate dispatches do — the `m == 1` fold already ships on
+    // every host. Measured on an M5 Max (PR #437): the ~190 dispatches the one-row gate left
+    // Gemma 4's 4-row verify bucket (RmsNorm x131, FusedAddRmsNorm x60, Add/ScalarWeightMul
+    // x30) collapse into 60 programs, the drafting step -8% (10.7 -> 9.9 ms mean ITL), plain
+    // 2- and 4-row serve steps +5.8%/+9.5%, and the buckets past the band byte-identical.
     let model = ModelFoldFacts {
         fold_projections,
         matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         matvec_norms: m == 1,
-        row_programs: m == 1,
+        row_programs: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         hidden_out: consts.spec_drafts > 0,
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.

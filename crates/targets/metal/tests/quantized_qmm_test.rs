@@ -26,7 +26,7 @@ use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::cpu_reference::affine_qmm_t_b4_bf16 as cpu_qmm_t_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, qmm_t_dispatch_shape,
+    DequantDtype, NaxDequant, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, qmm_t_dispatch_shape,
     qmm_t_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
@@ -57,7 +57,7 @@ fn build_qmm_t_pipeline(
     codes: AffineCodes,
 ) -> BakedPipeline {
     let aligned_n = match kernel {
-        QmmTKernel::Nax => n.is_multiple_of(64),
+        QmmTKernel::Nax(_) => n.is_multiple_of(64),
         _ => n.is_multiple_of(32),
     };
     let kernel_name = qmm_t_kernel_name(kernel, dtype, scale_dtype, group_size, bits, aligned_n);
@@ -74,7 +74,7 @@ fn build_qmm_t_pipeline(
     }
     constants.extend(codes.constant());
     let library = match kernel {
-        QmmTKernel::Nax => "quantized_qmm_nax",
+        QmmTKernel::Nax(_) => "quantized_qmm_nax",
         _ => "quantized_qmm",
     };
     baked_pipeline(device, library, &kernel_name, constants).expect("qmm_t pipeline")
@@ -208,7 +208,7 @@ fn run_qmm_t_bf16_codes(
     let (out_elements, split_k) = match expected_kernel {
         QmmTKernel::Standard => (m * n, 1u32),
         QmmTKernel::SplitK { split_k, .. } => (split_k as usize * m * n, split_k),
-        QmmTKernel::Nax => (m * n, 1u32),
+        QmmTKernel::Nax(_) => (m * n, 1u32),
     };
     let y_buf = zeroed_buffer(&device, out_elements * std::mem::size_of::<half::bf16>());
 
@@ -716,98 +716,102 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
     let x_buf = buffer_from_bytes(&device, x_bytes);
     let y_buf = zeroed_buffer(&device, m * n * std::mem::size_of::<half::bf16>());
 
-    let pipeline = build_qmm_t_pipeline(
-        &device,
-        QmmTKernel::Nax,
-        m as u32,
-        n as u32,
-        k as u32,
-        group_size as u32,
-        4,
-        DequantDtype::Bf16,
-        ScaleDtype::F16,
-        AffineCodes::AsWritten,
-    );
-    let (tg, tpg) = qmm_t_dispatch_shape(QmmTKernel::Nax, m as u32, n as u32, 1);
-    let threadgroups = objc2_metal::MTLSize {
-        width: tg.0 as usize,
-        height: tg.1 as usize,
-        depth: tg.2 as usize,
-    };
-    let threads = objc2_metal::MTLSize {
-        width: tpg.0 as usize,
-        height: tpg.1 as usize,
-        depth: tpg.2 as usize,
-    };
-    // packed_w(0), scales(1), biases(2), x(3), y(4) — same as `affine_qmm_t`.
-    if !common::dispatch_threadgroups(
-        &device,
-        &pipeline,
-        &[&packed_buf, &scales_buf, &biases_buf, &x_buf, &y_buf],
-        threadgroups,
-        threads,
-    ) {
-        return;
-    }
+    for dequant in NaxDequant::ALL {
+        let kernel = QmmTKernel::Nax(dequant);
+        let pipeline = build_qmm_t_pipeline(
+            &device,
+            kernel,
+            m as u32,
+            n as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::F16,
+            AffineCodes::AsWritten,
+        );
+        let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
+        let threadgroups = objc2_metal::MTLSize {
+            width: tg.0 as usize,
+            height: tg.1 as usize,
+            depth: tg.2 as usize,
+        };
+        let threads = objc2_metal::MTLSize {
+            width: tpg.0 as usize,
+            height: tpg.1 as usize,
+            depth: tpg.2 as usize,
+        };
+        // packed_w(0), scales(1), biases(2), x(3), y(4) — same as `affine_qmm_t`.
+        if !common::dispatch_threadgroups(
+            &device,
+            &pipeline,
+            &[&packed_buf, &scales_buf, &biases_buf, &x_buf, &y_buf],
+            threadgroups,
+            threads,
+        ) {
+            return;
+        }
 
-    let metal = read_buffer_bf16(&y_buf, m * n);
+        let metal = read_buffer_bf16(&y_buf, m * n);
 
-    // Diagnostic: count mismatches per simdgroup (BM=BN=64 single tile, WM=WN=2).
-    let mut sg_bad = [0usize; 4];
-    let mut sg_ok = [0usize; 4];
-    for i in 0..m {
-        for j in 0..n {
-            let idx = i * n + j;
-            let abs_err = (metal[idx].to_f32() - expected[idx].to_f32()).abs();
-            let allowed = 4.0
-                * ((k as f32).sqrt() * 0.5 * (1.0 / 128.0) * 0.5
-                    + expected[idx].to_f32().abs() * (1.0 / 128.0));
-            // simd_gid: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
-            let sg = (i / 32) * 2 + (j / 32);
-            if abs_err > allowed {
-                sg_bad[sg] += 1;
-            } else {
-                sg_ok[sg] += 1;
+        // Diagnostic: count mismatches per simdgroup (BM=BN=64 single tile, WM=WN=2).
+        let mut sg_bad = [0usize; 4];
+        let mut sg_ok = [0usize; 4];
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                let abs_err = (metal[idx].to_f32() - expected[idx].to_f32()).abs();
+                let allowed = 4.0
+                    * ((k as f32).sqrt() * 0.5 * (1.0 / 128.0) * 0.5
+                        + expected[idx].to_f32().abs() * (1.0 / 128.0));
+                // simd_gid: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+                let sg = (i / 32) * 2 + (j / 32);
+                if abs_err > allowed {
+                    sg_bad[sg] += 1;
+                } else {
+                    sg_ok[sg] += 1;
+                }
             }
         }
-    }
-    eprintln!(
-        "simdgroup mismatches: TL(0)={}/{} TR(1)={}/{} BL(2)={}/{} BR(3)={}/{}",
-        sg_bad[0],
-        sg_ok[0] + sg_bad[0],
-        sg_bad[1],
-        sg_ok[1] + sg_bad[1],
-        sg_bad[2],
-        sg_ok[2] + sg_bad[2],
-        sg_bad[3],
-        sg_ok[3] + sg_bad[3]
-    );
+        eprintln!(
+            "simdgroup mismatches: TL(0)={}/{} TR(1)={}/{} BL(2)={}/{} BR(3)={}/{}",
+            sg_bad[0],
+            sg_ok[0] + sg_bad[0],
+            sg_bad[1],
+            sg_ok[1] + sg_bad[1],
+            sg_bad[2],
+            sg_ok[2] + sg_bad[2],
+            sg_bad[3],
+            sg_ok[3] + sg_bad[3]
+        );
 
-    // Print first row of each simdgroup, metal vs cpu
-    for &sg_row in &[0, 32] {
-        for &sg_col in &[0, 32] {
-            let i = sg_row;
-            let j = sg_col;
-            let pairs: Vec<String> = (0..8)
-                .map(|d| {
-                    format!(
-                        "[{}]m={:.2}/c={:.2}",
-                        j + d,
-                        metal[i * n + j + d].to_f32(),
-                        expected[i * n + j + d].to_f32()
-                    )
-                })
-                .collect();
-            eprintln!("row{} col{}+: {}", i, j, pairs.join(" "));
+        // Print first row of each simdgroup, metal vs cpu
+        for &sg_row in &[0, 32] {
+            for &sg_col in &[0, 32] {
+                let i = sg_row;
+                let j = sg_col;
+                let pairs: Vec<String> = (0..8)
+                    .map(|d| {
+                        format!(
+                            "[{}]m={:.2}/c={:.2}",
+                            j + d,
+                            metal[i * n + j + d].to_f32(),
+                            expected[i * n + j + d].to_f32()
+                        )
+                    })
+                    .collect();
+                eprintln!("row{} col{}+: {}", i, j, pairs.join(" "));
+            }
         }
-    }
 
-    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
-    assert!(
-        abs_err <= allowed,
-        "qmm_t NAX gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
+        let (idx, mv, ev, abs_err, allowed) =
+            worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+        assert!(
+            abs_err <= allowed,
+            "qmm_t NAX {dequant:?} gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
          (allowed {allowed:.5}; metal={mv}, cpu={ev})"
-    );
+        );
+    }
 }
 
 /// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
@@ -827,7 +831,7 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
         pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, gs, false),
     ];
     if scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
-        kernels.push(QmmTKernel::Nax);
+        kernels.extend(NaxDequant::ALL.map(QmmTKernel::Nax));
     }
     let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7, n, k, m, gs as usize);
     let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, gs as usize);
@@ -861,5 +865,55 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
             wrong > allowed * slack,
             "{kernel:?}: flipped codes read as written must be wrong"
         );
+    }
+}
+
+/// NAX qmm_t over many K steps with M and N tails, at both group sizes and
+/// both code layouts, under both W-dequant schedules: every K step's
+/// dequantized W tile (a stale or skipped one is off by whole partial
+/// sums), the N-tail rows and the M tails all land on the CPU reference.
+#[test]
+fn affine_qmm_t_nax_k_steps_and_tails_match_cpu_reference() {
+    let Some(dev) = detect_device() else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    for (m, n, k, gs) in [
+        (96, 160, 1024, 64),
+        (96, 160, 1024, 128),
+        (200, 72, 512, 64),
+    ] {
+        let (packed, scales, biases, x) = make_inputs_bf16(0x7A115, n, k, m, gs);
+        let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
+        let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+        for (dequant, (codes, packed)) in NaxDequant::ALL.into_iter().flat_map(|d| {
+            [
+                (AffineCodes::AsWritten, &packed),
+                (AffineCodes::Offset8, &offset8),
+            ]
+            .map(|c| (d, c))
+        }) {
+            let got = run_qmm_t_bf16_codes(
+                packed,
+                &scales,
+                &biases,
+                &x,
+                (m, n, k, gs as u32),
+                QmmTKernel::Nax(dequant),
+                codes,
+            )
+            .expect("MTL4 queue");
+            let (idx, mv, ev, err, allowed) =
+                worst_abs_error_vs_noise_floor(&got, &expected, k, 0.5);
+            assert!(
+                err <= allowed,
+                "{m}x{n}x{k} gs {gs} {dequant:?} {codes:?}: abs_err={err:.5} at {idx} \
+                 (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+            );
+        }
     }
 }

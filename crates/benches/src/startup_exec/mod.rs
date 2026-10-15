@@ -118,6 +118,8 @@ pub(crate) struct ChildUsage {
     pub major_faults: i64,
     /// Whether it exited 0.
     pub ok: bool,
+    /// How it ended, for an error message: `exit 3`, `signal 11`.
+    pub status: String,
 }
 
 /// Reap `child` with `wait4(2)` so the usage belongs to *that* child.
@@ -144,10 +146,16 @@ fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
     let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
     anyhow::ensure!(rc == pid, "wait4({pid}) returned {rc}");
     let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let how = if libc::WIFSIGNALED(status) {
+        format!("signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("exit {}", libc::WEXITSTATUS(status))
+    };
     Ok(ChildUsage {
         peak_rss_mib: rss_to_mib(ru.ru_maxrss as i64),
         major_faults: ru.ru_majflt as i64,
         ok,
+        status: how,
     })
 }
 
@@ -322,16 +330,21 @@ fn preflight_evict(strategy: Evict, paths: &[PathBuf]) -> Result<()> {
     match strategy {
         Evict::None => Ok(()),
         Evict::Purge => {
+            // Ask about purge itself, not `sudo -n true`: a sudoers rule letting
+            // purge alone run without a password must pass, since a cached
+            // `sudo -v` can expire partway through a multi-hour run.
             let ok = Command::new("sudo")
-                .args(["-n", "true"])
+                .args(["-n", "-l", "/usr/sbin/purge"])
+                .stdout(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
             anyhow::ensure!(
                 ok,
-                "FROZEN with `--evict purge` needs a cached sudo credential: `purge` requires \
-                 root and macOS has no unprivileged equivalent.\n  \
-                 Run `sudo -v`, then re-run this command.\n  \
+                "FROZEN with `--evict purge` needs `sudo purge` to run without a password: \
+                 `purge` requires root and macOS has no unprivileged equivalent.\n  \
+                 Add a sudoers rule for /usr/sbin/purge, or run `sudo -v` (which can \
+                 expire mid-run), then re-run this command.\n  \
                  Or pass `--evict none` to skip eviction — FROZEN then collapses toward COLD \
                  and the frozen-vs-cold validity checks will not mean anything."
             );
@@ -437,7 +450,23 @@ pub(crate) struct Rep {
     /// when unmeasurable (no /proc/meminfo) or when nothing was evicted.
     pub evicted_kib: Option<i64>,
     pub text: String,
+    /// CLI mode: how the child ended when it did not exit 0, with the end of
+    /// its stderr. Not in the JSON; the parity gate reports it as a crash
+    /// rather than comparing a half-written answer.
+    #[serde(skip)]
+    pub crash: Option<String>,
 }
+
+/// How much of a CLI child's stderr an error message carries.
+const STDERR_TAIL_BYTES: usize = 2048;
+
+/// How long to wait for a reaped child's stderr to reach EOF. A process the
+/// child started and left running can hold the pipe open indefinitely.
+const STDERR_DRAIN: Duration = Duration::from_secs(2);
+
+/// How long the stderr reader waits on the pipe before checking whether it
+/// should stop: its exit comes at most this late after STDERR_DRAIN.
+const STDERR_POLL_MS: libc::c_int = 100;
 
 /// Spawn a one-shot CLI and stop the clock on its first content byte.
 ///
@@ -451,9 +480,50 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to exec {}", argv[0]))?;
+
+    // Drained on its own thread so a chatty child never blocks on a full pipe.
+    // Only the end is kept, a sliding STDERR_TAIL_BYTES, which is where a
+    // traceback or panic lands. The thread waits on the pipe in short polls
+    // and checks `stop` between them, so once the child is reaped and
+    // STDERR_DRAIN has passed it ends within one poll, even when a process the
+    // child started still holds the pipe open.
+    let mut stderr = child.stderr.take().expect("piped");
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    {
+        let (tail, stop) = (tail.clone(), stop.clone());
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            let mut pfd = libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let mut chunk = [0u8; 4096];
+            while !stop.load(Ordering::SeqCst) {
+                // SAFETY: `pfd` is one initialized pollfd for a descriptor this
+                // thread owns (through `stderr`) for the whole call.
+                let ready = unsafe { libc::poll(&mut pfd, 1, STDERR_POLL_MS) };
+                if ready <= 0 {
+                    continue; // timed out (or interrupted): check `stop` again
+                }
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break, // EOF: every writer has closed it
+                    Ok(n) => {
+                        let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+                        t.extend_from_slice(&chunk[..n]);
+                        let over = t.len().saturating_sub(STDERR_TAIL_BYTES);
+                        t.drain(..over);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+    }
 
     let mut stdout = child.stdout.take().expect("piped");
     let mut t_first: Option<Instant> = None;
@@ -489,16 +559,37 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
     }
 
     let usage = wait4_child(&mut child)?;
-    anyhow::ensure!(
-        usage.ok || t_first.is_some(),
-        "child exited non-zero without emitting a token"
-    );
+    // EOF, or STDERR_DRAIN: then stop the reader and keep what it has.
+    let held = done_rx.recv_timeout(STDERR_DRAIN).is_err();
+    stop.store(true, Ordering::SeqCst);
+    let tail = {
+        let t = tail.lock().unwrap_or_else(|p| p.into_inner());
+        let text = String::from_utf8_lossy(&t).trim().to_string();
+        match (held, text.is_empty()) {
+            (true, true) => "(stderr still held open by a process the child started)".to_string(),
+            _ => text,
+        }
+    };
+    let crash = (!usage.ok).then(|| {
+        if tail.is_empty() {
+            format!("{}, nothing on stderr", usage.status)
+        } else {
+            format!("{}; its stderr ended:\n{tail}", usage.status)
+        }
+    });
+    if let Some(ref why) = crash {
+        anyhow::ensure!(
+            t_first.is_some(),
+            "child {why}\nIt exited without emitting a token."
+        );
+    }
 
     Ok(Rep {
         ttft_exec_s: t_first.map(|t| t.duration_since(t_zero).as_secs_f64()),
         peak_rss_mib: usage.peak_rss_mib,
         major_faults: usage.major_faults,
         text,
+        crash,
         ..Default::default()
     })
 }
@@ -964,6 +1055,71 @@ const PARITY_PROMPTS: &[(&str, &str, usize)] = &[
     ("count", "Count from 1 to 10.", 40),
 ];
 
+/// GLM-4.5-Air-3bit swaps the count prompt for a third short factual one.
+///
+/// Its 3-bit thought preamble ties at 0.0–0.5 logits on every procedural
+/// phrasing we measured (bare count, comma-instructed count, a months
+/// listing), while the metal build's default TurboQuant 4-bit KV cache —
+/// which the mlx-lm reference does not share, it runs fp16 KV — shifts
+/// logits past exactly those ties: the bare count flipped at a 0.25-margin
+/// step, while capital's 0.5 and arith's 2.25 held. The load path is not in
+/// question — a build without the turboquant feature is byte-identical to
+/// mlx-lm on all 40 count tokens — so this is the gate asking a question the
+/// codec difference can answer, not a load-path defect. "sky" holds a 1.25
+/// top-2 margin, five times the flip, and the TurboQuant build agrees with
+/// mlx-lm on it exactly. Any model added here gets its margins measured the
+/// same way first (per-step top-2 gaps along the greedy path, both sides).
+const PARITY_PROMPTS_GLM_4_5_AIR_3BIT: &[(&str, &str, usize)] = &[
+    (
+        "capital",
+        "What is the capital of France? Answer in one word.",
+        12,
+    ),
+    (
+        "arith",
+        "What is 17 plus 25? Reply with just the number.",
+        12,
+    ),
+    (
+        "sky",
+        "What color is the sky on a clear day? Answer in one word.",
+        12,
+    ),
+];
+
+/// Qwen3.6-35B-A3B swaps capital and arith for two prompts with measured
+/// headroom. Its template prefills the open think tag (`simd\n`), so the
+/// 12-token budgets of the default set die inside the thinking preamble
+/// before any deterministic answer exists — and the first preamble token is
+/// a near-tie ('Here' 25.75 vs 'Thinking' 25.25 on capital, a 0.5-logit gap
+/// that mlx-lm 0.32.0 and scratchy land on opposite sides of; both prompts
+/// also pass the load path — `count` agrees on all 40 tokens). `week` holds
+/// a 2.125 top-2 margin and `colors` a 2.75, and both agree with mlx-lm
+/// exactly on all 40 tokens. The same measurement rule as GLM-4.5-Air-3bit
+/// applies: per-step top-2 gaps along the greedy path, both sides.
+const PARITY_PROMPTS_QWEN3_6_35B_A3B: &[(&str, &str, usize)] = &[
+    (
+        "week",
+        "How many days are in a week? Answer with just the number.",
+        40,
+    ),
+    ("colors", "List the primary colors.", 40),
+    ("count", "Count from 1 to 10.", 40),
+];
+
+/// The gate's prompts for a model, by the `--model` id it was resolved from.
+/// Models that cannot honestly pass the default set get their own, chosen by
+/// measurement — never by loosening the comparison, which stays exact-match.
+fn parity_prompts(model: &str) -> &'static [(&'static str, &'static str, usize)] {
+    if model.contains("GLM-4.5-Air-3bit") {
+        PARITY_PROMPTS_GLM_4_5_AIR_3BIT
+    } else if model.contains("Qwen3.6-35B-A3B") {
+        PARITY_PROMPTS_QWEN3_6_35B_A3B
+    } else {
+        PARITY_PROMPTS
+    }
+}
+
 fn normalize(s: &str, backend: Backend) -> String {
     let body = if backend == Backend::MlxLm {
         s.split("==========").nth(1).unwrap_or(s)
@@ -987,18 +1143,23 @@ fn parity_gate(
     a_backend: Backend,
     b_cmd: &[String],
     b_backend: Backend,
+    model: &str,
 ) -> Result<()> {
     println!("=== parity gate: same model, greedy, high-confidence prompts ===");
     let mut failures = Vec::new();
-    for (name, prompt, ntok) in PARITY_PROMPTS {
-        let a = normalize(
-            &run_cli(&expand(a_cmd, prompt, *ntok), a_backend)?.text,
-            a_backend,
-        );
-        let b = normalize(
-            &run_cli(&expand(b_cmd, prompt, *ntok), b_backend)?.text,
-            b_backend,
-        );
+    // A side that crashes after printing part of an answer would otherwise
+    // read as a mismatch, and send the reader hunting a dequant bug.
+    let answer = |cmd: &[String], backend: Backend, name: &str, prompt: &str, ntok: usize| {
+        let rep = run_cli(&expand(cmd, prompt, ntok), backend)
+            .with_context(|| format!("the {backend:?} child crashed on the {name} prompt"))?;
+        if let Some(why) = rep.crash {
+            anyhow::bail!("the {backend:?} child crashed on the {name} prompt: {why}");
+        }
+        Ok(normalize(&rep.text, backend))
+    };
+    for (name, prompt, ntok) in parity_prompts(model) {
+        let a = answer(a_cmd, a_backend, name, prompt, *ntok)?;
+        let b = answer(b_cmd, b_backend, name, prompt, *ntok)?;
         let agree = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
         let common = a.chars().count().min(b.chars().count());
         let exact = common > 0 && agree == common;
@@ -1101,7 +1262,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     };
 
     if let Some(ref other) = ex.parity_cmd {
-        parity_gate(&argv, ex.backend, &other.argv, ex.parity_backend)?;
+        parity_gate(&argv, ex.backend, &other.argv, ex.parity_backend, &model)?;
     }
 
     // Provenance: a number without its machine state is not a result.
@@ -1422,6 +1583,139 @@ mod tests {
         assert!(Backend::Vllm.rejects_cli_mode().is_some());
         assert!(Backend::Scratchy.rejects_cli_mode().is_none());
         assert!(Backend::MlxLm.rejects_cli_mode().is_none());
+    }
+
+    /// A child that dies after printing part of an answer is a crash, carried
+    /// with its exit status and the end of its stderr, so the parity gate can
+    /// say so instead of reporting the half answer as a mismatch.
+    #[test]
+    fn a_crashed_child_reports_its_status_and_stderr() {
+        let rep = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo partial; echo 'Traceback: json.loads failed' >&2; exit 3".into(),
+            ],
+            Backend::Scratchy,
+        )
+        .expect("a child that emitted a token still returns its rep");
+        let crash = rep.crash.expect("a non-zero exit is a crash");
+        assert!(crash.contains("exit 3"), "{crash}");
+        assert!(crash.contains("json.loads failed"), "{crash}");
+
+        let err = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo boom >&2; exit 2".into(),
+            ],
+            Backend::Scratchy,
+        )
+        .expect_err("no token and a non-zero exit is an error");
+        assert!(format!("{err:#}").contains("boom"), "{err:#}");
+
+        let ok = run_cli(&["/bin/echo".into(), "hi".into()], Backend::Scratchy).unwrap();
+        assert!(ok.crash.is_none());
+    }
+
+    /// A grandchild that inherits stderr and outlives the child must not hang
+    /// the reap: the wait for stderr is bounded.
+    #[test]
+    fn a_grandchild_holding_stderr_does_not_hang_run_cli() {
+        let t0 = Instant::now();
+        let rep = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "(sleep 30 >/dev/null &) ; echo hi; exit 1".into(),
+            ],
+            Backend::Scratchy,
+        )
+        .expect("the child emitted a token");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "run_cli waited {:?} on an inherited pipe",
+            t0.elapsed()
+        );
+        assert!(rep.crash.expect("exit 1 is a crash").contains("exit 1"));
+    }
+
+    /// A child that floods stderr is reported by its end, not all of it: the
+    /// reader keeps a sliding STDERR_TAIL_BYTES however much it reads.
+    #[test]
+    fn a_flood_of_stderr_keeps_only_its_tail() {
+        let rep = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo partial; head -c 1048576 /dev/zero | tr '\\0' 'x' >&2; echo >&2; echo 'last line' >&2; exit 4".into(),
+            ],
+            Backend::Scratchy,
+        )
+        .expect("the child emitted a token");
+        let crash = rep.crash.expect("exit 4 is a crash");
+        assert!(
+            crash.contains("exit 4") && crash.ends_with("last line"),
+            "{crash}"
+        );
+        assert!(
+            crash.len() < STDERR_TAIL_BYTES + 200,
+            "kept {} bytes",
+            crash.len()
+        );
+    }
+
+    #[test]
+    fn parity_gate_reports_a_crash_not_a_mismatch() {
+        let good: Vec<String> = ["/bin/sh", "-c", "echo {prompt}"]
+            .map(String::from)
+            .to_vec();
+        let crashing: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "echo {prompt}; echo 'killed by OOM' >&2; exit 1",
+        ]
+        .map(String::from)
+        .to_vec();
+        let err = parity_gate(
+            &good,
+            Backend::Scratchy,
+            &crashing,
+            Backend::Scratchy,
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+        )
+        .expect_err("a crashing side fails the gate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("crashed") && msg.contains("killed by OOM"),
+            "{msg}"
+        );
+        assert!(!msg.contains("load path"), "reported as a mismatch: {msg}");
+    }
+
+    /// The gate asks GLM-4.5-Air-3bit and Qwen3.6-35B-A3B questions their
+    /// near-tied thought preambles cannot flip, and every other model keeps
+    /// the stronger default set.
+    #[test]
+    fn glm_3bit_gates_on_sky_not_count() {
+        let names = |p: &'static [(&'static str, &'static str, usize)]| -> Vec<&'static str> {
+            p.iter().map(|(n, _, _)| *n).collect()
+        };
+        let glm = parity_prompts("mlx-community/GLM-4.5-Air-3bit");
+        assert_eq!(names(glm), vec!["capital", "arith", "sky"]);
+        assert_eq!(
+            names(parity_prompts("mlx-community/Qwen3.6-35B-A3B-4bit")),
+            vec!["week", "colors", "count"]
+        );
+        for other in [
+            "mlx-community/gemma-4-26b-a4b-it",
+            "mlx-community/qwen3.6-27b-4bit",
+        ] {
+            assert_eq!(
+                names(parity_prompts(other)),
+                vec!["capital", "arith", "count"]
+            );
+        }
     }
 
     /// Banner-only output must yield NO measurement, not a fast one.

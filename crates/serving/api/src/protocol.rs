@@ -173,6 +173,25 @@ pub struct StandardResponseFormat {
 // Function / Tool types
 // ---------------------------------------------------------------------------
 
+/// Client-written JSON that chat templates render, held in the key order the
+/// client sent it.
+///
+/// Templates `tojson` a tool's parameter schema, and Hugging Face renders
+/// Python dicts in insertion order. A `serde_json::Value` sorts object keys
+/// unless serde_json's crate-wide `preserve_order` feature is on, and turning
+/// that on in the binary but not in the build scripts makes every release
+/// build compile the crates both share twice. minijinja's own maps keep
+/// insertion order (its `preserve_order`, which only the binary links).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OrderedJson(minijinja::Value);
+
+impl From<serde_json::Value> for OrderedJson {
+    fn from(value: serde_json::Value) -> Self {
+        Self(minijinja::Value::from(minijinja::value::Serde(value)))
+    }
+}
+
 /// A function definition for tool use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionDefinition {
@@ -180,7 +199,7 @@ pub struct FunctionDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<serde_json::Value>,
+    pub parameters: Option<OrderedJson>,
 }
 
 /// A function call in a response.

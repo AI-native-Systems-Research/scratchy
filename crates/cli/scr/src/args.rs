@@ -122,7 +122,10 @@ pub struct LaunchClaudeArgs {
     #[arg(long)]
     pub tool_call_parser: Option<String>,
 
-    /// Maximum model context length (overrides config.json).
+    /// Maximum model context length for the spawned server. Unset leaves the
+    /// window to the server: the model's native context, capped by what this
+    /// machine's KV cache holds. Set it only to shrink — e.g. matching another
+    /// engine's window for a benchmark.
     #[arg(long)]
     pub max_model_len: Option<usize>,
 

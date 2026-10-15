@@ -16,8 +16,8 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b8_bf16_s_bf16, affine_qmm_t_b8_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{
-    DequantDtype, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape,
-    qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
+    DequantDtype, NaxDequant, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
+    qmm_t_dispatch_shape, qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{ComputePipelineState, ConstantValue};
 
@@ -108,7 +108,7 @@ enum Op {
     QmmT,
     /// Force the NAX (Apple9 MMA) qmm_t via `execute_with_kernel` —
     /// the b8 W-loader (byte-per-element dequant) parity gate.
-    QmmTNax,
+    QmmTNax(NaxDequant),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,8 +200,8 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
             let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
             (ComputePipelineState::clone(p), tg, tpg)
         }
-        Op::QmmTNax => {
-            let kernel = QmmTKernel::Nax;
+        Op::QmmTNax(dequant) => {
+            let kernel = QmmTKernel::Nax(dequant);
             let aligned_n = (n as u32).is_multiple_of(64);
             let name = qmm_t_kernel_name(
                 kernel,
@@ -285,12 +285,20 @@ fn qmm_t_nax_b8_bf16_prefill_shape() {
     }
     // N multiple of 64 (aligned) + an unaligned-N case for the
     // N-tail zeroing path.
-    run_case_bf16(Op::QmmTNax, 64, 256, 1536, 64, 19, 0.05);
-    run_case_bf16(Op::QmmTNax, 64, 224, 1536, 64, 29, 0.05);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 1536, 64, 19, 0.05);
+    }
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 224, 1536, 64, 29, 0.05);
+    }
     // M-tail: M not a multiple of 64.
-    run_case_bf16(Op::QmmTNax, 40, 256, 1536, 64, 31, 0.05);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 40, 256, 1536, 64, 31, 0.05);
+    }
     // gs=128 instantiation.
-    run_case_bf16(Op::QmmTNax, 64, 256, 1536, 128, 37, 0.05);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 64, 256, 1536, 128, 37, 0.05);
+    }
 }
 
 #[test]
@@ -411,12 +419,22 @@ fn qwen_gdn_b8_bf16_nax_prefill_shapes() {
         return;
     }
     // in_proj_a / in_proj_b: N=32 (sub-tile, unaligned), K=2048.
-    run_case_bf16(Op::QmmTNax, 20, 32, 2048, 64, 81, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 20, 32, 2048, 64, 81, 0.08);
+    }
     // out_proj: N=2048 (aligned), K=4096.
-    run_case_bf16(Op::QmmTNax, 20, 2048, 4096, 64, 83, 0.10);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 20, 2048, 4096, 64, 83, 0.10);
+    }
     // in_proj_z/qkv trimmed to 512 (aligned) K=2048.
-    run_case_bf16(Op::QmmTNax, 20, 512, 2048, 64, 85, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 20, 512, 2048, 64, 85, 0.08);
+    }
     // A second sub-tile N to bracket (N=64 exactly one tile, N=40 partial).
-    run_case_bf16(Op::QmmTNax, 20, 64, 2048, 64, 87, 0.08);
-    run_case_bf16(Op::QmmTNax, 20, 40, 2048, 64, 89, 0.08);
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 20, 64, 2048, 64, 87, 0.08);
+    }
+    for dequant in NaxDequant::ALL {
+        run_case_bf16(Op::QmmTNax(dequant), 20, 40, 2048, 64, 89, 0.08);
+    }
 }

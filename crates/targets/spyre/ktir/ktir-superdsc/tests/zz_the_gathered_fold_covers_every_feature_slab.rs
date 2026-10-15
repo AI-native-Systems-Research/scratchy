@@ -115,6 +115,7 @@ fn try_emit_at<const HD: u32>(
         // arms, whose slab loops were never missing — so a test that forgot this argument would pass
         // against the code that was broken.
         Some("t_kv_idx"),
+        None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
         handoff,

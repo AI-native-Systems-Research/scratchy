@@ -102,7 +102,12 @@ nothing is self-reported.
   server: TTFT in the usual sense, and the startup-independent half of
   `ttft_exec`.
 - **`tpot`** — per-token decode interval over N−1 intervals, matching
-  `crates/benches/src/serve.rs`. `decode tok/s` is `1000/tpot`.
+  `crates/benches/src/serve.rs`. `decode tok/s` is `1000/tpot`. N is the
+  server's own token count (`usage.completion_tokens`), never the number of
+  stream chunks, so TPOT holds when a chunk carries several tokens, as it does
+  under multi-token prediction or speculative decoding. ITL, the gap between
+  chunks, does not: one gap then spans several tokens, so it reads slow. The
+  Metal matrix neither asks `bench serve` for ITL nor keeps it.
 - **`peak_rss`** / **`major_faults`** — the child's own `ru_maxrss` /
   `ru_majflt`, read via `wait4(2)` when it is reaped, same call for every
   backend. It has to be `wait4` rather than `getrusage(RUSAGE_CHILDREN)`: the
@@ -174,7 +179,17 @@ bimodal ITL distribution in this repo for a week
    defaults it off and prefills an empty thought channel — so the matrix gives
    the mlx-lm side a per-model `--chat-template-config`
    (`mlx_parity_config` in `scripts/bench_metal_matrix.sh`) wherever the two
-   disagree.
+   disagree. The two sides also run **different KV caches by design** on
+   metal: scratchy's build carries TurboQuant 4-bit KV, the reference fp16.
+   That difference is real quantization noise, not a load-path error — on
+   GLM-4.5-Air-3bit it flips a 0.25-logit near-tie inside the model's own
+   thought preamble (a no-TurboQuant build is byte-identical to mlx-lm on the
+   same 40 tokens), so that model gates on prompts chosen so the noise cannot
+   reach the argmax: its set swaps the count prompt, whose procedural
+   preamble ties at 0.0–0.5 logits at 3 bits, for a third short factual one
+   with a 1.25-logit minimum margin (`parity_prompts` in
+   `crates/benches/src/startup_exec/mod.rs`). Every model keeps the exact-match
+   comparison; only the questions are chosen per model.
 4. **Same weights, matching preset.** scratchy must be built with the preset
    matching the checkpoint's `config.json`.
 5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
@@ -205,7 +220,41 @@ These favour one side or the other and must travel with any published number.
   KV as TurboQuant codes (3-bit for the Llama family, 4-bit otherwise; the
   `turboquant` feature) while mlx-lm uses an uncompressed cache — a *quality*
   difference as well as a perf one. It is fixed at build time, so match it with
-  a build without the feature, not a runtime flag.
+  a build without the feature, not a runtime flag. The Metal matrix runs oMLX
+  both ways for this reason: **oMLX TurboQuant** (4-bit KV, set per model in
+  its `model_settings.json`) is the like-for-like rival for a default
+  scratchy build, and **oMLX** as shipped (FP16 KV) the like-for-like one for
+  mlx-lm.
+- **oMLX is the Metal matrix's default rival, run as it ships.** Its own
+  caching stays on (the SSD cache kept in the run's output, a fresh one per
+  variant, so nothing carries between runs), because `--no-cache` drops it to
+  plain mlx-lm batching. Its memory guard stays at its default tier and
+  rejects a prompt it estimates will not fit. The guard is not raised:
+  requests it refuses inside a cell count as failed (‡ on the page, and the
+  cell's numbers cover only the rest), and a cell it refuses outright has no
+  numbers. The guard can also refuse the *model* itself, before any weights
+  move: each load is planned against a dynamic ceiling derived from
+  system-reclaimable memory minus a reserve — not the Metal cap, so raising
+  `iogpu.wired_limit_mb` does not move it — and a model near the size of the
+  Mac's memory is admitted only on a near-idle machine. Measured on
+  GLM-4.5-Air-3bit (45.75 GB) on a 64 GB M5 Max with normal residents: HTTP
+  507, "does not fit under the dynamic memory ceiling" (43.2 GB at the
+  time). A refusal like that is not a cell failure: preparing the engine
+  sends one tiny request first, and a refusal is recorded as
+  `engine_declined` with the engine's own message and that engine's cells
+  skipped for the model — the page says "Declined before serving" instead of
+  ‡'d cells that never ran. `--engines all` adds mlx-lm,
+  vllm-metal, ollama, llama.cpp and mistral.rs.
+- **Not every engine serves the same files.** oMLX, mlx-lm and vllm-metal load
+  the same mlx-community checkpoint as scratchy; ollama's `-mlx` tags are
+  ollama's own MLX builds (`gemma4:26b-mlx` is NVFP4, not 4-bit affine); llama.cpp
+  and mistral.rs run a Q4_K_M GGUF. The run records each engine's quantization
+  and file revision, and the page names them on its row.
+- **Prefix caching differs by engine and model**, so `bench serve` warms up
+  and checks connectivity with prompts outside the measured set: replaying a
+  measured prompt let an engine with a prefix cache serve it as a full hit
+  (#344). scratchy turns prefix caching off for Gated-DeltaNet hybrids
+  (Qwen3.5/3.6), as vLLM does.
 - **Process shape differs.** scratchy is one static binary; mlx-lm is a CPython
   interpreter plus imports. FROZEN evicts both, which is the real-world cost, but
   it is not a like-for-like measurement of model loading alone.

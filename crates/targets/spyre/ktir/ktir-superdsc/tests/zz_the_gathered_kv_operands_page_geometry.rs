@@ -145,6 +145,7 @@ fn prefix_score_op(rung: u32, kv_block_index: Option<&str>) -> serde_json::Value
         "t_pmask",
         "t_cmask",
         kv_block_index,
+        None,
         ktir_superdsc::place::PlaceId::Act(900),
         true,
         false,

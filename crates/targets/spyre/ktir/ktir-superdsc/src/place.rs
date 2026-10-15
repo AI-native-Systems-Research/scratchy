@@ -67,6 +67,14 @@ pub enum SynthRole {
     // buffer would have the value leg reading the score leg's blocks.
     GatherKt,
     GatherV,
+    // ── the SPLIT-KV CHUNK's wide buffers (`ChunkScratch`) ──
+    //
+    // `[nkvh][gqa][chunk slots]`: each kv head owns a WHOLE `[gqa, slots]` RowBlocked block, never a row
+    // slice of a taller multi-stick buffer (see `ChunkScratch::rows_corner` for the card measurement that
+    // forbids the slice).
+    ChunkSc,
+    ChunkESub,
+    ChunkExp,
     // ── flash-attention online-softmax state ──
     NewKt,
     Sc,
@@ -121,6 +129,9 @@ impl fmt::Display for SynthRole {
             Self::Xn => f.write_str("xn"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
+            Self::ChunkSc => f.write_str("csc"),
+            Self::ChunkESub => f.write_str("cesub"),
+            Self::ChunkExp => f.write_str("cexp"),
             Self::NewKt => f.write_str("newkt"),
             Self::Sc => f.write_str("sc"),
             Self::BMax => f.write_str("bmax"),

@@ -21,6 +21,21 @@ updates:
         patterns:
           - "opentelemetry*"
           - "tracing-opentelemetry"
+      # One repo releases all three at one version, and the grammar guide
+      # runs llguidance's parser over the token trie toktrie_hf_tokenizers
+      # builds: bumped apart, llguidance pulls toktrie along but leaves
+      # toktrie_hf_tokenizers behind, pairing releases never shipped together.
+      llguidance:
+        patterns:
+          - "llguidance"
+          - "toktrie*"
+      # The chat template hands minijinja-contrib's pycompat method callback
+      # to minijinja's Environment: bumped apart, two minijinjas land in the
+      # tree and the callback's `State` is the other one's, so serving stops
+      # compiling.
+      minijinja:
+        patterns:
+          - "minijinja*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

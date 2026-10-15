@@ -728,6 +728,96 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
 // Invisible under `-Fsendnn`; it broke the KTIR-only build, which is exactly what `8bd5c755b` had
 // just repaired.
 #[cfg(feature = "spyre-hw")]
+/// What a chunk body attends, for [`chunk_index_table`]: the keys resident before it (positions
+/// `0..resident`, which the chunk must hold) and the slots whose pages its table names.
+///
+/// ⛔ EACH ITEM CARRIES ITS OWN `#[cfg]` — see the note above: an item inserted under another's
+/// attribute takes it, and the item it guarded is left ungated.
+struct ChunkKeys {
+    resident: usize,
+    mapped: u32,
+}
+
+#[cfg(feature = "spyre-hw")]
+/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX TABLE — for the two bodies whose rows share ONE resident
+/// history: the one-request decode and a prompt chunk's prefix. The body that will RUN (`step`) names
+/// its chunk by its swept extent (`pages * PAGE_SLOTS`, the rung the macro recorded), so the table is
+/// built for exactly that chunk — a table for another width names blocks the copies do not read and
+/// leaves the ones they do at zero. `None` when the body gathers nothing.
+///
+/// The keys (see [`ChunkKeys`]) must all lie inside the chunk: `select_body` chose the smallest rung
+/// covering them, so a shortfall means the ladder stopped below this context — attending a prefix that
+/// ends early — and it refuses.
+///
+/// The pages are `req.page_map(ctx, want)` — the very map the launch installed, holes served from the
+/// pool's reserved range included — so the table the card reads and the map the cache write used are one
+/// derivation. A chunk wider than the map repeats the LAST real page; the broadcast validity row (over
+/// logical slots, exactly the order the chunk gathers) silences those slots, the reference's pad-up law.
+///
+/// ⛔ EVERY FAILURE REFUSES, never a zero table: an unstaged entry reads ZERO, and zero is a VALID block
+/// — page 0's keys, fluently wrong.
+fn chunk_index_table(
+    what: &str,
+    sh: &Shared<'_>,
+    session: &SuperDscSession,
+    step: scratchy_target_spyre::superdsc_exec::StepBody,
+    req: &ReqState,
+    ctx: PageMapCtx<'_>,
+    keys: ChunkKeys,
+) -> ExecutorResult<Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>>> {
+    let ChunkKeys { resident, mapped } = keys;
+    if !step.gathers().get() {
+        return Ok(None);
+    }
+    const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let swept = step.swept().get();
+    let chunk_pages = swept / PER_PAGE;
+    if !swept.is_multiple_of(PER_PAGE) || (chunk_pages as usize) * (PER_PAGE as usize) < resident {
+        return Err(werr(format!(
+            "{what}: the chunk body sweeps {swept} slot(s) — not a whole number of {PER_PAGE}-slot \
+             pages, or fewer slots than the {resident} resident key(s). The chunk ladder's top rung \
+             ({} pages) is below this context.",
+            scratchy_subtile::sdsc_abstract::ChunkScratch::PAGES_MAX
+        )));
+    }
+    // The pool geometry the entry factor needs — `kv_dim / head_dim`, `head_dim`, the same two numbers
+    // the batched site reads off the model.
+    let pool =
+        scratchy_subtile::sdsc_abstract::PagedKvPool::new(sh.kv_dim / sh.head_dim, sh.head_dim);
+    let per_page = session.gather_entries_per_page(pool).ok_or_else(|| {
+        werr(format!(
+            "{what}: this bundle emits a GATHERED KV read, but a physical page is not a whole number \
+             of STICK BLOCKS — no integer index can name a page boundary"
+        ))
+    })?;
+    let scratch = scratchy_subtile::sdsc_abstract::ChunkScratch::of_chunk(pool, chunk_pages)
+        .ok_or_else(|| {
+            werr(format!(
+                "{what}: a {chunk_pages}-page chunk is not expressible at this geometry, but the bake \
+                 emitted one — the bake and the host disagree about the chunk"
+            ))
+        })?;
+    let want = scratchy_subtile::sdsc_abstract::RowPages::holding(
+        scratchy_subtile::sdsc_abstract::SlotCount::new(mapped),
+    );
+    let map = req.page_map(ctx, want).ok_or_else(|| {
+        werr(format!(
+            "{what}: cannot map {want:?} page(s): the host granted {} block(s) — every page holding a \
+             key must be a host block",
+            ctx.host.len(),
+        ))
+    })?;
+    scratchy_subtile::sdsc_abstract::chunk_gather_index_table(scratch, &map.as_i64(), per_page)
+        .map(Some)
+        .ok_or_else(|| {
+            werr(format!(
+                "{what}: could not build the chunk gather's index table from this request's page map \
+                 — the map is empty or an entry overflows int32"
+            ))
+        })
+}
+
+#[cfg(feature = "spyre-hw")]
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
     session: &mut SuperDscSession,
@@ -1022,18 +1112,38 @@ pub(crate) fn superdsc_forward_chunk(
                         })
                     })
                     .collect::<ExecutorResult<Vec<usize>>>()?;
+                // ⭐⭐⭐⭐⭐ THE BODY THIS CHUNK RUNS, ASKED BEFORE THE LAUNCH. Past one page of prefix the
+                // prompt chunk's body is a split-KV chunk — every resident page attended in ONE launch —
+                // so the index table and the gather answer must be the RUNNING body's, the solo decode's
+                // own law. `step_body(start)` is the selection the launch makes (`valid_len = start + 1`),
+                // and the chunk must hold the `start` resident keys; this chunk's own rows, written
+                // before attention, sit at slots `>= start`, which the broadcast validity row masks.
+                let step = pf.step_body(chunk_start).map_err(|e| {
+                    werr(format!(
+                        "prompt chunk at {chunk_start}: the session could not say which body runs: {e}"
+                    ))
+                })?;
+                let kv_blocks = chunk_index_table(
+                    "prompt chunk",
+                    sh,
+                    pf,
+                    step,
+                    req,
+                    ctx,
+                    ChunkKeys {
+                        resident: chunk_start,
+                        mapped: chunk_start as u32,
+                    },
+                )?;
                 prefill_logits = run_prefill_batch(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
                     // that statement — there are no per-request rows, so the chunk laws are the only
                     // ones reachable.
                     None,
-                    // ⛔ AND NO INDEX TABLE, for the same reason: a prompt chunk's rows share ONE
-                    // resident history, so there is nothing per-row for an index to distinguish, and
-                    // `compute_bundle_layout` places no index tensor for a bundle whose rows are not
-                    // requests. If one ever did, `kernel_values` refuses here rather than gathering
-                    // through an unstaged (zero, and therefore valid) index.
-                    None,
+                    // The chunk's index table — `None` for a body that gathers nothing (no prefix, or
+                    // a prefix within one page on the per-page body).
+                    kv_blocks.as_deref(),
                     sh,
                     pf,
                     pmeta,
@@ -1049,10 +1159,10 @@ pub(crate) fn superdsc_forward_chunk(
                                     .to_string(),
                             )
                         })?,
-                    // ⭐ THE PREFILL META'S OWN FACTS, which here IS the bundle being run — a prompt
-                    // chunk launches `pf` under `pmeta`, so unlike the batched rung the borrowed-meta
-                    // divergence does not arise and the artifact answer is the meta's.
-                    scratchy_target_spyre::wiring::GathersKv::of(&pmeta.facts),
+                    // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
+                    // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
+                    // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
+                    step.gathers(),
                     chunk_start,
                     // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
                     // read however many rows this chunk ran at.
@@ -1259,15 +1369,24 @@ pub(crate) fn superdsc_forward_chunk(
                 holds: |col: usize| req.kv_hist.contains(col),
             }
         });
+        // The body this launch RUNS: `step_body(p)` is the same selection `run_step(1, p, ..)` makes
+        // (same session, same `p`).
+        let step = session.step_body(p).map_err(|e| {
+            werr(format!(
+                "solo decode: the session could not say which body pos {p} runs: {e}"
+            ))
+        })?;
         // ⭐ ONE ROW, and the SAME call prefill makes. Decode is the batched form at `rows == 1`;
         // the lemmas in `forward_tape`'s tests are what make that exact rather than approximate.
         let shape = b.wiring.forward_shape(
             scratchy_target_spyre::wiring::StagedRows::ONE,
             prefix_src.is_some(),
-            // ⛔ THE BUNDLE'S OWN ANSWER, not "solo decode never gathers". A solo decode runs the
-            // SAME bundle a batched step does when the model bakes one decode graph, so asking the
-            // phase here instead of the artifact is how the two halves drift.
-            scratchy_target_spyre::wiring::GathersKv::of(&b.facts),
+            // ⛔ THE RUNNING BODY'S OWN ANSWER — not "solo decode never gathers", and not the
+            // bundle's. The one-request ladder mixes bodies under one bundle: the per-page bodies
+            // within one page gather nothing, the split-KV chunks past it gather every page, and
+            // the bundle's `KV_BLOCK_INDEX` placement is the chunk ceiling's. Asked of the bundle,
+            // a one-page context demanded a table its body never reads and the step refused.
+            step.gathers(),
             consts.len(),
         );
         // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —
@@ -1281,6 +1400,21 @@ pub(crate) fn superdsc_forward_chunk(
                 *v = 0.0;
             }
         }
+        // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
+        // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
+        // token's page too.
+        let kv_blocks = chunk_index_table(
+            "solo decode",
+            sh,
+            session,
+            step,
+            req,
+            ctx,
+            ChunkKeys {
+                resident: p,
+                mapped: p as u32 + 1,
+            },
+        )?;
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
             head_dim: hd,
@@ -1297,11 +1431,12 @@ pub(crate) fn superdsc_forward_chunk(
             // Proven to be the identity at one row, so this is decode's existing row-major
             // staging spelled as the general form.
             stick_major: true,
-            // ⛔ SOLO DECODE STAGES NO TABLE, and if the bundle gathers, `kernel_values` REFUSES
-            // rather than reading an unstaged index as block 0. That refusal is the correct outcome:
-            // this path resolves ONE page base per launch from `SessionKv`, so it has no per-row table
-            // to offer, and a bundle that gathers must be driven through the batched path.
-            kv_blocks: None,
+            // ⭐ THE GATHER'S TABLE, from this request's own installed page map — one row, one
+            // page per pass, the reference's walk. `None` when the bundle places no index, which
+            // `kernel_values` turns into a REFUSAL if the tape carries the step — never into an
+            // empty buffer, because an unstaged index reads as block 0 and block 0 is a real
+            // address (row 0's first page), so every pass would answer from row 0's keys.
+            kv_blocks: kv_blocks.as_deref(),
         };
         let fsteps = shape.steps();
         let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
@@ -1321,15 +1456,30 @@ pub(crate) fn superdsc_forward_chunk(
             &mut launcher,
         )
         .map_err(|e| werr(format!("forward tape: {e}")))?;
-        debug_assert!(launcher.launched, "the tape must reach its device step");
-        let acts = launcher.acts;
+        // ⛔ EVERY STAGED LIST IS NAMED, no `..`: this site took `launcher.acts` alone and called the
+        // f32-only `run_step`, so the chunk gather's int32 index table (`acts_i32`) was staged and then
+        // DROPPED — the device read an all-zero index and every gathered block was block 0 (measured on
+        // granite-3.1-2b fp8: 64 pages of every kv head byte-identical). A new staged list is now a
+        // missing field here, and an unbound one is an unused binding.
+        let ForwardLauncher {
+            shape: _,
+            steps: _,
+            inputs: _,
+            staged: _,
+            acts,
+            acts_f16,
+            acts_i32,
+            launched,
+        } = launcher;
+        debug_assert!(launched, "the tape must reach its device step");
 
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
         let _t_fwd = std::time::Instant::now();
-        log_binds(&format!("decode pos={p}"), b.wiring, &acts, &[]);
+        log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
         let logits = session
-            .run_step(1, p, &acts)
-            .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?;
+            .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, true)
+            .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?
+            .unwrap_or_default();
         if flags().timing {
             let rss_gb = std::fs::read_to_string("/proc/self/statm")
                 .ok()

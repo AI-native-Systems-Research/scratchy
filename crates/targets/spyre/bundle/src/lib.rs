@@ -310,11 +310,12 @@ pub struct KvShifts {
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
     /// (request, page).
     pub batched_requests: bool,
-    /// ⭐ That axis walks a GATHERED scratch, so each row's PAGE came from the index the host stages
-    /// rather than from a segment shift. Two consequences the runtime must know: the pool needs no single
-    /// stride for the passes to collapse, and the fold's KV shift must be ZERO (an absolute entry plus a
-    /// per-pass page base composes two bases and lands inside neither). Meaningful only with
-    /// [`Self::batched_requests`].
+    /// ⭐ This group reads the pool through the GATHER — each page came from the index the host stages
+    /// rather than from a segment shift. Two consequences the runtime must know: the group's KV shift
+    /// must be ZERO (an absolute entry plus a page base composes two bases and lands inside neither),
+    /// and the host must stage the index table for any body carrying such a group. On a fold group it
+    /// also lets the passes collapse with no single pool stride (with [`Self::batched_requests`]); on a
+    /// non-fold group it is the split-KV chunk's gather copies, launched once.
     pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
@@ -515,6 +516,11 @@ pub struct RerollMeta<'a> {
     pub body_fused: SiblingFp<'a>,
     /// The sk_bucket ladder, ASCENDING by `active_cap`; the top rung is this body itself.
     pub rungs: Cow<'a, [LadderRung<'a>]>,
+    /// ⛔ THE RUNG A CONTEXT PAST EVERY RUNG'S SWEEP RUNS — an index into [`Self::rungs`], decided and
+    /// PROVEN at bake (`fold_plan::the_fallback_serves_any_length`: never a split-KV chunk, which
+    /// attends only its own pages). The runtime reads it rather than choosing, so it cannot run a rung
+    /// the bake did not prove serves any length.
+    pub fallback_rung: u32,
     /// How many times the body runs — the layer count.
     pub iters: u32,
     /// Byte stride between one layer's weights and the next (seg1).
@@ -773,6 +779,7 @@ mod tests {
                     body_fused: SiblingFp::none(),
                 },
             ]),
+            fallback_rung: 1,
             iters: 40,
             weight_stride: 60872704,
             kv_stride: 786432,
