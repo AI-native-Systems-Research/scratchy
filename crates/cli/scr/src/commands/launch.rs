@@ -237,9 +237,10 @@ fn claude_code_window(served: Option<usize>, user: Option<&str>) -> (Option<usiz
 
 /// The reply budget Claude Code falls back to for a model ID it does not
 /// recognise — every model scratchy serves (Claude Code's env-vars docs,
-/// 32000). Launch leaves this alone on a window that fits it, and pins
-/// [`DEFAULT_OUTPUT_BUDGET`] on one that does not.
-const CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE: usize = 32_000;
+/// 32000). Launch leaves this alone on a window that fits it with room to
+/// spare, and pins a smaller budget on one that does not
+/// ([`pinned_output_budget`]).
+const CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE: u32 = 32_000;
 
 /// The reply budget launch pins when the window needs one, as
 /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
@@ -261,8 +262,28 @@ const CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE: usize = 32_000;
 /// and a reply that outgrows it degrades — Claude Code continues from "Output
 /// token limit hit" — rather than fails. The cap counts thinking tokens too
 /// (launch passes no `enable_thinking`, and Qwen-style templates think by
-/// default), which is one reason it is pinned only when the window needs it.
+/// default), which is one reason launch pins only as much as the window needs.
 const DEFAULT_OUTPUT_BUDGET: u32 = 8192;
+
+/// The budget launch pins on a `window` Claude Code is told, or `None` where
+/// Claude Code's own 32000 fits with room to spare.
+///
+/// Below the window where the 32000 first fits — [`claude_code_fixed_costs`] of
+/// it, 95000 — the pin is [`DEFAULT_OUTPUT_BUDGET`]. Past it the pin grows
+/// one-for-one with the window until it reaches 32000, where launch stops
+/// pinning. A step from 8192 straight to "nothing" would shrink a session's
+/// room as its window grows: a 94999-token window pinned at 8192 compacts at
+/// 73807, while a 95000-token one left at 32000 compacts at 50000 — exactly the
+/// startup baseline, no room for a conversation. Growing the pin instead holds
+/// the compaction line at 73808 across 95000..118808 and lets it rise from
+/// there, so a larger window never compacts earlier.
+fn pinned_output_budget(window: usize) -> Option<u32> {
+    let past = window.saturating_sub(claude_code_fixed_costs(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE));
+    let budget = u32::try_from(past).map_or(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE, |past| {
+        past.saturating_add(DEFAULT_OUTPUT_BUDGET)
+    });
+    (budget < CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE).then_some(budget)
+}
 
 /// The `CLAUDE_CODE_MAX_OUTPUT_TOKENS` Claude Code is given, if launch gives
 /// one at all, and how the `Launching …` line names it.
@@ -271,12 +292,12 @@ const DEFAULT_OUTPUT_BUDGET: u32 = 8192;
 /// no value of it can make the server reject a request: a larger one only
 /// compacts earlier, a smaller one only shortens replies.
 ///
-/// When the environment has none, launch pins a smaller budget **only when
-/// the window needs it**: a session survives only while the window clears
-/// startup prompt + reserve + 13000, so on a window that fits Claude Code's
-/// own 32000, launch sets nothing — a pin would cap every reply to buy room
-/// the window already has. Below that — or when the window is unknown — launch
-/// pins 8192, moving the compact line as far up as the budget allows.
+/// When the environment has none, launch pins a smaller budget **only as far
+/// as the window needs it** ([`pinned_output_budget`]): a session survives only
+/// while the window clears startup prompt + reserve + 13000, so on a window
+/// that fits Claude Code's own 32000 with room to spare, launch sets nothing —
+/// a pin would cap every reply to buy room the window already has. An unknown
+/// window pins 8192, moving the compact line as far up as the budget allows.
 ///
 /// `window` is the window Claude Code is told (`claude_code_window`), the one
 /// it compacts against. A value the user set in a Claude Code settings file is
@@ -292,36 +313,28 @@ fn claude_code_output_budget(user: Option<&str>, window: Option<usize>) -> (Opti
             format!(", reply budget: {n} tokens from CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
         );
     }
-    // Whether Claude Code's own 32000 reservation fits the window it is told.
-    // An unknown window conservatively reads as "does not fit": the pin's cost
-    // is capped replies, the no-pin cost is a session that never clears its
-    // compact line.
-    let fits =
-        window.is_some_and(|w| w >= claude_code_fixed_costs(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE));
-    let (value, mut label) = if fits {
-        if user.is_some() {
-            // A value that failed to parse must not reach Claude Code as-is,
-            // so launch pins the default it was going to leave alone.
-            (
-                Some(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE as u32),
-                format!(", reply budget: {CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE} tokens"),
-            )
-        } else {
-            (None, String::new())
-        }
-    } else if window.is_some() {
-        (
-            Some(DEFAULT_OUTPUT_BUDGET),
-            format!(
-                ", reply budget: {DEFAULT_OUTPUT_BUDGET} tokens (the window can't spare Claude \
-                 Code's {CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE} default)"
-            ),
-        )
-    } else {
-        (
+    // An unknown window conservatively pins the smallest budget: the pin's
+    // cost is capped replies, the no-pin cost is a session that never clears
+    // its compact line.
+    let (value, mut label) = match window.map(pinned_output_budget) {
+        None => (
             Some(DEFAULT_OUTPUT_BUDGET),
             format!(", reply budget: {DEFAULT_OUTPUT_BUDGET} tokens"),
-        )
+        ),
+        Some(Some(pin)) => (
+            Some(pin),
+            format!(
+                ", reply budget: {pin} tokens (the window can't spare Claude Code's \
+                 {CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE} default)"
+            ),
+        ),
+        // A value that failed to parse must not reach Claude Code as-is, so
+        // launch pins the default it was going to leave alone.
+        Some(None) if user.is_some() => (
+            Some(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE),
+            format!(", reply budget: {CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE} tokens"),
+        ),
+        Some(None) => (None, String::new()),
     };
     if let Some(raw) = user {
         // Not a positive number: launch's own choice, with the value named.
@@ -346,8 +359,8 @@ const CLAUDE_CODE_SUMMARY_BUFFER: usize = 13_000;
 /// prompt plus the reply reserve it holds back plus the summary buffer it
 /// keeps below its compact trigger. Below this, a session starting near the
 /// baseline is over its compact line from the first turn.
-fn claude_code_fixed_costs(reserve: usize) -> usize {
-    CLAUDE_CODE_PROMPT_BASELINE + reserve + CLAUDE_CODE_SUMMARY_BUFFER
+fn claude_code_fixed_costs(reserve: u32) -> usize {
+    CLAUDE_CODE_PROMPT_BASELINE + reserve as usize + CLAUDE_CODE_SUMMARY_BUFFER
 }
 
 /// Who set the window Claude Code is told — the levers that can widen it
@@ -384,7 +397,7 @@ fn claude_code_floor_warning(
     reserve: u32,
     origin: &SmallWindowOrigin,
 ) -> Option<String> {
-    let floor = claude_code_fixed_costs(reserve as usize);
+    let floor = claude_code_fixed_costs(reserve);
     (told < floor).then(|| {
         let lever = match origin {
             SmallWindowOrigin::UserEnv { served } => format!(
@@ -396,7 +409,8 @@ fn claude_code_floor_warning(
                  this machine's KV cache."
                 .to_string(),
             SmallWindowOrigin::ExternalServer => " The window comes from the server at \
-                 --server-url; that server's own --max-model-len sets it."
+                 --server-url: that server's --max-model-len, its model's native context, or \
+                 its machine's KV cache sets it."
                 .to_string(),
             SmallWindowOrigin::Native => " The window levers are a bigger-context model or \
                  more KV memory (--kv-cache-dtype fp8_e4m3) — not --max-model-len, which only \
@@ -667,7 +681,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     if let Some(told) = context_window {
         // The reserve actually held back: launch's pin, or Claude Code's own
         // 32000 when launch set none.
-        let reserve = output_budget.unwrap_or(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE as u32);
+        let reserve = output_budget.unwrap_or(CLAUDE_CODE_DEFAULT_OUTPUT_RESERVE);
         if let Some(warning) = claude_code_floor_warning(told, reserve, &small_window_origin) {
             eprintln!("{warning}");
         }
@@ -1595,24 +1609,39 @@ mod tests {
 
     /// The pin exists to rescue windows that cannot fit Claude Code's own
     /// 32000 reservation — startup prompt + 32000 + 13000 — and it costs every
-    /// reply (thinking counts against the cap), so it is pinned exactly there:
-    /// never above that floor, always below it and when the window is unknown.
+    /// reply (thinking counts against the cap), so it is only as large a cut as
+    /// the window needs: 8192 below that floor, growing one-for-one with the
+    /// window past it, and nothing once it reaches 32000.
     #[test]
-    fn output_budget_pinned_only_when_the_window_needs_it() {
+    fn output_budget_pinned_only_as_far_as_the_window_needs_it() {
         let fits = 50_000 + 32_000 + 13_000;
-        assert_eq!(
-            claude_code_output_budget(None, Some(fits)),
-            (None, String::new())
-        );
-        assert_eq!(
-            claude_code_output_budget(None, Some(262_144)),
-            (None, String::new())
-        );
-
         let (told, label) = claude_code_output_budget(None, Some(fits - 1));
         assert_eq!(told, Some(8192));
         assert!(label.contains("8192"), "{label}");
         assert!(label.contains("32000"), "{label}");
+
+        // Past the floor the pin grows with the window, holding the compact
+        // line where 8192 left it — e.g. Gemma 4 31B on a 64 GB M5 Max, whose
+        // KV cache serves 115648 tokens (#431).
+        for (window, pin) in [
+            (fits, 8_192),
+            (100_000, 13_192),
+            (115_648, 28_840),
+            (fits + 23_807, 31_999),
+        ] {
+            let (told, label) = claude_code_output_budget(None, Some(window));
+            assert_eq!(told, Some(pin), "{window}");
+            assert!(label.contains(&pin.to_string()), "{label}");
+        }
+
+        // Where the pin would reach Claude Code's own 32000: nothing set.
+        for window in [fits + 23_808, 131_072, 262_144] {
+            assert_eq!(
+                claude_code_output_budget(None, Some(window)),
+                (None, String::new()),
+                "{window}"
+            );
+        }
 
         // The window Claude Code is told decides, not the one the server
         // serves: a user pinning a small CLAUDE_CODE_MAX_CONTEXT_TOKENS
@@ -1624,6 +1653,25 @@ mod tests {
         let (told, label) = claude_code_output_budget(None, None);
         assert_eq!(told, Some(8192));
         assert_eq!(label, ", reply budget: 8192 tokens");
+    }
+
+    /// A larger window never compacts earlier. Claude Code compacts at
+    /// min(92% × (window − reserve), window − reserve − 13000)
+    /// (anthropics/claude-code#97568); a reserve that jumped from 8192 straight
+    /// to 32000 at one window would drop that line by 23808 tokens there.
+    #[test]
+    fn compact_line_never_falls_as_the_window_grows() {
+        let compact_line = |window: usize| {
+            let (pin, _) = claude_code_output_budget(None, Some(window));
+            let usable = window - pin.unwrap_or(32_000) as usize;
+            (usable * 92 / 100).min(usable - 13_000)
+        };
+        let mut previous = compact_line(60_000);
+        for window in 60_001..=300_000 {
+            let line = compact_line(window);
+            assert!(line >= previous, "{window}: {line} < {previous}");
+            previous = line;
+        }
     }
 
     /// The case this fix exists for: a window below Claude Code's fixed costs
@@ -1675,9 +1723,8 @@ mod tests {
         assert!(warn.contains("--server-url"), "{warn}");
 
         // At or above the floor: nothing to say. The floor moves with the
-        // reserve actually held back — Claude Code's own 32000 when launch
-        // pinned nothing (which is exactly when the told window is at or
-        // above 50000 + 32000 + 13000).
+        // reserve actually held back — launch's pin, or Claude Code's own
+        // 32000 when launch pinned nothing.
         assert_eq!(
             claude_code_floor_warning(floor, 8_192, &SmallWindowOrigin::Native),
             None

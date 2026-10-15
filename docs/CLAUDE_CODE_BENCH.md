@@ -264,11 +264,12 @@ still appear on every published row:
    same number, or its sessions compact at a different point and the
    per-session comparison is not like-for-like. The same goes for
    `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, whose reservation moves the same point
-   (#428): `scr launch claude` pins it to 8192 only when the window cannot fit
-   Claude Code's own 32000 reservation (below ~95k tokens), and sets nothing on
-   a larger one — so the ollama arm matches the `Launching …` line: pin 8192
-   when launch did, leave the variable unset when launch did — or the value a
-   run overrides it with, matched on both sides.
+   (#428): `scr launch claude` pins it to 8192 below ~95k tokens, grows the
+   pin one-for-one with the window from there, and sets nothing from ~119k up,
+   where the pin would reach Claude Code's own 32000 — so the ollama arm
+   matches the `Launching …` line: pin the budget launch named when it named
+   one, leave the variable unset when it named none — or the value a run
+   overrides it with, matched on both sides.
 
 3. **Which binary.** Per-tool relocatable spans are a Cargo feature, off by
    default (`crates/serving/api/Cargo.toml:47`, forwarded at
