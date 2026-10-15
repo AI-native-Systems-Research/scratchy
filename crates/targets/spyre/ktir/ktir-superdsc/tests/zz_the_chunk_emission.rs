@@ -238,6 +238,148 @@ fn a_wide_prompt_chunk_cuts_its_probabilities_into_untiled_parts() {
     }
 }
 
+/// The chunk at `pages` × `mq`, emitted against a REAL layout — the residency the body declares
+/// (`BundleLayout::synth_lx_core_local`) only reaches the descriptors through one. Every caller-bound
+/// operand is placed (an undeclared name is a build error); `assemble_attn` declares its own scratches.
+fn emit_chunk_in_layout(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
+    use ktir_superdsc::place::PlaceId;
+    use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
+    let mut layout = BundleLayout::default();
+    let mut names = Vec::new();
+    for (i, tid) in (1..=8u32).chain([900]).enumerate() {
+        let name = PlaceId::Act(tid).to_string();
+        layout
+            .ids
+            .borrow_mut()
+            .insert(name.clone(), PlaceId::Act(tid));
+        names.push(name);
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: 3,
+                bank: 0,
+                offset: (i as u64) << 30,
+                size: 1 << 30,
+            },
+        );
+    }
+    let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
+    let rows = if mq == 1 {
+        attn_bundle_rows(geom, 1, true).expect("the one-request decode rung")
+    } else {
+        attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
+    };
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+        .expect("a chunk granite-2b admits");
+    let mut sym = 0i64;
+    let ops = assemble_attn(
+        0,
+        geom,
+        rows,
+        CAP,
+        CAP,
+        &names[0],
+        &names[1],
+        &names[2],
+        &names[3],
+        &names[4],
+        &names[5],
+        &names[6],
+        Some(&names[7]),
+        Some(chunk),
+        PlaceId::Act(900),
+        false,
+        false,
+        &mut sym,
+        Some(&layout),
+    )
+    .unwrap_or_else(|e| panic!("pages={pages} mq={mq}: assemble_attn refused: {}", e.0));
+    named(ops)
+}
+
+/// ⭐ THE CHUNK's `esub` OUTPUT NEVER LEAVES LX, AT DECODE AND AT THE SHIPPED PROMPT WIDTH, ON EVERY RUNG.
+/// Each `esub` writes the `cesub` scratch LX-only and each `exp` reads it LX-only, at ONE start address on
+/// every core (core-local: each core holds its own slice, the reference's form for its softmax
+/// intermediates). That the whole ladder emits at all is the build-time proof that every `exp` divides
+/// the work exactly as its `esub` did — the emitter refuses any op that does not.
+#[test]
+fn the_chunk_probabilities_stay_in_lx_between_esub_and_exp() {
+    let lx_only = |v: &serde_json::Value| {
+        v["memOrg_"]
+            .as_object()
+            .is_some_and(|m| m.len() == 1 && m.contains_key("lx"))
+    };
+    for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
+        for &j in &ChunkScratch::LADDER {
+            let ops = emit_chunk_in_layout(j, mq);
+            for (stem, at) in [("attn_cesub_g", "out"), ("attn_cexp_g", "in")] {
+                let mine: Vec<&(String, serde_json::Value)> =
+                    ops.iter().filter(|(n, _)| n.starts_with(stem)).collect();
+                assert!(!mine.is_empty(), "{stem}* at {j} page(s), mq {mq}");
+                for (name, v) in mine {
+                    let body = &v["dscs_"][0][name];
+                    let lds = body["labeledDs_"].as_array().expect("labeled operands");
+                    let lds =
+                        if at == "out" { lds.last() } else { lds.first() }.expect("an operand");
+                    assert!(
+                        lx_only(lds),
+                        "{name} at {j} page(s), mq {mq}: cesub is {}",
+                        lds["memOrg_"]
+                    );
+                    let idx = lds["ldsIdx_"].as_u64();
+                    let alloc = body["scheduleTree_"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|n| n["nodeType_"] == "allocate" && n["ldsIdx_"].as_u64() == idx)
+                        .expect("cesub's allocate node");
+                    assert_eq!(alloc["component_"], "lx", "{name}");
+                    let starts: std::collections::BTreeSet<String> =
+                        alloc["startAddressCoreCorelet_"]["data_"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .map(|(_, a)| a.to_string())
+                            .collect();
+                    assert_eq!(
+                        starts.len(),
+                        1,
+                        "{name} at {j} page(s), mq {mq}: cesub starts at {starts:?} — one pin on \
+                         every core"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// ⛔ A CORE-LOCAL TENSOR TAKES ONE WORK DIVISION: the first op's is recorded, the same one again stands,
+/// and any other is refused — the build-time half of "each core holds only what its own producer wrote".
+#[test]
+fn a_core_local_tensor_refuses_a_second_division() {
+    use ktir_superdsc::place::PlaceId;
+    use ktir_superdsc::placement::BundleLayout;
+    let l = BundleLayout::default();
+    l.synth_lx_core_local(PlaceId::Act(7), 4096);
+    let name = PlaceId::Act(7).to_string();
+    assert!(l.lx_core_local(&name));
+    assert_eq!(l.lx_pin(&name).map(|(_, fp)| fp), Some(4096));
+    assert_eq!(
+        l.record_lx_division(&name, "esub", "split {out: 32}".into()),
+        Ok(())
+    );
+    assert_eq!(
+        l.record_lx_division(&name, "exp", "split {out: 32}".into()),
+        Ok(())
+    );
+    assert!(
+        l.record_lx_division(&name, "sum", "split {mb: 32}".into())
+            .is_err()
+    );
+}
+
 /// ⛔ EXACTLY THE GATHER COPIES ARE DECLARED GATHERED, AND NOTHING IS A FOLD OP. A gathered op groups on
 /// its own (`GroupKind::Gathered`): its launch takes no KV page shift — the entries are absolute — and its
 /// body is the one the host stages the index for. An unmarked copy lands in an ordinary group, whose

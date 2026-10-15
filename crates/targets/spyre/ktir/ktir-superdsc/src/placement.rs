@@ -313,8 +313,15 @@ pub struct LxAlloc {
     pub next: u64,
     /// Pinned byte address per synth name.
     pub map: std::collections::BTreeMap<String, u64>,
-    /// Declared footprint (bytes) per name — the resolve-time window guard's bound.
+    /// Declared footprint (bytes) per name — the resolve-time window guard's bound. For a
+    /// CORE-LOCAL tensor this is ONE core's slice, not the tensor.
     pub sizes: std::collections::BTreeMap<String, u64>,
+    /// The names declared CORE-LOCAL ([`BundleLayout::synth_lx_core_local`]): each core holds only its
+    /// own work slice at the pin, so they are readable only under the work division that wrote them.
+    pub core_local: std::collections::BTreeSet<String>,
+    /// The work division the first op to touch each core-local tensor used, as a comparable
+    /// signature ([`BundleLayout::record_lx_division`]). Every later op must match it.
+    pub divisions: std::collections::BTreeMap<String, String>,
 }
 impl Default for LxAlloc {
     fn default() -> Self {
@@ -322,6 +329,8 @@ impl Default for LxAlloc {
             next: LX_PIN_BASE,
             map: std::collections::BTreeMap::new(),
             sizes: std::collections::BTreeMap::new(),
+            core_local: std::collections::BTreeSet::new(),
+            divisions: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -428,6 +437,70 @@ impl BundleLayout {
         );
         a.map.insert(name.clone(), o);
         a.sizes.insert(name, fp);
+    }
+
+    /// Declare a synthetic intermediate LX-resident CORE-LOCALLY: every core holds only ITS OWN work
+    /// slice, `per_core_bytes` of it, at one pinned address shared by all cores — the reference's form
+    /// for every softmax intermediate (`allocate … component_ lx`, one `startAddressCoreCorelet_` value
+    /// on all 32 cores). Like [`Self::synth_lx`] it REPLACES the seg3 HBM slot: the tensor never leaves
+    /// LX. Idempotent per name.
+    ///
+    /// ⛔ ONLY AN OP THAT DIVIDES THE WORK EXACTLY AS THE PRODUCER DID CAN READ IT — core `c`'s slice is
+    /// whatever core `c`'s producer pass wrote. The emitter records the first op's division and refuses
+    /// every op that differs, at build ([`Self::record_lx_division`]).
+    ///
+    /// ⛔ PANICS past [`LX_SIZE`], the same `cargo build` guard as [`Self::synth_lx`].
+    pub fn synth_lx_core_local(&self, id: PlaceId, per_core_bytes: u64) {
+        let name = id.to_string();
+        self.ids.borrow_mut().insert(name.clone(), id);
+        let mut a = self.lx.borrow_mut();
+        if a.map.contains_key(&name) {
+            return;
+        }
+        let o = a.next;
+        let fp = align128(per_core_bytes.max(1));
+        a.next = o + fp;
+        let end = a.next;
+        assert!(
+            end <= LX_SIZE,
+            "a core-local LX intermediate overflows the 2 MiB per-core scratchpad: '{name}' pins at \
+             {o} with a {fp}-byte per-core slice, pushing the region to {end} > {LX_SIZE}. Cut the op \
+             into smaller parts so one core's slice fits, or keep the tensor in HBM \
+             (`BundleLayout::synth`)."
+        );
+        a.map.insert(name.clone(), o);
+        a.sizes.insert(name.clone(), fp);
+        a.core_local.insert(name);
+    }
+
+    /// Whether `name` is LX-resident CORE-LOCALLY ([`Self::synth_lx_core_local`]).
+    pub fn lx_core_local(&self, name: &str) -> bool {
+        self.lx.borrow().core_local.contains(name)
+    }
+
+    /// ⛔ THE CORE-LOCAL READ LAW, at build: the FIRST op to touch core-local `name` records its work
+    /// division (`signature`); every later op must present the same one, or this is an `Err` naming both.
+    /// A different division hands core `c` a slice core `c`'s producer never wrote — fluent garbage on
+    /// card with no fault.
+    pub fn record_lx_division(
+        &self,
+        name: &str,
+        op: &str,
+        signature: String,
+    ) -> Result<(), String> {
+        let mut a = self.lx.borrow_mut();
+        match a.divisions.get(name) {
+            None => {
+                a.divisions.insert(name.to_string(), signature);
+                Ok(())
+            }
+            Some(first) if *first == signature => Ok(()),
+            Some(first) => Err(format!(
+                "op '{op}' divides core-local LX tensor '{name}' as {signature}, but its first op \
+                 divided it as {first} — each core holds only the slice its own producer pass wrote, so \
+                 every op on a core-local tensor must divide the work identically"
+            )),
+        }
     }
 
     /// The pinned-LX address + declared footprint of `name`, or `None` when the tensor is not

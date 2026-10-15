@@ -1786,6 +1786,19 @@ struct ChunkAttn<'a> {
 ///
 /// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
 /// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
+/// Pages per probability part of a chunk whose kv heads carry `g_rows` query rows each: the fewest EQUAL
+/// whole-page parts whose `[g_rows, part]` pointwise op runs untiled (asked of the builder's own tiler),
+/// one page at worst. ONE place, so the caller that sizes the core-local `cesub` pin and the body that
+/// cuts the parts read the same number.
+fn softmax_part_pages(chunk: crate::sdsc_abstract::ChunkScratch, g_rows: u32) -> u32 {
+    let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    (1..=chunk.pages())
+        .filter(|n| chunk.pages().is_multiple_of(*n))
+        .map(|n| chunk.pages() / n)
+        .find(|&pp| crate::emit::pointwise_fits_untiled(g_rows, pp * page_slots, 2))
+        .unwrap_or(1)
+}
+
 fn assemble_attn_chunk(
     ops: &mut Vec<EmittedOp>,
     a: ChunkAttn<'_>,
@@ -1970,12 +1983,14 @@ fn assemble_attn_chunk(
     // part's base a whole multiple of its own block, the stick-major condition. ONE part, the whole
     // chunk, wherever that already fits — every width at decode and at 96 prompt rows, byte for byte. A
     // geometry where even one page is tiled keeps one-page parts and meets the builder's refusal.
-    let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-    let sm_pages = (1..=chunk.pages())
-        .filter(|n| chunk.pages().is_multiple_of(*n))
-        .map(|n| chunk.pages() / n)
-        .find(|&pp| crate::emit::pointwise_fits_untiled(g_rows, pp * page_slots, 2))
-        .unwrap_or(1);
+    //
+    // ⭐ AND `esub`'s OUTPUT NEVER LEAVES LX: `cb.cesub` is a CORE-LOCAL scratch (declared by the caller,
+    // `BundleLayout::synth_lx_core_local`) holding one core's slice of ONE part of ONE kv head, reused
+    // part after part — each `exp` reads it straight after its `esub` wrote it, under the same division
+    // (both are the tiler's own `[gqa·mq, part]` pointwise op; `emit`'s core-local read law proves it at
+    // build). That is the reference's form for every softmax intermediate, and it removes the `cesub`
+    // write and read from HBM: two of the chunk's eight passes over its score block.
+    let sm_pages = softmax_part_pages(chunk, g_rows);
     let sm_parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.slot_parts(sm_pages).collect();
     for kvh in 0..nkvh {
         let h0 = kvh * g_rows;
@@ -1989,6 +2004,7 @@ fn assemble_attn_chunk(
                 format!("_s{p}")
             };
             // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
+            // `cesub` is core-local LX, so both address it at its pin (no corner).
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_cesub_g{kvh}{suffix}_o{t}"),
                 "subtract",
@@ -1999,7 +2015,7 @@ fn assemble_attn_chunk(
                     In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
                 ],
                 &rb(&cb.cesub, g_rows, ps),
-                pc,
+                DevOff::ZERO,
                 sym_id_base,
                 layout,
             ));
@@ -2008,7 +2024,7 @@ fn assemble_attn_chunk(
                 "exp",
                 grp_rows,
                 pw,
-                &[In::sliced(&rb(&cb.cesub, g_rows, ps), pc).ew()],
+                &[In::sliced(&rb(&cb.cesub, g_rows, ps), DevOff::ZERO).ew()],
                 &rb(&cb.cexp, g_rows, ps),
                 pc,
                 sym_id_base,
@@ -2901,9 +2917,21 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 l.synth(out_id.synth(r), &chunk.footprint_dims());
             }
             // Every query ROW's scores over the chunk — `nqh·mq` rows, the token stream's own.
-            for r in [R::ChunkSc, R::ChunkESub, R::ChunkExp] {
+            for r in [R::ChunkSc, R::ChunkExp] {
                 l.synth(out_id.synth(r), &[nqh * mq, chunk.slots()]);
             }
+            // ⭐ `esub`'s output is CORE-LOCAL LX: one core's slice of one kv head's probability part —
+            // what the tiler hands a core of that `[gqa·mq, part]` op. See the body's step (4).
+            let g_rows = (nqh / nkvh) * mq;
+            let part = softmax_part_pages(chunk, g_rows)
+                * crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+            let slice = crate::emit::pointwise_untiled_slice_bytes(g_rows, part, 2).ok_or_else(|| {
+                SuperDscError(format!(
+                    "attention o{t}: a one-page probability part of {g_rows} rows is time-tiled, so its \
+                     esub output has no core-local slice to pin in LX"
+                ))
+            })?;
+            l.synth_lx_core_local(out_id.synth(R::ChunkESub), slice);
         }
         assemble_attn_chunk(
             &mut ops,

@@ -166,6 +166,13 @@ fn per_core_addr(
     cores: u32,
 ) -> Result<Vec<u64>, SuperDscError> {
     let cores = cores.max(1);
+    // ⭐ A CORE-LOCAL LX OPERAND STARTS AT ITS PIN ON EVERY CORE — no corner. Each core's scratchpad holds
+    // only that core's own slice, and the op's coordinates (the same ones an HBM operand carries) say
+    // which slice it is. The reference's softmax intermediates are exactly this: one LX start address
+    // repeated on all 32 cores.
+    if view.allocation.is_core_local() {
+        return Ok(vec![intra_base; cores as usize]);
+    }
     // LX residency is core-local: there is no HBM segment base to add, but the per-core slice
     // CORNER fold below still applies. A replicated producer ([`WorkPlan::replicate`]) walks the
     // whole tensor from the pin in EVERY core's private copy; a consumer's own slice corner then
@@ -507,9 +514,14 @@ pub(crate) fn pointwise_broadcast_opspec(
 /// cuts an op this answers `false` for, because a time-tiled op with a broadcast operand is refused
 /// (`concrete_trips` would advance the broadcast operand per trip).
 pub fn pointwise_fits_untiled(rows: u32, cols: u32, n_inputs: u32) -> bool {
-    let Ok(stick) = StickExtent::<Fp16>::new(cols) else {
-        return false;
-    };
+    pointwise_untiled_slice_bytes(rows, cols, n_inputs).is_some()
+}
+
+/// The bytes of ONE core's slice of that op's fp16 `[rows, cols]` output under the tiler's own work
+/// division — what a core-local LX pin for it must hold ([`BundleLayout::synth_lx_core_local`]). `None`
+/// when the op would be time-tiled, which a core-local tensor cannot be.
+pub fn pointwise_untiled_slice_bytes(rows: u32, cols: u32, n_inputs: u32) -> Option<u64> {
+    let stick = StickExtent::<Fp16>::new(cols).ok()?;
     let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
         name,
         size,
@@ -534,7 +546,16 @@ pub fn pointwise_fits_untiled(rows: u32, cols: u32, n_inputs: u32) -> bool {
             crate::work::distribute_cores,
             "out",
         )
-        .is_ok_and(|t| t.time_tile.is_none())
+        .ok()
+        .filter(|t| t.time_tile.is_none())
+        .map(|t| {
+            t.plan
+                .dims()
+                .iter()
+                .map(|d| u64::from(t.plan.per_core_extent(d.name)))
+                .product::<u64>()
+                * u64::from(Df::Fp16.word_length())
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1284,21 +1305,88 @@ pub fn pointwise_chunk_out_offset(cols_start: u32) -> u32 {
 ///     producer pass wrote. A split producer would partition the tensor across different cores'
 ///     scratchpads, unreadable where the consumers' slices point.
 ///
+/// A CORE-LOCAL pin ([`BundleLayout::synth_lx_core_local`]) is the exception to the second law: its
+/// producer keeps its own division, and `emit_sdsc_tiled` holds every op touching the tensor to it.
+///
 /// A no-op (and byte-identical emission) for every bundle that declares no LX intermediates.
 fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
     let Some(l) = layout else { return };
     for a in op.args.iter_mut() {
         if l.lx_pin(a.arg_name()).is_some() {
-            a.set_allocation(Allocation::Lx);
+            a.set_allocation(if l.lx_core_local(a.arg_name()) {
+                Allocation::LxCoreLocal
+            } else {
+                Allocation::Lx
+            });
         }
     }
     if op
         .args
         .last()
-        .is_some_and(|o| l.lx_pin(o.arg_name()).is_some())
+        .is_some_and(|o| l.lx_pin(o.arg_name()).is_some() && !l.lx_core_local(o.arg_name()))
     {
         op.iter = WorkPlan::replicate(op.iter.dims());
     }
+}
+
+/// ⛔⛔⛔ THE CORE-LOCAL READ LAW, in the ONE emission path so no builder can route around it. Each core
+/// holds only the slice its own producer pass wrote, so every op touching a core-local LX tensor must:
+///   * have DECLARED it core-local (its view's allocation) — an op that reaches the pinned name without
+///     the residency consult would address LX bytes as HBM;
+///   * run UNTILED — a trip-sliced op walks a different slice per trip, and the pin holds one;
+///   * fit one core's slice inside the pin;
+///   * divide the work EXACTLY as the first op on the tensor did ([`BundleLayout::record_lx_division`]).
+///
+/// Any other op is a build `Err` naming the tensor — never fluent garbage on card.
+fn core_local_reads_agree(
+    op_name: &str,
+    op: &OpSpec,
+    views: &[ArgView<'_>],
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let Some(l) = layout else { return Ok(()) };
+    for v in views.iter().filter(|v| l.lx_core_local(v.name)) {
+        let name = v.name;
+        if !v.allocation.is_core_local() {
+            return Err(SuperDscError(format!(
+                "op '{op_name}' addresses core-local LX tensor '{name}' without declaring it core-local \
+                 — it did not pass the residency consult (`apply_lx_residency`), so it would read LX \
+                 bytes as an HBM address"
+            )));
+        }
+        if op.time_tile.is_some() {
+            return Err(SuperDscError(format!(
+                "op '{op_name}' is time-tiled over core-local LX tensor '{name}' — a trip-sliced op \
+                 walks a different slice per trip, and the pin holds one"
+            )));
+        }
+        let plan = &op.iter;
+        let slice_bytes = plan
+            .dims()
+            .iter()
+            .map(|d| u64::from(plan.per_core_extent(d.name)))
+            .product::<u64>()
+            * u64::from(v.df.word_length());
+        let (_, pin_bytes) = l.lx_pin(name).unwrap_or_default();
+        if slice_bytes > pin_bytes {
+            return Err(SuperDscError(format!(
+                "op '{op_name}': one core's slice of core-local LX tensor '{name}' is {slice_bytes} B, \
+                 past its {pin_bytes}-byte pin"
+            )));
+        }
+        let signature = format!(
+            "{:?} split {:?} on {} cores",
+            plan.dims()
+                .iter()
+                .map(|d| (d.name, d.size))
+                .collect::<Vec<_>>(),
+            plan.splits(),
+            plan.cores_used().get()
+        );
+        l.record_lx_division(name, op_name, signature)
+            .map_err(SuperDscError)?;
+    }
+    Ok(())
 }
 
 /// [`assemble_pointwise_broadcast`] that writes the output to a COLUMN-BLOCK OFFSET
@@ -2320,6 +2408,18 @@ fn resolve_seg_base(
         //    allocate is byte-granular end-to-end (bake-verified: the +16 lands in the
         //    compiled reader's lxlu register).
         if let Some((pin, fp)) = l.lx_pin(name) {
+            // A CORE-LOCAL tensor's pin holds ONE core's slice, so the whole-operand window is not its
+            // bound — `core_local_reads_agree` checks the per-core slice against it. And it has no
+            // addressable offset: every core's slice starts AT the pin.
+            if l.lx_core_local(name) {
+                if slice != 0 {
+                    return Err(SuperDscError(format!(
+                        "core-local LX tensor '{name}' addressed at offset {slice}B — each core's slice \
+                         sits at the pin, so a view into it has no offset to take"
+                    )));
+                }
+                return Ok((0, pin));
+            }
             if window_end > fp {
                 return Err(SuperDscError(format!(
                     "lx-resident '{name}': access window end {window_end}B (offset {slice}B, \
@@ -2438,8 +2538,11 @@ pub fn emit_sdsc(
     // (`WorkPlan::replicate`: all MAX_CORES, no splits) — and must not be time-tiled
     // (a trip-sliced producer leaves rows unwritten in most cores' copies).
     // Violations are a build `Err` naming the law, never silently-unreadable LX bytes.
+    // A CORE-LOCAL output is the one exception: its producer keeps its own division, which
+    // `apply_lx_residency` recorded and holds every reader to.
     if let Some(v) = views.get(out_idx)
         && v.allocation.is_lx()
+        && !v.allocation.is_core_local()
     {
         let replicated =
             op.iter.cores_used().get() == MAX_CORES && op.iter.splits().values().all(|&s| s == 1);
@@ -2455,6 +2558,7 @@ pub fn emit_sdsc(
             )));
         }
     }
+    core_local_reads_agree(op_name, op, &views, layout)?;
     // fp8 W8A8 matmul: a matmul/batchmatmul with an fp8 (SEN143_FP8) NON-OUTPUT operand. The DDL
     // `batchmatmulfp8` kernel (bmm.ddl:55) + its dataflow constraint require a DISTINCT operand layout
     // vs the fp16 kernel (verified against IBM's l0_tethering/fp8_32core_nonmx fixture): the fp8 WEIGHT
