@@ -96,8 +96,10 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.34"
 
-# Metrics
-prometheus = "0.14"
+# Metrics. default-features=false drops the default `protobuf` feature: /metrics
+# serves the text exposition format (`TextEncoder`), so the protobuf runtime
+# would only ever be compiled, never called.
+prometheus = { version = "0.14", default-features = false }
 
 # Error handling
 thiserror = "2"
@@ -127,10 +129,12 @@ rand = "0.9"
 # ZeroMQ
 zeromq = "0.6"
 
-# Tokenizer. default-features=false drops the `progressbar` default feature —
-# tokenizer-training progress bars, and we only ever infer. onig + esaxx_fast
-# are kept to preserve exact tokenization behavior.
-tokenizers = { version = "0.23", default-features = false, features = ["onig", "esaxx_fast"] }
+# Tokenizer. default-features=false drops the training-only defaults, since we
+# only ever infer: `progressbar` (training progress bars) and `esaxx_fast` (the
+# C++ suffix array the Unigram *trainer* uses — encode/decode never reach it).
+# onig is kept to preserve exact tokenization behavior: it is the pre-tokenizer
+# regex engine.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 # Template engine (for HuggingFace chat templates)
 # `preserve_order`: template maps keep insertion order like the Python dicts
@@ -221,6 +225,19 @@ scratchy-cli = { path = "crates/cli/scr" }
 scratchy-e2e = { path = "crates/e2e" }
 
 [profile.release]
+
+# Dev/test builds: line tables only. Panics and backtraces still resolve to
+# file:line; what goes is the variable/type info lldb steps with — the bulk of
+# the debug info, and so of codegen and link time on every `cargo test`
+# (~14% less rustc CPU on a cold third-party set), plus the CI cache.
+#
+# Set here, NOT as `[profile.dev.package."*"]`: a package override outranks
+# build-override, so it would ALSO switch line tables ON for third-party build
+# scripts, proc-macros and their deps, which cargo otherwise builds with no
+# debug info (measured +11% CPU on that side — clippy pays only that side).
+# The profile-level value leaves cargo's no-debuginfo host default intact.
+[profile.dev]
+debug = "line-tables-only"
 
 # `scratchy-models` is the proc-macro fan-out site: `#[forward]`
 # expands each arch DSL into 10-20 dense-size specializations plus

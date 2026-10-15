@@ -90,11 +90,6 @@ ktir-emulator = { path = "ktir/ktir-emulator", optional = true }
 # session setters accept. Optional: only the `spyre-hw` run path binds a session.
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 
-# Compiles the card's C++ launcher shim (csrc/sdsc_shim.cpp). Unconditional
-# build-dep (tiny); build.rs only invokes it under the `spyre-hw` feature.
-[build-dependencies]
-cc = "1"
-
 # `fold_plan`'s fixtures mint the law-governed `SessionKv` fields (the mask /
 # intermediate rep strides) through the same `sdsc_abstract` laws production
 # uses, so a fixture cannot encode a relationship production can't.
