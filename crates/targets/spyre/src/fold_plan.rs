@@ -762,6 +762,30 @@ pub struct RungReach {
     pub folds: bool,
     /// The body is a split-KV chunk: it attends exactly its own pages and nothing past them.
     pub chunk: bool,
+    /// The rung baked a fold-fused twin — the body `superdsc_exec::select_body_paged` runs whenever the
+    /// fold would make ONE pass, i.e. at most one resident page for one request.
+    pub fused_twin: bool,
+}
+
+/// ⛔⛔⛔ NO SPLIT-KV CHUNK RUNG CARRIES A FOLD-FUSED TWIN — the bake's proof, panicked on by the macro.
+///
+/// A chunk body has no fold to fuse, so its twin is the same program again, and the selector's
+/// one-pass arm takes the first FUSED rung that covers the live length. "One pass" is a fact about the
+/// resident PREFIX, the length is the whole context: a prompt chunk over a one-page prefix
+/// (`valid_len` 257, `n_fold_pages` 1) is one pass at a length past every one-page body. Its first
+/// covering twin was the 64-page chunk ceiling's, and granite-2b paid ~0.45 s on that chunk of every
+/// request (the 96- and 128-row ladders both), against ~0.1 s for its neighbours. Without a twin the
+/// step falls to the split ladder's narrowest covering chunk.
+pub fn no_chunk_has_a_fused_twin(rungs: &[RungReach]) -> Result<(), String> {
+    match rungs.iter().position(|r| r.chunk && r.fused_twin) {
+        Some(at) => Err(format!(
+            "rung {at} of {} is a split-KV CHUNK with a fold-fused twin — the selector's one-pass arm \
+             would run that chunk for any context inside its pages whose prefix is one page. Bake no \
+             twin for a chunk rung.",
+            rungs.len()
+        )),
+        None => Ok(()),
+    }
 }
 
 /// ⛔⛔⛔ THE BAKE'S HALF OF [`past_every_sweep`] — and why a ladder that cannot serve the pool DOES NOT
@@ -1157,14 +1181,17 @@ mod tests {
         let fold = RungReach {
             folds: true,
             chunk: false,
+            fused_twin: true,
         };
         let chunk = RungReach {
             folds: false,
             chunk: true,
+            fused_twin: false,
         };
         let whole = RungReach {
             folds: false,
             chunk: false,
+            fused_twin: true,
         };
         assert!(the_fallback_serves_any_length(&[chunk, chunk, chunk]).is_err());
         assert_eq!(
@@ -1173,6 +1200,32 @@ mod tests {
         );
         assert_eq!(the_fallback_serves_any_length(&[fold, fold, fold]), Ok(2));
         assert_eq!(the_fallback_serves_any_length(&[whole, whole]), Ok(1));
+    }
+
+    /// ⛔ A CHUNK RUNG WITH A FOLD-FUSED TWIN IS REFUSED — the bake panics on this `Err`, wherever in the
+    /// ladder the chunk sits (the prompt chunk's ceiling is rung 0). Twins on folding and whole rungs
+    /// stand, and so does a chunk without one.
+    #[test]
+    fn a_chunk_rung_with_a_fused_twin_is_refused() {
+        use super::{RungReach, no_chunk_has_a_fused_twin};
+        let fold = RungReach {
+            folds: true,
+            chunk: false,
+            fused_twin: true,
+        };
+        let chunk = RungReach {
+            folds: false,
+            chunk: true,
+            fused_twin: false,
+        };
+        let twinned = RungReach {
+            fused_twin: true,
+            ..chunk
+        };
+        assert!(no_chunk_has_a_fused_twin(&[twinned, chunk, chunk]).is_err());
+        assert!(no_chunk_has_a_fused_twin(&[fold, fold, chunk, twinned]).is_err());
+        assert_eq!(no_chunk_has_a_fused_twin(&[chunk, chunk, chunk]), Ok(()));
+        assert_eq!(no_chunk_has_a_fused_twin(&[fold, fold, chunk]), Ok(()));
     }
     use super::*;
 

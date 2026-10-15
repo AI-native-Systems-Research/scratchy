@@ -122,13 +122,14 @@ fn the_chunk_reductions_are_per_row_on_stick_blocked_operands() {
     }
 }
 
-/// ⭐⭐⭐ A PROMPT CHUNK'S PREFIX IS THE SAME CHUNK OVER EVERY ROW: at 96 rows per head each kv head's
-/// score, row max and denominator span its `gqa·96 = 384` query rows over the whole chunk, the op count
-/// outside the gather does not grow with the chunk, and nothing is a fold op — every row of every head
-/// in one launch, nothing per page.
+/// ⭐⭐⭐ A PROMPT CHUNK'S PREFIX IS THE SAME CHUNK OVER EVERY ROW: at the shipped prompt-chunk width
+/// (`PREFILL_CHUNK_SLOTS` rows per head, 128 → `gqa·128 = 512` query rows per kv head) each kv head's
+/// score, row max and denominator span all of its rows over the whole chunk, the op count outside the
+/// gather does not grow with the chunk, and nothing is a fold op — every row of every head in one
+/// launch, nothing per page.
 #[test]
 fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
-    const MQ: u32 = 96;
+    const MQ: u32 = PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
     let gqa_rows = u64::from(NQH / NKVH * MQ);
     // The gather's copies and the value leg's K-parts grow with the chunk by design (one copy per index
     // stick; one PV per `VALUE_PART_PAGES` pages, see `ChunkScratch::value_parts`); nothing else may.
@@ -202,6 +203,38 @@ fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
                 e.op_name
             );
         }
+    }
+}
+
+/// ⛔ A 256-ROW PROMPT CHUNK EMITS AT EVERY WIDTH, its probabilities in slot parts. At 1024 query rows per
+/// kv head a 64-page chunk's `esub` is time-tiled whole, and a time-tiled op with a broadcast operand (the
+/// row max) is the builder's own refusal. Cut into equal parts that each run untiled, every width emits,
+/// and the parts cover each kv head's chunk exactly once, one `exp` per `esub`.
+#[test]
+fn a_wide_prompt_chunk_cuts_its_probabilities_into_untiled_parts() {
+    const MQ: u32 = 256;
+    for &j in &ChunkScratch::LADDER {
+        let ops = named(emit_chunk_ops_at(j, MQ));
+        let esub: Vec<&(String, serde_json::Value)> = ops
+            .iter()
+            .filter(|(n, _)| n.starts_with("attn_cesub_g"))
+            .collect();
+        let covered: u64 = esub
+            .iter()
+            .map(|(name, v)| v["dscs_"][0][name]["N_"]["out_"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(
+            covered,
+            u64::from(NKVH * j * 256),
+            "{j} page(s): the esub parts cover {covered} slots across the kv heads"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|(n, _)| n.starts_with("attn_cexp_g"))
+                .count(),
+            esub.len(),
+            "{j} page(s): one exp per esub part"
+        );
     }
 }
 

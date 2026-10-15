@@ -5170,19 +5170,23 @@ impl PagedKvPool {
     ///
     /// ⛔ IT IS NOT THE CHUNK'S REAL LENGTH. Every continuation chunk runs on that ONE bundle
     /// (`use_prefix = chunk_start > 0`), and its cache write is a single `[mq, hd]` copy per kv head —
-    /// so a chunk with 12 real rows still writes 96 CONSECUTIVE SLOTS, the last 84 of them padding.
+    /// so a chunk with 12 real rows still writes 128 CONSECUTIVE SLOTS, the last 116 of them padding.
     /// That is why this number, and not the chunk length, is what the page has to accommodate.
     ///
     /// Kept here rather than beside the prefill rung ladder because the POOL is what must make room for
     /// it; `codegen`'s `PREFILL_RUNGS` ceiling is asserted equal to it, so the two cannot drift.
-    pub const PREFILL_CHUNK_SLOTS: usize = 96;
+    ///
+    /// ⭐ 128, WHICH DIVIDES THE PAGE: a prompt chunked from a page boundary starts its chunks at page
+    /// offsets 0 and 128, so no padded write needs [`chunk_write_start`](Self::chunk_write_start) to step
+    /// back. At 96 the third chunk of every page did, and re-processed the overlap.
+    pub const PREFILL_CHUNK_SLOTS: usize = 128;
 
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
     /// of the next kv head's keys.
     ///
-    /// ⛔ THIS IS THE LONG-CONTEXT BUG, MADE UNREACHABLE. `PREFILL_CHUNK_SLOTS` (96) does not divide
-    /// `PAGE_SLOTS` (256), so a chunk eventually starts with less than a full chunk of room left: with
+    /// ⛔ THIS IS THE LONG-CONTEXT BUG, MADE UNREACHABLE. `PREFILL_CHUNK_SLOTS` was 96, which does not
+    /// divide `PAGE_SLOTS` (256), so a chunk eventually started with less than a full chunk of room left: with
     /// chunks clipped to the room remaining, starts land on page offsets 0, 96, 192, and the one at 192
     /// has 64 slots of room for a 96-slot write. The 32-slot tail used to land at
     /// `block + PAGE_SLOTS*hd`, which IS the next kv head's block — so kv heads 1..nkvh lost the first
@@ -6838,12 +6842,18 @@ impl ChunkScratch {
     /// is 512 KB, which fits whole, so no part takes the repair. The one-request decode's 4-row PV bakes
     /// at every width and stays ONE part, byte for byte.
     pub fn value_parts(self, cut: bool) -> impl Iterator<Item = ChunkPart> {
-        let total = self.slots();
-        let per = if cut {
-            Self::VALUE_PART_PAGES * PagedKvPool::PAGE_SLOTS as u32
+        self.slot_parts(if cut {
+            Self::VALUE_PART_PAGES
         } else {
-            total
-        };
+            self.pages
+        })
+    }
+
+    /// The chunk's slots in runs of `pages_per_part` pages (the last one short), as [`ChunkPart`]s —
+    /// whole stick-columns of every per-head `[rows, slots]` block, so a part is itself a block.
+    pub fn slot_parts(self, pages_per_part: u32) -> impl Iterator<Item = ChunkPart> {
+        let total = self.slots();
+        let per = pages_per_part.clamp(1, self.pages) * PagedKvPool::PAGE_SLOTS as u32;
         (0..total.div_ceil(per)).map(move |i| ChunkPart {
             chunk: self,
             first_slot: i * per,

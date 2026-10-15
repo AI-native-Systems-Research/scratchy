@@ -1962,35 +1962,59 @@ fn assemble_attn_chunk(
     }
 
     // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
+    //
+    // ⭐ THE PROBABILITIES IN SLOT PARTS — the fewest EQUAL whole-page parts whose `[gqa·mq, part]`
+    // sub-block runs untiled, asked of the builder's own tiler (`pointwise_fits_untiled`). A time-tiled
+    // op with a broadcast operand — `esub`'s row max — is refused at build, and at 1024 rows a 64-page
+    // chunk is time-tiled whole (`attn_cesub_g0`, granite-2b at 256 prompt rows). Equal parts keep every
+    // part's base a whole multiple of its own block, the stick-major condition. ONE part, the whole
+    // chunk, wherever that already fits — every width at decode and at 96 prompt rows, byte for byte. A
+    // geometry where even one page is tiled keeps one-page parts and meets the builder's refusal.
+    let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let sm_pages = (1..=chunk.pages())
+        .filter(|n| chunk.pages().is_multiple_of(*n))
+        .map(|n| chunk.pages() / n)
+        .find(|&pp| crate::emit::pointwise_fits_untiled(g_rows, pp * page_slots, 2))
+        .unwrap_or(1);
+    let sm_parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.slot_parts(sm_pages).collect();
     for kvh in 0..nkvh {
         let h0 = kvh * g_rows;
         let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
-        // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_cesub_g{kvh}_o{t}"),
-            "subtract",
-            grp_rows,
-            width,
-            &[
-                In::sliced(&rb(&cb.csc, g_rows, slots), rc).ew(),
-                In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
-            ],
-            &rb(&cb.cesub, g_rows, slots),
-            rc,
-            sym_id_base,
-            layout,
-        ));
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_cexp_g{kvh}_o{t}"),
-            "exp",
-            grp_rows,
-            width,
-            &[In::sliced(&rb(&cb.cesub, g_rows, slots), rc).ew()],
-            &rb(&cb.cexp, g_rows, slots),
-            rc,
-            sym_id_base,
-            layout,
-        ));
+        for (p, part) in sm_parts.iter().enumerate() {
+            let pc = corner(part.probs_corner(kvh, g_rows), "a kv head's score part")?;
+            let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
+            let suffix = if sm_parts.len() == 1 {
+                String::new()
+            } else {
+                format!("_s{p}")
+            };
+            // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_cesub_g{kvh}{suffix}_o{t}"),
+                "subtract",
+                grp_rows,
+                pw,
+                &[
+                    In::sliced(&rb(&cb.csc, g_rows, ps), pc).ew(),
+                    In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                ],
+                &rb(&cb.cesub, g_rows, ps),
+                pc,
+                sym_id_base,
+                layout,
+            ));
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_cexp_g{kvh}{suffix}_o{t}"),
+                "exp",
+                grp_rows,
+                pw,
+                &[In::sliced(&rb(&cb.cesub, g_rows, ps), pc).ew()],
+                &rb(&cb.cexp, g_rows, ps),
+                pc,
+                sym_id_base,
+                layout,
+            ));
+        }
         // ⭐ EACH ROW's SUM OVER THE WHOLE CHUNK, straight into `bsum` — the stick-major `sum` over
         // `rows > 1 × cols > one stick`, the cell `Sum` combines correctly (prefill's RMS sums run it).
         ops.push(assemble_reduce_off(
