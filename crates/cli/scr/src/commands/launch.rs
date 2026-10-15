@@ -1122,15 +1122,24 @@ fn session_id_from_args(args: &[String]) -> Option<String> {
 }
 
 /// A RFC-4122 v4-shaped UUID for a fresh session id. Not cryptographically
-/// random — derived from the wall clock + pid via splitmix64 — but unique enough
-/// to key a per-session KV store and valid-shaped for `claude --session-id`.
+/// random — derived from the wall clock + pid + a per-process mint counter via
+/// splitmix64 — but unique enough to key a per-session KV store and valid-shaped
+/// for `claude --session-id`. The counter is load-bearing: the clock's
+/// nanosecond field can repeat between back-to-back calls (observed failing a
+/// release-mode test run), and the pid only separates processes, so without it
+/// two mints from one process can come out identical.
 fn gen_uuid_v4() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static MINT: AtomicU64 = AtomicU64::new(0);
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
         ^ ((std::process::id() as u64).wrapping_shl(32))
+        ^ MINT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ 0x9E37_79B9_7F4A_7C15;
     let mut z = seed;
     let mut next = || {
