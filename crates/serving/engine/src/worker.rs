@@ -194,6 +194,13 @@ pub trait Worker: Send {
         scratchy_core_common::KvAddressing::ByToken
     }
 
+    /// Where a hybrid sliding-window model's global group keeps its KV, known at `load_model` time like
+    /// [`Self::kv_addressing`]: the block tracker gives a group in a store of its own an ID space of its
+    /// own, so neither store is mapped for blocks only the other uses.
+    fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
+        scratchy_core_common::HybridKvStores::Shared
+    }
+
     /// Whether this worker's DECODE path implements the hybrid sliding-window
     /// KV layout — separate paged cache groups per sliding window, addressed by
     /// the `sliding_groups` per-request block tables. Metal wires this; the CUDA

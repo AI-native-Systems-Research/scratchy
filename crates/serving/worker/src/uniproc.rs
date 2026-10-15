@@ -121,6 +121,10 @@ impl Executor for UniProcExecutor {
         self.worker.kv_addressing()
     }
 
+    fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
+        self.worker.hybrid_kv_stores()
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,

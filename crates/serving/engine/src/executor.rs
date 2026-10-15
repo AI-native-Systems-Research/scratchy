@@ -349,6 +349,12 @@ pub trait Executor: Send {
         scratchy_core_common::KvAddressing::ByToken
     }
 
+    /// Forwarded from [`crate::worker::Worker::hybrid_kv_stores`], asked when the engine builds the block
+    /// tracker, beside [`Self::kv_addressing`].
+    fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
+        scratchy_core_common::HybridKvStores::Shared
+    }
+
     /// Check whether the executor is healthy.
     ///
     /// Returns `Ok(())` if healthy, or an error describing the problem.
