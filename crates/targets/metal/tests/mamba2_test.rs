@@ -289,6 +289,11 @@ struct Gpu {
     dt_bias: Buffer,
     d: Buffer,
     norm: Buffer,
+    /// Route the scan as the lowering does at state 128: a decode step (one row a sequence) to the
+    /// simd scan, which leaves a plain sequence of more than one row to the pipelined scan
+    /// (`GDN_SCAN_PLAIN_ROWS_PIPELINED`), and any other step to `gdn_scan_pipelined` in its
+    /// selective form.
+    routed: bool,
 }
 
 impl Gpu {
@@ -311,9 +316,19 @@ impl Gpu {
             dt_bias: shared(&device, &dtype.bytes(&w.dt_bias)),
             d: shared(&device, &w.d),
             norm: shared(&device, &w.norm),
+            routed: false,
             device,
             geo,
             dtype,
+        }
+    }
+
+    /// The same, routing the scan as the lowering does.
+    fn routed(self) -> Self {
+        assert!(self.geo.state == 128 && self.geo.head_dim.is_multiple_of(32));
+        Self {
+            routed: true,
+            ..self
         }
     }
 
@@ -434,9 +449,30 @@ impl Gpu {
                 ConstantValue::uint(8, 0),
             ]
         };
-        if geo.simd() {
+        let decode = cu.windows(2).all(|w| w[1] - w[0] == 1);
+        if self.routed && !decode {
+            // The lowering's twin: the simd scan's geometry and selective form (0-7) but its
+            // drafts, its block at 10.
+            let mut c: Vec<ConstantValue> = scan_constants().into_iter().take(6).collect();
+            c.extend(dt_slice(6));
+            c.push(ConstantValue::uint(10, 12));
+            let scan = self.key("gdn_scan_pipelined", dtype.symbol("gdn_scan_pipelined"), c);
+            let mut b = vec![(&y, 0), (&conv_out, 1), (&zx_buf, 2), (&zx_buf, 3)];
+            b.extend(state_bindings(4));
+            b.extend([(&self.a_log, 8), (&self.dt_bias, 9), (&self.d, 10)]);
+            batch.encode(
+                &baked_build(&self.cache, &scan).expect("pipelined scan pipeline"),
+                &b,
+                &[],
+                &[],
+                &[],
+                size(geo.heads * geo.head_dim / 32, 1, num_seqs),
+                size(128, 1, 1),
+            );
+        } else if geo.simd() {
             let mut c = scan_constants();
             c.extend(dt_slice(6));
+            c.extend(self.routed.then(|| ConstantValue::boolean(9, true)));
             let scan = self.key("gdn_scan_varlen", dtype.symbol("gdn_scan_simd"), c);
             let mut b = vec![(&y, 0), (&conv_out, 1), (&zx_buf, 2), (&zx_buf, 3)];
             b.extend(state_bindings(4));
@@ -520,7 +556,7 @@ impl Gpu {
 
 /// Run `steps` over a pool of `slots` slots on the GPU and on the reference, comparing every
 /// step's output and, after the last, every slot's conv ring and ssm state.
-fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step]) {
+fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;
@@ -531,6 +567,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step]) {
     // Garbage in every slot: a fresh sequence must not read it.
     let (conv0, ssm0) = (fill(slots * ring, 11, 9.0), fill(slots * ssm, 12, 9.0));
     let gpu = Gpu::new(di.device.clone(), geo, dtype, &w, &conv0, &ssm0);
+    let gpu = if routed { gpu.routed() } else { gpu };
     let mut states = vec![SeqState::fresh(geo); slots];
     for (i, step) in steps.iter().enumerate() {
         let tokens: usize = step.iter().map(|s| s.1).sum();
@@ -621,7 +658,7 @@ fn mamba2_per_thread_scan_matches_reference() {
     };
     assert!(!geo.simd());
     for dtype in [Dtype::F32, Dtype::Bf16] {
-        run(geo, dtype, 4, &schedule());
+        run(geo, dtype, 4, &schedule(), false);
     }
 }
 
@@ -639,7 +676,25 @@ fn mamba2_simd_scan_matches_reference() {
     };
     assert!(geo.simd());
     for dtype in [Dtype::F32, Dtype::Bf16] {
-        run(geo, dtype, 4, &schedule());
+        run(geo, dtype, 4, &schedule(), false);
+    }
+}
+
+/// The real checkpoints' state routed as the lowering routes it — every step but a decode step
+/// through the pipelined scan in its selective form, a decode step through the simd scan — over
+/// the same schedule.
+#[test]
+fn mamba2_pipelined_scan_matches_reference() {
+    let _turn = gpu_turn();
+    let geo = Geometry {
+        heads: 8,
+        head_dim: 64,
+        groups: 2,
+        state: 128,
+        kernel: 4,
+    };
+    for dtype in [Dtype::F32, Dtype::Bf16] {
+        run(geo, dtype, 4, &schedule(), true);
     }
 }
 
@@ -665,7 +720,7 @@ fn assert_bits(got: &[f32], want: &[f32], what: &str) {
 /// step on slot 0 restores slot 3 and runs the prefill's remaining rows: its output is the
 /// prefill's rows past the junction and its state the prefill's, the snapshot as it was. All bit
 /// for bit: a save stores the registers the scan carries on, a restore loads them back.
-fn snapshots(geo: Geometry, dtype: Dtype) {
+fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;
@@ -675,6 +730,7 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
     let ssm = geo.heads * geo.head_dim * geo.state;
     let (conv0, ssm0) = (fill(5 * ring, 11, 1.0), fill(5 * ssm, 12, 1.0));
     let gpu = Gpu::new(di.device.clone(), geo, dtype, &w, &conv0, &ssm0);
+    let gpu = if routed { gpu.routed() } else { gpu };
     let slot = |pools: &(Vec<f32>, Vec<f32>), s: usize| {
         let (conv, ssm_state) = pools;
         let ssm_slot = &ssm_state[s * ssm..][..ssm];
@@ -742,8 +798,8 @@ fn snapshots(geo: Geometry, dtype: Dtype) {
     same(slot(&restored, 3), slot(&after, 3), "the restored snapshot");
 }
 
-/// [`snapshots`] for both scan mappings — the per-thread scan (state 16) and the simd one (state
-/// 128) — in both dtypes.
+/// [`snapshots`] for the per-thread scan (state 16), the simd one (state 128) and the lowering's
+/// routing at state 128 — a prefill the pipelined scan's — in both dtypes.
 #[test]
 fn mamba2_snapshots_resume_a_prefill() {
     let _turn = gpu_turn();
@@ -761,9 +817,9 @@ fn mamba2_snapshots_resume_a_prefill() {
         state: 128,
         kernel: 4,
     };
-    for geo in [per_thread, simd] {
+    for (geo, routed) in [(per_thread, false), (simd, false), (simd, true)] {
         for dtype in [Dtype::F32, Dtype::Bf16] {
-            snapshots(geo, dtype);
+            snapshots(geo, dtype, routed);
         }
     }
 }

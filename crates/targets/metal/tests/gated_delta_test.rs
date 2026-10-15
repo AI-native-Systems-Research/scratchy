@@ -1043,8 +1043,7 @@ fn gdn_scan_pipelined_is_the_gating_then_scan() {
                 ConstantValue::uint(2, hk as u32),
                 ConstantValue::uint(3, hv as u32),
                 ConstantValue::float(4, scale),
-                ConstantValue::uint(8, 0),
-                ConstantValue::uint(5, 12), // TB
+                ConstantValue::uint(10, 12), // TB
             ]
         };
         let size = |width, height, depth| MTLSize {
@@ -1166,7 +1165,7 @@ fn gdn_scan_pipelined_keeps_a_drafting_models_slots() {
         ConstantValue::uint(8, u32::from(rows.0)),
     ];
     // A plain step's scan takes the geometry, not the drafts (the lowering's twin).
-    let pipe_consts = [scan_consts[..5].to_vec(), vec![ConstantValue::uint(5, 12)]].concat();
+    let pipe_consts = [scan_consts[..5].to_vec(), vec![ConstantValue::uint(10, 12)]].concat();
     let simd = baked_build(
         &cache,
         &PipelineKey::new("gdn_scan_varlen", "gdn_scan_simd_f32", scan_consts),
@@ -2671,9 +2670,9 @@ fn gdn_scan_pipelined_saves_and_restores_snapshots() {
             ConstantValue::uint(2, hk as u32),
             ConstantValue::uint(3, hv as u32),
             ConstantValue::float(4, (hk as f32).powf(-0.5)),
-            ConstantValue::uint(5, 12),
+            ConstantValue::uint(10, 12),
         ];
-        constants.extend(beside.then(|| ConstantValue::boolean(6, true)));
+        constants.extend(beside.then(|| ConstantValue::boolean(11, true)));
         let key = PipelineKey::new("gdn_scan_pipelined", "gdn_scan_pipelined_f32", constants);
         let pipeline = baked_build(&cache, &key).expect("gdn_scan_pipelined pipeline");
         let coded = |pools: &[Vec<f32>], r: std::ops::Range<usize>, seq, code| {
