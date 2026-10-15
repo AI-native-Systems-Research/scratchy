@@ -17,4 +17,5 @@ pub mod head_rewrite;
 #[cfg(test)]
 pub(crate) mod ir_builder;
 pub mod matmul_tile;
+pub mod splat_sink;
 pub mod tile_coalesce;
