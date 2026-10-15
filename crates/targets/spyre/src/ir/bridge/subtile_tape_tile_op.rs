@@ -91,6 +91,13 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
 
     match n.op {
+        // The router's dense `[m, experts]` projection — the SAME tile shape the dense
+        // matmul takes (K from the activation's column extent), because it IS the dense
+        // matmul: `lower_router_logits_node` runs `KtirFunc::matmul` over it verbatim.
+        // BEFORE the `expansion_ops!()` refusal so its later listing there is
+        // unreachable for this one op (the rest of the MoE/KV/sample expansions still
+        // have no tile shape).
+        SubOp::RouterLogits { .. } => matmul_tile_dims(n, mb, out_active, y),
         // The standard pointwise/reduce tile over `[mb, out_active, y]`:
         // the ops differ only in operand count, which
         // `crate::op_abi` declares. One arm, so adding such an op is a
@@ -98,10 +105,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         // Not members of the standard tile class: the shared front end expresses the
         // whole arch vocabulary now, so these reach every target and each one answers
         // for itself. Enumerated rather than `_` so a new SubOp is E0004 here.
-        SubOp::TanhSoftCap
-        | SubOp::RmsNormUnit { .. }
-        | SubOp::ScalarWeightMul
-        | SubOp::GateSplit { .. }
+        SubOp::GateSplit { .. }
         | SubOp::GateApply
         | SubOp::Concat { .. }
         | SubOp::GateScale
@@ -142,26 +146,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         // A matmul K-chunk's OUTPUT is the dense [mr, nr] partial; `out` = nr (the N/stick dim), `in`
         // (K) comes from the FIRST input's column extent (the A-slice's [mr, kr]), matching how
         // `matmul_lx_resident` reads `per_core_extent("in")`.
-        SubOp::MatmulTile { .. } => {
-            let k = n.inputs.first().map(|t| t.region.cols.len).unwrap_or(1);
-            let dims = vec![
-                mb,
-                ItDim {
-                    name: "in",
-                    size: k.max(1),
-                    is_reduction: true,
-                    is_stick: false,
-                    df: Df::Fp16,
-                },
-                out_active,
-                y,
-            ];
-            Ok(vec![TileOp {
-                kind: TileOpKind::Matmul,
-                dims,
-                df: Df::Fp16,
-            }])
-        }
+        SubOp::MatmulTile { .. } => matmul_tile_dims(n, mb, out_active, y),
         // SumReduce is a split-K COMBINE — elementwise over equal-shaped inputs, not a stick reduce.
         // n_operands = inputs + the output (mirrors `pointwise_lx_resident`'s convention).
         // Shape-preserving elementwise: unary (Silu) reads 1 input, binary (Mul/Add) reads 2 — both
@@ -230,6 +215,54 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
           // says does NOT belong in lowering. `PointwiseOrReduce{n_operands}` is a true, non-invented
           // statement here: the node reads `n_operands-1` tensors and writes 1, at this shape — nothing more.
     }
+}
+
+/// The `[mb, in(reduction), out, y]` matmul tile both the dense `MatmulTile` and the router's
+/// `RouterLogits` take — K from the FIRST input's column extent (the A-slice's `[mr, kr]`),
+/// matching how `matmul_lx_resident` reads `per_core_extent("in")`.
+fn matmul_tile_dims(
+    n: &SubtileNode<impl scratchy_subtile::subtile_ir::RopeForm>,
+    mb: ItDim,
+    out_active: ItDim,
+    y: ItDim,
+) -> Result<Vec<TileOp>, String> {
+    let k = n.inputs.first().map(|t| t.region.cols.len).unwrap_or(1);
+    let dims = vec![
+        mb,
+        ItDim {
+            name: "in",
+            size: k.max(1),
+            is_reduction: true,
+            is_stick: false,
+            df: Df::Fp16,
+        },
+        out_active,
+        y,
+    ];
+    Ok(vec![TileOp {
+        kind: TileOpKind::Matmul,
+        dims,
+        df: Df::Fp16,
+    }])
+}
+
+/// Convenience for a caller that KNOWS (by `SubOp` kind) its node decomposes into exactly one
+/// `TileOp` — `Elementwise`/`SumReduce`/`SiluMul`/`ScalarMul`/`RmsNorm*`/`MatmulTile`, everything
+/// except the composite RoPE mapping. `Err` if that expectation is violated (a future `node_to_tile_ops`
+/// change making a kind multi-op would surface here as a build-time-adjacent error, not a silent
+/// wrong pick of `tile_ops[0]`).
+pub(crate) fn node_to_single_tile_op<F: scratchy_subtile::subtile_ir::RopeForm>(
+    n: &SubtileNode<F>,
+) -> Result<TileOp, String> {
+    let mut ops = node_to_tile_ops(n)?;
+    if ops.len() != 1 {
+        return Err(format!(
+            "node {}: expected exactly 1 TileOp, node_to_tile_ops produced {}",
+            n.id.index(),
+            ops.len()
+        ));
+    }
+    Ok(ops.remove(0))
 }
 
 #[cfg(test)]

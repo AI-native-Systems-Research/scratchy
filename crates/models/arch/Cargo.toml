@@ -161,11 +161,16 @@ all-arches = [
 # gemma4 (2 configs)
 "gemma-4-12b-it" = ["arch-gemma4"]
 "gemma-4-12b-it-parity-tiny" = ["arch-gemma4"]
+"gemma-4-12b-it-parity-tiny-allglobal" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
-# gemma4-moe (1 configs)
+# gemma4-moe (6 configs)
 "gemma-4-26b-a4b-it" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it-class-tiny" = ["arch-gemma4-moe"]
 "gemma-4-26b-a4b-it-parity-tiny" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it-parity-tiny30" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it-parity-tiny30p6" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it-parity-tiny30p6w" = ["arch-gemma4-moe"]
 
 # glm4-moe (1 configs)
 "glm-4.5-air" = ["arch-glm4-moe"]
@@ -372,11 +377,13 @@ all-arches = [
 "gemma4" = [
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
     "gemma-4-31b-it",
 ]
 "gemma4-moe" = [
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
 ]
 "glm4-moe" = [
     "glm-4.5-air",
@@ -569,6 +576,7 @@ all = [
     "gemma-3-4b-it-parity-tiny",
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",
@@ -744,6 +752,10 @@ nccl = [
 ]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
 spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
+# THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
+# an emu build refuses to compile a bundle whose emulator run diverges from the
+# reference semantics at the probe.
+spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
 # TurboQuant KV compression for every metal model whose geometry the codec
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
 # other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.

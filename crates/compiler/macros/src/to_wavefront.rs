@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
-use scratchy_subtile::handoff::{Expansion, ExpansionId};
+use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
@@ -261,7 +261,7 @@ struct Builder<'a> {
     cos_sin: BTreeMap<(u32, bool), (usize, usize)>,
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
     /// extern index (one per layer).
-    prefix: HashMap<u64, (usize, usize)>,
+    prefix: HashMap<(u64, u32), (usize, usize)>,
     /// The model's head geometry, minted once at the bounds parse below — one value, with its GQA
     /// grouping already proven, rather than three integers this builder could pair up wrongly.
     geom: Option<ModelAttnGeometry>,
@@ -337,12 +337,15 @@ impl<'a> Builder<'a> {
     /// The expert half: the `(token, expert)` pairs of `x` sorted by expert, projected by
     /// `bank` and activated as the expert body says, projected back, restored to token order,
     /// summed by `scores`. Closes the expansion; returns the sum.
+    ///
+    /// `bank` resolves one projection's WEIGHT and SCALE sources — the two are separate
+    /// launch tensors (a bundle holds both), so the matmul binds them as operands 2 and 3.
     fn experts(
         &mut self,
         x: InputRef,
         indices: usize,
         scores: usize,
-        bank: InputRef,
+        bank: &dyn Fn(ExpertProj) -> (InputRef, InputRef),
         e: Experts,
     ) -> usize {
         let (k, quant, bundle) = (e.k, e.quant, e.bundle);
@@ -359,19 +362,24 @@ impl<'a> Builder<'a> {
             bundle,
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
-        let rows = |r: usize| vec![InputRef::Op(r), InputRef::Op(pairs), bank];
+        let rows =
+            |r: usize, w: InputRef, s: InputRef| vec![InputRef::Op(r), InputRef::Op(pairs), w, s];
         let act = match e.body {
             ExpertBody::Gated(act) => {
-                let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs));
-                let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
+                let (gw, gs) = bank(ExpertProj::Gate);
+                let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs, gw, gs));
+                let (uw, us) = bank(ExpertProj::Up);
+                let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs, uw, us));
                 self.push(SubOp::ExpertGatedAct { act }, &[gate, up])
             }
             ExpertBody::Ungated(act) => {
-                let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
+                let (uw, us) = bank(ExpertProj::Up);
+                let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs, uw, us));
                 self.push(SubOp::ExpertAct { act }, &[up])
             }
         };
-        let down = self.push_op(matmul(ExpertProj::Down, e.hidden), rows(act));
+        let (dw, ds) = bank(ExpertProj::Down);
+        let down = self.push_op(matmul(ExpertProj::Down, e.hidden), rows(act, dw, ds));
         let tokens = self.push(SubOp::ExpertUnsort, &[down, pairs]);
         let (hidden, shared) = (e.hidden, e.shared);
         let sum = self.push(SubOp::ExpertCombine { hidden, shared }, &[tokens, scores]);
@@ -502,22 +510,50 @@ impl<'a> Builder<'a> {
         (cos, sin)
     }
 
-    fn prefix_for(&mut self, layer: u64) -> (usize, usize) {
-        if let Some(pp) = self.prefix.get(&layer) {
+    /// The per-layer prefix-KV source pair at the CALLING CLASS's kv width.
+    ///
+    /// ⭐ THE WIDTH IS AN ARGUMENT, NOT A MODEL FACT. A hybrid model (gemma-4) has TWO attention
+    /// classes — its sliding layers run (nkvh=8, hd=256) and its global layers (nkvh=1, hd=512) —
+    /// so "the model's kv width" does not exist; each call site passes its own class's, read off
+    /// the same class geometry the `AttnDecode` it feeds gets. Memoized per `(layer, width)`:
+    /// one layer's K and V caches share a width, and a second call from the SAME class finds its
+    /// pair; a wrong pairing would be caught by the SubtileIR shape validator, which refuses a
+    /// cache region wider than its source.
+    fn prefix_for(&mut self, layer: u64, kvdim: u32) -> (usize, usize) {
+        if let Some(pp) = self.prefix.get(&(layer, kvdim)) {
             return *pp;
         }
-        let kvdim = self
-            .geom
-            .expect(
-                "prefix_for is only reachable from KV-cache arms, which refuse \
-                 on canonicals without attention geometry",
-            )
-            .kv_width();
         let pk = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixK { layer });
         let pv = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixV { layer });
-        self.prefix.insert(layer, (pk, pv));
+        self.prefix.insert((layer, kvdim), (pk, pv));
         (pk, pv)
     }
+}
+
+/// The sliding window extent every sliding-attention tile reads — the one
+/// source every target already trusts (`model.bounds["sliding_window"]`).
+/// A sliding tile on a model with no such bound is a config error, named
+/// here so it cannot become a default window that silently attends the
+/// wrong span.
+fn sliding_window_bound(
+    tile: TileId,
+    model: &ModelParams,
+    op: OpKind,
+) -> Result<std::num::NonZeroU32, BridgeError> {
+    Ok(
+        std::num::NonZeroU32::new(model.bounds.get("sliding_window").copied().ok_or(
+            BridgeError::MalformedOp {
+                tile,
+                op,
+                detail: "a sliding-attention tile, but the model config carries no \
+                         `sliding_window` bound",
+            },
+        )? as u32)
+        .expect(
+            "`sliding_window` = 0 is not a window; NonZeroU32::new returns None \
+             only for 0, and a config with 0 is malformed",
+        ),
+    )
 }
 
 /// Pull the kv-cache extern's layer index out of an attention /
@@ -971,10 +1007,6 @@ pub fn lower_decode_to_wavefront(
             // the serializer maps attention onto the runtime paged cache, so
             // the new K/V are NOT a separate cache round-trip.
             OpKind::RopeAppend | OpKind::RopeAppendInterleaved => {
-                let head_dim = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                    .hd();
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
                 // slot 2 (v) is the third input's producer, aliased.
@@ -1003,13 +1035,32 @@ pub fn lower_decode_to_wavefront(
                         }
                     )
                 });
+                // ⭐ THE HEAD DIM IS THE ROTARY CLASS'S OWN, NOT THE MODEL'S. A hybrid-attention
+                // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE class
+                // (`bx.geom`) and plain `rotary` names the GLOBAL one (`bx.geom_global`, head_dim
+                // 512 where the base is 256). This used to stamp `bx.geom.hd()` on every rope
+                // node, so a global layer's 512-wide head rotated as two 256-wide heads with a
+                // 256-half pairing — a rotation the consumer's own geometry contradicts. The
+                // class selection mirrors the attention arm's (`AttnMask::Causal ⇒ geom_global`):
+                // the base class never has a global twin (its geometry IS the model's), and a
+                // global twin exists exactly when the two classes differ.
+                let head_dim = if local_rope {
+                    bx.geom
+                } else {
+                    bx.geom_global.or(bx.geom)
+                }
+                .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                .hd();
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
                 // E.12 — RopeAppend writes rotated K and V into the
                 // paged KV cache. Pull the per-layer PrefixK / PrefixV
-                // source indices via the cached `prefix_for(layer)`
-                // helper (same indices Attention will receive later).
-                let (pk, pv) = bx.prefix_for(layer as u64);
+                // source indices via the cached `prefix_for(layer, k_cols)`
+                // helper (same indices Attention will receive later). The
+                // WIDTH is this layer's own k-rope width — a hybrid model's
+                // classes have different kv widths, so the cache the append
+                // writes must be THIS class's.
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let qi = bx.push_op(
                     SubOp::rope_rotate(head_dim),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
@@ -1057,7 +1108,12 @@ pub fn lower_decode_to_wavefront(
                     op: node.op,
                     detail: "kv_append missing kv_cache extern index",
                 })? as u32;
-                let (pk, pv) = bx.prefix_for(layer as u64);
+                // The prefix cache at THIS layer's own K width — a hybrid
+                // model's classes have different kv widths, so the cache the
+                // append writes must be THIS class's (the same rule the rope
+                // arm's `prefix_for(layer, k_cols)` follows).
+                let k_cols = bx.out_cols(tile, 0, "kv_append k cols")?;
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let ki = bx.push_op(
                     // `Causal` by default; the consuming attention arm backpatches
                     // `SlidingWindow` for sliding layers.
@@ -1135,7 +1191,6 @@ pub fn lower_decode_to_wavefront(
                     result = Some(idx);
                     continue;
                 };
-                let (pk, pv) = bx.prefix_for(layer);
                 // valid_len = the modeled prefix-cache rows: the RopeAppend
                 // above wrote the new token into the cache at decode_position,
                 // so the cache `[prefix_len, kv]` already spans prefix ++ new
@@ -1144,9 +1199,21 @@ pub fn lower_decode_to_wavefront(
                 // row arrives via the separate k/v segments). The GPU mask
                 // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
+                // ⭐ THE WINDOW SIZE, from the model's own bounds (the
+                // helper's doc states the law). A placeholder `1` on the
+                // causal arms never escapes the mask construction below.
+                let window = if matches!(
+                    node.op,
+                    OpKind::SlidingAttention | OpKind::SinkSlidingAttention
+                ) {
+                    sliding_window_bound(tile, bx.model, node.op)?
+                } else {
+                    // Causal: unused below; a placeholder value that never escapes.
+                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
+                };
                 let mask = match node.op {
                     OpKind::SlidingAttention | OpKind::SinkSlidingAttention => {
-                        AttnMask::SlidingWindow
+                        AttnMask::SlidingWindow { window }
                     }
                     _ => AttnMask::Causal,
                 };
@@ -1155,16 +1222,20 @@ pub fn lower_decode_to_wavefront(
                     .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
-                    AttnMask::SlidingWindow => base_geom,
+                    AttnMask::SlidingWindow { .. } => base_geom,
                 };
-                if mask == AttnMask::SlidingWindow {
+                // The prefix cache at THIS layer's class width — a hybrid model's
+                // sliding and global layers have different kv widths, and the cache
+                // this attention reads is the one its own class's RopeAppend wrote.
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                if let AttnMask::SlidingWindow { window } = mask {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
                     if let InputRef::Op(ri) = k
                         && let SubOp::RopeAppend { attn, .. } | SubOp::KvAppend { attn, .. } =
                             &mut bx.ops[ri].op
                     {
-                        *attn = AttnMask::SlidingWindow;
+                        *attn = AttnMask::SlidingWindow { window };
                     }
                 }
                 let mut attn_inputs = vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v];
@@ -1215,9 +1286,17 @@ pub fn lower_decode_to_wavefront(
                     op: node.op,
                     detail: "shared attention missing kv_cache extern index",
                 })?;
-                let (pk, pv) = bx.prefix_for(layer);
+                // ⭐ THE WINDOW SIZE — the same bound the attention arm
+                // reads (`sliding_window_bound`); a placeholder `1` on the
+                // causal arm never escapes the mask construction below.
+                let window = if matches!(node.op, OpKind::SharedSlidingAttention) {
+                    sliding_window_bound(tile, bx.model, node.op)?
+                } else {
+                    // Causal: unused below; a placeholder value that never escapes.
+                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
+                };
                 let mask = match node.op {
-                    OpKind::SharedSlidingAttention => AttnMask::SlidingWindow,
+                    OpKind::SharedSlidingAttention => AttnMask::SlidingWindow { window },
                     _ => AttnMask::Causal,
                 };
                 let base_geom = bx
@@ -1225,8 +1304,12 @@ pub fn lower_decode_to_wavefront(
                     .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
-                    AttnMask::SlidingWindow => base_geom,
+                    AttnMask::SlidingWindow { .. } => base_geom,
                 };
+                // The prefix cache at THIS layer's class width — a hybrid
+                // model's sliding and global layers have different kv widths,
+                // and the cache this attention reads is its own class's.
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
                 let idx = bx.push_op(
                     SubOp::attn_decode(geom, bx.scale, bx.prefix_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],
@@ -1424,7 +1507,11 @@ pub fn lower_decode_to_wavefront(
                     body,
                     shared: SharedExpertBound(shared),
                 };
-                let idx = bx.experts(expert_x, indices, scores, w, experts);
+                // The fused MoE bundle is ONE source (its affine scales resolve by tensor
+                // role at the target, not as separate operands), so both of a projection's
+                // weight operands bind it.
+                let bank = &|_proj: ExpertProj| (w, w);
+                let idx = bx.experts(expert_x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1509,22 +1596,37 @@ pub fn lower_decode_to_wavefront(
                         });
                     }
                 };
-                let rsrc = bx.push_source(
-                    1,
-                    1,
-                    SourceBinding::Weight {
-                        id: rw.0,
-                        index: rw.1,
-                    },
-                );
-                let esrc = bx.push_source(
-                    1,
-                    1,
-                    SourceBinding::Weight {
-                        id: ew.0,
-                        index: ew.1,
-                    },
-                );
+                // ⭐ ONE SOURCE PER BUNDLE TENSOR, NOT ONE PER BUNDLE. A MoE bundle is ONE
+                // `Weights` field (one accessor, one load) holding SEVERAL tensors, and a
+                // launch source must carry exactly one staged tensor — so the block binds as
+                // many sources as it has tensors, each naming the bundle's `(id, index)` plus
+                // WHICH tensor (`BundleTensor`). The single-tensor `Weight` binding this arm
+                // used to push had shape `[1,1]` and bound NOTHING a worker could stage, which
+                // is why the spyre weight-bindings walk refused the kind.
+                //
+                // Shapes are the STACKED ON-DISK extents (the expert axis folded into rows,
+                // the same fold `weight_source` gives a rank-3 `[E, r, c]`), stated from the
+                // model bounds the block already read. The router's projection is FUF-layout
+                // `[k=hidden, n=E]` like every other gemm weight; its two gains are rows of a
+                // `[1, ·]` vector like every other norm gain.
+                let bundle_src = |bx: &mut Builder,
+                                  id: u32,
+                                  index: Option<UnrollIndex>,
+                                  tensor: BundleTensor,
+                                  rows: u32,
+                                  cols: u32| {
+                    bx.push_source(
+                        rows,
+                        cols,
+                        SourceBinding::BundleTensor { id, index, tensor },
+                    )
+                };
+                let router_src = |bx: &mut Builder, tensor: BundleTensor, rows: u32, cols: u32| {
+                    bundle_src(bx, rw.0, rw.1, tensor, rows, cols)
+                };
+                let expert_src = |bx: &mut Builder, tensor: BundleTensor, rows: u32, cols: u32| {
+                    bundle_src(bx, ew.0, ew.1, tensor, rows, cols)
+                };
                 let b = &bx.bounds;
                 let num_experts = b
                     .get("num_experts")
@@ -1556,21 +1658,41 @@ pub fn lower_decode_to_wavefront(
                     }
                     _ => (64, 4),
                 };
-                let (router, bank) = (InputRef::Ext(rsrc), InputRef::Ext(esrc));
                 // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
                 // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
                 // `expert_in`.
                 let (experts, k) = moe_counts(tile, num_experts, top_k)?;
                 let hidden = bx.out_cols(tile, 0, "gemma_moe output")?;
                 let gemma = RouterBundle::Gemma;
+                // The bundle's tensors as launch sources, in block order: the router's
+                // projection (FUF `[k=hidden, n=E]`), its two gains, then each expert
+                // projection's codes and per-channel scale (stacked on-disk extents
+                // `[E·out, in]` / `[E·out, 1]`).
+                let e_rows = num_experts;
+                let r_gate = router_src(&mut bx, BundleTensor::RouterGate, hidden, e_rows);
+                let r_scale = router_src(&mut bx, BundleTensor::RouterScale, 1, hidden);
+                let r_per_expert =
+                    router_src(&mut bx, BundleTensor::RouterPerExpertScale, 1, e_rows);
+                let w_src = |bx: &mut Builder, t: BundleTensor, out: u32, inp: u32| {
+                    expert_src(bx, t, e_rows * out, inp)
+                };
+                let s_src = |bx: &mut Builder, t: BundleTensor, out: u32| {
+                    expert_src(bx, t, e_rows * out, 1)
+                };
+                let gate_w = w_src(&mut bx, BundleTensor::ExpertGateW, moe_inter, hidden);
+                let gate_s = s_src(&mut bx, BundleTensor::ExpertGateS, moe_inter);
+                let up_w = w_src(&mut bx, BundleTensor::ExpertUpW, moe_inter, hidden);
+                let up_s = s_src(&mut bx, BundleTensor::ExpertUpS, moe_inter);
+                let down_w = w_src(&mut bx, BundleTensor::ExpertDownW, hidden, moe_inter);
+                let down_s = s_src(&mut bx, BundleTensor::ExpertDownS, hidden);
                 bx.expand();
                 let norm = SubOp::RouterNorm { eps, router: gemma };
-                let xr = bx.push_op(norm, vec![router_in, router]);
+                let xr = bx.push_op(norm, vec![router_in, InputRef::Ext(r_scale)]);
                 let logits = SubOp::RouterLogits {
                     experts,
                     router: gemma,
                 };
-                let lg = bx.push_op(logits, vec![InputRef::Op(xr), router]);
+                let lg = bx.push_op(logits, vec![InputRef::Op(xr), InputRef::Ext(r_gate)]);
                 let indices = bx.route_top_k(lg, k);
                 let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
                 let scale = (hidden as f32).powf(-0.5);
@@ -1578,7 +1700,7 @@ pub fn lower_decode_to_wavefront(
                 let scores = bx.push(SubOp::RouteSoftmax, &[scores]);
                 let scale = SubOp::RouteExpertScale { router: gemma };
                 let (s, i) = (InputRef::Op(scores), InputRef::Op(indices));
-                let scores = bx.push_op(scale, vec![s, i, router]);
+                let scores = bx.push_op(scale, vec![s, i, InputRef::Ext(r_per_expert)]);
                 let experts = Experts {
                     experts,
                     k,
@@ -1588,6 +1710,14 @@ pub fn lower_decode_to_wavefront(
                     bundle: ExpertBundle::SwitchGlu,
                     body: ExpertBody::Gated(GatedAct::Gelu),
                     shared: SharedExpertBound(None),
+                };
+                let bank = &|proj: ExpertProj| {
+                    let (w, s) = match proj {
+                        ExpertProj::Gate => (gate_w, gate_s),
+                        ExpertProj::Up => (up_w, up_s),
+                        ExpertProj::Down => (down_w, down_s),
+                    };
+                    (InputRef::Ext(w), InputRef::Ext(s))
                 };
                 let idx = bx.experts(expert_in, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1689,13 +1819,32 @@ pub fn lower_decode_to_wavefront(
                     body: ExpertBody::Gated(GatedAct::SwigluOai),
                     shared: SharedExpertBound(None),
                 };
-                let idx = bx.experts(x, indices, scores, w, experts);
+                // The fused MoE bundle is ONE source (its affine scales resolve by tensor
+                // role at the target, not as separate operands), so both of a projection's
+                // weight operands bind it — the `moe_block` arm's own law.
+                let bank = &|_proj: ExpertProj| (w, w);
+                let idx = bx.experts(x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::TanhSoftCap => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(SubOp::TanhSoftCap, vec![x]);
+                // The cap is a MODEL CONSTANT (`final_logit_softcapping`, HF
+                // naming) — the only models that emit a `tanh_softcap(...)` tile
+                // are the capping ones, so it is present whenever this arm runs.
+                // Read at the same site every other model-const scalar is (the
+                // parsed `scalars` table, which hoists nested `text_config`),
+                // and carried on the op so the tape holds it — metal/cuda bake
+                // it into kernels and spyre binds it as a registry const.
+                let cap = bx
+                    .model
+                    .scalars
+                    .get("final_logit_softcapping")
+                    .copied()
+                    .ok_or(BridgeError::MissingScalar {
+                        key: "final_logit_softcapping",
+                    })? as f32;
+                let idx = bx.push_op(SubOp::TanhSoftCap { cap }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

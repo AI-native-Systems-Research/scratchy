@@ -509,6 +509,21 @@ impl RowScale {
     pub const fn preserves_rows(self) -> bool {
         matches!(self, Self::Times(k) if k.get() == 1)
     }
+    /// The numerator of `m · mult / div` — 1 for `Over` (a view that divides
+    /// cannot also multiply).
+    pub const fn mult(self) -> u32 {
+        match self {
+            Self::Times(k) => k.get(),
+            Self::Over(_) => 1,
+        }
+    }
+    /// The denominator of `m · mult / div` — 1 for `Times`.
+    pub const fn div(self) -> u32 {
+        match self {
+            Self::Times(_) => 1,
+            Self::Over(k) => k.get(),
+        }
+    }
 }
 
 // ── Sub-operations ─────────────────────────────────────────────────
@@ -571,9 +586,26 @@ pub enum AttnMask {
     /// Every position up to and including the query's own.
     Causal,
     /// The gemma class's local layers: causal, further restricted to the last `window`
-    /// positions. The WINDOW SIZE is not here — like the tanh soft cap it is a model constant
-    /// resolved at emission and has never ridden the tape.
-    SlidingWindow,
+    /// positions. The window size RIDES the tape — it is a model constant, but one the
+    /// numeric oracle needs (`eval_dag`'s host reference attends to the last `window`
+    /// positions, exactly what a sliding kernel does); without it on the tape a hybrid
+    /// model had NO golden bisection, only a panic. Set from the bridge
+    /// (`model.bounds["sliding_window"]`) at the one place every attention is minted.
+    SlidingWindow {
+        /// How many of the most recent positions (including the query's own) stay
+        /// attendable. A model constant, identical for every sliding layer.
+        window: std::num::NonZeroU32,
+    },
+}
+
+impl AttnMask {
+    /// The sliding window size, for every consumer that only needs the number.
+    pub fn window(self) -> Option<std::num::NonZeroU32> {
+        match self {
+            AttnMask::Causal => None,
+            AttnMask::SlidingWindow { window } => Some(window),
+        }
+    }
 }
 
 // ── The mixture-of-experts vocabulary ──────────────────────────────
@@ -804,7 +836,6 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             // No attributes: the discriminant is the whole class.
             SubOp::SumReduce { .. }
             | SubOp::SiluMul
-            | SubOp::TanhSoftCap
             | SubOp::ScalarWeightMul
             | SubOp::GateApply
             | SubOp::GateScale
@@ -842,9 +873,14 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::SampleRowsGather
             | SubOp::SampleRowsScatter
             | SubOp::AllRowsMatmul => {}
+            // The row scale is a fact of the VIEW's shape class (per-head vs
+            // merger), not per-layer identity — a sliding layer's per-head
+            // view and a global layer's re-roll onto different extents than
+            // its cells claim.
             SubOp::Reshape { rows, cols } => (rows, cols).hash(h),
             SubOp::Elementwise(k) => std::mem::discriminant(k).hash(h),
             SubOp::ScalarMul { scale } => scale.to_bits().hash(h),
+            SubOp::TanhSoftCap { cap } => cap.to_bits().hash(h),
             SubOp::RmsNorm { eps, gain } => {
                 eps.to_bits().hash(h);
                 std::mem::discriminant(gain).hash(h);
@@ -868,7 +904,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 std::mem::discriminant(attn).hash(h);
             }
             // `layout`, `producer`'s node index and `softmax_state` are per-layer identity;
-            // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs.
+            // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs —
+            // and the WINDOW is a model constant, so it hashes with the class rather than
+            // splitting one model's layers across hash buckets.
             SubOp::AttnDecode {
                 geom,
                 scale,
@@ -884,6 +922,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 valid_len.hash(h);
                 std::mem::discriminant(producer).hash(h);
                 std::mem::discriminant(mask).hash(h);
+                if let Some(w) = mask.window() {
+                    w.get().hash(h);
+                }
             }
             SubOp::GateSplit { half_cols } => half_cols.hash(h),
             SubOp::Concat { cols } => cols.hash(h),
@@ -997,6 +1038,15 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// Re-interpret `inputs[0]`'s elements under a new `[out_rows, out_cols]`.
     /// Element COUNT is preserved and row-major order is preserved; only the
     /// extents change. Host semantics are the identity.
+    ///
+    /// The target extents are a function of the TOKEN COUNT:
+    /// `out_rows = m · rows_mult / rows_div`, `out_cols = cols` — the same
+    /// fact [`crate::lower::LoweredOp::Reshape`] carries, threaded here so
+    /// the node's regions can state the TRUE re-laid extents (a per-head
+    /// view `[m, heads·hd] → [m·heads, hd]` MULTIPLIES rows; the vision
+    /// patch merger DIVIDES). Without it the node understates the output by
+    /// the mult factor and every downstream region (the per-head norms, the
+    /// placement pool) inherits the lie.
     ///
     /// ⛔ IT IS NOT FREE ON A STICK-LAID-OUT DEVICE, and that is the whole
     /// reason it is an OP rather than a view. `sdsc_abstract::dev_off_stk`
@@ -1141,10 +1191,12 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // place that can answer it: the target's opcode lowering.
     /// `cap · tanh(x / cap)` — Gemma's logit/attention soft cap.
     ///
-    /// ⛔ THE CAP IS NOT HERE, AND THAT IS A REPORTED GAP, NOT A DESIGN. The value is a model
-    /// constant resolved at emission, so the tape has never held it. `eval_node` therefore has no host reference for this op and says so instead
-    /// of inventing a cap.
-    TanhSoftCap,
+    /// ⭐ THE CAP IS ON THE TAPE, following the `RmsNormUnit { eps }` precedent: a model constant
+    /// the device-side decomposition needs (`x / cap`, `· cap`) is carried on the op, minted from
+    /// `model.scalars["final_logit_softcapping"]` at the bridge, so `eval_node`'s host reference
+    /// and every target's emitter read ONE value rather than the front end's own knowledge of the
+    /// config key.
+    TanhSoftCap { cap: f32 },
     /// Unit-gain RmsNorm — no learnable scale (Gemma4 `v_norm`). `inputs[0]` = x.
     RmsNormUnit { eps: f32 },
     /// Multiply by a loaded `[1]`-shaped weight (Gemma4 `layer_scalar[layer]`).
@@ -1762,6 +1814,14 @@ pub fn eval_node<F: RopeForm>(
             out
         }
 
+        // ⭐ THE CAP IS ON THE TAPE now, so the host reference exists — the same
+        // `cap · tanh(x / cap)` every target's emitter states.
+        SubOp::TanhSoftCap { cap } => {
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            debug_assert_eq!((xr, xc), (out_rows, out_cols), "tanh_softcap shape");
+            x.iter().map(|&v| cap * (v / cap).tanh()).collect()
+        }
+
         // ── Ops with NO host reference ──────────────────────────────
         //
         // ⛔ THESE PANIC, AND THE MESSAGE NAMES WHAT IS MISSING. `eval_node` is the
@@ -1771,12 +1831,6 @@ pub fn eval_node<F: RopeForm>(
         // is not a gatherable tensor) has no oracle, and returning zeros or the
         // input unchanged would make the comparison PASS while proving nothing.
         // That is strictly worse than no oracle, so it is not on offer.
-        SubOp::TanhSoftCap => panic!(
-            "SubOp::TanhSoftCap has no host reference: the cap is a model constant \
-             resolved at emission and has never been carried on the tape (neither \
-             SubOp::TanhSoftCap nor Instruction::TanhSoftCap holds it), so there \
-             is no value here to divide by"
-        ),
         SubOp::GateSplit { .. } => panic!(
             "SubOp::GateSplit has no host reference: it has TWO outputs (q and gate) \
              and eval_node returns the buffer for ONE region, so the gate half would \
@@ -1815,16 +1869,13 @@ pub fn eval_node<F: RopeForm>(
         SubOp::AttnDecode {
             geom, scale, mask, ..
         } => {
-            // ⛔ THE WINDOW SIZE IS NOT ON THE TAPE, so a sliding-window layer has no
-            // host reference — evaluating it with the causal bound would silently
-            // attend across the whole prefix and report agreement with a kernel that
-            // does not do that.
-            assert!(
-                matches!(mask, AttnMask::Causal),
-                "SubOp::AttnDecode has no host reference under AttnMask::SlidingWindow: \
-                 the window size is a model constant resolved at emission and has never \
-                 been carried on the tape"
-            );
+            // ⭐ THE WINDOW IS ON THE TAPE, so a sliding-window layer HAS a host
+            // reference: the window bound is `window` positions back from the
+            // query's own, the same left-edge every sliding kernel reads. Without
+            // it (a bare causal bound) the reference would silently attend across
+            // the whole prefix and report agreement with a kernel that does not
+            // do that — which is why this used to refuse.
+            let window = mask.window().map(|w| w.get() as usize);
             // Head-block aware: this node computes a contiguous q-head range,
             // derived from the OUTPUT region (its column slice), and reads the
             // matching kv-head range — derived from the K input region. The
@@ -1892,10 +1943,18 @@ pub fn eval_node<F: RopeForm>(
                     // of the concatenated sequence, so query row qi sits at absolute
                     // position `seq_len - mq + qi` and may attend to keys 0..=that.
                     // For mq==1 this is `seq_len-1` (all keys) ⇒ decode is unchanged.
-                    let causal_bound = seq_len - mq + qi;
+                    // A sliding layer additionally drops everything more than
+                    // `window` positions behind its own — the left edge
+                    // `own_pos + 1 - window`, the same bound every sliding kernel
+                    // reads (`kv_len-1 - k >= window` masked out).
+                    let own_pos = seq_len - mq + qi;
+                    let left = match window {
+                        Some(w) => own_pos + 1 - w.min(own_pos + 1),
+                        None => 0,
+                    };
                     let mut scores = vec![0f32; seq_len];
                     for (s, score) in scores.iter_mut().enumerate() {
-                        if s > causal_bound {
+                        if s > own_pos || s < left {
                             *score = f32::NEG_INFINITY;
                             continue;
                         }
@@ -2240,9 +2299,24 @@ pub fn lower_region(
         let out_cols = desc
             .op
             .out_cols(|k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2);
+        // ⭐ TRUE OUTPUT ROW COUNT — `desc.m` is the TOKEN count, and the two diverge
+        // exactly once a Reshape view enters the chain. The bridge stamps every op's
+        // `m` with the token count (it never rescales through a per-head view), so the
+        // row scale lives in the TENSORS: a shape-preserving op INHERITS operand 0's
+        // registered rows through the registry's `rows = [in0]` class, and Reshape —
+        // the one op the front end states a scale for — rescales the token count by its
+        // own payload. So the graph's tensor shapes and node regions state the RE-LAID
+        // extents: a per-head chain `[m, heads·hd] → [m·heads, hd] → norm → back`
+        // multiplies rows through the norm and divides them back at the flatten.
+        // Under-stating them (registering everything at `m`) made the Reshape count law
+        // fire on every per-head view AND reserved the re-laid buffer at a fraction of
+        // its size.
+        let out_rows: u32 = desc.op.out_rows(m, |k| {
+            resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).1
+        });
         let out_t = TensorId(tensors.len() as u32);
         tensors.push(TensorShape {
-            rows: m,
+            rows: out_rows,
             cols: out_cols,
         });
 
@@ -2377,7 +2451,7 @@ pub fn lower_region(
                     mask,
                 }
             }
-            SubOp::TanhSoftCap => SubOp::TanhSoftCap,
+            SubOp::TanhSoftCap { cap } => SubOp::TanhSoftCap { cap },
             SubOp::RmsNormUnit { eps } => SubOp::RmsNormUnit { eps },
             SubOp::ScalarWeightMul => SubOp::ScalarWeightMul,
             SubOp::GateSplit { half_cols } => SubOp::GateSplit { half_cols },
@@ -2437,10 +2511,13 @@ pub fn lower_region(
             let (in0_t, _r, in0_cols) = in0_named("MatmulTile");
             let k = in0_cols;
             let (w_t, _wr, _wc) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
+            // The activation's OWN registered rows — not the token count: a matmul
+            // consuming a per-head view computes `m·heads` output rows.
+            let act_rows = tensors[in0_t.0 as usize].rows;
             let act = TensorRegion {
                 tensor: in0_t,
                 region: Region {
-                    rows: Range::new(0, m),
+                    rows: Range::new(0, act_rows),
                     cols: Range::new(0, k),
                 },
             };
@@ -2487,7 +2564,7 @@ pub fn lower_region(
                 output: TensorRegion {
                     tensor: out_t,
                     region: Region {
-                        rows: Range::new(0, m),
+                        rows: Range::new(0, act_rows),
                         cols: whole,
                     },
                 },
@@ -2525,7 +2602,10 @@ pub fn lower_region(
                             TensorRegion {
                                 tensor: t,
                                 region: Region {
-                                    rows: Range::new(0, m),
+                                    // The op's OWN registered rows — shape-preserving, so
+                                    // every operand is read at the output's row count (the
+                                    // token count rescaled by any upstream per-head view).
+                                    rows: Range::new(0, out_rows),
                                     cols: blk,
                                 },
                             }
@@ -2582,7 +2662,7 @@ pub fn lower_region(
                     output: TensorRegion {
                         tensor: out_t,
                         region: Region {
-                            rows: Range::new(0, m),
+                            rows: Range::new(0, out_rows),
                             cols: blk,
                         },
                     },
@@ -3055,6 +3135,115 @@ mod tests {
             "reshape is the identity on the element sequence"
         );
     }
+
+    /// ⭐ THE ROW LAW, end to end through `lower_region`. `desc.m` is the TOKEN count and the
+    /// bridge never rescales it through a per-head view, so the row scale must ride the
+    /// TENSORS: the split Reshape states `Times(heads)`, every shape-preserving consumer
+    /// INHERITS operand 0's registered rows, and the flatten-back states `Times(1)` —
+    /// registering everything at the token count instead understates the per-head domain
+    /// (the reshape count law then fires on the flatten-back, and the buffer is reserved at
+    /// a fraction of its size).
+    #[test]
+    fn a_per_head_chain_registers_its_re_laid_rows() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let (heads, hd) = (2u32, 64u32);
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: 128 },
+                SourceShape {
+                    rows: 128,
+                    cols: 128,
+                },
+                SourceShape { rows: 1, cols: 64 },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 128,
+                        weight: crate::lower::GemmWeight::Dense,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: SubOp::Reshape {
+                        rows: RowScale::Times(nz(heads)),
+                        cols: hd,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Op(0)],
+                },
+                OpDesc {
+                    op: SubOp::RmsNormUnit { eps: 1e-6 },
+                    m: 1,
+                    inputs: vec![InputRef::Op(1)],
+                },
+                OpDesc {
+                    op: SubOp::Reshape {
+                        rows: RowScale::Times(nz(1)),
+                        cols: heads * hd,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Op(2)],
+                },
+            ],
+            result: 3,
+        };
+        let g = lower_region(&input, nz(64));
+        assert!(validate(&g).is_ok(), "a per-head chain must validate");
+        // The projections stay at the token count; the per-head view and its norm register
+        // the RE-LAID rows; the flatten-back divides them back.
+        let shape = |i: usize| (g.tensors[i].rows, g.tensors[i].cols);
+        assert_eq!(shape(3), (1, 128), "the projection is [m, heads·hd]");
+        assert_eq!(shape(4), (heads, hd), "the view is [m·heads, hd]");
+        assert_eq!(shape(5), (heads, hd), "the norm inherits the view's rows");
+        assert_eq!(
+            shape(6),
+            (1, heads * hd),
+            "the flatten-back restores the flat row"
+        );
+        // And the node regions state the same extents — the regions are what every target's
+        // lowering reads.
+        let rows_of = |n: usize| g.nodes[n].output.region.rows.len;
+        assert_eq!(
+            (rows_of(0), rows_of(1), rows_of(2), rows_of(3)),
+            (1, heads, heads, 1)
+        );
+    }
+
+    /// The OTHER direction of the row law: the vision patch merger's `Over` view divides the
+    /// token count, and the ops after it inherit the DIVIDED rows.
+    #[test]
+    fn a_merger_view_registers_its_divided_rows() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let input = crate::lower::LoweringInput {
+            sources: vec![SourceShape { rows: 4, cols: 64 }],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::Reshape {
+                        rows: RowScale::Over(nz(2)),
+                        cols: 128,
+                    },
+                    m: 4,
+                    inputs: vec![InputRef::Ext(0)],
+                },
+                OpDesc {
+                    op: SubOp::RmsNormUnit { eps: 1e-6 },
+                    m: 4,
+                    inputs: vec![InputRef::Op(0)],
+                },
+            ],
+            result: 1,
+        };
+        let g = lower_region(&input, nz(64));
+        assert!(validate(&g).is_ok(), "a merger chain must validate");
+        assert_eq!((g.tensors[1].rows, g.tensors[1].cols), (2, 128));
+        assert_eq!(
+            (g.tensors[2].rows, g.tensors[2].cols),
+            (2, 128),
+            "the op after the merger inherits the DIVIDED rows, not the token count"
+        );
+    }
     use crate::lower::{InputRef, OpDesc};
     use crate::model_geometry::{KvHeads, QueryHeads};
 
@@ -3260,12 +3449,11 @@ mod tests {
         // Each Apply reads the inv_rms tensor (whole) → single
         // predecessor = RmsNormReduce. (x and gamma are sources, so
         // they contribute no node preds.)
-        for apply in 1..4 {
+        for (apply, p) in preds.iter().enumerate().take(4).skip(1) {
             assert_eq!(
-                preds[apply],
+                *p,
                 vec![SubtileId(0)],
-                "RmsNormApply {} reads inv_rms from the sole reduce writer",
-                apply,
+                "RmsNormApply {apply} reads inv_rms from the sole reduce writer",
             );
         }
         // Each Mul tile k reads cols [k*2..(k+1)*2] of out_t — exactly

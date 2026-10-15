@@ -20,7 +20,7 @@
 //! type-check — hence `bail!` (recoverable), never `unimplemented!()`.
 
 use anyhow::Result;
-use scratchy_tensors::{DType, LoadStream};
+use scratchy_tensors::{DType, GpuTensor, LoadStream};
 
 use crate::weights::GpuWeights;
 
@@ -326,26 +326,37 @@ impl LinearLayerOps for LinearLayer {
     }
 
     fn load_affine_dequant_as_dense(
-        _weights: &mut GpuWeights,
-        _prefix: &str,
-        _group_size: u32,
-        _bits: u32,
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
     ) -> Result<Self> {
-        anyhow::bail!(
-            "scratchy-target-spyre: load_affine_dequant_as_dense load not yet implemented"
-        )
+        let weight = affine_dequant_b4(weights, prefix, group_size, bits, DType::BF16)?;
+        let bias_name = format!("{prefix}.bias");
+        let bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        Ok(Self::Dense(Linear::new(weight, bias)))
     }
 
     fn load_affine_dequant_concat_as_dense(
-        _weights: &mut GpuWeights,
-        _prefixes: &[&str],
-        _group_size: u32,
-        _bits: u32,
-        _expected_in_features: u32,
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        expected_in_features: u32,
     ) -> Result<Self> {
-        anyhow::bail!(
-            "scratchy-target-spyre: load_affine_dequant_concat_as_dense load not yet implemented"
-        )
+        let weight = affine_dequant_b4_concat(
+            weights,
+            prefixes,
+            group_size,
+            bits,
+            DType::BF16,
+            expected_in_features,
+        )?;
+        Ok(Self::Dense(Linear::new(weight, None)))
     }
 
     fn load_nvfp4_quant(
@@ -363,6 +374,162 @@ impl LinearLayerOps for LinearLayer {
     ) -> Result<Self> {
         anyhow::bail!("scratchy-target-spyre: load_nvfp4_quant_concat load not yet implemented")
     }
+}
+
+// ── MLX-affine int4 → dense host dequant (the P2 slow-reference path) ───────
+//
+// The same three helpers metal's `layers_quant.rs` carries, over the SAME
+// frozen `WeightSource` seam: spyre's `GpuWeights` implements it (neutral, in
+// scratchy-layers), so the reads and the `alloc_packed_from_host` writes are
+// allocator-generic with no GPU kernel anywhere. The dequant arithmetic itself
+// is the shared neutral `affine_dequant_b4_to_dtype` (scratchy-quantizations).
+//
+// ⛔ THE FORWARD-TIME KERNEL PATH (`load_affine_quant`) STAYS A `bail!` — this
+// is the DEQUANT-AT-LOAD path only, which the macro emits for `mlx-affine-*`
+// presets. A dequantized-then-staged weight is fp16 bandwidth, not int4 — the
+// slow reference, exactly as on metal.
+
+/// CPU-dequantize one MLX-affine int4 prefix's `{weight,scales,biases}` triple
+/// to `(dense [N,K] bytes, n, k)` — the shared validation + math half.
+fn affine_dequant_b4_bytes(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    group_size: u32,
+    bits: u32,
+    dtype_out: DType,
+) -> Result<(Vec<u8>, usize, usize)> {
+    anyhow::ensure!(
+        bits == 4 || bits == 8,
+        "affine_dequant_b4: only bits=4 or bits=8 supported, got bits={bits}"
+    );
+    anyhow::ensure!(
+        matches!(dtype_out, DType::F16 | DType::BF16),
+        "affine_dequant_b4: dtype_out must be F16 or BF16, got {dtype_out}"
+    );
+
+    let (w_bytes, w_shape, w_dtype) = weights.take_cpu(&format!("{prefix}.weight"))?;
+    let (s_bytes, s_shape, s_dtype) = weights.take_cpu(&format!("{prefix}.scales"))?;
+    let (b_bytes, b_shape, b_dtype) = weights.take_cpu(&format!("{prefix}.biases"))?;
+
+    anyhow::ensure!(
+        w_dtype == DType::U32,
+        "affine_dequant_b4: `{prefix}.weight` dtype is {w_dtype} (expected U32)",
+    );
+    // mlx-community 4bit repos ship scales/biases as either F16 (older
+    // Llama / Mixtral) or BF16 (newer Qwen3-MoE); the dequant loop decodes
+    // the right bit pattern from the actual dtype.
+    anyhow::ensure!(
+        matches!(s_dtype, DType::F16 | DType::BF16),
+        "affine_dequant_b4: `{prefix}.scales` dtype is {s_dtype} (expected F16 or BF16)",
+    );
+    anyhow::ensure!(
+        b_dtype == s_dtype,
+        "affine_dequant_b4: `{prefix}.biases` dtype is {b_dtype} (expected same as scales {s_dtype})",
+    );
+    anyhow::ensure!(
+        w_shape.len() == 2,
+        "affine_dequant_b4: packed weight shape rank {} (expected 2)",
+        w_shape.len(),
+    );
+
+    // pack_factor = 32 / bits (8 for bits=4 U32-packed nibbles; 4 for bits=8
+    // U32-packed bytes). The packed weight is `[N, K / pack_factor]`.
+    let pack_factor = (32 / bits) as usize;
+    let n = w_shape[0];
+    let k = w_shape[1] * pack_factor;
+    anyhow::ensure!(
+        k.is_multiple_of(group_size as usize),
+        "affine_dequant_b4: K={k} not divisible by group_size={group_size}"
+    );
+    anyhow::ensure!(
+        s_shape == [n, k / group_size as usize],
+        "affine_dequant_b4: scales shape {:?} != [{n}, {}]",
+        s_shape,
+        k / group_size as usize,
+    );
+    anyhow::ensure!(
+        b_shape == s_shape,
+        "affine_dequant_b4: biases shape {:?} != scales shape {:?}",
+        b_shape,
+        s_shape,
+    );
+
+    let out_bytes = scratchy_quantizations::affine_dequant_b4_to_dtype(
+        &w_bytes, &s_bytes, &b_bytes, n, k, group_size, bits, s_dtype, dtype_out,
+    )?;
+    Ok((out_bytes, n, k))
+}
+
+/// Dequantize one MLX-affine int4 prefix into a dense `[N, K]` host tensor.
+fn affine_dequant_b4(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    group_size: u32,
+    bits: u32,
+    dtype_out: DType,
+) -> Result<GpuTensor> {
+    let (out_bytes, n, k) = affine_dequant_b4_bytes(weights, prefix, group_size, bits, dtype_out)?;
+    weights.alloc_packed_from_host(&out_bytes, &[n, k], dtype_out)
+}
+
+/// Concat sibling of [`affine_dequant_b4`]: CPU-dequantizes each prefix's
+/// affine triple, byte-concats the `[N, K]` results along dim 0 into one
+/// packed buffer. All sources must share `K`, `group_size`, `bits`, `dtype_out`.
+fn affine_dequant_b4_concat(
+    weights: &mut GpuWeights,
+    prefixes: &[&str],
+    group_size: u32,
+    bits: u32,
+    dtype_out: DType,
+    expected_in_features: u32,
+) -> Result<GpuTensor> {
+    anyhow::ensure!(
+        !prefixes.is_empty(),
+        "affine_dequant_b4_concat: empty prefix list"
+    );
+    let elem_size = match dtype_out {
+        DType::F16 | DType::BF16 => 2,
+        _ => anyhow::bail!(
+            "affine_dequant_b4_concat: dtype_out must be F16 or BF16, got {dtype_out}"
+        ),
+    };
+
+    let mut packed: Vec<u8> = Vec::new();
+    let mut total_n: usize = 0;
+    let mut k_shared: Option<usize> = None;
+    for prefix in prefixes {
+        let (bytes, n, k) = affine_dequant_b4_bytes(weights, prefix, group_size, bits, dtype_out)?;
+        // Alignment check: reject a checkpoint whose packed `.weight` implies
+        // a K that disagrees with the compiled preset's declared in_features
+        // (i.e. it was quantized at different bits than this build expects).
+        anyhow::ensure!(
+            k == expected_in_features as usize,
+            "affine dequant checkpoint/preset mismatch at `{prefix}`: packed `.weight` implies \
+             in_features={k} at bits={bits} (pack_factor={}); this build expects \
+             in_features={expected_in_features}. The checkpoint is quantized at a different \
+             bit-width than this build's preset.",
+            32 / bits,
+        );
+        if let Some(prev_k) = k_shared {
+            anyhow::ensure!(
+                prev_k == k,
+                "affine_dequant_b4_concat: in_features mismatch across prefixes \
+                 ({prev_k} vs {k} at `{prefix}`)"
+            );
+        } else {
+            k_shared = Some(k);
+        }
+        total_n += n;
+        anyhow::ensure!(
+            bytes.len() == n * k * elem_size,
+            "affine_dequant_b4_concat: `{prefix}` produced {} bytes; expected {}",
+            bytes.len(),
+            n * k * elem_size,
+        );
+        packed.extend_from_slice(&bytes);
+    }
+    let k = k_shared.expect("affine_dequant_b4_concat: prefixes non-empty above");
+    weights.alloc_packed_from_host(&packed, &[total_n, k], dtype_out)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,12 +579,13 @@ impl EmbeddingOps for Embedding {
     }
 
     fn load_affine_dequant(
-        _weights: &mut GpuWeights,
-        _prefix: &str,
-        _group_size: u32,
-        _bits: u32,
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
     ) -> Result<Self> {
-        anyhow::bail!("scratchy-target-spyre: load_affine_dequant load not yet implemented")
+        let weight = affine_dequant_b4(weights, prefix, group_size, bits, DType::BF16)?;
+        Ok(Self::new(weight))
     }
 }
 

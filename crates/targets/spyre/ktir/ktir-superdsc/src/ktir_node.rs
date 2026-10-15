@@ -167,6 +167,34 @@ pub enum Program {
     /// does not, so the producer writes silu longhand and this recognises it.
     SiluMul,
     RmsNorm,
+    /// `x · rsqrt(mean(x²) + eps)` with NO gain — gemma's per-head V/K norms
+    /// (`rmsnorm_unit` in the DSL). Same chain as [`Program::RmsNorm`] minus the
+    /// final gamma multiply: the normalising multiply IS the output, so the
+    /// program has ONE tensor parameter where RmsNorm has two.
+    RmsNormUnit,
+    /// `cap · tanh(x / cap)` — Gemma's final-logit soft cap, written longhand as
+    /// `realdiv` by the cap, `tanh`, then `multiply` by the cap. The cap is a
+    /// model constant (`final_logit_softcapping`) carried on the SubOp; the
+    /// program splats it as an immediate, and [`program_tanhsoftcap_cap`] reads
+    /// that splat back so the emit side resolves the `[1,1]` registry slot by
+    /// value — the same contract `program_rmsnorm_eps` holds for the epsilon.
+    TanhSoftCap,
+    /// `out = x · w` where `w` is a LOADED `[1]`-shaped weight (gemma4
+    /// `layer_scalar[layer]`) — a bound weight-source operand broadcast on
+    /// both dims, the same operand mode ScalarMul gives its registry const
+    /// but with the value staged by the host rather than baked. TWO tensor
+    /// parameters (x and the weight) where ScalarMul has one.
+    ScalarWeightMul,
+    /// A RE-LAYING COPY that re-sticks a whole buffer `[r_in, c_in]` →
+    /// `[r_out, c_out]`, preserving the flat element sequence (gemma4's
+    /// per-head q/k/v-norm views `[1, H·D] → [H, D]` and their
+    /// flatten-backs). ONE tensor parameter. It cannot be a view alias —
+    /// the device layout is a function of the ROW COUNT, so two views over
+    /// one buffer with different extents disagree about every element; the
+    /// door lowers it to single-stick `identity` copies (the `lmlast`
+    /// mechanism). See
+    /// [`reshape`](crate::emit::lower_ktir_to_superdsc::reshape).
+    Reshape,
     ScalarMul,
     Matmul,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
@@ -193,6 +221,108 @@ pub enum Program {
     /// REFUSES that shape by name rather than emitting it; the shipped attention's answer — pad the
     /// row count to a stick multiple and loop whole 64×64 tiles — is named in the refusal.
     Transpose,
+    /// A ROW SOFTMAX over `[rows, cols]` — `exp(x − rowmax(x)) / rowsum(exp(x − rowmax(x)))`,
+    /// written longhand as max-reduce → broadcast-sub → exp → sum-reduce → broadcast-div.
+    /// The MoE router's `RouteSoftmax` (gemma: softmax over the scaled top-k scores)
+    /// and `RouteRenorm` (mixtral: scores / rowsum(scores), the same chain minus the
+    /// exp) lower to it. ONE tensor parameter (the scores); the row-max and row-sum
+    /// live in one-stick synthetics, exactly as rmsnorm's mean does.
+    RouteSoftmax,
+    /// `x / rowsum(x, dim=-1)` — mixtral's renormalised top-k scores, the softmax
+    /// chain minus the stability subtract and the exp. ONE tensor parameter.
+    RouteRenorm,
+    /// `act(gate) · up` over the MoE pair rows — the gated activation of the expert
+    /// MLP, the SiluMul computation with the act the block declares (gemma-4: gelu).
+    /// TWO tensor parameters (gate and up). The pair rows fold into `[m, k·w]`
+    /// columns, so the computation is pointwise over whatever layout the sort
+    /// produced — no pair structure is read here.
+    ExpertGatedAct(GatedAct),
+    /// `Reshape{Times(H>1)} → RmsNorm{eps, gain}/RmsNormUnit{eps} →
+    /// Reshape{Times(1)}` — the per-head q/k norm SANDWICH, fused to per-head
+    /// windows over the ORIGINAL tensor. The flatten-back restores exactly the
+    /// split's source arrangement (same element count, row-major order, the
+    /// split is `Times(H)` and the flatten `Times(1)`), so the sandwich is
+    /// `rmsnorm` applied to head windows: read `t_in[:, h·D..(h+1)·D]`, norm
+    /// over `[m, D]`, write `t_out`'s head window — and BOTH reshapes (true
+    /// re-laying copies, 87% of gemma-4's descriptors) vanish.
+    ///
+    /// THREE tensor parameters in the gained form (the split's source `x`, the
+    /// `gamma` row `[1, D]` shared across heads, the flatten's output `t_out`);
+    /// TWO in the unit form (no gamma). Which form a program is — and the head
+    /// count, width and gain convention — is derived at the door from the
+    /// program's own views, the same way [`Program::Attn`]'s geometry is: `x`
+    /// states `[m, H·D]`, `gamma` states `[1, D]` (or is absent), the output
+    /// states `[m, H·D]` and its first access tile is one head's window
+    /// `[m, D]`.
+    ///
+    /// ⭐ THE HEAD-WINDOW / BLOCK-ALIGNMENT LAW (why the offsets are legal):
+    /// a stick-blocked `[m, H·D]` tensor places element `(r, h·D + c)` at
+    /// `h·D·m + (c/64)·(m·64) + r·64 + c%64` (D is a 64-multiple — every head
+    /// dim this crate serves is), and a `[m, D]` op at base offset `h·D·m`
+    /// places `(r, c)` at exactly the same address — the head window is a
+    /// WHOLE-BLOCK SHIFT of the op's own block, which is the one offset class
+    /// `pointwise.rs`/`reduce.rs` accept for their stick-major rank-2 form.
+    /// The synthetics ([`crate::place::SynthRole`] `Sq16`/`Mean`/`Meps`/`Rinv`,
+    /// plus `Xn` in the gained form) are declared ONCE at the full re-laid
+    /// footprints — `[H·m, D]` for the pointwise ones, `[H·m, stick]` for the
+    /// reduced ones — and addressed per head through the same law, so a
+    /// program's heads share one set of buffers the way the un-fused form's
+    /// one norm did.
+    WindowedRmsNorm {
+        unit: bool,
+    },
+    // ── THE MoE ROUTING + EXPERT OPS, in program order ──────────────────
+    // Each names what it computes so the card track can REFUSE IT BY NAME: the
+    // routing permutation and the gathered expert weights need the vendor
+    // `topk.ddl` / gather vocabulary, a separate worklist item, and a silent
+    // nearest-primitive substitution would run a different function.
+    /// Each row's expert indices sorted by ascending score, as the RANK VECTOR
+    /// `rank[i,j] = |{h : x[i,h] < x[i,j]}| + |{h : x[i,h] == x[i,j] ∧ h < j}|`
+    /// — a compare/reduce form of the sort, no permutation emitted. ONE tensor
+    /// parameter (the scores `[m, E]`); the output holds f16 indices.
+    RouteArgsort,
+    /// The last `k` sorted indices of each row — its top-k experts. ONE tensor
+    /// parameter (the sorted indices `[m, E]`); output `[m, k]`.
+    RouteTopK,
+    /// The scores at the chosen indices, `[m, k]` — a row gather by the top-k
+    /// index tensor. TWO tensor parameters (scores `[m, E]`, indices `[m, k]`).
+    RouteGatherScores,
+    /// Each score times its expert's learned scale (`per_expert_scale[idx]`).
+    /// THREE tensor parameters (scores `[m, k]`, indices `[m, k]`, the router
+    /// bundle's per-expert scale row `[E]`).
+    RouteExpertScale,
+    /// The (token, expert) pair rows the expert projections read. GATHERED
+    /// (decode) semantics: a blockwise copy `[m, w] → [m, k·w]` whose output
+    /// column block `j` is the input row — exactly the `[N, top_k, out]` layout
+    /// metal's gathered kernels write, numerically identical, no data-dependent
+    /// permutation. TWO tensor parameters (x, indices — the copy itself is
+    /// data-independent; the indices ride along because every projection reads
+    /// them through the routing).
+    ExpertSort,
+    /// The pair rows back in token order — the identity copy in the same
+    /// (token, slot) layout the sort wrote. TWO tensor parameters.
+    ExpertUnsort,
+    /// Each token's pair rows summed by its scores: `out[n, d] =
+    /// Σ_k rows[n, k, d] · scores[n, k]`. TWO tensor parameters (rows
+    /// `[m·k, hidden]`, scores `[m, k]`).
+    ExpertCombine,
+    /// One projection of each pair's expert over the stacked `[E·out, in]`
+    /// weight bank — the gathered form of `Program::Matmul`'s W8A8 body: the
+    /// weight row each pair reads is selected by its expert index (an
+    /// `indirect` access-tile dim), and the fp8 dequant scale multiply is the
+    /// dense path's own. FOUR tensor parameters at fp8 (rows, routing,
+    /// weights, scales).
+    ExpertMatmul,
+}
+
+/// The activation an expert gates its up projection with — this crate's OWN copy of
+/// the front end's `GatedAct`, because the leaf crate depends on nothing upstream
+/// (a third-party producer states its act the same way). [`Program::ExpertGatedAct`]
+/// carries it, and the door dispatches on it to pick the device primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatedAct {
+    Silu,
+    Gelu,
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.

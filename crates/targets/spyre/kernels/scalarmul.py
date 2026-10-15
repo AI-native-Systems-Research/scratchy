@@ -16,7 +16,12 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `SubOp::ScalarMul { scale }` payload, plus the STORAGE the region windows
   (`N_TOTAL =` the tensor's full width, `C_START =` the region's column corner). A
   whole-region node states `N_TOTAL = N`, `C_START = 0` — the same constants the
-  one-tile form implied.
+  one-tile form implied. ⚠️ THE `SubOp::RouteScale` ROW STATES THE LOGICAL WIDTH
+  instead — window AND storage — because the router's scores follow a GATHER that
+  writes the logical `[m, k]`, not a matmul that padded the columns; the door
+  re-derives its own device width off the region and caps it at the placement, so
+  the descriptor is the same either way (the splice's own law, in its
+  `kernel_spec` arm for the row).
 * GRID: `[1]`.
 
 ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE LOAD NAMES THE WINDOW — the front end's

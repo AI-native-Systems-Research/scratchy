@@ -35,6 +35,20 @@ from the program's own views and access tiles, so the kernel states them:
 THE ROW ORDER, kept from the fixture (delta 7, measured): row = position * H + head,
 TOKEN-MAJOR, which is `addr_eq`'s same-bytes reshape of the worker's `[mq, heads*hd]`
 row-major staging — the arrangement the attention that consumes this tensor reads.
+
+⭐ THE ROW WINDOW (per-row rope): the real front end's per-position decomposition
+produces rope nodes whose regions are ONE row's `[1, qw]` slice of the shared q
+plane, and a row slice is expressed by the ACCESS TILE's row corner, never by a
+taller view (main's `view_rows` law: the offset rides the tile's row index, which
+is the only form legible to both the emulator and the GEMM offload). The kernel
+therefore states `Y_TOTAL` — the x TENSOR's full re-tiled height `rows·H`, so the
+tile corner is in bounds — and `R_START` — the region's row corner `ri·H`, baked
+into every load/store row. `MQ` is then the REGION's row count: a whole-region
+node states `R_START = 0`, `Y_TOTAL = MQ·H`, which is byte-identical to the one
+form this kernel used to state; a per-row node states `MQ = 1` at `R_START =
+ri·H`. cos/sin take the same corner: position `p`'s angles are rows
+`[p·H, (p+1)·H)` of the head-replicated table, so the region's rows are exactly
+`[R_START, R_START + MQ·H)`.
 """
 
 import triton
@@ -44,39 +58,42 @@ import triton.language as tl
 @triton.jit
 def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
              H: tl.constexpr, MQ: tl.constexpr,
-             HEAD_DIM: tl.constexpr, HALF: tl.constexpr):
+             HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
+             Y_TOTAL: tl.constexpr, R_START: tl.constexpr):
     tl.static_assert(HALF + HALF == HEAD_DIM)
-    y_dim = MQ * H
-    # The x/out views over the worker-staged plane, `[mq*heads, hd]` — the same extents
-    # main's `KtirFunc::rope` states (`view_shaped(x_t, mh, hd)`), so the door's derivation of
-    # `heads` and `mq` from the view and its access tiles reads the right facts.
-    x_desc = tl.make_tensor_descriptor(desc_x, shape=[y_dim, HEAD_DIM],
+    # The x/out views over the worker-staged plane, `[rows*heads, hd]` — the full
+    # TENSOR re-tiled (Y_TOTAL), so the row-windowed tile corners stay in bounds.
+    # The cos/sin views are the same-bytes head-replicated tables, `[tbl_rows*H,
+    # hd]` — their extents agree with x's when the tables are per-position rows.
+    x_desc = tl.make_tensor_descriptor(desc_x, shape=[Y_TOTAL, HEAD_DIM],
                                        strides=[HEAD_DIM, 1],
                                        block_shape=[H, HALF])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[y_dim, HEAD_DIM],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[Y_TOTAL, HEAD_DIM],
                                        strides=[HEAD_DIM, 1],
                                        block_shape=[H, HALF])
     # THE WORKER-STAGED cos/sin, `[mq*heads, hd]` head-replicated (spyre_forward.rs's
     # `tile`): position p's angles are H consecutive rows starting at p*H — read at x's
     # own row base, so cos rows line up with x's H head-rows row for row.
-    cos_desc = tl.make_tensor_descriptor(desc_cos, shape=[y_dim, HEAD_DIM],
+    cos_desc = tl.make_tensor_descriptor(desc_cos, shape=[Y_TOTAL, HEAD_DIM],
                                          strides=[HEAD_DIM, 1],
                                          block_shape=[H, HALF])
-    sin_desc = tl.make_tensor_descriptor(desc_sin, shape=[y_dim, HEAD_DIM],
+    sin_desc = tl.make_tensor_descriptor(desc_sin, shape=[Y_TOTAL, HEAD_DIM],
                                          strides=[HEAD_DIM, 1],
                                          block_shape=[H, HALF])
 
-    # ONE ACCESS TILE PER POSITION (`[H, HALF]` at row base `pos * H`, column offsets 0
-    # and HALF). The trip count is constexpr, so `to_ktir` unrolls it and the spliced
-    # program is straight-line with one tile per position — the door's first-tile read
-    # (`heads = r_len`, `mq = v_rows / heads`) then states exactly the builder's facts.
+    # ONE ACCESS TILE PER POSITION (`[H, HALF]` at row base `R_START + pos * H`,
+    # column offsets 0 and HALF). The trip count is constexpr, so `to_ktir`
+    # unrolls it and the spliced program is straight-line with one tile per
+    # position. A whole-region node states `R_START = 0`, so its tiles sit at
+    # `pos * H` exactly as before; a per-row node states `MQ = 1` and its single
+    # trip's corner is the region's own row.
     for pos in tl.range(0, MQ, 1):
-        offs_m = pos * H
+        offs_m = R_START + pos * H
         x1 = x_desc.load([offs_m, 0])
         x2 = x_desc.load([offs_m, HALF])
         c = cos_desc.load([offs_m, 0])
         s = sin_desc.load([offs_m, 0])
-        # rotate_half, per half: the MINUS is on the second half's contribution to the
-        # first, which is `cat(-x2, x1)` written out.
+        # rotate_half, per half: the MINUS is on the second half's contribution to
+        # the first, which is `cat(-x2, x1)` written out.
         o_desc.store([offs_m, 0], x1 * c - x2 * s)
         o_desc.store([offs_m, HALF], x2 * c + x1 * s)

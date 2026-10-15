@@ -579,8 +579,24 @@ fn split_run(
 /// touch in the window to its last touch in the window — or to the window end if
 /// it is also touched later in the program (it then crosses the sub-run boundary
 /// and must persist to be stored). This captures exactly the wide intermediates
-/// the per-op reclaim cannot free (e.g. an MLP's gate/up/product held at once);
-/// intra-node temporaries are GPU/scratch-side, not large LX tiles.
+/// the per-op reclaim cannot free (e.g. an MLP's gate/up/product held at once).
+/// INTRA-NODE temporaries ARE charged LX at run time — the interpreter's
+/// per-op binding creates the op's result tile on LX — and are NOT counted
+/// here: the worst case (an fp8 gemm's mulf-broadcast epilogue holding three
+/// `[m, N]` f16 tiles + the `[N]` scale row at once, the gemma-4-12b emu
+/// refusal `1935360 + 952320 > 2097152`) is bounded OUTSIDE this planner —
+/// the bake derives the emu's prefill width from the model's own fp8 gemms
+/// (`emu_prefill_lx_width` in the forward-compiler macro), and `tensor_bytes`'s
+/// F16-uniform sizing inflates an fp8 weight to its phantom f16 footprint,
+/// which always isolates the fp8 node into its own fused segment anyway.
+/// THAT ISOLATION IS THE ONLY THING BOUNDING THE BLIND SPOT, and it holds
+/// only while the fp8 WEIGHT is counted at all — a phantom-f16 HBM operand
+/// that is not genuinely LX-resident. "Fixing" the estimate to charge fp8
+/// weights at their true 1 B/elem (still ~59 MB here — still isolated), or
+/// to exclude HBM operands outright, must FIRST extend this count with the
+/// fp8 node's intra-node temporaries (`3·m·N·2 + N·2`), or the gemma-4-12b
+/// refusal returns as a fused-segment overflow this planner can no longer
+/// see.
 fn peak_live_bytes(
     nodes: &[NodeSpec],
     s: usize,
@@ -698,12 +714,21 @@ pub fn fuse_program<'a>(
         // An OUTPUT arg is forwarded iff the producer writes the whole tensor and
         // every consuming node can forward it (same full-shape + whole/sliceable).
         // Record the resident SSA so later nodes can forward off it.
+        //
+        // ⭐ AND THE STORED VALUE MUST SPELL THE VIEW'S SHAPE. A Reshape's store is
+        // whole-tensor over a view whose shape it deliberately does NOT have: the
+        // value is `[31, 4096]`, the view `[496, 256]`. Forwarding that value as the
+        // tensor's identity hands every consumer a differently-shaped SSA — the
+        // gemma-4 fused segment died as `ArithDivf: shape mismatch [31] vs [496]`.
+        // The store stays an HBM round-trip instead, which is what a reshape IS.
+        // A shape we could not read (`value_shape` empty) also declines.
         for st in &an.stores {
             let Some(b) = arg_to_tensor.get(&st.arg) else {
                 continue;
             };
             if b.is_output
                 && st.whole_tensor
+                && st.value_shape == st.view_shape
                 && is_intermediate(b.tensor)
                 && all_consumers_forwardable(spec, &analyses, b.tensor, &st.view_shape)
             {
@@ -922,6 +947,14 @@ struct StoreChain {
     tile: Ssa,
     whole_tensor: bool,
     view_shape: Vec<i64>,
+    /// ⭐ THE STORED VALUE'S OWN SHAPE — the type of the `ktdp.store`'s value operand,
+    /// which is NOT always the view's. A Reshape stores a `[31, 4096]` value through
+    /// a `[496, 256]` view: the flat bytes agree, but the LAYOUTS disagree, and an
+    /// SSA forward of that value as the tensor's identity would hand every consumer
+    /// a `[31, 4096]` value where their own `m` says 496 — the gemma-4 fused segment
+    /// died as `ArithDivf: shape mismatch [31] vs [496]`. Forwarding is only sound
+    /// when the two spellings agree.
+    value_shape: Vec<i64>,
 }
 
 /// A construct_access_tile's decoded fields.
@@ -941,6 +974,11 @@ struct Analysis {
     views: HashMap<Ssa, (Ssa, Vec<i64>)>,
     /// access tile -> decoded tile.
     tiles: HashMap<Ssa, TileInfo>,
+    /// ⭐ SSA VALUE -> ITS TYPE'S DIMS, the reader side of the store-forward guard. A
+    /// store's value operand resolves here to the shape the producing op gave it,
+    /// which the view it is stored through does not state (and, for a Reshape,
+    /// deliberately disagrees with).
+    value_dims: HashMap<Ssa, Vec<i64>>,
 }
 
 /// Trace every `ktdp.load`/`ktdp.store` — at any region depth — back through its
@@ -951,14 +989,16 @@ struct Analysis {
 fn analyze(func: &IRFunction<'_>) -> Analysis {
     let mut a = Analysis::default();
     collect_views_tiles(func.operations, &mut a);
-    // Borrow-split: read views/tiles while pushing into loads/stores.
+    collect_value_dims(func.operations, &mut a.value_dims);
+    // Borrow-split: read views/tiles/value types while pushing into loads/stores.
     let Analysis {
         views,
         tiles,
         loads,
         stores,
+        value_dims,
     } = &mut a;
-    collect_loads_stores(func.operations, views, tiles, loads, stores);
+    collect_loads_stores(func.operations, views, tiles, value_dims, loads, stores);
     a
 }
 
@@ -1003,6 +1043,7 @@ fn collect_loads_stores(
     ops: &[Operation],
     views: &HashMap<Ssa, (Ssa, Vec<i64>)>,
     tiles: &HashMap<Ssa, TileInfo>,
+    value_dims: &HashMap<Ssa, Vec<i64>>,
     loads: &mut Vec<LoadChain>,
     stores: &mut Vec<StoreChain>,
 ) {
@@ -1037,19 +1078,38 @@ fn collect_loads_stores(
                     && let Some((arg, vshape)) = views.get(&ti.view)
                 {
                     let whole = !ti.shape.is_empty() && &ti.shape == vshape;
+                    let value_shape = value_dims.get(stored).cloned().unwrap_or_default();
                     stores.push(StoreChain {
                         arg: *arg,
                         stored: *stored,
                         tile: *tile_ssa,
                         whole_tensor: whole,
                         view_shape: vshape.clone(),
+                        value_shape,
                     });
                 }
             }
             _ => {}
         }
         for rg in op.regions {
-            collect_loads_stores(rg, views, tiles, loads, stores);
+            collect_loads_stores(rg, views, tiles, value_dims, loads, stores);
+        }
+    }
+}
+
+/// Record every op result's type dims, at any region depth — the reader the
+/// store-forward guard resolves a stored value's own shape through. Unshaped
+/// results are simply absent from the map (the guard then treats the shape as
+/// unknown and declines to forward).
+fn collect_value_dims(ops: &[Operation<'_>], dims: &mut HashMap<Ssa, Vec<i64>>) {
+    for op in ops {
+        if let Some(res) = op.result
+            && let Some(d) = op.result_type.and_then(|t| t.dims())
+        {
+            dims.insert(res, d.to_vec());
+        }
+        for rg in op.regions {
+            collect_value_dims(rg, dims);
         }
     }
 }
@@ -1233,11 +1293,24 @@ mod tests {
             let o = ops.op(Some(res), OpKind::KtdpConstructAccessTile, &[view]);
             ops.attr(o, AttrKey::Shape, ops.int_list(vec![tile_shape]))
         };
+        // ⭐ THE PRODUCED VALUE IS TYPED, as the lowering always emits it
+        // (`self.typed(op, ty)`): the store-forward guard reads the value's own
+        // shape off `result_type` and declines an untyped one (it cannot prove the
+        // value spells the view's shape). An untyped fixture here would pin the
+        // DECLINE, not the forward.
+        let y_op = ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]);
+        let y_op = ops.ty(
+            y_op,
+            IrType::Tensor {
+                dims: ops.arena().ints(vec![tile_shape]),
+                elem: DType::F16,
+            },
+        );
         let body = vec![
             mk_view(&mut ops, "%vin", "%in"),
             mk_tile(&mut ops, "%tin", "%vin"),
             ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]),
-            ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]),
+            y_op,
             mk_view(&mut ops, "%vout", "%out"),
             mk_tile(&mut ops, "%tout", "%vout"),
             ops.op(None, OpKind::KtdpStore, &["%y", "%tout"]),
@@ -1275,7 +1348,16 @@ mod tests {
         );
         let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![tile]));
         let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
+        // ⭐ TYPED, as the lowering emits it — see copy_node's note: the
+        // store-forward guard declines untyped values.
         let y = ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]);
+        let y = ops.ty(
+            y,
+            IrType::Tensor {
+                dims: ops.arena().ints(vec![tile]),
+                elem: DType::F16,
+            },
+        );
         let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
         let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![tile]));
         let vout = ops.attr(vout, AttrKey::Strides, ops.int_list(vec![1]));

@@ -2268,6 +2268,25 @@ pub fn stage_2d(layout: &StickLayout, get: impl Fn(usize, usize) -> f32) -> Vec<
     out
 }
 
+/// [`stage_2d`] for a SQUARE `[hd, hd]` KERNEL table (the identity and rope-P rotation matrices),
+/// at ANY head dim — the one staging a reserved kernel table needs, because a model config may
+/// declare a head dim the stick does not divide (a parity-tiny fixture at `head_dim = 32` against
+/// the 64-fp16 stick).
+///
+/// ⭐ PADDED, NEVER TRUNCATED. The table is staged at `hd_pad = ceil(hd / lanes) · lanes` with the
+/// entries outside `hd` reading zero — the padding every whole-stick device read of a
+/// sub-stick-wide row already assumes. At a stick-divisible head dim `hd_pad == hd`, so the bytes
+/// are IDENTICAL to `stage_2d(&StickLayout::kernel(hd, hd), entry)` and every real model's table is
+/// unchanged; the pad exists only where the unpadded call would have refused.
+pub fn stage_kernel_table(hd: usize, entry: impl Fn(usize, usize) -> f32) -> Vec<f32> {
+    let lanes = Df::Fp16.elems_per_stick() as usize;
+    let pad = lanes.max(1);
+    let hd_pad = hd.div_ceil(pad) * pad;
+    stage_2d(&StickLayout::kernel(hd_pad, hd_pad), |i, j| {
+        if i < hd && j < hd { entry(i, j) } else { 0.0 }
+    })
+}
+
 /// A device-bind buffer whose bytes were placed THROUGH a layout — the TYPE-LEVEL worker↔emit firewall.
 /// There is NO `Vec<f32> → Staged` conversion (the field is private, the only ctors are `tiled`/`filled`),
 /// so a caller CANNOT bind a hand-written-`(c/64)*(rows*64)+…`-offset buffer: 2-D layout math is forced
@@ -4614,6 +4633,36 @@ impl SeqPos {
     }
 }
 
+/// ⭐⭐⭐ THE SUB-PAGE INDEX BANK — the `[E, S]` const table the fine expert gather's index is
+/// minted from (see [`crate::reserved_tids::expert_subpage_bank_tid`]): stick `e` holds the `S`
+/// values `e·S + s`, `s < S`, one u32 each. A gather OF this bank by the router's raw expert-id
+/// index copies whole sticks, so the result's flat lane `j` is `e_{j/S}·S + j%S` — the fine
+/// entry that names (expert, sub-page), the composition the sub-paged weight gather addresses
+/// its cut pages by.
+///
+/// ⭐ A LAYOUT LAW SHARED BY THE EMITTER AND THE WORKER, like
+/// [`decode_batch_prefix_mask_f16`]: the placement pass mints the `[E, S]` footprint from the
+/// door's own `e_count`, and the worker's forward tape stages these bytes through the raw-i32
+/// bind — both sides must derive the same words from the same `e_count` or the fine gather
+/// addresses sub-pages that are not the router's experts'. Lives here (not the worker) because
+/// it is the door's own composition, stated once where both readers can see it.
+///
+/// `S` is [`CopyDims::ENTRIES_PER_OP`] — one u32 index stick — because the gather that copies
+/// this bank moves whole sticks (a sub-stick `out` extent would leave holes in the fine index's
+/// flat lane sequence). The values reach `E·S − 1` = 4095 at E=128, past fp16's exact-integer
+/// range of 2048, so the table is u32 and the bytes are the raw-i32 bind's own LITTLE-ENDIAN
+/// wire form.
+pub fn expert_subpage_index_bank(e_count: u32) -> Vec<u8> {
+    let sub = CopyDims::ENTRIES_PER_OP;
+    let mut out = Vec::with_capacity(e_count as usize * sub as usize * 4);
+    for e in 0..e_count {
+        for s in 0..sub {
+            out.extend_from_slice((e * sub + s).to_le_bytes().as_slice());
+        }
+    }
+    out
+}
+
 /// THE DECODE-BATCH PREFIX MASK, staged in the device's own f16 — the whole `ATTN_MASK_TID` buffer for
 /// a batch of `hists.len()` requests, blocked by the grid's own [`MaskBlockForm`].
 ///
@@ -5162,6 +5211,63 @@ const _: () = assert!(
     "a prefill chunk's padded write must fit inside ONE page — otherwise no write slot exists that keeps \
      it off the next kv head's plane"
 );
+
+/// ⛔ THE LARGEST SINGLE dxp GROUP A BUNDLE MAY STAGE (descriptors) — the ONE ceiling the emitter's
+/// gathered-fold chunk split and the bake-side oversized-group guard BOTH read.
+///
+/// Lives HERE — in the leaf crate that owns the emission it bounds — so the split decision and the
+/// guard cannot each grow their own constant; the spyre target crate re-exports it under the same
+/// name its own paths already used, which is the whole enforcement of "one const": a second
+/// divergent value would have to be a NEW name in a file that already resolves this one.
+///
+/// Distinct from the spyre crate's `GroupSize::CEILING`: that is the largest value the per-kind cap
+/// may be SET to; this is the largest group the whole partition may produce once the uncapped kinds
+/// (gathered PageFold, `run_may_be_chunked == false`) and time-trip fan-out have had their say. A
+/// group past this ceiling is a build error (the oversized-group guard in
+/// `lower_subtile_tape_to_superdsc::ktir_groups_via_superdsc`), not a multi-hour dxp that looks
+/// like a hang — and the emitter pre-empts it by splitting an over-ceiling gathered fold into
+/// self-contained window chunks (see `attn.rs`'s chunk sweep).
+pub struct DxGroupCeiling;
+
+impl DxGroupCeiling {
+    /// 4204: the granite-8b fp8 baseline's LARGEST MEASURED GROUP — the accepted 30-minute bake's
+    /// own maximum (bundle `4f460f8b68a6c85a` group_1, an mq=32 gathered fold: 4 windows ×
+    /// (2·32·8·2 legs + 11 ladder) + 64 gather copies = 4204, verified against the plan-only dump
+    /// three ways: file count, `bundle_id.json` (mq=32, attn=4722), and the fan-out formula).
+    /// ⛔ NOT 512/`GroupSize::CEILING`: the ORIGINAL guard doc claimed the baseline "never exceeds
+    /// ~512" and 512 would refuse granite-8b's own accepted bake — a doc comment is not evidence,
+    /// and the dump is. Gemma-4-12b fp8's ladder is lawful under 4204 except ONE group: the
+    /// 8,300-descriptor mq=32 class-0 fold, which the window-chunk split cuts into k self-contained
+    /// chunks each at or under this value; the next-largest gemma group is 4,183 and stays unsplit.
+    /// Moving this constant is a MEASURED decision that names the bake, never a silent one.
+    pub const MAX_DESCRIPTORS: usize = 4204;
+
+    /// The TARGET the window-chunk split aims each gathered-fold chunk at. Distinct from
+    /// `MAX_DESCRIPTORS` on purpose: the ceiling (4204) is the largest group a bake may STAGE —
+    /// a correctness/legal bound, informed by granite-8b's own measured maximum — while this is
+    /// the largest chunk the split should LEAVE in place, a COMPILE-TIME-COST bound.
+    ///
+    /// MEASURED on the gemma-4-12b fp8 bake's own dump (2026-10-05, 3490 groups / 202,189
+    /// descriptor files): dxp bakes groups in PARALLEL, so the bake SPAN is set by the LARGEST
+    /// group, and group cost is superlinear in size (8,300 descriptors ≈ 2.5 h, 4,183 ≈ 57 min ⇒
+    /// exponent ≈ 1.4). The 12b's critical path is its ~4,183-descriptor gathered folds; one
+    /// WINDOW of that fold is 2,059 descriptors + 64 copies, so window chunking SATURATES at
+    /// 2,123-per-chunk at this geometry — any target ≤ 2,123 yields the same split. The dump's
+    /// largest non-fold groups (2,157) then set the new floor: modeled span ~57 → ~23 min.
+    ///
+    /// ⛔ THIS SPLITS GRANITE TOO. Granite-8b's own 4,204-descriptor fold is over any useful
+    /// target, so its bake changes — LAWFULLY (each chunk carries its own gather copies, the
+    /// online softmax is accumulate-only, `k == 1` whenever one chunk fits) but NOT
+    /// byte-identically: granite's card output must be re-verified coherent on the binary that
+    /// lands with a move of this constant. Byte-identity holds only for folds projecting at or
+    /// under the target. Groups the split cannot touch (non-fold kinds at 2,100–4,200) are
+    /// unchanged — this is a cheaper arrangement of the same computation, not a smaller one.
+    ///
+    /// Moving THIS constant is a bake-cost decision validated against a measured span, never a
+    /// numerics one: the 12b's greedy output must be identical across the move (same garbage in,
+    /// same garbage out — the numerics are untouched), verified on the rebuild that lands with it.
+    pub const SPLIT_TARGET: usize = 512;
+}
 
 impl PagedKvPool {
     /// Positions per page.

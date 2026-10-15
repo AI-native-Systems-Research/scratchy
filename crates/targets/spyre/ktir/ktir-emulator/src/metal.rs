@@ -23,6 +23,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+// Pure objc2/MTL4 dispatch — only exists on a Metal build.
+#[cfg(metal)]
 mod mtl4;
 
 use crate::attrkey::AttrKey;
@@ -328,10 +330,12 @@ pub struct MatmulLoopInfo {
     /// GEMM's full-M reconstruction (read from the stick base) untouched.
     pub m_row_off: i64,
     /// ⭐ THE B VIEW'S OWN ELEMENT TYPE — `Fp8E4m3` for an fp8-packed weight (one
-    /// byte per element, widened on read), `F16` for every dense weight. The B
-    /// resolvers charge bytes and decode elements at THIS size: reading an fp8
-    /// weight at the F16 default would read `count * 2` bytes (half of them the
-    /// NEXT stick's) and decode garbage — the fp8 splice's weight view is what
+    /// byte per element, widened on read), `F16` for every dense weight. The
+    /// pointer is an ELEMENT index in that dtype (RFC #110), so the byte
+    /// address and every HBM read width key on it: the B resolvers charge
+    /// bytes and decode elements at THIS size — reading an fp8 weight at the
+    /// F16 default would read `count * 2` bytes (half of them the NEXT
+    /// stick's) and decode garbage — the fp8 splice's weight view is what
     /// states the truth, so the offload reads it rather than assuming.
     pub b_dtype: DType,
 }
@@ -952,8 +956,14 @@ pub fn run_matmul_loop_gpu(
             want_b_f16: false, // A (activation) is always f32 in
         };
         let _t_res = std::time::Instant::now();
-        let ua =
-            resolve_gemm_operand_unified_off(info.a_root, m, k, info.m_row_off as usize, &gemm_a)?;
+        let ua = resolve_gemm_operand_unified_off(
+            info.a_root,
+            m,
+            k,
+            info.m_row_off as usize,
+            DType::F16, // A's views are model-dtype; only B carries a packed weight dtype
+            &gemm_a,
+        )?;
         // B operand, resolved VERBATIM (no transpose, no gather):
         //   * transpose-B: the [n,k] weight, or its CONTIGUOUS row-slice for an
         //     N-tile (rows [n_off, n_off+n) — a contiguous block, not a gather).
@@ -961,9 +971,17 @@ pub fn run_matmul_loop_gpu(
         let ub = if info.transpose_b {
             resolve_gemm_bt_operand(info.b_root, n, k, info.n_off, info.b_dtype, &gemm)?
         } else if info.n_off == 0 && info.b_stride == info.n {
-            resolve_gemm_operand_unified(info.b_root, k, n, &gemm)?
+            resolve_gemm_operand_unified(info.b_root, k, n, info.b_dtype, &gemm)?
         } else {
-            resolve_gemm_weight_slice(info.b_root, k, n, info.n_off, info.b_stride, &gemm)?
+            resolve_gemm_weight_slice(
+                info.b_root,
+                k,
+                n,
+                info.n_off,
+                info.b_stride,
+                info.b_dtype,
+                &gemm,
+            )?
         };
         GEMM_RESOLVE_NS.fetch_add(
             _t_res.elapsed().as_nanos() as u64,
@@ -1049,8 +1067,28 @@ pub fn run_matmul_loop_gpu(
     // The K-loop's result tensor is f16 (matmul outs dtype); this f16 rounding at
     // write-back is what keeps NAX and AMX golden-equivalent (both quantize the
     // f32 result identically), matching the interpreter's matmul precision.
-    let tile = crate::tile::Tile::compute(c, DType::F16, vec![m, n]);
-    let bytes = tile.size_bytes() as i64;
+    // EXCEPT over an fp8 weight: that result is the UN-scaled code-dot (the
+    // dequant scale `mulf` follows the loop), and real checkpoints carry LARGE
+    // codes with SMALL scales (gemma-4-26b q_proj: codes rms 84, scales ~2.6e-4,
+    // dots ~1e5) — f16 write-back made every QKV projection inf on the first
+    // prefill and NaN'd the layer one norm later. F32 is the hardware
+    // `matmulfp8`'s own wider-accumulate convention (see `matmul2d` in
+    // linalg.rs, the interpreter-side twin of this fix).
+    let out_dtype = if info.b_dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        DType::F16
+    };
+    let tile = crate::tile::Tile::compute(c, out_dtype, vec![m, n]);
+    // ⛔ LX RESIDENCY STAYS THE DEVICE'S fp16 FOOTPRINT. The F32 widen above is a
+    // NUMERICS convention (the wider accumulate), not a device layout: the card's
+    // `matmulfp8` output IS the DDL's fp16 `%ptsum_fp` (`bmm.ddl`), so what lives in
+    // LX on the device is `m*n*2` bytes whatever the emulator computes in. Charging
+    // the f32 tile's size instead made gemma-4-12b-fp8's prefill refuse here — two
+    // live `[31, 15360]` outs are 1.9 MB + 1.9 MB > the 2 MB core, while the device
+    // fits the same two at 952 KB each (granite's `[31, 8192]` happened to squeak
+    // under even at f32, which is why only gemma tripped it).
+    let bytes = (m * n * DType::F16.bytes_per_elem()) as i64;
     ctx.set_value(info.out_ssa, crate::ir::Value::Tile(tile));
     // Name the GEMM in an LX refusal: the charge is `m*n*2`, so the shape IS the diagnosis.
     ctx.track_lx(info.out_ssa, bytes).map_err(|e| {
@@ -1066,6 +1104,167 @@ pub fn run_matmul_loop_gpu(
     };
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// cfg dispatch for the K-loop offload: the Metal build reconstructs the GEMM on
+/// the GPU (NAX/AMX, above); every other build reconstructs it on the CPU
+/// (`crate::blas`). Same signature, same contract, same Err law — the caller
+/// (`comm_sched`) treats `Err` at `m > 1` as fatal and falls through to the
+/// interpreter's K-loop only at `m == 1`.
+#[cfg(metal)]
+pub fn run_matmul_loop(
+    info: &MatmulLoopInfo,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    run_matmul_loop_gpu(info, ctx)
+}
+
+/// The NON-Metal twin of [`run_matmul_loop_gpu`]: the SAME full-M reconstruction
+/// over the SAME recognized operands — the recognizer cluster above
+/// (`matmul_loop_schedule` / `recognize_matmul_loop` / the offset resolvers) is
+/// shared, not cfg-gated — computed with `crate::blas` instead of NAX/AMX.
+///
+/// ⛔ WHY A NON-METAL BUILD NEEDS ITS OWN ARM. The fusion planner forces every
+/// fused segment to grid `[1,1]` so a single-core offload can rebuild the full M
+/// there, while the matmul LX tiler keys an m>1 contraction's row corner on
+/// `ktdp.get_compute_tile_id` — core 0 of a grid the fused function does not
+/// have. On Metal the reconstruction erases that dependence; on a build without
+/// it the decomposed K-loop would key on tile id 0 and silently compute ONLY
+/// ROW 0 of every m>1 GEMM, leaving rows 1..M at the segment's zero-init (the
+/// metal arm treats a failed m>1 offload as FATAL for exactly this reason, and
+/// Linux has no GPU arm at all — MEASURED as the router e2e's row-1-exact-zero
+/// logits at m=2/64 with m=1 perfect). Same write-back convention: an f16 tile
+/// (f32 over an fp8 weight, the wider-accumulate numerics) charged at the
+/// device's fp16 LX footprint, which `store_data`'s grid-M-tiled scatter then
+/// lays through the per-core `[1, w]` footprint.
+#[cfg(not(metal))]
+pub fn run_matmul_loop(
+    info: &MatmulLoopInfo,
+    ctx: &mut crate::context::CoreContext,
+) -> Result<(), String> {
+    let (m, k, n) = (info.m as usize, info.k as usize, info.n as usize);
+    // A: [m, k] from the row offset (the last-token-only rewrite pins a static
+    // row; the default pid-keyed corner resolves to 0). A's views are
+    // model-dtype — only B carries a packed weight dtype.
+    let a = cpu_gemm_operand(info.a_root, m, k, info.m_row_off as usize, DType::F16, ctx)?;
+    // B, the metal arm's own three cases: transpose-B ([n, k] on disk, rows
+    // [n_off, n_off+n) — a contiguous block), plain untiled (the whole [k, n]),
+    // plain N-tiled (a strided column slice of the wider weight).
+    let b = if info.transpose_b {
+        cpu_gemm_operand(info.b_root, n, k, info.n_off as usize, info.b_dtype, ctx)?
+    } else if info.n_off == 0 && info.b_stride == info.n {
+        cpu_gemm_operand(info.b_root, k, n, 0, info.b_dtype, ctx)?
+    } else {
+        cpu_gemm_weight_slice(
+            info.b_root,
+            k,
+            n,
+            info.n_off,
+            info.b_stride,
+            info.b_dtype,
+            ctx,
+        )?
+    };
+    let c = if info.transpose_b {
+        crate::blas::sgemm_rowmajor_bt(m, k, n, &a, &b)
+    } else {
+        crate::blas::sgemm_rowmajor(m, k, n, &a, &b)
+    };
+    // f16 write-back (f32 over an fp8 weight) — the metal arm's own convention,
+    // which keeps every backend golden-equivalent (all quantize the f32 result
+    // identically) and matches the interpreter's matmul precision.
+    let out_dtype = if info.b_dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        DType::F16
+    };
+    let tile = crate::tile::Tile::compute(c, out_dtype, vec![m, n]);
+    // ⛔ LX RESIDENCY STAYS THE DEVICE'S fp16 FOOTPRINT (the metal arm's law):
+    // the f32 widen is a NUMERICS convention, not a device layout.
+    let bytes = (m * n * DType::F16.bytes_per_elem()) as i64;
+    ctx.set_value(info.out_ssa, crate::ir::Value::Tile(tile));
+    ctx.track_lx(info.out_ssa, bytes).map_err(|e| {
+        format!(
+            "{e} (GEMM out [{m}, {n}] k={k} n_off={} b_stride={})",
+            info.n_off, info.b_stride
+        )
+    })?;
+    Ok(())
+}
+
+/// Resolve a GEMM operand to `rows × cols` f32 on the CPU — the twin of
+/// [`resolve_gemm_operand_unified_off`] without the GPU upload and weight cache:
+/// a resident activation (`Value::Tile`) widens straight out of its tile, a
+/// constant weight (`Value::Index`, an ELEMENT index in the view's own dtype,
+/// RFC #110) decodes from HBM. `row_off` skips that many rows of `cols`
+/// elements first.
+#[cfg(not(metal))]
+fn cpu_gemm_operand(
+    root: Ssa,
+    rows: usize,
+    cols: usize,
+    row_off: usize,
+    dtype: DType,
+    ctx: &crate::context::CoreContext,
+) -> Result<Vec<f32>, String> {
+    let n = rows * cols;
+    let elem_off = row_off * cols;
+    match ctx.get_value(root)? {
+        crate::ir::Value::Tile(t) => {
+            let mut out = vec![0.0f32; n];
+            if !t.write_f32_into(elem_off, &mut out) {
+                return Err(format!(
+                    "cpu gemm: operand %{} resident tile has {} elems, need {} at row_off {row_off}",
+                    root.0,
+                    t.len(),
+                    elem_off + n
+                ));
+            }
+            Ok(out)
+        }
+        crate::ir::Value::Index(elem) => {
+            let addr = (elem + elem_off as i64) * dtype.bytes_per_elem() as i64;
+            Ok(ctx.hbm.borrow().read_decoded(addr, n, dtype))
+        }
+        other => Err(format!(
+            "cpu gemm: operand %{} is {other:?}, want tile/ptr",
+            root.0
+        )),
+    }
+}
+
+/// The N-TILED plain-B case — `k` rows of `n` elements at column `n_off` of a
+/// `b_stride`-wide weight (the lm_head's column tiles). The twin of
+/// [`resolve_gemm_weight_slice`]: weights only (the recognizer rejects
+/// activation N-tiles), decoded row by row.
+#[cfg(not(metal))]
+fn cpu_gemm_weight_slice(
+    root: Ssa,
+    k: usize,
+    n: usize,
+    n_off: i64,
+    b_stride: i64,
+    b_dtype: DType,
+    ctx: &crate::context::CoreContext,
+) -> Result<Vec<f32>, String> {
+    let elem = match ctx.get_value(root)? {
+        crate::ir::Value::Index(s) => *s,
+        other => {
+            return Err(format!(
+                "cpu gemm: N-tiled weight %{} is {other:?}, want an HBM pointer",
+                root.0
+            ));
+        }
+    };
+    let bpe = b_dtype.bytes_per_elem() as i64;
+    let base = elem * bpe;
+    let hbm = ctx.hbm.borrow();
+    let mut out = Vec::with_capacity(k * n);
+    for r in 0..k as i64 {
+        let row_addr = base + (r * b_stride + n_off) * bpe;
+        out.extend(hbm.read_decoded(row_addr, n, b_dtype));
+    }
+    Ok(out)
 }
 
 /// The GEMM weight resolvers' shared facts — the bundle that keeps every
@@ -1094,9 +1293,10 @@ fn resolve_gemm_operand_unified(
     root: Ssa,
     rows: usize,
     cols: usize,
+    b_dtype: DType,
     gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
-    resolve_gemm_operand_unified_off(root, rows, cols, 0, gemm)
+    resolve_gemm_operand_unified_off(root, rows, cols, 0, b_dtype, gemm)
 }
 
 /// [`resolve_gemm_operand_unified`] with a leading ROW offset: read the `rows×cols`
@@ -1104,11 +1304,13 @@ fn resolve_gemm_operand_unified(
 /// elements). `row_off=0` is the default full-tensor read. Used by the
 /// last-token-only rewrite to reconstruct a single activation row (`m_row_off`).
 #[cfg(metal)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_operand_unified_off(
     root: Ssa,
     rows: usize,
     cols: usize,
     row_off: usize,
+    b_dtype: DType,
     gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
     let GemmResolveCtx {
@@ -1141,18 +1343,19 @@ fn resolve_gemm_operand_unified_off(
         }
         // Constant weight in HBM: cache by (name, len, content fingerprint).
         crate::ir::Value::Index(elem) => {
-            // The pointer SSA value is an ELEMENT index (RFC #110): byte address
-            // is elem*bytes_per_elem (f16 weight), NOT elem*STICK_BYTES.
-            let addr = (elem + elem_off as i64) * DType::F16.bytes_per_elem() as i64;
+            // The pointer SSA value is an ELEMENT index (RFC #110) in the view's own
+            // dtype: byte address is elem*bytes_per_elem(dtype), NOT elem*STICK_BYTES.
+            let addr = (elem + elem_off as i64) * b_dtype.bytes_per_elem() as i64;
             // Build the resident weight buffer: f16 (raw HBM bytes, no f32 expansion,
-            // half the streamed bytes) when `want_b_f16`, else f32 (decoded).
+            // half the streamed bytes) when `want_b_f16` AND the weight really is f16 —
+            // an FP8 weight's 1-byte codes must always decode, never copy raw.
             let build = || -> Result<UnifiedBuffer, String> {
                 let hbm = ctx.hbm.borrow();
-                if want_b_f16 {
-                    let raw = hbm.read_bytes(addr, n * DType::F16.bytes_per_elem());
+                if want_b_f16 && b_dtype == DType::F16 {
+                    let raw = hbm.read_bytes(addr, n * b_dtype.bytes_per_elem());
                     engine.unified_f16_from_raw(&raw)
                 } else {
-                    let decoded = hbm.read_decoded(addr, n, DType::F16);
+                    let decoded = hbm.read_decoded(addr, n, b_dtype);
                     engine.unified_from(&decoded)
                 }
             };
@@ -1162,14 +1365,14 @@ fn resolve_gemm_operand_unified_off(
             }
             let fingerprint = {
                 let hbm = ctx.hbm.borrow();
-                weight_fingerprint(hbm, addr, n, DType::F16)
+                weight_fingerprint(hbm, addr, n, b_dtype)
             };
             let key = WeightKey {
                 addr,
                 len: n,
                 fingerprint,
                 col_off: 0,
-                f16: want_b_f16,
+                f16: want_b_f16 && b_dtype == DType::F16,
             };
             // Fast path: a hit returns the cached buffer with no further HBM work.
             if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
@@ -1215,6 +1418,7 @@ fn resolve_gemm_weight_slice(
     n: usize,
     col_off: i64,
     b_stride: i64,
+    b_dtype: DType,
     gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
     let GemmResolveCtx {
@@ -1231,14 +1435,16 @@ fn resolve_gemm_weight_slice(
             ));
         }
     };
-    let bpe = DType::F16.bytes_per_elem() as i64;
-    // The pointer SSA value is an ELEMENT index (RFC #110): byte base = elem*bpe.
+    let bpe = b_dtype.bytes_per_elem() as i64;
+    // The pointer SSA value is an ELEMENT index (RFC #110) in the view's own dtype:
+    // byte base = elem*bpe(dtype).
     let base = elem * bpe;
     // Build the [k,n] resident slice. f16: gather raw f16 bytes (half the bytes, no
-    // f32 expansion). f32: decode each strided row to f32.
+    // f32 expansion). f32 — and every FP8 weight, whose 1-byte codes must widen:
+    // decode each strided row.
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
-        if want_b_f16 {
+        if want_b_f16 && b_dtype == DType::F16 {
             let mut raw = Vec::with_capacity(k * n * bpe as usize);
             for r in 0..k as i64 {
                 let row_addr = base + (r * b_stride + col_off) * bpe;
@@ -1249,7 +1455,7 @@ fn resolve_gemm_weight_slice(
             let mut out = Vec::with_capacity(k * n);
             for r in 0..k as i64 {
                 let row_addr = base + (r * b_stride + col_off) * bpe;
-                out.extend_from_slice(&hbm.read_decoded(row_addr, n, DType::F16));
+                out.extend_from_slice(&hbm.read_decoded(row_addr, n, b_dtype));
             }
             engine.unified_from(&out)
         }
@@ -1260,14 +1466,14 @@ fn resolve_gemm_weight_slice(
     // Fingerprint the FULL weight (root identity); col_off keys the slice apart.
     let fingerprint = {
         let hbm = ctx.hbm.borrow();
-        weight_fingerprint(hbm, base, k * b_stride as usize, DType::F16)
+        weight_fingerprint(hbm, base, k * b_stride as usize, b_dtype)
     };
     let key = WeightKey {
         addr: base,
         len: k * n,
         fingerprint,
         col_off,
-        f16: want_b_f16,
+        f16: want_b_f16 && b_dtype == DType::F16,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1292,6 +1498,7 @@ fn resolve_gemm_weight_slice(
 /// CONTIGUOUS block (`n*k` elements at `n_off*k`) — so this is a plain contiguous
 /// read either way. Cached once per process (keyed by `col_off = n_off`).
 #[cfg(metal)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_bt_operand(
     root: Ssa,
     n: usize,
@@ -1317,7 +1524,8 @@ fn resolve_gemm_bt_operand(
     let bpe = b_dtype.bytes_per_elem() as i64;
     // Contiguous [n,k] block: the N-tile is just rows [n_off, n_off+n) on disk.
     let elem_off = n_off * k as i64;
-    // The pointer SSA value is an ELEMENT index (RFC #110): byte addr = elem*bpe.
+    // The pointer SSA value is an ELEMENT index (RFC #110) in the VIEW's dtype:
+    // byte addr = elem·bpe(dtype) — an fp8 weight is 1 byte per element.
     let addr = (elem + elem_off) * bpe;
     let count = n * k;
     // f16: copy the contiguous raw f16 block verbatim (half the bytes). f32: decode
@@ -1346,7 +1554,7 @@ fn resolve_gemm_bt_operand(
         len: count,
         fingerprint,
         col_off: n_off,
-        f16: want_b_f16,
+        f16: want_b_f16 && b_dtype == DType::F16,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1519,6 +1727,33 @@ fn recognize_reduce_combiner(op: &Operation) -> Option<ReduceCombiner> {
     }
 }
 
+/// The `outs` init of a reduce, read as a per-row seed: `outs(%init)` names a
+/// value the context holds; a `[rows]` tile (a partial sum from a blocked
+/// variance chain) yields its data, a scalar tile broadcasts, and anything
+/// unbound or shape-mismatched yields `None` (the caller seeds the combiner
+/// identity, the only case every pre-existing reduce hit — an identity splat).
+#[cfg(metal)]
+fn init_of(op: &Operation, ctx: &crate::context::CoreContext, rows: usize) -> Option<Vec<f32>> {
+    // The `outs` value is named by the `OutsVar` attr or is operand[1] — the two
+    // spellings the interpreter's `reduce` accepts (`head_rewrite`'s `mk_reduce`
+    // uses the attr; `KtirFunc::reduce` used the operand alone).
+    let outs = match op.attr(AttrKey::OutsVar) {
+        Some(crate::ir::Attr::Ssas(v)) => v.first().copied(),
+        _ => op.operands.get(1).copied(),
+    }?;
+    let tile = match ctx.get_value(outs) {
+        Ok(crate::ir::Value::Tile(t)) => t,
+        _ => return None,
+    };
+    if tile.shape.len() == 1 && tile.shape[0] == rows {
+        Some(tile.as_f32().to_vec())
+    } else if tile.shape.is_empty() {
+        Some(vec![tile.as_f32()[0]; rows])
+    } else {
+        None
+    }
+}
+
 /// Run a `linalg.reduce ins(%x) dimensions=[1]` over the last axis of a 2-D
 /// tensor `[rows, cols]` as a GPU reduction (one threadgroup row → one output
 /// element). Binds the reduced `[rows]` tensor (or a scalar if `rows==1` AND the
@@ -1550,8 +1785,23 @@ pub fn run_reduce_gpu(op: &Operation, ctx: &mut crate::context::CoreContext) -> 
     }
     let dtype = x.dtype;
     let kernel = reduce_kernel(combiner, dtype);
+    // ⭐ THE ACCUMULATOR SEED IS THE OP'S `outs` INIT, NOT THE COMBINER IDENTITY.
+    // `linalg.reduce ins(%x) outs(%init)` seeds each row's fold at `init[row]`;
+    // the interpreter folds it unconditionally (`reduce`'s `test_reduce_folds_outs_init`).
+    // Seeding from the combiner identity instead drops a NON-identity init on the
+    // floor — and `rmsnorm_inv`'s column-blocked variance chains exactly that: a
+    // second reduce seeded with the first block's partial sum. Identity-seeding
+    // made the sum cover only the last block's columns (MEASURED at m=64,
+    // hidden=2816: sum-of-squares ~35× too small). `init` may be a `[rows]` tile
+    // (a partial sum) or an unbound/shape-mismatched value (fall back to the
+    // identity, the old behavior).
+    let identity_seed = vec![combiner.identity; rows];
+    let seed: Vec<f32> = match init_of(op, ctx, rows) {
+        Some(v) => v,
+        None => identity_seed,
+    };
     // One output element per row; the kernel folds `cols` along the row.
-    let out = run_reduce_kernel(&kernel, &x.as_f32(), rows, cols, combiner.identity)?;
+    let out = run_reduce_kernel(&kernel, &x.as_f32(), rows, cols, &seed)?;
     // Result shape = input shape with axis 1 removed -> [rows]. (rows>=1; the
     // interpreter only collapses to a scalar when the remaining shape is empty,
     // which can't happen for a 2-D input.)
@@ -1571,8 +1821,9 @@ pub fn run_reduce_gpu(op: &Operation, ctx: &mut crate::context::CoreContext) -> 
 }
 
 /// MSL for a row reduction: each thread folds one row of `cols` elements with the
-/// combiner (sum or max), seeded from `identity` (passed as a buffer so the same
-/// kernel serves both). `rows` is the dispatch width.
+/// combiner (sum or max), seeded from that row's `init` entry (passed as a buffer
+/// so the same kernel serves identity and partial-sum seeds alike). `rows` is
+/// the dispatch width.
 #[cfg(metal)]
 fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
     let ty = msl_type(dtype);
@@ -1590,10 +1841,10 @@ fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
          \x20   device const {ty}* x [[buffer(0)]],\n\
          \x20   device {ty}* out [[buffer(1)]],\n\
          \x20   constant uint& cols [[buffer(2)]],\n\
-         \x20   constant float& identity [[buffer(3)]],\n\
+         \x20   device const float* init [[buffer(3)]],\n\
          \x20   uint row [[thread_position_in_grid]]\n\
          ) {{\n\
-         \x20   float acc = identity;\n\
+         \x20   float acc = init[row];\n\
          \x20   for (uint c = 0; c < cols; c++) {{ float xv = float(x[row * cols + c]); {acc_fold}; }}\n\
          \x20   out[row] = ({ty})acc;\n\
          }}\n",
@@ -1618,16 +1869,17 @@ fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
     }
 }
 
-/// Dispatch the row-reduce kernel: upload `x` (rows*cols, dtype-encoded), pass
-/// `cols`/`identity` as inline bytes, dispatch `rows` threads, read back `rows`
-/// f32. Uses the shared device/queue/pipeline cache (`cached_dispatch`).
+/// Dispatch the row-reduce kernel: upload `x` (rows*cols, dtype-encoded) and the
+/// per-row `init` seed (f32), pass `cols` as inline bytes, dispatch `rows`
+/// threads, read back `rows` f32. Uses the shared device/queue/pipeline cache
+/// (`cached_dispatch`).
 #[cfg(metal)]
 fn run_reduce_kernel(
     kernel: &MslKernel,
     x: &[f32],
     rows: usize,
     cols: usize,
-    identity: f32,
+    init: &[f32],
 ) -> Result<Vec<f32>, String> {
     use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
     use std::ffi::c_void;
@@ -1655,6 +1907,18 @@ fn run_reduce_kernel(
         .ok_or("metal: reduce output buffer alloc failed")?;
 
     let cols_u = cols as u32;
+    // The per-row seed, uploaded f32 (the kernel reads `init[row]` as float).
+    let init_bytes: Vec<u8> = init.iter().flat_map(|f| f.to_ne_bytes()).collect();
+    // SAFETY: `init_bytes` outlives the copy inside newBufferWithBytes.
+    let init_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(init_bytes.as_ptr() as *mut c_void).unwrap(),
+                init_bytes.len().max(1),
+                res,
+            )
+            .ok_or("metal: reduce init buffer alloc failed")?
+    };
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(rows).max(1);
     let (raw, _elapsed) = mtl4::dispatch_readback(
         &device,
@@ -1663,7 +1927,7 @@ fn run_reduce_kernel(
             mtl4::Arg::Buffer(&in_buf),
             mtl4::Arg::Buffer(&out_buf),
             mtl4::Arg::Bytes(&cols_u.to_ne_bytes()),
-            mtl4::Arg::Bytes(&identity.to_ne_bytes()),
+            mtl4::Arg::Buffer(&init_buf),
         ],
         mtl4::Extent::Threads(MTLSize {
             width: rows,
@@ -2093,11 +2357,13 @@ fn matmul_b_axis_offset(name: Ssa, defs: &HashMap<Ssa, &Operation>, last: bool) 
     }
 }
 
-/// Resolve a matmul operand to (resident-root value, FULL 2-D shape).
+/// Resolve a matmul operand to (resident-root value, FULL 2-D shape, the view's dtype).
 /// A forwarded activation is `tensor.extract_slice %src[..]` -> the full src
 /// tensor; a weight is `ktdp.load` of an access tile -> its memory view's full
 /// shape. The per-iteration tile (the [1,64] slice) is intentionally ignored —
-/// we reconstruct the whole GEMM.
+/// we reconstruct the whole GEMM. The dtype is the VIEW's own (`DType::F16` when
+/// the view carries none — the dense default), which is what a W8A8 model's
+/// packed fp8 weight view reports.
 fn matmul_operand_full(
     name: Ssa,
     defs: &HashMap<Ssa, &Operation>,
@@ -2215,17 +2481,26 @@ fn emit_map_region_kernel_with(
         .get(&live_out_name)
         .ok_or("metal: map window live-out has no defining op")?;
 
-    // Lower the live-out's defining op into one MSL expression, accumulating the
-    // external live-in buffers (first-seen order).
-    let mut live_ins: Vec<Ssa> = Vec::new();
-    let expr = lower_map_compute(root, defs, &in_window, &mut live_ins, 0)?;
-
     // out shape/dtype from the live-out op's attrs (default f16, the KTIR tile dtype).
+    // ⭐ KNOWN BEFORE THE EXPRESSION IS LOWERED, because a live-in leaf READS IT:
+    // a live-in whose own shape is SMALLER than the window's output (e.g. the
+    // argsort tie-break's `[1, E, E]` iota-compare consumed by a `[m, E, E]`
+    // window) must be read through a BROADCAST index, not `buf[gid]` — `gid`
+    // runs over the OUTPUT extent and would run off the live-in's buffer. The
+    // interpreter's `broadcast_pair` does this NumPy-style for the same op;
+    // the fused kernel must agree or the two paths silently diverge (MEASURED:
+    // the fused-map argsort produced duplicate ranks for every row but the
+    // first — row 0's gids happen to stay in bounds).
     let out_shape: Vec<usize> = shape_attr_vec(Some(root))
         .ok_or("metal: map window live-out has no shape attribute")?
         .into_iter()
         .map(|d| d as usize)
         .collect();
+
+    // Lower the live-out's defining op into one MSL expression, accumulating the
+    // external live-in buffers (first-seen order).
+    let mut live_ins: Vec<Ssa> = Vec::new();
+    let expr = lower_map_compute(root, defs, &in_window, &mut live_ins, &out_shape, 0)?;
     let out_dtype = match root.attr(AttrKey::Dtype) {
         Some(Attr::Dtype(dt)) => *dt,
         _ => DType::F16,
@@ -2306,6 +2581,7 @@ fn lower_map_compute(
     defs: &HashMap<Ssa, &Operation>,
     in_window: &HashSet<Ssa>,
     live_ins: &mut Vec<Ssa>,
+    out_shape: &[usize],
     depth: usize,
 ) -> Result<String, String> {
     compose_compute_expr(op, &mut |i: usize| -> Result<String, String> {
@@ -2313,7 +2589,7 @@ fn lower_map_compute(
             .operands
             .get(i)
             .ok_or_else(|| format!("metal: {:?} missing operand {i}", op.op_type))?;
-        lower_map_value(name, defs, in_window, live_ins, depth)
+        lower_map_value(name, defs, in_window, live_ins, out_shape, depth)
     })
 }
 
@@ -2324,12 +2600,16 @@ fn lower_map_compute(
 ///     broadcast index expr; if its input is an in-window scalar -> recurse,
 ///   * any other in-window compute op -> recurse,
 ///   * anything else (a load, a value from outside the window, the reduce sum)
-///     -> a LIVE-IN buffer leaf, read `buf[0]` if scalar else `buf[gid]`.
+///     -> a LIVE-IN buffer leaf, read `buf[0]` if scalar, `buf[gid]` if the
+///     live-in's shape equals the window's output shape, else `buf[<broadcast
+///     index>]` (a smaller live-in is broadcast NumPy-style, matching the
+///     interpreter's `broadcast_pair` — `buf[gid]` would run off its buffer).
 fn lower_map_value(
     name: Ssa,
     defs: &HashMap<Ssa, &Operation>,
     in_window: &HashSet<Ssa>,
     live_ins: &mut Vec<Ssa>,
+    out_shape: &[usize],
     depth: usize,
 ) -> Result<String, String> {
     if depth > MAX_FUSE_DEPTH {
@@ -2349,7 +2629,7 @@ fn lower_map_value(
                 .ok_or("metal: tensor.splat missing operand")?;
             Ok(format!(
                 "({})",
-                lower_map_value(inner, defs, in_window, live_ins, depth + 1)?
+                lower_map_value(inner, defs, in_window, live_ins, out_shape, depth + 1)?
             ))
         }
         Some(d) if d.op_type == OpKind::LinalgBroadcast => {
@@ -2381,7 +2661,7 @@ fn lower_map_value(
                 if input_scalar {
                     Ok(format!(
                         "({})",
-                        lower_map_value(input, defs, in_window, live_ins, depth + 1)?
+                        lower_map_value(input, defs, in_window, live_ins, out_shape, depth + 1)?
                     ))
                 } else {
                     // A rank-reducing broadcast of an in-window NON-scalar value
@@ -2408,7 +2688,7 @@ fn lower_map_value(
         // the parenthesizing in `lower_value`.
         Some(d) if in_win => Ok(format!(
             "({})",
-            lower_map_compute(d, defs, in_window, live_ins, depth + 1)?
+            lower_map_compute(d, defs, in_window, live_ins, out_shape, depth + 1)?
         )),
         // A scalar constant (directly or via splat) reached as a plain operand
         // folds to its literal — it would be a `Value::Scalar` at runtime, not a
@@ -2428,7 +2708,7 @@ fn lower_map_value(
         )),
         // Any other value (a load result, a value produced outside the window —
         // e.g. a prior region's output or the reduce sum) is an external input.
-        _ => Ok(map_live_in_leaf(name, defs, live_ins)),
+        _ => map_live_in_leaf(name, defs, live_ins, out_shape),
     }
 }
 
@@ -2455,20 +2735,62 @@ fn try_fold_scalar(name: Ssa, defs: &HashMap<Ssa, &Operation>) -> Option<String>
 
 /// Emit a live-in buffer leaf for `name`: register it (dedup, original SSA) and
 /// return `buf[0]` if it's a scalar (shape product == 1, e.g. the reduce sum),
-/// else `buf[gid]`. `buf` is the sanitized identifier the buffer binding uses.
-fn map_live_in_leaf(name: Ssa, defs: &HashMap<Ssa, &Operation>, live_ins: &mut Vec<Ssa>) -> String {
+/// `buf[gid]` if the live-in's shape equals the window's output shape, else
+/// `buf[<broadcast index>]` — a live-in SMALLER than the output (e.g. the
+/// argsort tie-break's `[1, E, E]` compare consumed by an `[m, E, E]` window)
+/// is broadcast NumPy-style, exactly as the interpreter's `broadcast_pair`
+/// does for the same op. `buf` is the sanitized identifier the buffer binding
+/// uses.
+///
+/// ⛔ `buf[gid]` FOR A SMALLER LIVE-IN READS OUT OF BOUNDS. `gid` runs over the
+/// WINDOW's output extent; a live-in with fewer elements than that gets its
+/// buffer over-read from the first output element past the live-in's own
+/// count — MEASURED as the fused-map argsort producing duplicate ranks for
+/// every row but the first (row 0's gids stay in bounds by coincidence).
+fn map_live_in_leaf(
+    name: Ssa,
+    defs: &HashMap<Ssa, &Operation>,
+    live_ins: &mut Vec<Ssa>,
+    out_shape: &[usize],
+) -> Result<String, String> {
     if !live_ins.contains(&name) {
         live_ins.push(name);
     }
     let buf = buf_ident(name);
-    let scalar = shape_attr_vec(defs.get(&name).copied())
+    let in_shape = shape_attr_vec(defs.get(&name).copied());
+    let scalar = in_shape
+        .as_ref()
         .map(|s| s.iter().product::<i64>() == 1)
         .unwrap_or(false);
     if scalar {
-        format!("{buf}[0]")
-    } else {
-        format!("{buf}[gid]")
+        return Ok(format!("{buf}[0]"));
     }
+    let (Some(in_shape), false) = (in_shape, out_shape.is_empty()) else {
+        return Ok(format!("{buf}[gid]"));
+    };
+    if in_shape.iter().map(|&d| d as usize).collect::<Vec<_>>() == out_shape {
+        return Ok(format!("{buf}[gid]"));
+    }
+    // Right-align the live-in's rank under the output's (leading 1s), the same
+    // normalization `broadcast_pair` applies, and read through the broadcast
+    // index expression. An incompatible shape (an axis neither equal nor 1)
+    // refuses the window — the interpreter handles it correctly instead.
+    let mut padded = vec![1i64; out_shape.len().saturating_sub(in_shape.len())];
+    padded.extend_from_slice(&in_shape);
+    for (s, &o) in padded.iter().zip(out_shape) {
+        if *s as usize != o && *s != 1 {
+            return Err(format!(
+                "metal: live-in %{} shape {in_shape:?} not broadcastable to window output \
+                 {out_shape:?} — window stays on interpreter",
+                name.0
+            ));
+        }
+    }
+    let idx = broadcast_index_expr(
+        &out_shape.iter().map(|&d| d as i64).collect::<Vec<_>>(),
+        &padded,
+    );
+    Ok(format!("{buf}[{idx}]"))
 }
 
 /// Lower a `linalg.broadcast` whose input is an external buffer to `buf[idx]`,
@@ -2624,6 +2946,7 @@ pub fn force_gpu_map() -> bool {
 /// left to the interpreter. Returns `(trigger -> kernel, skip set)`.
 pub type MapRegionPlan = (HashMap<usize, MapRegionKernel>, HashSet<usize>);
 
+#[cfg(metal)]
 pub fn map_fusion_plan(ops: &[Operation]) -> MapRegionPlan {
     // Build the function-wide def map and use map ONCE; share them across every
     // window's emit (the analysis is linear in ops, so per-window rebuilds would
@@ -3183,6 +3506,7 @@ fn cached_dispatch(
     })
 }
 
+#[cfg(metal)]
 pub fn run_kernel(
     kernel: &MslKernel,
     inputs: &[Vec<f32>],
@@ -3254,6 +3578,7 @@ pub fn run_kernel(
 /// the M5 NAX path) require. Compiled from source at runtime because the offline
 /// `xcrun metal` toolchain miscompiles MPP (per scratchy's findings). Returns
 /// `Ok(())` if the source compiles on the system device, else the compiler error.
+#[cfg(metal)]
 pub fn compile_metal4(source: &str) -> Result<(), String> {
     use objc2_foundation::NSString;
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLLanguageVersion, MTLMathMode};
@@ -3294,6 +3619,7 @@ pub const NAX_TILE_K: usize = 16;
 /// via the BaseNAXFrag lane layout → `run` → store with the same layout. Mirrors
 /// scratchy's proven register-fragment `mma` (the metal::tensor `run` overload
 /// has a different, unvalidated output layout — see the kernel body).
+#[cfg(metal)]
 const NAX_MATMUL_TILE_SRC: &str = "\
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -3365,6 +3691,7 @@ using namespace metal;
 /// Run one NAX tile: `C[16×32] = A[16×16] · B[16×32]` on the M5 tensor engine.
 /// `a` is row-major 16×16, `b` is row-major 16×32; returns row-major 16×32.
 /// `Err("no Metal device …")` when no GPU is available, so callers can skip.
+#[cfg(metal)]
 pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
     use objc2_foundation::NSString;
     use objc2_metal::{
@@ -3441,6 +3768,7 @@ pub fn run_nax_matmul_tile(a: &[f32], b: &[f32]) -> Result<Vec<f32>, String> {
 
 /// Reinterpret an `&[f32]` as bytes without a dependency. (The runtime copies
 /// it immediately into a Metal buffer.)
+#[cfg(metal)]
 fn bytemuck_cast(data: &[f32]) -> &[u8] {
     // SAFETY: f32 is plain-old-data; the returned slice covers exactly the same
     // bytes and borrows for the same lifetime.
@@ -3448,6 +3776,7 @@ fn bytemuck_cast(data: &[f32]) -> &[u8] {
 }
 
 /// Reinterpret a `&[u32]` as bytes (for small uniform buffers like dims/codes).
+#[cfg(metal)]
 fn bytemuck_u32(data: &[u32]) -> &[u8] {
     // SAFETY: u32 is plain-old-data; same bytes, same lifetime.
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
@@ -3455,6 +3784,7 @@ fn bytemuck_u32(data: &[u32]) -> &[u8] {
 
 /// Decode a native-endian byte buffer (an MTL4 dispatch's `Vec<u8>` readback,
 /// with no f32 alignment guarantee) into `f32`s.
+#[cfg(metal)]
 fn decode_f32_ne(raw: &[u8]) -> Vec<f32> {
     raw.as_chunks::<4>()
         .0
@@ -3549,6 +3879,7 @@ impl Epilogue {
 /// the other threadgroup half while the current panel feeds the matmuls, hiding
 /// load latency behind compute. Ragged M/N/K are zero-padded on stage and
 /// guarded on store.
+#[cfg(metal)]
 const NAX_MATMUL_SRC: &str = include_str!("../shaders/nax_matmul.metal");
 
 /// Pre-M5 GEMM via `simdgroup_float8x8` — the matrix path available on every

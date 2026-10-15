@@ -123,6 +123,13 @@ impl Session {
     ) -> Result<HashMap<u64, Output>, String> {
         self.exec.run_program(idx, outputs)
     }
+
+    /// The tensor ids a run of program `idx` can leave in observable state — the
+    /// honest readback set for a caller comparing per-node reference values (see
+    /// [`crate::resident::ResidentExecutor::observable_tids`]).
+    pub fn observable_tids(&self, idx: usize) -> Vec<u64> {
+        self.exec.observable_tids(idx)
+    }
 }
 
 #[cfg(test)]

@@ -113,42 +113,42 @@ pub fn register(d: &mut Dispatch) {
 fn addf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    binary_float(op, ctx, "arith.addf", |a, b| a + b)
+    binary_float(op, ctx, env, "arith.addf", |a, b| a + b)
 }
 
 fn subf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    binary_float(op, ctx, "arith.subf", |a, b| a - b)
+    binary_float(op, ctx, env, "arith.subf", |a, b| a - b)
 }
 
 fn mulf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    binary_float(op, ctx, "arith.mulf", |a, b| a * b)
+    binary_float(op, ctx, env, "arith.mulf", |a, b| a * b)
 }
 
 fn divf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    binary_float(op, ctx, "arith.divf", |a, b| a / b)
+    binary_float(op, ctx, env, "arith.divf", |a, b| a / b)
 }
 
 fn remf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
     // operator.mod on floats: numpy/Python `%` — result takes divisor's sign.
-    binary_float(op, ctx, "arith.remf", py_fmod)
+    binary_float(op, ctx, env, "arith.remf", py_fmod)
 }
 
 // ===========================================================================
@@ -178,10 +178,10 @@ fn absf(
 fn maxf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
     // np.maximum — NaN-propagating.
-    binary_float(op, ctx, "arith.maxf", |a, b| {
+    binary_float(op, ctx, env, "arith.maxf", |a, b| {
         if a.is_nan() || b.is_nan() {
             f32::NAN
         } else if a >= b {
@@ -195,18 +195,18 @@ fn maxf(
 fn maxnumf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
     // np.fmax — NaN non-propagating.
-    binary_float(op, ctx, "arith.maxnumf", f32::max)
+    binary_float(op, ctx, env, "arith.maxnumf", f32::max)
 }
 
 fn minf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    binary_float(op, ctx, "arith.minf", |a, b| {
+    binary_float(op, ctx, env, "arith.minf", |a, b| {
         if a.is_nan() || b.is_nan() {
             f32::NAN
         } else if a <= b {
@@ -220,9 +220,9 @@ fn minf(
 fn minnumf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    binary_float(op, ctx, "arith.minnumf", f32::min)
+    binary_float(op, ctx, env, "arith.minnumf", f32::min)
 }
 
 // ===========================================================================
@@ -862,13 +862,23 @@ fn unary_operand(op: &Operation, ctx: &CoreContext, name: &str) -> Result<Value,
 
 /// Float binary op accepting scalar/scalar, tile/tile, or mixed (scalar
 /// broadcast across the tile). Mirrors `_float_binop`.
+///
+/// ⭐ THE LANDING GRID. A tile result lands on IEEE `dtype` by default
+/// ([`Tile::compute`] — NumPy per-op semantics, the vendor oracle's own law),
+/// EXCEPT when the env names this op's result as one of the rmsnorm scalar
+/// chain's sticks: those run as f16-mode SEN169 instructions on card, whose
+/// results carry the DLF16 grid ([`Tile::compute_dlf16`]). The check pairs
+/// with a dtype gate — an f32-typed result never lands DLF16 — and the
+/// scalar/scalar arm is exempt (a Python-float scalar is not a card value).
 fn binary_float(
     op: &Operation,
     ctx: &mut CoreContext,
+    env: &ExecutionEnv,
     name: &str,
     f: fn(f32, f32) -> f32,
 ) -> Result<Option<Value>, String> {
     let (a, b) = two_operands(op, ctx, name)?;
+    let dlf16 = env.lands_dlf16(op);
     match (a, b) {
         (Value::Scalar(x), Value::Scalar(y)) => {
             let x = x
@@ -886,17 +896,18 @@ fn binary_float(
                 })?;
             let data: Vec<f32> = lhs.iter().zip(&rhs).map(|(&p, &q)| f(p, q)).collect();
             let dtype = result_float_dtype(x.dtype, y.dtype);
-            Ok(Some(Value::Tile(Tile::compute(data, dtype, out_shape))))
+            Ok(Some(Value::Tile(landed(data, dtype, out_shape, dlf16))))
         }
         (Value::Tile(x), Value::Scalar(y)) => {
             let y = y
                 .as_f32()
                 .ok_or_else(|| format!("{name}: non-float scalar"))?;
             let data: Vec<f32> = x.as_f32().iter().map(|&p| f(p, y)).collect();
-            Ok(Some(Value::Tile(Tile::compute(
+            Ok(Some(Value::Tile(landed(
                 data,
                 x.dtype,
                 x.shape.clone(),
+                dlf16,
             ))))
         }
         (Value::Scalar(x), Value::Tile(y)) => {
@@ -904,13 +915,25 @@ fn binary_float(
                 .as_f32()
                 .ok_or_else(|| format!("{name}: non-float scalar"))?;
             let data: Vec<f32> = y.as_f32().iter().map(|&q| f(x, q)).collect();
-            Ok(Some(Value::Tile(Tile::compute(
+            Ok(Some(Value::Tile(landed(
                 data,
                 y.dtype,
                 y.shape.clone(),
+                dlf16,
             ))))
         }
         _ => Err(format!("{name}: operand kinds not float-compatible")),
+    }
+}
+
+/// The op's result tile on its card grid: IEEE `dtype` ([`Tile::compute`], the
+/// default) or DLF16 ([`Tile::compute_dlf16`], the rmsnorm scalar chain's
+/// f16-mode SEN169 instructions). See `binary_float`'s doc for the law.
+fn landed(data: Vec<f32>, dtype: DType, shape: Vec<usize>, dlf16: bool) -> Tile {
+    if dlf16 && dtype == DType::F16 {
+        Tile::compute_dlf16(data, dtype, shape)
+    } else {
+        Tile::compute(data, dtype, shape)
     }
 }
 

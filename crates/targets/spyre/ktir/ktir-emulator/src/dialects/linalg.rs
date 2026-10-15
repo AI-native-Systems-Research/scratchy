@@ -442,7 +442,22 @@ fn batch_matmul(
     Ok(Some(Value::Tile(result)))
 }
 
-/// 2-D matmul `A @ B` keeping A's dtype. A is [M, K], B is [K, N].
+/// 2-D matmul `A @ B` keeping A's dtype, EXCEPT over an fp8 weight tile: the
+/// result of a contraction against RAW e4m3 codes is the UN-scaled code-dot
+/// (the scale `mulf` follows the matmul in the dequant form), and a
+/// checkpoint's codes are large precisely because its scales are small — the
+/// dot overflows f16 long before the scale brings it home. The fp8 result
+/// tile is F32 — a RANGE exit for THIS emulator's own IEEE-f16 grid
+/// (MEASURED on gemma-4-26b prefill: q_proj's code-dots reach ~1e5 = inf in
+/// f16, NaN-ing the layer one norm later), NOT a hardware convention: on
+/// RCUDD1A there is no wider fp8 accumulator (vendor `bmm.ddl` types the
+/// ptsum AND pesum internals SEN169_FP16; only Sen1.5 widens), so the CARD
+/// accumulates DLF16 — whose 2^31-scale range absorbs the ~1e5 code-dot
+/// fine, and the card-side "raw-dot inf" sightings were READBACK artifacts
+/// (host readback converts DLF16→IEEE f16, saturating ≥2^16). ⚠ This tile is
+/// therefore FINER than card-true; flipping it to the DLF16 grid couples to
+/// the numeric-gate shape decision (a card-faithful matmul is noisier vs the
+/// f32 golden), so the two move together or not at all.
 fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
     if a.shape.len() != 2 || b.shape.len() != 2 {
         return Err(format!(
@@ -459,7 +474,12 @@ fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
     }
     let n = b.shape[1];
     let data = gemm(m, k, n, &a.as_f32(), &b.as_f32());
-    Ok(Tile::compute(data, a.dtype, vec![m, n]))
+    let out_dtype = if b.dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        a.dtype
+    };
+    Ok(Tile::compute(data, out_dtype, vec![m, n]))
 }
 
 /// Apply the optional `outs` accumulator (operands[2]) of a matmul-family op:
@@ -520,7 +540,13 @@ fn matmul2d_bt(a: &Tile, b: &Tile, op_name: &str) -> Result<Tile, String> {
     } else {
         crate::blas::sgemm_rowmajor_bt(m, k, n, &a.as_f32(), &b.as_f32())
     };
-    Ok(Tile::compute(data, a.dtype, vec![m, n]))
+    // fp8 weight tile ⇒ F32 result (the un-scaled code-dot): see `matmul2d`.
+    let out_dtype = if b.dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        a.dtype
+    };
+    Ok(Tile::compute(data, out_dtype, vec![m, n]))
 }
 
 // ===========================================================================
@@ -561,6 +587,15 @@ fn reduce(
             .map(|o| o.op_type)
     })
     .unwrap_or(OpKind::ArithAddf);
+
+    // ⭐ THE ACCUMULATE CLASS: `addf`/`mulf` reduces are the card's FMA-accumulated
+    // templates (`sum`/`mean`/`exx2` — `summeanmaxexx2.ddl`, `exx2_fwd.smc`), whose
+    // accumulator is DLF16 (`SEN169_FP16`, see `codec::round_dlf16`), so an f16
+    // reduce's per-round partials round THERE — not to IEEE f16, whose 65504
+    // ceiling and subnormal band the card's accumulator does not have. Compare-class
+    // combiners (`maxf`/`minf`) never accumulate — loaded values compare exactly —
+    // so their partial rounding stays the storage dtype.
+    let fma_accum = matches!(reduce_fn, OpKind::ArithAddf | OpKind::ArithMulf);
 
     // SHORTHAND (no region): fold `reduce_fn` directly. This used to synthesize a
     // one-op region over invented block-argument NAMES (`"__reduce_in__"`,
@@ -610,12 +645,17 @@ fn reduce(
     // (This reorders element groupings vs. MLIR's left-associative scalar loop for
     // multi-axis f16 — the documented Python xfail `test_reduce_multi_axis_treefold_bug`
     // — but is the implemented behavior the oracle prescribes.)
+    let reducer = Reducer {
+        bb0_names: &bb0_names,
+        body_ops: &body_ops,
+        fast_combine,
+        fma_accum,
+    };
     let (mut data, mut shape) = (tile.as_f32().to_vec(), tile.shape.clone());
     let mut reduced_value = match &dims {
         None => {
             // Collapse all: flatten then fold to a single scalar.
-            let (folded, _) =
-                tree_fold(&tile, None, &bb0_names, &body_ops, fast_combine, ctx, env)?;
+            let (folded, _) = tree_fold(&tile, None, &reducer, ctx, env)?;
             Value::Scalar(Scalar::F32(folded[0]))
         }
         Some(ds) if ds.is_empty() => {
@@ -628,8 +668,7 @@ fn reduce(
             sorted.sort_unstable();
             for &d in sorted.iter().rev() {
                 let cur = Tile::compute(data.clone(), tile.dtype, shape.clone());
-                let (folded, fshape) =
-                    tree_fold(&cur, Some(d), &bb0_names, &body_ops, fast_combine, ctx, env)?;
+                let (folded, fshape) = tree_fold(&cur, Some(d), &reducer, ctx, env)?;
                 data = folded;
                 shape = fshape;
             }
@@ -639,6 +678,22 @@ fn reduce(
             }
             if shape.is_empty() {
                 Value::Scalar(Scalar::F32(data[0]))
+            } else if fma_accum && tile.dtype == DType::F16 {
+                // ⭐ THE LANDING — the fma-class law's second half. The raw sum is
+                // a program-level fiction the door always fuses: `sum · INV_D` is
+                // re-assembled into the exx2 descriptor, whose DLF16 accumulator
+                // holds the sum and whose f16 output is the scaled MEAN. Rounding
+                // this landing to the f16 grid would turn the 12b's layer-18/22/48
+                // sums (89,771 / 94,669 / 91,950) into inf and zero the norm. Land
+                // the DLF16-folded value as decoded f32 (an F16 tile stores rounded
+                // f32 — the f32 arm). The consumer's scaled MEAN lands on the
+                // DLF16 grid too on card (the exx2scale rides the same SEN169
+                // accumulator; the emulator's `·INV_D` multiply carries
+                // `Tile::compute_dlf16` for exactly the rmsnorm chains, via
+                // `comm_sched::rmsnorm_scalar_sticks`) — the earlier claim that the
+                // consumer's IEEE-f16 multiply is the card's materialization point
+                // was this emulator's own behavior, not the card's.
+                Value::Tile(Tile::from_decoded(data, tile.dtype, shape, None, None))
             } else {
                 Value::Tile(Tile::compute(data, tile.dtype, shape))
             }
@@ -725,7 +780,9 @@ fn reduce(
 ///
 /// Each closure matches the corresponding `arith` handler exactly (incl. the
 /// NaN-propagating `maximumf`/`minimumf` vs the `*numf` fmax/fmin variants); the
-/// caller rounds the result to the tile dtype each round, mirroring how the
+/// caller rounds the partials each round to the accumulator the combiner's class
+/// uses on the card — DLF16 for the FMA-accumulated `addf`/`mulf` (see
+/// `fast_tree_fold`'s doc), the storage dtype otherwise — mirroring how the
 /// region path's `Tile::compute` rounds after every combine.
 fn reduce_combiner(op_name: OpKind) -> Option<fn(f32, f32) -> f32> {
     Some(match op_name {
@@ -757,6 +814,18 @@ fn reduce_combiner(op_name: OpKind) -> Option<fn(f32, f32) -> f32> {
     })
 }
 
+/// The reduce's combiner, both spellings beside the law that picks between them:
+/// the region (`bb0_names` + `body_ops`) the general path executes pairwise, the
+/// recognized `fast_combine` the fast path folds the f32 buffer with, and
+/// `fma_accum` — whether the accumulator class rounds its per-round partials to
+/// the card's DLF16 grid (the fma-class f16 reduce's own law).
+struct Reducer<'a> {
+    bb0_names: &'a [Ssa],
+    body_ops: &'a [Operation<'static>],
+    fast_combine: Option<fn(f32, f32) -> f32>,
+    fma_accum: bool,
+}
+
 /// Reduce `tile` along `dim` by folding the combiner region pairwise.
 ///
 /// Splits the reduced axis in half, combines the two halves with one
@@ -766,9 +835,7 @@ fn reduce_combiner(op_name: OpKind) -> Option<fn(f32, f32) -> f32> {
 fn tree_fold(
     tile: &Tile,
     dim: Option<usize>,
-    bb0_names: &[Ssa],
-    body_ops: &[Operation<'static>],
-    fast_combine: Option<fn(f32, f32) -> f32>,
+    reducer: &Reducer<'_>,
     ctx: &mut CoreContext,
     env: &ExecutionEnv,
 ) -> Result<(Vec<f32>, Vec<usize>), String> {
@@ -790,8 +857,15 @@ fn tree_fold(
     // the f32 buffer with strided indexing — no per-round `slice_along` Tiles, no
     // region dispatch. Bit-identical to the region path below (same pairwise tree
     // order, same per-round dtype rounding).
-    if let Some(f) = fast_combine {
-        return Ok(fast_tree_fold(acc, shape, axis, tile.dtype, f));
+    if let Some(f) = reducer.fast_combine {
+        return Ok(fast_tree_fold(
+            acc,
+            shape,
+            axis,
+            tile.dtype,
+            f,
+            reducer.fma_accum,
+        ));
     }
 
     let mut n = shape[axis];
@@ -801,8 +875,8 @@ fn tree_fold(
         let (right_data, right_shape) = slice_along(&acc, &shape, axis, half, 2 * half);
 
         let combined = run_combiner(
-            bb0_names,
-            body_ops,
+            reducer.bb0_names,
+            reducer.body_ops,
             Tile::compute(left_data, tile.dtype, left_shape.clone()),
             Tile::compute(right_data, tile.dtype, right_shape),
             ctx,
@@ -841,12 +915,30 @@ fn tree_fold(
 /// with `i+half`) instead of materializing two slice Tiles and dispatching the
 /// combiner op each round. This is what makes `linalg.reduce` cheap on the hot
 /// `addf`-sum path the real model emits.
+///
+/// ⭐ THE PER-ROUND ROUNDING IS THE ACCUMULATOR, NOT THE STORAGE: for an F16
+/// reduce whose combiner is FMA-accumulated on the card (`fma_accum` — the
+/// `addf`/`mulf` sum/mean/exx2 templates), partials live in the SFP_FMA
+/// accumulator across rounds, and that accumulator is DLF16 (`SEN169_FP16`:
+/// 6-bit exponent, 9-bit mantissa, no subnormals, magnitudes to ~8.58e9 —
+/// `codec::round_dlf16`'s doc is the law). Rounding them to IEEE f16 instead
+/// overflows at Σx² > 65504 (gemma-4-12b's layer-18/22/48 norm rows sit at
+/// Σx² 89-95k — `rsqrt(inf) = 0`, exact-zero norms) and crushes small-row
+/// partials in f16's subnormal band, which DLF16 does not have. Compare-class
+/// combiners and non-F16 dtypes keep the storage-dtype rounding. The fma-class
+/// reduce's FINAL value lands on the DLF16 grid too (`reduce`'s landing arm —
+/// the door fuses `sum·INV_D` into one descriptor, so the card never stores the
+/// raw sum in f16; the scaled MEAN the chain continues with is itself a SEN169
+/// value on card, which the emulator states through the scalar-chain DLF16
+/// landing, not an IEEE-f16 materialization). Compare-class reduces land on the
+/// storage dtype as before.
 fn fast_tree_fold(
     mut acc: Vec<f32>,
     mut shape: Vec<usize>,
     axis: usize,
     dtype: DType,
     f: fn(f32, f32) -> f32,
+    fma_accum: bool,
 ) -> (Vec<f32>, Vec<usize>) {
     let outer: usize = shape[..axis].iter().product();
     let inner: usize = shape[axis + 1..].iter().product();
@@ -872,7 +964,11 @@ fn fast_tree_fold(
                 next[dst..dst + inner].copy_from_slice(&acc[src..src + inner]);
             }
         }
-        crate::codec::round_to_dtype(&mut next, dtype);
+        if fma_accum && dtype == DType::F16 {
+            crate::codec::round_dlf16_in_place(&mut next);
+        } else {
+            crate::codec::round_to_dtype(&mut next, dtype);
+        }
         acc = next;
         n = new_n;
         shape[axis] = n;
@@ -1536,6 +1632,39 @@ mod tests {
         .unwrap();
         let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
+    }
+
+    #[test]
+    fn matmul_over_fp8_weights_keeps_the_prescale_dot_in_f32() {
+        // The dequant form is `scale ⊙ (A · codes)`; the contraction output is
+        // the UN-scaled code-dot, and a real checkpoint's codes are large
+        // exactly because its per-channel scales are small (gemma-4-26b
+        // q_proj: codes rms 84, scales ~2.6e-4, dots ~1e5). Rounding that dot
+        // to the activation's f16 overflows to inf and NaNs the layer one norm
+        // later — MEASURED on the 26b's first prefill. Pin both facts: the
+        // result tile is F32, and a code-dot far past f16's 65504 comes back
+        // finite.
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        // A [1, 8] of 300s against codes [8, 2] of 300s: the e4m3 grid rounds
+        // 300 to 288 (binade [256, 512), ulp 32), so the dot is 8·300·288 =
+        // 691200 — an order of magnitude past f16's 65504.
+        ctx.set_value(
+            ops.ssa("%a"),
+            Value::Tile(Tile::compute(vec![300.0; 8], DType::F16, vec![1, 8])),
+        );
+        let codes = Tile::compute(vec![300.0; 16], DType::Fp8E4m3, vec![8, 2]);
+        ctx.set_value(ops.ssa("%b"), Value::Tile(codes));
+        let r = ops.ssa("%r");
+        run(
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"])],
+            &mut ctx,
+        )
+        .unwrap();
+        let t = get_tile(&ctx, r);
+        assert_eq!(t.dtype, DType::F32, "fp8 contraction result must be F32");
+        assert_eq!(t.shape, vec![1, 2]);
+        assert_eq!(t.as_f32().to_vec(), vec![691_200.0; 2]);
     }
 
     #[test]

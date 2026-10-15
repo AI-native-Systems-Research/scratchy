@@ -554,7 +554,9 @@ impl Recording<'_> {
             InputRef::Ext(e)
                 if matches!(
                     self.l.bindings[*e],
-                    SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. }
+                    SourceBinding::Weight { .. }
+                        | SourceBinding::WeightScale { .. }
+                        | SourceBinding::BundleTensor { .. }
                 ) =>
             {
                 Some(*e)
@@ -570,9 +572,9 @@ impl Recording<'_> {
     /// A weight's layer: its unroll index, else 0.
     fn layer(&self, e: usize) -> LayerId {
         match &self.l.bindings[e] {
-            SourceBinding::Weight { index, .. } | SourceBinding::WeightScale { index, .. } => {
-                LayerId(index.map_or(0, |u| u.0 as u32))
-            }
+            SourceBinding::Weight { index, .. }
+            | SourceBinding::WeightScale { index, .. }
+            | SourceBinding::BundleTensor { index, .. } => LayerId(index.map_or(0, |u| u.0 as u32)),
             _ => LayerId(0),
         }
     }
@@ -586,7 +588,9 @@ impl Recording<'_> {
     /// else a trailing numeral path segment (`merger_mlp_2` → 2).
     fn layer_with_path(&self, e: usize) -> LayerId {
         match &self.l.bindings[e] {
-            SourceBinding::Weight { id, index } | SourceBinding::WeightScale { id, index } => {
+            SourceBinding::Weight { id, index }
+            | SourceBinding::WeightScale { id, index }
+            | SourceBinding::BundleTensor { id, index, .. } => {
                 if let Some(u) = index {
                     return LayerId(u.0 as u32);
                 }
@@ -607,9 +611,14 @@ impl Recording<'_> {
     /// the numeral here: the layer is appended again downstream, which yields `merger_mlp_0_0` /
     /// `merger_mlp_2_2` and still resolves no safetensors key. It belongs at the accessor-NAME
     /// composition site, which must carry (base, layer) as a pair instead of a string.
+    /// A weight's accessor base: its path joined with `_`, less a trailing `_<digits>`. A
+    /// `BundleTensor` binding names the BUNDLE's path — the tensor inside it resolves by
+    /// `WeightTensor` at command lowering, so the base is the bundle's own.
     fn base(&self, i: usize, e: usize) -> Result<String, StepRefusal> {
         match &self.l.bindings[e] {
-            SourceBinding::Weight { id, .. } | SourceBinding::WeightScale { id, .. } => {
+            SourceBinding::Weight { id, .. }
+            | SourceBinding::WeightScale { id, .. }
+            | SourceBinding::BundleTensor { id, .. } => {
                 let mut joined = self.facts.weight_paths[*id as usize].join("_");
                 if let Some(pos) = joined.rfind('_')
                     && joined[pos + 1..].parse::<u32>().is_ok()
@@ -1951,7 +1960,7 @@ impl Recording<'_> {
             }
             L::Elementwise(E::GeluErf) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluErf))?,
             L::Elementwise(E::Relu2) => unary(&|i, o, w| S::Activation(i, o, w, Act::Relu2))?,
-            L::TanhSoftCap => unary(&S::TanhSoftCap)?,
+            L::TanhSoftCap { .. } => unary(&S::TanhSoftCap)?,
             L::RmsNorm { gain, .. } => self.norm(i, gain)?,
             L::MatmulTile { .. } => {
                 let sampled = self
@@ -2030,12 +2039,14 @@ impl Recording<'_> {
                     rotated.then_some(site).into_iter().collect::<Vec<_>>()
                 };
                 use AttnMask::{Causal, SlidingWindow as Sliding};
+                // `Sliding` matches ANY window size — this dispatch cares only
+                // about the CLASS (which kernel lowers), never the span.
                 let (step, sites) = match (self.l.input.ops[i].m > 1, mask) {
-                    (true, Sliding) => {
+                    (true, Sliding { .. }) => {
                         (S::SlidingAttentionPrefillPaged(q, out, layer, neox), vec![])
                     }
                     (true, Causal) => (S::AttentionPrefillPaged(q, out, layer, neox), vec![]),
-                    (false, Sliding) => (
+                    (false, Sliding { .. }) => (
                         S::SlidingAttentionViaCache(q, out, layer, pairing),
                         rotary(),
                     ),

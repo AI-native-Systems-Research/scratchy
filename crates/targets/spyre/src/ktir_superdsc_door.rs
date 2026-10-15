@@ -33,8 +33,8 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at, scalarmul,
-    silumul, split_out,
+    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at,
+    route_renorm, route_softmax, scalarmul, silumul, split_out,
 };
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
@@ -62,10 +62,19 @@ use ktir_superdsc::placement::BundleLayout;
 /// error naming them, never a descriptor built on a default.
 #[derive(Clone, Copy, Debug)]
 pub struct BundleAttnParams {
-    /// main's `SubOp::AttnDecode { geom }` — the model's head geometry, as the VALUE the two doors
-    /// below turn into const generics.
-    pub geom: ktir_superdsc::head_counts::ModelAttnGeometry,
     /// main's `lower_one_node(.., rows_are_requests, ..)`.
+    ///
+    /// ⛔ THE GEOMETRY IS NO LONGER HERE, AND THE REASON IS THE HYBRID MODEL. This used to carry the
+    /// bundle's ONE `SubOp::AttnDecode { geom }` — a fact under the assumption that one `#[forward]`
+    /// expansion has one attention geometry. Gemma-4 falsifies that assumption: its sliding layers run
+    /// (nqh=16, nkvh=8, hd=256) and every sixth layer runs a GLOBAL class (nqh=16, nkvh=1, hd=512), so
+    /// one graph carries TWO and no per-bundle value can describe both. The program's own views state
+    /// the geometry of the attention they compute (`q`'s view is `[mq, nqh·hd]`, a kv stream's is
+    /// `[·, nkvh·hd]`, and its first access tile on `q` is `hd` wide), so the door MINTS the geometry
+    /// there — the same reading rope already does for its head dim, and the same direction the scale,
+    /// `mq` and the swept extent all took: facts the program states are read from the program, and a
+    /// fact only the caller knows stays a caller's argument. The row KIND is the one that stays: no
+    /// program states it, for the reason its own comment gives.
     pub rows_are_requests: bool,
     /// ⭐ WHETHER THIS BUNDLE'S ATTENTION READS THE PAGED KV THROUGH AN INDEX — the batched rungs'
     /// per-page gather (`rows_are_requests`) or the one-request rung's split-KV chunk
@@ -84,19 +93,23 @@ pub struct BundleAttnParams {
     /// PROGRAM sweeps one page whatever the rung, so the chunk width cannot be read back from it, and it
     /// is folded into the bundle fingerprint for exactly that reason. `None` = the per-page fold.
     pub chunk_pages: Option<u32>,
-    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION SCALE WAS FOLDED INTO `W_q`/`W_k` — and it is here because
-    /// the fold makes the program UNABLE to state the one fact that remains.
+    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION SCORE SCALE IS CARRIED BY THE STAGED WEIGHTS — and it is
+    /// here because both cases that make it so leave the program UNABLE to state the one fact that
+    /// remains.
     ///
     /// The score multiplier was the one thing the program stated and the door read back
-    /// (`program_score_scale`, on the `qk · scale` mulf). The fold rewrites the node's scale to 1.0
+    /// (`program_score_scale`, on the `qk · scale` mulf). A FOLD rewrites the node's scale to 1.0
     /// before the splice mints the program, and the triton→ktir pipeline folds a multiply by 1.0
     /// away entirely — so a folded attention program states NO multiplier, which is the truth (no
-    /// device multiply is left to do: the weights carry `√scale` each) but is indistinguishable, at
-    /// the door, from a broken program. This bool is the caller's statement of which one it is, and
-    /// the door HARD-REFUSES a multiplier-less program without it — a fact about what the program
-    /// cannot say, not a value duplicated from what it does (the caller-stated `f32` this struct
-    /// once carried beside the program's own reading, and lost for exactly that reason).
-    pub scale_folded: bool,
+    /// device multiply is left to do: the weights carry `√scale` each). A model whose attention
+    /// scale genuinely IS 1.0 (gemma-4's arch defaults `attention_multiplier` to it) states none
+    /// either, for the same reason and just as truthfully — `√1.0` leaves the weights carrying
+    /// the whole scale with nothing folded. This bool is the caller's statement that one of those
+    /// two is the case, and the door HARD-REFUSES a multiplier-less program without it — a fact
+    /// about what the program cannot say, not a value duplicated from what it does (the
+    /// caller-stated `f32` this struct once carried beside the program's own reading, and lost
+    /// for exactly that reason).
+    pub scale_in_weights: bool,
     /// ⭐ WHETHER THIS BUNDLE'S o_proj READS THE HEAD-MAJOR COPY — the finalize/weight contract of
     /// the multi-slab single-row body, and the SECOND fact the program cannot state.
     ///
@@ -165,6 +178,22 @@ pub fn lower(
         Program::Elementwise(ew) => elementwise(name, ew, &r, &[], sym_id_base, layout),
         Program::SiluMul => silumul(name, &r, sym_id_base, layout),
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
+        Program::RmsNormUnit => lk::rmsnorm_unit(name, k, &r, sym_id_base, layout),
+        // The fused per-head norm sandwich — the door derives its geometry off the
+        // program's own views (one head's window is the output's first access tile).
+        Program::WindowedRmsNorm { .. } => lk::windowed_rmsnorm(name, k, &r, sym_id_base, layout),
+        Program::TanhSoftCap => lk::tanhsoftcap(name, k, &r, sym_id_base, layout),
+        // The router's row softmax/renorm — no geometry door to cross, no registry
+        // const to resolve: the whole chain is data-driven and the body is the
+        // rmsnorm's structure with the softmax's primitives in it.
+        Program::RouteSoftmax => route_softmax(name, &r, sym_id_base, layout),
+        Program::RouteRenorm => route_renorm(name, &r, sym_id_base, layout),
+        // The expert MLP's gated activation — silumul's body with the act's own
+        // device primitive (key `"silu"`/`"gelu"`, the wire `gelufwd` coming from
+        // the OpFunc), over the pair rows the sort laid out.
+        Program::ExpertGatedAct(act) => lk::gated_act(name, act, &r, sym_id_base, layout),
+        Program::ScalarWeightMul => lk::scalarweightmul(name, &r, sym_id_base, layout),
+        Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),
         Program::Matmul => matmul(
             name,
@@ -200,6 +229,57 @@ pub fn lower(
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
         // above, whose head geometry has to become const generics on this side.
         Program::Transpose => lk::transpose(name, &r, sym_id_base, layout),
+        // ── THE MoE ROUTING + EXPERT OPS — the router's bare corners (an
+        // argsort whose ranks feed anything but the fused pair, a gather
+        // whose ids arrive from anywhere else) plus the expert chain. The
+        // EMULATOR runs these programs' ops directly (`ktir_groups` ignores
+        // the Program field off-card), so these doors only fire under
+        // `-Fspyre-hw`. Each row's expert indices sorted by ascending
+        // score, AS THE RANK VECTOR — the compare/reduce form the emu
+        // states, one `j` at a time with every token riding the mb axis
+        // (see the door's own doc for the 7E+1 chain and the pad-mask
+        // sanitize that makes it correct).
+        Program::RouteArgsort => lk::route_argsort(name, &r, sym_id_base, layout),
+        // The fused vendor top-k pair over the RAW LOGITS — the argsort and
+        // the score gather folded into it (the splice's two router folds),
+        // so the program's parameters are `[lg, vals, ids]` in the mint
+        // order. The door stages to `[m_pad, W]` (the add-form pad-row
+        // sanitize at `W > E`), Kᵀ-restickifies to the pair's
+        // token-sticked orientation, runs `topkindex`/`topkvalue` at 64
+        // slots, and lands both token-major `[m_pad, 64]` — the ids scan
+        // positions, unique by construction, never the duplicate-rank sums
+        // that faulted the 26b card's FETCH (wall 11). See the door's own
+        // doc for the full chain.
+        Program::RouteTopK => lk::route_topk(name, &r, sym_id_base, layout),
+        // The scores at the chosen indices — a ONE-HOT SELECT over the score
+        // row (equal the per-row index against the iota columns, mask, reduce)
+        // rather than an indirect access tile: no data-dependent memory
+        // traffic, the same compare/reduce machinery as the doors before it.
+        // 6k-2 ops, per slot; see the door's own doc.
+        Program::RouteGatherScores => lk::route_gather_scores(name, &r, sym_id_base, layout),
+        // Each score times its expert's learned scale — the gather door's own
+        // one-hot select with the LOADED [E] scale row as the parent, then the
+        // score riding the matched lane through the reduce. 7k-2 ops; see the
+        // door's own doc.
+        Program::RouteExpertScale => lk::route_expert_scale(name, &r, sym_id_base, layout),
+        // The (token, slot) pair rows — `k` identity legs at stick-aligned column
+        // offsets, the gathered regime's own statement that the permutation is a
+        // no-op (metal's gathered bake emits nothing and reads token rows k times).
+        Program::ExpertSort => lk::expert_sort(name, &r, sym_id_base, layout),
+        // The pair rows back in token order — ONE identity over the whole
+        // `[m, k·w]` tile, the materialized no-op of the same regime.
+        Program::ExpertUnsort => lk::expert_unsort(name, &r, sym_id_base, layout),
+        // The pair rows weighted by their routing scores and summed back into
+        // the token stream — the per-slot fma chain, the add legs
+        // accumulating into one scratch (in place, the softmax's own
+        // destination-reuse law) and the final add writing the output.
+        Program::ExpertCombine => lk::expert_combine(name, &r, sym_id_base, layout),
+        // One projection of each pair's expert over the stacked `[E·out, in]`
+        // fp8 bank — the gathered W8A8 body: the index converted to u32, the
+        // expert slabs and scales gathered into pair-indexed scratch, then the
+        // dense body's own per-pair `matmulfp8` + dequant at baked offsets.
+        // See the door's own doc for the five legs and the gather laws.
+        Program::ExpertMatmul => lk::expert_matmul(name, &r, sym_id_base, layout, quantized),
     }
 }
 
@@ -218,9 +298,20 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for AttnAt<'_> {
 
 /// ⭐ THE DOOR. main's `lower_attn_node` read its cache identity off `node.inputs` and `ir.tensors`,
 /// its geometry and multiplier off the node's `SubOp`, and `active_cap`/`rows_are_requests` off its
-/// call site. The first group the PROGRAM states, so `attn_at` reads it there (`attn_operands`); the
-/// rest are [`BundleAttnParams`], main's own remaining parameters, stated for this bundle by the
-/// caller. `mq` is [`KtirNode::out_shape`]'s row count, which is what main's `TileOp` `mb` dim was.
+/// call site. The cache identity and multiplier the PROGRAM states, so `attn_at` reads them there
+/// (`attn_operands`); the row kind is [`BundleAttnParams`], main's own walk parameter, stated for
+/// this bundle by the caller. `mq` is `q`'s own view's row count, which is what main's `TileOp` `mb`
+/// dim was.
+///
+/// ⭐⭐ THE GEOMETRY IS MINTED HERE, OFF THE PROGRAM'S OWN VIEWS. It used to ride the bundle as one
+/// `SubOp::AttnDecode { geom }` per expansion — sound only while one model had one attention class.
+/// Gemma-4's layers alternate a SLIDING class (nqh=16, nkvh=8, hd=256) with a GLOBAL one
+/// (nqh=16, nkvh=1, hd=512), so one graph carries two and no per-bundle value describes both. The
+/// program states its own: `q`'s view is `[mq, nqh·hd]`, a kv stream's is `[·, nkvh·hd]`, and the
+/// first access tile over `q` is `hd` wide — the same three readings `attn_operands` already makes
+/// under a caller-stated geometry, so minting from them is not a new derivation but the existing one
+/// with its input source moved. The GQA divisibility proof is spent at the same `mint` it always
+/// was; a program whose views do not divide is a build error naming them.
 fn attn(
     name: &str,
     k: &KtirNode,
@@ -231,17 +322,79 @@ fn attn(
 ) -> Result<Vec<EmittedOp>, Error> {
     let p = attn_params.ok_or_else(|| Error {
         message: format!(
-            "{name}: an attention program reached the lowering with no `BundleAttnParams`. Its head \
-             geometry and multiplier are the model's (main reads them off `SubOp::AttnDecode`) and \
-             its swept rung and row kind are this bundle's (main's own walk parameters) — no KTIR \
-             states any of the four, so the caller must state them at the door."
+            "{name}: an attention program reached the lowering with no `BundleAttnParams`. Its row \
+             kind is this bundle's (main's own walk parameter — whether its rows are separate \
+             requests or one prompt's positions) and no KTIR states it, so the caller must state it \
+             at the door."
+        ),
+    })?;
+    // ── THE PROGRAM'S OWN GEOMETRY ── `q` is parameter 0 (checked against the store order in
+    // `attn_operands`); a kv stream is the first K view after `q`/`out`; the head dim is the first
+    // access tile's width over `q` — the tile whose corner is `arith.constant` at decode and
+    // `pid·hd` at prefill, so the TILE's own Shape is the one reading that holds at both.
+    let q = r.first().ok_or_else(|| Error {
+        message: format!(
+            "{name}: an attention program states {} parameter(s); its construction mints at least \
+             six (q, out, and each segment's K then V)",
+            r.len()
+        ),
+    })?;
+    let kv_cols = {
+        // The runtime length mask is a SYNTHETIC parameter (`[1, cap]`) that `KtirFunc::attn` mints
+        // between `out` and the segments — `attn_operands` filters it by `k.mask`, and so does this
+        // reading, or the mask's capacity would be read as a kv stream's width.
+        let mask_tid = k.mask.map(|b| b.get());
+        r.iter().skip(2).find_map(|x| {
+            (x.tid != q.tid && Some(x.tid) != mask_tid && !x.is_out).then_some(x.v_cols)
+        })
+    };
+    let (Some(q_cols), Some(kv_cols), Some((_, hd))) = (
+        Some(q.v_cols),
+        kv_cols,
+        lk::param_first_tile(&k.func, &k.func.arguments[0].0),
+    ) else {
+        return Err(Error {
+            message: format!(
+                "{name}: the program does not state a complete geometry — `q`'s view is \
+                 `[{}, ·]`, a kv stream is {} wide, and `q`'s first access tile is {} — one of the \
+                 three is absent, so the head counts this door needs cannot be read off it",
+                q.v_rows,
+                kv_cols
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "missing".into()),
+                lk::param_first_tile(&k.func, &k.func.arguments[0].0)
+                    .map(|(_, c)| c.to_string())
+                    .unwrap_or_else(|| "absent".into()),
+            ),
+        });
+    };
+    if hd == 0 || q_cols % hd != 0 || kv_cols % hd != 0 {
+        return Err(Error {
+            message: format!(
+                "{name}: the program's own views do not divide into a geometry — `q` is {q_cols} \
+                 wide, a kv stream {kv_cols}, the head-dim window {hd}; a head must tile both \
+                 widths exactly or no GQA grouping exists"
+            ),
+        });
+    }
+    let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+        ktir_superdsc::head_counts::QueryHeads::new(q_cols / hd),
+        ktir_superdsc::head_counts::KvHeads::new(kv_cols / hd),
+        ktir_superdsc::head_counts::HeadDim::new(hd),
+    )
+    .ok_or_else(|| Error {
+        message: format!(
+            "{name}: the geometry read off the program's views (nqh={}, nkvh={}, head_dim={hd}) has \
+             no GQA grouping — the kv-head count does not divide the query-head count, so \
+             `AttnGeometry` cannot be named at it",
+            q_cols / hd,
+            kv_cols / hd,
         ),
     })?;
     // ⭐⭐ THE ONE PLACE THE MODEL'S HEAD GEOMETRY STOPS BEING VALUES for the attention path — the SAME
-    // door `lower_one_node` crossed, on the SAME value it crossed it with (carried, not re-minted, so
-    // the GQA division is still evaluated exactly once).
+    // door `lower_one_node` crossed, now crossed with the geometry the program itself states.
     scratchy_subtile::model_geometry::with_config_attn_geometry(
-        p.geom,
+        geom,
         AttnAt(lk::AttnAt {
             name,
             k,
@@ -249,7 +402,7 @@ fn attn(
             rows_are_requests: p.rows_are_requests,
             gathers_kv: p.gathers_kv,
             chunk_pages: p.chunk_pages,
-            scale_folded: p.scale_folded,
+            scale_in_weights: p.scale_in_weights,
             headmajor_handoff: p.headmajor_handoff,
             sym_id_base,
             layout,
@@ -257,7 +410,7 @@ fn attn(
     )
     .ok_or_else(|| Error {
         message: format!(
-            "{name}: AttnDecode geometry has no const-generic instantiation. The head counts and \
+            "{name}: AttnDecode geometry ({geom}) has no const-generic instantiation. The head counts and \
              the head dim parameterise the device layout (GQA grouping, slabs, head strides), so \
              they must be consts, not values. The instantiations are read from the model configs in \
              scope ({}); this geometry belongs to none of them.",
@@ -328,6 +481,25 @@ fn rope(
             ins[0].c_len,
         ));
     }
+    // ⛔ THE WHOLE-TENSOR ROW WINDOW, THE 2a LAW. `rope.py`'s per-row form states a row window
+    // (`R_START` baked into every access tile's corner) — the producer's per-position
+    // decomposition mints one rope node per tail row, and the splice compiles each one. But
+    // `RopeAt` addresses the buffers at their BASES, so a window whose corner is not the
+    // tensor's first row would lower to ops that read and write every position shifted by
+    // the corner — a silently wrong answer, not a loud one. Refusing here names the gap at
+    // the door itself; the row-base extension (an `R_START`-scaled base per buffer) is the
+    // 2b worklist item. A whole-region rope states `R_START = 0` and passes untouched.
+    for (x, role) in [(&ins[0], "the `x` view"), (&out, "the `out` view")] {
+        if x.r_cover != (0, x.v_rows) {
+            return err(format!(
+                "{name}: {role} covers rows [{}, {}) of {} — a per-row rope window. `RopeAt` \
+                 addresses the buffer base, so lowering a windowed rope would shift every \
+                 position by the window's corner. The row-base extension is the 2b worklist \
+                 item; until it lands, only whole-tensor ropes lower through this door",
+                x.r_cover.0, x.r_cover.1, x.v_rows,
+            ));
+        }
+    }
     let mq = ins[0].v_rows / heads;
     let total = heads * hd;
     // ⛔ THE ROW KIND, AS A PARAMETER — main's `LowerRope::rows_are_requests`, which main also took as
@@ -342,6 +514,22 @@ fn rope(
     if hd == 0 {
         return err(format!("{name}: the `x` view states a zero head dim"));
     }
+    // ⭐ THE ROPE-P CLASS TID — which `[hd,hd]` P table this rope's `matmul(x, P)` names. The class
+    // set is the bake's OWN registry (`BundleLayout::rope_class_hds`, the same registry mechanism
+    // `scalarmul_scales` established), so the emitter, the placement pass and the worker's load-time
+    // bind all resolve class↔tid through ONE list. A rope arriving with no registry, or a head dim
+    // the registry does not hold, is a desync — refuse it rather than guessing class 0.
+    let p_tid = layout
+        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == hd))
+        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{name}: rope head_dim {hd} absent from BundleLayout.rope_class_hds {:?} (registry \
+                 desync — the placement pass and this lowering disagree about the tape's rope \
+                 classes, so which P table this rope reads is not a fact either of them states)",
+                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
+            ),
+        })?;
     scratchy_subtile::model_geometry::with_config_head_dim(
         scratchy_subtile::model_geometry::HeadDim::new(hd),
         RopeAt(lk::RopeAt {
@@ -353,6 +541,7 @@ fn rope(
             t: out.tid,
             mq,
             total,
+            p_tid,
             sym_id_base,
             layout,
             rows_are_requests,

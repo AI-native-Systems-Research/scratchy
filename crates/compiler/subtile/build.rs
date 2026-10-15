@@ -104,6 +104,28 @@ fn emit_config_geometry() {
                     used = true;
                 }
             }
+            // The GLOBAL attention class of a per-layer-class model (Gemma-4: global layers run
+            // `global_head_dim` with `num_global_key_value_heads`). The macro's config loader
+            // derives the same defaults (`num_global_key_value_heads` ← `num_key_value_heads`,
+            // `global_head_dim` ← `head_dim`), so a uniform-geometry model reproduces the base
+            // triple here — deduped away — while a dual-class model yields its second triple. The
+            // door must know BOTH: an AttnDecode node carries its own class's geometry, and a
+            // global-class node whose triple has no arm is a bake refusal, not a fallback.
+            let g_kv = bounds
+                .get("num_global_key_value_heads")
+                .or_else(|| bounds.get("num_key_value_heads"));
+            let g_hd = bounds
+                .get("global_head_dim")
+                .or_else(|| bounds.get("head_dim"));
+            #[expect(clippy::collapsible_if)]
+            if let (Some(&nqh), Some(&gkvh), Some(&ghd)) =
+                (bounds.get("num_attention_heads"), g_kv, g_hd)
+            {
+                if nqh > 0 && gkvh > 0 && ghd > 0 && nqh % gkvh == 0 {
+                    geometries.push((nqh, gkvh, ghd));
+                    used = true;
+                }
+            }
             // Every head dim a rotary op of this model can carry. `head_dim` is the decoder's;
             // `global_head_dim` is the second head dim of a per-layer-class model (Gemma-4's global
             // layers), and `qk_rope_head_dim` is MLA's rope width.
@@ -231,6 +253,20 @@ fn geometry_bounds(json: &serde_json::Value) -> std::collections::BTreeMap<Strin
         && let Some(&heads) = flat.get("num_attention_heads")
     {
         flat.insert("num_key_value_heads".into(), heads);
+    }
+    // The same per-class defaults `apply_generic_bound_defaults` applies to the macro's own bounds:
+    // a uniform-geometry arch declares neither `global_*` key, and the global class then IS the base
+    // class — default these so the global-geometry arm above dedups onto the base one rather than
+    // being silently absent.
+    if !flat.contains_key("global_head_dim")
+        && let Some(&hd) = flat.get("head_dim")
+    {
+        flat.insert("global_head_dim".to_string(), hd);
+    }
+    if !flat.contains_key("num_global_key_value_heads")
+        && let Some(&kv) = flat.get("num_key_value_heads")
+    {
+        flat.insert("num_global_key_value_heads".to_string(), kv);
     }
     flat
 }

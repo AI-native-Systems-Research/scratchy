@@ -168,17 +168,22 @@ type MapPlan = (
     std::collections::HashSet<usize>,
 );
 
-#[cfg(metal)]
 thread_local! {
     static MATMUL_SCHED_CACHE: std::cell::RefCell<
         HashMap<u64, Rc<HashMap<Ssa, crate::metal::MatmulLoopInfo>>>,
     > = std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(metal)]
+thread_local! {
     static MAP_PLAN_CACHE: std::cell::RefCell<HashMap<u64, Rc<MapPlan>>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
 /// Memoized [`crate::metal::matmul_loop_schedule`] keyed by `key` ([`plan_key`]).
-#[cfg(metal)]
+/// Built on EVERY target: the recognizer is target-neutral, and the non-Metal
+/// build reconstructs each recognized loop on the CPU (`blas`) — see
+/// [`crate::metal::run_matmul_loop`].
 fn cached_matmul_schedule(
     ops: &[Operation<'static>],
     key: u64,
@@ -1238,9 +1243,9 @@ struct CoreRunner {
     /// per call. Shared (identical for every core).
     dies_at: Rc<Vec<Vec<Ssa>>>,
     /// Structural fingerprint of `ops` (hashed once in
-    /// [`execute_with_communication`]); the key into the per-segment Metal plan
-    /// caches, so [`step`](Self::step) never re-hashes the ops tree.
-    #[cfg(metal)]
+    /// [`execute_with_communication`]); the key into the per-segment plan caches
+    /// (the matmul-loop schedule on every target, the Metal map plan besides), so
+    /// [`step`](Self::step) never re-hashes the ops tree.
     plan_key: u64,
 }
 
@@ -1288,14 +1293,15 @@ impl CoreRunner {
                 }
             }
         }
-        // MLX-style GPU offload: recognized matmul K-loops run as one GPU GEMM
-        // instead of the interpreter's K-tiled loop. Gated to SINGLE-CORE
-        // functions: there the K-loop's M-offset is 0 / the forwarded source
-        // gives the full M, so reconstructing the whole GEMM is correct. A
-        // multi-core grid M-tiles across cores (each core a block offset by its
-        // tile id), so the full-shape reconstruction would be wrong — those keep
-        // the interpreter loop. Skipped under a latency tracker (the model must
-        // see each op). The fused whole-program function is grid [1,1].
+        // Matmul-loop offload: recognized matmul K-loops run as one full-M GEMM
+        // (GPU on Metal, CPU `blas` elsewhere) instead of the interpreter's
+        // K-tiled loop. Gated to SINGLE-CORE functions: there the K-loop's
+        // M-offset is 0 / the forwarded source gives the full M, so
+        // reconstructing the whole GEMM is correct. A multi-core grid M-tiles
+        // across cores (each core a block offset by its tile id), so the
+        // full-shape reconstruction would be wrong — those keep the interpreter
+        // loop. Skipped under a latency tracker (the model must see each op).
+        // The fused whole-program function is grid [1,1].
         //
         // The same single-core/tracker-free conditions also gate the (opt-in)
         // attention-island offloads (plain matmul / reduce / transpose) below,
@@ -1320,16 +1326,30 @@ impl CoreRunner {
         let gpu_reduce = gpu_base && std::env::var_os("KTIR_GPU_REDUCE").is_some();
         #[cfg(metal)]
         let gpu_transpose = gpu_base && std::env::var_os("KTIR_GPU_TRANSPOSE").is_some();
-        // Structural fingerprint shared by both Metal plan caches below — hashed
-        // ONCE per segment in `execute_with_communication`, threaded in here.
-        #[cfg(metal)]
+        // Structural fingerprint shared by the plan caches below — hashed ONCE
+        // per segment in `execute_with_communication`, threaded in here.
         let plan_key = self.plan_key;
+        // The matmul-loop schedule is built on EVERY target: a recognized K-loop
+        // reconstructs as ONE full-M GEMM — on the GPU (NAX/AMX) under Metal,
+        // on the CPU (`blas`) everywhere else (`crate::metal::run_matmul_loop`).
+        // The Metal build honors the GPU offload gates (tracker / single-core /
+        // KTIR_NO_GPU_GEMM); every other build the same tracker/single-core
+        // conditions — a latency tracker must see each op, and a multi-core grid
+        // M-tiles across cores, where the full-shape reconstruction would be
+        // wrong (the interpreter loop is correct there).
         #[cfg(metal)]
         let matmul_sched: Rc<HashMap<Ssa, crate::metal::MatmulLoopInfo>> = if gpu_offload {
             cached_matmul_schedule(ops, plan_key)
         } else {
             Rc::new(HashMap::new())
         };
+        #[cfg(not(metal))]
+        let matmul_sched: Rc<HashMap<Ssa, crate::metal::MatmulLoopInfo>> =
+            if env.tracker.is_none() && env.grid.num_cores == 1 {
+                cached_matmul_schedule(ops, plan_key)
+            } else {
+                Rc::new(HashMap::new())
+            };
         // MLX-style map-window fusion: each maximal run of fusable elementwise/
         // cast/broadcast ops runs as ONE fused GPU kernel (instead of op-by-op on
         // the interpreter). Same gating as the matmul-loop offload above. The plan
@@ -1420,17 +1440,36 @@ impl CoreRunner {
                 }
                 continue;
             }
-            // Offload a recognized K-loop as a full-M GEMM (NAX or AMX). On Ok the
+            // Offload a recognized K-loop as ONE full-M GEMM (NAX/AMX on Metal,
+            // `blas` on every other build — `run_matmul_loop`). On Ok the
             // interpreter skips the loop body. On Err the fallback is the loop's
             // own `scf.for` below — correct at grid [1,1] ONLY for m==1 (decode: it
             // computes the single row). For m>1 (prefill) that body would compute
             // ONLY row 0 and silently drop the rest, so a failed offload is FATAL —
             // fail loud rather than emit a row-0-only result.
-            #[cfg(metal)]
             if op.op_type == OpKind::ScfFor
                 && let Some(info) = op.result.and_then(|r| matmul_sched.get(&r))
             {
-                match crate::metal::run_matmul_loop_gpu(info, &mut self.ctx) {
+                // ⭐ FREE THE LOOP'S INIT SEED BEFORE THE OFFLOAD CHARGES ITS OUTPUT. The
+                // offload never READS the seed — it reconstructs the GEMM from `a_root`/
+                // `b_root` and accumulates in its own f32 buffers — but it does CHARGE the
+                // full-M `[m, n]` result beside it, and a recognized loop's seed is an
+                // `[m, n]` splat too. For an f32 fp8 pre-scale code-dot (matmul_fp8's
+                // f32 seed) that pair is 2× the output alone: MEASURED at the gemma-4-12b
+                // fp8 prefill, `1904640 + 1904640 > 2097152 charging %16 (GEMM out
+                // [31, 15360])` — the f16 pair fit exactly, the f32 one needs the seed
+                // freed first. The dies_at reclaim below frees it right AFTER the offload;
+                // hoisting it to before is LX-equivalent for every consumer (the seed's
+                // only readers are the skipped loop bodies of this and sibling offloaded
+                // loops). m>1 only: at m==1 the offload may fall through to the
+                // interpreter's `scf.for`, whose body DOES read the seed (the matmul's
+                // `outs`) — and an m==1 charge is `n` elements, never the problem.
+                if info.m > 1
+                    && let Some(&seed) = op.operands.get(3)
+                {
+                    self.ctx.forget(seed);
+                }
+                match crate::metal::run_matmul_loop(info, &mut self.ctx) {
                     Ok(()) => {
                         if let Some(dead) = self.dies_at.get(this_idx) {
                             for &id in dead {
@@ -1441,7 +1480,7 @@ impl CoreRunner {
                     }
                     Err(e) if info.m > 1 => {
                         return Err(format!(
-                            "metal: full-M GEMM offload failed for m={} (%{}): {e}; \
+                            "full-M GEMM offload failed for m={} (%{}): {e}; \
                              refusing the row-0-only interpreter fallback",
                             info.m, info.out_ssa.0
                         ));
@@ -1739,6 +1778,152 @@ pub fn set_parallel_safe(on: bool) -> bool {
     PARALLEL_SAFE.with(|c| c.replace(on))
 }
 
+/// Collect the SSA results whose pointwise f16 landing is the card's **DLF16
+/// grid** — the rmsnorm scalar chain's sticks: the square `x·x`, the `·INV_D`
+/// mean, and the `+ eps` sum.
+///
+/// # THE CARD FACT
+///
+/// On card those three values never touch an IEEE-f16 unit. The square and the
+/// `1/cols` scale ride the exx2 reduce's own DLF16 accumulator
+/// (`summeanmaxexx2.ddl`, `exx2_fwd.smc`); the `+ eps` add is a 16-bit-mode
+/// SEN169 pointwise op (`PE_FMUL … tgtlx=result`); every value the chain
+/// exchanges therefore carries `SEN169_FP16`'s 9-bit mantissa and 2⁻³⁰ normal
+/// floor. The emulator's mirror materializes them as separate f16-typed
+/// pointwise ops, and `Tile::compute`'s IEEE grid is the WRONG grid for them at
+/// small magnitudes: a gemma-4 epsilon (1e-6) plus its mean-of-squares sits in
+/// IEEE f16's SUBNORMAL band (6% relative steps at 1e-6) where DLF16 is still
+/// normal (0.2% steps) — the IEEE model puts a +1% scale error on the
+/// reciprocal, which the numeric gate convicted on gemma-4's tiny probes (mean
+/// ~ eps: the one regime real weights never visit, where the eps term carries
+/// the sum). `rinv`, `xn` and the gain multiply are NOT collected — they are
+/// DLF16 on the card too (every fp16 tensor's device format is SEN169), and
+/// leaving them on the storage grid here is the DEFERRED global store-grid
+/// decision's residue, not a card fact. The deferral is inert in the gate: the
+/// golden's own F16-stick law rounds node outputs on the same IEEE grid, so at
+/// O(1) magnitudes the grids cancel on both sides of the comparison.
+///
+/// # THE SHAPE
+///
+/// The same four discriminators the door's own chain proof uses
+/// (`ktir-superdsc`'s `program_rmsnorm_chains`, re-derived here because the
+/// emulator cannot depend on the door's crate — a re-derivation that is
+/// PINNED, not merely claimed: the spyre crate's recognizer-parity test runs
+/// this walk and the door's recognizer over the same shipped programs and
+/// asserts the two agree, which is also why this walk is `pub`): the chain rooted at
+/// `math.rsqrt`, whose operand is an `arith.addf` adding one splatted constant
+/// (the eps) to a value produced by an `arith.mulf` scaling a SUM-reduce by
+/// exactly `1/cols`, over a square whose two operands are the SAME value. A
+/// chain that almost matches contributes nothing — the walk is a filter, not a
+/// refusal, because the executor runs whatever it is handed. The raw reduce
+/// result is NOT collected: the reduce's own landing arm already holds it on
+/// the DLF16 accumulator grid (`linalg::reduce`'s fma-class law).
+pub fn rmsnorm_scalar_sticks(ops: &[Operation<'static>]) -> std::collections::HashSet<Ssa> {
+    let mut sticks = std::collections::HashSet::new();
+    let def_of = |s: Ssa| ops.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    for root in ops.iter().filter(|o| o.op_type == OpKind::MathRsqrt) {
+        // `rsqrt(add)`. A root over anything else is a plain elementwise rsqrt.
+        let Some(add) = root.operands.first().copied().and_then(def_of) else {
+            continue;
+        };
+        if add.op_type != OpKind::ArithAddf {
+            continue;
+        }
+        // `mean + eps`: exactly one splatted constant, the other the mean.
+        let (eps, ms) = {
+            let mut e = None;
+            let mut m = None;
+            for &s in add.operands.iter() {
+                match splat_value(s) {
+                    Some(v) => e = Some(v),
+                    None => m = Some(s),
+                }
+            }
+            (e, m)
+        };
+        let (Some(_eps), Some(ms)) = (eps, ms) else {
+            continue;
+        };
+        // `ms = <reduce> · INV_D`.
+        let Some(scale) = def_of(ms) else {
+            continue;
+        };
+        if scale.op_type != OpKind::ArithMulf {
+            continue;
+        }
+        let (inv_d, red_v) = {
+            let mut d = None;
+            let mut r = None;
+            for &s in scale.operands.iter() {
+                match splat_value(s) {
+                    Some(v) => d = Some(v),
+                    None => r = Some(s),
+                }
+            }
+            (d, r)
+        };
+        let (Some(inv_d), Some(red_v)) = (inv_d, red_v) else {
+            continue;
+        };
+        let Some(red) = def_of(red_v) else {
+            continue;
+        };
+        if red.op_type != OpKind::LinalgReduce {
+            continue;
+        }
+        // The reduction is a SUM — a max/min in that slot is not a mean of squares.
+        let sum = red
+            .attributes
+            .iter()
+            .any(|(k, v)| matches!((k, v), (AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf))));
+        if !sum {
+            continue;
+        }
+        // The square: the reduce reads an `x·x`, same value on both sides.
+        let Some(sq) = red.operands.first().copied().and_then(def_of) else {
+            continue;
+        };
+        if sq.op_type != OpKind::ArithMulf {
+            continue;
+        }
+        let [sa, sb] = sq.operands[..] else {
+            continue;
+        };
+        if sa != sb {
+            continue;
+        }
+        // The divisor is exactly `1/cols` for the squared tile — checked
+        // numerically against the square's own trailing dim, the door's law: a
+        // different multiplier makes the program something other than a mean of
+        // squares, and this walk must not claim its sticks.
+        let cols = match sq.result_type {
+            Some(IrType::Tensor { dims, .. }) if !dims.is_empty() => dims[dims.len() - 1] as f64,
+            _ => continue,
+        };
+        if (inv_d as f32) != (1.0f64 / cols) as f32 {
+            continue;
+        }
+        for v in [sq.result, scale.result, add.result].into_iter().flatten() {
+            sticks.insert(v);
+        }
+    }
+    sticks
+}
+
 /// Drive all cores to completion, resolving cross-core recvs. Port of
 /// `GridExecutor.execute_with_communication`. Cores with no comm op simply run
 /// to completion on the first advance.
@@ -1751,9 +1936,13 @@ pub fn execute_with_communication(
     tracker: Option<&std::cell::RefCell<crate::latency::LatencyTracker>>,
     precomputed_key: Option<u64>,
 ) -> Result<(), String> {
+    // The rmsnorm scalar chain's DLF16 landings (see the walk's doc) — computed
+    // for the very ops this run executes, so fused-segment SSA renames cannot
+    // detach the set from the values it names.
+    let dlf16_sticks = rmsnorm_scalar_sticks(ops);
     let env = match tracker {
-        Some(t) => ExecutionEnv::with_tracker(dispatch, grid, t),
-        None => ExecutionEnv::new(dispatch, grid),
+        Some(t) => ExecutionEnv::with_tracker(dispatch, grid, t).with_dlf16_sticks(&dlf16_sticks),
+        None => ExecutionEnv::new(dispatch, grid).with_dlf16_sticks(&dlf16_sticks),
     };
     let num_cores = grid.num_cores.max(1);
 
@@ -1798,7 +1987,6 @@ pub fn execute_with_communication(
                 active_region: None,
                 active_region_idx: 0,
                 dies_at: Rc::clone(&dies_at),
-                #[cfg(metal)]
                 plan_key,
             },
         );
@@ -1957,7 +2145,11 @@ pub fn execute_function_single_tile(
     tile: usize,
     precomputed_key: Option<u64>,
 ) -> Result<(), String> {
-    let env = ExecutionEnv::new(dispatch, grid);
+    // The rmsnorm scalar chain's DLF16 landings, same law as the segment loop's
+    // entry (`execute_with_communication`) — this path runs the SAME functions'
+    // ops per compute-tile.
+    let dlf16_sticks = rmsnorm_scalar_sticks(ops);
+    let env = ExecutionEnv::new(dispatch, grid).with_dlf16_sticks(&dlf16_sticks);
     let pk = precomputed_key.unwrap_or_else(|| plan_key(ops));
     let dies_at = cached_dies_at(ops, pk);
     let mut ctx = CoreContext::new(
@@ -1978,7 +2170,6 @@ pub fn execute_function_single_tile(
         active_region: None,
         active_region_idx: 0,
         dies_at: Rc::clone(&dies_at),
-        #[cfg(metal)]
         plan_key: pk,
     };
     match runner.step(ops, &env, None)? {
@@ -2030,7 +2221,6 @@ mod tests {
                     active_region: None,
                     active_region_idx: 0,
                     dies_at: Rc::clone(&dies_at),
-                    #[cfg(metal)]
                     plan_key: plan_key(ops),
                 }
             })
@@ -2218,6 +2408,218 @@ mod tests {
         match &results[1] {
             Some(Value::Tile(t)) => assert_eq!(t.as_f32().to_vec(), vec![2.0]),
             o => panic!("{o:?}"),
+        }
+    }
+
+    // ── The rmsnorm scalar-chain law (`rmsnorm_scalar_sticks` + the DLF16
+    // landing) ── two pins: the walk collects EXACTLY the chain's interior
+    // sticks, and the pointwise landing for a collected stick rounds to the
+    // DLF16 grid where the IEEE grid is card-untrue.
+    //
+    // The chain, spelled as the spliced mirror mints it:
+    //   %c_eps = arith.constant 1e-6        %s_eps = tensor.splat %c_eps
+    //   %c_inv = arith.constant 1/64        %s_inv = tensor.splat %c_inv
+    //   %sq  = arith.mulf %x, %x            (result_type tensor<1x64xf16>)
+    //   %red = linalg.reduce addf [%sq]
+    //   %ms  = arith.mulf %red, %s_inv
+    //   %meps = arith.addf %ms, %s_eps
+    //   %r   = math.rsqrt %meps
+    //   %xn  = arith.mulf %x, %r
+    fn chain_ops(ops: &mut TestOps) -> Vec<Operation<'static>> {
+        let c_eps = ops.op(Some("%c_eps"), OpKind::ArithConstant, &[]);
+        let c_eps = ops.attr(c_eps, AttrKey::Value, Attr::Float(1e-6));
+        let s_eps = ops.op(Some("%s_eps"), OpKind::TensorSplat, &["%c_eps"]);
+        let c_inv = ops.op(Some("%c_inv"), OpKind::ArithConstant, &[]);
+        let c_inv = ops.attr(c_inv, AttrKey::Value, Attr::Float(1.0 / 64.0));
+        let s_inv = ops.op(Some("%s_inv"), OpKind::TensorSplat, &["%c_inv"]);
+        let sq = ops.op(Some("%sq"), OpKind::ArithMulf, &["%x", "%x"]);
+        let sq = Operation {
+            result_type: Some(IrType::Tensor {
+                dims: ops.arena().ints(vec![1, 64]),
+                elem: DType::F16,
+            }),
+            ..sq
+        };
+        let red = ops.op(Some("%red"), OpKind::LinalgReduce, &["%sq"]);
+        let red = ops.attr(red, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+        let ms = ops.op(Some("%ms"), OpKind::ArithMulf, &["%red", "%s_inv"]);
+        let meps = ops.op(Some("%meps"), OpKind::ArithAddf, &["%ms", "%s_eps"]);
+        let r = ops.op(Some("%r"), OpKind::MathRsqrt, &["%meps"]);
+        let xn = ops.op(Some("%xn"), OpKind::ArithMulf, &["%x", "%r"]);
+        vec![c_eps, s_eps, c_inv, s_inv, sq, red, ms, meps, r, xn]
+    }
+
+    /// The walk collects EXACTLY the three interior sticks — the square, the
+    /// scaled mean, the +eps sum — never the raw reduce result (the reduce's own
+    /// landing arm already holds it DLF16), never `rinv`/`xn` (the deferred
+    /// class). A mis-shaped chain — a non-splat eps, a non-square, a divisor
+    /// that is not 1/cols, a max-reduce — contributes nothing.
+    #[test]
+    fn rmsnorm_scalar_sticks_collect_exactly_the_chain_interior() {
+        let mut ops = TestOps::new();
+        let _ = ops.ssa("%x"); // the chain's input tile (no defining op needed)
+        let got = rmsnorm_scalar_sticks(&chain_ops(&mut ops));
+        let want: std::collections::HashSet<Ssa> =
+            [ops.ssa("%sq"), ops.ssa("%ms"), ops.ssa("%meps")]
+                .into_iter()
+                .collect();
+        assert_eq!(got, want, "the walk must name exactly sq16/mean/meps");
+    }
+
+    /// The filter half: each discriminator that fails drops the WHOLE chain
+    /// rather than collecting a partial set — a collected meps whose producer
+    /// links do not close would round an unrelated add to the DLF16 grid.
+    #[test]
+    fn rmsnorm_scalar_sticks_refuse_misshaped_chains() {
+        // A non-square under the reduce (`x·y`): not a mean of squares.
+        let mut ops = TestOps::new();
+        let _ = ops.ssa("%x");
+        let _ = ops.ssa("%y");
+        let mut chain = chain_ops(&mut ops);
+        let sq_pos = chain
+            .iter()
+            .position(|o| o.op_type == OpKind::ArithMulf && o.result == Some(ops.ssa("%sq")))
+            .unwrap();
+        chain[sq_pos] = ops.op(Some("%sq"), OpKind::ArithMulf, &["%x", "%y"]);
+        assert!(
+            rmsnorm_scalar_sticks(&chain).is_empty(),
+            "x·y under the reduce is not a mean of squares"
+        );
+
+        // A divisor that is not 1/cols: a different function, not a mean.
+        let mut ops = TestOps::new();
+        let _ = ops.ssa("%x");
+        let mut chain = chain_ops(&mut ops);
+        let inv_pos = chain
+            .iter()
+            .position(|o| o.result == Some(ops.ssa("%c_inv")))
+            .unwrap();
+        chain[inv_pos] = ops.attr(
+            chain[inv_pos],
+            AttrKey::Value,
+            Attr::Float(1.0 / 32.0), // 1/cols for a 32-wide tile, not this 64-wide one
+        );
+        assert!(
+            rmsnorm_scalar_sticks(&chain).is_empty(),
+            "a divisor that is not 1/cols is not this chain"
+        );
+
+        // A max-reduce in the mean slot: not a sum.
+        let mut ops = TestOps::new();
+        let _ = ops.ssa("%x");
+        let mut chain = chain_ops(&mut ops);
+        let red_pos = chain
+            .iter()
+            .position(|o| o.result == Some(ops.ssa("%red")))
+            .unwrap();
+        chain[red_pos] = ops.attr(
+            chain[red_pos],
+            AttrKey::ReduceFn,
+            Attr::Op(OpKind::ArithMaxf),
+        );
+        assert!(
+            rmsnorm_scalar_sticks(&chain).is_empty(),
+            "a max-reduce is not a mean of squares"
+        );
+    }
+
+    /// The landing half, at the magnitudes that convicted the IEEE model: a
+    /// gemma-4 eps (f16(1e-6), staged through the splat the mirror states) plus
+    /// a mean-of-squares at the same scale sits in IEEE f16's SUBNORMAL band,
+    /// where the card's SEN169 value is still normal. The collected stick must
+    /// round DIRECTLY to the DLF16 grid — never through IEEE f16 first (a
+    /// double-rounded subnormal keeps the first grid's +1% error).
+    #[test]
+    fn scalar_chain_sticks_land_on_the_dlf16_grid() {
+        use crate::codec::round_dlf16;
+        use crate::interpreter::{execute_op, single_core_context};
+
+        let mut ops = TestOps::new();
+        let chain = chain_ops(&mut ops);
+        let addf = chain
+            .iter()
+            .find(|o| o.result == Some(ops.ssa("%meps")))
+            .unwrap();
+        // The mean lands DLF16-partialed and unrounded (the reduce's landing
+        // arm holds it as decoded f32); the eps splat is the f16 constant the
+        // mirror states — f16(1e-6) = 17·2⁻²⁴ exactly.
+        let mean = 1.11e-6_f32;
+        let eps_f16 = 1.0132789611816406e-6_f32; // f16(1e-6), exactly representable in f32
+
+        let mut ctx = single_core_context();
+        ctx.set_value(
+            ops.ssa("%ms"),
+            Value::Tile(Tile::from_decoded(
+                vec![mean],
+                DType::F16,
+                vec![1],
+                None,
+                None,
+            )),
+        );
+        ctx.set_value(
+            ops.ssa("%s_eps"),
+            Value::Tile(Tile::compute(vec![eps_f16], DType::F16, vec![1])),
+        );
+
+        // With the stick armed: the sum lands on the DLF16 grid, which at this
+        // magnitude is a DIFFERENT VALUE than the IEEE subnormal landing.
+        let dispatch = Dispatch::new();
+        let grid = GridExecutor::new((1, 1, 1));
+        let sticks: std::collections::HashSet<Ssa> = [ops.ssa("%meps")].into_iter().collect();
+        let env = ExecutionEnv::new(&dispatch, &grid).with_dlf16_sticks(&sticks);
+        let got = execute_op(addf, &mut ctx, &env)
+            .unwrap()
+            .expect("addf produces a value");
+        let sum = mean + eps_f16;
+        match got {
+            Value::Tile(t) => {
+                assert_eq!(
+                    t.as_f32().to_vec(),
+                    vec![round_dlf16(sum)],
+                    "the +eps stick lands DIRECTLY on the DLF16 grid"
+                );
+                assert_ne!(
+                    t.as_f32().to_vec(),
+                    vec![
+                        crate::codec::f16_units_to_f32(&crate::codec::f32_to_f16_units(&[sum]))[0]
+                    ],
+                    "the landing must not be the IEEE subnormal grid (f16(2.1233e-6) = \
+                     36·2⁻²⁴, the +1% the numeric gate convicted)"
+                );
+            }
+            o => panic!("expected a tile, got {o:?}"),
+        }
+
+        // Without the stick armed (the direct-dispatch paths): the IEEE grid,
+        // the vendor oracle's own semantics — the env channel, not the handler,
+        // decides.
+        let mut ctx = single_core_context();
+        ctx.set_value(
+            ops.ssa("%ms"),
+            Value::Tile(Tile::from_decoded(
+                vec![mean],
+                DType::F16,
+                vec![1],
+                None,
+                None,
+            )),
+        );
+        ctx.set_value(
+            ops.ssa("%s_eps"),
+            Value::Tile(Tile::compute(vec![eps_f16], DType::F16, vec![1])),
+        );
+        let env = ExecutionEnv::new(&dispatch, &grid);
+        let got = execute_op(addf, &mut ctx, &env)
+            .unwrap()
+            .expect("addf produces a value");
+        match got {
+            Value::Tile(t) => assert_eq!(
+                t.as_f32().to_vec(),
+                vec![crate::codec::f16_units_to_f32(&crate::codec::f32_to_f16_units(&[sum]))[0]],
+                "an unarmed env keeps the IEEE landing"
+            ),
+            o => panic!("expected a tile, got {o:?}"),
         }
     }
 }

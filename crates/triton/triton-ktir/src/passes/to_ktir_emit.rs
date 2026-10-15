@@ -548,6 +548,8 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
         O::TensorEmpty => KOpKind::TensorEmpty,
         O::TensorCollapseShape => KOpKind::TensorCollapseShape,
         O::TensorExpandShape => KOpKind::TensorExpandShape,
+        O::TensorGenerate => KOpKind::TensorGenerate,
+        O::TensorYield => KOpKind::TensorYield,
         O::LinalgMatmul => KOpKind::LinalgMatmul,
         O::LinalgGeneric => KOpKind::LinalgGeneric,
         O::LinalgReduce => KOpKind::LinalgReduce,
@@ -602,6 +604,8 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
         O::Other(s) => match s.as_str() {
             "arith.negf" => KOpKind::ArithNegf,
             "arith.cmpf" => KOpKind::ArithCmpf,
+            "arith.sitofp" => KOpKind::ArithSitofp,
+            "arith.fptosi" => KOpKind::ArithFptosi,
             "arith.subi" => KOpKind::ArithSubi,
             "arith.extsi" => KOpKind::ArithExtsi,
             "arith.trunci" => KOpKind::ArithTrunci,
@@ -809,6 +813,7 @@ fn lower_op_kind<'a>(op: &Op, a: &'a Arena, fresh: &mut Fresh) -> Result<Vec<Ope
     }
     built = lift_region_args(op, built, a)?;
     built.regions = lower_regions(&op.regions, a, fresh)?;
+    built = prepend_bb0_args(op, built, a);
     Ok(vec![built])
 }
 
@@ -835,6 +840,36 @@ fn lift_region_args<'a>(op: &Op, mut built: Operation<'a>, a: &'a Arena) -> Resu
         built = built.with_attr(a, KAttrKey::IterArgs, KAttr::Ssas(a.ssa(args)));
     }
     Ok(built)
+}
+
+/// `tensor.generate`'s block argument is a REGION ARG here and the
+/// `region.bb0_args` marker op there -- a third convention alongside the two
+/// `lift_region_args` bridges (`scf.for` lifts to attributes, `linalg.*` reads
+/// positionally from operands). The executor's generate handler binds the
+/// arguments the marker names as full meshgrid index grids, so the marker is not
+/// optional: a generate that reaches it without one executes a body whose index
+/// has no name. [`crate::passes::to_ktir`] is the only minter of the op, and it
+/// always states the argument, so an absent one here is a wiring defect upstream
+/// -- stated by leaving the region argument-less rather than inventing a name.
+fn prepend_bb0_args<'a>(op: &Op, mut built: Operation<'a>, a: &'a Arena) -> Operation<'a> {
+    let Some(region) = op.regions.first() else {
+        return built;
+    };
+    if region.args.is_empty() {
+        return built;
+    }
+    let names: Vec<KSsa> = region.args.iter().map(|(v, _)| ssa(*v)).collect();
+    let bb0 = Operation::new(a, None, KOpKind::RegionBb0Args, &[]).with_attr(
+        a,
+        KAttrKey::Names,
+        KAttr::Ssas(a.ssa(names)),
+    );
+    let body = built.regions.first().copied().unwrap_or(&[]);
+    let mut ops = Vec::with_capacity(body.len() + 1);
+    ops.push(bb0);
+    ops.extend(body.iter().copied());
+    built.regions = a.regions(vec![a.ops(ops)]);
+    built
 }
 
 fn lower_regions<'a>(

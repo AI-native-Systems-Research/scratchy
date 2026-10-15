@@ -3592,7 +3592,7 @@ fn lower_one(
                     p.num_global_kv_heads,
                     p.global_block_size,
                 ),
-                AttnMask::SlidingWindow => (p.head_dim, p.num_kv_heads, p.block_size),
+                AttnMask::SlidingWindow { .. } => (p.head_dim, p.num_kv_heads, p.block_size),
             };
             LoweredCommand {
                 kernel: KernelId::KvAppend,
@@ -4952,7 +4952,9 @@ fn lower_one(
             let ops = TqOperands::of(p, *offsets, *layer, w)?;
             let decode = match class {
                 AttnMask::Causal => I::AttentionViaCache(*q, *out, *layer, *pairing),
-                AttnMask::SlidingWindow => I::SlidingAttentionViaCache(*q, *out, *layer, *pairing),
+                AttnMask::SlidingWindow { .. } => {
+                    I::SlidingAttentionViaCache(*q, *out, *layer, *pairing)
+                }
             };
             let via_cache = lower_one(
                 p,
@@ -8201,8 +8203,18 @@ mod tests {
             ..tp()
         }
     }
-    use AttnMask::{Causal, SlidingWindow};
+    /// The sliding class every test here binds — one window size, the
+    /// gemma value, because these tests assert STRUCTURE (which step a
+    /// class lowers to), not numerics.
+    use AttnMask::Causal;
     use RopeFormTag::{Interleaved, NeoX};
+    const SW: AttnMask = AttnMask::SlidingWindow {
+        window: match std::num::NonZeroU32::new(1024) {
+            Some(w) => w,
+            // A const arm that cannot happen and must not call formatting macros.
+            None => std::num::NonZeroU32::MIN,
+        },
+    };
 
     /// Minimal `CanonicalParams` impl for lowering-shape tests. No
     /// kernel actually runs — `lower_one` just inspects the variant
@@ -8396,9 +8408,9 @@ mod tests {
         use MetalStep as S;
         let (decode, q, out, layer, pairing, class) = match attention {
             S::AttentionViaCache(q, o, l, p) => (true, q, o, l, p, Causal),
-            S::SlidingAttentionViaCache(q, o, l, p) => (true, q, o, l, p, SlidingWindow),
+            S::SlidingAttentionViaCache(q, o, l, p) => (true, q, o, l, p, SW),
             S::AttentionPrefillPaged(q, o, l, p) => (false, q, o, l, p, Causal),
-            S::SlidingAttentionPrefillPaged(q, o, l, p) => (false, q, o, l, p, SlidingWindow),
+            S::SlidingAttentionPrefillPaged(q, o, l, p) => (false, q, o, l, p, SW),
             other => panic!("a coded attention: {other:?}"),
         };
         let gated = |step, guard| match METAL_GUARD_GATES.gate(guard) {
@@ -9180,7 +9192,7 @@ mod tests {
             ..tq_consts()
         };
         let rows = plain(&[
-            tq_writer(1, SlidingWindow, LLAMA_KV),
+            tq_writer(1, SW, LLAMA_KV),
             attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved),
         ]);
         assert!(matches!(
@@ -9999,7 +10011,7 @@ mod tests {
             ..tq_consts()
         };
         let global_writer = tq_writer(0, Causal, LLAMA_KV);
-        let sliding_writer = tq_writer(1, SlidingWindow, LLAMA_KV);
+        let sliding_writer = tq_writer(1, SW, LLAMA_KV);
         let global = attention(MetalStep::AttentionViaCache, 0, Interleaved);
         let sliding = attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved);
         let rows = [

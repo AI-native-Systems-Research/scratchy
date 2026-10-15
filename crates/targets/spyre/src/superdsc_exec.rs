@@ -177,6 +177,13 @@ struct Diag {
     /// `SCRATCHY_SDSC_OPTRACE`: after each on-card op, D2H every segment and print nonzero-count +
     /// max|.| — the op index where the signal collapses IS the divergence.
     optrace: bool,
+    /// `SCRATCHY_SDSC_TENSORDUMP=<dir>`: after each on-card op, D2H the readable segments and write
+    /// every placement whose bytes MOVED since the last dump as LE-f32 files named to match the
+    /// emulator's `SCRATCHY_EMU_TENSORDUMP` (`prog{idx}_seg{seg}_t{tid}.bin` + `.n`, plus a
+    /// `op{op}_…` timeline copy and an `ops.txt` mapping op numbers to programs) — the bisection
+    /// instrument for a card-vs-emulator divergence. The prog index is a per-FINGERPRINT global in
+    /// first-dumped order, and `progs.txt` records the assignment so a diff never has to guess it.
+    tensordump: Option<std::path::PathBuf>,
     /// `SCRATCHY_SDSC_LAUNCH_MARK`: one line BEFORE each submit naming the op and rep.
     ///
     /// ⭐ IT EXISTS FOR THE ONE FAULT NO OTHER PATH CAN ATTRIBUTE. `RAS::PCI::BusFence` (0xa35e) is
@@ -208,6 +215,8 @@ impl Diag {
                 phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
                 prep_time: on("SCRATCHY_SDSC_PREP_TIME"),
                 optrace: on("SCRATCHY_SDSC_OPTRACE"),
+                tensordump: std::env::var_os("SCRATCHY_SDSC_TENSORDUMP")
+                    .map(std::path::PathBuf::from),
                 launch_mark: on("SCRATCHY_SDSC_LAUNCH_MARK"),
                 reset_probe: std::env::var("SCRATCHY_SDSC_RESET_PROBE")
                     .ok()
@@ -399,24 +408,27 @@ enum SourceFiller {
     Nobody,
 }
 
-/// The re-rolled layer loop: the body is ONE layer, re-launched `iters` times with the weight and
-/// KV segment bases advanced per layer, between a prefix (embed) and a suffix (lm_head).
+/// The re-rolled layer loop: ONE BODY PER ATTENTION CLASS, each re-launched for its own layers
+/// with the weight and KV segment bases shifted per layer, between a prefix (embed) and a suffix
+/// (lm_head). ⭐ THE LAUNCH TABLE IS DECLARED DATA — one row per layer, in true layer order, each
+/// naming its body and its segment shifts. There is no per-layer arithmetic left here: no
+/// `v·weight_stride`, no `v / layers_per_bank`, no `v·kv_stride`. A class-split model's classes
+/// have DIFFERENT per-layer strides and different layer counts, which is exactly why the shifts
+/// are a table the bake proved against the placements rather than formulae the runtime re-derives.
 struct Rolled {
-    iters: i64,
-    /// seg1 per-layer byte stride.
-    weight_stride: u64,
-    /// ⭐ LAYERS PER WEIGHT BANK. Layer `v` is `(v / layers_per_bank)`'s bank at
-    /// `(v % layers_per_bank) · weight_stride` — the whole of banking, at launch time. Equal to
-    /// `iters` when the weights fit one region, which makes the division a no-op and this path
-    /// byte-identical to the single-region one. NEVER 0 (`load_rolled` refuses that: it would divide
-    /// by zero on the first launch).
-    layers_per_bank: i64,
+    /// How many attention classes there are (one body each). 1 for every single-class model.
+    n_bodies: usize,
+    /// ⭐ ONE ROW PER LAYER, IN TRUE LAYER ORDER — which body runs it and the segment shifts the
+    /// launch applies. `(body, w_bank, w_off, kv_off)`: the launch binds bank `w_bank` into
+    /// positional slot 1, shifts seg1's base by `w_off` and seg2's by `kv_off`.
+    launches: Vec<(usize, u8, u64, u64)>,
+    /// Bytes of ONE pool page — every layer of every class (`Σ_c n_c · stride_c`). Differs from
+    /// any single class's stride exactly when the classes have different KV geometry.
+    kv_page_stride: u64,
     /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
     /// proved each group's weights live in ONE bank, because a launch has one base per segment.
     prefix_weight_bank: usize,
     suffix_weight_bank: usize,
-    /// seg2 per-layer byte stride.
-    kv_stride: u64,
     // ⛔ NO HIDDEN-STREAM FIELDS. reroll_meta names `hidden_in`/`hidden_out`/`suffix_in` tids, but
     // the loop-carried residual and the body→suffix seam thread IN-PLACE via emitter placement
     // aliasing (hidden_out and suffix_in are aliased onto hidden_in's resident buffer), so the host
@@ -476,14 +488,17 @@ pub struct Executor {
     // ── Programs ──
     rolled: Option<Rolled>,
     prefix_ops: Ops,
-    body_ops: Ops,
+    /// ONE LIST PER ATTENTION CLASS — `body_ops[c]` is class `c`'s body. A single-class model
+    /// (every model but the hybrid-attention ones) has exactly one.
+    body_ops: Vec<Ops>,
     suffix_ops: Ops,
-    /// The SAME body with the per-page fold fused back in — one fewer launch per layer. Used
+    /// Each class's body with the per-page fold fused back in — one fewer launch per layer. Used
     /// whenever the context fits ONE page, which is the case that must cost what unpaged cost.
-    body_fused: Ops,
-    /// sk_bucket LADDER (decode): `(active_cap, ops)` ascending; the top rung is the full cap.
-    body_rungs: Vec<(SweptCols, Ops)>,
-    body_rungs_fused: Vec<(SweptCols, Ops)>,
+    body_fused: Vec<Ops>,
+    /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
+    /// is the full cap.
+    body_rungs: Vec<(SweptCols, Vec<Ops>)>,
+    body_rungs_fused: Vec<(SweptCols, Vec<Ops>)>,
     /// PAGED: the SPLIT bodies are only reachable once a context outgrows one page, so their
     /// Program memory is allocated on first selection.
     split_bodies_ready: bool,
@@ -549,6 +564,34 @@ pub struct Executor {
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
+    /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
+    /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
+    /// and its own op counter. `None` unless the env gate is set.
+    dump: Option<TensorDump>,
+}
+
+/// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
+struct TensorDump {
+    /// This fingerprint's program index, assigned from the process-global first-dumped registry.
+    prog: usize,
+    /// This session's op counter (one per launch group, prefix/body/suffix alike).
+    op: usize,
+    /// Last-seen device bytes per placement (sen format, exactly what D2H brought back).
+    snap: std::collections::HashMap<bundle::PlaceId, Vec<u8>>,
+}
+
+/// The process-global fingerprint → program-index registry for the tensordump, in first-dumped
+/// order. On the card the sessions are built prefill-first-then-decode, which is the emulator's
+/// program order (`new_multi`: prefill first, then the decode cap buckets), so the indices line up
+/// with an `SCRATCHY_EMU_TENSORDUMP` of the same run for the two sessions that actually run — the
+/// ladder rungs that never launch never claim an index.
+fn dump_prog_index(fp: &str) -> usize {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let reg = REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut reg = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let n = reg.len();
+    *reg.entry(fp.to_string()).or_insert(n)
 }
 
 // Driven single-threaded by the worker thread (the session moves between forwards, as the C++
@@ -681,6 +724,7 @@ impl Executor {
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
+            dump: None,
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -727,20 +771,9 @@ impl Executor {
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
-        // ⛔ `layers_per_bank` DIVIDES a layer index on every launch, so a 0 here is a division by
-        // zero on the first body launch — and it can only be 0 if a bundle was baked before the
-        // field existed or by an emitter that did not set it. Refuse at LOAD, naming the bundle,
-        // rather than faulting mid-forward.
-        if m.layers_per_bank == 0 {
-            bail!(
-                "load: reroll meta declares layers_per_bank=0 (iters={}, {} weight bank(s)) — the \
-                 per-layer advance divides by it",
-                m.iters,
-                self.weight_bank_bytes.len() + 1
-            );
-        }
         // A bank index the session has no region for would silently fall back to another bank's
-        // base, which is a whole program reading the wrong weights. Check both groups at load.
+        // base, which is a whole program reading the wrong weights. Check every launch's bank and
+        // both seam groups at load.
         let banks = self.weight_bank_bytes.len() + 1;
         for (what, b) in [
             ("prefix", m.prefix_weight_bank),
@@ -753,42 +786,102 @@ impl Executor {
                 );
             }
         }
+        // ⛔ EVERY LAUNCH'S BANK AND BODY, CHECKED AT LOAD. A launch naming a body the meta does
+        // not carry, or a bank the bundle does not hold, is a bake/runtime disagreement that would
+        // otherwise surface as a wrong-base launch — fluent garbage or an unaddressable region.
+        // The launches' bodies also name the CLASS COUNT, which the rungs must agree with.
+        for l in m.launches.iter() {
+            if l.body as usize >= m.bodies.len() {
+                bail!(
+                    "load: reroll meta's launch table names body {} but the meta carries {} \
+                     body(ies)",
+                    l.body,
+                    m.bodies.len()
+                );
+            }
+            if l.w_bank as usize >= banks {
+                bail!(
+                    "load: reroll meta's launch table puts layer (body {}, iter {}) in bank {}, \
+                     but this bundle has only {banks} weight bank(s)",
+                    l.body,
+                    l.iter,
+                    l.w_bank
+                );
+            }
+        }
+        if m.launches.is_empty() {
+            bail!(
+                "load: reroll meta declares an EMPTY launch table — the layer sequence is the one \
+                 thing the executor cannot re-derive"
+            );
+        }
         self.rolled = Some(Rolled {
-            iters: m.iters as i64,
-            weight_stride: m.weight_stride,
-            layers_per_bank: m.layers_per_bank as i64,
+            n_bodies: m.bodies.len(),
+            launches: m
+                .launches
+                .iter()
+                .map(|l| (l.body as usize, l.w_bank, l.w_off, l.kv_off))
+                .collect(),
+            kv_page_stride: m.kv_page_stride,
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
-            kv_stride: m.kv_stride,
         });
         self.prefix_ops = Self::sibling_ops("rolled prefix", &m.prefix)?;
         self.suffix_ops = Self::sibling_ops("rolled suffix", &m.suffix)?;
         debug!(
-            "[sdsc-superdsc] load: RE-ROLLED — body + prefix({}) + suffix({}); iters={} \
-             wstride={} kvstride={}",
+            "[sdsc-superdsc] load: RE-ROLLED — {} body class(es) + prefix({}) + suffix({}); {} \
+             launch(es), page_stride={} B",
+            m.bodies.len(),
             m.prefix.as_str(),
             m.suffix.as_str(),
-            m.iters,
-            m.weight_stride,
-            m.kv_stride
+            m.launches.len(),
+            m.kv_page_stride
         );
+        // The launch table verbatim — body/iter/w_bank/w_off/kv_off per layer, in true order. This
+        // is the arithmetic the card run's launch loop applies, so a card fault at a known device
+        // address is traced to its producing launch by reading this against the region bases the
+        // prepare-time seg-alloc debug prints.
+        debug!("[sdsc-superdsc] launch table: {:?}", m.launches);
         Ok(())
     }
 
     /// Bind the body's launch groups: either the sk_bucket LADDER (one body per attention sweep
-    /// extent) or the single body, each with its fold-fused twin where one was baked.
+    /// extent, ONE LIST PER CLASS per rung) or the single bodies (one per class), each with its
+    /// fold-fused twin where one was baked.
+    ///
+    /// ⭐ THE ANCHOR RULE: `bodies[0]` is THIS bundle, and every other class is a sibling the meta
+    /// names — the same rule the prefix/suffix follow. A single-class model's `bodies` is exactly
+    /// `[self.code]`.
     fn load_bodies(&mut self) -> Result<()> {
         let rungs: &[bundle::LadderRung<'static>] = match &self.code.reroll {
             Some(m) if m.rungs.len() > 1 => &m.rungs,
             _ => &[],
         };
+        // ONE LIST PER CLASS, this bundle as class 0's anchor and every other class a sibling.
+        let class_ops = |m: &'static bundle::RerollMeta<'static>| -> Result<Vec<Ops>> {
+            let mut v = Vec::with_capacity(m.bodies.len());
+            for (ci, fp) in m.bodies.iter().enumerate() {
+                v.push(if ci == 0 {
+                    bind_ops(self.code)
+                } else {
+                    Self::sibling_ops("rolled body class", fp)?
+                });
+            }
+            Ok(v)
+        };
         if rungs.is_empty() {
-            self.body_ops = bind_ops(self.code);
             if let Some(m) = &self.code.reroll {
-                self.body_fused = match bundle::sibling(&m.body_fused) {
-                    Some(f) => bind_ops(f),
-                    None => Vec::new(),
-                };
+                self.body_ops = class_ops(m)?;
+                self.body_fused = m
+                    .bodies_fused
+                    .iter()
+                    .map(|fp| match bundle::sibling(fp) {
+                        Some(f) => bind_ops(f),
+                        None => Vec::new(),
+                    })
+                    .collect();
+            } else {
+                self.body_ops = vec![bind_ops(self.code)];
             }
             // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
             //
@@ -802,8 +895,8 @@ impl Executor {
             //
             // So the counts go at INFO, always, next to the fingerprint: one line that says whether the
             // thing that was loaded can run. And zero says so in its own words rather than by arithmetic.
-            if self.body_ops.is_empty() && self.prefix_ops.is_empty() && self.suffix_ops.is_empty()
-            {
+            let n_body: usize = self.body_ops.iter().map(|o| o.len()).sum();
+            if n_body == 0 && self.prefix_ops.is_empty() && self.suffix_ops.is_empty() {
                 bail!(
                     "bundle {} has ZERO device programs (0 body / 0 prefix / 0 suffix launch groups). \
                      Its memory plan is present, which is why every session line would otherwise report \
@@ -818,8 +911,10 @@ impl Executor {
                 );
             } else {
                 info!(
-                    "[sdsc-superdsc] bundle {}: {} body + {} prefix + {} suffix launch group(s)",
+                    "[sdsc-superdsc] bundle {}: {} body ({} class(es)) + {} prefix + {} suffix \
+                     launch group(s)",
                     self.code.fp,
+                    n_body,
                     self.body_ops.len(),
                     self.prefix_ops.len(),
                     self.suffix_ops.len()
@@ -827,16 +922,31 @@ impl Executor {
             }
             return Ok(());
         }
-        // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. The ceiling rung's
-        // body IS this bundle, which the registry resolves like any other sibling.
+        // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. Each rung's
+        // class 0 body IS this bundle's rung sibling — the registry resolves like any other.
         for r in rungs {
-            self.body_rungs
-                .push((r.active_cap, Self::sibling_ops("decode rung", &r.body)?));
-            // A rung's fold-fused twin is optional: absent simply means this rung always uses the
-            // split body — correct, one launch per layer dearer.
-            if let Some(f) = bundle::sibling(&r.body_fused) {
-                self.body_rungs_fused.push((r.active_cap, bind_ops(f)));
-            }
+            self.body_rungs.push((
+                r.active_cap,
+                r.bodies
+                    .iter()
+                    .map(|fp| Self::sibling_ops("decode rung", fp))
+                    .collect::<Result<Vec<_>>>()?,
+            ));
+            // A rung's fold-fused twins are optional: an ABSENT one simply means that class
+            // always uses the split body at this rung — correct, one launch per layer dearer.
+            // Present ones are ALL-or-nothing per rung (`bodies_fused.len() == bodies.len()`),
+            // with `SiblingFp::none()` marking the classes that sit out.
+            self.body_rungs_fused.push((
+                r.active_cap,
+                r.bodies_fused
+                    .iter()
+                    .filter(|fp| !fp.is_none())
+                    .map(|fp| match bundle::sibling(fp) {
+                        Some(f) => bind_ops(f),
+                        None => Vec::new(),
+                    })
+                    .collect(),
+            ));
         }
         debug!(
             "[sdsc-superdsc] PAGED KV: {} of {} rungs have a fold-fused twin (a context inside one \
@@ -862,10 +972,13 @@ impl Executor {
     /// manifest, which is what makes the servable context an allocation instead of a baked constant.
     fn latch_paged_geometry(&mut self) {
         let mut page_slots = 0i64;
+        // A rung holds ONE `Ops` PER ATTENTION CLASS (the roll split by class), so the ladder's
+        // contribution to the sweep is the rungs' class vectors FLATTENED — the same `&Ops` items
+        // `lists()` yields.
         for ops in self
             .lists()
             .into_iter()
-            .chain(self.body_rungs.iter().map(|(_, o)| o))
+            .chain(self.body_rungs.iter().flat_map(|(_, o)| o))
         {
             for o in ops {
                 if o.kv.page_slots > 0 {
@@ -876,12 +989,17 @@ impl Executor {
         if page_slots == 0 {
             return;
         }
-        let iters = self.rolled.as_ref().map_or(0, |r| r.iters);
-        let kv_stride = self.rolled.as_ref().map_or(0, |r| r.kv_stride);
+        // ⭐ THE PAGE STRIDE IS BAKED, NOT DERIVED. It used to be `iters × kv_stride`, which is
+        // only right while every layer has the same KV geometry — a hybrid model's classes do not,
+        // and the emitter's `kv_page_stride` already sums every class's extent (`Σ n_c·stride_c`),
+        // proven against the placements. 0 on an UNROLLED bundle (no reroll meta) is the same value
+        // the old `iters × kv_stride` formula produced there (0 × 0), and the geometry latch below
+        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole.
+        let page_stride_bytes = self.rolled.as_ref().map_or(0, |r| r.kv_page_stride);
         self.kv = KvGeometry {
             paged: true,
             page_slots: PageSlots(page_slots),
-            page_stride_bytes: iters as u64 * kv_stride, // all layers of one page
+            page_stride_bytes,
             pool_pages: PoolPages(if self.num_blocks.0 > 0 {
                 self.num_blocks.0
             } else {
@@ -908,7 +1026,11 @@ impl Executor {
     }
 
     fn lists(&self) -> Vec<&Ops> {
-        vec![&self.prefix_ops, &self.body_ops, &self.suffix_ops]
+        vec![&self.prefix_ops]
+            .into_iter()
+            .chain(self.body_ops.iter())
+            .chain(std::iter::once(&self.suffix_ops))
+            .collect()
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1405,7 +1527,9 @@ impl Executor {
         {
             self.alloc_ops_at(ListSel::Prefix)?;
             if self.body_rungs.is_empty() {
-                self.alloc_ops_at(ListSel::Body)?;
+                for c in 0..self.body_ops.len() {
+                    self.alloc_ops_at(ListSel::Body(c))?;
+                }
                 self.split_bodies_ready = true;
             } else {
                 // When every rung has a fold-fused twin, the SPLIT bodies are dead weight until
@@ -1417,7 +1541,9 @@ impl Executor {
                 let twins_cover_every_rung = self.body_rungs_fused.len() == self.body_rungs.len();
                 if !twins_cover_every_rung {
                     for i in 0..self.body_rungs.len() {
-                        self.alloc_ops_at(ListSel::Rung(i))?;
+                        for c in 0..self.body_rungs[i].1.len() {
+                            self.alloc_ops_at(ListSel::Rung(i, c))?;
+                        }
                     }
                     self.split_bodies_ready = true;
                 }
@@ -1490,6 +1616,34 @@ impl Executor {
                 })?);
         }
         lap("seg-alloc", &mut t0);
+        // ⭐ THE REGION BASES, ONCE PER SESSION. A card HMI fault names a device address; these
+        // lines are what turns that address into "which segment/bank, which offset" — chunk0's
+        // (region, offset) plus the alloc's padded total, for every segment and every weight bank.
+        // Read against the launch-table debug line: together they are the full addressing state the
+        // launch loop computes from.
+        for i in 0..NUM_SEGMENTS {
+            let Some(a) = self.seg_addr[i].as_ref() else {
+                continue;
+            };
+            debug!(
+                "[sdsc-superdsc] seg-alloc seg{i}: bytes={} chunk0={:?} (padded total {})",
+                self.segment_bytes[i],
+                a.chunk0(),
+                a.total_size()
+            );
+        }
+        for b in 0..self.weight_bank_bytes.len() {
+            let Some(a) = self.weight_bank_addr[b].as_ref() else {
+                continue;
+            };
+            debug!(
+                "[sdsc-superdsc] seg-alloc bank{}: bytes={} chunk0={:?} (padded total {})",
+                b + 1,
+                self.weight_bank_bytes[b],
+                a.chunk0(),
+                a.total_size()
+            );
+        }
 
         // ── FUSED TWINS ALLOCATE LAST ── They are the only allocation PAGING adds to this session,
         //    and everything above now happens in the order, and at the sizes, the unpaged path used
@@ -1498,9 +1652,13 @@ impl Executor {
         //    roofline. An allocation ahead of the weights therefore taxes decode and leaves prefill
         //    alone, which is the exact shape of the gap. They are KB each, so being last is free.
         for i in 0..self.body_rungs_fused.len() {
-            self.alloc_ops_at(ListSel::RungFused(i))?;
+            for c in 0..self.body_rungs_fused[i].1.len() {
+                self.alloc_ops_at(ListSel::RungFused(i, c))?;
+            }
         }
-        self.alloc_ops_at(ListSel::BodyFused)?;
+        for c in 0..self.body_fused.len() {
+            self.alloc_ops_at(ListSel::BodyFused(c))?;
+        }
         lap("fused-twin-program-h2d", &mut t0);
 
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
@@ -1762,11 +1920,11 @@ impl Executor {
     fn list_mut(&mut self, sel: ListSel) -> &mut Ops {
         match sel {
             ListSel::Prefix => &mut self.prefix_ops,
-            ListSel::Body => &mut self.body_ops,
+            ListSel::Body(c) => &mut self.body_ops[c],
             ListSel::Suffix => &mut self.suffix_ops,
-            ListSel::BodyFused => &mut self.body_fused,
-            ListSel::Rung(i) => &mut self.body_rungs[i].1,
-            ListSel::RungFused(i) => &mut self.body_rungs_fused[i].1,
+            ListSel::BodyFused(c) => &mut self.body_fused[c],
+            ListSel::Rung(i, c) => &mut self.body_rungs[i].1[c],
+            ListSel::RungFused(i, c) => &mut self.body_rungs_fused[i].1[c],
         }
     }
 
@@ -1775,11 +1933,11 @@ impl Executor {
     fn list(&self, sel: ListSel) -> &Ops {
         match sel {
             ListSel::Prefix => &self.prefix_ops,
-            ListSel::Body => &self.body_ops,
+            ListSel::Body(c) => &self.body_ops[c],
             ListSel::Suffix => &self.suffix_ops,
-            ListSel::BodyFused => &self.body_fused,
-            ListSel::Rung(i) => &self.body_rungs[i].1,
-            ListSel::RungFused(i) => &self.body_rungs_fused[i].1,
+            ListSel::BodyFused(c) => &self.body_fused[c],
+            ListSel::Rung(i, c) => &self.body_rungs[i].1[c],
+            ListSel::RungFused(i, c) => &self.body_rungs_fused[i].1[c],
         }
     }
 
@@ -1805,33 +1963,66 @@ impl Executor {
         // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
         // KV before attention. Spelled ONCE, here, for both readers of the selection.
         let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
+        // ⭐ EVERY CLASS'S OWN OPS ANSWER IT, folded to the strongest claim: the gather scratch must
+        // satisfy every class that reads through one, and the unswept-slot guard must use the
+        // NARROWEST sweep any class runs (a rung's extent is shared by every class, so this is the
+        // same number for each — but reading it per class keeps the fact with the ops that carry
+        // it). Same discipline as `latch_paged_geometry` reading `page_slots` off the ops: a bake
+        // fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
+        // that gathers cannot be driven as one that does not, or the reverse.
+        let mut gathers_any = false;
+        // Same authority, same reason: whether this body re-launches a page fold is the
+        // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by) — any
+        // class's fold makes the step a fold, not a chunk.
+        let mut folds_any = false;
+        for c in 0..self.n_classes() {
+            let ls = self.list_sel_for(sel, c);
+            gathers_any |= crate::wiring::GathersKv::of_launch_groups(
+                self.list(ls).iter().map(|o| o.kv.gathered),
+            )
+            .get();
+            folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold);
+        }
         Ok(StepBody {
             sel,
             swept: self.body_swept(sel),
-            // ⭐ THE BODY'S OWN OPS ANSWER IT, not a flag beside them and not the bundle's placement.
-            // Same discipline as `latch_paged_geometry` reading `page_slots` off the ops: a bake fact
-            // rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body that
-            // gathers cannot be driven as one that does not, or the reverse.
-            gathers: crate::wiring::GathersKv::of_launch_groups(
-                self.list(sel).iter().map(|o| o.kv.gathered),
-            ),
-            // Same authority, same reason: whether this body re-launches a page fold is the
-            // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by).
-            folds: self.list(sel).iter().any(|o| o.kv.page_fold),
+            gathers: crate::wiring::GathersKv::of_launch_groups([gathers_any]),
+            folds: folds_any,
+            // The bank's placement census is the BUNDLE's own layout (see the accessor's doc for
+            // why that, and not a per-class fold, is this fact's granularity).
+            subpage_bank: crate::wiring::StagesSubpageBank::of_layout(&self.code.layout),
         })
     }
 
-    /// THIS body's swept extent — its own ladder rung's `active_cap`.
+    /// How many attention classes this session carries (one body each). 1 for every single-class
+    /// model — the case every existing rolled bundle was.
+    fn n_classes(&self) -> usize {
+        self.rolled.as_ref().map_or(1, |r| r.n_bodies).max(1)
+    }
+
+    /// THIS selection's swept extent — its own ladder rung's `active_cap`, which every class of a
+    /// rung shares (a rung IS one swept extent; the classes are the programs baked for it).
     ///
     /// The ladderless arms (`Body`/`BodyFused`: an UNROLLED bundle, which has no `rungs` and therefore
     /// no ladder) sweep their whole baked capacity, and on the paged path that is one page — the number
     /// the ops themselves carry. It is the value the host's guard used for every bundle before the
     /// ladder's own extent was plumbed through, so a ladderless bundle behaves exactly as it did.
-    fn body_swept(&self, sel: ListSel) -> SweptCols {
+    fn body_swept(&self, sel: BodySel) -> SweptCols {
         match sel {
-            ListSel::Rung(i) => self.body_rungs[i].0,
-            ListSel::RungFused(i) => self.body_rungs_fused[i].0,
+            BodySel::Rung(i) => self.body_rungs[i].0,
+            BodySel::RungFused(i) => self.body_rungs_fused[i].0,
             _ => SweptCols::new(self.kv.page_slots.0.max(0) as u32),
+        }
+    }
+
+    /// One `ListSel` for every class of a body selection — the class dimension is the launch
+    /// table's to supply, not the selector's: a rung is ONE swept extent shared by every class.
+    fn list_sel_for(&self, sel: BodySel, class: usize) -> ListSel {
+        match sel {
+            BodySel::Body => ListSel::Body(class),
+            BodySel::BodyFused => ListSel::BodyFused(class),
+            BodySel::Rung(i) => ListSel::Rung(i, class),
+            BodySel::RungFused(i) => ListSel::RungFused(i, class),
         }
     }
 
@@ -1852,7 +2043,9 @@ impl Executor {
             return Ok(());
         }
         for i in 0..self.body_rungs.len() {
-            self.alloc_ops_at(ListSel::Rung(i))?;
+            for c in 0..self.body_rungs[i].1.len() {
+                self.alloc_ops_at(ListSel::Rung(i, c))?;
+            }
         }
         // Their binaries must land before the first launch.
         self.stream_ref()?
@@ -1869,14 +2062,14 @@ impl Executor {
     /// Select the SPLIT decode body for a valid KV length of `valid_len` positions: the smallest
     /// rung whose `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every return is a
     /// split body, so this is also where they are guaranteed to EXIST.
-    fn select_body(&mut self, valid_len: i64) -> Result<ListSel> {
+    fn select_body(&mut self, valid_len: i64) -> Result<BodySel> {
         self.ensure_split_bodies()?;
         let reqs = self.fold_requests_or_1();
         if self.body_rungs.is_empty() {
             // The ladderless single body — traced for the same reason as the fused one: an untraced
             // return is indistinguishable from a step that never reached the selector at all.
             self.trace_body("split-noladder", valid_len, -1, reqs, 0, false);
-            return Ok(ListSel::Body);
+            return Ok(BodySel::Body);
         }
         for (i, (swept, _)) in self.body_rungs.iter().enumerate() {
             // ⛔ `SweptCols::covers` AND NOT `>=` ON BARE INTEGERS. The sibling ladder is keyed by the
@@ -1884,7 +2077,7 @@ impl Executor {
             // type-check and return a body baked for a 64-column sweep because four requests are live.
             if swept.covers(valid_len.max(0) as u64) {
                 self.trace_body("split", valid_len, -1, reqs, swept.get() as i64, false);
-                return Ok(ListSel::Rung(i));
+                return Ok(BodySel::Rung(i));
             }
         }
         // ⚠️ THE FALLBACK, VISIBLE — AND BAKED. A `valid_len` past every rung's sweep runs the rung the
@@ -1907,7 +2100,7 @@ impl Executor {
             })?;
         let cap = self.body_rungs[top].0.get() as i64;
         self.trace_body("split-CEILING", valid_len, -1, reqs, cap, false);
-        Ok(ListSel::Rung(top))
+        Ok(BodySel::Rung(top))
     }
 
     /// Pick the body for this step: the sk_bucket rung by live length, and — when the fold would
@@ -1919,7 +2112,7 @@ impl Executor {
     /// a short context with N requests, ran the prefix fold once — the (request 0, page 0) pass —
     /// and left every other request attending NO resident prefix. Request 0 looked fine, everyone
     /// else produced garbage from their second token.
-    fn select_body_paged(&mut self, valid_len: i64, n_fold_pages: i64) -> Result<ListSel> {
+    fn select_body_paged(&mut self, valid_len: i64, n_fold_pages: i64) -> Result<BodySel> {
         let reqs = self.fold_requests_or_1();
         let single_page = !self.kv.paged || (n_fold_pages <= 1 && reqs <= 1);
         if single_page {
@@ -1934,7 +2127,7 @@ impl Executor {
                             swept.get() as i64,
                             true,
                         );
-                        return Ok(ListSel::RungFused(i));
+                        return Ok(BodySel::RungFused(i));
                     }
                 }
                 // ⛔ NO FUSED RUNG COVERS THIS CONTEXT — fall through to the SPLIT ladder, do NOT
@@ -1946,9 +2139,11 @@ impl Executor {
                 self.trace_body("fused-none-fits", valid_len, n_fold_pages, reqs, 0, false);
                 return self.select_body(valid_len);
             }
-            if !self.body_fused.is_empty() {
+            // The ladderless fused bodies — one per class; present for at least one class is
+            // present (the classes of a bake agree on whether a twin was baked).
+            if self.body_fused.iter().any(|o| !o.is_empty()) {
                 self.trace_body("fused-noladder", valid_len, n_fold_pages, reqs, 0, true);
-                return Ok(ListSel::BodyFused);
+                return Ok(BodySel::BodyFused);
             }
         }
         self.select_body(valid_len)
@@ -2368,6 +2563,9 @@ impl Executor {
             if d.optrace {
                 self.optrace(oi)?;
             }
+            if d.tensordump.is_some() {
+                self.tensordump(oi, op)?;
+            }
         }
         Ok(())
     }
@@ -2639,9 +2837,15 @@ impl Executor {
                 Ok(got) => {
                     let host = &self.seg_host[i][..got.min(self.seg_host[i].len())];
                     let (mut nz, mut mx) = (0usize, 0.0f32);
+                    let mut n_inf = 0usize;
+                    // First NON-FINITE element offsets (element index in the segment), so a divergence
+                    // probe can say WHICH tensor went inf rather than only that the segment holds one.
+                    // `SCRATCHY_SDSC_OPTRACE_INF=1` opts in: printing offsets costs a scan this line
+                    // already pays, but the extra string only matters when it fires.
+                    let mut inf_at: Vec<usize> = Vec::new();
                     // `as_chunks` over `chunks_exact`: a CONSTANT chunk width yields `&[u8; 2]`, so the
                     // pair cannot be short (clippy::chunks_exact_to_as_chunks).
-                    for c in host.as_chunks::<2>().0 {
+                    for (ei, c) in host.as_chunks::<2>().0.iter().enumerate() {
                         let bits = u16::from_le_bytes(*c);
                         if bits != 0 {
                             nz += 1;
@@ -2649,15 +2853,173 @@ impl Executor {
                             if v > mx {
                                 mx = v;
                             }
+                            if !v.is_finite() {
+                                n_inf += 1;
+                                if inf_at.len() < 4 {
+                                    inf_at.push(ei);
+                                }
+                            }
                         }
                     }
-                    format!("nz={nz} max={mx:.3}")
+                    if n_inf > 0 && std::env::var_os("SCRATCHY_SDSC_OPTRACE_INF").is_some() {
+                        format!("nz={nz} max={mx:.3} INF={n_inf} at {inf_at:?}")
+                    } else {
+                        format!("nz={nz} max={mx:.3}")
+                    }
                 }
                 Err(_) => "unreadable".to_string(),
             };
             line.push_str(&format!(" | seg{i} {stat}"));
         }
         eprintln!("{line}");
+        Ok(())
+    }
+
+    /// ⭐ CARD-SIDE TENSORDUMP (`SCRATCHY_SDSC_TENSORDUMP=<dir>`) — the emulator-diff half of the
+    /// bisection instrument. After the op at `oi` settles, D2H every readable segment and write each
+    /// placement whose bytes MOVED since the last dump:
+    ///
+    /// * `prog{P}_seg{S}_t{T}.bin` + `.n` — the LATEST value, named to match the emulator's
+    ///   `SCRATCHY_EMU_TENSORDUMP` (`ktir-emulator/src/resident.rs`) so a diff joins on
+    ///   (program, tensor id). The emulator's `seg` is ITS planned-segment index (a run of fused
+    ///   nodes) while ours is the memory segment — the join key is (prog, tid), never the seg number.
+    /// * `op{O}_prog{P}_seg{S}_t{T}.bin` + `.n` — the timeline copy, one file per write, so the
+    ///   FIRST divergent op for a tensor is the first `op…` file that disagrees with the emulator's
+    ///   trajectory for that tid.
+    /// * `ops.txt` — one line per op: `op{O} prog{P} list-oi {label}`. `progs.txt` — the
+    ///   fingerprint → program-index assignment.
+    ///
+    /// First-writer semantics match the emulator's dump law (only tensors the segment actually
+    /// wrote), by CHANGE DETECTION on the host shadow rather than by an output list: a card launch
+    /// group carries its program's arg→tensor mapping but no direction, and a byte-move is the same
+    /// evidence the emulator's `PROBE6` change detection uses. A recolored slot whose bytes moved
+    /// under an ALIASED tensor fires here too — the diff script must tolerate a card-only dump file
+    /// (the emulator has no entry for that tid at that point), which is why every file is
+    /// self-describing via `.n`.
+    ///
+    /// Elements are LE f32 converted from the device's SEN169 fp16 (2 B/elem) — the same
+    /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, in
+    /// `raw_ids`) are dumped as i32→f32 with `.n = size/4` so the file stays comparable; the
+    /// emulator never dumps those (host-bound sources), so they simply have no reference file.
+    /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
+    /// with one `skip.txt` line so the gap is visible rather than silent.
+    fn tensordump(&mut self, oi: usize, op: &OpProg) -> Result<()> {
+        let Some(dir) = Diag::get().tensordump.clone() else {
+            return Ok(());
+        };
+        if self.dump.is_none() {
+            let prog = dump_prog_index(&self.code.fp);
+            let _ = std::fs::create_dir_all(&dir);
+            // Append (never truncate): a run may build several sessions, and the registry line for
+            // each is one row.
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("progs.txt"))
+            {
+                let _ = writeln!(f, "prog{prog} fp={}", self.code.fp);
+            }
+            self.dump = Some(TensorDump {
+                prog,
+                op: 0,
+                snap: std::collections::HashMap::new(),
+            });
+        }
+        let _ = self.stream_ref()?.synchronize();
+        // D2H every segment a placement can live in. seg2's shadow is one page (clamped read), and
+        // an aliased segment's device region belongs to its owner — reading it back is still SOUND
+        // (a read never writes), it just reflects the owner's bytes, which is exactly what this
+        // session's launches compute against.
+        let mut got = [0usize; NUM_SEGMENTS];
+        for (i, g) in got.iter_mut().enumerate() {
+            if self.seg_addr[i].is_none() {
+                continue;
+            }
+            *g = self
+                .d2h_seg_clamped(SegIdx::checked(i as i64).expect("< NUM_SEGMENTS"))
+                .unwrap_or(0);
+        }
+        let dump = self.dump.as_mut().expect("just initialized");
+        dump.op += 1;
+        let (prog, opno) = (dump.prog, dump.op);
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("ops.txt"))
+            {
+                let _ = writeln!(f, "op{opno} prog{prog} list-oi={oi} {}", op.label());
+            }
+        }
+        let mut skipped = String::new();
+        for (id, p) in &self.places {
+            if p.bank != 0 || p.size == 0 {
+                continue; // a banked weight is not in its segment's region
+            }
+            let i = p.segment as usize;
+            if i >= NUM_SEGMENTS || self.seg_addr[i].is_none() {
+                continue;
+            }
+            // Only whole-tensor reads that the clamped D2H actually brought back: a placement past
+            // the shadow's window would read stale host bytes and masquerade as a write.
+            let avail = got[i] as u64;
+            if avail == 0 || p.offset + p.size > avail {
+                if p.segment as usize == SEG_WEIGHT.get() {
+                    // The weight segment's shadow is full-size; a miss there is a layout shock.
+                    skipped.push_str(&format!(
+                        "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
+                        p.segment, p.offset, p.size, avail
+                    ));
+                }
+                continue;
+            }
+            let cur = &self.seg_host[i][p.offset as usize..][..p.size as usize];
+            let moved = match dump.snap.get(id) {
+                Some(prev) => prev.as_slice() != cur,
+                None => cur.iter().any(|b| *b != 0),
+            };
+            if !moved {
+                continue;
+            }
+            dump.snap.insert(*id, cur.to_vec());
+            let raw = self.raw_ids.contains(id);
+            let elems = if raw {
+                p.size as usize / 4
+            } else {
+                p.size as usize / 2
+            };
+            let mut vals = Vec::with_capacity(elems);
+            if raw {
+                for c in cur.as_chunks::<4>().0 {
+                    vals.push(i32::from_le_bytes(*c) as f32);
+                }
+            } else {
+                for c in cur.as_chunks::<2>().0 {
+                    vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(
+                        u16::from_le_bytes(*c),
+                    )));
+                }
+            }
+            let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let stem = format!("prog{prog}_seg{}_t{id}", p.segment);
+            let tl = format!("op{opno}_prog{prog}_seg{}_t{id}", p.segment);
+            let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
+            let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
+            let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
+            let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+        }
+        if !skipped.is_empty() {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("skip.txt"))
+            {
+                let _ = write!(f, "{skipped}");
+            }
+        }
         Ok(())
     }
 
@@ -2996,17 +3358,15 @@ impl Executor {
             let n_fold_pages = self.n_fold_pages(seq_pos);
             let sel = self.step_body(seq_pos)?.sel;
             let base = self.page_base_for_write(seq_pos);
-            // UNROLLED: one body over the whole model, and an unrolled bundle has no layer boundary
-            // to bank on — its weights are one region by construction (`bank_weight_segment` refuses
-            // to bank without layer classes), so bank 0 is the only bank there is.
-            return self.launch_ops(sel, zero, seq_pos, base, n_fold_pages, 0);
+            // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
+            // split), and an unrolled bundle has no layer boundary to bank on — its weights are one
+            // region by construction (`bank_weight_segment` refuses to bank without layer classes),
+            // so bank 0 is the only bank there is.
+            let ls = self.list_sel_for(sel, 0);
+            return self.launch_ops(ls, zero, seq_pos, base, n_fold_pages, 0);
         };
-        let (iters, wstride, kvstride) = (rolled.iters, rolled.weight_stride, rolled.kv_stride);
-        let (lpb, pre_bank, suf_bank) = (
-            rolled.layers_per_bank.max(1),
-            rolled.prefix_weight_bank,
-            rolled.suffix_weight_bank,
-        );
+        let pre_bank = rolled.prefix_weight_bank;
+        let suf_bank = rolled.suffix_weight_bank;
 
         self.launch_ops(ListSel::Prefix, zero, SeqPos(0), Bytes(0), 1, pre_bank)?;
 
@@ -3017,23 +3377,33 @@ impl Executor {
         let n_fold_pages = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
         let base = self.page_base_for_write(seq_pos);
-        for v in 0..iters {
+        // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
+        // order, each naming its body's CLASS and the segment shifts the launch applies — no
+        // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
+        // against the placements that were baked (see the launch-table guard in
+        // `lower_subtile_tape_to_ktir`), so this loop cannot disagree with the layout: it reads
+        // the table the layout was checked against.
+        //
+        // A class-split model runs its bodies OUT of tape order here — the table is TRUE ORDER
+        // (sorted by absolute layer id), which a single-class roll degenerates to
+        // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
+        // COPIED OUT before the loop: each launch takes `&mut self`, so the table cannot be
+        // borrowed out of `self.rolled` across them. It is one small tuple per layer — the copy
+        // is the table's bytes, not a graph.
+        let launches: Vec<_> = self
+            .rolled
+            .as_ref()
+            .expect("checked above")
+            .launches
+            .clone();
+        for (body, wbank, woff, kvoff) in launches {
             let mut off = [0u64; NUM_SEGMENTS];
-            // ⭐ THE PER-LAYER WEIGHT ADDRESS, IN TWO COORDINATES. `v·wstride` alone was a byte
-            // offset into ONE region, which capped a model's weights at that region's 16 GiB. Layer
-            // `v` is now `(v / lpb)`'s BANK at `(v % lpb)·wstride` — the same descriptors, a
-            // different base — so the ceiling is banks × 16 GiB. `lpb == iters` for an unbanked
-            // bundle, which makes this `(0, v·wstride)`: byte-identical to what it replaced.
-            //
-            // ⛔ THE DIVISION AND THE REMAINDER MUST AGREE WITH THE PLACEMENTS, and they are not
-            // checked here — they are PROVEN at cargo-build, per layer, against the addresses that
-            // were actually baked (see the per-layer formula guard in `lower_subtile_tape_to_superdsc`).
-            let wbank = (v / lpb) as usize;
-            off[SEG_WEIGHT.get()] = (v % lpb) as u64 * wstride;
-            off[SEG_KV.get()] = v as u64 * kvstride;
+            off[SEG_WEIGHT.get()] = woff;
+            off[SEG_KV.get()] = kvoff;
+            let ls = self.list_sel_for(sel, body);
             // The WRITE lands in the page holding seq_pos; the FOLD covers every page the RESIDENT
             // PREFIX [0, seq_pos) spans — zero of them when there is no prefix.
-            self.launch_ops(sel, off, seq_pos, base, n_fold_pages, wbank)?;
+            self.launch_ops(ls, off, seq_pos, base, n_fold_pages, wbank as usize)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
@@ -3095,7 +3465,7 @@ impl Executor {
         let zero = [0u64; NUM_SEGMENTS];
         let (sel, bank) = match self.rolled.as_ref() {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
-            None => (ListSel::Body, 0),
+            None => (ListSel::Body(0), 0),
         };
         self.launch_ops(sel, zero, SeqPos(0), Bytes(0), 1, bank)?;
         self.stream_ref()?
@@ -3589,16 +3959,33 @@ impl Executor {
     }
 }
 
-/// Which op list a selection names. An index rather than a reference so the selector can hand one
-/// back while `&mut self` is still needed to allocate it.
+/// ⭐ WHICH BODY — NOT WHICH LIST. The selector picks the BODY (a swept extent, possibly
+/// fold-fused); the launch table then names the CLASS whose list runs it. Splitting the two is
+/// what keeps a hybrid model's selector identical to a single-class one: a rung is one extent
+/// shared by every class, so "which body serves this context" never needs a class argument.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ListSel {
-    Prefix,
+enum BodySel {
     Body,
-    Suffix,
     BodyFused,
     Rung(usize),
     RungFused(usize),
+}
+
+/// Which op list a selection names. An index rather than a reference so the selector can hand one
+/// back while `&mut self` is still needed to allocate it.
+///
+/// ⭐ EVERY BODY ARM CARRIES A CLASS INDEX. A hybrid-attention model has one body per attention
+/// class; a single-class model has exactly one, so `Body(0)`/`BodyFused(0)`/`Rung(i, 0)` is the
+/// case every existing rolled bundle was. The RUNG index names the ladder entry (shared by every
+/// class — a rung is one swept extent); the class index names which class's list inside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListSel {
+    Prefix,
+    Body(usize),
+    Suffix,
+    BodyFused(usize),
+    Rung(usize, usize),
+    RungFused(usize, usize),
 }
 
 /// ⭐⭐⭐⭐⭐ THE BODY ONE STEP RUNS, AND THE PER-BODY FACTS THE HOST MUST DECIDE FROM — as ONE value,
@@ -3615,10 +4002,11 @@ enum ListSel {
 /// ⛔ `sel` IS PRIVATE. The host may not name a body — only ask which one, and read what it declares.
 #[derive(Clone, Copy, Debug)]
 pub struct StepBody {
-    sel: ListSel,
+    sel: BodySel,
     swept: SweptCols,
     gathers: crate::wiring::GathersKv,
     folds: bool,
+    subpage_bank: crate::wiring::StagesSubpageBank,
 }
 
 impl StepBody {
@@ -3645,6 +4033,19 @@ impl StepBody {
     /// wrong layout.
     pub const fn chunk(self) -> bool {
         self.gathers.get() && !self.folds
+    }
+
+    /// ⭐ WHETHER THE FINE-INDEX BANK IS STAGED FOR **THIS** LAUNCH — the bundle's own placement
+    /// census (`StagesSubpageBank::of_layout`), NOT a per-body fold, because the bank is placed
+    /// once per bundle (the expert door's census) and the tape step it gates belongs to the whole
+    /// launch: any body of the bundle that reads the fine index reads it after the one staging
+    /// step, so the bundle-level answer is the step's own granularity. A body that stages no bank
+    /// is inert (`subpage_bank_e == 0` mints no step); the reverse — a sub-paged expert gather
+    /// with no staged bank — reads an unstaged u32 table of zeros, and expert 0's sub-page 0 is a
+    /// REAL address, which is fluent, wrong output from a clean bake (the reason the parameter is
+    /// a witness type and not a `bool`; see [`crate::wiring::StagesSubpageBank`]).
+    pub const fn subpage_bank(self) -> crate::wiring::StagesSubpageBank {
+        self.subpage_bank
     }
 }
 

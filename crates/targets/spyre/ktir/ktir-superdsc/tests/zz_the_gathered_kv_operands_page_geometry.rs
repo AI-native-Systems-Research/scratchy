@@ -346,6 +346,7 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
         // happens to fit only at the widest page.
         page.get() * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex {
             name: "Tensor3".to_string(),
             entry_dim: axis,
@@ -353,7 +354,8 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
-        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
+        // Global block numbers — no source base (the `GatherCopy` law).
+        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
     )
     .expect("the gather-copy op builds at the score leg's extents");
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -370,12 +372,14 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
         // The SAME width as the gathered control above, for the same reason — one index stick.
         HD * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex::of_scratch_rows(
             "Tensor3".to_string(),
             PageExtent::of_positions(HD),
             ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         ),
-        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
+        // Global block numbers — no source base (the `GatherCopy` law).
+        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
     )
     .expect("the gather-copy op builds");
     // Drop the index operand and the declaration, leaving the bare two-operand identity.

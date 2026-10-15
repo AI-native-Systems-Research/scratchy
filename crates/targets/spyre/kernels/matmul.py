@@ -48,6 +48,15 @@ states it as exactly that. Three facts make the device width the honest spelling
    applied by the door to BOTH paths — so a spliced tile at `n_dev` and a builder
    tile at the logical `n` reach the SAME `assemble_matmul_*` call, byte-identical.
 
+⚠️ THE `SubOp::RouterLogits` ROW STATES THE LOGICAL `n` INSTEAD — the router's own
+consumers (argsort, gather) state logical `[m, e]` views, so a padded producer view
+would stride-disagree with them on the emulator path (the matmul writes stride
+`n_dev`, the consumers read stride `e` — measured as the prefill router e2e's
+row-0-only-correct divergence at m=64, where the `macs ≥ 2^20` bump pads e=128 to
+512). The door re-derives `n_dev` off the REGION for the card either way
+(`matmul_oriented`'s own law), so the descriptor is unchanged; the router family
+is simply all-logical, the same law `routesoftmax_fwd` states for its chain.
+
 The weight descriptor's shape is `[N, K]` at the same device width — the zero-padded
 staging the worker binds (the checkpoint's leading `n_logical` rows, then zero pad
 rows feeding only the output's don't-care pad columns).

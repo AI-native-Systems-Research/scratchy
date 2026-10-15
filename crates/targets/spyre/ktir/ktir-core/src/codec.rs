@@ -108,6 +108,89 @@ pub fn round_to_dtype(data: &mut [f32], dtype: DType) {
     }
 }
 
+/// Round f32 to **SEN169_FP16** ("DLF16") — the card's 16-bit SFP_FMA
+/// *accumulator* format, used by the fused reduce templates (`sum`/`mean`/
+/// `exx2` ride `summeanmaxexx2.ddl` / `exx2_fwd.smc`): 1 sign, 6-bit exponent
+/// (bias 31), 9-bit mantissa, **no subnormals**. Representable magnitudes:
+/// `[2^-30, 1023·2^23 ≈ 8.58e9]`; below `2^-31` flushes to zero (the tie at
+/// exactly `2^-31` rounds to even — zero; there is no subnormal encoding to
+/// catch the gap), at/above the halfway to `2^33` overflows to infinity (a
+/// convention matching this file's f16 overflow — unreachable in practice, the
+/// model's largest reduce sums sit four-plus orders below). Round-to-nearest-
+/// even on the 9-bit mantissa.
+///
+/// ⭐ WHY THIS IS NOT `round_to_dtype(F16)`: an IEEE-f16 accumulator model is
+/// range-unfaithful to the card at BOTH ends of a real model's rows. It
+/// overflows at Σx² > 65504 — gemma-4-12b's layer-18/22/48 norm rows sit at
+/// Σx² 89-95k, so an f16 model turns their `rsqrt` into `rsqrt(inf) = 0` — and
+/// it crushes small-row partials in the subnormal band this format does not
+/// have (values down to `2^-30` are normal here). The vendor sources:
+/// `util/sendefs/numeric_convert.h` (the SEN169_FP16 layout),
+/// `senulator/computeElement.cpp` (`SFP_FMA` with no `mode=` bit ⇒ SEN169_FP16;
+/// the 32-bit variant needs `mode=1` + the `_32.ddl` templates).
+///
+/// ⛔ POINTWISE op results round to the STORAGE dtype (f16) via
+/// `round_to_dtype`/`Tile::compute` — with ONE slice excepted: the rmsnorm
+/// scalar chain's sticks (the square, the `·INV_D` mean, the `+ eps` sum) are
+/// f16-mode SEN169 instructions on card and land HERE via
+/// [`crate::tile::Tile::compute_dlf16`]. That slice is deliberately narrow:
+/// every OTHER pointwise landing is DLF16 on card too, and its staying on the
+/// storage grid here is the DEFERRED global DLF16-store decision's residue,
+/// not a card fact — inert in the gate because the golden rounds node outputs
+/// on the same storage grid, so at O(1) magnitudes the grids cancel on both
+/// sides of the comparison. The reduce's own values are DLF16 throughout:
+/// the partials across tree-fold rounds AND the fma-class reduce's landing
+/// (the door fuses `sum·INV_D` into one descriptor, so the card never stores
+/// the raw sum in f16 — and the scaled MEAN it produces is itself a SEN169
+/// value, not an IEEE-f16 materialization; the emulator's earlier
+/// "the consumer's f16 multiply is the materialization point" model was its
+/// own behavior, not the card's).
+pub fn round_dlf16(f: f32) -> f32 {
+    if f.is_nan() || f == 0.0 {
+        return f; // NaN propagates; ±0 is exact in every format
+    }
+    let sign = if f < 0.0 { -1.0f32 } else { 1.0 };
+    let a = f.abs();
+    // Overflow: at/above the halfway between max finite (1023·2^23) and the
+    // next exponent's 1024·2^23 = 2^33.
+    if a >= 1023.5 * (1 << 23) as f32 {
+        return sign * f32::INFINITY;
+    }
+    // Underflow: no subnormals — below the halfway to the min normal (2^-30)
+    // flushes to zero; the tie at exactly 2^-31 rounds to even (zero).
+    if a <= 2.0f32.powi(-31) {
+        return sign * 0.0;
+    }
+    if a < 2.0f32.powi(-30) {
+        return sign * 2.0f32.powi(-30); // (2^-31, 2^-30): only neighbor above
+    }
+    // Normal range: a = m·2^e with m ∈ [1,2), e ∈ [-30, 32]. Scale the mantissa
+    // to an exact integer step count — a is a normal f32, so a·2^(9-e) keeps
+    // f32's 24 significant bits and the floor/fraction split below is exact.
+    let e = (((a.to_bits() >> 23) & 0xff) as i32) - 127;
+    let m_scaled = a * 2.0f32.powi(9 - e); // ∈ [512, 1024)
+    let floor = m_scaled.floor();
+    let frac = m_scaled - floor;
+    let mut steps = floor as u32;
+    if frac > 0.5 || (frac == 0.5 && steps & 1 == 1) {
+        steps += 1; // round-to-nearest-even
+    }
+    // A carry to 1024 steps is the next exponent's 512: 1024·2^(e-9) = 512·2^(e+1-9).
+    let (steps, e) = if steps == 1024 {
+        (512u32, e + 1)
+    } else {
+        (steps, e)
+    };
+    sign * (steps as f32) * 2.0f32.powi(e - 9)
+}
+
+/// In-place form of [`round_dlf16`] for a partial-sum buffer.
+pub fn round_dlf16_in_place(data: &mut [f32]) {
+    for x in data.iter_mut() {
+        *x = round_dlf16(*x);
+    }
+}
+
 /// Encode a flat f32 tile into raw bytes for memory, per `dtype`.
 pub fn encode(data: &[f32], dtype: DType) -> Vec<u8> {
     // f16 is the hot dtype in a real-model run — convert 4 lanes/instruction
@@ -631,6 +714,81 @@ mod tests {
         let mut g = vec![0.15625f32];
         round_to_dtype(&mut g, DType::F32);
         assert_eq!(g[0], 0.15625);
+    }
+
+    #[test]
+    fn dlf16_representable_values_are_fixed_points() {
+        // steps·2^(e-9) for steps ∈ [512,1023], e ∈ [-30,32] is the format's
+        // own grid — rounding must not move a value already on it.
+        for &(steps, e) in &[
+            (512u32, -30i32),
+            (513, -30),
+            (512, 0),
+            (768, 10),
+            (1023, 31),
+            (1023, 32),
+            (512, 32),
+        ] {
+            let v = (steps as f32) * 2.0f32.powi(e - 9);
+            assert_eq!(round_dlf16(v), v, "steps={steps} e={e}");
+            assert_eq!(round_dlf16(-v), -v, "steps={steps} e={e} (sign)");
+        }
+    }
+
+    #[test]
+    fn dlf16_range_bounds() {
+        // Max finite 1023·2^23; at/above the halfway to 2^33 -> inf.
+        let max = 1023.0 * (1 << 23) as f32;
+        assert_eq!(round_dlf16(max), max);
+        assert_eq!(round_dlf16(-max), -max);
+        assert_eq!(
+            round_dlf16(1023.25 * (1 << 23) as f32),
+            max,
+            "below halfway rounds down to max"
+        );
+        assert_eq!(
+            round_dlf16(1023.5 * (1 << 23) as f32),
+            f32::INFINITY,
+            "the halfway itself rounds up to inf"
+        );
+        // Min normal 2^-30; no subnormals — below the halfway to it flushes to
+        // zero, and the tie at exactly 2^-31 rounds to even (zero).
+        assert_eq!(round_dlf16(2.0f32.powi(-30)), 2.0f32.powi(-30));
+        let just_above = 2.0f32.powi(-31) * 1.000001;
+        assert_eq!(round_dlf16(just_above), 2.0f32.powi(-30));
+        assert_eq!(round_dlf16(2.0f32.powi(-31)), 0.0, "tie rounds to even");
+        assert_eq!(round_dlf16(2.0f32.powi(-31) * 0.999), 0.0);
+        // A sum the f16 accumulator model cannot hold but the card does every
+        // layer: gemma-4-12b's layer-18 norm rows sit at Σx² 89-95k, and the
+        // ceiling-test row runs at 1.57M — all far inside DLF16.
+        for &sum in &[89_771.0f32, 94_669.0, 1_572_000.0] {
+            let r = round_dlf16(sum);
+            assert!(
+                r.is_finite() && r > 0.0,
+                "sum {sum} must stay finite: got {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn dlf16_mantissa_is_nine_bits_rne() {
+        // 1 + 2^-10 is f16-EXACT (10-bit mantissa) but sits exactly halfway
+        // between DLF16's 1.0 and 1 + 2^-9 — the tie rounds to even (1.0).
+        assert_eq!(round_dlf16(1.0 + 2.0f32.powi(-10)), 1.0);
+        // Just past the halfway rounds up to 1 + 2^-9.
+        assert_eq!(
+            round_dlf16(1.0 + 2.0f32.powi(-10) * 1.01),
+            1.0 + 2.0f32.powi(-9)
+        );
+        // An odd-step halfway (between 513 and 514 steps) rounds UP to even.
+        let base = 513.0 * 2.0f32.powi(-9);
+        assert_eq!(
+            round_dlf16(base + 2.0f32.powi(-10)),
+            514.0 * 2.0f32.powi(-9)
+        );
+        // NaN and signed zero pass through.
+        assert!(round_dlf16(f32::NAN).is_nan());
+        assert_eq!(round_dlf16(-0.0).to_bits(), (-0.0f32).to_bits());
     }
 }
 

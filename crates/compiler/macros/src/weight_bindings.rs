@@ -182,7 +182,9 @@ fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
             InputRef::Ext(e)
                 if matches!(
                     lowered.bindings[*e],
-                    SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. }
+                    SourceBinding::Weight { .. }
+                        | SourceBinding::WeightScale { .. }
+                        | SourceBinding::BundleTensor { .. }
                 ) =>
             {
                 Some(*e)
@@ -195,9 +197,9 @@ fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
 /// `(WeightId, layer)` of a weight-carrying binding.
 fn weight_of(lowered: &LoweredDecode, ext: usize) -> Option<(WeightId, Option<UnrollIndex>)> {
     match &lowered.bindings[ext] {
-        SourceBinding::Weight { id, index } | SourceBinding::WeightScale { id, index } => {
-            Some((WeightId(*id), *index))
-        }
+        SourceBinding::Weight { id, index }
+        | SourceBinding::WeightScale { id, index }
+        | SourceBinding::BundleTensor { id, index, .. } => Some((WeightId(*id), *index)),
         _ => None,
     }
 }
@@ -283,6 +285,9 @@ pub(crate) fn emit_weight_bindings(
     tw: &TapeWeights,
 ) -> Result<proc_macro2::TokenStream, String> {
     use quote::quote;
+    // Function-scoped because every user is in this spyre-gated body: a
+    // module-level import would be dead under `-Fmetal` (b76516bab).
+    use scratchy_subtile::handoff::BundleTensor;
     // Accessor name → how to reach that field on `w`. The three group shapes
     // are the struct emitter's own (`Unindexed` ⇒ `w.base`,
     // `LayeredContiguous` ⇒ `w.base[L]`, `LayeredSparse` ⇒ `w.base_L`), keyed
@@ -332,9 +337,16 @@ pub(crate) fn emit_weight_bindings(
 
     let mut arms: Vec<proc_macro2::TokenStream> = Vec::new();
     for (i, b) in lowered.bindings.iter().enumerate() {
+        // Which tensor inside the field the source binds — `None` for the field's own
+        // primary tensor, `Some(..)` for a tensor of a MULTI-TENSOR bundle.
+        let mut bundle_tensor = None;
         let (id, index, is_scale) = match b {
             SourceBinding::Weight { id, index } => (WeightId(*id), *index, false),
             SourceBinding::WeightScale { id, index } => (WeightId(*id), *index, true),
+            SourceBinding::BundleTensor { id, index, tensor } => {
+                bundle_tensor = Some(*tensor);
+                (WeightId(*id), *index, false)
+            }
             _ => continue,
         };
         let name = crate::emit::weight_field_name(program, id, index).to_string();
@@ -364,6 +376,55 @@ pub(crate) fn emit_weight_bindings(
             (WeightKind::RmsNorm | WeightKind::LayerNorm | WeightKind::Embedding, _) => {
                 quote! { #expr.weight }
             }
+            // A MoE bundle's tensor: `bundle_tensor` names WHICH one (the source's own
+            // `BundleTensor`), and the wiring accessors are per-(kind, tensor) — one free
+            // function per combination, so an unmodelled combination is a MISSING arm here
+            // rather than a wrong-tensor guess.
+            (WeightKind::GemmaRouter, false) => match bundle_tensor {
+                Some(BundleTensor::RouterGate) => {
+                    quote! { ::scratchy_target_spyre::wiring::gemma_router_gate(&#expr) }
+                }
+                Some(BundleTensor::RouterPerExpertScale) => {
+                    quote! { ::scratchy_target_spyre::wiring::gemma_router_per_expert_scale(&#expr) }
+                }
+                Some(BundleTensor::RouterScale) => {
+                    quote! { ::scratchy_target_spyre::wiring::gemma_router_scale(&#expr) }
+                }
+                other => {
+                    return Err(format!(
+                        "weight_bindings: GemmaRouter field `{name}` binds bundle tensor \
+                         {other:?}, which is not a router tensor — the source and the field \
+                         kind disagree"
+                    ));
+                }
+            },
+            (WeightKind::GemmaSwitchGlu, false) => match bundle_tensor {
+                Some(BundleTensor::ExpertGateW) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_gate_w(&#expr) }
+                }
+                Some(BundleTensor::ExpertGateS) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_gate_s(&#expr) }
+                }
+                Some(BundleTensor::ExpertUpW) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_up_w(&#expr) }
+                }
+                Some(BundleTensor::ExpertUpS) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_up_s(&#expr) }
+                }
+                Some(BundleTensor::ExpertDownW) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_down_w(&#expr) }
+                }
+                Some(BundleTensor::ExpertDownS) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_down_s(&#expr) }
+                }
+                other => {
+                    return Err(format!(
+                        "weight_bindings: SwitchGluExperts field `{name}` binds bundle tensor \
+                         {other:?}, which is not an expert tensor — the source and the field \
+                         kind disagree"
+                    ));
+                }
+            },
             (other, _) => {
                 return Err(format!(
                     "weight_bindings: no staged-tensor accessor for weight kind {other:?} (field \
@@ -371,7 +432,17 @@ pub(crate) fn emit_weight_bindings(
                 ));
             }
         };
-        let is_gemm = gemm_operands.contains(&i);
+        // ⭐ A BUNDLE TENSOR'S GEMM-NESS IS THE TENSOR'S OWN FACT. `gemm_operands` reads
+        // `MatmulTile` operand-1 positions, which an expansion op never occupies — its matmuls are
+        // `ExpertMatmul`/`RouterLogits`, and their weight operands sit at other positions. A gemm
+        // bundle tensor (the router's `[E,hidden]` projection, the experts' `[E·out,in]` codes) is
+        // staged by the SAME on-disk-`[n,k]`-verbatim + device-width contract every other gemm
+        // weight is, so it must carry the flag its own `BundleTensor::is_gemm_operand()` states —
+        // the same fact the JSON manifest emits for the same source, so the two cannot disagree.
+        let is_gemm = match bundle_tensor {
+            Some(t) => t.is_gemm_operand(),
+            None => gemm_operands.contains(&i),
+        };
         let i = proc_macro2::Literal::u32_unsuffixed(i as u32);
         arms.push(quote! {
             out.push(::scratchy_forward_compiler::BoundWeight {

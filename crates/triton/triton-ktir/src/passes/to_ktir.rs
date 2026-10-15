@@ -286,6 +286,7 @@ fn convert_body(module: &mut Module) -> Result<()> {
     convert_all(module, OpKind::TtExpandDims, convert_expand_dims)?;
     convert_all(module, OpKind::TtTrans, convert_trans)?;
     convert_all(module, OpKind::TtSplat, convert_splat_of_argument)?;
+    convert_all(module, OpKind::TtMakeRange, convert_make_range)?;
     expand_splat_of_scalar_argument(module)?;
     Ok(())
 }
@@ -636,6 +637,98 @@ fn convert_trans(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result
     let block = walk::block_mut(module, path).expect("path");
     block[idx] = transpose;
     block.insert(idx, init_op);
+    Ok(())
+}
+
+/// `tt.make_range {start, end}` -> `tensor.generate {^bb0(%i): ...}`: the constant
+/// lane vector `[start, start+1, ..., end)` as a generated index grid, the one
+/// scheduler-dialect form that CONSTRUCTS a tensor from nothing (a splat fans one
+/// value out; it cannot state per-lane indices).
+///
+/// ⭐ THE GROUP IS THE BRANCH'S OWN `index_grid` SHAPE (gemma4-spyre's
+/// `lower_subtile_tape_to_ktir`): one block argument named in the emit-side
+/// `region.bb0_args` marker, a body of `arith.constant start` + `arith.addi
+/// `%i, %start` when `start != 0` and a bare `tensor.yield %i` when it is, and the
+/// executor binding the argument as a full i32 meshgrid grid, running the body
+/// once, and casting the yield to the declared dtype. Rank-1 only: `tl.arange`
+/// is the front end's only producer of `tt.make_range` and it is rank-1 by
+/// construction, so a wider rank is a front end that changed, refused here by
+/// name rather than half-modelled.
+fn convert_make_range(module: &mut Module, _index: &DefIndex, path: &OpPath) -> Result<()> {
+    let op = walk::at(module, path).expect("path").clone();
+    let res_ty = op
+        .result_types
+        .first()
+        .cloned()
+        .ok_or_else(|| refuse("tt.make_range has no result type"))?;
+    let dims = res_ty
+        .dims()
+        .ok_or_else(|| refuse("tt.make_range's result is not a tensor"))?;
+    if dims.len() != 1 {
+        return Err(refuse(format!(
+            "tt.make_range is rank {}, but the lane vector `tl.arange` spells is rank 1",
+            dims.len()
+        )));
+    }
+    // The bounds ride `AttrKey::Other` -- `start`/`end` have no key of their own
+    // (see `from_ttir`'s ATTR_KEYS note) -- with key-agnostic `Attr::Int` values.
+    let start = match op.attr(&AttrKey::Other("start".into())) {
+        Some(Attr::Int(i)) => *i,
+        _ => {
+            return Err(refuse(
+                "tt.make_range has no `start`, so its lane vector is unknown",
+            ));
+        }
+    };
+    let end = match op.attr(&AttrKey::Other("end".into())) {
+        Some(Attr::Int(i)) => *i,
+        _ => {
+            return Err(refuse(
+                "tt.make_range has no `end`, so its lane vector is unknown",
+            ));
+        }
+    };
+    if dims[0] != end - start {
+        return Err(refuse(format!(
+            "tt.make_range spans {start}..{end} but its result is tensor<{dims:?}>; the \
+             extent and the type disagree"
+        )));
+    }
+
+    // The block argument is the grid index; the executor binds it as the full i32
+    // grid, so the honest type is the grid's tile shape.
+    let hint = module.hint(op.results[0]);
+    let iv = module.fresh_named(&hint);
+    let mut body: Vec<Op> = Vec::new();
+    let yielded = if start == 0 {
+        iv
+    } else {
+        let c = module.fresh_named(&hint);
+        let sum = module.fresh_named(&hint);
+        body.push(
+            Op::new(OpKind::ArithConstant)
+                .with_result(c, IrType::Scalar(DType::I32))
+                .with_attr(AttrKey::Value, Attr::Int(start)),
+        );
+        body.push(
+            Op::new(OpKind::ArithAddi)
+                .with_result(sum, res_ty.clone())
+                .with_operands([iv, c]),
+        );
+        sum
+    };
+    body.push(Op::new(OpKind::TensorYield).with_operands([yielded]));
+
+    let generate = Op::new(OpKind::TensorGenerate)
+        .with_result(op.results[0], res_ty.clone())
+        .with_region(Region {
+            args: vec![(iv, res_ty)],
+            ops: body,
+        });
+
+    let idx = path.index();
+    let block = walk::block_mut(module, path).expect("path");
+    block[idx] = generate;
     Ok(())
 }
 

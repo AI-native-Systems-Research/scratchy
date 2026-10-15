@@ -37,7 +37,7 @@
 //! the `matmulfp8` identifies the o matmul by DATA), replicated per-layer with distinct
 //! weights the `n_layer_input_distinct` way — a baked-layer-0 regression must diverge.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::Error as DoorError;
@@ -64,6 +64,16 @@ const H: u32 = 4096;
 const KV: u32 = 1024;
 const I: u32 = 4096;
 const HD: u32 = 128;
+/// The attention scale, stated as `1/√128` — a NON-f16-exact value, ON PURPOSE. The program
+/// states the multiplier's fp16 image (its `qk * SCALE` mulf runs on the fp16 dot's result,
+/// so the constant is the f16-rounded spelling: f32 0.088388347… vs fp16 0.088378906), while
+/// the census registers the config's f32 — the two agree by bits only for f16-exact scales.
+/// The door resolves that through `scale_slot`'s second query, the f16 image — the value the
+/// worker binds anyway (`SCALE_BYTES = 2`) — the same law every other bound constant uses; a
+/// bits-only lookup in the attention arm once refused this very fixture ("registry
+/// desync"). Stating the mismatch on purpose PINS the fallback: this scale must keep
+/// resolving the slot the config's f32 names, not the slot its fp16 image happens to equal.
+const ATTN_SCALE: f32 = 0.088_388_346; // f32(1/√128)
 /// Two layers: the reroll needs a repeating body, and `per_layer` needs a second entry to
 /// prove the copy FAMILY (not just one placement) — the minimum that exercises both.
 const LAYERS: u32 = 2;
@@ -101,6 +111,13 @@ fn fp8_oproj_one_layer() -> LoweringInput {
         weight: GemmWeight::Fp8Dynamic,
     };
     o.inputs.push(InputRef::Ext(16));
+    // Restate the base fixture's own `1/√hd` explicitly — the non-f16-exact spelling IS the
+    // pin (see `ATTN_SCALE`): the door must resolve it through the f16 image, not by bits.
+    for op in &mut input.ops {
+        if let SubOp::AttnDecode { scale, .. } = &mut op.op {
+            *scale = ATTN_SCALE;
+        }
+    }
     input
 }
 
@@ -195,11 +212,21 @@ fn n_layer_fp8_oproj(n: u32) -> (LoweringInput, HashSet<u32>) {
                     InputRef::Ext(e) => InputRef::Ext(map_ext(*e, layer)),
                 })
                 .collect();
-            ops.push(OpDesc {
+            let mut op = OpDesc {
                 op: op.op,
                 m: op.m,
                 inputs,
-            });
+            };
+            // ⭐ THE KV WRITER'S LAYER ID IS PER-COPY STATE. Production graphs stamp each
+            // layer's rope append with its TRUE index (`to_wavefront`, from `model.bounds`),
+            // and the walk derives the launch table from those ids — a replicated layer-0
+            // id would name one layer twice, which the walk refuses ("two launches name
+            // layer 0"). Rewrite it the way the expansion does.
+            let true_layer = layer as u32;
+            if let SubOp::RopeAppend { layer, .. } | SubOp::KvAppend { layer, .. } = &mut op.op {
+                *layer = true_layer;
+            }
+            ops.push(op);
         }
         // This layer's staged weights: the twelve per-layer sources minus the KV caches.
         for &e in &per_layer_src_ids {
@@ -261,11 +288,12 @@ fn door_lower_op(
 
 /// The body's matmul programs, in walk order (one canonical layer's worth: q, k, v, o,
 /// gate, up, down — node ids 2, 3, 4, 8, 11, 12, 14 of the fixture, one past the
-/// prologue).
+/// prologue). Every class's bodies — one, for this uniform-geometry fixture.
 fn matmul_body_ops(rolled: &RolledSuperDsc) -> Vec<&EmittedOp> {
     let ops: Vec<&EmittedOp> = rolled
-        .body
+        .bodies
         .iter()
+        .flat_map(|b| b.ops.iter())
         .filter(|e| e.op_name.starts_with("matmul_s"))
         .collect();
     assert_eq!(
@@ -384,13 +412,22 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
 
     // ── 4. THE FAMILY AND THE STRIDE ──────────────────────────────────────────────────────────
     // The copy registers as a per-layer family keyed on the CANONICAL copy tid, and its
-    // per-layer advance is the SAME weight_stride the companion family advances by — the
-    // uniformity the executor's one-base-per-segment bind needs (and the stride guard
-    // proves; this is the walk's own statement of it).
-    assert_eq!(rolled.iters, LAYERS);
+    // per-layer advance is the SAME weight stride the companion family advances by — the
+    // uniformity the executor's one-base-per-segment bind needs. The stride itself is
+    // stated by the per-launch weight shift `launch_w` — (bank, offset delta from the
+    // class's layer-0 placements) — whose mint REFUSES a class whose per-layer weight
+    // tables disagree, so a family that did not advance with the rest is a build error,
+    // not a misread address. This is the walk's own statement of that law.
     assert_eq!(
-        rolled.layers_per_bank, rolled.iters,
-        "unbanked: every layer in bank 0"
+        rolled.bodies.len(),
+        1,
+        "the uniform-geometry fixture is one attention class"
+    );
+    assert_eq!(rolled.iters(), LAYERS);
+    assert_eq!(
+        rolled.launches,
+        [(0, 0), (0, 1)],
+        "a single-class roll degenerates to [(0, 0), (0, 1)]"
     );
     assert_eq!(
         rolled.per_layer.get(&perm0).map(|v| v.as_slice()),
@@ -402,24 +439,34 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
         Some(&[11, 23][..]),
         "the companions form theirs"
     );
-    assert!(rolled.weight_stride > 0);
+    assert!(
+        rolled.launch_w.iter().all(|&(bank, _)| bank == 0),
+        "unbanked: every layer in bank 0"
+    );
+    assert_eq!(
+        rolled.launch_w[0],
+        (0, 0),
+        "layer 0 binds the class's own base"
+    );
+    let stride = rolled.launch_w[1].1;
+    assert!(stride > 0);
     assert_eq!(
         rolled.layout.placements[&perm1].offset - rolled.layout.placements[&perm0].offset,
-        rolled.weight_stride,
+        stride,
         "the copy family advances by the weight stride"
     );
     assert_eq!(
         rolled.layout.placements[&23].offset - rolled.layout.placements[&11].offset,
-        rolled.weight_stride,
+        stride,
         "…exactly as the companion family does"
     );
 
     // ── 5. THE MINT IS BUNDLE-INVARIANT ───────────────────────────────────────────────────────
     // The copies exist for the PREFILL row kind too: the gate is the GEOMETRY, never this
     // bundle's row count, because every bundle of a model shares ONE staged weight
-    // segment. (The empty per-layer map is the wiring pass's own production call shape —
-    // `graph_wiring` mints unbanked.)
-    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, false, &BTreeMap::new())
+    // segment. (The empty class slice is the unbanked mint — no layer structure stated,
+    // so no banking; the copies mint from the geometry alone.)
+    let layout_prefill = compute_bundle_layout(&rg, &weight_ids, false, false, &[])
         .expect("the mint runs for the prefill row kind");
     assert_eq!(
         layout_prefill.weight_copies,
@@ -434,8 +481,9 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
     // The names are the door's own (the fp8 chain ends `…_fq_mm`; the finalize forms carry
     // `attn_o_s{slab}` / `attn_o_h{head}s{slab}`), never a node index.
     let attn_body = rolled
-        .body
+        .bodies
         .iter()
+        .flat_map(|b| b.ops.iter())
         .find(|e| e.op_name.starts_with("attn_s"))
         .expect("the body's attention program");
     let with = door_lower_op(&rolled, attn_body, Some(params))

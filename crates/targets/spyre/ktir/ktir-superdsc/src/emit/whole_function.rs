@@ -1983,6 +1983,7 @@ pub fn lower_function(
                 r_len: dims[0],
                 c_len: dims[1],
                 r_cover: (0, dims[0]),
+                c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
             };
@@ -2381,6 +2382,7 @@ fn gathered_matmul_materializes(
         r_len: rows,
         c_len: head,
         r_cover: (0, rows),
+        c_cover: (0, head),
         is_out: true,
         is_fp8: false,
     };

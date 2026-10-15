@@ -52,9 +52,11 @@
 //!   (the consumer's `elementwise_op_func` refuses them by name, and substituting
 //!   `"gelu"` would run a different function and report success). [`elementwise_row`]
 //!   enumerates them so the same law holds.
-//! * **`GainConvention::OnePlusScale`** — the door's rmsnorm body assembles `xn·gamma`
-//!   from the LOADED gain tensor and has no statement for a `+1` offset; the arm is the
-//!   compile-time enumeration, never a silently-wrong Scale splice.
+//!
+//! `GainConvention::OnePlusScale` WAS this list's third member and is a ROW now: the
+//! kernel states the `+1` as an addf over the loaded gain and the door states the same
+//! add against the offset's `[1,1]` registry const (the epsilon's own mechanism) —
+//! see [`rmsnorm_row`].
 //!
 //! # THE GATE, AND WHY IT IS AT THE DESCRIPTOR LEVEL
 //!
@@ -95,11 +97,19 @@ use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
 use scratchy_subtile::lower::GemmWeight;
-use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
+use scratchy_subtile::subtile_ir::{
+    EwKind, GainConvention, GatedAct, SubOp, SubtileIR, SubtileNode,
+};
 
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
+
+/// THE ADDRESSING WELL-FORMEDNESS PASS — the general compile-time lockdown every
+/// bake runs under. See [`addressing`] for the layering (this crate's binding-time
+/// guard, the door's bank guard, and this pass's graph sweep) and the closed class
+/// tables an index-minted tensor's readers must appear in.
+pub mod addressing;
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -131,10 +141,11 @@ pub enum TritonKernelRow {
 // here, which is the whole design: we are a procmacro compiler, everything is known
 // at compile time, and no runtime lookup can miss.
 
-/// `SubOp::RmsNorm`'s two gain conventions. The door's rmsnorm body assembles `xn·gamma`
-/// from the loaded gain; the `(1 + w)` class (gemma) needs the door to state the offset,
-/// which it does not yet — the arm exists so wiring one in is a compile error until the
-/// kernel + door support land together.
+/// `SubOp::RmsNorm`'s two gain conventions — two entries of one kernel file. The
+/// Scale form multiplies by the loaded gain; the `(1 + w)` class (gemma) adds the
+/// offset over the load first, a constant the door resolves through the SAME
+/// `[1,1]` registry slot mechanism the epsilon uses (`program_gain_offset` reads
+/// it off the program; `compute_bundle_layout` collects `gain.offset()`).
 pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
     match gain {
         GainConvention::Scale => TritonKernelRow::Spliced {
@@ -143,19 +154,20 @@ pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
             entry: "rmsnorm_fwd",
             program: Program::RmsNorm,
         },
-        // ⛔ NO DEVICE STATEMENT: the door multiplies by the LOADED gain with no offset
-        // term, and the wavefront lowering CARRIES the convention rather than folding
-        // it into the weights (folding would make the loaded gain disagree with the
-        // checkpoint). Splicing the Scale kernel here would scale every gemma
-        // activation by roughly nothing — a model that loads, runs, and is quietly
-        // wrong. The arm is the compile-time enumeration; the realization lands here
-        // when the door states the offset (metal's own `ScalarOffsetRmsNorm`, whose
-        // kernel applies `weight + offset`, is the precedent shape).
-        GainConvention::OnePlusScale => TritonKernelRow::Refused(
-            "the (1 + w) gain convention: the door's rmsnorm body assembles xn·gamma from \
-             the loaded gain and has no +1 offset statement — the Scale kernel would scale \
-             every activation by roughly nothing. The kernel + door support land together",
-        ),
+        // ⭐ THE (1 + w) ROW — the offset is CARRIED, never folded into the weights
+        // (folding would make the loaded gain disagree with the checkpoint, so every
+        // consumer that re-reads it — dumps, the numeric reference, a second target —
+        // would see a different tensor). The kernel states the addf over the load;
+        // the door states the SAME add against the offset's registry const, so the
+        // descriptor computes the formula the program runs — metal's own
+        // `ScalarOffsetRmsNorm` (whose kernel applies `weight + offset`) is the
+        // precedent shape.
+        GainConvention::OnePlusScale => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/rmsnorm.py"),
+            file: "rmsnorm.py",
+            entry: "rmsnorm_oneplus_fwd",
+            program: Program::RmsNorm,
+        },
     }
 }
 
@@ -293,9 +305,9 @@ pub fn attn_row() -> TritonKernelRow {
 }
 
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
-/// splice is one of the five families below (attention rides its own `lower_attn` entry);
-/// the ops the spyre target has no kernel FOR (the expansion ops, reshape, …) never reach
-/// this crate — `lower_one_node`'s own arms own those refusals by name.
+/// splice has a family below (attention rides its own `lower_attn` entry); the ops the
+/// spyre target has no kernel FOR (the 2b expansion kinds, the host-routed pairs, …)
+/// never reach this crate — `lower_one_node`'s own arms own those refusals by name.
 pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKernelRow {
     match op {
         SubOp::RmsNorm { gain, .. } => rmsnorm_row(*gain),
@@ -331,6 +343,193 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // binding, and the dead-prefix view injection that no pure-Triton program can
         // state).
         SubOp::AttnDecode { .. } => attn_row(),
+        // ── THE GEMMA-4 / MoE-2a KINDS — one row each, the same four facts the families
+        // above state. Their door arms already exist (they were written against the
+        // builder path on the gemma-4 branch), so the splice's whole job is minting a
+        // program whose views state what those arms read. ──
+        //
+        // ⭐ ROUTERNORM IS RMSNORM, VERBATIM (branch: `lower_router_norm_node`). The
+        // router's gain is a dense `[1, hidden]` row the host stages like every other
+        // norm gain, and gemma's router gain is the SCALE convention (the loader stores
+        // `router.scale` verbatim, no `+1`) — the one `Program::RmsNorm` multiplies by —
+        // so the node's program is the rmsnorm family's own, unmodified. The `routernorm`
+        // STEM (the builder's naming law) is stated in `program_stem`.
+        SubOp::RouterNorm { .. } => rmsnorm_row(GainConvention::Scale),
+        // ⭐ ROUTERLOGITS IS A DENSE MATMUL, VERBATIM (branch:
+        // `lower_router_logits_node`). The router gate is a dense weight the loader
+        // staged `[hidden, experts]` (the FUF `[k, n]` convention), exactly the form
+        // every dense `MatmulTile` reads; the router weights are staged dense fp16 —
+        // quantizing them would change the routing decision every expert downstream
+        // consumes. Same `Program::Matmul` the dense row states; `routerlogits` stem in
+        // `program_stem`.
+        SubOp::RouterLogits { .. } => matmul_row(&GemmWeight::Dense),
+        // ⭐ ROUTESCALE IS SCALARMUL, VERBATIM — a scores-times-constant is the
+        // ScalarMul computation with the value read off the `RouteScale` payload,
+        // so the row is the scalarmul family's own (SCALE stated from the payload
+        // in `kernel_spec`). ⛔ BUT THE WIDTH IS THE ROUTER'S OWN LAW, NOT THE
+        // FAMILY'S: the scores ride the LOGICAL `[m, k]` storage, not a padded
+        // one. The family's device-width law exists because a ScalarMul on the
+        // lm-head logits follows a MATMUL that emitted `for_matmul`-padded
+        // columns with the layout reserving exactly that — the router's scores
+        // follow a GATHER that writes the logical width with nobody reserving
+        // any pad, so `for_pointwise(k=8)`'s util-floor pad to 512 is fictional
+        // and the view faults the fused segment (measured: `view [m, 512]
+        // strides [512, 1] spans 2048 bytes but the tensor allocated … holds
+        // only [m·k·2]`). `kernel_spec` states the logical width; the door's
+        // `scalarmul_scaled` re-derives its own device width off the REGION and
+        // caps it at the placement, so the descriptor is the same either way —
+        // `routesoftmax`'s own law ("it reads k off the output view's own
+        // v_cols — the LOGICAL count — and pads the device width itself").
+        // `scalarmul` stem automatic via the program.
+        SubOp::RouteScale { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/scalarmul.py"),
+            file: "scalarmul.py",
+            entry: "scalarmul_fwd",
+            program: Program::ScalarMul,
+        },
+        SubOp::RouteSoftmax => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/routesoftmax.py"),
+            file: "routesoftmax.py",
+            entry: "routesoftmax_fwd",
+            program: Program::RouteSoftmax,
+        },
+        SubOp::RouteRenorm => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/routerenorm.py"),
+            file: "routerenorm.py",
+            entry: "routerenorm_fwd",
+            program: Program::RouteRenorm,
+        },
+        // ⭐ THE 2b ROUTER-INDEX ROWS BEGIN HERE — the rank vector first. The
+        // kernel is the LANE-FREE count form (`routeargsort.py`'s header
+        // states the law: `tl.arange` refuses the chain fixture's `E = 5`,
+        // and the door's own per-`j` compare needs no lanes), so the body
+        // compiles on the compare/select/cast extension M2b step 2 landed
+        // plus `tl.zeros`/`tl.sum` the norm family already exercises. The
+        // door re-derives its `9W + 1` chain from the minted views (the
+        // full-tile `x` view first, the `[M, 1]` column stores over the
+        // output), never walking this body's ops. ⭐ THIS ROW IS THE
+        // BARE-ARGSORT CORNER'S OWN: `lower_all` folds the argsort away
+        // (emits nothing) when every consumer of its rank vector is a
+        // RouteTopK — the fused top-k reads the LOGITS, not the ranks — so
+        // this kernel runs only for an argsort whose ranks feed anything
+        // else, exactly the tapes the argsort door's own tests construct.
+        SubOp::RouteArgsort => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/routeargsort.py"),
+            file: "routeargsort.py",
+            entry: "routeargsort_fwd",
+            program: Program::RouteArgsort,
+        },
+        // ⭐ THE FUSED PAIR — the vendor `topkindex`/`topkvalue` selection as
+        // ONE kernel over the RAW LOGITS (the argsort and the score gather
+        // are folded into it: `lower_all` silences both when the argsort's
+        // only consumers are RouteTopKs and the gather's ids come from a
+        // RouteTopK). The measured stick law — the reduction dim may not
+        // ride the stick, and the `[m, W]` logits put the experts ON it —
+        // sends the pair through the Kᵀ-restickify door first (`topk.ddl`'s
+        // own orientation: `[W, m]` sticked on the token axis), which is the
+        // door's work, never this body's. The kernel is the ripple mirror
+        // (`routetopk.py`'s header states the law — the K running registers
+        // live in the OUTPUT buffers, the grammar's own no-subscript-store
+        // law), and it lands BOTH the ids and the values: `desc_v` IS the
+        // old gather's output, so the fold removes that program whole.
+        SubOp::RouteTopK { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/routetopk.py"),
+            file: "routetopk.py",
+            entry: "routetopk_fwd",
+            program: Program::RouteTopK,
+        },
+        // ⭐ THE TRUE GATHER — `take_along_axis` at the last axis over
+        // whatever indices the node states, the door's own one-hot select
+        // chain's exact function (no top-k re-derivation: the chain fixture
+        // feeds hand-set indices, so a value-recomputing substitute would
+        // fail it by construction). The kernel is the LANE-FREE column-scan
+        // form (`routegather.py`'s header states the law). ⭐ THIS ROW IS
+        // THE NON-ROUTER GATHER'S OWN: `lower_all` folds the gather away
+        // when its indices come from a RouteTopK over the same source — the
+        // fused top-k lands the values itself — so this kernel runs only
+        // for a gather whose ids arrive from anywhere else.
+        SubOp::RouteGatherScores => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/routegather.py"),
+            file: "routegather.py",
+            entry: "routegather_fwd",
+            program: Program::RouteGatherScores,
+        },
+        // ⭐ THE PER-EXPERT SCALE — each score times its expert's learned
+        // scale, the same one-hot select as the gather with the LOADED
+        // `[1, E]` scale row as the gather parent (`routeexpertscale.py`'s
+        // header states the law). ⛔ THE BINDING IS THE DOOR'S MINT ORDER,
+        // NOT THE NODE'S: the door reads `[scale, idx, scores, out]`
+        // positionally (`tensors[0]` IS the scale row — the recorded m=8
+        // mis-read law), so the kernel's parameters and the splice's binding
+        // row both reorder the node's `[scores, idx, scale]` (see
+        // `bindings_for`'s RouteExpertScale arm).
+        SubOp::RouteExpertScale { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/routeexpertscale.py"),
+            file: "routeexpertscale.py",
+            entry: "routeexpertscale_fwd",
+            program: Program::RouteExpertScale,
+        },
+        SubOp::ExpertGatedAct { act } => gated_act_row(*act),
+        SubOp::ExpertSort { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/expertsort.py"),
+            file: "expertsort.py",
+            entry: "expertsort_fwd",
+            program: Program::ExpertSort,
+        },
+        SubOp::ExpertUnsort => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/expertunsort.py"),
+            file: "expertunsort.py",
+            entry: "expertunsort_fwd",
+            program: Program::ExpertUnsort,
+        },
+        // ⛔ A SHARED EXPERT IS A BUNDLE-CONTRACT REFUSAL, NOT A SILENT DROP —
+        // checked in [`lower_all`], the last place the bound is visible before a
+        // program is minted (`Program::ExpertCombine` carries no payload, so the
+        // door cannot re-state the guard the branch's builder fn carried).
+        SubOp::ExpertCombine { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/expertcombine.py"),
+            file: "expertcombine.py",
+            entry: "expertcombine_fwd",
+            program: Program::ExpertCombine,
+        },
+        // ⭐ THE EXPERT BANK'S OWN PROJECTION — the one-hot-over-E ladder form
+        // (`expertmatmul.py`'s header states the law). The node's `inputs[1]`
+        // is the SORT's output, wired for the PRODUCER WALK only: the splice
+        // resolves the sort's index input and binds it as the program's
+        // `desc_idx`, the branch's own builder walk (`mint`'s binding law
+        // below). The program's parameters are mint-ordered `[w, s, idx,
+        // rows]`, which the door resolves by extent — the same views this
+        // kernel's descriptors state.
+        SubOp::ExpertMatmul { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/expertmatmul.py"),
+            file: "expertmatmul.py",
+            entry: "expertmatmul_fwd",
+            program: Program::ExpertMatmul,
+        },
+        SubOp::TanhSoftCap { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/tanhsoftcap.py"),
+            file: "tanhsoftcap.py",
+            entry: "tanhsoftcap_fwd",
+            program: Program::TanhSoftCap,
+        },
+        SubOp::RmsNormUnit { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/rmsnormunit.py"),
+            file: "rmsnormunit.py",
+            entry: "rmsnormunit_fwd",
+            program: Program::RmsNormUnit,
+        },
+        SubOp::ScalarWeightMul => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/scalarwmul.py"),
+            file: "scalarwmul.py",
+            entry: "scalarwmul_fwd",
+            program: Program::ScalarWeightMul,
+        },
+        SubOp::Reshape { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/reshape.py"),
+            file: "reshape.py",
+            entry: "reshape_fwd",
+            program: Program::Reshape,
+        },
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
         // match is the gate: these kinds have their own arms there (attention's
@@ -339,11 +538,7 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // message names what must land, and no `_` arm can swallow it.
         SubOp::RmsNormReduce { .. }
         | SubOp::RmsNormApply { .. }
-        | SubOp::Reshape { .. }
         | SubOp::SumReduce { .. }
-        | SubOp::TanhSoftCap
-        | SubOp::RmsNormUnit { .. }
-        | SubOp::ScalarWeightMul
         | SubOp::GateSplit { .. }
         | SubOp::GateApply
         | SubOp::Concat { .. }
@@ -357,11 +552,55 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }
         | SubOp::Mean
-        | scratchy_subtile::expansion_ops!() => TritonKernelRow::Refused(
+        // ⛔ AND THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the
+        // 2a routing above made the macro's patterns for THOSE kinds unreachable
+        // (unreachable_patterns is `-D warnings`), and the remaining members are a
+        // fixed list the registry's `@expansion` section states — a new expansion op
+        // is E0004 here until it gets its own row or refusal, exactly as before.
+        // The remaining router rows are the biased routers (the Phase-2b
+        // worklist); the rest have their own `lower_one_node` arms.
+        | SubOp::KvEncode { .. }
+        | SubOp::KvStage { .. }
+        | SubOp::RotateRows { .. }
+        | SubOp::AttnPackedKv
+        | SubOp::RouteSigmoidBias { .. }
+        | SubOp::RouteBias { .. }
+        | SubOp::ExpertAct { .. }
+        | SubOp::SampleRowsGather
+        | SubOp::SampleRowsScatter
+        | SubOp::AllRowsMatmul => TritonKernelRow::Refused(
             "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
         ),
+    }
+}
+
+/// `SubOp::ExpertGatedAct`'s acts — an exhaustive match over the act vocabulary, the
+/// family-function law. Silu and gelu are real DDL primitives (`silumul`'s two-op body
+/// with the act's primitive in place of `"silu"`); `SwigluOai`'s ±7-clamped
+/// `min`/`max`/`sigmoid` chain needs compare/select primitives the ladder has not
+/// landed (the Phase-2b compare/select extension names them), and substituting silu or
+/// gelu would run a different function and report success — the refusal states it.
+fn gated_act_row(act: scratchy_subtile::subtile_ir::GatedAct) -> TritonKernelRow {
+    use scratchy_subtile::subtile_ir::GatedAct as Sub;
+    let ktir_act = match act {
+        Sub::Silu => ktir_superdsc::ktir_node::GatedAct::Silu,
+        Sub::Gelu => ktir_superdsc::ktir_node::GatedAct::Gelu,
+        Sub::SwigluOai => {
+            return TritonKernelRow::Refused(
+                "gpt-oss's SwiGLU-OAI act: `min(g,7)`, `clamp(u,±7)` and `sigmoid` need the \
+                 compare/select primitives the ladder has not landed (the Phase-2b \
+                 compare/select extension), and neither `silu` nor `gelu` is that function — \
+                 substituting one would run the wrong model and report success",
+            );
+        }
+    };
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/gatedact.py"),
+        file: "gatedact.py",
+        entry: "gatedact_fwd",
+        program: Program::ExpertGatedAct(ktir_act),
     }
 }
 
@@ -389,6 +628,27 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     lower_one(node, ir, rows_are_requests)
 }
 
+/// The prefill lm-head tail predicate, stated ONCE — every consumer of the fold
+/// (the `lower_all` rewrite and the one-op `lower`'s routing echo below) reads
+/// the SAME four conjuncts, because the width test alone was falsified by the
+/// gemma-4 parity fixture (vocab 512), whose GLOBAL-layer q projection is ALSO
+/// 512 cols (4 heads × hd 128) — the fold fired on every global layer's Q, and
+/// the model's first sampled token was garbage while every width-128 tensor
+/// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
+/// rows are dead, and only the result's ancestors are the tail. The walk is
+/// [`tensor_feeds_result_through_row_local_ops`] (main's own law).
+fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+) -> bool {
+    let result_cols = ir.tensors[ir.result.index()].cols;
+    node.output.region.cols.len == result_cols
+        && node.output.region.rows.len > 1
+        && !rows_are_requests
+        && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
+}
+
 /// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
 /// lm-head tail, whose fold is TWO — the last-row extraction (its own program, the
 /// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul — exactly the
@@ -399,10 +659,55 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<Vec<EmittedOp>, String> {
-    let result_cols = ir.tensors[ir.result.index()].cols;
-    let is_prefill_lm_head_tail = node.output.region.cols.len == result_cols
-        && node.output.region.rows.len > 1
-        && !rows_are_requests;
+    // ⛔ A SHARED EXPERT IS REFUSED HERE — the LAST place the bound is visible
+    // before a program is minted (branch: `lower_expert_combine_node`; the port's
+    // `Program::ExpertCombine` carries no payload, so the door cannot re-state
+    // it). The chain this kernel spells has no term for a shared expert's
+    // contribution (the emu's own doc: "a shared expert's contribution would be
+    // an extra `fma` term on the same accumulator"), so a bundle that declares
+    // one cannot be lowered — the refusal names the bound, per the no-refusals
+    // law that a missing capability is a named error, not a silent drop. The
+    // loader-level gate (to_wavefront's Qwen path) is the FIRST line; this is
+    // the second.
+    if let SubOp::ExpertCombine {
+        shared: scratchy_subtile::subtile_ir::SharedExpertBound(Some(shared_inter)),
+        ..
+    } = &node.op
+    {
+        return Err(format!(
+            "ExpertCombine t{} declares a shared expert (intermediate width {shared_inter}): the \
+             KTIR combine is the k-slot fma chain over the routed pair rows, and a shared expert's \
+             contribution is an extra term that chain does not state — shared-expert models are \
+             the loader's worklist, not a silent drop",
+            node.output.tensor.index() as u32
+        ));
+    }
+    // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
+    // program is emitted; the flatten-back (tail) and the middle (norm) self-identify
+    // as fused-away and emit NOTHING. The match is dataflow-based
+    // ([`sandwich_at_split`]), so it is a pure function of the graph — every walk
+    // reaches the same answer at the same nodes, and any failed check falls back to
+    // the byte-identical un-fused lowering (the ordinary reshape/norm rows below).
+    // ⛔ THE MATCHER ACCEPTS GAINED (`Scale`/`OnePlusScale`) AND `RmsNormUnit`
+    // MIDDLES. The two gained conventions are two ENTRIES of the same windowed
+    // body (`windowedrmsnorm_gained_fwd` / `windowedrmsnorm_oneplus_fwd`), and the
+    // door reads the oneplus form's offset off the program's own addf — the same
+    // law the plain rmsnorm row carries — so neither convention needs to stay
+    // un-fused: the matcher is a pure function of the graph either way.
+    if let SubOp::Reshape { .. } = &node.op {
+        if is_sandwich_flatten(node, ir) {
+            return Ok(Vec::new());
+        }
+        if let Some(sandwich) = sandwich_at_split(node, ir) {
+            return lower_sandwich_node(&sandwich);
+        }
+    }
+    if matches!(&node.op, SubOp::RmsNorm { .. } | SubOp::RmsNormUnit { .. })
+        && is_sandwich_norm(node, ir)
+    {
+        return Ok(Vec::new());
+    }
+    let is_prefill_lm_head_tail = is_prefill_lm_head_tail(node, ir, rows_are_requests);
     if let SubOp::MatmulTile { .. } = &node.op
         && is_prefill_lm_head_tail
     {
@@ -420,6 +725,63 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     {
         let at_m1 = node_at_one_row(node);
         return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+    }
+    // ⭐ AND THE LOGITS TANH-SOFTCAP IS THE TAIL'S THIRD KIND — the same
+    // `node_at_one_row` law (main gives TanhSoftCap the fold ScalarMul has): the
+    // softcap sits ON the logits, so the folded tail caps ONE row of them instead
+    // of mq rows of which mq−1 were never written.
+    if let SubOp::TanhSoftCap { .. } = &node.op
+        && is_prefill_lm_head_tail
+    {
+        let at_m1 = node_at_one_row(node);
+        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+    }
+    // ⭐ THE ROUTER'S ARGSORT FOLDS INTO THE TOP-K — the fused pair reads the RAW
+    // LOGITS (the argsort's own input, one producer up: `bindings_for`'s RouteTopK
+    // walk), so when every consumer of the rank vector is a RouteTopK the argsort's
+    // program is dead weight: its `9W + 1` per-row-scalar chain was also the
+    // wall-11 culprit (its rank targets could DUPLICATE at ties — the one-hot
+    // match then summed TWO expert ids into one slot, and the gather read past
+    // the bank, faulting the card's FETCH — measured on the 26b card run). The
+    // pair's ids are scan positions, unique by construction, so the fold is the
+    // fix, not an optimization. ⛔ TWO CORNER GUARDS: the ranks must have a
+    // consumer at all (zero consumers is the vacuous-`all` trap — an argsort
+    // whose output is the tape's RESULT has no node consumer, and folding it
+    // would leave the result buffer unwritten), and the ranks must not BE the
+    // result (same trap one level up: the pair writes the LOGITS' consumers, so
+    // a result rank vector would return garbage). The BARE-ARGSORT CORNER
+    // (ranks feeding anything but a RouteTopK — the argsort door's own tapes)
+    // still emits: the row stays registered for exactly those.
+    if let SubOp::RouteArgsort = &node.op
+        && node.output.tensor != ir.result
+        && {
+            let consumers = consumers_of(ir, node.output.tensor);
+            !consumers.is_empty()
+                && consumers
+                    .iter()
+                    .all(|c| matches!(c.op, SubOp::RouteTopK { .. }))
+        }
+    {
+        return Ok(Vec::new());
+    }
+    // ⭐ AND THE SCORE GATHER FOLDS WITH IT — the fused pair lands the VALUES in
+    // the gather's own output (its K running value-registers ARE the top-k
+    // scores), so the chain's gather emits nothing. ⛔ CHAIN MEMBERSHIP, NOT
+    // PROVENANCE ALONE: the fold fires only when the gather's ids come from a
+    // RouteTopK whose logits (its argsort producer's input) are THIS gather's
+    // source — a gather reading the same ids over a DIFFERENT source keeps its
+    // own program (the pair lands values only in its own chain's gather, and
+    // the top-k walk refuses a second gather by name).
+    if let SubOp::RouteGatherScores = &node.op
+        && producer_of(ir, node.inputs[1].tensor).is_some_and(|topk| {
+            matches!(topk.op, SubOp::RouteTopK { .. })
+                && producer_of(ir, topk.inputs[0].tensor).is_some_and(|sort| {
+                    matches!(sort.op, SubOp::RouteArgsort)
+                        && node.inputs[0].tensor == sort.inputs[0].tensor
+                })
+        })
+    {
+        return Ok(Vec::new());
     }
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
 }
@@ -449,6 +811,381 @@ fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
         inputs,
         output: one_row(&node.output),
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE HEAD-NORM SANDWICH — `Reshape{Times(H)} → RmsNorm/RmsNormUnit → Reshape{Times(1)}`,
+//  gemma-4's per-head q/k norms (87% of its descriptors when un-fused), fused to ONE
+//  windowed program over the ORIGINAL tensor with both reshapes deleted.
+//
+//  The flatten-back proof the match demands: the split states `Times(H)` (a per-head view
+//  multiplies rows), the flatten states `Times(1)`, both preserve the element count and
+//  row-major order (the Reshape law), and the flatten's `[rows, cols]` must equal the
+//  SPLIT'S INPUT's `[rows, cols]` — the same extents, not merely the same count, so the
+//  flatten restores exactly the arrangement the split left and head window `h` of the
+//  output is the split input's columns `h·D..(h+1)·D`.
+//
+//  ⛔ EVERY CHECK IS A REFUSAL BACK TO THE UN-FUSED PATH. Any extra consumer of the
+//  split's output (a skip connection reading the flat q), any op between norm and
+//  flatten, an in-place alias (split output == flatten output), a windowed region (the
+//  splice's own addition: the kernel addresses the TENSOR BASES where the builder's
+//  `load_region` honored a region's corner) — the matcher returns `None` and all three
+//  nodes lower exactly as they did before this existed, through their ordinary rows.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The matched sandwich, carried from the split (the one position the fused program
+/// is emitted from) to the mint.
+struct HeadNormSandwich<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    /// The split `Reshape{Times(H)}` node.
+    split: &'a SubtileNode<F>,
+    /// The per-head norm node (gained or unit).
+    norm: &'a SubtileNode<F>,
+    /// The flatten-back `Reshape{Times(1)}` node.
+    flatten: &'a SubtileNode<F>,
+    /// The per-head width `D` (the split's output columns). The head COUNT is not
+    /// carried: it is `full / D` of the split input's own extents, re-derived by the
+    /// spec and the door alike, so no second spelling can disagree.
+    head_dim: u32,
+    /// The norm's epsilon, read once here so the mint states one value.
+    eps: f32,
+    /// Whether the norm carries a gamma row (`RmsNorm`) or not (`RmsNormUnit`).
+    gained: bool,
+    /// Whether the gained form is the `(1 + w)` convention — a THIRD entry of the
+    /// same windowed body whose gamma leg adds `GAIN_OFFSET` over the load. Kept
+    /// separate from `gained`: the unit form is neither, and the two gained
+    /// conventions differ in the ENTRY and one constexpr only, never in bindings.
+    oneplus: bool,
+}
+
+/// The nodes reading `t` (any region of it) — the consumers a single-use match demands.
+fn consumers_of<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> Vec<&SubtileNode<F>> {
+    ir.nodes
+        .iter()
+        .filter(|n| n.inputs.iter().any(|r| r.tensor == t))
+        .collect()
+}
+
+/// Whether `n`'s input region is the WHOLE of `t` at the norm's own output extents —
+/// the fused norm must read every element of the re-laid view (a partial read means a
+/// window this fusion cannot state).
+fn reads_whole<F: scratchy_subtile::subtile_ir::RopeForm>(
+    n: &SubtileNode<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> bool {
+    let Some(r) = n.inputs.iter().find(|r| r.tensor == t) else {
+        return false;
+    };
+    r.region.rows.start == 0
+        && r.region.cols.start == 0
+        && r.region.rows.len == n.output.region.rows.len
+        && r.region.cols.len == n.output.region.cols.len
+}
+
+/// The node whose OUTPUT is `t`, if exactly one — the producer a chain-walk follows
+/// upward. `None` for a source (no producer) or a tensor two nodes write (not a chain).
+fn producer_of<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> Option<&SubtileNode<F>> {
+    let mut it = ir.nodes.iter().filter(|n| n.output.tensor == t);
+    let p = it.next()?;
+    it.next().is_none().then_some(p)
+}
+
+/// Match the sandwich AT THE SPLIT — the one position the fused program is emitted
+/// from. Both gained conventions and the unit form match: the gained forms are two
+/// entries of the same windowed body, and the door resolves the OnePlusScale form's
+/// offset off the program's own addf (the plain rmsnorm row's law), so the matcher
+/// stays a pure function of the graph for every convention.
+fn sandwich_at_split<'a, F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+) -> Option<HeadNormSandwich<'a, F>> {
+    use scratchy_subtile::subtile_ir::RowScale;
+    let SubOp::Reshape {
+        rows: RowScale::Times(heads),
+        cols: head_dim,
+    } = &node.op
+    else {
+        return None;
+    };
+    // A per-head view MULTIPLIES rows; `Times(1)` is a shape-preserving op's non-view.
+    if heads.get() == 1 {
+        return None;
+    }
+    if node.inputs.len() != 1 {
+        return None;
+    }
+    let src = &node.inputs[0];
+    let split_out = node.output.tensor;
+    // The split's single consumer must be the per-head norm, reading the whole view.
+    let [norm] = consumers_of(ir, split_out)[..] else {
+        return None;
+    };
+    let (eps, gained, oneplus) = match &norm.op {
+        SubOp::RmsNorm {
+            eps,
+            gain: GainConvention::Scale,
+        } => (*eps, true, false),
+        SubOp::RmsNorm {
+            eps,
+            gain: GainConvention::OnePlusScale,
+        } => (*eps, true, true),
+        SubOp::RmsNormUnit { eps } => (*eps, false, false),
+        _ => return None,
+    };
+    if gained && norm.inputs.len() != 2 || !gained && norm.inputs.len() != 1 {
+        return None;
+    }
+    if !reads_whole(norm, split_out) {
+        return None;
+    }
+    // The norm's single consumer must be the flatten-back, restoring the split's input.
+    let norm_out = norm.output.tensor;
+    let [flatten] = consumers_of(ir, norm_out)[..] else {
+        return None;
+    };
+    let SubOp::Reshape {
+        rows: RowScale::Times(one),
+        cols: flat_cols,
+    } = &flatten.op
+    else {
+        return None;
+    };
+    if one.get() != 1 {
+        return None;
+    }
+    // THE FLATTEN-BACK PROOF: same extents as the split's input, so the flat
+    // arrangement — and therefore each head window — is restored exactly. A
+    // same-count/different-shape flatten (e.g. `[m, H·D] → [m·D, H]`) permutes
+    // elements and is NOT this fusion.
+    if flatten.inputs.len() != 1
+        || flatten.inputs[0].tensor != norm_out
+        || flatten.output.region.rows.len != src.region.rows.len
+        || *flat_cols != src.region.cols.len
+        || flatten.output.tensor == split_out
+    {
+        return None;
+    }
+    // ⭐ THE SPLICE'S OWN LAW, the one the builder did not need: the kernel addresses
+    // the TENSOR BASES (its descriptors bind the split's source and the flatten's
+    // output directly), where the builder's `load_region` honored a region's corner.
+    // A windowed sandwich stays un-fused — the ordinary reshape + norm + reshape rows
+    // spell it.
+    let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        let s = &ir.tensors[tr.tensor.index()];
+        tr.region.rows.start == 0
+            && tr.region.rows.len == s.rows
+            && tr.region.cols.start == 0
+            && tr.region.cols.len == s.cols
+    };
+    if !whole(src) || !whole(&flatten.output) || gained && !whole(&norm.inputs[1]) {
+        return None;
+    }
+    Some(HeadNormSandwich {
+        split: node,
+        norm,
+        flatten,
+        head_dim: *head_dim,
+        eps,
+        gained,
+        oneplus,
+    })
+}
+
+/// Whether `node` is the MIDDLE (norm) of a sandwich matched at its own split — the
+/// node whose program is emitted there and whose own lowering must therefore be NOTHING.
+fn is_sandwich_norm<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> bool {
+    let Some(x) = node.inputs.first() else {
+        return false;
+    };
+    producer_of(ir, x.tensor)
+        .is_some_and(|split| sandwich_at_split(split, ir).is_some_and(|s| s.norm.id == node.id))
+}
+
+/// Whether `node` is the TAIL (flatten-back) of a sandwich — same derivation, one hop up.
+fn is_sandwich_flatten<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> bool {
+    let Some(x) = node.inputs.first() else {
+        return false;
+    };
+    producer_of(ir, x.tensor).is_some_and(|norm| is_sandwich_norm(norm, ir))
+}
+
+/// Lower the per-head norm SANDWICH to ONE program — the norm applied to head windows
+/// of the ORIGINAL tensor, both reshapes deleted. [`HeadNormSandwich`]'s docs carry
+/// the proof; this mints the kernel: `windowedrmsnorm.py`'s gained, oneplus, or unit
+/// entry, compiled at the sandwich's own geometry, bound to the split's SOURCE `x`, the
+/// gamma row (gained form only) and the flatten's OUTPUT — the same
+/// synthetic-node-and-mint shape the prefill lm-head fold uses for `lmlast.py`.
+fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
+    sandwich: &HeadNormSandwich<'_, F>,
+) -> Result<Vec<EmittedOp>, String> {
+    let HeadNormSandwich {
+        split,
+        norm,
+        flatten,
+        head_dim,
+        eps,
+        gained,
+        oneplus,
+    } = sandwich;
+    let x_r = &split.inputs[0];
+    let out_r = &flatten.output;
+    let (m, full) = (out_r.region.rows.len, out_r.region.cols.len);
+    if *head_dim == 0 || full % head_dim != 0 {
+        return Err(format!(
+            "triton splice: rmsnorm_s{} (head-norm sandwich): the output t{} is [{m}, {full}] \
+             over head dim {head_dim}, which does not divide — a per-head window must tile the \
+             width exactly",
+            split.id.index(),
+            out_r.tensor.index()
+        ));
+    }
+    let heads = full / head_dim;
+    let src = include_str!("../../../targets/spyre/kernels/windowedrmsnorm.py");
+    // THREE entries, one body: the matcher's own convention triple, stated as the
+    // entry name only — the bindings are identical across the gained forms, and the
+    // oneplus entry is the only one that takes `GAIN_OFFSET`.
+    let entry = match (*gained, *oneplus) {
+        (true, true) => "windowedrmsnorm_oneplus_fwd",
+        (true, false) => "windowedrmsnorm_gained_fwd",
+        (false, _) => "windowedrmsnorm_unit_fwd",
+    };
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    let params: &[&str] = if *gained {
+        &["desc_x", "desc_gamma", "desc_o"]
+    } else {
+        &["desc_x", "desc_o"]
+    };
+    for p in params {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("M", Val::Int(i128::from(m)))?;
+    ce("D", Val::Int(i128::from(*head_dim)))?;
+    ce("HEADS", Val::Int(i128::from(heads)))?;
+    ce("EPS", Val::Float(f64::from(*eps)))?;
+    ce("INV_D", Val::Float(1.0 / f64::from(*head_dim)))?;
+    if *oneplus {
+        // The convention's own `offset()` (1.0), the same value the census
+        // collects and the door resolves — one constant, three readers, one
+        // value, the epsilon's law.
+        ce(
+            "GAIN_OFFSET",
+            Val::Float(f64::from(GainConvention::OnePlusScale.offset())),
+        )?;
+    }
+    let spec = KernelSpec {
+        file: "windowedrmsnorm.py".to_string(),
+        kernel: entry.to_string(),
+        signature,
+        constexprs,
+    };
+    let module = compile_kernel(src, &spec, &[1])?;
+    // The synthetic node: the NORM's op (so `mint`'s `program_stem` answers the
+    // sandwich's own `rmsnorm` stem), the SPLIT's id (the naming law), and the
+    // bindings in the kernel's parameter order — the split's source, the gamma row
+    // (gained form only), the flatten's output.
+    let mut inputs = vec![*x_r];
+    if *gained {
+        inputs.push(norm.inputs[1]);
+    }
+    let synth = SubtileNode {
+        id: split.id,
+        op: norm.op,
+        inputs,
+        output: *out_r,
+    };
+    let program = Program::WindowedRmsNorm { unit: !*gained };
+    let k = mint(&synth, module, &program, default_bindings(&synth))?;
+    // `mint` already named the node `rmsnorm_s{split.id}` (the program stem + the
+    // split's id, main's own naming law for the fused form).
+    let name = k.func.name.to_string();
+    let mut e = EmittedOp::bare(name);
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE PREFILL TAIL'S DATAFLOW WALK — main's own law, ported verbatim.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The ROW-LOCAL op set: ops whose output row `r` depends only on input row `r` (plus
+/// weights and per-row tables). The prefill lm-head fold is sound only inside this set —
+/// see [`tensor_feeds_result_through_row_local_ops`].
+fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> bool {
+    matches!(
+        op,
+        SubOp::MatmulTile { .. }
+            | SubOp::SumReduce { .. }
+            | SubOp::Elementwise(_)
+            | SubOp::SiluMul
+            | SubOp::ScalarMul { .. }
+            | SubOp::RmsNorm { .. }
+            | SubOp::RmsNormReduce { .. }
+            | SubOp::RmsNormApply { .. }
+            | SubOp::RmsNormUnit { .. }
+            | SubOp::TanhSoftCap { .. }
+            | SubOp::ScalarWeightMul
+    )
+}
+
+/// Does tensor `t` feed `ir.result` through ROW-LOCAL consumers only (or is it the result)?
+///
+/// The prefill lm-head fold must fire ONLY on the result's own tail. The width test alone
+/// (`cols == result_cols`) was falsified by the gemma-4 parity fixture (vocab 512): its
+/// GLOBAL-layer q projection is also 512 cols (4 heads × hd 128), so the fold fired there
+/// too — the q matmul ran at m=1, only row 0 of the roped Q was ever real, attention saw
+/// zero rows past it, and the first sampled token was garbage while every width-128
+/// tensor stayed fp16-clean. A width COLLISION is not an identity.
+///
+/// What separates the real tail: its rows die at the result (the host reads row 0 only),
+/// and everything between it and the result is ROW-LOCAL — so computing one row and
+/// placing it at row 0 loses nothing. The q projection fails that: its output passes
+/// through a norm, a rope, and an ATTENTION (row-mixing — output row `i` reads K/V rows
+/// `0..=i`), so every one of its rows is live and folding to one row corrupts the layer.
+/// Rope is excluded from the row-local set deliberately: `RopeAppend` also writes the
+/// paged KV cache, a consumer the prefill graph cannot see.
+fn tensor_feeds_result_through_row_local_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> bool {
+    if t == ir.result {
+        return true;
+    }
+    // Every consumer of `t` must be a row-local op whose own output keeps the property —
+    // one row-mixing reader anywhere in the chain makes `t`'s other rows live and the
+    // fold unsound.
+    let mut any_reader = false;
+    for n in &ir.nodes {
+        if !n.inputs.iter().any(|i| i.tensor == t) {
+            continue;
+        }
+        any_reader = true;
+        if !row_local_tail_op(&n.op)
+            || !tensor_feeds_result_through_row_local_ops(ir, n.output.tensor)
+        {
+            return false;
+        }
+    }
+    any_reader
 }
 
 fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
@@ -481,11 +1218,13 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
     // ⛔ THE LM-HEAD TAIL'S FOLD IS `lower_all`'s now — the vocab-wide m>1 matmul is
     // rewritten THERE (last-row extraction + the re-lowered m=1 matmul), so a
-    // MatmulTile reaching THIS one-op body with m>1 over the result cols means the
-    // one-op `lower` was called where the walk's `lower_all` belongs. The vocab-width
-    // test is the builder's own (the lm_head matmul and the logits ScalarMul are the
-    // ONLY ops whose output spans the result cols — every intermediate is hidden or
-    // intermediate width).
+    // MatmulTile reaching THIS one-op body as the tail means the one-op `lower`
+    // was called where the walk's `lower_all` belongs. The test is the FULL
+    // [`is_prefill_lm_head_tail`] — width, m>1, rows-not-requests, AND the
+    // row-local dataflow walk — because the echo must not fire on a width
+    // COLLISION the walk already refused (the q-projection law: a collision
+    // matmul that feeds the result through rope lowers through here normally,
+    // un-folded, every row kept).
     //
     // ⭐ THE ODD VOCAB SPLICES. A decode lm_head at vocab 49155 (granite) has N odd,
     //    and the ladder's `PlanCorelets` now re-patterns an odd N to `single_corelet`
@@ -493,19 +1232,16 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     //    builder path has emitted exactly this matmul for this repo's whole life, so
     //    the device runs it, and the two-corelet plan was a LADDER artifact, not a
     //    device fact.
-    if matches!(node.op, SubOp::MatmulTile { .. }) {
-        let result_cols = ir.tensors[ir.result.index()].cols;
-        if node.output.region.cols.len == result_cols {
-            let rows = node.output.region.rows.len;
-            if rows > 1 && !rows_are_requests {
-                return Err(format!(
-                    "triton splice: matmul_s{} is the prefill lm-head tail (vocab-wide, m={rows}, \
-                     rows not requests) — the fold is `lower_all`'s; call it, not the one-op \
-                     `lower`",
-                    node.id.index()
-                ));
-            }
-        }
+    if matches!(node.op, SubOp::MatmulTile { .. })
+        && is_prefill_lm_head_tail(node, ir, rows_are_requests)
+    {
+        let rows = node.output.region.rows.len;
+        return Err(format!(
+            "triton splice: matmul_s{} is the prefill lm-head tail (vocab-wide, m={rows}, \
+             rows not requests) — the fold is `lower_all`'s; call it, not the one-op \
+             `lower`",
+            node.id.index()
+        ));
     }
     // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS A SHAPE ONLY A KERNEL THAT
     // STATES ITS CORNER CAN SPELL. The measured instance was the front end's COLUMN
@@ -533,7 +1269,16 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     // production today), and this guard reads the REGION, not the op kind, so a
     // front-end change that windows any other op's regions reproduces the same
     // refusal with the kernel row named — a windowed kernel is the fix shape.
-    {
+    // ⭐ ROPE STATES ITS OWN ROW WINDOW — `R_START` bakes the region's row corner into
+    // every access tile and `Y_TOTAL` the tensor's full re-tiled height, so the
+    // per-position decomposition's windowed regions ARE spellable. The law (whole
+    // columns on all four regions, ONE shared row window, equal tensor heights) is
+    // stated where the facts are read, in the rope arm of `kernel_spec` below — which
+    // is stricter than either branch here, so the generic guard stands down for it.
+    if !matches!(
+        &node.op,
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }
+    ) {
         let states_the_corner = matches!(
             &node.op,
             SubOp::SiluMul
@@ -543,7 +1288,30 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
                     EwKind::Silu | EwKind::Gelu | EwKind::Add | EwKind::Mul | EwKind::Sub,
                 )
         );
-        if !states_the_corner {
+        // ⭐ THE TANH-SOFTCAP STATES NEITHER CORNER — its kernel's view IS the region
+        // (`[M, N]`, tiles from row 0 / column 0), so BOTH corners must be 0 while the
+        // extents are free: the prefill lm-head fold re-lowers the vocab-wide softcap
+        // at m=1 (row 0 of the `[mq, vocab]` logits storage, a legal prefix view), and
+        // the front end's chunker never tiles this op (its chunk set is the
+        // elementwise/scalarmul/silumul family), so a column window never arises.
+        let states_neither_corner = matches!(&node.op, SubOp::TanhSoftCap { .. });
+        if states_neither_corner {
+            let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+                tr.region.rows.start == 0 && tr.region.cols.start == 0
+            };
+            if !corner0(&node.output) || node.inputs.iter().any(|tr| !corner0(tr)) {
+                return Err(format!(
+                    "triton splice: {} t{} has a nonzero region corner (row {} / column {}) — \
+                     the softcap kernel's view IS the region with tiles from the origin, and no \
+                     constant carries a corner; a windowed softcap is a kernel-family worklist \
+                     item",
+                    program_stem(node, program),
+                    node.output.tensor.index(),
+                    node.output.region.rows.start,
+                    node.output.region.cols.start,
+                ));
+            }
+        } else if !states_the_corner {
             let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion, ir: &SubtileIR<F>| {
                 let s = &ir.tensors[tr.tensor.index()];
                 tr.region.rows.start == 0
@@ -604,6 +1372,42 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::Elementwise(_) => 2,
         SubOp::ScalarMul { .. } => 1,
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
+        // ── THE 2a KINDS' OWN ARITIES, the registry's `arity_ok` rows stated here so
+        // the splice and the front end cannot disagree (the builder arm's check is
+        // identical). ⭐ EXPERT SORT/UNSORT CARRY A SECOND INPUT (the routing) THE
+        // KERNEL DOES NOT BIND — `mint` binds operand 0 only, because the routing
+        // rides in the GRAPH (the door's `split_out(.., 1)` count) exactly as the
+        // builder's program did; the arity here still demands the node STATE it.
+        SubOp::RouterNorm { .. }
+        | SubOp::RouterLogits { .. }
+        | SubOp::ScalarWeightMul
+        | SubOp::ExpertGatedAct { .. }
+        | SubOp::ExpertSort { .. }
+        | SubOp::ExpertUnsort
+        | SubOp::ExpertCombine { .. } => 2,
+        // ⭐ THE EXPERT MATMUL'S FOUR COMPUTE INPUTS: `[rows, pairs, w, s]` —
+        // the fp8 expert-bank form the wavefront wires (the branch's own
+        // `lower_expert_matmul_node` refuses anything else). `pairs` is
+        // stated but not BOUND: the mint resolves the sort's index input
+        // through it, the same graph-edge law the sort/unsort's routing
+        // follows.
+        SubOp::ExpertMatmul { .. } => 4,
+        SubOp::RouteSoftmax
+        | SubOp::RouteScale { .. }
+        | SubOp::RouteRenorm
+        | SubOp::TanhSoftCap { .. }
+        | SubOp::RmsNormUnit { .. }
+        | SubOp::Reshape { .. } => 1,
+        // ── THE 2b ROUTER-INDEX KINDS — the rank vector's own family: the
+        // argsort and the top-k take the scores/ranks in and write one
+        // index-shaped vector out; the gather takes the source AND the
+        // indices (two inputs the door's `split_out(.., 2)` counts and the
+        // kernel binds both); the expert-scale takes the scores, the indices
+        // AND the [1, E] scale row (three inputs, which the door counts
+        // positionally in its OWN mint order — see `bindings_for`). ──
+        SubOp::RouteArgsort | SubOp::RouteTopK { .. } => 1,
+        SubOp::RouteGatherScores => 2,
+        SubOp::RouteExpertScale { .. } => 3,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => {
@@ -622,7 +1426,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     let spec = kernel_spec(node, ir, file, entry)?;
     let m = compile_kernel(src, &spec, &grid(node, ir)?)?;
-    let k = mint(node, m, program)?;
+    let k = mint(node, m, program, bindings_for(node, ir)?)?;
     let name = format!("{}_s{}", program_stem(node, program), node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
@@ -714,7 +1518,12 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
         TritonKernelRow::Spliced { program, .. } => program,
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
-    let mut k = mint(&extraction_node, module, &lmlast_program)?;
+    let mut k = mint(
+        &extraction_node,
+        module,
+        &lmlast_program,
+        default_bindings(&extraction_node),
+    )?;
     // The KtirNode's own fields: `node_out_tid` names the TAIL'S output (the door
     // names its copies `lmlast{j}_o{tid}` after it), and the name is the builder's
     // `lmlast_s{id}` law.
@@ -1213,7 +2022,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     match (&node.op, entry) {
-        (SubOp::RmsNorm { eps, .. }, "rmsnorm_fwd") => {
+        // ⭐ ROUTERNORM SHARES THE RMSNORM ARM — the router's gain is the SCALE
+        // convention (the loader stores `router.scale` verbatim), so the node's
+        // constants are the rmsnorm family's own, weight from input 1.
+        (SubOp::RmsNorm { eps, .. } | SubOp::RouterNorm { eps, .. }, "rmsnorm_fwd") => {
             // The fixture's own parameter spellings: desc_x, desc_w, desc_o, then the
             // constexprs M / D_MODEL / BLOCK_M / EPS / INV_D. Every constexpr is BOTH a
             // signature entry (`ArgSpec::Constexpr`) and a binding, exactly as the case
@@ -1249,6 +2061,40 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // registry scale (the consumer binds `1/cols` at the reserved
             // `RMS_INVCOLS_TID`, never through `scalarmul_scales`).
             ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
+        }
+        // ⭐ THE (1 + w) FORM'S OWN SPEC — the same signature and constants as the Scale
+        // arm, plus the offset itself. The value is the convention's own `offset()`
+        // (1.0; `GainConvention::from_offset` refuses every other value), and it is the
+        // SAME value `compute_bundle_layout` collects into `scalarmul_scales` and the
+        // door reads back off the program's splat — one constant, three readers, one
+        // value, the epsilon's law.
+        (
+            SubOp::RmsNorm {
+                eps,
+                gain: GainConvention::OnePlusScale,
+            },
+            "rmsnorm_oneplus_fwd",
+        ) => {
+            for p in ["desc_x", "desc_w", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("D_MODEL", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("EPS", Val::Float(f64::from(*eps)))?;
+            ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
+            ce(
+                "GAIN_OFFSET",
+                Val::Float(f64::from(GainConvention::OnePlusScale.offset())),
+            )?;
         }
         (
             SubOp::MatmulTile {
@@ -1432,6 +2278,63 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
             ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
         }
+        // ⭐ ROUTESCALE SHARES THE SCALARMUL ARM — a scores-times-constant is the
+        // ScalarMul computation with the value read off the `RouteScale` payload, so
+        // it states the SAME facts (device width, storage window, the registry-bound
+        // SCALE) the logits scale states.
+        (SubOp::RouteScale { scale }, "scalarmul_fwd") => {
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            let (n_total, c_start) = window_of(node, ir)?;
+            // ⛔ THE ROUTER'S SCORES STATE THE LOGICAL WIDTH — WINDOW AND STORAGE
+            // BOTH. The scalarmul family's device-width law (the arm below) pads
+            // through `for_pointwise` on the strength of a PRECONDITION this
+            // node does not meet: that the producer is a matmul which emitted
+            // `for_matmul`-padded columns and the layout reserved exactly that
+            // footprint. The scores' producer is `RouteGatherScores` — a gather
+            // writing the logical `[m, k]` — and nobody reserved any pad, so the
+            // util floor's `for_pointwise(8) = 512` is a width that exists
+            // nowhere: MEASURED as the fused segment's refusal `view [m, 512]
+            // strides [512, 1] spans 2048 bytes but the tensor allocated at byte
+            // … holds only 32` (the [m, k] allocation) at every router geometry.
+            //
+            // The door needs no pad stated here: its `scalarmul_scaled` derives
+            // the device width from the REGION's own `c_len` and caps it at what
+            // the placement holds (`pointwise_width_the_output_holds`), so it
+            // emits the same descriptor whether the program states 8 or 512 —
+            // the cap does the door's work, and the program's views name the
+            // storage that actually exists. This is `routesoftmax`'s own law
+            // (its door "reads k off the output view's own v_cols — the LOGICAL
+            // count — and pads the device width itself").
+            //
+            // ⚠️ THE FRONT-END FLOOR PASSES AT THE MODEL'S k: a block whose last
+            // dim is under 16 bytes is refused by the Triton front end
+            // (`semantic.py`), and `k = 8` fp16 is exactly 16 — legal. A router
+            // with `k < 8` would state a sub-floor block and be refused by name
+            // there; `routesoftmax` carries the same exposure, and no such model
+            // exists in scope today.
+            let (block_m, n_blocks, tail_h) = blocks_of(m, c, 3);
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
+            // THE SCALE, from the node's own payload — the same registry-slot
+            // agreement the family's arm states below.
+            ce("SCALE", Val::Float(f64::from(*scale)))?;
+        }
         (SubOp::ScalarMul { scale }, "scalarmul_fwd") => {
             for p in ["desc_x", "desc_o"] {
                 signature.insert(
@@ -1517,10 +2420,684 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 constexprs.insert(k.to_string(), v);
                 Ok(())
             };
+            // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
+            // per-position decomposition mints rope nodes whose regions are ONE
+            // row's slice of the shared q plane — a row slice expressed by the
+            // ACCESS TILE's row corner (`R_START`), never by a taller view. The
+            // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
+            // height `rows·H`, so the tile corners stay in bounds) and `R_START`
+            // (the window's row corner `ri·H`, baked into every load/store row);
+            // `MQ` is then the REGION's row count. A whole-region node states
+            // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
+            // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
+            // only this arm reads the facts: all four regions share ONE row
+            // window, take WHOLE columns of `total`, and sit over tensors of ONE
+            // height (the single `Y_TOTAL` names all four views, and the
+            // head-replicated cos/sin reinterpretation is same-bytes only at that
+            // width).
+            let x = &node.inputs[0];
+            let window = (x.region.rows.start, x.region.rows.len);
+            let y_rows = ir.tensors[x.tensor.index()].rows;
+            for (tr, role) in [
+                (x, "the `x` view"),
+                (&node.inputs[1], "the `cos` view"),
+                (&node.inputs[2], "the `sin` view"),
+                (out, "the `out` view"),
+            ] {
+                let t_rows = ir.tensors[tr.tensor.index()].rows;
+                let shared = (tr.region.rows.start, tr.region.rows.len) == window;
+                let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
+                if !shared || !cols_whole || t_rows != y_rows {
+                    return Err(format!(
+                        "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
+                         {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
+                         [{y_rows}, {total}] one — a rope's four regions must share ONE row \
+                         window and whole `total` columns over tensors of one height (the \
+                         single `Y_TOTAL` names all four views)",
+                        node.output.tensor.index(),
+                        tr.region.rows.start,
+                        tr.region.rows.len,
+                        tr.region.cols.start,
+                        tr.region.cols.len,
+                        ir.tensors[tr.tensor.index()].cols,
+                        window.0,
+                        window.1,
+                    ));
+                }
+            }
+            let (r_start, mq_rows) = (window.0 * heads, window.1);
+            let y_total = y_rows * heads;
             ce("H", Val::Int(i128::from(heads)))?;
-            ce("MQ", Val::Int(i128::from(m)))?;
+            ce("MQ", Val::Int(i128::from(mq_rows)))?;
             ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
             ce("HALF", Val::Int(i128::from(hd / 2)))?;
+            ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
+            ce("R_START", Val::Int(i128::from(r_start)))?;
+        }
+        (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
+            // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs
+            // M / N / BLOCK_M / BLOCK_N / CAP / N_BLOCKS / TAIL_H.
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            // ⛔ THE CAP DIVIDES THE LOGITS — a non-positive cap makes `x / cap` a
+            // division by zero or a sign flip, and no kernel can state it. The
+            // producer-side refusal (main's own), re-homed here where the value is
+            // read.
+            if *cap <= 0.0 {
+                return Err(format!(
+                    "triton splice: tanhsoftcap t{} states cap {cap} — the cap divides the \
+                     logits (`x / cap`) and multiplies the tanh back up, so it must be positive",
+                    node.output.tensor.index()
+                ));
+            }
+            // ROW BLOCKING, the builder's own law: three live tiles (x, the tanh's
+            // operand, the result) over the VOCAB-wide logits, wider than any
+            // activation — prefill rungs exceed the LX budget while decode (m=1)
+            // never does.
+            let (block_m, n_blocks, tail_h) = blocks_of(m, c, 3);
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("CAP", Val::Float(f64::from(*cap)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
+        }
+        (SubOp::RmsNormUnit { eps }, "rmsnormunit_fwd") => {
+            // The rmsnorm arm's constants minus the weight: desc_x, desc_o, then M /
+            // D_MODEL / BLOCK_M / EPS / INV_D — the unit form has ONE tensor parameter
+            // where RmsNorm has two, the only structural difference.
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("D_MODEL", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("EPS", Val::Float(f64::from(*eps)))?;
+            ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
+        }
+        (SubOp::ScalarWeightMul, "scalarwmul_fwd") => {
+            // desc_x, `w` (the `[1]` weight as a RUNTIME fp16 SCALAR — rung 3 of the
+            // address-provenance ladder, `mul_scale.py`'s own shape), desc_o, then
+            // M / N — the logical width (the door's own `check_pointwise_cols` law for
+            // this family; the weight is read in the scalar broadcast mode and pads its
+            // own placement). ⛔ THE WEIGHT IS NOT A DESCRIPTOR: a `[1]`-region load
+            // would have to broadcast its `[1, 1]`-widened tile over `[M, N]`, an
+            // all-unit source `to_ktir` refuses (it would need a rank-0 source), while
+            // a rank-0 argument SPLATS — no broadcast anywhere — and the launch binds
+            // the same staged buffer through the `[1, 1]` view the rung-3 rewrite
+            // mints over the argument.
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            signature.insert(
+                "w".to_string(),
+                ArgSpec::parse("fp16").map_err(|e| e.to_string())?,
+            );
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::Reshape { .. }, "reshape_fwd") => {
+            // The stick walk's own facts: both sides at their TRUE region extents
+            // (the whole-tensor law is the region guard's), the element-count law,
+            // and the stick law the walk's `// 64` arithmetic assumes.
+            let src = &node.inputs[0];
+            let (r_in, c_in) = (src.region.rows.len, src.region.cols.len);
+            let (r_out, c_out) = (out.region.rows.len, out.region.cols.len);
+            let elems_in = u64::from(r_in) * u64::from(c_in);
+            let elems_out = u64::from(r_out) * u64::from(c_out);
+            if elems_in != elems_out {
+                return Err(format!(
+                    "triton splice: reshape t{}: [{r_in}, {c_in}] → [{r_out}, {c_out}] is \
+                     {elems_in} → {elems_out} elements — a re-laying copy preserves the flat \
+                     element sequence (the Reshape law), and no kernel can state a count change",
+                    node.output.tensor.index()
+                ));
+            }
+            let stk: u32 = 64; // Fp16::ELEMS_PER_STICK — the door's own stick law
+            if c_in % stk != 0 || c_out % stk != 0 {
+                return Err(format!(
+                    "triton splice: reshape t{}: a {c_in}- or {c_out}-wide side is not a whole \
+                     {stk}-fp16 stick — a device tensor is stick-blocked, so flat elements \
+                     {stk}q..{stk}q+{stk} are one `[1, {stk}]` tile of each side only when both \
+                     column extents are whole sticks (the door's own law, stated here so the \
+                     walk's `// {stk}` arithmetic is well-formed)",
+                    node.output.tensor.index()
+                ));
+            }
+            for p in ["desc_src", "desc_dst"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("R_IN", Val::Int(i128::from(r_in)))?;
+            ce("C_IN", Val::Int(i128::from(c_in)))?;
+            ce("R_OUT", Val::Int(i128::from(r_out)))?;
+            ce("C_OUT", Val::Int(i128::from(c_out)))?;
+            ce("N_STICKS", Val::Int(i128::from(elems_in / u64::from(stk))))?;
+        }
+        (SubOp::RouterLogits { experts, .. }, "matmul_fwd") => {
+            // The dense matmul arm's constants with the Linear's width read off the
+            // `experts` payload: A is [M, K] (K from A's own columns), W the router
+            // gate staged `[hidden, experts]` (the FUF `[k, n]` convention), N the
+            // expert count. ⛔ N IS THE LOGICAL COUNT, NOT THE DOOR'S DEVICE WIDTH:
+            // the door re-derives `n_dev = for_matmul(m, n, k)` off the REGION
+            // itself (`matmul_oriented`'s own law — "the SubtileIR/manifest LOGICAL
+            // shape stays n; ONLY the on-device layout uses n_dev"), so stating the
+            // padded width here changed NOTHING on the card but built a `[m, n_dev]`
+            // out view in the emulator that DISAGREED with every consumer's logical
+            // `[m, e]` view (argsort/gather read stride `e`, the matmul wrote stride
+            // `n_dev`) — MEASURED as the prefill router e2e's row-0-only-correct
+            // divergence at m=64, where `for_output`'s `macs ≥ 2^20` bump pads
+            // e=128 to 512 (at m=2 the MACs stay under the floor and the widths
+            // coincidentally agree, which is why whole/decode were green). The
+            // routesoftmax row below states the same law for the same reason.
+            let k = node.inputs[0].region.cols.len;
+            for p in ["desc_a", "desc_w", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            let (m_total, _a_total) = matmul_window_of(node, ir)?;
+            let n = experts.get();
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+            ce("N", Val::Int(i128::from(n)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_K", Val::Int(i128::from(k)))?;
+            ce("BLOCK_N", Val::Int(i128::from(n)))?;
+            ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
+        }
+        (SubOp::RouteSoftmax, "routesoftmax_fwd") => {
+            // desc_x, desc_o, then M / N — the LOGICAL score width: the door pads
+            // the whole chain to the stick itself (`route_softmax`'s own sanitize
+            // law), so the program states what the node states and the door derives
+            // the padded width from it.
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::RouteRenorm, "routerenorm_fwd") => {
+            // desc_x, desc_o, then M / N — the LOGICAL width, the branch's own
+            // mirror (the door's `check_pointwise_cols` is the width law here, as
+            // it is for the builder's program).
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::ExpertGatedAct { act }, "gatedact_fwd") => {
+            // desc_gate, desc_up, desc_o, then M / N / BLOCK_M / BLOCK_N / ACT /
+            // N_BLOCKS / TAIL_H — eight live tiles (SILU_MUL_LIVE_TILES' own count:
+            // gate, up, the act's temporaries, the result), the same row-blocking
+            // law the silumul row states. `ACT` folds at codegen (`if` on a
+            // constexpr), so a program carries exactly one act's chain.
+            let act_code = match act {
+                GatedAct::Silu => 0,
+                GatedAct::Gelu => 1,
+                // ⛔ NOT REACHED THROUGH A ROW: `gated_act_row` refuses this act by
+                // name, so arriving here means the routing changed.
+                GatedAct::SwigluOai => {
+                    return Err(format!(
+                        "triton splice: gatedact t{} states the SwiGLU-OAI act — the registry \
+                         row refuses it (the ladder's compare/select extension is the \
+                         Phase-2b worklist); reaching this signature means the routing changed",
+                        node.output.tensor.index()
+                    ));
+                }
+            };
+            for p in ["desc_gate", "desc_up", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            let (block_m, n_blocks, tail_h) =
+                blocks_of(m, c, ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES);
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("ACT", Val::Int(i128::from(act_code)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
+        }
+        (SubOp::ExpertSort { k, .. }, "expertsort_fwd") => {
+            // desc_x, desc_o, then M / W / K — W the input's own width, K the
+            // payload's top-k, and the agreement law the door derives for itself
+            // (`full / w`): the output is `[m, k·w]`.
+            let w = node.inputs[0].region.cols.len;
+            let full = c;
+            let k = k.get();
+            if u64::from(full) != u64::from(w) * u64::from(k) {
+                return Err(format!(
+                    "triton splice: expertsort t{}: the output is [{m}, {full}] but the input \
+                     t{} is {w}-wide over k={k} — the pair-row layout is `[m, k·w]` over the \
+                     SAME `w` the projections contract",
+                    node.output.tensor.index(),
+                    node.inputs[0].tensor.index()
+                ));
+            }
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("W", Val::Int(i128::from(w)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+        }
+        (SubOp::ExpertUnsort, "expertunsort_fwd") => {
+            // desc_rows, desc_o, then M / COLS — the identity copy's own extents
+            // (the door's `pointwise_extents_agree` demands the input region and
+            // the output agree; the kernel states both at the same [M, COLS]).
+            for p in ["desc_rows", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("COLS", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::ExpertCombine { hidden, .. }, "expertcombine_fwd") => {
+            // desc_rows, desc_scores, desc_o, then M / W / K — W the `hidden`
+            // payload, K the scores' own width, and the agreement law the door
+            // derives by extent: the pair rows are `[m, k·w]`, the scores `[m, k]`,
+            // the output `[m, w]`.
+            let w = *hidden;
+            let k = node.inputs[1].region.cols.len;
+            let full = node.inputs[0].region.cols.len;
+            if u64::from(full) != u64::from(w) * u64::from(k) || c != w {
+                return Err(format!(
+                    "triton splice: expertcombine t{}: the output is [{m}, {c}] but the pair \
+                     rows t{} are {full}-wide over scores t{} of k={k} — the combine reads the \
+                     `[m, k·w]` layout the sort wrote (w = {w}), so these must agree",
+                    node.output.tensor.index(),
+                    node.inputs[0].tensor.index(),
+                    node.inputs[1].tensor.index()
+                ));
+            }
+            for p in ["desc_rows", "desc_scores", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("W", Val::Int(i128::from(w)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+        }
+        (SubOp::ExpertMatmul { k, .. }, "expertmatmul_fwd") => {
+            // desc_w, desc_s, desc_idx, desc_x, desc_o — the MINT ORDER (the
+            // row's own note): the door resolves each parameter by extent, so
+            // the kernel's parameter order IS the binding order and both state
+            // the bank pair first. The constants are the door's own extent
+            // laws read off the node's regions: `IN = rows.v_cols / K`,
+            // `N = out.v_cols / K`, `E = w.v_rows / N` — the door re-derives
+            // every one from the minted views, so a disagreement between this
+            // reading and the graph is the door's refusal, never a silent
+            // second reading. ⛔ THE STICK AND CHUNK LAWS STAY THE DOOR'S —
+            // the extent guards here are only the ones the constexpr
+            // derivations need to be integral; the 64-fp16/128-fp8 stick law
+            // and the sub-page chunk cut are card-side facts the door owns
+            // (the chunk-cut test pins its refusal by name).
+            let k = k.get();
+            let rows = &node.inputs[0];
+            let w = &node.inputs[2];
+            let rows_cols = rows.region.cols.len;
+            let w_rows = w.region.rows.len;
+            let w_cols = w.region.cols.len;
+            if k == 0 || !rows_cols.is_multiple_of(k) || !c.is_multiple_of(k) {
+                return Err(format!(
+                    "triton splice: expertmatmul t{}: the pair rows t{} are {rows_cols}-wide and \
+                     the output is {c}-wide over k={k} — both are `[m, k·w]` layouts, so k must \
+                     divide them",
+                    node.output.tensor.index(),
+                    rows.tensor.index()
+                ));
+            }
+            let inn = rows_cols / k;
+            let n = c / k;
+            if !w_rows.is_multiple_of(n) || w_cols != inn {
+                return Err(format!(
+                    "triton splice: expertmatmul t{}: the weight bank t{} is [{w_rows}, {w_cols}] \
+                     but the projection contracts {inn} columns at width {n} — the stacked bank is \
+                     `[E·N, IN]`, so N must divide its rows and its columns are the activation's \
+                     per-pair width",
+                    node.output.tensor.index(),
+                    w.tensor.index()
+                ));
+            }
+            signature.insert(
+                "desc_w".to_string(),
+                ArgSpec::parse("*fp8e4nv").map_err(|e| e.to_string())?,
+            );
+            for p in ["desc_s", "desc_idx", "desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+            ce("E", Val::Int(i128::from(w_rows / n)))?;
+            ce("IN", Val::Int(i128::from(inn)))?;
+            ce("N", Val::Int(i128::from(n)))?;
+        }
+        (SubOp::RouteArgsort, "routeargsort_fwd") => {
+            // desc_x, desc_o — the node's own operand order, the plain `[input,
+            // output]` binding (no reorder: the door resolves its ONE input and its
+            // output positionally, and the parameters are minted in first-use order
+            // with `desc_x`'s view opening first). The constants are the door's own
+            // extent laws read off the node's regions: `M` the output's rows, `E`
+            // the output's cols — guarded SHAPE-PRESERVING against the scores' own
+            // `[M, E]` (the door's law: out is `[m, E]` like x; a disagreement is
+            // refused here rather than minting a view that lies about the input).
+            // ⛔ THE PAD-WIDTH LAW STAYS THE DOOR'S — `W = E.next_multiple_of(64)`
+            // and the pad-lane ranks the door writes are card-side facts this
+            // kernel's logical-`E` body does not state, exactly as the stick and
+            // chunk laws are the expertmatmul door's.
+            let scores = &node.inputs[0];
+            if scores.region.rows.len != m || scores.region.cols.len != c {
+                return Err(format!(
+                    "triton splice: routeargsort t{}: the scores t{} are [{}, {}] but the rank \
+                     vector is [{m}, {c}] — the argsort is shape-preserving (the door's own \
+                     law: out is `[m, E]` like x), so these must agree",
+                    node.output.tensor.index(),
+                    scores.tensor.index(),
+                    scores.region.rows.len,
+                    scores.region.cols.len,
+                ));
+            }
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("E", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::RouteTopK { k: topk }, "routetopk_fwd") => {
+            // desc_l, desc_v, desc_o — the FUSED PAIR's own order (the logits,
+            // the values output, the ids output), resolved by `bindings_for`'s
+            // RouteTopK walk: the argsort and the score gather are folded into
+            // this kernel, so `desc_l` is the rank vector's ARGSORT producer's
+            // input (the raw logits), `desc_v` is the GATHER consumer's output
+            // (this kernel lands the values — the old gather's whole job), and
+            // `desc_o` is the node's own `[m, k]` ids output. THREE pointer
+            // parameters where the node states ONE input: the fold re-points
+            // the top-k at the head of its own chain. The constants are the
+            // door's own extent laws: `M` the output's rows, `K` the output's
+            // cols, `E` the rank vector's cols (the argsort is
+            // shape-preserving, so the rank's E IS the logits' E — and the
+            // binding walk cross-checks the two regions) — guarded so the
+            // chain is row-preserving over a non-empty expert axis, the
+            // stated `k` IS the output's width (the node's own payload and
+            // its region must agree), and `k ≤ E` (the door's own law at
+            // `route_topk`: a wider top-k than the expert count reads pad
+            // lanes the logits never wrote). ⛔ THE PAD-WIDTH LAW STAYS THE
+            // DOOR'S — `W = E.next_multiple_of(64)` and the pad-lane
+            // sanitize the door's staging folds in are card-side facts this
+            // kernel's logical-`E` body does not state, exactly as the
+            // argsort row's.
+            let ranks = &node.inputs[0];
+            let k = topk.get();
+            if ranks.region.rows.len != m || ranks.region.cols.len == 0 {
+                return Err(format!(
+                    "triton splice: routetopk t{}: the rank vector t{} is [{}, {}] but the \
+                     top-k indices are [{m}, {k}] — the selection is row-preserving over a \
+                     non-empty expert axis, so the rows must agree",
+                    node.output.tensor.index(),
+                    ranks.tensor.index(),
+                    ranks.region.rows.len,
+                    ranks.region.cols.len,
+                ));
+            }
+            if c != k {
+                return Err(format!(
+                    "triton splice: routetopk t{}: the node states k = {k} but its output t{} \
+                     is [{m}, {c}] — the payload and the region must agree",
+                    node.output.tensor.index(),
+                    node.output.tensor.index(),
+                ));
+            }
+            let e = ranks.region.cols.len;
+            if k > e {
+                return Err(format!(
+                    "triton splice: routetopk t{}: k = {k} over E = {e} — the door's own law: \
+                     a top-k wider than the expert count reads pad lanes the logits \
+                     never wrote",
+                    node.output.tensor.index(),
+                ));
+            }
+            for p in ["desc_l", "desc_v", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("E", Val::Int(i128::from(e)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+        }
+        (SubOp::RouteGatherScores, "routegather_fwd") => {
+            // desc_x, desc_i, desc_o — the node's own operand order (the
+            // source, the indices, the output), the plain binding. The
+            // constants are the door's own extent laws read off the node's
+            // regions: `M` the output's rows, `K` the output's cols, `E` the
+            // source's cols — guarded so the indices' `[m, k]` matches the
+            // output's and every view shares one row count (the door's
+            // `split_out(.., 2)` resolves these same two inputs by extent:
+            // the source carries E, the indices carry k).
+            // ⛔ THE PAD-WIDTH LAW STAYS THE DOOR'S — `W =
+            // E.next_multiple_of(64)` and the pad-lane inertness the door's
+            // one-hot chain states are card-side facts this kernel's
+            // logical-`E` body does not state, exactly as the argsort row's.
+            let src = &node.inputs[0];
+            let idx = &node.inputs[1];
+            let e = src.region.cols.len;
+            for (view, role) in [(src, "the source"), (idx, "the indices")] {
+                if view.region.rows.len != m {
+                    return Err(format!(
+                        "triton splice: routegather t{}: {role} t{} is [{}, {}] but the \
+                         gathered output is [{m}, {c}] — the gather is row-preserving, so \
+                         every view must share one row count",
+                        node.output.tensor.index(),
+                        view.tensor.index(),
+                        view.region.rows.len,
+                        view.region.cols.len,
+                    ));
+                }
+            }
+            if idx.region.cols.len != c || e == 0 || c == 0 {
+                return Err(format!(
+                    "triton splice: routegather t{}: the source t{} is [{m}, {e}] and the \
+                     indices t{} [{}, {}] but the output is [{m}, {c}] — the indices' width \
+                     is the output's, and both widths must be positive",
+                    node.output.tensor.index(),
+                    src.tensor.index(),
+                    idx.tensor.index(),
+                    idx.region.rows.len,
+                    idx.region.cols.len,
+                ));
+            }
+            for p in ["desc_x", "desc_i", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("E", Val::Int(i128::from(e)))?;
+            ce("K", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::RouteExpertScale { .. }, "routeexpertscale_fwd") => {
+            // desc_p, desc_i, desc_s, desc_o — ⛔ THE DOOR'S MINT ORDER, NOT the
+            // node's operand order `[scores, idx, scale]`: the door reads its
+            // parameters positionally with `tensors[0]` THE SCALE ROW (the
+            // recorded m=8 mis-read law — the old door bound the scores there
+            // and every descriptor computed the wrong function), so the scale
+            // descriptor is parameter 0 and `bindings_for` reorders the node's
+            // inputs to feed it. The constants are the door's own extent laws
+            // read off the node's regions: `M` the output's rows, `K` the
+            // output's cols, `E` the scale row's cols — guarded so the scores'
+            // and indices' `[m, k]` match the output's (the select is
+            // row-preserving over one slot width) and the scale row is ONE row
+            // (the kernel loads `[0, h]` of a `[1, E]` view; a multi-row scale
+            // is a different function the kernel would silently truncate).
+            // ⛔ THE PAD-WIDTH LAW STAYS THE DOOR'S — `W =
+            // E.next_multiple_of(64)` and the pad-lane inertness the door's
+            // one-hot chain states are card-side facts this kernel's
+            // logical-`E` body does not state, exactly as the argsort row's.
+            let scores = &node.inputs[0];
+            let idx = &node.inputs[1];
+            let scale = &node.inputs[2];
+            for (view, role) in [(scores, "the scores"), (idx, "the indices")] {
+                if view.region.rows.len != m || view.region.cols.len != c {
+                    return Err(format!(
+                        "triton splice: routeexpertscale t{}: {role} t{} is [{}, {}] but the \
+                         scaled scores are [{m}, {c}] — the select is row-preserving over one \
+                         slot width, so these must agree",
+                        node.output.tensor.index(),
+                        view.tensor.index(),
+                        view.region.rows.len,
+                        view.region.cols.len,
+                    ));
+                }
+            }
+            if scale.region.rows.len != 1 {
+                return Err(format!(
+                    "triton splice: routeexpertscale t{}: the scale row t{} is [{}, {}] — the \
+                     per-expert scale is ONE row of E lanes (the door's own `[1, W]` gather \
+                     parent), and a multi-row scale is a different function",
+                    node.output.tensor.index(),
+                    scale.tensor.index(),
+                    scale.region.rows.len,
+                    scale.region.cols.len,
+                ));
+            }
+            let e = scale.region.cols.len;
+            if e == 0 || c == 0 {
+                return Err(format!(
+                    "triton splice: routeexpertscale t{}: the scale row t{} is [1, {e}] and the \
+                     scaled scores are [{m}, {c}] — the widths must be positive",
+                    node.output.tensor.index(),
+                    scale.tensor.index(),
+                ));
+            }
+            for p in ["desc_p", "desc_i", "desc_s", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("E", Val::Int(i128::from(e)))?;
+            ce("K", Val::Int(i128::from(c)))?;
         }
         (op, entry) => {
             return Err(format!(
@@ -1667,6 +3244,31 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
         // spliced program is straight-line like the builder's — no grid axis at all.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
+        // ── THE 2a KINDS — every one a `(1, 1)` launch like the pointwise family:
+        // the head/slot/stick loops are constant-trip `tl.range`s the ladder
+        // unrolls, and the row blocks are in-kernel tiles. ──
+        SubOp::RouterNorm { .. }
+        | SubOp::RouterLogits { .. }
+        | SubOp::RouteSoftmax
+        | SubOp::RouteScale { .. }
+        | SubOp::RouteRenorm
+        | SubOp::ExpertGatedAct { .. }
+        | SubOp::ExpertSort { .. }
+        | SubOp::ExpertUnsort
+        | SubOp::ExpertCombine { .. }
+        | SubOp::ExpertMatmul { .. }
+        | SubOp::TanhSoftCap { .. }
+        | SubOp::RmsNormUnit { .. }
+        | SubOp::ScalarWeightMul
+        | SubOp::Reshape { .. } => Ok(vec![1]),
+        // ── THE 2b ROUTER-INDEX KINDS — the same one-work-item law: the per-expert
+        // and per-slot loops are constant-trip `tl.static_range`s the trace unrolls
+        // (the inner bound is the outer's own induction variable), so the program is
+        // straight-line. ──
+        SubOp::RouteArgsort
+        | SubOp::RouteTopK { .. }
+        | SubOp::RouteGatherScores
+        | SubOp::RouteExpertScale { .. } => Ok(vec![1]),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -1797,10 +3399,241 @@ fn compile_kernel_uncached(
     Ok(m)
 }
 
+/// ⛔ THE DEFAULT BINDING LAW — the node's operand prefix, the output LAST. Rope binds
+/// three (a `RopeAppend`'s V and KV-cache destinations flow through GRAPH edges, so the
+/// kernel consumes x, cos, sin only); the sort and unsort bind their DATA operand only
+/// (the routing rides in the graph exactly as the rope's cache destinations do, because
+/// every projection reads it through this node's output routing; the door's
+/// `split_out(.., 1)` count states the same law at the descriptor half).
+fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+) -> Vec<BufferId> {
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    let n_bound = match &node.op {
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
+        SubOp::ExpertSort { .. } | SubOp::ExpertUnsort => 1,
+        _ => node.inputs.len(),
+    };
+    let mut bindings: Vec<BufferId> = node.inputs.iter().take(n_bound).map(&t).collect();
+    bindings.push(t(&node.output));
+    bindings
+}
+
+/// ⛔ THE BINDINGS A MINTED PROGRAM TAKES — one `BufferId` per kernel parameter, the
+/// tape's tensor indices with the output LAST — the exact law `KtirFunc::finish_shaped`
+/// states. `regions()` reads `bindings[i]` for `arguments[i]`, so the kernel's parameter
+/// order must be the binding order (the registry row's contract, checked at the
+/// signature above). Every kind but one follows [`default_bindings`].
+///
+/// ⭐⭐ EXPERTMATMUL IS THE ONE REORDER — and the resolution is the branch's own
+/// builder walk, verbatim. `KtirFunc::expert_matmul` mints `w` and `s` FIRST (their
+/// `arg_for`s open the bank views), then `idx`, then `rows`, so the parameters
+/// arrive as `[w, s, idx, rows]` and NO position names a node operand. And `idx` is
+/// not the node's own `inputs[1]` at all: that input is the SORT's output (the pair
+/// routing), wired so this walk can follow it one producer up and bind the sort's
+/// OTHER input — the `[m, k]` expert-id tensor — the exact walk
+/// `lower_expert_matmul_node` performed, refusal text included. A pairs tensor with
+/// no two-input `ExpertSort` producer is refused BY NAME: a projection without its
+/// indices would read slab 0 for every pair.
+fn bindings_for<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Vec<BufferId>, String> {
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    if let SubOp::ExpertMatmul { .. } = &node.op {
+        let pairs = &node.inputs[1];
+        // ⛔⭐ P1's GRAPH HALF — the ids' PROVENANCE, the addressing lockdown's own
+        // door-side twin (the BANK-side half is `expert_matmul`'s k ≤ e_count
+        // refusal in the ktir-superdsc door). The sort's index input must be the
+        // router's `RouteTopK` output with k ≤ the sort's expert count:
+        // `RouteTopK` is the ONLY mint of in-range ids (the argsort's +inf pad
+        // lanes sort last, so the top-k never selects one), while a source
+        // tensor or any other producer can hold an out-of-range id — and the
+        // weight gather would read past the bank and fault the card's FETCH.
+        // Refused HERE, at the last place the producer chain is visible before
+        // a program is minted; the five acceptance tapes that hand-fed an idx
+        // source are migrated to a constructed RouteTopK (their rank vectors
+        // invert to the same idx), so the refusal and the honest tapes landed
+        // together.
+        let idx = match producer_of(ir, pairs.tensor) {
+            Some(sort) if matches!(sort.op, SubOp::ExpertSort { .. }) && sort.inputs.len() == 2 => {
+                let SubOp::ExpertSort { experts, .. } = &sort.op else {
+                    unreachable!("the arm above matched ExpertSort")
+                };
+                match producer_of(ir, sort.inputs[1].tensor) {
+                    Some(topk) => match &topk.op {
+                        SubOp::RouteTopK { k } if k.get() <= experts.get() => &sort.inputs[1],
+                        SubOp::RouteTopK { k } => {
+                            return Err(format!(
+                                "triton splice: ExpertMatmul t{} routes its pairs through a \
+                                 top-k of {} over {} experts — the top-k would have to include \
+                                 the argsort's +inf pad lanes, and a pad lane's id runs past the \
+                                 bank and faults the card's FETCH. The routing is only in range \
+                                 while k <= the expert count",
+                                node.output.tensor.index() as u32,
+                                k.get(),
+                                experts.get()
+                            ));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "triton splice: ExpertMatmul t{} reads its expert ids from t{} \
+                                 whose producer is not the router's RouteTopK — RouteTopK is the \
+                                 only mint of in-range ids (the argsort's +inf pad lanes sort \
+                                 last), so anything else can put an out-of-range id in the gather \
+                                 and fault the card's FETCH",
+                                node.output.tensor.index() as u32,
+                                sort.inputs[1].tensor.index() as u32
+                            ));
+                        }
+                    },
+                    None => {
+                        return Err(format!(
+                            "triton splice: ExpertMatmul t{} reads its expert ids from t{} which \
+                             no node produces — a source tensor is not the router's RouteTopK, \
+                             the only mint of in-range ids, so the gather would read whatever it \
+                             holds past the bank",
+                            node.output.tensor.index() as u32,
+                            sort.inputs[1].tensor.index() as u32
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "triton splice: ExpertMatmul t{} reads its routing from t{} whose producer \
+                     is not a two-input ExpertSort — the expert indices cannot be bound, and a \
+                     projection without them would read slab 0 for every pair",
+                    node.output.tensor.index() as u32,
+                    pairs.tensor.index() as u32
+                ));
+            }
+        };
+        return Ok(vec![
+            t(&node.inputs[2]),
+            t(&node.inputs[3]),
+            t(idx),
+            t(&node.inputs[0]),
+            t(&node.output),
+        ]);
+    }
+    // ⭐⭐ ROUTEEXPERTSCALE IS THE SECOND REORDER — and the ONLY one that is a
+    // pure permutation of the node's own operands (no producer walk): the door
+    // reads its parameters positionally as `[scale, idx, scores, out]` with
+    // `tensors[0]` THE SCALE ROW, while the node's inputs are `[scores, idx,
+    // scale]` (the chain fixture's and the door test's own order). The kernel
+    // declares `desc_p` first to match (`routeexpertscale.py`'s header states
+    // the law), so the bindings permute `[0, 1, 2]` → `[2, 1, 0]`. ⛔ THE
+    // MIS-ORDER IS NOT A BENIGN SWAP: the door's own ⛔ note records the old
+    // door binding the scores into `tensors[0]` — the col_at lane read then
+    // materialized `m` rows out of the ONE-ROW scale tensor, passing at m ≤ 4
+    // only because the mis-read fit the bumped footprint, until the placement
+    // guard refused at m=8 — and every descriptor the m=1 bake shipped
+    // computed the WRONG function (the score rode the scale row's lanes).
+    if let SubOp::RouteExpertScale { .. } = &node.op {
+        return Ok(vec![
+            t(&node.inputs[2]),
+            t(&node.inputs[1]),
+            t(&node.inputs[0]),
+            t(&node.output),
+        ]);
+    }
+    // ⭐⭐ ROUTETOPK IS THE THIRD REORDER — the FOLD'S OWN WALK, re-pointing the
+    // top-k at the head of its chain. The argsort and the score gather are folded
+    // into the top-k's kernel (`lower_all`'s two router folds), so no position
+    // names a node operand: `desc_l` is the rank vector's producer's input — walk
+    // `inputs[0]` (the ranks) up to its `RouteArgsort`, then take the argsort's
+    // OWN input, the raw logits — `desc_v` is the GATHER consumer's output (the
+    // fused kernel lands the values, the old gather's whole job, so the values
+    // region is the gather's), and `desc_o` is the node's own ids output, LAST
+    // per the tape's own law. ⛔ EVERY STEP IS REFUSED BY NAME, NOT FALLEN BACK:
+    // the old per-row-scalar top-k path is replaced wholesale (wall-11 — its
+    // ids could alias at ties and sum expert ids past the bank, faulting the
+    // card's FETCH), so a chain this walk cannot resolve is a naming error, not
+    // a shape to lower some other way.
+    if let SubOp::RouteTopK { k } = &node.op {
+        let ranks = &node.inputs[0];
+        let k = k.get();
+        let m = node.output.region.rows.len;
+        let sort = match producer_of(ir, ranks.tensor) {
+            Some(sort) if matches!(sort.op, SubOp::RouteArgsort) => sort,
+            _ => {
+                return Err(format!(
+                    "triton splice: routetopk t{} reads its ranks from t{} whose producer is \
+                     not a RouteArgsort — the fused top-k reads the RAW LOGITS (the argsort's \
+                     own input, one producer up), so the chain must state the argsort to name \
+                     them",
+                    node.output.tensor.index() as u32,
+                    ranks.tensor.index() as u32
+                ));
+            }
+        };
+        let lg = &sort.inputs[0];
+        if lg.region.rows.len != m
+            || lg.region.cols.len != ranks.region.cols.len
+            || lg.region.cols.len == 0
+        {
+            return Err(format!(
+                "triton splice: routetopk t{}'s logits t{} are [{}, {}] but its ranks t{} are \
+                 [{m}, {}] — the argsort is shape-preserving over the rows (the fused pair \
+                 selects per token), so the chain must agree",
+                node.output.tensor.index() as u32,
+                lg.tensor.index() as u32,
+                lg.region.rows.len,
+                lg.region.cols.len,
+                ranks.tensor.index() as u32,
+                ranks.region.cols.len,
+            ));
+        }
+        // The gather: the chain's own consumer, reading the SAME logits the pair
+        // selects over (`g.inputs[0] == lg`) with this node's ids (`g.inputs[1]`)
+        // — its output is the values landing.
+        let gathers = consumers_of(ir, node.output.tensor)
+            .into_iter()
+            .filter(|g| matches!(g.op, SubOp::RouteGatherScores))
+            .collect::<Vec<_>>();
+        let [g] = gathers.as_slice() else {
+            return Err(format!(
+                "triton splice: routetopk t{} has {} RouteGatherScores consumers — the fused \
+                 top-k lands the pair's VALUES in the gather's output (desc_v), so the chain \
+                 must state exactly one",
+                node.output.tensor.index() as u32,
+                gathers.len()
+            ));
+        };
+        if g.inputs[1].tensor != node.output.tensor || g.inputs[0].tensor != lg.tensor {
+            return Err(format!(
+                "triton splice: routetopk t{}'s gather t{} reads t{} and t{} — it must read \
+                 this node's ids and the SAME logits t{} the pair selects over (the chain's \
+                 own law: the values are the logits gathered at the ids)",
+                node.output.tensor.index() as u32,
+                g.output.tensor.index() as u32,
+                g.inputs[0].tensor.index() as u32,
+                g.inputs[1].tensor.index() as u32,
+                lg.tensor.index() as u32
+            ));
+        }
+        if g.output.region.rows.len != m || g.output.region.cols.len != k {
+            return Err(format!(
+                "triton splice: routetopk t{}'s values t{} are [{}, {}] but the ids are \
+                 [{m}, {k}] — the pair lands one value per id, so the regions must agree",
+                node.output.tensor.index() as u32,
+                g.output.tensor.index() as u32,
+                g.output.region.rows.len,
+                g.output.region.cols.len,
+            ));
+        }
+        return Ok(vec![t(lg), t(&g.output), t(&node.output)]);
+    }
+    Ok(default_bindings(node))
+}
+
 /// Mint the [`KtirNode`]: the adapter's `node_for` compilation, then RE-STATE the fields
-/// the tape owns — the name (the builder's naming law), the bindings (the tape's tensor
-/// indices in the node's operand order), `mask` (none for rmsnorm), and `node_out_tid`
-/// (None — the program writes its own node's output).
+/// the tape owns — the name (the builder's naming law), the bindings (resolved by
+/// [`bindings_for`]: the tape's tensor indices, the output LAST), `mask` (none for
+/// rmsnorm), and `node_out_tid` (None — the program writes its own node's output).
 ///
 /// ⛔ THE RE-STATE IS THE WHOLE POINT. `node_for` mints positional `BufferId`s
 /// (`0, 1, 2`); the tape's rmsnorm node reads `t37`/`t41` and writes `t42`. The
@@ -1810,27 +3643,11 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     module: triton_ktir::ir::Module,
     program: &Program,
+    bindings: Vec<BufferId>,
 ) -> Result<KtirNode, String> {
     // The adapter's mint: `to_ktir_emit::lower` over the module, positional buffer ids.
     let positional = triton_ktir_superdsc::node_for(&module, *program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
-    // ⛔ BINDINGS ARE THE TAPE'S TENSOR INDICES, in the node's operand order, with the
-    // output LAST — the exact law `KtirFunc::finish_shaped` states. `regions()` reads
-    // `bindings[i]` for `arguments[i]`, so the kernel's parameter order must be the
-    // node's operand order (the registry row's contract, checked at the signature above).
-    // ⭐ ROPE BINDS THREE, not the node's whole input list: the kernel consumes x, cos,
-    // sin (the rotation), while a `RopeAppend`'s V and KV-cache inputs flow through
-    // GRAPH edges — `lower_rope_node` binds exactly these three plus the output, and so
-    // does the splice. The arity match above pinned `inputs.len() >= 3`.
-    let rope = matches!(node.op, SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. });
-    let n_bound = if rope { 3 } else { node.inputs.len() };
-    let mut bindings: Vec<BufferId> = node
-        .inputs
-        .iter()
-        .take(n_bound)
-        .map(|tr| BufferId::new(tr.tensor.index() as u32))
-        .collect();
-    bindings.push(BufferId::new(node.output.tensor.index() as u32));
     // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key
     // follow the same law the builder path established — what the golden pins.
     let name = Arena::global().str(format!(
@@ -1879,12 +3696,40 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
             other => unreachable!("elementwise kind {other:?} has no program stem"),
         };
     }
+    // ⭐ THE 2a KINDS THAT SHARE ANOTHER FAMILY'S PROGRAM but keep their OWN builder
+    // names (main's naming law: `routernorm_s{id}`, `routerlogits_s{id}`) — read off
+    // the NODE, like the elementwise stems above, because the program match below
+    // would answer the shared family's name.
+    if let SubOp::RouterNorm { .. } = &node.op {
+        return "routernorm";
+    }
+    if let SubOp::RouterLogits { .. } = &node.op {
+        return "routerlogits";
+    }
     match program {
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
         Program::Rope => "rope",
         Program::ScalarMul => "scalarmul",
+        // ⭐ THE SANDWICH'S OWN STEM — `rmsnorm_s{split.id}` (the split's id, not the
+        // middle norm's), main's naming law for the fused per-head norm.
+        Program::WindowedRmsNorm { .. } => "rmsnorm",
+        Program::RmsNormUnit => "rmsnormunit",
+        Program::TanhSoftCap => "tanhsoftcap",
+        Program::ScalarWeightMul => "scalarwmul",
+        Program::Reshape => "reshape",
+        Program::RouteSoftmax => "routesoftmax",
+        Program::RouteRenorm => "routerenorm",
+        Program::RouteArgsort => "routeargsort",
+        Program::RouteTopK => "routetopk",
+        Program::RouteGatherScores => "routegather",
+        Program::RouteExpertScale => "routeexpertscale",
+        Program::ExpertGatedAct(_) => "gatedact",
+        Program::ExpertSort => "expertsort",
+        Program::ExpertUnsort => "expertunsort",
+        Program::ExpertCombine => "expertcombine",
+        Program::ExpertMatmul => "expertmatmul",
         _ => "triton",
     }
 }

@@ -220,6 +220,17 @@ def derive_bounds(cfg):
     has = b.__contains__
     put = b.setdefault
 
+    # derive_sliding_window_pattern (from verbatim layer_types) — config.rs
+    # runs this BEFORE derive_implicit_bounds, so the remainder rule below
+    # sees the derived period. Explicit `sliding_window_pattern` wins.
+    if not has("sliding_window_pattern"):
+        types = cfg.get("layer_types")
+        if isinstance(types, list) and types:
+            for i, t in enumerate(types):
+                if t != types[0]:
+                    put("sliding_window_pattern", i + 1)
+                    break
+
     if not has("head_dim") and has("qk_nope_head_dim") and has("qk_rope_head_dim"):
         put("head_dim", b["qk_nope_head_dim"] + b["qk_rope_head_dim"])
     if not has("head_dim") and has("hidden_size") and has("num_attention_heads"):
@@ -258,14 +269,6 @@ def derive_bounds(cfg):
         put("q_global_dim", b["num_attention_heads"] * b["global_head_dim"])
     if not has("k_global_dim") and has("num_global_key_value_heads") and has("global_head_dim"):
         put("k_global_dim", b["num_global_key_value_heads"] * b["global_head_dim"])
-    # derive_sliding_window_pattern (from verbatim layer_types)
-    if not has("sliding_window_pattern"):
-        types = cfg.get("layer_types")
-        if isinstance(types, list) and types:
-            for i, t in enumerate(types):
-                if t != types[0]:
-                    put("sliding_window_pattern", i + 1)
-                    break
     return b
 
 
@@ -2844,6 +2847,18 @@ def main():
     dump("logits", logits.float())
     dump("block_table", np.asarray(STATE["block_table"] + [0] * (NUM_BLOCKS - len(STATE["block_table"])), dtype=np.int64))
     dump("slot_mapping", np.asarray(STATE["slot_mapping"], dtype=np.int64))
+    # Per-layer K/V goldens (block 0). The rolled body REUSES its residual
+    # slot across iterations, so per-layer K/V writes are the only per-layer
+    # boundary values a rolled card dump can compare against — the first
+    # layer whose K/V diverges names the layer whose INPUT was wrong.
+    for l, (kc, vc) in enumerate(STATE["kv_cache"]):
+        dump(f"kv_k_{l}", kc[0])
+        dump(f"kv_v_{l}", vc[0])
+    # W11 probe: per-layer block-boundary values (residual in/out, attention
+    # output, mid-block residual, dense/moe/combine outputs), present only
+    # when the carrier defines PROBE (probe builds only); a no-op otherwise.
+    for name, l, t in env.get("PROBE", ()):
+        dump(f"probe_{name}_{l}", t)
     if is_vision:
         dump("cos", STATE["vision_cos"])
         dump("sin", STATE["vision_sin"])

@@ -120,3 +120,19 @@ fn the_f32_island_form_compiles_for_all_three() {
         accept(call, op);
     }
 }
+
+/// `tanh` is the same `@_check_dtype` family (and the same widen / call / truncate
+/// island law) — the arm is newer than the three above, so it gets the same pair:
+/// refused on f16 with Triton's wording, compiled inside the island emitting
+/// `math.tanh`. `tanhsoftcap.py`'s cap chain is the consumer this exists for.
+#[test]
+fn tanh_on_f16_is_refused_and_its_island_compiles() {
+    for call in ["tl.tanh(x)", "tl.math.tanh(x)"] {
+        let msg = refuse(call);
+        assert!(
+            msg.contains("Expected dtype ['fp32', 'fp64'] but got fp16"),
+            "`{call}` must be refused on f16 with Triton's wording; got: {msg}"
+        );
+    }
+    accept("tl.tanh(x.to(tl.float32)).to(tl.float16)", "math.tanh");
+}

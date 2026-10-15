@@ -71,6 +71,30 @@ fn attrkey(k: ktir_core::attrkey::AttrKey) -> proc_macro2::TokenStream {
     quote! { __KAttrKey::#v }
 }
 
+/// ⛔ ±inf AND NaN ARE LEGAL VALUES AND ILLEGAL LITERALS. `Literal::f64_unsuffixed` asserts
+/// `is_finite`, but the programs the splice bakes carry real non-finite constants from TWO
+/// measured sources: the attention chain's `tl.max` lowers through `tt.reduce` →
+/// `ArithMaxnumf`, whose accumulator seed is `f32::NEG_INFINITY` (`to_ktir.rs`'s
+/// `combiner_identity`) — MEASURED: the `spyre,model/llama-3.2-1b` bake panicked at that
+/// assert, the first `#[forward]` expansion with attention, because the golden tests
+/// construct IR at runtime and never run the token bake — and the router chain's softmax
+/// `-inf` row-max init and argsort `+inf` NaN-sanitize are the same kind of constant
+/// (MEASURED: the gemma-4-26b parity-tiny build panicked at `f.is_finite()` on one). The
+/// non-finite spellings render as the std consts, which are the same f64s in a `const`-legal
+/// form; everything finite stays a literal.
+fn float(f: f64) -> proc_macro2::TokenStream {
+    if f.is_finite() {
+        let l = proc_macro2::Literal::f64_unsuffixed(f);
+        quote! { #l }
+    } else if f.is_nan() {
+        quote! { f64::NAN }
+    } else if f.is_sign_positive() {
+        quote! { f64::INFINITY }
+    } else {
+        quote! { f64::NEG_INFINITY }
+    }
+}
+
 fn ints(v: &[i64]) -> proc_macro2::TokenStream {
     let it = v.iter().map(|i| proc_macro2::Literal::i64_unsuffixed(*i));
     quote! { &[#(#it),*] }
@@ -173,7 +197,9 @@ fn affine_map(m: &ktir_core::affine::AffineMap<'_>) -> proc_macro2::TokenStream 
 /// `convert_ttir_to_ktdp` DOES: every `tt.make_tensor_descriptor` becomes a
 /// `ktdp.construct_memory_view` with a `CoordinateSet` range set, and every block load
 /// an `AccessTileSet`. Those attributes are part of the program the splice bakes, so
-/// the serializer states them rather than panicking on them.
+/// the serializer states them rather than panicking on them. The MoE router's gathers
+/// state theirs the same way (an UNCONSTRAINED full box — the tile's own shape is the
+/// space); a set with real constraints is the same rendering.
 fn affine_set(s: &ktir_core::affine::AffineSet<'_>) -> proc_macro2::TokenStream {
     let nd = proc_macro2::Literal::usize_unsuffixed(s.num_dims);
     let ns = proc_macro2::Literal::usize_unsuffixed(s.num_syms);
@@ -191,27 +217,6 @@ fn affine_set(s: &ktir_core::affine::AffineSet<'_>) -> proc_macro2::TokenStream 
             num_syms: #ns,
             constraints: &[#(#cs),*],
         }
-    }
-}
-
-/// ⛔ ±inf AND NaN ARE LEGAL VALUES AND ILLEGAL LITERALS. `Literal::f64_unsuffixed` asserts
-/// `is_finite`, but the programs the splice bakes carry real non-finite constants — the
-/// attention chain's `tl.max` lowers through `tt.reduce` → `ArithMaxnumf`, whose accumulator
-/// seed is `f32::NEG_INFINITY` (`to_ktir.rs`'s `combiner_identity`). MEASURED: the
-/// `spyre,model/llama-3.2-1b` bake panicked at that assert — the first `#[forward]`
-/// expansion with attention, because the golden tests construct IR at runtime and never
-/// run the token bake. The non-finite spellings render as the std consts, which are the
-/// same f64s in a `const`-legal form; everything finite stays a literal.
-fn float(f: f64) -> proc_macro2::TokenStream {
-    if f.is_finite() {
-        let l = proc_macro2::Literal::f64_unsuffixed(f);
-        quote! { #l }
-    } else if f.is_nan() {
-        quote! { f64::NAN }
-    } else if f.is_sign_positive() {
-        quote! { f64::INFINITY }
-    } else {
-        quote! { f64::NEG_INFINITY }
     }
 }
 
@@ -434,6 +439,19 @@ fn synth_role_tokens(
         R::LAcc(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(i);
             quote! { #path::LAcc(#i) }
+        }
+        // The amax partial slot — indexed like the four above; the catch-all below would render
+        // `FqAmaxP(2)` from Debug, which is not an ident.
+        R::FqAmaxP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::FqAmaxP(#j) }
+        }
+        // The expert-combine product slot — indexed for the same reason (the catch-all would
+        // render `ECombP(2)` from Debug, not an ident). `ECombAcc` is unit and rides the
+        // catch-all.
+        R::ECombP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::ECombP(#j) }
         }
         other => {
             let v = variant(format!("{other:?}"));

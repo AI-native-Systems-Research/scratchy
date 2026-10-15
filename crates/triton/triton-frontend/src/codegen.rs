@@ -2457,6 +2457,26 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `tl.where(condition, x, y)` -> `arith.select`: the router kernels' slot
+            // selection (`tl.where(tl.arange(...) == j, xsan, 0.0)`). Like `tanh`, it is a
+            // real `triton.language` function every downstream dialect already serves
+            // (`OpKind::ArithSelect`; the emulator runs it) -- this arm and the census row
+            // are the front end's missing spelling of it.
+            "where" => {
+                let c = get(0, "condition").ok_or_else(|| {
+                    Error::new("tl.where needs three arguments", pos.line, pos.col)
+                })?;
+                let x = get(1, "x").ok_or_else(|| {
+                    Error::new("tl.where needs three arguments", pos.line, pos.col)
+                })?;
+                let y = get(2, "y").ok_or_else(|| {
+                    Error::new("tl.where needs three arguments", pos.line, pos.col)
+                })?;
+                self.sem
+                    .select(&c, &x, &y)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
             "arange" => {
                 let a = get(0, "start")
                     .and_then(|v| v.as_int())
@@ -2502,11 +2522,18 @@ impl<'a> CodeGen<'a> {
             // decorated `@core._tensor_member_fn` and re-exported into `tl` by
             // `language/__init__.py`, so both spellings reach `create_rsqrt`. Measured in
             // `rmsnorm.ttir_raw.mlir`, where `tl.rsqrt` emits `math.rsqrt`.
-            "exp" | "math.exp2" | "rsqrt" | "math.rsqrt" => {
+            // `tanh` is the same shape: `math.py`'s `tanh` is re-exported into `tl`, and
+            // the KTIR side has had `OpKind::MathTanh` all along (to_ktir_emit maps it;
+            // the emulator runs it) — this arm is the front end's missing spelling of an
+            // op every downstream dialect already serves. The f32 width gate applies as
+            // to every `math.*` unary, so a kernel states the widen/truncate island
+            // (`tanhsoftcap.py`), which LegalizeTypes collapses.
+            "exp" | "math.exp2" | "rsqrt" | "math.rsqrt" | "tanh" | "math.tanh" => {
                 let v = self.ir_arg(&get(0, "x"), name, pos)?;
                 let op = match name {
                     "exp" => "math.exp",
                     "math.exp2" => "math.exp2",
+                    "tanh" | "math.tanh" => "math.tanh",
                     _ => "math.rsqrt",
                 };
                 self.sem

@@ -240,6 +240,74 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
                 format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
             })? = AnyTensorArg::R3(kernel);
         }
+        // ⭐⭐⭐⭐⭐ THE TOKEN-PLANE FORM — entries on `mb` (one per token row, each a RAW expert id),
+        // no second pin: the prefill-m>1 per-expert batched matmul. The kernel is re-declared
+        // rank-3 with the PINNED DIM FIRST — `["mb","in","out"]`, NOT the KV arm's
+        // `["in","out","mb"]` — because that is the spelling the one-matmul card probe measured
+        // (2026-10-09, `/tmp/prefill-m1-probe-report.md`): `maxDimSizes_ [1,-1,-1]` pins position 0,
+        // dxp reads the operand list POSITIONALLY (`getMinParamBmm` front/.at(1)/.back), and the
+        // scheduled tree engaged the vendor's paged loop nest at BOTH the small and 26b-gate
+        // geometries with `RC=0`. A different dim order here is not a cosmetic choice: the pin
+        // lands wherever `mb` sits, and the mds the emitter derives would page a different axis.
+        //
+        // The same pairing law as the KV arm: the rank-3 kernel is sound ONLY WITH the gather, and
+        // this arm lives inside the gathered builder for exactly that reason. The bake needs
+        // `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` (the exploration path's flop-per-byte accounting is
+        // uninputtable for a gathered index — a vendor ordering gap, not a gather prohibition) and
+        // the plan splits `mb` only (enforced below), or `skip_addr` shrinks below one expert plane.
+        if g.entry_dim == crate::superdsc_opspec::KernelAxis::Batch && g.per_position.is_none() {
+            // ⭐⭐⭐⭐⭐ THE PLAN SPLITS `mb` ONLY, AT THE ENTRY AXIS'S OWN `core_split` —
+            // enforced where the plan is made. The generic splitter pairs with the form,
+            // and at a prefill geometry with a MULTI-STICK `out` (the 26b DOWN chunk's
+            // 704 = 11 sticks) the cost model K- and N-splits — legal and PSUM-accumulated
+            // on an ungathered matmul, but under this gather `skip_addr` is the pin × the
+            // per-core extents of the UNPINNED `in`/`out`, so a split there makes every
+            // index entry step a FRACTION of the expert plane it names (the emit-time
+            // guard refuses that BY NAME — this division never trips it). This IS the
+            // probe's card-proven plan stated as law: {in:1, mb:32, out:1} at mb=96 is
+            // `core_split(96, 32)`, the same expression the single-stick-`out` reduce
+            // branch takes — so at every geometry that emits today (single-stick `out`,
+            // the reduce branch) the division is byte-identical, and the multi-stick
+            // geometries the guard refused now get the probe's own shape instead.
+            let mb_split = crate::work::core_split(
+                op.iter.extent(MbAxis::NAME),
+                crate::superdsc_opspec::MAX_CORES,
+            );
+            let mut mb_only = std::collections::BTreeMap::new();
+            if mb_split > 1 {
+                mb_only.insert(MbAxis::NAME, mb_split);
+            }
+            if op.iter.splits() != &mb_only {
+                let dims = op.iter.dims().to_vec();
+                op.iter = crate::superdsc_opspec::WorkPlan::divide(
+                    &dims,
+                    MaxCores::<{ MAX_CORES }>,
+                    |_, _| mb_only,
+                )?;
+            }
+            let stick = crate::superdsc_opspec::KernelAxis::Slot.dim();
+            let layout = [
+                crate::superdsc_opspec::KernelAxis::Batch.dim(),
+                crate::superdsc_opspec::KernelAxis::Feature.dim(),
+                stick,
+            ];
+            let kernel = TensorArg::<3>::new(
+                true,
+                w_name.to_string(),
+                Role::Kernel,
+                [Scale::Active; 3],
+                op.iter.iter_syms(layout),
+                layout,
+                stick,
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(w_off)
+            .with_df(operand_df);
+            *op.args.get_mut(KERNEL_OPERAND).ok_or_else(|| {
+                format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
+            })? = AnyTensorArg::R3(kernel);
+        }
         op.attach_gather_index(g, KERNEL_OPERAND).ok_or_else(|| {
             format!(
                 "the matmul has {} operand(s), so position {KERNEL_OPERAND} is not a kernel a \

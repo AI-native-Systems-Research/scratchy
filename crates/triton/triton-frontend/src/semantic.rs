@@ -1241,6 +1241,32 @@ impl Semantic {
         ))
     }
 
+    /// `tl.where(cond, x, y)` (`semantic.py`'s `where`) -> `arith.select`.
+    ///
+    /// The value operands pair through `binary_op_type_checking` WITHOUT arithmetic
+    /// promotion (`arithmetic_check = false`): a select chooses between its operands
+    /// rather than computing with them, so an fp16 pair stays fp16. The condition is
+    /// then broadcast to the pair's common shape -- a scalar condition rides `splat`,
+    /// a shaped one `tt.broadcast` -- and its element type must be `i1`, which is
+    /// what every compare in this front end produces. The result type is the pair's
+    /// type, which is `create_select`'s contract: the condition selects, it does not
+    /// widen.
+    pub fn select(&mut self, cond: &Val, lhs: &Val, rhs: &Val) -> Result<ValueId> {
+        let (l, r) = self.binary_op_type_checking(lhs, rhs, false, false, false, false)?;
+        let ty = self.ty(l);
+        let c = self.to_tensor(cond)?;
+        let cs = self.ty(c).scalar().clone();
+        if !cs.is_int() || cs.int_bitwidth() != Some(1) {
+            return Err(Error::new(
+                format!("tl.where's condition must be bool (i1), got {cs}"),
+                0,
+                0,
+            ));
+        }
+        let c = self.broadcast_to(c, ty.shape())?;
+        Ok(self.emit1("arith.select", &[c, l, r], ty, &[]))
+    }
+
     // ===------------------------------------------------------------------===//
     //                         The tl.* surface
     // ===------------------------------------------------------------------===//

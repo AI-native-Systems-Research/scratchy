@@ -71,6 +71,56 @@ pub fn fp8_scale(l: &scratchy_layers::layers::Fp8AnyLinear) -> GpuTensor {
     }
 }
 
+// ── The MoE bundle tensors, one accessor per (bundle, tensor) ─────────────────
+//
+// A MoE bundle field holds SEVERAL tensors where every other weight kind holds one, so
+// `superdsc_weights`'s per-source arms reach INSIDE the field through these. They return the
+// tensor VERBATIM — staging (orientation, device-width pad) is the worker's, decided by the
+// source's baked shape, exactly as for a single-tensor weight.
+
+/// The gemma-4 router's dense `[num_experts, hidden]` projection.
+pub fn gemma_router_gate(l: &scratchy_layers::layers_moe::GemmaRouterLayer) -> GpuTensor {
+    l.gate
+}
+
+/// The gemma-4 router's `[num_experts]` per-expert score scale.
+pub fn gemma_router_per_expert_scale(
+    l: &scratchy_layers::layers_moe::GemmaRouterLayer,
+) -> GpuTensor {
+    l.per_expert_scale
+}
+
+/// The gemma-4 router's `[hidden]` RMSNorm gain on its input.
+pub fn gemma_router_scale(l: &scratchy_layers::layers_moe::GemmaRouterLayer) -> GpuTensor {
+    l.scale
+}
+
+/// The SwitchGLU experts' gate-projection codes, stacked `[E, out, in]`.
+pub fn switch_glu_gate_w(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_gate_w
+}
+
+/// The SwitchGLU experts' gate-projection per-channel scale, stacked `[E, out, 1]`.
+pub fn switch_glu_gate_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_gate_scales
+}
+
+pub fn switch_glu_up_w(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_up_w
+}
+
+pub fn switch_glu_up_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_up_scales
+}
+
+pub fn switch_glu_down_w(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_down_w
+}
+
+pub fn switch_glu_down_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_down_scales
+}
+
 // ── WHAT THE BAKE PLACED ────────────────────────────────────────────────────
 
 /// The bundle's own answers about what it placed.
@@ -98,6 +148,32 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ THE ROUTER CONST GEOMETRY `(padded expert width W, expert count E)`, off the
+    /// router_const region's own placements: W from the `[W,W]` IDENTITY table's size
+    /// (`sqrt(size/2)` — the one router table EVERY router tape places), and E from the
+    /// layout's own `router_experts` registry entry — the one fact no placement size
+    /// carries, because the pad rows' VALUES need the UNPADDED count. k rides the
+    /// layout's own `router_k` registry entry (the `[k,W]` targets table that used to
+    /// carry it died with the rank-inversion door the fused pair replaced).
+    /// `(0, 0)` when the bundle has no MoE router. Same "asked of the artifact" law as
+    /// `ones_reduce_len`.
+    pub router: (usize, usize),
+    /// The top-k width, off the layout's `router_k` registry — the softmax mask's bind
+    /// builds its k-boundary (0 below k, −inf above) from it. 0 when the bundle has no
+    /// top-k.
+    pub router_k: usize,
+    /// ⭐ THE BARE-ARGSORT CORNER — the bundle placed the `[W,W]` tie table, i.e. some
+    /// argsort's rank vector feeds something other than a RouteTopK (the splice folds
+    /// every all-topk argsort into the fused pair, which reads the raw logits and needs
+    /// no ranks). The tie table and the argsort's maximum-form pad mask are bound ONLY
+    /// here; the placement and this lookup answer ONE question, so they cannot desync.
+    pub router_argsort: bool,
+    /// ⭐ THE FUSED TOP-K'S PAD ROW — the bundle placed `router_topk_pad_tid` (a RouteTopK
+    /// exists AND `W > E`: the logits' stick pad is real, so the staging's add-form
+    /// sanitize must force those lanes to −inf or a zero pad lane would outrank every
+    /// negative logit and steal a slot). The row's bind builds 0 below E, −inf above,
+    /// from the same `(W, E)` the geometry carries.
+    pub router_topk_pad: bool,
     /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
     /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
     /// step and the launch must stage a block table.
@@ -108,6 +184,21 @@ pub struct BakeFacts {
     /// step reads an unstaged index, and an unstaged index is ZERO — a VALID block — so every row
     /// attends row 0's keys, fluently and wrongly.
     pub gathers_kv: bool,
+    /// ⭐⭐⭐ THE SUB-PAGE INDEX BANK'S EXPERT COUNT — the bundle placed
+    /// [`expert_subpage_bank_tid`](crate::lower_subtile_tape_to_superdsc::expert_subpage_bank_tid)
+    /// (an expert door's `expert_slab_subpages` cut fired — the vendor-scheduler LX law, wall #6),
+    /// so the forward tape carries a [`ForwardKernel::SubpageBank`](crate::forward_tape::ForwardKernel::SubpageBank)
+    /// step and the launch must stage the `[E, 32]` fine-index table through the raw-i32 bind.
+    /// E is read off the bank's OWN placement (`[E, S]` u32 ⇒ `size / (S·4)` rows — the placement
+    /// pass mints it at exactly the door's `e_count`), never re-derived: the placement IS the
+    /// authority the door's gather addresses. 0 when unplaced — every model whose expert pages
+    /// fit the vendor scheduler's 4×page budget, i.e. everything before the 26b.
+    ///
+    /// Same mechanism and the same asymmetry as [`Self::gathers_kv`]: a bank step this bundle
+    /// did not place is refused at the raw bind (loud); a placed bank with no step leaves the
+    /// fine gather reading an UNSTAGED index — zero, a VALID entry, so every pair gathers
+    /// expert 0's sub-page 0 with a clean bake. One artifact-derived question answers both.
+    pub subpage_bank_e: usize,
 }
 
 impl BakeFacts {
@@ -119,17 +210,57 @@ impl BakeFacts {
         uses_identity: false,
         scalarmul_scales: &[],
         gathers_kv: false,
+        subpage_bank_e: 0,
+        router: (0, 0),
+        router_k: 0,
+        router_argsort: false,
+        router_topk_pad: false,
     };
 
     /// Read them off the generated layout.
     pub fn of(layout: &'static bundle::BundleLayout<'static>) -> Self {
         use crate::lower_subtile_tape_to_superdsc as sd;
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
+        // The router geometry, off the IDENTITY table's placement and the layout's own
+        // `router_experts` registry entry (the E fact no placement size carries — the pad
+        // rows' VALUES need the unpadded count). The placement pass mints the identity
+        // table at exactly `[W, W]` fp16 for EVERY router tape (the expert-scale door
+        // reads it), so `sqrt(size/2)` IS W. k rides the layout's `router_k` registry
+        // (the targets table that used to carry it died with the rank-inversion door).
+        let router = match layout.place_of_tid(sd::router_identity_tid()) {
+            Some(p) => {
+                let w = ((p.size / 2) as f64).sqrt() as usize;
+                let e = layout.router_experts as usize;
+                (w, e)
+            }
+            None => (0, 0),
+        };
+        let router_k = layout.router_k as usize;
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
+            // The bank's own rows — `[E, S]` u32 at `S = CopyDims::ENTRIES_PER_OP` (32), so a
+            // placed bank of `size` bytes states `size / 128` experts. The placement pass and
+            // the door read ONE `e_count`; this reads it back off the artifact, so a drift
+            // between them is a load-time wrong-E, not a silent one.
+            subpage_bank_e: layout
+                .place_of_tid(sd::expert_subpage_bank_tid())
+                .map(|p| {
+                    (p.size
+                        / (scratchy_subtile::sdsc_abstract::CopyDims::ENTRIES_PER_OP as u64 * 4))
+                        as usize
+                })
+                .filter(|&e| e > 0)
+                .unwrap_or(0),
+            router,
+            router_k,
+            // The bare-argsort corner and the fused top-k's pad row, both asked of the
+            // artifact the placement pass itself minted (the tie table / the pad row) —
+            // one question, one answer, no second derivation to drift.
+            router_argsort: layout.place_of_tid(sd::router_rank_tie_tid()).is_some(),
+            router_topk_pad: layout.place_of_tid(sd::router_topk_pad_tid()).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -181,60 +312,149 @@ impl BakeFacts {
             uses_identity: self.uses_identity,
             rows: rows.get(),
             scalarmul_scales: self.scalarmul_scales,
-            identity: w.identity,
-            rope_p: w.rope_p,
+            rope_class_hds: w.rope_class_hds,
+            attn_class_hds: w.attn_class_hds,
             rms_invcols: w.rms_invcols,
+            router: self.router,
+            router_k: self.router_k,
+            router_argsort: self.router_argsort,
+            router_topk_pad: self.router_topk_pad,
         }
     }
 }
 
 impl Wiring {
-    /// ⛔ THE EMITTED KERNEL TABLES, CHECKED AGAINST A FRESH COMPUTATION — ONCE, AT LOAD.
+    /// ⛔ THE CLASS SETS, CHECKED AGAINST THE PLACEMENTS — ONCE, AT LOAD.
     ///
-    /// [`Self::identity`] and [`Self::rope_p`] are `stage_2d` output the macro evaluated at bake.
-    /// They are correct BY CONSTRUCTION — the emitter calls the same two shared helpers the
-    /// runtime used to call per forward — but "by construction" is exactly the argument that was
-    /// also true of `t{tid}` before the ids and the spellings drifted, and of the K-split zero the
-    /// worker bound for a tensor the emitter named nowhere.
+    /// The bake used to emit the identity and rope-P tables as f32 LITERALS staged at the BASE head
+    /// dim, while the placement pass sized their tids at the MAX head dim over the tape's classes.
+    /// Both halves were individually "correct by construction" — the same shared helpers, the same
+    /// `ir` — and their disagreement was the gemma-4 card-garbage defect: a `[64,64]` table in a
+    /// `[128,128]` placement, the wide class's rope rotating pairs at half=32 and its GQA krep
+    /// reading slab 1 as zeros. No layer of the old check could see it, because the old check
+    /// (`verify_kernel_tables`'s literal-vs-freshcomputation form) re-staged at the SAME base head
+    /// dim the emission used.
     ///
-    /// So it is checked. The cost is one `stage_2d` per model load against `hd²` elements, versus
-    /// the two it used to pay on every token, and a mismatch means the emitted table and the
-    /// device layout law have desynced — which is silent otherwise: an identity that is wrong off
-    /// the diagonal zeroes every copy-via-matmul it drives, and a wrong rope-P rotates into the
-    /// wrong lane. Both read as fluent-but-incoherent output, not as an error.
-    pub fn verify_kernel_tables(&self) -> Result<(), String> {
-        use scratchy_subtile::sdsc_abstract::{StickLayout, rope_p_entry, stage_2d};
-        let hd = self.geometry.head_dim as usize;
-        let want_ident = stage_2d(
-            &StickLayout::kernel(hd, hd),
-            |i, j| {
-                if i == j { 1.0 } else { 0.0 }
-            },
-        );
-        if self.identity != want_ident.as_slice() {
-            return Err(format!(
-                "emitted identity table ({} elems) does not match `stage_2d(kernel({hd},{hd}))` \
-                 ({} elems) — the bake and the device layout law disagree",
-                self.identity.len(),
-                want_ident.len(),
-            ));
-        }
-        let want_rope: Vec<f32> = if hd >= 2 {
-            stage_2d(&StickLayout::kernel(hd, hd), |inn, o| {
-                rope_p_entry(hd, inn, o) as f32
-            })
-        } else {
-            Vec::new()
+    /// The class fix moves the tables to LOAD-TIME staging (a 512² literal table is 262k f32 of
+    /// expansion), so what the bake emits is the class SET — and the check that replaces the old
+    /// one is the fact that actually failed: every rope-P class tid must be placed at exactly
+    /// `hd_c² · 2` bytes, every identity class tid likewise, and every PLACED class tid must be in
+    /// the wiring's set. A mismatch means the wiring and the layout come from different bakes —
+    /// which is silent otherwise (fluent, incoherent output), and is exactly what an
+    /// "emu green, card garbage" divergence looks like from the inside: the emulator executes the
+    /// KTIR dialect ops and never reads these tids at all.
+    pub fn verify_class_placements(&self, layout: &bundle::BundleLayout<'_>) -> Result<(), String> {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        // One class family's check: every class in the wiring's set is placed at exactly hd²·2
+        // bytes, and every placed tid of that family is in the set. Both directions, because a
+        // one-sided check passes on exactly the desync that produced this bug (a stale set naming
+        // a tid the newer layout never placed, or a newer layout placing a class the wiring
+        // predates).
+        let check = |hds: &'static [u32],
+                     tid_of: fn(usize) -> u32,
+                     what: &str|
+         -> Result<(), String> {
+            for (class, &hd) in hds.iter().enumerate() {
+                let tid = tid_of(class);
+                let want = hd as u64 * hd as u64 * 2;
+                match layout.place_of_tid(tid) {
+                    Some(p) if p.size == want => {}
+                    Some(p) => {
+                        return Err(format!(
+                            "class {class} of {what} (t{tid}, head_dim {hd}) is placed at {} B, \
+                             but its table is {want} B — the wiring and the layout come from \
+                             different bakes; a table that does not fill its placement is the \
+                             wide-class-reads-zeros defect",
+                            p.size,
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "class {class} of {what} (t{tid}, head_dim {hd}) is in the wiring's \
+                             class set but the layout never placed it — the wiring and the layout \
+                             come from different bakes"
+                        ));
+                    }
+                }
+            }
+            // The other direction: a placed tid of this family that the wiring's set does not
+            // resolve to. The family is identified by tid (`is_kernel_table_class_tid`), not by
+            // size — a size match is what a desynced pair would get WRONG, not right.
+            for p in layout.places.iter() {
+                let bundle::PlaceId::Act(tid) = p.id else {
+                    continue;
+                };
+                if sd::is_kernel_table_class_tid(tid, what)
+                    && !hds
+                        .iter()
+                        .enumerate()
+                        .any(|(class, _)| tid_of(class) == tid)
+                {
+                    return Err(format!(
+                        "the layout placed t{tid} ({} B) as a {what} class table, but the \
+                         wiring's class set {hds:?} does not name it — the wiring and the layout \
+                         come from different bakes",
+                        p.size,
+                    ));
+                }
+            }
+            Ok(())
         };
-        if self.rope_p != want_rope.as_slice() {
-            return Err(format!(
-                "emitted rope-P table ({} elems) does not match `rope_p_entry` over \
-                 `kernel({hd},{hd})` ({} elems)",
-                self.rope_p.len(),
-                want_rope.len(),
-            ));
-        }
+        check(self.rope_class_hds, sd::rope_p_class_tid, "rope-P")?;
+        check(self.attn_class_hds, sd::identity_class_tid, "identity")?;
         Ok(())
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE CAUSAL MASK'S ROW EXTENT vs ITS PLACEMENT — ONCE, AT LOAD.
+    ///
+    /// The placement reserves `nqh · mq · mq_pad` fp16 elements for `ATTN_CAUSAL_TID`
+    /// (`lower_subtile_tape_to_superdsc.rs`, the `cmbytes` law), and the host stages exactly
+    /// `causal_tiled(cmask, mq, mq_pad, nqh)` into it. The row count both halves share is the
+    /// head count — which every host staging site used to DERIVE as `hidden / head_dim`. That
+    /// quotient is the head count only for a SQUARE Q projection (`hidden == nqh·hd`): true of
+    /// granite/llama, false of gemma-4 (production hidden 3840 against nqh·hd 4096/8192; the
+    /// tiny-allglobal fixture's hidden 128 against 4·64). A host staging at the quotient binds
+    /// only that many of the baked `nqh·mq` rows, and `refill_activations`' bind guard refuses
+    /// OVER-binds only — the shortfall is silent, and the ops read the unstaged tail of the
+    /// ADDITIVE mask as ZERO, i.e. as "no mask". MEASURED on the tiny fixture: heads 2-3 of
+    /// every layer ran with no causal mask, heads 0-1 exact.
+    ///
+    /// The fix bakes the count ([`Geometry::nqh`], from the same bounds the tape was lowered
+    /// at). This check is its guard: the placement's byte size must be exactly
+    /// `nqh · mq · score_width · 2`, so a staging shape built on any other head count — the
+    /// quotient, a stale wiring, a different model's geometry — is a load-time refusal instead
+    /// of a silent partial mask. Same shape of check as [`Self::verify_class_placements`], for
+    /// the same reason: the emulator executes the KTIR dialect ops and never reads this tid, so
+    /// nothing on its path can see the disagreement.
+    pub fn verify_causal_placement(
+        &self,
+        layout: &bundle::BundleLayout<'_>,
+        mq: u32,
+        score_width: u32,
+    ) -> Result<(), String> {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        let nqh = self.geometry.nqh as u64;
+        let want = nqh * mq as u64 * score_width as u64 * 2;
+        match layout.place_of_tid(sd::ATTN_CAUSAL_TID) {
+            Some(p) if p.size == want => Ok(()),
+            Some(p) => Err(format!(
+                "the causal mask (t{}) is placed at {} B, but this wiring's geometry bakes \
+                 {nqh} query head(s) × {mq} row(s) × {score_width} score width = {want} B. The \
+                 host stages `nqh·mq` mask rows; a placement that does not match is a \
+                 wiring/layout desync — and a STAGING at any other head count (the old \
+                 `hidden / head_dim` derivation, right only for a square Q projection) binds \
+                 only part of the placement, which the bind guard cannot see because it \
+                 refuses over-binds only. The unstaged tail of an ADDITIVE mask reads as ZERO, \
+                 i.e. as no mask.",
+                sd::ATTN_CAUSAL_TID,
+                p.size,
+            )),
+            None => Err(format!(
+                "the causal mask (t{}) is nowhere in this layout, but every attention bundle \
+                 places it — the wiring and the layout come from different bakes",
+                sd::ATTN_CAUSAL_TID,
+            )),
+        }
     }
 
     /// The query-row CAPACITY this bundle was baked at — the embedding activation's placement rows.
@@ -268,6 +488,7 @@ impl Wiring {
         rows: StagedRows,
         owns_prefix: bool,
         gathers: GathersKv,
+        subpage_bank: StagesSubpageBank,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         self.forward_shape_within(
@@ -275,6 +496,7 @@ impl Wiring {
             rows,
             owns_prefix,
             gathers,
+            subpage_bank,
             n_consts,
         )
     }
@@ -306,6 +528,9 @@ impl Wiring {
         // ⛔ A WITNESS, NOT A `bool` — mintable only from a [`BakeFacts`] read off the bundle's own
         // layout. See [`GathersKv`].
         gathers: GathersKv,
+        // ⛔ THE SAME DISCIPLINE FOR THE FINE-INDEX BANK — mintable only from the facts or the
+        // layout. See [`StagesSubpageBank`].
+        subpage_bank: StagesSubpageBank,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -322,6 +547,7 @@ impl Wiring {
             sin_srcs: self.sin_srcs,
             prefix_mask: owns_prefix,
             kv_block_index: gathers.get(),
+            subpage_bank_e: subpage_bank.experts(),
             n_consts,
         }
     }
@@ -385,6 +611,55 @@ impl GathersKv {
     }
 
     pub const fn get(self) -> bool {
+        self.0
+    }
+}
+
+/// ⭐⭐⭐ THE PROOF THAT "THIS BUNDLE'S EXPERT GATHER IS SUB-PAGED" CAME FROM THE BUNDLE — the
+/// fine-index bank's expert count, or 0 for a bundle that placed none. Exactly
+/// [`GathersKv`]'s discipline, because the failure modes are the same pair in the same
+/// arrangement: the door's `embi` gather and this staging are the two halves of one fine
+/// index, and they fail asymmetrically. A bank step on a bundle that placed none is refused
+/// at the raw bind (loud); a PLACED bank with no step leaves the fine weight gathers reading
+/// an unstaged index — zero, a VALID entry, so every pair gathers expert 0's sub-page 0 with
+/// a clean bake and fluent, wrong output. A bare `usize` parameter is the arrangement in
+/// which a caller answers the question from a phase or a rung instead of the artifact, so
+/// the only doors are the facts and the layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StagesSubpageBank(usize);
+
+impl StagesSubpageBank {
+    /// The bundle's own answer, off its facts.
+    pub fn of(facts: &BakeFacts) -> Self {
+        StagesSubpageBank(facts.subpage_bank_e)
+    }
+
+    /// The same answer straight off a LAYOUT — the load-time placement check, mirroring
+    /// [`GathersKv::of_layout`]. The bank's `[E, S]` u32 placement states its own row count.
+    pub fn of_layout(layout: &bundle::BundleLayout<'_>) -> Self {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        StagesSubpageBank(
+            layout
+                .place_of_tid(sd::expert_subpage_bank_tid())
+                .map(|p| {
+                    (p.size
+                        / (scratchy_subtile::sdsc_abstract::CopyDims::ENTRIES_PER_OP as u64 * 4))
+                        as usize
+                })
+                .filter(|&e| e > 0)
+                .unwrap_or(0),
+        )
+    }
+
+    /// ⭐ THE EMULATOR'S ANSWER: no SuperDSC layout to ask, no bank to stage. Same named-door
+    /// law as [`GathersKv::no_layout_to_ask`] — the one sound caller-side zero.
+    pub const fn no_layout_to_ask() -> Self {
+        StagesSubpageBank(0)
+    }
+
+    /// The bank's expert count — the value the tape's `SubpageBank` kernel builds its table
+    /// from. 0 means no bank, no step.
+    pub const fn experts(self) -> usize {
         self.0
     }
 }
@@ -489,6 +764,13 @@ pub struct LayerWiring {
     pub prefix_v: u32,
     pub new_k: u32,
     pub new_v: u32,
+    /// THIS layer's per-token KV width (`kv_heads * head_dim`), off the prefix-K
+    /// source's own baked shape. Hybrid-attention arches (gemma-4: sliding
+    /// 8×256 vs global 1×512) give different layers different widths, so a
+    /// single `Geometry::kv_dim` cannot size a per-layer buffer or readback —
+    /// this is the per-layer answer, from the same `tensor_shapes` the tape
+    /// was lowered at.
+    pub kv_width: u32,
 }
 
 /// Model geometry, baked.
@@ -506,6 +788,23 @@ pub struct Geometry {
     pub vocab: u32,
     pub layers: u32,
     pub head_dim: u32,
+    /// ⭐⭐⭐⭐⭐ THE QUERY-HEAD COUNT, baked — `num_attention_heads` from the same
+    /// bounds the tape was lowered at.
+    ///
+    /// ⛔⛔⛔ NOT `hidden / head_dim`, WHICH IS WHAT EVERY HOST STAGING SITE USED TO
+    /// DERIVE. That quotient is the head count only when the Q projection is SQUARE
+    /// (`hidden == nqh·hd`) — true of granite/llama and false of gemma-4, whose
+    /// `hidden` (3840) is not a multiple of any class's `nqh·hd` (16·256 = 4096,
+    /// 16·512 = 8192). A host that stages the causal mask or the prefix mask tiled
+    /// to `hidden/head_dim` head rows binds only that many of the baked `nqh·mq`
+    /// rows — the bind guard refuses OVER-binds only, so the shortfall is silent,
+    /// and the ops read the unstaged tail of an ADDITIVE mask as ZERO, i.e. as
+    /// "no mask". MEASURED, gemma-4 tiny-allglobal (hidden 128, nqh 4, hd 64):
+    /// the causal mask covered heads 0-1 and heads 2-3 ran with NO causal mask,
+    /// every layer, prefill — card dump `sc` rows 22..43 unmasked, heads 0-1 exact.
+    /// The fix is the count itself, baked here from the bounds, so the staged row
+    /// count and the baked placement cannot disagree.
+    pub nqh: u32,
     /// Rotary base, as bits — `f32` is not structurally-eq, so a `const`-able
     /// struct cannot hold one and still derive `Eq`. Read via [`Self::rope_theta`].
     pub rope_theta_bits: u32,
@@ -515,6 +814,63 @@ impl Geometry {
     #[inline]
     pub const fn rope_theta(&self) -> f32 {
         f32::from_bits(self.rope_theta_bits)
+    }
+}
+
+/// ⭐ WHICH ROTARY TABLE A COS/SIN SOURCE CARRIES — the class of the layer(s) it
+/// rotates. A uniform model has ONE class; a hybrid-attention arch (gemma-4:
+/// sliding layers vs every-6th global layers) has TWO, and a table built from
+/// the wrong one is silent garbage — the rotation multiplies Q/K by wrong
+/// frequencies, which is fluent-but-wrong output, not a fault.
+///
+/// ⛔ NOT A `bool`. `local`/`global` are negations of each other and both are in
+/// scope at every construction site — the exact shape that lets one land in the
+/// other. The two classes here have DIFFERENT ARITY of parameters (the
+/// proportional class carries its own rotated-dim count), which a bool cannot.
+///
+/// Every class's frequency law, from mlx `rope_utils.py` (the reference):
+/// - `Default` — `freq_i = θ^(-2i/hd)` for the full head dim, NeoX pairing
+///   (d, d+hd/2).
+/// - `Proportional` — mlx `ProportionalRoPE`: `freq_i = θ^(-2i/hd)` for
+///   `2i < rotated`, INFINITE past it (the pass-through lanes — identity, the
+///   tail stays unrotated). The exponent's denominator is the FULL hd, not
+///   `rotated`: that is the class's defining difference.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RotaryKind {
+    /// The base class: full rotary at the class's own head dim and θ.
+    Default {
+        /// The class's head dim — the width of one head in THIS table's
+        /// consumers (sliding: `head_dim`; a uniform model: `head_dim`).
+        head_dim: u32,
+        /// The class's rope base θ.
+        theta_bits: u32,
+    },
+    /// mlx `ProportionalRoPE` — partial rotary whose exponent denominator is
+    /// the FULL head dim (gemma-4 global layers: hd 512, rotated 128, θ 1e6).
+    Proportional {
+        head_dim: u32,
+        theta_bits: u32,
+        /// How many leading dims of the head actually rotate; the rest are
+        /// pass-through (freq = ∞ ⇒ cos 1, sin 0).
+        rotated: u32,
+    },
+}
+
+impl RotaryKind {
+    /// The class's head dim — the width one row of its table spans.
+    pub const fn head_dim(self) -> u32 {
+        match self {
+            Self::Default { head_dim, .. } | Self::Proportional { head_dim, .. } => head_dim,
+        }
+    }
+
+    /// The class's rope base θ, as bits (see [`Geometry::rope_theta_bits`]).
+    pub const fn theta(self) -> f32 {
+        match self {
+            Self::Default { theta_bits, .. } | Self::Proportional { theta_bits, .. } => {
+                f32::from_bits(theta_bits)
+            }
+        }
     }
 }
 
@@ -539,26 +895,36 @@ pub struct Wiring {
     /// strings this replaced, just with a nicer type. The roles are still an
     /// exhaustive enum where they belong: in the macro, over `SourceBinding`.
     pub embed_src: u32,
-    /// Rotary `cos` / `sin` sources as `(id, full column width)`. GQA gives
-    /// more than one width (Q vs K), so this is a list, not a pair.
-    pub cos_srcs: &'static [(u32, u32)],
-    pub sin_srcs: &'static [(u32, u32)],
+    /// Rotary `cos` / `sin` sources as `(id, full column width, rotary class)`.
+    /// GQA gives more than one width (Q vs K), so this is a list, not a pair;
+    /// a hybrid-attention arch (gemma-4) additionally gives CLASSES different
+    /// rotary tables, so every source carries its own [`RotaryKind`].
+    pub cos_srcs: &'static [(u32, u32, RotaryKind)],
+    pub sin_srcs: &'static [(u32, u32, RotaryKind)],
     /// Per-layer AttnDecode wiring, in layer order.
     pub layers: &'static [LayerWiring],
     pub geometry: Geometry,
-    /// The `[hd, hd]` identity, STAGED THROUGH THE KERNEL LAYOUT — the matmul-by-identity the KV
-    /// cachewr and the GQA new_k/new_v replication read.
+    /// ⭐ THE KERNEL-TABLE CLASS SETS — this program's DISTINCT rope head dims and DISTINCT
+    /// attention head dims, each sorted descending. Index `i` of the rope set ↔ the tid
+    /// `rope_p_class_tid(i)` holding that class's `[hd,hd]` P table; index `i` of the attention
+    /// set ↔ `identity_class_tid(i)` holding that class's `[hd,hd]` identity. Class 0 of each is
+    /// the widest and keeps the pre-class sentinel (`ROPE_P_TID`/`IDENTITY_TID`), so a uniform
+    /// model names the same tids it always did.
     ///
-    /// ⛔ EMITTED, NOT REBUILT. This is `stage_2d(&StickLayout::kernel(hd, hd), ..)`, a pure
-    /// function of `head_dim`, and it was recomputed on EVERY forward — 16,384 f32 for hd=128,
-    /// per token, to produce the same bytes every time. Row-major coincides with the kernel layout
-    /// only at hd == 64; at hd == 128, 16,256 of those entries come from a different byte, which is
-    /// why this cannot be a `vec![]` of an obvious pattern.
-    pub identity: &'static [f32],
-    /// The RoPE rotate-half permutation P — the KERNEL of `rot = matmul(x, P)`, from the shared
-    /// Kani-proven `rope_p_entry` so the on-card fill and the proof cannot drift. Same story as
-    /// [`Self::identity`]: a pure function of `head_dim`, formerly rebuilt per forward.
-    pub rope_p: &'static [f32],
+    /// ⛔ THE TABLES ARE BUILT AT LOAD, NOT BAKED AS LITERALS — a hybrid model's widest class is
+    /// `hd = 512` (gemma-4 production), and a 512² table is 262,144 f32 literals for one field,
+    /// which is the expansion-cost rule broken in its most expensive form. The bake carries the
+    /// class HEAD DIMS (a handful of u32s); `constant_acts` stages each class's table at load
+    /// through the SAME shared helpers the emission used (`stage_kernel_table` + `rope_p_entry`),
+    /// so the value and the proof still cannot drift — and [`Wiring::verify_kernel_tables`]
+    /// cross-checks the class set against the PLACEMENTS the bake made.
+    ///
+    /// (This replaces the two baked single-table fields `identity: &[f32]` / `rope_p: &[f32]`:
+    /// they were staged at the BASE head dim while the placement was sized at the MAX — the
+    /// gemma-4 defect, a `[64,64]` table in a `[128,128]` placement with the wide class reading
+    /// zeros.)
+    pub rope_class_hds: &'static [u32],
+    pub attn_class_hds: &'static [u32],
     /// `1/hidden` broadcast over one stick — the mq>1 sum-based amax pre-scale. A pure function of
     /// `hidden`, formerly `vec![1.0 / h as f32; 64]` per forward.
     pub rms_invcols: &'static [f32],
@@ -594,6 +960,24 @@ pub struct Wiring {
     /// `BundleLayout`; this is the copy the emulator path has, on a program it resolved by fingerprint
     /// rather than through a layout it never asks for.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ THE DENSE fp8 K-PADS — for every arity-3 MatmulTile weight whose contraction k is not a
+    /// whole 128-elem SEN143_FP8 stick: `(source id, k_pad)`. The FIRST fp8 model with a
+    /// non-legal K is gemma-4-26b (dense GeGLU DOWN, k=2112 → 2176): the quantize chain and the
+    /// packed weight both run at `k_pad`, so the worker's staging must WIDEN the on-disk
+    /// `[n, k]` buffer's INNER axis to match the retile — a strided rebuild, not the outer-axis
+    /// `resize` the N-pad uses. Baked here (from the same `ir` the retile reads) because the
+    /// bank/weight orientation is a BAKE fact the worker cannot re-derive from `tensor_shapes`
+    /// alone (a bank's N axis is its ROWS). Empty for every 128-aligned model — granite, g8b
+    /// and g12b stage byte-identically.
+    pub fp8_k_pads: &'static [(u32, u32)],
+    /// ⭐ THE EXPERT BANK IN-PADS — `(bank source id, in_pad)` for EVERY arity-4 ExpertMatmul's
+    /// bank operand, UNFILTERED (a MEMBERSHIP list: the worker's bank arm consults it before
+    /// the DeviceWidth N-pad, which at a bank pads the WRONG axis — the bank's N is its ROWS —
+    /// so an aligned bank must be listed too or it would take that arm). The bank's k axis is
+    /// its COLS (`[E·out, in]`, the stacked host form), and the pad is the same `fp8_k_pad` the
+    /// manifest's expert retile and the door's contraction K take. Empty for every model with
+    /// no MoE fp8 experts.
+    pub expert_k_pads: &'static [(u32, u32)],
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
@@ -641,9 +1025,12 @@ pub struct ConstantEnv {
     pub ones_reduce_len: usize,
     /// From the bundle's own placements.
     pub uses_identity: bool,
-    /// The EMITTED `[hd,hd]` identity and rope-P kernels — see [`Wiring::identity`].
-    pub identity: &'static [f32],
-    pub rope_p: &'static [f32],
+    /// ⭐ THE KERNEL-TABLE CLASS SETS (see [`Wiring::rope_class_hds`]). The tables themselves are
+    /// BUILT HERE, at load, by [`synthetic_constants`] through the same shared helpers the
+    /// emission used — the bake carries only the head dims, because a widest-class `hd=512` table
+    /// is 262,144 f32 literals the expansion would otherwise emit.
+    pub rope_class_hds: &'static [u32],
+    pub attn_class_hds: &'static [u32],
     /// The EMITTED `1/hidden` stick — see [`Wiring::rms_invcols`].
     pub rms_invcols: &'static [f32],
     /// The bundle's BAKED query-row count — 1 for decode, M for batched prefill.
@@ -662,6 +1049,24 @@ pub struct ConstantEnv {
     /// as a subslice rather than copied into a fresh `vec![sc]` per scale per forward. The array
     /// is already a `static` the macro emitted onto the layout, so the borrow is real.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ THE ROUTER CONST GEOMETRY, off the bundle's own placements: `(padded expert width W,
+    /// expert count E)`. W derives from the router_const region's placement exactly as the
+    /// placement pass minted it (W = the `[W,W]` IDENTITY table's placement width — the one
+    /// router table every router tape places), E from the layout's `router_experts` registry
+    /// entry (the pad rows' values need it and no placement size carries it). `(0, 0)` when
+    /// the bundle has no MoE router — a non-MoE model binds nothing.
+    pub router: (usize, usize),
+    /// The top-k width, off the layout's `router_k` registry — the softmax mask's bind
+    /// builds its k-boundary (0 below k, −inf above) from it. 0 when the bundle has no
+    /// top-k, and then no mask is bound.
+    pub router_k: usize,
+    /// The bare-argsort corner (the `[W,W]` tie table is placed — some argsort's ranks
+    /// feed something other than the fused top-k): the tie table and the argsort's
+    /// maximum-form pad mask are bound only here.
+    pub router_argsort: bool,
+    /// The fused top-k's add-form pad row is placed (a RouteTopK exists AND `W > E`): its
+    /// bind builds 0 below E, −inf above, from the `(W, E)` the geometry carries.
+    pub router_topk_pad: bool,
 }
 
 // ── THE CONSTANTS THAT ARE LITERALLY CONSTANT ───────────────────────────────
@@ -706,6 +1111,12 @@ pub type Bind = (bundle::PlaceId, std::borrow::Cow<'static, [f32]>);
 pub enum ConstValues {
     /// A table the `#[forward]` macro put in the binary.
     Borrowed(&'static [f32]),
+    /// A table BUILT AT LOAD — the per-class kernel tables. Their values are pure functions of a
+    /// head dim the bake carries, but a widest-class table at `hd=512` is 262,144 f32 literals the
+    /// expansion would have to emit, so the bake carries the head dims and the load stages the
+    /// bytes through the same shared helpers the emission used. OWNED because no `static` holds
+    /// them; the bind loop reads each exactly once per step, the same read pattern `Borrowed` has.
+    Owned(Vec<f32>),
     /// `len` copies of one compile-time value.
     ///
     /// ⭐ THE VALUE IS THE CONSTANT; THE LENGTH IS NOT, AND THAT IS THE WHOLE DISTINCTION. Both
@@ -727,6 +1138,7 @@ impl ConstValues {
     pub fn to_cow(&self) -> std::borrow::Cow<'static, [f32]> {
         match self {
             ConstValues::Borrowed(v) => std::borrow::Cow::Borrowed(v),
+            ConstValues::Owned(v) => std::borrow::Cow::Owned(v.clone()),
             ConstValues::Fill { value, len } => std::borrow::Cow::Owned(vec![*value; *len]),
         }
     }
@@ -735,6 +1147,7 @@ impl ConstValues {
     pub fn to_vec(&self) -> Vec<f32> {
         match self {
             ConstValues::Borrowed(v) => v.to_vec(),
+            ConstValues::Owned(v) => v.clone(),
             ConstValues::Fill { value, len } => vec![*value; *len],
         }
     }
@@ -742,6 +1155,7 @@ impl ConstValues {
     pub fn len(&self) -> usize {
         match self {
             ConstValues::Borrowed(v) => v.len(),
+            ConstValues::Owned(v) => v.len(),
             ConstValues::Fill { len, .. } => *len,
         }
     }
@@ -771,6 +1185,7 @@ impl ConstValues {
 /// only in the [`ConstantEnv`] they pass, which is DATA.
 pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     use crate::lower_subtile_tape_to_superdsc as sd;
+    use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
     let mut out: Vec<(u32, ConstValues)> = Vec::new();
     let (hd, h) = (env.head_dim, env.hidden);
 
@@ -813,12 +1228,16 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
         out.push((sd::ONES_REDUCE_TID, ConstValues::Fill { value: 1.0, len }));
     }
     if env.uses_identity {
-        // Staged THROUGH the kernel layout: a reserved seg0 tid has no
-        // RetileDescriptor, so the host fill IS the device layout, and it is
-        // consumed as a `[hd, hd]` matmul KERNEL. Row-major coincides with that
-        // only at hd == 64; at hd == 128, 16256 of 16384 entries would come from
-        // the wrong byte.
-        out.push((sd::IDENTITY_TID, ConstValues::Borrowed(env.identity)));
+        // ⭐ ONE IDENTITY PER ATTENTION CLASS, BUILT AT LOAD. A reserved seg0 tid has no
+        // RetileDescriptor, so the host fill IS the device layout, and each class's table is
+        // consumed as that class's `[hd_c, hd_c]` matmul KERNEL — staged through the SAME
+        // `stage_kernel_table` the emission's addressing law comes from. One table per DISTINCT
+        // attention head dim because a hybrid model's single max-hd placement holding a base-hd
+        // table zeroes the wide class's upper lanes (the gemma-4 defect, dump-proven).
+        for (class, &hd) in env.attn_class_hds.iter().enumerate() {
+            let table = stage_kernel_table(hd as usize, |i, j| if i == j { 1.0 } else { 0.0 });
+            out.push((sd::identity_class_tid(class), ConstValues::Owned(table)));
+        }
     }
 
     // Zeros for new_k/new_v's PADDING rows [mq..mq_pad), which the emitter
@@ -832,11 +1251,22 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     ));
 
     if hd >= 2 {
-        // RoPE rotate-half permutation P — the KERNEL of `rot = matmul(x, P)`,
-        // filled from the SHARED Kani-proven entry fn so the on-card fill and
-        // the proof cannot drift. Staged through the kernel layout for the same
-        // reason as IDENTITY.
-        out.push((sd::ROPE_P_TID, ConstValues::Borrowed(env.rope_p)));
+        // ⭐ ONE ROPE-P PER ROPE CLASS, BUILT AT LOAD — the KERNEL of `rot = matmul(x, P)`, filled
+        // from the SHARED Kani-proven `rope_p_entry` so the on-card fill and the proof cannot
+        // drift, and staged through the kernel layout for the same reason as the identity. A
+        // composite single P is IMPOSSIBLE on a hybrid tape (the big class's contraction reads the
+        // small class's nonzero block as spurious ±1 terms), so one table per DISTINCT rope head
+        // dim. `hd >= 2` is the runtime's own guard on emitting a rope-P at all — a model with no
+        // rope has an empty class set and binds nothing, byte-identical to before.
+        for (class, &hd_c) in env.rope_class_hds.iter().enumerate() {
+            if hd_c < 2 {
+                continue;
+            }
+            let table = stage_kernel_table(hd_c as usize, |inn, o| {
+                rope_p_entry(hd_c as usize, inn, o) as f32
+            });
+            out.push((sd::rope_p_class_tid(class), ConstValues::Owned(table)));
+        }
     }
 
     // granite ScalarMul multipliers: `t{scalarmul_scale_tid(i)} = [scale_i]`, a
@@ -848,6 +1278,108 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
             sd::scalarmul_scale_tid(i),
             ConstValues::Borrowed(&env.scalarmul_scales[i..=i]),
         ));
+    }
+
+    // ⭐ THE ROUTER CONST ROWS — the MoE router doors' token-independent factors, BUILT HERE at
+    // load exactly like the identity/rope-P tables: the values are pure functions of the router
+    // geometry the placements carry, so the bake ships only the geometry and this bind stages the
+    // bytes. `(0, 0)` (no MoE router) binds nothing — a non-MoE model is byte-identical.
+    let (w, e) = env.router;
+    if w > 0 && e > 0 {
+        // ⭐⭐ THE ARGSORT FAMILY IS GATED ON THE BARE CORNER — the splice folds every
+        // all-topk argsort into the fused pair (which reads the raw logits and needs no
+        // ranks, no tie table, no rank pad), so the `[W,W]` tie table and the argsort's
+        // maximum-form pad mask are bound only when the bundle PLACED the tie table —
+        // the same artifact-derived question the placement pass answered.
+        if env.router_argsort {
+            // The stable-argsort tie-break table `tie[j,h'] = 𝟙[h' < j]` — j on rows, h' on
+            // lanes, the orientation the rank compare's mb-broadcast multiply reads. fp16 0/1.
+            let mut tie = vec![0.0f32; w * w];
+            for j in 0..w {
+                for h in 0..j {
+                    tie[j * w + h] = 1.0;
+                }
+            }
+            out.push((sd::router_rank_tie_tid(), ConstValues::Owned(tie)));
+            // The ARGSORT PAD-MASK row: −inf in lanes 0..E (the real experts — `maximum(v, −inf) = v`
+            // for every non-NaN v, NEGATIVES INCLUDED), +inf in lanes E..W (the producer's zero-padded
+            // lanes — `maximum` forces them to sort last, so a zero pad lane can never outrank a
+            // negative real score). ⛔ The real-lane value MUST be −inf, never 0: `maximum(v, 0)`
+            // CLAMPS every negative logit to exactly 0 (measured on-card: the 26b sanitize output
+            // held 0 wherever the router logit was negative), collapsing the ranks into tie-runs —
+            // every MoE model with negative router logits misroutes.
+            let mask: Vec<f32> = (0..w)
+                .map(|h| {
+                    if h < e {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    }
+                })
+                .collect();
+            out.push((sd::router_pad_mask_tid(), ConstValues::Owned(mask)));
+        }
+        // The identity table, row j = the one-hot row with lane j hot. ONE [W,W] table serves
+        // every per-slot one-hot read — the argsort corner's per-EXPERT lane writes and the
+        // expert-scale door's per-SLOT writes are rows of the same E-sized identity.
+        let mut ident = vec![0.0f32; w * w];
+        for j in 0..w {
+            ident[j * w + j] = 1.0;
+        }
+        out.push((sd::router_identity_tid(), ConstValues::Owned(ident)));
+        // The iota row `h ↦ h` (the value the one-hot select chains multiply their match
+        // masks against).
+        let iota: Vec<f32> = (0..w).map(|h| h as f32).collect();
+        out.push((sd::router_topk_iota_tid(), ConstValues::Owned(iota)));
+        if env.router_k > 0 {
+            // The SOFTMAX SANITIZE row — 0 at the top-k landing's REPLICA-RUN HEADS, −inf
+            // everywhere else. The pair emits each of the k results replicated 64/k lanes
+            // wide per token stick (the ring's slots-per-core form, card-measured at the
+            // 26b: the landing's [m,64] row holds result r at lanes [r·rep, (r+1)·rep)), so
+            // keeping lanes 0..k — the OLD content — kept k replicas of result 0 and made
+            // every softmax row uniform (rsub 1.0×k, scores 1/k×k, measured). The head at
+            // each run's first lane is the one lane per result the chain must keep: `x + 0`
+            // bit-identical there, `exp(−inf)=0` kills every other replica and pad lane.
+            // k off the layout's own registry (the `[k,W]` targets table that used to
+            // carry it died with the rank-inversion door the fused pair replaced).
+            let k = env.router_k;
+            let stick = ktir_superdsc::work::FP16_ELEMS_PER_STICK as usize;
+            // ⛔ THE HEADS SIT AT LANE r·(64/k), WHOLE LANES ONLY WHEN k DIVIDES 64 — the
+            // top-k door refuses a k that does not divide the stick at bake; this assert
+            // states the same law against the registry so a desync fails loudly at bind
+            // instead of staging a silently fractional head mask.
+            assert!(
+                k <= stick && stick.is_multiple_of(k),
+                "router top-k k={k} against the {stick}-lane stick: the landing's replica-run \
+                 heads sit at lane r·{stick}/{k}, which is not a whole lane",
+            );
+            let rep = stick / k;
+            let sm_mask: Vec<f32> = (0..w)
+                .map(|h| {
+                    if h < stick && h % rep == 0 {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect();
+            out.push((sd::router_sm_mask_tid(), ConstValues::Owned(sm_mask)));
+        }
+        // ⭐ THE FUSED TOP-K'S ADD-FORM PAD ROW — 0 in lanes 0..E (the real experts:
+        // `x + 0 = x` bit-identical, negatives included), −inf in lanes E..W (the
+        // producer's zero-padded lanes: the pair's scan runs to W, and a zero pad lane
+        // would OUTRANK every negative router logit and steal a slot, emitting the
+        // out-of-range id whose expert-page fetch faults the card — wall-11's own
+        // root). ADD-form, not the argsort's maximum-form: `maximum` can only RAISE,
+        // so no maximum row can force a zero pad lane DOWN to −inf. Bound only when
+        // the bundle PLACED it (a RouteTopK exists AND `W > E`; at every real router
+        // W == E and the row is never minted).
+        if env.router_topk_pad {
+            let pad: Vec<f32> = (0..w)
+                .map(|h| if h < e { 0.0 } else { f32::NEG_INFINITY })
+                .collect();
+            out.push((sd::router_topk_pad_tid(), ConstValues::Owned(pad)));
+        }
     }
     out
 }
@@ -1045,26 +1577,7 @@ mod constant_tape_tests {
         }
     }
 
-    /// The two emitted kernel tables at `head_dim == 64`, built here the way the macro builds
-    /// them — at hd == 64 the kernel layout coincides with row-major, which is why the identity
-    /// reads as the obvious pattern and why hd == 128 would NOT.
-    fn kernel_tables() -> (Vec<f32>, Vec<f32>) {
-        use scratchy_subtile::sdsc_abstract::{StickLayout, rope_p_entry, stage_2d};
-        (
-            stage_2d(
-                &StickLayout::kernel(64, 64),
-                |i, j| if i == j { 1.0 } else { 0.0 },
-            ),
-            stage_2d(&StickLayout::kernel(64, 64), |inn, o| {
-                rope_p_entry(64, inn, o) as f32
-            }),
-        )
-    }
-
     fn env(rows: usize) -> ConstantEnv {
-        // Leaked so the fixture can hand out the `&'static` the emitted tables have in a real
-        // build; a test binary's lifetime is the process.
-        let (ident, ropep) = kernel_tables();
         ConstantEnv {
             hidden: 2048,
             head_dim: 64,
@@ -1074,9 +1587,17 @@ mod constant_tape_tests {
             uses_identity: true,
             rows,
             scalarmul_scales: &[1.5, 2.5],
-            identity: Vec::leak(ident),
-            rope_p: Vec::leak(ropep),
+            // A uniform-model class set: one rope class, one attention class, both the base 64 —
+            // which resolves to the class-0 sentinels `ROPE_P_TID`/`IDENTITY_TID`, exactly what a
+            // single-class model's bind must still name.
+            rope_class_hds: &[64],
+            attn_class_hds: &[64],
             rms_invcols: Vec::leak(vec![1.0f32 / 2048.0; 64]),
+            // No MoE router in this fixture's model — the router consts bind nothing.
+            router: (0, 0),
+            router_k: 0,
+            router_argsort: false,
+            router_topk_pad: false,
         }
     }
 
@@ -1151,5 +1672,250 @@ mod constant_tape_tests {
             vec![sd::RMS_INVCOLS_TID, sd::ONES_REDUCE_TID],
             "multi-row adds the reduce pair and nothing else"
         );
+    }
+
+    /// ⭐ THE PER-CLASS BIND — a hybrid class set binds one P and one identity PER CLASS, at that
+    /// class's own tid, each table staged through `stage_kernel_table` at that class's head dim.
+    /// This is the load-time half of the gemma-4 fix: the bake carries the head dims, and the
+    /// tables are built HERE (a 512² literal table would be 262k f32 of expansion).
+    #[test]
+    fn a_hybrid_class_set_binds_one_table_per_class_at_its_own_tid() {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
+        let mut env = env(1);
+        env.rope_class_hds = &[128, 64];
+        env.attn_class_hds = &[128, 64];
+        env.uses_identity = true;
+        let consts = synthetic_constants(&env);
+        let get = |tid: u32| {
+            consts
+                .iter()
+                .find(|(t, _)| *t == tid)
+                .map(|(_, v)| v.to_vec())
+        };
+        // One P per class, at the class tids (class 0 = the sentinel).
+        for (class, hd) in [(0usize, 128u32), (1, 64)] {
+            let tid = sd::rope_p_class_tid(class);
+            let table = get(tid).unwrap_or_else(|| panic!("rope class {class} (t{tid}) not bound"));
+            let want = stage_kernel_table(hd as usize, |inn, o| {
+                rope_p_entry(hd as usize, inn, o) as f32
+            });
+            assert_eq!(table.len(), hd as usize * hd as usize);
+            assert_eq!(table, want, "rope class {class}'s table is hd={hd}'s P");
+            // The identity, likewise.
+            let itid = sd::identity_class_tid(class);
+            let itable =
+                get(itid).unwrap_or_else(|| panic!("identity class {class} (t{itid}) not bound"));
+            let iwant = stage_kernel_table(hd as usize, |i, j| if i == j { 1.0 } else { 0.0 });
+            assert_eq!(itable, iwant, "identity class {class}'s table is hd={hd}'s");
+        }
+        // And the tables are DIFFERENT — the composite-single-P mistake would make class 1's table
+        // the max-hd one (the nonzero block in the wrong places for a 64-wide rotation).
+        assert_ne!(
+            get(sd::rope_p_class_tid(0)).unwrap(),
+            get(sd::rope_p_class_tid(1)).unwrap(),
+            "the two rope classes bound the SAME P — the composite-single-P defect"
+        );
+    }
+
+    /// ⭐ THE LOAD-TIME CROSS-CHECK — `verify_class_placements` fires on exactly the desync that
+    /// produced the card garbage: a wiring/layout pair whose class set and placements disagree.
+    /// Both directions, because a one-sided check passes on the mismatch that actually happened
+    /// (the value/placement size disagreement) while missing the stale-set direction.
+    #[test]
+    fn the_class_placement_cross_check_fires_on_a_desynced_pair() {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        // A wiring with the gemma-4 tiny-allglobal class sets.
+        let wiring = Wiring {
+            rope_class_hds: &[128, 64],
+            attn_class_hds: &[128, 64],
+            ..uniform_wiring()
+        };
+        // A layout that places BOTH rope classes at the MAX size — the defect's exact shape: the
+        // placement pass's max-fold, held against the class set.
+        let lay_max = class_layout(&[
+            (sd::rope_p_class_tid(0), 128),
+            (sd::rope_p_class_tid(1), 128),
+        ]);
+        let why = wiring
+            .verify_class_placements(&lay_max)
+            .expect_err("a class-1 placement sized at the max must refuse");
+        assert!(
+            why.contains("t") && why.to_lowercase().contains("class 1"),
+            "the refusal names the class and its tid, got {why:?}"
+        );
+        // A layout that places only class 0 — the stale-set direction.
+        let lay_missing = class_layout(&[(sd::rope_p_class_tid(0), 128)]);
+        assert!(
+            wiring.verify_class_placements(&lay_missing).is_err(),
+            "a class the layout never placed must refuse"
+        );
+        // And the AGREED pair passes — the check is not a blanket refusal.
+        let lay_ok = class_layout(&[
+            (sd::rope_p_class_tid(0), 128),
+            (sd::rope_p_class_tid(1), 64),
+            (sd::identity_class_tid(0), 128),
+            (sd::identity_class_tid(1), 64),
+        ]);
+        wiring
+            .verify_class_placements(&lay_ok)
+            .expect("an agreed wiring/layout pair passes");
+
+        // ⭐ A UNIFORM MODEL'S PAIR, STILL ONE CLASS — the byte-identity case: class 0 is the
+        // sentinel and the check is satisfied by the single placement it always had.
+        let uniform = Wiring {
+            rope_class_hds: &[64],
+            attn_class_hds: &[64],
+            ..uniform_wiring()
+        };
+        let lay_uniform = class_layout(&[
+            (sd::rope_p_class_tid(0), 64),
+            (sd::identity_class_tid(0), 64),
+        ]);
+        uniform
+            .verify_class_placements(&lay_uniform)
+            .expect("a uniform model's single-class pair passes");
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE CAUSAL-MASK HEAD-COUNT DEFECT, PINNED — gemma-4 tiny-allglobal's exact
+    /// geometry (hidden 128, nqh 4, head_dim 64), where `hidden / head_dim` = 2 ≠ 4.
+    ///
+    /// The host used to stage `causal_tiled(cmask, mq, mq_pad, hidden / head_dim)` rows into a
+    /// placement sized `nqh · mq · mq_pad`. The quotient is the head count only for a SQUARE Q
+    /// projection (`hidden == nqh·hd`) — true of granite/llama, false of gemma-4 at production
+    /// scale too (hidden 3840 against nqh·hd 4096/8192). The shortfall was silent: the bind
+    /// guard refuses OVER-binds only, and the unstaged tail of the ADDITIVE mask reads as ZERO,
+    /// i.e. as "no mask". MEASURED on the tiny fixture: heads 2-3 of every layer ran unmasked.
+    ///
+    /// This test pins both halves of the fix: the BAKED count stages the full placement (the
+    /// cross-check passes at `Geometry::nqh`), and the QUOTIENT's staging does not cover the
+    /// placement — which the load-time cross-check refuses, because its `want` is computed from
+    /// the bake's own `nqh` and not from any host arithmetic.
+    #[test]
+    fn the_causal_mask_head_count_is_the_bake_not_the_hidden_quotient() {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        // The gemma-4 tiny-allglobal geometry: hidden 128, FOUR query heads, head_dim 64.
+        // `hidden / head_dim` = 2 — the wrong count every host staging site used to derive.
+        let wiring = Wiring {
+            geometry: Geometry {
+                hidden: 128,
+                head_dim: 64,
+                nqh: 4,
+                ..uniform_wiring().geometry
+            },
+            ..uniform_wiring()
+        };
+        // The tiny fixture's prefill: mq = 11, mq_pad = 64. The placement law:
+        // `nqh · mq · score_width · 2` bytes.
+        let (mq, width) = (11u32, 64u32);
+        let placed_bytes = 4u64 * mq as u64 * width as u64 * 2;
+        let mut lay = class_layout(&[]);
+        lay.places.to_mut().push(bundle::Placement {
+            id: bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID),
+            segment: 0,
+            bank: 0,
+            offset: 0,
+            size: placed_bytes,
+            is_logits: false,
+        });
+        // The BAKED count's staging covers the placement — the pair agrees.
+        wiring
+            .verify_causal_placement(&lay, mq, width)
+            .expect("the bake's own nqh stages exactly its placement");
+        // THE DEFECT'S SHAPE: a staging at the QUOTIENT covers only `2·mq` of the `4·mq` rows.
+        // The quotient staging itself is silent at bind time (under-binding is allowed), so the
+        // CHECK is what must fire — its `want` comes from the bake's `nqh`, never from host
+        // arithmetic, and the two counts disagree on exactly this geometry.
+        let quotient = wiring.geometry.hidden / wiring.geometry.head_dim;
+        assert_ne!(
+            quotient, wiring.geometry.nqh,
+            "the fixture must be one where the quotient is NOT the head count, or this test \
+             pins nothing"
+        );
+        let quotient_bytes = quotient as u64 * mq as u64 * width as u64 * 2;
+        assert!(
+            quotient_bytes < placed_bytes,
+            "the quotient's staging is a PARTIAL bind, which is the silent direction of the \
+             bind guard"
+        );
+        // And the cross-check fires when the placement does not match the bake's head count —
+        // here simulated from the layout side (a placement sized at the quotient), which is the
+        // same disagreement seen from the other half.
+        let mut lay_quotient = class_layout(&[]);
+        lay_quotient.places.to_mut().push(bundle::Placement {
+            id: bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID),
+            segment: 0,
+            bank: 0,
+            offset: 0,
+            size: quotient_bytes,
+            is_logits: false,
+        });
+        let why = wiring
+            .verify_causal_placement(&lay_quotient, mq, width)
+            .expect_err("a placement sized at the hidden/head_dim quotient must refuse");
+        assert!(
+            why.contains("4 query head"),
+            "the refusal names the bake's head count, got {why:?}"
+        );
+        // And a layout with no causal placement at all refuses — the stale-bake direction.
+        let lay_missing = class_layout(&[]);
+        assert!(
+            wiring
+                .verify_causal_placement(&lay_missing, mq, width)
+                .is_err(),
+            "a wiring whose layout never placed the causal mask must refuse"
+        );
+    }
+
+    /// A minimal `Wiring` for the cross-check tests — only the class fields are load-bearing.
+    fn uniform_wiring() -> Wiring {
+        Wiring {
+            result: 0,
+            num_sources: 0,
+            attn_mask: None,
+            decode_position: 0,
+            tensor_shapes: &[],
+            embed_src: 0,
+            cos_srcs: &[],
+            sin_srcs: &[],
+            layers: &[],
+            geometry: Geometry {
+                hidden: 128,
+                kv_dim: 128,
+                vocab: 512,
+                layers: 1,
+                head_dim: 64,
+                nqh: 2,
+                rope_theta_bits: 0,
+            },
+            rope_class_hds: &[],
+            attn_class_hds: &[],
+            rms_invcols: &[],
+            scalarmul_scales: &[],
+            fp8_k_pads: &[],
+            expert_k_pads: &[],
+            weight_scale_folds: &[],
+            weight_copies: &[],
+        }
+    }
+
+    /// A layout placing one `[hd,hd]` fp16 table per `(tid, hd)` pair.
+    fn class_layout(tables: &[(u32, u32)]) -> bundle::BundleLayout<'static> {
+        bundle::BundleLayout {
+            places: std::borrow::Cow::Owned(
+                tables
+                    .iter()
+                    .map(|&(tid, hd)| bundle::Placement {
+                        id: bundle::PlaceId::Act(tid),
+                        segment: 0,
+                        bank: 0,
+                        offset: 0,
+                        size: hd as u64 * hd as u64 * 2,
+                        is_logits: false,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
     }
 }

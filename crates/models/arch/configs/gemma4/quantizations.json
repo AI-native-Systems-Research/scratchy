@@ -1,5 +1,6 @@
 {
   "quantizations": [
-    "mlx-affine-b4-g64"
+    "mlx-affine-b4-g64",
+    "fp8-dynamic-per-channel"
   ]
 }
