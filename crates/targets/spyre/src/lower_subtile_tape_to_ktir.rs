@@ -468,16 +468,19 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // (`!is_prefill && decode_rows == 1 && seq_sym.is_none()` in the `#[forward]` emission):
     // a CONCRETE single-row decode, never a symbolic batch template and never a prefill chunk.
     one_request_decode: bool,
-    // The split-KV chunk this rung bakes — the ladder's own bake fact, `Some` ONLY on the one-request
-    // rung (see `BundleAttnParams::chunk_pages`).
+    // The split-KV chunk this rung bakes — the ladder's own bake fact, `Some` ONLY on a ONE-REQUEST body:
+    // the one-request decode rung, or a prompt chunk's prefix (see `BundleAttnParams::chunk_pages`).
     chunk_pages: Option<u32>,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
+    // ⛔ A CHUNK ATTENDS ONE REQUEST'S PAGES, so a body whose rows are REQUESTS cannot carry it. A
+    // prompt chunk's rows are one request's consecutive positions sharing ONE resident history — the
+    // same single page map the one-request decode gathers — so both take it.
     if let Some(pages) = chunk_pages
-        && !one_request_decode
+        && rows_are_requests
     {
         return Err(SuperDscError(format!(
-            "a split-KV chunk of {pages} page(s) was asked of a bake that is not the one-request decode \
-             rung — a chunk attends ONE request's pages, so a batched or prefill body cannot carry it"
+            "a split-KV chunk of {pages} page(s) was asked of a bake whose rows are requests — a chunk \
+             attends ONE request's pages, so a batched body cannot carry it"
         )));
     }
     // The fold's node set, taken once: a node is folded iff the attention-fold recognition named

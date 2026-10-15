@@ -1749,6 +1749,8 @@ struct ChunkAttn<'a> {
     nqh: u32,
     hd: u32,
     gqa: u32,
+    // Query rows per head: 1 at decode, the prompt chunk's width at prefill.
+    mq: u32,
     chunk: crate::sdsc_abstract::ChunkScratch,
     index: &'a str,
     kct: &'a str,
@@ -1795,6 +1797,7 @@ fn assemble_attn_chunk(
         nqh,
         hd,
         gqa,
+        mq,
         chunk,
         index,
         kct,
@@ -1810,8 +1813,13 @@ fn assemble_attn_chunk(
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let width = BlockCols::of_chunk(chunk);
     let slots = width.get();
-    let all_rows = RowCount::of_head_major_rows(nqh);
-    let grp_rows = RowCount::of_head_major_rows(gqa);
+    // ⭐ ROWS, NOT HEADS. A head's rows are `mq` consecutive positions of the head-major token stream
+    // (row `h·mq + r`): one at decode, the prompt chunk's width at prefill. So kv head `kvh`'s query rows
+    // are the contiguous `[kvh·gqa·mq, (kvh+1)·gqa·mq)`, and every per-head block, base and extent below
+    // is in those rows; at `mq == 1` each is the decode body's, byte for byte.
+    let (g_rows, q_rows) = (gqa * mq, nqh * mq);
+    let all_rows = RowCount::of_head_major_rows(q_rows);
+    let grp_rows = RowCount::of_head_major_rows(g_rows);
     let nkvh = chunk.nkvh();
     if nkvh * gqa != nqh {
         return Err(SuperDscError(format!(
@@ -1856,23 +1864,23 @@ fn assemble_attn_chunk(
     // ── (2) SCORE per kv head, then each head GROUP's max over its whole chunk ──
     let mask_h = hm(pmask);
     for kvh in 0..nkvh {
-        let h0 = kvh * gqa;
+        let h0 = kvh * g_rows;
         let kc = corner(chunk.kernel_corner(kvh), "a kv head's kernel block")?;
-        let rc = corner(chunk.rows_corner(kvh, gqa), "a kv head's score block")?;
+        let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
         // `sc_g = Q_g · Kᵗ_g + mask` — the mask is the broadcast prefix-validity row over the chunk's
         // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue.
         ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_csc_g{kvh}_o{t}"),
-            MatM::of_head_major_rows(gqa),
+            MatM::of_head_major_rows(g_rows),
             MatN::of_kv_window(width),
             MatK::of_head_dim(hd),
             MatY::unbatched(),
             bmm_form,
-            &rb(qs, nqh, hd),
+            &rb(qs, q_rows, hd),
             row_step(h0),
             &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
             kc,
-            &rb(&cb.csc, gqa, slots),
+            &rb(&cb.csc, g_rows, slots),
             rc,
             &mask_h,
             DevOff::ZERO,
@@ -1898,14 +1906,14 @@ fn assemble_attn_chunk(
     // `maxnonstick`, and an elementwise slab fold — walked only part of each core's rows on card. Those used
     // row-major operands with a declared walk; this op's operands are stick-blocked (dxp reconstructs).
     for kvh in 0..nkvh {
-        let h0 = kvh * gqa;
-        let rc = corner(chunk.rows_corner(kvh, gqa), "a kv head's score block")?;
+        let h0 = kvh * g_rows;
+        let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
         ops.push(assemble_reduce_off(
             &format!("attn_cbmax_g{kvh}_o{t}"),
             "max",
             grp_rows,
             width,
-            &rb(&cb.csc, gqa, slots),
+            &rb(&cb.csc, g_rows, slots),
             rc,
             &hm(&bufs.bmax),
             row_step(h0),
@@ -1955,8 +1963,8 @@ fn assemble_attn_chunk(
 
     // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
     for kvh in 0..nkvh {
-        let h0 = kvh * gqa;
-        let rc = corner(chunk.rows_corner(kvh, gqa), "a kv head's score block")?;
+        let h0 = kvh * g_rows;
+        let rc = corner(chunk.rows_corner(kvh, g_rows), "a kv head's score block")?;
         // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
         ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_cesub_g{kvh}_o{t}"),
@@ -1964,10 +1972,10 @@ fn assemble_attn_chunk(
             grp_rows,
             width,
             &[
-                In::sliced(&rb(&cb.csc, gqa, slots), rc).ew(),
+                In::sliced(&rb(&cb.csc, g_rows, slots), rc).ew(),
                 In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
             ],
-            &rb(&cb.cesub, gqa, slots),
+            &rb(&cb.cesub, g_rows, slots),
             rc,
             sym_id_base,
             layout,
@@ -1977,8 +1985,8 @@ fn assemble_attn_chunk(
             "exp",
             grp_rows,
             width,
-            &[In::sliced(&rb(&cb.cesub, gqa, slots), rc).ew()],
-            &rb(&cb.cexp, gqa, slots),
+            &[In::sliced(&rb(&cb.cesub, g_rows, slots), rc).ew()],
+            &rb(&cb.cexp, g_rows, slots),
             rc,
             sym_id_base,
             layout,
@@ -1990,7 +1998,7 @@ fn assemble_attn_chunk(
             "sum",
             grp_rows,
             width,
-            &rb(&cb.cexp, gqa, slots),
+            &rb(&cb.cexp, g_rows, slots),
             rc,
             &hm(&bufs.bsum),
             row_step(h0),
@@ -2015,29 +2023,63 @@ fn assemble_attn_chunk(
         sym_id_base,
         layout,
     ));
-    let otmp_h = hm(&bufs.otmp);
+    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
+    // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
+    // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
+    // the buffer it writes: part `p` writes `run_o` when `p` is even. An even part count leaves the sum
+    // in `otmp`, and one copy brings it home below.
+    let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.value_parts(mq > 1).collect();
     for kvh in 0..nkvh {
-        let h0 = kvh * gqa;
-        let kc = corner(chunk.kernel_corner(kvh), "a kv head's value block")?;
-        let rc = corner(chunk.rows_corner(kvh, gqa), "a kv head's probability block")?;
-        // `run_o_g = P_g · V_g + otmp_g` — the `stridedadd` epilogue is the online-softmax update.
-        ops.push(assemble_matmul_off_maybe_epilogue(
-            &format!("attn_cov_g{kvh}_o{t}"),
-            MatM::of_head_major_rows(gqa),
-            MatN::of_head_dim(hd),
-            MatK::of_kv_window(width),
-            MatY::unbatched(),
-            bmm_form,
-            &rb(&cb.cexp, gqa, slots),
-            rc,
-            &Stk::<KernelTag>::kernel(slots as usize, hd as usize, &cb.gv),
-            kc,
-            &rb(&bufs.run_o, nqh, hd),
-            row_step(h0),
-            Some((&otmp_h, row_step(h0))),
-            EpilogueOpFunc::StridedAdd,
-            &[],
-            false,
+        let h0 = kvh * g_rows;
+        for (p, part) in parts.iter().enumerate() {
+            let kc = corner(part.value_corner(kvh), "a kv head's value block")?;
+            let rc = corner(
+                part.probs_corner(kvh, g_rows),
+                "a kv head's probability block",
+            )?;
+            let (out, addend) = if p % 2 == 0 {
+                (&bufs.run_o, &otmp_h)
+            } else {
+                (&bufs.otmp, &run_o_h)
+            };
+            let name = if parts.len() == 1 {
+                format!("attn_cov_g{kvh}_o{t}")
+            } else {
+                format!("attn_cov_g{kvh}_k{p}_o{t}")
+            };
+            // `run_o_g = P_g · V_g + otmp_g` — the `stridedadd` epilogue is the online-softmax update.
+            ops.push(assemble_matmul_off_maybe_epilogue(
+                &name,
+                MatM::of_head_major_rows(g_rows),
+                MatN::of_head_dim(hd),
+                MatK::of_kv_window(BlockCols::of_chunk_part(*part)),
+                MatY::unbatched(),
+                bmm_form,
+                &rb(&cb.cexp, g_rows, slots),
+                rc,
+                &Stk::<KernelTag>::kernel(part.slots() as usize, hd as usize, &cb.gv),
+                kc,
+                &rb(out, q_rows, hd),
+                row_step(h0),
+                Some((addend, row_step(h0))),
+                EpilogueOpFunc::StridedAdd,
+                &[],
+                false,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    if parts.len().is_multiple_of(2) {
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_covsum_o{t}"),
+            "identity",
+            all_rows,
+            BlockCols::of_head_dim(hd),
+            &[In::full(&otmp_h).ew()],
+            &run_o_h,
+            DevOff::ZERO,
             sym_id_base,
             layout,
         ));
@@ -2834,8 +2876,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             for r in [R::GatherKt, R::GatherV] {
                 l.synth(out_id.synth(r), &chunk.footprint_dims());
             }
+            // Every query ROW's scores over the chunk — `nqh·mq` rows, the token stream's own.
             for r in [R::ChunkSc, R::ChunkESub, R::ChunkExp] {
-                l.synth(out_id.synth(r), &[nqh, chunk.slots()]);
+                l.synth(out_id.synth(r), &[nqh * mq, chunk.slots()]);
             }
         }
         assemble_attn_chunk(
@@ -2845,6 +2888,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 nqh,
                 hd,
                 gqa: nqh / nkvh,
+                mq,
                 chunk,
                 index,
                 kct,

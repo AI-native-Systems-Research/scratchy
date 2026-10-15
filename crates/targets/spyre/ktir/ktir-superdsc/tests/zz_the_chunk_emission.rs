@@ -10,8 +10,11 @@ const HD: u32 = 64;
 const CAP: u32 = 256;
 
 fn emit_chunk(pages: u32) -> Vec<(String, serde_json::Value)> {
-    emit_chunk_ops(pages)
-        .iter()
+    named(emit_chunk_ops(pages))
+}
+
+fn named(ops: Vec<ktir_superdsc::emit::EmittedOp>) -> Vec<(String, serde_json::Value)> {
+    ops.iter()
         .map(|e| {
             let v = serde_json::to_value(&e.op).unwrap();
             let name = v["dscs_"][0]
@@ -24,8 +27,18 @@ fn emit_chunk(pages: u32) -> Vec<(String, serde_json::Value)> {
 }
 
 fn emit_chunk_ops(pages: u32) -> Vec<ktir_superdsc::emit::EmittedOp> {
+    emit_chunk_ops_at(pages, 1)
+}
+
+/// A `pages`-page chunk at `mq` query rows per head: 1 is the one-request decode rung, more is a
+/// prompt chunk over its resident prefix (rows are one sequence's positions, not requests).
+fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
-    let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
+    let rows = if mq == 1 {
+        attn_bundle_rows(geom, 1, true).expect("the one-request decode rung")
+    } else {
+        attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
+    };
     let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
         .expect("a chunk granite-2b admits");
     let mut sym = 0i64;
@@ -105,6 +118,89 @@ fn the_chunk_reductions_are_per_row_on_stick_blocked_operands() {
                     "{name} at {j} page(s): the data walks {walk:?}, not the reconstructed layout"
                 );
             }
+        }
+    }
+}
+
+/// ⭐⭐⭐ A PROMPT CHUNK'S PREFIX IS THE SAME CHUNK OVER EVERY ROW: at 96 rows per head each kv head's
+/// score, row max and denominator span its `gqa·96 = 384` query rows over the whole chunk, the op count
+/// outside the gather does not grow with the chunk, and nothing is a fold op — every row of every head
+/// in one launch, nothing per page.
+#[test]
+fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
+    const MQ: u32 = 96;
+    let gqa_rows = u64::from(NQH / NKVH * MQ);
+    // The gather's copies and the value leg's K-parts grow with the chunk by design (one copy per index
+    // stick; one PV per `VALUE_PART_PAGES` pages, see `ChunkScratch::value_parts`); nothing else may.
+    let non_gather = |ops: &[(String, serde_json::Value)]| {
+        ops.iter()
+            .filter(|(n, _)| {
+                !n.starts_with("attn_cgkt_")
+                    && !n.starts_with("attn_cgv_")
+                    && !n.starts_with("attn_cov_g")
+                    && !n.starts_with("attn_covsum_")
+            })
+            .count()
+    };
+    let narrowest = non_gather(&named(emit_chunk_ops_at(ChunkScratch::LADDER[0], MQ)));
+    for &j in &ChunkScratch::LADDER {
+        let ops = named(emit_chunk_ops_at(j, MQ));
+        let slots = u64::from(j * 256);
+        for stem in ["attn_cbmax_g", "attn_cbsum_g"] {
+            let reds: Vec<&(String, serde_json::Value)> =
+                ops.iter().filter(|(n, _)| n.starts_with(stem)).collect();
+            assert_eq!(reds.len(), 8, "{stem}* at {j} page(s): one per kv head");
+            for (name, v) in reds {
+                let n = &v["dscs_"][0][name]["N_"];
+                assert_eq!(
+                    (n["mb_"].as_u64(), n["out_"].as_u64()),
+                    (Some(gqa_rows), Some(slots)),
+                    "{name} at {j} page(s): N_ = {n}"
+                );
+            }
+        }
+        for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_csc_g")) {
+            assert_eq!(
+                v["dscs_"][0][name]["N_"]["mb_"].as_u64(),
+                Some(gqa_rows),
+                "{name} at {j} page(s): the score covers every query row of its kv head"
+            );
+        }
+        assert_eq!(
+            non_gather(&ops),
+            narrowest,
+            "{j} page(s): the prompt chunk's ops outside the gather grow with the chunk"
+        );
+        // ⛔ THE VALUE LEG IS CUT ALONG K, AND EVERY PART CONTRACTS AT MOST `VALUE_PART_PAGES` PAGES —
+        // the whole-chunk PV at 384 rows is what dxp refused to verify.
+        let parts = j.div_ceil(ChunkScratch::VALUE_PART_PAGES);
+        let pv: Vec<&(String, serde_json::Value)> = ops
+            .iter()
+            .filter(|(n, _)| n.starts_with("attn_cov_g"))
+            .collect();
+        assert_eq!(
+            pv.len() as u32,
+            NKVH * parts,
+            "{j} page(s): {parts} value part(s) per kv head"
+        );
+        for (name, v) in pv {
+            let k = v["dscs_"][0][name]["N_"]["in_"].as_u64().unwrap_or(0);
+            assert!(
+                k > 0 && k <= u64::from(ChunkScratch::VALUE_PART_PAGES * 256),
+                "{name} at {j} page(s): contracts {k} slots"
+            );
+        }
+        assert_eq!(
+            ops.iter().any(|(n, _)| n.starts_with("attn_covsum_")),
+            parts.is_multiple_of(2),
+            "{j} page(s): the copy home exists exactly when the part count is even"
+        );
+        for e in emit_chunk_ops_at(j, MQ) {
+            assert!(
+                !e.kv_page_fold,
+                "{} at {j} page(s) is a fold op — the chunk launches once",
+                e.op_name
+            );
         }
     }
 }
