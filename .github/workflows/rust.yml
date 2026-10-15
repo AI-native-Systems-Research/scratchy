@@ -280,6 +280,13 @@ jobs:
       # tests don't run transitively. Test the crate that actually holds the
       # GPU kernel suite (~155 tests: qmm/qmv/softmax/attention/rope/moe vs CPU
       # reference). The macos-26 runner has a real Apple GPU, so these execute.
+      # The scratchy-models clippy above lints this crate's lib only; its unit
+      # and integration tests (and the test-only `serial-pipeline-builds`
+      # feature they enable) are otherwise compiled by `cargo test` alone,
+      # which doesn't lint.
+      - name: Clippy (metal kernel tests)
+        run: cargo clippy -p scratchy-target-metal --all-targets -- -D warnings
+
       - name: Kernel tests
         run: cargo test -p scratchy-target-metal
 

@@ -3933,6 +3933,7 @@ dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-subtile",
+ "scratchy-target-metal",
  "scratchy-tensors",
  "scratchy-vision",
  "serde",

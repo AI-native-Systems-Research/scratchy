@@ -14,10 +14,10 @@
 //!
 //! Dispatches on the production MTL4 path (see `common::dispatch_threadgroups`).
 
-pub mod common;
+mod common;
 
-use common::baked_build;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,

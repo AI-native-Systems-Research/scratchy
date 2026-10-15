@@ -6,10 +6,10 @@
 //! `CONCAT_ROWS_N` so the bounds guard is exercised. Dispatches on the production MTL4 path
 //! (`common::dispatch_threadgroups`).
 
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use objc2_metal::{MTLBuffer, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::ids::ElementCount;
 use scratchy_target_metal::tape::kernel_constants::ConcatRowsConstants;

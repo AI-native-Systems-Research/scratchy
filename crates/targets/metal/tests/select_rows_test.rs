@@ -4,10 +4,10 @@
 //! to its destination at its offset; ops of one dispatch pick independently. GPU test — run with
 //! `--test-threads=1` (standing rule).
 
-pub mod common;
+mod common;
 
-use common::baked_build;
 use objc2_metal::{MTLBuffer as _, MTLSize};
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{read_slice, shared_slice, shared_zeroed};
 use scratchy_target_metal::select_rows::{SelectFrom, SelectInto, SelectOp, Selection};

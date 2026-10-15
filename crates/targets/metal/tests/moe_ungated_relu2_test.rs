@@ -7,12 +7,12 @@
 // The fused command must also give the split chain's bits (`affine_gather_qmv`, then `relu2`),
 // and routing the token itself (`MetalFusion::MoeRouted`) the routing command's. The gated and
 // combine kernels take their pair / token along X (the plain gather along Z).
-pub mod common;
+mod common;
 
-use common::{BakedPipeline, baked_pipeline};
 use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_subtile::subtile_ir::{ExpertBody, UngatedAct};
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::constants::ConstantValue;
 use scratchy_target_metal::tape::ids::{ElementCount, KDimI32, NDimI32, NumExperts, TopK};

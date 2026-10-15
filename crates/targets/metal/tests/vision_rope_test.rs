@@ -9,10 +9,10 @@
 //! independently verified == the mlx-vlm golden fixture (rope_block0_q:
 //! max_abs_err 9.5e-7, cosine 1.0) — see vllm-rs/tools/vision_parity.
 
-pub mod common;
+mod common;
 
-use common::baked_build;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,

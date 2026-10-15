@@ -8,11 +8,11 @@
 //! Top-k semantics: the trailing `top_k` indices of the sorted-
 //! ascending output are the indices of the top-k entries by value.
 
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use half::{bf16, f16};
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::ids::NumExperts;
 use scratchy_target_metal::tape::kernel_constants::ArgsortConstants;

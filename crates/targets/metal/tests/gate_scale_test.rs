@@ -5,11 +5,11 @@
 //! (rows=1, hidden=2048) and a prefill bucket (rows=64). Dispatches on
 //! the production MTL4 path (see `common::dispatch_threadgroups`).
 
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::ids::HiddenSize;
 use scratchy_target_metal::tape::kernel_constants::GateScaleConstants;

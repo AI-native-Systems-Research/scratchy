@@ -19,10 +19,10 @@
 // (M, N) to keep the test allocation modest while still exercising
 // every threadgroup boundary.
 
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use objc2_metal::{MTLComputePipelineState, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, splitk_reduce_kernel_static_name};
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;

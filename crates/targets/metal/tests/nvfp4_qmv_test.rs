@@ -12,10 +12,10 @@
 
 #![cfg(target_os = "macos")]
 
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
     QmmTKernel, QmvKernel, qmm_t_dispatch_shape, qmv_dispatch_shape,

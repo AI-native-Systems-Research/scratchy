@@ -19,10 +19,10 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use common::{BakedPipeline, baked_pipeline};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::cpu_reference::affine_qmm_t_b4_bf16 as cpu_qmm_t_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
@@ -32,7 +32,7 @@ use scratchy_target_metal::quantized::{
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
-pub mod common;
+mod common;
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;

@@ -14,15 +14,15 @@
 //   - qmv_fast:    N%8==0 ∧ K%512==0       → tested with N=64, K=512
 //   - qmv generic: neither                  → tested with N=12, K=384
 
-pub mod common;
+mod common;
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use common::baked_pipeline;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{

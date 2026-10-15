@@ -15,6 +15,12 @@ sampler-telemetry = ["scratchy-core-common/sampler-telemetry"]
 # compiles the image-decode crates. Forwarded from `scr`'s `multimodal`
 # feature via scratchy-serving-api -> scratchy-serving-worker.
 vision = ["scratchy-forward-compiler/vision", "dep:scratchy-vision"]
+# Test-only: the bake's kernel-test helpers (`aot::test_support`) and one MTL4
+# pipeline build at a time per process (#288). Turned on
+# for this crate's integration tests by the self dev-dependency below; the lib
+# unit tests get it from `cfg(test)`. Nothing else enables it, so no
+# production build carries the lock.
+test-support = []
 
 [dependencies]
 scratchy-tensors = { path = "../../tensors" }
@@ -98,6 +104,7 @@ serde_json = "1.0"
 # bf16 safetensors fixture and loads it through the real metal loader.
 half = { workspace = true }
 safetensors = { workspace = true }
+scratchy-target-metal = { path = ".", features = ["test-support"] }
 
 # build.rs uses only `xcrun` via std::process::Command — no crate
 # dependencies needed.

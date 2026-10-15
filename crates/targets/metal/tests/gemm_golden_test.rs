@@ -7,12 +7,11 @@
 //! counts. M/N/K are compiled into the kernel, so the only bindings are
 //! output(0), input(1), weight(2).
 
-pub mod common;
+mod common;
 
-use common::baked_build;
 use half::{bf16, f16};
 use objc2_metal::MTLSize;
-use scratchy_target_metal::aot::baked_kernels;
+use scratchy_target_metal::aot::{baked_build, baked_kernels};
 use scratchy_target_metal::cpu_golden;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::interpreter::metal::__re::ComputePipelineState;

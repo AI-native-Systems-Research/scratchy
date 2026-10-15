@@ -6,16 +6,16 @@
 //!
 //! Dispatched standalone on the MTL4 command path (see
 //! `common::dispatch_threadgroups`); the baked kernels carry the constants
-//! the lowering bakes, compiled in (`common::baked_pipeline`).
+//! the lowering bakes, compiled in (`aot::baked_pipeline`).
 //! LayerNorm reference = the affine LayerNorm with biased variance +
 //! eps-inside-sqrt, independently verified == `mlx.nn.LayerNorm`
 //! (max_abs_err 2.4e-7).
 
-pub mod common;
+mod common;
 
-use common::{baked_build, baked_pipeline};
 use half::{bf16, f16};
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::{baked_build, baked_pipeline};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,

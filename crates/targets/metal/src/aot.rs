@@ -14,16 +14,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
-use crate::interpreter::metal::SpecializedPipelines;
 use crate::interpreter::metal::pipelines::{GemmBody, gemm_pipeline};
-use crate::specialized_pipeline_cache::{
-    ConstantType, ConstantValue, Device, PipelineKey, SpecializedPipelineCache,
-};
-use crate::stream::MetalStreamError;
+use crate::specialized_pipeline_cache::{ConstantType, ConstantValue, PipelineKey};
 use crate::tape::constants::{TapeVariant, UnboundConstant};
-use crate::tape::lowered::{
-    BakedKernel, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, baked,
-};
+use crate::tape::lowered::{KernelId, LoweredCommand, MetalDtype};
 
 /// A library whose kernels compile only in the bake ([`bake`]).
 pub struct BakedLibrary {
@@ -325,42 +319,104 @@ fn guarded_headers(library: &str) -> Vec<String> {
     out
 }
 
-/// `keys`' kernels, baked, as the statics a baked tape holds
-/// ([`ClassedTape::kernels`](crate::tape::lowered::ClassedTape::kernels)) — for kernels lowered or
-/// dispatched outside the macro (kernel tests).
-pub fn baked_kernels(keys: &[PipelineKey]) -> Vec<BakedKernel> {
-    let bake = bake(keys);
-    let kernels = keys.iter().zip(bake.kernels);
-    kernels
-        .map(|(key, kernel)| BakedKernel {
-            library: key.library_name,
-            function: key.kernel_name,
-            constants: baked(key.constants.clone()),
-            metallib: baked(kernel.metallib.to_vec()),
-            entry: Box::leak(kernel.entry.into_boxed_str()),
-        })
-        .collect()
-}
+/// The bake's kernel-test helpers — compiled only into test builds (the crate's own `cfg(test)`
+/// and its integration tests, through the `test-support` feature its dev-dependency on itself
+/// turns on), never into production.
+#[cfg(any(test, feature = "test-support"))]
+mod test_support {
+    use std::sync::Arc;
 
-/// The standard shaders and every baked kernel `tapes` name at `dtype` for tape `variant`, as the
-/// pool registers a model's — for tapes lowered outside the macro (tests).
-pub fn tape_pipelines(
-    device: &Device,
-    tapes: &[LoweredMetalTape],
-    dtype: MetalDtype,
-    variant: TapeVariant,
-) -> Result<SpecializedPipelines, MetalStreamError> {
-    let commands = tapes.iter().flat_map(|t| t.commands.iter());
-    let keys = commands.map(|c| bake_keys(&c.command, dtype, variant));
-    let keys: Vec<_> = (keys.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| MetalStreamError::ShaderCompilationFailed(e.to_string()))?
-        .into_iter()
-        .flatten()
-        .collect();
-    let cache = SpecializedPipelineCache::new(device.clone(), &[])?;
-    cache.register_baked(&baked_kernels(&keys));
-    Ok(SpecializedPipelines::new(Arc::new(cache), variant))
+    use super::{bake, bake_keys, baked_library};
+    use crate::interpreter::metal::SpecializedPipelines;
+    use crate::specialized_pipeline_cache::{
+        ComputePipelineState, ConstantValue, Device, PipelineKey, SpecializedPipelineCache,
+    };
+    use crate::stream::MetalStreamError;
+    use crate::tape::constants::TapeVariant;
+    use crate::tape::lowered::{BakedKernel, LoweredMetalTape, MetalDtype, baked};
+
+    /// `keys`' kernels, baked, as the statics a baked tape holds
+    /// ([`ClassedTape::kernels`](crate::tape::lowered::ClassedTape::kernels)) — for kernels lowered or
+    /// dispatched outside the macro (kernel tests).
+    pub fn baked_kernels(keys: &[PipelineKey]) -> Vec<BakedKernel> {
+        let bake = bake(keys);
+        let kernels = keys.iter().zip(bake.kernels);
+        kernels
+            .map(|(key, kernel)| BakedKernel {
+                library: key.library_name,
+                function: key.kernel_name,
+                constants: baked(key.constants.clone()),
+                metallib: baked(kernel.metallib.to_vec()),
+                entry: Box::leak(kernel.entry.into_boxed_str()),
+            })
+            .collect()
+    }
+
+    /// The standard shaders and every baked kernel `tapes` name at `dtype` for tape `variant`, as the
+    /// pool registers a model's — for tapes lowered outside the macro (tests).
+    pub fn tape_pipelines(
+        device: &Device,
+        tapes: &[LoweredMetalTape],
+        dtype: MetalDtype,
+        variant: TapeVariant,
+    ) -> Result<SpecializedPipelines, MetalStreamError> {
+        let commands = tapes.iter().flat_map(|t| t.commands.iter());
+        let keys = commands.map(|c| bake_keys(&c.command, dtype, variant));
+        let keys: Vec<_> = (keys.collect::<Result<Vec<_>, _>>())
+            .map_err(|e| MetalStreamError::ShaderCompilationFailed(e.to_string()))?
+            .into_iter()
+            .flatten()
+            .collect();
+        let cache = SpecializedPipelineCache::new(device.clone(), &[])?;
+        cache.register_baked(&baked_kernels(&keys));
+        Ok(SpecializedPipelines::new(Arc::new(cache), variant))
+    }
+
+    /// `key`'s pipeline from `cache`, its kernel baked first — for kernel tests that build several
+    /// pipelines through one cache.
+    pub fn baked_build(
+        cache: &SpecializedPipelineCache,
+        key: &PipelineKey,
+    ) -> Result<ComputePipelineState, MetalStreamError> {
+        if baked_library(key.library_name).is_some() {
+            cache.register_baked(&baked_kernels(std::slice::from_ref(key)));
+        }
+        cache.get_or_build(key)
+    }
+
+    /// A kernel test's baked pipeline, held with the cache that built it: a pipeline used after its
+    /// cache (MTL4 compiler, library) is dropped computes garbage.
+    pub struct BakedPipeline {
+        pipeline: ComputePipelineState,
+        _cache: SpecializedPipelineCache,
+    }
+
+    impl std::ops::Deref for BakedPipeline {
+        type Target = ComputePipelineState;
+        fn deref(&self) -> &ComputePipelineState {
+            &self.pipeline
+        }
+    }
+
+    /// The pipeline of `library`'s kernel `function` with `constants`, baked and built the way the
+    /// pool builds it — for kernel tests.
+    pub fn baked_pipeline(
+        device: &Device,
+        library: &'static str,
+        function: &str,
+        constants: Vec<ConstantValue>,
+    ) -> Result<BakedPipeline, MetalStreamError> {
+        let key = PipelineKey::new(library, Box::leak(Box::from(function)), constants);
+        let cache = SpecializedPipelineCache::new(device.clone(), &[])?;
+        let pipeline = baked_build(&cache, &key)?;
+        Ok(BakedPipeline {
+            pipeline,
+            _cache: cache,
+        })
+    }
 }
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::*;
 
 /// The Metal toolchain's identity — the compiler's `--version` and the SDK version — read once per
 /// process: part of every kept compile's key, so an Xcode or SDK update recompiles.
@@ -415,67 +471,5 @@ fn msl_literal(c: &ConstantValue) -> String {
             "bake: constant slot {} is bound to its tape variant; `bake_keys` resolves it",
             c.index
         ),
-    }
-}
-
-/// Kernel-test pipeline builds for the crate's unit tests; the integration tests carry their own
-/// copy in `tests/common`.
-#[cfg(test)]
-pub(crate) mod test_pipelines {
-    use std::sync::Mutex;
-
-    use super::{baked_kernels, baked_library};
-    use crate::specialized_pipeline_cache::{
-        ComputePipelineState, ConstantValue, Device, PipelineKey, SpecializedPipelineCache,
-    };
-    use crate::stream::MetalStreamError;
-
-    /// `key`'s pipeline from `cache`, its kernel baked first — for kernel tests that build several
-    /// pipelines through one cache.
-    ///
-    /// One build at a time, process-wide: parallel tests each build through their own cache (and
-    /// `MTL4Compiler`), and AGX's compiler corrupts the heap when those builds overlap (#288). The
-    /// serving pool builds on one thread, so production's `get_or_build` takes no lock.
-    pub(crate) fn baked_build(
-        cache: &SpecializedPipelineCache,
-        key: &PipelineKey,
-    ) -> Result<ComputePipelineState, MetalStreamError> {
-        if baked_library(key.library_name).is_some() {
-            cache.register_baked(&baked_kernels(std::slice::from_ref(key)));
-        }
-        static BUILD: Mutex<()> = Mutex::new(());
-        let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get_or_build(key)
-    }
-
-    /// A kernel test's baked pipeline, held with the cache that built it: a pipeline used after its
-    /// cache (MTL4 compiler, library) is dropped computes garbage.
-    pub(crate) struct BakedPipeline {
-        pipeline: ComputePipelineState,
-        _cache: SpecializedPipelineCache,
-    }
-
-    impl std::ops::Deref for BakedPipeline {
-        type Target = ComputePipelineState;
-        fn deref(&self) -> &ComputePipelineState {
-            &self.pipeline
-        }
-    }
-
-    /// The pipeline of `library`'s kernel `function` with `constants`, baked and built the way the
-    /// pool builds it — for kernel tests.
-    pub(crate) fn baked_pipeline(
-        device: &Device,
-        library: &'static str,
-        function: &str,
-        constants: Vec<ConstantValue>,
-    ) -> Result<BakedPipeline, MetalStreamError> {
-        let key = PipelineKey::new(library, Box::leak(Box::from(function)), constants);
-        let cache = SpecializedPipelineCache::new(device.clone(), &[])?;
-        let pipeline = baked_build(&cache, &key)?;
-        Ok(BakedPipeline {
-            pipeline,
-            _cache: cache,
-        })
     }
 }

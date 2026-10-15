@@ -10,11 +10,9 @@
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
-pub mod common;
-
-use common::baked_build;
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{

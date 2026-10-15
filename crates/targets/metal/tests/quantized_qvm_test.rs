@@ -16,10 +16,10 @@
 // W storage convention for transpose=false: `[K, N / pack_factor]`
 // u32 (last axis = N is quantized). Scales/biases: `[K, N / gs]`.
 
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::affine_qvm_b4_bf16 as cpu_qvm_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{

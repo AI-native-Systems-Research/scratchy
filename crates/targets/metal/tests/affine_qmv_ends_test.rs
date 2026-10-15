@@ -14,12 +14,10 @@
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
-pub mod common;
-
-use common::baked_build;
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_subtile::subtile_ir::ExpertBody;
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::cpu_reference::affine_qmv_b3_bf16_s_bf16;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
@@ -723,16 +721,16 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
         let groups = n * k / group_size;
         let scales: Vec<bf16> = (0..groups)
             .map(|_| c.dtype.bits(0.0008 + 0.0004 * rng.unit().abs()))
-            .map(|b| bf16::from_bits(b))
+            .map(bf16::from_bits)
             .collect();
         let biases: Vec<bf16> = (0..groups)
             .map(|_| c.dtype.bits(-0.1 + 0.02 * rng.unit()))
-            .map(|b| bf16::from_bits(b))
+            .map(bf16::from_bits)
             .collect();
         let (x, gain) = inputs(&c, &mut rng);
         let linear_bias: Vec<bf16> = (0..n)
             .map(|_| c.dtype.bits(0.25 * rng.unit()))
-            .map(|b| bf16::from_bits(b))
+            .map(bf16::from_bits)
             .collect();
 
         // The exact row: rmsnorm(x, gain) in f64, rounded to bf16 per
@@ -855,21 +853,21 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
     let groups = n * k / group_size;
     let scales: Vec<bf16> = (0..groups)
         .map(|_| c.dtype.bits(0.0008 + 0.0004 * rng.unit().abs()))
-        .map(|b| bf16::from_bits(b))
+        .map(bf16::from_bits)
         .collect();
     let biases: Vec<bf16> = (0..groups)
         .map(|_| c.dtype.bits(-0.1 + 0.02 * rng.unit()))
-        .map(|b| bf16::from_bits(b))
+        .map(bf16::from_bits)
         .collect();
     let (x, gain) = inputs(&c, &mut rng);
     let linear_bias: Vec<bf16> = (0..n)
         .map(|_| c.dtype.bits(0.25 * rng.unit()))
-        .map(|b| bf16::from_bits(b))
+        .map(bf16::from_bits)
         .collect();
     // The residual row already in y: QMV_ADDS adds into it.
     let residual: Vec<bf16> = (0..n)
         .map(|_| c.dtype.bits(4.0 * rng.unit()))
-        .map(|b| bf16::from_bits(b))
+        .map(bf16::from_bits)
         .collect();
 
     // The exact row: rmsnorm(x, gain) rounded to bf16, b3 reference;

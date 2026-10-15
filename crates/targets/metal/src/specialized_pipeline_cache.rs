@@ -178,6 +178,15 @@ impl SpecializedPipelineCache {
         let lib_fn_super: &::objc2_metal::MTL4FunctionDescriptor = &lib_fn_desc;
         pipe_desc.setComputeFunctionDescriptor(Some(lib_fn_super));
 
+        // Test builds only: AGX's MTL4 compiler corrupts the heap when two pipeline builds
+        // overlap (#288), and libtest runs kernel tests on parallel threads, each with its own
+        // cache and compiler. Production builds each pool's pipelines on one thread, so the lock
+        // is compiled out of it.
+        #[cfg(any(test, feature = "test-support"))]
+        let _build = {
+            static BUILD: Mutex<()> = Mutex::new(());
+            BUILD.lock().unwrap_or_else(|e| e.into_inner())
+        };
         let compiler = self.compiler.get_or_init(|| {
             let cdesc = MTL4CompilerDescriptor::new();
             self.device

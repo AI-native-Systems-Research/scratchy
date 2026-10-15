@@ -1,10 +1,10 @@
 // The grouped MoE path's counting sort (`moe_group.metal`): `moe_group_offsets` histograms a step's
 // (token, expert) pairs by expert and lays out each expert's run padded to the grouped GEMM's
 // 64-row tile. Its histogram holds every expert of the model — Gemma-4's 128 and Qwen3.5/3.6's 256.
-pub mod common;
+mod common;
 
-use common::baked_pipeline;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 

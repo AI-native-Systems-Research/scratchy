@@ -1,13 +1,13 @@
 // The MoE routing kernel (`moe_route.metal`) against the kernels it replaces, for each router's
 // program: it must give the same top-k indices and scores, bit for bit. `bench_moe_route` times
 // Gemma-4-26B-A4B's routing both ways (`BENCH` lines).
-pub mod common;
+mod common;
 
 use std::time::Instant;
 
-use common::{BakedPipeline, baked_pipeline};
 use half::bf16;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{ElementCount, NumExperts, TopK};

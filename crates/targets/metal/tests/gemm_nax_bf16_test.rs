@@ -6,17 +6,17 @@
 //!
 //! Run: cargo test -p scratchy-target-metal --release --test gemm_nax_bf16_test -- --ignored --nocapture
 
-pub mod common;
+mod common;
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::time::Instant;
 
-use common::{BakedPipeline, baked_pipeline};
 use half::bf16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 

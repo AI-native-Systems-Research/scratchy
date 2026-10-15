@@ -10448,7 +10448,7 @@ mod tests {
         p.final_logit_softcapping = 30.0;
         let cap = MetalStep::TanhSoftCap(Slot(2), Slot(2), ActivationWidth::of_cols(1000));
         let at = |bucket_m| {
-            let tape = row_tape(plain(&[cap.clone()]));
+            let tape = row_tape(plain(std::slice::from_ref(&cap)));
             lower_subtile_tape_to_metal(&tape, &p, bake_point(bucket_m, None)).expect("lowers")
         };
         let one = at(1);

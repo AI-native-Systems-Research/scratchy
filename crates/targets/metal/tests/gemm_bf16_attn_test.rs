@@ -10,15 +10,15 @@
 //! guards the latent bug where the GEMM strode the weight by `kv_len` instead of
 //! `max_kv` (correct only when they happen to be equal).
 
-pub mod common;
+mod common;
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use common::baked_pipeline;
 use half::bf16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 

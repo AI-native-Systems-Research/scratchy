@@ -200,10 +200,7 @@ mod tests {
     };
 
     /// `tq_compress_paged` baked for `kv` with no offset, writing its dequant back into the pool.
-    fn compress_pipeline(
-        device: &Device,
-        kv: PagedKv,
-    ) -> crate::aot::test_pipelines::BakedPipeline {
+    fn compress_pipeline(device: &Device, kv: PagedKv) -> crate::aot::BakedPipeline {
         use crate::tape::ids::{
             BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, RopePairOff, RotDim, TqCodeBits,
         };
@@ -219,13 +216,8 @@ mod tests {
             rot_dim: RotDim(0),
             pair_off: RopePairOff(0),
         };
-        crate::aot::test_pipelines::baked_pipeline(
-            device,
-            "turboquant",
-            "tq_compress_paged",
-            constants.into(),
-        )
-        .expect("tq_compress_paged")
+        crate::aot::baked_pipeline(device, "turboquant", "tq_compress_paged", constants.into())
+            .expect("tq_compress_paged")
     }
 
     /// Encode with `body` into one MTL4 batch and commit it, waiting for the GPU.
