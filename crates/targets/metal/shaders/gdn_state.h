@@ -47,7 +47,25 @@ inline bool gdn_saves_after(int2 through, uint j, int row) {
   return row >= 0 && through[j] == row + 1;
 }
 
-// A scan whose rows run one at a time runs a step's in `GDN_SAVES + 1` stretches instead, a save's
+// Where a block of rows starting at `t0` and running to `t1` ends instead: at the first save's
+// row inside it, so the state is stored between blocks and the per-token loop carries no save
+// (`gdn_scan_pipelined`).
+inline int gdn_cut_at_save(int2 through, int t0, int t1) {
+  for (uint j = 0; j < GDN_SAVES; j++) {
+    if (through[j] > t0 && through[j] < t1) {
+      t1 = through[j];
+    }
+  }
+  return t1;
+}
+
+// Whether a sequence saves nothing this step — decode, and every prefill chunk short of a save
+// point: `gdn_scan_pipelined` then cuts no block at a save.
+inline bool gdn_saves_none(int2 through) {
+  return through.x <= 0 && through.y <= 0;
+}
+
+// A scan whose rows run one at a time runs a saving step in `GDN_SAVES + 1` stretches, a save's
 // store after each but the last, so its per-row loop carries no save: stretch `k` ends at the row
 // its `k`-th save stores after (saves in row order, one of `0` rows last), the last at the step's
 // end.

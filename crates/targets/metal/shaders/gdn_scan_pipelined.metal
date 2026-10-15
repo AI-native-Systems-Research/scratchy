@@ -44,7 +44,8 @@
 // records runs `gdn_scan_simd`. `state_indices[seq]` is the sequence's
 // `GdnSeqSlots` (`gdn_state.h`): a slot start reads a restore's snapshot entry
 // when it has one, and a save stores the state after its row into its
-// snapshot's entry as the block loop passes the row.
+// snapshot's entry — a block ends at a save's row, so the store sits between
+// blocks and the per-token loop is the plain step's.
 //
 // Baked constants (every compile sets every one; slots 0–4 are the scan's):
 //   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
@@ -147,9 +148,6 @@ template <typename T>
     }
   }
 
-  // The rows a save stores the state after (`gdn_state.h`).
-  const int2 saves_through = gdn_saves_through(seq_slots);
-
   // ── Block staging ──────────────────────────────────────────────────
   // k/q: this key head's head_k channels per token (4 float4s per lane).
   // v: the threadgroup's 32 value rows. a/b: per token, RAW. The row's 8
@@ -224,9 +222,14 @@ template <typename T>
     }                                                                     \
   }
 
+  // The rows a save stores the state after: a block ends at one (`gdn_state.h`).
+  const int2 saves_through = gdn_saves_through(seq_slots);
+  const bool saves = !gdn_saves_none(saves_through);
   int t0 = 0;
   while (t0 < seq_len) {
-    const uint tt = uint(min((int)TB, seq_len - t0));
+    const int block_end = min(t0 + (int)TB, seq_len);
+    const int t1 = saves ? gdn_cut_at_save(saves_through, t0, block_end) : block_end;
+    const uint tt = uint(t1 - t0);
     GDN_PIPE_FETCH(t0, (int)tt)
     // Store the prefetch into threadgroup memory (cooperative).
     _Pragma("unroll")
@@ -254,8 +257,8 @@ template <typename T>
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Prefetch the NEXT block into registers while this one runs.
-    if (t0 + (int)TB < seq_len) {
-      const int tn = t0 + (int)TB;
+    if (t1 < seq_len) {
+      const int tn = t1;
       GDN_PIPE_FETCH(tn, seq_len - tn)
     }
 
@@ -300,84 +303,80 @@ template <typename T>
     // ── The steps. Each lane reads its own k/q fragments (threadgroup
     // memory; lane seg touches columns 4*seg..4*seg+3 only) and runs both
     // rows' recurrences. The butterflies reduce across a row's 8 lanes
-    // (xor 4, 2, 1). In stretches: a save's store after each but the last
-    // when its row is this block's (`gdn_state.h`; the threadgroup's one
-    // sequence's, so uniform) — both rows' fragments, into its snapshot.
-    uint t = 0;
-    for (uint stretch = 0; stretch <= GDN_SAVES; stretch++) {
-      const int end = gdn_stretch_end(saves_through, stretch, seq_len) - t0;
-      for (const uint stop = uint(clamp(end, int(t), int(tt))); t < stop; t++) {
-        const float decay = dec_s[t];
-        const float den = den_s[t];
-        float4 kc[4], qn[4];
+    // (xor 4, 2, 1).
+    for (uint t = 0; t < tt; t++) {
+      const float decay = dec_s[t];
+      const float den = den_s[t];
+      float4 kc[4], qn[4];
+      _Pragma("unroll")
+      for (uint i = 0; i < 4; i++) {
+        kc[i] = k_s[t][seg][i];
+        qn[i] = q_s[t][seg][i];
+      }
+      const float k_inv = kinv_s[t][seg];
+
+      // Decay, then the S·k partial dots.
+      float p0, p1;
+      {
+        float2 a2 = 0.0f;
         _Pragma("unroll")
         for (uint i = 0; i < 4; i++) {
-          kc[i] = k_s[t][seg][i];
-          qn[i] = q_s[t][seg][i];
+          st0[i] = st0[i] * decay;
+          a2 += float2(dot(st0[i].xy, kc[i].xy * k_inv), dot(st0[i].zw, kc[i].zw * k_inv));
         }
-        const float k_inv = kinv_s[t][seg];
-
-        // Decay, then the S·k partial dots.
-        float p0, p1;
-        {
-          float2 a2 = 0.0f;
-          _Pragma("unroll")
-          for (uint i = 0; i < 4; i++) {
-            st0[i] = st0[i] * decay;
-            a2 += float2(dot(st0[i].xy, kc[i].xy * k_inv), dot(st0[i].zw, kc[i].zw * k_inv));
-          }
-          p0 = a2.x + a2.y;
-        }
-        {
-          float2 a2 = 0.0f;
-          _Pragma("unroll")
-          for (uint i = 0; i < 4; i++) {
-            st1[i] = st1[i] * decay;
-            a2 += float2(dot(st1[i].xy, kc[i].xy * k_inv), dot(st1[i].zw, kc[i].zw * k_inv));
-          }
-          p1 = a2.x + a2.y;
-        }
-        _Pragma("unroll")
-        for (uint m = 4; m >= 1; m /= 2) {
-          p0 += simd_shuffle_xor(p0, m);
-          p1 += simd_shuffle_xor(p1, m);
-        }
-
-        // S += k·delta; o partial = S·q.
-        float out0, out1;
-        {
-          const float dk = ((v_s[t][rg] - p0) * k_inv) / den;
-          float2 o2 = 0.0f;
-          _Pragma("unroll")
-          for (uint i = 0; i < 4; i++) {
-            st0[i] = fma(kc[i], float4(dk), st0[i]);
-            o2 += float2(dot(st0[i].xy, qn[i].xy), dot(st0[i].zw, qn[i].zw));
-          }
-          out0 = o2.x + o2.y;
-        }
-        {
-          const float dk = ((v_s[t][rg + RS] - p1) * k_inv) / den;
-          float2 o2 = 0.0f;
-          _Pragma("unroll")
-          for (uint i = 0; i < 4; i++) {
-            st1[i] = fma(kc[i], float4(dk), st1[i]);
-            o2 += float2(dot(st1[i].xy, qn[i].xy), dot(st1[i].zw, qn[i].zw));
-          }
-          out1 = o2.x + o2.y;
-        }
-        _Pragma("unroll")
-        for (uint m = 4; m >= 1; m /= 2) {
-          out0 += simd_shuffle_xor(out0, m);
-          out1 += simd_shuffle_xor(out1, m);
-        }
-        if (seg == 0u) {
-          o[(uint(bos) + t0 + t) * value_dim + vr] = out0;
-          o[(uint(bos) + t0 + t) * value_dim + vr + RS] = out1;
-        }
+        p0 = a2.x + a2.y;
       }
-      const int sv = gdn_stretch_save(saves_through, stretch, seq_len);
-      if (sv >= 0 && end > 0 && end <= int(tt)) {
-        device float* snap = row_in(state_indices[i_n].saves[sv].y) + 4u * seg;
+      {
+        float2 a2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st1[i] = st1[i] * decay;
+          a2 += float2(dot(st1[i].xy, kc[i].xy * k_inv), dot(st1[i].zw, kc[i].zw * k_inv));
+        }
+        p1 = a2.x + a2.y;
+      }
+      _Pragma("unroll")
+      for (uint m = 4; m >= 1; m /= 2) {
+        p0 += simd_shuffle_xor(p0, m);
+        p1 += simd_shuffle_xor(p1, m);
+      }
+
+      // S += k·delta; o partial = S·q.
+      float out0, out1;
+      {
+        const float dk = ((v_s[t][rg] - p0) * k_inv) / den;
+        float2 o2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st0[i] = fma(kc[i], float4(dk), st0[i]);
+          o2 += float2(dot(st0[i].xy, qn[i].xy), dot(st0[i].zw, qn[i].zw));
+        }
+        out0 = o2.x + o2.y;
+      }
+      {
+        const float dk = ((v_s[t][rg + RS] - p1) * k_inv) / den;
+        float2 o2 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st1[i] = fma(kc[i], float4(dk), st1[i]);
+          o2 += float2(dot(st1[i].xy, qn[i].xy), dot(st1[i].zw, qn[i].zw));
+        }
+        out1 = o2.x + o2.y;
+      }
+      _Pragma("unroll")
+      for (uint m = 4; m >= 1; m /= 2) {
+        out0 += simd_shuffle_xor(out0, m);
+        out1 += simd_shuffle_xor(out1, m);
+      }
+      if (seg == 0u) {
+        o[(uint(bos) + t0 + t) * value_dim + vr] = out0;
+        o[(uint(bos) + t0 + t) * value_dim + vr + RS] = out1;
+      }
+    }
+    // A save whose row ends this block: both rows' fragments, into its snapshot.
+    for (uint j = 0; saves && j < GDN_SAVES; j++) {
+      if (saves_through[j] == t1) {
+        device float* snap = row_in(seq_slots.saves[j].y) + 4u * seg;
         for (uint i = 0; i < 4; i++) {
           ((device float4*)snap)[8u * i] = st0[i];
           ((device float4*)(snap + RS * K))[8u * i] = st1[i];
@@ -385,7 +384,7 @@ template <typename T>
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    t0 += (int)TB;
+    t0 = t1;
   }
 #undef GDN_PIPE_FETCH
 

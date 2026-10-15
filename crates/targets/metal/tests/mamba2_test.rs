@@ -34,7 +34,8 @@ const THREADS: usize = 256;
 /// pipelines at the same time, each through its own `SpecializedPipelineCache` (crash reports: in
 /// `AGX::UserCommonShaderFactory` and `ReflectionKey::initGPUCompilerSPIOptionsHash`, under
 /// `SpecializedPipelineCache::get_or_build`), and `cargo test -p scratchy-target-metal` runs them
-/// on parallel threads.
+/// on parallel threads. The driver crash is #288's (first seen in `quantized_qmv_test`); this lock
+/// goes when that is fixed.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// This test's turn on the GPU; a test that panicked with it held leaves it usable.
