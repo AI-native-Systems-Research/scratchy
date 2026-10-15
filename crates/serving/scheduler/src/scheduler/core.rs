@@ -4377,17 +4377,21 @@ mod tests {
     #[test]
     fn test_hybrid_kept_prompt_window_never_raises_the_high_water_mark() {
         // On a fresh pool, the 300-token reply fits under the high-water mark its prompt set only
-        // by recycling the prompt's window, as with caching off. The window yields, so the worker's
-        // KV pool covers the same block IDs either way.
-        let mut uncached = SimpleBlockTracker::new(512, 16);
-        uncached.enable_hybrid(
-            512,
-            vec![(false, 0, 32), (true, 64, 16)],
-            HybridKvStores::Shared,
-        );
-        let (_, uncached_high_water) = hybrid_reuse_after_reply(uncached, 200, 300);
-        let (_, cached_high_water) = hybrid_reuse_after_reply(caching_hybrid(512, 64), 200, 300);
-        assert_eq!(cached_high_water, uncached_high_water);
+        // by recycling the prompt's window, as with caching off. The window yields, so every
+        // store is addressed with the same block IDs either way.
+        for stores in [HybridKvStores::Shared, HybridKvStores::GlobalApart] {
+            let tracker = |caching: bool| {
+                let mut t = match caching {
+                    true => SimpleBlockTracker::with_caching(512, 16),
+                    false => SimpleBlockTracker::new(512, 16),
+                };
+                t.enable_hybrid(512, vec![(false, 0, 32), (true, 64, 16)], stores);
+                t
+            };
+            let (_, uncached) = hybrid_reuse_after_reply(tracker(false), 200, 300);
+            let (_, cached) = hybrid_reuse_after_reply(tracker(true), 200, 300);
+            assert_eq!(cached, uncached, "{stores:?}");
+        }
     }
 
     #[test]
@@ -6264,88 +6268,19 @@ mod tests {
         }
     }
 
-    /// #317's 8 users × 4096/512 cell (12 distinct prompts) on the gemma-4-26b layout over a roomy
-    /// pool. Returns the highest block each store is addressed with, as the worker maps them: the
-    /// global group's store through group 0's blocks, the shared pool through every group whose KV
-    /// lives in it.
-    fn store_reaches(stores: HybridKvStores) -> (usize, usize) {
-        let cfg = SchedulerConfig {
-            max_num_batched_tokens: 2048,
-            max_num_seqs: 256,
-            enable_chunked_prefill: true,
-            ..Default::default()
-        };
-        let pool = 27_000usize;
-        let mut tracker = SimpleBlockTracker::new(pool, 16);
-        let mut groups = vec![(false, 0usize, 32usize)];
-        groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
-        tracker.enable_hybrid(pool, groups, stores);
-        let mut sched = Scheduler::new(&cfg, 32768, Box::new(tracker));
-        let (num_prompts, conc, prompt_len, max_tokens) = (12u32, 8u32, 4096u32, 512u32);
-        let request = |i: u32| {
-            let first = (i + 1) * 100_000;
-            Request::new(
-                format!("r{i}"),
-                (first..first + prompt_len).collect(),
-                SamplingParams {
-                    max_tokens: Some(max_tokens),
-                    ..Default::default()
-                },
-                i as f64,
-                0,
-                0,
-                None,
-            )
-        };
-        let mut next = 0u32;
-        while next < conc {
-            sched.add_request(request(next));
-            next += 1;
-        }
-        let (mut global_reach, mut pool_reach) = (0usize, 0usize);
-        while sched.has_unfinished_requests() {
-            let out = sched.schedule();
-            let tables = (out.scheduled_new_reqs.iter())
-                .map(|r| &r.block_ids)
-                .chain(out.scheduled_cached_reqs.new_block_ids.iter().flatten());
-            for table in tables {
-                for (g, ids) in table.iter().enumerate() {
-                    let highest = ids.iter().copied().max().unwrap_or(0);
-                    if g == 0 {
-                        global_reach = global_reach.max(highest);
-                    }
-                    if g != 0 || stores == HybridKvStores::Shared {
-                        pool_reach = pool_reach.max(highest);
-                    }
-                }
-            }
-            for id in out.num_scheduled_tokens.keys() {
-                let r = sched.get_request(id).unwrap();
-                if r.num_computed_tokens as usize >= r.num_tokens() {
-                    sched.append_output_tokens(id, &[7]);
-                    if sched.get_request(id).unwrap().num_output_tokens() >= max_tokens as usize {
-                        sched.finish_requests(&[id.as_str()], RequestStatus::FinishedLengthCapped);
-                        if next < num_prompts {
-                            sched.add_request(request(next));
-                            next += 1;
-                        }
-                    }
-                }
-            }
-        }
-        (global_reach, pool_reach)
-    }
-
     #[test]
     fn test_hybrid_global_apart_maps_each_store_for_its_own_blocks() {
-        // Sharing one space, the global group's blocks interleave with the sliding groups', so its
-        // store is addressed far past the blocks it holds, and the shared pool past the sliding
-        // groups'. Apart, the global store's highest block is exactly the global group's peak: 8
-        // requests of 4,608 tokens hold 144 blocks of 32 each.
-        let (global, pool) = store_reaches(HybridKvStores::Shared);
-        let (global_apart, pool_apart) = store_reaches(HybridKvStores::GlobalApart);
-        assert_eq!(global_apart, 8 * (4096 + 512usize).div_ceil(32));
-        assert_eq!((global, pool, pool_apart), (3153, 4376, 3240));
+        // #317's 8 users × 4096/512 cell. Sharing one space, the global group's blocks interleave
+        // with the sliding groups', so its store is addressed far past the blocks it holds, and the
+        // shared pool past the sliding groups'. Apart, the global store's highest block is exactly
+        // the global group's peak: 8 requests of 4,608 tokens hold 144 blocks of 32 each.
+        let shared = run_317_cell(HybridKvStores::Shared, false, 27_000, CELL_4096_512);
+        let apart = run_317_cell(HybridKvStores::GlobalApart, false, 27_000, CELL_4096_512);
+        assert_eq!(apart.global_reach, 8 * (4096 + 512usize).div_ceil(32));
+        assert_eq!(
+            (shared.global_reach, shared.pool_reach, apart.pool_reach),
+            (3153, 4376, 3240)
+        );
     }
 
     #[test]
@@ -6413,18 +6348,26 @@ mod tests {
     }
 
     /// A gemma-4-shaped scheduler (one full group, bs 32, + five sliding groups, window 1024,
-    /// bs 16) with prefix caching over a `pool`-block pool.
-    fn gemma4_caching_scheduler(pool: usize, max_num_seqs: usize) -> Scheduler {
+    /// bs 16) over a `pool`-block pool.
+    fn gemma4_scheduler(
+        pool: usize,
+        max_num_seqs: usize,
+        stores: HybridKvStores,
+        caching: bool,
+    ) -> Scheduler {
         let cfg = SchedulerConfig {
             max_num_batched_tokens: 2048,
             max_num_seqs,
             enable_chunked_prefill: true,
             ..Default::default()
         };
-        let mut tracker = SimpleBlockTracker::with_caching(pool, 16);
+        let mut tracker = match caching {
+            true => SimpleBlockTracker::with_caching(pool, 16),
+            false => SimpleBlockTracker::new(pool, 16),
+        };
         let mut groups = vec![(false, 0usize, 32usize)];
         groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
-        tracker.enable_hybrid(pool, groups, HybridKvStores::Shared);
+        tracker.enable_hybrid(pool, groups, stores);
         Scheduler::new(&cfg, 32768, Box::new(tracker))
     }
 
@@ -6462,8 +6405,8 @@ mod tests {
     /// #328, through the scheduler: a `prompt_len`-token prompt with a 300-token reply, then the
     /// same prompt again. Returns how much of it the resend reused, after checking that every
     /// sliding group still holds the window the first recomputed token reads.
-    fn resend_after_long_reply(prompt_len: u32) -> u32 {
-        let mut sched = gemma4_caching_scheduler(2634, 1);
+    fn resend_after_long_reply(stores: HybridKvStores, prompt_len: u32) -> u32 {
+        let mut sched = gemma4_scheduler(2634, 1, stores, true);
         sched.add_request(request_from("r1", 0, prompt_len, 300));
         while sched.has_unfinished_requests() {
             step_and_sample(&mut sched, 300);
@@ -6490,14 +6433,14 @@ mod tests {
         reused
     }
 
+    const BOTH_STORES: [HybridKvStores; 2] = [HybridKvStores::Shared, HybridKvStores::GlobalApart];
+
     #[test]
     fn test_hybrid_same_prompt_after_long_reply_hits_prefix_cache() {
         // The issue's ~1.4k-token prompt: it reused 0 once the first reply passed ~150 tokens.
-        assert_eq!(
-            resend_after_long_reply(1418),
-            1408,
-            "every full global block"
-        );
+        for stores in BOTH_STORES {
+            assert_eq!(resend_after_long_reply(stores, 1418), 1408, "{stores:?}");
+        }
     }
 
     #[test]
@@ -6505,74 +6448,79 @@ mod tests {
         // A prompt that is a whole number of global blocks: the lookup stops a global block short,
         // so the scheduler never backs P off below the window the lookup checked, and the first
         // recomputed token's window holds no null block.
-        assert_eq!(resend_after_long_reply(1408), 1376);
+        for stores in BOTH_STORES {
+            assert_eq!(resend_after_long_reply(stores, 1408), 1376, "{stores:?}");
+        }
     }
 
-    /// What one of #317's A/B cells costs through the scheduler.
+    /// One of #317's A/B cells: `prompts` distinct `prompt_len`-token prompts, `users` at a time,
+    /// each replying `reply_len` tokens.
+    #[derive(Clone, Copy)]
+    struct Cell {
+        users: u32,
+        prompts: u32,
+        prompt_len: u32,
+        reply_len: u32,
+    }
+
+    const CELL_4096_512: Cell = Cell {
+        users: 8,
+        prompts: 12,
+        prompt_len: 4096,
+        reply_len: 512,
+    };
+
+    /// What one cell costs through the scheduler.
     struct CellRun {
         computed: usize,
         preemptions: usize,
-        /// The blocks the worker's KV pool grows to: one 128-block chunk, then each step's highest
-        /// block ID through `KvCachePool::growth_target`'s doubling.
-        kv_pool_blocks: usize,
+        /// The highest block the global group's store is addressed with: group 0's.
+        global_reach: usize,
+        /// The highest block the shared pool is addressed with: every group's whose KV lives in it.
+        pool_reach: usize,
     }
 
-    /// #317's A/B cell on the gemma-4 layout over a `pool`-block pool: `num_prompts` distinct
-    /// `prompt_len`-token prompts, `conc` at a time, each replying `max_tokens` tokens.
-    fn run_317_cell(
-        pool: usize,
-        conc: u32,
-        num_prompts: u32,
-        prompt_len: u32,
-        max_tokens: u32,
-    ) -> CellRun {
-        const BLOCKS_PER_CHUNK: usize = 128;
-        let mut sched = gemma4_caching_scheduler(pool, 256);
+    /// `cell` on the gemma-4 layout over a `pool`-block pool, with the global group's KV where
+    /// `stores` puts it.
+    fn run_317_cell(stores: HybridKvStores, caching: bool, pool: usize, cell: Cell) -> CellRun {
+        let mut sched = gemma4_scheduler(pool, 256, stores, caching);
         let mut next = 0u32;
         let add = |sched: &mut Scheduler, next: &mut u32| {
             let id = format!("r{next}");
-            sched.add_request(request_from(
-                &id,
-                (*next + 1) * 100_000,
-                prompt_len,
-                max_tokens,
-            ));
+            let first = (*next + 1) * 100_000;
+            sched.add_request(request_from(&id, first, cell.prompt_len, cell.reply_len));
             *next += 1;
         };
-        while next < conc {
+        while next < cell.users {
             add(&mut sched, &mut next);
         }
         let mut run = CellRun {
             computed: 0,
             preemptions: 0,
-            kv_pool_blocks: BLOCKS_PER_CHUNK.min(pool),
+            global_reach: 0,
+            pool_reach: 0,
         };
         while sched.has_unfinished_requests() {
             let running = sched.get_unfinished_request_ids().len();
-            let out = step_and_sample(&mut sched, max_tokens);
+            let out = step_and_sample(&mut sched, cell.reply_len);
             run.computed += out.num_scheduled_tokens.values().sum::<usize>();
             run.preemptions += out.preempted_req_ids.as_ref().map_or(0, |p| p.len());
-            let step_max = out
-                .scheduled_new_reqs
-                .iter()
-                .flat_map(|r| r.block_ids.iter().flatten())
-                .chain(
-                    out.scheduled_cached_reqs
-                        .new_block_ids
-                        .iter()
-                        .flatten()
-                        .flat_map(|g| g.iter().flatten()),
-                )
-                .copied()
-                .max()
-                .unwrap_or(0);
-            if step_max >= run.kv_pool_blocks {
-                let target = step_max.max(2 * run.kv_pool_blocks - 1);
-                run.kv_pool_blocks =
-                    ((target.min(pool - 1) / BLOCKS_PER_CHUNK + 1) * BLOCKS_PER_CHUNK).min(pool);
+            let tables = (out.scheduled_new_reqs.iter())
+                .map(|r| &r.block_ids)
+                .chain(out.scheduled_cached_reqs.new_block_ids.iter().flatten());
+            for table in tables {
+                for (g, ids) in table.iter().enumerate() {
+                    let highest = ids.iter().copied().max().unwrap_or(0);
+                    if g == 0 {
+                        run.global_reach = run.global_reach.max(highest);
+                    }
+                    if g != 0 || stores == HybridKvStores::Shared {
+                        run.pool_reach = run.pool_reach.max(highest);
+                    }
+                }
             }
             let finished = running - sched.get_unfinished_request_ids().len();
-            for _ in 0..finished.min((num_prompts - next) as usize) {
+            for _ in 0..finished.min((cell.prompts - next) as usize) {
                 add(&mut sched, &mut next);
             }
         }
@@ -6584,28 +6532,43 @@ mod tests {
         // #317's 8 users × 4096/512 cell on the 32 GB box's 3,407-block pool. Keeping every running
         // request's prompt window with no way to release it preempted 75 times and computed 3.7×
         // the tokens; released on demand, it is #317's single preemption.
-        let run = run_317_cell(3407, 8, 12, 4096, 512);
-        let ideal = 12 * (4096 + 512 - 1);
-        assert!(
-            run.preemptions <= 1,
-            "{} preemptions (#317: 1)",
-            run.preemptions
-        );
-        assert!(
-            run.computed <= ideal,
-            "{} tokens computed for an ideal {ideal}",
-            run.computed
-        );
+        let cell = CELL_4096_512;
+        let ideal = (cell.prompts * (cell.prompt_len + cell.reply_len - 1)) as usize;
+        for stores in BOTH_STORES {
+            let run = run_317_cell(stores, true, 3407, cell);
+            let preemptions = run.preemptions;
+            assert!(
+                preemptions <= 1,
+                "{stores:?}: {preemptions} preemptions (#317: 1)"
+            );
+            let computed = run.computed;
+            assert!(
+                computed <= ideal,
+                "{stores:?}: {computed} tokens for an ideal {ideal}"
+            );
+        }
     }
 
     #[test]
-    fn test_hybrid_kept_prompt_windows_never_grow_the_kv_pool() {
-        // #317's 8 users × 4096/2048 cell on a roomy 27,000-block pool. Held until each request
-        // ends, the kept prompt windows doubled the worker's KV pool to 12,288 blocks. Released
-        // before they would reach past the high-water mark, they leave it at 6,144 — what the
-        // same cell grows it to with caching off.
-        let run = run_317_cell(27_000, 8, 16, 4096, 2048);
-        assert_eq!(run.kv_pool_blocks, 6144);
-        assert_eq!(run.preemptions, 0);
+    fn test_hybrid_kept_prompt_windows_never_grow_a_kv_store() {
+        // #317's 8 users × 4096/2048 cell on a roomy pool. Held until each request ends, the kept
+        // prompt windows raised the highest block of the store they live in, and so the memory
+        // the worker maps for it: the shared pool's doubled to 12,288 blocks. Released before they
+        // would reach past their space's high-water mark, they leave every store where caching off
+        // does. Apart, they live in the sliding groups' pool, so the global store never sees them.
+        let cell = Cell {
+            prompts: 8,
+            reply_len: 1280,
+            ..CELL_4096_512
+        };
+        for stores in BOTH_STORES {
+            let kept = run_317_cell(stores, true, 27_000, cell);
+            let uncached = run_317_cell(stores, false, 27_000, cell);
+            assert_eq!(kept.pool_reach, uncached.pool_reach, "{stores:?}");
+            if stores == HybridKvStores::GlobalApart {
+                assert_eq!(kept.global_reach, uncached.global_reach);
+            }
+            assert_eq!(kept.preemptions, 0, "{stores:?}");
+        }
     }
 }
