@@ -191,7 +191,10 @@ mod tests {
         .into_iter()
         .map(|n| n.map(|n| o.ssa(n)))
         .collect();
-        assert_eq!(got, want, "each splat sits directly before its first reader");
+        assert_eq!(
+            got, want,
+            "each splat sits directly before its first reader"
+        );
     }
 
     /// A program with nothing to move is reported unchanged and left byte-identical.
