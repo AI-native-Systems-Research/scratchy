@@ -1326,12 +1326,23 @@ impl Role {
 pub enum Allocation {
     /// Resident in HBM (default for matmul operands).
     Hbm,
-    /// Resident in the LX scratchpad only (memOrg_ → lx only).
+    /// Resident in the LX scratchpad only (memOrg_ → lx only), the WHOLE tensor in every core's copy:
+    /// produced by a REPLICATED op ([`WorkPlan::replicate`]), so a consumer's own slice corner selects
+    /// its rows inside its core's copy.
     Lx,
+    /// Resident in the LX scratchpad only, each core holding exactly ITS OWN work slice at the pin —
+    /// the reference's form for every softmax intermediate (one LX start address on all 32 cores, the
+    /// coordinates the HBM operand would carry). Readable only by an op that divides the work exactly
+    /// as its producer did, which the emitter proves at build (`apply_lx_residency`).
+    LxCoreLocal,
 }
 impl Allocation {
     pub fn is_lx(self) -> bool {
-        matches!(self, Allocation::Lx)
+        matches!(self, Allocation::Lx | Allocation::LxCoreLocal)
+    }
+    /// Each core holds only its own slice, at the pin — no per-core corner.
+    pub fn is_core_local(self) -> bool {
+        matches!(self, Allocation::LxCoreLocal)
     }
     pub fn component(self) -> &'static str {
         if self.is_lx() { "lx" } else { "hbm" }
