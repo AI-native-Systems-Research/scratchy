@@ -232,10 +232,10 @@ pub struct SimpleBlockTracker {
     /// a time, so a single reverse entry suffices.
     hybrid_id_to_key: HashMap<usize, (u32, u64)>,
 
-    /// Hybrid per-request full-block hashes per group: `request_id ->
-    /// Vec_by_group<Vec_by_logical_block<hash>>`. Sliding groups only ever
-    /// register hashes for blocks still in-window at seal time.
-    hybrid_req_hashes: HashMap<String, Vec<Vec<u64>>>,
+    /// Hybrid per-request block hashes, per group: `request_id ->
+    /// Vec_by_group<GroupHashes>`. Extended as the request's tokens fill
+    /// blocks, so each block is hashed and registered once.
+    hybrid_req_hashes: HashMap<String, Vec<GroupHashes>>,
 
     /// Hybrid + caching: per running request, the sliding blocks that slid
     /// out of the window but cover its PROMPT's last window — what a re-sent
@@ -247,6 +247,14 @@ pub struct SimpleBlockTracker {
     /// space: keeping a cache entry must never cost a preemption, nor grow a
     /// KV store.
     hybrid_kept: HashMap<String, Vec<usize>>,
+}
+
+/// One request's full-block hashes in one hybrid group, and how many of its
+/// blocks have been registered in `hybrid_hash_to_id`.
+#[derive(Clone, Debug, Default)]
+struct GroupHashes {
+    hashes: Vec<u64>,
+    registered: usize,
 }
 
 /// One KV-cache group's allocation spec on the hybrid (SWA) path.
@@ -508,30 +516,32 @@ impl SimpleBlockTracker {
         h.finish()
     }
 
-    /// Build a per-block list of image hashes whose placeholder range
-    /// overlaps that block's token range. Returns `None` for text-only
-    /// requests so the hash is byte-identical to the pre-MM behavior.
+    /// Build, for each block in `blocks`, the list of image hashes whose
+    /// placeholder range overlaps that block's token range (indexed from
+    /// `blocks.start`). Returns `None` for text-only requests so the hash is
+    /// byte-identical to the pre-MM behavior.
     fn build_mm_extras(
         mm: Option<&MultimodalData>,
-        num_full_blocks: usize,
+        blocks: std::ops::Range<usize>,
         block_size: usize,
     ) -> Option<Vec<Vec<u64>>> {
         let mm = mm?;
-        if mm.images.is_empty() || num_full_blocks == 0 {
+        if mm.images.is_empty() || blocks.is_empty() {
             return None;
         }
-        let mut per_block = vec![Vec::<u64>::new(); num_full_blocks];
+        let mut per_block = vec![Vec::<u64>::new(); blocks.len()];
         for (i, ph) in mm.image_placeholders.iter().enumerate() {
             let img = match mm.images.get(i) {
                 Some(img) => img,
                 None => continue,
             };
+            let start_blk = (ph.offset / block_size).max(blocks.start);
+            let end_blk = (ph.offset + ph.length).div_ceil(block_size).min(blocks.end);
+            if start_blk >= end_blk {
+                continue;
+            }
             let img_hash = Self::hash_image(img);
-            let start_blk = ph.offset / block_size;
-            let end_blk = (ph.offset + ph.length)
-                .div_ceil(block_size)
-                .min(num_full_blocks);
-            for slot in per_block.iter_mut().take(end_blk).skip(start_blk) {
+            for slot in &mut per_block[start_blk - blocks.start..end_blk - blocks.start] {
                 slot.push(img_hash);
             }
         }
@@ -643,11 +653,32 @@ impl SimpleBlockTracker {
         mm: Option<&MultimodalData>,
         block_size: usize,
     ) -> Vec<u64> {
+        let mut hashes = Vec::new();
+        self.extend_block_hashes(&mut hashes, all_tokens, annotations, mm, block_size);
+        hashes
+    }
+
+    /// Append to `hashes` — the hashes of `all_tokens`' first `hashes.len()`
+    /// full blocks — the hashes of every full block after them, chained from
+    /// the last. A request's tokens only ever grow, so a request hashes each
+    /// block once.
+    fn extend_block_hashes(
+        &self,
+        hashes: &mut Vec<u64>,
+        all_tokens: &[u32],
+        annotations: Option<&scratchy_core_common::BlockAnnotations>,
+        mm: Option<&MultimodalData>,
+        block_size: usize,
+    ) {
         let num_full_blocks = all_tokens.len() / block_size;
-        let mm_extras = Self::build_mm_extras(mm, num_full_blocks, block_size);
-        let mut hashes = Vec::with_capacity(num_full_blocks);
-        let mut parent_hash = Self::NONE_HASH;
-        for i in 0..num_full_blocks {
+        let first = hashes.len();
+        if first >= num_full_blocks {
+            return;
+        }
+        let mm_extras = Self::build_mm_extras(mm, first..num_full_blocks, block_size);
+        hashes.reserve(num_full_blocks - first);
+        let mut parent_hash = hashes.last().copied().unwrap_or(Self::NONE_HASH);
+        for i in first..num_full_blocks {
             let start = i * block_size;
             let end = start + block_size;
             let block_tokens = &all_tokens[start..end];
@@ -662,13 +693,14 @@ impl SimpleBlockTracker {
             // `is_span_first_block` stays exact).
             let ann_idx = start / self.block_size;
             let kind = annotations.and_then(|a| a.get(&ann_idx).copied());
-            let extras: &[u64] = mm_extras.as_ref().map(|v| v[i].as_slice()).unwrap_or(&[]);
+            let extras: &[u64] = (mm_extras.as_ref())
+                .map(|v| v[i - first].as_slice())
+                .unwrap_or(&[]);
             let hash =
                 self.hash_block_with_parent(parent_hash, block_tokens, tokens_before, kind, extras);
             parent_hash = hash;
             hashes.push(hash);
         }
-        hashes
     }
 
     /// Try to allocate `count` fresh block IDs from the free queue.
@@ -1136,9 +1168,10 @@ impl SimpleBlockTracker {
     }
 
     /// Register group-namespaced full-block hashes for the request's current
-    /// tables. Full groups register every full block; sliding groups register
-    /// only blocks still in-window (NULL slots skipped). Idempotent per logical
-    /// block (re-registers the same hash→id, harmless).
+    /// tables. Each block is hashed once, when the request's tokens fill it,
+    /// and registered once, when it is also allocated, as the uniform path's
+    /// `seal` does: full groups register every full block; sliding groups only
+    /// blocks still in-window (NULL slots skipped).
     fn register_hybrid_hashes(
         &mut self,
         request: &Request,
@@ -1151,28 +1184,33 @@ impl SimpleBlockTracker {
         let all_tokens = &request.all_token_ids;
         let annotations = request.block_annotations.as_ref();
         let mm = request.mm_data.as_ref();
-        let mut req_group_hashes: Vec<Vec<u64>> = vec![Vec::new(); groups.len()];
+        let mut req_hashes = (self.hybrid_req_hashes.remove(&request.request_id))
+            .unwrap_or_else(|| vec![GroupHashes::default(); groups.len()]);
         for (g, grp) in groups.iter().enumerate() {
-            let hashes = self.hash_all_blocks_bs(all_tokens, annotations, mm, grp.block_size);
+            let group = &mut req_hashes[g];
+            self.extend_block_hashes(
+                &mut group.hashes,
+                all_tokens,
+                annotations,
+                mm,
+                grp.block_size,
+            );
             let table = &tables[g];
-            let num_full = all_tokens.len() / grp.block_size;
-            for i in 0..num_full {
-                if i >= table.len() || i >= hashes.len() {
-                    break;
-                }
-                let bid = table[i];
+            let ready = table.len().min(group.hashes.len());
+            let new = group.registered.min(ready)..ready;
+            for (&bid, &hash) in table[new.clone()].iter().zip(&group.hashes[new]) {
                 if bid == Self::NULL_BLOCK {
                     continue; // out-of-window: never register (KV is gone)
                 }
-                let key = (g as u32, hashes[i]);
+                let key = (g as u32, hash);
                 self.hybrid_hash_to_id.insert(key, bid);
                 let slot = self.space_slot(grp.space, bid);
                 self.hybrid_id_to_key.insert(slot, key);
             }
-            req_group_hashes[g] = hashes.into_iter().take(num_full).collect();
+            group.registered = group.registered.max(ready);
         }
         self.hybrid_req_hashes
-            .insert(request.request_id.clone(), req_group_hashes);
+            .insert(request.request_id.clone(), req_hashes);
     }
 
     /// Hybrid prefix-cache lookup. Returns `(num_computed_tokens, per_group
@@ -6569,6 +6607,86 @@ mod tests {
                 assert_eq!(kept.global_reach, uncached.global_reach);
             }
             assert_eq!(kept.preemptions, 0, "{stores:?}");
+        }
+    }
+
+    #[test]
+    fn test_block_hashes_extended_in_pieces_equal_a_full_rehash() {
+        // Extending a request's hashes as its tokens grow gives, at every length, exactly what
+        // hashing all its tokens gives: across relocatable and prefixed span blocks (annotated by
+        // token offset at the config block size) and image placeholders, at both block sizes.
+        use scratchy_core_common::multimodal::{ImageData, PlaceholderRange};
+        let t = SimpleBlockTracker::with_caching(64, 16);
+        let tokens: Vec<u32> = (0..400u32).map(|i| i * 7 % 251).collect();
+        let mut ann = std::collections::BTreeMap::new();
+        ann.insert(3, BlockKind::Relocatable { first_token: 48 });
+        ann.insert(4, BlockKind::Relocatable { first_token: 48 });
+        ann.insert(9, BlockKind::Prefixed { first_token: 0 });
+        let image = |v: f32| ImageData {
+            pixels: vec![v; 12],
+            height: 2,
+            width: 2,
+        };
+        let mm = MultimodalData {
+            images: vec![image(0.5), image(0.25)],
+            image_placeholders: vec![
+                PlaceholderRange {
+                    offset: 20,
+                    length: 30,
+                },
+                PlaceholderRange {
+                    offset: 250,
+                    length: 70,
+                },
+            ],
+        };
+        for block_size in [16usize, 32] {
+            let mut hashes = Vec::new();
+            let mut len = 0;
+            for step in [1usize, 7, 37, 5, 64, 13, 100, 3, 170] {
+                len = (len + step).min(tokens.len());
+                let seen = &tokens[..len];
+                t.extend_block_hashes(&mut hashes, seen, Some(&ann), Some(&mm), block_size);
+                let full = t.hash_all_blocks_bs(seen, Some(&ann), Some(&mm), block_size);
+                assert_eq!(hashes, full, "block size {block_size}, {len} tokens");
+            }
+            assert_eq!(hashes.len(), tokens.len() / block_size);
+        }
+    }
+
+    #[test]
+    fn test_hybrid_decode_registers_every_block_at_its_full_hash() {
+        // A request prefilled then decoded token by token (sealing each step, as the engine does)
+        // ends holding exactly the hashes a full rehash of its tokens gives, each in-window block
+        // registered under its own.
+        for stores in BOTH_STORES {
+            let mut t = SimpleBlockTracker::with_caching(512, 16);
+            t.enable_hybrid(512, vec![(false, 0, 32), (true, 64, 16)], stores);
+            let mut r = hybrid_req("r1", 200);
+            t.allocate_slots(&r, 200, 0, &[]).unwrap();
+            r.num_computed_tokens = 200;
+            t.seal(&r);
+            for i in 0..300u32 {
+                r.append_output_token_ids(&[10_000 + i]);
+                t.allocate_slots(&r, 1, 0, &[]).unwrap();
+                r.num_computed_tokens += 1;
+                t.seal(&r);
+            }
+            let groups = t.swa_groups.clone().unwrap();
+            let tables = t.get_blocks("r1");
+            for (g, grp) in groups.iter().enumerate() {
+                let full = t.hash_all_blocks_bs(&r.all_token_ids, None, None, grp.block_size);
+                assert_eq!(
+                    t.hybrid_req_hashes["r1"][g].hashes, full,
+                    "{stores:?} group {g}"
+                );
+                for (i, &bid) in tables[g].iter().enumerate().take(full.len()) {
+                    if bid != SimpleBlockTracker::NULL_BLOCK {
+                        let key = (g as u32, full[i]);
+                        assert_eq!(t.hybrid_hash_to_id.get(&key), Some(&bid), "{stores:?}");
+                    }
+                }
+            }
         }
     }
 }
