@@ -2610,18 +2610,24 @@ impl AsyncEngine {
                             content_text,
                         );
 
+                        // Whether an arm below already sent this output's finish on a
+                        // content delta — the separate finish delta after the match
+                        // must not duplicate it, and must fire when no arm did.
+                        let mut finish_sent = false;
+
                         match parser_result {
                             ToolParserDelta::Content(content) => {
+                                let attach_finish = is_finished && !req_state.tool_calls_emitted;
                                 let delta = StreamDelta {
                                     index: req_state.choice_index,
                                     new_token_ids: output.new_token_ids.clone(),
                                     text: Some(content),
-                                    finish_reason: if is_finished && !req_state.tool_calls_emitted {
+                                    finish_reason: if attach_finish {
                                         delta_finish_reason
                                     } else {
                                         None
                                     },
-                                    stop_reason: if is_finished && !req_state.tool_calls_emitted {
+                                    stop_reason: if attach_finish {
                                         delta_stop_reason.clone()
                                     } else {
                                         None
@@ -2632,6 +2638,7 @@ impl AsyncEngine {
                                     usage,
                                 };
                                 let _ = tx.send(delta);
+                                finish_sent |= attach_finish;
                             }
                             ToolParserDelta::ToolCalls(tool_deltas) => {
                                 // Emit reasoning delta separately if present.
@@ -2698,13 +2705,31 @@ impl AsyncEngine {
                             }
                         }
 
-                        // Send finish delta separately if finished and tool calls were emitted.
-                        if is_finished && req_state.tool_calls_emitted {
+                        // Send the finish delta separately whenever this output ends
+                        // the request and no arm above already carried the finish.
+                        // The arms above attach it inline only to a content delta
+                        // with no tool calls emitted — a final increment the parser
+                        // returns `None` for reaches none of them. That is the
+                        // normal EOS ending for a tool-parsed reply: the terminal
+                        // token decodes to a control token (gemma 4:
+                        // `<end_of_turn>`) the parser strips to empty, so the last
+                        // `process_delta` says "buffering" and the request finishes
+                        // with no finish-bearing delta ever sent. The stream would
+                        // end with no `message_delta`/`message_stop`, and every SSE
+                        // client reads the response as truncated (Claude Code:
+                        // "Streaming response ended before any complete data was
+                        // received").
+                        if is_finished && !finish_sent {
+                            let finish_reason = if req_state.tool_calls_emitted {
+                                Some(FinishReason::Stop)
+                            } else {
+                                delta_finish_reason
+                            };
                             let finish_delta = StreamDelta {
                                 index: req_state.choice_index,
                                 new_token_ids: vec![],
                                 text: None,
-                                finish_reason: Some(FinishReason::Stop),
+                                finish_reason,
                                 stop_reason: delta_stop_reason.clone(),
                                 logprobs: None,
                                 tool_call_deltas: None,
@@ -5837,6 +5862,62 @@ mod tests {
         let args: serde_json::Value =
             serde_json::from_str(calls[0].function_arguments.as_deref().unwrap()).unwrap();
         assert_eq!(args["command"], "ls");
+    }
+
+    /// Gemma 4 behind Claude Code: a tools-bearing request whose reply is plain
+    /// text. The terminal `<end_of_turn>` token decodes into the stream, the
+    /// gemma4 parser strips it to empty and returns `None` (buffering) for the
+    /// final increment — so no content delta can carry the finish. The stream
+    /// must still end with a finish-bearing delta: without one the SSE response
+    /// ends with no `message_delta`/`message_stop` and the client reads a
+    /// truncated message (Claude Code retries without streaming, then fails).
+    #[test]
+    fn test_streaming_gemma4_plain_reply_ends_with_finish_delta() {
+        let parser = crate::tool_parser::get_tool_parser("gemma4").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(Some(tx));
+        state.tool_parser_state = Some(parser.create_streaming_state());
+        requests.insert("req-1".to_string(), state);
+
+        // Plain-text reply pieces, then the terminal control token with the
+        // finish stamped on the same output — the shape the detokenizer
+        // produces for an EOS ending on a gemma 4 reply.
+        let pieces: [(&[u32], &str, Option<FinishReason>); 3] = [
+            (&[10], "Hello", None),
+            (&[11], ", I'm Claude.", None),
+            (&[106], "<end_of_turn>", Some(FinishReason::Stop)),
+        ];
+        for (ids, text, finish) in pieces {
+            let output = EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: ids.to_vec(),
+                finish_reason: finish,
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            };
+            let detok = Some((None, Some(text.to_string())));
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        }
+
+        let mut content = String::new();
+        let mut finishes = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            content.push_str(delta.text.as_deref().unwrap_or(""));
+            if let Some(f) = delta.finish_reason {
+                finishes.push(f);
+            }
+        }
+        assert_eq!(content, "Hello, I'm Claude.");
+        assert_eq!(
+            finishes,
+            vec![FinishReason::Stop],
+            "the stream must end with exactly one finish-bearing delta"
+        );
     }
 
     #[test]
