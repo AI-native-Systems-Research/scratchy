@@ -26,7 +26,6 @@ serde_json = { workspace = true }
 indicatif = { workspace = true }
 # ureq, not reqwest: see src/http.rs. Same door the Hub downloader uses.
 ureq = { workspace = true }
-tokenizers = { workspace = true }
 rand = { workspace = true }
 # 0.5 is the line that pairs with rand 0.9; 0.4 would pin a second rand.
 rand_distr = "0.5"
