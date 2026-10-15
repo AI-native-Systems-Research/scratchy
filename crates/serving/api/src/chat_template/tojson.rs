@@ -353,8 +353,15 @@ mod tests {
     use crate::chat_template::ChatTemplate;
 
     fn render(template: &str, tools: &str) -> Result<String, crate::error::ServeError> {
-        let tools: serde_json::Value = serde_json::from_str(tools).unwrap();
-        ChatTemplate::new(template.to_owned())?.apply(&[], false, Some(&tools))
+        // Parsed as a request's tool schema is, so the input keeps the key
+        // order it was written in.
+        let tools: crate::protocol::OrderedJson = serde_json::from_str(tools).unwrap();
+        ChatTemplate::new(template.to_owned())?.render_values(
+            minijinja::Value::from(Vec::<minijinja::Value>::new()),
+            false,
+            Some(minijinja::Value::from(minijinja::value::Serde(&tools))),
+            None,
+        )
     }
 
     #[test]

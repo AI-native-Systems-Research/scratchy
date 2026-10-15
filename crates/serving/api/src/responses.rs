@@ -85,7 +85,7 @@ pub struct FunctionToolDef {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub parameters: Option<Value>,
+    pub parameters: Option<crate::protocol::OrderedJson>,
     #[serde(default)]
     pub strict: Option<bool>,
 }
@@ -1139,7 +1139,7 @@ mod tests {
                 tool_type: "function".into(),
                 name: "search".into(),
                 description: Some("Search".into()),
-                parameters: Some(serde_json::json!({"type": "object"})),
+                parameters: Some(serde_json::json!({"type": "object"}).into()),
                 strict: None,
             }],
             tool_choice: None,
