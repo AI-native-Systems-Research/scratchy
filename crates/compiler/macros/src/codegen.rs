@@ -10313,7 +10313,16 @@ fn dump_wavefront_mega(
                                     // only reader (`superdsc_exec::select_body_paged`) is
                                     // `spyre-hw`-gated. Same rule as the prefix/suffix below: bake it
                                     // where it is read.
-                                    let bod_fused = if card {
+                                    // ⛔ NOT FOR A CHUNK CEILING, like no chunk rung: a chunk body has
+                                    // no fold to fuse, so its "twin" is the same program again — and
+                                    // the selector's single-page arm takes the first FUSED rung that
+                                    // covers the context, which past the per-page bodies was this one.
+                                    // A prompt chunk whose prefix is exactly one page (`valid_len` 257,
+                                    // `n_fold_pages` 1) ran the 64-page chunk: ~0.45 s against ~0.1 s
+                                    // for its neighbours, on every request (granite-2b, 96 and 128
+                                    // rows). Without the twin it falls to the split ladder's 2-page
+                                    // chunk. The ladder proves it (`no_chunk_has_a_fused_twin`).
+                                    let bod_fused = if card && chunk_ceiling.is_none() {
                                         superdsc::emit_bundle(
                                             &rolled.body,
                                             Some(&rolled.layout),
@@ -10404,6 +10413,9 @@ fn dump_wavefront_mega(
                                                 scratchy_target_spyre::fold_plan::RungReach {
                                                     folds: folds_of(&bfp),
                                                     chunk: chunk_ceiling.is_some(),
+                                                    fused_twin: !decode_rungs[0]
+                                                        .body_fused
+                                                        .is_none(),
                                                 },
                                             )];
                                             // The per-page sweep rungs below one page — every decode
@@ -10536,9 +10548,10 @@ fn dump_wavefront_mega(
                                                                     // has no fold group, so its "fused" twin
                                                                     // is the same program under a second
                                                                     // name — a whole extra bake per rung —
-                                                                    // and the selector reaches a fused twin
-                                                                    // only within one page, where no chunk
-                                                                    // rung is ever chosen.
+                                                                    // and the selector's one-pass arm keys
+                                                                    // on a one-page PREFIX, which a prompt
+                                                                    // chunk past one page has. Proven below
+                                                                    // (`no_chunk_has_a_fused_twin`).
                                                                     let rfused = if card
                                                                         && rung_chunk.is_none()
                                                                     {
@@ -10567,6 +10580,13 @@ fn dump_wavefront_mega(
                                                                         scratchy_target_spyre::fold_plan::RungReach {
                                                                             folds: rung_folds,
                                                                             chunk: rung_chunk.is_some(),
+                                                                            // Read off the rung just pushed:
+                                                                            // the record the runtime loads.
+                                                                            fused_twin: decode_rungs
+                                                                                .last()
+                                                                                .is_some_and(|r| {
+                                                                                    !r.body_fused.is_none()
+                                                                                }),
                                                                         },
                                                                     ));
                                                                 }
@@ -10603,6 +10623,16 @@ fn dump_wavefront_mega(
                                                     Ok(at) => at as u32,
                                                     Err(e) => panic!("[spyre-superdsc] {base}: {e}"),
                                                 };
+                                            // ⛔ AND NO CHUNK RUNG BAKES A FOLD-FUSED TWIN: the
+                                            // selector's one-pass arm would run it for a prompt chunk
+                                            // over a one-page prefix (see the twins' bake above).
+                                            if let Err(e) =
+                                                scratchy_target_spyre::fold_plan::no_chunk_has_a_fused_twin(
+                                                    &reach,
+                                                )
+                                            {
+                                                panic!("[spyre-superdsc] {base}: {e}");
+                                            }
                                             // ⭐ THE LAYER LOOP, ATTACHED TO THE BODY IT DESCRIBES.
                                             // Every fingerprint in it is a sibling the registry
                                             // resolves at load, and `RerollMeta::siblings` walks the
@@ -11199,9 +11229,9 @@ fn dump_wavefront_mega(
         /// extra chunk. A 65-row prompt split 63+2 and the 2-token tail alone cost 56.8 ms.
         /// 80 sits between 63 and 96 to halve the worst-case padding in that gap.
         ///
-        /// `2^k − 1` is no longer required now that the widths exceed one stick, but every value here
-        /// still avoids the structural dims (4, 8, 32, 64, 128, 256, 2048, 8192) so `symbolicize_seq`
-        /// cannot mistake the tape width for a model dim.
+        /// `2^k − 1` is no longer required: this ladder is the SuperDSC bake's alone, and that prefill
+        /// tape is CONCRETE (`seq_sym` is forced to `None` below), so `symbolicize_seq` never runs on
+        /// it. That is why 128 may equal granite-8b's head_dim here.
         ///
         /// Rungs that fail to lower for a given model are logged and SKIPPED, so this list is an upper
         /// bound on the ladder, not a promise — a model whose FFN blows the LX budget at a wide rung
@@ -11229,21 +11259,26 @@ fn dump_wavefront_mega(
         /// none of it. 7 and 11 cover that. Measured mid-range case: a 20-token prompt sat on rung 23
         /// (`n_new=23` in the phase log) and wasted 3 rows; 21 takes that to one.
         ///
-        /// 🛑 96 IS A HARD CEILING UNTIL K-TIME PSUM LANDS — it is not a tuning choice. Chunk count
-        /// dominates TTFT (measured 2026-07-30: splitting a ~23-token prompt 15+8 instead of one chunk
-        /// cost **+48 ms**, since a forward's ~40-45 ms fixed term is paid PER CHUNK), so taller rungs
-        /// are exactly the right lever — but adding 127 fails the BUILD, not the ladder:
+        /// ⭐ THE CEILING IS 128, AND 127 IS WHY IT WAS 96. Chunk count dominates TTFT (measured
+        /// 2026-07-30: splitting a ~23-token prompt 15+8 instead of one chunk cost **+48 ms**, since a
+        /// forward's ~40-45 ms fixed term is paid PER CHUNK), so taller rungs are exactly the right
+        /// lever. Adding 127 failed the BUILD, not the ladder:
         ///   time_tile_for_lx('out'): per-core tile does not fit the 1,677,721-B usable LX scratchpad
         ///   even tiled to single 64-elem sticks (resident 1,923,712 B) — needs K-time PSUM
         ///   accumulation (Stage 2), which the frontend does not emit.
-        /// That is down_proj (K=8192) at mq_pad=128. Note this contradicts "logged and SKIPPED" above:
-        /// the skip covers a `lower_decode_to_wavefront` Err, but an LX overflow raises inside
-        /// `emit_bundle` and PANICS the proc-macro. So do not extend this list expecting a graceful
-        /// fallback — prove the rung lowers first, or make interior-rung bake failures skip while the
-        /// ceiling keeps panicking (the panic is deliberate: a swallowed eprintln once shipped a
-        /// zero-group bundle that only crashed at pod load).
-        const PREFILL_RUNGS: [u32; 21] = [
-            7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96,
+        /// That is down_proj (K=8192) — but at 127 rows, which is PRIME: `matmul_split_plan` splits `mb`
+        /// only over divisors of M, so every core kept all 127 rows. 128 splits, and every granite-2b
+        /// projection fits LX at one stick. MEASURED, granite-3.1-2b fp16 on card: a 10k-token prompt's
+        /// TTFT 25.65 s at 96 rows → 17.07 s at 128, 3/3 byte-identical; 1k 1.67 → 1.30 s. And 128 divides
+        /// the page, so no chunk steps back (see `PagedKvPool::PREFILL_CHUNK_SLOTS`).
+        ///
+        /// ⛔ An LX overflow still PANICS the proc-macro rather than shortening the ladder — the skip above
+        /// covers a `lower_decode_to_wavefront` Err, and an overflow raises inside `emit_bundle`. That
+        /// panic is deliberate (a swallowed eprintln once shipped a zero-group bundle that only crashed
+        /// at pod load), so a rung added here must be proven to lower on every spyre model first.
+        const PREFILL_RUNGS: [u32; 23] = [
+            7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112,
+            128,
         ];
         // ⛔ THE POOL SIZES ITS SLACK FROM THIS CEILING, so the two cannot be allowed to drift.
         //
@@ -11392,8 +11427,8 @@ fn dump_wavefront_mega(
         // of the whole model, and the emulator worker can only ever run ONE of them:
         // `KtirBundle::prefill` is a single `Option` (`manifest.rs:167`) and the narrower rungs are
         // reached through `prefill_rungs`, which `spyre_forward.rs` reads under `spyre-hw` alone.
-        // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 — the generated model source
-        // and rustc's single-threaded pass over it both paid for all 21.
+        // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (23 now, at 128) — the generated
+        // model source and rustc's single-threaded pass over it both paid for all of them.
         let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-hw") {
             let mut v: Vec<u32> = PREFILL_RUNGS
                 .into_iter()
