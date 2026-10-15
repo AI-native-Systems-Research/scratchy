@@ -46,6 +46,49 @@ pub enum ReasoningDelta {
     None,
 }
 
+impl ReasoningDelta {
+    /// Split into (reasoning, content) parts.
+    fn into_parts(self) -> (Option<String>, Option<String>) {
+        match self {
+            ReasoningDelta::Reasoning(r) => (Some(r), None),
+            ReasoningDelta::Content(c) => (None, Some(c)),
+            ReasoningDelta::Split { reasoning, content } => (reasoning, content),
+            ReasoningDelta::None => (None, None),
+        }
+    }
+
+    /// Concatenate two deltas into one. The engine folds a parser's
+    /// end-of-stream [`StreamingReasoningParserState::flush`] into the final
+    /// output delta with this.
+    pub fn merge(self, other: ReasoningDelta) -> ReasoningDelta {
+        let combine = |a: Option<String>, b: Option<String>| match (a, b) {
+            (Some(mut x), Some(y)) => {
+                x.push_str(&y);
+                Some(x)
+            }
+            // Covers (Some, None), (None, Some) and (None, None).
+            (x, None) | (None, x) => x,
+        };
+        let (reasoning, content) = match (self, other) {
+            (ReasoningDelta::None, x) | (x, ReasoningDelta::None) => return x,
+            (a, b) => {
+                let (ar, ac) = a.into_parts();
+                let (br, bc) = b.into_parts();
+                (combine(ar, br), combine(ac, bc))
+            }
+        };
+        match (reasoning, content) {
+            (None, None) => ReasoningDelta::None,
+            (Some(r), None) => ReasoningDelta::Reasoning(r),
+            (None, Some(c)) => ReasoningDelta::Content(c),
+            (Some(r), Some(c)) => ReasoningDelta::Split {
+                reasoning: Some(r),
+                content: Some(c),
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Traits
 // ---------------------------------------------------------------------------
@@ -59,6 +102,14 @@ pub trait ReasoningParser: Send + Sync {
 
     /// Create a new per-request streaming state.
     fn create_streaming_state(&self) -> Box<dyn StreamingReasoningParserState + Send>;
+
+    /// Whether the parser needs the server to keep special tokens in the
+    /// detokenized text: its markers are real added tokens that
+    /// `skip_special_tokens` would strip before the parser ever runs. Mirrors
+    /// [`crate::tool_parser::ToolCallParser::requires_special_tokens`].
+    fn requires_special_tokens(&self) -> bool {
+        false
+    }
 }
 
 /// Per-request state for streaming reasoning extraction.
@@ -84,6 +135,26 @@ pub trait StreamingReasoningParserState: Send {
         current_token_ids: &[u32],
         delta_token_ids: &[u32],
     ) -> ReasoningDelta;
+
+    /// Whether reasoning can re-open after content in a single generation.
+    ///
+    /// Most formats are strictly reasoning-first (DeepSeek, Qwen3, harmony);
+    /// the engine stops routing text through the parser once content has been
+    /// seen. Gemma 4's thought channels interleave — text, then a channel,
+    /// then a tool call — so its parser overrides this and keeps routing
+    /// every delta.
+    fn interleaved(&self) -> bool {
+        false
+    }
+
+    /// Release anything the parser held back against a marker that never
+    /// arrived, as a final delta. Called once when the request finishes;
+    /// parsers that hold text back across deltas (Gemma 4's channel-name
+    /// hold) must return it here so a reply ending on held text is not
+    /// truncated.
+    fn flush(&mut self) -> ReasoningDelta {
+        ReasoningDelta::None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +637,449 @@ impl StreamingReasoningParserState for GptOssStreamingState {
 }
 
 // ---------------------------------------------------------------------------
+// Gemma 4 Parser
+// ---------------------------------------------------------------------------
+
+/// Reasoning parser for Gemma 4 (dense `gemma4*`, MoE, and `-unified` ports).
+///
+/// Gemma 4 wraps its reasoning in a *channel*: the model emits
+/// `<|channel>thought\n{reasoning}\n<channel|>` and the answer follows the
+/// closing marker. Channels interleave — the model may answer some text,
+/// then open a channel, then make a tool call — and a degenerate stream can
+/// re-open a channel many times without ever closing one (the
+/// "hundreds of lines of `thought`" flood). Both markers are real added
+/// tokens, so this parser is text-based but whitespace-tolerant (shared with
+/// the Gemma 4 tool parser) to also match quantized ports that emit the
+/// markers as ordinary text pieces.
+pub struct Gemma4ReasoningParser;
+
+impl Gemma4ReasoningParser {
+    /// `<|channel>` — opens a channel; the channel name follows.
+    const OPEN_ATOMS: [&str; 4] = ["<", "|", "channel", ">"];
+    /// `<channel|>` — closes the open channel.
+    const CLOSE_ATOMS: [&str; 4] = ["<", "channel", "|", ">"];
+    /// Canonical marker strings, for split-across-deltas detection.
+    const OPEN: &'static str = "<|channel>";
+    const CLOSE: &'static str = "<channel|>";
+}
+
+impl ReasoningParser for Gemma4ReasoningParser {
+    fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
+        let mut state = Gemma4StreamingState::default();
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        state.scan(model_output, &mut reasoning, &mut content);
+        // A complete generation cannot end inside a marker; whatever the
+        // carry holds is trailing text.
+        state.scan_carry(&mut reasoning, &mut content);
+        ExtractedReasoning {
+            reasoning: non_empty(reasoning.trim()),
+            content: non_empty(content.trim()),
+        }
+    }
+
+    fn create_streaming_state(&self) -> Box<dyn StreamingReasoningParserState + Send> {
+        Box::new(Gemma4StreamingState::default())
+    }
+
+    fn requires_special_tokens(&self) -> bool {
+        true
+    }
+}
+
+/// Where the scanner sits relative to the channel markers.
+#[derive(Clone, Copy, Default)]
+enum Gemma4ChannelMode {
+    /// Outside any channel — text is content.
+    #[default]
+    Outside,
+    /// Between the open marker and the newline ending the channel name.
+    Name,
+    /// Inside the channel body; the body routes to reasoning iff `reasoning`.
+    Body { reasoning: bool },
+}
+
+#[derive(Default)]
+struct Gemma4StreamingState {
+    mode: Gemma4ChannelMode,
+    /// Channel name accumulated in [`Gemma4ChannelMode::Name`] (never emitted).
+    name: String,
+    /// Suffix of the previous delta that may be the start of a marker; prepended
+    /// to the next delta so a marker split across deltas still matches.
+    carry: String,
+    /// A trailing newline held back from a thought channel's body: the format
+    /// writes `{reasoning}\n<channel|>`, so a body-final newline is the
+    /// *separator* and must not stream as reasoning. It is dropped when the
+    /// next delta opens with a marker, and emitted as reasoning otherwise.
+    pending_newline: bool,
+    /// Outside-mode text held back because it may be the *name* of a channel
+    /// whose open marker the degenerate stream dropped: the flood shape is
+    /// `thought\n<channel|>` repeated with no `<|channel>` in sight. The
+    /// held text is dropped when a close marker arrives and emitted as
+    /// content otherwise.
+    held: String,
+}
+
+impl Gemma4StreamingState {
+    /// Scan `text`, appending reasoning-channel bodies to `reasoning` and
+    /// everything else to `content`. Marker spans and channel names are
+    /// consumed and never emitted.
+    fn scan(&mut self, text: &str, reasoning: &mut String, content: &mut String) {
+        let mut i = 0;
+        while i < text.len() {
+            match self.mode {
+                Gemma4ChannelMode::Outside => {
+                    let open = crate::tool_parser::gemma4_tolerant_find(
+                        text,
+                        &Gemma4ReasoningParser::OPEN_ATOMS,
+                        i,
+                    );
+                    let close = crate::tool_parser::gemma4_tolerant_find(
+                        text,
+                        &Gemma4ReasoningParser::CLOSE_ATOMS,
+                        i,
+                    );
+                    // Earliest marker: an open starts a channel; a close with
+                    // no channel open is the degenerate flood's leftover.
+                    let boundary = [open, close]
+                        .into_iter()
+                        .flatten()
+                        .min_by_key(|(start, _)| *start);
+                    match boundary {
+                        // A close marker with no channel open — the late stage
+                        // of the flood, where the stream writes
+                        // `thought\n<channel|>` cycles and drops the opens.
+                        // The marker is syntax and must never surface; the
+                        // separator newlines before it and a trailing name
+                        // line are the lost channel's name, dropped with it.
+                        Some((start, end)) if Some((start, end)) == close => {
+                            let mut cut = start;
+                            while cut > i && text[..cut].ends_with('\n') {
+                                cut -= 1;
+                            }
+                            let mut before = &text[i..cut];
+                            let trim = trailing_reasoning_name(before);
+                            if trim > 0 {
+                                before = &before[..before.len() - trim];
+                            }
+                            self.held.clear();
+                            content.push_str(before);
+                            i = end;
+                        }
+                        // A real open: whatever was held was content, not a
+                        // lost channel's name.
+                        Some((start, end)) => {
+                            let held = std::mem::take(&mut self.held);
+                            content.push_str(&held);
+                            content.push_str(&text[i..start]);
+                            i = end;
+                            self.mode = Gemma4ChannelMode::Name;
+                            self.name.clear();
+                        }
+                        None => {
+                            let hold = partial_marker_len(&text[i..]);
+                            let emit_to = text.len() - hold;
+                            let slice = &text[i..emit_to];
+                            if self.held.is_empty() {
+                                // Hold a trailing exact channel name (plus
+                                // its newline) back: the flood writes the
+                                // name in one delta and its close marker in
+                                // the next.
+                                let trim = trailing_reasoning_name(slice);
+                                let (emit, held) = slice.split_at(slice.len() - trim);
+                                content.push_str(emit);
+                                self.held.push_str(held);
+                            } else {
+                                // Waiting on the close: separator newlines
+                                // extend the hold; any other text means the
+                                // hold was content after all.
+                                let nl = slice.len() - slice.trim_start_matches('\n').len();
+                                self.held.push_str(&slice[..nl]);
+                                let rest = &slice[nl..];
+                                if !rest.is_empty() {
+                                    let held = std::mem::take(&mut self.held);
+                                    content.push_str(&held);
+                                    let trim = trailing_reasoning_name(rest);
+                                    let (emit, held) = rest.split_at(rest.len() - trim);
+                                    content.push_str(emit);
+                                    self.held.push_str(held);
+                                }
+                            }
+                            self.carry.push_str(&text[emit_to..]);
+                            i = text.len();
+                        }
+                    }
+                }
+                Gemma4ChannelMode::Name => {
+                    // The name ends at a newline, or — on a degenerate stream
+                    // that never writes one — at whichever marker comes first.
+                    let nl = text[i..].find('\n').map(|rel| (i + rel, i + rel));
+                    let open = crate::tool_parser::gemma4_tolerant_find(
+                        text,
+                        &Gemma4ReasoningParser::OPEN_ATOMS,
+                        i,
+                    );
+                    let close = crate::tool_parser::gemma4_tolerant_find(
+                        text,
+                        &Gemma4ReasoningParser::CLOSE_ATOMS,
+                        i,
+                    );
+                    let boundary = [nl, open, close]
+                        .into_iter()
+                        .flatten()
+                        .min_by_key(|(start, _)| *start);
+                    match boundary {
+                        // Newline: the name is complete, the body follows.
+                        Some((start, end)) if Some((start, end)) == nl => {
+                            self.name.push_str(&text[i..start]);
+                            self.mode = Gemma4ChannelMode::Body {
+                                reasoning: is_reasoning_channel(&self.name),
+                            };
+                            i = end + 1;
+                        }
+                        // Re-open before the name finished: an empty channel;
+                        // restart the name.
+                        Some((start, end)) if Some((start, end)) == open => {
+                            self.name.clear();
+                            i = end;
+                        }
+                        // Close right after the name: an empty channel.
+                        Some((_start, end)) => {
+                            self.mode = Gemma4ChannelMode::Outside;
+                            i = end;
+                        }
+                        None => {
+                            self.name.push_str(&text[i..]);
+                            i = text.len();
+                        }
+                    }
+                }
+                // `is_reasoning` (not `reasoning`) so the binding does not
+                // shadow the `&mut String` sink of the same name.
+                Gemma4ChannelMode::Body {
+                    reasoning: is_reasoning,
+                } => {
+                    // Resolve a newline held back from the previous delta: it
+                    // is the channel separator if a marker opens this delta,
+                    // body text otherwise.
+                    if self.pending_newline {
+                        let marker_opens = crate::tool_parser::gemma4_tolerant_find(
+                            text,
+                            &Gemma4ReasoningParser::CLOSE_ATOMS,
+                            i,
+                        )
+                        .is_some_and(|(start, _)| start == i)
+                            || crate::tool_parser::gemma4_tolerant_find(
+                                text,
+                                &Gemma4ReasoningParser::OPEN_ATOMS,
+                                i,
+                            )
+                            .is_some_and(|(start, _)| start == i);
+                        if !marker_opens {
+                            if is_reasoning {
+                                reasoning.push('\n');
+                            } else {
+                                content.push('\n');
+                            }
+                        }
+                        self.pending_newline = false;
+                    }
+                    let open = crate::tool_parser::gemma4_tolerant_find(
+                        text,
+                        &Gemma4ReasoningParser::OPEN_ATOMS,
+                        i,
+                    );
+                    let close = crate::tool_parser::gemma4_tolerant_find(
+                        text,
+                        &Gemma4ReasoningParser::CLOSE_ATOMS,
+                        i,
+                    );
+                    // Earliest marker ends the body: the close normally, a
+                    // re-open when the stream loops on channel openers.
+                    let boundary = [open, close]
+                        .into_iter()
+                        .flatten()
+                        .min_by_key(|(start, _)| *start);
+                    let (start, end, next) = match boundary {
+                        Some((start, end)) if Some((start, end)) == close => {
+                            (start, end, Gemma4ChannelMode::Outside)
+                        }
+                        // Re-open: the channel implicitly closed empty; start
+                        // a fresh name.
+                        Some((start, end)) => {
+                            self.name.clear();
+                            (start, end, Gemma4ChannelMode::Name)
+                        }
+                        None => {
+                            let hold = partial_marker_len(&text[i..]);
+                            let emit_to = text.len() - hold;
+                            let tail = &text[i..emit_to];
+                            // Hold a thought channel's body-final newline back:
+                            // the format writes `{reasoning}\n<channel|>`, so
+                            // it may be the separator once the next delta
+                            // arrives. Non-reasoning bodies emit verbatim.
+                            if is_reasoning && let Some(stripped) = tail.strip_suffix('\n') {
+                                reasoning.push_str(stripped);
+                                self.pending_newline = true;
+                            } else if is_reasoning {
+                                reasoning.push_str(tail);
+                            } else {
+                                content.push_str(tail);
+                            }
+                            self.carry.push_str(&text[emit_to..]);
+                            i = text.len();
+                            continue;
+                        }
+                    };
+                    // In a thought channel the newline directly before the
+                    // marker is the format's separator, not body.
+                    let body = if is_reasoning {
+                        text[i..start].strip_suffix('\n').unwrap_or(&text[i..start])
+                    } else {
+                        &text[i..start]
+                    };
+                    if is_reasoning {
+                        reasoning.push_str(body);
+                    } else {
+                        content.push_str(body);
+                    }
+                    self.mode = next;
+                    i = end;
+                }
+            }
+        }
+    }
+
+    /// Flush the carry as trailing text (a complete generation cannot end
+    /// inside a marker). A newline still held back at flush time is body
+    /// text — the separator it might have been part of never arrived.
+    fn scan_carry(&mut self, reasoning: &mut String, content: &mut String) {
+        // A name still held back never met its close marker: it was content.
+        let held = std::mem::take(&mut self.held);
+        content.push_str(&held);
+        if self.pending_newline {
+            match self.mode {
+                Gemma4ChannelMode::Body { reasoning: r } => {
+                    if r {
+                        reasoning.push('\n');
+                    } else {
+                        content.push('\n');
+                    }
+                }
+                _ => content.push('\n'),
+            }
+            self.pending_newline = false;
+        }
+        let rest = std::mem::take(&mut self.carry);
+        if rest.is_empty() {
+            return;
+        }
+        match self.mode {
+            Gemma4ChannelMode::Body { reasoning: r } => {
+                if r {
+                    reasoning.push_str(&rest);
+                } else {
+                    content.push_str(&rest);
+                }
+            }
+            _ => content.push_str(&rest),
+        }
+    }
+}
+
+/// Length of the longest suffix of `text` that is a proper prefix of either
+/// Gemma 4 channel marker — text that may grow into a marker once the next
+/// delta arrives.
+fn partial_marker_len(text: &str) -> usize {
+    let mut best = 0;
+    for marker in [Gemma4ReasoningParser::OPEN, Gemma4ReasoningParser::CLOSE] {
+        for n in 1..marker.len() {
+            if text.ends_with(&marker[..n]) && n > best {
+                best = n;
+            }
+        }
+    }
+    best
+}
+
+/// Length of the suffix of `text` that is a reasoning-channel name alone on
+/// its final line, plus that line's trailing newline if present. The flood
+/// stream writes the lost channel's name as a bare line — `thought\n` — so
+/// Outside mode holds exactly that shape back; prose that merely ends with
+/// the word ("I had a thought") does not match and streams normally.
+fn trailing_reasoning_name(text: &str) -> usize {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let line_start = body.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    if is_exact_reasoning_name(&body[line_start..]) {
+        text.len() - line_start
+    } else {
+        0
+    }
+}
+
+/// Exact channel-name match (contrast [`is_reasoning_channel`], which matches
+/// names that *contain* a keyword).
+fn is_exact_reasoning_name(line: &str) -> bool {
+    let l = line.to_lowercase();
+    ["analysis", "think", "thought", "reason", "commentary"].contains(&l.as_str())
+}
+
+impl StreamingReasoningParserState for Gemma4StreamingState {
+    fn process_delta(
+        &mut self,
+        _previous_text: &str,
+        _current_text: &str,
+        delta_text: &str,
+        _previous_token_ids: &[u32],
+        _current_token_ids: &[u32],
+        _delta_token_ids: &[u32],
+    ) -> ReasoningDelta {
+        let mut text = std::mem::take(&mut self.carry);
+        text.push_str(delta_text);
+        // A marker may straddle this delta's boundary; hold its partial start
+        // back so the next delta completes it.
+        let hold = partial_marker_len(&text);
+        let split_at = text.len() - hold;
+        self.carry = text.split_off(split_at);
+
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        self.scan(&text, &mut reasoning, &mut content);
+        match (non_empty(&reasoning), non_empty(&content)) {
+            (None, None) => ReasoningDelta::None,
+            (Some(r), None) => ReasoningDelta::Reasoning(r),
+            (None, Some(c)) => ReasoningDelta::Content(c),
+            (Some(r), Some(c)) => ReasoningDelta::Split {
+                reasoning: Some(r),
+                content: Some(c),
+            },
+        }
+    }
+
+    fn interleaved(&self) -> bool {
+        true
+    }
+
+    fn flush(&mut self) -> ReasoningDelta {
+        // Whatever is held back — a channel name that never met its close
+        // marker, a body-final newline, a partial marker — is trailing text
+        // once the generation is over.
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        self.scan_carry(&mut reasoning, &mut content);
+        match (non_empty(&reasoning), non_empty(&content)) {
+            (None, None) => ReasoningDelta::None,
+            (Some(r), None) => ReasoningDelta::Reasoning(r),
+            (None, Some(c)) => ReasoningDelta::Content(c),
+            (Some(r), Some(c)) => ReasoningDelta::Split {
+                reasoning: Some(r),
+                content: Some(c),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -580,6 +1094,7 @@ pub fn get_reasoning_parser(
         "deepseek_r1" => Ok(Arc::new(DeepSeekR1ReasoningParser::new(vocab)?)),
         "qwen3" => Ok(Arc::new(Qwen3ReasoningParser::new(vocab)?)),
         "gpt_oss" => Ok(Arc::new(GptOssReasoningParser)),
+        "gemma4" => Ok(Arc::new(Gemma4ReasoningParser)),
         other => Err(format!("Unknown reasoning parser: {other}")),
     }
 }
@@ -596,6 +1111,10 @@ pub fn detect_reasoning_parser(arch: &str) -> Option<&'static str> {
     let a = arch.to_lowercase();
     if a.contains("gpt_oss") || a.contains("gpt-oss") || a.contains("gptoss") {
         Some("gpt_oss")
+    } else if a.contains("gemma4") {
+        // Gemma 4 (dense, MoE, and `-unified` ports) wraps reasoning in
+        // `<|channel>thought … <channel|>` channels.
+        Some("gemma4")
     } else if a.contains("deepseek") {
         // deepseek_v3 / R1 emit `<think>…</think>`.
         Some("deepseek_r1")
@@ -1480,9 +1999,333 @@ mod gpt_oss_tests {
         assert_eq!(detect_reasoning_parser("qwen3_5_moe"), Some("qwen3"));
         assert_eq!(detect_reasoning_parser("nemotron_h"), Some("qwen3"));
         assert_eq!(detect_reasoning_parser("deepseek_v3"), Some("deepseek_r1"));
+        // Gemma 4's thought channels (`<|channel>thought … <channel|>`),
+        // dense and MoE alike.
+        assert_eq!(detect_reasoning_parser("gemma4"), Some("gemma4"));
+        assert_eq!(detect_reasoning_parser("gemma4_moe"), Some("gemma4"));
+        assert_eq!(detect_reasoning_parser("gemma4_unified"), Some("gemma4"));
         // Architectures with no known reasoning format get no parser.
-        assert_eq!(detect_reasoning_parser("gemma4"), None);
+        assert_eq!(detect_reasoning_parser("gemma3"), None);
         assert_eq!(detect_reasoning_parser("llama"), None);
         assert_eq!(detect_reasoning_parser("qwen2"), None);
+    }
+}
+
+#[cfg(test)]
+mod gemma4_tests {
+    use super::*;
+
+    /// Drive a streaming state token-by-token (one delta per piece) and
+    /// collect (reasoning, content).
+    fn stream(pieces: &[&str]) -> (String, String) {
+        let parser = Gemma4ReasoningParser;
+        let mut state = parser.create_streaming_state();
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for p in pieces {
+            let r = state.process_delta("", p, p, &[], &[], &[]);
+            match r {
+                ReasoningDelta::Reasoning(s) => reasoning.push_str(&s),
+                ReasoningDelta::Content(c) => content.push_str(&c),
+                ReasoningDelta::Split {
+                    reasoning: Some(r),
+                    content: Some(c),
+                } => {
+                    reasoning.push_str(&r);
+                    content.push_str(&c);
+                }
+                ReasoningDelta::Split {
+                    reasoning: Some(r),
+                    content: None,
+                } => reasoning.push_str(&r),
+                ReasoningDelta::Split {
+                    reasoning: None,
+                    content: Some(c),
+                } => content.push_str(&c),
+                _ => {}
+            }
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn thought_channel_then_answer() {
+        let p = Gemma4ReasoningParser;
+        let r = p.extract_reasoning("<|channel>thought\nweighing options\n<channel|>the answer");
+        assert_eq!(r.reasoning.as_deref(), Some("weighing options"));
+        assert_eq!(r.content.as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn content_then_empty_channel_then_tool_call() {
+        // The live `git status` capture: text, an empty thought channel, then
+        // the tool call. The channel's markers AND its name must never surface.
+        let p = Gemma4ReasoningParser;
+        let out = "```bash\ngit status\n```\n<|channel>thought\n<channel|>\
+                   <|tool_call>call:Bash{command:<|\"|>git status<|\"|>}<tool_call|>";
+        let r = p.extract_reasoning(out);
+        assert_eq!(r.reasoning, None);
+        assert_eq!(
+            r.content.as_deref(),
+            Some(
+                "```bash\ngit status\n```\n<|tool_call>call:Bash{command:<|\"|>git status<|\"|>}<tool_call|>"
+            )
+        );
+    }
+
+    #[test]
+    fn channel_open_loop_is_fully_consumed() {
+        // The reported flood: the model re-opens the thought channel hundreds
+        // of times without closing. The channel *names* must never surface.
+        // The trailing text is the body of the never-closed thought channel,
+        // so it routes to reasoning (same convention as gpt_oss: an
+        // unterminated reasoning channel runs to the end of the output).
+        let p = Gemma4ReasoningParser;
+        let mut out = String::new();
+        for _ in 0..227 {
+            out.push_str("<|channel>thought\n");
+        }
+        out.push_str("finally, the answer");
+        let r = p.extract_reasoning(&out);
+        assert_eq!(r.reasoning.as_deref(), Some("finally, the answer"));
+        assert_eq!(r.content, None);
+    }
+
+    #[test]
+    fn channel_open_loop_then_close_recovers_content() {
+        // The same flood, but the model eventually closes the channel: the
+        // answer after the close marker is content again.
+        let p = Gemma4ReasoningParser;
+        let mut out = String::new();
+        for _ in 0..227 {
+            out.push_str("<|channel>thought\n");
+        }
+        out.push_str("<channel|>finally, the answer");
+        let r = p.extract_reasoning(&out);
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("finally, the answer"));
+    }
+
+    #[test]
+    fn no_channels_is_all_content() {
+        let p = Gemma4ReasoningParser;
+        let r = p.extract_reasoning("plain answer, no channels");
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("plain answer, no channels"));
+    }
+
+    #[test]
+    fn non_reasoning_channel_body_is_content() {
+        // A channel whose name is not a reasoning channel (Gemma 4 only emits
+        // `thought` today) routes its body as content rather than swallowing it.
+        let p = Gemma4ReasoningParser;
+        let r = p.extract_reasoning("<|channel>final\nvisible body\n<channel|>tail");
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("visible body\ntail"));
+    }
+
+    #[test]
+    fn whitespace_variant_markers_match() {
+        // Quantized ports sometimes emit the markers as ordinary text with
+        // stray spaces between the pieces.
+        let p = Gemma4ReasoningParser;
+        let r = p.extract_reasoning("< |channel>thought\ndeliberating\n< channel|>answer");
+        assert_eq!(r.reasoning.as_deref(), Some("deliberating"));
+        assert_eq!(r.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn streaming_matches_extract_token_by_token() {
+        let pieces: Vec<&str> = vec![
+            "```bash",
+            "\ngit",
+            " status",
+            "\n",
+            "```",
+            "\n",
+            "<|channel>",
+            "thought",
+            "\n",
+            "<channel|>",
+            "<|tool_call>",
+            "call:",
+            "Bash",
+            "{",
+            "command:",
+            "<|\"|>",
+            "git",
+            " status",
+            "<|\"|>",
+            "}",
+            "<tool_call|>",
+        ];
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "");
+        assert_eq!(
+            content,
+            "```bash\ngit status\n```\n<|tool_call>call:Bash{command:<|\"|>git status<|\"|>}<tool_call|>"
+        );
+    }
+
+    #[test]
+    fn streaming_thought_first() {
+        let pieces: Vec<&str> = vec![
+            "<|channel>",
+            "thought\n",
+            "Let",
+            " me",
+            " check",
+            "\n",
+            "<channel|>",
+            "The ",
+            "answer",
+        ];
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "Let me check");
+        assert_eq!(content, "The answer");
+    }
+
+    #[test]
+    fn streaming_marker_split_across_deltas() {
+        let pieces: Vec<&str> = vec!["text<", "|chan", "nel>thought\nbody\n<channel", "|>done"];
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "body");
+        assert_eq!(content, "textdone");
+    }
+
+    #[test]
+    fn streaming_open_loop_token_by_token() {
+        // Unterminated channel: the trailing text streams as reasoning.
+        let mut pieces: Vec<&str> = Vec::new();
+        for _ in 0..50 {
+            pieces.extend(vec!["<|channel>", "thought", "\n"]);
+        }
+        pieces.push("answer at last");
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "answer at last");
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn streaming_open_loop_then_close_recovers_content() {
+        let mut pieces: Vec<&str> = Vec::new();
+        for _ in 0..50 {
+            pieces.extend(vec!["<|channel>", "thought", "\n"]);
+        }
+        pieces.extend(vec!["<channel|>", "answer at last"]);
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "");
+        assert_eq!(content, "answer at last");
+    }
+
+    #[test]
+    fn bare_close_flood_is_consumed() {
+        // The flood's late stage, measured on the live stream: the model
+        // drops the `<|channel>` opens and emits `thought\n<channel|>`
+        // cycles. Nothing may reach content or reasoning — not the names,
+        // not the newlines, not the marker text.
+        let p = Gemma4ReasoningParser;
+        let mut out = String::new();
+        for _ in 0..200 {
+            out.push_str("thought\n<channel|>");
+        }
+        out.push_str("finally, the answer");
+        let r = p.extract_reasoning(&out);
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.content.as_deref(), Some("finally, the answer"));
+    }
+
+    #[test]
+    fn bare_close_flood_token_by_token() {
+        // The same flood as the detokenizer splits it: the name, the
+        // separator newline, and the close marker arrive as three deltas.
+        let mut pieces: Vec<&str> = Vec::new();
+        for _ in 0..50 {
+            pieces.extend(vec!["thought", "\n", "<channel|>"]);
+        }
+        pieces.push("answer at last");
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "");
+        assert_eq!(content, "answer at last");
+    }
+
+    #[test]
+    fn bare_close_flood_with_sporadic_opens() {
+        // The live flood still emits a proper empty channel now and then
+        // between the open-less cycles.
+        let mut pieces: Vec<&str> = Vec::new();
+        for k in 0..60 {
+            if k % 7 == 0 {
+                pieces.extend(vec!["<|channel>", "thought", "\n", "<channel|>"]);
+            }
+            pieces.extend(vec!["thought", "\n", "<channel|>"]);
+        }
+        pieces.push("answer at last");
+        let (reasoning, content) = stream(&pieces);
+        assert_eq!(reasoning, "");
+        assert_eq!(content, "answer at last");
+    }
+
+    #[test]
+    fn stray_close_never_reaches_content() {
+        // Marker text is syntax wherever it appears — with a channel open or
+        // not — and must never stream as text.
+        let (reasoning, content) = stream(&["<channel|><|channel><channel|>", "hi"]);
+        assert_eq!(reasoning, "");
+        assert_eq!(content, "hi");
+        let p = Gemma4ReasoningParser;
+        let r = p.extract_reasoning("a<channel|>b");
+        assert_eq!(r.content.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn held_name_released_when_no_close_follows() {
+        // `thought` as ordinary prose is held one delta and then released.
+        let (reasoning, content) = stream(&["I had a ", "thought", " about it"]);
+        assert_eq!(reasoning, "");
+        assert_eq!(content, "I had a thought about it");
+    }
+
+    #[test]
+    fn prose_containing_the_word_is_not_held() {
+        // Only a line that IS the name is held; "I had a thought" streams
+        // untouched even when a close marker follows in a later delta.
+        let (reasoning, content) = stream(&["I had a thought", "!", "<channel|>ok"]);
+        assert_eq!(reasoning, "");
+        assert_eq!(content, "I had a thought!ok");
+    }
+
+    #[test]
+    fn flush_releases_held_text_at_end_of_stream() {
+        // A reply whose final line is the word must not lose it: the engine
+        // folds the parser's flush into the final delta.
+        let parser = Gemma4ReasoningParser;
+        let mut state = parser.create_streaming_state();
+        let _ = state.process_delta("", "", "one ", &[], &[], &[]);
+        let _ = state.process_delta("", "", "thought", &[], &[], &[]);
+        let flushed = state.flush();
+        match flushed {
+            ReasoningDelta::Content(c) => assert_eq!(c, "thought"),
+            other => panic!("expected flushed content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_trailing_partial_marker_flushes_on_extract() {
+        // extract_reasoning is the complete-generation path: a trailing `<`
+        // that streaming would hold in carry is plain text.
+        let p = Gemma4ReasoningParser;
+        let r = p.extract_reasoning("ends with a partial <");
+        assert_eq!(r.content.as_deref(), Some("ends with a partial <"));
+    }
+
+    #[test]
+    fn gemma4_declares_interleaved_and_special_tokens() {
+        let parser = Gemma4ReasoningParser;
+        assert!(parser.requires_special_tokens());
+        assert!(parser.create_streaming_state().interleaved());
+        // The default parsers stay reasoning-first and text-based.
+        assert!(!GptOssReasoningParser.requires_special_tokens());
+        assert!(!GptOssReasoningParser.create_streaming_state().interleaved());
     }
 }

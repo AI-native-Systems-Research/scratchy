@@ -166,6 +166,7 @@ fn long_chat_request() -> scratchy_serving_api::protocol::ChatCompletionRequest 
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }],
         max_tokens: Some(4),
         temperature: Some(0.0),

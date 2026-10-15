@@ -2536,11 +2536,17 @@ impl AsyncEngine {
 
                 // Phase 1: Reasoning parsing (runs before tool parsing).
                 // If reasoning parser is active and reasoning hasn't ended yet,
-                // route through reasoning parser first.
+                // route through reasoning parser first. Interleaved parsers
+                // (Gemma 4's channels open after content too) keep routing
+                // every delta; strictly reasoning-first formats stop here once
+                // content has been seen.
                 let (reasoning_delta, content_text_for_tools) =
                     if let Some(ref mut rp_state) = req_state.reasoning_parser_state {
-                        if !req_state.reasoning_ended {
-                            if let Some(ref text) = delta_text {
+                        if !req_state.reasoning_ended || rp_state.interleaved() {
+                            // The final delta folds in the parser's
+                            // end-of-stream flush: text it held back against
+                            // a marker that never arrived must not vanish.
+                            let rd = if let Some(ref text) = delta_text {
                                 let prev_len = req_state.accumulated_token_ids.len()
                                     - output.new_token_ids.len();
                                 let previous_ids = &req_state.accumulated_token_ids[..prev_len];
@@ -2557,36 +2563,45 @@ impl AsyncEngine {
                                     current_ids,
                                     &output.new_token_ids,
                                 );
-
-                                match rd {
-                                    ReasoningDelta::Reasoning(r) => {
-                                        // Still in reasoning — emit reasoning delta.
-                                        let reasoning_out = if req_state.include_reasoning {
-                                            Some(r)
-                                        } else {
-                                            None
-                                        };
-                                        (reasoning_out, None)
-                                    }
-                                    ReasoningDelta::Content(c) => {
-                                        // Reasoning ended previously, this is content.
-                                        req_state.reasoning_ended = true;
-                                        (None, Some(c))
-                                    }
-                                    ReasoningDelta::Split { reasoning, content } => {
-                                        // Reasoning ends in this delta.
-                                        req_state.reasoning_ended = true;
-                                        let reasoning_out = if req_state.include_reasoning {
-                                            reasoning
-                                        } else {
-                                            None
-                                        };
-                                        (reasoning_out, content)
-                                    }
-                                    ReasoningDelta::None => (None, None),
+                                if is_finished {
+                                    rd.merge(rp_state.flush())
+                                } else {
+                                    rd
                                 }
+                            } else if is_finished {
+                                // Finished with no text (e.g. a stop-token-only
+                                // final step): still release held-back text.
+                                rp_state.flush()
                             } else {
-                                (None, None)
+                                ReasoningDelta::None
+                            };
+
+                            match rd {
+                                ReasoningDelta::Reasoning(r) => {
+                                    // Still in reasoning — emit reasoning delta.
+                                    let reasoning_out = if req_state.include_reasoning {
+                                        Some(r)
+                                    } else {
+                                        None
+                                    };
+                                    (reasoning_out, None)
+                                }
+                                ReasoningDelta::Content(c) => {
+                                    // Reasoning ended previously, this is content.
+                                    req_state.reasoning_ended = true;
+                                    (None, Some(c))
+                                }
+                                ReasoningDelta::Split { reasoning, content } => {
+                                    // Reasoning ends in this delta.
+                                    req_state.reasoning_ended = true;
+                                    let reasoning_out = if req_state.include_reasoning {
+                                        reasoning
+                                    } else {
+                                        None
+                                    };
+                                    (reasoning_out, content)
+                                }
+                                ReasoningDelta::None => (None, None),
                             }
                         } else {
                             // Reasoning already ended — pass text to tool parser or as content.
@@ -3510,14 +3525,21 @@ impl AsyncEngine {
 
         // Some tool parsers (Gemma 4's `<|tool_call>` / `<|"|>`) key on real
         // added tokens that `skip_special_tokens` (default true) would strip
-        // before the parser ever runs. When such a parser is active and the
-        // request actually carries tools, keep special tokens in the output so
-        // the delimiters survive detokenization. Non-tool requests and
+        // before the parser ever runs. The same holds for reasoning parsers
+        // whose thinking markers are added tokens (Gemma 4's thought
+        // channels) — including on tool-less requests, where the reasoning
+        // parser is the only consumer. When such a parser is active, keep
+        // special tokens in the output so the delimiters survive
+        // detokenization. Requests without a special-token-hungry parser and
         // plain-text parsers (Hermes, Granite 3.1, …) are unaffected.
         let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
-        let keep_special_tokens = has_tools
+        let keep_special_tokens = (has_tools
             && self
                 .tool_parser
+                .as_ref()
+                .is_some_and(|p| p.requires_special_tokens()))
+            || self
+                .reasoning_parser
                 .as_ref()
                 .is_some_and(|p| p.requires_special_tokens());
 
@@ -4157,6 +4179,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
             }],
             temperature: Some(0.7),
             top_p: Some(0.9),
@@ -5691,6 +5714,66 @@ mod tests {
             "reasoning should be None without parser"
         );
         assert!(msg.content.is_some(), "content should be present");
+    }
+
+    /// Gemma 4 thought-channel flood (the `launch claude` bug): the stream
+    /// degrades into `thought\n<channel|>` cycles with the `<|channel>` opens
+    /// dropped. Phase 1 must consume the cycles wholesale — no `thought` line
+    /// may stream as text — and the final delta must fold in the parser's
+    /// flush so a reply ending on the held-back word is not truncated.
+    #[test]
+    fn test_streaming_gemma4_flood_consumed_and_flushed() {
+        let vocab = HashMap::new();
+        let parser = crate::reasoning_parser::get_reasoning_parser("gemma4", &vocab).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state = Some(parser.create_streaming_state());
+        state.include_reasoning = true;
+        requests.insert("req-1".to_string(), state);
+
+        let steps: &[(&str, Option<FinishReason>)] = &[
+            ("```bash\ngit status\n```\n", None),
+            ("thought", None),
+            ("\n", None),
+            ("<channel|>", None),
+            ("thought\n", None),
+            ("<channel|>", None),
+            ("one ", None),
+            ("thought", Some(FinishReason::Stop)),
+        ];
+        for (text, finish) in steps {
+            let output = EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![10],
+                finish_reason: *finish,
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            };
+            let detok = Some((None, Some(text.to_string())));
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        }
+
+        let mut content_parts = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            if let Some(t) = delta.text {
+                content_parts.push(t);
+            }
+        }
+        let content = content_parts.join("");
+        assert_eq!(
+            content, "```bash\ngit status\n```\none thought",
+            "flood cycles must vanish and the final held word must flush"
+        );
+        assert!(
+            !content.contains("<channel|>"),
+            "marker text must never stream as content"
+        );
     }
 
     #[test]
