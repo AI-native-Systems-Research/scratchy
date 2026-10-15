@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ServeError;
 use crate::protocol;
 
+mod generation;
+#[cfg(test)]
+mod hf_renders;
 mod tojson;
 
 // ---------------------------------------------------------------------------
@@ -95,7 +98,10 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     // tool schemas and tool-call arguments reach the prompt through it.
     env.add_filter("tojson", tojson::tojson);
 
-    env.add_template_owned("chat", template_str.to_owned())
+    // HuggingFace's `{% generation %}` block, compiled as the call block it is.
+    env.add_function(generation::CALLEE, generation::render_caller);
+
+    env.add_template_owned("chat", generation::respell(template_str).into_owned())
         .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;
 
     Ok(env)
@@ -164,9 +170,9 @@ impl ChatTemplate {
 
     /// Load a `ChatTemplate` from a `tokenizer_config.json` file.
     ///
-    /// Returns `None` if the file doesn't exist or doesn't contain a
-    /// `chat_template` field (falls back to a sibling
-    /// `chat_template.jinja` in both cases).
+    /// Returns `None` if the file doesn't exist or its `chat_template` is
+    /// missing or empty and there is no sibling `chat_template.jinja` to
+    /// fall back to.
     pub fn from_tokenizer_config(path: &Path) -> Result<Option<Self>, ServeError> {
         if !path.exists() {
             return Self::from_sibling_jinja(path);
@@ -214,7 +220,7 @@ impl ChatTemplate {
         };
 
         if template_str.is_empty() {
-            return Ok(None);
+            return Self::from_sibling_jinja(path);
         }
 
         let bos_token = extract_token_string(config.bos_token);
@@ -848,6 +854,32 @@ mod tests {
             result,
             r#"TOOLS:[{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]"#
         );
+    }
+
+    fn render_messages(template: &str, messages: &str) -> Result<String, ServeError> {
+        let messages: Vec<serde_json::Value> = serde_json::from_str(messages).unwrap();
+        ChatTemplate::new(template.to_owned())?.apply(&messages, false, None)
+    }
+
+    /// `{% break %}`, `{% continue %}` and `{% generation %}` — the statements
+    /// HuggingFace's environment adds to Jinja — render what transformers
+    /// renders, `{% generation %}`'s body in its own scope.
+    #[test]
+    fn test_statements_render_what_huggingface_renders() {
+        for &(template, messages, expected) in hf_renders::HF_STATEMENT_RENDERS {
+            assert_eq!(
+                render_messages(template, messages).unwrap(),
+                expected,
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_statements_refuse_what_huggingface_refuses() {
+        for &(template, messages) in hf_renders::HF_STATEMENT_ERRORS {
+            assert!(render_messages(template, messages).is_err(), "{template}");
+        }
     }
 
     /// An assistant message whose arguments the template will try to iterate.
