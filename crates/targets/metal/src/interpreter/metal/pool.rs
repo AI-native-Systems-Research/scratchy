@@ -497,6 +497,19 @@ impl PickedRung<'_> {
         }
         arena_layout
     }
+
+    /// The arena slots the host reads by pointer, which stay shared: each bucket's backbone hidden
+    /// states (an MTP head's next input; an encoder's output, its terminal too) and, where the host
+    /// reads the logits (`terminal`), each terminal slot.
+    pub fn host_slots(&self, terminal: TerminalReads) -> Vec<u32> {
+        (self.tapes.iter())
+            .flat_map(|(spec, _)| {
+                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
+                [Some(spec.backbone_slot), logits]
+            })
+            .flatten()
+            .collect()
+    }
 }
 
 /// Pick the macro-baked rung a pool on `device` runs: the device's generation class and
@@ -721,6 +734,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         )?;
         let variant = rung.variant();
         let arena_layout = rung.arena_layout();
+        let host_slots = rung.host_slots(terminal);
         let picked = rung.tapes;
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
@@ -735,16 +749,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
-        // Every slot the host reads by pointer stays shared: each bucket's backbone hidden states
-        // (an MTP head's next input; an encoder's output, its terminal too) and, where the host
-        // reads the logits, each terminal slot.
-        let host_slots = (picked.iter())
-            .flat_map(|(spec, _)| {
-                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
-                [Some(spec.backbone_slot), logits]
-            })
-            .flatten()
-            .collect();
         let sparse_plan = SparsePlan {
             bucket_arena: picked.iter().map(|(spec, _)| spec.arena_bytes).collect(),
             host_slots,
