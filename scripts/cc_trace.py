@@ -41,10 +41,12 @@ in the leaderboard's Lane A shape (`site/build_leaderboard.py` validates it):
         --out run-laneA.json
 
 One engine per invocation: alternating engines across repeats is the runner's
-job, not this tool's. A run that cannot be trusted — the engine's request
-counter disagrees with what was sent, a turn returned no tokens, timed out or
-answered 4xx — is written with `status: "void"` and the reason, and exits
-non-zero. Standard library only.
+job, not this tool's. A run that cannot be trusted is written with
+`status: "void"` and the reason, and exits non-zero. That covers a session
+too long for the engine's context window, a request counter that disagrees
+with what was sent, a prefix cache that survived its reset, and a turn that
+returned no tokens, timed out, answered 4xx or was cut short at max_tokens.
+Standard library only.
 """
 
 import argparse
@@ -123,6 +125,11 @@ def _json_or_none(data):
         return None
 
 
+def _connect(scheme, host, port, timeout):
+    cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    return cls(host, port, timeout=timeout)
+
+
 def script_sha():
     """The checkout this script runs from, with `-dirty` when it has local edits."""
     try:
@@ -139,11 +146,10 @@ def script_sha():
 def probe_engine(upstream, timeout=3):
     """Ask the engine behind `upstream` what it is: {"name", "version"} or None."""
     scheme, host, port, base = upstream
-    conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
     # ollama answers /api/version; scratchy answers /server_info.
     for path, read in (("/api/version", lambda j: ("ollama", j.get("version"))),
                        ("/server_info", lambda j: ("scratchy", j["system_env"]["vllm_version"]))):
-        conn = conn_cls(host, port, timeout=timeout)
+        conn = _connect(scheme, host, port, timeout)
         try:
             conn.request("GET", base + path)
             resp = conn.getresponse()
@@ -334,8 +340,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
     def _forward(self, body, row):
         scheme, host, port, base = self.upstream
-        conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-        conn = conn_cls(host, port, timeout=self.upstream_timeout)
+        conn = _connect(scheme, host, port, self.upstream_timeout)
         saved = None
         # Everything below closes the upstream socket on the way out, so an
         # engine is never left generating for a client that has gone.
@@ -409,7 +414,7 @@ for _m in METHODS:
     setattr(RelayHandler, f"do_{_m}", RelayHandler._relay)
 
 
-def _parse_upstream(url, flag="--upstream"):
+def _parse_url(url, flag="--upstream"):
     u = urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise SystemExit(f"{flag} must be an http(s) URL, got {url!r}")
@@ -423,7 +428,7 @@ class _Server6(http.server.ThreadingHTTPServer):
 def make_server(listen, upstream, out, *, agent=None, engine_sha=None,
                 upstream_timeout=1200, redact=()):
     """Build (not start) a recording relay. `listen` is (host, port); port 0 picks one."""
-    up = _parse_upstream(upstream)
+    up = _parse_url(upstream)
     corpus = Corpus(out, upstream, f"{listen[0]}:{listen[1]}", agent=agent,
                     engine=probe_engine(up), engine_sha=engine_sha)
     handler = type("Handler", (RelayHandler,), {
@@ -482,27 +487,44 @@ def cmd_record(args):
 
 SCHEMA = 1
 TURN_PATH = "/v1/messages"
-# The engines a leaderboard run carries per-engine provenance for, and whether
-# each one's server reports `requests_served` (#161 fairness rule 7). Data, not
-# a code path: the replay is the same for both.
-ENGINES = {"scratchy": {"counts_requests": True}, "ollama": {"counts_requests": False}}
+# What each engine's server offers the replay's checks. Data, not a code path:
+# the replay itself is the same for both.
+#   counts_requests  reports `requests_served` on /server_info (#161 fairness rule 7)
+#   reset_path       clears the prefix cache; POSTed before every repeat
+ENGINES = {
+    "scratchy": {"counts_requests": True, "reset_path": "/reset_prefix_cache"},
+    "ollama": {"counts_requests": False, "reset_path": None},
+}
+# Provenance a run names for both engines. It comes from flags: the tool cannot
+# discover it, and the validator requires both sides' values on every run.
+PER_ENGINE_PROVENANCE = ("kv_cache_dtype", "quantization", "checkpoint_revision")
 # `site/build_leaderboard.py`'s TURN_CLASSES; "all" is the headline cell itself.
 TURN_CLASSES = ("all", "tool-call", "file-write")
 # Claude Code writes files through these tools, so a turn that calls one is a
-# file-write rather than a tool call. A text-only reply this long is a file
-# written inline.
+# file-write rather than a tool call.
 FILE_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
-LONG_TEXT_CHARS = 2000
 # Delta fields that carry generated content. A delta with all of them empty
 # (or a `signature_delta`) is framing, not a first token.
 DELTA_CONTENT = ("text", "partial_json", "thinking")
 # Request headers the replay does not resend: framing, and compression (the
 # stream is timed as plain bytes). Redacted secrets are dropped by value.
 NOT_REPLAYED = HOP_BY_HOP | {"accept-encoding"}
-# Disclosure ids, declared in site/data/leaderboard/board.json.
-DISCLOSE_NO_COUNTER = "requests-served-unavailable"
+# Lane A metrics read straight off each turn, and why a run can have none.
+TURN_METRICS = {
+    "ttft_ms": "no turn produced content",
+    "tpot_ms": "no turn streamed its reply in more than one delta",
+    "turn_e2e_ms": "no turn finished",
+    "reprefill_ratio": "no turn reported its prompt usage",
+}
+E2E_STAR_NONE = ("no turn both streamed its reply and has a recorded response to take the "
+                 "output length from")
+# Disclosure ids. The first two are declared in site/data/leaderboard/board.json;
+# the other three are not yet (#441).
 DISCLOSE_KV = "kv-dtype-unmatched"
 DISCLOSE_QUANT = "quantizer-differs"
+DISCLOSE_NO_COUNTER = "requests-served-unavailable"
+DISCLOSE_NO_RESET = "prefix-cache-not-reset"
+DISCLOSE_SERIAL = "replay-serialized"
 
 
 class TurnFailed(Exception):
@@ -529,7 +551,15 @@ def reprefill_ratio(input_tokens, cache_read, cache_creation=0):
     return prefilled / total if total else None
 
 
-def sse_events(lines, clock=time.monotonic):
+def prompt_tokens(usage):
+    """The whole prompt's length from Anthropic usage, or None when it has no count."""
+    if usage.get("input_tokens") is None:
+        return None
+    return sum(usage.get(k) or 0 for k in
+               ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+
+
+def sse_events(lines):
     """(data dict, arrival time) per SSE event from an iterable of raw lines."""
     event, data = None, []
     for raw in lines:
@@ -545,14 +575,14 @@ def sse_events(lines, clock=time.monotonic):
                 raise TurnFailed(f"unparseable SSE data: {b''.join(data)[:200]!r}") from None
             if isinstance(payload, dict):
                 payload.setdefault("type", event)
-                yield payload, clock()
+                yield payload, time.monotonic()
             event, data = None, []
 
 
-def time_stream(lines, t_sent, clock=time.monotonic):
+def time_stream(lines, t_sent):
     """One turn's timings from its Anthropic SSE stream. Raises TurnFailed."""
-    usage, deltas, t_stop = {}, [], None
-    for ev, t in sse_events(lines, clock):
+    usage, deltas, t_stop, stop_reason = {}, [], None, None
+    for ev, t in sse_events(lines):
         kind = ev.get("type")
         if kind == "message_start":
             usage.update((ev.get("message") or {}).get("usage") or {})
@@ -563,6 +593,7 @@ def time_stream(lines, t_sent, clock=time.monotonic):
         elif kind == "message_delta":
             # The final usage; it overrides message_start's provisional one.
             usage.update(ev.get("usage") or {})
+            stop_reason = (ev.get("delta") or {}).get("stop_reason") or stop_reason
         elif kind == "error":
             raise TurnFailed(f"error event: {ev.get('error')}")
         elif kind == "message_stop":
@@ -574,41 +605,52 @@ def time_stream(lines, t_sent, clock=time.monotonic):
     if out <= 0 or not deltas:
         # A dead worker behind a live HTTP layer looks exactly like this (#413).
         raise TurnFailed(f"zero output tokens (output_tokens={out}, {len(deltas)} content deltas)")
+    # A reply that arrives in one delta has no decode interval to measure. Its
+    # TPOT would read as 0 and flatter an engine that buffers its output, so it
+    # has none, the way bench_serve_compare.sh leaves unstreamed requests out.
+    unstreamed = out > 1 and len(deltas) < 2
     gaps = [(b - a) * 1000 for a, b in zip(deltas, deltas[1:])]
     return {
         "ttft_ms": (deltas[0] - t_sent) * 1000,
         "turn_e2e_ms": (t_stop - t_sent) * 1000,
-        "tpot_ms": (deltas[-1] - deltas[0]) * 1000 / (out - 1) if out > 1 else None,
+        "tpot_ms": None if unstreamed or out < 2 else (deltas[-1] - deltas[0]) * 1000 / (out - 1),
         # Per chunk: Anthropic deltas carry text, not token counts (#208).
         "itl_chunk_p99_ms": percentile(gaps, 99) if gaps else None,
+        "unstreamed": unstreamed,
+        "stop_reason": stop_reason,
         "output_tokens": out,
         "input_tokens": usage.get("input_tokens"),
         "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+        "prompt_tokens": prompt_tokens(usage),
         "reprefill_ratio": reprefill_ratio(usage.get("input_tokens"),
                                            usage.get("cache_read_input_tokens"),
                                            usage.get("cache_creation_input_tokens")),
     }
 
 
-def recorded_output_tokens(corpus, row):
-    """Output tokens of the response the recorder saved for `row`, or None.
+def recorded_usage(corpus, row):
+    """{output_tokens, prompt_tokens, stop_reason} of the response the recorder
+    saved for `row`; empty when it saved none.
 
-    The engine-independent output length E2E* normalizes against.
+    The engine-independent reference: E2E* normalizes to its output length, and
+    the context and cut-short checks compare against it.
     """
     path = Path(corpus) / "responses" / f"{row['seq']:06d}.body"
     if not path.exists():
-        return None
+        return {}
     data = path.read_bytes()
     if (row.get("resp_content_encoding") or "").lower() == "gzip":
         data = gzip.decompress(data)
-    out = None
+    usage, stop_reason = {}, None
     try:
         for ev, _ in sse_events(data.splitlines(keepends=True) + [b"\n"]):
-            out = (ev.get("usage") or {}).get("output_tokens", out)
+            usage.update((ev.get("message") or {}).get("usage") or ev.get("usage") or {})
+            stop_reason = (ev.get("delta") or {}).get("stop_reason") or stop_reason
     except TurnFailed:
-        return None
-    return out or None
+        return {}
+    return {"output_tokens": usage.get("output_tokens") or None,
+            "prompt_tokens": prompt_tokens(usage), "stop_reason": stop_reason}
 
 
 def load_corpus(corpus):
@@ -645,7 +687,7 @@ def load_corpus(corpus):
             turns.append({"seq": seq, "query": req.get("query") or "",
                           "headers": req.get("headers") or [], "body": req["body"],
                           "in_flight": row.get("in_flight", 0),
-                          "recorded_output_tokens": recorded_output_tokens(d, row)})
+                          "recorded": recorded_usage(d, row)})
             continue
         skipped[reason] = skipped.get(reason, 0) + 1
     return manifest, turns, skipped
@@ -673,15 +715,11 @@ def _prefix_hashes(messages):
 def reply_class(message):
     """The turn class of one assistant message, or None for "all" only."""
     content = message.get("content")
-    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
-    tools = [b.get("name") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
-    if any(t in FILE_WRITE_TOOLS for t in tools):
+    blocks = content if isinstance(content, list) else []
+    tools = {b.get("name") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"}
+    if tools & FILE_WRITE_TOOLS:
         return "file-write"
-    if tools:
-        return "tool-call"
-    text = sum(len(b.get("text") or "") for b in blocks
-               if isinstance(b, dict) and b.get("type") == "text")
-    return "file-write" if text >= LONG_TEXT_CHARS else None
+    return "tool-call" if tools else None
 
 
 def classify(turns):
@@ -706,12 +744,11 @@ def classify(turns):
 
 def _http(method, url, body=None, timeout=10):
     """(status, parsed JSON or None) for one small request."""
-    scheme, host, port, base = _parse_upstream(url, "URL")
+    scheme, host, port, base = _parse_url(url, "URL")
     path = base or "/"
     if urlsplit(url).query:
         path += "?" + urlsplit(url).query
-    conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(host, port, timeout=timeout)
+    conn = _connect(scheme, host, port, timeout)
     try:
         headers = {"Content-Type": "application/json"} if body is not None else {}
         conn.request(method, path, body=body, headers=headers)
@@ -751,15 +788,15 @@ def send_turn(endpoint, turn, *, temperature, served_model=None, timeout_s=600):
     """Replay one turn and time it. Raises TurnFailed."""
     scheme, host, port, base = endpoint
     body = dict(turn["body"])
-    # The only edits: pinned sampling, and a stream to time. max_tokens, the
-    # messages, the tools and cache_control are the work; they stay as recorded.
+    # The edits: pinned sampling, a stream to time, and (only when asked) the
+    # name the engine serves the model under. max_tokens, the messages, the
+    # tools and cache_control are the work; they stay as recorded.
     body["temperature"] = temperature
     body["stream"] = True
     if served_model:
         body["model"] = served_model
     data = json.dumps(body).encode()
-    conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(host, port, timeout=timeout_s)
+    conn = _connect(scheme, host, port, timeout_s)
     try:
         path = base + TURN_PATH + (f"?{turn['query']}" if turn["query"] else "")
         conn.putrequest("POST", path, skip_accept_encoding=True)
@@ -824,96 +861,104 @@ def parse_per_engine(flag, text):
 
 
 def _stat(values):
+    # `samples` is how many values the stat is over, beside `n`, the repeat count.
     return {"median": round(percentile(values, 50), 4), "p10": round(percentile(values, 10), 4),
-            "p90": round(percentile(values, 90), 4), "p99": round(percentile(values, 99), 4)}
+            "p90": round(percentile(values, 90), 4), "p99": round(percentile(values, 99), 4),
+            "samples": len(values)}
 
 
-def _e2e_star(t):
-    # median_ttft + (output_len - 1) * median_tpot, per turn, with the output
-    # length the *recording* produced: an engine that stops early gains nothing.
-    out = t["recorded_output_tokens"]
-    if out is None:
+def _group(rows, key):
+    out = {}
+    for r in rows:
+        out.setdefault(r[key], []).append(r)
+    return dict(sorted(out.items()))
+
+
+def e2e_star(rows):
+    """median_ttft + (output_len - 1) * median_tpot over `rows`, or None.
+
+    bench_serve_compare.sh's formula, from the medians. Only turns that
+    streamed count, as there. output_len is the median length the *recording*
+    produced for those turns, so an engine that stops early gains nothing.
+    """
+    timed = [t for t in rows if t["tpot_ms"] is not None and t["recorded_output_tokens"]]
+    if not timed:
         return None
-    if out == 1:
-        return t["ttft_ms"]
-    return None if t["tpot_ms"] is None else t["ttft_ms"] + (out - 1) * t["tpot_ms"]
+    return (percentile([t["ttft_ms"] for t in timed], 50)
+            + (percentile([t["recorded_output_tokens"] for t in timed], 50) - 1)
+            * percentile([t["tpot_ms"] for t in timed], 50))
 
 
 def aggregate(samples, *, engine, model, repeat):
-    """(measurements, gaps) from every replayed turn of every repeat."""
-    base = {"lane": "A", "engine": engine, "model": model}
-    headline = {
-        "ttft_ms": lambda t: t["ttft_ms"],
-        "tpot_ms": lambda t: t["tpot_ms"],
-        "turn_e2e_ms": lambda t: t["turn_e2e_ms"],
-        "reprefill_ratio": lambda t: t["reprefill_ratio"],
-        "e2e_star_ms": _e2e_star,
-    }
-    measurements, gaps = [], []
+    """(measurements, gaps, by_turn_index) from every replayed turn of every repeat.
 
-    def cell(metric, pick, facet=None):
-        rows = [(t["turn_index"], v) for t in samples if (v := pick(t)) is not None]
-        if not rows:
+    A per-turn metric's stat is over every (repeat, turn) value, E2E*'s over one
+    value per repeat; `stat.samples` says which. `n` is the repeat count, the
+    page's "×reps". The board takes series points as [x, y] pairs, so the
+    series carries each turn index's p50, and `by_turn_index` (written to the
+    .turns.json artifact) carries its p50 and p99.
+    """
+    base = {"lane": "A", "engine": engine, "model": model}
+    measurements, gaps, by_turn_index = [], [], {}
+    classes = {tc: [t for t in samples if t["turn_class"] == tc] for tc in TURN_CLASSES[1:]}
+    per_turn = _group(samples, "turn_index")
+
+    def add(metric, values, facet=None, points=None):
+        if not values:
             return False
-        m = {**base, "metric": metric, "n": repeat, "stat": _stat([v for _, v in rows])}
+        m = {**base, "metric": metric, "n": repeat, "stat": _stat(values)}
         if facet:
             m["facet"] = facet
-        else:
-            by_turn = {}
-            for i, v in rows:
-                by_turn.setdefault(i, []).append(v)
-            m["series"] = {"x": "turn_index", "points": [
-                [i, round(percentile(vs, 50), 4)] for i, vs in sorted(by_turn.items())]}
+        if points:
+            m["series"] = {"x": "turn_index", "points": points}
         measurements.append(m)
         return True
 
-    for metric, pick in headline.items():
-        if not cell(metric, pick):
-            gaps.append({**base, "metric": metric, "state": "not-run",
-                         "reason": f"no replayed turn yielded a {metric} value"
-                                   + (" (the corpus saved no response to take the output "
-                                      "length from)" if metric == "e2e_star_ms" else "")})
-        for tc in TURN_CLASSES[1:]:
-            cell(metric, lambda t, pick=pick, tc=tc: pick(t) if t["turn_class"] == tc else None,
-                 facet={"turn_class": tc})
+    def per_turn_cells(metric, field, facet=None):
+        def values(rows):
+            return [t[field] for t in rows if t[field] is not None]
+
+        turns = {i: v for i, rows in per_turn.items() if (v := values(rows))}
+        by_turn_index[field] = [{"turn_index": i, "p50": round(percentile(v, 50), 4),
+                                 "p99": round(percentile(v, 99), 4), "samples": len(v)}
+                                for i, v in turns.items()]
+        points = None if facet else [[i, round(percentile(v, 50), 4)] for i, v in turns.items()]
+        found = add(metric, values(samples), facet=facet, points=points)
+        for tc, rows in classes.items():
+            add(metric, values(rows), facet={**(facet or {}), "turn_class": tc})
+        return found
+
+    for metric, none_reason in TURN_METRICS.items():
+        if not per_turn_cells(metric, metric):
+            gaps.append({**base, "metric": metric, "state": "not-run", "reason": none_reason})
+
+    def per_repeat(rows):
+        return [v for reps in _group(rows, "repeat").values() if (v := e2e_star(reps)) is not None]
+
+    points = [[i, round(v, 4)] for i, rows in per_turn.items() if (v := e2e_star(rows)) is not None]
+    by_turn_index["e2e_star_ms"] = [{"turn_index": i, "value": v} for i, v in points]
+    if not add("e2e_star_ms", per_repeat(samples), points=points):
+        gaps.append({**base, "metric": "e2e_star_ms", "state": "not-run", "reason": E2E_STAR_NONE})
+    for tc, rows in classes.items():
+        add("e2e_star_ms", per_repeat(rows), facet={"turn_class": tc})
+
     # ITL: only a per-chunk number exists on the wire, so the headline is a gap
     # and the chunk figure sits beside it under its own facet.
     gaps.append({**base, "metric": "itl_p99_ms", "state": "blocked", "issue": 208,
                  "reason": "Anthropic SSE deltas carry text, not token counts, so per-token "
                            "ITL is not on the wire; see the granularity=chunk facet"})
-    cell("itl_p99_ms", lambda t: t["itl_chunk_p99_ms"], facet={"granularity": "chunk"})
+    per_turn_cells("itl_p99_ms", "itl_chunk_p99_ms", facet={"granularity": "chunk"})
     gaps.append({**base, "metric": "spec_accept_rate", "state": "not-run",
                  "reason": "the Anthropic stream reports no draft acceptance; the replay "
                            "cannot measure it"})
-    return measurements, gaps
+    return measurements, gaps, by_turn_index
 
 
-def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha,
-           kv_cache_dtype, quantization, checkpoint_revision, repeat=3, temperature=0.0,
-           ollama_version=None, context_length=None, served_model=None,
-           server_info_url=None, reset_cache_url=None, timeout_s=600, run_id=None,
-           log=lambda msg: print(msg, file=sys.stderr, flush=True)):
-    """Replay `corpus` against `endpoint` and return (run, turns detail).
+def check_endpoint(up, endpoint, engine, *, ollama_version, context_length, model_name):
+    """(ollama_version, context_length), once the endpoint is shown to be `engine`.
 
-    Configuration problems raise SystemExit before anything is sent. A run that
-    cannot be trusted comes back with status "void" and a `void` reason.
+    Runs before the counter snapshot, because these requests may count.
     """
-    if engine not in ENGINES:
-        raise SystemExit(f"--engine must be one of {sorted(ENGINES)}, got {engine!r}")
-    if repeat < 1:
-        raise SystemExit("--repeat must be at least 1")
-    up = _parse_upstream(endpoint, "--endpoint")
-    manifest, turns, skipped = load_corpus(corpus)
-    if not turns:
-        raise SystemExit(f"{corpus} holds no replayable {TURN_PATH} turns ({skipped or 'empty'})")
-    classify(turns)
-    if manifest.get("agent") != "claude-code" or not manifest.get("agent_version"):
-        raise SystemExit(f"{corpus}: manifest names agent {manifest.get('agent')!r} "
-                         f"{manifest.get('agent_version')!r}, not a Claude Code version")
-    if not scratchy_sha:
-        raise SystemExit("--scratchy-sha is required: the commit the scratchy side was built from")
-
-    # Everything this tool asks before the counter snapshot may itself count.
     found = probe_engine(up)
     if found is None or found["name"] != engine:
         raise SystemExit(f"--endpoint {endpoint} answers as {found and found['name']!r}, "
@@ -925,75 +970,75 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha,
         ollama_version = found["version"]
     if not ollama_version:
         raise SystemExit("--ollama-version is required: the ollama side's version")
-    reported = served_context_length(endpoint, served_model or turns[0]["body"].get("model"))
+    reported = served_context_length(endpoint, model_name)
     if context_length and reported and context_length != reported:
         raise SystemExit(f"--context-length {context_length} but /v1/models reports {reported}")
-    context_length = context_length or reported
-    if not context_length:
+    if not (context_length or reported):
         raise SystemExit("/v1/models reports no max_model_len; pass --context-length")
+    return ollama_version, context_length or reported
 
-    disclosed = []
-    if len(set(kv_cache_dtype.values())) > 1:
-        disclosed.append(DISCLOSE_KV)
-    if len(set(quantization.values())) > 1:
-        disclosed.append(DISCLOSE_QUANT)
-    info_url = server_info_url or endpoint.rstrip("/") + "/server_info"
-    counts = ENGINES[engine]["counts_requests"]
-    void = None
-    served_before = requests_served(info_url)
-    if served_before is None:
-        if counts:
-            void = (f"{info_url} reports no requests_served, so nothing proves this "
-                    "endpoint served the replay (#161 fairness rule 7)")
-        else:
-            disclosed.append(DISCLOSE_NO_COUNTER)
-    resets_count = reset_cache_url and urlsplit(reset_cache_url).netloc == urlsplit(info_url).netloc
 
+def replay_turns(up, turns, *, repeat, temperature, served_model, timeout_s, reset_url,
+                 resets_count, log):
+    """(samples, requests sent, void reason or None) for `repeat` passes over `turns`.
+
+    Stops at the first turn that voids the run: nothing after it is averaged in.
+    """
     sent, samples = 0, []
     for r in range(1, repeat + 1):
-        if void:
-            break
-        if reset_cache_url:
+        if reset_url:
             try:
-                status, _ = _http("POST", reset_cache_url, body=b"{}")
+                status, _ = _http("POST", reset_url, body=b"{}")
             except (OSError, http.client.HTTPException) as e:
                 status = f"{type(e).__name__}: {e}"
-            sent += 1 if resets_count else 0
+            sent += int(resets_count)
             if status not in (200, 204):
-                void = f"--reset-cache-url {reset_cache_url} answered {status}"
-                break
+                return samples, sent, f"cache reset {reset_url} answered {status}"
         for i, t in enumerate(turns, 1):
+            where = f"repeat {r} turn {i} (seq {t['seq']})"
             sent += 1
             try:
                 timing = send_turn(up, t, temperature=temperature, served_model=served_model,
                                    timeout_s=timeout_s)
             except TurnFailed as e:
-                void = f"repeat {r} turn {i} (seq {t['seq']}): {e}"
-                break
+                return samples, sent, f"{where}: {e}"
+            if reset_url and i == 1 and timing["cache_read_input_tokens"]:
+                return samples, sent, (
+                    f"{where}: read {timing['cache_read_input_tokens']} prompt tokens from "
+                    f"the prefix cache right after {reset_url} cleared it, so this repeat "
+                    "did not start cold")
+            recorded_out = t["recorded"].get("output_tokens")
+            cut = timing["stop_reason"] == "max_tokens"
+            if cut and (recorded_out or 0) > timing["output_tokens"]:
+                return samples, sent, (
+                    f"{where}: stopped at max_tokens after {timing['output_tokens']} tokens "
+                    f"where the recording produced {recorded_out}: the reply was cut short "
+                    "(#161 fairness rule 3)")
             samples.append({"repeat": r, "turn_index": i, "seq": t["seq"],
                             "turn_class": t["turn_class"], "in_flight": t["in_flight"],
-                            "recorded_output_tokens": t["recorded_output_tokens"], **timing})
-            log(f"[{engine} r{r} t{i:03d} seq {t['seq']}] ttft {timing['ttft_ms']:.0f}ms "
+                            "recorded_output_tokens": recorded_out,
+                            "recorded_prompt_tokens": t["recorded"].get("prompt_tokens"),
+                            **timing})
+            log(f"[r{r} t{i:03d} seq {t['seq']}] ttft {timing['ttft_ms']:.0f}ms "
                 f"e2e {timing['turn_e2e_ms']:.0f}ms out {timing['output_tokens']} "
                 f"reprefill {timing['reprefill_ratio']}")
+    return samples, sent, None
 
-    served_after = requests_served(info_url) if served_before is not None else None
-    if not void and served_before is not None:
-        if served_after is None or served_after - served_before != sent:
-            void = (f"requests_served went {served_before} -> {served_after} but this tool "
-                    f"sent {sent}: the endpoint did not serve exactly this replay "
-                    "(#161 fairness rule 7)")
 
-    prov = {
+def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung,
+                     scratchy_sha, ollama_version, context_length, engine_provenance,
+                     temperature, cache_reset, served_model, disclosed):
+    """The run's provenance block, every key the leaderboard requires."""
+    differs = [t for t in samples if None not in (t["prompt_tokens"], t["recorded_prompt_tokens"])
+               and t["prompt_tokens"] != t["recorded_prompt_tokens"]]
+    return {
         "machine": machine,
         "rung": rung,
         "scratchy_sha": scratchy_sha,
         "claude_version": manifest["agent_version"],
         "ollama_version": ollama_version,
         "context_length_tokens": context_length,
-        "kv_cache_dtype": kv_cache_dtype,
-        "quantization": quantization,
-        "checkpoint_revision": checkpoint_revision,
+        **engine_provenance,
         "sampling": {"temperature": temperature},
         "trace_corpus": {
             "id": Path(corpus).resolve().name,
@@ -1003,26 +1048,115 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha,
             "skipped": sum(skipped.values()),
             "skipped_by_reason": skipped,
             # The only record of Claude Code's real concurrency; the replay
-            # itself is serial.
+            # itself is serial (DISCLOSE_SERIAL).
             "turns_recorded_in_flight": sum(1 for t in turns if t["in_flight"]),
             "max_in_flight": max(t["in_flight"] for t in turns),
             "turn_classes": {tc: sum(1 for t in turns if t["turn_class"] == tc)
                              for tc in TURN_CLASSES[1:]},
+            "max_recorded_prompt_tokens": max(t["recorded"].get("prompt_tokens") or 0
+                                              for t in turns),
+            # How this run replayed it. The board's provenance has no key of its
+            # own for this, so it travels with the corpus it describes.
+            "replay": {
+                "concurrency": 1,
+                "cache_reset": cache_reset,
+                "served_model": served_model,
+                "unstreamed_turns": sum(1 for t in samples if t["unstreamed"]),
+                "max_tokens_turns": sum(1 for t in samples if t["stop_reason"] == "max_tokens"),
+                "prompt_tokens_differ_turns": len(differs),
+            },
         },
         "disclosed": disclosed,
     }
+
+
+def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_provenance,
+           repeat=3, temperature=0.0, ollama_version=None, context_length=None,
+           served_model=None, server_info_url=None, reset_cache_url=None, timeout_s=600,
+           run_id=None, log=lambda msg: print(msg, file=sys.stderr, flush=True)):
+    """Replay `corpus` against `endpoint` and return (run, turns detail).
+
+    `engine_provenance` maps each PER_ENGINE_PROVENANCE key to a per-engine dict.
+    Configuration problems raise SystemExit before anything is sent. A run that
+    cannot be trusted comes back with status "void" and a `void` reason.
+    """
+    if engine not in ENGINES:
+        raise SystemExit(f"--engine must be one of {sorted(ENGINES)}, got {engine!r}")
+    if repeat < 1:
+        raise SystemExit("--repeat must be at least 1")
+    if not scratchy_sha:
+        raise SystemExit("--scratchy-sha is required: the commit the scratchy side was built from")
+    for key in PER_ENGINE_PROVENANCE:
+        if sorted(engine_provenance.get(key) or {}) != sorted(ENGINES):
+            raise SystemExit(f"{key} must name every engine in {sorted(ENGINES)}")
+    up = _parse_url(endpoint, "--endpoint")
+    manifest, turns, skipped = load_corpus(corpus)
+    if not turns:
+        raise SystemExit(f"{corpus} holds no replayable {TURN_PATH} turns ({skipped or 'empty'})")
+    if manifest.get("agent") != "claude-code" or not manifest.get("agent_version"):
+        raise SystemExit(f"{corpus}: manifest names agent {manifest.get('agent')!r} "
+                         f"{manifest.get('agent_version')!r}, not a Claude Code version")
+    classify(turns)
+    ollama_version, context_length = check_endpoint(
+        up, endpoint, engine, ollama_version=ollama_version, context_length=context_length,
+        model_name=served_model or turns[0]["body"].get("model"))
+
+    reset_path = ENGINES[engine]["reset_path"]
+    reset_url = reset_cache_url or (reset_path and endpoint.rstrip("/") + reset_path)
+    info_url = server_info_url or endpoint.rstrip("/") + "/server_info"
+    disclosed = [d for d, applies in (
+        (DISCLOSE_KV, len(set(engine_provenance["kv_cache_dtype"].values())) > 1),
+        (DISCLOSE_QUANT, len(set(engine_provenance["quantization"].values())) > 1),
+        (DISCLOSE_SERIAL, any(t["in_flight"] for t in turns)),
+        (DISCLOSE_NO_RESET, not reset_url),
+    ) if applies]
+
+    void = None
+    biggest = max(t["recorded"].get("prompt_tokens") or 0 for t in turns)
+    if biggest > context_length:
+        void = (f"the corpus's largest recorded prompt is {biggest} tokens and this engine's "
+                f"context window is {context_length}: the session does not fit "
+                "(#161 fairness rule 3, #322)")
+    served_before = requests_served(info_url)
+    if served_before is None:
+        if ENGINES[engine]["counts_requests"]:
+            void = void or (f"{info_url} reports no requests_served, so nothing proves this "
+                            "endpoint served the replay (#161 fairness rule 7)")
+        else:
+            disclosed.append(DISCLOSE_NO_COUNTER)
+
+    samples, sent = [], 0
+    if not void:
+        resets_count = bool(reset_url) and urlsplit(reset_url).netloc == urlsplit(info_url).netloc
+        samples, sent, void = replay_turns(
+            up, turns, repeat=repeat, temperature=temperature, served_model=served_model,
+            timeout_s=timeout_s, reset_url=reset_url, resets_count=resets_count, log=log)
+    served_after = requests_served(info_url) if served_before is not None else None
+    if not void and served_before is not None:
+        if served_after is None or served_after - served_before != sent:
+            void = (f"requests_served went {served_before} -> {served_after} but this tool "
+                    f"sent {sent}: the endpoint did not serve exactly this replay "
+                    "(#161 fairness rule 7)")
+
+    prov = build_provenance(
+        manifest, corpus, turns, skipped, samples, machine=machine, rung=rung,
+        scratchy_sha=scratchy_sha, ollama_version=ollama_version,
+        context_length=context_length, engine_provenance=engine_provenance,
+        temperature=temperature, cache_reset=bool(reset_url), served_model=served_model,
+        disclosed=disclosed)
     run = {"schema": SCHEMA, "run_id": run_id or f"laneA-{engine}-{model}-{machine}-{rung}",
            "lane": "A", "status": "published", "provenance": prov,
            "measurements": [], "gaps": [], "ablations": []}
+    by_turn_index = {}
     if void:
         # Unpublishable on purpose: the validator rejects both the status and the key.
         run["status"] = "void"
         run["void"] = void
     else:
-        run["measurements"], run["gaps"] = aggregate(samples, engine=engine, model=model,
-                                                     repeat=repeat)
+        run["measurements"], run["gaps"], by_turn_index = aggregate(
+            samples, engine=engine, model=model, repeat=repeat)
     detail = {"requests_served_before": served_before, "requests_served_after": served_after,
-              "sent": sent, "void": void, "turns": samples}
+              "sent": sent, "void": void, "by_turn_index": by_turn_index, "turns": samples}
     return run, detail
 
 
@@ -1033,9 +1167,8 @@ def cmd_replay(args):
         machine=args.machine, rung=args.rung, repeat=args.repeat,
         temperature=args.temperature, scratchy_sha=args.scratchy_sha,
         ollama_version=args.ollama_version, context_length=args.context_length,
-        kv_cache_dtype=parse_per_engine("--kv-cache-dtype", args.kv_cache_dtype),
-        quantization=parse_per_engine("--quantization", args.quantization),
-        checkpoint_revision=parse_per_engine("--checkpoint-revision", args.checkpoint_revision),
+        engine_provenance={k: parse_per_engine("--" + k.replace("_", "-"), getattr(args, k))
+                           for k in PER_ENGINE_PROVENANCE},
         served_model=args.served_model, server_info_url=args.server_info_url,
         reset_cache_url=args.reset_cache_url, timeout_s=args.timeout_s,
         run_id=args.run_id or out.stem)
@@ -1045,8 +1178,9 @@ def cmd_replay(args):
     turns_path.write_text(json.dumps(detail, indent=2) + "\n")
     out.write_text(json.dumps(run, indent=2) + "\n")
     tc = run["provenance"]["trace_corpus"]
-    print(f"{tc['turns']} turns x {args.repeat} replayed, {tc['skipped']} requests skipped; "
-          f"wrote {out} and {turns_path}", file=sys.stderr)
+    print(f"{tc['turns']} turns x {args.repeat} replayed, {tc['skipped']} requests skipped, "
+          f"{tc['replay']['unstreamed_turns']} unstreamed; wrote {out} and {turns_path}",
+          file=sys.stderr)
     if run["status"] == "void":
         raise SystemExit(f"VOID: {run['void']}")
 
@@ -1090,8 +1224,8 @@ def main(argv=None):
     a.add_argument("--server-info-url",
                    help="where requests_served is read (default: <endpoint>/server_info)")
     a.add_argument("--reset-cache-url",
-                   help="POSTed before each repeat, e.g. <endpoint>/reset_prefix_cache "
-                        "(a sanity control)")
+                   help="POSTed before each repeat to clear the prefix cache (default for "
+                        "scratchy, which cannot opt out: <endpoint>/reset_prefix_cache)")
     a.add_argument("--timeout-s", type=float, default=600,
                    help="per-turn ceiling; a timeout voids the run (default 600)")
     a.set_defaults(func=cmd_replay)
