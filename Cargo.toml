@@ -133,8 +133,10 @@ zeromq = "0.6"
 tokenizers = { version = "0.23", default-features = false, features = ["onig", "esaxx_fast"] }
 
 # Template engine (for HuggingFace chat templates)
-minijinja = { version = "2", features = ["builtins", "json", "loader"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
+# `preserve_order`: template maps keep insertion order like the Python dicts
+# HuggingFace renders with, so `tojson` and `.items()` match its prompt bytes.
+minijinja = { version = "3", features = ["builtins", "json", "preserve_order", "serde"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
 
 # Structured output / constrained decoding
 llguidance = { version = "1.6" }

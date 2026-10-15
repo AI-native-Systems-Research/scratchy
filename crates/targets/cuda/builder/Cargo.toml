@@ -13,4 +13,4 @@ cuda = ["cudaforge"]
 cudaforge = { version = "0.1.6", optional = true }
 dirs = { workspace = true }
 # FlashInfer per-tuple shim is rendered at build time from `templates/`.
-minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
+minijinja = { version = "3", default-features = false, features = ["builtins"] }
