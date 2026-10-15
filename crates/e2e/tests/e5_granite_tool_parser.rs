@@ -51,13 +51,16 @@ fn weather_tool() -> ChatCompletionToolsParam {
         function: FunctionDefinition {
             name: "get_weather".to_string(),
             description: Some("Get the weather for a city".to_string()),
-            parameters: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string"}
-                },
-                "required": ["city"]
-            }).into()),
+            parameters: Some(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    },
+                    "required": ["city"]
+                })
+                .into(),
+            ),
         },
     }
 }

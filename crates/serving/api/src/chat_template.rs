@@ -462,10 +462,9 @@ impl<'a> TemplateMessageView<'a> {
                     call_type: &call.call_type,
                     function: TemplateFunctionCallView {
                         name: &call.function.name,
-                        arguments: serde_json::from_str(&call.function.arguments)
-                            .unwrap_or_else(|_| {
-                                minijinja::Value::from(call.function.arguments.as_str())
-                            }),
+                        arguments: serde_json::from_str(&call.function.arguments).unwrap_or_else(
+                            |_| minijinja::Value::from(call.function.arguments.as_str()),
+                        ),
                     },
                 })
                 .collect()
@@ -842,7 +841,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = tpl.render_chat(&[], Some(&tools), None, None, false).unwrap();
+        let result = tpl
+            .render_chat(&[], Some(&tools), None, None, false)
+            .unwrap();
         assert_eq!(
             result,
             r#"TOOLS:[{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]"#
@@ -932,7 +933,10 @@ mod tests {
         msg.tool_calls.as_mut().unwrap()[0].function.arguments =
             r#"{"path":"/tmp","command":"ls","args":{"z":1,"a":2}}"#.to_string();
         let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
-        assert_eq!(out, r#"{"path": "/tmp", "command": "ls", "args": {"z": 1, "a": 2}}"#);
+        assert_eq!(
+            out,
+            r#"{"path": "/tmp", "command": "ls", "args": {"z": 1, "a": 2}}"#
+        );
     }
 
     /// Normalization must not overwrite content a message actually has.
