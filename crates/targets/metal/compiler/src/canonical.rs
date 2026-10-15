@@ -263,6 +263,8 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
         has_spec_tokens: false,
         unrotated_blocks: false,
         gdn_plain: true,
+        // A decode step's sequences are one row each.
+        gdn_plain_rows: false,
     };
     let runs = |r: &StepRow| matches!(r, StepRow::Step(_, g) if gate_matches(*g, decode));
     (t.rows.iter().zip(flags))

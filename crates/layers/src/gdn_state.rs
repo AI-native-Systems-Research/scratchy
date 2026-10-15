@@ -230,6 +230,123 @@ impl GdnStep {
     }
 }
 
+/// Where one sequence's recurrent state comes from and goes in a step — the per-sequence element
+/// of the `state_indices` buffer every GDN and Mamba-2 kernel reads (the shaders' `GdnSeqSlots`,
+/// `shaders/gdn_state.h`, the same 24 bytes).
+///
+/// The prefix cache keeps snapshots of the state in slots past the live ones, in the same
+/// buffers, so a kernel reaches them by index alone:
+/// * a restore — a request resuming at a cached prefix — reads its start state from the
+///   snapshot (`source`) and writes the step's state to its own `slot`, with no copy;
+/// * a save stores the state after a given row into a snapshot slot as the scan passes that row,
+///   inside the forward that runs it.
+///
+/// The record is built only through [`Self::plain`], [`Self::restoring`] and [`Self::saving`];
+/// [`Self::words`] alone writes the kernels' encoding (`source` as slot + 1, a save of `0` rows as
+/// none), so no caller writes a sentinel by hand. All zeros is a plain step on slot 0: a zeroed
+/// buffer tail is a no-op (`runtime.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnSeqSlots {
+    /// The sequence's own slot: where the step's state lands.
+    slot: GdnSlot,
+    /// The snapshot a [`GdnStart::Slot`] start reads instead of `slot` — a restore. Ignored by
+    /// every other start.
+    source: Option<GdnSlot>,
+    /// Up to [`GDN_SAVES`] snapshot stores, in any order.
+    saves: [Option<GdnSave>; GDN_SAVES],
+}
+
+/// Snapshot stores one sequence's step can carry: the kernels' `GDN_SAVES` (`gdn_state.h`).
+pub const GDN_SAVES: usize = 2;
+
+/// A slot of a GDN state pool — a live sequence's or, past them, a snapshot's — as the kernels
+/// index it (an `i32`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GdnSlot(u32);
+
+impl GdnSlot {
+    /// Slot `index`. Panics from `i32::MAX` on (a `source` word is the slot + 1), which no pool
+    /// reaches: a slot is megabytes of state.
+    pub fn new(index: usize) -> Self {
+        let slot = u32::try_from(index)
+            .ok()
+            .filter(|&s| s < i32::MAX as u32)
+            .expect("a GDN state slot index fits the kernels' i32");
+        Self(slot)
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The slot as the kernels index it.
+    pub fn word(self) -> i32 {
+        self.0 as i32
+    }
+}
+
+/// One snapshot store: once a step has run the sequence's first `rows_through` rows, the state
+/// after them is ALSO stored into `snapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnSave {
+    pub rows_through: std::num::NonZeroU32,
+    pub snapshot: GdnSlot,
+}
+
+impl GdnSeqSlots {
+    /// `i32`s per sequence in the flattened `state_indices` buffer.
+    pub const WORDS: usize = 6;
+
+    /// A step on `slot` with no snapshot work — what every sequence was before snapshots.
+    pub fn plain(slot: GdnSlot) -> Self {
+        Self {
+            slot,
+            source: None,
+            saves: [None; GDN_SAVES],
+        }
+    }
+
+    /// This step's slot start reads `source` — a snapshot it resumes from — not its own slot.
+    pub fn restoring(self, source: GdnSlot) -> Self {
+        Self {
+            source: Some(source),
+            ..self
+        }
+    }
+
+    /// This step stores `saves` too.
+    pub fn saving(self, saves: [Option<GdnSave>; GDN_SAVES]) -> Self {
+        Self { saves, ..self }
+    }
+
+    pub fn slot(self) -> GdnSlot {
+        self.slot
+    }
+
+    pub fn source(self) -> Option<GdnSlot> {
+        self.source
+    }
+
+    pub fn saves(self) -> [Option<GdnSave>; GDN_SAVES] {
+        self.saves
+    }
+
+    /// The record as the kernels read it: `[slot, source, rows_0, snapshot_0, rows_1,
+    /// snapshot_1]`, `source` `0` for none and `s + 1` for slot `s`, a save of `0` rows none.
+    pub fn words(self) -> [i32; Self::WORDS] {
+        let save = |s: Option<GdnSave>| {
+            s.map_or([0, 0], |s| {
+                let rows = i32::try_from(s.rows_through.get())
+                    .expect("a step's rows fit the kernels' i32");
+                [rows, s.snapshot.word()]
+            })
+        };
+        let [[r0, s0], [r1, s1]] = self.saves.map(save);
+        let source = self.source.map_or(0, |s| s.word() + 1);
+        [self.slot.word(), source, r0, s0, r1, s1]
+    }
+}
+
 /// One GDN layer's state geometry: its causal conv's channels and width, and its delta-rule
 /// heads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +375,13 @@ impl GdnStateDims {
     /// kernels lay a lane out the same way.
     pub fn ssm_lane_len(self, rows: CheckpointRows) -> usize {
         2 * rows.rows() * self.ssm_record_len()
+    }
+
+    /// One slot's conv and ssm bytes: the stride a slot index steps through each of a linear
+    /// layer's two slot buffers.
+    pub fn slot_bytes(self) -> (usize, usize) {
+        let ([conv, ssm], _) = self.bytes(1, None);
+        (conv, ssm)
     }
 
     /// Conv-state ring length: `conv_kernel - 1` past tokens retained per channel.
@@ -528,6 +652,29 @@ impl<M: PoolMemory> GdnStatePool<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record's words are the kernels' encoding (`gdn_state.h`): a plain step is its slot and
+    /// zeros, a source its slot + 1, a save `[rows, snapshot]` in the place it was given.
+    #[test]
+    fn a_seq_record_encodes_as_the_kernels_read_it() {
+        let rows = |n| std::num::NonZeroU32::new(n).unwrap();
+        assert_eq!(GdnSeqSlots::plain(GdnSlot::new(0)).words(), [0; 6]);
+        assert_eq!(
+            GdnSeqSlots::plain(GdnSlot::new(4)).words(),
+            [4, 0, 0, 0, 0, 0]
+        );
+        let save = |n, s| {
+            Some(GdnSave {
+                rows_through: rows(n),
+                snapshot: GdnSlot::new(s),
+            })
+        };
+        let seq = GdnSeqSlots::plain(GdnSlot::new(3))
+            .restoring(GdnSlot::new(0))
+            .saving([None, save(96, 9)]);
+        assert_eq!(seq.words(), [3, 1, 0, 0, 96, 9]);
+        assert_eq!(seq.source(), Some(GdnSlot::new(0)));
+    }
 
     /// Every step the pool can describe decodes back from its code, and only a slot or fresh
     /// start without drafts is plain.

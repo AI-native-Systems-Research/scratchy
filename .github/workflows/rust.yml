@@ -158,6 +158,11 @@ jobs:
       - name: Scheduler tests (backend-neutral)
         run: cargo test -p scratchy-serving-scheduler --lib
 
+      # The engine's memory-budget arithmetic and the GDN state-slot allocator are plain Rust:
+      # no backend, no GPU, and no other step runs their unit tests.
+      - name: Engine and slot-allocator unit tests (no backend feature)
+        run: cargo test -p scratchy-serving-engine -p scratchy-forward-compiler --lib
+
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
       # invisible to it and no job anywhere compiles them. These three steps
@@ -427,6 +432,14 @@ jobs:
         run: cargo test -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
           --test e_prefix_caching test_prefix_cache_reports_cached_tokens_metal -- --ignored --test-threads=1
+
+      # The recurrent-hybrid tests in the same file (`gdn::{qwen3_6,nemotron_3_nano}::*`) need a
+      # 17 GB checkpoint and a Metal 4 GPU, which this runner lacks; the step above compiles them,
+      # and this one fails the build on a warning in them rather than leaving it to a local run.
+      - name: Lint the prefix-cache e2e tests (metal)
+        run: cargo clippy -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/smollm2-135m
+          --test e_prefix_caching -- -D warnings
 
       # REGRESSION GUARD — `/v1/messages` token accounting (issue #298, epic #158).
       # The endpoint Claude Code uses reported no cache read at all, and on a

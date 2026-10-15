@@ -141,6 +141,30 @@ pub fn compute_available_kv_bytes(
     requested.saturating_sub(non_kv_cache)
 }
 
+/// The share of the KV budget the prefix cache's recurrent-state snapshots may take: an eighth.
+///
+/// A snapshot is only useful beside the KV of the prefix it resumes, so KV keeps most of the
+/// memory. An eighth is ~46 snapshots of Qwen3.6-35B-A3B's 62.8 MiB state on a 64 GB Mac.
+pub const SNAPSHOT_KV_SHARE: usize = 8;
+
+/// ⭐ HOW MANY RECURRENT-STATE SNAPSHOTS THE PREFIX CACHE MAY HOLD, out of `kv_budget_bytes`, at
+/// `snapshot_bytes` each (one slot of a Gated-DeltaNet / Mamba-2 model's state pool).
+///
+/// One cap, and the KV budget stays the hard limit. Snapshot slots are mapped only when a
+/// snapshot is first saved into them, so a slot never used costs nothing. KV memory, though,
+/// stays mapped once mapped, and under traffic the KV pool reaches its whole budget: snapshots
+/// mapped on top of that would overrun the device. So their capacity comes out of the KV
+/// budget — at most [`SNAPSHOT_KV_SHARE`] of it, and never below [`KV_FLOOR_BYTES`] of KV.
+/// 0 means no room for one: prefix caching stays off for the model.
+pub fn recurrent_snapshot_capacity(kv_budget_bytes: usize, snapshot_bytes: usize) -> usize {
+    if snapshot_bytes == 0 {
+        return 0;
+    }
+    let share = kv_budget_bytes / SNAPSHOT_KV_SHARE;
+    let above_floor = kv_budget_bytes.saturating_sub(KV_FLOOR_BYTES);
+    share.min(above_floor) / snapshot_bytes
+}
+
 /// Outcome of target-reactive prefill-bucket selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillBucketSelection {
@@ -360,6 +384,39 @@ mod max_num_seqs_default_tests {
             false,
         );
         assert_eq!(w, BASE_MAX_NUM_SEQS);
+    }
+}
+
+#[cfg(test)]
+mod recurrent_snapshot_tests {
+    use super::{KV_FLOOR_BYTES, recurrent_snapshot_capacity};
+
+    const GIB: usize = 1024 * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+    /// Qwen3.6-35B-A3B: 30 GDN layers × (8192×3 + 32×128×128) f32.
+    const SNAP: usize = 65_863_680;
+
+    #[test]
+    fn an_eighth_of_the_kv_budget() {
+        // The 64 GB M5 Max: ~23 GiB of KV budget.
+        let n = recurrent_snapshot_capacity(23 * GIB, SNAP);
+        assert_eq!(n, 46);
+        assert!(n * SNAP <= 23 * GIB / 8);
+    }
+
+    #[test]
+    fn never_below_the_kv_floor() {
+        // An eighth of 1.5 GiB is 192 MiB, but only half a GiB sits above the floor.
+        let budget = KV_FLOOR_BYTES + GIB / 2;
+        let n = recurrent_snapshot_capacity(budget, SNAP);
+        assert_eq!(n, (GIB / 2).min(budget / 8) / SNAP);
+        assert!(budget - n * SNAP >= KV_FLOOR_BYTES);
+        assert_eq!(recurrent_snapshot_capacity(KV_FLOOR_BYTES, SNAP), 0);
+        assert_eq!(
+            recurrent_snapshot_capacity(KV_FLOOR_BYTES + 10 * MIB, SNAP),
+            0
+        );
+        assert_eq!(recurrent_snapshot_capacity(10 * GIB, 0), 0);
     }
 }
 

@@ -13959,12 +13959,18 @@ pub fn emit_model(
                             // GDN persistent state (per-layer) + per-forward
                             // indices/fresh flags (Shared, overwritten each
                             // forward). Index buffers sized to the max bucket
-                            // (num_seqs <= num_tokens <= max_m).
+                            // (num_seqs <= num_tokens <= max_m): a 24-byte
+                            // `GdnSeqSlots` record a sequence, a u32 step code.
                             gdn_state_conv: gdn_conv.clone(),
                             gdn_state_ssm: gdn_ssm.clone(),
                             gdn_lanes_conv: gdn_lanes_conv.clone(),
                             gdn_lanes_ssm: gdn_lanes_ssm.clone(),
-                            gdn_state_indices: alloc(max_m * 4),
+                            gdn_state_indices: alloc(
+                                max_m
+                                    * ::std::mem::size_of::<
+                                        ::scratchy_target_metal::gdn_state::GdnSeqSlots,
+                                    >() as u64,
+                            ),
                             gdn_is_fresh: alloc(max_m * 4),
                             // Vision externs: sized from the baked
                             // METAL_VISION_*_BYTES consts (16-byte floor
@@ -14156,8 +14162,9 @@ pub fn emit_model(
             });
 
             // GDN per-forward indices (hybrid arches): read from ctx's
-            // host-visible TensorViews (slot id per seq, fresh flag per seq).
-            // `None` for non-hybrid arches (ctx fields are None).
+            // host-visible TensorViews (a `GdnSeqSlots` record — 6 i32s —
+            // per seq, a step code per seq). `None` for non-hybrid arches
+            // (ctx fields are None).
             let gdn_state_indices = ctx.gdn_state_indices.map(|tv| {
                 ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const i32,

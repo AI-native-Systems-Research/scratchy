@@ -753,6 +753,11 @@ pub enum RuntimeGate {
     /// Gated-DeltaNet rows (a speculative verify step, the step after one):
     /// the conv and the simd scan, which replay and record.
     UnlessPlainGdn,
+    /// Run on a step one of whose sequences takes a plain Gated-DeltaNet step
+    /// over more than one row — a prefill chunk: the pipelined scan's twin for
+    /// a step that also replays or records, which runs those sequences and
+    /// leaves the rest to the simd scan.
+    OnlyIfPlainGdnRows,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
     /// Run when some gate in the list matches.
@@ -1299,8 +1304,10 @@ pub enum RuntimeBindingKind {
     GdnSsmLanes {
         layer: LayerId,
     },
-    /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence
-    /// (cu_seqlens order). Written per forward by the worker.
+    /// `[num_seqs]` `GdnSeqSlots` (`scratchy_layers::gdn_state`, the shaders' `gdn_state.h`) —
+    /// per batched sequence (cu_seqlens order) its state-pool slot, the snapshot a restore reads
+    /// its start state from and the snapshots a save stores into, 6 i32s. Written per forward by
+    /// the worker.
     GdnStateIndices,
     /// `[num_seqs]` u32 — 1 when the sequence is on its first (fresh)
     /// forward; the GDN conv1d/scan kernels then treat the slot's state

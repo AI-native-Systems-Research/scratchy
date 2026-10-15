@@ -309,6 +309,24 @@ impl Client {
         Ok(v["is_sleeping"].as_bool().unwrap_or(false))
     }
 
+    /// POST /reset_prefix_cache — drop every cached prefix.
+    ///
+    /// The server answers 200 even when the scheduler refused (requests still running), so a
+    /// test that needs the cache empty asserts it on the next request's `cached_tokens`.
+    pub async fn reset_prefix_cache(&self) -> Result<()> {
+        let resp = self
+            .inner
+            .post(format!("{}/reset_prefix_cache", self.base_url))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("reset_prefix_cache failed with status {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// GET /gpu_memory — query GPU memory usage.
     pub async fn gpu_memory(&self) -> Result<GpuMemoryInfo> {
         let resp = self

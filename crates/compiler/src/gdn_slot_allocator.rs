@@ -40,7 +40,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use scratchy_layers::gdn_state::{
-    CheckpointRows, DraftLane, DraftLanes, GdnStart, GdnStep, RecordArea,
+    CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
+    GdnStep, RecordArea,
 };
 
 /// Why a step's GDN inputs could not be built.
@@ -55,6 +56,13 @@ pub enum GdnStepError {
     },
     /// Every draft lane is held: more sequences verify than the pool keeps draft state for.
     Lanes { capacity: u16 },
+    /// A sequence starts past its first token with no state anywhere: it owns no slot, restores
+    /// no snapshot, and its admitting step was not refused. A prefix-cache hit without a
+    /// snapshot, refused here instead of run on a zeroed state.
+    MissingState { tokens_before: u32 },
+    /// A verify step restores or saves a snapshot: its rows include drafts a rejection takes
+    /// back, and its slot entry holds the state it started from.
+    SnapshotInVerify,
 }
 
 impl std::fmt::Display for GdnStepError {
@@ -78,6 +86,43 @@ impl std::fmt::Display for GdnStepError {
                 "GDN draft lanes exhausted (capacity {capacity}): more sequences verify drafts \
                  than the pool keeps draft state for"
             ),
+            Self::MissingState { tokens_before } => write!(
+                f,
+                "a sequence resumes at token {tokens_before} with no recurrent state: a \
+                 prefix-cache hit on a recurrent model must restore a state snapshot"
+            ),
+            Self::SnapshotInVerify => {
+                write!(f, "a verify step cannot restore or save a state snapshot")
+            }
+        }
+    }
+}
+
+/// One sequence of a step, as [`GdnSlotAllocator::step`] takes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GdnRow {
+    pub request_id: u64,
+    /// Its draft tokens this step (a verify step's).
+    pub drafts: usize,
+    /// Its tokens computed before this step (`num_computed_tokens`).
+    pub tokens_before: u32,
+    /// The absolute slot of the snapshot a prefix-cache hit resumes from.
+    pub restore: Option<GdnSlot>,
+    /// Snapshot stores this step, as [`GdnSeqSlots::saves`].
+    pub saves: [Option<GdnSave>; GDN_SAVES],
+    /// The step that admitted it was refused before it ran (`InputBatch::refused`), and the
+    /// engine is aborting it: its state never existed here.
+    pub refused: bool,
+}
+
+impl GdnRow {
+    /// A sequence with no snapshot work.
+    pub fn new(request_id: u64, drafts: usize, tokens_before: u32) -> Self {
+        Self {
+            request_id,
+            drafts,
+            tokens_before,
+            ..Self::default()
         }
     }
 }
@@ -120,17 +165,27 @@ impl GdnSlotAllocator {
         }
     }
 
-    /// One step's GDN inputs, for its sequences in `cu_seqlens` order as `(request_id, drafts)`:
-    /// each sequence's state slot (`state_indices`) and its [`GdnStep`] code. A verify step
-    /// (`drafts > 0`) keeps what a rejected draft needs undone (`gdn_state` module docs) in the
-    /// sequence's draft lane; a sequence whose step does not verify gives its lane back, once every
-    /// sequence's inputs are built (module docs).
+    /// One step's GDN inputs, for its sequences in `cu_seqlens` order: each sequence's
+    /// [`GdnSeqSlots`] (`state_indices`) and its [`GdnStep`] code. A verify step (`drafts > 0`)
+    /// keeps what a rejected draft needs undone (`gdn_state` module docs) in the sequence's draft
+    /// lane; a sequence whose step does not verify gives its lane back, once every sequence's
+    /// inputs are built (module docs).
+    ///
+    /// ⭐ WHERE A SEQUENCE'S STATE STARTS COMES FROM WHERE IT STANDS, not from whether this
+    /// allocator has seen the id before:
+    /// * a restore starts from its snapshot ([`GdnSeqSlots::source`]);
+    /// * token 0 starts from zero, whatever the slot held — a recycled slot's new owner (the
+    ///   degeneration guard), and a preempted request whose release never reached the worker;
+    /// * a sequence that owns its slot continues as the slot says (a later chunk, a decode, the
+    ///   step after a verify step);
+    /// * a refused sequence starts from zero with no snapshot work: its output is dropped;
+    /// * anything else has no state to start from: [`GdnStepError::MissingState`].
     pub fn step(
         &mut self,
-        seqs: impl IntoIterator<Item = (u64, usize)>,
-    ) -> Result<(Vec<i32>, Vec<u32>), GdnStepError> {
+        rows: impl IntoIterator<Item = GdnRow>,
+    ) -> Result<(Vec<GdnSeqSlots>, Vec<u32>), GdnStepError> {
         let mut released = Vec::new();
-        let built = self.build_step(seqs, &mut released);
+        let built = self.build_step(rows, &mut released);
         self.free_lanes.extend(released);
         built
     }
@@ -138,14 +193,15 @@ impl GdnSlotAllocator {
     /// [`Self::step`]'s inputs, the lanes its sequences give back in `released`.
     fn build_step(
         &mut self,
-        seqs: impl IntoIterator<Item = (u64, usize)>,
+        rows: impl IntoIterator<Item = GdnRow>,
         released: &mut Vec<DraftLane>,
-    ) -> Result<(Vec<i32>, Vec<u32>), GdnStepError> {
+    ) -> Result<(Vec<GdnSeqSlots>, Vec<u32>), GdnStepError> {
         let (mut entries, mut steps) = (Vec::new(), Vec::new());
         let capacity = self.num_slots;
         let lane_rows = self.lanes.map_or(CheckpointRows::NONE, DraftLanes::rows);
         let lane_capacity = self.lanes.map_or(0, DraftLanes::count);
-        for (request_id, drafts) in seqs {
+        for row in rows {
+            let (request_id, drafts) = (row.request_id, row.drafts);
             let checkpoint_rows = u8::try_from(drafts)
                 .map(CheckpointRows)
                 .ok()
@@ -154,11 +210,30 @@ impl GdnSlotAllocator {
                     drafts,
                     checkpoint_rows: lane_rows,
                 })?;
+            let snapshots = row.restore.is_some() || row.saves.iter().any(Option::is_some);
+            if snapshots && drafts > 0 {
+                return Err(GdnStepError::SnapshotInVerify);
+            }
+            let owned = self.assigned.contains_key(&request_id);
+            let start = if row.refused {
+                Some(GdnStart::Fresh)
+            } else if row.restore.is_some() {
+                Some(GdnStart::Slot)
+            } else if row.tokens_before == 0 {
+                Some(GdnStart::Fresh)
+            } else if owned {
+                None
+            } else {
+                return Err(GdnStepError::MissingState {
+                    tokens_before: row.tokens_before,
+                });
+            };
             let free_lanes = &mut self.free_lanes;
-            let (slot, state) = (Self::slot_for(&mut self.free, &mut self.assigned, request_id))
+            let (slot, state) = (Self::claim_slot(&mut self.free, &mut self.assigned, request_id))
                 .ok_or(GdnStepError::Exhausted { capacity })?;
-            entries.push(i32::try_from(slot).expect("GDN state slot fits the kernels' i32"));
-            let start = std::mem::replace(&mut state.start, GdnStart::Slot);
+            let slot = GdnSlot::new(slot as usize);
+            let start = start.unwrap_or(state.start);
+            state.start = GdnStart::Slot;
             if drafts > 0 && state.lane.is_none() {
                 state.lane = Some(Self::take_lane(free_lanes, &mut state.records).ok_or(
                     GdnStepError::Lanes {
@@ -174,6 +249,13 @@ impl GdnSlotAllocator {
                 // held its lane through this step.
                 (true, None) => unreachable!("request {request_id} replays without its lane"),
             };
+            entries.push(match (row.refused, row.restore) {
+                (true, _) => GdnSeqSlots::plain(slot),
+                (false, None) => GdnSeqSlots::plain(slot).saving(row.saves),
+                (false, Some(source)) => {
+                    GdnSeqSlots::plain(slot).restoring(source).saving(row.saves)
+                }
+            });
             let step = GdnStep {
                 start,
                 checkpoint_rows,
@@ -220,17 +302,15 @@ impl GdnSlotAllocator {
         }
     }
 
-    /// Resolve the state slot for `request_id` and where its step starts:
-    /// * [`GdnStart::Fresh`] → the request's **first** forward (or its first prefill chunk). The
-    ///   GDN op MUST zero-init the slot's conv + recurrent state and ignore whatever stale data a
-    ///   prior, now-released owner left there.
-    /// * [`GdnStart::Slot`] → a continuing forward (decode step / later prefill chunk); read and
-    ///   update the slot's existing state.
-    /// * [`GdnStart::Checkpoint`] → the step after a verify step ([`Self::verified`]).
+    /// The slot `request_id` owns — claiming a free one the first time — and the slot's state:
+    /// its draft lane and record area, and where its next step starts as the slot knows it
+    /// ([`GdnStart::Slot`], or [`GdnStart::Checkpoint`] after a verify step, [`Self::verified`]).
+    /// [`Self::step`] decides the start from where the sequence stands and overrides this where it
+    /// must.
     ///
     /// Returns `None` when the pool is exhausted — the scheduler must never
     /// admit more GDN sequences than `num_slots`.
-    fn slot_for<'a>(
+    fn claim_slot<'a>(
         free: &mut Vec<u32>,
         assigned: &'a mut HashMap<u64, (u32, SlotState)>,
         request_id: u64,
@@ -279,20 +359,48 @@ impl GdnSlotAllocator {
 mod tests {
     use super::*;
 
-    /// The slot `request_id` steps in and where it starts, as `step` takes them.
-    fn take_start(a: &mut GdnSlotAllocator, request_id: u64) -> Option<(u32, GdnStart)> {
-        let (slot, state) = GdnSlotAllocator::slot_for(&mut a.free, &mut a.assigned, request_id)?;
-        Some((slot, std::mem::replace(&mut state.start, GdnStart::Slot)))
+    /// The slot `request_id` steps in at `tokens_before` and where it starts, through `step`.
+    fn take_start(
+        a: &mut GdnSlotAllocator,
+        request_id: u64,
+        tokens_before: u32,
+    ) -> Option<(u32, GdnStart)> {
+        let (entries, codes) = a.step([GdnRow::new(request_id, 0, tokens_before)]).ok()?;
+        Some((
+            entries[0].slot().index() as u32,
+            GdnStep::decode(codes[0]).start,
+        ))
+    }
+
+    /// A sequence's row past its first token, drafting `drafts`.
+    fn at(request_id: u64, drafts: usize) -> GdnRow {
+        GdnRow::new(request_id, drafts, 10)
+    }
+
+    /// The records of plain slots `slots`.
+    fn plain(slots: &[usize]) -> Vec<GdnSeqSlots> {
+        slots
+            .iter()
+            .map(|&s| GdnSeqSlots::plain(GdnSlot::new(s)))
+            .collect()
+    }
+
+    /// A save into `snapshot` after `rows` rows.
+    fn save(rows: u32, snapshot: usize) -> Option<GdnSave> {
+        Some(GdnSave {
+            rows_through: std::num::NonZeroU32::new(rows).expect("rows"),
+            snapshot: GdnSlot::new(snapshot),
+        })
     }
 
     #[test]
     fn test_fresh_then_continue() {
         let mut a = GdnSlotAllocator::new(4, None);
         // First forward of req 7 → fresh.
-        let (s, fresh) = take_start(&mut a, 7).unwrap();
+        let (s, fresh) = take_start(&mut a, 7, 0).unwrap();
         assert_eq!(fresh, GdnStart::Fresh, "first forward must be fresh");
         // Subsequent decode steps reuse the same slot, not fresh.
-        let (s2, fresh2) = take_start(&mut a, 7).unwrap();
+        let (s2, fresh2) = take_start(&mut a, 7, 12).unwrap();
         assert_eq!(s, s2);
         assert_eq!(
             fresh2,
@@ -305,9 +413,9 @@ mod tests {
     #[test]
     fn test_distinct_requests_get_distinct_slots() {
         let mut a = GdnSlotAllocator::new(4, None);
-        let (s0, _) = take_start(&mut a, 100).unwrap();
-        let (s1, _) = take_start(&mut a, 200).unwrap();
-        let (s2, _) = take_start(&mut a, 300).unwrap();
+        let (s0, _) = take_start(&mut a, 100, 0).unwrap();
+        let (s1, _) = take_start(&mut a, 200, 0).unwrap();
+        let (s2, _) = take_start(&mut a, 300, 0).unwrap();
         assert_ne!(s0, s1);
         assert_ne!(s1, s2);
         assert_ne!(s0, s2);
@@ -320,15 +428,15 @@ mod tests {
     #[test]
     fn test_recycled_slot_is_fresh_no_degeneration() {
         let mut a = GdnSlotAllocator::new(2, None);
-        let (s_a, fa) = take_start(&mut a, 1).unwrap();
-        let (_s_b, fb) = take_start(&mut a, 2).unwrap();
+        let (s_a, fa) = take_start(&mut a, 1, 0).unwrap();
+        let (_s_b, fb) = take_start(&mut a, 2, 0).unwrap();
         assert_eq!((fa, fb), (GdnStart::Fresh, GdnStart::Fresh));
         assert_eq!(a.num_active(), 2);
         // Pool full. Finish req 1, freeing its slot.
         a.release(1);
         assert_eq!(a.num_active(), 1);
         // New req 3 must reuse the freed slot AND be flagged fresh.
-        let (s_c, fc) = take_start(&mut a, 3).unwrap();
+        let (s_c, fc) = take_start(&mut a, 3, 0).unwrap();
         assert_eq!(s_c, s_a, "freed slot should be recycled");
         assert_eq!(
             fc,
@@ -338,14 +446,17 @@ mod tests {
     }
 
     #[test]
-    fn test_exhaustion_returns_none() {
+    fn test_exhaustion() {
         let mut a = GdnSlotAllocator::new(2, None);
-        assert!(take_start(&mut a, 1).is_some());
-        assert!(take_start(&mut a, 2).is_some());
+        assert!(take_start(&mut a, 1, 0).is_some());
+        assert!(take_start(&mut a, 2, 0).is_some());
         // Third distinct request with no release → exhausted.
-        assert!(take_start(&mut a, 3).is_none());
+        assert_eq!(
+            a.step([GdnRow::new(3, 0, 0)]),
+            Err(GdnStepError::Exhausted { capacity: 2 })
+        );
         // But an already-assigned request still resolves.
-        assert!(take_start(&mut a, 1).is_some());
+        assert!(take_start(&mut a, 1, 8).is_some());
     }
 
     /// Long churn well past capacity never exhausts as long as active ≤ cap,
@@ -356,14 +467,14 @@ mod tests {
         let mut a = GdnSlotAllocator::new(cap, None);
         for round in 0..1000u64 {
             let rid = round; // each round a brand-new request id
-            let (_slot, fresh) = take_start(&mut a, rid).expect("never exhausts at active=1");
+            let (_slot, fresh) = take_start(&mut a, rid, 0).expect("never exhausts at active=1");
             assert_eq!(
                 fresh,
                 GdnStart::Fresh,
                 "each brand-new request must be fresh"
             );
             // one decode step (not fresh), then it finishes
-            let (_s2, fresh2) = take_start(&mut a, rid).unwrap();
+            let (_s2, fresh2) = take_start(&mut a, rid, 5).unwrap();
             assert_eq!(fresh2, GdnStart::Slot);
             a.release(rid);
             assert_eq!(a.num_active(), 0);
@@ -388,6 +499,73 @@ mod tests {
         .encode()
     }
 
+    #[test]
+    fn token_zero_starts_fresh_even_on_a_slot_still_owned() {
+        let mut a = GdnSlotAllocator::new(2, None);
+        let (s, _) = take_start(&mut a, 1, 0).unwrap();
+        assert_eq!(take_start(&mut a, 1, 16), Some((s, GdnStart::Slot)));
+        // Preempted, its release never seen, re-run from token 0: zero-init, same slot.
+        assert_eq!(take_start(&mut a, 1, 0), Some((s, GdnStart::Fresh)));
+    }
+
+    #[test]
+    fn a_restore_reads_its_snapshot_and_writes_its_own_slot() {
+        let mut a = GdnSlotAllocator::new(2, None);
+        let saves = [save(96, 9), None];
+        let row = GdnRow {
+            restore: Some(GdnSlot::new(7)),
+            saves,
+            ..GdnRow::new(5, 0, 512)
+        };
+        let (entries, codes) = a.step([row]).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                GdnSeqSlots::plain(GdnSlot::new(0))
+                    .restoring(GdnSlot::new(7))
+                    .saving(saves)
+            ]
+        );
+        assert_eq!(GdnStep::decode(codes[0]).start, GdnStart::Slot);
+        // Its next step continues in its own slot.
+        assert_eq!(take_start(&mut a, 5, 600), Some((0, GdnStart::Slot)));
+    }
+
+    #[test]
+    fn a_sequence_past_token_zero_with_no_state_is_refused() {
+        let mut a = GdnSlotAllocator::new(2, None);
+        assert_eq!(
+            a.step([GdnRow::new(5, 0, 256)]),
+            Err(GdnStepError::MissingState { tokens_before: 256 })
+        );
+        assert_eq!(a.num_active(), 0, "a refused row claims nothing");
+    }
+
+    #[test]
+    fn a_row_whose_admitting_step_was_refused_runs_fresh_with_no_snapshot_work() {
+        let mut a = GdnSlotAllocator::new(2, None);
+        let row = GdnRow {
+            refused: true,
+            restore: Some(GdnSlot::new(3)),
+            saves: [save(16, 4), None],
+            ..GdnRow::new(5, 0, 256)
+        };
+        let (entries, codes) = a.step([row]).unwrap();
+        assert_eq!(entries, plain(&[0]));
+        assert_eq!(GdnStep::decode(codes[0]).start, GdnStart::Fresh);
+    }
+
+    #[test]
+    fn a_verify_step_takes_no_snapshot() {
+        let mut a = GdnSlotAllocator::new(2, DraftLanes::new(CheckpointRows(2), 2));
+        take_start(&mut a, 5, 0).unwrap();
+        let row = GdnRow {
+            saves: [save(1, 4), None],
+            ..at(5, 2)
+        };
+        assert_eq!(a.step([row]), Err(GdnStepError::SnapshotInVerify));
+    }
+
     /// A verify step makes the request's next step — and only that one — replay its rows through
     /// the last kept one, whether it kept every draft or none: the slot holds the state the verify
     /// step started from. A verify step moves the records to the other area of its lane; a step
@@ -401,25 +579,28 @@ mod tests {
         let mut a = GdnSlotAllocator::new(2, lanes);
         let none = CheckpointRows::NONE;
         let fresh = code(GdnStart::Fresh, none, R0, None);
-        assert_eq!(a.step([(5, 0), (6, 0)]), Ok((vec![0, 1], vec![fresh; 2])));
-        let ok = |start, records| Ok((vec![0], vec![code(start, rows, records, lane)]));
-        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Slot, R0));
+        assert_eq!(
+            a.step([GdnRow::new(5, 0, 0), GdnRow::new(6, 0, 0)]),
+            Ok((plain(&[0, 1]), vec![fresh; 2]))
+        );
+        let ok = |start, records| Ok((plain(&[0]), vec![code(start, rows, records, lane)]));
+        assert_eq!(a.step([at(5, 3)]), ok(GdnStart::Slot, R0));
         a.verified(5, 1, 3);
         // Replay R1's rows 0..=1, record to R0.
-        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Checkpoint(1), R1));
+        assert_eq!(a.step([at(5, 3)]), ok(GdnStart::Checkpoint(1), R1));
         a.verified(5, 3, 3);
         // Every draft kept: still a replay, of all four rows.
-        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Checkpoint(3), R0));
+        assert_eq!(a.step([at(5, 3)]), ok(GdnStart::Checkpoint(3), R0));
         a.verified(5, 0, 3);
         // A decode after a verify step replays and updates the slot in place.
         let decode = code(GdnStart::Checkpoint(0), none, R1, lane);
-        assert_eq!(a.step([(5, 0)]), Ok((vec![0], vec![decode])));
+        assert_eq!(a.step([at(5, 0)]), Ok((plain(&[0]), vec![decode])));
         let slot = code(GdnStart::Slot, none, R1, None);
-        assert_eq!(a.step([(5, 0)]), Ok((vec![0], vec![slot])));
+        assert_eq!(a.step([at(5, 0)]), Ok((plain(&[0]), vec![slot])));
         assert_eq!(a.free_lanes.len(), 2, "the replay gave the lane back");
 
         assert_eq!(
-            a.step([(6, 4)]),
+            a.step([at(6, 4)]),
             Err(GdnStepError::Drafts {
                 drafts: 4,
                 checkpoint_rows: rows
@@ -434,18 +615,19 @@ mod tests {
         let rows = CheckpointRows(2);
         let lanes = DraftLanes::new(rows, 1);
         let lane = lanes.and_then(|l| l.lanes().next());
+        let first = [GdnRow::new(1, 0, 0), GdnRow::new(2, 0, 0)];
         let mut a = GdnSlotAllocator::new(3, lanes);
-        assert!(a.step([(1, 0), (2, 0)]).is_ok());
-        assert!(a.step([(1, 2)]).is_ok());
+        assert!(a.step(first).is_ok());
+        assert!(a.step([at(1, 2)]).is_ok());
         a.verified(1, 2, 2);
         // 1 replays its one lane while 2 would verify: no lane is left for 2.
         assert_eq!(
-            a.step([(1, 0), (2, 2)]),
+            a.step([at(1, 0), at(2, 2)]),
             Err(GdnStepError::Lanes { capacity: 1 })
         );
         let mut a = GdnSlotAllocator::new(3, lanes);
-        assert!(a.step([(1, 0), (2, 0)]).is_ok());
-        assert!(a.step([(1, 2)]).is_ok());
+        assert!(a.step(first).is_ok());
+        assert!(a.step([at(1, 2)]).is_ok());
         a.verified(1, 2, 2);
         let replay = code(
             GdnStart::Checkpoint(2),
@@ -453,19 +635,19 @@ mod tests {
             RecordArea::Second,
             lane,
         );
-        let plain = code(
+        let slot = code(
             GdnStart::Slot,
             CheckpointRows::NONE,
             RecordArea::First,
             None,
         );
         assert_eq!(
-            a.step([(1, 0), (2, 0)]),
-            Ok((vec![0, 1], vec![replay, plain]))
+            a.step([at(1, 0), at(2, 0)]),
+            Ok((plain(&[0, 1]), vec![replay, slot]))
         );
         // The step after it: 2 verifies in the lane 1 replayed.
         let verify = code(GdnStart::Slot, rows, RecordArea::First, lane);
-        assert_eq!(a.step([(2, 2)]), Ok((vec![1], vec![verify])));
+        assert_eq!(a.step([at(2, 2)]), Ok((plain(&[1]), vec![verify])));
     }
 
     /// A sequence holds a lane from the step it drafts in, across steps it does not run, until a
@@ -476,17 +658,18 @@ mod tests {
         let rows = CheckpointRows(2);
         let lanes = DraftLanes::new(rows, 2);
         let mut a = GdnSlotAllocator::new(4, lanes);
-        assert!(a.step([(1, 0), (2, 0), (3, 0)]).is_ok());
+        let first = [1, 2, 3].map(|id| GdnRow::new(id, 0, 0));
+        assert!(a.step(first).is_ok());
         assert!(!a.hold_lane(9), "a request without a slot drafts nothing");
         assert!(a.hold_lane(1) && a.hold_lane(1), "a held lane stays held");
         assert!(a.hold_lane(2));
         assert!(!a.hold_lane(3), "both lanes are held");
         // 1 is skipped for a step; 2 runs one without its drafts and gives its lane back.
-        assert!(a.step([(2, 0)]).is_ok());
+        assert!(a.step([at(2, 0)]).is_ok());
         assert!(a.hold_lane(3));
         let first = lanes.and_then(|l| l.lanes().next());
         let verify = code(GdnStart::Slot, rows, RecordArea::First, first);
-        assert_eq!(a.step([(1, 2)]), Ok((vec![0], vec![verify])));
+        assert_eq!(a.step([at(1, 2)]), Ok((plain(&[0]), vec![verify])));
         a.release(1);
         assert_eq!(a.free_lanes, Vec::from_iter(first));
     }

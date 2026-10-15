@@ -41,7 +41,11 @@
 // This kernel runs only a plain step (`scratchy_layers::gdn_state::GdnStep::
 // is_plain`: `gdn_step[seq]` starts from the slot or from zero and carries no
 // drafts), so it reads and writes the entry alone; a step that replays or
-// records runs `gdn_scan_simd`.
+// records runs `gdn_scan_simd`. `state_indices[seq]` is the sequence's
+// `GdnSeqSlots` (`gdn_state.h`): a slot start reads a restore's snapshot entry
+// when it has one, and a save stores the state after its row into its
+// snapshot's entry — a block ends at a save's row, so the store sits between
+// blocks and the per-token loop is the plain step's.
 //
 // Baked constants (every compile sets every one; slots 0–4 are the scan's):
 //   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
@@ -55,6 +59,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "gdn_state.h"
 
 using namespace metal;
 
@@ -64,6 +69,10 @@ SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_PIPE_SCALE, 4);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 5);
+// Set on the twin that runs beside the simd scan, in a step that also replays or records
+// (`route_gdn`): it takes only a plain sequence of more than one row — a prefill chunk — and
+// leaves the rest, a verify step's or a decode's row, to the simd scan.
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_PIPE_BESIDE_SIMD, 6);
 
 template <typename T>
 [[kernel]] void gdn_scan_pipelined(
@@ -73,7 +82,7 @@ template <typename T>
     const device T*     b             [[buffer(3)]],
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
-    const device int*   state_indices [[buffer(6)]],
+    const device GdnSeqSlots* state_indices [[buffer(6)]],
     const device uint*  gdn_step      [[buffer(7)]],
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
@@ -109,11 +118,16 @@ template <typename T>
   const int bos = cu_seqlens[i_n];
   const int eos = cu_seqlens[i_n + 1];
   const int seq_len = eos - bos;
-  const int slot = state_indices[i_n];
+  const GdnSeqSlots seq_slots = state_indices[i_n];
+  const int slot = seq_slots.slot;
   if (seq_len <= 0 || slot < 0) {
     return;
   }
-  const bool fresh = (gdn_step[i_n] & 0xffu) == 1u;
+  if (GDN_PIPE_BESIDE_SIMD && !(gdn_step_plain(gdn_step[i_n]) && seq_len > 1)) {
+    return;
+  }
+  const uint start = gdn_step[i_n] & 0xffu;
+  const bool fresh = start == 1u;
 
   // Per-head scalars, off the recurrence path.
   const float neg_a = -exp(a_log[i_hv]);
@@ -122,13 +136,17 @@ template <typename T>
 
   // The slot's stride, as `gdn_scan_varlen` lays it out: its entry.
   const uint entry_len = HV * Vd * K;
-  device float* state_row0 = ssm_state + uint(slot) * entry_len + (i_hv * Vd + i_v) * K;
+  // The thread's first state row in slot `s`'s entry (the second sits RS rows below).
+  auto row_in = [&](int s) { return ssm_state + uint(s) * entry_len + (i_hv * Vd + i_v) * K; };
+  device float* state_row0 = row_in(slot);
   device float* state_row1 = state_row0 + RS * K;
-  // State fragments in registers, a row each: channels 4*(seg + 8*i) .. +3, i = 0..3.
+  // State fragments in registers, a row each: channels 4*(seg + 8*i) .. +3, i = 0..3 — from the
+  // slot, or a restore's snapshot.
   float4 st0[4], st1[4];
   {
-    const device float4* S0 = (const device float4*)(state_row0 + 4u * seg);
-    const device float4* S1 = (const device float4*)(state_row1 + 4u * seg);
+    const device float* start_row0 = row_in(gdn_start_slot(seq_slots, start));
+    const device float4* S0 = (const device float4*)(start_row0 + 4u * seg);
+    const device float4* S1 = (const device float4*)(start_row0 + RS * K + 4u * seg);
     for (uint i = 0; i < 4; i++) {
       st0[i] = fresh ? 0.0f : S0[8u * i];
     }
@@ -211,9 +229,14 @@ template <typename T>
     }                                                                     \
   }
 
+  // The rows a save stores the state after: a block ends at one (`gdn_state.h`).
+  const int2 saves_through = gdn_saves_through(seq_slots);
+  const bool saves = !gdn_saves_none(saves_through);
   int t0 = 0;
   while (t0 < seq_len) {
-    const uint tt = uint(min((int)TB, seq_len - t0));
+    const int block_end = min(t0 + (int)TB, seq_len);
+    const int t1 = saves ? gdn_cut_at_save(saves_through, t0, block_end) : block_end;
+    const uint tt = uint(t1 - t0);
     GDN_PIPE_FETCH(t0, (int)tt)
     // Store the prefetch into threadgroup memory (cooperative).
     _Pragma("unroll")
@@ -241,8 +264,8 @@ template <typename T>
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Prefetch the NEXT block into registers while this one runs.
-    if (t0 + (int)TB < seq_len) {
-      const int tn = t0 + (int)TB;
+    if (t1 < seq_len) {
+      const int tn = t1;
       GDN_PIPE_FETCH(tn, seq_len - tn)
     }
 
@@ -357,8 +380,18 @@ template <typename T>
         o[(uint(bos) + t0 + t) * value_dim + vr + RS] = out1;
       }
     }
+    // A save whose row ends this block: both rows' fragments, into its snapshot.
+    for (uint j = 0; saves && j < GDN_SAVES; j++) {
+      if (saves_through[j] == t1) {
+        device float* snap = row_in(seq_slots.saves[j].y) + 4u * seg;
+        for (uint i = 0; i < 4; i++) {
+          ((device float4*)snap)[8u * i] = st0[i];
+          ((device float4*)(snap + RS * K))[8u * i] = st1[i];
+        }
+      }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    t0 += (int)TB;
+    t0 = t1;
   }
 #undef GDN_PIPE_FETCH
 

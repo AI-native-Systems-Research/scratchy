@@ -34,7 +34,7 @@ use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
 };
-use scratchy_target_metal::gdn_state::GdnStatePool;
+use scratchy_target_metal::gdn_state::{GdnSeqSlots, GdnSlot, GdnStatePool};
 use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
@@ -472,7 +472,7 @@ fn step_inputs(
         cu_seqlens_q: vec![0, n as u32],
         seqused_k: vec![ctx_len as u32],
         last_token_indices: vec![n as u32 - 1],
-        gdn_indices: vec![0],
+        gdn_indices: GdnSeqSlots::plain(GdnSlot::new(0)).words().to_vec(),
         gdn_fresh: vec![u32::from(fresh)],
     }
 }
@@ -536,7 +536,7 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         gdn_state_indices: l
             .gdn
             .as_ref()
-            .map(|_| view(&s.gdn_indices, &[1], DType::I32)),
+            .map(|_| view(&s.gdn_indices, &[s.gdn_indices.len()], DType::I32)),
         gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
         has_spec_tokens: false,
         last_token_indices: Some(view(&s.last_token_indices, &[1], u32t)),

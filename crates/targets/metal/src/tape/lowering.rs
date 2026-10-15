@@ -1145,7 +1145,12 @@ impl GdnStepsKnown {
 ///   simd scan and its own dispatch (grid (value_dim/[`GDN_PIPE_ROWS`], 1, 1) scaled by num_seqs
 ///   on Z, threads (128,1,1));
 /// - the simd scan: what those two leave — a step that replays or records among them, which only
-///   the conv and the simd scan can run;
+///   the conv and the simd scan can run. On a geometry the pipelined scan covers, a plain sequence
+///   of more than one row in such a step — a prefill chunk batched beside a verify step — is still
+///   the pipelined scan's (its twin `GDN_PIPE_BESIDE_SIMD`, gated on such a sequence being there),
+///   and the simd scan skips it (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): every row a prefix-cache
+///   snapshot is saved after is the pipelined scan's or a one-row step's last, so the simd scan's
+///   row loop carries no save;
 /// - the conv and the norm: every step the decode command leaves.
 ///
 /// A model without drafts thus runs main's split: decode steps the decode command (a one-row
@@ -1158,7 +1163,7 @@ fn route_gdn(
     bucket_m: u32,
 ) -> Vec<GatedCommand> {
     use crate::tape::ids::BucketM;
-    use crate::tape::lowered::{MScaleAxis, MScaling};
+    use crate::tape::lowered::{MScaleAxis, MScaling, RuntimeGate};
     if !matches!(step, MetalStep::GatedDeltaNet(..)) {
         return cmds;
     }
@@ -1216,8 +1221,42 @@ fn route_gdn(
             out.extend(gated(command, &decoded));
         } else if pipelines && command.library == "gdn_scan_varlen" && command.function == simd {
             let twin = pipelined(&command);
-            out.extend(gated(command, &|d, q| !decoded(d, q) && !piped(d, q)));
+            let simd_runs = |d: bool, q: bool| !decoded(d, q) && !piped(d, q);
+            // Beside the simd scan — a step that also replays or records — the pipelined scan
+            // still runs every plain sequence of more than one row, a prefill chunk, and the simd
+            // scan skips them (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): such a sequence's rows and the
+            // snapshots it saves are the pipelined scan's wherever it is batched, so no save ever
+            // lands inside the simd scan's row loop. A model without drafts has no such step.
+            let beside = LoweredCommand {
+                constants: baked(
+                    (twin.constants.iter().copied())
+                        .chain([ConstantValue::boolean(GDN_PIPE_BESIDE_SIMD_SLOT, true)])
+                        .collect(),
+                ),
+                ..twin
+            };
+            // A one-row bucket's steps, and a model without drafts, have no such sequence there.
+            let beside_gate = match (known.plain, known.decode, known.run(simd_runs)) {
+                (Some(true), _, _) | (_, Some(true), _) | (_, _, GuardRun::Dropped) => None,
+                (_, _, GuardRun::Gated(gate)) => Some(GatedCommand {
+                    command: beside,
+                    gate: Some(RuntimeGate::and(gate, &[RuntimeGate::OnlyIfPlainGdnRows])),
+                }),
+            };
+            let simd_scan = LoweredCommand {
+                constants: baked(
+                    (command.constants.iter().copied())
+                        .chain([ConstantValue::boolean(
+                            GDN_SCAN_PLAIN_ROWS_PIPELINED_SLOT,
+                            true,
+                        )])
+                        .collect(),
+                ),
+                ..command
+            };
+            out.extend(gated(simd_scan, &simd_runs));
             out.extend(gated(twin, &piped));
+            out.extend(beside_gate);
         } else {
             out.extend(gated(command, &|d, q| !decoded(d, q)));
         }
@@ -6468,6 +6507,14 @@ fn recurrent_conv(
 /// (`GDN_SCAN_DRAFTS`): what a plain step's kernels, which keep no draft state, do not take.
 const GDN_SCAN_DRAFTS_SLOT: u16 = 8;
 
+/// The simd scan's constant slot that says the pipelined scan runs every plain sequence of more
+/// than one row (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): set on a geometry the pipelined scan covers.
+const GDN_SCAN_PLAIN_ROWS_PIPELINED_SLOT: u16 = 9;
+
+/// The pipelined scan's constant slot of its twin beside the simd scan (`GDN_PIPE_BESIDE_SIMD`),
+/// which takes only plain sequences of more than one row.
+const GDN_PIPE_BESIDE_SIMD_SLOT: u16 = 6;
+
 /// How a recurrent mixer's scan gates and updates its state: GDN's gated delta rule, its gate
 /// inputs `a` / `b` their own `[T, heads]` activations; Mamba-2's selective scan, `dt` a column
 /// slice of its in-projection row `zx`, with the `D` skip.
@@ -8578,7 +8625,8 @@ mod tests {
     #[test]
     fn gdn_lowers_by_the_step_it_serves() {
         use crate::tape::lowered::RuntimeGate::{
-            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessPlainGdn,
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, OnlyIfPlainGdnRows, UnlessDecodeStep,
+            UnlessPlainGdn,
         };
         let drafting = |(nk, nv, hk, hv): (u32, u32, u32, u32), bucket_m, spec_drafts| {
             let p = MetalModelConsts {
@@ -8654,12 +8702,15 @@ mod tests {
         let plain_prefill = Some(All(&[UnlessDecodeStep, OnlyIfPlainGdn]));
         let not_plain_decode = Some(Any(&[UnlessDecodeStep, UnlessPlainGdn]));
         let (plain, replays) = (Some(OnlyIfPlainGdn), Some(UnlessPlainGdn));
+        // Beside the simd scan, the pipelined scan's twin takes a prefill chunk's rows.
+        let beside = Some(All(&[UnlessPlainGdn, OnlyIfPlainGdnRows]));
         let q27 = drafting((16, 48, 128, 128), 64, 2);
         let want = [
             (decode, plain_decode),
             (conv, not_plain_decode),
             (simd, replays),
             (pipe, plain_prefill),
+            (pipe, beside),
             (norm, not_plain_decode),
         ];
         assert_eq!(shape(&q27), want);
@@ -8686,6 +8737,24 @@ mod tests {
             constants(3),
             [geometry, &[ConstantValue::uint(5, GDN_PIPE_TB)][..]].concat()
         );
+        // The simd scan leaves a prefill chunk's rows to the pipelined scan, whose twin beside it
+        // takes only those.
+        assert_eq!(
+            constants(2)[6..],
+            [ConstantValue::boolean(
+                GDN_SCAN_PLAIN_ROWS_PIPELINED_SLOT,
+                true
+            )]
+        );
+        assert_eq!(
+            constants(4),
+            [
+                constants(3),
+                &[ConstantValue::boolean(GDN_PIPE_BESIDE_SIMD_SLOT, true)][..]
+            ]
+            .concat()
+        );
+        assert_eq!(q27[4].command.bindings, q27[3].command.bindings);
         let lanes = |i: usize, kind: fn(LayerId) -> RuntimeBindingKind, index: u8| {
             let lane = Binding::Runtime {
                 kind: kind(LayerId(0)),
@@ -8724,10 +8793,13 @@ mod tests {
             (norm, not_plain_decode),
         ];
         assert_eq!(shape(&drafting((2, 6, 64, 128), 64, 2)), want);
+        const SIMD_STEPS: crate::tape::lowered::RuntimeGate =
+            Any(&[OnlyIfDecodeStep, UnlessPlainGdn]);
         let want = [
             (conv, None),
-            (simd, Some(Any(&[OnlyIfDecodeStep, UnlessPlainGdn]))),
+            (simd, Some(SIMD_STEPS)),
             (pipe, plain_prefill),
+            (pipe, Some(All(&[SIMD_STEPS, OnlyIfPlainGdnRows]))),
             (norm, None),
         ];
         assert_eq!(shape(&drafting((1, 8, 128, 128), 64, 2)), want);

@@ -460,8 +460,11 @@ mod imp {
             .expect("GdnStatePool::new")
         });
 
-        // Recurrent-state slot 0 for our one sequence.
-        let gdn_idx: [i32; 1] = [0];
+        // Recurrent-state slot 0 for our one sequence: its `state_indices` record.
+        let gdn_idx = scratchy_target_metal::gdn_state::GdnSeqSlots::plain(
+            scratchy_target_metal::gdn_state::GdnSlot::new(0),
+        )
+        .words();
 
         // Sliding KV-cache groups (gemma4 SWA), the worker's encoding: group
         // 0 (full) keeps the dumped slot_mapping/block_table (identity block
@@ -543,7 +546,7 @@ mod imp {
                 gdn_state: gdn_pool.as_ref(),
                 gdn_state_indices: gdn_pool
                     .as_ref()
-                    .map(|_| host_view(&gdn_idx, &[1], DType::I32)),
+                    .map(|_| host_view(&gdn_idx, &[gdn_idx.len()], DType::I32)),
                 gdn_is_fresh: gdn_pool.as_ref().map(|_| host_view(&fresh, &[1], u32t)),
                 has_spec_tokens: false,
                 mm_embeds: None,
