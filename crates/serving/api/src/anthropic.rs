@@ -824,6 +824,35 @@ fn stream_buffered_messages_response(
                     }),
                 ));
             }
+            ResponseContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                events.push((
+                    "content_block_start",
+                    serde_json::json!({
+                        "type": "content_block_start",
+                        "index": i,
+                        "content_block": { "type": "thinking", "thinking": "", "signature": "" }
+                    }),
+                ));
+                events.push((
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": i,
+                        "delta": { "type": "thinking_delta", "thinking": thinking }
+                    }),
+                ));
+                events.push((
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": i,
+                        "delta": { "type": "signature_delta", "signature": signature }
+                    }),
+                ));
+            }
             ResponseContentBlock::ToolUse { id, name, input } => {
                 events.push((
                     "content_block_start",
