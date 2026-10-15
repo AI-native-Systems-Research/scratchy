@@ -2595,7 +2595,8 @@ fn lower_map_compute(
 
 /// Resolve one operand SSA name to its MSL sub-expression inside a map window.
 ///   * an `arith.constant` -> folded literal,
-///   * a `tensor.splat` -> transparent (lower its scalar operand),
+///   * a `tensor.splat` of a constant -> its folded literal; of a runtime value
+///     -> a LIVE-IN on the splat's own (resident) result,
 ///   * a `linalg.broadcast` whose input is external/a load -> buffer leaf with the
 ///     broadcast index expr; if its input is an in-window scalar -> recurse,
 ///   * any other in-window compute op -> recurse,
@@ -2617,21 +2618,26 @@ fn lower_map_value(
     }
     let in_win = in_window.contains(&name);
     match defs.get(&name) {
-        // Constants and splats fold/are transparent regardless of window
-        // membership (they're scheduling plumbing, never window members).
+        // Constants and splats are scheduling plumbing, never window members, so
+        // they resolve the same regardless of window membership.
         Some(d) if d.op_type == OpKind::ArithConstant => constant_literal(d),
-        Some(d) if d.op_type == OpKind::TensorSplat => {
-            // Splat is transparent (every lane reads the same scalar sub-expr);
-            // parenthesize so a compound scalar keeps precedence in its parent.
-            let inner = *d
-                .operands
-                .first()
-                .ok_or("metal: tensor.splat missing operand")?;
-            Ok(format!(
-                "({})",
-                lower_map_value(inner, defs, in_window, live_ins, out_shape, depth + 1)?
-            ))
-        }
+        // ⭐ A SPLAT IS TRANSPARENT ONLY WHEN IT FOLDS TO A CONSTANT.
+        //
+        // A splat is plumbing: the interpreter EXECUTES it at its own index, and the
+        // liveness reclaim then frees its operand there — the splat is that operand's
+        // last use. Seeing through a splat of a RUNTIME value would make the operand
+        // the live-in, read at the trigger AFTER it was freed. MEASURED (gemma-4 emu
+        // prefill, the per-layer scalar `splat(load %layer_scalar : [1, 1])` feeding
+        // the residual's `mulf`): `undefined SSA value` at the window's trigger.
+        //
+        // The splat's OWN result is resident (the interpreter materialized it) and a
+        // window op reads it, so its reclaim is deferred to the trigger: it is the
+        // live-in. A constant still folds to its literal, parenthesized so it keeps
+        // its precedence in the parent.
+        Some(d) if d.op_type == OpKind::TensorSplat => match try_fold_scalar(name, defs) {
+            Some(lit) => Ok(format!("({lit})")),
+            None => map_live_in_leaf(name, defs, live_ins, out_shape),
+        },
         Some(d) if d.op_type == OpKind::LinalgBroadcast => {
             let input = *d
                 .operands
@@ -6734,6 +6740,43 @@ kernel void mpp_probe(
             })
             .collect();
         assert_eq!(sizes, vec![MAX_KERNEL_WINDOW, MAX_KERNEL_WINDOW, 5]);
+    }
+
+    /// The gemma-4 per-layer-scalar shape: `y = x · splat(load s)` then `z = y · splat(2.0)`.
+    /// The runtime splat's operand `%s` dies at the splat (the interpreter runs plumbing at
+    /// its own index), so the kernel must read the splat's RESULT — a value a window op
+    /// reads, whose reclaim the trigger defers. The constant splat still folds.
+    #[test]
+    fn a_runtime_splat_is_a_live_in_on_its_own_result() {
+        let mut ops = Ops::new();
+        let tile = ops.int_list(vec![4, 8]);
+        let scalar = ops.int_list(vec![1, 1]);
+        let x = ops.op(Some("%x"), OpKind::KtdpLoad, &["%tx"]);
+        let x = ops.attr(x, AttrKey::Shape, tile.clone());
+        let s = ops.op(Some("%s"), OpKind::KtdpLoad, &["%ts"]);
+        let s = ops.attr(s, AttrKey::Shape, scalar);
+        let ss = ops.op(Some("%ss"), OpKind::TensorSplat, &["%s"]);
+        let ss = ops.attr(ss, AttrKey::Shape, tile.clone());
+        let y = ops.op(Some("%y"), OpKind::ArithMulf, &["%x", "%ss"]);
+        let y = ops.attr(y, AttrKey::Shape, tile.clone());
+        let c = ops.op(Some("%c"), OpKind::ArithConstant, &[]);
+        let c = ops.attr(c, AttrKey::Value, Attr::Float(2.0));
+        let cs = ops.op(Some("%cs"), OpKind::TensorSplat, &["%c"]);
+        let cs = ops.attr(cs, AttrKey::Shape, tile.clone());
+        let z = ops.op(Some("%z"), OpKind::ArithMulf, &["%y", "%cs"]);
+        let z = ops.attr(z, AttrKey::Shape, tile);
+        let st = ops.op(None, OpKind::KtdpStore, &["%z", "%tz"]);
+        let stmts = vec![x, s, ss, y, c, cs, z, st];
+        let mrk = emit_map_region_kernel(&stmts, &[3, 6]).unwrap();
+        assert_eq!(
+            mrk.live_ins,
+            vec![ops.ssa("%x"), ops.ssa("%ss")],
+            "the runtime splat is read through its own result, never its freed operand"
+        );
+        assert!(
+            mrk.kernel.source.contains("2.0"),
+            "the constant splat still folds to its literal"
+        );
     }
 
     #[test]
