@@ -250,6 +250,10 @@ still appear on every published row:
    row discloses and the one the matched-context rule matches. The rule needs
    ollama's `OLLAMA_CONTEXT_LENGTH` set to it, and **no truncation on either
    side, proven** by per-turn token accounting — T0.4 for the ollama number.
+   For the replay lane, `scripts/cc_trace.py replay` now does that accounting
+   and voids the run when it fails. See
+   [What the replay enforces](#what-the-replay-enforces-lane-a). The live lane
+   still needs it.
 
    Claude Code's own idea of the window has to match as well, because it
    decides when a session compacts. For a model name it does not recognise —
@@ -332,9 +336,55 @@ request**, nothing per token, so it is not on the decode path. A published
 number needs no disclosure about its own measurement apparatus.
 
 **Request counts only.** Server-side token totals would cross-check the
-client's own accounting, which is what the no-truncation row above needs, but
-they answer a different question from "did the traffic arrive here" and are
-deliberately not part of T0.9. They remain open in the table below.
+client's own accounting, but they answer a different question from "did the
+traffic arrive here" and are deliberately not part of T0.9. They remain open in
+the table below. The client's own accounting is no longer open on the replay
+lane: the replay compares each turn's token counts against the recording (next
+section).
+
+### What the replay enforces (Lane A)
+
+`scripts/cc_trace.py replay` re-sends a recorded session to one engine and
+writes one Lane A run. It refuses to produce a number it cannot back up: a run
+that fails any check below is written with `status: "void"` and the reason, and
+the leaderboard's validator will not publish it.
+
+**No truncation, on either side** (#161 fairness rule 3). The engine's own
+`usage` block is checked against the recording, turn by turn:
+
+- **The session fits.** If the largest prompt in the recording (input + cache
+  read + cache creation tokens) is longer than the context window `/v1/models`
+  reports, the run is void before anything is sent. This catches #322 up front
+  rather than as a 400 halfway through.
+- **The reply was not cut short.** A turn that stops at `max_tokens` with a
+  shorter reply than the recording produced voids the run.
+- **The prompt was not cut short.** A turn whose prompt comes back shorter than
+  the recording's by more than the tolerance voids the run. The tolerance is the
+  larger of 64 tokens and 5% of the recorded prompt, which leaves room for two
+  tokenizers or chat templates counting the same prompt differently. The run
+  names it in `provenance.trace_corpus.replay.prompt_shortfall_tolerance`. A
+  longer prompt is only counted (`prompt_tokens_differ_turns`).
+
+**The engine under test served the traffic.** scratchy's `requests_served` must
+rise by exactly the number of requests the replay sent (see the section above).
+ollama has no such counter, so its runs carry the `requests-served-unavailable`
+disclosure.
+
+**Every repeat starts cold on scratchy.** Before each repeat, the replay clears
+scratchy's prefix cache (`POST /reset_prefix_cache`). This is the default and
+cannot be turned off. If the first turn after a reset still reads tokens from
+the cache, the run is void. ollama has no way to clear its cache, so its repeats
+after the first may start warm, and its runs carry the `prefix-cache-not-reset`
+disclosure.
+
+**Overlapping requests are replayed one at a time.** Claude Code sometimes sends
+a side request while a turn is still running. The recording keeps that
+(`in_flight`), but the replay sends turns serially, so it measures each turn
+without the contention the live session had. A run whose recording had overlap
+carries the `replay-serialized` disclosure.
+
+Those three disclosure ids are not declared in the leaderboard's `board.json`
+yet (#441), so a run that names one fails validation until they are.
 
 ## Blocked
 
@@ -346,7 +396,7 @@ an estimate.
 | R1, ollama side — tag digest and the quantization each default tag carries | **T0.4** | pulling `gemma4:12b` / `gemma4:26b` / `qwen3.6:35b` and reading the manifest |
 | R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit? | **T0.6** | manifest + config of `gemma4:{12b,26b}-mlx` and `qwen3.6:35b-mlx`; R2 names a concrete pair, or the fallback above takes effect |
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
-| no-truncation proof on both sides | **T0.4** + the phase 2 harness | per-turn token accounting in the replay client and the live driver |
+| no-truncation proof on both sides | replay lane: **done** in `cc_trace.py replay` (#440). Live lane: **T0.4** + the live driver (T2.2) | per-turn token accounting; for the replay, see [What the replay enforces](#what-the-replay-enforces-lane-a) |
 | KV-quant deferral and its layer-coverage evidence | **T0.8** | the [Scope and deferrals](#scope-and-deferrals) section above |
 | per-run provenance record (which config served how many requests) | phase 2's provenance check | `GET /server_info` carries both `scratchy_core_config` and `requests_served`; **T0.9 landed the count** (see [Proving the engine under test served the traffic](#proving-the-engine-under-test-served-the-traffic)) |
 | server-side **token totals**, as a cross-check on the client's own accounting | still open — **not** delivered by T0.9 | a server-side counter alongside `requests_served`, or the `metrics` feature's `prompt_tokens_total` / `output_tokens_total` if a build is willing to carry it |

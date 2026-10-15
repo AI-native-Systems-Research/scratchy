@@ -45,7 +45,8 @@ job, not this tool's. A run that cannot be trusted is written with
 `status: "void"` and the reason, and exits non-zero. That covers a session
 too long for the engine's context window, a request counter that disagrees
 with what was sent, a prefix cache that survived its reset, and a turn that
-returned no tokens, timed out, answered 4xx or was cut short at max_tokens.
+returned no tokens, timed out, answered 4xx, was cut short at max_tokens, or
+counted a prompt shorter than the recording's by more than the tolerance.
 Standard library only.
 """
 
@@ -515,9 +516,15 @@ TURN_METRICS = {
     "tpot_ms": "no turn streamed its reply in more than one delta",
     "turn_e2e_ms": "no turn finished",
     "reprefill_ratio": "no turn reported its prompt usage",
+    "e2e_star_ms": "no turn both streamed its reply and has a recorded response to take the "
+                   "output length from",
 }
-E2E_STAR_NONE = ("no turn both streamed its reply and has a recorded response to take the "
-                 "output length from")
+# How much shorter than the recorded prompt a replayed prompt may be before the
+# run is void: the larger of the two. Room for two tokenizers or chat templates
+# counting the same prompt differently, not for an engine that silently dropped
+# part of it (#161 fairness rule 3). A longer prompt is only counted.
+PROMPT_SHORTFALL_TOKENS = 64
+PROMPT_SHORTFALL_FRACTION = 0.05
 # Disclosure ids. The first two are declared in site/data/leaderboard/board.json;
 # the other three are not yet (#441).
 DISCLOSE_KV = "kv-dtype-unmatched"
@@ -874,27 +881,40 @@ def _group(rows, key):
     return dict(sorted(out.items()))
 
 
-def e2e_star(rows):
-    """median_ttft + (output_len - 1) * median_tpot over `rows`, or None.
+def e2e_star(t):
+    """ttft + (recorded output length - 1) * tpot for one turn, or None.
 
-    bench_serve_compare.sh's formula, from the medians. Only turns that
-    streamed count, as there. output_len is the median length the *recording*
-    produced for those turns, so an engine that stops early gains nothing.
+    The per-turn form of bench_serve_compare.sh's E2E*. That script can work
+    from medians because each of its cells has one fixed output length; a
+    coding session mixes short tool calls with long file writes, so a product
+    of medians would describe no real turn. The length is the one the
+    *recording* produced, so an engine that stops early gains nothing. An
+    unstreamed turn has no TPOT, so it has no E2E* either.
     """
-    timed = [t for t in rows if t["tpot_ms"] is not None and t["recorded_output_tokens"]]
-    if not timed:
+    out = t["recorded_output_tokens"]
+    if not out or t["unstreamed"]:
         return None
-    return (percentile([t["ttft_ms"] for t in timed], 50)
-            + (percentile([t["recorded_output_tokens"] for t in timed], 50) - 1)
-            * percentile([t["tpot_ms"] for t in timed], 50))
+    if out == 1:
+        return t["ttft_ms"]
+    return None if t["tpot_ms"] is None else t["ttft_ms"] + (out - 1) * t["tpot_ms"]
+
+
+def prompt_shortfall(recorded, replayed):
+    """Tokens the replayed prompt is short of the recorded one, when that is more
+    than the tolerance; 0 otherwise, or when either side has no count."""
+    if not recorded or replayed is None:
+        return 0
+    short = recorded - replayed
+    allowed = max(PROMPT_SHORTFALL_TOKENS, PROMPT_SHORTFALL_FRACTION * recorded)
+    return short if short > allowed else 0
 
 
 def aggregate(samples, *, engine, model, repeat):
     """(measurements, gaps, by_turn_index) from every replayed turn of every repeat.
 
-    A per-turn metric's stat is over every (repeat, turn) value, E2E*'s over one
-    value per repeat; `stat.samples` says which. `n` is the repeat count, the
-    page's "×reps". The board takes series points as [x, y] pairs, so the
+    Each stat is over every (repeat, turn) value, and `stat.samples` says how
+    many; `n` is the repeat count, the page's "×reps". The board takes series
+    points as [x, y] pairs, so the
     series carries each turn index's p50, and `by_turn_index` (written to the
     .turns.json artifact) carries its p50 and p99.
     """
@@ -931,16 +951,6 @@ def aggregate(samples, *, engine, model, repeat):
     for metric, none_reason in TURN_METRICS.items():
         if not per_turn_cells(metric, metric):
             gaps.append({**base, "metric": metric, "state": "not-run", "reason": none_reason})
-
-    def per_repeat(rows):
-        return [v for reps in _group(rows, "repeat").values() if (v := e2e_star(reps)) is not None]
-
-    points = [[i, round(v, 4)] for i, rows in per_turn.items() if (v := e2e_star(rows)) is not None]
-    by_turn_index["e2e_star_ms"] = [{"turn_index": i, "value": v} for i, v in points]
-    if not add("e2e_star_ms", per_repeat(samples), points=points):
-        gaps.append({**base, "metric": "e2e_star_ms", "state": "not-run", "reason": E2E_STAR_NONE})
-    for tc, rows in classes.items():
-        add("e2e_star_ms", per_repeat(rows), facet={"turn_class": tc})
 
     # ITL: only a per-chunk number exists on the wire, so the headline is a gap
     # and the chunk figure sits beside it under its own facet.
@@ -1014,11 +1024,20 @@ def replay_turns(up, turns, *, repeat, temperature, served_model, timeout_s, res
                     f"{where}: stopped at max_tokens after {timing['output_tokens']} tokens "
                     f"where the recording produced {recorded_out}: the reply was cut short "
                     "(#161 fairness rule 3)")
-            samples.append({"repeat": r, "turn_index": i, "seq": t["seq"],
-                            "turn_class": t["turn_class"], "in_flight": t["in_flight"],
-                            "recorded_output_tokens": recorded_out,
-                            "recorded_prompt_tokens": t["recorded"].get("prompt_tokens"),
-                            **timing})
+            recorded_prompt = t["recorded"].get("prompt_tokens")
+            short = prompt_shortfall(recorded_prompt, timing["prompt_tokens"])
+            if short:
+                return samples, sent, (
+                    f"{where}: the engine counted a {timing['prompt_tokens']}-token prompt where "
+                    f"the recording had {recorded_prompt}, {short} tokens short — more than the "
+                    f"{PROMPT_SHORTFALL_TOKENS}-token / {PROMPT_SHORTFALL_FRACTION:.0%} "
+                    "tolerance, so part of the prompt was dropped (#161 fairness rule 3)")
+            sample = {"repeat": r, "turn_index": i, "seq": t["seq"],
+                      "turn_class": t["turn_class"], "in_flight": t["in_flight"],
+                      "recorded_output_tokens": recorded_out,
+                      "recorded_prompt_tokens": recorded_prompt, **timing}
+            sample["e2e_star_ms"] = e2e_star(sample)
+            samples.append(sample)
             log(f"[r{r} t{i:03d} seq {t['seq']}] ttft {timing['ttft_ms']:.0f}ms "
                 f"e2e {timing['turn_e2e_ms']:.0f}ms out {timing['output_tokens']} "
                 f"reprefill {timing['reprefill_ratio']}")
@@ -1064,6 +1083,8 @@ def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung
                 "unstreamed_turns": sum(1 for t in samples if t["unstreamed"]),
                 "max_tokens_turns": sum(1 for t in samples if t["stop_reason"] == "max_tokens"),
                 "prompt_tokens_differ_turns": len(differs),
+                "prompt_shortfall_tolerance": {"tokens": PROMPT_SHORTFALL_TOKENS,
+                                               "fraction": PROMPT_SHORTFALL_FRACTION},
             },
         },
         "disclosed": disclosed,

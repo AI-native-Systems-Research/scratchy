@@ -350,11 +350,11 @@ def _stream(output_tokens=3, input_tokens=100, cache_read=0, stop_reason="end_tu
 
 def _one_delta(output_tokens):
     """A reply the engine buffered: every token arrives in a single delta."""
-    return [(0, _ev("message_start", message={"usage": {"input_tokens": 9}})),
+    return [(0, _ev("message_start", message={"usage": {"input_tokens": 100}})),
             (TTFT_GAP, _ev("content_block_delta", index=0,
                            delta={"type": "text_delta", "text": "all at once"})),
             (0, _ev("message_delta", delta={"stop_reason": "end_turn"},
-                    usage={"input_tokens": 9, "output_tokens": output_tokens})),
+                    usage={"input_tokens": 100, "output_tokens": output_tokens})),
             (0, _ev("message_stop"))]
 
 
@@ -578,26 +578,26 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual({g["metric"]: g["state"] for g in run["gaps"]},
                          {"itl_p99_ms": "blocked", "spec_accept_rate": "not-run"})
 
-    def test_e2e_star_is_computed_from_the_medians(self):
+    def test_e2e_star_is_computed_per_turn(self):
         run, detail = self._replay(repeat=2)
         turns = detail["turns"]
-
-        def med(xs):
-            return cc_trace.percentile(xs, 50)
-
-        # One value per repeat, from that repeat's medians. The recording
-        # produced 5 tokens per reply and the replay 3: E2E* uses 5.
-        want = sorted(med([t["ttft_ms"] for t in turns if t["repeat"] == r])
-                      + 4 * med([t["tpot_ms"] for t in turns if t["repeat"] == r])
-                      for r in (1, 2))
+        # Each turn's own TTFT and TPOT, at the length the recording produced
+        # (5 tokens), not the replay's (3).
+        for t in turns:
+            self.assertAlmostEqual(t["e2e_star_ms"], t["ttft_ms"] + 4 * t["tpot_ms"])
+        # The stat is over turns x repeats, like every other per-turn metric.
         [e2e] = self._meas(run, "e2e_star_ms")
-        self.assertEqual(e2e["stat"]["samples"], 2)
-        self.assertAlmostEqual(e2e["stat"]["p10"], want[0] + (want[1] - want[0]) * 0.1, places=2)
-        self.assertAlmostEqual(e2e["stat"]["median"], sum(want) / 2, places=2)
-        first = [t for t in turns if t["turn_index"] == 1]
-        self.assertAlmostEqual(e2e["series"]["points"][0][1],
-                               med([t["ttft_ms"] for t in first])
-                               + 4 * med([t["tpot_ms"] for t in first]), places=2)
+        values = [t["e2e_star_ms"] for t in turns]
+        self.assertEqual((e2e["n"], e2e["stat"]["samples"]), (2, 10))
+        self.assertAlmostEqual(e2e["stat"]["median"], cc_trace.percentile(values, 50), places=3)
+        self.assertAlmostEqual(e2e["stat"]["p99"], cc_trace.percentile(values, 99), places=3)
+        first = [t["e2e_star_ms"] for t in turns if t["turn_index"] == 1]
+        self.assertAlmostEqual(e2e["series"]["points"][0][1], cc_trace.percentile(first, 50),
+                               places=3)
+        # A recorded length of 1 is just the TTFT; no recorded reply, no E2E*.
+        t = dict(turns[0], recorded_output_tokens=1)
+        self.assertEqual(cc_trace.e2e_star(t), t["ttft_ms"])
+        self.assertIsNone(cc_trace.e2e_star(dict(turns[0], recorded_output_tokens=None)))
 
     def test_a_reply_in_one_delta_has_no_tpot(self):
         FakeAnthropic.reply = staticmethod(lambda body: _one_delta(output_tokens=40))
@@ -609,7 +609,7 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(self._meas(run, "tpot_ms") + self._meas(run, "e2e_star_ms"), [])
         gaps = {g["metric"]: g["reason"] for g in run["gaps"]}
         self.assertEqual(gaps["tpot_ms"], cc_trace.TURN_METRICS["tpot_ms"])
-        self.assertEqual(gaps["e2e_star_ms"], cc_trace.E2E_STAR_NONE)
+        self.assertEqual(gaps["e2e_star_ms"], cc_trace.TURN_METRICS["e2e_star_ms"])
         self.assertEqual(len(self._meas(run, "ttft_ms")), 1)
 
     def test_reprefill_ratio(self):
@@ -617,9 +617,11 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(cc_trace.reprefill_ratio(1, 166), 1 / 167)
         self.assertEqual(cc_trace.reprefill_ratio(10, 80, 10), 0.2)
         self.assertIsNone(cc_trace.reprefill_ratio(0, 0))
-        # The two one-message requests have nothing to reuse; the other three reuse 75%.
+        # Every prompt is the recording's 100 tokens. The two one-message requests
+        # have nothing to reuse; the other three reuse 75 of them.
         FakeAnthropic.reply = staticmethod(lambda body: _stream(
-            input_tokens=25, cache_read=75 if len(body["messages"]) > 1 else 0))
+            **({"input_tokens": 25, "cache_read": 75} if len(body["messages"]) > 1
+               else {"input_tokens": 100})))
         run, detail = self._replay()
         self.assertEqual([t["reprefill_ratio"] for t in detail["turns"]],
                          [1.0, 1.0, 0.25, 0.25, 0.25])
@@ -631,7 +633,7 @@ class ReplayTest(unittest.TestCase):
             # Whatever this engine says, the class must not follow it.
             ev = _ev("content_block_delta", index=0,
                      delta={"type": "input_json_delta", "partial_json": "{}"})
-            return [(0, _ev("message_start", message={"usage": {"input_tokens": 9}})),
+            return [(0, _ev("message_start", message={"usage": {"input_tokens": 100}})),
                     (0, ev), (0, ev),
                     (0, _ev("message_delta", usage={"output_tokens": 2})), (0, _ev("message_stop"))]
 
@@ -685,6 +687,27 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(run["status"], "published", run.get("void"))
         self.assertEqual(run["provenance"]["trace_corpus"]["replay"]["max_tokens_turns"], 5)
 
+    def test_a_prompt_that_comes_back_shorter_voids_the_run(self):
+        # The recording's prompts were 100 tokens; this engine counts 10.
+        FakeAnthropic.reply = staticmethod(lambda body: _stream(input_tokens=10))
+        run, detail = self._replay()
+        self.assertEqual(run["status"], "void")
+        self.assertIn("90 tokens short", run["void"])
+        self.assertEqual(detail["turns"], [])
+        # 60 short is inside the 64-token floor: counted, not void.
+        FakeAnthropic.reply = staticmethod(lambda body: _stream(input_tokens=40))
+        run, detail = self._replay()
+        self.assertEqual(run["status"], "published", run.get("void"))
+        replay = run["provenance"]["trace_corpus"]["replay"]
+        self.assertEqual(replay["prompt_tokens_differ_turns"], 5)
+        self.assertEqual(replay["prompt_shortfall_tolerance"],
+                         {"tokens": cc_trace.PROMPT_SHORTFALL_TOKENS,
+                          "fraction": cc_trace.PROMPT_SHORTFALL_FRACTION})
+        # On a long prompt the percentage sets the bar, not the floor.
+        self.assertEqual(cc_trace.prompt_shortfall(10000, 9600), 0)
+        self.assertEqual(cc_trace.prompt_shortfall(10000, 9400), 600)
+        self.assertEqual(cc_trace.prompt_shortfall(None, 5), 0)
+
     def test_a_cache_that_survives_the_reset_voids_the_run(self):
         FakeAnthropic.reply = staticmethod(lambda body: _stream(input_tokens=25, cache_read=75))
         run, detail = self._replay()
@@ -726,8 +749,10 @@ class ReplayTest(unittest.TestCase):
             # Coverage of the other cells is the whole board's concern, not one run's.
             return [p for p in lb.validate(board) if p.startswith(run["run_id"])]
 
-        # No concurrency in the recording, so no disclosure the board has yet to
-        # declare (#441).
+        # Not full coverage: a recording with no overlapping requests, because a
+        # run from one that has them (every real Claude Code session) names
+        # `replay-serialized`, which the board does not declare yet. #441 adds it
+        # and a test for that run.
         run, _ = self._replay(self._corpus("serial", concurrent=False), repeat=3)
         self.assertEqual(run["status"], "published", run.get("void"))
         self.assertEqual(problems(run), [])

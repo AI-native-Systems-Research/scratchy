@@ -214,7 +214,11 @@ These favour one side or the other and must travel with any published number.
 - **An agentic workload adds asymmetries of its own**, and resolves the
   quantization rungs to concrete per-engine artifacts: see
   [`CLAUDE_CODE_BENCH.md`](CLAUDE_CODE_BENCH.md), which carries the Claude Code
-  comparison's pins, disclosures and blocked cells. Its method is promoted into
+  comparison's pins, disclosures and blocked cells. Two of them come from the
+  trace replay itself
+  ([What the replay enforces](CLAUDE_CODE_BENCH.md#what-the-replay-enforces-lane-a)).
+  It clears scratchy's prefix cache before every repeat, which ollama offers no
+  way to do. And it sends a session's overlapping requests one at a time. Its method is promoted into
   this file as a §7 once that epic's phase 5 lands.
 
 ## 5. Running it
