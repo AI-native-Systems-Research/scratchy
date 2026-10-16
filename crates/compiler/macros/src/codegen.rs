@@ -10180,15 +10180,25 @@ fn dump_wavefront_mega(
                     // per-page fold that relaunched once per resident page at ~108 ops a page. The
                     // ceiling body is the WIDEST chunk; the ladder below bakes the narrower ones.
                     // Asked of the graph's own geometry (`admitted_chunk`): a model the chunk cannot
-                    // express (hd above one slab) keeps its per-page fold AND its sweep ladder.
-                    let chunk_ceiling: Option<u32> = if one_request || prompt_chunk_prefix {
-                        scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk(
-                            &krg,
-                            Some(ktir_superdsc::sdsc_abstract::ChunkScratch::PAGES_MAX),
-                        )
-                    } else {
-                        None
-                    };
+                    // express (a head dim past one page's stick blocks, see `ChunkScratch`) keeps its
+                    // per-page fold AND its sweep ladder.
+                    //
+                    // ⛔ AND ONLY ON THE CARD — the chunk ladder is a card feature, like the prefill
+                    // width ladder. The one reader of its rungs is `superdsc_exec`'s selector, which
+                    // compiles under `spyre-hw` alone, and off-card no launch group carries the
+                    // `page_fold` the fallback proof reads (`emitted_bundle_folds`), so an emulator
+                    // ladder with a chunk in it cannot prove a fallback and its bake panics:
+                    // granite-8b under `spyre-emu` did, the moment hd=128 was admitted. Off-card the
+                    // body stays the per-page fold, as it was.
+                    let chunk_ceiling: Option<u32> =
+                        if cfg!(feature = "spyre-hw") && (one_request || prompt_chunk_prefix) {
+                            scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk(
+                                &krg,
+                                Some(ktir_superdsc::sdsc_abstract::ChunkScratch::PAGES_MAX),
+                            )
+                        } else {
+                            None
+                        };
                     match ValidatedGraph::new(&krg) {
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);

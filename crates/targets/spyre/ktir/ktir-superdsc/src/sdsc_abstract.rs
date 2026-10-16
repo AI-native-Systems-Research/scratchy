@@ -6640,13 +6640,20 @@ impl PageScratch {
 /// * a kv head's Kᵗ block in one page is RowBlocked `[hd, PAGE_SLOTS]` (slot sticks outermost, so
 ///   `(s/64)*(hd*64) + d*64 + s%64`), and its `pages` blocks laid end to end are RowBlocked
 ///   `[hd, pages * PAGE_SLOTS]` — the plain 2-D kernel a single score matmul reads, `n` = the whole chunk;
-/// * a kv head's V block is RowBlocked `[PAGE_SLOTS, hd]` at ONE feature slab, and end to end it is
-///   `[pages * PAGE_SLOTS, hd]` — the kernel a single value matmul contracts over the whole chunk.
+/// * a kv head's V block in one page is RowBlocked `[PAGE_SLOTS, hd]` — `[slab][slot][stick]` — so its
+///   pages laid end to end in PAGE order interleave slabs and stop being `[slots, hd]`. The V gather
+///   therefore takes its OWN, SLAB-MAJOR entry order ([`Self::value_entry_coord`]): kv head, then slab,
+///   then page, then the run of the slab inside the page. End to end that IS RowBlocked
+///   `[pages * PAGE_SLOTS, hd]`, the kernel a value matmul contracts over the whole chunk, one slab per
+///   op. At ONE slab the two orders are the same, so V shares K's index sticks there and the emission is
+///   the one-slab form, byte for byte.
 ///
-/// ⛔ ONE SLAB ONLY, AND THAT IS A REFUSAL, NOT A FALLBACK. Above one feature slab the V block is
-/// `[slab][slot][stick]`, so pages laid end to end interleave slabs and stop being `[slots, hd]`; the fix
-/// is a slab-major destination order, which is a different row law. Refused here so a head dim this
-/// cannot express is a BUILD failure.
+/// ⛔ THE SLABS MUST DIVIDE A PAGE's STICK BLOCKS. An entry is one stick block, `hd * POOL_STICK`
+/// contiguous elements, and a kv head's page holds `PAGE_SLOTS / POOL_STICK` (= 4) of them at every head
+/// dim. In V's `[slab][slot][stick]` layout an entry is therefore `hd` consecutive slots of ONE slab —
+/// `PAGE_SLOTS / hd` runs per slab — only while `hd <= PAGE_SLOTS`, i.e. while the slab count divides 4
+/// (head dims 64, 128, 256). Above that one entry straddles two slabs and no entry order is slab-major:
+/// refused, so such a head dim keeps the per-page fold as a BUILD-TIME fact.
 ///
 /// ⭐ THE COPY OP IS [`PageScratch`]'s, UNCHANGED — a one-stick-block entry, one index stick per op, `mb`
 /// counted in sub-rows. Only the row law and the source block an entry names differ, so the descriptor
@@ -6705,7 +6712,12 @@ impl ChunkScratch {
         let Some(plane) = PagePlaneExtent::of_pool(pool) else {
             return None;
         };
-        if pages == 0 || pages > Self::PAGES_MAX || plane.slabs() != 1 {
+        if pages == 0 || pages > Self::PAGES_MAX {
+            return None;
+        }
+        // One slab's V entries per page must be whole runs of that slab — see the type's doc.
+        let blocks_per_page = (plane.head_block_elems() / plane.entry_elems()) as u32;
+        if plane.slabs() == 0 || !blocks_per_page.is_multiple_of(plane.slabs()) {
             return None;
         }
         // ⛔ EVERY COPY NAMES EXACTLY ONE FULL INDEX STICK, so one op's entries must fit LX and the
@@ -6810,25 +6822,6 @@ impl ChunkScratch {
         Some(ChunkCorner(off as u32))
     }
 
-    /// ⭐ A PER-HEAD WIDE INTERMEDIATE'S CORNER — kv head `kvh`'s `[rows_per_head, slots]` block of a
-    /// buffer laid out `[nkvh][rows_per_head][slots]`, i.e. `kvh * rows_per_head * slots`.
-    ///
-    /// ⛔ WHY EACH KV HEAD GETS A WHOLE BLOCK AND NOT A ROW SLICE OF ONE `[nqh, slots]` BUFFER: dxp
-    /// rebuilds a stick-blocked operand's stick-GROUP stride from the op's own `N_` (the windowed
-    /// matmul's card measurement, `assemble_matmul_windowed`), so a 4-row op over a 32-row RowBlocked
-    /// buffer strides its slabs `4*64` apart where the buffer's are `32*64` — incoherent on card at more
-    /// than one slab. A block that IS `[rows_per_head, slots]` has nothing to disagree about.
-    pub const fn rows_corner(self, kvh: u32, rows_per_head: u32) -> Option<ChunkCorner> {
-        if kvh >= self.nkvh() {
-            return None;
-        }
-        let off = kvh as u64 * rows_per_head as u64 * self.slots() as u64;
-        if off > u32::MAX as u64 {
-            return None;
-        }
-        Some(ChunkCorner(off as u32))
-    }
-
     /// ⭐ PAGES ONE VALUE-LEG PART COVERS when a chunk's PV is cut along K — see [`Self::value_parts`].
     pub const VALUE_PART_PAGES: u32 = 16;
 
@@ -6892,6 +6885,126 @@ impl ChunkScratch {
             },
         })
     }
+
+    /// The V gather's copies — [`Self::copies`]' ops, reading the index from
+    /// [`Self::value_index_base`] on: the same sticks at one slab, V's own sticks above it.
+    pub fn value_copies(self) -> impl Iterator<Item = GatherCopy> {
+        let base = self.value_index_base();
+        self.copies().map(move |c| GatherCopy {
+            stick: c.stick + base,
+            ..c
+        })
+    }
+
+    /// The index stick V's run starts at: 0 at one slab, where V's entry order IS K's and the two gathers
+    /// share one run; after K's [`Self::index_sticks`] above it, where V is slab-major
+    /// ([`Self::value_entry_coord`]).
+    pub const fn value_index_base(self) -> u32 {
+        if self.plane.slabs() == 1 {
+            0
+        } else {
+            self.index_sticks()
+        }
+    }
+
+    /// Index sticks the host stages for this chunk — K's run, plus V's own above one slab. The table's
+    /// size and the copies' highest stick are this one number.
+    pub const fn table_sticks(self) -> u32 {
+        self.value_index_base() + self.index_sticks()
+    }
+
+    /// ⭐ THE V GATHER's ENTRY ORDER — `(kv head, slab, page, run)` for destination entry `e`, and the
+    /// SOURCE block inside the `(page, kv head)` block it names. V's page block is `[slab][slot][stick]`,
+    /// so its `PAGE_SLOTS / POOL_STICK` blocks are slab-major already: block `slab * runs + run`. Laid out
+    /// in this order a kv head's whole-chunk V is RowBlocked `[chunk slots, hd]`. At one slab `runs` is the
+    /// whole block and this is [`Self::entry_coord`] exactly.
+    ///
+    /// Returns `(kv head, page, source block)`.
+    pub const fn value_entry_coord(self, e: u32) -> (u32, u32, u32) {
+        let (per_row, eph) = (self.entries_per_row(), self.entries_per_head_page());
+        let runs = eph / self.plane.slabs();
+        let (kvh, r) = (e / per_row, e % per_row);
+        let per_slab = self.pages * runs;
+        let (slab, r) = (r / per_slab, r % per_slab);
+        (kvh, r / runs, slab * runs + r % runs)
+    }
+
+    /// ⭐ HOW THE CHUNK's WIDE INTERMEDIATES ARE CUT INTO ROW BLOCKS — see [`ChunkRowBlocks`].
+    pub const fn row_blocks(self, gqa: u32, mq: u32) -> ChunkRowBlocks {
+        if self.plane.slabs() == 1 {
+            ChunkRowBlocks {
+                blocks: self.nkvh(),
+                rows: gqa * mq,
+                heads: gqa,
+                gqa,
+                slots: self.slots(),
+            }
+        } else {
+            ChunkRowBlocks {
+                blocks: self.nkvh() * gqa,
+                rows: mq,
+                heads: 1,
+                gqa,
+                slots: self.slots(),
+            }
+        }
+    }
+}
+
+/// ⭐⭐⭐ THE ROW BLOCKS A CHUNK's WIDE INTERMEDIATES ARE CUT INTO — one per KV HEAD at one feature slab,
+/// one per QUERY HEAD above it.
+///
+/// ⛔ WHY THE UNIT CHANGES WITH THE SLAB COUNT. Each block's score/probability data is a whole
+/// `[rows, slots]` RowBlocked block (dxp rebuilds a stick-blocked operand's group stride from the op's own
+/// `N_`, so a row slice of a taller multi-stick buffer is incoherent), and its query rows must be ONE
+/// contiguous operand. In the token stream head `h`'s rows sit at `h·mq·hd`, slab-major inside the head
+/// ([`OperandPlacement::of_token_stream`]): at one slab a GQA group's `gqa·mq` rows are contiguous, so a
+/// block per kv head scores the whole group in one op. Above one slab the group's rows interleave the
+/// slabs and only ONE head's `[mq, hd]` is a contiguous operand — so a block per query head, scored by
+/// the fold's own per-head form (`ScoreArm::PerHead`, the whole head dim in one unbatched op).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkRowBlocks {
+    blocks: u32,
+    rows: u32,
+    /// Query heads one block covers: `gqa` per kv head, 1 per query head.
+    heads: u32,
+    gqa: u32,
+    slots: u32,
+}
+
+impl ChunkRowBlocks {
+    pub const fn count(self) -> u32 {
+        self.blocks
+    }
+    /// Query rows one block covers.
+    pub const fn rows(self) -> u32 {
+        self.rows
+    }
+    /// Whether a block is a whole kv head's GQA group (one slab) rather than one query head.
+    pub const fn per_kv_head(self) -> bool {
+        self.heads == self.gqa
+    }
+    /// The first query head of block `b` — its rows start at `first_head(b) * mq` in the head-major
+    /// stream.
+    pub const fn first_head(self, b: u32) -> u32 {
+        b * self.heads
+    }
+    /// The kv head whose keys and values block `b` attends.
+    pub const fn kv_head(self, b: u32) -> u32 {
+        b * self.heads / self.gqa
+    }
+    /// Block `b`'s corner in a `[blocks][rows][slots]` buffer. `None` past the block count or the `u32`
+    /// an address carries.
+    pub const fn corner(self, b: u32) -> Option<ChunkCorner> {
+        if b >= self.blocks {
+            return None;
+        }
+        let off = b as u64 * self.rows as u64 * self.slots as u64;
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
+    }
 }
 
 /// A device element corner inside a split-KV chunk tensor — minted ONLY by [`ChunkScratch`]'s own laws
@@ -6921,30 +7034,36 @@ impl ChunkPart {
         self.slots
     }
 
-    /// kv head `kvh`'s probabilities for this part: stick-columns `[first_slot, first_slot + slots)` of
-    /// its RowBlocked `[rows_per_head, chunk slots]` block, whose columns are OUTERMOST
-    /// (`(c/64)*(rows*64) + r*64 + c%64`) — so the part starts `first_slot · rows_per_head` in, and its
+    /// Row block `b`'s probabilities for this part: stick-columns `[first_slot, first_slot + slots)` of
+    /// its RowBlocked `[rows, chunk slots]` block ([`ChunkRowBlocks::corner`]), whose columns are
+    /// OUTERMOST (`(c/64)*(rows*64) + r*64 + c%64`) — so the part starts `first_slot · rows` in, and its
     /// rows keep the block's pitch.
-    pub const fn probs_corner(self, kvh: u32, rows_per_head: u32) -> Option<ChunkCorner> {
-        let Some(base) = self.chunk.rows_corner(kvh, rows_per_head) else {
+    pub const fn probs_corner(self, blocks: ChunkRowBlocks, b: u32) -> Option<ChunkCorner> {
+        let Some(base) = blocks.corner(b) else {
             return None;
         };
-        let off = base.0 as u64 + self.first_slot as u64 * rows_per_head as u64;
+        let off = base.0 as u64 + self.first_slot as u64 * blocks.rows() as u64;
         if off > u32::MAX as u64 {
             return None;
         }
         Some(ChunkCorner(off as u32))
     }
 
-    /// kv head `kvh`'s V rows for this part: rows `[first_slot, first_slot + slots)` of its
-    /// `[chunk slots, hd]` block — ONE feature slab ([`ChunkScratch::of_chunk`] refuses more), so
-    /// row-major, `first_slot · hd` in.
-    pub const fn value_corner(self, kvh: u32) -> Option<ChunkCorner> {
+    /// kv head `kvh`'s V rows for this part, in feature slab `slab`: rows `[first_slot, first_slot +
+    /// slots)` of slab `slab` of its RowBlocked `[chunk slots, hd]` block (slab-major, see
+    /// [`ChunkScratch::value_entry_coord`]) — `slab · chunk_slots · stick + first_slot · stick` in. At one
+    /// slab that is `first_slot · hd`, the row-major offset.
+    pub const fn value_corner(self, kvh: u32, slab: u32) -> Option<ChunkCorner> {
         let Some(base) = self.chunk.kernel_corner(kvh) else {
             return None;
         };
-        let hd = self.chunk.head_chunk_elems() / self.chunk.slots() as u64;
-        let off = base.0 as u64 + self.first_slot as u64 * hd;
+        if slab >= self.chunk.plane.slabs() {
+            return None;
+        }
+        let stick = POOL_STICK as u64;
+        let off = base.0 as u64
+            + slab as u64 * self.chunk.slots() as u64 * stick
+            + self.first_slot as u64 * stick;
         if off > u32::MAX as u64 {
             return None;
         }
@@ -6959,6 +7078,10 @@ impl ChunkPart {
 /// chunk wider than the list repeats the LAST real page for its tail — never page 0, which is another
 /// request's keys; the mask silences the repeat (the reference's `_pad_num_blocks` law).
 ///
+/// ⭐ ABOVE ONE FEATURE SLAB THE TABLE IS TWO RUNS: K's entries, then V's in V's own slab-major order
+/// ([`ChunkScratch::value_entry_coord`]), starting at [`ChunkScratch::value_index_base`] — the stick the
+/// V copies read from. At one slab the orders agree and V reads K's run.
+///
 /// `None` on an empty page list or an entry that leaves `i32`.
 pub fn chunk_gather_index_table(
     scratch: ChunkScratch,
@@ -6966,13 +7089,15 @@ pub fn chunk_gather_index_table(
     per_page: EntriesPerPage,
 ) -> Option<Vec<GatherEntry>> {
     let last = *pages.last()?;
-    (0..scratch.entries())
-        .map(|e| {
-            let (kvh, page, q) = scratch.entry_coord(e);
-            let phys = *pages.get(page as usize).unwrap_or(&last);
-            GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
-        })
-        .collect()
+    let entry = |(kvh, page, q): (u32, u32, u32)| {
+        let phys = *pages.get(page as usize).unwrap_or(&last);
+        GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
+    };
+    let keys = (0..scratch.entries()).map(|e| entry(scratch.entry_coord(e)));
+    let values = (0..scratch.entries())
+        .filter(|_| scratch.value_index_base() > 0)
+        .map(|e| entry(scratch.value_entry_coord(e)));
+    keys.chain(values).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
