@@ -520,53 +520,93 @@ pub(crate) fn oproj_edges<F: RopeForm>(ir: &SubtileIR<F>) -> Result<OprojEdges, 
     })
 }
 
-/// ⭐ THE SPLIT-KV CHUNK THIS GRAPH'S ATTENTION GEOMETRY CAN EXPRESS — `requested` when
-/// `ChunkScratch::of_chunk` admits it at the model's own `(nkvh, hd)`, `None` otherwise.
+/// ⭐ THE SPLIT-KV CHUNK THIS GRAPH'S ATTENTION CAN EXPRESS — `requested` when EVERY attention
+/// class's pool admits it, `None` otherwise.
 ///
 /// ⛔ `None` IS THE PER-PAGE FOLD, WHICH IS THE SHIPPED AND CORRECT DECODE — not a silently degraded
 /// one. The chunk is refused where its V gather has no slab-major order (a head dim past one page's stick
 /// blocks — `ChunkScratch::of_chunk`; hd 64, 128 and 256 are admitted), and a model there keeps exactly
-/// the emission it had. Asked of the GRAPH, so a third-party producer's geometry decides for itself; a
-/// graph with no attention node has nothing to chunk.
+/// the emission it had. Asked of the GRAPH — a CONJUNCTION over every `AttnDecode` geometry, never one
+/// class's answer in another's place (#554: the ladder was admitted off the sliding class alone and the
+/// door refused the global class's hd=512 at bake) — so a third-party producer's geometry decides for
+/// itself; a graph with no attention node has nothing to chunk.
 pub fn admitted_chunk<F: RopeForm>(ir: &SubtileIR<F>, requested: Option<u32>) -> Option<u32> {
-    let pages = requested?;
-    ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(attn_pool(ir)?, pages).map(|_| pages)
+    let pools = attn_pools(ir);
+    requested.filter(|&pages| admits_chunk(&pools, pages))
 }
 
-/// The paged KV pool this graph's attention reads — `None` for a graph with no attention node.
-fn attn_pool<F: RopeForm>(ir: &SubtileIR<F>) -> Option<ktir_superdsc::sdsc_abstract::PagedKvPool> {
-    let geom = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode { geom, .. } => Some(*geom),
-        _ => None,
-    })?;
-    Some(ktir_superdsc::sdsc_abstract::PagedKvPool::new(
-        geom.nkvh().get() as usize,
-        geom.hd().get() as usize,
-    ))
+/// The paged KV pools this graph's attention reads — one per DISTINCT `AttnDecode` geometry, in
+/// first-appearance order. ⛔ EVERY CLASS, NOT THE FIRST: a hybrid model (gemma-4's sliding layers
+/// plus every-sixth global ones) carries two geometries in one graph, and a chunk is lowered at
+/// EVERY class's attention, so an admission read off one class speaks for a class that never
+/// offered it (#554). Empty for a graph with no attention node.
+fn attn_pools<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<ktir_superdsc::sdsc_abstract::PagedKvPool> {
+    let mut pools = Vec::new();
+    for n in &ir.nodes {
+        if let SubOp::AttnDecode { geom, .. } = &n.op {
+            let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+                geom.nkvh().get() as usize,
+                geom.hd().get() as usize,
+            );
+            if !pools.contains(&pool) {
+                pools.push(pool);
+            }
+        }
+    }
+    pools
+}
+
+/// ⭐ THE ONE ADMISSION PREDICATE — a chunk width this graph's attention can express is a width
+/// EVERY class's pool expresses ([`ChunkScratch::of_chunk`] at each). Both doors into the bake —
+/// the ladder that mints a rung ([`admitted_chunk_ladder`]) and the bundle that narrows one
+/// ([`admitted_chunk`]) — ask THIS, so a rung can never name a width some class's own door
+/// refuses (#554: the two answers were read off different classes, and the bake panicked between
+/// them).
+fn admits_chunk(pools: &[ktir_superdsc::sdsc_abstract::PagedKvPool], pages: u32) -> bool {
+    !pools.is_empty()
+        && pools.iter().all(|pool| {
+            ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(*pool, pages).is_some()
+        })
 }
 
 /// ⭐ THE CHUNK LADDER THIS GRAPH's GEOMETRY ADMITS for a body of `requests` request rows, ascending —
-/// [`ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for`] at the graph's own pool (one request for a
-/// body whose rows share a history, the batch width for a decode batch). Empty where the chunk is not
-/// expressible at all, which keeps the per-page fold, as [`admitted_chunk`]'s `None` does.
+/// [`ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for`] at the graph's pools (one request for a
+/// body whose rows share a history, the batch width for a decode batch). The rung widths are
+/// pool-independent (`ChunkScratch::LADDER`; `B × J` for a batch), so one class's ladder enumerates
+/// them and [`admits_chunk`] — the ONE predicate — admits each at EVERY class's pool: a graph whose
+/// classes disagree offers no rung at all, which keeps the per-page fold, as [`admitted_chunk`]'s
+/// `None` does.
 pub fn admitted_chunk_ladder<F: RopeForm>(ir: &SubtileIR<F>, requests: u32) -> Vec<u32> {
-    attn_pool(ir).map_or_else(Vec::new, |pool| {
-        ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for(pool, requests)
-    })
+    let pools = attn_pools(ir);
+    pools
+        .first()
+        .map_or_else(Vec::new, |&pool| {
+            ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for(pool, requests)
+        })
+        .into_iter()
+        .filter(|&pages| admits_chunk(&pools, pages))
+        .collect()
 }
 
 /// ⭐ A LADDER CHUNK's SWEPT EXTENT PER REQUEST — the rung key the body selector compares the live
 /// context against ([`ktir_superdsc::sdsc_abstract::ChunkScratch::swept_per_request`]). `pages` comes off
-/// [`admitted_chunk_ladder`] at the same `requests`; `None` for a chunk this pool refuses, which the bake
-/// turns into a build failure (a rung its own ladder never offered), never a guessed extent.
+/// [`admitted_chunk_ladder`] at the same `requests`; `None` for a chunk some class of this graph's
+/// attention refuses, which the bake turns into a build failure (a rung its own ladder never
+/// offered), never a guessed extent.
 pub fn chunk_swept_per_request<F: RopeForm>(
     ir: &SubtileIR<F>,
     pages: u32,
     requests: u32,
 ) -> Option<u32> {
-    attn_pool(ir)
-        .and_then(|pool| ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(pool, pages))
-        .map(|c| c.swept_per_request(requests))
+    let pools = attn_pools(ir);
+    if !admits_chunk(&pools, pages) {
+        return None;
+    }
+    // `swept_per_request` counts PAGES (`pages × PAGE_SLOTS` at one request, `J × PAGE_SLOTS` for a
+    // batch) — no pool's geometry enters it — so any admitting pool's scratch states it and the law
+    // stays in ONE place.
+    ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(pools[0], pages)
+        .map(|chunk| chunk.swept_per_request(requests))
 }
 
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
@@ -1479,9 +1519,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // segment walk mints a program. One implementation (the splice's `addressing`
     // module), two bake heads.
     scratchy_triton_splice::addressing::verify_addressing(ir).map_err(SuperDscError)?;
-    // ⭐ THE CHUNK THIS GEOMETRY CAN EXPRESS, decided ONCE for both of its consumers — the index
-    // placement (`compute_bundle_layout`'s `gathers_kv`) and the door's `BundleAttnParams` — so an index
-    // is reserved exactly where a chunk gathers through it.
+    // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
+    // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
+    // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
     let chunk_pages = admitted_chunk(ir, chunk_pages);
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
