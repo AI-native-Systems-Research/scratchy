@@ -8,7 +8,7 @@
 
 use crate::address::ByteSize;
 use crate::memory_region::DomainId;
-use crate::senlib_ffi_allocator::{self, LiveAllocationHandle};
+use crate::senlib_ffi::{self, LiveAllocationHandle};
 
 /// Permanent (long-lived, e.g. model weights) vs Temporary (short-lived,
 /// e.g. activations) allocation lifetime hint. Port of `flex::AllocType`.
@@ -59,7 +59,7 @@ impl DeviceMemoryAllocation {
     // `AllocIndex()` is the VF-only `AIUMsg::V1::AllocationIndex` used by
     // `DeviceMemoryAllocator::Free`'s VF branch to call
     // `vfw_->Deallocate(index)`; this crate's unified
-    // `flex_senlib_memory_free(handle)` (see `senlib_ffi_allocator.rs`)
+    // `flex_senlib_memory_free(handle)` (see `senlib_ffi.rs`)
     // already carries that index inside the opaque handle itself, so a
     // separate public accessor for it has no caller here. This is an
     // intentionally narrower accessor surface than the real type's, not an
@@ -75,7 +75,7 @@ impl Drop for DeviceMemoryAllocation {
         // The C++ `~DeviceMemoryAllocation()` cannot report a failed `Free`
         // either, but it does not hide one: log it rather than dropping it on
         // the floor (a leaked device allocation is silent otherwise).
-        let rc = unsafe { senlib_ffi_allocator::flex_senlib_memory_free(self.handle.as_raw()) };
+        let rc = unsafe { senlib_ffi::flex_senlib_memory_free(self.handle.as_raw()) };
         if rc != 0 {
             tracing::error!(handle = ?self.handle, "senlib device-memory Free failed; allocation leaked");
         }
@@ -93,7 +93,7 @@ pub enum DeviceMemoryAllocatorError {
     /// `RAS::MEMORY::VFAllocFailed()` (device_memory_allocator.cpp:194,
     /// `vfw_->Allocate` returning a zero index after exhausting retries).
     /// This is intentionally kept as ONE variant rather than split into
-    /// `PfAllocFailed`/`VfAllocFailed`: `senlib_ffi_allocator`'s
+    /// `PfAllocFailed`/`VfAllocFailed`: `senlib_ffi`'s
     /// `flex_senlib_memory_allocate` unifies both backends behind a single
     /// call whose failure sentinel (`handle == 0`) does not indicate which
     /// backend produced it (see that module's doc comment for why). This
@@ -192,7 +192,7 @@ impl DeviceMemoryAllocator {
         // Real `TryAllocate` only runs this loop on the VF (`vfw_ != nullptr`)
         // path, never for a PF `memory_allocator_->Allocate` failure — this
         // crate's FFI boundary unifies both backends behind one
-        // `flex_senlib_memory_allocate` call (see `senlib_ffi_allocator.rs`)
+        // `flex_senlib_memory_allocate` call (see `senlib_ffi.rs`)
         // and cannot tell which backend a given failure came from, so the
         // retry loop below runs unconditionally for any failure. For a real
         // VF failure this exactly matches the real retry behavior; for a
@@ -211,14 +211,14 @@ impl DeviceMemoryAllocator {
         // SAFETY: FFI call into senlib with plain integer arguments; no
         // pointers, no aliasing concerns. Failure is signaled via a
         // zero handle per the `senlib_ffi` contract.
-        let mut handle = unsafe { senlib_ffi_allocator::flex_senlib_memory_allocate(padded_bytes) };
+        let mut handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(padded_bytes) };
         let mut retry_count = 0;
         while handle.into_live().is_none() && retry_count < max_retries {
             retry_count += 1;
             std::thread::sleep(std::time::Duration::from_millis(
                 retry_delay_ms.max(0) as u64
             ));
-            handle = unsafe { senlib_ffi_allocator::flex_senlib_memory_allocate(padded_bytes) };
+            handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(padded_bytes) };
             retry_delay_ms = retry_delay_ms.saturating_mul(BACKOFF_MULTIPLIER);
         }
         let handle = handle
@@ -234,7 +234,7 @@ impl DeviceMemoryAllocator {
 // `DeviceMemoryAllocator` over a fake/mock senlib allocator seam
 // (`MockSenlibAllocator` or equivalent) so it can assert on success/failure
 // without real hardware. This Rust type has no such seam: `try_allocate`
-// above calls `senlib_ffi_allocator::flex_senlib_memory_allocate`
+// above calls `senlib_ffi::flex_senlib_memory_allocate`
 // unconditionally, so a test here would either require real senlib
 // hardware (not exercisable as a unit test) or inventing a mock backend
 // this crate's production code doesn't have — fabricating test coverage

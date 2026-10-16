@@ -45,7 +45,8 @@
 //! either pure arithmetic/bookkeeping (fixups, DMPA translation) or a
 //! software simulation of device execution (the mock `*ControlBlockHandler`
 //! hierarchy) that reads/writes a `flex`-owned `DeviceMemory` buffer, never
-//! senlib. See `SENLIB_BOUNDARY_dma-compute-controlblocks.md`.
+//! senlib. See `SENLIB_BOUNDARY.md`'s "DMA/compute params + control blocks"
+//! section.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

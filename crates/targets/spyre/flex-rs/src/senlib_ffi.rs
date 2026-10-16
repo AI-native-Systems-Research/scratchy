@@ -1,29 +1,32 @@
-//! Consolidated senlib FFI boundary.
+//! THE senlib FFI boundary — every `extern "C"` declaration this crate makes
+//! against senlib lives here, and nowhere else.
 //!
-//! Each parallel phase produced its own `senlib_ffi_<label>.rs` file (per the
-//! task brief, to avoid symbol collisions while phases ran concurrently).
-//! This module is the Assembly-phase consolidation point: it re-exports each
-//! phase's FFI surface under one root, and is also where genuine cross-phase
-//! duplicates were found and merged into a single canonical declaration.
+//! The port was written by parallel phases, each with its own
+//! `senlib_ffi_<label>.rs` file (to avoid symbol collisions while phases ran
+//! concurrently); this module is the full consolidation — the per-phase files
+//! are gone, their declarations moved here uncurated (the crate's scope is
+//! checked against a CodeQL class-hierarchy closure, and a silently-shrunk
+//! boundary is a silent API regression). The one subsystem whose declarations
+//! did NOT survive is `multi_device` — see "The multi_device deletion" below.
 //!
-//! See `SENLIB_BOUNDARY.md` at the crate root for the full boundary
-//! rationale; this file only carries module wiring + the dedup fix below.
+//! See `SENLIB_BOUNDARY.md` at the crate root for the full per-subsystem
+//! boundary rationale; this file carries module wiring, the declarations, the
+//! safe wrappers, and the audit trail.
 //!
 //! ## Duplicate found and fixed: "how many Spyre cards are there"
 //!
 //! Three phases independently reached `senlib::v2::SenPci::ncards()` (PCI
 //! enumeration of physical cards) from three different call sites in the
-//! C++ source, and each declared its own
-//! `extern "C"` binding for it:
-//!   - the runtime-core phase, as `flex_senlib_pci_ncards` in
-//!     `senlib_ffi_runtime.rs` (from `RuntimeContext`/`getNumDevices`);
-//!   - the config/util phase, as `senlib_senpci_ncards` in
-//!     `senlib_ffi_config_util.rs` (from `FlexConfig::FlexSpyreDevices`);
-//!   - this file's own pre-split placeholder, as part of a since-removed
+//! C++ source, and each declared its own `extern "C"` binding for it:
+//!   - the runtime-core phase, as `flex_senlib_pci_ncards` (from
+//!     `RuntimeContext`/`getNumDevices`);
+//!   - the config/util phase, as `senlib_senpci_ncards` (from
+//!     `FlexConfig::FlexSpyreDevices`);
+//!   - a pre-split placeholder, as part of a since-removed
 //!     `flex_senlib_query_topology` (topology-phase card+HBM-layout query).
 //!
-//! UPDATE (2026-08-15): `flex_senlib_query_topology` was never implemented in
-//! `cxx-shim/flex_shim.cpp` (no such symbol exists in the real SDK either —
+//! `flex_senlib_query_topology` was never implemented in
+//! `cxx-shim/senlib_ffi.cpp` (no such symbol exists in the real SDK either —
 //! see the "REAL LINK-TARGET AUDIT" below) and real-hardware testing hit a
 //! `FlexAllocator` OOM traced to scratchy's runtime bring-up
 //! (`scratchy-target-spyre`'s `runtime::build_runtime`) sizing its
@@ -33,49 +36,123 @@
 //! the real C++ path does (`device_memory_topology.cpp::populateDomainTopology`
 //! fed by `getDeviceMemorySize()`) — this crate's 1p0 target has exactly one
 //! domain, so a full multi-domain query was never actually needed. The other
-//! two —
-//! `flex_senlib_pci_ncards` and `senlib_senpci_ncards` — are ASSUMED to be
-//! the same zero-argument `ncards() -> count` call declared twice under
+//! two — `flex_senlib_pci_ncards` and `senlib_senpci_ncards` — are ASSUMED to
+//! be the same zero-argument `ncards() -> count` call declared twice under
 //! different names, both citing `senlib::v2::SenPci`/`SenPciShared::ncards()`
 //! from their respective call sites in `flex_config.cpp`. This is an
 //! unverified assumption, not a confirmed fact: `flex-cxx` does not vendor
 //! senlib itself, so there is no header available in this audit to check
 //! that `SenPci::ncards()` and `SenPciShared::ncards()` really are the exact
 //! same underlying call rather than, say, two related-but-distinct methods
-//! on different senlib-side wrapper types. `senlib_ffi_runtime::flex_senlib_pci_ncards`
-//! is kept as the one canonical declaration (it has the closer-to-source name); the
-//! config/util phase's `senlib_senpci_ncards` extern was deleted from
-//! `senlib_ffi_config_util.rs` and its safe wrapper (`sen_pci_card_count`)
-//! now calls the canonical declaration instead. `flex_config.rs`, which
-//! calls `sen_pci_card_count()`, needed no changes.
+//! on different senlib-side wrapper types. `flex_senlib_pci_ncards` is kept
+//! as the one canonical declaration (it has the closer-to-source name); the
+//! config/util phase's `senlib_senpci_ncards` extern was deleted and its
+//! safe wrapper (`sen_pci_card_count`) now calls the canonical declaration
+//! instead. `flex_config.rs`, which calls `sen_pci_card_count()`, needed no
+//! changes.
 //!
-//! The old pre-split placeholder externs that used to live directly in this
-//! file (`flex_senlib_stream_create/destroy/submit/poll_completions`,
-//! `SenlibStreamHandle`, `RawControlBlock`) had zero callers anywhere in the
-//! crate — they were superseded by the scheduler phase's real,
-//! call-site-verified `senlib_ffi_scheduler.rs` (`senlib_cbi_*`/`senlib_rbi_*`,
-//! used by `scheduler.rs`/`stream.rs`) before this file was consolidated, and
-//! have been removed rather than re-exported as dead code.
+//! The old pre-split placeholder externs that used to live directly in the
+//! pre-consolidation hub file (`flex_senlib_stream_create/destroy/submit/
+//! poll_completions`, `SenlibStreamHandle`, `RawControlBlock`) had zero
+//! callers anywhere in the crate — they were superseded by the scheduler
+//! phase's real, call-site-verified declarations (`senlib_cbi_*`/
+//! `senlib_rbi_*`, used by `scheduler.rs`/`stream.rs`) and were removed
+//! rather than re-exported as dead code.
+//!
+//! ## The multi_device deletion (resolved 2026-10-16, issue #530)
+//!
+//! The RDMA/HDMA subsystem's thirteen declarations (`flex_senlib_pin_and_map`,
+//! `flex_senlib_pinned_memory_*`, `flex_senlib_direct_set_wdone`,
+//! `flex_senlib_ainc_wdone`, `flex_senlib_rdma_*`) and their would-be caller
+//! `multi_device.rs` (1928 lines: `BitmaskHelper`/`BitSetHelper`/
+//! `HdmaAllocationManager`/`RdmaUnit`-shaped surface, barrier/broadcast over
+//! a POSIX rendezvous file) were DELETED, not folded, on evidence:
+//!   1. **No callers.** Nothing in the workspace referenced
+//!      `flex_rs::multi_device` — only `lib.rs`'s module declaration and this
+//!      hub's re-export (verified by a workspace-wide grep).
+//!   2. **No link targets.** `cxx-shim/senlib_ffi.cpp` implements ZERO of the
+//!      thirteen symbols; anything that called them would fail at `ld` with
+//!      undefined references. They were written against flex-cxx's
+//!      mock-device shared-memory layer (`RdmaShm`), not even the real P2P
+//!      surface.
+//!
+//! That half-state was a trap for whoever wires P2P next: they would find a
+//! fully-shaped module whose FFI bottom links to nothing. Git history
+//! preserves all of it; re-adding with real shim entrypoints when P2P wiring
+//! actually happens is the honest shape. The per-call-site citations for the
+//! deleted declarations live in `SENLIB_BOUNDARY.md`'s deletion record.
+//!
+//! ## The controlblocks phase: no declarations, on purpose
+//!
+//! The DMA/compute-params + control-blocks subsystem (`crate::dma`,
+//! `crate::compute`, `crate::control_blocks`) makes **zero senlib calls** —
+//! verified by reading every file assigned to that phase:
+//! `runtime_submission_params.{hpp,cpp}` (pure parameter validation),
+//! `control_block_stream.hpp`/`segment_addressing.hpp` (pure arithmetic),
+//! `dma_descriptor_pack_*` (plain value types), and the mock/software CB
+//! executors `dma_control_block_handler`/`control_block_handler`/
+//! `compute_pipeline_control_block_handler` (memcpy/pointer arithmetic into
+//! a flex-owned `DeviceMemory` mock buffer, selected when
+//! `RuntimeConfig::FlexCompute()` is `"NULL"`/`"SENULATOR"`). The one
+//! senlib-adjacent type `DmaControlBlockHandler` names is a read-only
+//! on-wire struct layout, not a call. The real hardware submission lives in
+//! the scheduler section below — nothing duplicates it here.
+//!
+//! # ---------------------------------------------------------------------
+//! # REAL LINK-TARGET AUDIT (2026-08-15, against the actual on-pod SDK at
+//! # /opt/ibm/spyre)
+//! # ---------------------------------------------------------------------
+//!
+//! Every `flex_senlib_*`/`senlib_*` symbol declared in this module is a NAME
+//! THAT DOES NOT EXIST in any installed SDK library (`nm -D --defined-only`
+//! on every .so under /opt/ibm/spyre/{senlib,runtime,deeptools}/lib turns up
+//! zero matches for `flex_senlib` or `senlib_control_block`/
+//! `senlib_response_block`). These declarations were written as an
+//! aspirational C shim contract; a real senlib/flex install is a C++ API
+//! (mangled `_Z...` symbols) with no C shim anywhere in the SDK exporting
+//! these plain names, so linking against a real build fails at `ld` with
+//! "undefined reference" for every one of them — not a runtime bug.
+//!
+//! The resolution, confirmed by reading the real headers on the pod:
+//! `cxx-shim/senlib_ffi.cpp` is the hand-written C++ shim TU that exports
+//! every one of these names as a plain `extern "C"` symbol, each a one-line
+//! marshal onto the real, PUBLIC `flex::DeviceHandle` /
+//! `senlib::ControlBlockInterface` / `senlib::ResponseBlockInterface`
+//! methods cited in each declaration's doc comment. It is compiled by
+//! flex-rs's `build.rs` unconditionally by default and links against the
+//! real senlib on the pod (`/opt/ibm/spyre/senlib/lib`, plus its own
+//! transitive deps); `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile for
+//! check/clippy on a machine without the SDK headers (a link then fails
+//! loudly).
+//!
+//! `flex_shim_cbi_for_pipeline`/`flex_shim_rbi_for_pipeline` are the shim
+//! entry points that turn a `PipelineId` into the actual
+//! `ControlBlockInterface*`/`ResponseBlockInterface*` opaque handle;
+//! `flex_shim_init_runtime` (below) brings up the real device and caches its
+//! `DeviceHandle` process-wide — it must be called once, successfully, before
+//! any other function here.
+//!
+//! `scheduler::FlexAllocatorAddressResolver` is the production
+//! `DeviceAddressResolver` — it resolves `Chunk::addr.region_id` through a
+//! live `FlexAllocator`'s `get_id_to_region_map()` and reads the region's
+//! real device physical address off `MemoryRegion::data().
+//! device_address_bytes()`. `PfBackend`/`VfBackend` can be constructed
+//! end-to-end by a caller that owns an `Arc<Mutex<FlexAllocator>>` and an
+//! `Arc<dyn HardwareSubmit>` built on top of this module's functions.
 
-pub use crate::senlib_ffi_allocator as allocator;
-pub use crate::senlib_ffi_config_util as config_util;
-pub use crate::senlib_ffi_controlblocks as controlblocks;
-pub use crate::senlib_ffi_multi_device as multi_device;
-pub use crate::senlib_ffi_runtime as runtime;
-pub use crate::senlib_ffi_scheduler as scheduler;
+use std::ffi::CStr;
+use std::ffi::c_void;
+use std::os::raw::{c_char, c_uint};
 
-/// Canonical "how many Spyre cards" call — see module doc. Re-exported here
-/// under the name most other code refers to it by; the real declaration
-/// lives in `senlib_ffi_runtime.rs` since that is the phase whose call site
-/// (`RuntimeContext`/`getNumDevices`) is the most direct match to the C++
-/// symbol name.
-pub use crate::senlib_ffi_runtime::flex_senlib_pci_ncards;
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  Runtime bring-up, topology, and IOMMU
+// ════════════════════════════════════════════════════════════════════════════════════════════
 
 unsafe extern "C" {
     /// Brings up the real device runtime (idempotent, thread-safe on the
     /// C++ side via `std::call_once` — see `cxx-shim/flex_shim.cpp`).
     /// MUST be called (and succeed, i.e. return 0) before any other
-    /// `senlib_ffi*` function in this crate is called; every other function
+    /// function in this module is called; every other function
     /// assumes a live `flex::DeviceHandle` is already cached.
     /// `logical_device_id` mirrors `flex::initializeRuntime`'s own parameter
     /// (which Spyre card to bring up; 0 for a single-device host).
@@ -105,6 +182,15 @@ unsafe extern "C" {
     /// `flex_senlib_device_memory_size`.
     pub fn flex_senlib_rcu_num_cores() -> u32;
 
+    /// Corresponds to `senlib::v2::SenPci::ncards()`
+    /// (`flex/src/runtime_stream/runtime_context.cpp:44`), which returns the
+    /// number of Spyre cards physically present in the system, independent
+    /// of any process-level device filtering (`SPYRE_DEVICES`/
+    /// `AIU_WORLD_SIZE`, applied by flex-side logic in `runtime.rs`, not
+    /// here). The canonical declaration for the duplicate resolved in this
+    /// module's doc.
+    pub fn flex_senlib_pci_ncards() -> u64;
+
     /// `PfIommuMapper::Map`: `RegisterMemForIOMMU` + `pin_and_map`, first
     /// sglist entry. 0 on success.
     ///
@@ -116,8 +202,8 @@ unsafe extern "C" {
     /// either underlying senlib call (`RegisterMemForIOMMU`/`pin_and_map`
     /// take no writable/permission argument in the real code,
     /// pf_iommu_mapper.cpp:48-49) — real `Map` only uses it to construct the
-    /// `IommuMapping` bookkeeping object (`iomap->writable_`) returned to
-    /// the caller. This shim function mirrors that: the parameter is
+    /// `IommuMapping` bookkeeping object (`iomap->writable_`) returned to the
+    /// caller. This shim function mirrors that: the parameter is
     /// accepted (so the signature matches the real `Map()` this function
     /// corresponds to) but is not passed to the two senlib calls beneath
     /// it, matching real behavior rather than inventing a senlib argument
@@ -141,136 +227,474 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-// ---------------------------------------------------------------------
-// REAL LINK-TARGET AUDIT (2026-08-15, against the actual on-pod SDK at
-// /opt/ibm/spyre) — see also senlib_ffi_allocator.rs and
-// senlib_ffi_scheduler.rs for the two other files this applies to.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  Device-memory allocator
+// ════════════════════════════════════════════════════════════════════════════════════════════
 //
-// Every `flex_senlib_*`/`senlib_*` symbol declared across
-// senlib_ffi{,_allocator,_runtime,_multi_device,_scheduler,_controlblocks,
-// _config_util}.rs is a NAME THAT DOES NOT EXIST in any installed SDK
-// library (`nm -D --defined-only` on every .so under
-// /opt/ibm/spyre/{senlib,runtime,deeptools}/lib turns up zero matches for
-// `flex_senlib` or `senlib_control_block`/`senlib_response_block`). These
-// modules' own doc comments already say why: "Not built/linked on this
-// machine (no senlib headers/libs present)" — they were written against
-// nothing, as an aspirational C shim contract that nobody has yet written.
-// A real senlib/flex install is a C++ API (mangled `_Z...` symbols); there
-// is no C shim anywhere in the SDK exporting these plain names, so linking
-// scratchy's `spyre_sdk_abi.cpp`-replacement against a real build fails at
-// `ld` with "undefined reference" for every one of them, not a runtime bug.
+// Everything in `flex::FlexAllocator`, `flex::MemoryRegion`,
+// `flex::DeviceTopology` is flex's own bookkeeping/algorithm and is ported
+// natively (`allocator.rs`, `memory_region.rs`, `topology.rs`, `domain.rs`,
+// `address.rs`). The literal bottom of the allocator call stack is exactly
+// two senlib primitives, both below, unified across PF/VF backends since
+// which backend is active is a hardware-driver concern, not flex logic.
+// Everything else in `device_memory_allocator.cpp` — `WriteDebugInfo`'s
+// fence-string formatting, `MemoryTracker` bookkeeping, padding/alignment
+// math (`sendnn::ceil_to`), and the VF retry-with-backoff loop — is
+// flex-side logic ported natively (`device_memory_allocator.rs`), not folded
+// into these calls' contracts.
+
+/// Opaque handle to a senlib-owned device memory allocation (PF `void*` from
+/// `senlib::MemoryAllocator::Allocate`, or a VF `AllocationIndex` widened to a
+/// handle-shaped integer — the two backends are unified at this FFI boundary
+/// so callers above it never need to know which one is active). `handle == 0`
+/// is the failure sentinel in both the VF (`alloc_index == 0` in
+/// `device_memory_allocator.cpp:180`) and unified-here PF case.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenlibAllocationHandle(pub u64);
+
+impl SenlibAllocationHandle {
+    /// The only way to turn a raw FFI return value into a handle this crate
+    /// will actually store/use/free. Checks the `handle == 0` failure
+    /// sentinel ONCE, here, and returns `None` for it — every other function
+    /// in this crate that needs a live handle takes `LiveAllocationHandle`,
+    /// not this type, so "forgot to check for the 0 sentinel before storing
+    /// it" cannot compile. Same shape as the `capacity() == 0` vs `None`
+    /// mapping already fixed in the scheduler subsystem.
+    pub fn into_live(self) -> Option<LiveAllocationHandle> {
+        std::num::NonZeroU64::new(self.0).map(LiveAllocationHandle)
+    }
+}
+
+/// A `SenlibAllocationHandle` KNOWN to be live (non-zero) — obtainable only
+/// via `SenlibAllocationHandle::into_live`. `DeviceMemoryAllocation` stores
+/// this, not the raw FFI type, so it can never hold onto a failure sentinel
+/// by accident.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveAllocationHandle(std::num::NonZeroU64);
+
+impl LiveAllocationHandle {
+    /// Widen back to the raw FFI type for the one call site that needs it
+    /// (`flex_senlib_memory_free`, which shares the ABI-level type with
+    /// `flex_senlib_memory_allocate`'s return value).
+    pub fn as_raw(self) -> SenlibAllocationHandle {
+        SenlibAllocationHandle(self.0.get())
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+unsafe extern "C" {
+    /// Corresponds to `senlib::MemoryAllocator::Allocate` (PF,
+    /// `device_memory_allocator.cpp:212`) / `senlib::v2::VfWrapper::Allocate`
+    /// (VF, `device_memory_allocator.cpp:176`). This FFI call is the bare
+    /// senlib primitive only — it does NOT include the retry-with-backoff
+    /// loop wrapping the VF call at `device_memory_allocator.cpp:180-191`.
+    /// That loop is flex-side C++ logic (`getMaxRetries()`/
+    /// `getInitialVfAllocRetryDelay()`, reading `FlexConfig::VfAllocMaxRetries()`/
+    /// `VfAllocInitialRetryDelayMs()`, plus a plain `std::this_thread::sleep_for`
+    /// exponential backoff), not a senlib/firmware behavior. The
+    /// retry loop is implemented on the Rust side, in
+    /// `device_memory_allocator.rs`'s `DeviceMemoryAllocator::try_allocate`,
+    /// which calls this function in a loop rather than assuming retries
+    /// happen underneath it.
+    /// Returns a null-equivalent (`handle == 0`) on failure; flex-side OOM
+    /// handling (memory-pressure callback + retry across regions) lives in
+    /// `allocator.rs`, above this call, not here.
+    ///
+    /// Takes only a byte count, matching the real signatures exactly:
+    /// `senlib::MemoryAllocator::Allocate(total_bytes)` and
+    /// `VfWrapper::Allocate(total_flits)` — neither accepts a domain id.
+    /// `TryAllocate`'s `std::optional<uint32_t> domain_id` argument is
+    /// currently logged only, never forwarded to either real call (see
+    /// `device_memory_allocator.cpp:153`'s
+    /// `TODO(unknown): Pass domain_id to senlib::MemoryAllocator / VfWrapper
+    /// when firmware adds bank-targeted allocation support`), so a prior
+    /// version of this declaration that took a `domain_id_or_negative_one`
+    /// parameter here invented an FFI argument with no real senlib analog.
+    pub fn flex_senlib_memory_allocate(num_bytes: u64) -> SenlibAllocationHandle;
+
+    /// Corresponds to `senlib::MemoryAllocator::Free` (PF,
+    /// `device_memory_allocator.cpp:272`) / `senlib::v2::VfWrapper::Deallocate`
+    /// (VF, `device_memory_allocator.cpp:261`).
+    /// Returns 0 on success, -1 if the free did not reach senlib (unknown
+    /// handle, or a senlib throw). Was `void`: a failed deallocation was
+    /// indistinguishable from a successful one, the same swallowed-failure shape
+    /// that caused the batched-decode hang on the submission path.
+    pub fn flex_senlib_memory_free(handle: SenlibAllocationHandle) -> i32;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  Scheduler: the CBI/RBI submission + completion surface
+// ════════════════════════════════════════════════════════════════════════════════════════════
 //
-// The good news, confirmed by reading the real headers on the pod: a
-// *legitimate*, minimal, hand-written C++ shim TU (compiled alongside these
-// declarations, exporting exactly these names via `extern "C"`) can
-// implement most of them by delegating to real, PUBLIC, `FLEX_EXPORT` flex
-// C++ API reachable from a live `flex::RuntimeContext` — not by
-// reimplementing raw hardware bring-up:
+// `flex::RuntimeScheduler` (abstract base) + `PfRuntimeScheduler`/
+// `VfRuntimeScheduler`/`MockRuntimeScheduler`. Everything else this subsystem
+// does — fence/barrier bookkeeping, in-flight counters, pipeline-switch
+// detection, DMA chunk looping, control-block *orchestration* — is flex's own
+// logic and is ported natively in `scheduler.rs`. Building the literal CB bit
+// layout (SBF structures) is `control_block_wire`'s scope; this section only
+// models the narrow senlib-facing surface the scheduler itself touches.
+
+/// Opaque handle mirroring `senlib::ControlBlockInterface*`. Never
+/// dereferenced field-by-field in this crate — only passed back into the
+/// `extern "C"` entry points below.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenlibControlBlockInterfaceHandle(pub *mut c_void);
+
+impl SenlibControlBlockInterfaceHandle {
+    /// The only way to get a `LiveCbiHandle`: checks the null sentinel
+    /// (shim runtime not initialized / pipeline out of range) exactly once.
+    /// Every safe wrapper below (`cbi_capacity`/`cbi_queue_control_blocks_sbf`)
+    /// takes `LiveCbiHandle`, not this raw type, so a caller cannot pass a
+    /// possibly-null handle to senlib without the compiler forcing the
+    /// `into_live()` check first — three separate hand-written
+    /// `cbi.0.is_null()` checks in `scheduler.rs` collapse to this one.
+    pub fn into_live(self) -> Option<LiveCbiHandle> {
+        std::ptr::NonNull::new(self.0).map(LiveCbiHandle)
+    }
+}
+
+/// A `SenlibControlBlockInterfaceHandle` known to be non-null.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveCbiHandle(std::ptr::NonNull<c_void>);
+
+impl LiveCbiHandle {
+    fn as_raw(self) -> SenlibControlBlockInterfaceHandle {
+        SenlibControlBlockInterfaceHandle(self.0.as_ptr())
+    }
+}
+
+/// Opaque handle mirroring `senlib::ResponseBlockInterface*`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenlibResponseBlockInterfaceHandle(pub *mut c_void);
+
+impl SenlibResponseBlockInterfaceHandle {
+    /// See `SenlibControlBlockInterfaceHandle::into_live` — same shape.
+    pub fn into_live(self) -> Option<LiveRbiHandle> {
+        std::ptr::NonNull::new(self.0).map(LiveRbiHandle)
+    }
+}
+
+/// A `SenlibResponseBlockInterfaceHandle` known to be non-null.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveRbiHandle(std::ptr::NonNull<c_void>);
+
+impl LiveRbiHandle {
+    fn as_raw(self) -> SenlibResponseBlockInterfaceHandle {
+        SenlibResponseBlockInterfaceHandle(self.0.as_ptr())
+    }
+}
+
+/// One control block in senlib's wire format (`senlib::ControlBlockSBF`).
+/// Opaque, fixed-size, POD from senlib's perspective — this crate never
+/// interprets its bytes; `control_block_wire` is responsible for populating
+/// it (via the `From` impl below).
+///
+/// SIZE VERIFIED 2026-08-15 against the real SDK on-pod
+/// (`hal/1p0/control_block_sbf.hpp`: `constexpr uint64_t CB_NUM_BYTES = 128;`,
+/// six 8/16-byte sections — CTRL/R5/DMI/DMO/CMPT/XLAT). The previous `[u8; 256]`
+/// here was never checked against a real senlib header and was simply
+/// wrong — double the real size. Getting this wrong would have silently
+/// corrupted every other queued CB (stride mismatch) the moment a real
+/// `senlib_control_block_interface_queue_control_blocks_sbf` was linked.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SenlibControlBlockSbf {
+    pub bytes: [u8; 128],
+}
+
+/// One response block in senlib's wire format (`senlib::ResponseBlockSBF`).
+///
+/// SIZE VERIFIED 2026-08-15 against the real SDK on-pod
+/// (`hal/1p0/response_block_sbf.hpp`: `constexpr uint64_t RB_NUM_BYTES = 64;`,
+/// enforced there by a `static_assert(sizeof(ResponseBlockSBF) == RB_NUM_BYTES)`).
+/// Same "never verified against a real header" issue as
+/// `SenlibControlBlockSbf` above — was `[u8; 256]`, four times too large.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SenlibResponseBlockSbf {
+    pub bytes: [u8; 64],
+}
+
+// SEALED: the `senlib_*` declarations in this block are module-private on
+// purpose. The only way to reach senlib's submission/completion surface from
+// the rest of the crate is through the safe `Result`-returning wrappers
+// below, so a call site cannot skip a status check or ignore a failure —
+// the port's original `void` submit + swallowed exception is unrepresentable
+// here now. The two `pub fn flex_shim_*` handle getters at the top of the
+// block are the deliberate exception: they only fetch opaque handles (whose
+// null sentinel is checked by `into_live()`) and cannot fail silently. Do
+// not add `pub` to anything else in this block.
+unsafe extern "C" {
+    /// Returns the `senlib::ControlBlockInterface*` for `pipeline`
+    /// (0=compute, 1=async-dma-in, 2=async-dma-out — see
+    /// `cxx-shim/flex_shim.cpp`'s `FlexShimPipeline` enum, kept in sync by
+    /// hand with `PipelineId` here) as an opaque handle, or a null handle if
+    /// the shim runtime has not been initialized (see
+    /// `flex_shim_init_runtime` above) or `pipeline` is out of range.
+    /// Backs `DeviceHandle::ComputeCbi()/AsyncDmaICbi()/AsyncDmaOCbi()`.
+    pub fn flex_shim_cbi_for_pipeline(pipeline: i32) -> SenlibControlBlockInterfaceHandle;
+
+    /// Returns the process's single `senlib::ResponseBlockInterface*`
+    /// (`DeviceHandle::Rbi()`) as an opaque handle. `pipeline` is accepted
+    /// for symmetry with `flex_shim_cbi_for_pipeline` but ignored by the
+    /// shim — senlib exposes exactly one RBI per device.
+    pub fn flex_shim_rbi_for_pipeline(pipeline: i32) -> SenlibResponseBlockInterfaceHandle;
+
+    /// Port of `senlib::ControlBlockInterface::capacity() const`.
+    /// Call site: `runtime_scheduler.cpp:1025` (`RuntimeScheduler::getQueueCapacity`).
+    #[link_name = "senlib_control_block_interface_capacity"]
+    fn senlib_cbi_capacity(cbi: SenlibControlBlockInterfaceHandle, out_capacity: *mut usize)
+    -> i32;
+
+    /// The calling thread's most recent shim error (`""` if none). Owned by the
+    /// shim, valid until this thread's next failed shim call.
+    #[link_name = "flex_shim_last_error"]
+    fn flex_shim_last_error() -> *const c_char;
+
+    /// Port of `senlib::ControlBlockInterface::QueueControlBlocksSBF(const ControlBlockSBF*, uint64_t)`
+    /// (`senlib/1p0/control_block_interface.hpp:46,76`).
+    /// Call site: `mock_runtime_scheduler.cpp:322` (direct); reached indirectly
+    /// by PF/VF through `response_worker.cpp:1214,1268` (out of this
+    /// subsystem's file scope — see the section doc above).
+    ///
+    /// Returns 0 on success, -1 if the submission did not reach senlib. The
+    /// senlib method itself is `void`; the status is the shim's stand-in for
+    /// the C++ exception that the real call site
+    /// (`response_worker.cpp:1268`, unguarded by any try/catch) lets
+    /// propagate. See `cxx-shim/senlib_ffi.cpp` for why this must not be
+    /// swallowed.
+    #[link_name = "senlib_control_block_interface_queue_control_blocks_sbf"]
+    fn senlib_cbi_queue_control_blocks_sbf(
+        cbi: SenlibControlBlockInterfaceHandle,
+        cbs: *const SenlibControlBlockSbf,
+        count: usize,
+    ) -> i32;
+
+    /// Port of `senlib::ControlBlockInterface::FreeResponses(uint64_t)`
+    /// (`senlib/1p0/control_block_interface.hpp:49`). Returns 0 on success,
+    /// -1 if the call did not reach senlib.
+    ///
+    /// Call site: `ResponseWorker::ParseResponseBlocks`
+    /// (`response_worker.cpp:1141-1152`), once per pipeline per drain. This
+    /// symbol did not exist in the port at all, so consumed response-block
+    /// slots were never returned to senlib: occupancy grew monotonically until
+    /// `QueueControlBlocksSBF` threw "Control block queue is full, and has not
+    /// drained" at exactly `cb_queue_length` CBs. That was the long-standing
+    /// long-context batched-decode hang.
+    #[link_name = "senlib_control_block_interface_free_responses"]
+    fn senlib_cbi_free_responses(cbi: SenlibControlBlockInterfaceHandle, num_responses: u64)
+    -> i32;
+
+    /// Port of `senlib::ResponseBlockInterface::ReceiveResponsesSBF(ResponseBlockSBF*, size_t, size_t)`.
+    /// Call site: `mock_runtime_scheduler.cpp:329`.
+    #[link_name = "senlib_response_block_interface_receive_responses_sbf"]
+    fn senlib_rbi_receive_responses_sbf(
+        rbi: SenlibResponseBlockInterfaceHandle,
+        out: *mut SenlibResponseBlockSbf,
+        max_count: usize,
+        min_count: usize,
+        out_received: *mut u64,
+    ) -> i32;
+}
+
+impl From<crate::control_block_wire::ControlBlockWire> for SenlibControlBlockSbf {
+    /// `ControlBlockWire::to_bytes()` is byte-for-byte the same 128-byte
+    /// `SentientSoc::V1::ControlBlockSBF` layout this type mirrors — see
+    /// `crate::control_block_wire`'s module doc for the verified layout.
+    fn from(wire: crate::control_block_wire::ControlBlockWire) -> Self {
+        Self {
+            bytes: wire.to_bytes(),
+        }
+    }
+}
+
+impl SenlibResponseBlockSbf {
+    /// Decode the RB's `ReturnSectionSBF` (completion status/tag/cancel).
+    /// See `crate::control_block_wire::ResponseBlockWire` for the verified
+    /// bit layout this delegates to.
+    pub fn decode(&self) -> crate::control_block_wire::ResponseBlockWire {
+        crate::control_block_wire::ResponseBlockWire::from_bytes(&self.bytes)
+    }
+}
+
+/// The calling thread's most recent shim error message, for attaching to a
+/// Rust-side error. Empty if the shim has not recorded one.
+pub fn last_shim_error() -> String {
+    // SAFETY: the shim returns a NUL-terminated, thread-local buffer that stays
+    // valid until this thread's next failed shim call; we copy it immediately.
+    unsafe {
+        let p = flex_shim_last_error();
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Safe wrapper: query a pipeline's configured CB queue capacity.
+///
+/// Returns `None` when `cbi` is `None` (mirrors the C++ `if(!cbi) return
+/// nullopt`) — the caller (this subsystem's `getQueueCapacity`) additionally
+/// treats a reported `0` as "not applicable", which is *not* senlib's
+/// concern and is handled in native Rust, not here. Taking `LiveCbiHandle`
+/// instead of the raw, possibly-null type means there is no null check left
+/// to write (or omit) in this function's own body.
+pub fn cbi_capacity(cbi: Option<LiveCbiHandle>) -> Option<usize> {
+    let cbi = cbi?;
+    let mut capacity = 0usize;
+    // SAFETY: `cbi` is a live senlib::ControlBlockInterface* obtained from
+    // DeviceHandle for the lifetime of the owning RuntimeScheduler; capacity()
+    // is a const, side-effect-free query per the senlib API contract.
+    // A senlib throw must NOT be reported as capacity 0: upper layers read 0 as
+    // "capacity not reported" and stop enforcing backpressure entirely.
+    // `None` here means the same thing, so the failure is logged loudly.
+    let rc = unsafe { senlib_cbi_capacity(cbi.as_raw(), &mut capacity) };
+    if rc != 0 {
+        tracing::error!(err = %last_shim_error(), "senlib ControlBlockInterface::capacity() failed");
+        return None;
+    }
+    Some(capacity)
+}
+
+/// Safe wrapper: ring the doorbell — hand a batch of already-built control
+/// blocks to senlib for hardware submission. `cbs` must have been fully
+/// populated by `control_block_wire` before this call.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the submission did not reach
+/// senlib. The real call site (`response_worker.cpp:1268`) makes an unguarded
+/// `void` call, so a senlib throw there propagates out of the worker; the
+/// caller must FAIL the request rather than observe-and-ignore. Swallowing it
+/// leaves the caller's already-incremented in-flight count waiting on a CB
+/// hardware never received.
+pub fn cbi_queue_control_blocks_sbf(
+    cbi: LiveCbiHandle,
+    cbs: &[SenlibControlBlockSbf],
+) -> Result<(), String> {
+    // SAFETY: `cbi` is a live handle; `cbs`/`cbs.len()` describe a valid
+    // slice for the duration of this call, matching
+    // `QueueControlBlocksSBF(const ControlBlockSBF*, uint64_t)`'s contract.
+    let rc = unsafe { senlib_cbi_queue_control_blocks_sbf(cbi.as_raw(), cbs.as_ptr(), cbs.len()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: return `num_responses` consumed response-block slots to
+/// senlib, the port of `ParseResponseBlocks`' per-pipeline
+/// `cbi->FreeResponses(n)` (`response_worker.cpp:1141-1152`). Without this the
+/// hardware queue never drains from senlib's point of view.
+///
+/// # Errors
+/// Returns `Err` with the shim's message if the call did not reach senlib.
+/// The real method is `void` and its call site is unguarded, so a senlib
+/// throw there propagates out of the response-completion thread; the caller
+/// decides how to surface that (see `scheduler.rs`).
+pub fn cbi_free_responses(cbi: LiveCbiHandle, num_responses: u64) -> Result<(), String> {
+    // SAFETY: `cbi` is a live senlib::ControlBlockInterface* for the lifetime
+    // of the owning scheduler; `FreeResponses` takes a plain count.
+    let rc = unsafe { senlib_cbi_free_responses(cbi.as_raw(), num_responses) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: drain up to `out.len()` response blocks, blocking until at
+/// least `min_count` have arrived. Returns the number actually received.
+/// # Errors
+/// Returns `Err` with the shim's recorded message if the senlib call threw. A
+/// count of `0` is NOT an error — with the real `min_count == 0` it is the
+/// normal "nothing has arrived yet" answer, which is exactly why the failure
+/// needs its own channel.
+pub fn rbi_receive_responses_sbf(
+    rbi: LiveRbiHandle,
+    out: &mut [SenlibResponseBlockSbf],
+    min_count: usize,
+) -> Result<u64, String> {
+    // SAFETY: `rbi` is a live handle; `out` is a valid mutable slice sized
+    // for `max_count`, matching `ReceiveResponsesSBF`'s out-parameter contract.
+    let mut received = 0u64;
+    let rc = unsafe {
+        senlib_rbi_receive_responses_sbf(
+            rbi.as_raw(),
+            out.as_mut_ptr(),
+            out.len(),
+            min_count,
+            &mut received,
+        )
+    };
+    if rc == 0 {
+        Ok(received)
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+//  Config/util: card-count and PCIe-address lookups
+// ════════════════════════════════════════════════════════════════════════════════════════════
 //
-//   flex::getFlexRuntimeContext()->getDeviceHandle()
-//     -> shared_ptr<const flex::DeviceHandle>, which itself exposes (all
-//        public, `flex/device_types/device_handle.hpp`):
-//          ->GetDeviceMemoryAllocator()  // flex::DeviceMemoryAllocator
-//              ->TryAllocate(&alloc, nbytes, context_id, alloc_type, domain)
-//              ->Free(alloc.get())
-//            i.e. a real target for flex_senlib_memory_allocate/_free —
-//            NOTE: real signature takes a context_id and returns a
-//            DeviceMemoryAllocationPtr (dmpa + size + alignment + VF alloc
-//            index), richer than this crate's `SenlibAllocationHandle(u64)`;
-//            the shim would need to own the DeviceMemoryAllocationPtr behind
-//            the u64 handle (e.g. a process-wide handle table), not just
-//            reinterpret a pointer.
-//          ->AsyncDmaICbi() / ->AsyncDmaOCbi() / ->ComputeCbi()
-//              -> senlib::ControlBlockInterface* (exactly the type
-//                 senlib_ffi_scheduler.rs's `SenlibControlBlockInterfaceHandle`
-//                 is meant to be an opaque handle to)
-//          ->Rbi() -> senlib::ResponseBlockInterface*
-//
-// `senlib::v2::SenPci::ncards()` (`senlib/1p0/senpci.hpp`) is a plain static
-// method with no bring-up prerequisite at all — a trivial, safe real target
-// for `flex_senlib_pci_ncards`.
-//
-// THE ACTUAL BLOCKER, not fixable this way: `PfBackend`/`VfBackend` in
-// `scheduler.rs` never build a `SentientSoc::V1::ControlBlockSBF` (or
-// `ResponseBlockSBF`) at all — `HardwareSubmit::submit(pipeline, num_cbs,
-// callback)` carries no DMA/compute payload whatsoever (no addresses, no
-// sizes, no kernel name, no bootstrap offset). So even with every senlib
-// symbol above wired to a real, correct C++ shim, calling into real hardware
-// through this path would ring the doorbell on control blocks that were
-// never populated with the actual work — the CB wire-format encoder (what
-// `flex/src/control_blocks/*` does in the real C++: turning `DmaParams`/
-// `ComputeParams` into CTRL/DMI/DMO/CMPT/XLAT section bytes per
-// `hal/1p0/{dma,compute,translation,ctrl,r5}_control_block_section_sbf.hpp`)
-// does not exist anywhere in this crate. This is the real, structural gap —
-// a whole unimplemented subsystem, not a signature mismatch — and is why
-// `SenlibControlBlockSbf`/`SenlibResponseBlockSbf`'s sizes (see
-// senlib_ffi_scheduler.rs, now fixed to the real 128/64 bytes) had never
-// been exercised against anything: nothing in this crate has ever populated
-// one.
-//
-// UPDATE (2026-08-15): the CB/RB wire-format encoder now exists —
-// `crate::control_block_wire` (`ControlBlockWire`/`ResponseBlockWire`),
-// ported from the real headers pulled off the pod
-// (`hal/1p0/{control_block,ctrl_section,dma_control_block_section{,_base},
-// compute_control_block_section,translation_control_block_section,
-// response_block,return_section,virtual_address}_sbf.hpp` under
-// `/opt/ibm/spyre/senlib/include/`), covering the graph-free compute/DMA/fill
-// CB shapes (`CreateGraphFreeCompute`/`CreateComputeDataTransfer`/
-// `CreateFillDma`) this crate actually needs — RDMA/HDMA/R5 section encoding
-// is intentionally not ported (this runtime never emits it). `scheduler.rs`'s
-// `HardwareSubmit::submit` now takes `&[ControlBlockWire]` instead of a bare
-// CB count, and `PfBackend`/`VfBackend::submit_dma`/`submit_compute` build
-// real CBs via `build_dma_cb`/`build_compute_cb` before calling it.
-// `senlib_ffi_scheduler::SenlibControlBlockSbf` has a `From<ControlBlockWire>`
-// impl (byte-identical layout) so the two link up directly.
-//
-// STILL OPEN: the senlib symbol-name problem described above is unchanged —
-// `senlib_control_block_interface_queue_control_blocks_sbf` et al. are still
-// not real C ABI names; a hand-written C++ shim TU (delegating to the real
-// `flex::DeviceHandle::AsyncDmaICbi()/AsyncDmaOCbi()/ComputeCbi()/Rbi()` +
-// `senlib::ControlBlockInterface::QueueControlBlocksSBF`/
-// `senlib::ResponseBlockInterface::ReceiveResponsesSBF`, per this file's own
-// citations above) still needs to be written and linked before this crate
-// can reach real hardware. `DeviceAddressResolver` (scheduler.rs) — the
-// `CompositeAddress` -> physical-address lookup the encoder needs — also
-// still needs a production implementation backed by
-// `FlexAllocator::get_id_to_region_map()`; no such impl exists in this crate
-// yet, so `PfBackend`/`VfBackend` cannot be constructed end-to-end without
-// one being supplied by the caller.
-// ---------------------------------------------------------------------
-//
-// UPDATE (2026-08-15, later same day): both remaining gaps are closed.
-//
-// `cxx-shim/flex_shim.cpp` is the real, hand-written C++ shim TU this audit
-// called for — it exports every `flex_senlib_*`/`senlib_*`/`flex_shim_*`
-// name declared across these `senlib_ffi*.rs` files as a plain `extern "C"`
-// symbol, each a one-line marshal onto the real
-// `flex::DeviceHandle`/`senlib::ControlBlockInterface`/
-// `senlib::ResponseBlockInterface` methods cited in this file's and
-// `senlib_ffi_scheduler.rs`'s doc comments. It is compiled by flex-rs's
-// `build.rs` unconditionally by default and links against the real senlib
-// on the pod (`/opt/ibm/spyre/senlib/lib`, plus its own transitive deps);
-// `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile for check/clippy on a
-// machine without the SDK headers (a link then fails loudly).
-//
-// `flex_shim_cbi_for_pipeline`/`flex_shim_rbi_for_pipeline` (new, in
-// `senlib_ffi_scheduler.rs`) are the shim entry points that turn a
-// `PipelineId` into the actual `ControlBlockInterface*`/
-// `ResponseBlockInterface*` opaque handle — the missing piece needed before
-// `senlib_cbi_capacity`/`senlib_cbi_queue_control_blocks_sbf`/
-// `senlib_rbi_receive_responses_sbf` have anything real to be called with.
-// `flex_shim_init_runtime` (this file) brings up the real device and caches
-// its `DeviceHandle` process-wide; it must be called once, successfully,
-// before any other function here.
-//
-// `scheduler::FlexAllocatorAddressResolver` is the production
-// `DeviceAddressResolver` this audit's second gap called for — it resolves
-// `Chunk::addr.region_id` through a live `FlexAllocator`'s
-// `get_id_to_region_map()` and reads the region's real device physical
-// address off `MemoryRegion::data().device_address_bytes()`
-// (`DeviceMemoryAllocation::DmpaAsBytes()`, surfaced through
-// `flex_senlib_memory_allocate`'s return value). `PfBackend`/`VfBackend` can
-// now be constructed end-to-end by a caller that owns a
-// `Arc<Mutex<FlexAllocator>>` and an `Arc<dyn HardwareSubmit>` built on top
-// of the shim's `senlib_ffi_scheduler` functions.
-// ---------------------------------------------------------------------
+// Almost entirely env-var/JSON-config parsing with process-wide caching
+// (`flex_config.rs`, `util.rs`); exactly two calls, both inside `FlexConfig`
+// (not `RuntimeConfig`), and both irreducible hardware/driver topology
+// queries with no flex-owned bookkeeping above them:
+//   - `senlib::v2::SenPci::ncards()` / `SenPciShared::ncards()` in
+//     `flex_config.cpp:379,408` (`FlexConfig::FlexSpyreDevices`) — the
+//     duplicate resolved onto `flex_senlib_pci_ncards` above.
+//   - `senlib::v2::SenPci::pf(card_index).to_string()` / `SenPciShared::pf(...)`
+//     in `flex_config.cpp:442,471` (`FlexConfig::RdmaGetPCIeAddress`).
+// Whether `SenPci` and `SenPciShared`'s methods are the exact same underlying
+// senlib call rather than two distinct-but-similar ones is NOT independently
+// verified — `flex-cxx` does not vendor senlib itself, so no senlib header
+// was available to check during the audit; it is carried as an assumption.
+
+// NOTE: `senlib::v2::SenPci::ncards()` used to be declared here a second time
+// as `senlib_senpci_ncards`. It is ASSUMED to be the same real senlib call as
+// `flex_senlib_pci_ncards` above — see the module doc's duplicate-resolution
+// note for the unverified-assumption caveat.
+unsafe extern "C" {
+    /// `senlib::v2::SenPci::pf(card_index).to_string()` /
+    /// `SenPciShared::pf(...)`: PCIe bus address string for the physical
+    /// function of card `card_index`. Returns a senlib-owned, null-terminated
+    /// buffer valid for the duration of the call (no ownership transfer).
+    fn senlib_senpci_pf_address(card_index: c_uint) -> *const c_char;
+}
+
+/// Safe wrapper over `senlib::v2::SenPci::ncards()`. Delegates to the
+/// canonical `flex_senlib_pci_ncards` declaration (see the module doc for why
+/// this used to have its own duplicate extern).
+pub fn sen_pci_card_count() -> i64 {
+    // SAFETY: `flex_senlib_pci_ncards` takes no arguments and returns a plain
+    // integer; senlib guarantees it is callable at any point after library
+    // init (card enumeration happens once at senlib load time).
+    unsafe { flex_senlib_pci_ncards() as i64 }
+}
+
+/// Safe wrapper over `senlib::v2::SenPci::pf(card_index).to_string()`.
+pub fn pcie_address_for_card(card_index: u32) -> String {
+    // SAFETY: `card_index` is caller-checked (by `FlexConfig`) to be less than
+    // `sen_pci_card_count()` before this is called; senlib returns a valid
+    // null-terminated C string for any in-range index, and the buffer is not
+    // retained by us beyond this call.
+    unsafe {
+        let ptr = senlib_senpci_pf_address(card_index);
+        if ptr.is_null() {
+            return String::new();
+        }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
+}

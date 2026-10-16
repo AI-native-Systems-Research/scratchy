@@ -28,13 +28,14 @@
 //!     `scheduler/scheduler.hpp`) — neither belongs to this
 //!     ABI-entrypoint-reachable `runtime_stream/` slice.
 //!
-//! ## What crossed into `senlib_ffi_scheduler.rs` and why
+//! ## What crossed into `senlib_ffi.rs` and why
 //!
 //! Only three things: `ControlBlockInterface::capacity()` (queue-capacity
 //! query — hardware/firmware-configured, unknowable on the host side),
 //! `ControlBlockInterface::QueueControlBlocksSBF()` (the literal doorbell
 //! ring), and `ResponseBlockInterface::ReceiveResponsesSBF()` (mock-only
-//! synchronous drain). See `SENLIB_BOUNDARY_scheduler.md` for full citations.
+//! synchronous drain). See `SENLIB_BOUNDARY.md`'s scheduler section for full
+//! citations.
 //!
 //! ## Scope note on PF/VF backend depth
 //!
@@ -409,7 +410,7 @@ impl SchedulerState {
 }
 
 // ---------------------------------------------------------------------
-// Queue-capacity backend hook (the only place `senlib_ffi_scheduler`
+// Queue-capacity backend hook (the only place `senlib_ffi`
 // functions are consulted)
 // ---------------------------------------------------------------------
 
@@ -1390,7 +1391,7 @@ pub struct SenlibHardwareSubmit {
     /// size on first use and reused, since only the one
     /// `ResponseCompletionThread` ever drains (the mutex exists because the
     /// trait method takes `&self`, not because there is real contention).
-    rbs_scratch: Mutex<Vec<crate::senlib_ffi_scheduler::SenlibResponseBlockSbf>>,
+    rbs_scratch: Mutex<Vec<crate::senlib_ffi::SenlibResponseBlockSbf>>,
 }
 
 impl Default for SenlibHardwareSubmit {
@@ -1416,19 +1417,19 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         let shim_pipeline = pipeline.shim_index();
         // SAFETY: safe to call at any time; returns a null handle if the
         // shim runtime is not initialized (see its own doc comment).
-        let cbi = unsafe { crate::senlib_ffi_scheduler::flex_shim_cbi_for_pipeline(shim_pipeline) };
+        let cbi = unsafe { crate::senlib_ffi::flex_shim_cbi_for_pipeline(shim_pipeline) };
         let Some(cbi) = cbi.into_live() else {
             return Err(mock_error(
                 "SenlibHardwareSubmit: no ControlBlockInterface for this pipeline (shim not initialized)",
             ));
         };
-        let wire: Vec<crate::senlib_ffi_scheduler::SenlibControlBlockSbf> =
+        let wire: Vec<crate::senlib_ffi::SenlibControlBlockSbf> =
             cbs.iter().copied().map(Into::into).collect();
         // Propagate rather than panic: the real `:1268` call is unguarded, so a
         // senlib throw unwinds into `schedule`'s `catch(...)` and fails the
         // request. Swallowing it (the original port) left the caller waiting out
         // its full timeout on a CB the hardware never received.
-        crate::senlib_ffi_scheduler::cbi_queue_control_blocks_sbf(cbi, &wire).map_err(|e| {
+        crate::senlib_ffi::cbi_queue_control_blocks_sbf(cbi, &wire).map_err(|e| {
             mock_error(&format!(
                 "SenlibHardwareSubmit: senlib QueueControlBlocksSBF failed (CB not submitted): {e}"
             ))
@@ -1444,7 +1445,7 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         // shim runtime is not initialized. The pipeline argument is genuinely
         // ignored by the real shim (see this struct's own doc comment), so
         // `0` here is not a choice among equals — there is only one `Rbi()`.
-        let rbi = unsafe { crate::senlib_ffi_scheduler::flex_shim_rbi_for_pipeline(0) };
+        let rbi = unsafe { crate::senlib_ffi::flex_shim_rbi_for_pipeline(0) };
         let Some(rbi) = rbi.into_live() else {
             return (0, ResponseCredit::none());
         };
@@ -1452,10 +1453,10 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         if scratch.len() < out.len() {
             scratch.resize(
                 out.len(),
-                crate::senlib_ffi_scheduler::SenlibResponseBlockSbf { bytes: [0; 64] },
+                crate::senlib_ffi::SenlibResponseBlockSbf { bytes: [0; 64] },
             );
         }
-        let n = match crate::senlib_ffi_scheduler::rbi_receive_responses_sbf(
+        let n = match crate::senlib_ffi::rbi_receive_responses_sbf(
             rbi,
             &mut scratch[..out.len()],
             min_count,
@@ -1490,7 +1491,7 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         let shim_pipeline = pipeline.shim_index();
         // SAFETY: as `queue_control_blocks` above — null handle if the shim
         // runtime is not initialized.
-        let cbi = unsafe { crate::senlib_ffi_scheduler::flex_shim_cbi_for_pipeline(shim_pipeline) };
+        let cbi = unsafe { crate::senlib_ffi::flex_shim_cbi_for_pipeline(shim_pipeline) };
         let Some(cbi) = cbi.into_live() else {
             tracing::error!(
                 pipeline = shim_pipeline,
@@ -1502,7 +1503,7 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         // senlib throw there propagates out of that thread. ERROR logging is
         // the closest faithful behavior at a leaf that cannot unwind into its
         // caller (see this file's notes on why that thread does not panic).
-        if let Err(e) = crate::senlib_ffi_scheduler::cbi_free_responses(cbi, num_responses) {
+        if let Err(e) = crate::senlib_ffi::cbi_free_responses(cbi, num_responses) {
             tracing::error!(pipeline = shim_pipeline, num_responses, err = %e, "senlib FreeResponses failed");
         }
     }
@@ -2885,7 +2886,7 @@ mod response_worker_tests {
     }
 }
 
-/// Production `QueueCapacitySource`: `senlib_ffi_scheduler::cbi_capacity`
+/// Production `QueueCapacitySource`: `senlib_ffi::cbi_capacity`
 /// against the real per-pipeline `ControlBlockInterface`.
 pub struct SenlibQueueCapacity;
 
@@ -2893,7 +2894,7 @@ impl QueueCapacitySource for SenlibQueueCapacity {
     fn capacity(&self, pipeline: PipelineId) -> Option<u64> {
         let shim_pipeline = pipeline.shim_index();
         // SAFETY: see `SenlibHardwareSubmit::submit`'s identical call.
-        let cbi = unsafe { crate::senlib_ffi_scheduler::flex_shim_cbi_for_pipeline(shim_pipeline) };
+        let cbi = unsafe { crate::senlib_ffi::flex_shim_cbi_for_pipeline(shim_pipeline) };
         let cbi = cbi.into_live();
         // Port of `RuntimeScheduler::getQueueCapacity`'s own `0` handling
         // (`runtime_scheduler.cpp:1022-1028`): "capacity() == 0 is senlib's
@@ -2906,7 +2907,7 @@ impl QueueCapacitySource for SenlibQueueCapacity {
         // `in_flight + needed <= capacity` unsatisfiable forever for any
         // `needed >= 1`, hanging every submission on that pipeline for the
         // full timeout on every single call.
-        match crate::senlib_ffi_scheduler::cbi_capacity(cbi) {
+        match crate::senlib_ffi::cbi_capacity(cbi) {
             Some(0) | None => None,
             Some(c) => Some(c as u64),
         }
@@ -3486,7 +3487,7 @@ impl DmaBufPool {
 /// Port of `PfRuntimeScheduler`. Hardware submission goes through the one
 /// [`ResponseWorker`] (`response_worker_` + `response_worker_init_`), so
 /// `capacity()` on the compute/DMAI/DMAO `ControlBlockInterface`s is
-/// meaningful — see `senlib_ffi_scheduler::cbi_capacity`.
+/// meaningful — see `senlib_ffi::cbi_capacity`.
 pub struct PfBackend {
     hw: Arc<dyn HardwareSubmit>,
     capacity: Arc<dyn QueueCapacitySource>,

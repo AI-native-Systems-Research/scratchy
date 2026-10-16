@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::allocator::FlexAllocator;
-use crate::senlib_ffi_runtime;
 use crate::stream::{
     DeviceId, RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority, SchedulerHandle, StreamId,
 };
@@ -78,7 +77,7 @@ pub fn num_physical_cards() -> u64 {
     *CACHED.get_or_init(|| {
         // SAFETY: `flex_senlib_pci_ncards` takes no arguments and returns a
         // plain integer; no ownership crosses the FFI boundary.
-        unsafe { senlib_ffi_runtime::flex_senlib_pci_ncards() }
+        unsafe { crate::senlib_ffi::flex_senlib_pci_ncards() }
     })
 }
 
@@ -549,7 +548,7 @@ impl RuntimeContext {
 ///     *real* device-backed region, which requires an actual senlib
 ///     allocation to succeed (`allocator.rs::pre_allocate_regions` ->
 ///     `allocate_new_region` -> `DeviceMemoryAllocator::try_allocate` ->
-///     `senlib_ffi_allocator::flex_senlib_memory_allocate`). This crate has
+///     `senlib_ffi::flex_senlib_memory_allocate`). This crate has
 ///     no mock senlib seam (see `device_memory_allocator.rs`'s own comment
 ///     on why its 6 `TryAllocate` tests aren't ported either) — hardware is
 ///     genuinely required for a `FlexAllocator` with any real *non-empty*

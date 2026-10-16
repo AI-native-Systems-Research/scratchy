@@ -9,7 +9,7 @@
 //! with process-wide caching — pure logic, no senlib involvement except the two
 //! `FlexConfig` methods that enumerate/locate physical cards
 //! (`FlexSpyreDevices`, `RdmaGetPCIeAddress`); those two cross into
-//! `senlib_ffi_config_util.rs`. See `SENLIB_BOUNDARY_config-util.md`.
+//! `senlib_ffi.rs`. See `SENLIB_BOUNDARY.md`'s "Config/util" section.
 //!
 //! ## Caching semantics (`common::TracedSetting`)
 //! Real `common::TracedSetting<T>` (`common/traced_setting.hpp:196-201`)
@@ -41,7 +41,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::senlib_ffi_config_util::{pcie_address_for_card, sen_pci_card_count};
+use crate::senlib_ffi::{pcie_address_for_card, sen_pci_card_count};
 
 // ===========================================================================
 // Small env-var parsing helpers (no `common::env_var` equivalent available)

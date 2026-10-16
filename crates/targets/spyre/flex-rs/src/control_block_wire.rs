@@ -748,7 +748,7 @@ pub const TS_SECTION: usize = 8;
 pub const PW_SECTION: usize = 28;
 
 /// A fully-encoded, hardware-ready control block: the real bytes that get
-/// queued via `senlib_ffi_scheduler::cbi_queue_control_blocks_sbf`. This is
+/// queued via `senlib_ffi::cbi_queue_control_blocks_sbf`. This is
 /// the type `HardwareSubmit::submit` now carries (see `scheduler.rs`) —
 /// previously that call site carried no payload at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -958,7 +958,7 @@ impl ControlBlockWire {
         ))
     }
 
-    /// Raw bytes ready to hand to `senlib_ffi_scheduler::SenlibControlBlockSbf`
+    /// Raw bytes ready to hand to `senlib_ffi::SenlibControlBlockSbf`
     /// (which is byte-for-byte this same 128-byte layout).
     pub const fn to_bytes(&self) -> [u8; CB_NUM_BYTES] {
         self.bytes
@@ -979,7 +979,7 @@ impl ControlBlockWire {
 }
 
 /// A decoded response block: the real bytes senlib hands back via
-/// `senlib_ffi_scheduler::rbi_receive_responses_sbf`. Port of the
+/// `senlib_ffi::rbi_receive_responses_sbf`. Port of the
 /// `ReturnSectionSBF` decode used by `ResponseWorker`/`DmaControlBlockHandler`
 /// to determine per-CB completion status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

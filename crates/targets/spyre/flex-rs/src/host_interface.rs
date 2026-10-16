@@ -21,8 +21,8 @@
 //! Modeled here as an opaque handle until the graph-executor phase needs to
 //! construct or inspect a real one.
 //!
-//! No senlib calls identified in this subsystem — see
-//! SENLIB_BOUNDARY_device-interface-misc.md.
+//! No senlib calls identified in this subsystem — see `SENLIB_BOUNDARY.md`'s
+//! "Device-interface misc" section.
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 

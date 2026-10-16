@@ -128,7 +128,7 @@ senlib::shared::MemoryAllocator* mem_allocator() {
 
 // Process-wide handle table for outstanding device-memory allocations.
 // senlib::shared::MemoryAllocator::Allocate returns a raw void*; Rust's
-// senlib_ffi_allocator::SenlibAllocationHandle is a bare u64, so this table
+// senlib_ffi::SenlibAllocationHandle is a bare u64, so this table
 // is what turns "free this u64" back into "free this void*" (the pointer
 // value itself, widened to u64, IS the handle — no separate ownership object
 // to track, unlike the old flex::DeviceMemoryAllocationPtr shared_ptr table).
@@ -194,7 +194,7 @@ uint32_t flex_senlib_rcu_num_cores(void) {
 }
 
 // ---------------------------------------------------------------------
-// senlib_ffi_allocator.rs — device memory allocate/free
+// senlib_ffi.rs (allocator section) — device memory allocate/free
 //   senlib::shared::MemoryAllocator::Allocate(bytes) -> void* / Free(void*)
 // ---------------------------------------------------------------------
 
@@ -207,7 +207,7 @@ uint64_t flex_senlib_memory_allocate(uint64_t num_bytes) {
         // This 1p0 target has exactly one memory domain (matches flex's own
         // single-domain PF topology). A domain_id parameter was removed from
         // this signature (and the Rust extern decl in
-        // senlib_ffi_allocator.rs) because neither senlib::MemoryAllocator::
+        // senlib_ffi.rs) because neither senlib::MemoryAllocator::
         // Allocate(bytes) (PF) nor VfWrapper::Allocate(flits) (VF) takes one —
         // see flex-cxx's own TODO at device_memory_allocator.cpp:153. Keeping
         // an unforwarded, unread param here was a real Rust/C++ ABI arity
@@ -259,7 +259,7 @@ int32_t flex_senlib_memory_free(uint64_t handle) {
 }
 
 // ---------------------------------------------------------------------
-// senlib_ffi_scheduler.rs — control-block-interface capacity / doorbell,
+// senlib_ffi.rs (scheduler section) — control-block-interface capacity / doorbell,
 // response-block receive.
 //   senlib::snt1p0::PfInterface::GetComputeCbi()/GetDmaiCbi()/GetDmaoCbi()
 //   senlib::snt1p0::PfInterface::GetRbi()
@@ -438,7 +438,7 @@ int32_t senlib_response_block_interface_receive_responses_sbf(void* rbi, void* o
 }
 
 // ---------------------------------------------------------------------
-// senlib_ffi_runtime.rs / senlib_ffi_config_util.rs — card count
+// senlib_ffi.rs (runtime + config/util sections) — card count
 //   senlib::snt1p0::SenPci::ncards() — a trivial static query with no bring-up
 //   prerequisite.
 // ---------------------------------------------------------------------
@@ -456,14 +456,14 @@ uint64_t flex_senlib_pci_ncards(void) {
 }
 
 // ---------------------------------------------------------------------
-// senlib_ffi_config_util.rs — per-card PCIe bus address
+// senlib_ffi.rs (config/util section) — per-card PCIe bus address
 //   senlib::shared::SenPciShared::pf(card_index).to_string()
 //   (flex/src/util/flex_config.cpp:471, FlexConfig::RdmaGetPCIeAddress)
 // ---------------------------------------------------------------------
 
 const char* senlib_senpci_pf_address(uint32_t card_index) {
     try {
-        // senlib_ffi_config_util.rs's doc comment promises "a senlib-owned,
+        // senlib_ffi.rs's doc comment promises "a senlib-owned,
         // null-terminated buffer valid for the duration of the call (no
         // ownership transfer)" — a thread_local std::string buffer backing
         // the returned c_str() matches that contract (stable until the next
@@ -481,7 +481,7 @@ const char* senlib_senpci_pf_address(uint32_t card_index) {
 }
 
 // ---------------------------------------------------------------------
-// senlib_ffi_iommu.rs — pf_iommu_mapper.cpp's Map/Unmap
+// senlib_ffi.rs (IOMMU declarations) — pf_iommu_mapper.cpp's Map/Unmap
 // ---------------------------------------------------------------------
 
 // `writable` matches the real `PfIommuMapper::Map(IommuMappingPtr*, void* hmva,
