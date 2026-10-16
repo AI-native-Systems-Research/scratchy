@@ -73,6 +73,17 @@ pub struct SparseStores {
     mapped: Arc<AtomicUsize>,
     capacity: usize,
     heaps: Vec<Pinned<ProtocolObject<dyn MTLHeap>>>,
+    /// A second run of blocks past the first, mapped on its own (`Self::with_tail`).
+    tail: Option<Tail>,
+}
+
+/// [`SparseStores`]' second run of blocks: `blocks` of them from block `start` — the first block
+/// whose offset is a whole number of tiles in every store, so no tile is shared with the first run
+/// — `mapped` of them mapped so far.
+struct Tail {
+    start: usize,
+    blocks: usize,
+    mapped: usize,
 }
 
 impl SparseStores {
@@ -107,7 +118,86 @@ impl SparseStores {
             mapped: Arc::default(),
             capacity,
             heaps: Vec::new(),
+            tail: None,
         })
+    }
+
+    /// Stores of `head` blocks grown from block 0 ([`Self::grow_to`]) and, past them, `tail` more
+    /// grown on their own from [`Self::tail_start`] ([`Self::grow_tail_to`]) — a recurrent model's
+    /// live state slots and its prefix-cache snapshot slots. Neither run takes memory until a step
+    /// maps it.
+    pub fn with_tail(
+        device: &ProtocolObject<dyn MTLDevice>,
+        residency: &MetalResidencySet,
+        head: usize,
+        tail: usize,
+        stores: &[(usize, bool)],
+    ) -> Result<Self, String> {
+        let tile = device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+        let aligned = |b: usize| {
+            stores
+                .iter()
+                .all(|&(bytes, _)| (b * bytes).is_multiple_of(tile))
+        };
+        let start = (head..)
+            .find(|&b| aligned(b))
+            .expect("a tile-aligned block");
+        let mut s = Self::new(device, residency, start + tail, 1, stores)?;
+        s.capacity = head;
+        s.tail = Some(Tail {
+            start,
+            blocks: tail,
+            mapped: 0,
+        });
+        Ok(s)
+    }
+
+    /// The first block of the second run (`Self::with_tail`).
+    pub fn tail_start(&self) -> Option<usize> {
+        self.tail.as_ref().map(|t| t.start)
+    }
+
+    /// Map the second run through its first `blocks` blocks, as [`Self::grow_to`] maps the first:
+    /// at least doubling what it maps. Whether it mapped a step.
+    pub fn grow_tail_to(&mut self, blocks: usize, mapper: &KvMapper) -> Result<bool, String> {
+        let Some(tail) = self.tail.as_ref() else {
+            return Err("no second run of blocks".into());
+        };
+        let (start, from) = (tail.start, tail.mapped);
+        if blocks > tail.blocks {
+            return Err(format!("{blocks} tail blocks, of {}", tail.blocks));
+        }
+        if blocks <= from {
+            return Ok(false);
+        }
+        let to = blocks.max(2 * from).min(tail.blocks);
+        self.map(start + from, start + to, mapper)?;
+        if let Some(tail) = self.tail.as_mut() {
+            tail.mapped = to;
+        }
+        Ok(true)
+    }
+
+    /// Map blocks `from..to` of every store: one heap, wired, and zeroed where a store's blocks must
+    /// read zero.
+    fn map(&mut self, from: usize, to: usize, mapper: &KvMapper) -> Result<(), String> {
+        let tile = self.device.sparseTileSizeInBytesForSparsePageSize(PAGE);
+        // A store's bytes through block `b`, rounded up to its tile: the last tile may be shared
+        // with block `b`'s successor, which the step that reaches it then finds already mapped —
+        // and zeroed, when its store must read zero, as `map_step` zeroes whole new tiles.
+        let through = |b: usize, bytes: usize| (b * bytes).next_multiple_of(tile);
+        let ranges: Vec<MapRange<'_>> = (self.stores.iter())
+            .map(|(buffer, bytes, zeroed)| MapRange {
+                buffer,
+                from: through(from, *bytes),
+                to: through(to, *bytes),
+                zeroed: *zeroed,
+            })
+            .filter(|r| r.to > r.from)
+            .collect();
+        let heap = map_step(&self.device, &self.residency, mapper, &ranges)?;
+        self.heaps.push(heap);
+        Ok(())
     }
 
     /// Store `i`'s buffer, for readers that bind it by address.
@@ -151,22 +241,7 @@ impl SparseStores {
         }
         let to = blocks.next_multiple_of(self.unit).max(2 * from);
         let to = to.min(self.capacity);
-        let tile = self.device.sparseTileSizeInBytesForSparsePageSize(PAGE);
-        // A store's bytes through block `b`, rounded up to its tile: the last tile may be shared
-        // with block `b`'s successor, which the step that reaches it then finds already mapped —
-        // and zeroed, when its store must read zero, as `map_step` zeroes whole new tiles.
-        let through = |b: usize, bytes: usize| (b * bytes).next_multiple_of(tile);
-        let ranges: Vec<MapRange<'_>> = (self.stores.iter())
-            .map(|(buffer, bytes, zeroed)| MapRange {
-                buffer,
-                from: through(from, *bytes),
-                to: through(to, *bytes),
-                zeroed: *zeroed,
-            })
-            .filter(|r| r.to > r.from)
-            .collect();
-        let heap = map_step(&self.device, &self.residency, mapper, &ranges)?;
-        self.heaps.push(heap);
+        self.map(from, to, mapper)?;
         self.mapped.store(to, Ordering::Relaxed);
         Ok(true)
     }
@@ -379,5 +454,65 @@ mod tests {
         );
         assert!(stores.grow_to(5, &mapper).expect("the rest"));
         assert_eq!(stores.mapped().load(Ordering::Relaxed), 5);
+    }
+
+    /// Two runs grown apart — a recurrent model's live slots and its snapshot slots: the second
+    /// starts on a whole tile of every store, past the first's last block, and maps on its own
+    /// with the first untouched; each run stays within its blocks.
+    #[test]
+    fn a_tail_maps_apart_from_the_head() {
+        let Some(device) = crate::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let residency = MetalResidencySet::new(&device);
+        let mapper = KvMapper::new(&device).expect("mapper");
+        // 1.5 tiles a block: three head blocks end mid-tile, so the tail starts at block 4.
+        let big = 3 * 32 * 1024;
+        let mut stores =
+            SparseStores::with_tail(&device, &residency, 3, 2, &[(big, false)]).expect("stores");
+        assert_eq!(stores.tail_start(), Some(4));
+        let host = shared_zeroed(&device, big);
+        let a = stores.buffer(0);
+        let gpu = |body: &dyn Fn(&ProtocolObject<dyn MTL4ComputeCommandEncoder>)| {
+            let batch = Mtl4DispatchBatch::begin(&device).expect("MTL4 queue");
+            batch.declare(&residency);
+            let _host = batch.residency().pin(host.clone());
+            body(batch.encoder());
+            batch.commit(true);
+        };
+        assert!(stores.grow_tail_to(1, &mapper).expect("tail block 0"));
+        assert_eq!(
+            stores.mapped().load(Ordering::Relaxed),
+            0,
+            "the head maps nothing"
+        );
+        // SAFETY (both): tail block 0 is mapped and resident, and `host` is shared.
+        gpu(&|e| unsafe { e.fillBuffer_range_value(&a, NSRange::new(4 * big, big), 0xcd) });
+        gpu(&|e| unsafe {
+            e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &a,
+                4 * big,
+                &host,
+                0,
+                big,
+            )
+        });
+        let got: Vec<u8> = read_slice(&host, big);
+        assert!(
+            got.iter().all(|&x| x == 0xcd),
+            "the tail block holds its writes"
+        );
+        assert!(stores.grow_to(3, &mapper).expect("the head"));
+        assert!(
+            stores.grow_to(4, &mapper).is_err(),
+            "past the head's blocks"
+        );
+        assert!(
+            stores.grow_tail_to(3, &mapper).is_err(),
+            "past the tail's blocks"
+        );
+        assert!(stores.grow_tail_to(2, &mapper).expect("the tail's rest"));
+        assert!(!stores.grow_tail_to(1, &mapper).expect("already mapped"));
     }
 }
