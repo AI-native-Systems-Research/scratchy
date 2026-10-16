@@ -280,8 +280,8 @@ pub struct SimpleBlockTracker {
     /// Lowest-free-first allocation order for the hybrid path (a min-heap of
     /// free block IDs). Full groups take the lowest IDs and hold them; sliding
     /// groups recycle their just-freed low IDs immediately, so the **max
-    /// allocated block ID stays ~`full_blocks + Σ window_blocks`** (kept prompt
-    /// windows never raise it: see `BlockSpace::high_water`). This is the
+    /// allocated block ID stays ~`full_blocks + Σ window_blocks`** plus the
+    /// kept prompt windows (`hybrid_kept`). This is the
     /// load-bearing adaptation to scratchy's substrate: lockstep
     /// `grow_to_cover` residency is keyed on the max block ID, so an unbounded
     /// (FIFO, free-to-back) ID would commit the whole pool resident and
@@ -312,12 +312,15 @@ pub struct SimpleBlockTracker {
     /// out of the window but cover its PROMPT's last window — what a re-sent
     /// prompt needs (#328). Out of the block tables (the worker never reads
     /// them) yet still referenced, so the lowest-free-first heap can't hand
-    /// them to the reply's next blocks and evict their hashes. Freed with the
-    /// request, or all at once by `release_kept_windows` when an allocation
-    /// would otherwise fail or reach past the high-water mark of their block
-    /// space: keeping a cache entry must never cost a preemption, nor grow a
-    /// KV store.
+    /// them to the reply's next blocks and evict their hashes. Like any cached
+    /// block they may grow the store; they are freed with the request, or all
+    /// at once by `release_kept_windows` when an allocation would otherwise
+    /// fail: keeping a cache entry must never cost a preemption.
     hybrid_kept: HashMap<String, Vec<usize>>,
+
+    /// Per `space_slot`: how many `hybrid_kept` entries name the block. Each is
+    /// also one of its `ref_cnt`.
+    kept_refs: Vec<usize>,
 
     /// Recurrent-state snapshots, for a model whose layers carry a per-sequence scan state
     /// (Gated-DeltaNet hybrids). `Some` makes EVERY prefix hit resume at a snapshot — see
@@ -365,24 +368,11 @@ struct BlockSpace {
     /// Free IDs, lowest first. Stale entries (a block touched for reuse keeps
     /// its heap slot) are skipped on pop.
     free_min: BinaryHeap<Reverse<usize>>,
-    /// The highest ID `alloc_hybrid_fresh` has handed out. The worker maps the
-    /// store through it and keeps it mapped, so a block at or below it costs
-    /// no new memory; every ID above it has never been handed out, so it is
-    /// free.
-    high_water: usize,
     /// IDs in use (`ref_cnt > 0`), the null block excluded.
     used: usize,
-    /// `hybrid_kept` entries in this space. Only these can keep an allocation
-    /// in this space below its high-water mark.
-    kept: usize,
-}
-
-impl BlockSpace {
-    /// Free blocks at or below the high-water mark: those an allocation can
-    /// take without the store growing.
-    fn free_below_high_water(&self) -> usize {
-        self.high_water - self.used
-    }
+    /// IDs in use that only kept prompt windows hold
+    /// (`SimpleBlockTracker::kept_only`): free once `release_kept_windows` runs.
+    kept_only: usize,
 }
 
 impl SwaGroup {
@@ -441,6 +431,7 @@ impl SimpleBlockTracker {
             hybrid_id_to_key: HashMap::new(),
             hybrid_req_hashes: HashMap::new(),
             hybrid_kept: HashMap::new(),
+            kept_refs: Vec::new(),
             recurrent: None,
         }
     }
@@ -504,6 +495,7 @@ impl SimpleBlockTracker {
         let num_spaces = groups.iter().map(|g| g.space + 1).max().unwrap_or(1);
         self.total_blocks = num_blocks;
         self.ref_cnt = vec![0; num_spaces * num_blocks];
+        self.kept_refs = vec![0; num_spaces * num_blocks];
         // Block 0 of each space = null (held out of the free set); data blocks
         // are 1..num_blocks.
         self.hybrid_spaces = (0..num_spaces)
@@ -541,6 +533,22 @@ impl SimpleBlockTracker {
     /// store never counts against another's.
     fn space_free(&self, space: usize) -> usize {
         self.total_blocks - 1 - self.hybrid_spaces[space].used
+    }
+
+    /// Whether every reference to block `slot` is a kept prompt window's, so
+    /// releasing the kept windows frees it.
+    fn kept_only(&self, slot: usize) -> bool {
+        self.kept_refs[slot] > 0 && self.kept_refs[slot] == self.ref_cnt[slot]
+    }
+
+    /// Apply `change` to the reference counts of block `slot` of block space
+    /// `space`, keeping the space's `kept_only` tally in step.
+    fn tallied(&mut self, space: usize, slot: usize, change: impl FnOnce(&mut Self)) {
+        let was = usize::from(self.kept_only(slot));
+        change(self);
+        let is = usize::from(self.kept_only(slot));
+        let tally = &mut self.hybrid_spaces[space].kept_only;
+        *tally = *tally + is - was;
     }
 
     /// Where block `id` of block space `space` keeps its per-block state
@@ -903,9 +911,7 @@ impl SimpleBlockTracker {
                 continue;
             }
             self.ref_cnt[slot] = 1;
-            let space_state = &mut self.hybrid_spaces[space];
-            space_state.high_water = space_state.high_water.max(id);
-            space_state.used += 1;
+            self.hybrid_spaces[space].used += 1;
             // Lazy eviction: if this recycled block was still hash-mapped, drop
             // both directions so it can't be handed out as a stale cache hit
             // (mirrors `allocate_fresh_blocks` / Python `_maybe_evict_cached_block`).
@@ -931,13 +937,15 @@ impl SimpleBlockTracker {
                 continue;
             }
             let slot = self.space_slot(space, b);
-            debug_assert!(self.ref_cnt[slot] > 0, "double-free of block {b}");
-            self.ref_cnt[slot] -= 1;
-            if self.ref_cnt[slot] == 0 {
-                let space_state = &mut self.hybrid_spaces[space];
-                space_state.used -= 1;
-                space_state.free_min.push(Reverse(b));
-            }
+            self.tallied(space, slot, |t| {
+                debug_assert!(t.ref_cnt[slot] > 0, "double-free of block {b}");
+                t.ref_cnt[slot] -= 1;
+                if t.ref_cnt[slot] == 0 {
+                    let space_state = &mut t.hybrid_spaces[space];
+                    space_state.used -= 1;
+                    space_state.free_min.push(Reverse(b));
+                }
+            });
         }
     }
 
@@ -1004,10 +1012,12 @@ impl SimpleBlockTracker {
         }
         self.free_hybrid_blocks(grp.space, &removed);
         if !kept.is_empty() {
-            self.hybrid_spaces[grp.space].kept += kept.len();
             let slots: Vec<usize> = (kept.into_iter())
                 .map(|b| self.space_slot(grp.space, b))
                 .collect();
+            for &slot in &slots {
+                self.tallied(grp.space, slot, |t| t.kept_refs[slot] += 1);
+            }
             self.hybrid_kept
                 .entry(request.request_id.clone())
                 .or_default()
@@ -1026,59 +1036,31 @@ impl SimpleBlockTracker {
     fn free_kept(&mut self, slots: Vec<usize>) {
         for slot in slots {
             let (space, id) = self.slot_block(slot);
-            self.hybrid_spaces[space].kept -= 1;
+            self.tallied(space, slot, |t| t.kept_refs[slot] -= 1);
             self.free_hybrid_blocks(space, &[id]);
         }
-    }
-
-    /// The `space_slot`s `release_kept_windows` would return to the free pool:
-    /// the kept blocks no block table references any more.
-    fn releasable_kept(&self) -> HashSet<usize> {
-        let mut kept_refs: HashMap<usize, usize> = HashMap::new();
-        for &slot in self.hybrid_kept.values().flatten() {
-            *kept_refs.entry(slot).or_default() += 1;
-        }
-        kept_refs
-            .into_iter()
-            .filter(|&(slot, refs)| self.ref_cnt[slot] == refs)
-            .map(|(slot, _)| slot)
-            .collect()
     }
 
     /// The capacity check of both hybrid allocation paths: may an allocation
     /// take `demand[s]` free blocks of each block space `s`, `reuses` being the
     /// `space_slot`s of the cached blocks it takes over? Each space fits on its
-    /// own. The kept windows are released first when the allocation would
-    /// otherwise fail, or reach past the high-water mark of a space they hold
-    /// blocks of, and releasing them lets it fit. A reused block that only kept
+    /// own. When the allocation would otherwise fail, the kept windows are
+    /// released first if that lets it fit. A reused block that only kept
     /// windows hold is a revival once they are released, so it then counts
     /// against its space too.
     fn make_hybrid_room(&mut self, demand: &[usize], reuses: &[usize]) -> bool {
         let spaces = 0..demand.len();
-        let failing = spaces.clone().any(|s| demand[s] > self.space_free(s));
-        // A space's growth matters here only if kept blocks live in it.
-        let crossing_kept = |s: usize| {
-            let space = &self.hybrid_spaces[s];
-            space.kept > 0 && demand[s] > space.free_below_high_water()
-        };
-        if !failing && !spaces.clone().any(crossing_kept) {
+        if !spaces.clone().any(|s| demand[s] > self.space_free(s)) {
             return true;
         }
-        let released = self.releasable_kept();
-        // Per space: the blocks a release frees, and the reuses it turns into revivals.
-        let (mut freed, mut revived) = (vec![0usize; demand.len()], vec![0usize; demand.len()]);
-        for &slot in &released {
-            freed[self.slot_block(slot).0] += 1;
-        }
-        for &slot in reuses.iter().filter(|slot| released.contains(slot)) {
+        // Per space: the reuses a release turns into revivals.
+        let mut revived = vec![0usize; demand.len()];
+        for &slot in reuses.iter().filter(|&&slot| self.kept_only(slot)) {
             revived[self.slot_block(slot).0] += 1;
-        }
-        if !failing && !spaces.clone().any(|s| crossing_kept(s) && freed[s] > 0) {
-            return true;
         }
         if spaces
             .clone()
-            .any(|s| demand[s] + revived[s] > self.space_free(s) + freed[s])
+            .any(|s| demand[s] + revived[s] > self.space_free(s) + self.hybrid_spaces[s].kept_only)
         {
             return false;
         }
@@ -1300,10 +1282,12 @@ impl SimpleBlockTracker {
     /// (stale heap entries are skipped on pop since ref_cnt > 0).
     fn touch_hybrid_block(&mut self, space: usize, block_id: usize) {
         let slot = self.space_slot(space, block_id);
-        if self.ref_cnt[slot] == 0 {
-            self.hybrid_spaces[space].used += 1;
-        }
-        self.ref_cnt[slot] += 1;
+        self.tallied(space, slot, |t| {
+            if t.ref_cnt[slot] == 0 {
+                t.hybrid_spaces[space].used += 1;
+            }
+            t.ref_cnt[slot] += 1;
+        });
     }
 
     /// Register group-namespaced full-block hashes for the request's current
@@ -1987,11 +1971,12 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     /// On the hybrid path, the tightest block space's: it is the one that
-    /// limits what fits.
+    /// limits what fits. Blocks only kept prompt windows hold count as free,
+    /// like any cached block: an allocation releases them before it fails.
     fn num_free_blocks(&self) -> usize {
         if self.swa_groups.is_some() {
             return (0..self.hybrid_spaces.len())
-                .map(|s| self.space_free(s))
+                .map(|s| self.space_free(s) + self.hybrid_spaces[s].kept_only)
                 .min()
                 .unwrap_or(0);
         }
@@ -2019,7 +2004,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             return self
                 .hybrid_id_to_key
                 .keys()
-                .filter(|&&bid| self.ref_cnt[bid] == 0)
+                .filter(|&&slot| self.ref_cnt[slot] == 0 || self.kept_only(slot))
                 .count();
         }
         self.block_id_to_hash
@@ -4745,13 +4730,12 @@ mod tests {
     }
 
     /// Prefill `prompt_len` tokens, decode `reply_len` more one at a time (sealing each step, as
-    /// the engine does), free, then look the same prompt up again. Returns the reusable P and each
-    /// block space's high-water mark.
+    /// the engine does), free, then look the same prompt up again. Returns the reusable P.
     fn hybrid_reuse_after_reply(
         mut t: SimpleBlockTracker,
         prompt_len: usize,
         reply_len: usize,
-    ) -> (u32, Vec<usize>) {
+    ) -> u32 {
         let mut r1 = hybrid_req("r1", prompt_len);
         t.allocate_slots(&r1, prompt_len, 0, &[]).unwrap();
         r1.num_computed_tokens = prompt_len as u32;
@@ -4763,42 +4747,70 @@ mod tests {
             t.seal(&r1);
         }
         t.free("r1");
-        let reused = t.get_computed_blocks(&hybrid_req("r2", prompt_len)).0;
-        (
-            reused,
-            t.hybrid_spaces.iter().map(|s| s.high_water).collect(),
-        )
+        t.get_computed_blocks(&hybrid_req("r2", prompt_len)).0
     }
 
     #[test]
     fn test_hybrid_prompt_window_survives_long_reply() {
         // #328: the sliding group's blocks covering the prompt's last window slide out of the
         // window during decode. Kept out of the lowest-free-first heap, they survive a reply of
-        // any length, so the same prompt sent again reuses everything but its last partial block.
-        let reuse = |reply_len| {
-            hybrid_reuse_after_reply(caching_hybrid_after_full_pool(512, 64), 200, reply_len).0
-        };
-        assert_eq!(reuse(8), 192, "short reply");
-        assert_eq!(reuse(300), 192, "long reply");
+        // any length — on a freshly started pool too, which has to grow to hold both the reply's
+        // window and the kept one — so the same prompt sent again reuses everything but its last
+        // partial block.
+        for stores in [HybridKvStores::Shared, HybridKvStores::GlobalApart] {
+            let reuse = |reply_len| {
+                let mut t = SimpleBlockTracker::with_caching(512, 16);
+                t.enable_hybrid(512, vec![(false, 0, 32), (true, 64, 16)], stores);
+                hybrid_reuse_after_reply(t, 200, reply_len)
+            };
+            assert_eq!(reuse(8), 192, "{stores:?} short reply");
+            assert_eq!(reuse(300), 192, "{stores:?} long reply");
+            assert_eq!(reuse(1000), 192, "{stores:?} reply 15 windows long");
+        }
     }
 
     #[test]
-    fn test_hybrid_kept_prompt_window_never_raises_the_high_water_mark() {
-        // On a fresh pool, the 300-token reply fits under the high-water mark its prompt set only
-        // by recycling the prompt's window, as with caching off. The window yields, so every
-        // store is addressed with the same block IDs either way.
+    fn test_hybrid_kept_prompt_window_is_reported_free() {
+        // A kept window is a cache entry an allocation takes back before it fails, so the
+        // reported KV usage counts it free, like every other cached block. Through a long reply
+        // on Gemma 4's group layout, the tightest store holds more blocks with caching on than
+        // off, yet usage reads the same.
         for stores in [HybridKvStores::Shared, HybridKvStores::GlobalApart] {
-            let tracker = |caching: bool| {
-                let mut t = match caching {
-                    true => SimpleBlockTracker::with_caching(512, 16),
-                    false => SimpleBlockTracker::new(512, 16),
+            let run = |caching: bool| {
+                let mut t = if caching {
+                    SimpleBlockTracker::with_caching(512, 16)
+                } else {
+                    SimpleBlockTracker::new(512, 16)
                 };
-                t.enable_hybrid(512, vec![(false, 0, 32), (true, 64, 16)], stores);
-                t
+                let mut groups = vec![(false, 0usize, 32usize)];
+                groups.extend(std::iter::repeat_n((true, 64usize, 16usize), 5));
+                t.enable_hybrid(512, groups, stores);
+                let mut r1 = hybrid_req("r1", 200);
+                t.allocate_slots(&r1, 200, 0, &[]).unwrap();
+                r1.num_computed_tokens = 200;
+                t.seal(&r1);
+                let mut steps = Vec::new();
+                for i in 0..300u32 {
+                    r1.append_output_token_ids(&[10_000 + i]);
+                    t.allocate_slots(&r1, 1, 0, &[]).unwrap();
+                    r1.num_computed_tokens += 1;
+                    t.seal(&r1);
+                    let tightest = t.hybrid_spaces.iter().map(|s| s.used).max().unwrap();
+                    steps.push((t.num_free_blocks(), tightest));
+                }
+                steps
             };
-            let (_, uncached) = hybrid_reuse_after_reply(tracker(false), 200, 300);
-            let (_, cached) = hybrid_reuse_after_reply(tracker(true), 200, 300);
-            assert_eq!(cached, uncached, "{stores:?}");
+            let (cached, uncached) = (run(true), run(false));
+            assert!(
+                cached.iter().zip(&uncached).any(|(c, u)| c.1 > u.1),
+                "{stores:?} test setup: caching keeps the prompt's window in the tightest store"
+            );
+            for (i, (c, u)) in cached.iter().zip(&uncached).enumerate() {
+                assert_eq!(
+                    c.0, u.0,
+                    "{stores:?} free blocks reported at reply token {i}"
+                );
+            }
         }
     }
 
@@ -4899,7 +4911,7 @@ mod tests {
             tracker.allocate_slots(&r, 1, 0, &[]).expect("decode");
             r.num_computed_tokens += 1;
             // Kept blocks are out of the table, so count the pool, not the table.
-            let used = pool - 1 - tracker.num_free_blocks();
+            let used = tracker.hybrid_spaces[0].used;
             assert!(
                 used <= 2 * win_blocks + 3,
                 "{used} blocks in use exceed window + kept prompt window at tok {i}",
@@ -4932,9 +4944,14 @@ mod tests {
         let kept = t.hybrid_kept.get("r1").map_or(0, Vec::len);
         assert!(kept > 0, "a 300-token reply slides the prompt's window out");
 
+        let free = t.space_free(0);
+        assert_eq!(
+            t.num_free_blocks(),
+            free + kept,
+            "the kept window is reported free"
+        );
         // The smallest fresh prompt that needs more than the free pool, but no more than the
         // free pool plus the kept window.
-        let free = t.num_free_blocks();
         let need = |n: usize| n.div_ceil(32) + n.div_ceil(16);
         let n = (1..).find(|&n| need(n) > free).unwrap();
         assert!(
@@ -4975,7 +4992,7 @@ mod tests {
         let mut fillers = Vec::new();
         if let Some(k) = leave_free {
             let need = |n: usize| n.div_ceil(32) + n.div_ceil(16);
-            let target = t.num_free_blocks() - k;
+            let target = t.space_free(0) - k;
             let (a, b) = (1..2000usize)
                 .flat_map(|a| (1..200usize).map(move |b| (a, b)))
                 .find(|&(a, b)| need(a) + need(b) == target)
@@ -5013,7 +5030,7 @@ mod tests {
             t.hybrid_kept.contains_key("r1"),
             "releasing r1's window can't make room, so it stays kept"
         );
-        assert_eq!(t.num_free_blocks(), 1, "the failed allocation took nothing");
+        assert_eq!(t.space_free(0), 1, "the failed allocation took nothing");
         for id in ["r1", "r2"].into_iter().chain(fillers) {
             t.free(id);
         }
@@ -6847,16 +6864,17 @@ mod tests {
         out
     }
 
-    /// #328, through the scheduler: a `prompt_len`-token prompt with a 300-token reply, then the
-    /// same prompt again. Returns how much of it the resend reused, after checking that every
-    /// sliding group still holds the window the first recomputed token reads.
-    fn resend_after_long_reply(stores: HybridKvStores, prompt_len: u32) -> u32 {
+    /// #328, through a freshly started scheduler: a `prompt_len`-token prompt with a
+    /// `reply`-token reply, then the same prompt again. Returns how much of it the resend reused,
+    /// after checking that every sliding group still holds the window the first recomputed token
+    /// reads.
+    fn resend_after_long_reply(stores: HybridKvStores, prompt_len: u32, reply: u32) -> u32 {
         let mut sched = gemma4_scheduler(2634, 1, stores, true);
-        sched.add_request(request_from("r1", 0, prompt_len, 300));
+        sched.add_request(request_from("r1", 0, prompt_len, reply));
         while sched.has_unfinished_requests() {
-            step_and_sample(&mut sched, 300);
+            step_and_sample(&mut sched, reply);
         }
-        sched.add_request(request_from("r2", 0, prompt_len, 300));
+        sched.add_request(request_from("r2", 0, prompt_len, reply));
         sched.schedule();
         let reused = sched.get_request("r2").unwrap().num_cached_tokens as u32;
         let tables = sched.kv_cache.get_blocks("r2");
@@ -6882,9 +6900,13 @@ mod tests {
 
     #[test]
     fn test_hybrid_same_prompt_after_long_reply_hits_prefix_cache() {
-        // The issue's ~1.4k-token prompt: it reused 0 once the first reply passed ~150 tokens.
+        // The issue's ~1.4k-token prompt: it reused 0 once the first reply passed ~150 tokens,
+        // whatever the reply's length.
         for stores in BOTH_STORES {
-            assert_eq!(resend_after_long_reply(stores, 1418), 1408, "{stores:?}");
+            for reply in [300, 2048] {
+                let reused = resend_after_long_reply(stores, 1418, reply);
+                assert_eq!(reused, 1408, "{stores:?}, {reply}-token reply");
+            }
         }
     }
 
@@ -6894,7 +6916,11 @@ mod tests {
         // so the scheduler never backs P off below the window the lookup checked, and the first
         // recomputed token's window holds no null block.
         for stores in BOTH_STORES {
-            assert_eq!(resend_after_long_reply(stores, 1408), 1376, "{stores:?}");
+            assert_eq!(
+                resend_after_long_reply(stores, 1408, 300),
+                1376,
+                "{stores:?}"
+            );
         }
     }
 
@@ -7017,21 +7043,31 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_kept_prompt_windows_never_grow_a_kv_store() {
-        // #317's 8 users × 4096/2048 cell on a roomy pool. Held until each request ends, the kept
-        // prompt windows raised the highest block of the store they live in, and so the memory
-        // the worker maps for it: the shared pool's doubled to 12,288 blocks. Released before they
-        // would reach past their space's high-water mark, they leave every store where caching off
-        // does. Apart, they live in the sliding groups' pool, so the global store never sees them.
+    fn test_hybrid_kept_prompt_windows_cost_a_window_per_running_request() {
+        // #317's 8 users × 4096/1280 cell on a roomy pool. Each running request keeps its prompt's
+        // last window while its reply decodes in another, so the pool holding the sliding groups
+        // grows by up to one window (5 groups × 65 blocks) per request running at once, and no
+        // more. Apart, the kept windows live in the sliding groups' pool and never reach the
+        // global store.
         let cell = Cell {
             prompts: 8,
             reply_len: 1280,
             ..CELL_4096_512
         };
+        let window = 5 * (1024usize.div_ceil(16) + 1);
         for stores in BOTH_STORES {
             let kept = run_317_cell(stores, true, 27_000, cell);
             let uncached = run_317_cell(stores, false, 27_000, cell);
-            assert_eq!(kept.pool_reach, uncached.pool_reach, "{stores:?}");
+            let bound = uncached.pool_reach + cell.users as usize * window;
+            assert!(
+                kept.pool_reach > uncached.pool_reach,
+                "{stores:?}: windows were kept"
+            );
+            assert!(
+                kept.pool_reach <= bound,
+                "{stores:?}: {} > {bound}",
+                kept.pool_reach
+            );
             if stores == HybridKvStores::GlobalApart {
                 assert_eq!(kept.global_reach, uncached.global_reach);
             }
