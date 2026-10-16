@@ -84,6 +84,32 @@ pub const DXP_LX_FRAC_AVAIL: f64 = 0.2;
 /// #3.)
 pub const USABLE_LX_BYTES: u64 = 1_677_721;
 
+/// LX bytes the VENDOR dxp SCHEDULER can actually allocate a single op into — a
+/// different, much smaller budget than [`USABLE_LX_BYTES`], and the binding one
+/// for one op's LX demand. Two vendor facts compose:
+///
+/// 1. `reserveFrontendLx` (ProgramLayout.cpp:81-98) carves
+///    `memCapacity × DXP_LX_FRAC_AVAIL` out of the scheduler-visible capacity
+///    BEFORE any op is placed — and the scheduler-visible capacity is already
+///    the 64 KiB-truncated `lxCapacity` (2 MiB − 64 KiB), not the raw 2 MiB.
+///    So the free pool is `floor((2 MiB − 64 KiB) × (1 − 0.2))` = **406,323 B**.
+/// 2. `allocAllMem` (L3DlOpsScheduler.cpp:6455) charges each gathered op
+///    `2 buffers × value-capacity + 2 buffers × output-capacity` at its MINIMUM
+///    chunk candidate (one page), i.e. **4 × one entry's bytes**.
+///
+/// Pod-proven on the 26b expert door (group_15/sdsc_79.json, wall #6): the
+/// gate/up page of 180,224 B ⇒ demand 720,896 B > 406,323 B ⇒
+/// `Expect valid chunk size that fits in LX` (L3DlOpsScheduler.cpp:2242).
+/// Control RC=1; `DXP_LX_FRAC_AVAIL=1.0` ⇒ RC=0; shrinking ONLY Tensor0's
+/// maxDimSizes[0] 1408→704 ⇒ RC=0 with init_binary emitted — the refusal keys
+/// on the page width alone, exactly this arithmetic.
+pub const VENDOR_LX_SCHED_BYTES: u64 = (LX_CAPACITY_BYTES - 64 * 1024) / 5;
+
+const _: () = assert!(
+    VENDOR_LX_SCHED_BYTES == 406_323,
+    "vendor LX scheduler budget: (2 MiB - 64 KiB) * 0.8 = 406,323 B"
+);
+
 /// fp16 = 2 bytes / element. The emitter is fp16-only ([`Fp16::WORD_LENGTH`]);
 /// this alias documents the residency-byte arithmetic in [`WorkPlan::time_tile_for_lx`].
 pub const FP16_BYTES: u64 = 2;
@@ -1444,6 +1470,19 @@ pub enum OpFunc {
     /// converts the fp32 accumulator → f16 for the output.
     Dl16ToFp32,
     Fp32ToDl16,
+    /// `fp32toint32` — the SFP VALUE CAST fp32 → 32-bit integer (unary_parallel.ddl:50, ICVT imm=8;
+    /// "the conversion is carried out in fp32 mode"). The MoE expert gather's index producer: the
+    /// router's top-k ids, computed on device as fp16 lane values, become the `SENUINT32` entries a
+    /// gather's index tensor must carry ([`SenUint32`]'s DT_CHECK law). The output tensor's DDL type
+    /// list accepts EITHER 32-bit integer format (unary_parallel.ddl:22) — `[%type_uint32,
+    /// %type_int32]` — so an IEEE_INT32 OUTPUT and a SENUINT32 INDEX are the same op under two type
+    /// spellings, which is what lets [`crate::emit::convert_dtypes`] pair `Df::Fp32` input with
+    /// `Df::SenUint32` output here while the vendor binds only the int32 side. Round-to-nearest is
+    /// the fp32 mode's conversion; every caller feeds ids that are already whole numbers, so the
+    /// rounding direction never reaches a value. ⛔ OUTPUT STICK NARROWER THAN THE INPUT (64→32):
+    /// the SAME rank-3 law as the fp16↔fp32 converts — a rank-2 collapse of a narrowing convert
+    /// drops the `y` dim dxp's buffer walk needs (see [`crate::emit::convert_opspec`]).
+    Fp32ToInt32,
     Sum,
     Max,
     Mean,
@@ -1545,6 +1584,57 @@ pub enum OpFunc {
     /// by a `DT_CHECK` that the attribute is present), so that is the variant to emit — the plain
     /// `quantscalepertoken` has no such branch and is not what an fp8 activation wants.
     QuantScalePerTokenFp8,
+    /// `lesserthan` — elementwise `a < b` as a 0/1 fp16 tensor (SFP unit; broadcast_ops.ddl:40).
+    /// The vendor realizes it as `LESSERTHAN` into a BOOL state reg, then `SELECT(plus1, zero)` —
+    /// so the wire-level result IS fp16 0.0/1.0, the exact shape every pointwise assembler here
+    /// already emits (same arity-2 broadcast op as `maximum`/`minimum`). NaN compares FALSE on the
+    /// SFP unit, matching the emulator's ordered `cmpf olt` — the MoE argsort's NaN→+inf sanitize
+    /// runs BEFORE this op, so no unsanitized NaN ever reaches one.
+    LesserThan,
+    /// `equal` — elementwise `a == b` as 0/1 fp16 (SFP unit; broadcast_ops.ddl:41, `EQUAL` +
+    /// SELECT). Used by the MoE router's one-hot selectors: `equal(x, splat(target))` masks a
+    /// single matching lane and the `sum` reduce extracts it.
+    Equal,
+    /// `notequal` — elementwise `a != b` as 0/1 fp16 (SFP unit; broadcast_ops.ddl:42, `NOTEQUAL` +
+    /// SELECT).
+    NotEqual,
+    /// `where3` — elementwise `cond ? a : b` over THREE fp16 tensors (SFP unit;
+    /// broadcast_ops.ddl:36): `NOTEQUAL(cond, zero)` into the state reg, then `SELECT(a, b)`. The
+    /// select primitive of the MoE port's sanitize/extract chains; the `cond` operand may
+    /// broadcast.
+    Where3,
+    /// ⭐⭐⭐ `topkindex` / `topkvalue` — the vendor's fused top-k PAIR (`topk.ddl`), the k largest
+    /// with slots DESCENDING (slot 0 = the max), ties keeping the FIRST index among equals.
+    /// `topkindex` emits the `[.., k]` indices, `topkvalue` the `[.., k]` values at those indices —
+    /// the pair the graph compiler's fission produces (`nodeFissionFusion.cpp:6542+` fissures a
+    /// "TopK" into "TopKValue"+"TopKIndex"), and the optimizer's own decomposition law
+    /// (`dwsrsAct2.cpp:601-716`) DT_CHECKs: ONE input, ONE output, the K dim the OUTPUT-ONLY dim
+    /// (`getNotIncludedDimId(output, input)` must be exactly `{K}`). The DDL binds the running
+    /// `(max, idx)` state and its ring as `ddl.internal_tensor`s — FIVE of them (`current_max`,
+    /// `current_idx`, `state_reg`, `tmp_val`, `tmp_idx`) — initialized `(-inf, -1)` and scanned by
+    /// a GREATERTHAN running max over the reduce dims, so the pair needs NO external constants
+    /// (`maskbyindex`/`keepbyindex` — the other two opFuncs in the same template, exactly one of
+    /// the four per dsc — are the decomposition's masking legs; `keepbyindex` alone takes
+    /// `maskval`). Registered in the shared vocabulary (`arch_enums.cpp` `opFuncsToString`
+    /// :491-492), same status as `quantscalepertokenfp8`.
+    ///
+    /// ⛔ THE STICK LAW, AND THE DOOR THAT NOW SATISFIES IT. The vendor's own
+    /// validator (`torch_spyre/_inductor/op_spec_validation.py:_check_stick_topk`)
+    /// refuses a topk whose REDUCTION dim or K dim rides the stick, and the DDL's
+    /// dataflow says why: the recipe is a SCALAR SFP scan (`unit="sfp"` per element,
+    /// the running max and the counter in single-element LRFs, `topk.ddl:117-195`) —
+    /// the stick lanes are PARALLEL instances of the whole recipe, so the candidates
+    /// must live on a sequentially-scanned non-stick dim and the stick axis must be a
+    /// SURVIVING batch. The MoE router's scores `[m, W]` are row-blocked with the
+    /// experts ON the stick, so the fused pair reads the TRANSPOSED form `[W, m_pad]`
+    /// (the tokens on the stick) — the dance this registry row used to record as the
+    /// M4b worklist is now [`crate::emit::topk_opspec`]'s door
+    /// (`lower_ktir_to_superdsc::route_topk`): the stage to `[m_pad, W]`, the Kᵀ
+    /// restickify to `[W, m_pad]`, the pair at slots 64, and the landing transposes
+    /// back token-major `[m_pad, 64]`. These rows carry the vocabulary facts (name,
+    /// unit, arity, consts) the door emits against.
+    TopKIndex,
+    TopKValue,
 }
 
 impl OpFunc {
@@ -1598,6 +1688,7 @@ impl OpFunc {
             OpFunc::Tanh => "tanh",
             OpFunc::Dl16ToFp32 => "dl16tofp32",
             OpFunc::Fp32ToDl16 => "fp32todl16",
+            OpFunc::Fp32ToInt32 => "fp32toint32",
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",
@@ -1612,6 +1703,16 @@ impl OpFunc {
             OpFunc::Clip => "clip",
             OpFunc::Qfp8ch => "qfp8ch",
             OpFunc::QuantScalePerTokenFp8 => "quantscalepertokenfp8",
+            // dxp's recognized names, per broadcast_ops.ddl's operation_binds and
+            // dscdefn.cpp opFuncsToString (LESSERTHAN/EQUAL/NOTEQUAL/WHERE3 enums).
+            OpFunc::LesserThan => "lesserthan",
+            OpFunc::Equal => "equal",
+            OpFunc::NotEqual => "notequal",
+            OpFunc::Where3 => "where3",
+            // The vendor top-k pair's spellings (topk.ddl's operation_binds,
+            // arch_enums.cpp opFuncsToString :491-492).
+            OpFunc::TopKIndex => "topkindex",
+            OpFunc::TopKValue => "topkvalue",
         }
     }
 
@@ -1691,6 +1792,13 @@ impl OpFunc {
             // E4M3 finite range, so they are quant-format constants, not model constants: they belong
             // to the op, which is why they live in this table.
             OpFunc::Clip => &[("clipMin", -448.0), ("clipMax", 448.0)],
+            // ⭐ THE TOP-K PAIR NEEDS NONE — the running `(max, idx)` state, the `-inf`/`-1`/`1`
+            // SFP constants and the ring are ALL `ddl.internal_tensor`s or template-internal
+            // constant units (`topk.ddl:87-115`), reached by no `ddl.get_external_constant` in
+            // either operation_bind. Only `keepbyindex` (the masking leg, not this pair) reads an
+            // external `maskval`. Stated explicitly — not left to the `_` default — so the fact is
+            // pinned where the next reader looks for it.
+            OpFunc::TopKIndex | OpFunc::TopKValue => &[],
             _ => &[],
         }
     }
@@ -1724,8 +1832,38 @@ impl OpFunc {
             // second operand to get wrong; the row exists so the emitter's build-time arity check
             // covers this op too.
             OpFunc::Clip => Some(1),
+            // `topk.ddl:36-37` binds both pair members as `([%inp1_tensor], [%topk_output_tensor])`
+            // — ONE input, ONE output; the K dim is the OUTPUT-ONLY dim (the optimizer's own
+            // `getNotIncludedDimId(output, input) == {K}` DT_CHECK). An unseeded op: the running
+            // state is internal, so passing an accumulator makes it unmatchable exactly like the
+            // fused scale above.
+            OpFunc::TopKIndex | OpFunc::TopKValue => Some(1),
             _ => None,
         }
+    }
+
+    /// ⭐⭐⭐ THE ONE OP PAIR WHOSE SHIPPED `constantInfo_` IS NOT THE GENERIC FORM. Both
+    /// vendor fixtures (`ddc/ddl_templates/test/sdsc_topKIndex.json` / `sdsc_topKValue.json`
+    /// — the only descriptors anywhere that name either opFunc) carry the FALSY empty OBJECT,
+    /// against this crate's generic truthy STRING `"{}"`. Not a matter of taste:
+    ///
+    /// • `constantInfo_` the FALSY empty OBJECT keeps dxp's `if constantInfo_:` SKIPPING the SFP
+    ///   constant-table setup. For every other op the truthy string exists to make an NR refinement
+    ///   run; `topk.ddl` HAS no refinement — it sources every constant it reads (negInf/negOne/one)
+    ///   from its own `ddl.define_constant` SFP-LRFs (`topk.ddl:45-50, 81-98`) and reads NO external
+    ///   constant, so a truthy entry can only install a table the template never consumes.
+    ///
+    /// The fixtures' OTHER divergence — the five-field scheduling row (`auxLoopName: ""`,
+    /// `isAtMainLoop: 1`, `isAtTop: 1`, `level: 0`, `opConsts: {}`) — is NOT shippable: the
+    /// dev stack's new SDSC-JSON validator rejects all five fields outright ("Unrecognized
+    /// field"). MEASURED: the tiny26 bake's dxp refused the pair's group with exactly that
+    /// error on both members (reproduced via manual dxp_standalone on the persisted stage
+    /// dir) — the same validator class as the `location: "invalid"` rejection. The fixtures
+    /// predate the validator; the pair now omits the row like every other op (see the
+    /// `ComputeOp` doc in `wire`), so this predicate keys the `constantInfo_` conversion
+    /// in `emit_sdsc_tiled` alone.
+    pub fn is_topk_pair(self) -> bool {
+        matches!(self, OpFunc::TopKIndex | OpFunc::TopKValue)
     }
 
     /// True for the transcendental sfp ops that need the SFP polynomial constant
@@ -2607,6 +2745,45 @@ impl DestEntry {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — the destination entry AND the source's own
+/// base, as ONE argument.
+///
+/// `addr = idx·skip_addr + base_addr` has a half at each end: `DestEntry` carries where the run
+/// lands in the destination, and the source's own base (in elements, relative to the source
+/// buffer's declared start) carries where the run reads from. They are handed over together
+/// because they advance together — a run cut out of a longer copy starts `n` entries into the
+/// destination AND `n·elems_per_entry` elements into the source — and a caller that supplies one
+/// without deciding the other has not stated the copy it wants.
+///
+/// ⛔ THE KV POOL'S ZERO IS A LAW, NOT A DEFAULT. A gathered KV copy's entries are GLOBAL stick-block
+/// numbers, and the pool's base is already folded into `skip_addr`'s derivation — see
+/// [`crate::sdsc_abstract::GatherCopy`]'s "source base stays ZERO" note. `GatherRun::contiguous`
+/// states that shape; the expert bank's chunk-major runs state theirs with `split` — both halves
+/// explicit, neither derivable from the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GatherRun {
+    /// The destination entry the run starts at (see [`DestEntry`]).
+    pub dest: DestEntry,
+    /// The source's own base, in ELEMENTS relative to the source buffer's declared start.
+    /// Zero for every KV copy (the pool's entries are global); the expert bank's chunk-major
+    /// staging puts chunk χ's base at `χ·E·chunk_elems`.
+    pub src_elems: u32,
+}
+
+impl GatherRun {
+    /// A run that is contiguous with its buffer's own start at both ends — the gathered KV copy's
+    /// shape: the pool's entries are GLOBAL block numbers, so the source needs no base of its own.
+    pub const CONTIGUOUS: GatherRun = GatherRun {
+        dest: DestEntry::ZERO,
+        src_elems: 0,
+    };
+
+    /// A run starting `dest` entries into the destination, with an explicit source base in elements.
+    pub const fn split(dest: DestEntry, src_elems: u32) -> GatherRun {
+        GatherRun { dest, src_elems }
+    }
+}
+
 /// ⭐⭐⭐ A GATHER, AS ONE ARGUMENT — the index operand's name plus the two facts that decide what an
 /// entry MEANS.
 ///
@@ -2711,6 +2888,47 @@ impl GatherIndex {
             per_position: Some(KernelAxis::Batch),
             // The whole index tensor — this form is not cut into runs.
             first_entry: EntryBase::ZERO,
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE TOKEN-PLANE FORM — one entry PER TOKEN ROW, each naming ONE WHOLE KERNEL PLANE:
+    /// the prefill-m>1 per-expert batched matmul, where entry `t` is token `t`'s RAW EXPERT ID and the
+    /// value operand is the chunk-major expert bank (`e·chunk + χ·E·chunk`, the `expert_slab_chunks`
+    /// law). Probe-proven end to end (2026-10-09, `/tmp/prefill-m1-probe-report.md`): this shape
+    /// schedules to `init_binary` with the gather ENGAGED at both the small (m8, in128) and the 26b
+    /// gate (m96, in2816) geometries — `RC=0`, `srcIndirect=YES`, the vendor's own paged loop nest
+    /// built by `processHbmPagedTensors`.
+    ///
+    /// The descriptor this door produces (all pinned by
+    /// `zz_the_token_plane_gathered_matmul_is_the_probe_form.rs` against the probe's emitted JSON):
+    /// kernel re-declared rank-3 `["mb","in","out"]` — the PINNED DIM FIRST, unlike the KV form's
+    /// `["in","out","mb"]` — with `maxDimSizes_ [1,-1,-1]`; index rank-1 `["mb"]`, SENUINT32,
+    /// HBM-only, `indexTensorType_ "index"` (every path — the wall-#8 law: the vendor's
+    /// GatherIndexConversion builds the INT32IDXTOADDR conversion from the mint's raw expert ids,
+    /// zeroes the value start, and flips the type to ADDRESS itself before the scheduler's reuse
+    /// path reads it); tensor order `[INPUT, KERNEL, INDEX, OUTPUT]` with array position ==
+    /// `ldsIdx_`.
+    ///
+    /// ⛔ THE BAKE NEEDS `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`. The exploration path
+    /// (`calculateFlopPerByte`) demands transfer users on the index's HBM alloc that only a pass
+    /// AFTER `addChunkDataStage` creates — a vendor ordering gap, not a gather prohibition; the env
+    /// skips it and does not affect plain bundles (control `RC=0` with and without). It is a BAKE-time
+    /// setting on the dxp invocation, never a target-crate behavior toggle.
+    ///
+    /// ⛔ THE WORK DIVISION MUST SPLIT `mb` ONLY. `skip_addr` is the pin (1) × the per-core extents
+    /// of the UNPINNED dims, so one expert plane is `in·out` only while `in` and `out` stay whole —
+    /// the emitter refuses a plan that splits either, for the same reason `gather_copy_cores` divides
+    /// by whole entries.
+    ///
+    /// `first_entry` names where this op's run of the index table starts (whole index sticks); ZERO
+    /// for the whole-table form the probe validated.
+    pub fn of_expert_planes(name: String, first_entry: EntryBase) -> Self {
+        Self {
+            name,
+            entry_dim: KernelAxis::Batch,
+            page: PageExtent::single_position(),
+            per_position: None,
+            first_entry,
         }
     }
 }

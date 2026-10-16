@@ -246,9 +246,13 @@ pub(crate) fn apply_attention_rewrites<'a>(a: &'a Arena, module: &mut IRModule<'
             crate::memory::lx_fusion_budget(),
         )
     };
+    // SPLAT SINK LAST: every pass above may mint constant tiles, and each must be born inside the
+    // block that reads it so a block's LX live set is its own (see `splat_sink`'s doc for the
+    // measured gelu prefill overflow this closes).
+    let n_sink = ktir_optimizer::splat_sink::apply_splat_sink(a, module);
     if std::env::var_os("KTIR_REWRITE_VERBOSE").is_some() {
         eprintln!(
-            "[ktir-optimizer] attention rewrites @ execution entry: head re-roll fired on {n_head} node(s), flash cap-tiling fired on {n_flash} node(s) (budget={budget} bytes); tile coalesce fired on {n_coalesce} node(s)"
+            "[ktir-optimizer] attention rewrites @ execution entry: head re-roll fired on {n_head} node(s), flash cap-tiling fired on {n_flash} node(s) (budget={budget} bytes); tile coalesce fired on {n_coalesce} node(s); splat sink reordered {n_sink} function(s)"
         );
     }
 }

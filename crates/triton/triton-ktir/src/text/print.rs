@@ -573,6 +573,34 @@ fn print_op(
                 ));
             }
         }
+        // `tensor.generate` prints its region itself, TtReduce-style: the block
+        // arguments as a `^bb0(...)` label line (the parser's generic label
+        // reader), the body ops at depth+1, and the result type on the closer as
+        // `} -> T`, the form `apply_closer` reads. The DEFAULT arm would print the
+        // header and SILENTLY DROP the region -- the `func.func` lesson -- and a
+        // generate without its body is a lane vector with no lanes.
+        OpKind::TensorGenerate => {
+            let r = &op.regions[0];
+            out.push_str("tensor.generate {\n");
+            indent(depth, out);
+            let args: Vec<String> = r
+                .args
+                .iter()
+                .map(|(v, t)| format!("{}: {}", n(*v), print_type(t)))
+                .collect();
+            out.push_str(&format!("^bb0({}):\n", args.join(", ")));
+            for inner in &r.ops {
+                print_op(module, names, aliases, inner, depth + 1, out);
+            }
+            indent(depth, out);
+            out.push_str(&format!(
+                "}} -> {}\n",
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
+            ));
+            return;
+        }
         _ => {
             // The default: `dialect.op %a, %b {attrs} : T`, which is the form every
             // `arith.*` / `math.*` / `tensor.splat` op uses.

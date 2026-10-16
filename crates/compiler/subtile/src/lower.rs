@@ -202,7 +202,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 | EwKind::Sub,
             )
             | O::RmsNormReduce { .. }
-            | O::TanhSoftCap
+            | O::TanhSoftCap { .. }
             | O::ScalarWeightMul
             | O::GateSplit { .. }
             | O::GateApply
@@ -329,7 +329,7 @@ impl LoweringInput {
                 (SubOp::MatmulTile { .. } | SubOp::AllRowsMatmul, Some(&InputRef::Op(j))) => {
                     return Some(j);
                 }
-                (SubOp::TanhSoftCap, Some(&InputRef::Op(j))) => at = j,
+                (SubOp::TanhSoftCap { .. }, Some(&InputRef::Op(j))) => at = j,
                 _ => return None,
             }
         }

@@ -13,6 +13,31 @@ use crate::superdsc_opspec::{
 };
 use crate::work::distribute_cores;
 
+/// ⛔ A REDUCE'S TileOp OPERAND COUNT IS THE DDL's OWN INPUT ARITY, NOT A LITERAL 2. The seeded
+/// convention (`sum`/`max`/`mean`, `ddl_input_arity() = None`) binds data + accumulator as
+/// `inputLabeledDs[0..1]` — two HBM-resident operands. The FUSED unseeded reduce
+/// (`quantscalepertokenfp8`, `Some(1)`) keeps its accumulator ON-CHIP as a `ddl.internal_tensor`
+/// (`quant_scale_per_token.ddl:41`), so its per-core LX residency is ONE `[per_core_mb, k]`
+/// operand. A literal 2 modeled an accumulator that op does not have, and at a PRIME prefill
+/// rung — where `core_split` finds no even divisor, so the reduce keeps the WHOLE row count per
+/// core — the doubled count overflowed the usable LX scratchpad and time-tiled the REDUCTION
+/// axis (granite-3.1-2b mq=71 k=8192: 2,324,224 B; gemma-4-12b mq=43 k=15360: 2,641,920 B vs
+/// the 1,677,721-B budget), whose per-trip outputs ALIAS — the accum is `Scale::RedStick`,
+/// stride-exempt in `rewrite_op_for_time_tile` — exactly the collision the #50
+/// `tiled_trips_alias` guard refuses. At the true arity both geometries are single-shot
+/// (1,162,112 / 1,320,960 B), matching the fused op's own pinned arithmetic
+/// ("`(1024/32)·16384·2 = 1,048,576 B` per core, HALF the old residency"). The `[m, stick]`
+/// scale output (one 64-elem stick = 128 B/row) is not charged: the tightest real margin
+/// (12b mq=43: 356,761 B) is two orders above it. Anything else (`None`/`Some(2)`) keeps the
+/// seeded convention's conservative two-operand model — byte-identical for every shipped
+/// seeded reduce.
+fn reduce_tile_operands(op: OpFunc) -> u32 {
+    match op.ddl_input_arity() {
+        Some(1) => 1,
+        _ => 2,
+    }
+}
+
 /// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
 /// both `inputLabeledDs[1]` and the sole output, `out`-axis stick-reduction
 /// `[Active, RedStick, Active]`).
@@ -68,9 +93,12 @@ pub fn reduce_opspec_df(
     // LOWER to TileIR: this reduce's iteration domain + kind, ONE `TileOp` declaration instead of
     // the inline `WorkPlan::divide` + hand-picked `pointwise_lx_resident` closure — reached from the
     // REAL `lower_one_node` SubtileTape dispatch (every reduce: rmsnorm's mean, softmax's max/sum,
-    // fp8's amax), same as `pointwise_opspec`.
+    // fp8's amax), same as `pointwise_opspec`. The operand count comes off the DDL's own input
+    // arity — see [`reduce_tile_operands`].
     let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+            n_operands: reduce_tile_operands(op),
+        },
         dims: dims.clone(),
         df,
     };
@@ -401,9 +429,12 @@ pub fn reduce_opspec_off(
             df: Df::Fp16,
         },
     ];
-    // LOWER to TileIR: same pattern as reduce_opspec_df — the per-head/offset reduce variant.
+    // LOWER to TileIR: same pattern as reduce_opspec_df — the per-head/offset reduce variant,
+    // including the DDL-arity operand count ([`reduce_tile_operands`]).
     let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+            n_operands: reduce_tile_operands(op),
+        },
         dims: dims.clone(),
         df: Df::Fp16,
     };
@@ -414,13 +445,28 @@ pub fn reduce_opspec_off(
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
     // ── STICK-MAJOR RESIDUAL ── flip ONLY the DATA input to rank-2
     // stick-major to match a stick-major producer (see `reduce_opspec`); a per-head OFFSET slice
-    // (data_off/accum_off ≠ 0) is head-structured and stays rank-3. head_major forces rank-3 too.
+    // (non-block-aligned data_off/accum_off) is head-structured and stays rank-3. head_major forces
+    // rank-3 too.
     // `cols > 64` matches `reduce_opspec`'s identical fix: rank-2 drops `y` from `layoutDimOrder_`
     // entirely, which only needs to happen for the wide (`cols>64`) case this optimization exists
     // for — a real pod crash confirmed a `cols<=64` per-head reduce (attn_dp/attn_dn) breaks
     // otherwise.
-    let stickmajor =
-        !head_major && rows > 1 && cols > Fp16::ELEMS_PER_STICK && data_off == 0 && accum_off == 0;
+    //
+    // ⛔ OFFSETS: only a WHOLE-BLOCK shift of this op's own `[rows, cols]` slab keeps rank-2 — the
+    // SAME rule `pointwise.rs` documents for its `out_offset`. A RowBlocked stick-group is
+    // `rows·64` elements, so a sub-block read at element base `k·(rows·cols)` (a whole number of
+    // the op's own blocks, each block a whole number of stick-groups since `cols` is a stick
+    // multiple) addresses through the identical law: the full tensor's `(r, k·cols + c)` sits at
+    // exactly `k·rows·cols + ((c/64)·rows·64 + r·64 + c%64)`. A NON-block-aligned offset (a flat
+    // column slice, a per-head head offset) is NOT a whole-block shift — a column slice of a
+    // stick-major tensor is NOT contiguous — so it stays rank-3 flat, exactly as before. Zero is
+    // block-aligned, so every existing caller (attn_dp/attn_dn at `DevOff::ZERO`) is byte-identical.
+    let block = rows.saturating_mul(cols).max(1);
+    let stickmajor = !head_major
+        && rows > 1
+        && cols > Fp16::ELEMS_PER_STICK
+        && data_off.is_multiple_of(block)
+        && accum_off.is_multiple_of(block);
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
     let data = if stickmajor {
         AnyTensorArg::R2(

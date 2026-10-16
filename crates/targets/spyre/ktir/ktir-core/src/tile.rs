@@ -164,12 +164,52 @@ impl Tile {
         }
     }
 
+    /// Construct a compute-produced tile whose result lands on the card's **DLF16**
+    /// grid ([`crate::codec::round_dlf16`], `SEN169_FP16`) rather than `dtype`'s own:
+    /// the f16-mode pointwise ops inside an rmsnorm's scalar chain (the square, the
+    /// `·INV_D` mean scale, the `+ eps` add) execute as SEN169 instructions on card,
+    /// so their results carry DLF16's 9-bit mantissa and 2⁻³⁰ normal floor — not
+    /// IEEE f16's 11-bit mantissa and subnormal band. The two grids differ
+    /// STRUCTURALLY at small magnitudes: a gemma-4 epsilon (1e-6) plus its
+    /// mean-of-squares sits inside IEEE f16's subnormal band (6% relative steps at
+    /// 1e-6) where DLF16 is still normal (0.2% steps), so the wrong grid there is a
+    /// percent-scale error on the reciprocal, not half-ulp noise. `dtype` is the
+    /// chain's f16 storage dtype; the emulator decides WHO lands here (the
+    /// rmsnorm-scalar-chain slice of its pointwise numerics), and this constructor
+    /// is the landing itself.
+    ///
+    /// Rounds ONCE, at the result, DIRECTLY to the DLF16 grid — never through IEEE
+    /// f16 first (a subnormal double-rounded through the IEEE grid keeps that grid's
+    /// error; the landing must replace `Tile::compute`'s rounding, not follow it).
+    /// Storage is the same f32 arm [`Tile::from_decoded`] uses for the reduce's
+    /// DLF16 landing: a DLF16-grid value is exactly representable as f32, and
+    /// keeping it widened spares every consumer the re-decode.
+    pub fn compute_dlf16(mut data: Vec<f32>, dtype: DType, shape: Vec<usize>) -> Self {
+        debug_assert_eq!(
+            data.len(),
+            shape.iter().product::<usize>(),
+            "tile data length must equal product of shape"
+        );
+        crate::codec::round_dlf16_in_place(&mut data);
+        Tile {
+            data: TileStorage::store_rounded(data, dtype),
+            dtype,
+            shape,
+            unique_sticks: None,
+            index_unique_sticks: None,
+        }
+    }
+
     /// Construct a tile from already-decoded `f32` data plus stick bookkeeping —
     /// the `ktdp.load` result path. The data was just `codec::decode`d from native
     /// HBM bytes, so it already sits on `dtype`'s representable set; encoding it
     /// back into the native arm is therefore lossless (the round-trip is exact for
     /// f16 and integers). This is the load-boundary analogue of [`Tile::compute`]
-    /// that threads the `unique_sticks` sidebands through.
+    /// that threads the `unique_sticks` sidebands through. The fma-class reduce's
+    /// DLF16 landing (`linalg::reduce`) is the second user: its data sits on the
+    /// DLF16 accumulator's grid — not the f16 grid — and the f32 arm an F16 tile
+    /// stores holds it exactly; the consumer's own compute-round is where the
+    /// value returns to the f16 grid.
     pub fn from_decoded(
         data: Vec<f32>,
         dtype: DType,

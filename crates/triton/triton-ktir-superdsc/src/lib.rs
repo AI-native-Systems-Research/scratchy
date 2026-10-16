@@ -232,6 +232,41 @@ fn emit_regions(
                 },
             )
         }
+        // THE NOT-YET-LOWERED VOCABULARY, REFUSED BY NAME — enumerated, never `_`, so a new
+        // `Program` variant is E0004 here rather than a surprise at emission. None of these has a
+        // row on this ladder: the splice's registry produces none of them (its by-name refusals
+        // stop their SubOps at the producer), so a node carrying one here is a ROUTING CHANGE, not
+        // a missing arm — the day the splice learns to produce one, its arm moves out of this
+        // group and takes a real entry point with it. (The gemma-4 campaign's vocabulary: the MoE
+        // router and expert programs, TanhSoftCap, RmsNormUnit, ScalarWeightMul, Reshape,
+        // WindowedRmsNorm. ⛔ And the old ladder's argsort/topk doors stand CONVICTED at prefill
+        // m>1 — duplicate ranks per row — so the router rows that eventually land here are new
+        // work, not a port of that emission.)
+        Program::RmsNormUnit
+        | Program::TanhSoftCap
+        | Program::ScalarWeightMul
+        | Program::Reshape
+        | Program::RouteSoftmax
+        | Program::RouteRenorm
+        | Program::RouteArgsort
+        | Program::RouteTopK
+        | Program::RouteGatherScores
+        | Program::RouteExpertScale
+        | Program::ExpertGatedAct(_)
+        | Program::ExpertSort
+        | Program::ExpertUnsort
+        | Program::ExpertCombine
+        | Program::ExpertMatmul
+        | Program::WindowedRmsNorm { .. } => {
+            return Err(Error {
+                stage: "program",
+                message: format!(
+                    "{:?} has no entry point on the Triton ladder — the splice produces none of \
+                     these, so a node carrying one here is a routing change, not a missing arm",
+                    node.program
+                ),
+            });
+        }
         // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and
         // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
         // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
@@ -423,6 +458,26 @@ pub fn drive_rope(
             ),
         });
     }
+    // ⭐ THE ROPE-P CLASS TID, RESOLVED OFF THE SHARED REGISTRY — the same resolution the consumer
+    // ladder's door performs (`scratchy-target-spyre`'s `ktir_superdsc_door`): the class index of
+    // this program's head dim in `BundleLayout::rope_class_hds`, then `rope_p_class_tid(idx)`
+    // (class 0 = the widest = `ROPE_P_TID`, so a uniform model's ops name the sentinel exactly as
+    // before). A head dim the registry does not hold is a registry desync — the placement pass and
+    // this lowering disagree about which P table the rope reads — and it is refused BY NAME rather
+    // than guessed at class 0, because a wrong class is a wrong `[hd, hd]` contraction with nothing
+    // downstream to catch it.
+    let p_tid = layout
+        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == head_dim))
+        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
+        .ok_or_else(|| Error {
+            stage: "geometry",
+            message: format!(
+                "{name}: rope head_dim {head_dim} absent from BundleLayout.rope_class_hds {:?} \
+                 (registry desync — the layout's class set and this rope's head dim disagree, so \
+                 which P table it reads is not a fact either of them states)",
+                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
+            ),
+        })?;
     let mut sym = 0i64;
     let a = emit::lower_ktir_to_superdsc::RopeAt {
         name,
@@ -433,6 +488,7 @@ pub fn drive_rope(
         t: out.tid,
         mq,
         total,
+        p_tid,
         sym_id_base: &mut sym,
         layout,
         rows_are_requests,

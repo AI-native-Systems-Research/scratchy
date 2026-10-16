@@ -356,7 +356,7 @@ fn run_region_with_map_offload(
             // current-generation) live-ins before charging the output's LX —
             // mirroring `execute_op`'s #134 consume-on-last-use order — so a wide
             // per-row window doesn't hold inputs + output simultaneously.
-            crate::metal::run_map_region_gpu(mrk, ctx)?;
+            crate::metal::run_map_region_gpu(mrk, ctx, env)?;
         } else if skip.contains(&i) {
             // Subsumed by the trigger's fused kernel — not executed.
         } else {

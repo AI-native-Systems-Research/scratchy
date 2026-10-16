@@ -585,6 +585,38 @@ mod signals {
     }
 }
 
+/// `haystack.contains(needle)` for byte slices — ` &[u8]` has no `contains(&[u8])` on this
+/// toolchain's std without going through `windows`, which this wraps once.
+fn substr(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The pure form of [`DxpTool::env_knob_guard`]'s check: every knob name must appear as a
+/// literal in the toolchain's own artifacts (the binary or the L3 scheduler lib), because a
+/// name `dtGetEnv` cannot match is a name the toolchain silently ignores.
+fn knobs_present(
+    knobs: &[&str],
+    bin: &[u8],
+    lib: &[u8],
+    bin_path: &std::path::Path,
+    lib_path: &std::path::Path,
+) -> Result<(), String> {
+    for knob in knobs {
+        if !substr(bin, knob.as_bytes()) && !substr(lib, knob.as_bytes()) {
+            return Err(format!(
+                "dxp knob '{knob}' is present in neither {} nor {} — this toolchain \
+                 build cannot read it, so it would silently run at the knob's default and \
+                 validate a different behavior than the emission requires (the \
+                 EXPLORE/EXPLODE name-drift class; see DxpTool::env_knob_guard's doc). Fix \
+                 the knob name in superdsc_bake.rs to match the toolchain",
+                bin_path.display(),
+                lib_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ ONE `dxp_standalone` CHILD, OWNED — in THIS PROCESS'S process group, registered in the [`Reaper`]
 /// for as long as `Self` is alive.
 ///
@@ -732,7 +764,17 @@ impl Drop for ChildProc<'_> {
 /// Counted in BYTES rather than groups because a group is 64 ops in one place and 512 in another, so
 /// a group count bounds nothing in particular. The emitter knows a group's exact size before it
 /// writes it (it already holds the rendered json), so the reservation is exact, not an estimate.
-pub const MAX_STAGED_BYTES: usize = 512 * 1024 * 1024;
+///
+/// ⛔ AND A BUDGET THAT BLOCKS THE EMITTER CAPS THE COMPILE WIDTH, WHICH IS WHAT 512 MB DID. That
+/// value was sized on granite-3.1-2b — measured peak staging 85 MB for the WHOLE bake — so it
+/// admitted ~6 concurrent granite groups and never approached [`COMPILE_WIDTH`]. A gemma-4-12b
+/// rolled body is 6 layers fused into one loop unit: one launch group stages ~55 MB (8,300
+/// descriptors), so 512 MB admitted ~9 groups and the emitter sat blocked in `reserve` while 11 of
+/// the pod's 20 CPU-quota cores idled — MEASURED on the pod: 9 live `dxp_standalone` children, each
+/// ~90% of one core, against `cpu.max` = 20. 4 GB admits the full width at gemma group sizes
+/// (32 × 55 MB ≈ 1.8 GB) with headroom, and is still nothing against the staging volume (the build
+/// pod's `/tmp` has 1.7 TB free; the old `superdscforge` tree routinely held more).
+pub const MAX_STAGED_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// ⭐ THE CPU BOUND: concurrent `dxp_standalone` processes.
 ///
@@ -972,6 +1014,152 @@ impl SealedGroup {
     }
 }
 
+/// ⭐ THE MEMO'S DISK TWIN: compiled groups that outlive the process, under the same content key.
+///
+/// The memo's law holds every build — same `key` ⇒ same dxp input ⇒ same [`CompiledGroup`] — but the
+/// table dies with the process, so a rebuild of an unchanged emission paid the whole dxp wall again.
+/// MEASURED on the port ladder, gemma-4-12b, one pod: ~50 dxp CPU-seconds per group, ~26,900
+/// CPU-seconds of compiler in ONE build, against a 20-CPU cgroup quota — ~22 minutes of wall that a
+/// flip changing no emission then paid AGAIN for byte-identical output. This store gives those bytes
+/// a disk lifetime; the warm build reads them instead of compiling them.
+///
+/// ⛔ THE STAMP NAMES THE COMPILER, NOT THE INPUT. The key covers everything dxp reads of OUR making;
+/// it cannot cover the compiler itself changing underneath (a deeptools upgrade compiles the same
+/// json differently). The stamp hashes the dxp binary's bytes plus a stat-walk of the share dir, and
+/// a store built by any other stamp is WIPED, not read — serving one byte of a previous compiler's
+/// output is the one wrong answer here.
+///
+/// Errors are MISSES, never build failures: a store that cannot be read or written costs a compile,
+/// which is exactly what not having it costs.
+#[derive(Debug)]
+struct DiskCache {
+    dir: PathBuf,
+}
+
+/// Entry-file magic — `SDC1`, little-endian — so a truncated or foreign file reads as a miss.
+const DISK_CACHE_MAGIC: u32 = 0x5344_4331;
+
+impl DiskCache {
+    /// Resolve the store: `$SCRATCHY_SUPERDSC_CACHE` if set, else `<OUT_DIR>/../../superdsc-dxp-cache`
+    /// (the target dir's `build/`, so `cargo clean` takes the cache with it and two model scopes
+    /// share one store), else `None` — a context with no `OUT_DIR` (a bare `cargo test` of this
+    /// crate) keeps only the in-process memo.
+    fn open(tool: &DxpTool) -> Option<DiskCache> {
+        let base = match std::env::var_os("SCRATCHY_SUPERDSC_CACHE") {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(std::env::var_os("OUT_DIR")?)
+                .join("../..")
+                .join("superdsc-dxp-cache"),
+        };
+        let dir = base.join(format!("{:016x}", Self::stamp(tool)));
+        // The stamp is the version. Anything else under `base` is a previous compiler's output (or a
+        // stray), and the whole point of stamping is that it is never read back.
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p == dir {
+                    continue;
+                }
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        std::fs::create_dir_all(&dir).ok()?;
+        // Crashed `put`s leave `.tmp-` files behind; they are never valid entries.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(".tmp-") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        Some(DiskCache { dir })
+    }
+
+    /// Hash the compiler's identity: the dxp binary BY BYTES (a rebuild changes them), the share
+    /// dir by a sorted stat-walk (a DDL or template change without a binary change still moves the
+    /// compiled output). A content hash of the share tree would be airtight but walks hundreds of MB
+    /// per build; the stat-walk is milliseconds and errs toward a wipe — a false mismatch costs a
+    /// cold rebuild, and reaching a false match takes identical names, sizes and mtimes.
+    fn stamp(tool: &DxpTool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn walk<H: Hasher>(h: &mut H, p: &Path) {
+            let Ok(rd) = std::fs::read_dir(p) else { return };
+            let mut es: Vec<_> = rd.flatten().collect();
+            es.sort_by_key(|e| e.file_name());
+            for e in es {
+                e.file_name().hash(h);
+                if let Ok(md) = e.metadata() {
+                    if md.is_dir() {
+                        walk(h, &e.path());
+                    } else {
+                        md.len().hash(h);
+                        if let Ok(t) = md.modified() {
+                            t.hash(h);
+                        }
+                    }
+                }
+            }
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Ok(b) = std::fs::read(&tool.bin) {
+            b.hash(&mut h);
+        }
+        walk(&mut h, &tool.deeptools);
+        h.finish()
+    }
+
+    fn entry(&self, key: u64) -> PathBuf {
+        self.dir.join(format!("{key:016x}.bin"))
+    }
+
+    /// The compiled group for `key`, or `None` for any reason at all — absent, truncated, foreign,
+    /// unreadable. A miss is a compile, which is the status quo ante.
+    fn get(&self, key: u64) -> Option<CompiledGroup> {
+        let b = std::fs::read(self.entry(key)).ok()?;
+        // [magic u32][job_bin_ptr u64][init_len u32][corr_len u32][init][corr]
+        if b.len() < 20 || u32::from_le_bytes(b[0..4].try_into().ok()?) != DISK_CACHE_MAGIC {
+            return None;
+        }
+        let job_bin_ptr = u64::from_le_bytes(b[4..12].try_into().ok()?);
+        let init_len = u32::from_le_bytes(b[12..16].try_into().ok()?) as usize;
+        let corr_len = u32::from_le_bytes(b[16..20].try_into().ok()?) as usize;
+        if b.len() != 20 + init_len + corr_len {
+            return None;
+        }
+        Some(CompiledGroup {
+            init_binary: b[20..20 + init_len].to_vec(),
+            job_bin_ptr,
+            correction: b[20 + init_len..].to_vec(),
+        })
+    }
+
+    /// Best-effort write, atomic by rename so a concurrent `get` sees the old file or the new one,
+    /// never a half of either. An image past `u32::MAX` is not stored — the length field cannot
+    /// spell it — and the compile it came from is still served this build by the in-process memo.
+    fn put(&self, key: u64, g: &CompiledGroup) {
+        if g.init_binary.len() > u32::MAX as usize || g.correction.len() > u32::MAX as usize {
+            return;
+        }
+        let mut b = Vec::with_capacity(20 + g.init_binary.len() + g.correction.len());
+        b.extend_from_slice(&DISK_CACHE_MAGIC.to_le_bytes());
+        b.extend_from_slice(&g.job_bin_ptr.to_le_bytes());
+        b.extend_from_slice(&(g.init_binary.len() as u32).to_le_bytes());
+        b.extend_from_slice(&(g.correction.len() as u32).to_le_bytes());
+        b.extend_from_slice(&g.init_binary);
+        b.extend_from_slice(&g.correction);
+        let tmp = self
+            .dir
+            .join(format!(".tmp-{key:016x}-{}", std::process::id()));
+        if std::fs::write(&tmp, &b).is_ok() {
+            let _ = std::fs::rename(&tmp, self.entry(key));
+        }
+    }
+}
+
 /// The dxp compiler, RESOLVED. Constructible only when both the binary and the SDK share dir it
 /// needs are present, so "can this build compile a bundle?" is a `Option<DxpTool>` rather than a
 /// pair of strings someone checks at the call site.
@@ -1001,6 +1189,51 @@ impl DxpTool {
         bin.exists().then_some(DxpTool { bin, deeptools })
     }
 
+    /// ⛔ THE SILENT-ENV-DRIFT GUARD — a dxp knob this bake sets that the toolchain build does not
+    /// READ must refuse the bake, because `dtGetEnv` returns `None` for an unknown name and the
+    /// knob silently stays at its default: the bake then validates a DIFFERENT toolchain behavior
+    /// than the one the emission was designed for, and the failure surfaces far away as a scheduler
+    /// refusal with nothing pointing back at the env.
+    ///
+    /// That is not hypothetical — it cost a full round on the 26b (2026-10-13): the round scripts
+    /// exported `DISABLE_ABOVE_LX_CHUNK_EXPLODE` (with a D), the pod's deeptools build reads
+    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE` (no D; `L3DlOpsScheduler::run`, L3DlOpsScheduler.cpp:9007),
+    /// the misspelling was silently ignored, and the chunk-parameter explorer ran on the
+    /// token-plane gathered expert gemm — whose index can never satisfy `calculateFlopPerByte`'s
+    /// LX demand (`Expect LX in labeledDs memOrg_.`, :2498; the shape is only schedulable with the
+    /// explorer off). Card-side dxp repro of the exact refusing group: RC=1 with the drifted name,
+    /// RC=0 with the real one.
+    ///
+    /// The check is cheap and exact: the knob NAMES are string literals in the toolchain's own
+    /// artifacts (measured with `strings`: the standalone binary carries `DEEPTOOLS_PATH` /
+    /// `DT_PARALLEL_THREADS`; `lib/libL3DlOpsScheduler.so` carries `DT_PARALLEL_THREADS` and
+    /// `DISABLE_ABOVE_LX_CHUNK_EXPLORE`). A name absent from both is a name this toolchain
+    /// cannot read.
+    fn env_knob_guard(&self) -> Result<(), String> {
+        /// The knobs whose SILENT NON-READ changes what the bake validates (a knob whose absence
+        /// fails loudly — `DEEPTOOLS_PATH` missing → dxp refuses to start; `DUMP_SPYRE_CODE`
+        /// missing → no `spyreCodeDir/`, which the runtime's marker check catches — does not need
+        /// this guard).
+        const KNOBS: &[&str] = &["DT_PARALLEL_THREADS", "DISABLE_ABOVE_LX_CHUNK_EXPLORE"];
+        /// Memoized: the toolchain is fixed for the life of the process, and `compile` runs per
+        /// launch group — hundreds of times per bake.
+        static GUARD: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        GUARD
+            .get_or_init(|| {
+                let lib = self
+                    .deeptools
+                    .parent()
+                    .map(|sdk| sdk.join("lib").join("libL3DlOpsScheduler.so"))
+                    .ok_or_else(|| "resolving the scheduler lib path".to_string())?;
+                let bin_bytes = std::fs::read(&self.bin)
+                    .map_err(|e| format!("reading {}: {e}", self.bin.display()))?;
+                let lib_bytes =
+                    std::fs::read(&lib).map_err(|e| format!("reading {}: {e}", lib.display()))?;
+                knobs_present(KNOBS, &bin_bytes, &lib_bytes, &self.bin, &lib)
+            })
+            .clone()
+    }
+
     /// Compile ONE group dir in place. `Ok(())` leaves `spyreCodeDir/{init_binary.bin,
     /// spyrecode.json}` beside the json; `Err` carries dxp's own message, which is the only useful
     /// thing about a scheduler refusal.
@@ -1009,6 +1242,11 @@ impl DxpTool {
     /// DIFFERENT worker's failure can reach and kill this child (via [`Reaper::fail`]) instead of leaving
     /// it to be orphaned when the build exits.
     fn compile(&self, group: &Path, reaper: &Reaper) -> Result<(), String> {
+        // ⛔ THE SILENT-ENV-DRIFT GUARD runs before anything is spawned: a knob name the
+        // toolchain cannot read must fail HERE, with the knob named — not silently at its
+        // default, changing what the whole bake validates (see `env_knob_guard`'s doc for the
+        // round that cost).
+        self.env_knob_guard()?;
         // DUMP_SPYRE_CODE=1 is what makes dxp emit `spyreCodeDir/` — the artifact the runtime reads
         // and the marker `build.rs` skips on. Mirrors build.rs's invocation exactly.
         let mut cmd = std::process::Command::new(&self.bin);
@@ -1052,6 +1290,24 @@ impl DxpTool {
             // is instantaneous and a bursty pool would look the same. The 448 s vs 680 s above is the
             // evidence that 1 is not slower here — not the thread count.
             .env("DT_PARALLEL_THREADS", "1")
+            // ⛔⛔⛔ THE TOKEN-PLANE GATHERED-KERNEL SHAPE ONLY SCHEDULES WITH THE CHUNK-PARAMETER
+            // EXPLORER OFF. `calculateFlopPerByte` (L3DlOpsScheduler.cpp:2417) runs only inside
+            // that exploration (its callers at :2695/:2792) and demands an LX `memOrg_` entry
+            // plus a non-null LX allocate node for EVERY HBM-pinned labeledDs — the gather index
+            // can satisfy neither, because `allocAllMem` stages arithmetic operands only (an
+            // index is read into the IBR). `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1`
+            // (`L3DlOpsScheduler::run`, :9007-9012) sets `enableChunkExplore = false` and the
+            // explorer — and its check — never runs. This is the admission contract behind
+            // `emit_sdsc`'s gathered-KERNEL guard: the ONE schedulable shape
+            // (`GatherIndex::of_expert_planes`, the expert gemm's per-pair gather) was
+            // probe-proven RC=0 with this knob set; tonight's 26b group_13 refusal
+            // (`Expect LX in labeledDs memOrg_.`, :2498) was the SAME shape compiled with the
+            // knob SILENTLY UNSET — the round scripts carried the drifted spelling
+            // `…EXPLODE` (with a D), which this deeptools build ignores; the correctly-spelled
+            // knob compiles the exact refusing group RC=0 (card-side dxp repro, 2026-10-13).
+            // Set HERE, on the child, so no ambient script can forget or misspell it;
+            // `env_knob_guard` refuses the bake if a toolchain build ever stops reading it.
+            .env("DISABLE_ABOVE_LX_CHUNK_EXPLORE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What `Command::output()` did implicitly, and spawning by hand does NOT: dxp gets EOF
@@ -1167,6 +1423,10 @@ pub struct BakeQueue<const N: usize> {
     /// cloned `Arc`s read it: this is the handle that outlives the queue itself.
     #[allow(dead_code)]
     memo: Arc<(Mutex<std::collections::HashMap<u64, MemoState>>, Condvar)>,
+    /// The memo's disk twin — compiled groups from PREVIOUS builds, keyed by the same content key.
+    /// `None` when no durable location resolved (no `OUT_DIR`, no `$SCRATCHY_SUPERDSC_CACHE`);
+    /// the in-process memo alone then carries the build, exactly as before this existed.
+    disk: Option<Arc<DiskCache>>,
     /// dxp runs actually skipped, for the build log.
     memo_hits: Arc<AtomicUsize>,
     /// `Mutex<Option<..>>` rather than `Option<..>` because ONE queue serves the whole emit from a
@@ -1217,6 +1477,7 @@ impl<const N: usize> BakeQueue<N> {
         let memo: Arc<(Mutex<std::collections::HashMap<u64, MemoState>>, Condvar)> =
             Arc::new((Mutex::new(std::collections::HashMap::new()), Condvar::new()));
         let memo_hits = Arc::new(AtomicUsize::new(0));
+        let disk: Option<Arc<DiskCache>> = DiskCache::open(&tool).map(Arc::new);
         // COMPILE_WIDTH workers, not N: N is only the channel depth. Conflating them is what made
         // the disk bound and the compile width the same number.
         let inflight: Arc<Latch> = Arc::new(Latch::default());
@@ -1228,6 +1489,7 @@ impl<const N: usize> BakeQueue<N> {
             let budget = Arc::clone(&budget);
             let (memo, memo_hits) = (Arc::clone(&memo), Arc::clone(&memo_hits));
             let inflight = Arc::clone(&inflight);
+            let disk = disk.clone();
             workers.push(std::thread::spawn(move || {
                 loop {
                     // Hold the receiver lock only for the recv, never across the compile — otherwise
@@ -1311,6 +1573,13 @@ impl<const N: usize> BakeQueue<N> {
                             );
                         }
                         cv.notify_all();
+                        // Fresh output is the one thing worth persisting: a later build whose
+                        // emission did not change reads it instead of running dxp again. Failures
+                        // are NOT stored — a later build deserves its own refusal, not a cached one
+                        // from a tree or tool it may no longer share.
+                        if let (Ok(g), Some(d)) = (&outcome, &disk) {
+                            d.put(job.key, g);
+                        }
                     }
                     // The staging dir is gone by now on success, and on failure it is kept for
                     // diagnosis — either way these bytes are no longer the emitter's problem.
@@ -1337,6 +1606,7 @@ impl<const N: usize> BakeQueue<N> {
             stage: StageRoot::resolve(),
             budget,
             memo,
+            disk,
             memo_hits,
             tx: Mutex::new(Some(tx)),
             workers: Mutex::new(workers),
@@ -1442,6 +1712,26 @@ impl<const N: usize> BakeQueue<N> {
     /// Has anything been submitted? Lets the caller skip a "0 groups" log line.
     pub fn any(&self) -> bool {
         self.compiled.load(Ordering::Relaxed) > 0
+    }
+
+    /// ⭐ A GROUP A PREVIOUS BUILD ALREADY COMPILED, supplied without staging or submitting it.
+    ///
+    /// The emitter calls this BEFORE writing a group's json: a hit means the bytes dxp would produce
+    /// are already in hand, so there is nothing to reserve, write, or spawn — the result is filed
+    /// under `id` exactly as a worker would have filed it, and [`Self::finish`] hands it back with
+    /// the rest. `false` is the caller's cue to stage and submit as before.
+    ///
+    /// Counts as a memo hit: it IS a dxp run skipped because an identical group was already
+    /// compiled — in an earlier build of the same emission. A supplied group never enters
+    /// [`Latch`], correctly: it is complete the moment it is filed, so there is nothing to wait for.
+    pub fn supply_cached(&self, id: &GroupId, key: u64) -> bool {
+        let Some(d) = &self.disk else { return false };
+        let Some(g) = d.get(key) else { return false };
+        if let Ok(mut r) = self.results.lock() {
+            r.insert(id.clone(), Arc::new(g));
+        }
+        self.memo_hits.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -1561,6 +1851,44 @@ mod tests {
             .stderr(Stdio::null())
             .stdin(Stdio::null());
         cmd
+    }
+
+    /// ⛔⭐ THE PROBE FOR THE SILENT-ENV-DRIFT GUARD — the test that fires on the ORIGINAL defect.
+    ///
+    /// The 26b round lost to `Expect LX in labeledDs memOrg_.` (L3DlOpsScheduler.cpp:2498) ran
+    /// with the knob exported under its DRIFTED spelling (`DISABLE_ABOVE_LX_CHUNK_EXPLODE`, with
+    /// a D); the toolchain reads `…EXPLORE` (no D), `dtGetEnv` returned `None` for the drifted
+    /// name, and the bake validated a different toolchain behavior than the emission requires.
+    /// A toolchain whose artifacts carry the real name is exactly a byte-stream the drifted name
+    /// is absent from — so this synthetic pair reproduces the defect class deterministically,
+    /// without a real toolchain.
+    #[test]
+    fn a_knob_the_toolchain_cannot_read_refuses_the_bake_naming_it() {
+        let knobs = ["DT_PARALLEL_THREADS", "DISABLE_ABOVE_LX_CHUNK_EXPLORE"];
+        // A toolchain that reads the REAL names — the drifted `EXPLODE` export is absent from it,
+        // exactly like the pod's build.
+        let bin: &[u8] = b"xxDT_PARALLEL_THREADSxx";
+        let lib: &[u8] = b"xxDT_PARALLEL_THREADSxxxxDISABLE_ABOVE_LX_CHUNK_EXPLORExx";
+        let p = std::path::Path::new("/fake/dxp_standalone");
+        let l = std::path::Path::new("/fake/libL3DlOpsScheduler.so");
+        // Sanity: the real names are present, so the guard passes.
+        assert!(
+            knobs_present(&knobs, bin, lib, p, l).is_ok(),
+            "the guard must pass a toolchain that reads every knob it sets"
+        );
+        // The drifted-name toolchain: carries EXPLODE (what the round scripts exported) but NOT
+        // EXPLORE (what the emission needs read). The guard must refuse, naming the unread knob.
+        let drifted: &[u8] = b"xxDISABLE_ABOVE_LX_CHUNK_EXPLODExx";
+        let err = knobs_present(&knobs, bin, drifted, p, l)
+            .expect_err("a knob absent from both artifacts must refuse the bake");
+        assert!(
+            err.contains("DISABLE_ABOVE_LX_CHUNK_EXPLORE"),
+            "the refusal must name the unread knob: {err}"
+        );
+        assert!(
+            err.contains("silently"),
+            "the refusal must state the failure mode (silently at the knob's default): {err}"
+        );
     }
 
     /// ⛔⭐ THE TEST THAT WOULD HAVE CAUGHT THIS ON DAY ONE, and the one no previous attempt wrote.

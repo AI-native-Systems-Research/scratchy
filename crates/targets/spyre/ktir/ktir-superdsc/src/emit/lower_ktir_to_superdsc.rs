@@ -36,22 +36,23 @@
 use super::{
     EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
     check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec,
-    pointwise_chunk_out_offset, pw2, rb, rbo,
+    pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
-    assemble_rmsnorm,
+    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_row_renorm, assemble_row_softmax,
+    assemble_tanhsoftcap,
 };
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{
-    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, IDENTITY_TID, LAST_HIDDEN_TID, ROPE_P_TID,
-    kct_resident_tid, scalarmul_scale_tid,
+    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID, kct_resident_tid,
+    scalarmul_scale_tid,
 };
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
@@ -132,6 +133,13 @@ pub struct Region {
     /// descriptor spans the whole node needs to know the blocks tile the node, and `r_len` above is
     /// block 0's height alone.
     pub r_cover: (u32, u32),
+    /// The COLUMN span every access tile over this view covers — `r_cover`'s twin. The reshape door
+    /// is the reader: a re-laying copy is stated as one `[1, 64]` tile per stick (the `lmlast`
+    /// mechanism, which the splice's kernel mirrors), so its FIRST tile is a stick and `c_len`
+    /// understates the buffer by the stick count — the COVERS are the form-independent statement of
+    /// "the program takes the whole view on this axis", and a chunked window (`(8192, 12800)` of a
+    /// 12800-wide view) answers differently than a whole one.
+    pub c_cover: (u32, u32),
     /// This parameter is the program's OUTPUT — a `ktdp.store` writes through its view.
     ///
     /// ⛔ NOT "THE LAST PARAMETER". Parameters are minted in FIRST-USE order, and a model constant
@@ -679,6 +687,25 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                 Some((s0, e0)) => Some((s0.min(s), e0.max(e))),
             })
             .unwrap_or((0, rows));
+        // `r_cover`'s twin over columns — see the field's doc for who reads it.
+        let c_cover = k
+            .func
+            .operations
+            .iter()
+            .filter(|o| {
+                o.op_type == OpKind::KtdpConstructAccessTile
+                    && o.operands.first().is_some_and(|v| param_views.contains(v))
+            })
+            .filter_map(|t| {
+                let (_, tc) = shape_2d(t)?;
+                let cs = t.operands.get(2).and_then(|s| consts.get(s).copied())? as u32;
+                Some((cs, cs + tc))
+            })
+            .fold(None::<(u32, u32)>, |acc, (s, e)| match acc {
+                None => Some((s, e)),
+                Some((s0, e0)) => Some((s0.min(s), e0.max(e))),
+            })
+            .unwrap_or((0, cols));
         let is_out = view.result.is_some_and(|v| stored.contains(&v));
         let is_fp8 = view.attributes.iter().any(|(key, v)| {
             matches!(
@@ -698,6 +725,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             r_len,
             c_len,
             r_cover,
+            c_cover,
             is_out,
             is_fp8,
         });
@@ -1004,6 +1032,32 @@ pub fn elementwise(
             ins.len(),
         ));
     }
+    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A COLUMN CORNER, AND ONE NEVER REACHES
+    // THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
+    // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
+    // one-stick output at the buffer base — neither form can state "columns
+    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor", which is what a column-blocked
+    // chunk is. The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`,
+    // `SiluMul`) is all DENSE, so a corner arriving at either arm is a producer shape this door
+    // refuses BY NAME rather than mis-addressing — the same contract `base_addressed` states for
+    // a row corner. The DENSE arm below carries the corner; this guard is what keeps the other
+    // two from silently dropping it.
+    if (bcast.iter().any(Option::is_some) || out.c_len == 1)
+        && (out.c_start != 0 || ins.iter().any(|x| x.c_start != 0))
+    {
+        let (who, cs) = ins
+            .iter()
+            .find(|x| x.c_start != 0)
+            .map(|x| (format!("input t{}", x.tid), x.c_start))
+            .unwrap_or_else(|| (format!("the output t{}", out.tid), out.c_start));
+        return err(format!(
+            "Elementwise({kind:?}) {name}: {who} states column corner {cs} of its view, and the \
+             arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
+             addresses its operands at the BUFFER BASE or at a broadcast mode — neither can place \
+             a column window. A column-blocked chunk is DENSE elementwise; the dense arm carries \
+             the corner, so give the broadcast/per-row chains whole-tensor regions.",
+        ));
+    }
     if bcast.iter().any(Option::is_some) {
         return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
     }
@@ -1026,20 +1080,107 @@ pub fn elementwise(
     // them. A comment claiming we emit the table describes the bug, not the fix.
     let cols = out.c_len;
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
-    let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
-    let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
+    let rows = pointwise_rows(name, &out)?;
     let op_name = format!("{op_func}_o{}", out.tid);
-    let tile_op = pointwise_tile_op(pointwise_rows(name, &out)?, cols, arity as u32 + 1);
-    let op = assemble_pointwise_seeded_from_tile(
+    // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
+    // EVERY OPERAND — the 12b gemma-4 garbage. `subtile_ir.rs`'s column-tiling set
+    // (`EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`) splits a wide op into nb-blocks that
+    // SHARE one output tensor; `SiluMul`'s body (`silumul`) and `ExpertGatedAct`'s (`gated_act`)
+    // carry each chunk's `region.cols.start` through `col_of`, but this door emitted every chunk
+    // at offset 0 — so chunk 1 RE-COMPUTED chunk 0's columns at base 0 and the columns past the
+    // first block were NEVER WRITTEN. MEASURED on the 12b card run: the gated-act product
+    // `t1121[8192..15360]` read back ALL ZERO at every one of 48 layers, the down-GEMM contracted
+    // a half-zero activation (residual row-norm correlates 0.937 with the chunk-1 activation
+    // norm), and |d_card|/|d_emu| = 0.687 against sqrt(8192/15360) = 0.73 predicted for a missing
+    // chunk. The tiny fixture never split (one block), which is why the class was invisible at
+    // small geometry. The fix is `silumul`'s own mechanism, verbatim: every read `In::sliced`
+    // through `col_of(rows, full_cols, c_start)`, the write at the same corner, `full_cols` the
+    // WHOLE tensor width (`c_start + c_len`) because the nest's row stride is a property of the
+    // storage, not of this chunk's view.
+    //
+    // ⭐ A WHOLE-TENSOR PROGRAM KEEPS THE SEEDED EMISSION, BYTE-IDENTICAL. The `broadcast_off`
+    // path and the seeded path produce different `TensorArg` forms at offset 0 (rank-2
+    // stick-major vs the seeded rank-3), and every whole-tensor elementwise program this crate
+    // has ever baked went through the seeded one — nine-plus fixtures verified on card. The
+    // offset is the ONLY thing this change adds, so it is the only thing that may change the
+    // bytes: any corner on any operand routes to the offset form, and a corner-free program does
+    // not.
+    if out.c_start == 0 && ins.iter().all(|x| x.c_start == 0) {
+        let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
+        let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
+        let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+        let op = assemble_pointwise_seeded_from_tile(
+            &op_name,
+            &tile_op,
+            op_func,
+            &in_refs,
+            &out.name(),
+            sym_id_base,
+            layout,
+        );
+        return Ok(vec![op]);
+    }
+    // ⛔ THE EXTENTS LAW RESTATED FOR THE CHUNK: `pointwise_extents_agree` compared
+    // `(v_rows, c_len)` — the window's width, which every chunk's operands share — so it cannot
+    // catch a chunk whose operands carry DIFFERENT corners. Every operand of a column-blocked
+    // op reads the same window of the same-width tensors, so the corners must be equal; a
+    // mismatch would address one operand's window at another's corner.
+    if !ins.iter().all(|x| x.c_start == out.c_start) {
+        let who: Vec<String> = ins
+            .iter()
+            .map(|x| format!("t{}@{}", x.tid, x.c_start))
+            .collect();
+        return err(format!(
+            "Elementwise({kind:?}) {name}: the output t{}'s window starts at column {} but its \
+             inputs sit at [{}] — a column-blocked chunk reads and writes ONE window shared by \
+             every operand, so unequal corners would address one operand's columns at another's. \
+             The tiling front end mints one block per operand set; unequal corners mean a producer \
+             windowed the operands by hand.",
+            out.tid,
+            out.c_start,
+            who.join(", "),
+        ));
+    }
+    let full_cols = out.c_start + out.c_len;
+    let out_off = crate::addr::col_of(
+        rows,
+        full_cols,
+        pointwise_chunk_out_offset(out.c_start),
+        Df::Fp16,
+    );
+    // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
+    // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
+    let out_h = rb(&out.name(), rows, cols);
+    let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
+    let ew: Vec<_> = in_handles
+        .iter()
+        .zip(&ins)
+        .map(|(h, x)| {
+            In::sliced(
+                h,
+                crate::addr::col_of(
+                    rows,
+                    full_cols,
+                    pointwise_chunk_out_offset(x.c_start),
+                    Df::Fp16,
+                ),
+            )
+            .ew()
+        })
+        .collect();
+    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
         op_func,
-        &in_refs,
-        &out.name(),
+        rows,
+        cols,
+        &ew,
+        &out_h,
+        out_off.into_raw_elems(),
         sym_id_base,
         layout,
-    );
-    Ok(vec![op])
+    )])
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -1225,9 +1366,10 @@ fn elementwise_broadcast(
         cols,
         &ew,
         &out_h,
-        // WHOLE-TENSOR, like the dense arm: this door's regions are un-windowed (its caller refuses a
-        // column corner), so there is no chunk offset to apply. A column-blocked broadcast op would
-        // need `crate::addr::col_of` here, as `silumul` does.
+        // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
+        // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
+        // neither of which can place a column window), so the offset is 0 by proof, not by
+        // default.
         0,
         sym_id_base,
         layout,
@@ -1379,6 +1521,38 @@ pub fn rmsnorm(
     check_pointwise_cols(out.c_len, "RmsNorm", out.tid)?;
     let rows = node_rows(name, &out)?;
     let cols = out.c_len;
+    // ⭐ THE GAIN OFFSET RIDES THE EPSILON'S LAW. `rmsnorm_oneplus_fwd` states the
+    // offset as ONE `arith.addf` over the loaded gain row with a constant splat;
+    // the door resolves the SAME value's `[1,1]` registry slot by bits (the census
+    // collected `GainConvention::OnePlusScale.offset()` for exactly this node) and
+    // `assemble_rmsnorm` emits ONE `add` ahead of the gain multiply — the same
+    // formula the program runs, op for op. `None` is the Scale program (no addf),
+    // and any value other than the convention's own 1.0 is refused by name: it is
+    // not a convention `GainConvention::from_offset` admits, so no program may
+    // state it.
+    let ones_const = match program_gain_offset(&k.func) {
+        None => None,
+        Some(1.0) => {
+            let ones_idx = scale_slot(layout, 1.0).ok_or_else(|| Error {
+                message: format!(
+                    "RmsNorm {name}: the program states gain offset 1.0 (the OnePlusScale \
+                     convention), which is absent from `BundleLayout::scalarmul_scales` — the \
+                     descriptor adds it as a bound `[1,1]` const ahead of the gain multiply, so \
+                     the value the program uses must have a registry slot (registry desync)"
+                ),
+            })?;
+            Some(crate::place::act_name(scalarmul_scale_tid(ones_idx)))
+        }
+        Some(other) => {
+            return Err(Error {
+                message: format!(
+                    "RmsNorm {name}: the program states gain offset {other}, which is not a \
+                     gain convention — `GainConvention::from_offset` admits 0.0 (Scale) and 1.0 \
+                     (OnePlusScale) only, so a program stating any other offset is a producer bug"
+                ),
+            });
+        }
+    };
     // rms_norm_eps (config) flows via the scalarmul registry (compute_bundle_layout collected it) —
     // the same reserved `[1,1]` const `subtile→superdsc` adds to the mean-of-squares.
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
@@ -1393,6 +1567,7 @@ pub fn rmsnorm(
         &gamma,
         PlaceId::Act(t),
         &eps_const,
+        ones_const.as_deref(),
         sym_id_base,
         layout,
     ))
@@ -1718,11 +1893,13 @@ pub struct AttnAt<'a> {
     /// `Some` lowers the prefix through [`crate::sdsc_abstract::ChunkScratch`] (every resident page in
     /// one pass); `None` keeps the per-page fold.
     pub chunk_pages: Option<u32>,
-    /// Whether this bundle's attention scale was folded into `W_q`/`W_k` — the caller-side twin of
-    /// the spyre door's `BundleAttnParams::scale_folded`. The fold removes the score mulf from the
-    /// program, so a folded program states NO multiplier; this fact is what tells the door that
-    /// absence is the fold and not a broken program.
-    pub scale_folded: bool,
+    /// Whether this bundle's attention score scale is carried by the staged weights — the
+    /// caller-side twin of the spyre door's `BundleAttnParams::scale_in_weights`. The fold removes
+    /// the score mulf from the program, so a folded program states NO multiplier; a model whose
+    /// attention scale genuinely IS 1.0 states none either (the triton→ktir pipeline folds a
+    /// multiply by 1.0 away). This fact is what tells the door that absence is one of those two
+    /// and not a broken program.
+    pub scale_in_weights: bool,
     /// ⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj SLAB-MAJOR — the caller-side twin of the spyre
     /// door's `BundleAttnParams::headmajor_handoff`, and the SAME fact the matmul door swaps the o
     /// matmul's B operand on (the permuted `oproj_headmajor_tid` copy): one fact, both halves of the
@@ -1930,7 +2107,10 @@ fn param_read_rows(f: &IRFunction<'static>, ptr: &Ssa) -> u32 {
 
 /// The `[rows, cols]` of the FIRST window the program takes of one parameter's buffer — its access
 /// tile's own `Shape`, which is stated whatever its corner is made of.
-fn param_first_tile(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
+/// PUBLIC for the door: the geometry mint reads a program's head dim here, the same way rope's
+/// head dim is read — the door (`ktir_superdsc_door::attn`) mints `ModelAttnGeometry` off the
+/// program's own views because a hybrid model's bundle carries more than one.
+pub fn param_first_tile(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
     param_tiles(f, ptr).find_map(shape_2d)
 }
 
@@ -2140,6 +2320,121 @@ fn scale_slot(layout: Option<&BundleLayout>, value: f32) -> Option<usize> {
     })
 }
 
+/// THE NORM'S GAIN OFFSET — the `(1+w)` convention's `+1`, read off the program's
+/// gamma leg: the ONE `arith.addf` whose non-splat operand is a `ktdp.load` (the
+/// gamma row's rank-1 load), with exactly one constant-splat operand.
+///
+/// The emulator executes this addition (the program states it, the oneplus kernel's
+/// `w = load + GAIN_OFFSET`), and the door now states the SAME addition as a
+/// descriptor: the value's `[1,1]` registry slot is resolved by bits and one `add`
+/// fills the `Gw` row ahead of the gain multiply — the epsilon's law, one constant,
+/// two readers, one value. `None` when there is no such addf (the `Scale`
+/// convention: the whole gemma-4 per-head family and the plain Scale rows), and
+/// `Some(0.0)` never occurs — the producer omits the addf entirely at offset 0, so
+/// a stated zero-offset addf is a producer bug worth seeing.
+fn program_gain_offset(f: &IRFunction<'static>) -> Option<f32> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(kk, v)| match (kk, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    for add in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithAddf)
+    {
+        // The gamma leg's addf: one operand a loaded row, the other the offset splat.
+        let has_load = add
+            .operands
+            .iter()
+            .any(|&s| def_of(s).is_some_and(|d| d.op_type == OpKind::KtdpLoad));
+        if !has_load {
+            continue;
+        }
+        let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
+        let v = splats.next()?;
+        if splats.next().is_some() {
+            return None;
+        }
+        return Some(v as f32);
+    }
+    None
+}
+
+/// THE WINDOWED NORM'S EPSILON — every `math.sqrt`/`math.rsqrt` root's feeding `arith.addf`
+/// splat, READ ACROSS ALL ROOTS AND REQUIRED TO AGREE.
+///
+/// [`program_rmsnorm_eps`] demands exactly ONE root, which is the whole-region norm's law
+/// (a second root there means two norms in one program). The fused sandwich is different
+/// BY CONSTRUCTION: one independent chain per head, so `H` roots stating the SAME epsilon —
+/// the same one-or-many-agree shape [`program_scalarmul_scale`] already established for a
+/// program that states one constant once per block. A root with no addf, an addf with no
+/// splat, or two roots disagreeing by a single bit are each "this is not a windowed norm"
+/// and answer `None`.
+///
+/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry
+/// this value is looked up in, by bits, so it must read the same value rather than restate
+/// the reading.
+pub fn program_windowed_eps(f: &IRFunction<'static>) -> Option<f32> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(kk, v)| match (kk, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    let mut roots = f
+        .operations
+        .iter()
+        .filter(|o| matches!(o.op_type, OpKind::MathSqrt | OpKind::MathRsqrt));
+    let _first = roots.next()?;
+    if roots.next().is_none() {
+        // One root is the whole-region form — `program_rmsnorm_eps`'s own reading, which
+        // this reader must agree with so the two norms resolve the same registry slot.
+        return program_rmsnorm_eps(f);
+    }
+    let mut found: Option<f64> = None;
+    for root in f
+        .operations
+        .iter()
+        .filter(|o| matches!(o.op_type, OpKind::MathSqrt | OpKind::MathRsqrt))
+    {
+        let add = def_of(*root.operands.first()?)?;
+        if add.op_type != OpKind::ArithAddf {
+            return None;
+        }
+        let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
+        let eps = splats.next()?;
+        if splats.next().is_some() {
+            return None;
+        }
+        match found {
+            None => found = Some(eps),
+            Some(v0) if v0.to_bits() == eps.to_bits() => {}
+            Some(_) => return None,
+        }
+    }
+    found.map(|v| v as f32)
+}
+
 /// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry this
 /// value is looked up in, by bits, so it must be able to read the same value rather than restate the
 /// reading.
@@ -2182,6 +2477,69 @@ pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
         })
 }
 
+/// The CAP a [`Program::TanhSoftCap`](crate::ktir_node::Program::TanhSoftCap)
+/// program states, read structurally: the ONE `math.tanh` root, then the
+/// `arith.divf` that feeds it — whose non-tile operand is the splatted cap.
+///
+/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds
+/// the registry the `[1,1]` const is resolved in BY BITS (`scale_slot`), so a
+/// producer-side value and an emit-side reading must be ONE fact, not two
+/// matchers that can drift.
+///
+/// ONE CAP, however many `math.tanh` roots state it. [`KtirFunc::tanhsoftcap`]
+/// emits one `divf → tanh → mulf` chain per ROW BLOCK — prefill's vocab-wide
+/// logits exceed the emulator's LX budget as one tile, so a prefill program is
+/// N blocks of the same softcap, and the reader must resolve the ONE value all
+/// of them state. Two roots with DIFFERENT caps is still refused: that is two
+/// softcaps in one program (or something that is not one at all), and picking
+/// either's cap would be a guess about which node is being lowered. The divisor
+/// is pinned to the `arith.divf` FEEDING each root — not "any divf" — so a
+/// program that divides by something else first cannot hand this reader the
+/// wrong constant.
+pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(kk, v)| match (kk, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    let mut cap: Option<f64> = None;
+    for tanh in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::MathTanh)
+    {
+        let div = def_of(*tanh.operands.first()?)?;
+        if div.op_type != OpKind::ArithDivf {
+            return None;
+        }
+        // Exactly one operand of the divide is the splatted cap; the other is
+        // the tile being capped.
+        let mut splats = div.operands.iter().filter_map(|&s| splat_value(s));
+        let this = splats.next()?;
+        if splats.next().is_some() {
+            return None;
+        }
+        match cap {
+            None => cap = Some(this),
+            Some(c) if c == this => {}
+            // Two softcaps in one program — the cap each block states must be
+            // the same value or this is not one softcap at all.
+            Some(_) => return None,
+        }
+    }
+    Some(cap? as f32)
+}
+
 /// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const — the
 /// consumer side of `with_config_head_dim`, exactly as main's `LowerRope` was.
 pub struct RopeAt<'a> {
@@ -2194,6 +2552,12 @@ pub struct RopeAt<'a> {
     pub t: u32,
     pub mq: u32,
     pub total: u32,
+    /// ⭐ THE ROPE-P CLASS TID this rope's `matmul(x, P)` names. One `[hd,hd]` P per DISTINCT rope
+    /// head dim in the tape (a hybrid model carries two, and a composite single P is impossible: the
+    /// big class's contraction reads the small class's nonzero block as spurious ±1 terms). The DOOR
+    /// resolves the class index off the shared `rope_class_hds` registry, so the emitter and the
+    /// placement pass cannot disagree about which table a class reads.
+    pub p_tid: u32,
     pub sym_id_base: &'a mut i64,
     pub layout: Option<&'a BundleLayout>,
     pub rows_are_requests: bool,
@@ -2228,6 +2592,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         t,
         mq,
         total,
+        p_tid,
         sym_id_base,
         layout,
         rows_are_requests,
@@ -2262,7 +2627,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             ns = hd / Fp16::ELEMS_PER_STICK,
         ));
     }
-    let p = crate::place::act_name(ROPE_P_TID);
+    // ⭐ THE CLASS TID, NOT THE BARE SENTINEL — the ONE P this rope's head dim class reads. A uniform
+    // model's door resolves class 0, which IS `ROPE_P_TID`, so its ops and bytes are unchanged.
+    let p = crate::place::act_name(p_tid);
     use SynthRole as R;
     let out_id = PlaceId::Act(t);
     let rot = syn(layout, out_id.synth(R::Rot)); // x · P  (rotate-half, synthetic seg3)
@@ -2923,7 +3290,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         rows_are_requests,
         gathers_kv,
         chunk_pages,
-        scale_folded,
+        scale_in_weights,
         headmajor_handoff,
         sym_id_base,
         layout,
@@ -2985,36 +3352,42 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // number its own program already states. There is one reading now, and no default: a program with
     // no multiplier is a build error naming it.
     //
-    // ⭐ EXCEPT THE ONE CASE WHERE THE PROGRAM CANNOT STATE IT, WHICH IS THE FOLD. When the bundle's
+    // ⭐ EXCEPT THE TWO CASES WHERE THE PROGRAM CANNOT STATE IT. One is THE FOLD: when the bundle's
     // `√attention_multiplier` was folded into `W_q`/`W_k`, the node's scale was rewritten to 1.0
     // before the splice minted this program, and the triton→ktir pipeline folds a multiply by 1.0
     // away entirely — the program TRUTHFULLY states no multiplier, because no device multiply is
-    // left to do (the weights carry `√scale` each). `scale_folded` is the caller's statement that
-    // this is that case; a multiplier-less program without it is still the build error below, and a
-    // program that states a real multiplier WHILE the caller says folded is the half-applied fold —
-    // the multiplies would double-scale pre-scaled weights, so it is refused, not best-efforted.
+    // left to do (the weights carry `√scale` each). The other is THE UNIT SCALE: a model whose
+    // attention scale genuinely is 1.0 (gemma-4's arch defaults `attention_multiplier` to it) has
+    // no multiply to state in the first place, and the same pipeline folding takes it — and the
+    // skip arm below is the correct lowering for both, because `√1.0` leaves the weights carrying
+    // the whole scale either way. `scale_in_weights` is the caller's statement that one of these
+    // is the case; a multiplier-less program without it is still the build error below, and a
+    // program that states a real multiplier WHILE the caller says the weights carry the scale is
+    // the half-applied fold — the multiplies would double-scale pre-scaled weights, so it is
+    // refused, not best-efforted.
     let scale_val = match program_score_scale(&k.func) {
-        None if scale_folded => None,
+        None if scale_in_weights => None,
         None => {
             return Err(Error {
                 message: format!(
                     "AttnDecode t{}: the program states no score multiplier. The attention program \
                      scales its scores with an `arith.mulf` against an `arith.constant`, and the \
                      descriptor's `[1,1]` scale const is resolved from that value, so a program \
-                     without one cannot be lowered — unless the bundle folded its √scale into \
-                     W_q/W_k, which the caller must then state in `BundleAttnParams::scale_folded`.",
+                     without one cannot be lowered — unless the bundle's score scale is already \
+                     carried by its staged weights (folded into W_q/W_k, or a unit attention \
+                     scale), which the caller must then state in `BundleAttnParams::scale_in_weights`.",
                     ops_in.out_id,
                 ),
             });
         }
-        Some(v) if scale_folded && v != 1.0 => {
+        Some(v) if scale_in_weights && v != 1.0 => {
             return Err(Error {
                 message: format!(
-                    "AttnDecode t{}: the bundle states the attention scale was folded into \
-                     W_q/W_k, but the program still states a score multiplier of {v}. The fold \
-                     rewrites the node's scale to 1.0 before the splice mints the program, so a \
-                     real multiplier here means the fold and the splice disagreed — emitting the \
-                     multiplies would scale weights that already carry √scale.",
+                    "AttnDecode t{}: the bundle states its attention scale is carried by the staged \
+                     weights, but the program still states a score multiplier of {v}. Both cases \
+                     that carry the scale (the fold, a unit multiplier) mint the program at 1.0, so \
+                     a real multiplier here means the graph and the splice disagreed — emitting the \
+                     multiplies would scale weights that already carry the scale.",
                     ops_in.out_id,
                 ),
             });
@@ -3089,22 +3462,41 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     let kc = crate::place::act_name(k_id); // natural K cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     let vc = crate::place::act_name(v_id); // natural V cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     let kct = crate::place::act_name(kct_resident_tid(k_id)); // resident Kᵀ scratch [nqh, hd, cap]
-    // ⭐⭐⭐ A FOLDED ATTENTION STATES NO SCALE AT ALL. The √scale was FOLDED into W_q and W_k (the
-    // producer half's `attn_scale_weight_folds` recognition): the splice minted this program at the
-    // REWRITTEN scale of 1.0, the triton→ktir pipeline folded the `qk · 1.0` multiply away entirely,
-    // and the registry census skipped the node's arm — so `scale_val` above is `None` (a model whose
-    // attention_multiplier genuinely IS 1.0 lands in the same place), and the query and the roped
-    // new-K arrive over the staged weights already carrying √scale each: `(q·√s)·(k·√s)ᵀ` is
-    // `(q·kᵀ)·s` with no device multiply left to do. The skip arm at the multiplies below takes
-    // both: no registry lookups (a folded node pushed no slot, so looking anything up is a desync
-    // error by design), no `qs`/`new_k_scaled` buffers, and the score legs read `q` and the roped
-    // new-K directly.
+    // ⭐⭐⭐ AN ATTENTION WHOSE SCALE THE WEIGHTS CARRY STATES NO SCALE AT ALL. The √scale was
+    // FOLDED into W_q and W_k (the producer half's `attn_scale_weight_folds` recognition), or the
+    // model's attention scale IS 1.0 and there was nothing to fold: the splice minted this program
+    // at scale 1.0 either way, the triton→ktir pipeline folded the `qk · 1.0` multiply away
+    // entirely, and the registry census skipped the node's arm — so `scale_val` above is `None`,
+    // and the query and the roped new-K arrive over the staged weights already carrying √scale
+    // each: `(q·√s)·(k·√s)ᵀ` is `(q·kᵀ)·s` with no device multiply left to do. The skip arm at the
+    // multiplies below takes both: no registry lookups (a folded node pushed no slot, so looking
+    // anything up is a desync error by design), no `qs`/`new_k_scaled` buffers, and the score legs
+    // read `q` and the roped new-K directly.
     let pmask = crate::place::act_name(ATTN_MASK_TID); // [nqh, cap]    prefix validity (worker-tiled, mb-broadcast over mq)
     let cmask = crate::place::act_name(ATTN_CAUSAL_TID); // [mq, mq_pad] causal triu (worker-tiled)
     // [mq, nqh·hd] — the identity; every scratch name below is a rendering of it.
     let attn_id = PlaceId::Act(t);
     let n = |r: SynthRole| syn(layout, attn_id.synth(r));
-    let ident = crate::place::act_name(IDENTITY_TID);
+    // ⭐ THE IDENTITY CLASS TID — which `[hd,hd]` identity table this attention class's krep/vrep and
+    // cachewr matmuls name. One table per DISTINCT AttnDecode head dim (the bake's
+    // `attn_class_hds` registry), because a hybrid model's wide class reads slab 1 of a
+    // max-hd placement holding a base-hd table as ALL ZERO (dump-proven on gemma-4
+    // tiny-allglobal: `newkrep` lanes 64..127 zero while lanes 0..63 equal the roped K).
+    // A uniform model resolves class 0, which IS `IDENTITY_TID`, so its ops are unchanged.
+    let ident = crate::place::act_name({
+        let class = layout
+            .and_then(|l| l.attn_class_hds.iter().position(|&h| h == hd))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "AttnDecode t{t}: head_dim {hd} absent from BundleLayout.attn_class_hds {:?} \
+                     (registry desync — the placement pass and this lowering disagree about the \
+                     tape's attention classes, so which identity table this node reads is not a \
+                     fact either of them states)",
+                    layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
+                ),
+            })?;
+        crate::reserved_tids::identity_class_tid(class)
+    });
 
     let mut ops: Vec<EmittedOp> = Vec::new();
 
@@ -3307,13 +3699,15 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         None | Some(1.0) => (q.clone(), new_k_rep.clone()),
         // attention_multiplier (config) — see the ORIGINAL header doc: NO 1/sqrt(hd) recompute.
         Some(scale_val) => {
-            let scale_idx = layout
-            .and_then(|l| {
-                l.scalarmul_scales
-                    .iter()
-                    .position(|s| s.to_bits() == scale_val.to_bits())
-            })
-            .ok_or_else(|| Error {
+            // ⭐ ONE LOOKUP LAW — `scale_slot`, the door every other bound constant resolves
+            // through (exact bits, then the f16 image). This arm once carried its own bits-only
+            // copy of the lookup, which refused any config whose attention multiplier is not
+            // f16-exact: the program states the multiplier's fp16 image (its `qk * SCALE` mulf
+            // runs on the fp16 dot's result, so the constant is the f16-rounded spelling) while
+            // the census registers the config's f32, and the two agree by bits only when the
+            // value is f16-exact. The f16 image the fallback matches is the value the worker
+            // binds anyway (`SCALE_BYTES = 2`).
+            let scale_idx = scale_slot(layout, scale_val).ok_or_else(|| Error {
                 message: format!(
                     "AttnDecode t{t}: scale {scale_val} absent from BundleLayout.scalarmul_scales \
                      (registry desync)"
@@ -3321,7 +3715,14 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             })?;
             // unused directly: torch-spyre splits into sqrt_scale on both Q and K.
             let _scale = crate::place::act_name(scalarmul_scale_tid(scale_idx));
-            let sqrt_scale_val = scale_val.sqrt();
+            // ⭐ √scale IS READ OFF THE REGISTRY'S OWN ENTRY — the census pushed `scale.sqrt()`
+            // of the config's f32, so the bits the lookup below wants match BY CONSTRUCTION;
+            // recomputing from the program's spelling could miss the census's entry by one
+            // f16 ulp of double rounding when the slot above resolved through the f16 image.
+            let sqrt_scale_val = match layout {
+                Some(l) => l.scalarmul_scales[scale_idx].sqrt(),
+                None => scale_val.sqrt(),
+            };
             let sqrt_scale_idx = layout
                 .and_then(|l| {
                     l.scalarmul_scales
@@ -4356,15 +4757,16 @@ pub fn matmul_oriented(
 /// bad extent (every `assemble_*` in that file does — they are called from a `#[forward]` expansion,
 /// where a panic IS the build error). A producer crossing this door gets an `Error` it can report
 /// against its own op instead: the stick law is re-stated below so the refusal can name the padding
-/// alternative, and the builder's OTHER refusal — the per-core 8×8 block division — arrives as an
-/// `Error` through [`super::try_assemble_transpose`]. The panicking form is never called from here.
+/// alternative, and the builder's remaining refusals arrive as `Error`s through
+/// [`super::try_assemble_transpose`]. The panicking form is never called from here.
 ///
-/// ⚠️ THE CORE DIVISION NARROWS THIS FURTHER THAN THE STICK LAW ALONE, AND THAT IS A DEFECT ELSEWHERE,
-/// NOT A LAW OF THE DEVICE. `distribute_cores` splits `mb` alone to all 32 cores, so today only a row
-/// extent that is a multiple of `8 · 32 = 256` gives each core whole 8-blocks — the vendor's own golden
-/// `sdsc_interslicetranspose.json` splits BOTH axes and its shape (`mb 384`) is therefore REFUSED here.
-/// See [`super::transpose_opspec`]'s guard: the fix is a core division measured against that fixture,
-/// which is out of scope of an entry point and must not be guessed from one fixture point.
+/// ✅ THE CORE DIVISION IS NO LONGER A NARROWING. This door used to refuse shapes the stick law
+/// accepts, because the builder split `mb` alone via `distribute_cores` — only a row extent that is
+/// a multiple of `8 · 32 = 256` gave whole 8-blocks, and the vendor golden's own shape (`mb 384`)
+/// was refused. That defect is fixed at the division: [`super::transpose_core_split`] cuts BOTH axes
+/// at the block, measured against that golden (it reproduces the fixture's
+/// `numWkSlicesPerDim_ {"out": 8, "mb": 4}` verbatim), so every pair of whole 64-stick extents now
+/// bakes. The stick law below is therefore the ONLY shape this door refuses, deliberately.
 pub fn transpose(
     name: &str,
     r: &[Region],
@@ -4567,6 +4969,7 @@ mod elementwise_tests {
             r_len: rows,
             c_len: cols,
             r_cover: (0, rows),
+            c_cover: (0, cols),
             is_out,
             is_fp8: false,
         }
@@ -5035,6 +5438,295 @@ mod elementwise_tests {
             assert_eq!(elementwise_op_func("p", k).unwrap().1, want, "{k:?} arity");
         }
     }
+
+    // ── THE COLUMN-BLOCKED CHUNK — the 12b gemma-4 garbage class ─────────────────────────────
+    //
+    // ⛔⛔⛔ THE MEASURED DEFECT. `subtile_ir.rs` column-tiles a wide `EwKind::Mul` (and `Add`/
+    // `Silu`/`ScalarMul`) into nb-blocks sharing ONE output tensor; this door emitted every
+    // chunk at offset 0, so chunk 1 re-computed chunk 0's columns at base 0 and the columns past
+    // the first block were NEVER WRITTEN. On the 12b card run the gated-act product
+    // `t1121[8192..15360]` was ALL ZERO at every one of 48 layers and the down-GEMM contracted a
+    // half-zero activation into garbage. The tiny fixture never split (one block), which is why
+    // the class was invisible at small geometry. `silumul`/`gated_act` already carried their
+    // corners; these tests pin the DENSE door doing the same.
+
+    /// A region whose window is the column block `[c_start, c_start+c_len)` of a wider
+    /// `[rows, v_cols]` view — the shape `regions()` reports for a column-chunked node's
+    /// parameters (`load_region`/`store_region` put the corner on the access tile).
+    fn chunked(tid: u32, rows: u32, c_start: u32, c_len: u32, v_cols: u32, is_out: bool) -> Region {
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols,
+            r_start: 0,
+            c_start,
+            r_len: rows,
+            c_len,
+            r_cover: (0, rows),
+            c_cover: (c_start, c_start + c_len),
+            is_out,
+            is_fp8: false,
+        }
+    }
+
+    /// The second chunk of a `[25, 15360]` MLP intermediate — THE measured node: the 12b gemma-4
+    /// gated-act product, blocked at nb=8192 into `[0,8192)` + `[8192,15360)`. Descriptor 594
+    /// (`594_multiply_o1121`, out=7168) was field-identical to descriptor 593 except width — no
+    /// offset anywhere — and `t1121[:, 8192:15360]` read back zero.
+    fn mlp_chunks() -> (Vec<Region>, u32, u32, u32) {
+        let rows = 25u32;
+        let c0 = 8192u32;
+        let c1 = 7168u32;
+        let r = vec![
+            chunked(5, rows, c0, c1, 15360, false),
+            chunked(6, rows, c0, c1, 15360, false),
+            chunked(7, rows, c0, c1, 15360, true),
+        ];
+        (r, rows, c0, c1)
+    }
+
+    /// ⛔ THE OUTPUT'S PER-CORE START SITS AT THE CHUNK'S STICK-BLOCK CORNER, NOT AT BASE 0.
+    /// Column `c` of a `[rows, full_cols]` stick-blocked tensor starts at
+    /// `(c/64)·(rows·64)` elements — NOT `c` (the flat index), which is equal only at `rows==1`.
+    /// This is the number the card's `startAddressCoreCorelet_` carries, so it is the number the
+    /// 12b dump measured zero against.
+    #[test]
+    fn a_column_blocked_chunk_writes_at_its_stick_block_corner() {
+        let (r, rows, c0, c1) = mlp_chunks();
+        let mut sym = 0i64;
+        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("a dense column-blocked chunk is exactly the arm that exists for it");
+        assert_eq!(ops.len(), 1);
+        let dsc = ops[0]
+            .op
+            .as_ref()
+            .expect("a dense elementwise op carries a descriptor")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        // The output operand is the LAST allocate node (inputs first, output last).
+        let out_node = dsc
+            .scheduleTree_
+            .iter()
+            .rfind(|n| n.nodeType_ == "allocate")
+            .expect("an allocate node per operand, the output last");
+        let start: u64 = out_node
+            .startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address");
+        // The intra-tensor element offset: `(8192/64)·(25·64)` = 128·1600 = 204800 elements = 409600 B.
+        // The per-core start folds the (single-core) work-slice offset onto the segment base, so the
+        // DELTA from the segment base is the corner — computed here as the difference against the
+        // chunk-0 twin's start, which cancels every segment/arg term both share.
+        let (r0, ..) = mlp_chunks_at_zero();
+        let mut sym0 = 0i64;
+        let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
+            .expect("chunk 0 lowers identically");
+        let dsc0 = ops0[0].op.as_ref().expect("descriptor").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        let out0 = dsc0
+            .scheduleTree_
+            .iter()
+            .rfind(|n| n.nodeType_ == "allocate")
+            .expect("output allocate");
+        let start0: u64 = out0
+            .startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address");
+        let expect = ((c0 / FP16_ELEMS_PER_STICK) as u64)
+            * (rows as u64)
+            * (FP16_ELEMS_PER_STICK as u64)
+            * 2;
+        assert_eq!(
+            start - start0,
+            expect,
+            "chunk 1's output start must sit {expect} B past chunk 0's — the stick-block corner \
+             `(c/64)·(rows·64)` of the [25, 15360] intermediate, not the flat {c0}·2 = {} B",
+            c0 * 2
+        );
+        let _ = c1;
+    }
+
+    /// Chunk 0 of the same pair — whole-tensor-shaped windows at corner 0 (the control the
+    /// delta above cancels against).
+    fn mlp_chunks_at_zero() -> (Vec<Region>, u32, u32, u32) {
+        let rows = 25u32;
+        let r = vec![
+            chunked(5, rows, 0, 8192, 15360, false),
+            chunked(6, rows, 0, 8192, 15360, false),
+            chunked(7, rows, 0, 8192, 15360, true),
+        ];
+        (r, rows, 0, 8192)
+    }
+
+    /// ⛔ AND THE INPUTS READ AT THE SAME CORNER — a multiply whose operands sit at base 0 while
+    /// its output writes the corner would recompute chunk 0's values into chunk 1's columns.
+    #[test]
+    fn a_column_blocked_chunk_reads_its_inputs_at_the_same_corner() {
+        let (r, rows, c0, _c1) = mlp_chunks();
+        let mut sym = 0i64;
+        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("the chunk lowers");
+        let (r0, ..) = mlp_chunks_at_zero();
+        let mut sym0 = 0i64;
+        let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
+            .expect("chunk 0 lowers");
+        let starts = |ops: &Vec<EmittedOp>| -> Vec<u64> {
+            let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
+                .values()
+                .next()
+                .expect("one dsc");
+            dsc.scheduleTree_
+                .iter()
+                .filter(|n| n.nodeType_ == "allocate")
+                .map(|n| {
+                    n.startAddressCoreCorelet_
+                        .data_
+                        .values()
+                        .next()
+                        .expect("a per-core address")
+                        .parse::<u64>()
+                        .expect("decimal")
+                })
+                .collect()
+        };
+        let s1 = starts(&ops);
+        let s0 = starts(&ops0);
+        assert_eq!(s1.len(), s0.len(), "same operand count");
+        let expect = ((c0 / FP16_ELEMS_PER_STICK) as u64)
+            * (rows as u64)
+            * (FP16_ELEMS_PER_STICK as u64)
+            * 2;
+        for (a, b) in s1.iter().zip(s0.iter()) {
+            assert_eq!(
+                a - b,
+                expect,
+                "every operand — inputs and output alike — moves by the corner"
+            );
+        }
+    }
+
+    /// ⛔ UNEQUAL CORNERS ARE REFUSED, not zipped: the tiling front end mints ONE window shared
+    /// by every operand of a chunk, so a producer that windowed operands by hand is a shape this
+    /// door names rather than guessing which corner to use.
+    #[test]
+    fn unequal_input_corners_are_refused_by_name() {
+        let rows = 25u32;
+        let r = vec![
+            chunked(5, rows, 8192, 7168, 15360, false),
+            chunked(6, rows, 0, 7168, 15360, false),
+            chunked(7, rows, 8192, 7168, 15360, true),
+        ];
+        let mut sym = 0i64;
+        let Err(e) = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None) else {
+            panic!("operands at different corners must refuse, not pick one")
+        };
+        assert!(
+            e.message.contains("t6@0"),
+            "names the operand and its corner: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE BROADCAST/PER-ROW ARMS CANNOT CARRY A CORNER — refused by name, the same contract
+    /// `base_addressed` states for a row corner.
+    #[test]
+    fn a_column_corner_on_a_broadcast_or_per_row_operand_is_refused() {
+        let rows = 25u32;
+        // A broadcast operand at a corner (the Col flag shape, input 1 `[25,1]`).
+        let rb = vec![
+            chunked(5, rows, 8192, 7168, 15360, false),
+            chunked(6, rows, 8192, 1, 15360, false),
+            chunked(7, rows, 8192, 7168, 15360, true),
+        ];
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &rb,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a broadcast arm at a column corner must refuse")
+        };
+        assert!(
+            e.message.contains("column corner"),
+            "names the corner and the arm: {}",
+            e.message
+        );
+        // The per-row chain: a `[rows, 1]` output at a corner (a binary Sub, the softmax's
+        // running-subtract shape).
+        let pr = vec![
+            chunked(5, rows, 8192, 8192, 15360, false),
+            chunked(6, rows, 8192, 8192, 15360, false),
+            chunked(7, rows, 8192, 1, 15360, true),
+        ];
+        let Err(e2) = elementwise("sub_s3", Elementwise::Sub, &pr, &[], &mut sym, None) else {
+            panic!("the per-row arm at a column corner must refuse")
+        };
+        assert!(
+            e2.message.contains("column corner"),
+            "names the corner and the arm: {}",
+            e2.message
+        );
+    }
+
+    /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,
+    /// byte-identical to every whole-tensor program this crate has ever baked. The offset is the
+    /// only thing the chunked arm adds, so a corner-free program must not change form. The
+    /// discriminator is the allocate nodes' `layoutDimOrder_`: the seeded path's `rows > 1` op
+    /// takes the rank-2 stick-major form (no `y`), while the offset path's column corner is not
+    /// block-aligned so it presents rank-3 flat (`y` present) — `pointwise_broadcast_opspec_
+    /// from_tile`'s own `stickmajor` predicate decides, and the two arms land on opposite sides.
+    #[test]
+    fn a_chunk_at_corner_zero_keeps_the_seeded_emission() {
+        let orders = |ops: &Vec<EmittedOp>| -> Vec<Vec<&'static str>> {
+            let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
+                .values()
+                .next()
+                .expect("one dsc");
+            dsc.scheduleTree_
+                .iter()
+                .filter(|n| n.nodeType_ == "allocate")
+                .map(|n| n.layoutDimOrder_.clone())
+                .collect()
+        };
+        let (r0, ..) = mlp_chunks_at_zero();
+        let mut sym = 0i64;
+        let ops = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym, None)
+            .expect("chunk 0 lowers");
+        assert_eq!(ops.len(), 1);
+        for o in orders(&ops) {
+            assert!(
+                !o.contains(&"y"),
+                "a corner-free chunk keeps the seeded rank-2 stick-major form (got {o:?})"
+            );
+        }
+        // And the chunked op — the SAME regions at corner 8192 — takes the offset form.
+        let (r1, ..) = mlp_chunks();
+        let mut sym1 = 0i64;
+        let ops1 = elementwise("mul_s23", Elementwise::Mul, &r1, &[], &mut sym1, None)
+            .expect("chunk 1 lowers");
+        for o in orders(&ops1) {
+            assert!(
+                o.contains(&"y"),
+                "the offset form presents rank-3 flat — a column corner is not block-aligned, so \
+                 the stickmajor predicate keeps it flat (got {o:?})"
+            );
+        }
+    }
 }
 
 /// ⛔ THE EXTENT GUARD AS A PROPERTY, over SYMBOLIC extents rather than the four examples the test
@@ -5055,6 +5747,7 @@ mod proofs {
             r_len: rows,
             c_len: cols,
             r_cover: (0, rows),
+            c_cover: (0, cols),
             is_out,
             is_fp8: false,
         }
@@ -5141,6 +5834,12 @@ pub fn rmsnorm_at(
     let x = tensors[0].name();
     let gamma = tensors[1].name();
     let t = out.tid;
+    // ⛔ NO GAIN OFFSET ON THIS DOOR YET — the whole-function chain reader
+    // (`program_rmsnorm_chains`) reads each chain's epsilon but not its gamma leg,
+    // so a whole kernel with a OnePlusScale rmsnorm cannot hand this door the
+    // offset. `None` is the Scale lowering; the first whole-function caller that
+    // needs the offset must widen the chain reader the way it reads eps, or this
+    // door would lower a different formula than the program runs.
     Ok(assemble_rmsnorm(
         &format!("o{t}"),
         rows,
@@ -5149,9 +5848,3331 @@ pub fn rmsnorm_at(
         &gamma,
         PlaceId::Act(t),
         &eps_const,
+        None,
         sym_id_base,
         layout,
     ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
+/// `out = x · rsqrt(mean(x²) + eps)`, no gain.
+///
+/// Same shape as [`rmsnorm`]: the epsilon is read off the program (the value the
+/// emulator adds), resolved to its registry slot by that value, and the body is
+/// [`assemble_rmsnorm_unit`] — the first five steps of the gained form with the
+/// normalising multiply writing `out` directly. ONE tensor parameter where
+/// `rmsnorm` splits two, which is the only structural difference.
+pub fn rmsnorm_unit(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::rmsnorm_unit` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let eps = program_rmsnorm_eps(&k.func).ok_or_else(|| Error {
+        message: format!(
+            "RmsNormUnit {name}: the program states no epsilon. `KtirFunc::rmsnorm_unit` splats \
+             it into the `arith.addf` that feeds its one root op, and the descriptor's `[1,1]` \
+             const is resolved from that value, so a program without it cannot be lowered."
+        ),
+    })?;
+    let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
+        message: format!(
+            "RmsNormUnit {name}: epsilon {eps}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor adds it as a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        )
+    })?;
+    check_pointwise_cols(out.c_len, "RmsNormUnit", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_rmsnorm_unit(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
+        &eps_const,
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
+/// FUSED per-head norm sandwich (`Reshape{Times(H)} → norm → Reshape{Times(1)}`).
+///
+/// `assemble_rmsnorm`'s chain applied per head: for each head `h`, the SAME six ops
+/// over the `[m, D]` window at base offset `h·D·m` of the original `[m, H·D]` tensor —
+/// which the head-window/block-alignment law (see the `Program` variant's docs) places
+/// at exactly the elements the deleted split+flatten computed. The door derives every
+/// extent from the program's own views, the way the attention door derives its geometry:
+/// `m` and `H·D` off the output's view, `D` off the output's FIRST ACCESS TILE (one
+/// head's window — the tile `KtirFunc::windowed_rmsnorm` states), `H = (H·D)/D`.
+///
+/// ⭐ THE SYNTHETICS ARE DECLARED ONCE, AT THE FULL RE-LAID FOOTPRINTS — `Sq16`/`Xn` at
+/// `[H·m, D]`, `Mean`/`Meps`/`Rinv` at `[H·m, stick]` — and addressed per head at
+/// `h·m·D` / `h·m·stick` base offsets: the writer and the reader of each synthetic use
+/// the SAME per-head offset, so the layout they agree on is H consecutive per-head
+/// blocks (the same nesting the un-fused form's one `[H·m, D]` norm used, which is why
+/// the memory plan is comparable rather than larger).
+///
+/// ⭐ THE EPSILON comes from [`program_windowed_eps`] — the read-all-roots-agree form —
+/// because this program states one root per head; the whole-region reader would refuse
+/// it. Resolved to the registry slot by bits, exactly as every other norm constant.
+///
+/// ⭐ THE GAIN OFFSET RIDES THE EPSILON'S LAW: the OnePlusScale program states it
+/// as ONE `arith.addf` over the loaded gamma row (`windowedrmsnorm_oneplus_fwd`'s
+/// `w = load + GAIN_OFFSET`), the door resolves the SAME value's `[1,1]` registry
+/// slot by bits, and ONE shared `add` ahead of the head loop fills the `[1, D]`
+/// `Gw` row every per-head gain multiply reads — the gamma row is shared by all
+/// heads, so the offset is applied once, not per head. Gemma-4's per-head q/k
+/// norms are the `Scale` convention (measured: the bake's `rmsnorm_s8` states no
+/// gain-offset addf), so they lower with no add at all — byte-identical to the
+/// form before this row existed.
+pub fn windowed_rmsnorm(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    let unit = matches!(
+        k.program,
+        crate::ktir_node::Program::WindowedRmsNorm { unit: true }
+    );
+    // x (+ gamma in the gained form) and the output — the parameters
+    // `KtirFunc::windowed_rmsnorm` mints, in first-use order.
+    let arity = if unit { 1 } else { 2 };
+    let (tensors, out) = split_out(name, r, layout, arity)?;
+    let eps = program_windowed_eps(&k.func).ok_or_else(|| Error {
+        message: format!(
+            "WindowedRmsNorm {name}: the program states no epsilon. `KtirFunc::windowed_rmsnorm` \
+             splats it into the `arith.addf` feeding each head's `math.sqrt` root — one root per \
+             head, all agreeing — and the descriptor's `[1,1]` const is resolved from that value, \
+             so a program without it cannot be lowered."
+        ),
+    })?;
+    let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
+        message: format!(
+            "WindowedRmsNorm {name}: epsilon {eps}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor adds it as a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        ),
+    })?;
+    // The door's own geometry, off the program's views: the output view states `[m, H·D]`
+    // and its first access tile is ONE head's `[m, D]` window.
+    let m = node_rows(name, &out)?;
+    let full = out.v_cols;
+    let d = out.c_len;
+    if d == 0 || full % d != 0 {
+        return err(format!(
+            "{name}: the output t{}'s view states [{m}, {full}] but its first access tile is \
+             [{}, {d}] — a windowed norm's tile is one head's width and must divide the view's",
+            out.tid, out.r_len,
+        ));
+    }
+    let heads = full / d;
+    // ⭐ THE GAIN OFFSET, OFF THE PROGRAM — the plain door's own match, stated here
+    // so the two doors cannot drift about what an offset IS. `None` is the Scale
+    // program (no addf), `Some(1.0)` is the OnePlusScale convention (the census
+    // collected that exact value for this node), and any other value is refused by
+    // name — not a convention `GainConvention::from_offset` admits.
+    let gw_ones = if unit {
+        None
+    } else {
+        match program_gain_offset(&k.func) {
+            None => None,
+            Some(1.0) => {
+                let ones_idx = scale_slot(layout, 1.0).ok_or_else(|| Error {
+                    message: format!(
+                        "WindowedRmsNorm {name}: the program states gain offset 1.0 (the \
+                         OnePlusScale convention), which is absent from \
+                         `BundleLayout::scalarmul_scales` — the descriptor adds it as a bound \
+                         `[1,1]` const ahead of the gain multiply, so the value the program \
+                         uses must have a registry slot (registry desync)"
+                    ),
+                })?;
+                Some(crate::place::act_name(scalarmul_scale_tid(ones_idx)))
+            }
+            Some(other) => {
+                return err(format!(
+                    "{name}: the program states gain offset {other}, which is not a gain \
+                     convention — `GainConvention::from_offset` admits 0.0 (Scale) and 1.0 \
+                     (OnePlusScale) only, so a program stating any other offset is a producer bug"
+                ));
+            }
+        }
+    };
+    check_pointwise_cols(d, "WindowedRmsNorm", out.tid)?;
+    let stk = crate::superdsc_opspec::Fp16::ELEMS_PER_STICK;
+    let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
+    let x = tensors[0].name();
+    let t = out.tid;
+    let out_id = PlaceId::Act(t);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    // ── THE SYNTHETICS ──
+    //
+    // `Sq16` (and `Xn` in the gained form) are ONE `[m, H·D]` buffer each — the same
+    // footprint the un-fused form's `[H·m, D]` re-laid intermediate had — addressed per
+    // head at the window offset, which the block-alignment law keeps on the stick-major
+    // rank-2 path at prefill (writer and reader of each use the SAME offset).
+    //
+    // ⭐ THE REDUCED SCALARS ARE PER-HEAD BUFFERS AT OFFSET ZERO (`HeadMean`/`HeadMeps`/
+    // `HeadRinv`, the fp8 amax-partial precedent): a reduce's accum must sit at a
+    // whole-block shift of its own slab for rank-2, and a shared `[H·m, stick]` buffer's
+    // `h·m·stick` offsets are not block-aligned at the reduce's `[m, D]` block — the flat
+    // rank-3 fallback would then read the stick-major `sq16` write scrambled. One buffer
+    // per head makes every scalar-chain op offset-free.
+    let sq16 = syn(R::Sq16);
+    let xn = syn(R::Xn);
+    let gw = syn(R::Gw); // γ+1   [1, d]  — OnePlusScale only
+    if let Some(l) = layout {
+        l.synth(out_id.synth(R::Sq16), &[m, full]);
+        if !unit {
+            l.synth(out_id.synth(R::Xn), &[m, full]);
+        }
+        if gw_ones.is_some() {
+            l.synth(out_id.synth(R::Gw), &[1, d]);
+        }
+        for h in 0..heads {
+            l.synth(out_id.synth(R::HeadMean(h)), &[m, stk]);
+            l.synth(out_id.synth(R::HeadMeps(h)), &[m, stk]);
+            l.synth(out_id.synth(R::HeadRinv(h)), &[m, stk]);
+        }
+    }
+    // Handle kinds: `x`/`out`/`sq16`/`xn` are the residual stream's RowBlocked; the
+    // reduced scalars are one-stick-wide. `assemble_rmsnorm`'s comment carries the law.
+    let x_h = rb(&x, m, full);
+    let out_h = rb(&out.name(), m, full);
+    let sq16_h = rb(&sq16, m, full);
+    let xn_h = rb(&xn, m, full);
+    let eps_h = rb(&eps_const, 1, stk);
+    let gamma_h = if unit {
+        None
+    } else {
+        Some(rb(&tensors[1].name(), 1, d))
+    };
+    // The OnePlusScale gain row: `gw = gamma + 1` filled ONCE, ahead of the head
+    // loop — the gamma row is shared by every head, and so is its offset sum. The
+    // add reads the `[1,1]`-broadcast offset (the eps operand mode) into the
+    // `[1, d]` `Gw` row the per-head gain multiplies read.
+    let gw_h = gw_ones.as_ref().map(|_| rb(&gw, 1, d));
+    let ones_h = gw_ones.as_ref().map(|c| rb(c, 1, stk));
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(d);
+    let s_cols = crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16);
+    let mut ops: Vec<EmittedOp> = Vec::new();
+    if let (Some(g), Some(ones), Some(gw)) = (&gamma_h, &ones_h, &gw_h) {
+        ops.push(pw2(
+            &format!("rmga_o{t}"),
+            "add",
+            crate::sdsc_abstract::RowCount::of_token_rows(1),
+            f_cols,
+            In::mb(g),
+            In::scalar(ones),
+            gw,
+            sym_id_base,
+            layout,
+        )); // gw = γ + 1, shared by every head
+    }
+    for h in 0..heads {
+        // The head window's base offset in the `[m, H·D]` buffers — a whole-block shift of
+        // this op's own `[m, D]` block (the block-alignment law).
+        let win = crate::addr::col_of(m, full, h * d, crate::superdsc_opspec::Df::Fp16);
+        // The per-head reduced scalars — their OWN buffers, addressed at ZERO.
+        let mean_h = rb(&syn(R::HeadMean(h)), m, stk);
+        let meps_h = rb(&syn(R::HeadMeps(h)), m, stk);
+        let rinv_h = rb(&syn(R::HeadRinv(h)), m, stk);
+        let prefix = format!("wh{h}_o{t}");
+        // 1. sq16 = x² over the head window (out at the window — `pw2`'s ZERO would
+        //    make every head overwrite head 0's block).
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("rmsq_{prefix}"),
+            "mul",
+            t_rows,
+            f_cols,
+            &[In::sliced(&x_h, win).ew(), In::sliced(&x_h, win).ew()],
+            &sq16_h,
+            win,
+            sym_id_base,
+            layout,
+        ));
+        // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
+        //    its own head's buffer at ZERO (the fp8 amax-partial shape).
+        ops.push(assemble_reduce_off(
+            &format!("rmmean_{prefix}"),
+            "mean",
+            t_rows,
+            f_cols,
+            &sq16_h,
+            win,
+            &mean_h,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 3. mean + eps.
+        ops.push(pw2(
+            &format!("rmeps_{prefix}"),
+            "add",
+            t_rows,
+            s_cols,
+            In::full(&mean_h),
+            In::scalar(&eps_h),
+            &meps_h,
+            sym_id_base,
+            layout,
+        ));
+        // 4. rinv = rsqrt(mean+eps).
+        ops.push(pw1(
+            &format!("rmrsqrt_{prefix}"),
+            "rsqrt",
+            t_rows,
+            s_cols,
+            In::full(&meps_h),
+            &rinv_h,
+            sym_id_base,
+            layout,
+        ));
+        // 5. xn = x·rinv (r per-row of the head's block, out-broadcast over D) — the
+        //    unit form's TERMINAL multiply writes `out` directly here instead.
+        // 6. out = xn·gamma (the `[1, D]` row, mb-broadcast) — the Gw row (γ+1)
+        //    when the convention states an offset, the stored row when it does not.
+        if let Some(g) = &gamma_h {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rmxn_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
+                &xn_h,
+                win,
+                sym_id_base,
+                layout,
+            ));
+            let gain = gw_h.as_ref().unwrap_or(g);
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rmg_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                &[In::sliced(&xn_h, win).ew(), In::mb(gain).ew()],
+                &out_h,
+                win,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rmxn_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
+                &out_h,
+                win,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::TanhSoftCap`] —
+/// `out = cap · tanh(x / cap)`, Gemma's final-logit soft cap.
+///
+/// Same shape as [`rmsnorm_unit`]: the cap is read off the program (the value
+/// the emulator divides and multiplies by), resolved to its registry slot by
+/// that value, and the body is [`assemble_tanhsoftcap`] — ONE `realdiv` by the
+/// bound `[1,1]` cap const, ONE `tanh`, ONE `multiply` by the same const.
+/// ONE tensor parameter, exactly like the unit norm.
+pub fn tanhsoftcap(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::tanhsoftcap` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let cap = program_tanhsoftcap_cap(&k.func).ok_or_else(|| Error {
+        message: format!(
+            "TanhSoftCap {name}: the program states no cap. `KtirFunc::tanhsoftcap` splats \
+             it as the divisor of the `arith.divf` that feeds its one `math.tanh` root, and \
+             the descriptor's `[1,1]` const is resolved from that value, so a program \
+             without it cannot be lowered."
+        ),
+    })?;
+    let cap_idx = scale_slot(layout, cap).ok_or_else(|| Error {
+        message: format!(
+            "TanhSoftCap {name}: cap {cap}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor divides and multiplies by a \
+             bound `[1,1]` const, so the value the program uses must have a registry slot \
+             (registry desync)"
+        ),
+    })?;
+    check_pointwise_cols(out.c_len, "TanhSoftCap", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let cap_const = crate::place::act_name(scalarmul_scale_tid(cap_idx));
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_tanhsoftcap(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
+        &cap_const,
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertGatedAct`] —
+/// `act(gate) · up` over the MoE pair rows, the SiluMul computation with the act
+/// the block declares.
+///
+/// `silumul`'s body verbatim (same handles, same synth, same column-block
+/// offsets), with the act's OWN device primitive in place of `"silu"`: `silu` for
+/// [`GatedAct::Silu`], `gelu` for [`GatedAct::Gelu`] (the `op_func_from_str`
+/// keys; the dxp wire spelling `gelufwd` comes from the `OpFunc` itself) — both
+/// real DDL primitives (`elementwise_op_func`), so the two-op form
+/// `act(gate) → tmp`, `multiply(tmp, up) → out` holds for either.
+pub fn gated_act(
+    name: &str,
+    act: crate::ktir_node::GatedAct,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // ⛔ THE `op_func_from_str` KEY, NOT THE WIRE SPELLING. `"gelufwd"` is
+    // `OpFunc::name()`'s dxp spelling — a different string with a different
+    // job (it reaches the descriptor via the `OpFunc`, never via this key);
+    // the key is `"gelu"`, the `elementwise_op_func` law. Passing the wire
+    // spelling here was a PANIC at the door's first execution (tiny26's
+    // GeGLU pairs), never caught locally because the emu bypasses the door.
+    let act_func = match act {
+        crate::ktir_node::GatedAct::Silu => "silu",
+        crate::ktir_node::GatedAct::Gelu => "gelu",
+    };
+    let (ins, o) = split_out(name, r, layout, 2)?;
+    let (gate_r, up_r) = (ins[0], ins[1]);
+    check_pointwise_cols(o.c_len, "ExpertGatedAct", o.tid)?;
+    let rows = node_rows(name, &o)?;
+    let cols = o.c_len;
+    let gate = gate_r.name();
+    let up = up_r.name();
+    let out = o.name();
+    let tmp_id = PlaceId::Act(o.tid).synth(SynthRole::Silu);
+    let tmp = syn(layout, tmp_id);
+    // `silumul`'s declaration contract, verbatim: the intermediate is at the OUTPUT
+    // tensor's width, shared by every column chunk.
+    if let Some(l) = layout {
+        l.synth_like(tmp_id, o.tid, &[rows, cols], Df::Fp16);
+    }
+    let act_name = format!("gact_o{}", o.tid);
+    let mul_name = format!("mulgact_o{}", o.tid);
+    let gate_off = pointwise_chunk_out_offset(gate_r.c_start);
+    let up_off = pointwise_chunk_out_offset(up_r.c_start);
+    let out_off = pointwise_chunk_out_offset(o.c_start);
+    let full_cols = o.c_start + o.c_len;
+    let gate = rb(&gate, rows, cols);
+    let up = rb(&up, rows, cols);
+    let tmp = rb(&tmp, rows, cols);
+    let out = rb(&out, rows, cols);
+    Ok(vec![
+        assemble_pointwise_broadcast_off(
+            &act_name,
+            act_func,
+            crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            &[In::sliced(
+                &gate,
+                crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
+            )
+            .ew()],
+            &tmp,
+            crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
+            sym_id_base,
+            layout,
+        ),
+        assemble_pointwise_broadcast_off(
+            &mul_name,
+            "multiply",
+            crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            &[
+                In::sliced(
+                    &tmp,
+                    crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+                )
+                .ew(),
+                In::sliced(&up, crate::addr::col_of(rows, full_cols, up_off, Df::Fp16)).ew(),
+            ],
+            &out,
+            crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+            sym_id_base,
+            layout,
+        ),
+    ])
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteSoftmax`] —
+/// `out = softmax(x, dim=-1)` over `[rows, cols]`, the MoE router's score
+/// softmax.
+///
+/// ⭐ THE CHAIN RUNS AT THE PADDED WIDTH, NOT THE LOGICAL `k`. The router's
+/// score buffer is `[m, k]` with `k` SUB-STICK (gemma-4: k=8 of a 64-lane
+/// stick), and `assemble_pointwise` emits no coordinate masking — so the door
+/// pads the whole computation to the stick and forces the pad lanes inert
+/// FIRST, with ONE sanitize add:
+///
+/// ```text
+/// xsan = x + sm_mask        0 in lanes 0..k (bit-identical), −inf above
+/// ```
+///
+/// `−inf` is inert through the whole softmax by arithmetic: the row-max
+/// ignores it (`max(real, −inf) = real`), `exp(−inf − m) = 0` keeps it out of
+/// the denominator, and the output's pad lanes land at a DEFINED 0 rather
+/// than stale bytes. ⛔ WITHOUT THE SANITIZE THE PAD LANES ARE LOAD-BEARING
+/// GARBAGE: a sub-stick `[m, k]` view rides a whole-stick buffer whose lanes
+/// `k..W` hold whatever the producer left there, and 62 zero lanes would each
+/// contribute `e^{−max}` to every row's denominator — a silently wrong
+/// softmax even when the pads happen to be zero.
+///
+/// ONE leading `add` + [`assemble_row_softmax`]'s five ops, all at `[m, W]`.
+pub fn route_softmax(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::route_softmax` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let rows = node_rows(name, &out)?;
+    let k = out.v_cols;
+    let w = k.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || k == 0 {
+        return err(format!(
+            "RouteSoftmax {name}: the output t{} states [{rows}, {k}] — the score count must be \
+             positive (got padded width {w})",
+            out.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteSoftmax", out.tid)?;
+    let out_tid = out.tid;
+    let x_s = tensors[0].name();
+    // The k-boundary mask row (0 below k, −inf above) — placed by the
+    // router-const block when the tape has a RouteTopK node, bound at load.
+    let sm_mask = rb(
+        &crate::place::act_name(crate::reserved_tids::router_sm_mask_tid()),
+        1,
+        w,
+    );
+    // The sanitized scores [m, W] — the buffer the softmax chain reads.
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let xsan_s = crate::placement::syn(layout, out_id.synth(R::AXSan));
+    if let Some(l) = layout {
+        l.synth_like(out_id.synth(R::AXSan), out_tid, &[rows, w], Df::Fp16);
+    }
+    let x = rb(&x_s, rows, w);
+    let xsan = rb(&xsan_s, rows, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(6);
+    // 0. THE SANITIZE: pad lanes → −inf (exp kills them), real lanes untouched.
+    ops.push(pw2(
+        &format!("rssan_o{out_tid}"),
+        "add",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::mb(&sm_mask),
+        &xsan,
+        sym_id_base,
+        layout,
+    ));
+    ops.extend(assemble_row_softmax(
+        &format!("o{out_tid}"),
+        rows,
+        w,
+        &xsan_s,
+        out_id,
+        sym_id_base,
+        layout,
+    ));
+    Ok(ops)
+}
+
+/// The per-`Program` door for the renorm form — `out = x / rowsum(x, dim=-1)`,
+/// mixtral's `RouteRenorm`. The softmax's chain minus the stability subtract
+/// and the exp, over the same one-stick reduce/broadcast structure.
+pub fn route_renorm(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    check_pointwise_cols(out.c_len, "RouteRenorm", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_row_renorm(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertSort`] — the
+/// (token, slot) pair rows, GATHERED semantics: a blockwise copy `[m, w] →
+/// [m, k·w]` whose output column block `j` is the input row again.
+///
+/// ⭐ `k` `identity` LEGS, ONE PER SLOT, at stick-aligned column offsets. The
+/// sort's permutation is a no-op in the gathered regime (the program's own
+/// builder states it: "numerically identical to metal's gathered bake, which
+/// emits nothing and reads token rows `k` times"), so the descriptor-level
+/// truth is exactly `k` copies of the `[m, w]` tile into slot `j`'s block of
+/// the `[m, k·w]` output. Each leg is the `silumul` chunk-offset pattern: the
+/// input read at `DevOff::ZERO` (base-addressed, `split_out`'s law), the output
+/// written at `pointwise_chunk_out_offset(j·w)` — the column-block law
+/// `silumul_chunks_cover_output` already locks for column-split wide ops, which
+/// this is (`k` blocks of one shared source).
+///
+/// ⛔ BOTH WIDTHS ARE STICK-LEGAL BY THE PRODUCER'S OWN GEOMETRY, and a
+/// violation is refused here rather than mis-addressed: `w` is a model width
+/// (2816/128 — 64-multiples), and `j·w` is a whole stick for the same reason.
+/// The one thing this door adds is the GUARD that says so, on both the block
+/// corner and the output extent, so a future model with a sub-stick expert
+/// width is a build error naming it, not a silently mis-strided copy.
+pub fn expert_sort(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::expert_sort` mints. The
+    // indices ride along in the GRAPH (every projection reads them through this
+    // node's output routing) but the program states only the tile it copies:
+    // the copy is data-independent, so the builder never binds them as a view
+    // and `split_out` would refuse an arity-2 count against a 2-parameter
+    // program (x, out) — the count this door states is the program's own.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let x = tensors[0];
+    let rows = node_rows(name, &out)?;
+    // ⭐ THE WIDTHS ARE THE BUFFERS' OWN (`v_cols`), NOT THE FIRST WINDOW'S. The
+    // program states its store windows one per slot — the FIRST access tile the
+    // region walk surfaces is slot 0's `[m, w]` window, so `c_len` understates
+    // the output by exactly the factor this door exists to divide out. The
+    // buffer's declared view is the whole `[m, k·w]`, and `k` is its ratio to
+    // the input's `[m, w]` — a graph constant, read here the way `matmul` reads
+    // `m`/`n` off the stored output tile's extents.
+    let w = x.v_cols;
+    let full = out.v_cols;
+    if full % w != 0 {
+        return err(format!(
+            "ExpertSort {name}: the output t{} is [{rows}, {full}] but the input t{}'s width is \
+             {w}, and {full} is not a whole number of slot blocks — the pair-row layout is \
+             `[m, k·w]` over the SAME `w` the projections contract",
+            out.tid, x.tid
+        ));
+    }
+    let k = full / w;
+    check_pointwise_cols(w, "ExpertSort", x.tid)?;
+    check_pointwise_cols(full, "ExpertSort", out.tid)?;
+    let out_tid = out.tid;
+    let x_s = x.name();
+    let out_s = out.name();
+    let x = rb(&x_s, rows, w);
+    let out = rb(&out_s, rows, full);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(k as usize);
+    for j in 0..k {
+        // Slot `j`'s block is the same `[m, w]` tile again, written at its column
+        // offset — `col_of` computes the stick-blocked address law from the
+        // output's own extents, so the leg cannot mis-stride.
+        let off = crate::addr::col_of(rows, full, pointwise_chunk_out_offset(j * w), Df::Fp16);
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("esort_j{j}_o{out_tid}"),
+            "identity",
+            t_rows,
+            f_cols,
+            &[In::full(&x).ew()],
+            &out,
+            off,
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertUnsort`] — the
+/// identity copy in the same (token, slot) layout the sort wrote.
+///
+/// ONE `identity` over the whole `[m, k·w]` pair rows: all `m·k·w` elements
+/// moved once, no arithmetic, no permutation — the materialized form of the
+/// no-op metal's gathered bake emits nothing for. The routing (the graph's
+/// second input) rides along exactly as the sort's indices do and is no more a
+/// parameter of THIS program than they are.
+pub fn expert_unsort(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    check_pointwise_cols(cols, "ExpertUnsort", out.tid)?;
+    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out)?;
+    let x_s = tensors[0].name();
+    let out_s = out.name();
+    let out_tid = out.tid;
+    let x = rb(&x_s, rows, cols);
+    let out = rb(&out_s, rows, cols);
+    Ok(vec![pw1(
+        &format!("eunsort_o{out_tid}"),
+        "identity",
+        crate::sdsc_abstract::RowCount::of_token_rows(rows),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        In::full(&x),
+        &out,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertCombine`] —
+/// `out[n, d] = Σ_k rows[n, k·w + d] · scores[n, k]`, the pair rows scaled by
+/// their routing scores and summed back into the token stream (metal's
+/// `moe_weighted_sum`, the kernel the emu's fma chain mirrors).
+///
+/// ⭐ `k` MULTIPLY LEGS + `k−1` ADD LEGS, in the pair-row column-block layout
+/// [`expert_sort`] writes. Slot `j`'s leg reads the `[m, w]` block of the
+/// `[m, k·w]` pair rows at its stick-aligned corner (`col_of`, the same law
+/// the sort's legs obey) and the score column `[m, j]` of the `[m, k]` scores
+/// in the `In::col` broadcast mode — out-broadcast over the stick, the ONE
+/// expressible per-row scalar, the exact operand mode the rmsnorm's `rinv`
+/// and the softmax's row-max use. The products accumulate with `add` into a
+/// synth `[m, w]` scratch, and the LAST add writes `out` directly — no
+/// trailing copy leg.
+///
+/// ⛔ PRECISION: the emu reference accumulates in f32 and narrows once, but
+/// the sfp pointwise ALU computes in fp16 — the partial products and sums
+/// each round to fp16, exactly the deviation class the tiny26 EMU-vs-card
+/// tensordump parity gate exists to measure and bound. The VENDOR's own
+/// conditional blocks (`broadcast_ops.ddl:36-42`) stage compare RESULTS as
+/// fp16 operands for subsequent `sum` reduces on the same basis, and gemma's
+/// combine is `k=8` fp16 addends of magnitude ≤1 — inside the range the
+/// parity gate green-lights or flags by measurement, not by assumption.
+pub fn expert_combine(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // scores, rows, and the output — the parameters `KtirFunc::expert_combine`
+    // mints. ⭐ MINT ORDER, NOT CALL ORDER: the program's parameter list is the
+    // builder's FIRST-USE order, and the emu loads the scores tile FIRST (its
+    // `arg_for` mints the view) — the narrow `[m, k]` scores parameter PRECEDES
+    // the wide `[m, k·w]` pair rows, so the door identifies the two operands by
+    // their extents, never by their position in the list. The pair rows' width
+    // is the BUFFER's (`v_cols`), not the first window's: the program states
+    // its block loads one slot at a time, so the region walk surfaces slot 0's
+    // `[m, w]` tile and `v_cols` is the whole `[m, k·w]` — the same law
+    // [`expert_sort`] pins.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    let rows = node_rows(name, &out)?;
+    let w = out.v_cols;
+    // The narrow operand is the scores, the wide one the pair rows — resolved
+    // by extent after the output's `w` is known, which is the only order the
+    // facts arrive in.
+    let (scores_r, rows_r) = if tensors[0].v_cols == w * tensors[1].v_cols {
+        (tensors[1], tensors[0])
+    } else if tensors[1].v_cols == w * tensors[0].v_cols {
+        (tensors[0], tensors[1])
+    } else {
+        return err(format!(
+            "ExpertCombine {name}: the two operands t{} [{}, {}] and t{} [{}, {}] cannot be the \
+             [m, k] scores and the [m, k·w] pair rows of an output t{} [{rows}, {w}] — neither \
+             width is the other times a whole k",
+            tensors[0].tid,
+            tensors[0].v_rows,
+            tensors[0].v_cols,
+            tensors[1].tid,
+            tensors[1].v_rows,
+            tensors[1].v_cols,
+            out.tid
+        ));
+    };
+    let full = rows_r.v_cols;
+    let k = scores_r.v_cols;
+    if full != w.checked_mul(k).unwrap_or(0) {
+        return err(format!(
+            "ExpertCombine {name}: the pair rows t{} are [{rows}, {full}] but the output t{}'s \
+             width is {w} and the scores t{} declare k={k} — the combine reads the [m, k·w] \
+             layout the sort wrote, so these must agree",
+            rows_r.tid, out.tid, scores_r.tid
+        ));
+    }
+    check_pointwise_cols(w, "ExpertCombine", out.tid)?;
+    check_pointwise_cols(full, "ExpertCombine", rows_r.tid)?;
+    let out_tid = out.tid;
+    let rows_s = rows_r.name();
+    let scores_s = scores_r.name();
+    let out_s = out.name();
+    let pair = rb(&rows_s, rows, full);
+    // The scores `[m, k]`: k=8 (26b) is SUB-STICK, so the handle's width is
+    // the padded stick — the score column `j` rides a ONE-STICK operand read
+    // in the `In::col` mode, at the column offset of its own lane.
+    let scores = rb(&scores_s, rows, crate::work::FP16_ELEMS_PER_STICK);
+    let out = rb(&out_s, rows, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    // The running [m, w] sum and each slot's [m, w] product — synths declared
+    // like the softmax's and rmsnorm's scratch, at the OUTPUT's extents. The
+    // chain is the emu's own shape: slot 0's product seeds the accumulator,
+    // every later slot is a product leg then an add leg, and the FINAL add
+    // writes `out` directly — `2k−1` ops.
+    let acc_id = PlaceId::Act(out_tid).synth(SynthRole::ECombAcc);
+    let acc_s = syn(layout, acc_id);
+    if let Some(l) = layout {
+        l.synth_like(acc_id, out_tid, &[rows, w], Df::Fp16);
+    }
+    let acc = rb(&acc_s, rows, w);
+    let mut ops = Vec::with_capacity(2 * k as usize - 1);
+    for j in 0..k {
+        // The pair block's stick-aligned corner in the [m, k·w] rows, and the
+        // score column's lane in the [m, k] scores — both through the view's
+        // own address laws.
+        let block_off =
+            crate::addr::col_of(rows, full, pointwise_chunk_out_offset(j * w), Df::Fp16);
+        let col_off = crate::addr::col_of(rows, crate::work::FP16_ELEMS_PER_STICK, j, Df::Fp16);
+        let block = In::sliced(&pair, block_off).ew();
+        let score = In::col_at(&scores, col_off).ew();
+        // The product leg's destination: `out` when the product IS the whole
+        // combine (k=1), the accumulator when it seeds the chain (j=0), a
+        // per-slot synth otherwise.
+        let prod_owned;
+        let prod_h = if k == 1 {
+            &out
+        } else if j == 0 {
+            &acc
+        } else {
+            let p_id = PlaceId::Act(out_tid).synth(SynthRole::ECombP(j));
+            let p_s = syn(layout, p_id);
+            if let Some(l) = layout {
+                l.synth_like(p_id, out_tid, &[rows, w], Df::Fp16);
+            }
+            prod_owned = rb(&p_s, rows, w);
+            &prod_owned
+        };
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("ecombmul_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            &[block, score],
+            prod_h,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // The add legs start at slot 1 — slot 0's product already IS the
+        // accumulator — and the LAST one writes `out` directly.
+        if j > 0 {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("ecombadd_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                f_cols,
+                &[In::full(&acc).ew(), In::full(prod_h).ew()],
+                if j + 1 == k { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertMatmul`] —
+/// one projection of each `(token, slot)` pair's expert over the stacked
+/// `[E·out, in]` fp8 weight bank, the gathered form of the dense W8A8 body.
+///
+/// The program's parameters, in `KtirFunc::expert_matmul` mint order:
+/// `rows [m, k·in]`, `idx [m, k]` (the SORT's index input, bound by the
+/// producer), `w [E·out, in]` (the packed fp8 bank), `s [E·out, 1]` (the
+/// bf16 per-channel scale bank) + `out [m, k·out]`. Every extent derives
+/// from the views: `k = idx.v_cols`, `in = rows.v_cols/k`,
+/// `out = out.v_cols/k`, `E = w.v_rows/out`.
+///
+/// ⭐ THE PAIR LOOP IS OVER PAIRS, NOT TOKENS — the emu's own enumeration
+/// (`for p in 0..m·k`, `(n_tok, slot) = (p/k, p%k)`), stated here as
+/// emit-time constants because `m` and `k` are graph constants. Five legs:
+///
+/// 1. **INDEX** — one `fp32toint32` convert of the whole `[m, W]` routing
+///    output to SENUINT32 (`OpFunc::Fp32ToInt32`, the vendor
+///    unary_parallel.ddl bind whose input list accepts fp16 and whose output
+///    list accepts uint32). Lane `j` of row `i` holds pair `(i, j)`'s expert
+///    id; the pad lanes past `k` are zero, which names expert 0 — the same
+///    slab every out-of-range pair reads, inert because no matmul leg reads
+///    past pair `m·k`.
+/// 2. **WEIGHT GATHER** — a kernel-less identity copy of the pair's expert
+///    slab from the retiled fp8 bank into a pair-indexed scratch. One entry
+///    per pair, `page = out·in/128` one-stick fp8 rows (the slab's whole
+///    height at the 128-elem fp8 stick), `cols = 128` (ONE fp8 stick — the
+///    gather's one-stick law, at the copied format's own width). The entry
+///    value is the RAW expert id: the bank's expert `e` slab is
+///    device-contiguous at elements `[e·out·in, (e+1)·out·in)` (the
+///    stage-weight test pins it), so `idx·skip_addr` with
+///    `skip_addr = page·128 = out·in` elements lands exactly on the slab.
+/// 3. **SCALE GATHER** — the same index tensor, the bf16 bank viewed `[E·out]`
+///    flat at fp16 geometry: `page = out/64` rows, `cols = 64` (one fp16
+///    stick), producing pair `p`'s `[out]` scale window at scratch offset
+///    `p·out`.
+/// 4. **MATMUL** — per pair, the dense W8A8 body's own `matmulfp8` at baked
+///    offsets: `A` = the quantized activation row `p/k` at
+///    `a_off = (p/k)·(k·in) + (p%k)·in` into `[m, k·in]` rows, `W` = the
+///    pair's fp8 scratch slab at `w_off = p·(out·in)`, `out` at
+///    `o_off = (p/k)·(k·out) + (p%k)·out` into the `[m, k·out]` pair rows.
+///    The activation quantize chain is the dense body's own, SHARED per
+///    distinct activation through `quantized` exactly as `matmul`'s door
+///    threads it — the pair rows are one activation from the quantizer's
+///    point of view, quantized once at `[m, k·in]`.
+/// 5. **DEQUANT** — `raw · s_scratch` (per-pair window) `· a_scale` (the
+///    per-row lane-0 broadcast, `In::col`): the pair-major `[m·k, out]`
+///    flattening of the output IS the token-major `[m, k·out]` the emu
+///    stores (`store_region` at `(n_tok, slot·out + c)`), so the dequant
+///    legs write the output tile directly at the same `o_off` windows the
+///    matmul wrote its raw product into — no unsort inside the door.
+///
+/// ⛔ THE GATHERS SIT ON THE COPIES, NOT THE MATMUL — the card-measured law
+/// (`emit/mod.rs`'s kernel-bearing refusal): a gather may not ride an op
+/// whose `primaryDsInfo_` carries a KERNEL. The copy feeds the matmul a
+/// regular scratch; the matmul is the dense body's own descriptor.
+///
+/// ⛔ THE INDEX IS ONE CONVERT PER ROUTER, NOT PER PROJECTION — the convert
+/// is keyed off the INDEX tensor's own tid (`rows`' sibling, resolved by
+/// extent), so gate/up/down each re-emit it against the same input buffer.
+/// The convert is idempotent on the wire (same input tensor, same output
+/// synth), so the three projections' converts land on the same scratch and
+/// the later ones merely re-write the bytes the first wrote. Wasted ops, no
+/// wrong bytes — the shared-convert refinement (a `quantized`-style dedup
+/// keyed on the index tid) is a worklist item, not this door's blocker.
+///
+/// ⛔ A PAIR COUNT ABOVE ONE INDEX STICK (m·k > 32) SPLITS THE GATHERS into
+/// one op per 32 entries, the `GatherScratch::copies` cut: the IBR is
+/// loaded one stick at a time and each core's read offset is taken modulo
+/// it, so entries past the first 32 WRAP silently (rung 8's corruption).
+/// The destination advances by the entries covered (`dest_entry`), the index
+/// base by whole sticks (`EntryBase::of_sticks`), the two numbers the
+/// `GatherCopy` law separates.
+pub fn expert_matmul(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    quantized: &mut std::collections::HashSet<String>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The four compute inputs + the output. ⭐ MINT ORDER, NOT CALL ORDER —
+    // and the mint order is NOT the call order: `KtirFunc::expert_matmul`
+    // mints `w` and `s` FIRST (their `arg_for`s open the bank views), then
+    // `idx` (`load_region`), then `rows` (the pair loop's first block load),
+    // so the parameters arrive as `[w, s, idx, rows]` and NO position in the
+    // list names an operand. Each is resolved by its extent law:
+    //   · the BANK PAIR `w`/`s` — the two inputs that share a row count
+    //     (the stacked `[E·out, in]` codes and `[E·out, 1]` scales have the
+    //     same bank rows), `s` the rank-1 one;
+    //   · `idx` — of the two `m`-rowed inputs left, the NARROW `[m, k]`
+    //     routing; `rows` the wide `[m, k·in]` pair rows (the wide one is
+    //     never ambiguous: `in` is a whole 64-stick, `k` is the top-k).
+    // ⛔ AND `k` IS THE ROUTING TENSOR'S OWN WIDTH, NOT A RATIO. An earlier
+    // version computed `k = rows.v_cols / idx.v_cols` — which is `in`, the
+    // per-pair width, not `k` — and then derived `in = rows.v_cols / k`, so
+    // the two facts traded places and every downstream extent (the bank's
+    // `in`, the output's `n`) was checked against the wrong one.
+    let (tensors, out) = split_out(name, r, layout, 4)?;
+    let rows = node_rows(name, &out)?;
+    // ⛔ THE SCALE BANK IS THE UNIQUE RANK-1-VIEWED INPUT — and the RANK is
+    // read off the VIEW's dimensionality, not off `v_rows/v_cols`. The
+    // builder mints the scale bank's view as ONE-DIM `[E·out]` with stride 1
+    // (`view_of(s_ptr, [bank_rows], [1])`), and `shape_2d` surfaces a rank-1
+    // view as `(1, E·out)` — a `[1, 1024]` REGION, not `[1024, 1]`. So the
+    // discriminator is `v_rows == 1 ∧ v_cols > 1` (one flat row), and `w` is
+    // the input whose ROW count is the scale bank's LENGTH. Two earlier
+    // drafts got this wrong in complementary ways: "two inputs sharing a row
+    // count" matched rows/idx at decode m=1 (t204 [1,256]/t199 [1,2], the
+    // round-8 retry refusal), and "the input with `v_cols == 1`" found
+    // nothing at all (the scale bank is `[1, E·out]`, not `[E·out, 1]` — the
+    // next refusal). The pair rows and the routing are always m-rowed with
+    // `m ≥ 1` and widths > 1, and a weight bank of one ROW would mean
+    // `E·out = 1` — a single expert with a one-channel projection, refused
+    // by the stick guards below.
+    let s_r = tensors
+        .iter()
+        .copied()
+        .find(|t| t.v_rows == 1 && t.v_cols > 1)
+        .ok_or_else(|| Error {
+            message: format!(
+                "ExpertMatmul {name}: no input is the rank-1 scale bank — the builder views the \
+                 stacked [E·out] scales as ONE flat row, and exactly one of the four inputs has \
+                 that shape",
+            ),
+        })?;
+    let w_r = tensors
+        .iter()
+        .copied()
+        .find(|t| t.tid != s_r.tid && t.v_rows == s_r.v_cols)
+        .ok_or_else(|| Error {
+            message: format!(
+                "ExpertMatmul {name}: no input carries the scale bank t{}'s {} rows — the \
+                 stacked [E·out, in] codes have the same bank row count as their scales",
+                s_r.tid, s_r.v_cols
+            ),
+        })?;
+    let (rows_r, idx_r) = {
+        let rest: Vec<Region> = tensors
+            .iter()
+            .copied()
+            .filter(|t| t.tid != w_r.tid && t.tid != s_r.tid)
+            .collect();
+        let [a, b] = rest[..] else {
+            return err(format!(
+                "ExpertMatmul {name}: {} input(s) remain after the bank pair — the pair rows and \
+                 the routing are exactly two",
+                rest.len()
+            ));
+        };
+        let (rows_r, idx_r) = if a.v_cols >= b.v_cols { (a, b) } else { (b, a) };
+        if idx_r.v_cols == 0 || rows_r.v_cols % idx_r.v_cols != 0 || rows_r.v_rows != idx_r.v_rows {
+            return err(format!(
+                "ExpertMatmul {name}: the pair rows t{} [{}, {}] and the routing t{} [{}, {}] — \
+                 the routing's width must be the top-k and divide the pair rows' k·in, at the same \
+                 row count",
+                rows_r.tid, rows_r.v_rows, rows_r.v_cols, idx_r.tid, idx_r.v_rows, idx_r.v_cols
+            ));
+        }
+        (rows_r, idx_r)
+    };
+    let k = idx_r.v_cols;
+    if k == 0 || out.v_cols % k != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: the routing t{} states k={k} but the output t{}'s width is \
+             {} — the pair output is [m, k·out], so k must divide it",
+            idx_r.tid, out.tid, out.v_cols
+        ));
+    }
+    let inn = rows_r.v_cols / k;
+    let n = out.v_cols / k;
+    let bank_rows = w_r.v_rows;
+    if bank_rows % n != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: the weight bank t{} is [{}, {}] but the projection's out width \
+             is {n} — the stacked bank is [E·out, in], so out must divide its rows",
+            w_r.tid, w_r.v_rows, w_r.v_cols
+        ));
+    }
+    let e_count = bank_rows / n;
+    // ⛔ P1 — k CANNOT EXCEED THE BANK'S EXPERT COUNT. The weight gather composes
+    // `bank_base + id·(out·in)` with no bound the card enforces, and the ids the
+    // routing carries are only provably `< E` while the top-k that minted them had
+    // `k <= E` (past that, the argsort's +inf pad lanes enter the top-k and their
+    // ids run past the bank — the wall-10 FETCH fault). The graph layer refuses the
+    // config-side fact (`RouteTopK`'s k vs the sort's expert count); THIS is the
+    // bank-side twin: the routing's own width k vs the experts the packed bank
+    // actually holds. A bank whose packing disagrees with the config refuses here,
+    // at build time, by name.
+    if k > e_count {
+        return err(format!(
+            "ExpertMatmul {name}: the routing t{} is k={k} wide but the weight bank t{} holds \
+             only {e_count} experts of n={n} rows — the top-k that minted these ids could not \
+             have stayed inside the bank, so the gather would compose an address past its end \
+             and fault the card's FETCH",
+            idx_r.tid, w_r.tid
+        ));
+    }
+    // ⛔ P1 — THE LANDING'S REPLICA RUNS. The top-k pair writes result r at slots
+    // [r·rep, (r+1)·rep) of the ids landing, rep = 64/k (the ring's slots-per-core
+    // form — see [`route_topk`]'s k-divides-64 law, where the mint refuses the
+    // geometry). Every index read in this door — the m>1 gathers' entry bases and
+    // the m=1 walks' head sticks — addresses result s's HEAD SLOT's run at u32
+    // elements `(s·rep)·m_pad`, so the division is stated here, once, with the same
+    // refusal the mint carries: a k that does not divide the stick has no head to
+    // address, and the gather would silently read result s/rep's replicas instead.
+    if !crate::work::FP16_ELEMS_PER_STICK.is_multiple_of(k) {
+        return err(format!(
+            "ExpertMatmul {name}: the routing t{} states k={k}, which does not divide the \
+             {}-slot landing — the pair replicates each result 64/k lanes wide and every \
+             gather below addresses the run heads at slot s·64/k, which is not a whole slot \
+             for this k",
+            idx_r.tid,
+            crate::work::FP16_ELEMS_PER_STICK
+        ));
+    }
+    let rep = crate::work::FP16_ELEMS_PER_STICK / k;
+    if w_r.v_cols != inn {
+        return err(format!(
+            "ExpertMatmul {name}: the weight bank t{} contracts {} columns but the rows t{} \
+             carry {} per pair — the bank's `in` must match the activation's",
+            w_r.tid, w_r.v_cols, rows_r.tid, inn
+        ));
+    }
+    // The stick guards: `out` must be a whole 64-stick for the scale gather's
+    // fp16 page and the dequant window; `n % 64 == 0` also keeps the bank's own
+    // retile law (each expert slab a whole number of n-sticks). `in` is PADDED,
+    // not guarded: `inn_pad = fp8_k_pad(inn)` is the dense K-pad's twin at the
+    // expert door — the 26b's DOWN projection contracts in=704 = 5.5 fp8
+    // sticks, and the activation quantize's convert, the gathered slab copy,
+    // and the packed bank's K rows all address whole 128-elem fp8 sticks.
+    let stk16 = crate::work::FP16_ELEMS_PER_STICK;
+    let stk8 = Df::Fp8.elems_per_stick();
+    if inn % stk16 != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: in={inn} is not a whole {stk16}-fp16 stick — the activation \
+             quantize reads whole fp16 sticks"
+        ));
+    }
+    let inn_pad = crate::work::fp8_k_pad(inn);
+    if n % stk16 != 0 {
+        return err(format!(
+            "ExpertMatmul {name}: out={n} is not a whole {stk16}-fp16 stick — the scale gather's \
+             page and the dequant window both address whole sticks"
+        ));
+    }
+    let out_tid = out.tid;
+    let idx_tid = idx_r.tid;
+    let rows_s = rows_r.name();
+    let w_s = w_r.name();
+    let s_s = s_r.name();
+    let out_s = out.name();
+    // The padded expert width W — the width the router chain's doors WRITE
+    // the routing buffer at (`w = next_multiple_of(64, E)`, the top-k door's
+    // own padded-width law). ⛔ IT IS NOT THE ROUTING TENSOR'S VIEW WIDTH:
+    // the view declares the graph shape `[m, k]` (sub-stick, the
+    // narrow-tensor law), while every router door reads and writes the
+    // buffer at W — so the convert's `cols` must be W, and W comes from the
+    // BANK's own expert count `E = bank_rows / n`, the one input that states
+    // it. The placement's `nbytes` pads the routing tensor's graph width to
+    // a stick, which for k ≤ 64 under-reserves the routing buffer relative
+    // to the doors' own writes — the top-k door's `out` handle is W wide and
+    // the router consts are placed at W, so the reserved `[m, k_pad]` buffer
+    // and the written `[m, W]` window only agree because the router chain's
+    // tensors share the segment; the convert reads W and the door's own
+    // scratch is sized W, keeping the two consistent here.
+    let w_pad = e_count.next_multiple_of(stk16);
+    if w_pad == 0 || e_count == 0 {
+        return err(format!(
+            "ExpertMatmul {name}: the bank t{} states E={e_count} — the padded expert width \
+             next_multiple_of(64, E) must be a nonzero stick",
+            w_r.tid
+        ));
+    }
+    // ⭐ THE PREFILL ROW PAD — `m` rounded to a whole fp16 stick, the mint's own quantity.
+    // The restickify needs whole-stick extents on BOTH axes (`[m_pad, W]`, the card-proven
+    // Kᵀ form's law), and the index-rows convert needs every slot's u32 run whole words:
+    // `m_pad` is a 64-multiple, so `m_pad/32` u32-index sticks is integral BY ARITHMETIC and
+    // every per-slot `first_entry` lands on a stick boundary. At `m == 1` (decode) the pad is
+    // never consulted — the mint is the m>1 body's own first leg.
+    let m_pad = rows.next_multiple_of(stk16);
+    // ── THE CHUNK LAW — stated BEFORE the scratch reservations, because the fine index's own
+    // reservation (below) is cut-gated. ⛔⭐⭐⭐⭐⭐ THE SLAB IS CUT INTO 64-COLUMN N-STICK CHUNKS,
+    // AND THE BANK IS STAGED CHUNK-MAJOR — the LX-fit law and the index law compose exactly.
+    // One gather entry stages its WHOLE page into per-core LX
+    // (`pointwise_lx_resident`: `n_operands · per_core_mb · out_per_time`) and
+    // the copy's work division splits `mb` by whole ENTRIES only
+    // (`gather_copy_cores`), so the only lever on the residency is the ENTRY'S
+    // OWN SIZE: a whole 26b gate/up slab is 704·2816 = 1,982,464 fp8 ≈ 3.96 MB
+    // staged per core against the 1,677,721-B budget, and `time_tile_for_lx`
+    // cannot help (`out` is already ONE stick — the RowBlocked-scatter law).
+    // Whole 64-column N-stick groups of one expert's packed `[N/64, K/2, 64,
+    // 2]` slab are ONE CONTIGUOUS device range (the bank-contiguity law
+    // `stage_weight.rs` pins) and a legal standalone `[chunk_n, in]` kernel,
+    // so the chunk is the unit the cut can name with NO relayout and NO
+    // on-device index remap:
+    //   · the bank is staged chunk-major — expert `e`'s chunk `χ` at
+    //     `(χ·E + e)·chunk_elems` — which the MANIFEST's own retile states
+    //     (the same `work::expert_slab_chunks` law this door reads);
+    //   · the INDEX stays the router's RAW expert id (`skip_addr` is DERIVED
+    //     as `page × the unpinned dims` = the chunk, so `idx·skip_addr` =
+    //     `e·chunk_elems` — the chunk-major bank's expert stride);
+    //   · the CHUNK rides the SOURCE BASE (`src_off = χ·E·chunk_elems`) —
+    //     card-proven arithmetic, `addr = idx·skip_addr + base_addr` adds the
+    //     index to the operand's OWN start, so the base term survives and
+    //     `e·chunk + χ·E·chunk = (χ·E + e)·chunk` EXACTLY.
+    // `chunks == 1` (every slab that fits whole — granite, tiny26, every model
+    // before the 26b) is byte-identical: the bank is the expert-major stack
+    // itself, `src_off` 0, one matmul per pair at the whole-slab offsets.
+    let groups = n / stk16; // whole 64-col N-stick groups per slab (the retile's N/64 axis)
+    if groups == 0 {
+        return err(format!(
+            "ExpertMatmul {name}: out={n} is under one 64-column N-stick group — the chunk cut \
+             needs at least one"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    // The pairs the gather serves — computed here (before the m=1 refusal below) so the chunk
+    // law is stated once, above; at every bundle that passes the refusal `rows == 1` and this
+    // is `k`, the value the original gather site computed.
+    let pairs = rows * k;
+    let run_entries = cap.min(pairs);
+    let chunk_groups = crate::work::expert_slab_chunks(groups, inn_pad / 2, run_entries, e_count);
+    let chunks = groups / chunk_groups;
+    let chunk_n = chunk_groups * stk16; // the chunk's output columns
+    let chunk_elems = chunk_n * inn_pad; // the chunk's fp8 elements AT THE PADDED K
+    let page_w = chunk_elems / stk8; // the chunk's one-stick sub-rows
+    // ⭐⭐⭐ THE VENDOR-SCHEDULER HALF OF THE LX LAW — wall #6. `expert_slab_chunks` sized the chunk
+    // against the FRONTEND planning budget (`USABLE_LX_BYTES`), but the vendor's `allocAllMem`
+    // (L3DlOpsScheduler.cpp:6455) charges the SCHEDULED op **4 × one page** (2 value buffers + 2
+    // output buffers at the one-page minimum chunk candidate) against the post-`reserveFrontendLx`
+    // free pool — 406,323 B, `work::VENDOR_LX_SCHED_BYTES`' law — a budget the chunk cut never
+    // consults. A page past it (the 26b gate/up's 1408 and DOWN's 4224 sub-rows; 793 is the
+    // boundary) is dxp-refused with `Expect valid chunk size that fits in LX`
+    // (L3DlOpsScheduler.cpp:2242) — pod-proven: control RC=1, `DXP_LX_FRAC_AVAIL=1.0` RC=0,
+    // Tensor0 maxDimSizes[0] 1408→704 RC=0. The chunk cut is EXHAUSTED at gate/up (chunk_groups=1
+    // minimum = 180,224 B still over), so the only lawful cut left is the PAGE ITSELF: sub-page it
+    // `sub` ways, one index entry per `page_w/sub` sticks, addressed through a FINE index
+    // `e·sub + s` the door mints from a const bank (leg 2a below). `sub == 1` — every model before
+    // the 26b — is byte-identical: the uncut loop, the raw index, no bank, no fine synth.
+    let sub = crate::work::expert_slab_subpages(page_w);
+    if sub > 1 && !page_w.is_multiple_of(sub) {
+        return err(format!(
+            "ExpertMatmul {name}: the sub-page cut needs {sub} to divide the chunk's {page_w} \
+             one-stick sub-rows. `page_w = chunk_groups · inn_pad/2` and `fp8_k_pad`'s \
+             `inn_pad ≡ 0 (mod 128)` make `64 | page_w` by proof, so a violation is a geometry \
+             this law never stated",
+        ));
+    }
+    // ── The scratch reservations, all keyed off the OUTPUT's tid (the
+    // per-matmul law the dense body states; the index convert keyed off the
+    // IDX tensor's own tid so the three projections share one scratch).
+    let out_id = PlaceId::Act(out_tid);
+    let idx_id = PlaceId::Act(idx_tid);
+    use crate::place::SynthRole as R;
+    let xidx_s = crate::placement::syn(layout, idx_id.synth(R::XIdx));
+    // The fine index's name — read only when the sub-page cut fired (`sub > 1`); an uncut door
+    // never names it, matching the reservation below.
+    let xsub_s = crate::placement::syn(layout, idx_id.synth(R::XSub));
+    let xw_s = crate::placement::syn(layout, out_id.synth(R::XWScratch));
+    let xs_s = crate::placement::syn(layout, out_id.synth(R::XSScratch));
+    let xraw_s = crate::placement::syn(layout, out_id.synth(R::XRaw));
+    let xdqa_s = crate::placement::syn(layout, out_id.synth(R::XDqA));
+    if let Some(l) = layout {
+        if rows > 1 {
+            // ⭐⭐ THE PREFILL (m>1) SHAPES — the top-k DOOR owns the index
+            // chain's tensors now (XP/XT/TopKIdx/TopKVal and the
+            // XFl/XF32/XIdx convert trio at every m, declared by
+            // [`route_topk`] at the pair's own geometry): the door lands the
+            // ids token-major `[m_pad, 64]` and mints the flat u32 index
+            // `[64, m_pad]` — result s's HEAD SLOT's run at elements
+            // `(s·rep)·m_pad`, the very law this door's P3/P4 gathers read. What stays HERE are the matmul/dequant tensors at
+            // the STICK-MAJOR `[m, k·n]` (the per-(slot, chunk) matmul C
+            // windows and the per-(slot, group) scale gathers both write
+            // stick-major at GROUP CORNERS — the M=m layout law, design
+            // §4.0). NO XWScratch and NO XSub at m>1: the matmuls gather the
+            // BANK directly through the kernel index (N3, probe-proven), so
+            // neither the copied slab nor the fine index that addressed its
+            // sub-pages exists.
+            // The scale staging at the matmul output's OWN arrangement — the
+            // per-(slot, group) gathers place whole sticks at the group corners of
+            // this exact shape, so the dequant's first leg reads both operands at
+            // one arrangement (the mismatch that made a flat staging unreadable).
+            l.synth_df(out_id.synth(R::XSScratch), &[rows, k * n], Df::Fp16);
+            l.synth_df(out_id.synth(R::XRaw), &[rows, k * n], Df::Fp16);
+            l.synth_df(out_id.synth(R::XDqA), &[rows, k * n], Df::Fp16);
+        } else {
+            // ⭐ THE INDEX CONVERT'S TENSORS ARE NOT RESERVED HERE: [`route_topk`]
+            // mints the flat XFl/XF32/XIdx trio at the pair's own `[64, m_pad]`
+            // at EVERY m (the decode arm's old staged `[1, W]` pair died with the
+            // halving law — see the door's convert block), so this door READS the
+            // door-minted u32 index and reserves nothing for it.
+            // The fine index `[rows, k·sub]` u32 — the sub-page cut's own index, minted by the
+            // bank gather (leg 1b) and read one stick per pair by the fine weight walk (leg 2).
+            // Reserved only when the cut fired: an uncut door has no fine index and no bank, so
+            // every pre-26b bundle's placement is byte-identical.
+            if sub > 1 {
+                l.synth_df(idx_id.synth(R::XSub), &[rows, k * sub], Df::SenUint32);
+            }
+            // The fp8 pair scratch — CHUNK-MAJOR `[CHUNKS·pairs·chunk_elems/128,
+            // 128]` one-stick sub-rows, the gathered copy's destination law (the
+            // same total bytes the uncut door reserved: `chunks·chunk_elems =
+            // n·inn_pad`). ⛔ The ORDER is chunk-major because the gather's derived
+            // `skip_addr` is the chunk — entry `c·pairs + first` writes the run's
+            // rows at `(c·pairs + first)·chunk_elems`, and the per-(pair, chunk)
+            // matmul windows below read the same order. At `chunks == 1` this is
+            // the uncut `[pairs·(n·inn/128), 128]` reservation byte for byte. The
+            // K axis is the PADDED `inn_pad` (the bank's staged K rows): a sub-128
+            // `inn` (the 26b DOWN's 704) pads to 768 and the pad lanes are the
+            // gather's own whole-stick law.
+            l.synth_df(
+                out_id.synth(R::XWScratch),
+                &[rows * k * (n * inn_pad / stk8), stk8],
+                Df::Fp8,
+            );
+            // The scale scratch: `[m·k, out]` fp16 — pair p's `[out]` window at
+            // `p·out` (the gathered scale copy's destination, row-major).
+            l.synth_df(out_id.synth(R::XSScratch), &[rows * k, n], Df::Fp16);
+            // The raw product and its a_scale-folded intermediate: the dense
+            // body's FqRaw/FqDqA at the pair-major flattening `[m·k, out]`.
+            l.synth_df(out_id.synth(R::XRaw), &[rows * k, n], Df::Fp16);
+            l.synth_df(out_id.synth(R::XDqA), &[rows * k, n], Df::Fp16);
+        }
+    }
+    let mut ops: Vec<EmittedOp> = Vec::new();
+    // ══ THE PREFILL (m>1) BODY ════════════════════════════════════════════
+    // The per-(slot, chunk) gathered form (design §4.4): the top-k door
+    // ([`route_topk`]) has already minted the flat u32 index `[64, m_pad]`
+    // (result s's HEAD SLOT's run at elements `(s·rep)·m_pad` — the landing's
+    // replica law; the contiguous run every per-slot gather below reads; the
+    // door's own XIdx declaration, the old
+    // mint chain's P0/P1 legs deleted in its favor), the shared quantize
+    // chain quantizes the whole `[m, k·in]` (m-generic at ANY `inn` — the
+    // aligned tail's whole-tensor convert and the half-stick tail's per-slot
+    // rank-2 arms, design §4.5), the matmuls gather the BANK directly through
+    // the kernel index (`GatherIndex::of_expert_planes`, probe-proven), the
+    // scale gathers stage the per-channel scales at the OUTPUT's own
+    // stick-major arrangement, and the dequant runs as two whole-tensor
+    // stick-major legs. The m=1 body below is UNTOUCHED — every decode bundle
+    // is byte-identical. The bake of a bundle carrying this form needs
+    // `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` (the probe's escape — ONE line in the
+    // bake script's dxp invocation, deliberately not a target-crate env
+    // toggle).
+    if rows > 1 {
+        // The u32 index's stick width — `first_entry` is measured in index sticks, and the
+        // per-slot runs start at u32 ELEMENT `s·m_pad`. `m_pad` is a 64-multiple (the pad
+        // law above), so `s·m_pad/32` is integral by arithmetic — stated here because a
+        // non-integral split would silently gather across a slot boundary.
+        let idx_stick = Df::SenUint32.elems_per_stick();
+        // ── P2. THE SHARED ACTIVATION QUANTIZE — the whole `[m, k·in]` ──────
+        // The same call the m=1 body makes (the chain is m-generic at any tail: at an
+        // aligned `inn` the whole-tensor convert stands, and at the half-stick tail its
+        // per-slot arms take the `col_of` group corners — design §4.5, the m>1 half of
+        // the same law); one amax per token row over all k slots' lanes, so the
+        // a_scale the dequant reads `In::col` is one row per token. NO dense body
+        // runs here, exactly as at m=1: the per-(slot, chunk) matmuls below ARE
+        // this door's body.
+        let fq = super::ktir_matmul_fp8::fp8_quantize_descriptors(
+            &super::ktir_matmul_fp8::Fp8Facts {
+                a_tid: rows_r.tid,
+                a_name: rows_s.clone(),
+                w_name: w_s.clone(),
+                ws_name: xs_s.clone(),
+                out_tid,
+            },
+            rows,
+            k * inn,
+            k,
+            sym_id_base,
+            layout,
+            quantized,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the expert activation quantize: {}", e.0),
+        })?;
+        ops.extend(fq);
+        // ── P3. THE PER-(SLOT, CHUNK) GATHERED MATMULS ──────────────────────
+        // A = the `afp8` window `[m, inn_pad]` at column corner `s·inn_pad` (a
+        // whole fp8 stick by the chain's per-pair padded layout — group-aligned,
+        // so the window is a contiguous group range of the stick-major
+        // `[m, k·inn_pad]`); B = the bank's chunk plane χ GATHERED by slot s's
+        // index run (source base `χ·E·chunk_elems`, the chunk-major bank law:
+        // `addr = e·chunk_elems + χ·E·chunk_elems` with the RAW expert id); C =
+        // the `xraw` window `[m, chunk_n]` at group corner `s·n + χ·chunk_n` of
+        // the stick-major `[m, k·n]`. NO XWScratch — the kernel reads the bank
+        // through the index, which is the whole point of the form. ⭐ THE ENTRY
+        // BASE IS THE HEAD SLOT's RUN — `(s·rep)·m_pad`, result s's own run over
+        // the tokens (the landing's replica law, stated at the door's `rep`).
+        let afp8_s = crate::placement::syn(layout, PlaceId::Act(rows_r.tid).synth(R::FqAfp8));
+        for s in 0..k {
+            let a_off =
+                crate::addr::col_of(rows, k * inn_pad, s * inn_pad, Df::Fp8).into_raw_elems();
+            for c in 0..chunks {
+                let w_off = c * e_count * chunk_elems;
+                let o_off = crate::addr::col_of(rows, k * n, s * n + c * chunk_n, Df::Fp16)
+                    .into_raw_elems();
+                let mut spec =
+                    crate::ir::bridge::tiled_op_sdsc_op::matmul::matmul_opspec_off_operands_phys_gathered::<
+                        crate::superdsc_opspec::Fp16,
+                    >(
+                        crate::sdsc_abstract::MatM::of_token_rows(rows),
+                        crate::sdsc_abstract::MatN::of_out_features(chunk_n),
+                        crate::sdsc_abstract::MatK::of_in_features(inn_pad),
+                        crate::sdsc_abstract::MatY::unbatched(),
+                        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
+                            super::bmm_site::TapeLoweringSite::witness(),
+                        ),
+                        &afp8_s,
+                        &w_s,
+                        &xraw_s,
+                        a_off,
+                        w_off,
+                        o_off,
+                        Df::Fp8,
+                        None,
+                        Some(crate::superdsc_opspec::GatherIndex::of_expert_planes(
+                            xidx_s.clone(),
+                            crate::superdsc_opspec::EntryBase::of_sticks(
+                                s * rep * m_pad / idx_stick,
+                            ),
+                        )),
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{name}: slot {s} chunk {c}'s gathered matmulfp8: {e}"),
+                    })?;
+                // ⛔ THE PAINT SKIPS THE INDEX TOO — `attach_gather_index` forces SENUINT32 on
+                // the index whatever the value operands are (the DT_CHECK pair
+                // GatherIndexConversion.cpp:133 + L3DlOpsScheduler.cpp:5928), so a W8A8 paint
+                // that touches it is a stick-extent refusal at best and a wrong-dtype index
+                // at worst. Pinned by `zz_the_token_plane_gathered_matmul_is_the_probe_form`.
+                for arg in &mut spec.args {
+                    if !matches!(
+                        arg.view().role,
+                        crate::superdsc_opspec::Role::Output | crate::superdsc_opspec::Role::Index
+                    ) {
+                        arg.set_df(Df::Fp8);
+                    }
+                }
+                let folds = crate::superdsc_opspec::SdscFoldSet::new(spec.iter.cores_used());
+                // `chunks == 1` keeps the one-chunk spelling (the m=1 body's own naming
+                // law: the uncut case must not grow a suffix).
+                let mmn = if chunks == 1 {
+                    format!("emmm_s{s}_o{out_tid}")
+                } else {
+                    format!("emmm_s{s}_c{c}_o{out_tid}")
+                };
+                ops.push(
+                    crate::emit::emit_sdsc_tiled(&mmn, &spec, &folds, sym_id_base, layout)
+                        .map_err(|e| Error {
+                            message: format!(
+                                "{name}: slot {s} chunk {c}'s gathered matmulfp8 emit: {}",
+                                e.0
+                            ),
+                        })?,
+                );
+            }
+        }
+        // ── P4. THE PER-(SLOT, GROUP) SCALE GATHERS ─────────────────────────
+        // The per-channel w_scale multiply needs the scale at the OUTPUT's own
+        // arrangement (a stick-major op reads every operand stick-major — the
+        // output kind drives the input reads), and the only gather that composes
+        // with the RAW expert id places WHOLE STICKS: the copy's derived
+        // `skip_addr` at `page = 1` is one 64-elem stick, so `addr = e·64 +
+        // g·E·64` — the GROUP-MAJOR scale bank's stick `(g, e)` at `(g·E + e)·64`
+        // EXACTLY (the bank is staged that way at m>1 — the manifest's
+        // `expert_scale_banks` retile, the chunk-major weight bank's own
+        // precedent). The destination is the same law read backwards: dest entry
+        // `(s·G + g)·m` × 64 elements is the stick-major `[m, k·n]` position of
+        // group `s·G + g`, row 0, and entry i lands at `+i·64` — row i's stick —
+        // so the per-(slot, group) runs place the WHOLE scale operand one stick
+        // at a time. `k·(n/64)` ops per door (88 gate/up at the 26b) — the
+        // design's resolution-2 count, bounded and accepted.
+        let scale_groups = n / stk16;
+        for s in 0..k {
+            for g in 0..scale_groups {
+                // ⛔ THE VENDOR'S ONE-INDEX-STICK-PER-OP LAW (`CopyDims::ENTRIES_PER_OP` — one
+                // 32-entry u32 stick): a copy op names at most one index stick, so the slot's
+                // m-entry run is split into `cap`-entry runs, the same `step_by` the m=1 walks
+                // state. Run `r` covers u32 elements `s·rep·m_pad + first .. +entries` — result
+                // s's HEAD SLOT's run (the landing's replica law), the same base P3 reads;
+                // `m_pad` is a 64-multiple and `first` steps by 32, so the run's index stick
+                // `(s·rep·m_pad + first)/32` is integral by arithmetic.
+                for (r, first) in (0..rows).step_by(cap as usize).enumerate() {
+                    let entries = cap.min(rows - first);
+                    ops.push(
+                        crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                            &s_s,
+                            &xs_s,
+                            entries, // `mb`: one stick per entry — the run's entries
+                            stk16,   // `out`: ONE fp16 stick (the copy's one-stick law)
+                            Df::Fp16,
+                            crate::superdsc_opspec::GatherIndex::of_expert_planes(
+                                xidx_s.clone(),
+                                crate::superdsc_opspec::EntryBase::of_sticks(
+                                    (s * rep * m_pad + first) / idx_stick,
+                                ),
+                            ),
+                            crate::superdsc_opspec::GatherRun::split(
+                                crate::superdsc_opspec::DestEntry::of_entries(
+                                    (s * scale_groups + g) * rows + first,
+                                ),
+                                g * e_count * stk16,
+                            ),
+                        )
+                        .map_err(|e| Error {
+                            message: format!("{name}: the expert scale gather: {e}"),
+                        })
+                        .and_then(|op| {
+                            let folds =
+                                crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+                            crate::emit::emit_sdsc_tiled(
+                                &format!("emsg_s{s}_g{g}_r{r}_o{out_tid}"),
+                                &op,
+                                &folds,
+                                sym_id_base,
+                                layout,
+                            )
+                            .map_err(|e| Error {
+                                message: format!("{name}: the expert scale gather emit: {}", e.0),
+                            })
+                        })?,
+                    );
+                }
+            }
+        }
+        // ── P5. THE DEQUANT, TWO WHOLE-TENSOR STICK-MAJOR LEGS ──────────────
+        // `xraw`, the staged scales, `xdqa` and the output all live at the ONE
+        // arrangement (`[m, k·n]` stick-major), so both legs are single ops: the
+        // raw product × the per-(row, channel) scale, then × the per-row a_scale
+        // (`In::col`, the dense prefill's own card-proven broadcast). This is the
+        // m=1 body's 1-row-flat pair, grown to the M=m form the matmul output's
+        // arrangement dictates.
+        let ascale_s = crate::placement::syn(layout, PlaceId::Act(rows_r.tid).synth(R::FqAscale));
+        let xraw_h = crate::emit::rb(&xraw_s, rows, k * n);
+        let xsscale_h = crate::emit::rb(&xs_s, rows, k * n);
+        let xdqa_h = crate::emit::rb(&xdqa_s, rows, k * n);
+        let out_h = crate::emit::rb(&out_s, rows, k * n);
+        let ascale_h = crate::emit::rb(&ascale_s, rows, stk16);
+        ops.push(crate::emit::pw2(
+            &format!("ems_o{out_tid}"),
+            "mul",
+            crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(k * n),
+            crate::emit::In::full(&xraw_h),
+            crate::emit::In::full(&xsscale_h),
+            &xdqa_h,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(crate::emit::pw2(
+            &format!("emo_o{out_tid}"),
+            "mul",
+            crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(k * n),
+            crate::emit::In::full(&xdqa_h),
+            crate::emit::In::col(&ascale_h),
+            &out_h,
+            sym_id_base,
+            layout,
+        ));
+        return Ok(ops);
+    }
+    // ⛔ THE m=1 (DECODE) REGIME — the per-pair matmuls write 1-row windows whose stick-group
+    // stride comes from the SWEPT mb, and every walk below reads the door-minted flat u32
+    // index ONE HEAD ENTRY AT A TIME (the landing's replica law: result s's id lives at u32
+    // element `(s·rep)·m_pad`, and the m=1 broadcast makes its whole head stick the same id —
+    // so a one-entry run at that stick is exactly result s's expert id, addressed through the
+    // vendor's one-index-stick-per-op law with the stride INSIDE the base).
+    // ── 1. THE INDEX CONVERT — DEAD, REPLACED BY THE DOOR'S FLAT TRIO ─────
+    // The decode arm used to mint its own `[1, W]` staged pair (`dl16tofp32` then
+    // `fp32toint32` over the token-major landing) — a form with two card-measured
+    // defects at the 26b: the STAGED widening HALVES the element stream (the
+    // shared-%stick_dim law resolves at the INPUT's fp16 stick count, so one
+    // converted value lands per fp16 pair), and the `[1, W]` window over the
+    // landing reads REPLICA RUNS, not compact ids — together they staged the
+    // top-2 experts ×4 (scale-fingerprint-proven). [`route_topk`] now mints the
+    // flat element-preserving trio over the pair's own `[64, m_pad]` at EVERY m,
+    // so this door only READS the u32 index — no convert of its own, and the
+    // fp16→u32 slice-equality law (unary_parallel.ddl:59, the two-leg chain the
+    // trio states) is the door's, not this body's.
+    // The u32 index's own stick width — every head-stick base below is stated in sticks.
+    let idx_stick = Df::SenUint32.elems_per_stick();
+    // ── 1b. THE FINE INDEX (sub > 1 only) ────────────────────────────────
+    // One gather of the `[E, sub]` const bank BY THE RAW INDEX mints the fine index `xsub`:
+    // entry `i` of index stick `s` is the expert id `e`; the page is ONE u32 stick (bank row
+    // `e`, the `sub` values `e·sub + s'`); so the run writes pair `first+i`'s `sub` fine
+    // entries at `xsub` words `(first+i)·sub` — pair `p`'s own stick, exactly the layout the
+    // fine weight walk's `EntryBase::of_sticks(p)` reads back. ⛔ NO POINTWISE LAW CAN MINT
+    // THIS INDEX: the raw index is `[rows, W]` at mb extent `rows` (1), and every expansion of
+    // it into a `[pairs, sub]`-shaped intermediate reads past the buffer's own declared range
+    // or lands on sub-stick out extents — the bank gather copies WHOLE STICKS instead, so the
+    // fine values arrive as data movement, not arithmetic. The bank is u32-typed (values reach
+    // `E·sub − 1` = 4095 at E=128, past fp16's exact-integer range of 2048) and worker-bound
+    // VERBATIM through the raw-i32 staging path (see `expert_subpage_bank_tid`). Keyed off the
+    // IDX tensor's own tid like the convert chain above, so the projections' bank gathers land
+    // on the same synth and the later ones merely re-write the bytes the first wrote.
+    if sub > 1 {
+        let bank_s = crate::place::act_name(crate::reserved_tids::expert_subpage_bank_tid());
+        // ⭐ ONE OP PER PAIR, ONE ENTRY PER OP. The replica-run heads are strided
+        // `rep·m_pad` u32 elements apart, so no contiguous run covers two of them
+        // (the old contiguous run read the staged `[1, W]` window, whose halved
+        // convert + replica content staged the top-2 experts ×4 — card-measured).
+        // Pair p's entry is the FIRST entry of stick `(p·rep)·m_pad/32` — element
+        // `(p·rep)·m_pad`, result p's head — which the m=1 token broadcast holds
+        // at pair p's expert id for the stick's whole 32 entries.
+        for p in 0..pairs {
+            ops.push(
+                crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                    &bank_s,
+                    &xsub_s,
+                    1,   // `mb`: ONE position — pair p's head entry
+                    sub, // `out`: ONE u32 stick (`sub` == `CopyDims::ENTRIES_PER_OP`)
+                    Df::SenUint32,
+                    crate::superdsc_opspec::GatherIndex {
+                        name: xidx_s.clone(),
+                        entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                        page: crate::superdsc_opspec::PageExtent::single_position(),
+                        per_position: None,
+                        first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
+                            p * rep * m_pad / idx_stick,
+                        ),
+                    },
+                    // Dest entry `p` covers `sub` words at `p·sub` — pair `p`'s own
+                    // stick of the fine index. No source base: the bank's entries
+                    // are expert ids, its own row space.
+                    crate::superdsc_opspec::GatherRun::split(
+                        crate::superdsc_opspec::DestEntry::of_entries(p),
+                        0,
+                    ),
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: the fine index gather: {e}"),
+                })
+                .and_then(|op| {
+                    let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+                    crate::emit::emit_sdsc_tiled(
+                        &format!("embi_p{p}_o{idx_tid}"),
+                        &op,
+                        &folds,
+                        sym_id_base,
+                        layout,
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{name}: the fine index gather emit: {}", e.0),
+                    })
+                })?,
+            );
+        }
+    }
+    // ── 2. THE WEIGHT GATHER ─────────────────────────────────────────────
+    // One kernel-less fp8 copy of the indexed expert slabs into the pair scratch. `mb` is the
+    // copy's one-stick sub-rows; `page` is the gathered unit's height in sub-rows. The chunk law
+    // and the sub-page cut are stated above (the scratch block); the two walks below are the
+    // SAME gather at the two cuts the LX laws allow.
+    // One gathered weight copy under `opn`, emitted with this door's own error text — the tail
+    // both walks share, so the fine and uncut forms cannot drift in emission, only in geometry.
+    let mut emit_weight_gather = |opn: String,
+                                  mb: u32,
+                                  index: crate::superdsc_opspec::GatherIndex,
+                                  run: crate::superdsc_opspec::GatherRun|
+     -> Result<EmittedOp, Error> {
+        crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+            &w_s,
+            &xw_s,
+            mb,
+            stk8,
+            Df::Fp8,
+            index,
+            run,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the expert weight gather: {e}"),
+        })
+        .and_then(|op| {
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+            crate::emit::emit_sdsc_tiled(&opn, &op, &folds, sym_id_base, layout).map_err(|e| {
+                Error {
+                    message: format!("{name}: the expert weight gather emit: {}", e.0),
+                }
+            })
+        })
+    };
+    if sub == 1 {
+        // ⭐ THE UNCUT WALK — one op per (chunk, PAIR), the raw expert-id index, ONE ENTRY
+        // per op: pair p's head stick `(p·rep)·m_pad/32` of the door-minted flat index, the
+        // whole page per entry. The replica-run heads are strided `rep·m_pad` elements apart,
+        // so no contiguous run covers two of them — the same per-pair law the fine gather
+        // states, at the uncut page unit.
+        for c in 0..chunks {
+            for p in 0..pairs {
+                // Chunk 0 keeps the shipped name (the attn chunk-cut's own law:
+                // two ops differing only in a baked offset must be tellable apart
+                // in every dump, and the uncut case must not rename).
+                let opn = if c == 0 {
+                    format!("emwg_p{p}_o{out_tid}")
+                } else {
+                    format!("emwg_c{c}_p{p}_o{out_tid}")
+                };
+                ops.push(emit_weight_gather(
+                    opn,
+                    page_w, // `mb`: ONE entry's one-stick sub-rows
+                    crate::superdsc_opspec::GatherIndex {
+                        name: xidx_s.clone(),
+                        entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                        page: crate::superdsc_opspec::PageExtent::of_positions(page_w),
+                        per_position: None,
+                        first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
+                            p * rep * m_pad / idx_stick,
+                        ),
+                    },
+                    // ⛔ THE DESTINATION IS CHUNK-MAJOR: entry `c·pairs + p`
+                    // lands the run's rows at `(c·pairs + p)·chunk_elems`,
+                    // the scratch's `[CHUNKS][pairs][chunk]` order — the order
+                    // the per-(pair, chunk) matmul windows below address. And the
+                    // source base is the CHUNK's chunk-major term `χ·E·chunk`,
+                    // so the raw-index expert term lands inside expert e's chunk
+                    // c exactly: `e·chunk + χ·E·chunk = (χ·E + e)·chunk`.
+                    crate::superdsc_opspec::GatherRun::split(
+                        crate::superdsc_opspec::DestEntry::of_entries(c * pairs + p),
+                        c * e_count * chunk_elems,
+                    ),
+                )?);
+            }
+        }
+    } else {
+        // ⭐⭐⭐ THE SUB-PAGED WALK — one op per (chunk, PAIR), the FINE index, `page_w/sub`
+        // sub-rows per entry. The vendor's one-index-stick-per-op law forces the finer grain:
+        // each op's 32 index entries are pair `p`'s 32 SUB-PAGES (`xsub` stick `p`), so the op
+        // covers exactly one pair's whole chunk — the only shape whose 4×page demand fits the
+        // vendor scheduler's pool. The composition is the uncut law at the finer unit, and both
+        // halves of it are exact:
+        //   · SOURCE: fine entry `e_p·sub + s` × `skip_addr = page_sub·128` + the same chunk base
+        //     `χ·E·chunk_elems` = `e_p·chunk_elems + s·page_sub·128 + χ·E·chunk_elems` — expert
+        //     `e_p`'s chunk `χ`, sub-page `s`, the chunk-major bank's own address;
+        //   · DESTINATION: entry `(c·pairs + p)·sub + s` × `page_sub·128` = `(c·pairs + p)·chunk_elems
+        //     + s·page_sub·128` — pair `p`'s chunk-`c` slab reassembled CONTIGUOUSLY, sub-pages in
+        //     order, at exactly the window the per-(pair, chunk) matmuls below read. The matmuls,
+        //     the scratch reservation, the manifest staging and the scale gather are all UNCHANGED:
+        //     the interleave is entirely WITHIN a pair's slab.
+        let page_sub = page_w / sub;
+        for c in 0..chunks {
+            for p in 0..pairs {
+                // The `p`-for-`s` rename keeps the two walks' ops tellable apart in every dump
+                // (the same law the chunk suffix states).
+                let opn = if c == 0 {
+                    format!("emwg_p{p}_o{out_tid}")
+                } else {
+                    format!("emwg_c{c}_p{p}_o{out_tid}")
+                };
+                ops.push(emit_weight_gather(
+                    opn,
+                    sub * page_sub, // `mb`: `sub` entries × `page_sub` one-stick sub-rows
+                    crate::superdsc_opspec::GatherIndex {
+                        name: xsub_s.clone(),
+                        entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                        page: crate::superdsc_opspec::PageExtent::of_positions(page_sub),
+                        per_position: None,
+                        // `xsub` stick `p` IS pair `p`'s 32 fine entries — the bank gather's
+                        // dest layout, read back one stick at a time.
+                        first_entry: crate::superdsc_opspec::EntryBase::of_sticks(p),
+                    },
+                    crate::superdsc_opspec::GatherRun::split(
+                        crate::superdsc_opspec::DestEntry::of_entries((c * pairs + p) * sub),
+                        c * e_count * chunk_elems,
+                    ),
+                )?);
+            }
+        }
+    }
+    // ── 3. THE SCALE GATHER ──────────────────────────────────────────────
+    // The same index, the bf16 bank at fp16 geometry: one entry covers the
+    // pair's `out` scales = `out/64` one-stick sub-rows, `cols` one fp16
+    // stick. The bank is viewed `[E·out, 1]` row-major, so `skip_addr` at
+    // `page·64 = out` fp16 elements steps exactly one bank row — the same
+    // arithmetic the weight gather states at its own format.
+    let page_s = n / stk16;
+    // ⭐ ONE OP PER PAIR, ONE ENTRY PER OP — the same head-stick law the weight
+    // walks state: pair p's entry is stick `(p·rep)·m_pad/32`'s first entry of the
+    // door-minted flat index (result p's expert id), staged at dest entry `p`.
+    for p in 0..pairs {
+        // The scale gather needs no chunk base: the scale bank stays EXPERT-major (its
+        // `page·64 = n` fp16-element `skip_addr` is one bank row of the `[E·n]` stack —
+        // the chunk cut is the WEIGHT bank's LX law, not the scales').
+        ops.push(
+            crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                &s_s,
+                &xs_s,
+                page_s, // `mb`: ONE entry's one-stick sub-rows
+                stk16,
+                Df::Fp16,
+                crate::superdsc_opspec::GatherIndex {
+                    name: xidx_s.clone(),
+                    entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                    page: crate::superdsc_opspec::PageExtent::of_positions(page_s),
+                    per_position: None,
+                    first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
+                        p * rep * m_pad / idx_stick,
+                    ),
+                },
+                // The scale bank is expert-major and its entries are whole bank rows —
+                // no chunk base (see the loop note above).
+                crate::superdsc_opspec::GatherRun::split(
+                    crate::superdsc_opspec::DestEntry::of_entries(p),
+                    0,
+                ),
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: the expert scale gather: {e}"),
+            })
+            .and_then(|op| {
+                let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+                crate::emit::emit_sdsc_tiled(
+                    &format!("emsg_p{p}_o{out_tid}"),
+                    &op,
+                    &folds,
+                    sym_id_base,
+                    layout,
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: the expert scale gather emit: {}", e.0),
+                })
+            })?,
+        );
+    }
+    // ── 4. THE SHARED ACTIVATION QUANTIZE + PER-PAIR MATMULS + DEQUANT ──
+    // The dense W8A8 chain's QUANTIZE HALF over the whole `[m, k·in]` pair
+    // rows, quantized once per distinct activation (`quantized`, the dense
+    // door's own dedup — gate and up share one chain). The pair rows ARE one
+    // activation from the quantizer's point of view: `fq_absx`/`fq_amax`/…
+    // run at `[rows, k·in]` and the per-row a_scale is one scale per
+    // TOKEN-PAIR row — exactly what leg 5's `In::col` broadcast reads.
+    // ⭐⭐ THE CHAIN IS ASKED FOR THE PAIR FORM, NOT THE DENSE ONE: `pairs = k`
+    // switches its tail law PER PAIR — the 26b DOWN's inn=704 is 5.5 fp8
+    // sticks, so the LOGICAL pair stride is a HALF stick and a half-stick
+    // operand start is unexpressible (the HBM walk loads whole 128-B sticks
+    // by stick index — the senulator's own memoryElement law); the chain
+    // therefore lays the tail out per-pair PADDED (`afp8` at
+    // `[m, k·inn_pad]`, pair `p`'s window at `p·inn_pad`; `cl` to its last
+    // convert's reach with the overhang zero-filled; one `qfp8ch` per pair
+    // at the padded windows) and every A window below reads the PADDED
+    // stride. At an aligned `inn` (gate/up's 2816, every model before the
+    // 26b) the padded layout IS the logical one and the chain emits its ONE
+    // whole-tensor convert, byte-identical to the pre-pair emission. ⛔ NO
+    // DENSE BODY RUNS HERE: its `fq_mm` binds the whole XWScratch as one
+    // `[k_pad, k·n]` W view — 126 MB against the chunk-cut's 17.3 MB
+    // reservation — which the synth footprint guard refuses at bake; the
+    // per-pair matmuls below ARE this door's body, so the chain half is
+    // taken directly and nothing is emitted only to be spliced out.
+    let fq = super::ktir_matmul_fp8::fp8_quantize_descriptors(
+        &super::ktir_matmul_fp8::Fp8Facts {
+            a_tid: rows_r.tid,
+            a_name: rows_s.clone(),
+            w_name: xw_s.clone(),
+            ws_name: xs_s.clone(),
+            out_tid,
+        },
+        rows,
+        // ⭐ THE WHOLE-TENSOR WIDTH, NOT PER-PAIR: the quantize chain runs over
+        // the full `[rows, k·in]` activation (one amax per token-PAIR row, so
+        // every pair's lanes are quantized); the per-pair structure rides the
+        // `pairs` argument (the tail law above), never a narrower width.
+        k * inn,
+        k,
+        sym_id_base,
+        layout,
+        quantized,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: the expert activation quantize: {}", e.0),
+    })?;
+    ops.extend(fq);
+    // The per-pair matmuls and dequant legs, at the pair offsets.
+    // ⛔ THE DEQUANT HANDLES ARE 1-ROW FLAT, NOT `[pairs, n]`. The matmuls and
+    // both gathers wrote the scratches FLAT at pair-major offsets (`p·n`), and
+    // a `[pairs, n]` pointwise op at pairs>1 ∧ n>64 classifies STICK-MAJOR
+    // (rows>1 ∧ cols>64 ∧ block-aligned) — a rank-2 read of a flat-written
+    // buffer, scrambled for every geometry but `n == 64 ∧ pairs < 2`. At the
+    // door's m=1 the pair-major `[pairs, n]` flattening IS one flat row
+    // `[1, pairs·n]` (the token-major law), so the dequant legs below run
+    // 1-row — rank-3 flat (rows=1 never classifies stick-major), the dense
+    // body's own decode shape.
+    let xraw = rb(&xraw_s, 1, pairs * n);
+    let xdqa = rb(&xdqa_s, 1, pairs * n);
+    let out_h = rb(&out_s, rows, k * n);
+    let xsscale = rb(&xs_s, 1, pairs * n);
+    let flat_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(pairs * n);
+    // ⭐ THE MATMUL'S A OPERAND IS THE CHAIN'S QUANTIZED `afp8`, NOT the raw
+    // fp16 pair rows: the fp8 contraction reads the buffer the quantize chain
+    // WROTE (its `FqAfp8` synth, reserved `[m, k·inn_pad]` fp8 — per-pair
+    // padded, the tail law section 4 states), and each pair's window is taken
+    // at the SAME padded stride the chain's convert wrote it at.
+    let afp8_s = crate::placement::syn(layout, PlaceId::Act(rows_r.tid).synth(R::FqAfp8));
+    for p in 0..pairs {
+        let (n_tok, slot) = (p / k, p % k);
+        // A's window: token `n_tok`'s slot-`slot` `[inn_pad]` block of the
+        // quantized pair rows, at the PER-PAIR PADDED stride — a whole
+        // 128-elem fp8 stick at every pair (the padded layout's own reason).
+        // A plain flat offset at the 1-row swept m — RowBlocked collapses to
+        // row-major at m=1.
+        let a_off = n_tok * (k * inn_pad) + slot * inn_pad;
+        // ⭐ THE MATMUL IS PER (PAIR, CHUNK) at the chunked door: pair `p`'s
+        // chunk `c` window into the CHUNK-MAJOR scratch — `(c·pairs + p)·
+        // chunk_elems`, the same order the gather's `dest_entry` wrote — and
+        // the matching `[chunk_n]`-wide window of the output row at `p·n +
+        // c·chunk_n` (the output stays PAIR-major: the dequant legs and the
+        // consumer read `[m, k·n]`). `chunks == 1` is one matmul per pair at
+        // the whole-slab `w_off = p·chunk_elems` (chunk_elems IS the slab at
+        // the uncut cut) and `o_off = p·n` — the uncut door's own offsets,
+        // byte-identical. ⛔ THE CONTRACTION'S K IS THE PADDED `inn_pad`: the
+        // gathered slab's K rows are the bank's own padded staging (the
+        // whole-stick gather law), and the A window's pad lanes are the
+        // chain's per-pair zero-fill — `0·w = 0`, inert by construction.
+        for c in 0..chunks {
+            let w_off = (c * pairs + p) * chunk_elems;
+            let o_off = p * n + c * chunk_n;
+            let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<
+                crate::superdsc_opspec::Fp16,
+            >(
+                crate::sdsc_abstract::MatM::of_token_rows(1),
+                crate::sdsc_abstract::MatN::of_out_features(chunk_n),
+                crate::sdsc_abstract::MatK::of_in_features(inn_pad),
+                crate::sdsc_abstract::MatY::unbatched(),
+                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
+                    super::bmm_site::TapeLoweringSite::witness(),
+                ),
+                &afp8_s,
+                &xw_s,
+                &xraw_s,
+                a_off,
+                w_off,
+                o_off,
+                Df::Fp8,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: pair {p} chunk {c}'s matmulfp8: {e}"),
+            })?;
+            for arg in &mut spec.args {
+                if !matches!(arg.view().role, crate::superdsc_opspec::Role::Output) {
+                    arg.set_df(Df::Fp8);
+                }
+            }
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(spec.iter.cores_used());
+            // `chunks == 1` keeps the uncut door's own name — the uncut case
+            // must not rename (every dump, golden and launch table keys on it).
+            let mmn = if chunks == 1 {
+                format!("emmm_p{p}_o{out_tid}")
+            } else {
+                format!("emmm_p{p}_c{c}_o{out_tid}")
+            };
+            ops.push(
+                crate::emit::emit_sdsc_tiled(&mmn, &spec, &folds, sym_id_base, layout).map_err(
+                    |e| Error {
+                        message: format!("{name}: pair {p} chunk {c}'s matmulfp8 emit: {}", e.0),
+                    },
+                )?,
+            );
+        }
+    }
+    // ── 5. THE DEQUANT, ONE FLAT ROW ─────────────────────────────────────
+    // ⛔ NOT `[pairs, n]` — and this replaces legs that had never executed
+    // and were wrong two ways:
+    //   · a `[pairs, n]` pointwise op at pairs>1 ∧ n>64 classifies
+    //     STICK-MAJOR (rows>1 ∧ cols>64 ∧ block-aligned) — a rank-2 read of
+    //     buffers the matmul and the gathers wrote FLAT at `p·n`: scrambled
+    //     for every geometry but `n == 64 ∧ pairs < 2`;
+    //   · leg 2's a_scale read demanded `pairs` rows out of the quantize's
+    //     one `[1, stk]` scale row (`In::col` per-row, then `In::mb` whose
+    //     materialized extent the synth guard prices at the op's rows) —
+    //     both refused or out-of-footprint.
+    // At the door's m=1 the pair-major `[pairs, n]` flattening IS one flat
+    // row `[1, pairs·n]` (the token-major law), so both legs run 1-ROW:
+    // rank-3 flat (rows=1 never classifies stick-major), reading the same
+    // flat bytes the matmul/gather wrote — the dense body's own decode
+    // shape (`fq_dqa_op` at m=1). The a_scale is the quantize's ONE scale
+    // row (every pair's token IS token 0 at m=1), read `In::col` over the
+    // `[1, stk]` footprint — one row, in-footprint, the dense body's own
+    // `ascale_h` idiom.
+    let ascale_s = crate::placement::syn(layout, PlaceId::Act(rows_r.tid).synth(R::FqAscale));
+    let ascale = rb(&ascale_s, rows, stk16);
+    ops.push(crate::emit::pw2(
+        &format!("ems_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        flat_cols,
+        In::full(&xraw),
+        In::full(&xsscale),
+        &xdqa,
+        sym_id_base,
+        layout,
+    ));
+    ops.push(crate::emit::pw2(
+        &format!("emo_o{out_tid}"),
+        "mul",
+        crate::sdsc_abstract::RowCount::of_token_rows(1),
+        flat_cols,
+        In::full(&xdqa),
+        In::col(&ascale),
+        &out_h,
+        sym_id_base,
+        layout,
+    ));
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteArgsort`] —
+/// each row's expert indices sorted by ascending score, AS THE RANK VECTOR:
+/// `rank[i, j] = |{h' : x[i,h'] < x[i,j]}| + |{h' : x[i,h'] == x[i,j] ∧ h' < j}|`,
+/// the stable ascending argsort (MLX `block_sort`'s ordering, ties by index).
+///
+/// ⭐ THE COMPARE/REDUCE FORM, ONE `j` AT A TIME, BATCHED OVER ALL TOKENS. The
+/// emu builds the full `[m, E, E]` compare product; the card's iteration space
+/// is 2-D `[mb, out]`, so the door fixes the RANKED expert `j` (one group of
+/// ops per `j`) and lets the token axis ride `mb` — every token's compare at
+/// once, `9W + 1` ops total (W = the padded expert width — the loop covers
+/// the pad lanes too, so the downstream full-stick compare never reads a
+/// stale rank), independent of `m`:
+///
+/// ```text
+/// xsan   = maximum(x, pad_mask)            pad lanes → +inf, sort last
+/// b_j    = sum(xsan · onehot_j, cols)      x[i, j] landed at LANE 0 (the
+///                                           one-hot mask-reduce — see below)
+/// lt_j   = lesserthan(xsan, col(b_j))      𝟙[x[i,h'] < x[i,j]] over [m, W]
+/// eq_j   = equal(xsan, col(b_j))           𝟙[x[i,h'] == x[i,j]]
+/// tie_j  = eq_j · tie_row_j                the stable tie-break, h' < j
+/// cnt_j  = lt_j + tie_j
+/// rank_j = sum(cnt_j, cols)                the [m, stick] reduce (lane 0)
+/// prod_j = rank_j · onehot_j               per-row scalar × the one-hot row
+/// out   += prod_j                          accumulate; lane j of the output
+/// ```
+///
+/// ⛔ THE PAD-MASK SANITIZE IS LOAD-BEARING, NOT COSMETIC. The producer's
+/// device-width pad (`DeviceWidth::for_output`) zero-fills lanes `E..W`, and a
+/// ZERO pad lane outranks every negative real score — the rank vector would
+/// count pad lanes among the smallest and the top-k would read pad "experts".
+/// `maximum(x, pad_mask)` forces them to +inf (sorts last) while leaving real
+/// lanes bit-identical (`maximum(v, −inf) = v` for every `v ≠ NaN`, NEGATIVES
+/// INCLUDED — the mask's real-lane value is −inf precisely so a negative logit
+/// survives the sanitize; a 0 there clamps every negative logit to exactly 0,
+/// measured on-card on the 26b). A NaN logit
+/// propagates through `maximum` as NaN (IEEE), winning neither compare — the
+/// emu's explicit NaN→+inf select is defense-in-depth the first card landing
+/// does not replicate; the tiny26 EMU-vs-card parity gate owns the question,
+/// and a real NaN divergence there upgrades the sanitize to the select chain.
+///
+/// ⛔ THE `x[:, j]` READ LANDS VIA A REDUCE, NEVER A MID-STICK `col_at`. The
+/// compare's B operand must be the per-row scalar `x[i, j]` broadcast over the
+/// row — and a RedStick broadcast operand (`In::col_at` at the lane offset
+/// `col_of(rows, W, j)`) does NOT select a mid-stick lane: the emitted
+/// descriptor's `startAddr` is byte-correct, but the broadcast read resolves
+/// the VALUE at a coarser granularity, so every `j` in a region compares
+/// against the SAME constant (measured on-card, two layers of the 26b decode:
+/// rank rows came out as `#zeros-before-j` and `#{x < x[0]} + tie`, the
+/// compare-vs-a-constant signatures). The card-true way to land a per-row
+/// scalar is a cols-reduce — lane 0 of the `[m, stick]` accum, read back with
+/// `In::col` (offset 0) — so leg 0 masks `xsan` with the one-hot row `j` and
+/// reduces, landing `x[i, j]` at lane 0; every card-proven broadcast scalar in
+/// this chain (`col(&rank)`, the reduce accums) is exactly that shape. The
+/// tie table's row `j` rides `In::mb_at` at `rc_of(W, W, j, 0)` — a whole-row
+/// shift of the `[W,W]` const, the same block-aligned base-offset law the
+/// per-head norm windows use.
+///
+/// ⛔ THE OUTPUT LANE WRITE IS THE COMBINE CHAIN'S OWN SHAPE: a cols-reduce
+/// lands its per-row scalar at LANE 0 of the `[m, stick]` accum, and pointwise
+/// ops are position-blind — so lane `j` of the `[m, W]` output is written as
+/// `rank_j · onehot_j`, the per-row scalar times the mb-broadcast one-hot row,
+/// accumulated with `add` (slot 0's product seeds the accumulator, exactly
+/// the combine door's chain). The output's lanes `E..W` hold the pad lanes'
+/// ranks, WRITTEN (the loop runs to W): +inf inputs sort last with the stable
+/// tie-break, so pad lane `e+t` carries rank `e+t` — a value the downstream
+/// top-k's `equal(rank, E−k+j)` never matches for `j < k`. ⛔ Writing them is
+/// load-bearing, not cosmetic: a cols-compare over the full stick reads
+/// whatever is there, and a STALE pad lane can spuriously match a target and
+/// mint a phantom expert.
+pub fn route_argsort(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    // x and the output — the parameters `KtirFunc::route_argsort` mints
+    // (shape-preserving: out is [m, E] like x).
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let rows = node_rows(name, &out)?;
+    // The logical expert count off the OUTPUT's view (the buffer's whole-tensor
+    // truth, the sort door's `v_cols` law), the padded width off the layout's
+    // own router registry — the same geometry the const placements were minted
+    // at, so the tie table's [W,W] and the one-hot rows' [1,W] agree with the
+    // buffers this door addresses.
+    let e = out.v_cols;
+    let w = e.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || e == 0 || w % crate::work::FP16_ELEMS_PER_STICK != 0 {
+        return err(format!(
+            "RouteArgsort {name}: the output t{}'s view states [{rows}, {e}] — the expert count \
+             must be positive and its padded width a whole 64-stick (got {w})",
+            out.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteArgsort", out.tid)?;
+    let out_tid = out.tid;
+    let x_s = tensors[0].name();
+    let out_s = out.name();
+    // The const tids — the reserved rows this door reads. Their placements are
+    // minted by the router-const block in `compute_bundle_layout` and their
+    // values bound at load by `wiring::synthetic_constants`. The one-hot row j
+    // is ROW j of the [W,W] identity table — the same whole-row mb shift the
+    // tie table's rows use, so one table serves every per-slot one-hot read
+    // (the argsort reads one row per ranked expert; the future top-k selector
+    // reads one row per slot — both are rows of the same E-sized identity).
+    let tie_tid = crate::reserved_tids::router_rank_tie_tid();
+    let mask_tid = crate::reserved_tids::router_pad_mask_tid();
+    let ident_tid = crate::reserved_tids::router_identity_tid();
+    let tie_s = crate::place::act_name(tie_tid);
+    let mask_s = crate::place::act_name(mask_tid);
+    let ident = rb(&crate::place::act_name(ident_tid), w, w);
+    // Synths: the sanitized scores [m, W], the per-j compare/sum [m, W], the
+    // per-j reduce accum [m, stick], and the output accumulator [m, W].
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    let xsan_s = syn(R::AXSan);
+    let lt_s = syn(R::ALt);
+    let cnt_s = syn(R::ACnt);
+    let rank_s = syn(R::ARank);
+    let acc_s = syn(R::AAcc);
+    if let Some(l) = layout {
+        l.synth_like(out_id.synth(R::AXSan), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ALt), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ACnt), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ARank), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::AAcc), out_tid, &[rows, w], Df::Fp16);
+    }
+    // Handles: x/out/xsan/lt/cnt/acc at the padded [m, W]; the per-row reduced
+    // rank at one stick; the consts at their own placements' shapes.
+    let x = rb(&x_s, rows, w);
+    let out = rb(&out_s, rows, w);
+    let xsan = rb(&xsan_s, rows, w);
+    let lt = rb(&lt_s, rows, w);
+    let cnt = rb(&cnt_s, rows, w);
+    let rank = rb(&rank_s, rows, w);
+    let acc = rb(&acc_s, rows, w);
+    let tie = rb(&tie_s, w, w);
+    let mask = rb(&mask_s, 1, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(1 + 9 * w as usize);
+    // 0. THE SANITIZE: pad lanes → +inf (sorts last). One op, whole [m, W].
+    ops.push(pw2(
+        &format!("rasan_o{out_tid}"),
+        "maximum",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::mb(&mask),
+        &xsan,
+        sym_id_base,
+        layout,
+    ));
+    // ⭐ THE LOOP RUNS TO THE PADDED WIDTH, NOT E. The downstream top-k's
+    // `equal(rank, target)` compare reads the FULL [m, W] stick (a partial
+    // stick is not an addressable thing), so a pad lane holding a stale
+    // garbage value can spuriously MATCH a target rank and mint a phantom
+    // expert. Writing every pad lane's rank makes them well-defined (a +inf
+    // pad lane outranks everything real, so its rank is e + its index among
+    // the pads, and the one-hot write still lands each at its own lane) —
+    // a target `e - k + j` for `j < k` is always < e, so no pad rank can
+    // ever match one. For a whole-stick E (26b: E=128=W) this is free; only
+    // a sub-stick E pays the extra groups.
+    for j in 0..w {
+        // The tie table's row j and the identity's row j as whole-row mb shifts
+        // of the [W,W] consts (the compares read the per-row scalar off the b_j
+        // reduce accum — the D1 law — not a mid-stick col_at).
+        let tie_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        let ident_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        let onehot = In::mb_at(&ident, ident_row);
+        // 0. b_j = x[i, j] LANDED AT LANE 0 — the one-hot mask-reduce. The
+        //    compares need the per-row scalar x[i, j] as a broadcast operand,
+        //    and the only card-true way to land one is a cols-reduce (lane 0
+        //    of the [m, stick] accum): a RedStick `col_at` at a MID-STICK lane
+        //    offset does not select the lane — the broadcast read resolves at
+        //    a coarser granularity, so every j in a region compares against
+        //    the SAME constant (measured on-card, two layers: rank rows came
+        //    out as `#zeros-before-j` and `#{x < x[0]} + tie` — the
+        //    compare-vs-a-constant signatures; the emitted descriptor's
+        //    startAddr was byte-correct, so the read mode itself drops the
+        //    sub-stick lane). The mask product reuses `lt`'s buffer (dead
+        //    until leg 1 rewrites it) and the reduce reuses the RANK accum —
+        //    b_j is dead once the compares have read it, before leg 5
+        //    overwrites that buffer with rank_j — so no new synths.
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("rabmk_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            &[In::full(&xsan).ew(), onehot.ew()],
+            &lt,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_reduce_off(
+            &format!("rab_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols,
+            &lt,
+            crate::addr::DevOff::ZERO,
+            &rank,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 1. lt_j = 𝟙[x[i,h'] < x[i,j]] — the row (full) against the per-row
+        //    scalar at LANE 0 of the b_j accum.
+        ops.push(pw2(
+            &format!("ralt_j{j}_o{out_tid}"),
+            "lesserthan",
+            t_rows,
+            f_cols,
+            In::full(&xsan),
+            In::col(&rank),
+            &lt,
+            sym_id_base,
+            layout,
+        ));
+        // 2-4. cnt_j = lt_j + equal(x[i,h'], x[i,j]) · tie_row_j — the compare
+        //      pair plus the stable tie-break, over a shared [m, W] scratch
+        //      (the equal's product reuses `lt`'s buffer: nothing reads `lt`
+        //      after this leg).
+        ops.push(pw2(
+            &format!("raeq_j{j}_o{out_tid}"),
+            "equal",
+            t_rows,
+            f_cols,
+            In::full(&xsan),
+            In::col(&rank),
+            &cnt,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("ratie_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            &[In::full(&cnt).ew(), In::mb_at(&tie, tie_row).ew()],
+            &cnt,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("racnt_j{j}_o{out_tid}"),
+            "add",
+            t_rows,
+            f_cols,
+            &[In::full(&lt).ew(), In::full(&cnt).ew()],
+            &cnt,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 5. rank_j = Σ_h' cnt_j — the native cols reduce, [m, stick].
+        ops.push(assemble_reduce_off(
+            &format!("rarnk_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols,
+            &cnt,
+            crate::addr::DevOff::ZERO,
+            &rank,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 6-7. lane j of the output = rank_j · onehot_j, accumulated — the
+        //      combine chain's own shape (slot 0 seeds the accumulator, the
+        //      last add writes `out` directly).
+        // The product leg: the per-row rank scalar (lane 0 of the reduce
+        // accum, read in the col mode) times the mb-broadcast one-hot row —
+        // row j of the [W,W] identity const.
+        ops.push(pw2(
+            &format!("raprd_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::col(&rank),
+            onehot,
+            &lt,
+            sym_id_base,
+            layout,
+        ));
+        // The accumulate leg: j==0 seeds the accumulator with the product
+        // itself; every later j adds into it; the LAST add writes `out`.
+        if j == 0 {
+            ops.push(pw1(
+                &format!("raseed_o{out_tid}"),
+                "identity",
+                t_rows,
+                f_cols,
+                In::full(&lt),
+                &acc,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("raacc_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                f_cols,
+                &[In::full(&acc).ew(), In::full(&lt).ew()],
+                if j + 1 == e { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteTopK`] — the
+/// FUSED ROUTER SELECTION: the vendor top-k pair
+/// ([`super::topk_opspec`], `topk.ddl`) over the raw router logits, landing
+/// the top-64 `(value, expert-id)` pairs of every token into the chain's two
+/// `[m, k]` tensors — the ids the expert doors gather by, and the values the
+/// score side renormalizes.
+///
+/// ⭐ THE SPLICE CONTRACT: the argsort and the scores-gather are FOLDED AWAY
+/// (`crates/triton/splice`), so this one node carries the whole selection and
+/// its parameters arrive in MINT ORDER `[lg, vals, ids]` — the raw logits, the
+/// values landing (the folded gather's output), and the ids landing (this
+/// node's own output). Positional, not `split_out`: the generated program
+/// stores TWO of its three parameters, so "the one a `ktdp.store` writes"
+/// does not name the output — the mint order is the contract (the
+/// `expert_matmul` door's own precedent).
+///
+/// THE CHAIN, and why every leg is forced:
+///
+/// ```text
+/// stage   lg [m, lgw] → XP [m_pad, W]     iff m_pad≠m ∨ lgw≠W ∨ W≠E
+/// Kᵀ      XP [m_pad, W] → XT [W, m_pad]   the restickify door
+/// pair    XT → SIX/SVL [64, m_pad]        OpFunc::TopKIndex / TopKValue
+/// flat    SIX → XFl [64, m_pad]           at every m (the shared-%stick_dim law)
+/// widen   XFl → XF32 [64, m_pad]          dl16tofp32, FLAT
+/// narrow  XF32 → XIdx [64, m_pad]         fp32toint32, FLAT — the gather index
+/// land    SIX/SVL → ids/vals [m_pad, 64]  the rerouted transposes, token-major
+/// ```
+///
+/// • THE STAGE restates the logits at the Kᵀ door's input contract
+///   `[m_pad, W]` (the row pad the pair's stick law demands, and the writer's
+///   width — the RouterLogits matmul pads E to W and may bump it further, so
+///   `lgw ≥ W` always and the stage reads the first `W/64` column groups,
+///   which both layouts place at identical bytes). At `W > E` the copy is an
+///   `add` against the `[1, W]` pad row (0 below E, −inf above): the producer
+///   matmul's zero pad lanes must LOSE every strict compare, or a pad lane
+///   would tie the pair's `(−inf, −1)` init registers and enter the top-k as
+///   a phantom expert. `0 + (−inf) = −inf` — the sanitize is exact.
+/// • THE Kᵀ RESTICKIFY turns the token-major logits into the pair's
+///   `[candidates, tokens]` input, sticked on the token axis — the same door
+///   and the same seam the prefill-m>1 mint chain already runs, so the pair's
+///   input is the card-proven form at any token count.
+/// • THE PAIR (wall 11's cure): the ripple's ids are SCAN POSITIONS `0..W−1`
+///   by construction — never a sum of duplicate ranks over the bank, so the
+///   gather can never compose an address past the bank's end. Slots run to
+///   64 (not k) so the landing transpose's stick law holds; slots `k..64`
+///   hold the `(−inf, −1)` init registers, inert to every consumer.
+/// • THE FLAT LEGS mint the gather index exactly as the old mint chain did —
+///   flat, result s's head-slot u32 run at elements `(s·rep)·m_pad` — but over
+///   the PAIR's 64 slots instead of the whole `[W, m_pad]` table, and at
+///   EVERY `m`: the decode arm's own staged converts are DEAD (their widening
+///   halved the element stream and their `[1, W]` window read replica runs —
+///   the 26b's top-2×4 staging), so this trio is the only index mint and the
+///   m=1 gathers read entries `0..k` of the head-slot runs.
+/// • THE LANDING TRANSPOSES re-orient the pair's slot-major outputs
+///   token-major `[m_pad, 64]` — the form every consumer already reads: the
+///   softmax's `rb[x, m, k_pad]`, the scalarmul, the combine, and the mint's
+///   own flat legs all address slots `0..64` of each token's row, which is
+///   the first stick group of the old `[m, W]` one-hot landing BYTE FOR
+///   BYTE. The pad rows `m..m_pad` hold garbage tokens whose ids are still
+///   scan positions (in range, never gathered: the per-slot runs stop at
+///   `m` entries and the decode reads row 0 only).
+///
+/// ⛔ THE SLOTS LAW: `k ≤ 64`. The landing's row is one 64-slot stick, so a
+/// k past 64 would read token `t+1`'s slots as token `t`'s — a silent
+/// cross-token corruption, refused here by name (the graph layer's `k ≤ E`
+/// twin).
+///
+/// ⛔ THE PAD ROW IS PLACED IFF `W > E` (the router-const block's own gate —
+/// at every whole-stick router, `W == E`, the row is never placed and the
+/// stage's copy is a plain `identity`), so a `W > E` door whose row is
+/// missing is a wiring failure this door refuses rather than mis-sanitizes.
+pub fn route_topk(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // THE SPLICE'S MINT ORDER — positional, the whole contract (see the doc:
+    // the program stores two of its three parameters, so `split_out`'s
+    // store-finding law cannot name the output here).
+    let [lg, vals, ids] = r else {
+        return err(format!(
+            "RouteTopK {name}: {} parameter(s) against the splice's 3-slot mint order \
+             [lg, vals, ids] — the fused selection binds the raw logits, the values landing, \
+             and the ids landing, in that order",
+            r.len()
+        ));
+    };
+    let rows = node_rows(name, ids)?;
+    let k = ids.v_cols;
+    let e = lg.v_cols;
+    let w = e.next_multiple_of(FP16_ELEMS_PER_STICK);
+    if w == 0 || e == 0 || k == 0 || k > e {
+        return err(format!(
+            "RouteTopK {name}: the logits t{} [{}, {}] and the ids t{} [{rows}, {k}] — the \
+             expert count and top-k must be positive with k ≤ E, and E's padded width a whole \
+             64-stick (got {w})",
+            lg.tid, lg.v_rows, lg.v_cols, ids.tid
+        ));
+    }
+    if k > FP16_ELEMS_PER_STICK {
+        return err(format!(
+            "RouteTopK {name}: k={k} exceeds the landing's {} slots — the pair emits one \
+             64-slot stick per token and every consumer (the softmax, the scalarmul, the mint's \
+             decode gathers) reads slots of that one row, so a wider top-k would read the NEXT \
+             token's slots as this token's",
+            FP16_ELEMS_PER_STICK
+        ));
+    }
+    // ⛔ THE PAIR REPLICATES: at slots=64 the k dim rides the 8-core ring as 64/8 = 8 slots
+    // per core, and the card-measured behavior of THAT form (the fixtures only demonstrate
+    // 1 slot per core — slots=8, the vendor's own geometry) is each result written
+    // REPLICATED 64/k lanes wide per token stick, result r at slots [r·rep, (r+1)·rep).
+    // Every consumer of the landings addresses the replica-run HEADS — the sanitize mask's
+    // 0-lanes at r·rep (wiring), the expert-scale's `col_at` at j·rep, and this door's own
+    // convert trio's per-slot entry bases at (s·rep)·m_pad — all integral only when k
+    // divides the stick. A k that does not divide 64 has no addressable head; refuse it
+    // here, at the mint, where the layout's replication law is decided.
+    if !FP16_ELEMS_PER_STICK.is_multiple_of(k) {
+        return err(format!(
+            "RouteTopK {name}: k={k} does not divide the landing's {} slots — the pair \
+             replicates each result 64/k lanes wide per token stick (the ring's slots-per-core \
+             form), so the consumers address the replica-run heads at lane j·{}/k, which is \
+             not a whole lane for this k",
+            FP16_ELEMS_PER_STICK, FP16_ELEMS_PER_STICK
+        ));
+    }
+    if vals.v_rows != rows || ids.v_rows != rows || lg.v_rows != rows || vals.v_cols != k {
+        return err(format!(
+            "RouteTopK {name}: the logits t{} [{}, {}], the values t{} [{}, {}], and the ids \
+             t{} [{rows}, {k}] — the chain is row-preserving and the two landings carry the \
+             same slot count",
+            lg.tid, lg.v_rows, lg.v_cols, vals.tid, vals.v_rows, vals.v_cols, ids.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteTopK", ids.tid)?;
+    let ids_tid = ids.tid;
+    let lg_s = lg.name();
+    let vals_s = vals.name();
+    let ids_s = ids.name();
+    let m_pad = rows.next_multiple_of(FP16_ELEMS_PER_STICK);
+    // The logits buffer's own held width — the writer's (the RouterLogits
+    // matmul pads E to W and bump-splits at macs ≥ 2^20, so lgw ≥ W always);
+    // the pointwise cap re-derives it from the placement so the stage reads
+    // the writer's true groups and never a width the buffer does not hold.
+    let lgw = pointwise_width_the_output_holds(
+        layout,
+        &[lg_s.as_str()],
+        rows,
+        DeviceWidth::for_pointwise(e).get(),
+    );
+    // The synths, all keyed off the IDS tensor's tid (the mint's own law: the
+    // three projections' gathers land on the same scratch). The convert trio
+    // is minted inside its own block below at EVERY m — one owner, so this
+    // landing never names the convert scratch itself.
+    let idx_id = PlaceId::Act(ids_tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, idx_id.synth(role));
+    let xt_s = syn(R::XT);
+    let six_s = syn(R::TopKIdx);
+    let svl_s = syn(R::TopKVal);
+    let staged = m_pad != rows || lgw != w || w != e;
+    if let Some(l) = layout {
+        l.synth_df(idx_id.synth(R::XT), &[w, m_pad], Df::Fp16);
+        l.synth_df(
+            idx_id.synth(R::TopKIdx),
+            &[FP16_ELEMS_PER_STICK, m_pad],
+            Df::Fp16,
+        );
+        l.synth_df(
+            idx_id.synth(R::TopKVal),
+            &[FP16_ELEMS_PER_STICK, m_pad],
+            Df::Fp16,
+        );
+    }
+    let mut ops: Vec<EmittedOp> = Vec::with_capacity(8 + (w / FP16_ELEMS_PER_STICK) as usize);
+    // ── THE STAGE (iff the logits buffer is not already the Kᵀ contract) ──
+    // Per 64-column group, ONE copy of the group's `rows` consecutive sticks
+    // into the staging table's group corner — the mint's own P0 form. At
+    // `W > E` the copy is an `add` against the pad row so the producer's zero
+    // pad lanes lose every strict compare (the sanitize law above).
+    let kt_src_s = if staged {
+        let xp_s = syn(R::XP);
+        if let Some(l) = layout {
+            l.synth_df(idx_id.synth(R::XP), &[m_pad, w], Df::Fp16);
+        }
+        let xp_h = rb(&xp_s, m_pad, w);
+        let lg_h = rb(&lg_s, rows, lgw);
+        let pad_row = rb(
+            &crate::place::act_name(crate::reserved_tids::router_topk_pad_tid()),
+            1,
+            w,
+        );
+        for g in 0..(w / FP16_ELEMS_PER_STICK) {
+            let corner = g * FP16_ELEMS_PER_STICK;
+            let (opf, pad_in) = if w == e {
+                ("identity", None)
+            } else {
+                (
+                    "add",
+                    Some(In::mb_at(
+                        &pad_row,
+                        crate::addr::col_of(1, w, corner, Df::Fp16),
+                    )),
+                )
+            };
+            let mut inputs =
+                vec![In::sliced(&lg_h, crate::addr::col_of(rows, lgw, corner, Df::Fp16)).ew()];
+            if let Some(p) = pad_in {
+                inputs.push(p.ew());
+            }
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rtkstg_g{g}_o{ids_tid}"),
+                opf,
+                crate::sdsc_abstract::RowCount::of_token_rows(rows),
+                crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+                &inputs,
+                &xp_h,
+                crate::addr::col_of(m_pad, w, corner, Df::Fp16),
+                sym_id_base,
+                layout,
+            ));
+        }
+        xp_s
+    } else {
+        lg_s.clone()
+    };
+    // ── THE Kᵀ RESTICKIFY: token-major logits → the pair's candidate-major input ──
+    ops.push(
+        super::try_assemble_restickify_transpose_2d(
+            &format!("rtkkt_o{ids_tid}"),
+            m_pad,
+            w,
+            &kt_src_s,
+            &xt_s,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the top-k Kᵀ restickify: {e}"),
+        })?,
+    );
+    // ── THE PAIR: the ids and the values, slots to 64, tokens to m_pad ──
+    let geom = super::TopKGeom {
+        candidates: w,
+        slots: FP16_ELEMS_PER_STICK,
+        tokens: m_pad,
+    };
+    ops.push(
+        super::try_assemble_topk(
+            &format!("rtkix_o{ids_tid}"),
+            crate::superdsc_opspec::OpFunc::TopKIndex,
+            geom,
+            &xt_s,
+            &six_s,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the top-k index pair: {e}"),
+        })?,
+    );
+    ops.push(
+        super::try_assemble_topk(
+            &format!("rtkvl_o{ids_tid}"),
+            crate::superdsc_opspec::OpFunc::TopKValue,
+            geom,
+            &xt_s,
+            &svl_s,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the top-k value pair: {e}"),
+        })?,
+    );
+    // ── THE INDEX CONVERTS — the flat form the gathers read, at EVERY m ──
+    // The same chain the mint ran (flat restickify → dl16tofp32 →
+    // fp32toint32, the composition `emit::convert_index_rows_law` pins), over
+    // the pair's 64 slots. ⭐ THE SLOT AXIS IS REPLICATED: the pair writes
+    // result r at slots [r·rep, (r+1)·rep) (rep = 64/k, the ring's
+    // slots-per-core form), so SLOT s's u32 run — elements `s·m_pad` — holds
+    // result s/rep's id at every token, and every gather that wants result
+    // s reads the HEAD SLOT's run at elements `(s·rep)·m_pad` (the m>1
+    // matmul/scale gathers) or its first entry (the m=1 decode walks). At
+    // m=1 this trio REPLACES the decode arm's old staged converts, whose
+    // dl16tofp32 halved the element stream (the shared-%stick_dim law) and
+    // whose [1, W] window over the token-major landing read replica runs —
+    // together they staged the top-2 experts ×4 at the 26b (card-measured).
+    {
+        let xfl_s = syn(R::XFl);
+        let xf32_s = syn(R::XF32);
+        let xidx_s = syn(R::XIdx);
+        if let Some(l) = layout {
+            l.synth_df(
+                idx_id.synth(R::XFl),
+                &[FP16_ELEMS_PER_STICK, m_pad],
+                Df::Fp16,
+            );
+            l.synth_df(
+                idx_id.synth(R::XF32),
+                &[FP16_ELEMS_PER_STICK, m_pad],
+                Df::Fp32,
+            );
+            l.synth_df(
+                idx_id.synth(R::XIdx),
+                &[FP16_ELEMS_PER_STICK, m_pad],
+                Df::SenUint32,
+            );
+        }
+        ops.push(
+            super::try_assemble_restickify_flat_2d(
+                &format!("rtkfl_o{ids_tid}"),
+                FP16_ELEMS_PER_STICK,
+                m_pad,
+                &six_s,
+                &xfl_s,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: the top-k flat restickify: {e}"),
+            })?,
+        );
+        ops.push(crate::emit::assemble_convert_index_rows_widen(
+            &format!("rtkxf_o{ids_tid}"),
+            FP16_ELEMS_PER_STICK,
+            m_pad,
+            &rb(&xfl_s, FP16_ELEMS_PER_STICK, m_pad),
+            &rb(&xf32_s, FP16_ELEMS_PER_STICK, m_pad),
+            sym_id_base,
+            layout,
+        ));
+        ops.push(crate::emit::assemble_convert_index_rows(
+            &format!("rtkxi_o{ids_tid}"),
+            FP16_ELEMS_PER_STICK,
+            m_pad,
+            &rb(&xf32_s, FP16_ELEMS_PER_STICK, m_pad),
+            &rb(&xidx_s, FP16_ELEMS_PER_STICK, m_pad),
+            sym_id_base,
+            layout,
+        ));
+    }
+    // ── THE LANDING TRANSPOSES: slot-major → token-major [m_pad, 64] ──────
+    // The ids and the values each ride the restickify door at (64, m_pad):
+    // the pair's token-sticked output read whole, written sticked on the
+    // 64-slot axis — one stick per token, flat, exactly the bytes every
+    // consumer addresses (the softmax's `[m, k_pad]`, the mint's decode
+    // converts, the expertscale's per-slot lanes).
+    ops.push(
+        super::try_assemble_restickify_transpose_2d(
+            &format!("rtkti_o{ids_tid}"),
+            FP16_ELEMS_PER_STICK,
+            m_pad,
+            &six_s,
+            &ids_s,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the ids landing transpose: {e}"),
+        })?,
+    );
+    ops.push(
+        super::try_assemble_restickify_transpose_2d(
+            &format!("rtktv_o{ids_tid}"),
+            FP16_ELEMS_PER_STICK,
+            m_pad,
+            &svl_s,
+            &vals_s,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: the values landing transpose: {e}"),
+        })?,
+    );
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteGatherScores`] —
+/// the scores at the chosen indices, `out[i, j] = scores[i, idx[i, j]]`
+/// (`take_along_axis` at axis −1, metal's `gather_scores`).
+///
+/// ⭐ A ONE-HOT SELECT, NOT AN INDIRECT ACCESS TILE. The emu's gather is a
+/// `construct_indirect_access_tile` (dim 0 direct, dim 1 read from the index
+/// view); the door's pointwise statement of the same function is
+/// `out[i, j] = Σ_h scores[i, h] · 𝟙[h == idx[i, j]]` — exactly one lane of
+/// the scores row survives the mask, so the cols-reduce IS the gather. No
+/// data-dependent memory traffic, the same compare/reduce machinery as the
+/// argsort and top-k, and NO new consts (the iota row names the column
+/// indices, the identity table writes the lane).
+///
+/// Per top-k SLOT `j`, every token riding `mb` — `6k−2` ops, independent of
+/// `m` (the top-k door's own chain with the compare's operands swapped):
+///
+/// ```text
+/// match_j = equal(idx[:,j], iota_row)      the per-row scalar vs the column id
+/// sel_j   = match_j · scores               one lane survives
+/// val_j   = sum(sel_j, cols)               the [m, stick] reduce (lane 0)
+/// prod_j  = val_j · ident_row_j            the per-row scalar, at LANE j
+/// out     = prod_0 + … + prod_{k−1}        the combine chain (lane-wise)
+/// ```
+///
+/// ⛔ THE COMPARE'S ORIENTATION IS THE INVERSE OF THE TOP-K'S. There the full
+/// rank row was compared against a per-SLOT target; here the per-ROW index
+/// scalar (read `In::col_at` at lane j, the combine door's own law) is
+/// compared against the mb-broadcast IOTA row — so the match mask is a
+/// per-row one-hot over COLUMNS, the orientation a column gather needs. Both
+/// operands broadcast (RedStick × RedNonStick), the proven fold pair.
+///
+/// ⛔ THE OUTPUT WRITE IS THE ARGSORT'S OWN ACCUMULATION SHAPE (see
+/// [`route_topk`]'s doc for why direct writes clobber earlier slots).
+///
+/// ⛔ PAD LANES ARE INERT BY ARITHMETIC: the iota row names columns `0..W`,
+/// and an index read from the top-k output is `< e` for every real slot —
+/// so lanes `e..W` never match and the scores' pad lanes (whatever the
+/// producer left there) are masked out before the reduce.
+pub fn route_gather_scores(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    // The scores [m, E], the indices [m, k], and the [m, k] output — the
+    // parameters `KtirFunc::route_gather_scores` mints.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    let rows = node_rows(name, &out)?;
+    let k = out.v_cols;
+    let e = tensors[0].v_cols;
+    let w = e.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || e == 0 || k == 0 {
+        return err(format!(
+            "RouteGatherScores {name}: the scores t{} [{}, {}], the indices t{} [{}, {}], and \
+             the output t{} [{rows}, {k}] — the widths must be positive and E's padded width a \
+             whole 64-stick (got {w})",
+            tensors[0].tid,
+            tensors[0].v_rows,
+            tensors[0].v_cols,
+            tensors[1].tid,
+            tensors[1].v_rows,
+            tensors[1].v_cols,
+            out.tid
+        ));
+    }
+    check_pointwise_cols(w, "RouteGatherScores", out.tid)?;
+    let out_tid = out.tid;
+    let scores_s = tensors[0].name();
+    let idx_s = tensors[1].name();
+    let out_s = out.name();
+    // The consts the select reads — the iota row and the identity table,
+    // both already placed by the router-const block.
+    let iota = rb(
+        &crate::place::act_name(crate::reserved_tids::router_topk_iota_tid()),
+        1,
+        w,
+    );
+    let ident = rb(
+        &crate::place::act_name(crate::reserved_tids::router_identity_tid()),
+        w,
+        w,
+    );
+    // Synths: the match mask, the selector product, the reduce accum, and the
+    // one-hot product accumulator — the top-k door's own set (this door's
+    // output is a different tid, so the names never collide).
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    let m_s = syn(R::AMatch);
+    let sel_s = syn(R::ASel);
+    let val_s = syn(R::AIdx);
+    let acc_s = syn(R::AAcc);
+    if let Some(l) = layout {
+        l.synth_like(out_id.synth(R::AMatch), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::ASel), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::AIdx), out_tid, &[rows, w], Df::Fp16);
+        l.synth_like(out_id.synth(R::AAcc), out_tid, &[rows, w], Df::Fp16);
+    }
+    let scores = rb(&scores_s, rows, w);
+    let idx = rb(&idx_s, rows, w);
+    let out = rb(&out_s, rows, w);
+    let m_ = rb(&m_s, rows, w);
+    let sel = rb(&sel_s, rows, w);
+    let val = rb(&val_s, rows, w);
+    let acc = rb(&acc_s, rows, w);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let mut ops = Vec::with_capacity(6 * k as usize);
+    for j in 0..k {
+        // The per-row index scalar: lane j of the [m, W] indices buffer, the
+        // combine door's own col_at law. The identity's row j for the write.
+        let lane = crate::addr::col_of(rows, w, j, Df::Fp16);
+        let ident_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        // 1. match_j = 𝟙[idx[i,j] == h] — the per-row scalar (out-broadcast
+        //    over the stick) against the column ids (mb-broadcast).
+        ops.push(pw2(
+            &format!("rgmtc_j{j}_o{out_tid}"),
+            "equal",
+            t_rows,
+            f_cols,
+            In::col_at(&idx, lane),
+            In::mb(&iota),
+            &m_,
+            sym_id_base,
+            layout,
+        ));
+        // 2. sel_j = match_j · scores — one lane of the scores row survives.
+        ops.push(pw2(
+            &format!("rgsel_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&m_),
+            In::full(&scores),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        // 3. val_j = Σ_h sel_j — the native cols reduce, [m, stick].
+        ops.push(assemble_reduce_off(
+            &format!("rgval_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols,
+            &sel,
+            crate::addr::DevOff::ZERO,
+            &val,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 4-6. lane j of the output = val_j · ident_row_j, accumulated — the
+        //      combine chain's own shape (slot 0 seeds the accumulator, the
+        //      last add writes `out` directly).
+        ops.push(pw2(
+            &format!("rgprd_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::col(&val),
+            In::mb_at(&ident, ident_row),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        if j == 0 {
+            ops.push(pw1(
+                &format!("rgseed_o{out_tid}"),
+                "identity",
+                t_rows,
+                f_cols,
+                In::full(&sel),
+                &acc,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rgacc_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                f_cols,
+                &[In::full(&acc).ew(), In::full(&sel).ew()],
+                if j + 1 == k { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteExpertScale`] —
+/// each score times its expert's learned scale,
+/// `out[i, j] = scores[i, j] · per_expert_scale[idx[i, j]]`, gemma's
+/// `moe_per_expert_scale`.
+///
+/// ⭐ THE SAME ONE-HOT SELECT AS [`route_gather_scores`], with the
+/// LOADED `[E]` SCALE ROW as the gather parent — the scale is a real weight
+/// parameter the worker stages, not a bake-time const, so the select masks
+/// the scale row itself and the score rides the matched lane:
+///
+/// ```text
+/// match_j = equal(idx[:,j], iota_row)      the per-row scalar vs the column id
+/// sel_j   = match_j · scale_row            the scale value lands at the matched lane
+/// prod_j  = sel_j · scores[:,j]            the score rides the same lane
+/// val_j   = sum(prod_j, cols)              the [m, stick] reduce (lane 0)
+/// out_j   = val_j · ident_row_j            the per-row scalar, at LANE j
+/// out     = out_0 + … + out_{k−1}          the combine chain (lane-wise)
+/// ```
+///
+/// Per slot `j`, every token riding `mb` — `7k−2` ops, independent of `m`.
+/// The f32 intermediate (the emu's `extf` pair, so the f16 result has ONE
+/// rounding) is not replicated on this first landing: every operand here is
+/// f16 and the multiply is the device's own `mul` — the tiny26 EMU-vs-card
+/// parity gate owns the question, and a real rounding divergence there
+/// upgrades the chain with the fp32 convert ops.
+///
+/// ⛔ THE OUTPUT WRITE IS THE ARGSORT'S OWN ACCUMULATION SHAPE (see
+/// [`route_topk`]'s doc for why direct writes clobber earlier slots).
+///
+/// ⛔ PAD LANES ARE INERT BY ARITHMETIC: the iota row names columns `0..W`,
+/// a top-k index is `< e` for every real slot, and the scale row's lanes
+/// `e..W` are the producer's zero-pad — never matched, never summed.
+///
+/// ⭐ THE IDS AND THE SCORES READ AT THE TOP-K LANDING'S OWN 64-SLOT ROW
+/// (token `t`'s slot `j` at `t·64 + j`), not at the old `[m, W]` one-hot box:
+/// the fused pair lands both tensors token-major `[m_pad, 64]`, and the
+/// per-slot `col_at` lanes (`j < k ≤ 64`) address the same bytes either way —
+/// but the VIEW width is what the footprint guard and the arrangement
+/// authority measure, and the score side's placements are carved at
+/// `[m, 64]` now, so a `[m, W]` view would be refused as an over-run at every
+/// `W > 64`. The compare/select/reduce legs (1-4) stay at the scale row's
+/// own `W` — that is the width the one-hot select sweeps — and only the
+/// OUTPUT legs (5-7) narrow to the landing's 64 (the products' surviving
+/// lanes are `0..k`, and the accumulator is `[m, 64]`).
+///
+/// ⛔ k ≤ 64 IS REFUSED HERE TOO, the [`route_topk`] slots law's consumer
+/// twin: a k past the landing's stick would read the next token's slots.
+pub fn route_expert_scale(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    // The [E] scale row, the indices [m, k], the scores [m, k], and the
+    // [m, k] output — the parameters `KtirFunc::route_expert_scale` mints,
+    // IN MINT ORDER (arg_for(scale) and arg_for(idx) open their views before
+    // load_region(scores) — first use, not call order; the same law the
+    // ExpertMatmul door learned the hard way). ⛔ THE OLD DOOR READ THEM AS
+    // `[scores, idx, scale]` — tensors[0] IS THE SCALE ROW, so the "scores"
+    // operand of every leg named the [1, E] scale buffer: the col_at lane
+    // read materialized `m` rows out of a ONE-ROW tensor, which the placement
+    // guard refused at m=8 (2B + 1024B > 1024B) after passing at m≤4 only
+    // because the mis-read FIT the bumped [1, 512·2B] footprint — and every
+    // descriptor the m=1 bake shipped computed the WRONG function (the score
+    // rode the scale row's lanes).
+    let (tensors, out) = split_out(name, r, layout, 3)?;
+    let rows = node_rows(name, &out)?;
+    let k = out.v_cols;
+    let e = tensors[0].v_cols;
+    let w = e.next_multiple_of(crate::work::FP16_ELEMS_PER_STICK);
+    if w == 0 || e == 0 || k == 0 {
+        return err(format!(
+            "RouteExpertScale {name}: the scale row t{} [{}, {}], the indices t{} [{}, {}], the \
+             scores t{} [{}, {}], and the output t{} [{rows}, {k}] — the widths must be \
+             positive and E's padded width a whole 64-stick (got {w})",
+            tensors[0].tid,
+            tensors[0].v_rows,
+            tensors[0].v_cols,
+            tensors[1].tid,
+            tensors[1].v_rows,
+            tensors[1].v_cols,
+            tensors[2].tid,
+            tensors[2].v_rows,
+            tensors[2].v_cols,
+            out.tid
+        ));
+    }
+    if k > crate::work::FP16_ELEMS_PER_STICK {
+        return err(format!(
+            "RouteExpertScale {name}: k={k} exceeds the top-k landing's {} slots — the ids and \
+             scores arrive token-major, one 64-slot stick per token, so a wider top-k would read \
+             the NEXT token's slots as this token's",
+            crate::work::FP16_ELEMS_PER_STICK
+        ));
+    }
+    // ⛔ P1 — THE LANDING'S REPLICA RUNS: the pair writes result r at slots
+    // [r·rep, (r+1)·rep), rep = 64/k (see [`route_topk`]'s k-divides-64 law).
+    // This door's two `col_at` reads take the HEAD lane j·rep; the division is
+    // stated here with the same refusal the mint carries.
+    if !crate::work::FP16_ELEMS_PER_STICK.is_multiple_of(k) {
+        return err(format!(
+            "RouteExpertScale {name}: k={k} does not divide the landing's {} slots — the pair \
+             replicates each result 64/k lanes wide, so the ids and scores live at the run heads \
+             lane j·{}/k, which is not a whole lane for this k",
+            crate::work::FP16_ELEMS_PER_STICK,
+            crate::work::FP16_ELEMS_PER_STICK
+        ));
+    }
+    let rep = crate::work::FP16_ELEMS_PER_STICK / k;
+    check_pointwise_cols(w, "RouteExpertScale", out.tid)?;
+    let out_tid = out.tid;
+    let scale_s = tensors[0].name();
+    let idx_s = tensors[1].name();
+    let scores_s = tensors[2].name();
+    let out_s = out.name();
+    // The consts the select reads — the iota row and the identity table.
+    let iota = rb(
+        &crate::place::act_name(crate::reserved_tids::router_topk_iota_tid()),
+        1,
+        w,
+    );
+    let ident = rb(
+        &crate::place::act_name(crate::reserved_tids::router_identity_tid()),
+        w,
+        w,
+    );
+    // Synths: the match mask, the scale select, the score product, the reduce
+    // accum, and the one-hot product accumulator — the gather door's own set
+    // (this door's output is a different tid, so the names never collide).
+    // ⛔ THE THREE W-WIDE ONES ARE DECLARED AT THEIR TRUE FOOTPRINTS, not
+    // `synth_like` off the output: the compare/select/reduce legs sweep the
+    // scale row's own `[m, W]`, while the output's placement is carved at the
+    // landing's `[m, 64]` — shadowing it would under-reserve the W-wide legs
+    // by exactly the factor the footprint guard exists to catch. The
+    // ACCUMULATOR alone runs at the landing's 64 (the output legs' own
+    // width), where the shadow is exact.
+    let out_id = PlaceId::Act(out_tid);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    let m_s = syn(R::AMatch);
+    let sel_s = syn(R::ASel);
+    let val_s = syn(R::AIdx);
+    let acc_s = syn(R::AAcc);
+    if let Some(l) = layout {
+        l.synth_df(out_id.synth(R::AMatch), &[rows, w], Df::Fp16);
+        l.synth_df(out_id.synth(R::ASel), &[rows, w], Df::Fp16);
+        l.synth_df(out_id.synth(R::AIdx), &[rows, w], Df::Fp16);
+        l.synth_like(
+            out_id.synth(R::AAcc),
+            out_tid,
+            &[rows, crate::work::FP16_ELEMS_PER_STICK],
+            Df::Fp16,
+        );
+    }
+    // The ids and the scores at the top-k landing's own [m, 64] (the doc's
+    // law); the scale row, the compare legs, and the door's own synths at
+    // the scale row's [m, W].
+    let scores = rb(&scores_s, rows, crate::work::FP16_ELEMS_PER_STICK);
+    let idx = rb(&idx_s, rows, crate::work::FP16_ELEMS_PER_STICK);
+    let scale = rb(&scale_s, 1, w);
+    let out = rb(&out_s, rows, crate::work::FP16_ELEMS_PER_STICK);
+    let m_ = rb(&m_s, rows, w);
+    let sel = rb(&sel_s, rows, w);
+    let val = rb(&val_s, rows, w);
+    let acc = rb(&acc_s, rows, crate::work::FP16_ELEMS_PER_STICK);
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(w);
+    let c_cols =
+        crate::sdsc_abstract::BlockCols::of_feature_cols(crate::work::FP16_ELEMS_PER_STICK);
+    let mut ops = Vec::with_capacity(7 * k as usize);
+    for j in 0..k {
+        // The per-row index and score scalars at lane j·rep of the landing's 64-slot
+        // rows — the HEAD of result j's replica run (the pair's replication law; the
+        // old lane j read result j/rep's replica, which at k=8 made every leg read
+        // result 0) — and the identity's row j (the write stays COMPACT at lane j:
+        // this door's output is what the combine reads).
+        let lane = crate::addr::col_of(rows, crate::work::FP16_ELEMS_PER_STICK, j * rep, Df::Fp16);
+        let ident_row = crate::addr::rc_of(w, w, j, 0, Df::Fp16);
+        // 1. match_j = 𝟙[idx[i,j] == h] — the per-row scalar against the
+        //    mb-broadcast column ids.
+        ops.push(pw2(
+            &format!("remtc_j{j}_o{out_tid}"),
+            "equal",
+            t_rows,
+            f_cols,
+            In::col_at(&idx, lane),
+            In::mb(&iota),
+            &m_,
+            sym_id_base,
+            layout,
+        ));
+        // 2. sel_j = match_j · scale_row — the matched lane carries its
+        //    expert's scale.
+        ops.push(pw2(
+            &format!("resel_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&m_),
+            In::mb(&scale),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        // 3. prod_j = sel_j · scores[:,j] — the score rides the same lane.
+        //    Written to the MATCH buffer: `m_` is dead from step 2 of this j
+        //    until step 1 of j+1 rewrites it, so the slot recycles (the
+        //    gather door's own single-assignment chain, one buffer per stage).
+        ops.push(pw2(
+            &format!("reprd_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&sel),
+            In::col_at(&scores, lane),
+            &m_,
+            sym_id_base,
+            layout,
+        ));
+        // 4. val_j = Σ_h prod_j — the native cols reduce, [m, stick], off the
+        //    product in the recycled match buffer.
+        ops.push(assemble_reduce_off(
+            &format!("reval_j{j}_o{out_tid}"),
+            "sum",
+            t_rows,
+            f_cols,
+            &m_,
+            crate::addr::DevOff::ZERO,
+            &val,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 5-7. lane j of the output = val_j · ident_row_j, accumulated — the
+        //      combine chain's own shape at the LANDING'S 64 columns (the
+        //      products' surviving lanes are 0..k ≤ 64; the ident row's first
+        //      64 lanes carry the one-hot, the same corner the W-wide legs
+        //      read). Slot 0 seeds the accumulator, the last add writes
+        //      `out` directly.
+        ops.push(pw2(
+            &format!("reout_j{j}_o{out_tid}"),
+            "multiply",
+            t_rows,
+            c_cols,
+            In::col(&val),
+            In::mb_at(&ident, ident_row),
+            &sel,
+            sym_id_base,
+            layout,
+        ));
+        if j == 0 {
+            ops.push(pw1(
+                &format!("reseed_o{out_tid}"),
+                "identity",
+                t_rows,
+                c_cols,
+                In::full(&sel),
+                &acc,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("reacc_j{j}_o{out_tid}"),
+                "add",
+                t_rows,
+                c_cols,
+                &[In::full(&acc).ew(), In::full(&sel).ew()],
+                if j + 1 == k { &out } else { &acc },
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
+/// `out = x · w`, `w` a host-staged `[1]`-shaped weight (gemma4
+/// `layer_scalar[layer]`).
+///
+/// ONE pointwise `multiply` whose second operand is the weight buffer read in
+/// the SCALAR broadcast mode (`In::scalar`) — exactly the operand mode
+/// [`scalarmul_at`] gives its registry const and `assemble_rmsnorm` gives its
+/// epsilon, over a weight the WORKER stages from the checkpoint instead of a
+/// const the bake binds. The weight's placement pads its `[1]` extent to a
+/// whole stick (`nbytes` → `[1, 64]` f16 = 128 B), so the one-stick scalar
+/// read is in bounds by construction.
+pub fn scalarweightmul(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x, the weight, and the output — the parameters `KtirFunc::scalar_weight_mul` mints.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out)?;
+    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let x = tensors[0].name();
+    let w = tensors[1].name();
+    let t = out.tid;
+    let x_h = rbo(&x);
+    // The weight is `[1]` on disk and `[1, stick]` in its placement — the same
+    // one-stick shape the rmsnorm's `[1,1]` epsilon const takes, read in the
+    // same `In::scalar` broadcast mode (lane 0 sprayed over rows and cols).
+    let w_h = rb(&w, 1, crate::work::FP16_ELEMS_PER_STICK);
+    let out_h = rbo(&out.name());
+    let op_name = format!("scalarmul_o{t}");
+    Ok(vec![pw2(
+        &op_name,
+        "multiply",
+        crate::sdsc_abstract::RowCount::of_token_rows(rows),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        In::full(&x_h),
+        In::scalar(&w_h),
+        &out_h,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::Reshape`] — a RE-LAYING COPY that
+/// re-sticks a whole buffer from `[r_in, c_in]` to `[r_out, c_out]` preserving the flat element
+/// sequence.
+///
+/// ⛔⛔⛔ THE VIEW CANNOT BE AN ALIAS, AND THE LAW IS ARITHMETIC, NOT A PREFERENCE. A device
+/// tensor is stick-blocked: logical `(i, j)` sits at `dev_off([rows, cols], ·) =
+/// (j/stk)·(rows·stk) + i·stk + (j%stk)` (see [`crate::sdsc_abstract`]), where `rows` is the
+/// tensor's own ROW COUNT. Two views over one buffer with different extents therefore disagree
+/// about where EVERY element lives — and `declare_arrangement` cannot catch the alias, because
+/// it keys on tensor NAME and an alias gives the two views two names. So the reshape is a real
+/// copy, and this door is the only spelling of it.
+///
+/// ⭐⭐ THE DECOMPOSITION IS SINGLE-STICK IDENTITY COPIES — the proven `lmlast` mechanism, and
+/// for the same reason its own comment gives: a whole stick is the one rectangle whose address is
+/// a corner a rank-2 view can name. Walk the flat sequence a stick at a time. Stick `q` covers
+/// flat elements `64q..64q+64`; on the input those are `r = 64q / c_in`, `j = 64q % c_in`
+/// (one or two adjacent column sticks — a stick never straddles three, because a column stick
+/// IS 64 elements), and on the output `ρ = 64q / c_out`, `d = 64q % c_out`. Every address is an
+/// [`rc_of`] corner of that side's OWN view, so the emitter never writes a hand-derived
+/// multiplier: the nest law IS the address. At `m=1` (decode) the input is one flat row and
+/// this degenerates to a row-blocked re-blocking — exactly the shape gemma4's per-head
+/// `[1, H·D] → [H, D]` views and their flatten-backs take.
+///
+/// ⛔ THE STICK LAWS, BOTH SIDES, BECAUSE A PARTIAL STICK IS AN ADDRESS A VIEW CANNOT NAME.
+/// `c_in` and `c_out` must each be whole 64-stick multiples (the producer's column widths are
+/// feature widths, which are); the element counts must agree exactly (the SubOp's own contract,
+/// re-stated here because a descriptor pair that moved a different number of elements than the
+/// program claims would be silently-wrong on both ends); and the windows must be whole views
+/// (`split_out` refuses a corner). A violated law is a build `Err` naming it.
+pub fn reshape(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The source and the destination — the parameters `KtirFunc::reshape` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let src = &tensors[0];
+    let stk = crate::work::FP16_ELEMS_PER_STICK;
+    let (r_in, c_in) = (src.v_rows, src.v_cols);
+    let (r_out, c_out) = (out.v_rows, out.v_cols);
+    // WHOLE VIEWS ON BOTH AXES, STATED AS COVERS: a re-laying copy moves a whole buffer, and the
+    // program may state that whole view as ONE tile (the builder's `load_region`/`store_region`
+    // form, where the first tile IS the view) or as the stick walk this door itself emits (one
+    // `[1, 64]` tile per stick, where the first tile understates the view on both axes). The
+    // COVERS are the form-independent statement — `r_cover == (0, v_rows)` and
+    // `c_cover == (0, v_cols)` — and they are STRICTER than the first-tile equality they replace:
+    // a windowed program (a chunk at `8192..12800` of a wider view) answers a cover that is not
+    // the whole view, exactly as it answered a first tile that was not. A windowed reshape is a
+    // different op the producer must materialize first (the same law [`transpose`] states for its
+    // two sides).
+    for (x, role) in [(src, "input"), (&out, "output")] {
+        if x.r_cover != (0, x.v_rows) || x.c_cover != (0, x.v_cols) {
+            return err(format!(
+                "{name}: the {role} t{}'s windows cover rows {}..{} and columns {}..{} of its \
+                 `[{}, {}]` view — a reshape re-sticks a WHOLE buffer, and the relayout builder \
+                 names a tensor and its two extents with no corner and no window. Materialize the \
+                 window first.",
+                x.tid, x.r_cover.0, x.r_cover.1, x.c_cover.0, x.c_cover.1, x.v_rows, x.v_cols,
+            ));
+        }
+    }
+    if !c_in.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: the input t{}'s column extent {c_in} is not a whole {stk}-element fp16 stick. \
+             The copies below read whole input column sticks, so a partial one is an address no \
+             rank-2 view can name. Pad the producer's width to a stick multiple.",
+            src.tid,
+        ));
+    }
+    if !c_out.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: the output t{}'s column extent {c_out} is not a whole {stk}-element fp16 \
+             stick. The copies below write whole output column sticks, so a partial one is an \
+             address no rank-2 view can name. Pad the destination's width to a stick multiple.",
+            out.tid,
+        ));
+    }
+    // THE COUNT LAW: a reshape preserves the element count (the SubOp's host oracle asserts the
+    // same). Stated here because these descriptors move exactly that many — a mismatch would be a
+    // build error in the producer's graph, not something this door can repair.
+    if u64::from(r_in) * u64::from(c_in) != u64::from(r_out) * u64::from(c_out) {
+        return err(format!(
+            "{name}: re-sticking t{} `[{r_in}, {c_in}]` into t{} `[{r_out}, {c_out}]` does not \
+             preserve the element count — a reshape moves the same elements to new coordinates, so \
+             these extents do not describe one.",
+            src.tid, out.tid,
+        ));
+    }
+    let total = u64::from(r_out) * u64::from(c_out);
+    // The store windows must tile the output (`node_rows` is that guard, and it returns the row
+    // count the walk below uses). The input's coverage is the whole-view loop above — it states
+    // `r_cover`/`c_cover` on BOTH sides once, which is what replaced this arm's own first-tile
+    // equality AND the input row-cover check that stood here separately.
+    node_rows(name, &out)?;
+    // ⭐ ONE `identity` COPY PER STICK — the `lmlast` mechanism over a two-sided coordinate
+    // walk. Each op is `[1, stk]` on the card (the one representable row offset, per `lmlast`'s
+    // own addressing note) and the addresses below are corners of each side's OWN view, so the
+    // nest law carries the stick-block arithmetic rather than a hand-derived multiplier.
+    //
+    // A STICK NEVER STRADDLES A ROW ON EITHER SIDE: `base`, `c_in` and `c_out` are all
+    // multiples of `stk`, so `base % c_in` (and `base % c_out`) is a multiple of `stk` at most
+    // `c − stk` — the 64-element run lies inside ONE row's column stick on both the input and
+    // the output, one copy covers it, and no partial-stick address is ever formed.
+    let src_name = rb(&src.name(), 1, stk);
+    let dst = rbo(&out.name());
+    let n_sticks = total / u64::from(stk);
+    let mut ops = Vec::with_capacity(n_sticks as usize);
+    for q in 0..n_sticks {
+        let base = q * u64::from(stk);
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("reshape{q}_o{}", out.tid),
+            "identity",
+            crate::sdsc_abstract::RowCount::of_token_rows(1),
+            crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+            &[In::sliced(
+                &src_name,
+                crate::addr::rc_of(
+                    r_in,
+                    c_in,
+                    (base / u64::from(c_in)) as u32,
+                    (base % u64::from(c_in)) as u32,
+                    Df::Fp16,
+                ),
+            )
+            .ew()],
+            &dst,
+            crate::addr::rc_of(
+                r_out,
+                c_out,
+                (base / u64::from(c_out)) as u32,
+                (base % u64::from(c_out)) as u32,
+                Df::Fp16,
+            ),
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(ops)
 }
 
 /// [`scalarmul`] with the multiplier SUPPLIED rather than read off the whole function.

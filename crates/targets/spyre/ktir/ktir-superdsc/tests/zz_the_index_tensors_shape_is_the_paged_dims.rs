@@ -186,7 +186,7 @@ fn a_paged_gather_pins_a_page_axis_and_a_per_position_axis() {
     );
 }
 
-/// ⛔⛔⛔⛔⛔ AND THE BATCH-INVARIANT **MATMUL** FORM IS UNSCHEDULABLE — a build failure, not a shape to
+/// ⛔⛔⛔⛔⛔ AND THE BATCH-INVARIANT **MATMUL** FORM IS REFUSED — a build failure, not a shape to
 /// assert properties of.
 ///
 /// `matmul_opspec_off_operands_phys_gathered` declares the Kᵗ kernel rank-3 so `mb` has somewhere to
@@ -199,9 +199,16 @@ fn a_paged_gather_pins_a_page_axis_and_a_per_position_axis() {
 /// `primaryDsInfo_.size() > 1 && count(DsTypes::KERNEL)`) turns on the arithmetic-intensity explorer at
 /// `:1550`, whose `calculateFlopPerByte` demands an LX allocate node for every HBM-pinned labeledDs
 /// (`:2334`/`:2337`) — which `allocAllMem` never gives an index. MEASURED on the card at BOTH possible
-/// index `memOrg_` values; there is no declaration that escapes it.
+/// index `memOrg_` values.
 ///
-/// So a green test on that shape is worse than no test: it pins an unschedulable descriptor as correct,
+/// ⭐ SUPERSEDED IN PART 2026-10-09: the probe (`/tmp/prefill-m1-probe-report.md`) root-caused those
+/// refusals to the exploration path only (a vendor ordering gap) and escaped them for the
+/// TOKEN-PLANE form — entries on `mb`, one position each, no second pin — which now EMITS
+/// (`zz_the_token_plane_gathered_matmul_is_the_probe_form.rs`, probe-proven `RC=0` at both
+/// geometries with `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` at bake). THIS form — `of_pool_blocks_per_row`,
+/// a Slot-paged kernel with a `per_position` batch pin — was never probed and stays refused.
+///
+/// So a green test on this shape is worse than no test: it pins an unschedulable descriptor as correct,
 /// in full detail, with a vendor fixture cited. What replaces them is the REFUSAL, plus the same
 /// properties asserted on the shape that ships — `zz_the_gather_op_is_kernel_less.rs`, whose harness is
 /// the vendor's own `identity` with both data operands typed `OUTPUT`.
@@ -234,9 +241,9 @@ fn the_batch_invariant_matmul_form_is_refused_at_build_time() {
     let err = match superdsc::emit_sdsc("MatMul_0", &op, &folds, None) {
         Err(e) => e.0,
         Ok(_) => panic!(
-            "a gathered MATMUL emitted. deeptools refuses to schedule it — measured as a bake failure \
-             on the card at both index memOrg_ values — so this must fail the build rather than reach \
-             dxp and be discovered again."
+            "the batch-invariant gathered MATMUL emitted. This paged-KV shape was never \
+             probe-validated — the token-plane form is the one proven to schedule — so this must \
+             fail the build rather than reach dxp and be discovered again."
         ),
     };
     assert!(
@@ -362,8 +369,13 @@ fn the_index_declares_entries_and_every_core_reads_the_same_table() {
         "KtScratch",
         d.mb(),
         d.out(),
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         GatherIndex::of_scratch_rows("BlockTable".to_string(), d.page(), runs[0].index_base()),
-        ktir_superdsc::superdsc_opspec::DestEntry::of_entries(runs[0].dest_entry()),
+        // Global block numbers — no source base (the `GatherCopy` law).
+        ktir_superdsc::superdsc_opspec::GatherRun::split(
+            ktir_superdsc::superdsc_opspec::DestEntry::of_entries(runs[0].dest_entry()),
+            0,
+        ),
     )
     .expect("the shipped gather-copy builds");
     let idx_pos = op.indirect.expect("a declaration").index;

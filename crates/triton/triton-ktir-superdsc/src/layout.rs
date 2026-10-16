@@ -338,6 +338,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // placement records the alternative's cost — a seg1/WEIGHT P is H2D'd only at PrepareModel,
     // where the worker binds only the manifest's model weights, so it "stays ZERO ⇒ rot=matmul(x,0)
     // ⇒ RoPE collapses to x·cos ⇒ wrong positional encoding".
+    //
+    // ⭐ THE CLASS SET IS REGISTERED WHERE P IS PLACED. `rope_p_class_tid(idx)` keys off
+    // `BundleLayout::rope_class_hds` (one entry per DISTINCT rope head dim, sorted descending,
+    // class 0 = the widest = `ROPE_P_TID`), and the door resolves this rope's `p_tid` off that same
+    // list — so the placement pass and the lowering read ONE registry, never two.
+    let mut rope_class_hds: Vec<u32> = Vec::new();
     if matches!(node.program, Program::Rope) {
         let out = r.iter().find(|reg| reg.is_out).ok_or_else(|| Error {
             stage: "layout",
@@ -359,6 +365,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
                 ),
             });
         }
+        // One rope program per single-kernel bundle, so one class — trivially the widest, and its
+        // ops name `ROPE_P_TID` exactly as a uniform model's do (the byte-identity law).
+        rope_class_hds.push(hd);
         let size = synth_footprint_bytes(&[hd, hd], Df::Fp16);
         pack(
             name,
@@ -510,6 +519,17 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No head-major o_proj copies: the restructure is minted from a spyre bundle's
         // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
         weight_copies: Vec::new(),
+        // The rope-P class set, filled where P itself is placed (see the Rope arm above). `drive_rope`
+        // resolves this rope's `p_tid` off it — the same registry the consumer ladder's door resolves
+        // through, so the two ladders cannot disagree about which P table a class reads.
+        rope_class_hds,
+        // No attention identity classes: `Attn` is refused BY NAME at this crate's doors, so no
+        // `AttnDecode` program reaches layout to state a head dim.
+        attn_class_hds: Vec::new(),
+        // No MoE router in a single-kernel Triton bundle — the Route/Expert programs have no entry
+        // points on this ladder (refused by name at the door), so there is no expert count to state.
+        router_experts: 0,
+        router_k: 0,
         synth,
         // No pinned-LX intermediates: the triton shim emits no rmsnorm-style scratchpad
         // tensors, so the per-core pin registry starts empty — same role as `synth` above.
@@ -608,6 +628,31 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul => None,
+        // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
+        // body this crate's door can reach — the splice's registry produces none of them (its
+        // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
+        // name — so there is no body whose reserved constants this table could state. Enumerated
+        // rather than `_` so a new `Program` variant is E0004 here, not a silent `None` that
+        // pretends to have read a body it never had. (These are the gemma-4 campaign's vocabulary:
+        // the MoE router and expert programs, TanhSoftCap, RmsNormUnit, ScalarWeightMul, Reshape,
+        // WindowedRmsNorm. Phase 2 gives the ones that earn it real rows; until then this arm is
+        // the honest statement.)
+        Program::RmsNormUnit
+        | Program::TanhSoftCap
+        | Program::ScalarWeightMul
+        | Program::Reshape
+        | Program::RouteSoftmax
+        | Program::RouteRenorm
+        | Program::RouteArgsort
+        | Program::RouteTopK
+        | Program::RouteGatherScores
+        | Program::RouteExpertScale
+        | Program::ExpertGatedAct(_)
+        | Program::ExpertSort
+        | Program::ExpertUnsort
+        | Program::ExpertCombine
+        | Program::ExpertMatmul
+        | Program::WindowedRmsNorm { .. } => None,
     }
 }
 
@@ -827,5 +872,27 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::Transpose
         | Program::Matmul
         | Program::Rope => Vec::new(),
+        // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
+        // this ladder (the splice produces none of them and the door refuses them by name), so
+        // there is no body to ask which values it looks up. A value registered for a program that
+        // cannot run would occupy a slot nothing asks for — the exact registry-divergence defect
+        // this function's doc records — so empty is the answer, and enumerated (never `_`) so a
+        // new variant is E0004 rather than a silent slot decision.
+        Program::RmsNormUnit
+        | Program::TanhSoftCap
+        | Program::ScalarWeightMul
+        | Program::Reshape
+        | Program::RouteSoftmax
+        | Program::RouteRenorm
+        | Program::RouteArgsort
+        | Program::RouteTopK
+        | Program::RouteGatherScores
+        | Program::RouteExpertScale
+        | Program::ExpertGatedAct(_)
+        | Program::ExpertSort
+        | Program::ExpertUnsort
+        | Program::ExpertCombine
+        | Program::ExpertMatmul
+        | Program::WindowedRmsNorm { .. } => Vec::new(),
     }
 }

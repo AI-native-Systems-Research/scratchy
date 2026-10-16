@@ -109,7 +109,10 @@ fn weight_arg(data: Vec<u8>, dt: SDType, shape: Vec<usize>) -> Arg {
         // the bytes must land in HBM verbatim and the VIEW's dtype — carried by
         // the program, mirrored here — is what makes the executor read them as
         // one element per byte. Routing this through the `other` arm's F32 would
-        // mislabel the bytes (4× the elements, decoded as garbage).
+        // mislabel the bytes (4× the elements, decoded as garbage): MEASURED as
+        // every fp8 matmul writing NaN from the first gemma-4-12b-FP8 layer
+        // (seg1-3 of the emu trace) — the resident executor `codec::decode`d the
+        // codes as f32, 4 bytes per 1-byte element, re-encoded to f16 sticks.
         SDType::Fp8E4m3 => Arg::TensorBytes {
             data,
             shape,
@@ -266,6 +269,14 @@ impl SpyreSession {
             );
         }
         Ok(res)
+    }
+
+    /// The tensor ids a run of program `prog` can leave in observable state — the
+    /// honest readback set for the bake-time numeric gate, which compares the
+    /// per-node reference values tensor by tensor (see
+    /// [`ktir_emulator::program::Session::observable_tids`]).
+    pub fn observable_tids(&self, prog: usize) -> Vec<u64> {
+        self.session.observable_tids(prog)
     }
 }
 

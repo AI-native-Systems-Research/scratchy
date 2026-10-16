@@ -64,6 +64,12 @@ pub const TL_FUNCTIONS: &[&str] = &[
     "static_assert",
     "static_range",
     "sum",
+    "tanh",
+    "math.tanh",
+    // Not in the five-fixture census: the router kernels' slot selection,
+    // `tl.where(mask, x, y)`. Like `tanh`, it is in the real `triton.language`
+    // surface and the semantic layer turns it into `arith.select`.
+    "where",
     "zeros",
 ];
 

@@ -46,7 +46,9 @@ pub mod latency;
 // Re-exported at the root so `crate::context::…` / `crate::memory::…` still resolve.
 pub mod machine_state;
 pub use machine_state::{context, memory};
-#[cfg(metal)]
+// The matmul-loop recognizer + its GEMM reconstruction arms (GPU under the
+// `metal` cfg, CPU `blas` otherwise — `metal::run_matmul_loop`) build on EVERY
+// target; the MSL/objc2 halves of the module gate themselves on `#[cfg(metal)]`.
 pub mod metal;
 pub mod ops_memory;
 #[cfg(test)]

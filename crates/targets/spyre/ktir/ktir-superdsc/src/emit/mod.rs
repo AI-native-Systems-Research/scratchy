@@ -254,16 +254,73 @@ fn per_core_addr(
         crate::sdsc_abstract::Span::Materialized,
     );
     let host_size: Vec<u64> = extents.dims().iter().map(|&e| e as u64).collect();
-    // Stick guard at the OPERAND's device format: fp8/int8 = 128-elem stick (StickExtent<Fp8> rejects a
-    // non-128-multiple at cargo build — the compile-time fp8 width guard), fp16/bf16 = 64, fp32 = 32.
-    match view.df {
-        Df::Fp8 | Df::SenInt8 => {
+    // Stick guard at the OPERAND's device format: fp8/int8 = 128-elem stick (StickExtent<Fp8>
+    // rejects a non-128-multiple at cargo build — the compile-time fp8 width guard), fp16/bf16 =
+    // 64, fp32 = 32. The ONE exception — the packed fp8 kernel — is the `(Df::Fp8, true)` arm
+    // below; see its own comment for why its law is 64-granular, not 128.
+    let packed_fp8_kernel = matches!(view.role, Role::Kernel) && matches!(view.df, Df::Fp8);
+    match (view.df, packed_fp8_kernel) {
+        // A NON-KERNEL fp8/int8 operand (an activation, a dequant scale) keeps the FULL 128-law:
+        // it is not retiled into the packed kernel form, so a sub-128 stick extent is a real
+        // sub-stick tile dxp rejects (L3DlOpsScheduler:1040).
+        (Df::Fp8 | Df::SenInt8, false) => {
             DeviceTileLayout::<Fp8>::new(layout, view.stick, &host_size)?;
         }
-        Df::Fp32 => {
+        // ⛔ THE PACKED fp8 KERNEL — the W8A8 matmul WEIGHT — stages as `[N/64, K/2, 64, 2]` (its
+        // RetileDescriptor), so its STICK axis (`out`, N) is legal at any 64-multiple and its `in`
+        // (K) at any even count, NOT the flat 128-law. This is not a weakening: every ADDRESSING
+        // consumer already states the 64-law (`fp8_kernel_stage_off`, `gen_fp8_kernel_out_fold`'s
+        // 8×8 N-subtile, the retile's own `N%64==0` guard — see
+        // `work::FP8_PACKED_KERNEL_OUT_GRAN`), and the flat model here was the ONLY dissenting
+        // reader. Inert on every fp8 model whose n was 128-aligned by luck (granite, g8b, g12b);
+        // gemma-4-26b's GATE/UP projection (n=2112 = 33 packed out-sticks) is the first
+        // 64-but-not-128-aligned N, and the flat model refused it.
+        (Df::Fp8, true) => {
+            // The packed kernel's own per-axis law: stick (out/N) at 64, in (K) at 2. Both axes
+            // are named — the granularities cannot be attached to the wrong one.
+            let stick_out =
+                host_size[layout
+                    .iter()
+                    .position(|&d| d == view.stick)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "packed fp8 kernel '{}': stick dim '{}' absent from layout {:?}",
+                            view.name, view.stick, layout
+                        ))
+                    })?];
+            if !stick_out.is_multiple_of(crate::work::FP8_PACKED_KERNEL_OUT_GRAN as u64) {
+                return Err(SuperDscError(format!(
+                    "packed fp8 kernel '{}': OUT extent {stick_out} is not a whole multiple of \
+                     the {}-col packed-kernel stick (the RetileDescriptor's [N/64, K/2, 64, 2] \
+                     tile — see work::FP8_PACKED_KERNEL_OUT_GRAN)",
+                    view.name,
+                    crate::work::FP8_PACKED_KERNEL_OUT_GRAN
+                )));
+            }
+            if let Some(in_extent) = layout
+                .iter()
+                .zip(host_size.iter())
+                .find(|&(&d, _)| d != view.stick)
+                .map(|(_, &e)| e)
+                && !in_extent.is_multiple_of(crate::work::FP8_PACKED_KERNEL_IN_GRAN as u64)
+            {
+                return Err(SuperDscError(format!(
+                    "packed fp8 kernel '{}': IN (K) extent {in_extent} is not a whole \
+                     multiple of the 2-packed fp8 K pair (the RetileDescriptor's \
+                     [N/64, K/2, 64, 2] tile)",
+                    view.name
+                )));
+            }
+        }
+        // Unreachable in practice (`packed_fp8_kernel` requires `Df::Fp8`), but the tuple match
+        // cannot know that — an int8 KERNEL gets the same flat 128-law as every non-packed operand.
+        (Df::SenInt8, true) => {
+            DeviceTileLayout::<Fp8>::new(layout, view.stick, &host_size)?;
+        }
+        (Df::Fp32, _) => {
             DeviceTileLayout::<Fp32>::new(layout, view.stick, &host_size)?;
         }
-        Df::Fp16 | Df::Bf16 => {
+        (Df::Fp16 | Df::Bf16, _) => {
             DeviceTileLayout::<Fp16>::new(layout, view.stick, &host_size)?;
         }
         // ⛔⛔⛔ A GATHER'S INDEX TABLE IS **EXEMPT FROM THE STICK-MULTIPLE GUARD**, and both vendor
@@ -284,7 +341,7 @@ fn per_core_addr(
         // it is what lets the stick dim be the vendor's own. `Df::SenUint32` occurs on index operands
         // and nowhere else (`attach_gather_index` is its only producer), so this arm cannot exempt
         // anything else.
-        Df::SenUint32 => {}
+        (Df::SenUint32, _) => {}
     }
 
     // The per-core start flows through [`view_stick_layout`] — the SAME classifier `emit_sdsc` declares to
@@ -482,10 +539,10 @@ impl<'a> EwOperand<'a> {
 /// PER-OPERAND broadcast (the generalization of [`pointwise_opspec`], which is the
 /// all-`full` case). Inputs may broadcast over `mb` or `out` ([`EwOperand`]); the
 /// output spans full `[mb,out,y]`. `out` is the 64-stick axis. Broadcast over the
-/// stick (`out`) is proven on-card (RedStick `alpha_=0` fold). A TILED broadcast op
-/// is REFUSED (build `Err`): a broadcast-over-`out` operand must NOT advance per
-/// trip, which `concrete_trips` does not yet special-case — better a build failure
-/// than a silently-wrong per-trip address.
+/// stick (`out`) is proven on-card (RedStick `alpha_=0` fold). A TIME-TILED op MAY
+/// carry a broadcast operand: [`rewrite_op_for_time_tile`] exempts any operand whose
+/// scale along the tiled dim is not `Active`, so its address never advances per trip
+/// (pinned by `time_tiled_broadcast_operand_is_address_stable`).
 /// fp16 wrapper (the 64-stick default): every existing caller. fp32 (the torch-spyre RMSNorm) uses
 /// [`pointwise_broadcast_opspec_df`].
 pub(crate) fn pointwise_broadcast_opspec(
@@ -1992,6 +2049,43 @@ impl EmittedOp {
             .unwrap_or_else(|| panic!("{}: a KTIR op has no SuperDSC descriptor", self.op_name))
     }
 
+    /// Expand this op into its CONCRETE per-trip [`SdscOp`]s — the ONE implementation, living with
+    /// the `time`/`affine_strides` fields it reads. A time=1 op yields `[dsc().clone()]`. A time=N
+    /// op yields N copies: in trip `t`, every tensor with an `affine_strides[ti]["out"]` entry has
+    /// its AllocNode start addresses bumped by `t · stride_bytes`; an operand with an EMPTY stride
+    /// map (an out-broadcast const, an LX tensor, a matmul's A) keeps its base — which is exactly
+    /// the address-stability a broadcast operand in a time-tiled op requires (see
+    /// [`rewrite_op_for_time_tile`]'s tiled predicate). The spyre crate's free `concrete_trips` is
+    /// a thin delegate to this, so the bundle writer and this crate's tests cannot drift apart.
+    pub fn concrete_trips(&self) -> Vec<SdscOp> {
+        if self.time <= 1 {
+            return vec![self.dsc().clone()];
+        }
+        (0..self.time)
+            .map(|t| {
+                let mut op = self.dsc().clone();
+                for dsc_map in op.dscs_.iter_mut() {
+                    for dsc in dsc_map.values_mut() {
+                        for node in dsc.scheduleTree_.iter_mut() {
+                            let ti = node.ldsIdx_ as usize;
+                            let Some(stride) =
+                                self.affine_strides.get(ti).and_then(|m| m.get("out"))
+                            else {
+                                continue; // non-tiled tensor — base address unchanged.
+                            };
+                            let bump = t as i64 * *stride;
+                            for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                                let base: i64 = v.parse().unwrap_or(0);
+                                *v = (base + bump).to_string();
+                            }
+                        }
+                    }
+                }
+                op
+            })
+            .collect()
+    }
+
     /// An op that carries ONLY its program.
     ///
     /// ⛔ EVERY OTHER FIELD IS THE SuperDSC DESCRIPTOR'S. `arg_bindings`, `affine_strides`, the
@@ -2247,10 +2341,26 @@ fn rewrite_op_for_time_tile(
     // `out` coordInfo; the AllocNode stays CONCRETE (isStartAddrSymbolic_ = None).
     let _ = (cores, sym_id_base, folds); // (no longer mints symbols; kept for sig parity)
     let mut affine_strides: Vec<BTreeMap<&'static str, i64>> = vec![BTreeMap::new(); views.len()];
-    // Which tensors are tiled: HBM tensors whose layout contains `tiled_dim` (the
-    // out stick dim). INPUT (A) does NOT carry `out`, so it stays un-bumped.
+    // Which tensors are tiled: HBM tensors that RANGE over `tiled_dim` — their layout
+    // contains it AND its scale is `Active`. Two operands are thereby exempt:
+    //   • an op whose layout lacks the dim (a matmul's INPUT/A does not carry `out`);
+    //   • ⭐ a BROADCAST/REDUCED operand, collapsed along the tiled dim (`out_broadcast`
+    //     → RedStick, `mb_broadcast` → RedNonStick — the tanhsoftcap cap const, the
+    //     rmsnorm eps). Its coordInfo is ALREADY the collapsed one-stick/one-row fold
+    //     `build_coordinates` wrote, and its address must NOT advance per trip: every
+    //     trip's out-window reads the SAME broadcast value. The old predicate
+    //     (`layout.contains(tiled_dim)` alone) handed such an operand a per-trip stride
+    //     AND re-derived its collapsed coordinate as a FULL per-time fold
+    //     (`divide_out_coordinate`) — silently-wrong on both counts, which the
+    //     pointwise_broadcast builder refused outright. The exemption IS the fix: the
+    //     operand is left byte-identical to what `emit_sdsc` wrote, and `concrete_trips`
+    //     keeps its base (an empty stride map is its no-bump path).
     for (ti, v) in views.iter().enumerate() {
-        let tiled = !v.allocation.is_lx() && v.layout.contains(&tiled_dim);
+        let tiled = !v.allocation.is_lx()
+            && v.layout
+                .iter()
+                .position(|&d| d == tiled_dim)
+                .is_some_and(|si| v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active)));
         if !tiled {
             continue;
         }
@@ -2678,7 +2788,26 @@ pub fn emit_sdsc(
     ss.name_ = "core";
     for d in op.iter.dims() {
         let per_core = (d.size / op.iter.split_of(d.name).max(1)).max(1);
-        set_iter_dim(&mut ss, d.name, per_core);
+        // ⭐ THE TOP-K PAIR'S OUT DIM STREAMS ONE SLOT PER DATASTAGE, not the whole
+        // per-core slice. Stating the slice (slots/ring — 8 at the 26b's slots=64,
+        // ring=8) makes the vendor DDC's minimum-datastage check refuse the WHOLE
+        // BUNDLE at bake: `allocAllMem(false)` → "Cannot allocate even the smallest
+        // size" (ddcv1.cpp:1351) — the pair's opaque-op register charge scales with
+        // the out unroll, and a slice-stated minimum prices the op past the
+        // post-reserveFrontendLx pool ([`crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES`],
+        // 406,323 B). Card-mutation-proven at the 26b decode bundle (b6e29c0c9d27eadf,
+        // group_7/sdsc_56 = rtkix): mutating ONLY `ss_`/`el_` `out_` 8→1 compiles the
+        // same dsc clean; `N_`, `numWkSlicesPerDim`, `coreIdToWkSlice`, `coreIdToDsc`
+        // untouched. ONE is also the vendor fixtures' own per-core out geometry
+        // (slots=8, one slot per core — the only form the fixtures demonstrate), and
+        // the DDC maximizes the datastage upward itself once the min-check passes,
+        // so the work split, the landing bytes and every consumer are unchanged.
+        let staged = if op.op.is_topk_pair() && d.name == "out" {
+            1
+        } else {
+            per_core
+        };
+        set_iter_dim(&mut ss, d.name, staged);
     }
     let stage = StageParam {
         ss_: ss.clone(),
@@ -2841,47 +2970,64 @@ pub fn emit_sdsc(
         )));
     }
 
-    // ⛔⛔⛔⛔⛔ A GATHER MAY NOT SIT ON AN OP THAT HAS A `KERNEL` — the card's own refusal, moved to
-    // the build.
+    // ⛔⛔⛔⛔⛔ A GATHER ON A `KERNEL`-BEARING OP IS REFUSED AT BUILD — EXCEPT THE ONE FORM THE CARD
+    // PROBE PROVED SCHEDULABLE: the TOKEN-PLANE form (entries on `mb`, one position each, no second
+    // pin — the prefill-m>1 per-expert batched matmul).
     //
+    // ## The original refusal, and what superseded it
     // MEASURED ON THE CARD (pod nickm-7db9667cdd-z2jc6, granite-3.1-2b fp8), with the gather on the
     // prefix score leg's Kᵗ operand. Two bakes, two refusals, bracketing the cause:
     //   index memOrg_ = hbm + lx  ->  sbf-ddc: DtException: Expect a valid allocate node.
     //                                 L3DlOpsScheduler.cpp:2337
     //   index memOrg_ = hbm       ->  sbf-ddc: DtException: Expect LX in labeledDs memOrg_.
     //                                 L3DlOpsScheduler.cpp:2334
-    // Both lines are in `calculateFlopPerByte`, which for EVERY HBM-pinned labeledDs requires an LX
+    // Both lines are in `calculateFlopPerByte`, which for every HBM-pinned labeledDs requires an LX
     // `memOrg_` entry (2334) AND a non-null LX allocate node (2337). `allocAllMem` gives an LX chunk
     // to each STAGED operand and never to an index — an index is read into the IBR, not staged — so
-    // no `memOrg_` satisfies both, and there is no third value to try. DO NOT TRY ONE.
+    // no `memOrg_` satisfies both. That measurement is real, and it is also NOT the whole story.
     //
-    // ⭐ AND IT ONLY RUNS FOR A REUSE OP, WHICH IS WHY THE CONDITION IS EXACTLY "HAS A KERNEL".
-    // `L3DlOpsScheduler.cpp:1550` gates the whole arithmetic-intensity explorer on `isReuse`, and
-    // `hasDimensionReuse` (`:303-321`) is verbatim
-    // `primaryDsInfo_.size() > 1 && primaryDsInfo_.count(DsTypes::KERNEL)`. So:
-    //   our score matmul    primaryDsInfo_ {INPUT, KERNEL, OUTPUT, KERNEL_IDX}  reuse -> REFUSED
-    //   test_gather_1core   primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 no KERNEL -> fine
-    //   sdsc_add_paged_l3lu primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 no KERNEL -> fine
-    // NEITHER VENDOR FIXTURE GATHERS ON A MATMUL. `test_gather_1core`'s op is `identity` with BOTH
-    // its source and its destination typed `OUTPUT`; IBM's paged attention gathers on `AddZero` — an
-    // elementwise copy — and feeds the RESULT to its matmul.
+    // ⭐ THE 2026-10-09 PROBE (`/tmp/prefill-m1-probe-report.md`) ROOT-CAUSED AND ESCAPED IT:
+    // `calculateFlopPerByte` runs only inside CHUNK-PARAM EXPLORATION (`addChunkDataStage → … →
+    // findBestParamsForArithmeticIntensity`, gated on `isReuse` at `:1550`), and demands — via
+    // `getLdsL3TransferNodes` (`:1779`) — TRANSFER USERS on the index's HBM alloc. Those users are
+    // inexpressible in the validated input schema (only `allocate` nodes with the curated field set)
+    // and are created only by `createStoreIndexTensorToLx`, which runs in `processHbmPagedTensors`
+    // AFTER `addChunkDataStage`: a VENDOR ORDERING GAP, not a gather prohibition. With
+    // `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` at bake, the token-plane form schedules END TO END — `RC=0`
+    // at both the small (m8, in128) and 26b-gate (m96, in2816) geometries, `init_binary.bin`
+    // emitted, the gather ENGAGED (kernel transfer `srcIndirect=YES`, index staged to the L3LU IBR,
+    // the vendor's own paged loop nest, 10 syncs). The index spelling is `"index"` on every path —
+    // the wall-#8 law at the `indexTensorType_` emission site: `"address"` bypasses the vendor's
+    // idx2addr conversion and puts the ABSOLUTE bank base into the EAR-domain mutable constant,
+    // which refuses past the 2^28-element EAR range at 26b chunk addresses.
     //
-    // ⛔ A BUILD `Err`, NOT AN ASSERT AND NOT A COMMENT. The next attempt's instinct is another
-    // `memOrg_`, another dtype, another pin — the loop this emitter's gather tests describe. The
-    // predicate is three lines of C++ and it is decidable from what this function has already built,
-    // so it is decided here, once, with the shape that DOES work named in the message.
-    if op.indirect.is_some() && primary.len() > 1 && primary.contains_key("KERNEL") {
+    // ## What stays refused, and why here
+    // Every OTHER gathered-KERNEL shape — the paged-KV forms (`of_pool_blocks`,
+    // `of_pool_blocks_per_row`) and any token-plane variant with a pin ≠ 1 — was NEVER probed, and an
+    // unprobed descriptor that reaches dxp re-runs the card loop this refusal exists to close.
+    // The predicate is decidable from what this function has already built, so it is decided here,
+    // once, with both the admitted shape and the KERNEL-LESS alternative named in the message.
+    let token_plane = match op.indirect.as_ref() {
+        Some(ia) => {
+            ia.entry_dim == crate::superdsc_opspec::KernelAxis::Batch
+                && ia.per_position.is_none()
+                && ia.page.get() == 1
+        }
+        None => false,
+    };
+    let kernel_bearing = primary.len() > 1 && primary.contains_key("KERNEL");
+    if op.indirect.is_some() && kernel_bearing && !token_plane {
         return Err(SuperDscError(format!(
             "op '{op_name}': a GATHER is declared on an op whose primaryDsInfo_ carries a KERNEL \
-             ({:?}). deeptools cannot schedule that: `hasDimensionReuse` (L3DlOpsScheduler.cpp:303) \
-             is `primaryDsInfo_.size() > 1 && count(KERNEL)`, which turns on the \
-             arithmetic-intensity explorer (:1550), whose `calculateFlopPerByte` demands an LX \
-             allocate node for every HBM-pinned labeledDs (:2334/:2337) — and `allocAllMem` never \
-             gives one to an index, because an index is read into the IBR rather than staged. \
-             MEASURED as a bake refusal on the card at BOTH possible index memOrg_ values, so there \
-             is no declaration that fixes it. Gather on a KERNEL-LESS op instead: both vendor \
-             fixtures use an elementwise copy (`identity` / `AddZero`) whose operands are all typed \
-             OUTPUT, and feed its RESULT to the matmul.",
+             ({:?}) in a shape that was never probe-validated. The card refused the paged-KV form \
+             twice (hasDimensionReuse L3DlOpsScheduler.cpp:303 turns on the arithmetic-intensity \
+             explorer at :1550, whose calculateFlopPerByte demands an LX allocate node for every \
+             HBM-pinned labeledDs at :2334/:2337 — and allocAllMem never gives one to an index); the \
+             ONE gathered-KERNEL shape that schedules is the TOKEN-PLANE form (entries on `mb`, one \
+             position each, no second pin — GatherIndex::of_expert_planes), probe-proven RC=0 at \
+             both probe geometries with DISABLE_ABOVE_LX_CHUNK_EXPLORE=1 at the bake. Otherwise \
+             gather on a KERNEL-LESS op: both vendor fixtures use an elementwise copy (`identity` / \
+             `AddZero`) whose operands are all typed OUTPUT, and feed its RESULT to the matmul.",
             primary.keys().collect::<Vec<_>>()
         )));
     }
@@ -2972,6 +3118,37 @@ pub fn emit_sdsc(
             None | Some(IndirectRole::Value { .. }) => std::borrow::Cow::Borrowed(&op.iter),
         };
         let iter: &WorkPlan = &iter;
+        // ⛔⛔ skip_addr IS THE PIN × THE PER-CORE EXTENTS OF THE **UNPINNED** DIMS — so a gathered
+        // value operand whose op SPLITS an unpinned dim shrinks every index step below the plane the
+        // entries enumerate. That is a DEFECT only where the semantics demand the whole plane: the
+        // KERNEL-bearing token-plane gather (the prefill-m>1 per-expert batch matmul), where an entry
+        // names ONE EXPERT PLANE `in·out` and the probe's plan split `mb` only ({in:1, mb:32, out:1})
+        // — a K-split under that gather is a build error, not a silently-short gather on the card.
+        // On a KERNEL-LESS copy an unpinned dim is legal by design (IBM's own paged fixture
+        // `sdsc_add_paged_l3lu` leaves `mb` unpinned, and the copy path's split law — whole entries,
+        // `gather_copy_cores` — is enforced where the plan is made), so the guard is scoped to the
+        // KERNEL predicate, exactly the `hasDimensionReuse` condition that gates dxp's own reuse-path
+        // handling of the gather.
+        if let Some(IndirectRole::Value { pins, .. }) = &indirect_role
+            && primary.contains_key("KERNEL")
+        {
+            for &d in v.layout.iter() {
+                if pins.iter().any(|&(pd, _)| pd == d) {
+                    continue;
+                }
+                let split = iter.split_of(d);
+                if split > 1 {
+                    return Err(SuperDscError(format!(
+                        "op {op_name}: operand {i} ('{}') is the gathered VALUE tensor, and the \
+                         work division splits its unpinned axis '{d}' ({split} ways) — skip_addr is \
+                         the pin × the per-core extents of the unpinned dims, so each index entry \
+                         would step a FRACTION of the expert plane it names. Split the entry axis \
+                         only.",
+                        v.name,
+                    )));
+                }
+            }
+        }
         // THE ONE device layout for this tensor view, computed ONCE and handed to BOTH the on-card WALK
         // (build_coordinates) and the per-core START (per_core_addr). Neither derives its own, so the walk
         // and start cannot address the tensor differently — a divergence is not representable (task #11).
@@ -3221,6 +3398,30 @@ pub fn emit_sdsc(
                 )
             }),
             // Only the INDEX side carries a tensor type; the vendor's value node omits it.
+            //
+            // ⭐⭐⭐ AND THE SPELLING IS `"index"` ON EVERY PATH — the 2026-10-09 wall-#8 law. An
+            // `"address"`-typed index means the buffer ALREADY HOLDS page addresses and the value
+            // tensor's start is only a within-page offset (GatherBuffers.cpp:198-208 zeroes it after
+            // the vendor's own conversion: "the value tensor start address is the offset within a
+            // page, that we do not need"). Spelling `"address"` while the mint still writes RAW
+            // EXPERT IDS and the value start still carries the ABSOLUTE bank base is doubly wrong:
+            // dcc routes that start into the EAR-domain mutable constant modulo 2^31 sticks-domain
+            // wrap, and the EAR range is 2^21·128 B = 2^28 fp8 elements — so at 26b, gate/up chunk
+            // c10's base 17,460,359,424 (mod 2^31 = 280,490,240 > 268,435,456) refused with
+            // `MutableAddrSplitting.cpp:814 EAR overflow` (probe-pinned: start 17,229,672,704 and
+            // 4,400,000,000 bake; 17,460,359,424, 268,435,457 and 278,435,456 refuse; the KV gather
+            // — `"index"`-typed — is clean at the SAME 17,460,359,424). `"index"` instead engages the
+            // vendor's GatherIndexConversion: it builds an INT32IDXTOADDR sdsc per gather computing
+            // `base + e·skip` in the INTEGER domain (base = value start/256, skip = the per-plane
+            // stride — 704·256 B = exactly one expert's chunk plane for the chunk-major bank, so the
+            // chunk-major law needs NO extra emission), zeroes the value start, and flips the index
+            // type to ADDRESS itself (GatherBuffers.cpp:199) before the scheduler's reuse path reads
+            // it — `isIndexLds` (L3DlOpsScheduler.cpp:7614) passes on the CONVERTED descriptor. The
+            // earlier `"index"`-died-at-`:1517`/`:1535` finding was the pre-wall-2/3 mint form; at
+            // the current form the whole m>1 group bakes `RC=0` with the conversion ENGAGED
+            // (init_binary grows by 185,856 B over 128 gathered sdscs — the idx2addr programs). The
+            // fp32 mint must NOT compute the addresses itself: the base needs 26+ bits and fp32
+            // carries 24.
             indexTensorType_: match &indirect_role {
                 Some(IndirectRole::Index { .. }) => Some("index"),
                 None | Some(IndirectRole::Value { .. }) => None,
@@ -3288,11 +3489,18 @@ pub fn emit_sdsc(
     // SKIPPED — transcendentals collapse to their seed (rsqrt→1/x, sqrt→identity): the
     // 35×-magnitude rmsnorm bug, with the matmul (no SFP, no NR) unaffected. The truthy
     // string "{}" makes dxp run the setup so the NR refinement executes on-card.
-    let constant_info = if constant_info.as_object().is_some_and(|o| o.is_empty()) {
-        serde_json::Value::String("{}".to_string())
-    } else {
-        constant_info
-    };
+    //
+    // ⛔ THE VENDOR TOPK PAIR IS THE EXCEPTION — BOTH its fixtures ship the falsy empty OBJECT,
+    // and falsy is CORRECT for it: `topk.ddl` reads no external constant (its negInf/negOne/one
+    // ride its own `ddl.define_constant` LRFs) and has no NR refinement to run, so the truthy
+    // string can only install a table the template never consumes. See
+    // [`OpFunc::is_topk_pair`] for the fixture citations.
+    let constant_info =
+        if !op.op.is_topk_pair() && constant_info.as_object().is_some_and(|o| o.is_empty()) {
+            serde_json::Value::String("{}".to_string())
+        } else {
+            constant_info
+        };
 
     // The fused epilogue's SECOND computeOp_ entry (when present): mirrors `sdsc_bmm_lxopt.json`'s
     // `MatMul_122` golden — it reads THIS op's own output plus the extra operand, and writes back
@@ -3322,13 +3530,6 @@ pub fn emit_sdsc(
                 // runs in the same loop nest as its matmul, so "Inner" — the same location every
                 // other computeOp in a bundle carries — is also the semantically right value.
                 location: "Inner",
-                auxLoopName: None,
-                isAtMainLoop: None,
-                isAtTop: None,
-                level: None,
-                coreExclude: vec![],
-                coreClExclude: vec![],
-                opConsts: None,
                 inputLabeledDs: vec![out_ref.clone(), epi_ref],
                 interimLabeledDs: vec![],
                 outputLabeledDs: vec![out_ref],
@@ -3393,6 +3594,19 @@ pub fn emit_sdsc(
                         <Fp8 as DataFormat>::NAME
                     } else if views.get(out_idx).is_some_and(|o| matches!(o.df, Df::Bf16)) {
                         "BF16E"
+                    } else if matches!(op.op, OpFunc::Fp32ToInt32) {
+                        // The value-cast converts are bound in fp32 MODE ONLY
+                        // (unary_parallel.ddl:47-50 — int32tofp32/fp32toint32 are
+                        // `operation_bind([%type_fp32], ...)`; the DDL comment:
+                        // "the conversion is carried out in fp32 mode, ICVT
+                        // imm=8"). The input TENSOR may be fp16 (`%inptensor`
+                        // carries both types — the vendor fp32toint32 fixture's
+                        // inputLabeledDs is IEEE_FP32 but the bind admits fp16),
+                        // but the OP's mode marker is IEEE_FP32, not the input's
+                        // format. An SEN169_FP16 marker here is dxp's
+                        // "Scheduler failed to find a suitable op mapping"
+                        // (SchedulerStages.cpp:40) — no fp16-mode bind exists.
+                        Df::Fp32.dataformat()
                     } else if views.first().is_some_and(|v| matches!(v.df, Df::Fp32)) {
                         // torch-spyre sets the computeOp data_format from args[0]
                         // (superdsc.py:882 `data_format=args[0].data_format`). The fp32 rmsnorm
@@ -3407,15 +3621,17 @@ pub fn emit_sdsc(
                     fidelity_: "regular",
                 },
                 location: "Inner",
-                // OMITTED to match torch-spyre's real frontend (see ComputeOp doc): emitting
-                // an explicit auxLoopName="" suppressed the SFP Newton-Raphson refine (rsqrt→1/x).
-                auxLoopName: None,
-                isAtMainLoop: None,
-                isAtTop: None,
-                level: None,
-                coreExclude: vec![],
-                coreClExclude: vec![],
-                opConsts: None,
+                // The scheduling row is OMITTED for the pair too — the `ComputeOp` doc's
+                // validator law. Both vendor topk fixtures carry the explicit row
+                // (`auxLoopName: ""`, `isAtMainLoop: 1`, `isAtTop: 1`, `level: 0`,
+                // `opConsts: {}`), but the dev stack's new SDSC-JSON validator rejects all
+                // five fields outright ("Unrecognized field") — MEASURED: the tiny26 bake's
+                // dxp refused the pair's group with exactly that error on both members,
+                // reproduced via manual dxp_standalone on the persisted stage dir (the same
+                // validator class as the `location: "invalid"` rejection above; the fixtures
+                // predate the validator). The pair's ONE surviving divergence is
+                // `constantInfo_` ([`OpFunc::is_topk_pair`]) — and it has no NR refine for
+                // an explicit `auxLoopName` to suppress.
                 inputLabeledDs: input_refs,
                 interimLabeledDs: vec![],
                 outputLabeledDs: output_refs,
@@ -3675,6 +3891,22 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         OpFunc::Fp32ToDl16 => (Df::Fp32, Df::Fp16),
         // qfp8ch: f16 activation → SEN143_FP8 (E4M3). The DDL `matmulfp8` then consumes the fp8 stick.
         OpFunc::Qfp8ch => (Df::Fp16, Df::Fp8),
+        // fp32toint32: IEEE_FP32 value → SENUINT32 index. ⛔ THE INPUT TENSOR
+        // MUST BE FP32 (stick 32, wordLength 4), NOT fp16: the DDL's slice
+        // constraint (unary_parallel.ddl:59) requires the input and output
+        // SLICE sizes equal, and `getStickSizes` measures the slice in
+        // ELEMENTS (elemInSlice = stickSize/8) — an fp16 input's 64-elem stick
+        // yields slice 8 against the u32 output's 32-elem stick slice 4, NEVER
+        // equal, so the direct fp16→u32 convert is dxp-refused at bake
+        // ("slice size does not match", ddl_conversion.cpp:2728). The `%type_fp16`
+        // entry on `%inptensor`'s type list (:20) serves the OTHER ops bound to
+        // that tensor; the cast's own bind (:50) is fp32-mode and its vendor
+        // fixture (`test/sdsc_fp32toint32.json`) states the legal form: an
+        // IEEE_FP32 wordLength-4 input. Callers stage the fp16 routing buffer
+        // through `dl16tofp32` FIRST — the expert door's own two-leg chain
+        // (`dl16tofp32` → `fp32toint32`), the widening convert carrying no
+        // slice constraint of its own (quantization_double_pad.ddl:58).
+        OpFunc::Fp32ToInt32 => (Df::Fp32, Df::SenUint32),
         _ => (Df::Fp16, Df::Fp16),
     }
 }
@@ -3686,6 +3918,87 @@ fn convert_opspec(
     in_name: &str,
     o_name: &str,
 ) -> Result<OpSpec, String> {
+    convert_opspec_arranged(op, rows, cols, in_name, o_name, ConvertArrangement::Staged)
+}
+
+/// The per-operand stick arrangement of a dtype-convert (see [`convert_opspec_arranged`]).
+///
+/// The STAGED form is every legacy caller's byte-identical default: input AND output keep
+/// their stick on `out`, addressed RowBlocked at rows>1 — the rank-3 `[mb,out,1]` staging
+/// every residual-style consumer reads. The FLAT form is the prefill-m>1 ExpertMatmul
+/// mint's two-leg chain, FORCED by the vendors' DDL arithmetic — TWO independent laws,
+/// one per leg:
+///  • `unary_parallel.ddl:59-60` binds `fp32toint32`'s input and output slice AND stick
+///    `(dim,size)` vectors EQUAL (`ddl_conversion.cpp:2715-2729` compares the vectors
+///    `getStickSizes` returns, whose dim component is the `PrimaryDimTypes` enum, so
+///    INPUT `["out"]` vs OUTPUT `["mb"]` is the `UNREACHABLE` "slice size does not match"
+///    the round-1 spelling hit on the pod) — the u32 index table's `mb`-sticked output
+///    demands an `mb`-sticked fp32 input too.
+///  • `quantization_double_pad.ddl` SHARES `%stick_dim` between `dl16tofp32`'s two
+///    operands — the input reaches it via `%slice_layout_in = layout(%stick_dim)`, the
+///    output via `%padded_dim_out`'s `nonPaddedDim` (the pad stripped at
+///    `ddl_conversion.cpp:2422-2426`), both order-fixed at sliceDims position 0 — so the
+///    leg's input and output sticks must name the SAME dim. The round-2 FLAT-TAIL
+///    spelling (input stick `out`, output stick `mb`) emptied the binding intersection
+///    and died at `ddl_conversion.cpp:2539` ("Could not find any suitable dimension
+///    mapping", measured at tiny26 sdsc_9 = the emxf leg); the probe falsified the
+///    shortcut of resting the Kᵀ-restickify's own output dim-0-sticked too (its input
+///    and output would stick the SAME axis, the same-dim class the probe's silent form
+///    refused at :2539). So the mint carries a SECOND restickify — the flat door
+///    [`restickify_flat_opspec_2d`], probe-validated on the pod — that re-sticks the
+///    Kᵀ door's m_pad-sticked output into the FLAT `[W, m_pad]` fp16 table this leg
+///    reads with BOTH sticks on `mb`.
+/// So the mint's chain is: emrt (Kᵀ restickify, RowBlocked fp16) → emfl (flat
+/// restickify) → emxf (`Flat`: flat read, flat write) → emidx (`Flat`: flat read, flat
+/// write — the equality) → the per-slot gathers' rank-1 u32 stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConvertArrangement {
+    /// Byte-identical legacy: both operands stick-on-`out`, RowBlocked at rows>1.
+    Staged,
+    /// The mint's two legs (`dl16tofp32` and `fp32toint32`): input AND output stick `mb`
+    /// — the shared-`%stick_dim` law and the DDL equality, both satisfied by construction.
+    Flat,
+}
+
+/// [`convert_opspec`] with the per-operand arrangement chosen. The STAGED form (every
+/// existing caller, byte-identical) keeps both sticks on `out`, which the
+/// ONE classifier reads RowBlocked post-fold — the rank-3 `[mb,out,1]` staging every
+/// residual-style consumer addresses. The FLAT form (design N1 — the prefill-m>1
+/// ExpertMatmul mint's two legs, `fp32toint32` and its `dl16tofp32` feeder) puts a stick
+/// on `mb` instead: NOT the last non-unit dim, so [`view_stick_layout`] classifies the
+/// view **Flat** (row-major `[W, m_pad]`) and slot s's token-run lands at u32 ELEMENTS
+/// `s·m_pad .. +m` — the ONE contiguous run the gather's rank-1 index view reads
+/// (`GatherIndexConversion`: one run in, one run out; per-slot `first_entry = s·m_pad`,
+/// stick-aligned because `cols` is a whole-stick multiple, so every row is whole words
+/// and ANY `mb` split is word-safe). `Flat` sticks BOTH operands there — the
+/// `fp32toint32` equality AND the `dl16tofp32` shared-`%stick_dim` law both demand the
+/// same-named dim on both sides (see [`ConvertArrangement`]); the flat-restickify
+/// [`restickify_flat_opspec_2d`] exists to produce the flat fp16 input. The
+/// V-restickify's input is the card-proven precedent for a stick-on-dim-0 Flat view.
+fn convert_opspec_arranged(
+    op: OpFunc,
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+    arrangement: ConvertArrangement,
+) -> Result<OpSpec, String> {
+    // ⛔ P1: the flat form is the mint's two legs and nothing else — every other convert's
+    // output is consumed stick-major (residual / fp8 activation), so a flat output for them is
+    // on-card garbage; a typed build `Err` here, never a silent emit.
+    match arrangement {
+        ConvertArrangement::Staged => {}
+        ConvertArrangement::Flat if !matches!(op, OpFunc::Fp32ToInt32 | OpFunc::Dl16ToFp32) => {
+            return Err(format!(
+                "convert {in_name}->{o_name}: the flat arrangement (BOTH operands stick 'mb', \
+                 flat consecutive rows) is the mint's two legs — fp32toint32 (the gather-index \
+                 leg) and dl16tofp32 (its feeder, whose quantization_double_pad.ddl bind shares \
+                 %stick_dim between operands); this convert's output is consumed stick-major \
+                 and has no reader for it"
+            ));
+        }
+        _ => {}
+    }
     let (in_df, out_df) = convert_dtypes(op);
     // A dtype-CONVERT touches BOTH its input and output dataspaces per core, so the stick-axis split
     // must keep each core's slab a whole stick of the WIDER of the two formats (max elems/stick):
@@ -3700,14 +4013,43 @@ fn convert_opspec(
     // Validate `cols` against the WIDER stick (128 for the fp8 output), not just fp16's 64: an fp8
     // convert whose cols is a 64- but not 128-multiple is a typed `Err` here, never a sub-stick fault.
     assert_df_stick_multiple(cols, stick_df)?;
+    // ⭐ N1: in the FLAT form a stick rides `mb` (`stickDimOrder_: ["mb"]`,
+    // `stickSize_: [32]` — the same u32 stick the gather's KERNEL_IDX view declares), so `rows`
+    // is a stick extent of the OUTPUT exactly as `cols` is of the staged form: it must tile
+    // whole sticks or the declaration itself is malformed — a typed `Err`, never a bake fault.
+    if arrangement != ConvertArrangement::Staged {
+        assert_df_stick_multiple(rows, out_df)?;
+    }
     let cols_ext = StickExtent::<Fp16>::new(cols)?;
     let dims = vec![
         ItDim {
             name: "mb",
             size: rows,
             is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
+            // ⭐ N1 WORK DIVISION — in the index-rows form `mb` CARRIES the output's stick, so it
+            // is a STICK dim of the division at the output's df (SenUint32 = 32 elems). The
+            // mb-first branch of `distribute_cores` splits `mb` to the hilt by ELEMENT count
+            // (its own doc: flat row-major activations, `!is_stick`), which at the mint's
+            // `[W, m_pad]` hands each core a SUB-STICK `mb` (tiny26 `[64, 64]`: 32 cores ⇒
+            // per-core mb 2). Each core's slab is still whole u32 WORDS — the collision guard
+            // passes, and that weaker property is exactly what let the division reach the pod —
+            // but the vendor's chunk-param walk demands more: every chunk param along a dim
+            // must be a multiple of that dim's stick size in EVERY non-index lds
+            // (`isDimensionParamMultipleOfStickSize`, L3DlOpsScheduler.cpp:1429; `getStickSize`
+            // :447 answers the stick size for a stick dim and 1 otherwise), so with the output
+            // sticked on `mb` at 32, `param % 32 != 0` for every `param ≤ 2` — the EMPTY
+            // candidate set the whole bundle is refused with (`DtException: There must be at
+            // least one valid candidate.`, :1535; measured ×2 deterministic at 26b and tiny26).
+            // Declaring the dim a stick keeps that branch off it (the out loop splits by STICK
+            // COUNT, never below one whole stick per core), and `WorkPlan::divide`'s
+            // whole-stick clause makes any sub-stick `mb` division a `cargo` `Err` naming the
+            // dim — the same law `out` has always had.
+            is_stick: arrangement != ConvertArrangement::Staged,
+            df: if arrangement != ConvertArrangement::Staged {
+                out_df
+            } else {
+                Df::Fp16
+            },
         },
         ItDim {
             name: "out",
@@ -3740,7 +4082,14 @@ fn convert_opspec(
     // needs. torch-spyre keeps dtype-converts RANK-3 (superdsc.py:756 "a type-conversion op requires an outer
     // spatial dim beyond the stick"). So keep qfp8ch stick-major; force the fp16↔fp32 converts rank-3.
     let is_fp32_convert = matches!(op, OpFunc::Dl16ToFp32 | OpFunc::Fp32ToDl16);
-    let stickmajor = rows > 1 && !is_fp32_convert;
+    // ⛔ fp32toint32 NARROWS TOO (output stick 32 < input 64) — the same rank-3 requirement: a
+    // rank-2 collapse drops the `y` dim dxp's buffer walk indexes (the `getBufferCapacityForNode`
+    // crash recorded above). Kept a SEPARATE flag from `is_fp32_convert` because that one also
+    // drives the RowBlocked arrangement pair, and the u32 output is a GATHER INDEX whose rows are
+    // consecutive u32 entries — the arrangement the index's own declaration states, not a residual's
+    // (and which [`convert_opspec_arranged`]'s index-rows form now EMITS for the mint's leg).
+    let is_narrowing_convert = is_fp32_convert || matches!(op, OpFunc::Fp32ToInt32);
+    let stickmajor = rows > 1 && !is_narrowing_convert;
     let time_tile = plan
         .time_tile_for_lx(|p, opt| pointwise_lx_resident(p, 2, opt, Df::Fp16), "out")
         .map_err(|e| e.0)?;
@@ -3749,6 +4098,23 @@ fn convert_opspec(
     // side reads RowBlocked x; the fp32 side writes RowBlocked x32). Only for multi-row fp32 converts.
     let rb = is_fp32_convert && rows > 1;
     let mk = |is_input: bool, name: &str, role: Role, df: Df| -> Result<AnyTensorArg, String> {
+        // ⭐ N1: the FLAT form puts a stick on `mb` — dim 0 of `[mb,out,y]`, NOT the last
+        // non-unit dim — so the ONE classifier folds the trailing `y` and classifies the
+        // view FLAT (`dev_off(s, t) = s·cols + t`). `Flat` sticks BOTH operands there
+        // (the fp32toint32 DDL equality, unary_parallel.ddl:59-60, AND the dl16tofp32
+        // shared-%stick_dim law — see [`ConvertArrangement`]); the flat-restickify
+        // produces the flat fp16 input the arrangement reads. The staged form keeps
+        // stick-on-`out` on both sides.
+        let stick = match arrangement {
+            ConvertArrangement::Staged => "out",
+            ConvertArrangement::Flat => "mb",
+        };
+        // RowBlocked addressing: the staged pair at rows>1 (the fp32 residual seam). The
+        // flat views are Flat by construction (their stick rides dim 0).
+        let rb_arg = match arrangement {
+            ConvertArrangement::Staged => rb,
+            ConvertArrangement::Flat => false,
+        };
         if stickmajor {
             Ok(AnyTensorArg::R2(
                 TensorArg::<2>::new(
@@ -3758,12 +4124,12 @@ fn convert_opspec(
                     [Scale::Active, Scale::Active],
                     device_dims_r2,
                     ["mb", "out"],
-                    "out",
+                    stick,
                     Allocation::Hbm,
                 )
                 .map_err(|e| e.0)?
                 .with_df(df)
-                .with_row_blocked(rb),
+                .with_row_blocked(rb_arg),
             ))
         } else {
             Ok(AnyTensorArg::R3(
@@ -3774,12 +4140,12 @@ fn convert_opspec(
                     [Scale::Active, Scale::Active, Scale::Active],
                     device_dims,
                     ["mb", "out", "y"],
-                    "out",
+                    stick,
                     Allocation::Hbm,
                 )
                 .map_err(|e| e.0)?
                 .with_df(df)
-                .with_row_blocked(rb),
+                .with_row_blocked(rb_arg),
             ))
         }
     };
@@ -3818,6 +4184,140 @@ pub fn assemble_convert(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"))
+}
+
+/// Assemble the mint's `dl16tofp32` leg — the FLAT convert ([`ConvertArrangement`]):
+/// reads the FLAT-restickify's fp16 output and writes the fp32 index table, BOTH
+/// stick `mb` — the shared-`%stick_dim` law (`quantization_double_pad.ddl` binds the
+/// leg's input and output sticks to the SAME dim; the flat-tail spelling that read the
+/// Kᵀ-restickify's `out`-sticked output died at `ddl_conversion.cpp:2539`, which is why
+/// the flat-restickify exists) and the arrangement the `fp32toint32` leg's DDL equality
+/// (`unary_parallel.ddl:59-60`) demands of its input. The op is FIXED to `dl16tofp32`
+/// (the P1 gate names the two legal legs), so it takes no `op_func` string. Emit-time
+/// panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
+/// other `assemble_*`.
+pub fn assemble_convert_index_rows_widen(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_: &Stk<RowBlockedTag>,
+    o: &Stk<RowBlockedTag>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let op = convert_opspec_arranged(
+        OpFunc::Dl16ToFp32,
+        rows,
+        cols,
+        in_.name(),
+        o.name(),
+        ConvertArrangement::Flat,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_index_rows_widen {op_name}: {e}"));
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_convert_index_rows_widen {op_name}: {e}"))
+}
+
+/// Assemble the mint's `fp32toint32` leg — a dtype-convert whose OUTPUT is the gather's INDEX
+/// TABLE at the TRANSPOSED shape `[rows=W, cols=m_pad]` (W = padded slot count, m_pad = padded
+/// token count): [`convert_opspec_arranged`] with the FLAT arrangement, so slot s's u32
+/// run lands at elements `s·m_pad` — the contiguous run the per-slot `GatherIndex::of_expert_planes`
+/// view reads at `first_entry = s·m_pad` — and the INPUT carries the SAME `mb` stick, the DDL
+/// equality (`unary_parallel.ddl:59-60`) both operands must share. The op is FIXED to
+/// `fp32toint32` (the form has no other legal op — the P1 gate in
+/// [`convert_opspec_arranged`]), so it takes no `op_func` string. The input is the
+/// `dl16tofp32` leg's fp32 output, read flat (the same declaration). Emit-time panic on a
+/// malformed spec = a `cargo build` error (guard-every-crash), same as the other `assemble_*`.
+pub fn assemble_convert_index_rows(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_: &Stk<RowBlockedTag>,
+    o: &Stk<RowBlockedTag>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let op = convert_opspec_arranged(
+        OpFunc::Fp32ToInt32,
+        rows,
+        cols,
+        in_.name(),
+        o.name(),
+        ConvertArrangement::Flat,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_index_rows {op_name}: {e}"));
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_convert_index_rows {op_name}: {e}"))
+}
+
+/// Assemble a dtype-convert op over an OFFSET SLICE of its operands (see [`convert_opspec`]):
+/// `in_off`/`o_off` are ELEMENT offsets along each operand's OWN df (the fp16 input counts fp16
+/// elements, the fp8 output fp8 elements), applied via [`AnyTensorArg::set_offset_elems`] before
+/// emit — the same plumbing the windowed matmul and the offset reduce use. ⛔ m=1 ONLY: the offset
+/// is a FLAT stick-axis slice, which addresses a single-row buffer's column window; at rows>1 a
+/// column window of a stick-major tensor is NOT contiguous (see `reduce_opspec_off`'s
+/// block-alignment law), so the per-pair caller routes `pairs > 1 ∧ m > 1` to
+/// [`assemble_convert_col`], the DevOff twin. Emit-time panic on a malformed spec = a `cargo build`
+/// error (guard-every-crash), same as the other `assemble_*`.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_convert_off(
+    op_name: &str,
+    op_func: &str,
+    rows: u32,
+    cols: u32,
+    in_: &Stk<RowBlockedTag>,
+    in_off: u32,
+    o: &Stk<RowBlockedTag>,
+    o_off: u32,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
+    // handles carry only `.name()` — the offsets ride the args, not the handles.
+    let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
+        .unwrap_or_else(|e| panic!("assemble_convert_off {op_name}: {e}"));
+    for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
+        arg.set_offset_elems(off);
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_convert_off {op_name}: {e}"))
+}
+
+/// Assemble a dtype-convert op over a COLUMN WINDOW of its operands (see [`convert_opspec`]):
+/// `in_off`/`o_off` are [`crate::addr::DevOff`]s — nest-derived column offsets built by
+/// [`crate::addr::col_of`], so the `(c/lanes)·(rows·lanes)` group-corner term of the stick-major
+/// layout is present by construction (a flat stick-axis slice drops it, which is why the m=1 twin
+/// [`assemble_convert_off`] cannot serve rows>1 — see `reduce_opspec_off`'s block-alignment law).
+/// The m>1 twin the per-pair quantize tail routes to when `pairs > 1 ∧ m > 1`: the same
+/// `set_offset_elems` plumbing the windowed matmul and the offset reduce use, at DevOff precision.
+/// Emit-time panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
+/// other `assemble_*`.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_convert_col(
+    op_name: &str,
+    op_func: &str,
+    rows: u32,
+    cols: u32,
+    in_: &Stk<RowBlockedTag>,
+    in_off: crate::addr::DevOff,
+    o: &Stk<RowBlockedTag>,
+    o_off: crate::addr::DevOff,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    // TYPED, same as `assemble_convert_off`: both operands are the RowBlocked token stream and
+    // the handles carry only `.name()` — the offsets ride the args, not the handles.
+    let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
+        .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
+        arg.set_offset_elems(off.into_raw_elems());
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"))
 }
 
 /// Assemble a complete SuperDSC for ONE shape-preserving ELEMENTWISE op over a
@@ -3900,6 +4400,99 @@ pub fn assemble_pointwise_seeded(
 /// bakes is answerable only against the golden `sdsc_interslicetranspose.json`, which is NOT in this
 /// repo. Until it is, the guard is the extent we have evidence for, and widening it needs that fixture
 /// — not this comment.
+/// The `[8, 8]` inter-slice block that IS the transpose output's stick — `emit_sdsc`'s
+/// `is_transpose_out` arm, `stickSize_: [8, 8]` in the vendor golden. The atomic unit a core must
+/// own a WHOLE number of, on both axes.
+const TRANSPOSE_BLOCK: u32 = 8;
+
+/// ⛔⛔⛔ THE TRANSPOSE'S OWN CORE DIVISION — BOTH AXES, AT THE BLOCK — MEASURED AGAINST THE VENDOR
+/// GOLDEN `sdsc_interslicetranspose.json`.
+///
+/// `distribute_cores` splits `mb` alone to the hilt because it was written for FLAT row-major
+/// activations (its own doc), and a transpose is not one: its OUTPUT is a grid of 8×8 inter-slice
+/// blocks, so a core handed a fraction of an 8-row block shares an output stick with its neighbour
+/// and each writes a partial one — the shared-stick failure class on this tree's record. The golden
+/// — the vendor scheduler's own emission for this exact op — splits BOTH axes:
+/// `numWkSlicesPerDim_ {"out": 8, "mb": 4}` at `mb 384, out 3072` on 32 cores, i.e. per-core
+/// (mb 96, out 384), both whole blocks.
+///
+/// THE LAW (legality): the `out` split divides the INPUT stick count (`out`/64 — whole 64-element
+/// sticks per core, which is also a whole number of 8-wide block columns a fortiori), the `mb`
+/// split divides the 8-block count (`mb`/[`TRANSPOSE_BLOCK`]), and the product stays within the
+/// budget. Every legal division gives each core whole sticks on the read side and whole 8×8 blocks
+/// on the write side — the invariant [`transpose_opspec`]'s guard nets over the built plan.
+///
+/// THE CHOICE, from the one fixture point plus the structure it exposes:
+///   1. the most cores (`s_out · s_mb`) — idle cores are the waste the golden does not make;
+///   2. on a tie, the division that BALANCES the per-core atomic units — `|blocks/s_mb −
+///      sticks/s_out|`, compared exactly — so no core waits on a disproportionately large slice;
+///   3. on a tie, the larger `out` split: at the golden's own shape the balanced pairs are
+///      `(4, 8)` and `(8, 4)` and the fixture picks `(8, 4)`.
+///
+/// At the golden's (mb 384, out 3072) this yields `{"out": 8, "mb": 4}` — the fixture's division
+/// verbatim, pinned by `the_fixtures_own_shape_gets_the_fixtures_division` in
+/// [`mod transpose_tests`]. At a square `[128, 128]` (the padded token count the prefill-m>1 index
+/// mint transposes) it yields `{"out": 2, "mb": 16}`; at `[64, 64]`, `{"mb": 8}`.
+fn transpose_core_split(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str, u32> {
+    let dim = |name: &str| {
+        dims.iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("transpose_core_split: no '{name}' dim in {dims:?}"))
+    };
+    let sticks = dim("out").size / FP16_ELEMS_PER_STICK;
+    let blocks = dim("mb").size / TRANSPOSE_BLOCK;
+    // The divisors that respect the law, capped at the budget: ≤ 32 per axis, so the pair
+    // enumeration is ≤ 1024 candidates at ANY extent — expansion-cheap.
+    let out_divs: Vec<u32> = (1..=max_cores.min(sticks.max(1)))
+        .filter(|d| sticks.is_multiple_of(*d))
+        .collect();
+    let mb_divs: Vec<u32> = (1..=max_cores.min(blocks.max(1)))
+        .filter(|d| blocks.is_multiple_of(*d))
+        .collect();
+    // Seed with the always-legal trivial division; every candidate below beats it on key (1).
+    let mut best: (u32, u32) = (1, 1);
+    for &s_out in &out_divs {
+        for &s_mb in &mb_divs {
+            let product = s_out * s_mb;
+            if product > max_cores {
+                continue;
+            }
+            let (b_out, b_mb) = best;
+            if product != b_out * b_mb {
+                if product > b_out * b_mb {
+                    best = (s_out, s_mb);
+                }
+                continue;
+            }
+            // Key (2): the per-core atomic-unit balance, `|blocks/s_mb − sticks/s_out|`, as an
+            // exact rational (a/b vs c/d ⟺ a·d vs c·b — no floats at expansion time).
+            let bal = |o: u32, m: u32| {
+                (
+                    (blocks as u64 * o as u64).abs_diff(sticks as u64 * m as u64),
+                    o as u64 * m as u64,
+                )
+            };
+            let (an, ad) = bal(s_out, s_mb);
+            let (bn, bd) = bal(b_out, b_mb);
+            match (an * bd).cmp(&(bn * ad)) {
+                std::cmp::Ordering::Less => best = (s_out, s_mb),
+                std::cmp::Ordering::Greater => {}
+                // Key (3): the golden's `(8, 4)` over the mirrored `(4, 8)`.
+                std::cmp::Ordering::Equal if s_out > b_out => best = (s_out, s_mb),
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+    }
+    let mut splits = BTreeMap::new();
+    if best.1 > 1 {
+        splits.insert("mb", best.1);
+    }
+    if best.0 > 1 {
+        splits.insert("out", best.0);
+    }
+    splits
+}
+
 fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<OpSpec, String> {
     let out_ext = StickExtent::<Fp16>::new(out)?;
     let mb_ext = StickExtent::<Fp16>::new(mb)?;
@@ -3929,17 +4522,20 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
     // LOWER to TileIR: same pattern as pointwise_opspec/reduce_opspec_df/the matmul builders.
     // LX-fit guard (#1535): a transpose's resident set is the 1 input + 1 output tile
     // (n_operands = 2), tiled over the `out` stick dim if it overflows.
+    // ⛔ THE SPLITTER IS THIS OP'S OWN, NOT `distribute_cores`: the transpose's output is a grid of
+    // 8×8 inter-slice blocks, so the division must cut BOTH axes at the block — the law measured
+    // against the vendor golden (see `transpose_core_split`).
     let tile_op = crate::ir::island::tile_op::TileOp {
         kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
         dims: dims.clone(),
         df: Df::Fp16,
     };
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
+        .tile(MaxCores::<MAX_CORES>, transpose_core_split, "out")
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    // ⛔⛔⛔ THE PER-CORE SLICE MUST BE WHOLE 8×8 OUTPUT BLOCKS, AND THE VENDOR'S OWN FIXTURE SAYS THIS
-    // BUILDER'S DIVISION IS NOT.
+    // ⛔⛔⛔ THE PER-CORE SLICE MUST BE WHOLE 8×8 OUTPUT BLOCKS. `transpose_core_split` GUARANTEES
+    // THAT BY CONSTRUCTION — THIS GUARD IS THE NET THAT KEEPS IT TRUE, NOT THE REFUSING AUTHORITY.
     //
     // The OUTPUT's stick is the 8×8 inter-slice block over (`out`, `mb`) — `emit_sdsc`'s
     // `is_transpose_out` arm, `stickSize_: [8, 8]`. A stick is the atomic unit a core moves, so if a
@@ -3947,36 +4543,26 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
     // each writes a partial one. That is the failure class already on this tree's record (the second Kᵀ
     // stick written wrong; the shared-stick per-core init).
     //
-    // MEASURED against the golden fixture at
-    // `/Users/nickm/git/deeptools/ddc/ddl_templates/test/sdsc_interslicetranspose.json`, whose op is
-    // this exact shape (`N_`: `mb_ 384`, `out_ 3072`, `y_ 1`, 32 cores):
-    //
-    //   fixture  `numWkSlicesPerDim_ {"out": 8, "mb": 4}`  ⇒ per-core (mb 96, out 384) — both 8-whole
-    //   ours     `numWkSlicesPerDim_ {"mb": 32, "out": 1}` ⇒ per-core (mb 12, out 3072) — 12 is NOT
-    //
-    // `distribute_cores` splits `mb` FIRST and to the hilt (its own doc explains why, for the FLAT
-    // row-major activations it was written for), which leaves `out` whole and hands each core a
-    // fraction of an 8-row block for every `mb` that is not a multiple of 8·MAX_CORES. So the division
-    // this op needs is the fixture's — both axes split at the block — and deriving that rule from ONE
-    // fixture point is not something this builder guesses. It REFUSES instead, naming the extent and
-    // the reference division, so the shape is a `cargo` error and not a descriptor whose cores collide.
-    // Lifting it is a core-division change with that fixture as its oracle, not a widening here.
-    const BLOCK: u32 = 8; // the `[8, 8]` output stick, `emit_sdsc`'s `is_transpose_out` arm
+    // HISTORY: this guard used to REFUSE, because the builder then split `mb` alone via
+    // `distribute_cores` — per-core (mb 12, out 3072) at the golden's own (mb 384, out 3072), 12
+    // not a whole block — and the division was deliberately not guessed from one fixture point.
+    // The division is now measured against that fixture (`transpose_core_split`: both axes at the
+    // block, reproducing the golden's `{"out": 8, "mb": 4}` verbatim), so the shapes the old guard
+    // refused — the golden's own, and every stick-multiple `mb` below 8·MAX_CORES — bake. The guard
+    // STAYS, stated over the built plan: a future splitter regression is a `cargo` error here,
+    // never a descriptor whose cores collide.
     let (per_mb, per_out) = (plan.per_core_extent("mb"), plan.per_core_extent("out"));
-    if !per_mb.is_multiple_of(BLOCK) || !per_out.is_multiple_of(BLOCK) {
+    if !per_mb.is_multiple_of(TRANSPOSE_BLOCK) || !per_out.is_multiple_of(TRANSPOSE_BLOCK) {
         return Err(format!(
             "transpose [{}, {}]: the core division gives each core (mb {per_mb}, out {per_out}) but \
-             the output's stick is the {BLOCK}x{BLOCK} inter-slice block over (out, mb), so a \
-             per-core extent that is not a whole multiple of {BLOCK} puts two cores inside one output \
-             stick and each writes a partial one. This builder's `distribute_cores` splits `mb` alone \
-             ({:?}); the golden `sdsc_interslicetranspose.json` splits BOTH axes at the block \
-             (`numWkSlicesPerDim_ {{\"out\": 8, \"mb\": 4}}` for mb=384/out=3072 on 32 cores, i.e. \
-             per-core mb 96 and out 384). Use an extent whose division lands on the block, or fix the \
-             division against that fixture — this refuses rather than guessing a division law from one \
-             fixture point.",
+             the output's stick is the {TRANSPOSE_BLOCK}x{TRANSPOSE_BLOCK} inter-slice block over \
+             (out, mb), so a per-core extent that is not a whole multiple of {TRANSPOSE_BLOCK} puts \
+             two cores inside one output stick and each writes a partial one. `transpose_core_split` \
+             builds only whole-block divisions measured against the golden \
+             `sdsc_interslicetranspose.json`, so this refusal names a splitter regression, not a \
+             shape the builder rejects.",
             mb_ext.elems(),
             out_ext.elems(),
-            plan.splits(),
         ));
     }
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
@@ -4035,11 +4621,12 @@ pub fn assemble_transpose(
 /// ⛔ THE PANIC IS RIGHT FOR THE ASSEMBLERS AND WRONG FOR THE DOOR. Every `assemble_*` here panics on a
 /// refused opspec, and that is correct where they are called from: inside a `#[forward]` expansion a
 /// panic IS the build error. But [`lower_ktir_to_superdsc::transpose`] is reached by a third-party KTIR
-/// producer that has its own op to blame, and this builder makes TWO refusals a caller cannot
-/// pre-check by inspecting extents — the stick law (which the lowering does re-state, so it can name
-/// the padding alternative) and the CORE-DIVISION law, which depends on `distribute_cores`' answer for
-/// the shape and so cannot be restated without duplicating the divider. So the fallible form exists and
-/// the door uses it; `assemble_transpose` keeps its signature and its panic for every existing caller.
+/// producer that has its own op to blame, and this builder refuses in ways a caller cannot pre-check
+/// by inspecting extents — the stick law (which the lowering does re-state, so it can name the padding
+/// alternative) and the LX-fit refusal, which depends on the built plan's per-core extents. (The
+/// core-division law is no longer among them: `transpose_core_split` builds only whole-block
+/// divisions, so its guard is a net and not a reachable refusal.) So the fallible form exists and the
+/// door uses it; `assemble_transpose` keeps its signature and its panic for every existing caller.
 #[allow(clippy::too_many_arguments)]
 pub fn try_assemble_transpose(
     op_name: &str,
@@ -4077,8 +4664,8 @@ pub fn try_assemble_transpose(
 /// ⚖️ WHAT THE FIXTURE DOES **NOT** LICENSE. It carries `stickRepl_` (which this crate deliberately
 /// never emits — see [`LayoutInfo`]) and `coreletFoldProp_ factor_ 2` against our 1, so this is NOT a
 /// byte-parity comparison and no test below claims one. What it settles is the layout contract, the
-/// wire name, the unit, and — the reason [`transpose_opspec`] now refuses its own fixture's shape — the
-/// per-core division. Everything else here is a REFUSAL with a control.
+/// wire name, the unit, and the per-core division — which [`transpose_core_split`] now reproduces
+/// verbatim at the fixture's own shape. Everything else here is a REFUSAL with a control.
 #[cfg(test)]
 mod transpose_tests {
     use super::*;
@@ -4089,9 +4676,10 @@ mod transpose_tests {
     use ktir_core::irtype::IrType;
     use ktir_core::opkind::OpKind;
 
-    /// A shape this builder's core division actually lands on the 8×8 block: `mb` must be a multiple
-    /// of `8 · MAX_CORES` because `distribute_cores` splits `mb` alone (see the guard in
-    /// [`transpose_opspec`]). 256 is the smallest such row extent.
+    /// The module's representative row extent. ANY 64-multiple works since the division became the
+    /// fixture-measured law ([`transpose_core_split`]) — 256 is kept for continuity with the tests
+    /// that were written while `distribute_cores` split `mb` alone and only `mb ≥ 8·MAX_CORES`
+    /// landed on whole blocks.
     const MB: u32 = 256;
 
     /// The `dscs_[0]` entry of an emitted op, by name.
@@ -4149,20 +4737,16 @@ mod transpose_tests {
     }
 
     /// The op's ITERATION SPACE is the fixture's, at the fixture's own extents: `out_ 3072`, `mb_ 384`,
-    /// `y_ 1`. This is the half of the fixture comparison that DOES agree — recorded because the other
-    /// half (the core division) does not, and a reader needs to know the divergence is the division and
-    /// not the shape. `N_` is read off a plan built for the fixture's extents; the guard below is what
-    /// stops that plan reaching a descriptor.
+    /// `y_ 1`. Both halves of the fixture comparison now agree — the shape reaches the divider intact
+    /// (asserted here) and the division is the fixture's (asserted by
+    /// `the_fixtures_own_shape_gets_the_fixtures_division` below).
     #[test]
     fn the_iteration_space_matches_the_fixture_at_the_fixture_extents() {
-        let dims_only = transpose_opspec(384, 3072, "t1", "t2");
-        // It refuses (see the divergence test) — but the refusal message carries the extents it was
-        // built from, which is what this pins: the shape reached the divider intact.
-        let e = dims_only.expect_err("the fixture's own shape is refused by the division guard");
-        assert!(
-            e.contains("transpose [384, 3072]"),
-            "the extents are the fixture's `mb_ 384` / `out_ 3072`, got: {e}"
-        );
+        let spec = transpose_opspec(384, 3072, "t1", "t2")
+            .expect("the fixture's own shape bakes under the fixture-measured division");
+        assert_eq!(spec.iter.extent("mb"), 384, "the fixture's `mb_`");
+        assert_eq!(spec.iter.extent("out"), 3072, "the fixture's `out_`");
+        assert_eq!(spec.iter.extent("y"), 1, "the fixture's `y_`");
     }
 
     /// ⭐ EXHAUSTIVE: a transpose declares exactly TWO tensors, one per role, and in that order. The
@@ -4186,36 +4770,78 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔⛔⛔ THE DIVERGENCE THE FIXTURE FOUND, PINNED AS A REFUSAL. At the golden's own shape
-    /// (`mb_ 384`, `out_ 3072`, 32 cores) the fixture splits BOTH axes — `{"out": 8, "mb": 4}`, per-core
-    /// (mb 96, out 384), both whole 8-blocks — while `distribute_cores` splits `mb` alone to 32, giving
-    /// per-core (mb 12, out 3072). 12 is not a multiple of 8, so two cores would sit inside one 8×8
-    /// output stick.
-    ///
-    /// This asserts the REFUSAL, never our division as an expectation. When the division is fixed
-    /// against the fixture this test fails loudly and is the place to record the new behaviour — which
-    /// is the point of pinning it.
+    /// ⛔⛔⛔ THE DIVISION IS THE FIXTURE'S, AT THE FIXTURE'S OWN SHAPE. At (`mb_ 384`, `out_ 3072`,
+    /// 32 cores) the fixture splits BOTH axes — `{"out": 8, "mb": 4}`, per-core (mb 96, out 384),
+    /// both whole 8-blocks — and [`transpose_core_split`] now reproduces exactly that. This is the
+    /// test that used to pin the divergence as a REFUSAL (`distribute_cores` split `mb` alone to 32,
+    /// per-core mb 12, not a whole block); the fixture was the oracle named in the refusal, and this
+    /// is the acceptance it demanded.
     #[test]
-    fn the_fixtures_own_shape_is_refused_because_our_core_division_is_not_the_fixtures() {
-        let e = transpose_opspec(384, 3072, "t1", "t2")
-            .expect_err("per-core mb 12 is not a whole 8-row block");
-        assert!(
-            e.contains("(mb 12, out 3072)"),
-            "names the per-core extents this builder produces, got: {e}"
+    fn the_fixtures_own_shape_gets_the_fixtures_division() {
+        let spec = transpose_opspec(384, 3072, "t1", "t2")
+            .expect("the fixture-measured division accepts the fixture's own shape");
+        assert_eq!(
+            spec.iter.splits(),
+            &BTreeMap::from([("mb", 4), ("out", 8)]),
+            "the fixture's `numWkSlicesPerDim_ {{\"out\": 8, \"mb\": 4}}`, verbatim"
         );
-        assert!(
-            e.contains(r#"{"out": 8, "mb": 4}"#),
-            "names the fixture's own division as the reference, got: {e}"
-        );
-        assert!(
-            e.contains("sdsc_interslicetranspose.json"),
-            "cites the fixture, got: {e}"
+        assert_eq!(spec.iter.per_core_extent("mb"), 96, "384 / 4");
+        assert_eq!(spec.iter.per_core_extent("out"), 384, "3072 / 8");
+        assert_eq!(
+            spec.iter.cores_used().get(),
+            32,
+            "the fixture's `numCoresUsed_ 32`"
         );
     }
 
+    /// THE CHOICE RULE IS NOT NUMEROLOGY — it is exercised on its tie-break keys, not just its
+    /// output at the golden's shape. At `[256, 128]`: 16 atomic 8-blocks, 2 input sticks; the
+    /// max-product candidates are `(out 1, mb 32)` and `(out 2, mb 16)`, both 32 cores, both
+    /// perfectly balanced in atomic units — key (3) (the larger out split, the golden's `(8, 4)`
+    /// over the mirrored `(4, 8)`) is what picks `(2, 16)`. And the MINT's own shapes land on whole
+    /// blocks with cores left over: `[128, 128]` — the padded token count the prefill-m>1 index mint
+    /// transposes — takes `{"out": 2, "mb": 16}` (per-core mb 8 = one whole block), and `[64, 64]`
+    /// takes `{"mb": 8}` (out is a single stick; per-core mb 8).
+    #[test]
+    fn the_choice_rule_breaks_its_ties_on_balance_then_the_stick_axis_and_covers_the_mint_shapes() {
+        let square_128 = transpose_opspec(128, 128, "t1", "t2")
+            .expect("the mint's padded token count is a whole-block division");
+        assert_eq!(
+            square_128.iter.splits(),
+            &BTreeMap::from([("mb", 16), ("out", 2)])
+        );
+        assert_eq!(
+            square_128.iter.per_core_extent("mb"),
+            8,
+            "one whole 8-block"
+        );
+        assert_eq!(
+            square_128.iter.per_core_extent("out"),
+            64,
+            "one whole input stick"
+        );
+
+        let square_64 =
+            transpose_opspec(64, 64, "t1", "t2").expect("one stick wide, one block tall");
+        assert_eq!(square_64.iter.splits(), &BTreeMap::from([("mb", 8)]));
+        assert_eq!(square_64.iter.per_core_extent("mb"), 8);
+        assert_eq!(square_64.iter.per_core_extent("out"), 64);
+
+        let tie = transpose_opspec(256, 128, "t1", "t2").expect("both candidates are legal");
+        assert_eq!(
+            tie.iter.splits(),
+            &BTreeMap::from([("mb", 16), ("out", 2)]),
+            "the tie between (1, 32) and (2, 16) breaks to the larger out split"
+        );
+        assert_eq!(tie.iter.per_core_extent("mb"), 16);
+        assert_eq!(tie.iter.per_core_extent("out"), 64);
+    }
+
     /// EVERY shape this builder ACCEPTS has whole-block per-core extents. This is the invariant, and it
-    /// is stated over the builder's output rather than over `distribute_cores` — so it holds however the
-    /// division is later fixed, and it cannot be satisfied by a divider that got lucky on one shape.
+    /// is stated over the builder's output rather than over `transpose_core_split` — so it holds however
+    /// the division is later fixed, and it cannot be satisfied by a divider that got lucky on one shape.
+    /// Since the division became the fixture-measured law every 64-multiple shape in the sweep is
+    /// accepted, so the sweep is now exhaustive over the stick-multiple regime, not a sample.
     #[test]
     fn every_accepted_transpose_gives_each_core_whole_8x8_blocks() {
         let mut accepted = 0u32;
@@ -4570,15 +5196,16 @@ mod transpose_tests {
 mod transpose_stick_law {
     use super::*;
 
-    /// NO `(mb, out)` in `0..=512²` that is not a pair of whole 64-element sticks is EVER accepted.
+    /// NO `(mb, out)` in `0..=512²` that is not a pair of whole 64-element sticks is EVER accepted —
+    /// and (since the division became the fixture-measured law) EVERY whole-stick pair IS.
     ///
-    /// ⭐ ONE DIRECTION, DELIBERATELY. The converse — "every whole-stick pair is accepted" — is FALSE
-    /// and must not be asserted: the core-division guard refuses the whole-stick pairs whose per-core
-    /// slice misses the output's 8×8 block, which today is most of them (see
-    /// `the_fixtures_own_shape_is_refused_because_our_core_division_is_not_the_fixtures`). A sweep that
-    /// demanded acceptance would have to encode `distribute_cores`' behaviour as an expectation, i.e.
-    /// assert our own division as truth. The invariant that acceptance implies whole blocks is stated
-    /// separately, over the builder's output, by
+    /// ⭐ BOTH DIRECTIONS, NOW. The converse used to be FALSE — `distribute_cores` split `mb` alone,
+    /// so most whole-stick pairs were refused by the core-division guard (the history
+    /// [`transpose_opspec`] records) — and this sweep deliberately skipped them rather than assert
+    /// our own division as truth. [`transpose_core_split`] makes acceptance a property of the SHAPE
+    /// (a whole-stick pair always has a whole-block division, `(1, 1)` at worst), so the sweep
+    /// asserts it: acceptance is exactly the stick law, nothing narrower. The whole-block invariant
+    /// on the accepted side is stated separately, over the builder's output, by
     /// `every_accepted_transpose_gives_each_core_whole_8x8_blocks`.
     ///
     /// 512 spans the extents a real transpose has (a chunk width against a head dim or feature width)
@@ -4587,11 +5214,17 @@ mod transpose_stick_law {
     #[test]
     fn no_unaligned_extent_can_produce_a_transpose_descriptor() {
         let stk = <Fp16 as DataFormat>::ELEMS_PER_STICK;
-        let (mut checked, mut sub_stick_but_8_whole) = (0u32, 0u32);
+        let (mut checked, mut sub_stick_but_8_whole, mut whole_stick) = (0u32, 0u32, 0u32);
         for mb in 0..=512u32 {
             for out in 0..=512u32 {
                 if mb != 0 && out != 0 && mb % stk == 0 && out % stk == 0 {
-                    continue; // the whole-stick pairs: the division guard decides those, not this law
+                    whole_stick += 1;
+                    assert!(
+                        transpose_opspec(mb, out, "t1", "t2").is_ok(),
+                        "[{mb}, {out}] is a pair of whole {stk}-element sticks, so the \
+                         fixture-measured division must accept it"
+                    );
+                    continue;
                 }
                 checked += 1;
                 if mb % 8 == 0 && out % 8 == 0 && mb != 0 && out != 0 {
@@ -4608,6 +5241,11 @@ mod transpose_stick_law {
             checked,
             513 * 513 - 64,
             "every pair but the 64 whole-stick ones"
+        );
+        // And the converse side really ran: 8 stick multiples per axis, squared.
+        assert_eq!(
+            whole_stick, 64,
+            "the whole-stick pairs the fixture-measured division must accept"
         );
         // THE SWEEP'S OWN NEGATIVE CONTROL: the domain really does contain the interesting case — a
         // pair that is a whole multiple of the 8×8 BLOCK but not of the 64-element STICK. If the guard
@@ -4842,6 +5480,285 @@ pub fn assemble_restickify_off(
         .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"))
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// THE VENDOR TOP-K PAIR — `topk.ddl`'s `topkindex`/`topkvalue`, the selection primitive that
+// replaces the router's argsort chain (wall 11: the chain's dup ranks summed expert ids past the
+// expert bank; the pair's counter-built indices are unique by construction).
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The three extents a top-k is over, each named for its ROLE so the triple cannot be handed over
+/// swapped (the [`assemble_restickify_kt_2d`] slots/feats law). See [`topk_opspec`] for what each
+/// role means in the descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct TopKGeom {
+    /// The CANDIDATE count — the reduction dim `in`: the router's expert width `W`, scanned whole
+    /// by every core of the ring.
+    pub candidates: u32,
+    /// The SLOT count — the k dim `out`: how many (value, index) pairs the pair emits per token,
+    /// DESCENDING (slot 0 = the max). The pair itself accepts any `slots ≥ 1` (the fixtures' own
+    /// k is 8); the landing chain runs it at 64 so the rerouted-transpose door can re-orient the
+    /// outputs token-major (its stick law needs a 64-multiple).
+    pub slots: u32,
+    /// The padded TOKEN count — the stick dim `y`, a whole 64-multiple: the one axis the pair's
+    /// input and output share, so it is the only axis allowed on the stick.
+    pub tokens: u32,
+}
+
+/// ⭐⭐⭐ THE PAIR'S OWN CORE DIVISION — `distribute_cores` cannot build it, because the top-k is
+/// neither a pointwise nor a plain reduce: its k dim is a RING (`ddl.core_to_core_communication(%k)`,
+/// `topk.ddl:72` — the displaced value ripples core-to-core through the insertion sort), and the
+/// reduction dim must NEVER split (the fixture's own `numWkSlicesPerDim_` carries `in: 1`; splitting
+/// the scan would need the partial-reduce collision machinery the pair's fixtures never exercise).
+///
+/// THE LAW, from the two fixtures plus the structure they expose:
+///   1. the ring = the largest divisor of `slots` that is ≤ 8 — BOTH fixtures carry
+///      `numWkSlicesPerDim_ {"out": 8}`, the only ring size any accepted top-k descriptor
+///      demonstrates, and the size that keeps the per-core `k_loop` ripple (the insertion sort
+///      over the core's k-vectorized internal tensors — `current_max`/`current_idx` are
+///      `internal_tensor`s of the OUTPUT's layout, so N slots per core is the vectorized ripple)
+///      at the depth the fixtures themselves run;
+///   2. then fill with the token-stick instances (`y` split at whole sticks) up to the budget —
+///      the fixtures' `mb: 2, i: 2` played exactly this role (instance parallelism outside the
+///      ring: the `core_to_core_communication` is scoped to the k dim, so cores in different
+///      `y` slices never communicate and each runs its own ring);
+///   3. NEVER `in` — the scan axis.
+///
+/// At the fixtures' own geometry (candidates 64, slots 8, tokens 64 = one stick) this yields
+/// `{"out": 8}` against their `{"in": 1, "out": 8, "mb": 2, "y": 1, "i": 2}`: the ring matches
+/// verbatim, and the `mb`/`i` instance splits are the documented divergence — this builder has no
+/// `mb`/`i` dims, because its `y` is already the multi-stick token axis those dims instanced.
+/// Pinned by `the_split_is_the_ring_first_then_token_sticks` in
+/// `tests/zz_the_topk_pair_matches_the_vendor_fixture.rs`.
+fn topk_core_split(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str, u32> {
+    let dim = |name: &str| {
+        dims.iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("topk_core_split: no '{name}' dim in {dims:?}"))
+    };
+    let slots = dim("out").size;
+    let sticks = dim("y").size / FP16_ELEMS_PER_STICK;
+    // (1) the ring: largest divisor of the slot count that is ≤ 8 (and inside the budget).
+    let ring = (1..=max_cores.min(8))
+        .filter(|d| slots.is_multiple_of(*d))
+        .max()
+        .unwrap_or(1);
+    // (2) the token instances: the LARGEST stick-count divisor that fits beside the ring — not a
+    // power-of-two climb, because stick counts are often odd (a 320-token prefill is 5 sticks, and
+    // `y: 3` at 192 tokens is as legal as `y: 2` at 128).
+    let y_split = (1..=sticks.min(max_cores))
+        .filter(|d| sticks.is_multiple_of(*d) && ring * d <= max_cores)
+        .max()
+        .unwrap_or(1);
+    let mut splits = BTreeMap::new();
+    if y_split > 1 {
+        splits.insert("y", y_split);
+    }
+    if ring > 1 {
+        splits.insert("out", ring);
+    }
+    splits
+}
+
+/// ⭐⭐⭐ THE VENDOR TOP-K PAIR AS A DESCRIPTOR — ONE member (`OpFunc::TopKIndex` emits the
+/// `[slots, tokens]` expert ids, `OpFunc::TopKValue` the values at those ids) over the TRANSPOSED
+/// scores, replacing the argsort + rank-inversion chains the router door used to emit.
+///
+/// THE FORM, and why every part of it is forced:
+///   • INPUT `[in, y]` = `[candidates, tokens]`, sticked on `y` (dim 1 = LAST, dxp-friendly) ⇒
+///     device walk `[tokens/64, candidates, 64]` — EXACTLY the Kᵀ restickify door's output bytes
+///     (`[cap/64, hd, 64]` at `candidates = hd`), so the chain scores → Kᵀ → pair is a
+///     byte-identical seam at ANY token count.
+///   • OUTPUT `[out, y]` = `[slots, tokens]`, sticked on `y` ⇒ walk `[tokens/64, slots, 64]` —
+///     the FLAT restickify door's input contract and the rerouted-transpose door's input contract
+///     are both EXACTLY this form, so both landings are one door each.
+///   • THE STICK LAW (torch_spyre `_check_stick_topk`, `op_spec_validation.py:743`): neither the
+///     reduction dim (`in`) nor the k dim (`out`) may ride the stick; any SURVIVING dim may. The
+///     stick must therefore be the token axis — the one dim input and output share — and the dims
+///     table below is that law made structural.
+///
+/// ⭐ WHY THE NAMES DON'T MATTER TO DDC — the dim↔DDL-symbol binding is a CONSTRAINT SOLVER, not a
+/// naming convention (`DdlConversion::matchDdl2Dsc`, `ddl_conversion.cpp:2360-2460`): the
+/// order-fixed slice/stick layouts pin `outer#0` to the SDSC's stick dim, the flexible global
+/// layouts restrict the reduce symbols to the INPUT-only dims and `%k` to the OUTPUT-only dim, and
+/// a backtracking search assigns the rest. With input `[in, y]`, output `[out, y]`, stick `y`, the
+/// solver derives reduce=`in`, k=`out`, `outer#0`=`y` — the exact roles `topk.ddl`'s dataflow needs
+/// (the element loop over the reduce dims, the ring over `%k`). The fixtures' own 4-dim
+/// `["in","i","y","mb"]` form is the same solver's output at a geometry with two extra instance
+/// dims; this 3-dim form is the minimal one.
+///
+/// The fixtures (`ddc/ddl_templates/test/sdsc_topKIndex.json`, `sdsc_topKValue.json`) are
+/// STRUCTURAL oracles, not byte parity: they are hand-built (`hbmSize_ 256/32` against volumes of
+/// 16384/2048 elements), carry `stickRepl_` and `pdsRelation_` this crate deliberately does not
+/// emit, and instance their volume on `mb`/`i` dims this form does not have. What they pin — and
+/// what `tests/zz_the_topk_pair_matches_the_vendor_fixture.rs` asserts — is the layout contract,
+/// the wire names, the unit, the ring-first division, and the computeOp row
+/// ([`OpFunc::is_topk_pair`]).
+fn topk_opspec(
+    member: OpFunc,
+    geom: TopKGeom,
+    in_name: &str,
+    o_name: &str,
+) -> Result<OpSpec, String> {
+    if !member.is_topk_pair() {
+        return Err(format!(
+            "topk {:?}: {member:?} is not a member of the vendor top-k pair — this builder emits \
+             the topk.ddl form (input [in, y] and output [out, y], both sticked on y, the SFP ring \
+             over out), which only topkindex/topkvalue bind. Route plain reductions through the \
+             reduce builder.",
+            geom
+        ));
+    }
+    let TopKGeom {
+        candidates: in_elems,
+        slots: out_elems,
+        tokens: y_elems,
+    } = geom;
+    if in_elems == 0 || out_elems == 0 {
+        return Err(format!(
+            "topk [in {in_elems}, out {out_elems}, y {y_elems}]: a top-k over zero candidates or \
+             into zero slots is empty — the vendor pair has no degenerate mode (its fixtures scan \
+             in=64 into out=8), and an empty descriptor would be a silent no-op instead of a refusal."
+        ));
+    }
+    // The whole-stick half of the stick law: the token axis must be a whole 64-multiple (the
+    // fixtures' y=64; the pad-the-row-count law the landing chain already runs).
+    let y_ext = StickExtent::<Fp16>::new(y_elems)?;
+    // THE STICK LAW, MADE STRUCTURAL: `in` is the reduction dim, `out` is the k dim, NEITHER is
+    // the stick, and `y` — the one dim both args share — is. `in` carries `is_reduction` so the
+    // tiler's reduction ladder knows the scan axis (and never proposes splitting it).
+    let dims = vec![
+        ItDim {
+            name: "in",
+            size: in_elems,
+            is_reduction: true,
+            is_stick: false,
+            df: Df::Fp16,
+        },
+        ItDim {
+            name: "out",
+            size: out_elems,
+            is_reduction: false,
+            is_stick: false,
+            df: Df::Fp16,
+        },
+        ItDim {
+            name: "y",
+            size: y_ext.elems(),
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        },
+    ];
+    // LOWER to TileIR: the resident set is the 1 input + 1 output tile (n_operands = 2), tiled
+    // over the `y` token dim if it overflows LX — every y tile is an independent top-k over its
+    // own tokens, so time-tiling is semantically free. ⛔ THE SPLITTER IS THE PAIR'S OWN
+    // (`topk_core_split`), NOT `distribute_cores`: the ring-over-k law and the never-split-the-
+    // scan law are both outside `distribute_cores`' vocabulary.
+    let tile_op = crate::ir::island::tile_op::TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims: dims.clone(),
+        df: Df::Fp16,
+    };
+    let tiled = tile_op
+        .tile(MaxCores::<MAX_CORES>, topk_core_split, "y")
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    // ⛔ THE MIN-DATASTAGE FOOTPRINT GUARD — a runtime allocation refusal is a
+    // build error (the user's law). The emitter pins the pair's datastage
+    // minimum on `out` at ONE slot (the vendor fixtures' own per-core geometry;
+    // see the datastage law in `emit_sdsc_tiled` — a slice-stated minimum made
+    // the DDC refuse the whole 26b decode bundle at bake, card-mutation-proven),
+    // so the one term of the minimum LX charge this mint can still let grow is
+    // the never-split INPUT scan: `in` is the reduction dim (`topk_core_split`
+    // never proposes splitting it) and the y stick is the streaming unit,
+    // staged double-buffered — `2 buffers · in · y_per_core · 2 B`. A scan that
+    // alone overflows the vendor scheduler's post-reserveFrontendLx pool
+    // ([`crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES`]) would make the DDC
+    // refuse the bundle at bake with nothing local to blame ("Cannot allocate
+    // even the smallest size", ddcv1.cpp:1351) — refuse it HERE, where the
+    // geometry names itself.
+    let y_per_core = y_ext.elems() / plan.split_of("y").max(1);
+    let scan_bytes = 2 * in_elems as u64 * y_per_core as u64 * 2;
+    if scan_bytes > crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES {
+        return Err(format!(
+            "topk [in {in_elems}, out {out_elems}, y {}]: the never-split input scan \
+             {in_elems} × {y_per_core} tokens, double-buffered, is {scan_bytes} B — past the \
+             vendor scheduler's post-reserveFrontendLx pool of {} B, so the DDC would refuse \
+             this bundle at its minimum-datastage check (allocAllMem, ddcv1.cpp:1351). Split \
+             the candidate axis at the producer or shrink the token stick",
+            y_ext.elems(),
+            crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES
+        ));
+    }
+    let input = TensorArg::<2>::new(
+        true,
+        in_name.to_string(),
+        Role::Input,
+        [Scale::Active, Scale::Active],
+        plan.iter_syms(["in", "y"]),
+        ["in", "y"],
+        "y",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?;
+    let output = TensorArg::<2>::new(
+        false,
+        o_name.to_string(),
+        Role::Output,
+        [Scale::Active, Scale::Active],
+        plan.iter_syms(["out", "y"]),
+        ["out", "y"],
+        "y",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?;
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    Ok(OpSpec {
+        op: member,
+        // A top-k IS a reduction (the `in` scan); `emit_sdsc_tiled`'s seeded-reduce arm cannot
+        // fire on it because the pair's `ddl_input_arity` is `Some(1)` — the unseeded, internal-
+        // state contract the registry row pins.
+        is_reduction: true,
+        iter: plan,
+        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
+        op_info: OpInfo::None,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+    })
+}
+
+/// [`topk_opspec`] assembled — the `#[forward]` form, for callers inside an expansion where a
+/// refusal IS the build error. Door arms that can name their own blame use [`try_assemble_topk`].
+pub fn assemble_topk(
+    op_name: &str,
+    member: OpFunc,
+    geom: TopKGeom,
+    in_name: &str,
+    o_name: &str,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    try_assemble_topk(op_name, member, geom, in_name, o_name, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_topk {op_name}: {e}"))
+}
+
+/// [`assemble_topk`] AS A `Result` — the form a door arm needs, so a refusal names the producer's
+/// own op instead of panicking inside the expansion (the `try_assemble_transpose` law).
+pub fn try_assemble_topk(
+    op_name: &str,
+    member: OpFunc,
+    geom: TopKGeom,
+    in_name: &str,
+    o_name: &str,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = topk_opspec(member, geom, in_name, o_name)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
+}
+
 /// PATH B (host_kv_write nuke): a genuine RANK-2 per-head restickify that TRANSPOSES the natural
 /// K cache `[cap,hd]` (flat row-major, the on-card `[1,hd]`-per-slot dense write) into the `[hd,cap]`
 /// cap-sticked Kᵀ KERNEL the score matmul reads — mirroring torch-spyre `key.transpose(-2,-1).
@@ -5055,6 +5972,146 @@ pub fn try_assemble_restickify_transpose_2d(
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
+/// ⭐ THE FLAT RESTICKIFY — the mint's SECOND restickify, and it is FORCED (wall 3 of the
+/// prefill-m>1 ExpertMatmul mint chain): the `dl16tofp32` leg's DDL bind
+/// (`quantization_double_pad.ddl`) SHARES `%stick_dim` between its two operands — input
+/// via `%slice_layout_in = layout(%stick_dim)`, output via `%padded_dim_out`'s
+/// `nonPaddedDim` — so the leg's input and output sticks must name the SAME dim, and its
+/// flat fp32 output therefore demands a FLAT fp16 input. The Kᵀ restickify's output is
+/// `[W, m_pad]` sticked on `m_pad` (dim 1, the card-proven `kcache_kt_write_offset`
+/// re-tile `[m_pad/64, W, 64]`) — NOT flat at `m_pad > 64` — and re-sticking the
+/// Kᵀ door's own output to dim 0 is IMPOSSIBLE: its input and output would then stick
+/// the SAME axis (the staging's W-sticked read and a W-sticked flat write), the
+/// same-dim binding the standalone probe measured REFUSED at
+/// `ddl_conversion.cpp:2539` ("Could not find any suitable dimension mapping" — the
+/// restickify DDL requires the two ports' stick dims to be DISTINCT actual dims). So the
+/// chain is TWO doors: the Kᵀ restickify (staging's W-stick → K-form's m_pad-stick,
+/// unchanged) then THIS door (K-form's m_pad-stick → flat W-stick):
+///   • INPUT  logical `[rows=W, cols=m_pad]`, stick = `out` (dim 1 = LAST) ⇒ stick-blocked
+///     `[m_pad/64, W, 64]` — reads the K-form at ANY `m_pad`, exactly the bytes the Kᵀ
+///     door wrote (that seam is byte-identical).
+///   • OUTPUT logical `[rows=W, cols=m_pad]`, stick = `mb` (dim 0, NOT last) ⇒ device_size
+///     FLAT row-major `w·m_pad + t` — the V-door's card-proven stick-on-dim-0 declaration,
+///     mirrored onto the write side; the buffer the `dl16tofp32` Flat leg reads.
+/// The binding (input stick `out` ≠ output stick `mb`, both dims shared across ports) is
+/// PROBE-VALIDATED on the pod (`dxp_standalone --bundle`: exit 0 with the real tiny26
+/// emrt sdsc re-dimensioned to exactly this form; the same-dim "silent" control refuses
+/// at :2539, proving the check discriminates). The physical forms are pinned by the two
+/// card-proven laws the whole stack already runs on: stick-on-last ⇒
+/// `[stickdim/64, other, 64]` (`kcache_kt_write_offset` at cap≫64) and stick-on-dim-0 ⇒
+/// flat row-major (the V-door read) — which coincide at the probe's 64×64, explaining its
+/// byte-identical control binary without vacuity.
+fn restickify_flat_opspec_2d(
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+) -> Result<OpSpec, String> {
+    // Both extents must be whole 64-sticks: `cols` (m_pad) is the Kᵀ door's own output
+    // stick, `rows` (W) is the staging contract's stick-group axis — both already 64s by
+    // the mint's pad laws; stated here so a violation is a typed `Err`, never a bake fault.
+    let _rows_ext = StickExtent::<Fp16>::new(rows)?;
+    let _cols_ext = StickExtent::<Fp16>::new(cols)?;
+    // Canonical dim names (`mb`/`out`) — `set_iter_dim_i` drops non-slot names from `N_`,
+    // and the converts this door feeds name the SAME axes `mb`(W)/`out`(m_pad), so the
+    // seam's vocabulary is shared, not merely compatible. Both marked stick (the Kᵀ door's
+    // pattern) so the splitter finds a valid stick-multiple candidate on each operand.
+    let dims = vec![
+        ItDim {
+            name: "mb",
+            size: rows,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        },
+        ItDim {
+            name: "out",
+            size: cols,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        },
+    ];
+    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
+    // INPUT: K-form view `[mb=W, out=m_pad]` sticked on `out` (dim 1 = LAST, the
+    // dxp-friendly position the Kᵀ door's own input requires) ⇒ stick-blocked
+    // `[m_pad/64, W, 64]` — the Kᵀ door's output bytes, read correctly at ANY `m_pad`.
+    let input = TensorArg::<2>::new(
+        true,
+        in_name.to_string(),
+        Role::Input,
+        [Scale::Active, Scale::Active],
+        plan.iter_syms(["mb", "out"]),
+        ["mb", "out"],
+        "out",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?;
+    // OUTPUT: flat view `[mb=W, out=m_pad]` sticked on `mb` (dim 0, NOT last) ⇒ FLAT
+    // row-major `w·m_pad + t` — the V-door's card-proven dim-0-stick declaration on the
+    // write side, the buffer the `dl16tofp32` Flat leg's shared-%stick_dim bind demands.
+    let output = TensorArg::<2>::new(
+        false,
+        o_name.to_string(),
+        Role::Output,
+        [Scale::Active, Scale::Active],
+        plan.iter_syms(["mb", "out"]),
+        ["mb", "out"],
+        "mb",
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?;
+    Ok(OpSpec {
+        op: OpFunc::Restickify,
+        is_reduction: false,
+        iter: plan,
+        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
+        op_info: OpInfo::None,
+        tiled_symbols: vec![],
+        time_tile: None,
+        indirect: None,
+    })
+}
+
+/// [`restickify_flat_opspec_2d`] assembled — the fallible form, because the mint's caller
+/// maps the LX refusal into its own named build error (the `try_assemble_restickify_transpose_2d`
+/// pattern). ⛔ MUST FAIL CLOSED ON LX for the same reason the transpose door does: this
+/// restickify carries `time_tile: None` — the output stick rides `mb`, and dividing `mb` in
+/// time would split an output stick — so a resident set that overflows the scratchpad is a
+/// NAMED REFUSAL, never a descriptor that addresses past LX and dies on card as a
+/// `DtException`.
+pub fn try_assemble_restickify_flat_2d(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = restickify_flat_opspec_2d(rows, cols, in_name, o_name)?;
+    // The resident set is the 1 input + 1 output per-core tile, which for a relayout are
+    // the same extents on both sides (the swap is in the addressing, not the size).
+    let (per_mb, per_out) = (
+        op.iter.per_core_extent("mb"),
+        op.iter.per_core_extent("out"),
+    );
+    let resident = 2 * u64::from(per_mb) * u64::from(per_out) * u64::from(Fp16::WORD_LENGTH);
+    if resident > USABLE_LX_BYTES {
+        return Err(format!(
+            "flat restickify [{rows}, {cols}]: the per-core tile is (mb {per_mb}, out {per_out}) \
+             on {} cores, so the resident input+output set is {resident} B against the \
+             {USABLE_LX_BYTES}-B LX scratchpad. This door carries `time_tile: None` and cannot be \
+             time-tiled instead — its output stick rides `mb`, so dividing `mb` in time would \
+             split an output stick. Flatten a narrower column block and loop, which keeps each \
+             descriptor's resident set inside LX.",
+            op.iter.cores_used().get(),
+        ));
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
+}
+
 /// PATH B (V side): a RANK-2 per-head restickify that RE-STICKS the natural V cache `[cap,hd]` (flat
 /// row-major, the on-card `[1,hd]`-per-slot write) into the hd-sticked `[cap,hd]` KERNEL the value bmm
 /// reads. UNLIKE K this is NOT a transpose — same dim order `[cap,hd]`, only the stick axis moves
@@ -5221,6 +6278,7 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "sigmoid" => OpFunc::Sigmoid,
         "dl16tofp32" => OpFunc::Dl16ToFp32,
         "fp32todl16" => OpFunc::Fp32ToDl16,
+        "fp32toint32" => OpFunc::Fp32ToInt32,
         "gelu" => OpFunc::Gelu,
         "mish" => OpFunc::Mish,
         "tanh" => OpFunc::Tanh,
@@ -5237,6 +6295,12 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "clip" => OpFunc::Clip,
         "qfp8ch" => OpFunc::Qfp8ch,
         "quantscalepertokenfp8" => OpFunc::QuantScalePerTokenFp8,
+        "lesserthan" => OpFunc::LesserThan,
+        "equal" => OpFunc::Equal,
+        "notequal" => OpFunc::NotEqual,
+        "where3" => OpFunc::Where3,
+        "topkindex" => OpFunc::TopKIndex,
+        "topkvalue" => OpFunc::TopKValue,
         other => panic!(
             "op_func_from_str: unknown op name {other:?} — would have silently become `add` \
              (wrong op). Add an explicit arm or fix the caller."
@@ -5993,5 +7057,568 @@ mod gather_cut {
             .is_ok(),
             "one index stick in one leg emits"
         );
+    }
+}
+
+/// ⭐ `fp32toint32` — the MoE expert gather's INDEX PRODUCER, and the descriptor properties the
+/// vendor DDL states for it (unary_parallel.ddl:50, datastage lines 879-889).
+///
+/// `cargo test` cannot run a bake. What it CAN pin is every property the gather's DT_CHECKs are a
+/// function of — so a change to any of them is a test failure saying "re-run the card leg" instead
+/// of a silent bake refusal (`L3DlOpsScheduler.cpp:5928` wants index `wordLength == 4`;
+/// `GatherIndexConversion.cpp:133` wants `dataFormat_ == SENUINT32`).
+#[cfg(test)]
+mod fp32toint32_convert_law {
+    use super::*;
+
+    /// The convert at the MoE router's own geometry: the top-k output's `[m, W]` rows over the
+    /// router's padded expert width (tiny26: m=2, E=8, W=64).
+    fn op(rows: u32) -> OpSpec {
+        convert_opspec(OpFunc::Fp32ToInt32, rows, 64, "rt_topk", "moe_idx")
+            .expect("the convert emits")
+    }
+
+    /// The output arg (arg 1, the non-input) — the INDEX dataspace-to-be.
+    fn out_arg(op: &OpSpec) -> &AnyTensorArg {
+        op.args
+            .iter()
+            .find(|a| !a.view().is_input)
+            .expect("an output arg")
+    }
+
+    /// ⭐ THE OUTPUT IS SENUINT32 AT 4 BYTES and the INPUT IS FP32 AT 4 BYTES — the numbers the
+    /// gather's DT_CHECKs read, and the slice-equality law (unary_parallel.ddl:59): both operands'
+    /// sticks are 32-elem (slice 4 each, the match), and the pair (4, 4) is also the control that
+    /// the two operands were not collapsed onto one df.
+    #[test]
+    fn the_output_is_senuint32_and_the_input_is_fp32_both_four_bytes() {
+        let o = op(2);
+        let out = out_arg(&o);
+        assert_eq!(out.view().df, Df::SenUint32, "the gather's index format");
+        assert_eq!(out.view().df.word_length(), 4, "DT_CHECK wordLength == 4");
+        let inp = o
+            .args
+            .iter()
+            .find(|a| a.view().is_input)
+            .expect("an input arg");
+        assert_eq!(inp.view().df, Df::Fp32, "the fp32 staging leg's format");
+        assert_eq!(inp.view().df.word_length(), 4, "the input is 4-byte fp32");
+    }
+
+    /// ⭐ THE TWO STICKS MATCH AT 32 — the slice-equality constraint's arithmetic
+    /// (unary_parallel.ddl:59: slice = stickSize/8 elements, must be EQUAL): both 32-elem
+    /// sticks yield slice 4, the vendor `sdsc_fp32toint32.json` fixture's own geometry. An
+    /// fp16 input here (stick 64, slice 8) is the dxp "slice size does not match" bake
+    /// refusal (ddl_conversion.cpp:2728).
+    #[test]
+    fn both_operands_sticks_yield_the_same_slice() {
+        let o = op(2);
+        let inp = o
+            .args
+            .iter()
+            .find(|a| a.view().is_input)
+            .expect("an input arg");
+        let out = out_arg(&o);
+        assert_eq!(
+            inp.view().df.elems_per_stick(),
+            out.view().df.elems_per_stick(),
+            "the slice-equality law: equal element counts per stick"
+        );
+        assert_eq!(
+            out.view().df.elems_per_stick(),
+            32,
+            "the u32 output's stick"
+        );
+    }
+
+    /// ⭐ THE NARROWING CONVERT STAYS RANK-3 — the `y` dim dxp's buffer walk indexes (the rank-2
+    /// collapse of the fp16↔fp32 converts crashed `getBufferCapacityForNode` on a real pod). Pinned
+    /// as the OUTPUT arg's rank, the side whose stick narrowed; the fp16↔fp32 pair drives the same
+    /// law through `is_fp32_convert`, which is why the check here is the shared flag's effect
+    /// (`is_narrowing_convert`) and not a copy of its body.
+    #[test]
+    fn the_narrowing_convert_stays_rank_3() {
+        let o = op(2);
+        let out = out_arg(&o);
+        assert!(
+            matches!(out, AnyTensorArg::R3(_)),
+            "a narrowing convert's operands keep the `y` dim"
+        );
+    }
+
+    /// ⭐ THE OPFUNC SPELLING — `fp32toint32`, the name `dscdefn.cpp` recognizes; a wrong name is
+    /// an on-card `Unrecognized opFunc` refusal, and the string round-trip through
+    /// `op_func_from_str` is what every assembler uses.
+    #[test]
+    fn the_name_round_trips() {
+        assert_eq!(OpFunc::Fp32ToInt32.name(), "fp32toint32");
+        assert_eq!(op_func_from_str("fp32toint32"), OpFunc::Fp32ToInt32);
+    }
+
+    /// ⭐ THE EX UNIT IS SFP — the cast runs on the SFP unit (the DDL datastage's `sfp`/`lxsu`
+    /// units), which `OpFunc::ex_unit` derives structurally; pinned so a reclassification of the
+    /// converts cannot silently move the op to `pt`.
+    #[test]
+    fn the_ex_unit_is_sfp() {
+        assert_eq!(OpFunc::Fp32ToInt32.ex_unit().as_str(), "sfp");
+    }
+}
+
+/// ⭐ N1 — the prefill-m>1 mint's convert chain: the CONSECUTIVE-ROWS output arrangement.
+/// The router's top-k table is transposed to `[W, m_pad]` (W padded slots × m_pad padded
+/// tokens), flattened by the SECOND restickify (the K-form's m_pad stick → the flat
+/// table's `mb` stick), then staged fp16→fp32 (the FLAT `dl16tofp32` leg) and minted
+/// into the gather's index table by the FLAT `fp32toint32` leg (both legs' operands
+/// `mb`-sticked — the shared-%stick_dim law and the DDL equality
+/// unary_parallel.ddl:59-60): slot s's u32 run must land at elements `s·m_pad .. +m` —
+/// ONE contiguous run per slot, exactly what the per-slot
+/// `GatherIndex::of_expert_planes` rank-1 index view reads at `first_entry = s·m_pad`.
+/// 26b: `[W=128, m_pad=128]`; tiny26: `[64, 64]`.
+#[cfg(test)]
+mod convert_index_rows_law {
+    use super::*;
+
+    fn op(rows: u32, cols: u32) -> OpSpec {
+        convert_opspec_arranged(
+            OpFunc::Fp32ToInt32,
+            rows,
+            cols,
+            "em_t32",
+            "em_idx",
+            ConvertArrangement::Flat,
+        )
+        .expect("the index-rows convert emits")
+    }
+
+    fn widen(rows: u32, cols: u32) -> OpSpec {
+        convert_opspec_arranged(
+            OpFunc::Dl16ToFp32,
+            rows,
+            cols,
+            "em_t",
+            "em_t32",
+            ConvertArrangement::Flat,
+        )
+        .expect("the flat widen convert emits")
+    }
+
+    fn out_arg(op: &OpSpec) -> &AnyTensorArg {
+        op.args
+            .iter()
+            .find(|a| !a.view().is_input)
+            .expect("an output arg")
+    }
+
+    fn in_arg(op: &OpSpec) -> &AnyTensorArg {
+        op.args
+            .iter()
+            .find(|a| a.view().is_input)
+            .expect("an input arg")
+    }
+
+    /// ⭐ THE OUTPUT IS FLAT AND ROW s LANDS AT ELEMENT s·m_pad — the whole point of the form:
+    /// the stick rides `mb` (NOT the last non-unit dim), the ONE classifier folds the trailing
+    /// `y` and classifies the view row-major, and `dev_off` — the SAME function the per-core
+    /// start and the on-card walk derive from — places element (s, t) at `s·m_pad + t`. The
+    /// staged form (stick on `out`) would place it at `(t/32)·W + s`: the gather's run would
+    /// straddle every token-group — the scramble this form exists to kill.
+    #[test]
+    fn the_output_is_flat_and_row_s_lands_at_s_times_m_pad() {
+        let (w, m_pad) = (128u32, 128u32);
+        let o = op(w, m_pad);
+        let out = out_arg(&o);
+        assert_eq!(out.view().stick, "mb", "the stick rides the row axis");
+        let sl = view_stick_layout(&out.view(), &o.iter);
+        assert!(
+            matches!(sl.addressing(), crate::sdsc_abstract::Addressing::RowMajor),
+            "flat row-major, not stick-major"
+        );
+        assert_eq!(sl.dev_off(0, 0), 0);
+        assert_eq!(
+            sl.dev_off(1, 0),
+            m_pad as usize,
+            "slot 1's run starts at m_pad"
+        );
+        assert_eq!(
+            sl.dev_off(3, 96),
+            3 * m_pad as usize + 96,
+            "element (s, t) at s·m_pad + t"
+        );
+        assert_eq!(
+            m_pad % out.view().df.elems_per_stick(),
+            0,
+            "every row is whole u32 sticks — the per-slot run is stick-aligned"
+        );
+    }
+
+    /// ⭐ THE INPUT CARRIES THE SAME `mb` STICK — the DDL equality
+    /// (`unary_parallel.ddl:59-60`: the fp32toint32 operands' slice AND stick
+    /// `(dim,size)` vectors must be EQUAL; `ddl_conversion.cpp:2715-2729` compares them and
+    /// the round-1 spelling — input `["out"]` vs output `["mb"]` — died in the
+    /// `UNREACHABLE` "slice size does not match"). The input reads the FLAT
+    /// `dl16tofp32` leg's fp32 output: same classifier, df, extents ⇒ `addr_eq`, the
+    /// arrangement authority's demand (a divergence is the producer/consumer scramble).
+    #[test]
+    fn the_input_still_reads_the_dl16tofp32_table_arrangement() {
+        let (w, m_pad) = (128u32, 128u32);
+        let o = op(w, m_pad);
+        let inp = in_arg(&o);
+        assert_eq!(inp.view().stick, "mb", "the DDL equality's dim component");
+        let reader = view_stick_layout(&inp.view(), &o.iter);
+        let writer = widen(w, m_pad);
+        let writer_out = out_arg(&writer);
+        assert_eq!(writer_out.view().stick, "mb");
+        assert!(
+            reader.addr_eq(&view_stick_layout(&writer_out.view(), &writer.iter)),
+            "the mint's fp32toint32 input and the dl16tofp32 output address the SAME bytes"
+        );
+    }
+
+    /// ⭐ THE WIDEN LEG — the mint's `dl16tofp32`: BOTH operands stick `mb` (the
+    /// shared-`%stick_dim` law `quantization_double_pad.ddl` binds on the leg — the
+    /// round-2 flat-TAIL spelling stuck the input on `out` and died at
+    /// `ddl_conversion.cpp:2539`), reading the FLAT-restickify's fp16 output and writing
+    /// the fp32 table the `fp32toint32` leg reads.
+    #[test]
+    fn the_widen_leg_reads_and_writes_flat() {
+        let (w, m_pad) = (128u32, 128u32);
+        let s = widen(w, m_pad);
+        let (inp, out) = (in_arg(&s), out_arg(&s));
+        assert_eq!(inp.view().stick, "mb", "the flat fp16 table's stick");
+        assert!(!inp.view().row_blocked, "flat read — the stick rides dim 0");
+        assert_eq!(out.view().stick, "mb", "the flat fp32 table's stick");
+        assert!(
+            !out.view().row_blocked,
+            "flat write — the stick rides dim 0"
+        );
+        let sl = view_stick_layout(&out.view(), &s.iter);
+        assert!(
+            matches!(sl.addressing(), crate::sdsc_abstract::Addressing::RowMajor),
+            "the fp32 table is flat row-major"
+        );
+        assert_eq!(
+            sl.dev_off(1, 0),
+            m_pad as usize,
+            "row 1 of the fp32 table starts at m_pad — the flat stride"
+        );
+        // The division keeps both axes whole sticks: `mb` (a stick dim in this form) rides
+        // unsplit, `out` takes one core per fp16 stick of the WIDER basis.
+        let per_mb = s.iter.per_core_extent("mb");
+        assert_eq!(per_mb, w, "`mb` — the output's stick axis — rides unsplit");
+        assert_eq!(per_mb % out.view().df.elems_per_stick(), 0);
+    }
+
+    /// ⛔ THE FLAT FORM IS THE MINT'S TWO LEGS (P1) — every other convert's output is
+    /// consumed stick-major, so a flat output for them is on-card garbage; each
+    /// combination is a typed build `Err`, never a silent emit. `fp32toint32` is the
+    /// gather-index leg and `dl16tofp32` its feeder — the only two the DDL laws license.
+    #[test]
+    fn the_form_is_the_mint_legs_only() {
+        for bad in [OpFunc::Fp32ToDl16, OpFunc::Qfp8ch] {
+            let err = convert_opspec_arranged(bad, 128, 128, "x", "y", ConvertArrangement::Flat)
+                .unwrap_err();
+            assert!(
+                err.contains("mint's two legs"),
+                "the law names the legs: {err}"
+            );
+        }
+    }
+
+    /// The STAGED default is unchanged: `convert_opspec` (every existing caller, the m=1 chain)
+    /// still emits stick-on-`out` and classifies stick-major at rows>1.
+    #[test]
+    fn the_staged_default_is_unchanged() {
+        let o = convert_opspec(OpFunc::Fp32ToInt32, 128, 128, "a", "b").expect("emits");
+        let out = out_arg(&o);
+        assert_eq!(out.view().stick, "out");
+        assert!(
+            matches!(
+                view_stick_layout(&out.view(), &o.iter).addressing(),
+                crate::sdsc_abstract::Addressing::StickBlocked
+            ),
+            "the staged output stays stick-major at rows>1"
+        );
+    }
+
+    /// The MINT SHAPES emit, and the division is WHOLE STICKS on both axes — the vendor's
+    /// chunk-param law, not merely the collision guard's whole words. ⛔ The pin this replaces
+    /// ("any `mb` split keeps each core's slab whole words", 32 cores at every shape) was
+    /// FALSIFIED on the pod: whole u32 WORDS per core is the collision guard's precondition,
+    /// but the vendor's `isValidChunkParamForDim` demands every chunk param along a dim be a
+    /// multiple of that dim's stick size in EVERY non-index lds (L3DlOpsScheduler.cpp:1429),
+    /// and this form's output stick rides `mb` at 32 — the 32-way split's per-core `mb = 2`
+    /// left `param % 32 != 0` for every candidate ≤ 2, the EMPTY set the whole bundle was
+    /// refused with (`DtException: There must be at least one valid candidate.`, :1535;
+    /// deterministic ×2 at 26b and tiny26). The division now splits STICK COUNTS: `mb` (a
+    /// stick dim in this form) rides unsplit and `out` takes one core per fp32 stick.
+    #[test]
+    fn the_mint_shapes_emit_and_split_whole_sticks() {
+        for (w, m_pad) in [(64u32, 64u32), (128, 128)] {
+            let o = op(w, m_pad);
+            let u32_stick = out_arg(&o).view().df.elems_per_stick();
+            let fp32_stick = in_arg(&o).view().df.elems_per_stick();
+            let per_mb = o.iter.per_core_extent("mb");
+            let per_out = o.iter.per_core_extent("out");
+            assert_eq!(per_mb, w, "`mb` — the output's stick axis — rides unsplit");
+            assert_eq!(
+                per_mb % u32_stick,
+                0,
+                "per-core `mb` is whole u32 sticks — the vendor's chunk-param multiple"
+            );
+            assert_eq!(
+                per_out % fp32_stick,
+                0,
+                "per-core `out` is whole sticks of the division's fp32-wide basis"
+            );
+            assert_eq!(
+                o.iter.cores_used().get(),
+                (m_pad / fp32_stick).max(1),
+                "one core per `out` stick at [{w}, {m_pad}]"
+            );
+            assert_eq!(
+                per_mb * per_out * o.iter.cores_used().get(),
+                w * m_pad,
+                "the division covers the whole table — no idle rows, no double-writes"
+            );
+        }
+    }
+
+    /// The emit path itself: the assembler runs the real `emit_sdsc_tiled` — the collision
+    /// guard (disjoint per-core output bytes), the Flat `maxDimSizes_` walk, and the
+    /// `stickDimOrder_ ["mb"]` serialization — at the 26b mint shape.
+    #[test]
+    fn the_mint_leg_emits_through_the_collision_guard() {
+        let t32 = rb("em_t32", 128, 128);
+        let idx = rb("em_idx", 128, 128);
+        let mut sym = 0i64;
+        let emitted = assemble_convert_index_rows("emidx_o1", 128, 128, &t32, &idx, &mut sym, None);
+        assert!(
+            !emitted.dsc().dscs_.is_empty(),
+            "a descriptor was emitted for the flat-output convert"
+        );
+    }
+
+    /// ⭐ THE FULL MINT CHAIN COMPOSES — every seam `addr_eq`-checked, the strongest proof
+    /// available short of a senulator run. The chain: the router's padded top-k table
+    /// `[m_pad, W]` (RowBlocked — the staging contract the door wiring must satisfy: a
+    /// `device_extent`-padded router write lands element (t, s) at `(s/64)·m_pad + t`,
+    /// EXACTLY the transpose input's classification below) → the Kᵀ restickify
+    /// (stick-major↔stick-major, card-proven door, unchanged) → the FLAT restickify
+    /// (K-form's m_pad-stick → flat W-stick, probe-validated binding) → `dl16tofp32`
+    /// → `fp32toint32` index-rows. Each producer's output arrangement equals its
+    /// consumer's input arrangement — the arrangement authority's demand at every seam,
+    /// so no producer/consumer scramble is constructible in this composition.
+    #[test]
+    fn the_transpose_legs_output_is_the_convert_legs_input() {
+        let (w, m_pad) = (128u32, 128u32);
+        // The transpose leg at the mint geometry: input `[y=m_pad, out=W]` stick-on-`out`,
+        // output `[out=W, y=m_pad]` stick-on-`y` — the card-proven Kᵀ form.
+        let tr = restickify_kt_opspec_2d(m_pad, w, "em_xp", "em_t", 0, 0)
+            .expect("the mint's transpose leg emits");
+        let (tr_in, tr_out) = (
+            tr.args.iter().find(|a| a.view().is_input).unwrap(),
+            tr.args.iter().find(|a| !a.view().is_input).unwrap(),
+        );
+        // The staging contract: the transpose INPUT is the router's RowBlocked table —
+        // slot-group g's base at g·m_pad WORDS (the padded stride), one word per token
+        // within a group (dev_off is in ELEMENTS of the re-tiled [W/64, m_pad, 64]).
+        let x = view_stick_layout(&tr_in.view(), &tr.iter);
+        assert!(matches!(
+            x.addressing(),
+            crate::sdsc_abstract::Addressing::StickBlocked
+        ));
+        assert_eq!(
+            x.dev_off(0, 64),
+            m_pad as usize * 64,
+            "slot-group 1's base at m_pad words — the padded RowBlocked stride"
+        );
+        assert_eq!(
+            x.dev_off(1, 0) - x.dev_off(0, 0),
+            64,
+            "one word per token within a slot-group"
+        );
+        // Seam 1: the Kᵀ transpose's OUTPUT is the FLAT restickify's INPUT (same bytes) —
+        // the K-form read, stick-blocked on `m_pad` at ANY m_pad.
+        let fl = restickify_flat_opspec_2d(w, m_pad, "em_t", "em_tfl")
+            .expect("the mint's flat restickify emits");
+        let (fl_in, fl_out) = (
+            fl.args.iter().find(|a| a.view().is_input).unwrap(),
+            fl.args.iter().find(|a| !a.view().is_input).unwrap(),
+        );
+        assert_eq!(
+            fl_in.view().stick,
+            "out",
+            "the flat door reads the K-form on its own stick dim"
+        );
+        assert!(
+            view_stick_layout(&tr_out.view(), &tr.iter)
+                .addr_eq(&view_stick_layout(&fl_in.view(), &fl.iter)),
+            "the Kᵀ restickify output and the flat restickify input address the SAME bytes"
+        );
+        // ⭐ THE FLAT OUTPUT: stick `mb` (dim 0, NOT last) ⇒ FLAT row-major — the V-door's
+        // card-proven declaration mirrored onto the write side. Element (w, t) at
+        // `w·m_pad + t`, NOT the K-form's `(t/64)·W·64 + w·64 + t%64` re-tile.
+        assert_eq!(fl_out.view().stick, "mb");
+        let fl_sl = view_stick_layout(&fl_out.view(), &fl.iter);
+        assert!(matches!(
+            fl_sl.addressing(),
+            crate::sdsc_abstract::Addressing::RowMajor
+        ));
+        assert_eq!(
+            fl_sl.dev_off(1, 0),
+            m_pad as usize,
+            "flat row 1 starts at m_pad — the flat stride"
+        );
+        // Seam 2: the flat restickify's OUTPUT is the dl16tofp32 leg's INPUT (same bytes).
+        let cv = widen(w, m_pad);
+        let (cv_in, cv_out) = (
+            cv.args.iter().find(|a| a.view().is_input).unwrap(),
+            cv.args.iter().find(|a| !a.view().is_input).unwrap(),
+        );
+        assert_eq!(cv_in.view().stick, "mb", "the widen leg reads flat");
+        assert!(
+            fl_sl.addr_eq(&view_stick_layout(&cv_in.view(), &cv.iter)),
+            "the flat restickify output and the dl16tofp32 input address the SAME bytes"
+        );
+        // Seam 3: the dl16tofp32 leg's FLAT output is the fp32toint32 leg's input (same
+        // bytes) — the DDL-equality pair, both `mb`-sticked.
+        let idx = op(w, m_pad);
+        let idx_in = idx.args.iter().find(|a| a.view().is_input).unwrap();
+        assert!(
+            view_stick_layout(&cv_out.view(), &cv.iter)
+                .addr_eq(&view_stick_layout(&idx_in.view(), &idx.iter)),
+            "the dl16tofp32 output and the fp32toint32 input address the SAME bytes"
+        );
+        // Seam 4 (the flat index-rows output, row s at s·m_pad) is pinned by this module's
+        // tests above — with these seams, the whole chain is arrangement-checked end to end.
+    }
+}
+
+/// ⛔⛔⛔ A BROADCAST OPERAND IN A TIME-TILED POINTWISE OP MUST BE **ADDRESS-STABLE** ACROSS TRIPS.
+///
+/// This is the class that fired on the gemma-4-12b fp8 bake (~80 min in): the prefill tanhsoftcap's
+/// `tscdiv` — `realdiv` of the vocab-wide logits `[rows=35, cols=262144]` by the `[1,1]` cap const
+/// (`In::scalar`, `out` scale `RedStick`) — overflows LX residency at full width, so the tiler picks
+/// `time > 1`, and the old refusal (`"a broadcast-over-'out' operand in a TIME-TILED op is not yet
+/// supported"`) turned the model's own softcap into a build failure.
+///
+/// The correct semantics is NOT "refuse" and NOT "advance": every trip's out-window must read the
+/// SAME broadcast value at the SAME base address. That is what `rewrite_op_for_time_tile`'s tiled
+/// predicate now guarantees — an operand is tiled only when it RANGES the tiled dim (`scale` ==
+/// `Active` there); a RedStick/RedNonStick operand is exempt, keeps the collapsed fold
+/// `build_coordinates` wrote, and gets an EMPTY affine-stride map, which is `concrete_trips`'s
+/// no-bump path (an empty map keeps the base address).
+///
+/// The properties below pin the three observable halves of that contract on the real door
+/// (`assemble_pointwise_broadcast_off`, the same one `assemble_tanhsoftcap` calls):
+///   1. the op is genuinely time-tiled (`time > 1`) and the broadcast operand survives;
+///   2. the broadcast operand has NO affine stride (the no-bump path) while some full-width operand
+///      DOES (the control — an empty stride map everywhere would make (2) vacuous);
+///   3. across the expanded concrete trips, the broadcast operand's start address is IDENTICAL in
+///      every trip while a strided operand's moves — and it actually advances (a stride of 0 would
+///      silently re-read trip 0, the #53-class bug).
+#[cfg(test)]
+mod time_tiled_broadcast_operand_is_address_stable {
+    use super::*;
+    use crate::sdsc_abstract::{BlockCols, RowCount};
+
+    /// The gemma-4 tanhsoftcap prefill geometry: vocab-wide cols (262144, many sticks) with few
+    /// rows, so `n_operands · per_core_mb · out_per_time · 2` overflows the 1,677,721-B usable LX
+    /// at `out_per_time == full` and the divisor search lands on `time > 1`.
+    const ROWS: u32 = 35;
+    const COLS: u32 = 262144;
+
+    /// The failing op itself, verbatim: `tscdiv` = realdiv(x, cap), x full, cap `[1,1]` broadcast.
+    fn tscdiv() -> EmittedOp {
+        let x = rb("tsc_x", ROWS, COLS);
+        let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
+        let out = rb("tsc_o", ROWS, COLS);
+        assemble_pointwise_broadcast_off(
+            "tscdiv_t2326",
+            "realdiv",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+            &[In::full(&x).ew(), In::scalar(&cap).ew()],
+            &out,
+            crate::addr::DevOff::ZERO,
+            &mut 0i64,
+            None,
+        )
+    }
+
+    /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
+    fn trip_start(e: &EmittedOp, t: usize, lds: u32) -> u64 {
+        let trips = e.concrete_trips();
+        let node = trips.get(t).expect("a trip per time").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc")
+            .scheduleTree_
+            .iter()
+            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .expect("an allocate node per operand");
+        node.startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address")
+    }
+
+    #[test]
+    fn the_op_time_tiles_and_keeps_the_broadcast_operand() {
+        let e = tscdiv();
+        assert!(
+            e.time > 1,
+            "vocab-wide softcap must time-tile, got time={}",
+            e.time
+        );
+        assert_eq!(e.arg_bindings.len(), 3, "x, cap, out — in door order");
+        assert_eq!(
+            e.arg_bindings[1].footprint_bytes,
+            Fp16::ELEMS_PER_STICK as u64 * 2,
+            "the cap's materialized footprint is ONE stick — the broadcast survived the door"
+        );
+    }
+
+    #[test]
+    fn the_broadcast_operand_takes_no_stride_but_the_full_operand_does() {
+        let e = tscdiv();
+        assert!(
+            e.affine_strides[1].is_empty(),
+            "the cap (out-broadcast) must have NO per-trip stride — concrete_trips keeps its base"
+        );
+        assert!(
+            e.affine_strides.iter().any(|m| !m.is_empty()),
+            "control: at least one operand (x and/or out) IS tiled and carries a stride"
+        );
+    }
+
+    #[test]
+    fn across_trips_the_broadcast_address_is_fixed_and_the_full_operand_advances() {
+        let e = tscdiv();
+        // The cap (lds 1): identical address in EVERY trip.
+        let cap0 = trip_start(&e, 0, 1);
+        for t in 1..e.time as usize {
+            assert_eq!(
+                trip_start(&e, t, 1),
+                cap0,
+                "trip {t} moved the broadcast operand's address — every trip must read the same value"
+            );
+        }
+        // x (lds 0) and out (lds 2): whichever carries a stride must actually advance.
+        for lds in [0u32, 2] {
+            if e.affine_strides[lds as usize].is_empty() {
+                continue; // only the strided operand is under test here
+            }
+            let a0 = trip_start(&e, 0, lds);
+            let a1 = trip_start(&e, 1, lds);
+            assert!(
+                a1 > a0,
+                "strided operand {lds} did not advance between trips 0→1 ({a0:#x} → {a1:#x}) — \
+                 a zero stride would re-read trip 0's window"
+            );
+        }
     }
 }

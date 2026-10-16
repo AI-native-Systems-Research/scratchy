@@ -84,9 +84,17 @@ fn opfunc_names_are_dxp_recognized() {
         // INTERNAL ComputeOpType namespace (fmul/reduce/exx2_32_p1/…) — "mean"/"sum"/"max" are not
         // in it either; the sysconfig array is the opFuncName registry.
         "exx2",
+        // The compare/select family of broadcast_ops.ddl (:36-42) — the gemma-4
+        // MoE port's rank-vector/one-hot vocabulary. Each name is the
+        // `operation_bind`'s own `opFuncName` string in the vendor template,
+        // which is the same evidence class as the on-card names above.
+        "lesserthan",
+        "equal",
+        "notequal",
+        "where3",
     ];
-    // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY THE FOUR ABOVE COULD GO MISSING. `OpFunc` has 27
-    // variants; this loop names 21. A new variant is NOT an E0004 here, so it joins the emitter
+    // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY OPS COULD GO MISSING. `OpFunc` has 31
+    // variants; this loop names 25. A new variant is NOT an E0004 here, so it joins the emitter
     // unguarded — exactly how `realdiv`/`abs`/`maximum`/`minimum` did. Making it exhaustive is the real
     // fix and is deliberately NOT done here: the six left out (`Transpose`, `Restickify`, `Identity`,
     // `Qfp8ch`, `Dl16ToFp32`, `Fp32ToDl16`) would each need their dxp name confirmed against
@@ -117,6 +125,10 @@ fn opfunc_names_are_dxp_recognized() {
         OpFunc::Maximum,
         OpFunc::Minimum,
         OpFunc::Exx2,
+        OpFunc::LesserThan,
+        OpFunc::Equal,
+        OpFunc::NotEqual,
+        OpFunc::Where3,
     ] {
         assert!(
             RECOGNIZED.contains(&f.name()),
@@ -240,6 +252,7 @@ fn reduce_and_multiop_invariants() {
         "w",
         scratchy_target_spyre::bundle_code::PlaceId::Act(7),
         "eps",
+        None,
         &mut sym,
         None,
     );
@@ -381,6 +394,10 @@ fn rmsnorm_rinv_is_pinned_lx() {
             "t2",
             PlaceId::Act(7),
             "t3",
+            // The Scale convention — no `γ+1` row, byte-identical to the emission before
+            // the OnePlusScale row existed. The oneplus law has its own golden
+            // (triton-numeric's `rmsnorm_oneplus`).
+            None,
             &mut sym,
             Some(&l),
         )
@@ -1022,6 +1039,7 @@ fn dump_gate_bundles() {
         "rms_w",
         scratchy_target_spyre::bundle_code::PlaceId::Act(7),
         "eps",
+        None,
         &mut sym,
         None,
     );

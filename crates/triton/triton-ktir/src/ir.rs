@@ -89,6 +89,12 @@ pub enum OpKind {
     TensorEmpty,
     TensorCollapseShape,
     TensorExpandShape,
+    /// `tensor.generate` -- the lane/index vector constructor. No ttir text spells
+    /// it: [`crate::passes::to_ktir`] mints it when it converts `tt.make_range`,
+    /// and the executor runs its region as one meshgrid-indexed pass.
+    TensorGenerate,
+    /// `tensor.yield` -- a `tensor.generate` body's terminator.
+    TensorYield,
 
     // --- triton
     TtGetProgramId,
@@ -173,6 +179,8 @@ impl OpKind {
             TensorEmpty => "tensor.empty",
             TensorCollapseShape => "tensor.collapse_shape",
             TensorExpandShape => "tensor.expand_shape",
+            TensorGenerate => "tensor.generate",
+            TensorYield => "tensor.yield",
             TtGetProgramId => "tt.get_program_id",
             TtMakeTensorDescriptor => "tt.make_tensor_descriptor",
             TtDescriptorLoad => "tt.descriptor_load",
@@ -248,6 +256,8 @@ impl OpKind {
             "tensor.empty" => TensorEmpty,
             "tensor.collapse_shape" => TensorCollapseShape,
             "tensor.expand_shape" => TensorExpandShape,
+            "tensor.generate" => TensorGenerate,
+            "tensor.yield" => TensorYield,
             "tt.get_program_id" => TtGetProgramId,
             "tt.make_tensor_descriptor" => TtMakeTensorDescriptor,
             "tt.descriptor_load" => TtDescriptorLoad,
@@ -338,6 +348,7 @@ impl OpKind {
                 | TensorEmpty
                 | TensorCollapseShape
                 | TensorExpandShape
+                | TensorGenerate
                 | TtExpandDims
                 | TtBroadcast
                 | TtSplat

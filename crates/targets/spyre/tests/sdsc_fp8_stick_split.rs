@@ -303,6 +303,39 @@ fn fp8_lx_overflow_is_rescued_by_a_reduction_split_not_a_substick() {
     );
 }
 
+#[test]
+fn fp8_untileable_matmul_is_err_not_substick() {
+    // A pathological fp8 matmul that needs K-TIME accumulation: even at the MAXIMAL reduction-core
+    // split and the output tiled to a SINGLE 128-fp8 stick, the per-core resident set does not fit
+    // the 1,677,721-B usable LX. K=524,288 = 4096 fp8 sticks (a power of two, so the repair walk in
+    // `divide_and_time_tile_for_lx` tries every divisor 2..=32 and reaches the full 32-core split):
+    // at in=32 the weight slab alone is (524,288/32)·128·1 B = 2,097,152 B > 1.68 MiB, and every
+    // smaller split is strictly larger. Reduction-CORE splits (the granite down_proj repair) are
+    // legal and must NOT turn this Ok; a shape past even those MUST return a typed `Err` at emit
+    // (the build-time DtException-1535/1070 guard), NEVER silently emit a 64-wide fp8 tile.
+    let r = matmul_opspec_off::<Fp8>(
+        mm(1),
+        nn(128),
+        kk(524_288),
+        yy(),
+        pf(),
+        "a",
+        "w",
+        "o",
+        0,
+        0,
+        0,
+    );
+    let Err(msg) = &r else {
+        panic!("an fp8 matmul past every reduction-core split must be Err, got Ok");
+    };
+    // And the refusal is the K-TIME one — naming Stage-2 accumulation, not a stick-law fault.
+    assert!(
+        msg.contains("K-TIME"),
+        "the Err must name K-TIME accumulation (the shape's actual need), got: {msg}"
+    );
+}
+
 /// The fp8 packed tile's re-tile map must read the ON-DISK `[out, in]` buffer, since the worker no
 /// longer transposes. granite-3.1-8b is fp8, so this branch — not the fp16 one — is what its GEMM
 /// weights go through; leaving it on the transposed map is what produced garbage output.

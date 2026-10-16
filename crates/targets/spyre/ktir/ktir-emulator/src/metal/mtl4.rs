@@ -73,6 +73,10 @@ pub(crate) fn mtl4_available(device: &Device) -> bool {
 /// MTL4 has no `setBytes`, every binding is an address.
 pub enum Arg<'a> {
     Buffer(&'a Buffer),
+    /// A buffer bound at a BYTE OFFSET into it — MTL4 binds addresses, so the kernel's
+    /// `[[buffer(i)]]` sees `gpuAddress() + offset` as its base. A no-copy view over one
+    /// tile of a larger allocation (an N-tile of a resident weight) binds this way.
+    BufferAt(&'a Buffer, u64),
     Bytes(&'a [u8]),
 }
 
@@ -125,10 +129,11 @@ pub fn dispatch_readback(
     // exactly like a real buffer's.
     let res = MTLResourceOptions::StorageModeShared;
     let mut scalars: Vec<Buffer> = Vec::new();
-    let mut bound: Vec<Buffer> = Vec::with_capacity(args.len());
+    let mut bound: Vec<(Buffer, u64)> = Vec::with_capacity(args.len());
     for a in args {
         match a {
-            Arg::Buffer(b) => bound.push((*b).clone()),
+            Arg::Buffer(b) => bound.push(((*b).clone(), 0)),
+            Arg::BufferAt(b, off) => bound.push(((*b).clone(), *off)),
             Arg::Bytes(bytes) => {
                 let buf = unsafe {
                     device
@@ -139,14 +144,14 @@ pub fn dispatch_readback(
                         )
                         .ok_or("mtl4: scalar buffer alloc failed")?
                 };
-                bound.push(buf.clone());
+                bound.push((buf.clone(), 0));
                 scalars.push(buf);
             }
         }
     }
 
     let residency = residency_set(device)?;
-    for b in &bound {
+    for (b, _) in &bound {
         let alloc: &ProtocolObject<dyn MTLAllocation> = b.as_ref();
         residency.addAllocation(alloc);
     }
@@ -157,9 +162,9 @@ pub fn dispatch_readback(
     let table = device
         .newArgumentTableWithDescriptor_error(&desc)
         .map_err(|e| format!("mtl4: argument table alloc failed: {e:?}"))?;
-    for (i, b) in bound.iter().enumerate() {
+    for (i, (b, off)) in bound.iter().enumerate() {
         unsafe {
-            table.setAddress_atIndex(b.gpuAddress(), i);
+            table.setAddress_atIndex(b.gpuAddress() + off, i);
         }
     }
 
@@ -200,9 +205,13 @@ pub fn dispatch_readback(
 
     let bytes = match readback {
         Some((idx, len)) => {
-            let buf = bound.get(idx).ok_or("mtl4: readback index out of range")?;
-            let raw =
-                unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len) };
+            let (buf, off) = bound.get(idx).ok_or("mtl4: readback index out of range")?;
+            let raw = unsafe {
+                std::slice::from_raw_parts(
+                    (buf.contents().as_ptr() as *const u8).add(*off as usize),
+                    len,
+                )
+            };
             raw.to_vec()
         }
         None => Vec::new(),
@@ -276,10 +285,11 @@ impl Batch {
         threads_per_threadgroup: MTLSize,
     ) -> Result<(), String> {
         let res = MTLResourceOptions::StorageModeShared;
-        let mut bound: Vec<Buffer> = Vec::with_capacity(args.len());
+        let mut bound: Vec<(Buffer, u64)> = Vec::with_capacity(args.len());
         for a in args {
             match a {
-                Arg::Buffer(b) => bound.push((*b).clone()),
+                Arg::Buffer(b) => bound.push(((*b).clone(), 0)),
+                Arg::BufferAt(b, off) => bound.push(((*b).clone(), *off)),
                 Arg::Bytes(bytes) => {
                     let buf = unsafe {
                         self.device
@@ -290,12 +300,12 @@ impl Batch {
                             )
                             .ok_or("mtl4: scalar buffer alloc failed")?
                     };
-                    bound.push(buf.clone());
+                    bound.push((buf.clone(), 0));
                     self.scalars.push(buf);
                 }
             }
         }
-        for b in &bound {
+        for (b, _) in &bound {
             let alloc: &ProtocolObject<dyn MTLAllocation> = b.as_ref();
             self.residency.addAllocation(alloc);
         }
@@ -306,9 +316,9 @@ impl Batch {
             .device
             .newArgumentTableWithDescriptor_error(&desc)
             .map_err(|e| format!("mtl4: argument table alloc failed: {e:?}"))?;
-        for (i, b) in bound.iter().enumerate() {
+        for (i, (b, off)) in bound.iter().enumerate() {
             unsafe {
-                table.setAddress_atIndex(b.gpuAddress(), i);
+                table.setAddress_atIndex(b.gpuAddress() + off, i);
             }
         }
 

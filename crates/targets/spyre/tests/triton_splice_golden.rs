@@ -33,23 +33,34 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
 /// both normalize at hidden 2048 (2b) and 4096 (8b), decode rows 1 and a prefill rung's
-/// width. (M, D_MODEL). The kernel widens the squares to f32 before its reduce (the
-/// accumulator's own precision, matching the historical builder program), so every width is
-/// splicable and byte-compared.
-const SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
+/// width; gemma-4 at 12b/31b normalizes at hidden 3840 — the ONE delivery width that is
+/// not a power of two, so its `1/cols` has no exact f16/f32 spelling and the constant
+/// reaches the program only as its f16 image. A shape set without it passed while every
+/// 3840 chain was refused, which is how the gemma-4 divergence shipped. (M, D_MODEL).
+/// The kernel states its sum ceiling-safe for the f16 the ladder
+/// runs it in (`rmsnorm.py`'s module doc — LegalizeTypes erases any widening), so every
+/// width is splicable and byte-compared.
+const SHAPES: &[(u32, u32)] = &[
+    (1, 2048),
+    (1, 4096),
+    (31, 2048),
+    (64, 4096),
+    (1, 3840),
+    (19, 3840),
+];
 
 #[test]
 fn spliced_rmsnorm_lowers_through_the_door() {
     for &(m, c) in SHAPES {
-        let ir = rmsnorm_ir(m, c);
+        let ir = rmsnorm_ir(m, c, GainConvention::Scale);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node. Every width is
-        // splicable (the kernel's f32 accumulator), so an Err here is a broken row.
+        // splicable (the kernel's ceiling-safe pre-scale), so an Err here is a broken row.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
@@ -80,10 +91,108 @@ fn spliced_rmsnorm_lowers_through_the_door() {
     }
 }
 
+/// ⭐ THE `(1 + w)` CONVENTION'S OWN DOOR GATE — the OnePlusScale row end to end:
+/// the splice compiles `rmsnorm_oneplus_fwd`, the census gives 1.0 a registry slot
+/// (the epsilon's own mechanism), and the door emits the `rmga_` add ahead of the
+/// `rmg_` gain multiply — the same formula the program runs, op for op. The SCALE
+/// CONTROL below pins the other half of the row's law: a Scale-only model pushes
+/// NO 1.0 into the registry (the nothing-is-seeded law) and emits NO `rmga_` op —
+/// byte-identical to the form before the row existed.
+#[test]
+fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
+    for &(m, c) in SHAPES {
+        let ir = rmsnorm_ir(m, c, GainConvention::OnePlusScale);
+        let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+
+        // The layout the tape walk computes for this graph — the census must have
+        // collected the convention's own 1.0 alongside the epsilon, or the door's
+        // slot lookup fails as a registry desync (the test's own control on the
+        // wiring, not an assertion here: the door refuses below).
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+            .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
+        assert!(
+            layout
+                .scalarmul_scales
+                .iter()
+                .any(|s| s.to_bits() == 1.0f32.to_bits()),
+            "the OnePlusScale node's census must collect the convention's 1.0 (m={m} c={c})"
+        );
+
+        // The splice — the row compiles the oneplus entry for this node.
+        let node = &ir.nodes[0];
+        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled the oneplus row m={m} c={c}: {e}"));
+
+        // ⛔ THE NAME LAW — the SAME stem as the Scale row: the convention differs
+        // in the ENTRY and one constexpr, never in the op the bundle keys on.
+        assert_eq!(
+            spliced.op_name,
+            format!("rmsnorm_s{}", node.id.index()),
+            "op_name (m={m} c={c})"
+        );
+
+        // The program lowers through the production door under the walk's own layout.
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let emitted = door_lower(
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {}", e.message));
+
+        // THE OP CENSUS — the fixture's output is t2, so the chain's prefixes are
+        // `o2`: the `rmga_o2` add must be present AND ahead of the `rmg_o2` gain
+        // multiply (the add fills the Gw row the multiply reads; the reverse order
+        // would read the stored row).
+        let t = 2;
+        let add = emitted
+            .iter()
+            .position(|op| op.op_name == format!("rmga_o{t}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no rmga_o{t} in the oneplus chain (m={m} c={c}): {:?}",
+                    emitted.iter().map(|o| &o.op_name).collect::<Vec<_>>()
+                )
+            });
+        let mul = emitted
+            .iter()
+            .position(|op| op.op_name == format!("rmg_o{t}"))
+            .unwrap_or_else(|| panic!("no rmg_o{t} in the oneplus chain (m={m} c={c})"));
+        assert!(
+            add < mul,
+            "rmga_o{t} must precede rmg_o{t} (m={m} c={c}): the add fills the Gw row the \
+             multiply reads"
+        );
+
+        // THE SCALE CONTROL — the same shape under Scale: no 1.0 in the registry,
+        // no rmga_ op. This is the nothing-is-seeded law read backwards: the oneplus
+        // push is gated on the node's own convention, so a Scale-only model's
+        // registry is byte-identical to the form before the row existed.
+        let scale_ir = rmsnorm_ir(m, c, GainConvention::Scale);
+        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, false, false, &[])
+            .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
+        assert!(
+            !scale_layout
+                .scalarmul_scales
+                .iter()
+                .any(|s| s.to_bits() == 1.0f32.to_bits()),
+            "a Scale-only model must not seed a 1.0 slot (m={m} c={c}) — the registry shifts \
+             every later constant's tid"
+        );
+    }
+}
+
 /// `rmsnorm(x, gamma) -> out` as a one-node [`SubtileIR`] — the same fixture shape
 /// `superdsc_time_tile.rs` mints for its matmul control. t0 = x source, t1 = gamma
-/// source, t2 = result. Eps is granite's `1e-5`.
-fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
+/// source, t2 = result. Eps is granite's `1e-5`; the gain convention is the caller's
+/// (Scale for the plain gate, OnePlusScale for the convention's own).
+fn rmsnorm_ir(m: u32, c: u32, gain: GainConvention) -> SubtileIR {
     let tensors = vec![
         TensorShape { rows: m, cols: c },
         TensorShape { rows: 1, cols: c },
@@ -95,10 +204,7 @@ fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
     };
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
-        op: SubOp::RmsNorm {
-            eps: 1e-5,
-            gain: GainConvention::Scale,
-        },
+        op: SubOp::RmsNorm { eps: 1e-5, gain },
         inputs: vec![whole(0), whole(1)],
         output: whole(2),
     };
@@ -126,7 +232,7 @@ fn spliced_silumul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node, at EVERY rung: a
@@ -214,7 +320,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&chunked, &weight_ids, false, false, &Default::default())
+    let layout = compute_bundle_layout(&chunked, &weight_ids, false, false, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
@@ -301,7 +407,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
+            let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
             // The splice — the row compiles the kernel for this node at every
@@ -396,7 +502,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The layout the tape walk computes for this graph (`rows_are_requests:
         // true` is the decode/batched shape).
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
@@ -741,7 +847,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles `scalarmul.py` for this node.
@@ -792,7 +898,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
+    let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
@@ -1016,7 +1122,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &Default::default())
+    let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
@@ -1067,7 +1173,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
@@ -1130,7 +1236,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &Default::default())
+        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
@@ -1411,7 +1517,7 @@ fn spliced_rope_lowers_through_the_door() {
                 &weight_ids,
                 rows_are_requests,
                 rows_are_requests,
-                &Default::default(),
+                &[],
             )
             .unwrap_or_else(|e| {
                 panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
@@ -1433,25 +1539,20 @@ fn spliced_rope_lowers_through_the_door() {
 
             // The program lowers through the production door under the walk's own
             // layout. Rope's door arm reads `rows_are_requests` off
-            // `BundleAttnParams`, so the bundle fact is stated here exactly as the
-            // tape walk states it (a geometry from the same config the model
-            // declares — 32/8 at the node's head dim).
-            let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
-                ktir_superdsc::head_counts::QueryHeads::new(32),
-                ktir_superdsc::head_counts::KvHeads::new(8),
-                ktir_superdsc::head_counts::HeadDim::new(hd),
-            )
-            .expect("granite's 32/8 geometry mints");
+            // `BundleAttnParams` — the bundle states NO geometry: the door mints
+            // each program's geometry from the program's own views (the
+            // hybrid-model law; gemma-4 carries two attention classes, so no
+            // per-bundle geometry exists to state here).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
-                geom,
                 rows_are_requests,
                 // The production mint's value for a batched-shape fixture with no one-request
                 // rung to widen it: the gather follows the row kind here.
                 gathers_kv: rows_are_requests,
                 chunk_pages: None,
-                // No fold: this fixture's q/k are Ext sources with no projection matmuls, so the
-                // program states its real scale and the door emits the score multiplies.
-                scale_folded: false,
+                // Not in weights: this fixture's q/k are Ext sources with no projection
+                // matmuls, so the program states its real scale and the door emits the score
+                // multiplies.
+                scale_in_weights: false,
                 // No handoff: this fixture's rope program has no o matmul at all, and a stated
                 // handoff without one is the door's own refusal.
                 headmajor_handoff: false,
@@ -1843,13 +1944,12 @@ fn the_kv_block_index_moves_no_other_staged_activation() {
         // The one-request rows (`rows_are_requests = false`) at both gather facts: the chunk ceiling's
         // call and the per-page body's.
         let layout = |gathers_kv: bool| {
-            compute_bundle_layout(&ir, &weight_ids, false, gathers_kv, &Default::default())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "layout minted geom={:?} gathers_kv={gathers_kv}: {e}",
-                        s.geom
-                    )
-                })
+            compute_bundle_layout(&ir, &weight_ids, false, gathers_kv, &[]).unwrap_or_else(|e| {
+                panic!(
+                    "layout minted geom={:?} gathers_kv={gathers_kv}: {e}",
+                    s.geom
+                )
+            })
         };
         let (plain, gathering) = (layout(false), layout(true));
         assert!(
@@ -1903,7 +2003,7 @@ fn spliced_attn_lowers_through_the_door() {
                 &weight_ids,
                 rows_are_requests,
                 rows_are_requests,
-                &Default::default(),
+                &[],
             )
             .unwrap_or_else(|e| {
                 panic!(
@@ -1963,14 +2063,14 @@ fn spliced_attn_lowers_through_the_door() {
             // them (`attn_at` reads the swept extent, the scale, the span guard and
             // the row laws off the program).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
-                geom: attn_geometry(s.geom).expect("granite's geometry mints"),
                 rows_are_requests,
                 // The production mint's value for a batched-shape fixture with no one-request
                 // rung to widen it: the gather follows the row kind here.
                 gathers_kv: rows_are_requests,
                 chunk_pages: None,
-                // No fold: same as the rope door's fixture — the program states its real scale.
-                scale_folded: false,
+                // Not in weights: same as the rope door's fixture — the program states its real
+                // scale.
+                scale_in_weights: false,
                 // No handoff: this fixture's attention output is the graph RESULT (no o matmul
                 // consumes it), so the dataflow the handoff keys on finds no edge — stated here
                 // exactly as `attn_bundle_params` would state it for such a graph.
@@ -1993,5 +2093,151 @@ fn spliced_attn_lowers_through_the_door() {
                 )
             });
         }
+    }
+}
+
+/// ⭐⭐ THE TWO RMSNORM RECOGNIZERS, PINNED TO EACH OTHER. The door recognizes
+/// rmsnorm chains to fuse them (`ktir_superdsc`'s `program_rmsnorm_chains`); the
+/// emulator re-derives the same walk to land the scalar chain's sticks on the
+/// card's DLF16 grid (`ktir_emulator`'s `rmsnorm_scalar_sticks` — the emulator
+/// cannot depend on the door's crate, so the walk is a second implementation of
+/// one pattern). Two implementations of one fact is the class that desyncs
+/// silently, so this pin runs BOTH over the same SHIPPED programs — every
+/// spelling the delivery scope runs: the gained `rmsnorm.py` under both gain
+/// conventions, and the un-gained `rmsnormunit.py` — and asserts they agree.
+/// The door's per-chain `consumed` interior must contain exactly the
+/// emulator's three sticks (the square, the `·INV_D` mean, the `+eps` sum —
+/// never the raw reduce or the rsqrt, which land on the reduce's own
+/// accumulator grid), the total must be three per chain with nothing outside
+/// the door's chains, and the un-gained spelling must read the SAME eps through
+/// the door's per-op reader that the walk's chain is built around. A non-norm
+/// program recognizes on NEITHER side. A recognizer that drifts — a new chain
+/// shape the door admits, or a discriminator the emulator tightens — fails
+/// here by name, instead of silently landing the wrong grid.
+#[cfg(feature = "spyre-emu")]
+#[test]
+fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
+    use ktir_emulator::comm_sched::rmsnorm_scalar_sticks;
+    use ktir_superdsc::emit::lower_ktir_to_superdsc::program_rmsnorm_eps;
+    use ktir_superdsc::emit::whole_function::program_rmsnorm_chains;
+
+    // The gained spellings, both conventions, at the delivery scope's shapes.
+    for &(m, c) in SHAPES {
+        for gain in [GainConvention::Scale, GainConvention::OnePlusScale] {
+            let ir = rmsnorm_ir(m, c, gain);
+            let node = &ir.nodes[0];
+            let spliced = scratchy_triton_splice::lower(node, &ir, false)
+                .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+            let f = spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program");
+
+            let chains = program_rmsnorm_chains(&f.func)
+                .unwrap_or_else(|e| panic!("door recognized m={m} c={c}: {}", e.message));
+            assert_eq!(
+                chains.len(),
+                1,
+                "one chain per gained program (m={m} c={c})"
+            );
+            let sticks = rmsnorm_scalar_sticks(f.func.operations);
+            assert_eq!(
+                sticks.len(),
+                3,
+                "exactly the square, mean and meps sticks (m={m} c={c})"
+            );
+            let consumed: HashSet<_> = chains[0].consumed.iter().copied().collect();
+            assert_eq!(
+                sticks.intersection(&consumed).count(),
+                3,
+                "the sticks are the chain's own interior (m={m} c={c})"
+            );
+            // The program's own eps, read by the door: the kernel's
+            // `(ms + EPS).to(tl.float32)` spelling states the add f16-typed, so
+            // the constant reaches the program ALREADY collapsed to its f16
+            // image — the same fact the golden's registry staging states, and
+            // the one the door's registry lookup serves through its f16-image
+            // fallback.
+            let eps = program_rmsnorm_eps(&f.func)
+                .unwrap_or_else(|| panic!("door read the gained program's eps (m={m} c={c})"));
+            assert_eq!(
+                eps,
+                half::f16::from_f32(1e-5).to_f32(),
+                "the gained program states its eps as the f16 image (m={m} c={c})"
+            );
+        }
+    }
+
+    // The un-gained spelling: the door reads it through the per-op epsilon
+    // reader (one root, the addf carrying the eps splat), the emulator through
+    // the same scalar-chain walk — and the eps both see is the f16 image.
+    for &(m, c) in SHAPES {
+        let ir = rmsnormunit_ir(m, c);
+        let node = &ir.nodes[0];
+        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled the unit row m={m} c={c}: {e}"));
+        let f = spliced
+            .ktir
+            .as_ref()
+            .expect("spliced op carries its program");
+
+        let eps = program_rmsnorm_eps(&f.func)
+            .unwrap_or_else(|| panic!("door read the unit program's eps (m={m} c={c})"));
+        assert_eq!(
+            eps,
+            half::f16::from_f32(1e-6).to_f32(),
+            "the unit program states its eps as the f16 image (m={m} c={c})"
+        );
+        let sticks = rmsnorm_scalar_sticks(f.func.operations);
+        assert_eq!(
+            sticks.len(),
+            3,
+            "the unit chain's three sticks (m={m} c={c})"
+        );
+    }
+
+    // The negative control: a program with no norm recognizes on NEITHER side.
+    let ir = silumul_ir(1, 4096);
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled the silumul control: {e}"));
+    let f = spliced
+        .ktir
+        .as_ref()
+        .expect("spliced op carries its program");
+    let chains = program_rmsnorm_chains(&f.func)
+        .unwrap_or_else(|e| panic!("door recognized the control: {}", e.message));
+    assert!(chains.is_empty(), "no rmsnorm chain in a silumul program");
+    assert!(
+        rmsnorm_scalar_sticks(f.func.operations).is_empty(),
+        "no scalar sticks in a silumul program"
+    );
+}
+
+/// `rmsnorm_unit(x) -> out` as a one-node [`SubtileIR`] — the un-gained spelling
+/// (`rmsnormunit.py`, the head-norm sandwich's unit): one input, no gamma. t0 = x
+/// source, t1 = result. Eps is gemma-4's `1e-6` — the subnormal regime the DLF16
+/// landing exists for.
+fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
+    let tensors = vec![
+        TensorShape { rows: m, cols: c },
+        TensorShape { rows: m, cols: c },
+    ];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::RmsNormUnit { eps: 1e-6 },
+        inputs: vec![whole(0)],
+        output: whole(1),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 1,
+        nodes: vec![node],
+        result: TensorId::from_index(1),
+        op_output: Vec::new(),
     }
 }

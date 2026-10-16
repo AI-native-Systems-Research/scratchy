@@ -37,6 +37,13 @@ spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scrat
 # A CARD. The device image is compiled from the KTIR at bake time, so this build has a device
 # compiler to drain; the emulator build has nothing to compile and nothing to wait for.
 spyre-hw = ["spyre", "scratchy-target-spyre/spyre-hw"]
+# THE EMULATOR — and with it the bake-time NUMERIC GATE: every decode bundle
+# the macro bakes runs on ktir-emulator under the synthetic probe and is
+# compared against the reference semantics of the same dsl_math; divergence
+# beyond the quant floor fails the build (see `numeric_gate`). Chained
+# model-crate → macro → target so a `-Fspyre-emu` CLI build gates every model
+# it expands.
+spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu"]
 # Tensor-parallel fanout. When any consumer crate forwards its `nccl`
 # feature into `scratchy-forward-compiler-macro/nccl` (every per-arch crate
 # does — see their `nccl = [..., "scratchy-forward-compiler-macro/nccl"]`),

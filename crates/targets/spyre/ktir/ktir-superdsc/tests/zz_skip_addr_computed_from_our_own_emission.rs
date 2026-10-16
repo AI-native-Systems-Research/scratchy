@@ -158,12 +158,17 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
                 "Tensor2",
                 cp.dims().mb(),
                 ktir_superdsc::sdsc_abstract::POOL_STICK,
+                ktir_superdsc::superdsc_opspec::Df::Fp16,
                 ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
                     "BlockTable".to_string(),
                     PageExtent::of_positions(scratch.entry_page()),
                     cp.index_base(),
                 ),
-                ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                // Global block numbers — no source base.
+                ktir_superdsc::superdsc_opspec::GatherRun::split(
+                    ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                    0,
+                ),
             )
             .expect("the gather-copy op builds");
             let value_idx = op.indirect.expect("a declared gather").value;
@@ -233,6 +238,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                     "Tensor2",
                     cp.dims().mb(),
                     ktir_superdsc::sdsc_abstract::POOL_STICK,
+                    ktir_superdsc::superdsc_opspec::Df::Fp16,
                     ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
                         "BlockTable".to_string(),
                         PageExtent::of_positions(
@@ -240,7 +246,11 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                         ),
                         cp.index_base(),
                     ),
-                    ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                    // Global block numbers — no source base.
+                    ktir_superdsc::superdsc_opspec::GatherRun::split(
+                        ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                        0,
+                    ),
                 )
                 .expect("the page gather-copy op builds");
                 let value_idx = op.indirect.expect("a declared gather").value;
@@ -325,6 +335,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
         "Tensor2",
         16,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
+        ktir_superdsc::superdsc_opspec::Df::Fp16,
         ktir_superdsc::superdsc_opspec::GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: axis,
@@ -332,7 +343,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
-        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
+        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
     )
     .expect("the gather-copy op builds");
     let value_idx = op.indirect.expect("a declared gather").value;
@@ -454,12 +465,13 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
             "Tensor2",
             mb,
             POOL_STICK,
+            ktir_superdsc::superdsc_opspec::Df::Fp16,
             GatherIndex::of_scratch_rows(
                 "BlockTable".to_string(),
                 PageExtent::of_positions(pin),
                 EntryBase::ZERO,
             ),
-            ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
+            ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
         )
         .expect("the gather-copy op builds at both pins");
         let value_idx = op.indirect.expect("a declared gather").value;

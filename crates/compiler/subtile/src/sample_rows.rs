@@ -66,7 +66,7 @@ fn under_logit_tail(input: &LoweringInput) -> usize {
             == 1
     };
     let mut r = input.result;
-    while let (SubOp::TanhSoftCap | SubOp::ScalarMul { .. }, [InputRef::Op(j)]) =
+    while let (SubOp::TanhSoftCap { .. } | SubOp::ScalarMul { .. }, [InputRef::Op(j)]) =
         (input.ops[r].op, input.ops[r].inputs.as_slice())
         && only_reader(*j)
     {
@@ -260,13 +260,21 @@ mod tests {
         };
         unchanged(head(1, affine(256)));
         unchanged(head(2, GemmWeight::Dense));
-        unchanged(then(head(1, affine(256)), SubOp::TanhSoftCap, 1));
+        unchanged(then(
+            head(1, affine(256)),
+            SubOp::TanhSoftCap { cap: 30.0 },
+            1,
+        ));
         // A cap over the norm, and a scale beside another reader of the matmul: neither is the
         // matmul's tail.
-        unchanged(then(head(2, affine(256)), SubOp::TanhSoftCap, 0));
+        unchanged(then(
+            head(2, affine(256)),
+            SubOp::TanhSoftCap { cap: 30.0 },
+            0,
+        ));
         let scale = SubOp::ScalarMul { scale: 0.25 };
         unchanged(then(
-            then(head(2, affine(256)), SubOp::TanhSoftCap, 1),
+            then(head(2, affine(256)), SubOp::TanhSoftCap { cap: 30.0 }, 1),
             scale,
             1,
         ));
@@ -291,7 +299,7 @@ mod tests {
     /// result, on its own tiles and outside the construct.
     #[test]
     fn a_result_matmul_under_its_logit_tail_is_sampled() {
-        let capped = then(head(2, affine(256)), SubOp::TanhSoftCap, 1);
+        let capped = then(head(2, affine(256)), SubOp::TanhSoftCap { cap: 30.0 }, 1);
         let tailed = then(capped, SubOp::ScalarMul { scale: 0.25 }, 2);
         let x = expand_sample_rows(&tailed, &AFFINE).expect("expands");
         assert_eq!(
@@ -368,7 +376,7 @@ mod tests {
                 .expect("colours");
             (c.count(), c.result())
         };
-        let capped = then(head(2, affine(256)), SubOp::TanhSoftCap, 1);
+        let capped = then(head(2, affine(256)), SubOp::TanhSoftCap { cap: 30.0 }, 1);
         for plain in [head(2, affine(256)), capped] {
             let sampled = expand_sample_rows(&plain, &AFFINE).expect("expands");
             assert_eq!(colours(&sampled), colours(&plain));

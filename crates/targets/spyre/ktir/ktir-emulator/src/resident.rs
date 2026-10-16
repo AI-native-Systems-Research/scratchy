@@ -200,8 +200,10 @@ pub struct ResidentExecutor {
     /// Native pointer binding must divide the stick's byte base by THE VIEW's
     /// bpe — always dividing by the model dtype's binds an fp8 view at half its
     /// true byte address, landing it INSIDE the previous tensor's allocation
-    /// (garbage reads), and `set_source_bytes`' verbatim arm must keep the
-    /// packed 1-byte layout instead of re-encoding it as F16.
+    /// (garbage reads — MEASURED as every fp8 matmul writing NaN from the first
+    /// gemma-4-12b-FP8 layer, seg1-3 of the emu trace), and `set_source_bytes`'
+    /// verbatim arm must keep the packed 1-byte layout instead of re-encoding
+    /// it as F16.
     view_dtype: HashMap<u64, DType>,
     /// Per-segment plan-cache key (`comm_sched::plan_key`), memoized by the ops
     /// slice address. The deep ops-tree hash that keys the scheduler's Metal/
@@ -254,6 +256,15 @@ pub struct ResidentExecutor {
 // executors on two threads could race its `Rc<AffineExpr>` refcounts.)
 unsafe impl Send for ResidentExecutor {}
 
+// The executor's HBM — the memory every borrowed weight view wraps — goes with it, so
+// retire the generation those views were minted under before anything can dispatch one.
+#[cfg(metal)]
+impl Drop for ResidentExecutor {
+    fn drop(&mut self) {
+        crate::metal::RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl ResidentExecutor {
     /// Plan `spec` into segments, derive every tensor's shape from the IR, and
     /// allocate ONE persistent HBM stick per tensor (stable address across
@@ -295,6 +306,10 @@ impl ResidentExecutor {
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         force_native: bool,
     ) -> Result<Self, String> {
+        // A new resident HBM: every borrowed weight view minted over a previous one is
+        // now stale (see `metal::RESIDENT_GEN`), and is discarded rather than dispatched.
+        #[cfg(metal)]
+        crate::metal::RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if programs.is_empty() {
             return Err("resident: new_multi needs at least one program".into());
         }
@@ -327,7 +342,19 @@ impl ResidentExecutor {
             let (prog_shapes, prog_dtypes) =
                 crate::segmented::derive_shapes_and_dtypes(&module, spec)?;
             for (&id, shp) in &prog_shapes {
-                shapes.entry(id).or_insert_with(|| shp.clone());
+                // The WIDEST program's shape stages the tid (the run_step extent
+                // law): decode and prefill share this id space, so the same tid
+                // arrives at different row counts and first-wins would stage the
+                // prefill's `m` at the decode stick — the readback clamp then
+                // starves the caller's `[..n*kv_width]` slice.
+                shapes
+                    .entry(id)
+                    .and_modify(|old| {
+                        if shp.iter().product::<usize>() > old.iter().product::<usize>() {
+                            *old = shp.clone();
+                        }
+                    })
+                    .or_insert_with(|| shp.clone());
             }
             for (&id, dt) in &prog_dtypes {
                 // First view wins; a disagreement is an error the collector raises.
@@ -589,8 +616,10 @@ impl ResidentExecutor {
         // through — the model dtype OR the tensor's own view dtype (an
         // fp8-packed weight's views decode each byte as e4m3, so its 1-byte
         // layout is the stick layout; re-encoding it as F16 would leave the
-        // view reading half the bytes as garbage). A dtype that matches
-        // neither (e.g. f32 host bytes into an f16 stick) falls through f32.
+        // view reading half the bytes as garbage — MEASURED as every fp8 matmul
+        // writing NaN from the first gemma-4-12b-FP8 layer, seg1-3 of the emu
+        // trace). A dtype that matches neither (e.g. f32 host bytes into an
+        // f16 stick) falls through f32.
         let view_dt = self.view_dtype.get(&tensor).copied().unwrap_or(self.dtype);
         if dtype == self.dtype || dtype == view_dt {
             // Verbatim: typed bytes already match the stick layout.
@@ -724,6 +753,24 @@ impl ResidentExecutor {
             &just_set,
         );
         Ok(())
+    }
+
+    /// The pointer VALUE for tensor `tid`'s stick: an ELEMENT index in the tensor's
+    /// OWN view dtype (RFC #110), so any view over it — the model-dtype ones AND the
+    /// fp8 weight view of a W8A8 model — computes `byte_address = elem·bpe(view)` at the
+    /// stick base. An fp8-staged tensor binds in fp8 elements (bpe=1); everything else
+    /// in the model dtype's.
+    fn ptr_for(&self, tid: u64) -> Result<i64, String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("resident: t{tid} has no resident stick"))?;
+        let bpe = self
+            .view_dtype
+            .get(&tid)
+            .unwrap_or(&self.dtype)
+            .bytes_per_elem();
+        Ok(s * STICK_BYTES / bpe as i64)
     }
 
     /// Every resident tensor's HBM byte ADDRESS -> its id. The GPU weight cache is keyed by the
@@ -991,6 +1038,43 @@ impl ResidentExecutor {
                     }
                 }
             }
+            // ⭐ DEBUG-ONLY TENSOR DUMP (`SCRATCHY_EMU_TENSORDUMP=<dir>`): every NON-SOURCE
+            // tensor's f32 values after this segment, one file per (program, segment, tensor)
+            // — `<dir>/prog<i>_seg<j>_t<tid>.bin` (LE f32, `n` elements, shapes derivable from
+            // the wiring). Print-only diagnostics env gate: it changes nothing the emulator
+            // computes. Written only when the segment actually wrote the tensor (value sum
+            // moved) so the FIRST writer names itself.
+            if let Some(dir) = std::env::var_os("SCRATCHY_EMU_TENSORDUMP") {
+                let dir = std::path::Path::new(&dir);
+                let _ = std::fs::create_dir_all(dir);
+                let mut written: Vec<u64> = match seg {
+                    Segment::Fused(fs) => fs.outputs.iter().copied().collect(),
+                    Segment::Native(_) => Vec::new(),
+                };
+                written.extend(outputs.iter().map(|&(t, _)| t));
+                written.sort_unstable();
+                written.dedup();
+                for tid in written {
+                    let (Some(&s), Some(&n)) = (self.stick.get(&tid), self.numel.get(&tid)) else {
+                        continue;
+                    };
+                    let bytes = self
+                        .mem
+                        .hbm
+                        .borrow()
+                        .read_bytes(s * STICK_BYTES, n * self.dtype.bytes_per_elem());
+                    let d = crate::codec::decode(&bytes, n, self.dtype);
+                    let raw: Vec<u8> = d.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    let _ =
+                        std::fs::write(dir.join(format!("prog{idx}_seg{seg_i}_t{tid}.bin")), raw);
+                    // `order.json`-lite: the shape rides the filename's tid only, so also drop
+                    // a one-line manifest per dump for convenience.
+                    let _ = std::fs::write(
+                        dir.join(format!("prog{idx}_seg{seg_i}_t{tid}.n")),
+                        format!("{n}\n"),
+                    );
+                }
+            }
         }
         if diag {
             eprintln!(
@@ -1119,6 +1203,27 @@ impl ResidentExecutor {
             );
         }
         Ok(result)
+    }
+
+    /// Every tensor id a run of program `idx` leaves in OBSERVABLE state: each
+    /// fused segment's boundary outputs plus each native segment's output
+    /// bindings — exactly the set the debug dump writes (fs.outputs ∪ requested),
+    /// minus the request. A tid fused AWAY inside a segment has a stick but is
+    /// never stored, so it reads the zero-init: it is not observable, and a caller
+    /// comparing per-node goldens must not ask for it.
+    pub fn observable_tids(&self, idx: usize) -> Vec<u64> {
+        let mut v: Vec<u64> = Vec::new();
+        for seg in &self.programs[idx].segments {
+            match seg {
+                Segment::Fused(fs) => v.extend(fs.outputs.iter().copied()),
+                Segment::Native(n) => {
+                    v.extend(n.bindings.iter().filter(|b| b.is_output).map(|b| b.tensor))
+                }
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// COMPUTE-TILE DATAFLOW — the general grid-parallel executor. The raw nodes
@@ -1287,12 +1392,9 @@ impl ResidentExecutor {
         }
         let mut input_ptrs: Vec<(Ssa, Value)> = Vec::with_capacity(node.bindings.len());
         for b in &node.bindings {
-            let s = *self
-                .stick
-                .get(&b.tensor)
-                .ok_or_else(|| format!("tile-dataflow: t{} has no resident stick", b.tensor))?;
-            // base_ptr is an ELEMENT index (RFC #110): bind elem = s*STICK_BYTES/bpe.
-            let elem = s * STICK_BYTES / self.dtype.bytes_per_elem() as i64;
+            // base_ptr is an ELEMENT index (RFC #110) in the tensor's own staging
+            // dtype (`ptr_for`).
+            let elem = self.ptr_for(b.tensor)?;
             input_ptrs.push((b.arg, Value::Index(elem)));
         }
         self.mem.get_lx(tile).borrow_mut().clear();

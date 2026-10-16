@@ -253,6 +253,38 @@ pub struct BundleLayout {
     /// bundles byte-identical to before this field existed.
     #[serde(default)]
     pub weight_copies: Vec<(u32, u32)>,
+    /// ⭐ THE ROPE-P CLASS SET — this tape's DISTINCT rope head dims, sorted descending. Index `i` ↔
+    /// [`rope_p_class_tid`](crate::reserved_tids::rope_p_class_tid)`(i)` (class 0 = the widest =
+    /// `ROPE_P_TID`). One `[hd,hd]` P table per class: a hybrid (gemma-4) carries two rope head dims
+    /// and a composite single P is IMPOSSIBLE (the big class's contraction reads the small class's
+    /// nonzero block as spurious ±1 terms). The DOOR resolves a rope program's class index here —
+    /// the same registry lookup `scalarmul_scales` established — so the emitter, the placement pass
+    /// and the worker's load-time bind all agree on class↔tid by construction.
+    #[serde(default)]
+    pub rope_class_hds: Vec<u32>,
+    /// ⭐ THE IDENTITY CLASS SET — this tape's DISTINCT `AttnDecode` head dims, sorted descending.
+    /// Index `i` ↔ [`identity_class_tid`](crate::reserved_tids::identity_class_tid)`(i)` (class 0 =
+    /// the widest = `IDENTITY_TID`). Same defect, same fix: the GQA krep/vrep matmuls read the
+    /// identity at THEIR class's head dim, and one max-sized placement holding a base-hd table zeroes
+    /// the wide class's upper lanes (dump-proven on gemma-4 tiny-allglobal).
+    #[serde(default)]
+    pub attn_class_hds: Vec<u32>,
+    /// ⭐ THE ROUTER EXPERT COUNT — the MoE router's `E`, the one geometry fact the router const
+    /// placements cannot carry by size alone (the tie table is `[W,W]` at the PADDED width; W does
+    /// not reveal E). The argsort pad-mask row's VALUE is E-dependent (0 below E, +inf above), so
+    /// the bake states it here and the worker's bind reads it — the same registry law
+    /// `rope_class_hds` established for the rope-P tables. 0 when the tape has no router.
+    #[serde(default)]
+    pub router_experts: u32,
+    /// ⭐ THE ROUTER TOP-K WIDTH — the `k` the tape's RouteTopK/ExpertSort nodes state (their
+    /// max). The old artifact seat for this fact was the `[k,W]` targets table's own placement,
+    /// which died with the one-hot rank-inversion door the fused pair replaced; the softmax's
+    /// k-boundary mask row is still k-DEPENDENT (0 below k, −inf above), so k now rides this
+    /// registry the same way E rides [`Self::router_experts`] — the placement pass states it
+    /// from the tape's own nodes and the worker's load-time bind reads it. 0 when the tape has
+    /// no top-k.
+    #[serde(default)]
+    pub router_k: u32,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
     /// rmsnorm's `{out}_sq/mean/meps/inv/tmp/eps`) are NOT SubtileIR tensors, so
     /// they have no `t{id}` placement. They are lazily assigned a STABLE offset in

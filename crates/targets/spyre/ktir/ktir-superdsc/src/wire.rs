@@ -289,35 +289,28 @@ pub struct LabeledDs {
 
 /// `computeOp_` entry. `exUnit` is a sealed `ExUnit` value from `OpFunc::ex_unit`
 /// only (witness #6) — never hand-set on a matmul.
+///
+/// FRONTEND-MINIMAL, like `LabeledDs` above: torch-spyre's real frontend emits ONLY the
+/// 6 core fields + the four labeledDs lists — VERIFIED on compiled `torch.rsqrt`/
+/// `F.rms_norm`/`add`/`mul` (every op = `exUnit/opFuncName/attributes_/location/
+/// inputLabeledDs/outputLabeledDs`, NOTHING else). The scheduler-filled fields the
+/// vendor's hand-built fixtures carry (`auxLoopName`/`isAtMainLoop`/`isAtTop`/`level`/
+/// `coreExclude`/`coreClExclude`/`opConsts`) are NOT ours to emit, on two independent
+/// witnesses: (1) the real frontend omits them and computes rsqrt CORRECTLY on-card —
+/// a prior me ADDED them citing the dxp `sdsc_silu.json` fixture, but an explicit
+/// `auxLoopName: ""` plausibly tells dxp "no aux loop" → suppresses the SFP
+/// Newton-Raphson refine (rsqrt→1/x); (2) the dev stack's new SDSC-JSON validator
+/// rejects them outright ("Unrecognized field") — MEASURED: the tiny26 bake's dxp
+/// refused the vendor topk pair's verbatim fixture row, the only emission that ever
+/// carried them (same validator class as the `location: "invalid"` rejection in
+/// `emit`). `interimLabeledDs`/`indirectAccessIndexLabeledDs` are the frontend's own
+/// conditional lists — skip-if-empty, populated when a paged op names them.
 #[derive(Serialize, Clone, Debug)]
 pub struct ComputeOp {
     pub exUnit: &'static str, // "pt" | "sfp"
     pub opFuncName: String,
     pub attributes_: ComputeAttrs,
-    pub location: &'static str, // "Inner"
-    // torch-spyre's REAL frontend emits ONLY the 6 core fields above + the two
-    // labeledDs lists — VERIFIED on compiled `torch.rsqrt`/`F.rms_norm`/`add`/`mul`
-    // (every op = `exUnit/opFuncName/attributes_/location/inputLabeledDs/outputLabeledDs`,
-    // NOTHING else). A prior me ADDED the loop-placement flags below citing the dxp
-    // `sdsc_silu.json` *fixture*, but the real frontend OMITS them and computes rsqrt
-    // CORRECTLY on-card — and an explicit `auxLoopName: ""` plausibly tells dxp "no aux
-    // loop" → suppresses the SFP Newton-Raphson refine (rsqrt→1/x). So every field below
-    // is Option/skip-if-empty: the default emission is byte-equal to torch-spyre (omitted),
-    // and a populated interim/indirect list (paged ops) still serializes when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auxLoopName: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub isAtMainLoop: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub isAtTop: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<i64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub coreExclude: Vec<i64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub coreClExclude: Vec<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub opConsts: Option<serde_json::Value>,
+    pub location: &'static str,      // "Inner"
     pub inputLabeledDs: Vec<String>, // ["Tensor0-idx0", …]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub interimLabeledDs: Vec<String>,
@@ -592,7 +585,16 @@ pub fn gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": if is_stick_reduction { 1 } else { size / elems_per_stick }, "label_": "elem_arr_1"},
+                    // ⛔ CEILING, NOT FLOOR — the vendor's compute_ops.py emits
+                    // `-(-size // elems_per_stick)` here, never 0: a stick-dim extent
+                    // SMALLER than one stick (the gather's U32 index tensor: mb=4
+                    // against elems_per_stick=32) folds to 1, not 0. The dev stack's
+                    // SDSC-JSON validator rejects factor_ < 1 ("Must be >= 1"), which
+                    // is how the floored port surfaced on the gemma-4 bake. Python's
+                    // `//` floors, so its double-negation is a ceiling — Rust's `/`
+                    // truncates toward zero, making the same spelling a floor again;
+                    // `div_ceil` says it outright.
+                    {"factor_": if is_stick_reduction { 1 } else { (size + elems_per_stick - 1) / elems_per_stick }, "label_": "elem_arr_1"},
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},
                 ],
             },

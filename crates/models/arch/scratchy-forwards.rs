@@ -218,7 +218,7 @@ const METAL_ONLY: &[&str] = &[
 ///
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
 /// is dropped by the `supported` gate below before its configs are read.
-const SPYRE_CAPABLE: &[&str] = &["llama", "granite"];
+const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).

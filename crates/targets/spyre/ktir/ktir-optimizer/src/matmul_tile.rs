@@ -58,15 +58,26 @@ fn k_block(k: i64, n: i64) -> i64 {
 ///
 /// The GEMM offload holds the `[m, bw]` accumulator (plus its K-loop siblings and the cross-block
 /// residue) resident in the 2 MB LX, so the constraint is on `m · bw`, NOT `n` alone.
-fn n_block(n: i64, m: i64) -> i64 {
+///
+/// ⛔ THE BUDGET IS A BYTE BUDGET. An F32 accumulator — the fp8 pre-scale code-dot
+/// `lower_subtile_tape_to_ktir`'s `matmul_fp8` keeps in f32 (the un-scaled dot overflows f16
+/// long before the scale `mulf` brings it home) — is 2× the bytes of the f16 one at the same
+/// `[m, bw]`, so the element budget it may spend is `BLOCK_MN_BYTES / bytes_per_elem`:
+/// MEASURED at the gemma-4-12b fp8 prefill (m=31, n=15360), an f32 `[31, 15360]` GEMM out is
+/// 1_904_640 B and the init splat beside it another 1_904_640 B — 3.8 MB against the 2 MB LX,
+/// where the f16 pair (952_320 + 952_320) fit exactly. The f16 element budget (1 MB / 2 B =
+/// 512K elements) is the historical value verbatim; the f32 one halves to 256K, which blocks
+/// the f32 form at half the width so the interpreter reclaims per block.
+fn n_block(n: i64, m: i64, elem: DType) -> i64 {
     const WHOLE_N_FITS_M1: i64 = 90_000;
     const BLOCK_N: i64 = 16_384;
-    const BLOCK_MN_BUDGET: i64 = 512 * 1024;
+    const BLOCK_MN_BYTES: i64 = 1024 * 1024;
     let m = m.max(1);
     if m.saturating_mul(n) <= WHOLE_N_FITS_M1 {
         n
     } else {
-        BLOCK_N.min(BLOCK_MN_BUDGET / m).max(1)
+        let budget = BLOCK_MN_BYTES / elem.bytes_per_elem() as i64;
+        BLOCK_N.min(budget / m).max(1)
     }
 }
 
@@ -309,7 +320,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         // scaled form takes exactly one block, which is the fp8 door's own
         // single-tile contract (`verify_canonical_fp8_matmul_kernel` refuses
         // `BLOCK_N < N`).
-        if scale.is_some() && n_block(n, m) < n {
+        if scale.is_some() && n_block(n, m, elem) < n {
             continue;
         }
         out.push(Untiled {
@@ -395,7 +406,7 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             p.a_row
         };
 
-        let nblk = n_block(p.n, p.m);
+        let nblk = n_block(p.n, p.m, elem);
         let mut n_off = 0i64;
         // The nest's result SSA (the loop's yield) — the scaled form has exactly
         // one N-block, so the single loop's result IS the contraction the
@@ -659,4 +670,222 @@ pub fn apply_matmul_tiling<'a>(a: &'a Arena, module: &mut IRModule<'a>) -> usize
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir_builder::Ops;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::dtypes::DType;
+    use ktir_core::ir::Attr;
+    use ktir_core::irtype::IrType;
+
+    /// One untiled contraction exactly as [`KtirFunc::matmul`] / [`KtirFunc::matmul_fp8`] emit it.
+    /// `m`, `n`, `k` fix the geometry; `dequant` inserts the fp8 form's `arith.mulf` by a loaded
+    /// `[1, scale_cols]` scale row between the matmul and the store (`scale_cols` lets a test ship
+    /// a row of the WRONG width, which the recognizer must refuse).
+    fn contraction(m: i64, n: i64, k: i64, dequant: bool, scale_cols: i64) -> IRFunction<'static> {
+        let mut ops = Ops::new();
+        let a = ops.arena();
+        let c0 = ops.op(Some("%c0"), OpKind::ArithConstant, &[]);
+        let c0 = ops.attr(c0, AttrKey::Value, Attr::Int(0));
+        let mk_view =
+            |ops: &mut Ops, res: &'static str, arg: &'static str, dims: Vec<i64>, elem: DType| {
+                let o = ops.op(Some(res), OpKind::KtdpConstructMemoryView, &[arg]);
+                let o = ops.attr(o, AttrKey::Shape, ops.int_list(dims.clone()));
+                let o = ops.attr(o, AttrKey::Strides, ops.int_list(vec![dims[1], 1]));
+                let o = ops.attr(o, AttrKey::MemorySpace, Attr::Str("HBM"));
+                ops.attr(o, AttrKey::Dtype, Attr::Dtype(elem))
+            };
+        let mk_tile = |ops: &mut Ops, res: &'static str, view: &'static str, dims: Vec<i64>| {
+            let o = ops.op(
+                Some(res),
+                OpKind::KtdpConstructAccessTile,
+                &[view, "%c0", "%c0"],
+            );
+            ops.attr(o, AttrKey::Shape, ops.int_list(dims))
+        };
+        let f16_tensor = |dims: Vec<i64>| IrType::Tensor {
+            dims: a.ints(dims),
+            elem: DType::F16,
+        };
+
+        let mut body = vec![c0];
+        body.push(mk_view(&mut ops, "%va", "%a_ptr", vec![m, k], DType::F16));
+        body.push(mk_view(
+            &mut ops,
+            "%vw",
+            "%w_ptr",
+            vec![n, k],
+            DType::Fp8E4m3,
+        ));
+        body.push(mk_view(
+            &mut ops,
+            "%vs",
+            "%s_ptr",
+            vec![1, scale_cols],
+            DType::F16,
+        ));
+        body.push(mk_view(
+            &mut ops,
+            "%vout",
+            "%out_ptr",
+            vec![m, n],
+            DType::F16,
+        ));
+        body.push(mk_tile(&mut ops, "%ta", "%va", vec![m, k]));
+        let la = ops.op(Some("%a_val"), OpKind::KtdpLoad, &["%ta"]);
+        let la = ops.attr(la, AttrKey::Shape, ops.int_list(vec![m, k]));
+        body.push(ops.ty(la, f16_tensor(vec![m, k])));
+        body.push(mk_tile(&mut ops, "%tw", "%vw", vec![n, k]));
+        let lw = ops.op(Some("%w_val"), OpKind::KtdpLoad, &["%tw"]);
+        let lw = ops.attr(lw, AttrKey::Shape, ops.int_list(vec![n, k]));
+        body.push(ops.ty(lw, f16_tensor(vec![n, k])));
+        let zc = ops.op(Some("%zc"), OpKind::ArithConstant, &[]);
+        let zc = ops.attr(zc, AttrKey::Value, Attr::Float(0.0));
+        body.push(ops.ty(zc, IrType::Scalar(DType::F16)));
+        let init = ops.op(Some("%init"), OpKind::TensorSplat, &["%zc"]);
+        let init = ops.attr(init, AttrKey::Shape, ops.int_list(vec![m, n]));
+        let init = ops.attr(init, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        body.push(ops.ty(init, f16_tensor(vec![m, n])));
+        let mm = ops.op(
+            Some("%part"),
+            OpKind::LinalgMatmul,
+            &["%a_val", "%w_val", "%init"],
+        );
+        let mm = ops.attr(mm, AttrKey::Shape, ops.int_list(vec![m, n]));
+        body.push(ops.ty(mm, f16_tensor(vec![m, n])));
+        let stored: &'static str = if dequant {
+            body.push(mk_tile(&mut ops, "%ts", "%vs", vec![1, scale_cols]));
+            let ls = ops.op(Some("%s_val"), OpKind::KtdpLoad, &["%ts"]);
+            let ls = ops.attr(ls, AttrKey::Shape, ops.int_list(vec![1, scale_cols]));
+            body.push(ops.ty(ls, f16_tensor(vec![1, scale_cols])));
+            let mul = ops.op(Some("%scaled"), OpKind::ArithMulf, &["%part", "%s_val"]);
+            let mul = ops.attr(mul, AttrKey::Shape, ops.int_list(vec![m, n]));
+            body.push(ops.ty(mul, f16_tensor(vec![m, n])));
+            "%scaled"
+        } else {
+            "%part"
+        };
+        body.push(mk_tile(&mut ops, "%tout", "%vout", vec![m, n]));
+        body.push(ops.op(None, OpKind::KtdpStore, &[stored, "%tout"]));
+        ops.func(
+            "contraction",
+            &[
+                ("%a_ptr", IrType::Index),
+                ("%w_ptr", IrType::Index),
+                ("%s_ptr", IrType::Index),
+                ("%out_ptr", IrType::Index),
+            ],
+            body,
+            (1, 1, 1),
+        )
+    }
+
+    /// The fp8 dequant form IS recognized, with the scale view carried — the gemma-4-12b fp8 emu
+    /// gate. Before this recognition the pass reported "0 of 1 contraction(s) recognised" for every
+    /// `matmul_fp8` node, leaving a whole `[n, k]` fp8 weight tile in LX (q_proj `[4096, 3840]` =
+    /// 15.7 MB against 2 MB).
+    #[test]
+    fn the_fp8_dequant_form_is_recognised_with_its_scale_view() {
+        let f = contraction(
+            1, 96, 128, /* dequant: */ true, /* scale_cols: */ 96,
+        );
+        let found = recognize(&f);
+        assert_eq!(
+            found.len(),
+            1,
+            "the fp8 dequant contraction must be recognized"
+        );
+        assert!(found[0].scale.is_some(), "the scale view must be carried");
+        assert_eq!(found[0].n, 96);
+        assert_eq!(found[0].k, 128);
+    }
+
+    /// The plain bf16 form keeps its DIRECT store drain and carries no scale view.
+    #[test]
+    fn the_plain_form_still_recognises_without_a_scale() {
+        let f = contraction(1, 96, 128, false, 96);
+        let found = recognize(&f);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].scale.is_none());
+    }
+
+    /// A scale row of the WRONG width is not this contraction's dequant — the recognizer must
+    /// refuse rather than scale N-blocks by an off-width slice.
+    #[test]
+    fn an_off_width_scale_row_is_refused() {
+        let f = contraction(1, 96, 128, true, /* scale_cols: */ 64);
+        assert!(recognize(&f).is_empty());
+    }
+
+    /// After tiling, the fp8 form stores an `arith.mulf` of the loop result by a `[1, bw]` scale
+    /// slice — one mulf and one scale load per N-block, outside the K-loop body.
+    #[test]
+    fn tiling_scales_each_n_block_by_its_own_scale_slice() {
+        let mut f = contraction(1, 96, 128, true, 96);
+        let done = tile_func(Arena::global(), &mut f);
+        assert_eq!(done, 1);
+        let mul_count = f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::ArithMulf)
+            .count();
+        let scale_loads = f
+            .operations
+            .iter()
+            .filter(|o| {
+                o.op_type == OpKind::KtdpLoad
+                    && o.operands
+                        .first()
+                        .and_then(|acc| f.operations.iter().find(|d| d.result == Some(*acc)))
+                        .is_some_and(|acc| {
+                            acc.attr(AttrKey::Shape)
+                                == Some(&Attr::IntList(Arena::global().ints(vec![1, 96])))
+                        })
+            })
+            .count();
+        assert!(mul_count >= 1, "the dequant mulf must survive tiling");
+        assert!(
+            scale_loads >= 1,
+            "the scale slice load must survive tiling (whole-n block here)"
+        );
+        // Every store drains an mulf, not a bare loop result.
+        for o in f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpStore)
+        {
+            let val = o.operands[0];
+            let def = f.operations.iter().find(|d| d.result == Some(val));
+            assert!(
+                def.is_some_and(|d| d.op_type == OpKind::ArithMulf),
+                "the fp8 store must drain the scaled value"
+            );
+        }
+    }
+
+    /// ⛔ The N-block budget is a BYTE budget. The gemma-4-12b fp8 prefill (m=31, n=15360)
+    /// keeps the pre-scale code-dot in f32, so its `[31, 15360]` GEMM out is 1_904_640 B —
+    /// beside the equally-sized f32 init splat that is 3.8 MB against the 2 MB LX, where the
+    /// f16 pair (952_320 + 952_320) fit exactly. An F32 accumulator must therefore block at
+    /// HALF the f16 element budget, while the f16 form keeps its exact old width.
+    #[test]
+    fn the_n_block_budget_is_bytes_not_elements() {
+        // f16 (the historical budget): 512K elements / m=31 = 16912, capped at 16384.
+        assert_eq!(n_block(200_000, 31, DType::F16), 16_384);
+        // f32: half the elements — 256K / 31 = 8456 — so a wide f32 out blocks below 1 MB.
+        assert_eq!(n_block(200_000, 31, DType::F32), 8_456);
+        // The MEASURED failure geometry: f32 [31, 15360] must NOT stay one whole-n block.
+        // m·n = 476_160 > 90_000, and with the f16 budget min(16384, 16912) = 16384 >= n
+        // would keep it whole (the 3.8 MB pair); the byte budget splits it.
+        assert!(
+            n_block(15_360, 31, DType::F32) < 15_360,
+            "the f32 12b prefill out must block, not stay whole-n"
+        );
+        // Whole-n small outputs are unchanged by dtype (decode's [1, n] is tiny either way).
+        assert_eq!(n_block(90_000, 1, DType::F32), 90_000);
+        assert_eq!(n_block(90_000, 1, DType::F16), 90_000);
+    }
 }

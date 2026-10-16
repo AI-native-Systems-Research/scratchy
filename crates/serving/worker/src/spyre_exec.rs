@@ -258,6 +258,40 @@ impl Worker for SpyreWorker {
         self.model.as_ref().map(|m| m.served_context)
     }
 
+    /// 🛑 THE DECODE READS ONE BLOCK TABLE, SO HYBRID SWA KV MUST STAY OFF — the trait's own
+    /// contract (`worker.rs`: "a worker whose decode reads a single block table ... must run on
+    /// the uniform single-pool layout"). CUDA overrides this for the same reason.
+    ///
+    /// ⛔⭐⭐ THE GEMMA-4-12B fp8 GARBAGE-OUTPUT DEFECT, FOUND (2026-10-05). `SpyreWorker`
+    /// inherited the trait default `true`, so the engine handed gemma-4 the HYBRID scheduler
+    /// config (card log: "Hybrid SWA KV enabled: 84 shared blocks, 6 groups (5 sliding)") while
+    /// this backend bakes exactly ONE KV group — `spyre_exec.rs`'s own install path reads only
+    /// group 0's table (`.and_then(|groups| groups.first())`) and its comment admits "A hybrid
+    /// model would need a group per attention class, which this backend does not bake".
+    ///
+    /// The corruption is structural, not subtle:
+    /// * Page-size unification (`compute_hybrid_kv_layout`) scales the FULL group's block size
+    ///   4× (1024 tokens/block for gemma-4-12b: sliding 8×256 vs global 1×512) while the spyre
+    ///   pool's page is `PagedKvPool::PAGE_SLOTS` = 256 slots and the worker maps each block id
+    ///   to ONE page — so from token 256 on, a request's full-attention KV lands on pages its
+    ///   truncated table never names, and it attends another request's (or stale) keys: fluent
+    ///   multilingual gibberish at full speed, exactly the observed 8.3 tok/s symptom.
+    /// * The 5 SLIDING groups' tables are DISCARDED outright — the sliding-window layers
+    ///   attend through the full group's block ids, which the allocator freed out-of-window
+    ///   (null-padded) blocks for.
+    /// * Every non-hybrid model (granite) is unaffected — the same binary serves it coherently.
+    /// * The emulator is unaffected — the paged install is `spyre-hw`-gated, so emu runs never
+    ///   read a scheduler block table at all.
+    ///
+    /// Returning `false` keeps the scheduler on the UNIFORM single-group pool, where one block
+    /// table per request, 256 slots per block, IS the layout this backend bakes. The cost is the
+    /// documented uniform-pool tradeoff (sliding layers keep full-context KV rather than
+    /// window-evicting) — memory, not correctness, and the pool's byte-budget sizing already
+    /// accounts for it.
+    fn supports_hybrid_swa_kv(&self) -> bool {
+        false
+    }
+
     fn init_device(&mut self) -> ExecutorResult<()> {
         Ok(())
     }
@@ -724,9 +758,7 @@ impl Worker for SpyreWorker {
                     embed_tokens: &model.embed_tokens,
                     hidden: model.hidden,
                     head_dim: model.head_dim,
-                    kv_dim: model.kv_dim,
                     vocab: model.vocab,
-                    rope_theta: model.rope_theta,
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
@@ -807,7 +839,21 @@ impl Worker for SpyreWorker {
                 // block. Declared here because this is where the row count and the head count are
                 // both known; idempotent, so restating it each step costs nothing and cannot drift
                 // from the rung actually running.
-                let nqh = sh.hidden / sh.head_dim.max(1);
+                // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT, NOT `sh.hidden / sh.head_dim`. The quotient is the
+                // head count only for a SQUARE Q projection; gemma-4's is not (hidden 3840 against
+                // nqh·hd 4096/8192), and a mask shape built on the quotient stages and strides only
+                // that many of the baked `nqh·mq` rows — the shortfall reads as ZERO in an additive
+                // mask, i.e. as no mask, exactly the causal-mask defect the prefill path recorded.
+                // The decode meta's wiring is the bake the rungs were lowered at; geometry is
+                // identical across cap buckets, so the bucket chosen here cannot disagree with the
+                // rung actually running.
+                let nqh = model
+                    .decode
+                    .last()
+                    .expect("at least one decode bucket")
+                    .wiring
+                    .geometry
+                    .nqh as usize;
                 // ROW-BATCHED FOLD (emitter: `per_request` at mq>1 with rows_are_requests). A pass is
                 // baked for ONE request's `nqh` rows, so a mask BLOCK is `nqh` rows deep, not
                 // `nqh*seqs`, and each pass must additionally be rebased onto its own request's row
@@ -1022,6 +1068,9 @@ impl Worker for SpyreWorker {
                 })?;
                 let swept = step.swept();
                 let gathers_kv = step.gathers();
+                // ⭐ THE RUNG'S OWN BANK CENSUS — the bundle this executor residently holds, from
+                // the same `StepBody` for the same reason: the borrowed meta describes neither.
+                let subpage_bank = step.subpage_bank();
                 let bake_gathers_kv = gathers_kv.get();
                 // ⭐⭐⭐ WHEN THE BODY IS A BATCH CHUNK, ITS LAW — read off the selected body's own swept
                 // extent (`J` pages per request) at this rung's width, the inverse of what the bake
@@ -1402,6 +1451,7 @@ impl Worker for SpyreWorker {
                     // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
                     // the meta above is borrowed for tensor ids and describes neither.
                     gathers_kv,
+                    subpage_bank,
                     launch_pos,
                     // Every row is a different request and every row is sampled — the tail runs
                     // unfolded, so the logits come back de-interleaved, one contiguous row each.

@@ -58,24 +58,50 @@ pub fn gather_copy_opspec(
     dst: &str,
     rows: u32,
     cols: u32,
+    // ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE expert
+    // slabs. The vendor's `identity` bind carries NO DDL type constraint (unary_parallel.ddl:17
+    // "identity and shuffle only move data, so their input and output are free to arrange it
+    // differently"), so the copy's df is a property of the BANK it copies, not of the op — and the
+    // ONE-STICK law below transfers per-format: an fp8 copy's `cols` is one 128-elem fp8 stick, and
+    // the RowBlocked-scatter refusal the fp16 law states is the same law at its own width.
+    df: Df,
     gather: crate::superdsc_opspec::GatherIndex,
-    // ⭐⭐⭐⭐⭐ THE DESTINATION ENTRY THIS RUN STARTS AT — separate from `gather.first_entry`, and it has to
-    // be. See `GatherCopy::dest_entry`: the two were one number while a run's entries and its destination
-    // rows advanced together (the window-granular cut, where one index stick IS 32 scratch rows), and a
-    // page-granular op breaks that — it names ONE entry but must sit at a stick boundary, so entries
-    // advance 32 per op while rows advance 1. Both are minted from the same request index by `copies()`,
-    // so they cannot drift; they simply are not equal any more.
-    dest_entry: crate::superdsc_opspec::DestEntry,
+    // ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — see `superdsc_opspec::GatherRun`. The
+    // destination entry is separate from `gather.first_entry`, and it has to be. See
+    // `GatherCopy::dest_entry`: the two were one number while a run's entries and its destination
+    // rows advanced together (the window-granular cut, where one index stick IS 32 scratch rows),
+    // and a page-granular op breaks that — it names ONE entry but must sit at a stick boundary, so
+    // entries advance 32 per op while rows advance 1. Both are minted from the same request index
+    // by `copies()`, so they cannot drift; they simply are not equal any more. The source base is
+    // the SECOND paged-axis half of `addr = idx·skip_addr + base_addr`, for a source whose entries
+    // are RELATIVE to a base inside its own buffer. ZERO for every gathered KV copy (the pool's
+    // entries are GLOBAL stick-block numbers, and a per-run base would be added twice — see
+    // [`crate::sdsc_abstract::GatherCopy`]'s "source base stays ZERO" law). The expert bank is
+    // the other shape: its entries are EXPERT IDS relative to the bank's base, and the bank's
+    // packed device layout makes one expert's slab ONE CONTIGUOUS range, so a chunk of that slab
+    // is the range `[src_off, src_off + mb·page·cols)` and the index term `idx·skip_addr` still
+    // supplies the WHOLE-slab stride. Both base and index are added by `ConvertData_gather_idx`
+    // — card-proven at the score leg ("the index supplies only the PAGE term", `emit/mod.rs`'s
+    // isStartAddrSymbolic note) — so a nonzero base here survives the gather and a zero one
+    // changes nothing on every existing caller.
+    run: crate::superdsc_opspec::GatherRun,
 ) -> Result<OpSpec, String> {
-    let cols_ext = crate::superdsc_opspec::StickExtent::<Fp16>::new(cols)?;
-    if cols != Fp16::ELEMS_PER_STICK {
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    // ⭐ `cols` IS the whole-stick width by the one-stick law below (`cols == df.elems_per_stick()`),
+    // so it needs no `StickExtent` round-trip — and a typed one would have to name a format. The
+    // historical `StickExtent::<Fp16>` spelling only ever worked by coincidence: fp16 (64) and fp8
+    // (128) sticks are both 64-multiples, so the fp16 extent accepted the fp8 caller's width. A
+    // SenUint32 stick is 32 elems and the fp16 extent refuses it — while the one-stick law holds at
+    // u32 exactly as at fp16, since the law is stated in the PASSED `df`'s own stick width.
+    if cols != df.elems_per_stick() {
         return Err(format!(
             "gather_copy_opspec('{src}' -> '{dst}'): `out` is {cols} elements, and a gathered copy's \
-             `out` must be exactly one fp16 stick ({}). Wider than one stick, the operand classifies \
-             stick-major and each gathered block is scattered `rows*64` apart instead of contiguous — \
-             which bakes clean and hands the score kernel another request's slots. Declare the block as \
-             `hd` one-stick sub-rows (`GatherScratch::sub_rows`) with the entry `page` covering them.",
-            Fp16::ELEMS_PER_STICK,
+             `out` must be exactly one {stick}-element stick of the value format. Wider than one \
+             stick, the operand classifies stick-major and each gathered block is scattered \
+             `rows*{stick}` apart instead of contiguous — which bakes clean and hands the consumer \
+             another entry's rows. Declare the block as one-stick sub-rows (`GatherScratch::sub_rows`) \
+             with the entry `page` covering them.",
+            stick = df.elems_per_stick(),
         ));
     }
     // ⛔ THE PAGE MUST DIVIDE THE ROWS, or the last entry covers a partial block. Refused rather than
@@ -105,7 +131,7 @@ pub fn gather_copy_opspec(
     // whole pool block. Named once, here, because it is also what `skip_addr` is (`page × the per-core
     // extents of the unpinned dims`, and `out` is the only unpinned one) — so the distance an index step
     // moves in the SOURCE and the distance a run's base moves in the DESTINATION are one number.
-    let entry_elems = page.saturating_mul(cols_ext.elems());
+    let entry_elems = page.saturating_mul(cols);
     if page == 0 || !rows.is_multiple_of(page) {
         return Err(format!(
             "gather_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into whole \
@@ -117,7 +143,7 @@ pub fn gather_copy_opspec(
         size,
         is_reduction: false,
         is_stick,
-        df: Df::Fp16,
+        df,
     };
     let tile_op = TileOp {
         // Two operands: the gathered source and the contiguous destination. The index is APPENDED by
@@ -126,17 +152,16 @@ pub fn gather_copy_opspec(
         kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
         dims: vec![
             dim("mb", rows, false),
-            dim("out", cols_ext.elems(), true),
+            dim("out", cols, true),
             dim("y", 1, false),
         ],
-        df: Df::Fp16,
+        df,
     };
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
         OpFunc::Identity,
         &[src],
-        dst,
-        // ⛔⛔⛔ RANK-3, AND THIS IS A CARD-MEASURED REQUIREMENT, NOT A PRESENTATION CHOICE. This flag was
+        dst, // ⛔⛔⛔ RANK-3, AND THIS IS A CARD-MEASURED REQUIREMENT, NOT A PRESENTATION CHOICE. This flag was
         // `false`, which puts a `rows > 1` op into [`pointwise_opspec_from_tile`]'s STICK-MAJOR rank-2
         // form — and that form OMITS `y` from `layoutDimOrder_` entirely rather than sizing it 1. The
         // sibling builder records the consequence from a real pod `dxp_standalone` crash
@@ -197,16 +222,25 @@ pub fn gather_copy_opspec(
         // consecutive destination rows. A page-granular op's index base is `32 * request` while its rows
         // start at `request`, so reusing it lands every op's rows 32× too far out, past the scratch and
         // into the next intermediate's bytes. Read as keys, clean bake, no fault.
-        entry_elems
-            .checked_mul(dest_entry.entries())
-            .ok_or_else(|| {
-                format!(
-                    "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
+        entry_elems.checked_mul(run.dest.entries()).ok_or_else(|| {
+            format!(
+                "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
                      {} overflows a 32-bit element offset at {entry_elems} elements per entry",
-                    dest_entry.entries()
-                )
-            })?,
+                run.dest.entries()
+            )
+        })?,
     )?;
+    // ⭐ THE VALUE OPERANDS' OWN df — `pointwise_opspec_from_tile_split` builds args at fp16 (the
+    // residual default), so an fp8 copy re-states BOTH value args here. The index arg does not
+    // exist yet: `attach_gather_index` below appends it with SENUINT32 FORCED, the one format a
+    // gather's index may carry, whatever the value operands are. The gathered SOURCE takes the
+    // chunk base AFTER the df is set (`set_offset_elems` scales by the word length itself).
+    for a in op.args.iter_mut() {
+        a.set_df(df);
+    }
+    if run.src_elems > 0 {
+        op.args[0].set_offset_elems(run.src_elems);
+    }
     // ⛔ OPERAND 0 IS THE GATHERED ONE, AND IT IS NOT THE OUTPUT. `attach_gather_index` refuses the
     // output slot itself (gathering INTO a destination is a scatter), so this cannot silently become
     // one; the `?` below turns a shape it cannot express into this function's own `Err`.
@@ -281,17 +315,25 @@ pub fn assemble_gather_copy(
         dst,
         d.mb(),
         d.out(),
+        // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
+        // first fp8 caller and states its own df at its own door.
+        Df::Fp16,
         crate::superdsc_opspec::GatherIndex::of_scratch_rows(
             index.to_string(),
             d.page(),
             // THE INDEX's base, in whole index STICKS — dxp loads the IBR one stick at a time.
             copy.index_base(),
         ),
-        // ⛔ AND THE DESTINATION's base SEPARATELY. It used to be derived from the index base above;
-        // see `GatherCopy::dest_entry` for the measurement that separated them (a page-granular op names
-        // one entry at stick `r` but writes run `r`, so the two advance at different rates). Both come
-        // from `copies()`, which mints them from one request index.
-        crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
+        // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
+        // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
+        // measurement that separated them (a page-granular op names one entry at stick `r` but
+        // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
+        // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
+        // source base (the `GatherCopy` law).
+        crate::superdsc_opspec::GatherRun::split(
+            crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
+            0,
+        ),
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -473,13 +515,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .all(|i| i.out_broadcast() || block_aligned(i.col_offset()));
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
 
-    if time_tile.is_some() && inputs.iter().any(|i| i.out_broadcast()) {
-        return Err(format!(
-            "pointwise_broadcast '{o_name}': a broadcast-over-`out` operand in a TIME-TILED op \
-             is not yet supported — concrete_trips would wrongly advance the broadcast operand's \
-             address per trip (silently-wrong). Refusing (build guard). [rows={rows} cols={cols}]"
-        ));
-    }
+    // ⛔ INVARIANT (was a refusal — see the exemption note in `rewrite_op_for_time_tile`): a
+    // broadcast-over-`out` operand in a TIME-TILED op must NOT advance per trip, and it
+    // now provably does not — `rewrite_op_for_time_tile` classifies a tensor as tiled only
+    // when it RANGES over the tiled dim (scale `Active`), so a RedStick/RedNonStick
+    // broadcast operand keeps the collapsed fold `build_coordinates` wrote and gets NO
+    // affine stride, which is `concrete_trips`' no-bump path (base address fixed across
+    // trips). If that classification ever regresses, the SFP-transcendental guard above
+    // and `tiled_trips_alias` (the OUTPUT-side backstop) still fire; the broadcast side
+    // is pinned by `time_tiled_broadcast_operand_is_address_stable` in `emit/mod.rs`.
 
     // Build a rank-2 stick-major (`stickmajor`) or the legacy rank-3 flat operand. rank-2 drops the
     // size-1 `y` dim + its scale so `for_view_df` classifies it RowBlocked (stick-major), matching

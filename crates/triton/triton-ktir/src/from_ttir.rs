@@ -62,12 +62,15 @@ const PASS: &str = "from-ttir";
 /// `OpKind::from_spelling` would happily turn into an `Other`, because "we do not model
 /// this" and "we model this as Other on purpose" must not look the same.
 ///
-/// THE TWO DELIBERATE `Other`s: `arith.negf` and `math.rsqrt` have no `OpKind` variant.
+/// THE FIVE DELIBERATE `Other`s: `arith.negf`, `math.rsqrt`, `arith.cmpf`,
+/// `arith.sitofp`, and `arith.fptosi` have no `OpKind` variant.
 /// They are listed here so the choice is visible, and it is safe because a consumer keys
 /// on `OpKind::spelling()` for exactly these -- `triton-superdsc-lower`'s op map reads
 /// `arith.negf` (its SiLU recogniser's head) and `math.rsqrt` through the spelling, and
 /// `crate::text::parse` produces the same `Other` from the C++'s own text, so the golden
-/// side and this side agree.
+/// side and this side agree. The three router-index spellings ride the same rule with the
+/// same justification: `to_ktir_emit`'s Other arm names their `KOpKind`, and the compare's
+/// `predicate` is an attribute carried verbatim, so no consumer is left keying on a guess.
 pub const OP_SET: &[&str] = &[
     // structure
     "tt.func",
@@ -88,12 +91,34 @@ pub const OP_SET: &[&str] = &[
     "arith.extf",
     "arith.truncf",
     "arith.negf", // Other, on purpose
+    // THE ROUTER-INDEX EXTENSION (Phase 2b): the MoE router rows spell a
+    // 0/1 compare mask and slot selection, which have no compare-free form,
+    // and their index arithmetic integerizes through fp<->int casts. The
+    // front end's `compare`/`where`/`cast` emit these five spellings; the
+    // emulator has served `ArithCmpf`/`ArithCmpi`/`ArithSelect`/
+    // `ArithSitofp`/`ArithFptosi` all along, and `predicate` rides
+    // `ATTR_KEYS` below (`Attr::Pred` is carried by `attr_value`, whose own
+    // comment says that hole was found by reading the reader). `cmpf`/
+    // `sitofp`/`fptosi` ride `Other` exactly like `negf`: `to_ktir_emit`'s
+    // Other arm names their variant.
+    "arith.cmpf", // Other, on purpose
+    "arith.cmpi",
+    "arith.select",
+    "arith.sitofp", // Other, on purpose
+    "arith.fptosi", // Other, on purpose
     // math
     "math.exp",
     "math.exp2",
     "math.rsqrt", // Other, on purpose
+    "math.tanh",
     // triton
     "tt.get_program_id",
+    // `tl.arange` -- the lane vector the router index kernels select with. Its
+    // `start`/`end` ride `ATTR_KEYS` below as `AttrKey::Other` (the escape hatch
+    // for a key with no variant), and `to_ktir`'s `convert_make_range` rewrites
+    // the op into the `tensor.generate` index-grid group the emulator's
+    // `generate` handler runs -- the branch's own `index_grid` shape.
+    "tt.make_range",
     "tt.make_tensor_descriptor",
     "tt.descriptor_load",
     "tt.descriptor_store",
@@ -128,6 +153,19 @@ pub const ATTR_KEYS: &[&str] = &[
     "noinline",
     "callee",
     "tt.divisibility",
+    // `arith.cmpf`/`arith.cmpi`'s predicate (`olt`, `oeq`, ...), printed inside the op's
+    // own parens, not a `{...}` dictionary. `attr_value` maps `ttir::Attr::Pred` to
+    // `Attr::Str` verbatim and `to_ktir_emit` re-keys it `KAttrKey::Predicate`; the
+    // emulator and the door both read it to pick the comparison.
+    "predicate",
+    // `tt.make_range`'s bounds (`start = 0 : i32`, `end = 64 : i32`), the two integers
+    // that name the lane vector's extent. They have no `AttrKey` variant -- the
+    // fingerprint-carrying enum stays untouched -- so they ride `AttrKey::Other`,
+    // which `from_spelling` builds for any spelling not in its table and
+    // `to_ktir`'s `convert_make_range` reads back by name when it rewrites the op
+    // into a `tensor.generate` group.
+    "start",
+    "end",
 ];
 
 /// Convert a post-`make_ttir` ttir module into a KTIR module.
@@ -461,8 +499,8 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
             }
         }),
         // `arith.cmpi slt` -- also a bare keyword, also a hand-written reader arm. No
-        // fixture has a compare today, which is exactly why it is carried: the hole this
-        // fills was found by reading the reader, not by a failing test.
+        // GOLDEN has a compare (the hole was found by reading the reader, not by a
+        // failing test); the router-index kernels send live ones through here now.
         ttir::Attr::Pred(p) => Attr::Str(p.to_string()),
         // `order = array<i32: 1, 0>` -> the reader's `array<` arm, an `IntList`.
         ttir::Attr::Array(items) => {

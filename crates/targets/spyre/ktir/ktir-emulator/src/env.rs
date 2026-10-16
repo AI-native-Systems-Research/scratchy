@@ -76,6 +76,14 @@ pub struct ExecutionEnv<'a> {
     pub dispatch: &'a Dispatch,
     pub grid: &'a GridExecutor,
     pub tracker: Option<&'a RefCell<LatencyTracker>>,
+    /// SSA results whose pointwise f16 landing is the card's DLF16 grid — the
+    /// rmsnorm scalar chain's sticks (the square, the `·INV_D` mean, the `+ eps`),
+    /// collected by `comm_sched::rmsnorm_scalar_sticks` on the paths that model
+    /// the card (the resident segment loop and the compute-tile dataflow). `None`
+    /// on every direct-dispatch path — the port conformance suite and the unit
+    /// harnesses — which keeps those on `Tile::compute`'s IEEE grid, the vendor
+    /// oracle's own semantics.
+    pub dlf16_sticks: Option<&'a std::collections::HashSet<crate::ir::Ssa>>,
 }
 
 impl<'a> ExecutionEnv<'a> {
@@ -85,6 +93,7 @@ impl<'a> ExecutionEnv<'a> {
             dispatch,
             grid,
             tracker: None,
+            dlf16_sticks: None,
         }
     }
 
@@ -98,7 +107,36 @@ impl<'a> ExecutionEnv<'a> {
             dispatch,
             grid,
             tracker: Some(tracker),
+            dlf16_sticks: None,
         }
+    }
+
+    /// Arm the DLF16 landing set (see the field's doc). Consumes and returns the
+    /// env so it chains after `new`/`with_tracker`; the set must outlive the env.
+    pub fn with_dlf16_sticks(
+        mut self,
+        sticks: &'a std::collections::HashSet<crate::ir::Ssa>,
+    ) -> Self {
+        self.dlf16_sticks = Some(sticks);
+        self
+    }
+
+    /// Does THIS op's result land on the card's DLF16 grid? True only on the
+    /// card-modeling paths, and only for the op whose result the scalar-chain
+    /// walk collected. Handlers pair this with their own dtype gate — an f32-typed
+    /// result never lands DLF16 (the 32-bit mode is f32 on card).
+    pub fn lands_dlf16(&self, op: &crate::ir::Operation) -> bool {
+        op.result.is_some_and(|r| self.lands_dlf16_value(r))
+    }
+
+    /// The value-level form of [`Self::lands_dlf16`]: does THIS SSA — some op's
+    /// result — land on the DLF16 grid? The fused map window's GPU landing asks
+    /// this for its single LIVE-OUT, because the window replaces the trigger
+    /// op's interpreter execution and must replace its landing grid with it: a
+    /// live-out the scalar-chain walk collected (a norm's square over prefill
+    /// rows) overflows IEEE f16 exactly where DLF16's 2³³ headroom holds it.
+    pub fn lands_dlf16_value(&self, result: crate::ir::Ssa) -> bool {
+        self.dlf16_sticks.is_some_and(|s| s.contains(&result))
     }
 }
 
