@@ -420,14 +420,22 @@ fn toolchain() -> &'static str {
     })
 }
 
-/// The compile of `source` with `flags`, whose inputs hash to `hash`. In a build (`OUT_DIR`) it is
-/// kept beside the build's other outputs under that hash — of every input: the Metal toolchain,
-/// the source, its flags and every file it can include — so a re-expansion that changed none of
-/// them reads it back instead of compiling it again.
+/// The compile of `source` with `flags`, whose inputs hash to `hash` — of every input: the Metal
+/// toolchain, the source, its flags and every file it can include. In a build (`OUT_DIR`) it is
+/// kept under that hash in [`kernel_cache`], so any build that changed none of them reads it back
+/// instead of compiling it again. A hit marks the file used (its mtime): CI keeps the compiles a
+/// run used, and prunes the rest.
 fn kept_compile(hash: u64, library: &str, source: &str, flags: &[&str]) -> Vec<u8> {
     let kept = std::env::var_os("OUT_DIR")
-        .map(|out| Path::new(&out).join(format!("metal-bake/batch-{hash:016x}.metallib")));
-    if let Some(bytes) = kept.as_ref().and_then(|path| std::fs::read(path).ok()) {
+        .map(|out| kernel_cache(Path::new(&out)).join(format!("batch-{hash:016x}.metallib")));
+    if let Some(path) = &kept
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        std::fs::File::options()
+            .append(true)
+            .open(path)
+            .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+            .unwrap_or_else(|e| panic!("bake: mark {} used: {e}", path.display()));
         return bytes;
     }
     // Not `<library>.metal`: the source includes that file, and would find itself first.
@@ -435,12 +443,35 @@ fn kept_compile(hash: u64, library: &str, source: &str, flags: &[&str]) -> Vec<u
     if let Some(path) = kept {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
-        std::fs::create_dir_all(path.parent().expect("metal-bake dir"))
+        std::fs::create_dir_all(path.parent().expect("the kernel cache"))
             .and_then(|()| std::fs::write(&tmp, &bytes))
             .and_then(|()| std::fs::rename(&tmp, &path))
             .unwrap_or_else(|e| panic!("bake: keep {}: {e}", path.display()));
     }
     bytes
+}
+
+/// ⭐ WHERE THE BAKE KEEPS ITS COMPILES: `metal-kernel-cache/` in the target directory holding
+/// `out_dir` (`<target>/<profile>/build/<package>-<hash>/out`), not `out_dir` itself. Each feature
+/// set, profile and test build expands in an `OUT_DIR` of its own, and they bake the same kernels;
+/// CI's cache drops workspace `OUT_DIR`s, so a store there compiled every kernel on every run. A
+/// kept compile is named by the hash of everything it reads, so sharing it is exact.
+fn kernel_cache(out_dir: &Path) -> PathBuf {
+    let build = (out_dir.ancestors())
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .unwrap_or_else(|| {
+            panic!(
+                "bake: OUT_DIR {} is outside cargo's build/",
+                out_dir.display()
+            )
+        });
+    let profile = build
+        .parent()
+        .expect("cargo's build/ is in a profile directory");
+    let target = profile
+        .parent()
+        .expect("a profile directory is in the target directory");
+    target.join("metal-kernel-cache")
 }
 
 /// `c` as an MSL literal of its declared type; a float as its shortest round-trip decimal, which

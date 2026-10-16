@@ -1,0 +1,24 @@
+name: Restore compiled Metal kernels
+description: >-
+  Restore the bake's kept compiles (target/metal-kernel-cache, each named by the
+  hash of everything it reads) from this job's last main run, so only the
+  kernels a change touched compile. Pair with metal-kernels-save.
+inputs:
+  job:
+    description: The cache's key prefix, one per job (jobs bake different kernels).
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache/restore@v6
+      with:
+        path: target/metal-kernel-cache
+        key: metal-kernels-${{ inputs.job }}-${{ github.sha }}
+        restore-keys: metal-kernels-${{ inputs.job }}-
+    # A compile the run reads back gets a fresh mtime; one it writes is new. The
+    # marker and the listing let metal-kernels-save tell both from what it restored.
+    - shell: bash
+      run: |
+        mkdir -p target/metal-kernel-cache
+        touch "$RUNNER_TEMP/metal-kernels-restored"
+        find target/metal-kernel-cache -type f | sort > "$RUNNER_TEMP/metal-kernels-before"
