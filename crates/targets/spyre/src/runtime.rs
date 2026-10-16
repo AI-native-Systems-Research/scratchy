@@ -19,7 +19,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use flex_rs::address::{ByteOffset, ByteSize, Chunk, CompositeAddress, LogicalAddress, RegionId};
+use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
     FlexAllocatorInit,
@@ -449,10 +449,10 @@ impl Stream {
     /// confuse "we refused" with "the card refused".
     pub fn h2d(&self, bytes: &[u8], addr: &DevAddr) -> Result<(), HwError> {
         let region = addr.total_size();
-        if bytes.len() as u64 > region {
+        if ByteSize(bytes.len() as u64) > region {
             return Err(HwError::OverrunsRegion {
                 len: bytes.len() as u64,
-                region,
+                region: region.as_u64(),
             });
         }
         let stream = self.live()?;
@@ -526,6 +526,10 @@ impl Drop for Stream {
     }
 }
 
+/// The byte types [`DevAddr`]'s signature speaks, re-exported so the player imports every device
+/// address type from this one module — the typed card surface hands out the types it takes.
+pub use flex_rs::address::{ByteOffset, ByteSize};
+
 /// One chunk's identity — what a shifted or sliced sub-address is built from. The fields are
 /// flex-rs's own newtypes, so a chunk cannot be rebuilt with a region id in the offset's place
 /// or a domain silently truncated.
@@ -553,7 +557,7 @@ pub struct DevAddr(Arc<CompositeAddress>);
 impl DevAddr {
     /// Allocate `nbytes` of device memory of the given [`MemoryType`]. The region is never freed
     /// (see the struct doc); this handle describes it.
-    pub fn alloc(nbytes: u64, kind: MemoryType) -> Result<DevAddr, HwError> {
+    pub fn alloc(nbytes: ByteSize, kind: MemoryType) -> Result<DevAddr, HwError> {
         let rt = get_or_init_runtime().map_err(HwError::BringUp)?;
         let directive = AllocationDirective::new(
             flex_rs::domain::PlacementPolicy::Bind,
@@ -567,7 +571,7 @@ impl DevAddr {
             .map_err(|e| HwError::Alloc(AllocError::Context(e)))?;
         let mut guard = allocator.lock().unwrap_or_else(|e| e.into_inner());
         guard
-            .allocate(ByteSize(nbytes), &directive)
+            .allocate(nbytes, &directive)
             .map(|a| DevAddr(Arc::new(a)))
             .map_err(|e| HwError::Alloc(AllocError::Allocator(e)))
     }
@@ -584,8 +588,8 @@ impl DevAddr {
         DevAddr(Arc::new(CompositeAddress::from_chunk(chunk)))
     }
 
-    pub fn total_size(&self) -> u64 {
-        self.0.total_size().as_u64()
+    pub fn total_size(&self) -> ByteSize {
+        self.0.total_size()
     }
 
     pub fn is_single_chunk(&self) -> bool {
@@ -604,28 +608,28 @@ impl DevAddr {
 
     /// A shifted single-chunk window `sh` bytes into this region — size = the bytes remaining
     /// past `sh`, or the whole chunk when `sh` is beyond it.
-    pub fn shifted(&self, sh: u64) -> Option<DevAddr> {
+    pub fn shifted(&self, sh: ByteSize) -> Option<DevAddr> {
         let c0 = self.chunk0()?;
-        let nsz = if c0.size.0 > sh {
-            ByteSize(c0.size.0 - sh)
+        let nsz = if c0.size > sh {
+            ByteSize(c0.size.0 - sh.0)
         } else {
             c0.size
         };
         Some(DevAddr::from_chunk(Chunk0 {
             region: c0.region,
-            offset: ByteOffset(c0.offset.0 + sh),
+            offset: ByteOffset(c0.offset.0 + sh.0),
             size: nsz,
             domain: c0.domain,
         }))
     }
 
     /// A sliced single-chunk window `[off, off+len)` of this region.
-    pub fn window(&self, off: u64, len: u64) -> Option<DevAddr> {
+    pub fn window(&self, off: ByteOffset, len: ByteSize) -> Option<DevAddr> {
         let c0 = self.chunk0()?;
         Some(DevAddr::from_chunk(Chunk0 {
             region: c0.region,
-            offset: ByteOffset(c0.offset.0 + off),
-            size: ByteSize(len),
+            offset: ByteOffset(c0.offset.0 + off.0),
+            size: len,
             domain: c0.domain,
         }))
     }

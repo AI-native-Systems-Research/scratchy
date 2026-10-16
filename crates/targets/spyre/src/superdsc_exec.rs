@@ -26,7 +26,7 @@ use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::fold_plan::{self, Bytes, OpKv, RowIdx, RowPage, SessionKv, SlotPos, UniformPages};
-use crate::runtime::{DevAddr, HwError, Stream};
+use crate::runtime::{ByteOffset, ByteSize, DevAddr, HwError, Stream};
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
 
@@ -353,7 +353,7 @@ type Ops = Vec<OpProg>;
 /// its region is a STAGING bug (`prepare` grows every shadow it sends to the region's extent), so it
 /// is reported here rather than becoming an out-of-bounds transfer.
 fn whole_shadow<'a>(shadow: &'a [u8], addr: &DevAddr, seg: usize) -> Result<&'a [u8]> {
-    let need = addr.total_size() as usize;
+    let need = addr.total_size().as_u64() as usize;
     shadow.get(..need).ok_or_else(|| {
         anyhow!(
             "seg{seg}: the host shadow is {} B but its device region is {need} B — this H2D would \
@@ -1466,7 +1466,7 @@ impl Executor {
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(bytes, MemoryType::Tensor)
+                DevAddr::alloc(ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -1481,13 +1481,14 @@ impl Executor {
             } else {
                 self.weight_bank_bytes[b].max(128)
             };
-            self.weight_bank_addr[b] =
-                Some(DevAddr::alloc(bytes, MemoryType::Tensor).map_err(|e| {
+            self.weight_bank_addr[b] = Some(
+                DevAddr::alloc(ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
                     )
-                })?);
+                })?,
+            );
         }
         lap("seg-alloc", &mut t0);
 
@@ -1521,7 +1522,9 @@ impl Executor {
             if i == SEG_KV.get() && self.kv.paged {
                 continue;
             }
-            let need = self.seg_addr[i].as_ref().map_or(0, |a| a.total_size()) as usize;
+            let need = self.seg_addr[i]
+                .as_ref()
+                .map_or(0, |a| a.total_size().as_u64()) as usize;
             if self.seg_host[i].len() < need {
                 self.seg_host[i].resize(need, 0);
             }
@@ -1532,7 +1535,7 @@ impl Executor {
             for b in 0..self.weight_bank_bytes.len() {
                 let need = self.weight_bank_addr[b]
                     .as_ref()
-                    .map_or(0, |a| a.total_size()) as usize;
+                    .map_or(0, |a| a.total_size().as_u64()) as usize;
                 if self.weight_bank_host[b].len() < need {
                     self.weight_bank_host[b].resize(need, 0);
                 }
@@ -1689,13 +1692,14 @@ impl Executor {
                         )
                     })?;
                 let head = img.bootstrap();
-                let addr = DevAddr::alloc(img.alloc_bytes(), MemoryType::Program).map_err(|e| {
-                    anyhow!(
-                        "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
-                        img.alloc_bytes(),
-                        img.image_bytes()
-                    )
-                })?;
+                let addr = DevAddr::alloc(ByteSize(img.alloc_bytes()), MemoryType::Program)
+                    .map_err(|e| {
+                        anyhow!(
+                            "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
+                            img.alloc_bytes(),
+                            img.image_bytes()
+                        )
+                    })?;
                 // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
                 //
                 // A BAKED program is `Cow::Borrowed(&'static [u8])`, which lives in the executable's
@@ -1729,7 +1733,7 @@ impl Executor {
                 // rounds up, so `addr.total_size()` can exceed the binary — sending that many bytes
                 // reads past its end. The pad needs no content: nothing executes past the program.
                 let dst = addr
-                    .window(head, op.code.init_binary.len() as u64)
+                    .window(ByteOffset(head), ByteSize(op.code.init_binary.len() as u64))
                     .ok_or_else(|| anyhow!("program window at {head} B unaddressable"))?;
                 self.stream_ref()?
                     .h2d(staged, &dst)
@@ -2157,7 +2161,7 @@ impl Executor {
                         && let Some(base) = base
                         && base.is_single_chunk()
                     {
-                        shifted[i] = base.shifted(sh);
+                        shifted[i] = base.shifted(ByteSize(sh));
                     }
                 }
                 let ta: Vec<&DevAddr> = (0..NUM_SEGMENTS)
@@ -2457,8 +2461,9 @@ impl Executor {
             // HMI report their addresses in.
             bootstrap / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
             base + bootstrap,
-            prog.total_size(),
-            prog.total_size() / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
+            prog.total_size().as_u64(),
+            prog.total_size().as_u64()
+                / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
         );
         let _ = writeln!(out, "[segaddr] {who} {}", self.prog_image_report(op, prog));
         eprint!("{out}");
@@ -2546,7 +2551,7 @@ impl Executor {
             .code
             .job_bin_ptr
             .saturating_sub(crate::runtime::prog_offset_base());
-        let Some(win) = prog.window(head, baked.len() as u64) else {
+        let Some(win) = prog.window(ByteOffset(head), ByteSize(baked.len() as u64)) else {
             return "progimg: program window unaddressable".to_string();
         };
         let mut host = vec![0u8; baked.len()];
@@ -2725,7 +2730,7 @@ impl Executor {
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             d2h_seg = lp.segment as i64;
             let addr = self.seg_addr[seg.get()].as_ref().unwrap();
-            let tot = addr.total_size();
+            let tot = addr.total_size().as_u64();
             // ⭐ THE LOGITS **PLACEMENT**, NOT ITS SEGMENT'S ALLOCATION — `d2h_bytes =
             // addr.total_size()` copied the WHOLE region every token to obtain one [1,vocab] row.
             //
@@ -2752,7 +2757,9 @@ impl Executor {
             let len = crate::lower_subtile_tape_to_superdsc::align128(lp.size).min(tot - lo);
             // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
             // whole-region read, which is what this always did.
-            let win = (len < tot).then(|| addr.window(lo, len)).flatten();
+            let win = (len < tot)
+                .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
+                .flatten();
             let (src, a, b) = match win.as_ref() {
                 Some(w) => (w, lo, lo + len),
                 None => (addr, 0, tot),
@@ -2932,7 +2939,7 @@ impl Executor {
                 continue;
             }
             let addr = self.seg_addr[i].as_ref().unwrap();
-            let tot = addr.total_size();
+            let tot = addr.total_size().as_u64();
             // THE MERGED ALIGNED RUNS, or the whole segment when they cannot be used.
             let mut runs: Vec<(u64, u64)> = Vec::new();
             if addr.is_single_chunk() {
@@ -2971,7 +2978,7 @@ impl Executor {
             } else {
                 for (a, b) in runs {
                     let win = addr
-                        .window(a, b - a)
+                        .window(ByteOffset(a), ByteSize(b - a))
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
                     stream
                         .h2d(&self.seg_host[i][a as usize..b as usize], &win)
@@ -3138,7 +3145,8 @@ impl Executor {
         let dev = self.seg_addr[i]
             .as_ref()
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
-            .total_size();
+            .total_size()
+            .as_u64();
         let host = self.seg_host[i].len() as u64;
         // The shadow, the region and the stream are three disjoint fields of `self`; splitting the
         // borrow here is what lets the DMA write into a real `&mut [u8]` instead of a pointer
@@ -3170,7 +3178,7 @@ impl Executor {
         }
         if host > 0 {
             let win = addr
-                .window(0, host)
+                .window(ByteOffset(0), ByteSize(host))
                 .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
             stream
                 .d2h(&mut seg_host[i][..host as usize], &win)
@@ -3255,7 +3263,7 @@ impl Executor {
         if !addr.is_single_chunk() {
             bail!("zero_seg(seg{i}): region is multi-chunk");
         }
-        let total = addr.total_size();
+        let total = addr.total_size().as_u64();
         if total == 0 {
             return Ok(());
         }
@@ -3266,7 +3274,7 @@ impl Executor {
         while off < total {
             let sz = CHUNK.min(total - off);
             let win = addr
-                .window(off, sz)
+                .window(ByteOffset(off), ByteSize(sz))
                 .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
             stream
                 .h2d(&zeros[..sz as usize], &win)
@@ -3312,7 +3320,7 @@ impl Executor {
             .as_ref()
             .ok_or_else(|| anyhow!("seg{i} has no region"))?;
         let win = addr
-            .window(0, data.len() as u64)
+            .window(ByteOffset(0), ByteSize(data.len() as u64))
             .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
         let stream = self.stream_ref()?;
         stream
@@ -3370,9 +3378,9 @@ impl Executor {
                 "alias_seg(seg{i}): SIZE MISMATCH dst(packed={},region={}) src(packed={},region={}) \
                  — REFUSING",
                 self.segment_bytes[i],
-                dst.total_size(),
+                dst.total_size().as_u64(),
                 owner.segment_bytes[i],
-                src.total_size()
+                src.total_size().as_u64()
             );
         }
         // Every tensor EITHER session places in this segment must agree on (offset, size). This is
