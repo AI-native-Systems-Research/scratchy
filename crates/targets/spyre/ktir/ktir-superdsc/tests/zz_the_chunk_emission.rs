@@ -174,7 +174,7 @@ fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
 }
 
 /// ⭐⭐⭐ A PROMPT CHUNK'S PREFIX IS THE SAME CHUNK OVER EVERY ROW: at the shipped prompt-chunk width
-/// (`PREFILL_CHUNK_SLOTS` rows per head, 128 → `gqa·128 = 512` query rows per kv head) each kv head's
+/// (`PREFILL_CHUNK_SLOTS` rows per head, 256 → `gqa·256 = 1024` query rows per kv head) each kv head's
 /// score, row max and denominator span all of its rows over the whole chunk, the op count outside the
 /// gather does not grow with the chunk, and nothing is a fold op — every row of every head in one
 /// launch, nothing per page.
@@ -182,8 +182,10 @@ fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
 fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
     const MQ: u32 = PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
     let gqa_rows = u64::from(NQH / NKVH * MQ);
-    // The gather's copies and the value leg's K-parts grow with the chunk by design (one copy per index
-    // stick; one PV per `VALUE_PART_PAGES` pages, see `ChunkScratch::value_parts`); nothing else may.
+    // Four op families grow with the chunk by design, and each is asserted on its own: the gather's
+    // copies (one per index stick), the value leg's K-parts (one PV per `VALUE_PART_PAGES` pages, below),
+    // the probabilities' slot parts (`a_wide_prompt_chunk_cuts_its_probabilities_into_untiled_parts`) and
+    // the row reductions' parts with their combines (the per-kv-head coverage below). Nothing else may.
     let non_gather = |ops: &[(String, serde_json::Value)]| {
         ops.iter()
             .filter(|(n, _)| {
@@ -191,23 +193,41 @@ fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
                     && !n.starts_with("attn_cgv_")
                     && !n.starts_with("attn_cov_g")
                     && !n.starts_with("attn_covsum_")
+                    && !n.starts_with("attn_cesub_g")
+                    && !n.starts_with("attn_cexp_g")
+                    && !n.starts_with("attn_cbmax_")
+                    && !n.starts_with("attn_cbsum_")
             })
             .count()
     };
     let narrowest = non_gather(&named(emit_chunk_ops_at(ChunkScratch::LADDER[0], MQ)));
     for &j in &ChunkScratch::LADDER {
-        let ops = named(emit_chunk_ops_at(j, MQ));
+        let raw = emit_chunk_ops_at(j, MQ);
+        let trips: std::collections::BTreeMap<String, u64> = raw
+            .iter()
+            .map(|e| (e.op_name.clone(), u64::from(e.time)))
+            .collect();
+        let ops = named(raw);
         let slots = u64::from(j * 256);
+        // Each kv head's row max and denominator cover ALL of its rows over the WHOLE chunk, in ONE trip
+        // each (the emitter refuses a time-tiled chunk op) — as one op, or as the equal parts it is cut
+        // into on a wide chunk at 256 rows.
         for stem in ["attn_cbmax_g", "attn_cbsum_g"] {
-            let reds: Vec<&(String, serde_json::Value)> =
-                ops.iter().filter(|(n, _)| n.starts_with(stem)).collect();
-            assert_eq!(reds.len(), 8, "{stem}* at {j} page(s): one per kv head");
-            for (name, v) in reds {
-                let n = &v["dscs_"][0][name]["N_"];
+            for kvh in 0..NKVH {
+                let mine = format!("{stem}{kvh}_");
+                let reds: Vec<&(String, serde_json::Value)> =
+                    ops.iter().filter(|(n, _)| n.starts_with(&mine)).collect();
+                assert!(!reds.is_empty(), "{mine}* at {j} page(s)");
+                let mut covered = 0u64;
+                for (name, v) in reds {
+                    let n = &v["dscs_"][0][name]["N_"];
+                    assert_eq!(trips.get(name).copied(), Some(1), "{name}: one trip");
+                    assert_eq!(n["mb_"].as_u64(), Some(gqa_rows), "{name}: N_ = {n}");
+                    covered += n["out_"].as_u64().unwrap_or(0);
+                }
                 assert_eq!(
-                    (n["mb_"].as_u64(), n["out_"].as_u64()),
-                    (Some(gqa_rows), Some(slots)),
-                    "{name} at {j} page(s): N_ = {n}"
+                    covered, slots,
+                    "{mine}* at {j} page(s) cover {covered} slots"
                 );
             }
         }
@@ -403,6 +423,62 @@ fn the_chunk_probabilities_stay_in_lx_between_esub_and_exp() {
                 }
             }
         }
+    }
+}
+
+/// ⭐⭐⭐ A WHOLE-STICK PROMPT CHUNK'S CAUSAL BLOCK IS ONE FIXED SET PER KV HEAD, and every other width keeps
+/// the sub-blocks. At 128 rows each kv head runs one score / max / esub / exp / sum / PV over its whole
+/// `[gqa·mq, mq_pad]` block — no per-query-head op — with `esub`'s output LX-only; at 96 rows (not a whole
+/// number of sticks, so its new-V block is shorter than `mq_pad`) none of that form appears.
+#[test]
+fn a_whole_stick_prompt_chunk_forms_its_causal_block_per_kv_head() {
+    let stems = [
+        "attn_ncsc_g",
+        "attn_ncbmax_g",
+        "attn_ncesub_g",
+        "attn_ncexp_g",
+        "attn_ncbsum_g",
+        "attn_ncov_g",
+    ];
+    let ops = emit_chunk_in_layout(2, 128);
+    for stem in stems {
+        assert_eq!(
+            ops.iter().filter(|(n, _)| n.starts_with(stem)).count(),
+            NKVH as usize,
+            "{stem}* at 128 rows: one per kv head"
+        );
+    }
+    assert!(
+        !ops.iter().any(|(n, _)| n.starts_with("attn_nsc_h")),
+        "128 rows: the per-query-head new-block scores are gone"
+    );
+    for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_ncsc_g")) {
+        let n = &v["dscs_"][0][name]["N_"];
+        assert_eq!(
+            (n["mb_"].as_u64(), n["out_"].as_u64()),
+            (Some(u64::from(NQH / NKVH * 128)), Some(128)),
+            "{name}: one kv head's rows over the whole block, N_ = {n}"
+        );
+    }
+    for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_ncesub_g")) {
+        let out = v["dscs_"][0][name]["labeledDs_"]
+            .as_array()
+            .and_then(|a| a.last())
+            .expect("an output");
+        assert_eq!(
+            out["memOrg_"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["lx".to_string()]),
+            "{name}: the causal block's esub output stays in LX"
+        );
+    }
+    let narrow = emit_chunk_in_layout(2, 96);
+    for stem in stems {
+        assert!(
+            !narrow.iter().any(|(n, _)| n.starts_with(stem)),
+            "{stem}* at 96 rows: a width that is not whole sticks keeps the sub-blocks"
+        );
     }
 }
 

@@ -9450,6 +9450,12 @@ fn synth_role_tokens(
         R::ChunkSc => quote! { #b::ChunkSc },
         R::ChunkESub => quote! { #b::ChunkESub },
         R::ChunkExp => quote! { #b::ChunkExp },
+        R::ChunkRedA => quote! { #b::ChunkRedA },
+        R::ChunkRedB => quote! { #b::ChunkRedB },
+        R::ChunkRedC => quote! { #b::ChunkRedC },
+        R::NewChunkSc => quote! { #b::NewChunkSc },
+        R::NewChunkESub => quote! { #b::NewChunkESub },
+        R::NewChunkExp => quote! { #b::NewChunkExp },
         R::NewKt => quote! { #b::NewKt },
         R::Sc => quote! { #b::Sc },
         R::BMax => quote! { #b::BMax },
@@ -11286,10 +11292,33 @@ fn dump_wavefront_mega(
         /// covers a `lower_decode_to_wavefront` Err, and an overflow raises inside `emit_bundle`. That
         /// panic is deliberate (a swallowed eprintln once shipped a zero-group bundle that only crashed
         /// at pod load), so a rung added here must be proven to lower on every spyre model first.
-        const PREFILL_RUNGS: [u32; 23] = [
+        ///
+        /// ⭐ ABOVE [`SUB_BLOCKED_PREFILL_CEILING`] A RUNG IS BAKED ONLY WHERE ITS CAUSAL BLOCK IS CHUNK-FORMED
+        /// (`NewBlockForm::of(rung, head_dim, false) == Chunk`: whole sticks at head dim 64). A wider chunk
+        /// re-streams the weights half as often, but sub-blocked per query head its causal block grows with
+        /// the width and gives that back. MEASURED, granite-3.1-2b fp16, one card, ABAB:
+        ///   10k TTFT  sub-blocked: 13.6 s at 128 rows → 13.0 s at 256 (and ~1k got SLOWER, 0.90 → 0.94 s)
+        ///             chunk-formed: 12.8 s at 128 → **11.3 s at 256**; ~1k 0.73 s, ~400 tokens 0.27 s
+        /// So 2b-class models get 192 and 256, and a model whose causal block stays sub-blocked (granite-8b
+        /// at hd=128, the gemma bakes) keeps its 128-row ladder byte for byte.
+        const PREFILL_RUNGS: [u32; 25] = [
             7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112,
-            128,
+            128, 192, 256,
         ];
+        /// The widest rung a SUB-BLOCKED causal block is baked at (see [`PREFILL_RUNGS`]).
+        const SUB_BLOCKED_PREFILL_CEILING: u32 = 128;
+        let prefill_head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
+        // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
+        let rung_admitted = |r: u32| {
+            r <= SUB_BLOCKED_PREFILL_CEILING
+                || scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, prefill_head_dim, false)
+                    == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
+        };
+        let admitted_ceiling = PREFILL_RUNGS
+            .into_iter()
+            .filter(|&r| rung_admitted(r))
+            .max()
+            .unwrap_or(SUB_BLOCKED_PREFILL_CEILING);
         // ⛔ THE POOL SIZES ITS SLACK FROM THIS CEILING, so the two cannot be allowed to drift.
         //
         // A continuation chunk's cache write covers the PREFIX BUNDLE'S BAKED ROW COUNT — this ceiling —
@@ -11420,8 +11449,9 @@ fn dump_wavefront_mega(
                 // ladder STARTS looking — not a value that has to be right. That is what demotes
                 // `KTIR_PREFILL_LEN` from a required flag to a diagnostic override, and what stops
                 // a model whose FFN blows the LX budget at the top width from failing the BUILD:
-                // it simply gets a shorter ladder. Still capped by the resident cache.
-                PREFILL_RUNGS[PREFILL_RUNGS.len() - 1].min(prefix_len.get())
+                // it simply gets a shorter ladder. Still capped by the resident cache — and by the widest
+                // rung THIS model admits (`rung_admitted`).
+                admitted_ceiling.min(prefix_len.get())
             } else {
                 prefix_len.get().min(PREFILL_LX_SAFE)
             });
@@ -11437,12 +11467,12 @@ fn dump_wavefront_mega(
         // of the whole model, and the emulator worker can only ever run ONE of them:
         // `KtirBundle::prefill` is a single `Option` (`manifest.rs:167`) and the narrower rungs are
         // reached through `prefill_rungs`, which `spyre_forward.rs` reads under `spyre-hw` alone.
-        // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (23 now, at 128) — the generated
+        // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (25 now, to 256) — the generated
         // model source and rustc's single-threaded pass over it both paid for all of them.
         let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-hw") {
             let mut v: Vec<u32> = PREFILL_RUNGS
                 .into_iter()
-                .filter(|&r| r > 1 && r <= prefill_m)
+                .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
                 .collect();
             // An explicit KTIR_PREFILL_LEN that is not itself a rung still gets baked, as the top.
             if v.last() != Some(&prefill_m) && prefill_m > 1 {

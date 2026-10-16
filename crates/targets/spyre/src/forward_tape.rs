@@ -85,6 +85,11 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     pub num_q_heads: usize,
     /// The stick-padded row count the emitter reads the causal mask at (`rows.div_ceil(64)*64`).
     pub mq_pad: usize,
+    /// Query heads per staged causal-mask block — [`NewBlockForm::mask_heads_per_block`] of the form the
+    /// bundle's new-token block was emitted in, so the host lays the mask out as the emitter reads it.
+    ///
+    /// [`NewBlockForm::mask_heads_per_block`]: scratchy_subtile::sdsc_abstract::NewBlockForm::mask_heads_per_block
+    pub causal_heads_per_block: usize,
     pub rope_theta: f32,
     /// The whole embedding table.
     pub embed_tokens: &'a [f32],
@@ -229,7 +234,13 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 col
             }
         }
-        ForwardKernel::CausalMask => causal_tiled(inp.causal, rows, inp.mq_pad, inp.num_q_heads),
+        ForwardKernel::CausalMask => causal_tiled(
+            inp.causal,
+            rows,
+            inp.mq_pad,
+            inp.num_q_heads,
+            inp.causal_heads_per_block,
+        ),
         ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
         ForwardKernel::KvBlockIndex => unreachable!("served above, where it stays an INTEGER"),
@@ -296,14 +307,31 @@ pub fn broadcast_prefix_mask(cap: usize, mask_neg: f32, valid: impl Fn(usize) ->
 /// Written once because the decode binder had its own `[nqh, mq_pad]` loop over
 /// `prefill_causal_col_valid(col, 0)`, which is this function at `mq == 1` —
 /// [`the_decode_causal_buffer_is_the_general_tiling_at_one_row`] proves it.
-pub fn causal_tiled(cmask: &[f32], mq: usize, mq_pad: usize, nqh: usize) -> Vec<f32> {
+///
+/// ⭐ IN BLOCKS OF `heads_per_block` HEADS ([`NewBlockForm::mask_heads_per_block`]): `nqh / heads_per_block`
+/// blocks, each `nsub` stick-wide column groups of its `heads_per_block·mq` rows. All `nqh` (one block) is
+/// the sub-blocked form above; one kv head's `gqa` is the chunk-formed new block, which reads a kv head's
+/// whole `[gqa·mq, mq_pad]` block and so needs it laid out at that row count. The total and the bytes at
+/// `nsub == 1` are the same either way.
+///
+/// [`NewBlockForm::mask_heads_per_block`]: scratchy_subtile::sdsc_abstract::NewBlockForm::mask_heads_per_block
+pub fn causal_tiled(
+    cmask: &[f32],
+    mq: usize,
+    mq_pad: usize,
+    nqh: usize,
+    heads_per_block: usize,
+) -> Vec<f32> {
     let nsub = (mq_pad / 64).max(1);
+    let heads_per_block = heads_per_block.clamp(1, nqh.max(1));
     let mut out = Vec::with_capacity(nsub * nqh * mq * 64);
-    for j in 0..nsub {
-        for _h in 0..nqh {
-            for r in 0..mq {
-                let row = r * mq_pad + j * 64;
-                out.extend_from_slice(&cmask[row..row + 64]);
+    for _block in 0..nqh.div_ceil(heads_per_block) {
+        for j in 0..nsub {
+            for _h in 0..heads_per_block {
+                for r in 0..mq {
+                    let row = r * mq_pad + j * 64;
+                    out.extend_from_slice(&cmask[row..row + 64]);
+                }
             }
         }
     }
@@ -688,6 +716,7 @@ mod tests {
             head_dim: 64,
             num_q_heads: 1,
             mq_pad: 64,
+            causal_heads_per_block: 1,
             rope_theta: 10000.0,
             embed_tokens: &[],
             tokens: &[],
@@ -871,6 +900,7 @@ mod tests {
             head_dim: 64,
             num_q_heads: 1,
             mq_pad: 64,
+            causal_heads_per_block: 1,
             rope_theta: 1e4,
             embed_tokens: &[0.0; 64],
             tokens: &[0],
@@ -974,7 +1004,7 @@ mod tests {
                     *v = 0.0;
                 }
             }
-            assert_eq!(causal_tiled(&row, 1, 64, nqh), want, "nqh={nqh}");
+            assert_eq!(causal_tiled(&row, 1, 64, nqh, nqh), want, "nqh={nqh}");
         }
     }
 
@@ -983,12 +1013,33 @@ mod tests {
     fn the_causal_tiling_is_block_major_and_per_row() {
         let (mq, mq_pad, nqh) = (2usize, 128usize, 3usize);
         let cmask: Vec<f32> = (0..mq * mq_pad).map(|i| i as f32).collect();
-        let got = causal_tiled(&cmask, mq, mq_pad, nqh);
+        let got = causal_tiled(&cmask, mq, mq_pad, nqh, nqh);
         assert_eq!(got.len(), (mq_pad / 64) * nqh * mq * 64);
         // Block 0, head 0, row 1 starts at cmask[1*128 + 0] = 128.
         assert_eq!(got[64], 128.0);
         // Block 1 (columns 64..128), head 0, row 0 starts at cmask[0*128 + 64] = 64.
         assert_eq!(got[nqh * mq * 64], 64.0);
+    }
+
+    /// ⭐ THE CHUNK-FORMED NEW BLOCK'S TILING: one block per kv head, each the stick-major layout of its own
+    /// `[gqa·mq, mq_pad]` rows — kv head `g`'s block at `g·gqa·mq·mq_pad`, its column group `j` at `j·gqa·mq·64`
+    /// inside it. The same total as the one-block tiling, and the same bytes at one stick.
+    #[test]
+    fn the_chunk_form_tiles_the_causal_mask_by_kv_head() {
+        let (mq, mq_pad, nqh, gqa) = (2usize, 128usize, 4usize, 2usize);
+        let cmask: Vec<f32> = (0..mq * mq_pad).map(|i| i as f32).collect();
+        let got = causal_tiled(&cmask, mq, mq_pad, nqh, gqa);
+        assert_eq!(got.len(), causal_tiled(&cmask, mq, mq_pad, nqh, nqh).len());
+        let block = gqa * mq * mq_pad;
+        // kv head 1's block, column group 1 (cols 64..128), head 0 of the group, row 1:
+        // cmask[1*128 + 64] = 192, at block + 1*(gqa*mq*64) + 1*64.
+        assert_eq!(got[block + gqa * mq * 64 + 64], 192.0);
+        // One stick wide, the two tilings are the same bytes.
+        let one: Vec<f32> = (0..mq * 64).map(|i| i as f32).collect();
+        assert_eq!(
+            causal_tiled(&one, mq, 64, nqh, gqa),
+            causal_tiled(&one, mq, 64, nqh, nqh)
+        );
     }
 
     /// ⭐⭐ THE LEMMA THE TWO BINDERS REST ON. Decode stages row-major, prefill stick-scattered;

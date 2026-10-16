@@ -56,7 +56,7 @@
 //! broadcast), lining up 1:1 with the worker's pre-tiled rows. Not yet verified on real hardware.
 
 use super::matmul::{
-    SharedKernelBmmForm, assemble_matmul_off_maybe_epilogue,
+    SharedKernelBmmForm, assemble_matmul_off, assemble_matmul_off_maybe_epilogue,
     assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
     assemble_matmul_off_with_epilogue,
 };
@@ -1740,6 +1740,8 @@ struct ChunkBufs {
     csc: String,
     cesub: String,
     cexp: String,
+    /// One-stick partial reductions, for a chunk whose row max / denominator is cut into parts.
+    red: [String; 3],
 }
 
 /// What one layer's split-KV chunk attends with: its geometry, the pool planes and index it gathers
@@ -1791,6 +1793,201 @@ struct ChunkAttn<'a> {
 ///
 /// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
 /// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
+/// The chunk-formed causal new-token block's operands ([`NewBlockForm::Chunk`]) — see
+/// [`assemble_new_block_chunk`].
+///
+/// [`NewBlockForm::Chunk`]: crate::sdsc_abstract::NewBlockForm::Chunk
+struct NewChunkAttn<'a> {
+    t: u32,
+    nqh: u32,
+    nkvh: u32,
+    hd: u32,
+    gqa: u32,
+    /// The chunk's rows per head — equal to `mq_pad` by [`NewBlockForm::of`]'s own condition.
+    ///
+    /// [`NewBlockForm::of`]: crate::sdsc_abstract::NewBlockForm::of
+    mq: u32,
+    cols: BlockCols,
+    qs: &'a str,
+    new_kt: &'a str,
+    new_v: &'a str,
+    cmask: &'a str,
+    bmm_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    bufs: &'a BlockBufs,
+    sc: &'a str,
+    esub: &'a str,
+    exp: &'a str,
+}
+
+/// ⭐⭐⭐ THE CAUSAL NEW-TOKEN BLOCK AS ONE BLOCK PER KV HEAD — the split-KV chunk's own form, over the chunk's
+/// own `mq_pad` keys, SEEDING the online softmax that the resident prefix then folds onto.
+///
+/// The sub-blocked form sweeps the block one 64-key window at a time, per QUERY head, so its op count
+/// grows with the chunk's width — at 256 prompt rows it costs about what halving the chunk count saves in
+/// weight streaming (see [`NewBlockForm`]). Here each kv head runs a fixed set over its whole
+/// `[gqa·mq, mq_pad]` block, at any width:
+///   * score `Q_g · Kᵗ_g + cmask_g` — `new_kt`'s kv-head block is already the `[hd, mq_pad]` kernel (the
+///     restickifies above fill it), and the causal mask rides in the matmul's epilogue as the full
+///     per-row addend it is (staged by kv head, [`NewBlockForm::mask_heads_per_block`]);
+///   * each row's max STRAIGHT into `run_m` — the seed has no prior state to merge with;
+///   * `esub` into a CORE-LOCAL LX scratch and `exp` out of it (the chunk's own residency, #501);
+///   * each row's sum straight into `run_l`, and `P_g · V_g` straight into `run_o`. `new_v`'s kv-head block
+///     is exactly `mq` = `mq_pad` rows (RoPE packs it `[nkvh][mq][hd]`), so the PV contracts it whole.
+///
+/// Every wide buffer is a WHOLE `[gqa·mq, mq_pad]` block per kv head (`[nkvh][gqa·mq][mq_pad]`), the
+/// chunk's law: dxp rebuilds a stick-blocked operand's group stride from the op's own row count, so a row
+/// slice of a taller multi-stick buffer is read wrong on card ([`ChunkScratch::rows_corner`]).
+///
+/// [`NewBlockForm`]: crate::sdsc_abstract::NewBlockForm
+/// [`NewBlockForm::mask_heads_per_block`]: crate::sdsc_abstract::NewBlockForm::mask_heads_per_block
+/// [`ChunkScratch::rows_corner`]: crate::sdsc_abstract::ChunkScratch::rows_corner
+fn assemble_new_block_chunk(
+    ops: &mut Vec<EmittedOp>,
+    a: NewChunkAttn<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let NewChunkAttn {
+        t,
+        nqh,
+        nkvh,
+        hd,
+        gqa,
+        mq,
+        cols,
+        qs,
+        new_kt,
+        new_v,
+        cmask,
+        bmm_form,
+        bufs,
+        sc,
+        esub,
+        exp,
+    } = a;
+    use crate::addr::DevOff;
+    use crate::superdsc_opspec::EpilogueOpFunc;
+    let stick = BlockCols::of_one_stick(Lanes::FP16);
+    let slots = cols.get();
+    let (g_rows, q_rows) = (gqa * mq, nqh * mq);
+    let grp_rows = RowCount::of_head_major_rows(g_rows);
+    // A kv head's query rows are the contiguous `[kvh·gqa·mq, …)` of the head-major token stream; in the
+    // one-stick `qs` and state buffers that is a single-stick view step.
+    let row_step = |h: u32| DevOff::from_view_step(h * stick.get());
+    // The whole-block laws, each from its nest's own footprint.
+    let wide = crate::addr::Nest::new(&["row", "slot"], &[g_rows, slots], Df::Fp16);
+    let kt = crate::addr::Nest::new(&["feat", "slot"], &[hd, slots], Df::Fp16);
+    let vv = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16);
+    let first_op = ops.len();
+    for kvh in 0..nkvh {
+        let h0 = kvh * g_rows;
+        let blk = wide.block(kvh).dev();
+        ops.push(assemble_matmul_off_with_epilogue(
+            &format!("attn_ncsc_g{kvh}_o{t}"),
+            MatM::of_head_major_rows(g_rows),
+            MatN::of_kv_window(cols),
+            MatK::of_head_dim(hd),
+            MatY::unbatched(),
+            bmm_form,
+            &rb(qs, q_rows, hd),
+            row_step(h0),
+            &Stk::<KernelTag>::kernel(hd as usize, slots as usize, new_kt),
+            kt.block(kvh).dev(),
+            &rb(sc, g_rows, slots),
+            blk,
+            &rb(cmask, g_rows, slots),
+            blk,
+            EpilogueOpFunc::StridedAdd,
+            &[],
+            false,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_reduce_off(
+            &format!("attn_ncbmax_g{kvh}_o{t}"),
+            "max",
+            grp_rows,
+            cols,
+            &rb(sc, g_rows, slots),
+            blk,
+            &hm(&bufs.run_m),
+            row_step(h0),
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_ncesub_g{kvh}_o{t}"),
+            "subtract",
+            grp_rows,
+            cols,
+            &[
+                In::sliced(&rb(sc, g_rows, slots), blk).ew(),
+                In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+            ],
+            &rb(esub, g_rows, slots),
+            DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_ncexp_g{kvh}_o{t}"),
+            "exp",
+            grp_rows,
+            cols,
+            &[In::sliced(&rb(esub, g_rows, slots), DevOff::ZERO).ew()],
+            &rb(exp, g_rows, slots),
+            blk,
+            sym_id_base,
+            layout,
+        ));
+        ops.push(assemble_reduce_off(
+            &format!("attn_ncbsum_g{kvh}_o{t}"),
+            "sum",
+            grp_rows,
+            cols,
+            &rb(exp, g_rows, slots),
+            blk,
+            &hm(&bufs.run_l),
+            row_step(h0),
+            sym_id_base,
+            layout,
+        ));
+        // The seed: no prior output to fold, so no epilogue.
+        ops.push(assemble_matmul_off(
+            &format!("attn_ncov_g{kvh}_o{t}"),
+            MatM::of_head_major_rows(g_rows),
+            MatN::of_head_dim(hd),
+            MatK::of_kv_window(cols),
+            MatY::unbatched(),
+            bmm_form,
+            &rb(exp, g_rows, slots),
+            blk,
+            &Stk::<KernelTag>::kernel(slots as usize, hd as usize, new_v),
+            vv.view().at(Idx::<Head>::n(kvh)).dev(),
+            &rb(&bufs.run_o, q_rows, hd),
+            row_step(h0),
+            sym_id_base,
+            layout,
+        ));
+    }
+    no_chunk_op_is_time_tiled(&ops[first_op..], t)
+}
+
+/// Pages per part of a chunk's ROW REDUCTIONS (each kv head's max and denominator): the fewest EQUAL
+/// whole-page parts whose `[g_rows, part]` reduction runs in one trip (`emit::reduce_fits_untiled`), one
+/// page at worst. One part — the whole chunk — wherever that fits: every width at decode and at 128 prompt
+/// rows. Read by the caller (which declares the partial buffers only when there is more than one part) and
+/// by the body, so the two cannot disagree. See `no_chunk_op_is_time_tiled` for why a trip-sliced chunk
+/// reduction is refused rather than emitted.
+fn reduction_part_pages(chunk: crate::sdsc_abstract::ChunkScratch, g_rows: u32) -> u32 {
+    let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    (1..=chunk.pages())
+        .filter(|n| chunk.pages().is_multiple_of(*n))
+        .map(|n| chunk.pages() / n)
+        .find(|&pp| crate::emit::reduce_fits_untiled(g_rows, pp * page_slots))
+        .unwrap_or(1)
+}
+
 /// Pages per probability part of a chunk whose row blocks carry `b_rows` query rows each: the fewest
 /// EQUAL whole-page parts whose `[b_rows, part]` pointwise op runs untiled (asked of the builder's own
 /// tiler), one page at worst. ONE place, so the caller that sizes the core-local `cesub` pin and the body
@@ -1828,6 +2025,7 @@ fn assemble_attn_chunk(
     } = a;
     use crate::addr::DevOff;
     use crate::superdsc_opspec::{EpilogueOpFunc, Scale};
+    let first_op = ops.len();
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let width = BlockCols::of_chunk(chunk);
     let slots = width.get();
@@ -1974,21 +2172,93 @@ fn assemble_attn_chunk(
     // ⛔ AND NOT A PAGE-AXIS REDUCE: every per-lane page-axis form tried over these HBM blocks —
     // `maxnonstick`, and an elementwise slab fold — walked only part of each core's rows on card. Those used
     // row-major operands with a declared walk; this op's operands are stick-blocked (dxp reconstructs).
-    for b in 0..blocks.count() {
-        let h0 = blocks.first_head(b) * mq;
-        let rc = corner(blocks.corner(b), "a row block's score block")?;
-        ops.push(assemble_reduce_off(
-            &format!("attn_cbmax_{}_o{t}", blk_name(b)),
-            "max",
-            blk_rows,
-            width,
-            &rb(&cb.csc, b_rows, slots),
-            rc,
-            &hm(&bufs.bmax),
-            row_step(h0),
+    //
+    // ⛔⛔ AND IN ONE TRIP. Where a row block's whole-chunk reduction would be time-tiled (256 prompt rows
+    // past 51 pages), it is cut into equal page parts that each run untiled, each part reduced into a
+    // one-stick partial and the partials combined elementwise (`maximum` / `add`, the online merge's own
+    // ops) — never in place, alternating between the partial buffers into the destination. A time-tiled
+    // chunk reduction answered garbage on card (`no_chunk_op_is_time_tiled`).
+    let red_parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
+        .slot_parts(reduction_part_pages(chunk, b_rows))
+        .collect();
+    let reduce_in_parts = |ops: &mut Vec<EmittedOp>,
+                           sym_id_base: &mut i64,
+                           stem: &str,
+                           func: &'static str,
+                           combine: &'static str,
+                           src: &str,
+                           dst: &str|
+     -> Result<(), SuperDscError> {
+        let temps = [cb.red[0].as_str(), cb.red[1].as_str(), cb.red[2].as_str()];
+        let mut acc = temps[0];
+        for (p, part) in red_parts.iter().enumerate() {
+            let into = if p == 0 { temps[0] } else { temps[1] };
+            for b in 0..blocks.count() {
+                let pc = corner(part.probs_corner(blocks, b), "a row block's reduction part")?;
+                ops.push(assemble_reduce_off(
+                    &format!("attn_c{stem}_{}_s{p}_o{t}", blk_name(b)),
+                    func,
+                    blk_rows,
+                    BlockCols::of_chunk_part(*part),
+                    &rb(src, b_rows, part.slots()),
+                    pc,
+                    &hm(into),
+                    row_step(blocks.first_head(b) * mq),
+                    sym_id_base,
+                    layout,
+                ));
+            }
+            if p > 0 {
+                let out = if p + 1 == red_parts.len() {
+                    dst
+                } else if acc == temps[2] {
+                    temps[0]
+                } else {
+                    temps[2]
+                };
+                ops.push(assemble_pointwise_broadcast_off(
+                    &format!("attn_c{stem}_k{p}_o{t}"),
+                    combine,
+                    all_rows,
+                    stick,
+                    &[In::full(&hm(acc)).ew(), In::full(&hm(temps[1])).ew()],
+                    &hm(out),
+                    DevOff::ZERO,
+                    sym_id_base,
+                    layout,
+                ));
+                acc = out;
+            }
+        }
+        Ok(())
+    };
+    if red_parts.len() == 1 {
+        for b in 0..blocks.count() {
+            let h0 = blocks.first_head(b) * mq;
+            let rc = corner(blocks.corner(b), "a row block's score block")?;
+            ops.push(assemble_reduce_off(
+                &format!("attn_cbmax_{}_o{t}", blk_name(b)),
+                "max",
+                blk_rows,
+                width,
+                &rb(&cb.csc, b_rows, slots),
+                rc,
+                &hm(&bufs.bmax),
+                row_step(h0),
+                sym_id_base,
+                layout,
+            ));
+        }
+    } else {
+        reduce_in_parts(
+            ops,
             sym_id_base,
-            layout,
-        ));
+            "bmax",
+            "max",
+            "maximum",
+            &cb.csc,
+            &bufs.bmax,
+        )?;
     }
 
     // ── (3) THE ONLINE MERGE ONTO THE SEED — the fold block's own four ops, in its order ──
@@ -2089,18 +2359,24 @@ fn assemble_attn_chunk(
         }
         // ⭐ EACH ROW's SUM OVER THE WHOLE CHUNK, straight into `bsum` — the stick-major `sum` over
         // `rows > 1 × cols > one stick`, the cell `Sum` combines correctly (prefill's RMS sums run it).
-        ops.push(assemble_reduce_off(
-            &format!("attn_cbsum_{bn}_o{t}"),
-            "sum",
-            blk_rows,
-            width,
-            &rb(&cb.cexp, b_rows, slots),
-            rc,
-            &hm(&bufs.bsum),
-            row_step(h0),
-            sym_id_base,
-            layout,
-        ));
+        // In parts below instead, after every block's probabilities, when one trip cannot hold it.
+        if red_parts.len() == 1 {
+            ops.push(assemble_reduce_off(
+                &format!("attn_cbsum_{bn}_o{t}"),
+                "sum",
+                blk_rows,
+                width,
+                &rb(&cb.cexp, b_rows, slots),
+                rc,
+                &hm(&bufs.bsum),
+                row_step(h0),
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    if red_parts.len() > 1 {
+        reduce_in_parts(ops, sym_id_base, "bsum", "sum", "add", &cb.cexp, &bufs.bsum)?;
     }
 
     // ── (5) RESCALE THE SEED'S OUTPUT, THEN THE VALUE LEG FOLDS ONTO IT ──
@@ -2252,7 +2528,34 @@ fn assemble_attn_chunk(
         sym_id_base,
         layout,
     ));
-    Ok(())
+    no_chunk_op_is_time_tiled(&ops[first_op..], t)
+}
+
+/// ⛔⛔⛔ NO SPLIT-KV CHUNK OP IS TIME-TILED — a bake refusal naming each op that is, never a card run.
+///
+/// MEASURED, granite-3.1-2b fp16 at 256 prompt rows: a ~16k-token prompt — whose last chunks are 52-64
+/// pages, the widths where the tiler first cuts a kv head's `[1024, J·256]` row max and denominator into
+/// two time trips — answered `" signature signature signature…"` on both runs, where the same prompt at
+/// 128 rows (nothing tiled) and every ~10k prompt at 256 (chunks ≤ 40 pages, nothing tiled) are coherent.
+/// The trips of a reduction over its own reduced axis do not combine into the whole-chunk value on card,
+/// so a chunk op must run in one trip; one that cannot fit is cut into parts instead (the probabilities'
+/// slot parts, the value leg's K-parts).
+fn no_chunk_op_is_time_tiled(ops: &[EmittedOp], t: u32) -> Result<(), SuperDscError> {
+    let tiled: Vec<String> = ops
+        .iter()
+        .filter(|e| e.time > 1)
+        .map(|e| format!("{} ({} trips)", e.op_name, e.time))
+        .collect();
+    if tiled.is_empty() {
+        Ok(())
+    } else {
+        Err(SuperDscError(format!(
+            "attention o{t}: split-KV chunk op(s) {} are TIME-TILED — a chunk reduction's trips do not \
+             combine on card (granite-2b at 256 prompt rows answered garbage past 52 pages). Cut the op \
+             into parts that each run in one trip.",
+            tiled.join(", ")
+        )))
+    }
 }
 
 /// Assemble the full AttnDecode node: ONE algorithm for any `mq`. `qs` is Q ALREADY multiplied by
@@ -2860,7 +3163,67 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         }
     }
     let _ = (rows_are_requests, batched.is_some());
-    for r in 0..if per_req { mq } else { 1 } {
+    // ⭐⭐⭐ A WHOLE-STICK PROMPT CHUNK'S NEW BLOCK IS ONE BLOCK PER KV HEAD (`assemble_new_block_chunk`); every
+    // other launch keeps the sub-blocks below, byte for byte. The same law (`NewBlockForm::of`) tells the
+    // host how to lay out the causal mask this reads.
+    let new_form = crate::sdsc_abstract::NewBlockForm::of(mq, hd, rows_are_requests);
+    if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
+        let (sc, esub, exp) = (
+            syn(R::NewChunkSc),
+            syn(R::NewChunkESub),
+            syn(R::NewChunkExp),
+        );
+        let cols = BlockCols::of_new_block(mq_pad_t.cols());
+        let g_rows = gqa * mq;
+        if let Some(l) = layout {
+            for r in [R::NewChunkSc, R::NewChunkExp] {
+                l.synth(out_id.synth(r), &[nqh * mq, cols.get()]);
+            }
+            // ⭐ `esub`'s output never leaves LX — one core's slice of one kv head's block, reused head after
+            // head, exactly as the chunk's `cesub`.
+            let slice = crate::emit::pointwise_untiled_slice_bytes(g_rows, cols.get(), 2)
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "attention o{t}: the {g_rows}-row causal new block is time-tiled at {} columns, \
+                         so its esub output has no core-local slice to pin in LX",
+                        cols.get()
+                    ))
+                })?;
+            l.synth_lx_core_local(out_id.synth(R::NewChunkESub), slice);
+        }
+        assemble_new_block_chunk(
+            &mut ops,
+            NewChunkAttn {
+                t,
+                nqh,
+                nkvh,
+                hd,
+                gqa,
+                mq,
+                cols,
+                qs,
+                new_kt: &new_kt,
+                new_v,
+                cmask,
+                bmm_form,
+                bufs: &bufs,
+                sc: &sc,
+                esub: &esub,
+                exp: &exp,
+            },
+            sym_id_base,
+            layout,
+        )?;
+    }
+    // The sub-blocked passes: none when the chunk form above emitted the block.
+    let sub_block_passes = if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
+        0
+    } else if per_req {
+        mq
+    } else {
+        1
+    };
+    for r in 0..sub_block_passes {
         for rw in mq_pad_t.row_windows() {
             let j = rw.index();
             assemble_attn_block(
@@ -3010,6 +3373,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             csc: syn(R::ChunkSc),
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
+            red: [syn(R::ChunkRedA), syn(R::ChunkRedB), syn(R::ChunkRedC)],
         };
         if let Some(l) = layout {
             for r in [R::GatherKt, R::GatherV] {
@@ -3023,6 +3387,16 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // what the tiler hands a core of that `[rows, part]` op (`ChunkRowBlocks`: a kv head's
             // `gqa·mq` rows at one slab, a query head's `mq` above it). See the body's step (4).
             let b_rows = chunk.row_blocks(nqh / nkvh, mq).rows();
+            // The partial reductions exist only when the chunk's reductions are cut into parts, so every
+            // bundle that needs none is laid out exactly as before.
+            if reduction_part_pages(chunk, b_rows) < chunk.pages() {
+                for r in [R::ChunkRedA, R::ChunkRedB, R::ChunkRedC] {
+                    l.synth(
+                        out_id.synth(r),
+                        &[nqh * mq, BlockCols::of_one_stick(Lanes::FP16).get()],
+                    );
+                }
+            }
             let part = softmax_part_pages(chunk, b_rows)
                 * crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
             let slice = crate::emit::pointwise_untiled_slice_bytes(b_rows, part, 2).ok_or_else(|| {

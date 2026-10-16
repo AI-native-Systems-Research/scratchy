@@ -517,6 +517,38 @@ pub fn pointwise_fits_untiled(rows: u32, cols: u32, n_inputs: u32) -> bool {
     pointwise_untiled_slice_bytes(rows, cols, n_inputs).is_some()
 }
 
+/// Whether a `[rows, cols]` fp16 ROW reduction (`max`/`sum` over `cols`) runs WITHOUT time-tiling — the
+/// very tile op the reduce builder (`reduce_opspec_off`) tiles, asked before the op is. A caller cuts a
+/// reduction this answers `false` for: a chunk reduction's time trips do not combine on card (see
+/// `attn`'s `no_chunk_op_is_time_tiled`).
+pub fn reduce_fits_untiled(rows: u32, cols: u32) -> bool {
+    let Ok(stick) = StickExtent::<Fp16>::new(cols) else {
+        return false;
+    };
+    let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction,
+        is_stick,
+        df: Df::Fp16,
+    };
+    crate::ir::island::tile_op::TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims: vec![
+            dim("mb", rows, false, false),
+            dim("out", stick.elems(), true, true),
+            dim("y", 1, false, false),
+        ],
+        df: Df::Fp16,
+    }
+    .tile(
+        crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
+        crate::work::distribute_cores,
+        "out",
+    )
+    .is_ok_and(|t| t.time_tile.is_none())
+}
+
 /// The bytes of ONE core's slice of that op's fp16 `[rows, cols]` output under the tiler's own work
 /// division — what a core-local LX pin for it must hold ([`BundleLayout::synth_lx_core_local`]). `None`
 /// when the op would be time-tiled, which a core-local tensor cannot be.

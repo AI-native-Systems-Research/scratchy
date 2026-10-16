@@ -4045,6 +4045,12 @@ impl BlockCols {
     pub const fn of_chunk_part(part: ChunkPart) -> BlockCols {
         BlockCols(part.slots())
     }
+    /// The WHOLE causal new-token block's score columns, `mq_pad` wide — the one sweep of the
+    /// chunk-formed block ([`NewBlockForm::Chunk`]). Demands the pad's own [`ScoreWidth`], so it cannot be
+    /// confused with one of the sub-blocked form's stick-wide windows.
+    pub const fn of_new_block(cols: ScoreWidth) -> BlockCols {
+        BlockCols(cols.score_axis_extent())
+    }
     /// One head-dim SLAB of features — quantity (4), [`FeatIdx::SLAB_FEATS`], demanded by type: the
     /// width a per-slab op writes. Distinct in meaning from one stick of lanes even though a slab
     /// is one stick of lanes by definition.
@@ -5206,10 +5212,13 @@ impl PagedKvPool {
     /// Kept here rather than beside the prefill rung ladder because the POOL is what must make room for
     /// it; `codegen`'s `PREFILL_RUNGS` ceiling is asserted equal to it, so the two cannot drift.
     ///
-    /// ⭐ 128, WHICH DIVIDES THE PAGE: a prompt chunked from a page boundary starts its chunks at page
-    /// offsets 0 and 128, so no padded write needs [`chunk_write_start`](Self::chunk_write_start) to step
-    /// back. At 96 the third chunk of every page did, and re-processed the overlap.
-    pub const PREFILL_CHUNK_SLOTS: usize = 128;
+    /// ⭐ 256 — ONE WHOLE PAGE, the widest a padded write can be and stay inside one: a prompt chunked from
+    /// a page boundary starts every chunk at offset 0, so no padded write needs
+    /// [`chunk_write_start`](Self::chunk_write_start) to step back. It is the ceiling of the ladder, not
+    /// every model's: a model whose causal block stays sub-blocked bakes to 128 (see `codegen`'s
+    /// `PREFILL_RUNGS`), and the runtime writes at the bundle's own baked width either way. (At 96 the
+    /// third chunk of every page stepped back and re-processed the overlap.)
+    pub const PREFILL_CHUNK_SLOTS: usize = 256;
 
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
@@ -6656,6 +6665,54 @@ impl PageScratch {
                 }
             })
         })
+    }
+}
+
+/// ⭐⭐⭐ HOW A LAUNCH'S CAUSAL NEW-TOKEN BLOCK IS EMITTED — one law, read by the emitter (`assemble_attn`)
+/// and by the host that tiles the causal mask (`forward_tape::causal_tiled`), so the mask's layout and the
+/// ops that read it cannot disagree.
+///
+/// ⭐ WHY THERE ARE TWO. The block is `mq_pad` columns wide. Folded as `mq_pad / 64` stick-wide sub-blocks
+/// per QUERY HEAD, its op count grows with the chunk's width: granite-2b at 256 prompt rows spends about
+/// as much on it as halving the chunk count saves in weight streaming (MEASURED, one card: 10k TTFT 13.6 s
+/// at 128 rows against 13.0 s at 256, and ~1k got SLOWER, 0.90 → 0.94 s). As ONE block per KV HEAD over
+/// all `mq_pad` columns — the split-KV chunk's own form — it is a fixed handful of ops at any width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewBlockForm {
+    /// Stick-wide sub-blocks folded per query head: decode, every batch, and every prompt rung that is
+    /// not a whole number of sticks.
+    SubBlocks,
+    /// One block per kv head over all `mq_pad` columns: a prompt chunk whose width is a whole number of
+    /// sticks (so its new-V block is exactly `mq_pad` rows and PV can contract it whole), at a head dim
+    /// of one stick (the chunk's own `[rows, slots]` blocks, see [`ChunkScratch`]).
+    Chunk,
+}
+
+impl NewBlockForm {
+    /// The form a launch of `mq` rows at head dim `hd` takes; `rows_are_requests` is a decode batch.
+    pub const fn of(mq: u32, hd: u32, rows_are_requests: bool) -> NewBlockForm {
+        if !rows_are_requests
+            && mq >= POOL_STICK
+            && mq.is_multiple_of(POOL_STICK)
+            && hd == POOL_STICK
+        {
+            NewBlockForm::Chunk
+        } else {
+            NewBlockForm::SubBlocks
+        }
+    }
+
+    /// ⭐ QUERY HEADS PER STAGED CAUSAL-MASK BLOCK. The mask is staged as consecutive blocks of this many
+    /// heads' rows, each block `mq_pad / 64` stick-wide column groups of those rows: the stick-major layout
+    /// of a `[heads·mq, mq_pad]` tensor. The sub-blocks read one stick of ALL heads (`nqh`); the chunk form
+    /// reads one kv head's `[gqa·mq, mq_pad]` block whole, and dxp rebuilds a stick-blocked operand's group
+    /// stride from the op's own row count — so that block must be laid out at ITS row count (`gqa`). Same
+    /// total size either way, and byte-identical at one stick (`mq_pad == 64`), where the two coincide.
+    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: u32) -> u32 {
+        match self {
+            NewBlockForm::SubBlocks => nqh,
+            NewBlockForm::Chunk => nqh / nkvh,
+        }
     }
 }
 
