@@ -851,7 +851,7 @@ pub(crate) fn execute_function_gpu(
             // Window trigger: run the fused kernel PER CORE. A failure is fatal
             // (the window's other ops were skipped — no interpreter fallback).
             for ctx in &mut ctxs {
-                crate::metal::run_map_region_gpu(mrk, ctx)?;
+                crate::metal::run_map_region_gpu(mrk, ctx, &env)?;
             }
             continue;
         }

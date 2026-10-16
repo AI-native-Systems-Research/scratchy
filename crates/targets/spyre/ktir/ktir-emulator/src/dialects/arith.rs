@@ -928,8 +928,11 @@ fn binary_float(
 
 /// The op's result tile on its card grid: IEEE `dtype` ([`Tile::compute`], the
 /// default) or DLF16 ([`Tile::compute_dlf16`], the rmsnorm scalar chain's
-/// f16-mode SEN169 instructions). See `binary_float`'s doc for the law.
-fn landed(data: Vec<f32>, dtype: DType, shape: Vec<usize>, dlf16: bool) -> Tile {
+/// f16-mode SEN169 instructions). See `binary_float`'s doc for the law. `pub`
+/// because the fused map window's GPU landing ([`crate::metal::run_map_region_gpu`])
+/// replaces the trigger op's interpreter execution and must replace its LANDING
+/// GRID with it — the same law, one implementation.
+pub fn landed(data: Vec<f32>, dtype: DType, shape: Vec<usize>, dlf16: bool) -> Tile {
     if dlf16 && dtype == DType::F16 {
         Tile::compute_dlf16(data, dtype, shape)
     } else {

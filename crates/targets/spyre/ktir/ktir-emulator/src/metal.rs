@@ -2510,7 +2510,8 @@ fn emit_map_region_kernel_with(
     // f32 throughout (the kernel computes in float and the resident tiles are
     // f32-backed), so encode/decode are no-ops and there is no half rounding in
     // the I/O — the per-step f16 rounding the oracle does is captured by writing
-    // the result Tile via `Tile::compute(.., out_dtype, ..)` in `run_map_region_gpu`.
+    // the result Tile through `landed(.., out_dtype, ..)` in `run_map_region_gpu`
+    // (IEEE grid, or DLF16 when the live-out is a scalar-chain stick).
     let mut buffers: Vec<BufferBinding> = Vec::with_capacity(live_ins.len() + 1);
     for &name in &live_ins {
         buffers.push(BufferBinding {
@@ -2844,13 +2845,16 @@ pub static MAP_REGION_GPU_COUNT: std::sync::atomic::AtomicUsize =
 /// Run a compiled Map window as one fused GPU kernel, binding its live-out tile
 /// in `ctx`. Reads each live-in's f32 data from the value table (must be a
 /// resident `Tile`), dispatches the kernel (one thread per output element), and
-/// binds the result as a `Tile` of `out_dtype`/`out_shape`. Returns `Err` if a
+/// binds the result as a `Tile` of `out_dtype`/`out_shape` on the grid `env`
+/// lands the live-out on (IEEE `dtype`, or DLF16 when it is a scalar-chain
+/// stick — `landed`'s law). Returns `Err` if a
 /// live-in is missing/not a tile or the kernel can't run — the caller treats a
 /// trigger failure as fatal (the window's ops were skipped on the interpreter).
 #[cfg(metal)]
 pub fn run_map_region_gpu(
     mrk: &MapRegionKernel,
     ctx: &mut crate::context::CoreContext,
+    env: &crate::env::ExecutionEnv,
 ) -> Result<(), String> {
     let out_len: usize = mrk.out_shape.iter().product();
     let mut inputs: Vec<Vec<f32>> = Vec::with_capacity(mrk.live_ins.len());
@@ -2886,7 +2890,15 @@ pub fn run_map_region_gpu(
         }
     }
     let out = run_kernel(&mrk.kernel, &inputs, out_len)?;
-    let tile = crate::tile::Tile::compute(out, mrk.out_dtype, mrk.out_shape.clone());
+    // The window's LIVE-OUT lands on the grid the interpreter would land it on:
+    // the fused kernel replaces the trigger op's execution, so it must replace
+    // its landing too — `landed`'s own law, which routes a live-out the
+    // scalar-chain walk collected onto the DLF16 grid. Without this a norm's
+    // SQUARE window (a stick, offloaded only at prefill widths ≥ the map gate)
+    // collapses x² > 65504 to IEEE f16 infinity and zeroes the row, while the
+    // same chain at decode width stays on the interpreter and holds DLF16.
+    let dlf16 = env.lands_dlf16_value(mrk.live_out);
+    let tile = crate::dialects::arith::landed(out, mrk.out_dtype, mrk.out_shape.clone(), dlf16);
     let bytes = tile.size_bytes() as i64;
     // Consume-on-last-use for the window's inputs BEFORE charging the output —
     // the same order `execute_op` uses (#134): the fused kernel has read every

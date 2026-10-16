@@ -126,8 +126,17 @@ impl<'a> ExecutionEnv<'a> {
     /// walk collected. Handlers pair this with their own dtype gate — an f32-typed
     /// result never lands DLF16 (the 32-bit mode is f32 on card).
     pub fn lands_dlf16(&self, op: &crate::ir::Operation) -> bool {
-        self.dlf16_sticks
-            .is_some_and(|s| op.result.is_some_and(|r| s.contains(&r)))
+        op.result.is_some_and(|r| self.lands_dlf16_value(r))
+    }
+
+    /// The value-level form of [`Self::lands_dlf16`]: does THIS SSA — some op's
+    /// result — land on the DLF16 grid? The fused map window's GPU landing asks
+    /// this for its single LIVE-OUT, because the window replaces the trigger
+    /// op's interpreter execution and must replace its landing grid with it: a
+    /// live-out the scalar-chain walk collected (a norm's square over prefill
+    /// rows) overflows IEEE f16 exactly where DLF16's 2³³ headroom holds it.
+    pub fn lands_dlf16_value(&self, result: crate::ir::Ssa) -> bool {
+        self.dlf16_sticks.is_some_and(|s| s.contains(&result))
     }
 }
 

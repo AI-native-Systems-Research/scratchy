@@ -1502,7 +1502,7 @@ impl CoreRunner {
             // values only AFTER the kernel has run.
             #[cfg(metal)]
             if let Some(mrk) = map_triggers.get(&this_idx) {
-                crate::metal::run_map_region_gpu(mrk, &mut self.ctx)?;
+                crate::metal::run_map_region_gpu(mrk, &mut self.ctx, env)?;
                 pending_skip.push(this_idx);
                 for idx in pending_skip.drain(..) {
                     if let Some(dead) = self.dies_at.get(idx) {
