@@ -179,12 +179,17 @@ fn send_request(
     let mut usage_completion_tokens: Option<usize> = None;
     let mut chunks = 0usize;
     let mut last_choices_time: Option<Instant> = None;
+    // Why the stream says the request failed, if it does: the first one wins.
+    let mut failure: Option<String> = None;
 
     loop {
         let n = match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => break,
+            Err(e) => {
+                failure.get_or_insert_with(|| format!("stream read failed: {e}"));
+                break;
+            }
         };
         buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
 
@@ -222,9 +227,19 @@ fn send_request(
                         last_token_time = now;
                     }
                     usage_completion_tokens = merge_usage(usage_completion_tokens, &parsed);
+                    if let Some(why) = chunk_failure(&parsed) {
+                        failure.get_or_insert(why);
+                    }
                 }
             }
         }
+    }
+
+    // A stream that ends the request as aborted or errored failed, whatever it streamed before:
+    // a server whose engine stopped answers every request at once with an empty `abort`.
+    if let Some(why) = failure {
+        eprintln!("Request failed: {why}");
+        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
     }
 
     // No chunk carried text, but the server did answer: mlx_lm.server holds
@@ -275,6 +290,24 @@ fn has_choices(chunk: &serde_json::Value) -> bool {
     chunk
         .get("choices")
         .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
+}
+
+/// Why a streamed chunk says its request failed: an `error` object (an SSE error event), or a
+/// choice finished `abort` or `error`. `None` for any other chunk, `stop` and `length` included:
+/// a request may stop early on its own (oMLX stops at EOS despite `ignore_eos`), so the token
+/// count alone says nothing.
+fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
+    if let Some(err) = chunk.get("error") {
+        let message = err["message"]
+            .as_str()
+            .map_or_else(|| err.to_string(), str::to_string);
+        return Some(format!("error event: {message}"));
+    }
+    let choices = chunk["choices"].as_array()?;
+    (choices.iter())
+        .filter_map(|c| c["finish_reason"].as_str())
+        .find(|r| matches!(*r, "abort" | "error"))
+        .map(|r| format!("finish_reason {r}"))
 }
 
 /// Whether a streamed chunk carries generated text: `text` on the completions
@@ -1412,6 +1445,40 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"hi"}}]}"#
         )));
         assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
+    }
+
+    #[test]
+    fn a_stream_that_ends_aborted_or_errored_failed() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // A scratchy server whose engine stopped: an empty `abort` delta, at once or after the
+        // no-progress watchdog.
+        assert_eq!(
+            chunk_failure(&c(
+                r#"{"choices":[{"index":0,"text":"","finish_reason":"abort"}]}"#
+            )),
+            Some("finish_reason abort".into())
+        );
+        assert!(
+            chunk_failure(&c(r#"{"choices":[{"delta":{},"finish_reason":"error"}]}"#)).is_some()
+        );
+        assert_eq!(
+            chunk_failure(&c(r#"{"error":{"message":"out of memory","code":500}}"#)),
+            Some("error event: out of memory".into())
+        );
+        // A request that stops early on its own, or runs to its length, did not fail.
+        assert_eq!(
+            chunk_failure(&c(r#"{"choices":[{"text":"","finish_reason":"stop"}]}"#)),
+            None
+        );
+        assert_eq!(
+            chunk_failure(&c(r#"{"choices":[{"text":"x","finish_reason":"length"}]}"#)),
+            None
+        );
+        assert_eq!(chunk_failure(&c(r#"{"choices":[{"text":"x"}]}"#)), None);
+        assert_eq!(
+            chunk_failure(&c(r#"{"choices":[],"usage":{"completion_tokens":4}}"#)),
+            None
+        );
     }
 
     fn req(output_tokens: usize, chunks: usize, ttft: f64, e2el: f64) -> RequestResult {
