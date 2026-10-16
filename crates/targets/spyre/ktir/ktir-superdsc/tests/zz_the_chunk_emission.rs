@@ -122,6 +122,57 @@ fn the_chunk_reductions_are_per_row_on_stick_blocked_operands() {
     }
 }
 
+/// ⭐ AT DECODE THE VALUE LEG's CONTRACTION IS DIVIDED ACROSS EVERY CORE, AND A PROMPT CHUNK's IS NOT. The
+/// one-request value matmul's output is one stick of `gqa` rows, so the planner alone would split only
+/// those 4 rows — 4 cores, each contracting the whole chunk and reading the kv head's whole V. The
+/// contraction-first split hands the cores whole-stick runs of the chunk instead (dxp PSUM-accumulates
+/// the partials into the shared output) — as many cores as whole sticks allow: the largest divisor of the
+/// chunk's `4·pages` sticks within the 32-core budget (8 at two pages, 32 from eight). The rows stay whole.
+/// A prompt chunk's value leg has `gqa·mq` rows to divide and keeps the planner's split, contraction whole.
+#[test]
+fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
+    let splits = |v: &serde_json::Value| {
+        let s = &v["numWkSlicesPerDim_"];
+        (
+            s["in"].as_u64().unwrap_or(1),
+            s["mb"].as_u64().unwrap_or(1),
+            v["numCoresUsed_"].as_u64(),
+        )
+    };
+    for &j in &ChunkScratch::LADDER {
+        let sticks = u64::from(j * 256 / 64);
+        let most = (1..=32u64.min(sticks))
+            .rev()
+            .find(|s| sticks.is_multiple_of(*s))
+            .unwrap_or(1);
+        for (name, v) in emit_chunk(j)
+            .iter()
+            .filter(|(n, _)| n.starts_with("attn_cov_g"))
+        {
+            assert_eq!(
+                splits(v),
+                (most, 1, Some(most)),
+                "{name} at {j} page(s): split {}",
+                v["numWkSlicesPerDim_"]
+            );
+        }
+        for (name, v) in named(emit_chunk_ops_at(
+            j,
+            PagedKvPool::PREFILL_CHUNK_SLOTS as u32,
+        ))
+        .iter()
+        .filter(|(n, _)| n.starts_with("attn_cov_g"))
+        {
+            assert_eq!(
+                splits(v).0,
+                1,
+                "{name} at {j} page(s), prompt chunk: split {}",
+                v["numWkSlicesPerDim_"]
+            );
+        }
+    }
+}
+
 /// ⭐⭐⭐ A PROMPT CHUNK'S PREFIX IS THE SAME CHUNK OVER EVERY ROW: at the shipped prompt-chunk width
 /// (`PREFILL_CHUNK_SLOTS` rows per head, 128 → `gqa·128 = 512` query rows per kv head) each kv head's
 /// score, row max and denominator span all of its rows over the whole chunk, the op count outside the

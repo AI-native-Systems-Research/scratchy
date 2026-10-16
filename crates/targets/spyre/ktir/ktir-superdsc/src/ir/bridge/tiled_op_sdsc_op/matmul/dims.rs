@@ -163,6 +163,38 @@ pub(crate) fn matmul_split_map_batch_requests(
     )
 }
 
+/// ⭐ THE CONTRACTION-FIRST SPLITTER — every core a whole-stick run of `in`, rows and output whole.
+///
+/// Reached only through [`crate::sdsc_abstract::ContractionSplit::AcrossCores`] (the split-KV chunk's
+/// one-request value leg), never as a regime's policy: that op's output is ONE stick of a few rows, so
+/// the planner's single-stick arm gives it its rows alone (`core_split(mb)` — 4 cores at granite-2b, 1
+/// at granite-8b's per-head row), each contracting the whole chunk. Here the cores divide the chunk
+/// instead: the largest divisor of the contraction's stick count within the core budget, so every
+/// core's run is whole sticks (the same law the reduction split obeys on the planner's arm). dxp
+/// PSUM-accumulates the partials into the shared output — the emitter admits a shared output only for a
+/// split `in` that the output does not carry (`emit_sdsc`'s reduction-split rule).
+pub(crate) fn matmul_split_map_contraction(
+    dims: &[crate::superdsc_opspec::ItDim],
+    max_cores: u32,
+) -> std::collections::BTreeMap<&'static str, u32> {
+    use crate::work::FP16_ELEMS_PER_STICK;
+    let (k, stick) = dims
+        .iter()
+        .find(|d| d.name == InAxis::NAME)
+        .map(|d| (d.size, d.df.elems_per_stick()))
+        .unwrap_or((1, FP16_ELEMS_PER_STICK));
+    let sticks = k.div_ceil(stick).max(1);
+    let split = (1..=max_cores.min(sticks))
+        .rev()
+        .find(|s| sticks.is_multiple_of(*s))
+        .unwrap_or(1);
+    let mut map = std::collections::BTreeMap::new();
+    if split > 1 {
+        map.insert(InAxis::NAME, split);
+    }
+    map
+}
+
 /// The work-division splitter signature `TileOp::tile` consumes — the type a rung regime's
 /// [`super::walk::RungRegime::split_map`] answers with.
 pub(crate) type SplitMapFn =
