@@ -20,9 +20,9 @@
 //! No device, no emulator session, no `SCRATCHY_PLAN_ONLY_BAKE`: these are pure
 //! facts of the graph, so the file runs at default features.
 
-use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use ktir_superdsc::sdsc_abstract::{ChunkScratch, PagedKvPool};
 use scratchy_subtile::lower::{InputRef, LoweringInput, OpDesc};
+use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::subtile_ir::{
     AttnMask, GainConvention, NeoX, SourceShape, SubOp, SubtileIR, SubtileId, SubtileNode,
     TensorId, TensorRegion, TensorShape, lower_region,

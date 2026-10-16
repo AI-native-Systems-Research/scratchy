@@ -73,12 +73,6 @@ scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # proc-macro crate can't export the IR types, so they live in a normal
 # crate it calls.
 scratchy-subtile = { path = "../subtile" }
-# The KTIR→SuperDSC leaf crate, named DIRECTLY rather than through a `scratchy-subtile` re-export:
-# `to_wavefront.rs` mints the model's `ModelAttnGeometry` from the parsed config, and that type lives
-# in `ktir_superdsc::head_counts`. Unconditional and free —
-# `scratchy-subtile` above already pulls it in on every backend, so this only lets the path be spelled
-# honestly instead of laundered through a re-export.
-ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"

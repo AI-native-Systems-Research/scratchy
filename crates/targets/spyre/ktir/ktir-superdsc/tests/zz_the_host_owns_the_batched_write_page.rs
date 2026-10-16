@@ -22,7 +22,7 @@
 //! What the reserve cost while it existed, for the record: `rows * 2 + 1` pages, so 9 at width 4 and 65 at the
 //! widest baked rung — pages the host could never allocate from, on a pool sized by the declaration.
 
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     AdmittedRequests, PagedKvPool, PoolPages, PoolPartition, PoolRows,
 };
 

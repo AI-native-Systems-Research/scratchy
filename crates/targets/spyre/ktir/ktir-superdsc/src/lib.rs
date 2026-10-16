@@ -58,11 +58,6 @@ pub mod addr;
 /// and `ir::bridge::tiled_op_sdsc_op::attn` — which its doc always said could not — now really
 /// cannot.
 pub mod emit;
-/// The per-head-axis COUNTS of a model as distinct types (`QueryHeads`/`KvHeads`/`HeadDim`/`Gqa`).
-/// Here only because [`addr`] and [`sdsc_abstract`] name `Gqa`; the doors that turn a model config's
-/// counts into these consts belong to the CALLER, for the reason the crate header gives — the arm set
-/// is the consumer's model inventory.
-pub mod head_counts;
 /// THE TileIR PIPELINE — the assemblers' INPUT type (`TileOp`/`TileOpKind`/`TiledOp`) and the tiler
 /// between them, plus the span-overflow refusal. Came in as an audit correction: the extraction filed
 /// the lowering's input as `KtirNode`, but every assembler under it takes a `&TileOp`.

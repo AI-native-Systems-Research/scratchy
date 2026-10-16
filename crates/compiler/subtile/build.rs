@@ -159,13 +159,12 @@ fn emit_config_geometry() {
     }
     out.push_str("];\n\n");
 
-    // ⭐ BOTH DOORS ARE UNCONDITIONAL, BECAUSE BOTH CONSUMERS ARE. The attention-geometry macro was
-    // generated only under the emit-mode feature, to match a `with_config_attn_geometry` that
-    // compiled under the same one — otherwise `-D warnings` rejected the macro as `unused_macros`
-    // on a metal/cuda build. There is no emit mode now: `model_geometry` is "always compiled: the
-    // tape carries a `ModelAttnGeometry` on every attention node, whatever the target"
-    // (`src/lib.rs:32-34`), so its door compiles on every target and the macro it expands must be
-    // there on every target too.
+    // ⭐ THE ATTENTION-GEOMETRY MACRO CARRIES ITS DOOR'S GATE. `with_config_attn_geometry` hands its
+    // body the SuperDSC emitter's `AttnGeometry` witness, so it compiles only under `spyre`; an
+    // ungated macro would be `unused_macros` on a metal/cuda build and fail `-D warnings`. The
+    // attribute is written into the generated file rather than decided here, so the gate is the
+    // crate's own `cfg(feature = "spyre")`, read where the file is compiled.
+    out.push_str("#[cfg(feature = \"spyre\")]\n");
     out.push_str("macro_rules! for_each_config_attn_geometry {\n");
     out.push_str("    ($emit:ident) => {\n        $emit! {\n");
     for (nqh, nkvh, hd) in &geometries {

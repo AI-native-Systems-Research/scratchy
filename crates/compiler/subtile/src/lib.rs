@@ -30,29 +30,20 @@ pub mod lower;
 /// `lower_subtile_tape_to_sengraph` peer was DELETED — sengraph is a dead end.)
 /// The model's head geometry as types, and the two value→const doors whose arms the build script
 /// generated from `crates/models/arch/*/configs/*.json`. Always compiled: the tape carries a
-/// [`ktir_superdsc::head_counts::ModelAttnGeometry`] on every attention node, whatever the target.
+/// [`model_geometry::ModelAttnGeometry`] on every attention node, whatever the target.
 pub mod model_geometry;
 pub mod subtile_ir;
-// SDSC opspec — addressing/op LAW, not emission: `sdsc_abstract` and the shared geometry types
-// depend on it, so it stayed substrate while the lowering that consumes it moved to the spyre
-// target crate.
-//
-// ⭐ IT NOW LIVES IN `ktir-superdsc`, RE-EXPORTED HERE SO EVERY EXISTING PATH KEEPS RESOLVING.
-// The `ktir -> superdsc` lowering is being extracted into a leaf crate a third-party KTIR producer
-// can consume without scratchy, and the typed SuperDSC IR was the first thing to move.
-// `scratchy_subtile::superdsc_opspec::…` / `…::superdsc_error::…` — and the
-// in-crate `crate::superdsc_opspec::…` that `sdsc_abstract` and `addr` use — all resolve through
-// these two re-exports, so nothing else in the tree changed. Inverting the edge and deleting these
-// re-exports is the last step, and it has not been taken.
-//
-// ⭐ `sdsc_abstract` AND `addr` FOLLOWED — the typed device facts, and the `addr` build-time
-// address interpreter that PROVES the emitted SDSC attention computes the SubtileIR math
+// ⭐ THE SuperDSC DEVICE FACTS, FROM THE `ktir-superdsc` LEAF CRATE: the typed SuperDSC IR
+// (`superdsc_opspec`/`superdsc_error`), `sdsc_abstract`, and the `addr` build-time address
+// interpreter that PROVES the emitted SDSC attention computes the SubtileIR math
 // (`softmax(q·kᵀ·scale+mask)·v`) over the real device addresses, so a translation bug is a
-// `cargo build` panic rather than an on-card discovery. Those two are MUTUALLY RECURSIVE
-// (`sdsc_abstract` names 66 `addr` paths; `addr` names `ElementArrangement`/`SpyreTensorLayout`/
-// `MaskCorner`/`PrefixMaskShape`/`OperandPlacement`), so they are one unit and moved together.
-// `model_geometry` and `subtile_ir` still name them and now reach them through this re-export;
-// the metal path reads `sdsc_abstract` through `model_geometry` exactly as before.
+// `cargo build` panic rather than an on-card discovery. Re-exported so the Spyre lowering and
+// worker name them as `scratchy_subtile::sdsc_abstract::…` and `model_geometry`'s attention door
+// names `AttnGeometry` through `crate::sdsc_abstract`.
+//
+// ⛔ GATED ON `spyre`, WITH THE DEPENDENCY. Nothing a metal or cuda build compiles names these, so
+// those builds leave the whole `ktir-superdsc`/`ktir-core` graph out.
+#[cfg(feature = "spyre")]
 pub use ktir_superdsc::{addr, sdsc_abstract, superdsc_error, superdsc_opspec};
 // ⛔ UNGATED, AND THAT IS THE POINT. The re-roll machinery (`reroll_subtile_tape` /
 // `lower_dag_to_tape` / the `OpenLoop`/`CloseLoop` tape) is THE shared artifact: the

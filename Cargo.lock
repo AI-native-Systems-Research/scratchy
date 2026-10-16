@@ -3595,7 +3595,6 @@ name = "scratchy-forward-compiler-macro"
 version = "0.1.0"
 dependencies = [
  "ktir-core",
- "ktir-superdsc",
  "proc-macro2",
  "quote",
  "rayon",

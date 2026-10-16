@@ -650,12 +650,12 @@ fn steps_of<'a>(
 mod tests {
     use super::*;
     use crate::lower::{ArchOp, GemmWeight, InputRef, LoweringInput, OpDesc};
+    use crate::model_geometry::HeadDim;
     use crate::subtile_ir::{
         EwKind, GainConvention, RowScale, SourceShape, ValidatedGraph, lower_region,
     };
     use crate::subtile_tape::{Instr, lower_dag_to_tape};
     use InputRef::{Ext, Op};
-    use ktir_superdsc::head_counts::HeadDim;
 
     /// A neutral rule table covering every pattern kind.
     fn rule(op: &SubOp) -> ColourRule {

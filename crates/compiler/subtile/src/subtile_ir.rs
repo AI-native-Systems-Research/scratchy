@@ -38,7 +38,7 @@
 
 #![allow(dead_code)]
 
-use ktir_superdsc::head_counts::{HeadDim, ModelAttnGeometry};
+use crate::model_geometry::{HeadDim, ModelAttnGeometry};
 use std::marker::PhantomData;
 
 // ── Identifiers & geometry ─────────────────────────────────────────
