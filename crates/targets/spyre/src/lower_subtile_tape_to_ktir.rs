@@ -424,10 +424,10 @@ pub(crate) fn oproj_edges<F: RopeForm>(ir: &SubtileIR<F>) -> Result<OprojEdges, 
 /// `ChunkScratch::of_chunk` admits it at the model's own `(nkvh, hd)`, `None` otherwise.
 ///
 /// ⛔ `None` IS THE PER-PAGE FOLD, WHICH IS THE SHIPPED AND CORRECT DECODE — not a silently degraded
-/// one. The chunk is refused above one feature slab (hd > 64: the V block stops concatenating into
-/// `[slots, hd]`, a different row law not yet written), and a model there keeps exactly the emission it
-/// had. Asked of the GRAPH, so a third-party producer's geometry decides for itself; a graph with no
-/// attention node has nothing to chunk.
+/// one. The chunk is refused where its V gather has no slab-major order (a head dim past one page's stick
+/// blocks — `ChunkScratch::of_chunk`; hd 64, 128 and 256 are admitted), and a model there keeps exactly
+/// the emission it had. Asked of the GRAPH, so a third-party producer's geometry decides for itself; a
+/// graph with no attention node has nothing to chunk.
 pub fn admitted_chunk<F: RopeForm>(ir: &SubtileIR<F>, requested: Option<u32>) -> Option<u32> {
     let pages = requested?;
     let geom = ir.nodes.iter().find_map(|n| match &n.op {
