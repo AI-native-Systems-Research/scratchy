@@ -156,19 +156,24 @@ pub fn round_dlf16(f: f32) -> f32 {
     if a >= 1023.5 * (1 << 23) as f32 {
         return sign * f32::INFINITY;
     }
+    // Every power of two below is an f32 NORMAL (exponents in [-39, 39]), so it is built from its
+    // exponent bits — exact, and no per-element `powi` (MEASURED: a top bake-gate cost, every
+    // DLF16 partial and stick lands here). Pinned against the `powi` spelling by
+    // `the_bit_built_dlf16_rounding_matches_the_powi_spelling`.
+    let pow2 = |n: i32| f32::from_bits(((n + 127) as u32) << 23);
     // Underflow: no subnormals — below the halfway to the min normal (2^-30)
     // flushes to zero; the tie at exactly 2^-31 rounds to even (zero).
-    if a <= 2.0f32.powi(-31) {
+    if a <= pow2(-31) {
         return sign * 0.0;
     }
-    if a < 2.0f32.powi(-30) {
-        return sign * 2.0f32.powi(-30); // (2^-31, 2^-30): only neighbor above
+    if a < pow2(-30) {
+        return sign * pow2(-30); // (2^-31, 2^-30): only neighbor above
     }
     // Normal range: a = m·2^e with m ∈ [1,2), e ∈ [-30, 32]. Scale the mantissa
     // to an exact integer step count — a is a normal f32, so a·2^(9-e) keeps
     // f32's 24 significant bits and the floor/fraction split below is exact.
     let e = (((a.to_bits() >> 23) & 0xff) as i32) - 127;
-    let m_scaled = a * 2.0f32.powi(9 - e); // ∈ [512, 1024)
+    let m_scaled = a * pow2(9 - e); // ∈ [512, 1024)
     let floor = m_scaled.floor();
     let frac = m_scaled - floor;
     let mut steps = floor as u32;
@@ -181,7 +186,7 @@ pub fn round_dlf16(f: f32) -> f32 {
     } else {
         (steps, e)
     };
-    sign * (steps as f32) * 2.0f32.powi(e - 9)
+    sign * (steps as f32) * pow2(e - 9)
 }
 
 /// In-place form of [`round_dlf16`] for a partial-sum buffer.
@@ -793,6 +798,156 @@ mod tests {
 }
 
 #[cfg(test)]
+mod e4m3_fast_path_tests {
+    /// The encoder as it was spelled before the fast path: `powi` constants and a
+    /// `log2().floor()` exponent. The oracle the fast path must equal bit for bit.
+    fn reference(v: f32) -> u8 {
+        if v.is_nan() {
+            return 0x7F;
+        }
+        let sign: u8 = if v.is_sign_negative() { 0x80 } else { 0 };
+        let a = v.abs();
+        if a == 0.0 {
+            return sign;
+        }
+        if a >= 448.0 {
+            return sign | 0x7E;
+        }
+        if a < 2.0f32.powi(-6) {
+            let q = (a / 2.0f32.powi(-9)).round() as i32;
+            return sign | (q.clamp(0, 8) as u8);
+        }
+        let exp = a.log2().floor() as i32;
+        let frac = a / 2.0f32.powi(exp) - 1.0;
+        let mut mant = (frac * 8.0).round() as i32;
+        let mut exp = exp;
+        if mant == 8 {
+            mant = 0;
+            exp += 1;
+        }
+        if exp + 7 >= 0x0F && mant >= 7 {
+            return sign | 0x7E;
+        }
+        sign | (((exp + 7) as u8) << 3) | (mant as u8 & 0x07)
+    }
+
+    /// Bit-identical on a strided sweep of every finite magnitude below 448 (both signs),
+    /// plus a dense window of ulps around every power of two in range — where an exponent
+    /// read from the bits and a `log2().floor()` could disagree — and the specials.
+    #[test]
+    fn the_fast_e4m3_encoder_matches_the_reference_spelling() {
+        let check = |v: f32| {
+            assert_eq!(
+                super::f32_to_e4m3(v),
+                reference(v),
+                "v = {v:e} ({:#010x})",
+                v.to_bits()
+            );
+            assert_eq!(super::f32_to_e4m3(-v), reference(-v), "v = -{v:e}");
+        };
+        let top = 448.0f32.to_bits();
+        let mut b = 0u32;
+        while b <= top {
+            check(f32::from_bits(b));
+            b += 97;
+        }
+        for e in -10i32..=9 {
+            let p = 2.0f32.powi(e).to_bits();
+            for d in 0..4096u32 {
+                check(f32::from_bits(p - d));
+                check(f32::from_bits(p + d));
+            }
+        }
+        for v in [
+            0.0,
+            448.0,
+            1e9,
+            f32::INFINITY,
+            f32::MIN_POSITIVE,
+            1e-45,
+            0.015_625,
+            0.001_953_125,
+        ] {
+            check(v);
+        }
+        assert_eq!(super::f32_to_e4m3(f32::NAN), reference(f32::NAN));
+    }
+
+    /// The decode table equals the exact arithmetic on all 256 bytes (NaN by class).
+    #[test]
+    fn the_e4m3_decode_table_is_the_exact_arithmetic() {
+        for b in 0..=255u8 {
+            let (got, want) = (super::e4m3_to_f32(b), super::e4m3_to_f32_compute(b));
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "byte {b:#04x}: {got} vs {want}"
+            );
+        }
+    }
+
+    /// `round_dlf16` as spelled with `powi` — the oracle for the bit-built powers of two.
+    fn dlf16_reference(f: f32) -> f32 {
+        if f.is_nan() || f == 0.0 {
+            return f;
+        }
+        let sign = if f < 0.0 { -1.0f32 } else { 1.0 };
+        let a = f.abs();
+        if a >= 1023.5 * (1 << 23) as f32 {
+            return sign * f32::INFINITY;
+        }
+        if a <= 2.0f32.powi(-31) {
+            return sign * 0.0;
+        }
+        if a < 2.0f32.powi(-30) {
+            return sign * 2.0f32.powi(-30);
+        }
+        let e = (((a.to_bits() >> 23) & 0xff) as i32) - 127;
+        let m_scaled = a * 2.0f32.powi(9 - e);
+        let floor = m_scaled.floor();
+        let frac = m_scaled - floor;
+        let mut steps = floor as u32;
+        if frac > 0.5 || (frac == 0.5 && steps & 1 == 1) {
+            steps += 1;
+        }
+        let (steps, e) = if steps == 1024 {
+            (512u32, e + 1)
+        } else {
+            (steps, e)
+        };
+        sign * (steps as f32) * 2.0f32.powi(e - 9)
+    }
+
+    /// Bit-identical on a strided sweep of every positive f32 (both signs) — subnormals,
+    /// the flush band, the normal range and the overflow edge — plus the specials.
+    #[test]
+    fn the_bit_built_dlf16_rounding_matches_the_powi_spelling() {
+        let check = |v: f32| {
+            for x in [v, -v] {
+                let (got, want) = (super::round_dlf16(x), dlf16_reference(x));
+                assert!(
+                    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                    "x = {x:e} ({:#010x}): {got:e} vs {want:e}",
+                    x.to_bits()
+                );
+            }
+        };
+        let mut b = 0u32;
+        while b < f32::INFINITY.to_bits() {
+            check(f32::from_bits(b));
+            b += 193;
+        }
+        for v in [
+            f32::INFINITY,
+            f32::NAN,
+            1023.5 * (1 << 23) as f32,
+            2.0f32.powi(-31),
+        ] {
+            check(v);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tile_round_tests {
     use crate::dtypes::DType;
     use crate::tile::Tile;
@@ -820,6 +975,16 @@ mod tile_round_tests {
 /// ordinary numbers — so the largest finite magnitude is 448, not a saturating inf. Mirrors
 /// `torch.float8_e4m3fn -> float32`.
 pub fn e4m3_to_f32(byte: u8) -> f32 {
+    // Table lookup, like `f16_bits_to_f32`: 256 inputs, filled once by the exact arithmetic in
+    // `e4m3_to_f32_compute`. MEASURED: the per-element `powi` was a top bake-gate cost (every fp8
+    // weight decodes through here).
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|b| e4m3_to_f32_compute(b as u8)))[byte as usize]
+}
+
+/// Reference e4m3fn→f32 arithmetic (exact); used to build the table.
+fn e4m3_to_f32_compute(byte: u8) -> f32 {
     let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
     let exp = ((byte >> 3) & 0x0F) as i32;
     let mant = (byte & 0x07) as i32;
@@ -862,12 +1027,18 @@ pub fn f32_to_e4m3(v: f32) -> u8 {
     // continuous. Clamping to 7 pushed such a value back DOWN a whole grid step to the largest
     // subnormal, i.e. it rounded away from nearest: 0.01538086 sat 0.000244 from 2^-6 and
     // 0.001709 from 7·2^-9, and came back as the FARTHER one.
-    if a < 2.0f32.powi(-6) {
-        let q = (a / 2.0f32.powi(-9)).round() as i32;
+    // ⭐ NO TRANSCENDENTALS ON THE HOT PATH: the powers of two are constants and the exponent is
+    // the f32's own (every `a` past the subnormal branch is an f32 normal), so encoding is a few
+    // integer ops. MEASURED: `powi`/`log2` per element were the bake gate's synth-staging cost
+    // (`__powisf2` + `log2f` atop the profile). Bit-identical to the `log2().floor()` spelling —
+    // pinned by `the_fast_e4m3_encoder_matches_the_reference_spelling`.
+    if a < 0.015_625 {
+        // 2^-6; the subnormal grid is 2^-9 = 1/512.
+        let q = (a * 512.0).round() as i32;
         return sign | (q.clamp(0, 8) as u8);
     }
-    let exp = a.log2().floor() as i32;
-    let frac = a / 2.0f32.powi(exp) - 1.0;
+    let exp = ((a.to_bits() >> 23) & 0xFF) as i32 - 127;
+    let frac = a / f32::from_bits(((exp + 127) as u32) << 23) - 1.0;
     let mut mant = (frac * 8.0).round() as i32;
     let mut exp = exp;
     if mant == 8 {

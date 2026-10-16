@@ -1489,15 +1489,22 @@ pub fn eval_node<F: RopeForm>(
             debug_assert_eq!(ar, out_rows, "matmul A rows vs out_rows");
             debug_assert_eq!(wc, out_cols, "matmul W cols vs out_cols");
             let (m, n, k) = (ar as usize, wc as usize, ac as usize);
+            // ⭐ ROW-STREAMING ORDER, SAME SUMS. W is `[K, N]` row-major (`w[l * N + j]`), so
+            // the inner loop walks one W ROW contiguously and accumulates `a[i, l] · w[l, :]`
+            // into `out[i, :]`. Every output element still adds its `K` products in `l`
+            // order from 0.0, so the result is bit-identical to the dot-per-element form —
+            // whose inner loop strode a whole W row (N floats) per multiply-add, a cache
+            // miss per FMA: MEASURED as the bake gate's dominant cost (gemma-4-12b lead6
+            // slice, ~110 s of a 146 s build in `eval_node`).
             let mut out = vec![0f32; m * n];
             for i in 0..m {
-                for j in 0..n {
-                    let mut sum = 0f32;
-                    for l in 0..k {
-                        // W is [K, N] row-major: w[l * N + j].
-                        sum += a[i * k + l] * w[l * n + j];
+                let row = &mut out[i * n..(i + 1) * n];
+                for l in 0..k {
+                    let s = a[i * k + l];
+                    let wrow = &w[l * n..(l + 1) * n];
+                    for (o, &wv) in row.iter_mut().zip(wrow) {
+                        *o += s * wv;
                     }
-                    out[i * n + j] = sum;
                 }
             }
             out
