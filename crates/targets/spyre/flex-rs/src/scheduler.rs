@@ -79,7 +79,7 @@ use crate::control_block_wire::{
     AllocationTotalSize, ControlBlockWire, DevicePhysicalAddress, Flits, HostPhysicalAddress,
     ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
 };
-use crate::dma::{DmaDirection, DmaParams, FillParams, FillPipeline};
+use crate::dma::{DmaDirection, DmaParams, DmaPipelineShape, FillParams, FillPipeline};
 use crate::flex_config::{DeviceKind, RuntimeConfig};
 use crate::stream::{
     CompletionCallback, RuntimeOperationKind, RuntimeStreamMode, SchedulerError, SchedulerHandle,
@@ -3779,10 +3779,22 @@ impl SchedulerBackend for PfBackend {
                 Ok(v) => v,
                 Err(e) => return callback(Err(e)),
             };
-        let pipeline = if dma.direction() == DmaDirection::HostToDevice {
-            PipelineId::AsyncDmaI
-        } else {
-            PipelineId::AsyncDmaO
+        // `pf_runtime_scheduler.cpp:113-114`:
+        // `use_compute_pipeline ? PipelineId::COMPUTE
+        //   : (to_device ? PipelineId::ASYNC_DMAI : PipelineId::ASYNC_DMAO)`
+        // — when the params ask for the compute pipeline, this DMA rides the
+        // COMPUTE queue with the compute-pipeline CB shape
+        // (`buildComputePathDmaControlBlocks`, which is what this crate's
+        // `build_dma_cb_chunk` has always emitted — see `dma_immediate`).
+        let pipeline = match dma.pipeline_shape() {
+            DmaPipelineShape::ComputePipeline => PipelineId::Compute,
+            DmaPipelineShape::AsyncDma => {
+                if dma.direction() == DmaDirection::HostToDevice {
+                    PipelineId::AsyncDmaI
+                } else {
+                    PipelineId::AsyncDmaO
+                }
+            }
         };
         // `remaining_size = xfer_size` — exactly what the caller asked for,
         // never clamped to the resolved device chunk.
@@ -4021,10 +4033,19 @@ impl SchedulerBackend for VfBackend {
         dma: &DmaParams,
         callback: CompletionCallback,
     ) {
-        let pipeline = if dma.direction() == DmaDirection::HostToDevice {
-            PipelineId::AsyncDmaI
-        } else {
-            PipelineId::AsyncDmaO
+        // Same ternary as `PfBackend::submit_dma` above — the vendor's VF
+        // scheduler selects the pipeline identically
+        // (`vf_runtime_scheduler.cpp:83-84`), with
+        // `buildComputePathDmaControlBlocks` picked at `:204-205`.
+        let pipeline = match dma.pipeline_shape() {
+            DmaPipelineShape::ComputePipeline => PipelineId::Compute,
+            DmaPipelineShape::AsyncDma => {
+                if dma.direction() == DmaDirection::HostToDevice {
+                    PipelineId::AsyncDmaI
+                } else {
+                    PipelineId::AsyncDmaO
+                }
+            }
         };
         // KNOWN GAP, parallel to the one `PfBackend`'s `DmaBuf` covers: no
         // VF-side IOMMU mapper is ported in this crate (only
@@ -4267,6 +4288,24 @@ impl RuntimeScheduler {
         }
     }
 
+    /// Test-only accessor: only meaningful when this scheduler wraps
+    /// `Backend::Mock`. The barrier TARGET of every `issueBarrier` call, in
+    /// order — the pipeline a barrier was issued against (`MockBackend`'s
+    /// `barrier_calls`), so a test can assert not just that a barrier fired
+    /// but which pipeline it fenced.
+    #[cfg(test)]
+    pub fn mock_barrier_targets(&self) -> Option<Vec<RuntimeOperationKind>> {
+        match &self.backend {
+            Backend::Mock(m) => Some(
+                m.barrier_calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Test-only accessor: the op counts of every `submit_compute_batch`
     /// call, in order — only meaningful when this scheduler wraps
     /// `Backend::Mock`.
@@ -4447,7 +4486,22 @@ impl RuntimeScheduler {
                 .issue_barrier(&self.state, fence_pipeline, id);
         }
         let fence = self.state.push_fence(pipeline, id);
-        self.state.record_last_pipeline(id, logical_kind);
+        // Vendor writes `stream_last_pipeline_[id] = Compute` for an H2D/D2H
+        // submitted via the compute pipeline (`runtime_scheduler.cpp:456`,
+        // D2H at `:535`), while every other op records its own (collapsed)
+        // tag — Fill records `Fill` even when routed to DMAO. The collapse is
+        // on the WRITE side only: `maybeSetBarrier` still compares the op's
+        // OWN uncollapsed tag, so a compute-pipeline H2D following a Compute
+        // op is not a switch (no auto-barrier), but the next H2D after a
+        // compute-pipeline D2H still is one (target `H2D` vs stored
+        // `Compute`).
+        let recorded_kind = match (kind, pipeline) {
+            (RuntimeOperationKind::H2D | RuntimeOperationKind::D2H, PipelineId::Compute) => {
+                RuntimeOperationKind::Compute
+            }
+            _ => logical_kind,
+        };
+        self.state.record_last_pipeline(id, recorded_kind);
 
         let fence_for_cb = fence.clone();
         let wrapped: CompletionCallback = Box::new(move |result| {
@@ -4528,13 +4582,27 @@ impl SchedulerHandle for RuntimeScheduler {
                         return Ok(());
                     }
                 };
+                // Port of `schedule(RuntimeOperationH2D/D2H)`'s three
+                // `op.useComputePipeline()` consults (`runtime_scheduler.cpp:408`
+                // and `:440`/`:454`, mirrored for D2H at `:497`/`:519`/`:533`):
+                // a compute-pipeline DMA fences, barriers, and tracks as a
+                // COMPUTE-pipeline op. `pipeline_override` carries the first
+                // two (the fence deque and the barrier target both derive from
+                // the resolved pipeline in `schedule_pipelined`); the third —
+                // `stream_last_pipeline_[id] = Compute` — is the write-side
+                // collapse in `schedule_pipelined`'s `record_last_pipeline`.
+                // The physical submission queue is re-derived from the same
+                // field inside both real backends' `submit_dma`
+                // (`pf_runtime_scheduler.cpp:113-114`).
+                let pipeline_override = (dma.pipeline_shape() == DmaPipelineShape::ComputePipeline)
+                    .then_some(PipelineId::Compute);
                 self.schedule_pipelined(
                     PipelinedOp {
                         id: stream_id,
                         mode,
                         kind: op.kind,
                         requested_barrier,
-                        pipeline_override: None,
+                        pipeline_override,
                     },
                     &*dma,
                     completion,
@@ -5284,6 +5352,35 @@ mod ported_cxx_tests {
         .expect("dummy_addr is never None")
     }
 
+    /// `dummy_h2d` with `DmaParams::use_compute_pipeline = true` — the
+    /// submission shape `runtime_scheduler.cpp`'s `schedule(H2D/D2H)`
+    /// consults three times per direction.
+    fn dummy_h2d_on_compute() -> DmaParams {
+        DmaParams::from_device_allocation(
+            HostVirtualAddress(0x1000),
+            DmaDirection::HostToDevice,
+            Some(dummy_addr(1)),
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                ..Default::default()
+            },
+        )
+        .expect("dummy_addr is never None")
+    }
+
+    fn dummy_d2h_on_compute() -> DmaParams {
+        DmaParams::from_device_allocation(
+            HostVirtualAddress(0x1000),
+            DmaDirection::DeviceToHost,
+            Some(dummy_addr(1)),
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                ..Default::default()
+            },
+        )
+        .expect("dummy_addr is never None")
+    }
+
     fn dummy_compute() -> ComputeParams {
         ComputeParams::new(
             dummy_addr(2),
@@ -5396,6 +5493,82 @@ mod ported_cxx_tests {
         .expect("dummy_addr is never None");
         stream.launch_h2d(dma, None).unwrap();
         assert_eq!(sched.mock_barrier_count(), Some(1));
+    }
+
+    /// Port of the `useComputePipeline` half of `schedule(RuntimeOperationH2D)`
+    /// (`runtime_scheduler.cpp:440-461`): a compute-pipeline H2D pushes its
+    /// fence on the COMPUTE deque and records `Compute` as the stream's last
+    /// pipeline, so the Compute op after it is NOT a pipeline switch — the
+    /// exact inverse of `strict_ordering_auto_barrier_h2d_to_compute` above,
+    /// which pins the plain-shape leg at one barrier.
+    #[test]
+    fn strict_ordering_no_barrier_compute_pipeline_h2d_to_compute() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        stream.launch_h2d(dummy_h2d_on_compute(), None).unwrap();
+        stream.launch_compute(dummy_compute(), None).unwrap();
+        assert_eq!(sched.mock_barrier_count(), Some(0));
+    }
+
+    /// The D2H side of the write-side collapse: a compute-pipeline D2H still
+    /// SWITCHES from a preceding Compute op — `maybeSetBarrier` compares the
+    /// op's own `D2H` tag (`runtime_scheduler.cpp:373-395`) against the
+    /// stored `Compute` — so the auto-barrier still fires. What moves is its
+    /// TARGET: the barrier fences the COMPUTE pipeline (`:497-500`,
+    /// `issueBarrier(RuntimeOperationType::Compute, id)`), so it drains the
+    /// DMAI/DMAO fence deques — which hold nothing once every DMA rides
+    /// COMPUTE — instead of waiting on the step's compute fences. The host
+    /// stops blocking before the readback submission; the queue's own FIFO
+    /// (readback CB submitted behind the step's compute CBs on the same
+    /// COMPUTE queue) carries the ordering.
+    #[test]
+    fn strict_ordering_compute_to_compute_pipeline_d2h_barrier_targets_compute() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        stream.launch_compute(dummy_compute(), None).unwrap();
+        stream.launch_d2h(dummy_d2h_on_compute(), None).unwrap();
+        assert_eq!(sched.mock_barrier_count(), Some(1));
+        assert_eq!(
+            sched.mock_barrier_targets(),
+            Some(vec![RuntimeOperationKind::Compute])
+        );
+    }
+
+    /// The collapse is on the WRITE side only: `maybeSetBarrier` compares the
+    /// op's OWN tag (`runtime_scheduler.cpp:373-395`, `target = op.getType()`),
+    /// so a compute-pipeline D2H followed by a compute-pipeline H2D is still
+    /// a switch (target `H2D` vs stored `Compute`) and still auto-barriers.
+    /// Pins that the port did not over-collapse.
+    #[test]
+    fn strict_ordering_compute_pipeline_d2h_to_h2d_still_switches() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        stream.launch_d2h(dummy_d2h_on_compute(), None).unwrap();
+        stream.launch_h2d(dummy_h2d_on_compute(), None).unwrap();
+        assert_eq!(sched.mock_barrier_count(), Some(1));
+    }
+
+    /// Port of `schedule(H2D)`'s barrier-target consult
+    /// (`runtime_scheduler.cpp:406-418`): when a barrier IS issued for a
+    /// compute-pipeline H2D, it fences the COMPUTE pipeline
+    /// (`issueBarrier(RuntimeOperationType::Compute, id)`), not H2D — the
+    /// fence deque the op itself pushed on (`:440-448`).
+    #[test]
+    fn compute_pipeline_h2d_barriers_against_compute() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::OpOrdering);
+        let dma = DmaParams::from_device_allocation(
+            HostVirtualAddress(0x1000),
+            DmaDirection::HostToDevice,
+            Some(dummy_addr(1)),
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                pipeline_barrier: true,
+                ..Default::default()
+            },
+        )
+        .expect("dummy_addr is never None");
+        stream.launch_h2d(dma, None).unwrap();
+        assert_eq!(
+            sched.mock_barrier_targets(),
+            Some(vec![RuntimeOperationKind::Compute])
+        );
     }
 
     /// Port of `ScheduleThrowsOnShutdownStream`: once a stream is in
@@ -5829,5 +6002,217 @@ mod compute_batch_tests {
         assert_eq!(sched.mock_compute_batch_sizes(), Some(Vec::new()));
         // The refusal never incremented the stream's in-flight count: nothing to wait for.
         stream.synchronize().unwrap();
+    }
+}
+
+/// The `useComputePipeline` submission-routing port, one level below the
+/// mock-level tests in `ported_cxx_tests`: these drive the REAL backends
+/// (`PfBackend`, `VfBackend`) through a full `RuntimeStream` launch with a
+/// recording `HardwareSubmit`, so they pin the physical queue the CARD would
+/// see — the vendor's `use_compute_pipeline ? PipelineId::COMPUTE :
+/// (to_device ? PipelineId::ASYNC_DMAI : PipelineId::ASYNC_DMAO)`
+/// (`pf_runtime_scheduler.cpp:113-114`, VF identically at
+/// `vf_runtime_scheduler.cpp:83-84`).
+///
+/// Every DMA here supplies a caller IOVA in its `DmaShaping`: the
+/// user-IOVA path of `DmaBuf::setup_dma_buf` (`scheduler_config.cpp:68-75`)
+/// skips the IOMMU map entirely, so no senlib call is made and the test
+/// exercises only the routing logic under test.
+#[cfg(test)]
+mod compute_pipeline_submission_tests {
+    use super::*;
+    use crate::address::{ByteOffset, LogicalAddress, RegionId};
+    use crate::control_block_wire::{RB_NUM_BYTES, ResponseBlockWire};
+    use crate::dma::{DmaShaping, HostVirtualAddress, IovaAddress};
+    use crate::iommu::PfIommuMapper;
+    use crate::memory_region::DomainId;
+    use crate::stream::{DeviceId, RuntimeStream, RuntimeStreamPriority};
+
+    /// A `HardwareSubmit` that records which PIPELINE every CB batch rode and
+    /// answers each queued CB with a `Good` response block — the
+    /// `LoopbackHardware` pattern from `response_worker_tests`, plus the one
+    /// fact these tests exist to observe.
+    struct RecordingHardware {
+        pipelines: Mutex<Vec<PipelineId>>,
+        queued: Mutex<VecDeque<ResponseBlockWire>>,
+    }
+
+    impl RecordingHardware {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                pipelines: Mutex::new(Vec::new()),
+                queued: Mutex::new(VecDeque::new()),
+            })
+        }
+
+        fn pipelines(&self) -> Vec<PipelineId> {
+            self.pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    /// A `Good`-status response block carrying `tag` — same encoding as
+    /// `response_worker_tests::loopback_response`: tag at bits [31:8],
+    /// status (`Good` = 0b00) at bits [6:5].
+    fn good_response(tag: ResponseTag) -> ResponseBlockWire {
+        let word = (tag.0 as u64) << 8;
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        bytes[0..8].copy_from_slice(&word.to_le_bytes());
+        ResponseBlockWire::from_bytes(&bytes)
+    }
+
+    impl HardwareSubmit for RecordingHardware {
+        fn queue_control_blocks(
+            &self,
+            pipeline: PipelineId,
+            cbs: &[ControlBlockWire],
+        ) -> Result<(), SchedulerError> {
+            self.pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(pipeline);
+            let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            for cb in cbs {
+                queued.push_back(good_response(cb.tag()));
+            }
+            Ok(())
+        }
+
+        fn receive_responses(
+            &self,
+            out: &mut [ResponseBlockWire],
+            _min_count: usize,
+        ) -> (u64, ResponseCredit) {
+            let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+            let n = queued.len().min(out.len());
+            for slot in out.iter_mut().take(n) {
+                *slot = queued.pop_front().expect("checked above");
+            }
+            (n as u64, ResponseCredit::received(n as u64))
+        }
+
+        fn free_responses(&self, _pipeline: PipelineId, _credit: PipelineCredit) {}
+    }
+
+    struct FixedResolver;
+
+    impl DeviceAddressResolver for FixedResolver {
+        fn resolve(&self, _chunk: &Chunk) -> Option<(u8, DevicePhysicalAddress, ByteSize)> {
+            Some((0, DevicePhysicalAddress(0x1000_0000), ByteSize(4096)))
+        }
+    }
+
+    /// One 4096-byte single-chunk DMA in `direction`, carrying a caller IOVA
+    /// (see the module doc) and `pipeline_shape`.
+    fn dma(direction: DmaDirection, pipeline_shape: DmaPipelineShape) -> DmaParams {
+        let chunk = Chunk::new(
+            LogicalAddress::new(RegionId(1), ByteOffset(0)),
+            ByteSize(4096),
+            DomainId(0),
+        );
+        DmaParams::from_device_allocation(
+            HostVirtualAddress(0x1000),
+            direction,
+            Some(Arc::new(CompositeAddress::from_chunk(chunk))),
+            DmaShaping {
+                iova: Some(IovaAddress(0x2000)),
+                pipeline_shape,
+                ..Default::default()
+            },
+        )
+        .expect("dummy chunk is never None")
+    }
+
+    /// Submit the four-shape matrix (plain H2D, plain D2H, compute-pipeline
+    /// H2D, compute-pipeline D2H) on one `OpOrdering` stream — no
+    /// auto-barriers, so every launch returns without a fence wait — then
+    /// report the pipeline each submission physically rode, in order.
+    /// `hw` must be the SAME recorder the `backend` was built from.
+    fn submitted_pipelines(hw: &RecordingHardware, backend: Backend) -> Vec<PipelineId> {
+        let sched = RuntimeScheduler::new(backend);
+        let stream = RuntimeStream::new(
+            sched,
+            DeviceId(0),
+            RuntimeStreamPriority::Normal,
+            RuntimeStreamMode::OpOrdering,
+        );
+        stream
+            .launch_h2d(
+                dma(DmaDirection::HostToDevice, DmaPipelineShape::AsyncDma),
+                None,
+            )
+            .unwrap();
+        stream
+            .launch_d2h(
+                dma(DmaDirection::DeviceToHost, DmaPipelineShape::AsyncDma),
+                None,
+            )
+            .unwrap();
+        stream
+            .launch_h2d(
+                dma(
+                    DmaDirection::HostToDevice,
+                    DmaPipelineShape::ComputePipeline,
+                ),
+                None,
+            )
+            .unwrap();
+        stream
+            .launch_d2h(
+                dma(
+                    DmaDirection::DeviceToHost,
+                    DmaPipelineShape::ComputePipeline,
+                ),
+                None,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        hw.pipelines()
+    }
+
+    #[test]
+    fn pf_submit_dma_routes_by_pipeline_shape() {
+        let hw = RecordingHardware::new();
+        let backend = Backend::Pf(PfBackend::new(
+            hw.clone(),
+            Arc::new(NoCapacity),
+            Arc::new(FixedResolver),
+            PfIommuMapper::new(),
+        ));
+        let recorded = submitted_pipelines(&hw, backend);
+        assert_eq!(
+            recorded,
+            vec![
+                PipelineId::AsyncDmaI,
+                PipelineId::AsyncDmaO,
+                PipelineId::Compute,
+                PipelineId::Compute,
+            ],
+            "pf submitDma: plain DMAs ride ASYNC_DMAI/ASYNC_DMAO by direction, \
+             ComputePipeline-shaped DMAs ride COMPUTE"
+        );
+    }
+
+    #[test]
+    fn vf_submit_dma_routes_by_pipeline_shape() {
+        let hw = RecordingHardware::new();
+        let backend = Backend::Vf(VfBackend::new(
+            hw.clone(),
+            Arc::new(NoCapacity),
+            Arc::new(FixedResolver),
+        ));
+        let recorded = submitted_pipelines(&hw, backend);
+        assert_eq!(
+            recorded,
+            vec![
+                PipelineId::AsyncDmaI,
+                PipelineId::AsyncDmaO,
+                PipelineId::Compute,
+                PipelineId::Compute,
+            ],
+            "vf submitDma: same ternary as PF (vf_runtime_scheduler.cpp:83-84)"
+        );
     }
 }

@@ -26,7 +26,7 @@ use flex_rs::allocator::{
 };
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
-use flex_rs::dma::{DmaDirection, DmaParams, DmaShaping, HostVirtualAddress};
+use flex_rs::dma::{DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, HostVirtualAddress};
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
@@ -431,7 +431,9 @@ impl Stream {
 
     /// ⛔⛔⛔ ASYNC H2D OF `bytes` INTO `addr`. THE LENGTH IS THE HOST SLICE'S — THERE IS NO OTHER FORM.
     ///
-    /// This is the only door, and that is the point. A raw pointer plus an independent length
+    /// A slice is the only form of door — `h2d` and `h2d_on_compute` differ only in which
+    /// hardware queue the transfer rides — and that is the point. A raw pointer plus an
+    /// independent length
     /// cannot be made safe by documentation: a caller can source the length from a DIFFERENT
     /// object than the buffer, and when it comes from `addr.total_size()` — the DEVICE region's
     /// alignment-padded extent — the DMA pins past the host buffer's end whenever the pad exceeds
@@ -448,6 +450,38 @@ impl Stream {
     /// is [`HwError::OverrunsRegion`] — a distinct variant, so a caller rendering the error cannot
     /// confuse "we refused" with "the card refused".
     pub fn h2d(&self, bytes: &[u8], addr: &DevAddr) -> Result<(), HwError> {
+        self.h2d_shaped(bytes, addr, DmaShaping::default())
+    }
+
+    /// ⭐ H2D ON THE COMPUTE PIPELINE — same transfer, same slice-length law, different hardware
+    /// queue. Port of the vendor's `DmaParams::use_compute_pipeline = true` submission shape:
+    /// the DMA rides `PipelineId::COMPUTE` with the step's compute ops instead of `ASYNC_DMAI`
+    /// (`runtime_scheduler.cpp:440-461`). The CB itself is unchanged — flex-rs's DMA control
+    /// block has always been the compute-path `CreateComputeDataTransfer` shape; only the queue
+    /// and its bookkeeping move.
+    ///
+    /// For the player's per-step preamble this buys two things. The step's `[preamble H2D,
+    /// compute...]` junction stops being a pipeline switch at all (the H2D records `Compute` as
+    /// the stream's last pipeline), so the compute submission no longer auto-barriers — and no
+    /// longer HOST-BLOCKS — on the preamble's fence. And the cross-step barrier that remains
+    /// (prev `D2H` → this `H2D`, still a switch by tag) fences COMPUTE, so it drains the
+    /// DMAI/DMAO deques — empty once every DMA rides COMPUTE — instead of waiting out the
+    /// previous step's readback. Ordering itself is carried by the COMPUTE queue's FIFO: the
+    /// preamble CB is submitted ahead of the step's compute CBs on the same queue.
+    pub fn h2d_on_compute(&self, bytes: &[u8], addr: &DevAddr) -> Result<(), HwError> {
+        self.h2d_shaped(
+            bytes,
+            addr,
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The one body behind [`Self::h2d`] and [`Self::h2d_on_compute`]: the slice-length law and
+    /// the `DmaParams` construction, parameterized only by the shaping the door names.
+    fn h2d_shaped(&self, bytes: &[u8], addr: &DevAddr, shaping: DmaShaping) -> Result<(), HwError> {
         let region = addr.total_size();
         if ByteSize(bytes.len() as u64) > region {
             return Err(HwError::OverrunsRegion {
@@ -468,7 +502,7 @@ impl Stream {
             ByteSize(bytes.len() as u64),
             DmaDirection::HostToDevice,
             Some(addr.0.clone()),
-            DmaShaping::default(),
+            shaping,
         )
         .expect("device_address is Some, constructed from an owned DevAddr");
         stream.launch_h2d(params, None).map_err(HwError::Stream)
@@ -476,6 +510,36 @@ impl Stream {
 
     /// Async D2H into `bytes` from the device window `addr`.
     pub fn d2h(&self, bytes: &mut [u8], addr: &DevAddr) -> Result<(), HwError> {
+        self.d2h_shaped(bytes, addr, DmaShaping::default())
+    }
+
+    /// ⭐ D2H ON THE COMPUTE PIPELINE — the readback twin of [`Self::h2d_on_compute`]: same
+    /// transfer on `PipelineId::COMPUTE` instead of `ASYNC_DMAO`
+    /// (`runtime_scheduler.cpp:519-540`). The `[compute..., logits D2H]` junction is still a
+    /// pipeline switch by tag (the D2H's own tag vs the recorded `Compute`), so an
+    /// auto-barrier still fires — but it fences COMPUTE, draining the DMAI/DMAO deques (empty
+    /// once every DMA rides COMPUTE) instead of HOST-BLOCKING on the step's compute fences
+    /// before the readback can even be submitted. The readback CB then rides the same
+    /// COMPUTE queue, FIFO-behind the step's compute CBs — the queue carries the ordering the
+    /// host-side wait used to.
+    pub fn d2h_on_compute(&self, bytes: &mut [u8], addr: &DevAddr) -> Result<(), HwError> {
+        self.d2h_shaped(
+            bytes,
+            addr,
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The one body behind [`Self::d2h`] and [`Self::d2h_on_compute`].
+    fn d2h_shaped(
+        &self,
+        bytes: &mut [u8],
+        addr: &DevAddr,
+        shaping: DmaShaping,
+    ) -> Result<(), HwError> {
         let stream = self.live()?;
         // See `h2d`: the slice's own length is the explicit transfer size — substituting
         // `addr.total_size()` would risk writing past the caller's host buffer.
@@ -484,7 +548,7 @@ impl Stream {
             ByteSize(bytes.len() as u64),
             DmaDirection::DeviceToHost,
             Some(addr.0.clone()),
-            DmaShaping::default(),
+            shaping,
         )
         .expect("device_address is Some, constructed from an owned DevAddr");
         stream.launch_d2h(params, None).map_err(HwError::Stream)
