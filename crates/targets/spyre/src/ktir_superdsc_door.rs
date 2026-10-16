@@ -473,6 +473,54 @@ fn rope(
     attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let (ins, out) = split_out(name, r, layout, 3)?;
+    // ⛔ THE WHOLE-TENSOR ROW WINDOW, THE 2a LAW — for BOTH forms below. `rope.py`'s per-row form states a
+    // row window (`R_START` baked into every access tile's corner) — the producer's per-position
+    // decomposition mints one rope node per tail row, and the splice compiles each one. But
+    // `RopeAt` addresses the buffers at their BASES, so a window whose corner is not the
+    // tensor's first row would lower to ops that read and write every position shifted by
+    // the corner — a silently wrong answer, not a loud one. Refusing here names the gap at
+    // the door itself; the row-base extension (an `R_START`-scaled base per buffer) is the
+    // 2b worklist item. A whole-region rope states `R_START = 0` and passes untouched.
+    for (x, role) in [(&ins[0], "the `x` view"), (&out, "the `out` view")] {
+        if x.r_cover != (0, x.v_rows) {
+            return err(format!(
+                "{name}: {role} covers rows [{}, {}) of {} — a per-row rope window. `RopeAt` \
+                 addresses the buffer base, so lowering a windowed rope would shift every \
+                 position by the window's corner. The row-base extension is the 2b worklist \
+                 item; until it lands, only whole-tensor ropes lower through this door",
+                x.r_cover.0, x.r_cover.1, x.v_rows,
+            ));
+        }
+    }
+    // ⭐ TWO FORMS, TOLD APART BY THE VIEW'S WIDTH, and the access tile is a half-head either way.
+    // A rope whose positions outnumber its heads loops over the HEADS (`rope.py`'s `_rope_per_head`):
+    // it views `x` as the plane it is, `[mq, heads·hd]`, one `[mq, hd/2]` tile per head half, so its
+    // program stops growing with the chunk. Every other rope loops over the POSITIONS and views `x`
+    // tall, `[rows·heads, hd]` — the arm below. A tall view is one head dim wide, i.e. exactly twice
+    // its tile; a plane view of two or more heads is wider than that.
+    if ins[0].c_len > 0 && ins[0].v_cols > 2 * ins[0].c_len {
+        let hd = 2 * ins[0].c_len;
+        if !ins[0].v_cols.is_multiple_of(hd) || ins[0].r_len != ins[0].v_rows {
+            return err(format!(
+                "{name}: the `x` view states `[{}, {}]` and its first tile `[{}, {}]` — a per-head \
+                 rope tiles every row of a plane a whole number of heads wide, half a head at a time",
+                ins[0].v_rows, ins[0].v_cols, ins[0].r_len, ins[0].c_len,
+            ));
+        }
+        return rope_at_geometry(
+            name,
+            &ins,
+            &out,
+            RopePlane {
+                hd,
+                mq: ins[0].v_rows,
+                total: ins[0].v_cols,
+            },
+            sym_id_base,
+            layout,
+            attn_params,
+        );
+    }
     // The rope program views `x` as `[rows·heads, hd]`, so the view's COLUMN extent is the head dim.
     let hd = ins[0].v_cols;
     // ⭐⭐⭐ ROWS AND WIDTH, BOTH READ OFF THE PROGRAM — AND THE READING IS THE TILE, NOT A VIEW.
@@ -512,27 +560,40 @@ fn rope(
             ins[0].c_len,
         ));
     }
-    // ⛔ THE WHOLE-TENSOR ROW WINDOW, THE 2a LAW. `rope.py`'s per-row form states a row window
-    // (`R_START` baked into every access tile's corner) — the producer's per-position
-    // decomposition mints one rope node per tail row, and the splice compiles each one. But
-    // `RopeAt` addresses the buffers at their BASES, so a window whose corner is not the
-    // tensor's first row would lower to ops that read and write every position shifted by
-    // the corner — a silently wrong answer, not a loud one. Refusing here names the gap at
-    // the door itself; the row-base extension (an `R_START`-scaled base per buffer) is the
-    // 2b worklist item. A whole-region rope states `R_START = 0` and passes untouched.
-    for (x, role) in [(&ins[0], "the `x` view"), (&out, "the `out` view")] {
-        if x.r_cover != (0, x.v_rows) {
-            return err(format!(
-                "{name}: {role} covers rows [{}, {}) of {} — a per-row rope window. `RopeAt` \
-                 addresses the buffer base, so lowering a windowed rope would shift every \
-                 position by the window's corner. The row-base extension is the 2b worklist \
-                 item; until it lands, only whole-tensor ropes lower through this door",
-                x.r_cover.0, x.r_cover.1, x.v_rows,
-            ));
-        }
-    }
     let mq = ins[0].v_rows / heads;
     let total = heads * hd;
+    rope_at_geometry(
+        name,
+        &ins,
+        &out,
+        RopePlane { hd, mq, total },
+        sym_id_base,
+        layout,
+        attn_params,
+    )
+}
+
+/// What a rope program states about its plane, whichever form stated it: the head dim, and the
+/// `[mq, total]` plane's rows and width. Both forms describe the same bytes, so the device program is
+/// one function of these three numbers.
+#[derive(Clone, Copy)]
+struct RopePlane {
+    hd: u32,
+    mq: u32,
+    total: u32,
+}
+
+/// The rope's lowering once its [`RopePlane`] is read.
+fn rope_at_geometry(
+    name: &str,
+    ins: &[Region],
+    out: &Region,
+    plane: RopePlane,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<BundleAttnParams>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let RopePlane { hd, mq, total } = plane;
     // ⛔ THE ROW KIND, AS A PARAMETER — main's `LowerRope::rows_are_requests`, which main also took as
     // a parameter and for the reason its own comment gives. It decides whether the head-major collapse
     // may span the query rows, which is a DEVICE law: the rope program never receives the fact and

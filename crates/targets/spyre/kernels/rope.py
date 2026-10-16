@@ -61,6 +61,38 @@ def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
              HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
              Y_TOTAL: tl.constexpr, R_START: tl.constexpr):
     tl.static_assert(HALF + HALF == HEAD_DIM)
+    # ⭐ THE LOOP RUNS OVER THE SHORTER AXIS — positions or heads — so the program holds
+    # `min(MQ, H)` bodies and stops growing with the chunk. The trip count is constexpr either
+    # way, so `to_ktir` unrolls it into a straight-line program.
+    #
+    # ⛔ IT WAS ALWAYS THE POSITION LOOP, AND THAT GREW WITH THE CHUNK: one body per position, so a
+    # 512-row prompt chunk's q rope was 512 bodies, every one walked by every pass of the lowering.
+    #
+    # Nested constexpr ifs, not `and`: the parser refuses a Python `BoolOp` in a @triton.jit kernel.
+    # One head (H == 1) always takes the position loop: the door tells the forms apart by the view's
+    # width, and at one head both views are one head dim wide. A ROW-WINDOWED rope (`R_START > 0`,
+    # the per-row form — one row, so never `MQ > H`) keeps the position loop too: its window rides
+    # the tall view's tile corner, which the per-head form's whole-plane view does not state.
+    if MQ > H:
+        if H > 1:
+            if R_START == 0:
+                _rope_per_head(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF)
+            else:
+                _rope_per_position(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM,
+                                   HALF, Y_TOTAL, R_START)
+        else:
+            _rope_per_position(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF,
+                               Y_TOTAL, R_START)
+    else:
+        _rope_per_position(desc_x, desc_cos, desc_sin, desc_o, H, MQ, HEAD_DIM, HALF,
+                           Y_TOTAL, R_START)
+
+
+@triton.jit
+def _rope_per_position(desc_x, desc_cos, desc_sin, desc_o,
+                       H: tl.constexpr, MQ: tl.constexpr,
+                       HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
+                       Y_TOTAL: tl.constexpr, R_START: tl.constexpr):
     # The x/out views over the worker-staged plane, `[rows*heads, hd]` — the full
     # TENSOR re-tiled (Y_TOTAL), so the row-windowed tile corners stay in bounds.
     # The cos/sin views are the same-bytes head-replicated tables, `[tbl_rows*H,
@@ -97,3 +129,31 @@ def rope_fwd(desc_x, desc_cos, desc_sin, desc_o,
         # the first, which is `cat(-x2, x1)` written out.
         o_desc.store([offs_m, 0], x1 * c - x2 * s)
         o_desc.store([offs_m, HALF], x2 * c + x1 * s)
+
+
+@triton.jit
+def _rope_per_head(desc_x, desc_cos, desc_sin, desc_o,
+                   H: tl.constexpr, MQ: tl.constexpr,
+                   HEAD_DIM: tl.constexpr, HALF: tl.constexpr):
+    # PER HEAD, over the plane as it is: `[MQ, H * HEAD_DIM]`, one `[MQ, HALF]` tile per head
+    # half. Same bytes as the tall view (row p, column h*HEAD_DIM + d is tall row p*H + h,
+    # column d), and the cos/sin tables are the same head-replicated bytes, so each head's
+    # tiles read its own angles. The door reads this form as `mq = v_rows`, `hd = 2 * c_len`,
+    # `heads = v_cols / hd` off x's view and first tile.
+    width = H * HEAD_DIM
+    x_desc = tl.make_tensor_descriptor(desc_x, shape=[MQ, width], strides=[width, 1],
+                                       block_shape=[MQ, HALF])
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[MQ, width], strides=[width, 1],
+                                       block_shape=[MQ, HALF])
+    cos_desc = tl.make_tensor_descriptor(desc_cos, shape=[MQ, width], strides=[width, 1],
+                                         block_shape=[MQ, HALF])
+    sin_desc = tl.make_tensor_descriptor(desc_sin, shape=[MQ, width], strides=[width, 1],
+                                         block_shape=[MQ, HALF])
+    for h in tl.range(0, H, 1):
+        col = h * HEAD_DIM
+        x1 = x_desc.load([0, col])
+        x2 = x_desc.load([0, col + HALF])
+        c = cos_desc.load([0, col])
+        s = sin_desc.load([0, col])
+        o_desc.store([0, col], x1 * c - x2 * s)
+        o_desc.store([0, col + HALF], x2 * c + x1 * s)
