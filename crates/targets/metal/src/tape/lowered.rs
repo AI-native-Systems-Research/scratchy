@@ -1452,8 +1452,10 @@ const _: () = assert!(cfg!(target_endian = "little"));
 impl<const N: usize> TapeBytes<N> {
     /// The `len` command indices at byte `at`.
     pub const fn command_ixs(&'static self, at: usize, len: usize) -> &'static [CommandIx] {
+        // `len <= (N - at) / 2`, not `at + 2 * len <= N`: the sum can wrap (`len = 1 << 63`) in a
+        // build without overflow checks, and pass.
         assert!(
-            at.is_multiple_of(2) && at + 2 * len <= N,
+            at.is_multiple_of(2) && at <= N && len <= (N - at) / 2,
             "command indices outside the tape bytes"
         );
         // SAFETY: `at..at + 2 * len` is in bounds and 2-aligned (asserted, in an `align(2)` array);
@@ -1464,7 +1466,7 @@ impl<const N: usize> TapeBytes<N> {
 
     /// The `len` fences at byte `at`. A byte that is no [`Fence`] fails the build.
     pub const fn fences(&'static self, at: usize, len: usize) -> &'static [Fence] {
-        assert!(at + len <= N, "fences outside the tape bytes");
+        assert!(at <= N && len <= N - at, "fences outside the tape bytes");
         let mut i = 0;
         while i < len {
             assert!(
@@ -1480,7 +1482,7 @@ impl<const N: usize> TapeBytes<N> {
 
     /// The `len` flags at byte `at`. A byte that is no `bool` fails the build.
     pub const fn flags(&'static self, at: usize, len: usize) -> &'static [bool] {
-        assert!(at + len <= N, "flags outside the tape bytes");
+        assert!(at <= N && len <= N - at, "flags outside the tape bytes");
         let mut i = 0;
         while i < len {
             assert!(self.0[at + i] <= 1, "a tape byte that is no bool");
@@ -1488,6 +1490,32 @@ impl<const N: usize> TapeBytes<N> {
         }
         // SAFETY: in bounds (asserted); every byte is 0 or 1 (asserted), a `bool`.
         unsafe { std::slice::from_raw_parts(self.0.as_ptr().add(at).cast(), len) }
+    }
+}
+
+#[cfg(test)]
+mod tape_bytes_tests {
+    use super::*;
+
+    static BYTES: TapeBytes<6> = TapeBytes([1, 0, 2, 0, 2, 1]);
+
+    #[test]
+    fn views_read_what_the_bake_wrote() {
+        assert_eq!(BYTES.command_ixs(0, 2), [CommandIx(1), CommandIx(2)]);
+        assert_eq!(BYTES.fences(4, 1), [Fence::Coherent]);
+        assert_eq!(BYTES.flags(5, 1), [true]);
+    }
+
+    /// A length whose byte count wraps `usize` is refused, not turned into a slice past the end.
+    #[test]
+    fn a_wrapping_length_is_refused() {
+        for view in [
+            (|| _ = BYTES.command_ixs(0, 1 << (usize::BITS - 1))) as fn(),
+            || _ = BYTES.fences(1, usize::MAX),
+            || _ = BYTES.flags(1, usize::MAX),
+        ] {
+            assert!(std::panic::catch_unwind(view).is_err());
+        }
     }
 }
 
