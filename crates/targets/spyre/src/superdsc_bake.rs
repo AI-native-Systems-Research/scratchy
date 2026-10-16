@@ -54,6 +54,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use scratchy_spyre_bundle::correction;
+// The dxp-group descriptor ceiling — ONE const, owned by the leaf crate beside the window-chunk
+// split that targets it (re-exported from `lower_subtile_tape_to_superdsc` under this same name
+// for the emission's own paths). See its doc in `sdsc_abstract` for 4204's measured pedigree.
+use ktir_superdsc::sdsc_abstract::DxGroupCeiling;
 
 use crate::dxp_cache::{DxpCache, DxpIdentity, GroupDigest};
 
@@ -1806,6 +1810,125 @@ pub struct BakeStats {
     pub disk_hits: usize,
 }
 
+/// ⛔ THE BAKE BUDGET — the counts a superdsc bake REFUSES past, so a minutes-scale bake stays
+/// minutes-scale by structure instead of by nobody having regressed it yet.
+///
+/// The granite-2b fp8 bake regressed 600 s → 1437 s with no single defect: the emission ladder
+/// grew to 33 emit closures (223 bundles, 1004 launch groups, 484 MB staged, 292,410,880 device
+/// bytes — probe 2026-10-14, the run the emitter fan-out fixes) and every closure ran on ONE host
+/// thread while the 32-wide dxp queue idled underneath. The fan-out fixes the threading; these
+/// ceilings are the other half — a bake whose counts blow past the envelope the fan-out was sized
+/// against is a BUILD ERROR naming its measured counts, not a bake that silently takes half an
+/// hour. That envelope is the POST-rewrite one: the prefill continuation-arm rewrite
+/// (`perf/spyre-prefill-512-main`) bakes a WIDER ladder (384/512 rungs plus a 512-row
+/// prefix-capable bundle — 2b fp16: 231 bundles, 2052 launch groups, 277 MB device code, 645 s
+/// serial on nickm2), so every density below names the leg it was measured on. Three keys, each
+/// enforced at the grain where it is decided:
+///
+/// - PER GROUP (descriptors): `DxGroupCeiling::MAX_DESCRIPTORS` — the leaf crate's one const,
+///   re-exported beside the emission it bounds (in `lower_subtile_tape_to_superdsc`) and enforced
+///   in that crate's `ktir_groups_via_superdsc`, where the rendered groups exist.
+///   A group is the unit dxp compiles, and its cost is SUPERLINEAR in size (8,300 descriptors ≈
+///   2.5 h; 4,183 ≈ 57 min ⇒ exponent ≈ 1.4), so one oversized group sets the whole bake's span.
+/// - PER BUNDLE (descriptors, trips): `MAX_BUNDLE_DESCRIPTORS` / `MAX_BUNDLE_TRIPS`, enforced in
+///   the same function, where `sdsc_ops` is complete. A bundle is the unit the emitter fans out,
+///   so the widest bundle is the wave's critical path; TRIPS (Σ `EmittedOp::time`), not
+///   descriptors, are what mint/render/dxp-input cost, and a handful of descriptors with a large
+///   `time` is indistinguishable from many descriptors unless both are bounded.
+/// - PER MODEL (launch groups): `MAX_GROUPS_PER_LAYER`, enforced at the emit's drain. The dxp
+///   floor is total compile cost ÷ [`COMPILE_WIDTH`], so group COUNT is the multiplication lever
+///   — a ladder that doubles its rungs doubles the floor, which no parallelism recovers. Scaled
+///   per layer because the models in scope span the measured 25 groups/layer (granite-2b, 40
+///   layers, 1004 groups) to 73 (gemma-4-12b, 48 layers, 3490 groups): a flat ceiling tight
+///   enough to hold the 2b refuses the 12b.
+///
+/// No wall clock anywhere in the build: time is evidence in the PR body, counts are the law.
+/// Moving any of these is a MEASURED decision that names the bake it was measured on, never a
+/// silent one — every refusal prints the measured value beside its ceiling, so the move is a
+/// one-line edit against a number the build itself reported.
+pub struct BakeBudget;
+
+impl BakeBudget {
+    /// 16,384 lowered descriptors in ONE bundle. MEASURED envelope: the 2b fp8 bake's widest
+    /// bundle is ~2,000 trip-files (fp `c29fb27f2e6c8c85`, 22.7 MB staged, 5 groups — probe
+    /// 2026-10-14), while the dense gemma-4-12b runs ~54 bundles whose group dirs total 202,189
+    /// descriptor files (2026-10-05) and whose widest bundle carries the 8,300-descriptor mq=32
+    /// class-0 fold — which the window-chunk split re-partitions into ≤2,123-descriptor GROUPS
+    /// without shrinking the bundle's own total. The prefill continuation-arm rewrite only
+    /// shrinks this axis (the 2b's prefix-capable top body dropped to 11 groups), so the
+    /// post-rewrite envelope is inside the pre-rewrite one. ⚠️ PROVISIONAL: the full
+    /// gemma-4-26b MoE has never been card-baked at merged main, and MoE route/expert/gather
+    /// was 72.5% of even tiny26's 29,887 descriptors — its first bake either fits with room or
+    /// refuses printing this bundle's measured count, which is the calibration.
+    pub const MAX_BUNDLE_DESCRIPTORS: usize = 16_384;
+
+    /// 65,536 trips in ONE bundle (`Σ EmittedOp::time`). Same envelope as
+    /// [`Self::MAX_BUNDLE_DESCRIPTORS`] with the time-tiling headroom on top: the 2b's widest
+    /// bundle carries ~2,066 trips and the 12b's fold bundle ≥ 8,300. Trips are what the mint,
+    /// the ONE shared render, and the dxp-input files each cost — a bundle past this ceiling is
+    /// the wave's critical path blowing up, not a slow compile to wait out. Same provisional
+    /// status and the same calibration rule as the descriptor ceiling.
+    pub const MAX_BUNDLE_TRIPS: u64 = 65_536;
+
+    /// 256 launch groups per MODEL layer, checked once per `#[forward]` expansion at the drain.
+    /// MEASURED densities: granite-2b 25.1 groups/layer at the probe's fp8 bake (1004 groups /
+    /// 40 layers), 51.3 POST-rewrite on the fp16 leg (2052 / 40 — the 384/512 ladder plus the
+    /// prefix-capable rung, `perf/spyre-prefill-512-main`), dense gemma-4-12b fp8 72.7
+    /// (3490 / 48). The ceiling holds ~5× the post-rewrite 2b's density and ~3.5× the 12b's —
+    /// headroom for the rope whole-chunk rewrite to move the 2b again, not room for a ladder
+    /// rung to double. ⚠️ PROVISIONAL: the full gemma-4-26b (30 layers × 128 experts) is
+    /// unmeasured; tiny26's MoE routing alone was 46–70% of every bundle, so its density lands
+    /// somewhere above the dense models' and its first bake calibrates this the same way — by
+    /// refusing with the measured count if it must.
+    pub const MAX_GROUPS_PER_LAYER: usize = 256;
+
+    /// The per-BUNDLE budget verdict — `Err` carries the refusal verbatim, for
+    /// `ktir_groups_via_superdsc` to return as the bundle's `Err` (fatal at a primary body,
+    /// the documented rung-skip on a ladder rung). `trips` is `Σ EmittedOp::time` over the
+    /// bundle's minted ops; `descriptors` is their count.
+    ///
+    /// ⛔ `>`, NOT `>=`: the granite-8b fp8 baseline's own largest group sits AT the group
+    /// ceiling below and its accepted bake must keep passing — a boundary bundle is lawful,
+    /// a past-boundary one is the blow-up. Same law here.
+    pub fn bundle_verdict(fp: &str, descriptors: usize, trips: u64) -> Result<(), String> {
+        if descriptors > Self::MAX_BUNDLE_DESCRIPTORS || trips > Self::MAX_BUNDLE_TRIPS {
+            return Err(format!(
+                "{fp}: {descriptors} lowered descriptor(s) over {trips} trip(s) is PAST THE BAKE \
+                 BUDGET of {} descriptors / {} trips per bundle. A bundle is the unit the \
+                 emitter runs concurrently, so this is the bake's critical path blowing up — \
+                 not a slow compile to wait out. Moving the budget is a measured decision that \
+                 names the bake; this refusal is the measurement.",
+                Self::MAX_BUNDLE_DESCRIPTORS,
+                Self::MAX_BUNDLE_TRIPS,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The per-GROUP verdict — the bake-side oversized-dxp-group guard the leaf crate's
+    /// `DxGroupCeiling` doc promises for `ktir_groups_via_superdsc`. `descriptors` is the
+    /// group's rendered trip count (one `sdsc_{li}.json` per trip). `Err` carries the refusal
+    /// verbatim.
+    ///
+    /// ⛔ `>`, NOT `>=` — 4204 IS the granite-8b baseline's largest measured group: the accepted
+    /// bake must keep passing at exactly the ceiling.
+    pub fn group_verdict(fp: &str, group: u32, descriptors: usize) -> Result<(), String> {
+        if descriptors > DxGroupCeiling::MAX_DESCRIPTORS {
+            return Err(format!(
+                "{fp}: launch group {group} carries {descriptors} descriptor(s), PAST THE \
+                 DXP-GROUP CEILING of {}. Group cost is superlinear in size — this is the \
+                 multi-hour compile that looks like a hang — and the gathered-fold window \
+                 split should have kept every fold under the ceiling, so a group this large \
+                 is a non-fold kind the split cannot touch or a split that stopped short. \
+                 Moving the ceiling is a measured decision that names the bake; this refusal \
+                 is the measurement.",
+                DxGroupCeiling::MAX_DESCRIPTORS,
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// ⛔ THE ZOMBIE REGRESSION TESTS — a leak that is COUNTED, so the test counts it.
 ///
 /// Each asks the one question the process table answers: after the teardown under test, is the child
@@ -2058,5 +2181,86 @@ mod tests {
         assert!(out.status.success(), "`true` must exit 0");
         assert!(!still_ours(pid), "a waited leader must already be reaped");
         assert!(reaper.inner().live.is_empty(), "the guard must deregister");
+    }
+
+    /// ⛔ THE GROUP BOUNDARY IS `>`, NOT `>=` — 4204 IS the granite-8b fp8 baseline's own largest
+    /// measured group, the very bake `DxGroupCeiling::MAX_DESCRIPTORS` was calibrated on, so a
+    /// group AT the ceiling is an accepted bake and refusing it would break the constant's own
+    /// pedigree. One past it refuses, naming the bundle, the group, and both counts — the
+    /// refusal IS the calibration measurement for whoever moves the constant next.
+    #[test]
+    fn a_group_at_the_ceiling_passes_and_one_past_it_refuses_naming_both() {
+        let at = DxGroupCeiling::MAX_DESCRIPTORS;
+        assert!(
+            BakeBudget::group_verdict("4f460f8b68a6c85a", 1, at).is_ok(),
+            "the granite-8b baseline's own largest group is lawful at exactly the ceiling"
+        );
+        let err = BakeBudget::group_verdict("4f460f8b68a6c85a", 1, at + 1).unwrap_err();
+        assert!(
+            err.contains("4f460f8b68a6c85a"),
+            "must name the bundle: {err}"
+        );
+        assert!(err.contains("launch group 1"), "must name the group: {err}");
+        assert!(
+            err.contains(&format!("carries {} descriptor(s)", at + 1)),
+            "must name the measured count: {err}"
+        );
+        assert!(
+            err.contains(&format!("of {at}")),
+            "must name the ceiling: {err}"
+        );
+    }
+
+    /// Same law on the per-BUNDLE axes: a bundle at BOTH ceilings is lawful (the measured
+    /// envelope — the 2b's widest at ~2,066 trips, the 12b's fold bundle at ≥ 8,300 — sits well
+    /// inside), one past EITHER axis refuses naming the bundle, the measured counts, and the
+    /// ceilings it blew past.
+    #[test]
+    fn a_bundle_at_the_budget_passes_and_one_past_either_axis_refuses() {
+        assert!(
+            BakeBudget::bundle_verdict(
+                "c29fb27f2e6c8c85",
+                BakeBudget::MAX_BUNDLE_DESCRIPTORS,
+                BakeBudget::MAX_BUNDLE_TRIPS,
+            )
+            .is_ok()
+        );
+
+        let err = BakeBudget::bundle_verdict(
+            "c29fb27f2e6c8c85",
+            BakeBudget::MAX_BUNDLE_DESCRIPTORS + 1,
+            2_066,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("c29fb27f2e6c8c85"),
+            "must name the bundle: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "{} lowered descriptor(s) over 2066 trip(s)",
+                BakeBudget::MAX_BUNDLE_DESCRIPTORS + 1
+            )),
+            "must name the measured counts: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "of {} descriptors / {} trips per bundle",
+                BakeBudget::MAX_BUNDLE_DESCRIPTORS,
+                BakeBudget::MAX_BUNDLE_TRIPS
+            )),
+            "must name the ceilings: {err}"
+        );
+
+        let err =
+            BakeBudget::bundle_verdict("c29fb27f2e6c8c85", 12, BakeBudget::MAX_BUNDLE_TRIPS + 1)
+                .unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "over {} trip(s)",
+                BakeBudget::MAX_BUNDLE_TRIPS + 1
+            )),
+            "the trips axis refuses on its own: {err}"
+        );
     }
 }

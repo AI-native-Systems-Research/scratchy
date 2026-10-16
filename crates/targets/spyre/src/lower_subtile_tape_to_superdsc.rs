@@ -97,6 +97,14 @@ pub use ktir_superdsc::work::{
     stick_count,
 };
 
+// ⭐ THE DXP-GROUP DESCRIPTOR CEILING LIVES IN THE LEAF CRATE — in `sdsc_abstract`, beside the
+// emitter's window-chunk split that targets it — so the split decision and the bake-side
+// oversized-group guard (in `ktir_groups_via_superdsc` below) cannot each grow their own
+// constant. Re-exported here under the leaf's own name: a second divergent value would have to
+// be a NEW name in a file that already resolves this one. See `DxGroupCeiling`'s own doc for
+// the measured pedigree of 4204.
+pub use ktir_superdsc::sdsc_abstract::DxGroupCeiling;
+
 // ── EMIT-TIME CONSTANTS THAT USED TO BE ENVIRONMENT READS ───────────────────
 //
 // ⛔⛔⛔ THE EMITTER MUST NOT READ THE SHELL. `#[forward]` compiles
@@ -7336,6 +7344,17 @@ fn ktir_groups_via_superdsc(
         }
     } // pc:guards
 
+    // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────
+    //    A bundle is the unit the emitter fans out, so its counts bound BOTH the wave's critical
+    //    path and every serial path's per-bundle cost. Refused here, after the correctness guards
+    //    but before the render: a bundle past the budget costs nothing to refuse, and a bundle
+    //    that is also incorrect should name the correctness defect, not the size.
+    {
+        let trips: u64 = sdsc_ops.iter().map(|o| o.time.max(1) as u64).sum();
+        crate::superdsc_bake::BakeBudget::bundle_verdict(fp, sdsc_ops.len(), trips)
+            .map_err(SuperDscError)?;
+    }
+
     // ⭐ ONE RENDER, TWO CONSUMERS. `render_dxp_input` serialises every trip of the bundle, and it
     // is the dearest per-op emitter cost after the mint: the artifact dump below and the staging
     // loop below THAT each used to pay a FULL pass of it (the dump via `write_dxp_input`'s internal
@@ -7347,6 +7366,21 @@ fn ktir_groups_via_superdsc(
         let _pc = crate::pc::Pc::start("render");
         render_dxp_input(&sdsc_ops, fold).map_err(|e| SuperDscError(e.to_string()))?
     };
+
+    // ── THE BAKE BUDGET, PER GROUP (`BakeBudget::group_verdict`) ── the bake-side
+    //    oversized-dxp-group guard the leaf crate's `DxGroupCeiling` doc promises for THIS
+    //    function. A group is what dxp compiles and its cost is superlinear in size (8,300
+    //    descriptors ≈ 2.5 h, 4,183 ≈ 57 min), the emitter's window-chunk split already
+    //    re-partitions over-ceiling gathered folds, and the granite-8b baseline's own largest
+    //    group (4,204) sits AT the ceiling — so a group past it here is either a non-fold kind
+    //    the split cannot touch or a split that stopped short, and the bake refuses instead of
+    //    compiling for hours behind a build that looks hung. One `sdsc_{li}.json` file per
+    //    trip; `bundle.mlir` is the +1 that is not a descriptor.
+    for g in &rendered {
+        let descriptors = g.files.len() - 1;
+        crate::superdsc_bake::BakeBudget::group_verdict(fp, g.group, descriptors)
+            .map_err(SuperDscError)?;
+    }
 
     // ⭐ WHICH BUNDLE THE NEXT `GROUPS` LINE BELONGS TO. `launch_index` prints the group/trip totals
     // but takes no bundle identity, so six `GROUPS` lines in a build log are unattributable on their
