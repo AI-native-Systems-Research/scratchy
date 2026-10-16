@@ -927,9 +927,9 @@ fn stream_responses(
                             "status": status,
                             "output": final_output,
                             "usage": {
-                                "input_tokens": 0,
+                                "input_tokens": delta.usage.prompt_tokens,
                                 "output_tokens": output_tokens,
-                                "total_tokens": output_tokens,
+                                "total_tokens": delta.usage.prompt_tokens + output_tokens,
                             },
                             "temperature": temperature,
                             "top_p": top_p,
@@ -1400,5 +1400,51 @@ mod tests {
             StopParam::Multiple(v) => assert_eq!(v, vec!["END", "STOP"]),
             _ => panic!("expected multiple"),
         }
+    }
+
+    /// A streamed reply used to report `"input_tokens": 0`, whatever the prompt.
+    #[tokio::test]
+    async fn test_stream_reports_input_tokens() {
+        use http_body_util::BodyExt;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for (text, finish) in [("Hello", None), (" there.", Some(FinishReason::Stop))] {
+            tx.send(StreamDelta {
+                index: 0,
+                new_token_ids: vec![1],
+                text: Some(text.to_string()),
+                finish_reason: finish,
+                stop_reason: None,
+                logprobs: None,
+                tool_call_deltas: None,
+                reasoning: None,
+                usage: crate::engine::StreamUsage {
+                    prompt_tokens: 42,
+                    cached_tokens: 0,
+                },
+            })
+            .unwrap();
+        }
+        drop(tx);
+        let req: ResponsesRequest =
+            serde_json::from_str(r#"{"input": "say hello", "stream": true}"#).unwrap();
+        let body = stream_responses("r".into(), "m".into(), req, rx)
+            .into_response()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let completed: Value = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).unwrap())
+            .find(|e| e["type"] == "response.completed")
+            .expect("response.completed");
+        let usage = &completed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 42);
+        assert_eq!(usage["output_tokens"], 2);
+        assert_eq!(usage["total_tokens"], 44);
     }
 }
