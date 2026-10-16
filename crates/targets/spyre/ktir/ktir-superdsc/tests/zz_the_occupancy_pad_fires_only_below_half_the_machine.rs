@@ -9,7 +9,7 @@
 
 use ktir_superdsc::superdsc_opspec::MAX_CORES;
 use ktir_superdsc::work::{
-    bump_sticks_to_splittable, core_split, DeviceWidth, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES,
+    DeviceWidth, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES, bump_sticks_to_splittable, core_split,
 };
 
 const STICK: u32 = FP16_ELEMS_PER_STICK;
