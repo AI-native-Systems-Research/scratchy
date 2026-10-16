@@ -1719,7 +1719,7 @@ impl Executor {
                 "[sdsc-superdsc] seg-alloc seg{i}: bytes={} chunk0={:?} (padded total {})",
                 self.segment_bytes[i],
                 a.chunk0(),
-                a.total_size()
+                a.total_size().as_u64()
             );
         }
         for b in 0..self.weight_bank_bytes.len() {
@@ -1731,7 +1731,7 @@ impl Executor {
                 b + 1,
                 self.weight_bank_bytes[b],
                 a.chunk0(),
-                a.total_size()
+                a.total_size().as_u64()
             );
         }
 
