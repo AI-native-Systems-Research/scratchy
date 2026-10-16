@@ -6373,6 +6373,119 @@ pub fn attach_reroll(fp: &str, meta: bundle::RerollMeta<'static>) {
     }
 }
 
+/// ⛔⛔⛔ ONE SESSION ALLOCATES ONE MEMORY PLAN, AND THAT PLAN MUST HOLD EVERY BODY THE SESSION LAUNCHES.
+///
+/// A re-rolled body's session allocates each segment ONCE, at the extent ITS OWN bundle declares
+/// (`Executor::load` reads `code.layout.segment_bytes`), and then launches every sibling against those
+/// regions: the prefix, the suffix, the fused twin, and every ladder rung's body. Each sibling was
+/// emitted against its OWN layout. [`ladder_stages_one_layout`] holds a rung's host-staged activations
+/// to the ceiling's, but nothing held a rung's SEGMENT EXTENTS to the session's. They fit only because
+/// the ceiling was the widest chunk, and the widest chunk had the widest HBM scratches.
+///
+/// ⛔ MEASURED ON CARD, granite-3.1-2b fp16 (pod nickm), when that stopped being true. With the split-KV
+/// chunk's Kᵗ and V gathered into LX (the chunk's LX form in `ktir_superdsc::sdsc_abstract`), the
+/// 64-page ceiling keeps NO gather scratch in HBM, while a rung with a tail keeps HBM scratches the
+/// ceiling lacks:
+///   * with Kᵗ whole in HBM at the 12-page rung, its first step faults `RAS::PCI::BusFence` (0xa35e,
+///     "PCIe bus master fence"). The rung's dxp input was byte-identical, op by op, to the V-only
+///     build's, which runs that rung. Only the session's extents had changed.
+///   * with only Kᵗ's and V's 4-page tails in HBM, the 12- and 20-page rungs faulted `HMI=STORE` at
+///     `0x8dbf00`, `0x8dfb00` (12 pages) and `0x8ddb00` (20 pages). Those rungs lack the same extent;
+///     that form has not been re-run under this law.
+///
+/// So the session's extent is the high-water mark of everything it launches, segment by segment
+/// ([`session_segment_bytes`]), and it is decided here, at bake. A segment that would then outgrow one
+/// device region is a build `Err`. Over-allocating a segment is inert for every body that addresses
+/// less of it; under-allocating it is an address. Under this law the first case's 12-page rung runs,
+/// with replies byte-identical to the V-only build's: a 2,413-token prompt that decodes in that rung
+/// from its first step, and a 1,987-token one that crosses into it from the 8-page rung.
+pub fn cover_ladder_allocation(fp: &str) -> Result<(), String> {
+    let mut c = emitted()
+        .lock()
+        .map_err(|_| "the emit collector was poisoned by a panic".to_string())?;
+    let siblings: Vec<String> = c
+        .get(fp)
+        .ok_or_else(|| format!("bundle {fp} was never emitted"))?
+        .1
+        .as_ref()
+        .ok_or_else(|| format!("bundle {fp} has no layer loop attached, so no siblings to cover"))?
+        .siblings()
+        .map(str::to_string)
+        .collect();
+    let bodies = siblings
+        .iter()
+        .map(|s| {
+            c.get(s.as_str())
+                .map(|(b, _)| b.layout.segment_bytes)
+                .ok_or_else(|| format!("bundle {fp} names sibling {s}, which was never emitted"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let slot = c
+        .get_mut(fp)
+        .ok_or_else(|| format!("bundle {fp} was never emitted"))?;
+    let covered = session_segment_bytes(slot.0.layout.segment_bytes, bodies);
+    if let Some((seg, &bytes)) = covered
+        .iter()
+        .enumerate()
+        .find(|(_, b)| **b > bundle::MAX_SEGMENT_BYTES)
+    {
+        return Err(format!(
+            "bundle {fp}: covering its {} sibling(s) grows seg{seg} to {bytes} B, past the {} B one \
+             device region can hold",
+            siblings.len(),
+            bundle::MAX_SEGMENT_BYTES
+        ));
+    }
+    slot.0.layout.segment_bytes = covered;
+    Ok(())
+}
+
+/// The extents one session must allocate: each segment at the largest extent the session's own bundle
+/// or any body it launches declares. See [`cover_ladder_allocation`].
+pub fn session_segment_bytes<const N: usize>(
+    session: [u64; N],
+    bodies: impl IntoIterator<Item = [u64; N]>,
+) -> [u64; N] {
+    bodies.into_iter().fold(session, |mut acc, b| {
+        for (a, x) in acc.iter_mut().zip(b) {
+            *a = (*a).max(x);
+        }
+        acc
+    })
+}
+
+#[cfg(test)]
+mod session_allocation_tests {
+    use super::session_segment_bytes;
+
+    /// The card's case: the 64-page ceiling keeps its chunk gather in LX, so its intermediate segment
+    /// is SMALLER than a tail rung's, which keeps Kᵗ in HBM. The session must allocate the rung's.
+    #[test]
+    fn a_session_allocates_every_segment_at_the_widest_body_it_launches() {
+        let mib = 1u64 << 20;
+        let ceiling = [9 * mib, 2_500 * mib, 128, 800 * 1024, 100 * 1024, 0, 0];
+        let tail_rung = [12 * mib, 2_500 * mib, 128, 790 * 1024, 100 * 1024, 0, 0];
+        let narrow_rung = [8 * mib, 2_500 * mib, 128, 780 * 1024, 100 * 1024, 0, 4096];
+        let s = session_segment_bytes(ceiling, [tail_rung, narrow_rung]);
+        assert_eq!(
+            s,
+            [12 * mib, 2_500 * mib, 128, 800 * 1024, 100 * 1024, 0, 4096]
+        );
+        for body in [ceiling, tail_rung, narrow_rung] {
+            assert!(
+                body.iter().zip(&s).all(|(b, a)| b <= a),
+                "a body addresses past its session's allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_with_no_siblings_allocates_its_own_extents() {
+        let own = [1u64, 2, 3, 4, 5, 6, 7];
+        assert_eq!(session_segment_bytes(own, []), own);
+    }
+}
+
 /// Whether the EMITTED bundle `fp` carries a page-fold launch group — the very `KvShifts::page_fold`
 /// the runtime loads. Asked of the emitted bundle, not of the program it was emitted from: the
 /// attention expands inside [`emit_bundle`], and the fold flag is set by that expansion. `None` when

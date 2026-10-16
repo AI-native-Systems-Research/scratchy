@@ -11615,6 +11615,13 @@ fn dump_wavefront_mega(
                                                     },
                                                 },
                                             );
+                                            // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
+                                            // SIBLING IT LAUNCHES, not for itself alone: a rung whose
+                                            // scratch outgrows the ceiling's addresses past its segment.
+                                            if let Err(e) = superdsc::cover_ladder_allocation(&bfp)
+                                            {
+                                                panic!("[spyre-superdsc] {base}: {e}");
+                                            }
                                             // The prefill probe's rotary classes, from the SAME
                                             // bindings the wiring bakes its classes from — one
                                             // value law (`superdsc_rotary_kind`), two consumers
