@@ -1532,20 +1532,9 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // the rung as literals), so it belongs in a type — `sdsc_abstract::QueryRows<ROWS_ARE_REQUESTS>` —
     // and in the signatures that need it.
     //
-    // What survives is ONE perf gate: a decode batch must not split `mb` (the PT array holds the weight
-    // stationary and streams M through it, so an `mb` split reloads the weight per split and cancels the
-    // amortization batching exists to buy). That is a throughput/compatibility choice, not a statement
-    // about what a row means, and it is named accordingly. See `matmul/dims.rs` for the const-generic
-    // fix that removes even this.
-    let _prev_split_gate =
-        crate::ir::bridge::tiled_op_sdsc_op::matmul::set_split_mb_forbidden(rows_are_requests);
-    struct RestoreSplitGate(bool);
-    impl Drop for RestoreSplitGate {
-        fn drop(&mut self) {
-            crate::ir::bridge::tiled_op_sdsc_op::matmul::set_split_mb_forbidden(self.0);
-        }
-    }
-    let _restore_split_gate = RestoreSplitGate(_prev_split_gate);
+    // The one perf gate that outlived it here (a decode batch must not split `mb`) is gone as well: it
+    // was scoped to this lowering, the descriptors are built later in `emit_bundle`, so it never reached
+    // one, and the form it asked for measured slower on the card (`matmul/dims.rs`).
     // ⭐ THE LAYER STRUCTURE FIRST, because the layout needs it: a weight BANK boundary may only fall
     // on a LAYER boundary, and `compute_bundle_layout` is where the weight segment is packed. Same
     // tape, same `ComputeInput::External::per_layer` the walk below reads — collected once, here.
