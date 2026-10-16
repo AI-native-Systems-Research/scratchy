@@ -1506,16 +1506,26 @@ mod tape_bytes_tests {
         assert_eq!(BYTES.flags(5, 1), [true]);
     }
 
-    /// A length whose byte count wraps `usize` is refused, not turned into a slice past the end.
+    // A length whose byte count wraps `usize` is refused BY THE VIEW'S OWN CHECK, not turned into a
+    // slice past the end. The expected message matters: with overflow checks on (`cargo test`), a
+    // check that wraps panics too — on the overflow, which these then reject.
+
     #[test]
-    fn a_wrapping_length_is_refused() {
-        for view in [
-            (|| _ = BYTES.command_ixs(0, 1 << (usize::BITS - 1))) as fn(),
-            || _ = BYTES.fences(1, usize::MAX),
-            || _ = BYTES.flags(1, usize::MAX),
-        ] {
-            assert!(std::panic::catch_unwind(view).is_err());
-        }
+    #[should_panic(expected = "command indices outside the tape bytes")]
+    fn command_ixs_refuses_a_wrapping_length() {
+        _ = BYTES.command_ixs(0, 1 << (usize::BITS - 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "fences outside the tape bytes")]
+    fn fences_refuses_a_wrapping_length() {
+        _ = BYTES.fences(1, usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "flags outside the tape bytes")]
+    fn flags_refuses_a_wrapping_length() {
+        _ = BYTES.flags(1, usize::MAX);
     }
 }
 
