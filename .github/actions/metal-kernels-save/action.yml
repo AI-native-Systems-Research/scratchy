@@ -1,0 +1,26 @@
+name: Save compiled Metal kernels
+description: >-
+  Keep only the compiles this run used, and save them when the run compiled any
+  that the restored cache lacked: an unchanged set is not saved again, so the
+  repo's cache budget holds one copy per kernel change, not one per merge.
+  Pair with metal-kernels-restore; run on main only.
+inputs:
+  job:
+    description: The cache's key prefix, the same one metal-kernels-restore was given.
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: prune
+      shell: bash
+      run: |
+        find target/metal-kernel-cache -type f ! -newer "$RUNNER_TEMP/metal-kernels-restored" -delete
+        find target/metal-kernel-cache -type f | sort > "$RUNNER_TEMP/metal-kernels-after"
+        new=$(comm -13 "$RUNNER_TEMP/metal-kernels-before" "$RUNNER_TEMP/metal-kernels-after" | wc -l | tr -d ' ')
+        echo "compiled $new kernel batches the restored cache lacked"
+        echo "new=$new" >> "$GITHUB_OUTPUT"
+    - if: steps.prune.outputs.new != '0'
+      uses: actions/cache/save@v6
+      with:
+        path: target/metal-kernel-cache
+        key: metal-kernels-${{ inputs.job }}-${{ github.sha }}

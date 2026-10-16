@@ -296,6 +296,12 @@ jobs:
         with:
           key: macos-metal-clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The catalog's ~430 kernel batches are most of the bake's time; rust-cache
+      # drops the OUT_DIR they would otherwise be kept in. See `kernel_cache` in
+      # crates/targets/metal/src/aot.rs.
+      - uses: ./.github/actions/metal-kernels-restore
+        with:
+          job: clippy
 
       # Clippy is a superset of `cargo check`, so we run only clippy + test.
       # `turboquant` is on in every default `scr` build but not in
@@ -312,6 +318,11 @@ jobs:
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
+      - if: github.ref == 'refs/heads/main'
+        uses: ./.github/actions/metal-kernels-save
+        with:
+          job: clippy
+
   macos-metal-tests:
     name: macos-arm64 (metal tests)
     needs: macos-scope
@@ -326,6 +337,11 @@ jobs:
         with:
           key: macos-metal-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Every scratchy-models build below bakes its models' kernels; see the
+      # clippy job's step.
+      - uses: ./.github/actions/metal-kernels-restore
+        with:
+          job: tests
 
       # `all` is model stems only, so the macos-metal-clippy job never turns
       # `hf-completions` on and its build-script path (the huggingface.co query
@@ -540,9 +556,14 @@ jobs:
           --features e2e,metal,scratchy-models/llama-3.2-1b
           --test e_long_prompt_metal long_prompt_metal_chunked_matches_single_prefill -- --test-threads=1
 
-      # See the clippy job's last step.
+      # See the clippy job's lock step.
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
+
+      - if: github.ref == 'refs/heads/main'
+        uses: ./.github/actions/metal-kernels-save
+        with:
+          job: tests
 
   # The required check: the branch rules name `macos-arm64 (metal)`, so this
   # passes only when both macOS jobs did, or when macos-scope found nothing
