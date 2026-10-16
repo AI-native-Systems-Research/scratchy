@@ -5852,6 +5852,7 @@ mod tests {
     /// A real capability probe (mirrors what `NaxGemm::new`/`Batch::begin`
     /// actually need), not a guess from matching an error string after a
     /// dispatch already failed.
+    #[cfg(metal)]
     fn no_gpu_here() -> bool {
         use objc2_metal::MTLCreateSystemDefaultDevice;
         match MTLCreateSystemDefaultDevice() {
@@ -5863,6 +5864,7 @@ mod tests {
     /// True when there is no Metal device at all — for tests (library compile
     /// probes) that don't touch an MTL4 command queue, so [`no_gpu_here`]'s
     /// extra MTL4 check would be over-broad.
+    #[cfg(metal)]
     fn no_metal_device() -> bool {
         use objc2_metal::MTLCreateSystemDefaultDevice;
         MTLCreateSystemDefaultDevice().is_none()
@@ -5874,6 +5876,7 @@ mod tests {
     /// half-K miscompile would trip `verify_full_k` inside `new`). On a build without
     /// AOT (toolchain/flag unavailable) the runtime falls back to JIT and this test
     /// simply records that AOT is off — never a failure.
+    #[cfg(metal)]
     #[test]
     fn aot_active_matches_build_cfg() -> Result<(), String> {
         if NaxGemm::aot_active() != cfg!(metal_aot) {
@@ -5896,6 +5899,7 @@ mod tests {
     /// Minimal Metal Performance Primitives probe — confirms the M5 NAX
     /// toolchain (`mpp::tensor_ops::matmul2d` + the MPP framework include)
     /// compiles through our `objc2-metal` runtime as Metal 4.
+    #[cfg(metal)]
     const MPP_PROBE: &str = "\
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -5915,6 +5919,7 @@ kernel void mpp_probe(
 }
 ";
 
+    #[cfg(metal)]
     #[test]
     fn mpp_tensor_ops_compiles_as_metal4() -> Result<(), String> {
         if no_metal_device() {
@@ -5932,6 +5937,7 @@ kernel void mpp_probe(
     /// A = I, `B[k,n] = n` must yield `C[m,n] = n` (column mapping) and
     /// `B[k,n] = k` must yield `C[m,n] = m` (row mapping) — together these catch
     /// any cooperative-tensor axis swap or scramble in the BaseNAXFrag layout.
+    #[cfg(metal)]
     #[test]
     fn nax_matmul_tile_matches_oracle() -> Result<(), String> {
         // The `matmul2d` MPP cooperative-tensor kernel only builds on M5+ (the
@@ -6010,6 +6016,7 @@ kernel void mpp_probe(
     /// M/N/K that exercise the zero-pad edge guards and multi-tile K
     /// accumulation. Small-integer inputs are exact in f16, so we assert exact
     /// equality with the naive oracle.
+    #[cfg(metal)]
     #[test]
     fn nax_matmul_general_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6060,6 +6067,7 @@ kernel void mpp_probe(
     /// `KTIR_TRANSPOSE_B` pipeline (B staged from on-disk `[n,k]`) must equal the
     /// `A·Bᵀ` oracle. A wrong staging index would compute a plausible-but-wrong
     /// product the GPU-vs-CPU self-check can't catch, so we pin it to the oracle.
+    #[cfg(metal)]
     #[test]
     fn nax_matmul_unified_transpose_b_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6104,6 +6112,7 @@ kernel void mpp_probe(
 
     /// Same guard for the pre-NAX simdgroup "metal matmul" kernel (forced via
     /// `new_simdgroup`), so transpose-B is covered on non-M5 GPUs too.
+    #[cfg(metal)]
     #[test]
     fn simdgroup_matmul_unified_transpose_b_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6148,6 +6157,7 @@ kernel void mpp_probe(
     /// value is exactly an f16 value, so the staged tile is identical. Covers the decode
     /// narrow-N grid (m=1), a prefill width (m=19) and a full multi-block shape, over
     /// codes spanning sign, subnormals (exp 0) and the top exponent (NaN codes excluded).
+    #[cfg(metal)]
     #[test]
     fn nax_matmul_unified_fp8_b_is_bit_identical_to_f32_b() -> Result<(), String> {
         if no_gpu_here() {
@@ -6200,6 +6210,7 @@ kernel void mpp_probe(
     /// offset that is NOT page-aligned (an N-tile of a resident weight) — computes the
     /// same bits as an owned copy of that tile's codes, and is refused (never dispatched)
     /// once the resident generation it was minted under is retired.
+    #[cfg(metal)]
     #[test]
     fn a_borrowed_fp8_view_matches_its_owned_copy_and_dies_with_its_generation()
     -> Result<(), String> {
@@ -6268,6 +6279,7 @@ kernel void mpp_probe(
     /// within f16 tolerance — both plain (`A·B`) and transpose-B (`A·Bᵀ`). Also
     /// pins `has_f16_b_pipelines()` true on the simdgroup tier (the gate the GEMM
     /// resolver checks before handing the kernel an f16 B buffer).
+    #[cfg(metal)]
     #[test]
     fn simdgroup_matmul_unified_f16_b_matches_f32() -> Result<(), String> {
         if no_gpu_here() {
@@ -6344,6 +6356,7 @@ kernel void mpp_probe(
     /// exact) make `assert_eq` valid — the same construction the `nax_matmul_*`
     /// oracle tests use. The GEMV kernel is plain MSL (no MPP/`matmul2d`), so it
     /// runs on EVERY Apple GPU tier — no NAX gate needed; only the no-device skip.
+    #[cfg(metal)]
     #[test]
     fn metal_gemv_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6419,6 +6432,7 @@ kernel void mpp_probe(
     /// A batched matmul chain (one command buffer, one sync) computes the same
     /// result as the matmuls run separately, and amortizes the per-dispatch
     /// latency: a chain of N small matmuls should be far faster than N calls.
+    #[cfg(metal)]
     #[test]
     fn matmul_chain_matches_and_amortizes() -> Result<(), String> {
         if no_gpu_here() {
@@ -6513,6 +6527,7 @@ kernel void mpp_probe(
     /// matmul is compute-bound (K ≳ 512) — the real way to exploit a SPMD grid's
     /// many small matmuls on the GPU. Measured speedups: ~1.25× at K=512 up to
     /// ~1.74× at K=2048 (see the module bench).
+    #[cfg(metal)]
     #[test]
     fn combined_matmul_matches_and_wins() -> Result<(), String> {
         if no_gpu_here() {
@@ -6569,6 +6584,7 @@ kernel void mpp_probe(
 
     /// Zero-copy unified-memory matmul: correct, and free of the host↔device
     /// fill/readback the copy-based `run` pays (CPU and GPU share the bytes).
+    #[cfg(metal)]
     #[test]
     fn unified_matmul_zero_copy_matches_and_is_faster() -> Result<(), String> {
         if no_gpu_here() {
@@ -6620,6 +6636,7 @@ kernel void mpp_probe(
     /// A batched dispatch (independent same-shape GEMMs in one submission)
     /// matches running them separately. (For *shared*-weight matmuls,
     /// `run_combined` is the faster path — see `combined_matmul_matches_and_wins`.)
+    #[cfg(metal)]
     #[test]
     fn batched_matmul_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6656,6 +6673,7 @@ kernel void mpp_probe(
     /// The pre-M5 `simdgroup_float8x8` GEMM is correct across shapes (incl.
     /// ragged) and supports the same fused epilogue. Forced on the M5 so we can
     /// validate that code path here.
+    #[cfg(metal)]
     #[test]
     fn simdgroup_matmul_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6698,6 +6716,7 @@ kernel void mpp_probe(
 
     /// Fused matmul→elementwise epilogue (`D = act(A·B BINOP E)`) computed in one
     /// kernel matches doing the matmul then the elementwise op separately.
+    #[cfg(metal)]
     #[test]
     fn nax_matmul_fused_epilogue_matches_oracle() -> Result<(), String> {
         if no_gpu_here() {
@@ -6742,6 +6761,7 @@ kernel void mpp_probe(
 
     /// Random (non-f16-exact) data: the NAX GEMM agrees with the f32 oracle to
     /// f16 tolerance. Documents the precision the engine actually delivers.
+    #[cfg(metal)]
     #[test]
     fn nax_matmul_general_f16_tolerance() -> Result<(), String> {
         if no_gpu_here() {
@@ -6785,6 +6805,7 @@ kernel void mpp_probe(
     ///
     /// The remaining gap to NAX's true peak is the per-K-step staging+barrier
     /// tax — a double-buffered kernel (overlap load with compute) is the next win.
+    #[cfg(metal)]
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
     fn bench_nax_vs_blas() {
@@ -7230,6 +7251,7 @@ kernel void mpp_probe(
         );
     }
 
+    #[cfg(metal)]
     #[test]
     fn matmul_loop_gate_and_backend() {
         // Default 3M k·n threshold (env KTIR_GEMM_GPU_MIN_KN unset in test).
@@ -7262,6 +7284,7 @@ kernel void mpp_probe(
         assert!(matmul_loop_use_nax(2048, 128256)); // llama lm_head -> NAX
     }
 
+    #[cfg(metal)]
     #[test]
     fn reports_device_tier_on_real_gpu() {
         use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
