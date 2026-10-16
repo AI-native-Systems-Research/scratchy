@@ -3591,19 +3591,11 @@ dependencies = [
 name = "scratchy-forward-compiler-macro"
 version = "0.1.0"
 dependencies = [
- "aho-corasick",
- "getrandom 0.3.4",
- "hashbrown 0.17.1",
- "http",
- "httparse",
- "indexmap",
  "ktir-core",
  "ktir-superdsc",
- "memchr",
  "proc-macro2",
  "quote",
  "rayon",
- "regex-automata",
  "scratchy-forward-compiler",
  "scratchy-ir",
  "scratchy-subtile",
@@ -3611,9 +3603,7 @@ dependencies = [
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
  "scratchy-target-spyre",
- "serde_core",
  "serde_json",
- "smallvec",
  "syn 3.0.8",
  "tracing",
  "tracing-subscriber",
@@ -3648,12 +3638,20 @@ dependencies = [
 name = "scratchy-models"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
+ "getrandom 0.3.4",
  "half",
+ "hashbrown 0.17.1",
  "hf-hub-downloader",
+ "http",
+ "httparse",
+ "indexmap",
+ "memchr",
  "objc2-metal",
  "proc-macro2",
  "rayon",
+ "regex-automata",
  "scratchy-core-config",
  "scratchy-core-model",
  "scratchy-forward-compiler",
@@ -3665,9 +3663,12 @@ dependencies = [
  "scratchy-target-spyre",
  "scratchy-tensors",
  "scratchy-vision",
+ "serde_core",
  "serde_json",
  "sha2 0.11.0",
+ "smallvec",
  "tokenizers 0.23.2",
+ "tracing",
  "ureq 3.4.2",
 ]
 

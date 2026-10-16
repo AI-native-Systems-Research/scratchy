@@ -760,11 +760,34 @@ spyre-emu = ["spyre", "scratchy-forward-compiler-macro/spyre-emu"]
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
 # other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.
 turboquant = ["scratchy-forward-compiler-macro/turboquant"]
-# The binary's serving stack, mirrored on the build side so the stack this crate's build script
-# shares with the binary compiles once (see scratchy-forward-compiler-macro's `serve`).
-# `scratchy-cli` turns each on with its own.
-serve = ["scratchy-forward-compiler-macro/serve"]
-guided-decoding = ["scratchy-forward-compiler-macro/guided-decoding"]
+# ⭐ THE BUILD SIDE OF A SERVING BINARY, GIVEN THE BINARY'S FEATURES. This crate's build script
+# (and the forward macro it runs) links the same stack the binary does (target-metal,
+# forward-compiler, core-model, …), and cargo resolves the two sides' features apart. `serve`'s
+# HTTP stack (axum, hyper, tower) and `guided-decoding`'s llguidance (with the `tokenizers` 0.21
+# its toktrie pins) turn features on in shared crates nothing on the build side asks for; then
+# those crates differ between the sides, and every crate above them, ours included, compiles
+# twice. These ask for exactly those features through `[build-dependencies]` below, so each shared
+# crate resolves the same on both sides and compiles once. `scratchy-cli` turns each on with its
+# own; a build without them is unchanged.
+serve = [
+    "serde_json/raw_value",
+    "dep:tracing",
+    "dep:smallvec",
+    "dep:memchr",
+    "dep:http",
+    "dep:httparse",
+    "dep:serde_core",
+]
+guided-decoding = [
+    "serde_json/preserve_order",
+    # `preserve_order` brings these onto the build side; the binary has them with defaults
+    # (indexmap: llguidance, minijinja; hashbrown: scratchy-serving-scheduler).
+    "dep:indexmap",
+    "dep:hashbrown",
+    "dep:regex-automata",
+    "dep:aho-corasick",
+    "dep:getrandom",
+]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",
     "scratchy-forward-compiler/spyre",
@@ -825,6 +848,18 @@ rayon = { workspace = true }
 # `hf-completions`, so a build without that feature links no HTTP client into
 # the build script at all and cannot reach the network even by accident.
 ureq = { workspace = true, optional = true }
+# Named only for the features `serve` / `guided-decoding` give them (see there); no code uses them.
+tracing = { workspace = true, optional = true, features = ["log"] }
+smallvec = { version = "1", optional = true, features = ["const_generics", "const_new"] }
+memchr = { version = "2", optional = true }
+http = { version = "1", optional = true }
+httparse = { version = "1", optional = true }
+serde_core = { version = "1", optional = true }
+indexmap = { version = "2", optional = true }
+hashbrown = { version = "0.17", optional = true }
+regex-automata = { version = "0.4", optional = true, default-features = false, features = ["dfa", "nfa", "perf"] }
+aho-corasick = { version = "1", optional = true }
+getrandom = { version = "0.3", optional = true, default-features = false, features = ["wasm_js"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLDevice", "MTLResource"] }

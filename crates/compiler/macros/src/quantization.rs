@@ -799,10 +799,16 @@ fn parse_compressed_tensors(
                 field: "config_groups",
                 reason: "missing or not an object",
             })?;
-    let group = config_groups.values().next().ok_or(ParseError::BadField {
-        field: "config_groups",
-        reason: "empty — no quantization group declared",
-    })?;
+    // The group with the first name, not the map's first entry: a `serde_json::Map` iterates in
+    // file order when the build resolves serde_json with `preserve_order` (a serving build does)
+    // and sorted otherwise, and a checkpoint with two groups must quantize the same in both.
+    let (_, group) =
+        (config_groups.iter())
+            .min_by_key(|(name, _)| *name)
+            .ok_or(ParseError::BadField {
+                field: "config_groups",
+                reason: "empty — no quantization group declared",
+            })?;
     let weights = group.get("weights").ok_or(ParseError::BadField {
         field: "config_groups.*.weights",
         reason: "missing weights spec",

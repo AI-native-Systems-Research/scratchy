@@ -1346,6 +1346,15 @@ pub fn load_gguf_spec(dir: &Path) -> Result<Option<GgufSpec>, ConfigError> {
             }
         }
     }
+    // Sorted by key, as `bits_overrides` is. These lists are emitted in order, and a
+    // `serde_json::Map` iterates in file order when the build resolves serde_json with
+    // `preserve_order` (a serving build does) and sorted otherwise: sorted, every build expands
+    // the same bytes.
+    spec.tensor_renames.sort();
+    spec.metadata_u32.sort();
+    spec.metadata_f32.sort();
+    spec.metadata_defaults_u32.sort();
+    spec.metadata_defaults_f32.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(Some(spec))
 }
 
