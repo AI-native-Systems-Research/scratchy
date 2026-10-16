@@ -84,9 +84,30 @@ fn baked_sources() -> &'static Path {
     })
 }
 
-/// Compile `source` — including from [`baked_sources`] — with `flags` to a metallib; empty on a
-/// host with no Metal toolchain (only the metal backend reads it).
-fn compile_metallib(name: &str, source: &str, flags: &[&str]) -> Vec<u8> {
+/// ⭐ A BAKE COMPILE'S WHOLE COMMAND: the `xcrun` argument lists that compile `<name>.metal` to
+/// `<name>.metallib` in the compile's directory — `metal` with `flags`, including from the
+/// directory's `src` link to [`baked_sources`], then `metallib`. [`bake`] hashes exactly these
+/// lists into the compile's name and [`compile_metallib`] runs exactly these, so no argument can
+/// reach a compile without reaching its key: a change to one is a new kept compile, never an old.
+///
+/// Every path is relative to the compile's directory, so the lists name nothing of the build that
+/// runs them, and identical compiles share a name across builds.
+fn compile_commands(name: &str, flags: &[&str]) -> [Vec<String>; 2] {
+    let (src, air) = (format!("{name}.metal"), format!("{name}.air"));
+    let metal = (["-sdk", "macosx", "metal", "-O3", "-c", "-I", "src"].iter())
+        .chain(flags)
+        .map(|arg| arg.to_string())
+        .chain([src, "-o".into(), air.clone()])
+        .collect();
+    let metallib = (["-sdk", "macosx", "metallib"].map(String::from).into_iter())
+        .chain([air, "-o".into(), format!("{name}.metallib")])
+        .collect();
+    [metal, metallib]
+}
+
+/// Run `commands` ([`compile_commands`] of `name`) on `source`, including from [`baked_sources`],
+/// to a metallib; empty on a host with no Metal toolchain (only the metal backend reads it).
+fn compile_metallib(name: &str, source: &str, commands: &[Vec<String>; 2]) -> Vec<u8> {
     let host_os =
         std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| std::env::consts::OS.to_string());
     if host_os != "macos" {
@@ -97,32 +118,24 @@ fn compile_metallib(name: &str, source: &str, flags: &[&str]) -> Vec<u8> {
     let tmp_dir = std::env::temp_dir().join(format!("scratchy-bake-{name}-{pid}-{seq}"));
     std::fs::create_dir_all(&tmp_dir)
         .and_then(|()| std::fs::write(tmp_dir.join(format!("{name}.metal")), source))
+        .and_then(|()| std::os::unix::fs::symlink(baked_sources(), tmp_dir.join("src")))
         .unwrap_or_else(|e| panic!("bake: write {}: {e}", tmp_dir.display()));
     // The compiler runs INSIDE `tmp_dir` on BARE file names and without `-frecord-sources`, whose
     // source archive records the working directory: no build-specific path reaches the bytes, so
     // identical inputs bake identical metallibs.
-    let run = |tool: &str, args: &[&str]| {
+    for args in commands {
         let status = Command::new("xcrun")
             .current_dir(&tmp_dir)
-            .args(["-sdk", "macosx", tool])
             .args(args)
             .status()
-            .unwrap_or_else(|e| panic!("bake: spawn xcrun {tool}: {e}"));
+            .unwrap_or_else(|e| panic!("bake: spawn xcrun {args:?}: {e}"));
         assert!(
             status.success(),
-            "bake: `xcrun {tool}` failed for `{name}` (in {tmp_dir:?})"
+            "bake: `xcrun {args:?}` failed for `{name}` (in {tmp_dir:?})"
         );
-    };
-    let include = baked_sources().to_str().expect("a UTF-8 bake source dir");
-    let (src, air) = (format!("{name}.metal"), format!("{name}.air"));
-    let lib = format!("{name}.metallib");
-    let mut args = vec!["-O3", "-c", "-I", include];
-    args.extend(flags);
-    args.extend([src.as_str(), "-o", air.as_str()]);
-    run("metal", &args);
-    run("metallib", &[air.as_str(), "-o", lib.as_str()]);
-    let bytes = std::fs::read(tmp_dir.join(&lib))
-        .unwrap_or_else(|e| panic!("bake: read {}: {e}", tmp_dir.join(&lib).display()));
+    }
+    let lib = tmp_dir.join(format!("{name}.metallib"));
+    let bytes = std::fs::read(&lib).unwrap_or_else(|e| panic!("bake: read {}: {e}", lib.display()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     bytes
 }
@@ -201,10 +214,13 @@ pub fn bake(keys: &[PipelineKey]) -> Bake {
             let source = batch_source(library, batch);
             let mut flags = vec!["-Wno-modules-import-nested-redundant"];
             flags.extend(MPP_FLAGS.iter().copied().filter(|_| lib.mpp));
+            // Not `<library>.metal`: the source includes that file, and would find itself first.
+            let name = format!("{library}-batch");
+            let commands = compile_commands(&name, &flags);
             let inputs = [toolchain(), &source, &format!("{:016x}", sources_hash())];
             let hash = fnv(inputs
                 .into_iter()
-                .chain(flags.iter().copied())
+                .chain(commands.iter().flatten().map(String::as_str))
                 .map(str::as_bytes));
             let cell = (BAKED.get_or_init(Mutex::default).lock().unwrap())
                 .entry(hash)
@@ -212,7 +228,7 @@ pub fn bake(keys: &[PipelineKey]) -> Bake {
                 .clone();
             let metallib = cell.get_or_init(|| {
                 compiled.fetch_add(1, Ordering::Relaxed);
-                kept_compile(hash, library, &source, &flags).into()
+                kept_compile(hash, &name, &source, &commands).into()
             });
             let entries = batch.iter().enumerate().map(|(i, (key, _))| {
                 let entry = format!("k{i}::{}", key.kernel_name);
@@ -420,12 +436,13 @@ fn toolchain() -> &'static str {
     })
 }
 
-/// The compile of `source` with `flags`, whose inputs hash to `hash` — of every input: the Metal
-/// toolchain, the source, its flags and every file it can include. In a build (`OUT_DIR`) it is
-/// kept under that hash in [`kernel_cache`], so any build that changed none of them reads it back
-/// instead of compiling it again. A hit marks the file used (its mtime): CI keeps the compiles a
-/// run used, and prunes the rest.
-fn kept_compile(hash: u64, library: &str, source: &str, flags: &[&str]) -> Vec<u8> {
+/// The compile of `source` by `commands` ([`compile_commands`] of `name`), whose inputs hash to
+/// `hash` — of every input: the Metal toolchain, the source, every file it can include, and the
+/// whole command lines that run. In a build (`OUT_DIR`) it is kept under that hash in
+/// [`kernel_cache`], so any build that changed none of them reads it back instead of compiling it
+/// again. A hit marks the file used (its mtime): CI keeps the compiles a run used, and prunes the
+/// rest.
+fn kept_compile(hash: u64, name: &str, source: &str, commands: &[Vec<String>; 2]) -> Vec<u8> {
     let kept = std::env::var_os("OUT_DIR")
         .map(|out| kernel_cache(Path::new(&out)).join(format!("batch-{hash:016x}.metallib")));
     if let Some(path) = &kept
@@ -438,8 +455,7 @@ fn kept_compile(hash: u64, library: &str, source: &str, flags: &[&str]) -> Vec<u
             .unwrap_or_else(|e| panic!("bake: mark {} used: {e}", path.display()));
         return bytes;
     }
-    // Not `<library>.metal`: the source includes that file, and would find itself first.
-    let bytes = compile_metallib(&format!("{library}-batch"), source, flags);
+    let bytes = compile_metallib(name, source, commands);
     if let Some(path) = kept {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
