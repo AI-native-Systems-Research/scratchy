@@ -24,9 +24,11 @@
 //! * [`ModelAttnGeometry`] is the VALUE side — the geometry as the tape carries it, minted once
 //!   from the config numbers with the GQA divisibility proven at the mint, so no consumer
 //!   downstream re-derives or re-checks a group size.
-//! * [`with_config_attn_geometry`] / [`with_config_head_dim`] are the DOORS — the only places a
+//! * `with_config_attn_geometry` / [`with_config_head_dim`] are the DOORS — the only places a
 //!   geometry value becomes a const, with the arms the build script generated. Same shape as
-//!   `sdsc_abstract::with_baked_rung`, which is the decode ladder's door.
+//!   `sdsc_abstract::with_baked_rung`, which is the decode ladder's door. The attention-geometry
+//!   door hands its body the SuperDSC emitter's `AttnGeometry` witness, so it compiles under
+//!   `spyre` only; the head-dim door and the value side compile on every target.
 
 // The build script's output: `GEOMETRY_SOURCE_STEMS` plus the two callback macros
 // `for_each_config_attn_geometry!` / `for_each_config_head_dim!`, whose bodies are the literals it
@@ -194,7 +196,8 @@ pub fn with_config_attn_geometry<C: OnAttnGeometry>(
 }
 
 /// What a head-dim-parameterised lowering runs once its head dim is a const — the consumer side of
-/// [`with_config_head_dim`], and the same discipline as [`OnAttnGeometry`].
+/// [`with_config_head_dim`], and the same discipline as `OnAttnGeometry` (the attention-geometry
+/// door's, under `spyre`).
 pub trait OnHeadDim {
     /// What the dispatch produces.
     type Out;

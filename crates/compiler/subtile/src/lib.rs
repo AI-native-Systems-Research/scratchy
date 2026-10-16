@@ -30,7 +30,8 @@ pub mod lower;
 /// `lower_subtile_tape_to_sengraph` peer was DELETED — sengraph is a dead end.)
 /// The model's head geometry as types, and the two value→const doors whose arms the build script
 /// generated from `crates/models/arch/*/configs/*.json`. Always compiled: the tape carries a
-/// [`model_geometry::ModelAttnGeometry`] on every attention node, whatever the target.
+/// [`model_geometry::ModelAttnGeometry`] on every attention node, whatever the target. Except the
+/// attention-geometry door, whose body takes the SuperDSC emitter's witness: it is `spyre`-only.
 pub mod model_geometry;
 pub mod subtile_ir;
 // ⭐ THE SuperDSC DEVICE FACTS, FROM THE `ktir-superdsc` LEAF CRATE: the typed SuperDSC IR
