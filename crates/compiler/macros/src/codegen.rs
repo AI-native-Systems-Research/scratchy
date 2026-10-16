@@ -12961,13 +12961,20 @@ fn dump_wavefront_mega(
         // ⛔ AND IT IS CARD-ONLY TOO: it is reached through `prefill_prefix`, which
         // `spyre_forward.rs:1641` reads under `spyre-hw` alone. An emulator build baked this whole
         // extra model and could never launch it.
+        // ⛔ AT THE WIDEST RUNG WITHIN THE RESIDENT CACHE, NOT THE LADDER'S CEILING — its attention
+        // program unrolls per row, so its compile grows with `mq²` and never finished at 512 rows. See
+        // `PagedKvPool::prefix_capable_rows`.
+        let baked_rungs: Vec<u32> = superdsc_prefill_rungs
+            .borrow()
+            .iter()
+            .map(|(m, _)| *m)
+            .collect();
         if sendnn_superdsc
             && cfg!(feature = "spyre-hw")
-            && let Some(top) = superdsc_prefill_rungs
-                .borrow()
-                .iter()
-                .map(|(m, _)| *m)
-                .max()
+            && let Some(top) = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_capable_rows(
+                &baked_rungs,
+                prefix_len.get(),
+            )
         {
             match crate::to_wavefront::lower_decode_to_wavefront(
                 fuf,

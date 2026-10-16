@@ -177,6 +177,28 @@ fn a_short_last_chunk_maps_no_page_past_its_real_rows() {
     assert_eq!(phys(&map), vec![10, 11, 12, 13]);
 }
 
+/// ⭐ THE PREFIX-CAPABLE BUNDLE STAYS WITHIN THE RESIDENT CACHE WHILE THE LADDER REACHES THE WINDOW. A
+/// continuation chunk's attention unrolls per row, so its bundle bakes at the widest rung within the
+/// cache's 256 rows; the first chunk's ladder still tops out at the 512-row window.
+#[test]
+fn the_prefix_capable_bundle_stays_at_256_while_the_ladder_reaches_512() {
+    let ladder = [7u32, 63, 128, 192, 256, 384, 512];
+    assert_eq!(PagedKvPool::prefix_capable_rows(&ladder, 256), Some(256));
+    assert_eq!(
+        PagedKvPool::prefill_ladder_reaches_the_window(true, WINDOW, &ladder, &[]),
+        Ok(()),
+        "the ladder itself reaches the window"
+    );
+    // A cache that is not a rung takes the widest rung under it; a model whose ladder stops short of
+    // the cache keeps its own top.
+    assert_eq!(PagedKvPool::prefix_capable_rows(&ladder, 300), Some(256));
+    assert_eq!(
+        PagedKvPool::prefix_capable_rows(&[7, 63, 128], 256),
+        Some(128)
+    );
+    assert_eq!(PagedKvPool::prefix_capable_rows(&[384, 512], 256), None);
+}
+
 /// ⛔⛔⛔ A CAPPED LADDER REFUSES. A chunk-form model (granite-2b's head dim) whose baked ladder stops
 /// at 256 fails the bake, naming why: a ceiling that never asked for the window (the resident-cache cap
 /// that hid the 512 rungs), or the rungs that did not lower and their reasons. The ladder that reaches

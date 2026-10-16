@@ -5418,6 +5418,24 @@ impl PagedKvPool {
     /// inside that page (see [`chunk_room`](Self::chunk_room)).
     pub const PREFILL_WINDOW_PAGES: usize = Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::PAGE_SLOTS);
 
+    /// ⭐ THE ROWS THE PREFIX-CAPABLE PREFILL BUNDLE IS BAKED AT — the widest baked ladder rung within the
+    /// resident cache's `resident_rows` (`KTIR_PREFIX_LEN`, 256 by default), not the ladder's ceiling.
+    ///
+    /// ⛔ BECAUSE ITS ATTENTION PROGRAM UNROLLS PER ROW. The ladder's rungs are first chunks, whose spliced
+    /// attention takes the one-pass arm (`[mq, mq]` scores, one body per head). A continuation chunk's
+    /// takes the 3-pass arm, which `attn.py` unrolls over `tl.static_range(0, MQ)` with each row's own
+    /// `[qi + 1, hd]` causal tiles — so its program grows with `mq²`. MEASURED, granite-2b at 512 rows:
+    /// one build-script thread at ~97 % CPU in `triton_ktir`'s `to_ktir_emit` for over 25 min at 102 GB
+    /// RSS, never finishing (256 rows: 94.7 s, the widest compile of the whole bake). So continuation
+    /// chunks stay 256 rows wide and only a prompt's FIRST chunk takes the 512-row window, until that
+    /// arm stops unrolling per row.
+    ///
+    /// `None` when no rung fits, which the caller reports — a prompt longer than its first chunk then has
+    /// no bundle to continue on.
+    pub fn prefix_capable_rows(baked: &[u32], resident_rows: u32) -> Option<u32> {
+        baked.iter().copied().filter(|&m| m <= resident_rows).max()
+    }
+
     /// ⛔⛔⛔ A CHUNK-FORM MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof,
     /// panicked on by the macro.
     ///
