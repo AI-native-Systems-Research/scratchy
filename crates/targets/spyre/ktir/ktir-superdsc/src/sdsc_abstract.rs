@@ -7351,8 +7351,8 @@ impl ChunkLx {
     ///
     /// ⛔ MEASURED ON CARD, granite-3.1-2b fp16, the 12- and 20-page rungs (8 + 4 and 16 + 4 pages).
     /// With Kᵗ in LX and its 4-page tail in HBM, the chunk FAULTS on the first step at that rung:
-    /// `status=Error locator=0x2 … HMI=STORE addr=<a valid address in the NEXT kv head's score block>
-    /// syndrome=0x1`, then `scheduler rejected submission … status=Retry`. Measured addresses: core 1
+    /// `status=Error locator=0x2 … HMI=STORE addr=… syndrome=0x1`, then `scheduler rejected submission …
+    /// status=Retry`. Measured addresses: core 1
     /// at `0x8dbf00` and core 31 at `0x8dfb00` (12 pages), core 31 at `0x8ddb00` (20 pages). It faults
     /// the same way whether the tail score splits its rows (`mb:2 × out:16`) or only its columns. V's
     /// tail part in HBM runs at those rungs. The no-tail rungs (8, 16, 40 pages) run with Kᵗ in LX.

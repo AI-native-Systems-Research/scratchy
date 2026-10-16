@@ -898,8 +898,9 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
 }
 
 /// ⛔ A Kᵗ LX FORM WITH A TAIL IS UNREPRESENTABLE — the bake-time lockout of the measured card fault.
-/// granite-2b's 12- and 20-page rungs (a 4-page tail) faulted with Kᵗ in LX (`HMI=STORE` in the next kv
-/// head's score block, see `ChunkLx::keys`). The only door to the Kᵗ LX form (`ChunkKeysLx`) refuses
+/// granite-2b's 12- and 20-page rungs (a 4-page tail) faulted with Kᵗ in LX (`HMI=STORE`, see
+/// `ChunkLx::keys`, which also says why that measurement is confounded by the session's allocation and
+/// not yet re-run). The only door to the Kᵗ LX form (`ChunkKeysLx`) refuses
 /// exactly the tail rungs, at every rung of both shipped granite pools. The bundles those rungs bake
 /// gather and score Kᵗ in HBM: no Kᵗ copy writes LX, and the score is one op per kv head.
 #[test]
