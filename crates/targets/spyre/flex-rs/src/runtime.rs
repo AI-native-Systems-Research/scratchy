@@ -600,24 +600,29 @@ mod tests {
         Arc::new(NullScheduler)
     }
 
-    /// A `FlexAllocator` buildable with zero senlib/hardware involvement: an
-    /// empty-domain `DeviceTopology` makes `preAllocateRegions`'s per-domain
-    /// region loop (`allocator.rs::pre_allocate_regions`) iterate zero times,
-    /// so `allocate_new_region` — the one function on this path that reaches
-    /// real senlib — is never called. Stands in for the real C++ tests'
-    /// actual device-backed `FlexAllocator`, which this crate cannot
-    /// construct in a unit test at all (see the `mod tests` doc comment
-    /// above on `AllocatorAllocMemory`).
+    /// A `FlexAllocator` buildable with zero senlib/hardware involvement:
+    /// `FlexAllocator::new_without_regions` skips `preAllocateRegions` — the
+    /// one constructor step that reaches real senlib — so this stands in for
+    /// the real C++ tests' actual device-backed `FlexAllocator`, which this
+    /// crate cannot construct in a unit test at all (same
+    /// `DeviceMemoryAllocator` mock-seam gap documented at the bottom of
+    /// `allocator.rs`). Sound for every test below because none of them
+    /// allocate: the `NullScheduler` completes each operation immediately
+    /// and the tests exercise only context/stream bookkeeping. (An earlier
+    /// version of this fixture aimed an empty-domain `DeviceTopology` at
+    /// `preAllocateRegions`' per-domain loop and relied on that loop
+    /// iterating zero times; that assumption died when
+    /// `pre_allocate_regions` learned to reject zero-domain topologies
+    /// outright — `FlexAllocatorError::NoDomains`, itself a deliberate
+    /// hardening the real C++ lacks (it would be integer-division-by-zero
+    /// UB there) — which is exactly what these tests were failing on.)
     fn test_allocator() -> Arc<Mutex<FlexAllocator>> {
         let topo = DeviceTopology::new(vec![]);
-        let init = FlexAllocatorInit {
-            max_regions: 1,
-            num_program_regions: 0,
-            ..Default::default()
-        };
-        Arc::new(Mutex::new(
-            FlexAllocator::new(init, topo, DeviceMemoryAllocator::new(1)).unwrap(),
-        ))
+        Arc::new(Mutex::new(FlexAllocator::new_without_regions(
+            FlexAllocatorInit::default(),
+            topo,
+            DeviceMemoryAllocator::new(1),
+        )))
     }
 
     /// Runs `body` with the `RuntimeContext` singleton guaranteed empty

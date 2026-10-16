@@ -1609,12 +1609,27 @@ mod tests {
 
     #[test]
     fn spyre_devices_defaults_to_empty_when_no_cards_and_no_env() {
-        // SAFETY: single-threaded test.
-        unsafe {
-            std::env::remove_var("SPYRE_DEVICES");
-        }
+        // Hermeticity fix (issue #536's run-to-run flaky pair): this test
+        // used to strip SPYRE_DEVICES bare — without `config_test_lock()`
+        // and without a cache reset — so it raced every EnvGuard test
+        // mutating the same process env and caches: stripping
+        // SPYRE_DEVICES mid-test made `runtime_config_read`'s cache-miss
+        // resolution come back empty instead of [0, 2, ...]; conversely,
+        // resolving here while another test's WORLD_SIZE=8 was live (or
+        // cached) made the rdma_local_size check reject a smaller device
+        // list and turned this test's own `unwrap()` into a panic.
+        // `EnvGuard` is exactly the serialization + snapshot/restore +
+        // cache reset this needs.
+        let _env = EnvGuard::new();
         let devices = FlexConfig::flex_spyre_devices().unwrap();
-        assert!(devices.0.is_empty() || !devices.0.is_empty()); // depends on sen_pci_card_count() stub
+        // With SPYRE_DEVICES unset, `FlexSpyreDevices` enumerates every card
+        // senlib reports, in ascending order (`flex_config.cpp:400-410`) —
+        // empty on a card-less host (the C++ fixture's stub senlib reports
+        // zero), the identity list on a host with cards. The previous
+        // `is_empty() || !is_empty()` assertion was a tautology that pinned
+        // nothing; this pins the actual ported contract without depending
+        // on how many cards the test host has.
+        assert_eq!(devices.0, (0..sen_pci_card_count()).collect::<Vec<i64>>());
     }
 
     #[test]
