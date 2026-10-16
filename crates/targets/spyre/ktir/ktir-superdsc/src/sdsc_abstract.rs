@@ -5418,6 +5418,51 @@ impl PagedKvPool {
     /// inside that page (see [`chunk_room`](Self::chunk_room)).
     pub const PREFILL_WINDOW_PAGES: usize = Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::PAGE_SLOTS);
 
+    /// ⛔⛔⛔ A CHUNK-FORM MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof,
+    /// panicked on by the macro.
+    ///
+    /// `codegen`'s const assert ties [`PREFILL_CHUNK_SLOTS`](Self::PREFILL_CHUNK_SLOTS) to the ceiling of
+    /// the CONST ladder, and the bake then lowers what it can of it: a rung that does not lower is
+    /// skipped, and the prefix-capable bundle is baked at the widest one that did. The host follows
+    /// whatever was baked, so a short ladder is never wrong — only silently slower. MEASURED: the
+    /// 512-row ladder baked to 256 behind a leftover resident-cache cap, loaded as `PREFILL ladder =
+    /// [..., 192, 256]`, and every TTFT cell matched the 256-row build to the millisecond.
+    ///
+    /// So the check is on what LOWERED. `chunk_form` says the model's causal block is chunk-formed at
+    /// the window's width (`NewBlockForm::of(PREFILL_CHUNK_SLOTS, hd, false) == Chunk`) — a model whose
+    /// block stays sub-blocked keeps its own shorter ladder by design. `baked` is every rung that
+    /// lowered, `refused` every rung that did not and why, and `attempted` the ceiling the ladder was
+    /// asked to reach. `Err` names the shortfall and each refusing rung's reason.
+    pub fn prefill_ladder_reaches_the_window(
+        chunk_form: bool,
+        attempted: u32,
+        baked: &[u32],
+        refused: &[(u32, String)],
+    ) -> Result<(), String> {
+        let window = Self::PREFILL_CHUNK_SLOTS as u32;
+        let top = baked.iter().copied().max().unwrap_or(0);
+        if !chunk_form || top >= window {
+            return Ok(());
+        }
+        let why = if refused.is_empty() {
+            format!(
+                "no rung above {top} was attempted: the ladder's ceiling was {attempted}, below the window"
+            )
+        } else {
+            refused
+                .iter()
+                .map(|(m, e)| format!("rung m={m} did not lower: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        Err(format!(
+            "the baked prefill ladder tops out at {top} rows, below the pool's {window}-row prompt window \
+             (PagedKvPool::PREFILL_CHUNK_SLOTS) for a model whose causal block is chunk-formed at that \
+             width — {why}. The host would run {top}-row chunks with no error and none of the window's \
+             speed; lower the missing rungs, or narrow the window."
+        ))
+    }
+
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
     /// of the next kv head's keys.

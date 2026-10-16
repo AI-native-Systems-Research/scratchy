@@ -9,8 +9,8 @@
 //! block of its own.
 
 use ktir_superdsc::sdsc_abstract::{
-    BlockTable, ChunkKvExtent, KvHistory, KvSlot, PagedKvPool, PoolPages, PoolPartition, PoolRows,
-    SlotCount,
+    BlockTable, ChunkKvExtent, KvHistory, KvSlot, NewBlockForm, PagedKvPool, PoolPages,
+    PoolPartition, PoolRows, SlotCount,
 };
 
 const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
@@ -175,4 +175,49 @@ fn a_short_last_chunk_maps_no_page_past_its_real_rows() {
         .wrote(SlotCount::new(WINDOW));
     let map = BlockTable::map_chunk(&hist, &host, back, part).expect("mappable");
     assert_eq!(phys(&map), vec![10, 11, 12, 13]);
+}
+
+/// ⛔⛔⛔ A CAPPED LADDER REFUSES. A chunk-form model (granite-2b's head dim) whose baked ladder stops
+/// at 256 fails the bake, naming why: a ceiling that never asked for the window (the resident-cache cap
+/// that hid the 512 rungs), or the rungs that did not lower and their reasons. The ladder that reaches
+/// the window passes, and so does a sub-blocked model's own shorter ladder.
+#[test]
+fn a_chunk_form_ladder_baked_short_of_the_window_refuses() {
+    let chunk_form = NewBlockForm::of(WINDOW, 64, false) == NewBlockForm::Chunk;
+    assert!(
+        chunk_form,
+        "granite-2b's causal block is chunk-formed at the window"
+    );
+    let to_256 = [7u32, 63, 128, 192, 256];
+
+    let capped = PagedKvPool::prefill_ladder_reaches_the_window(true, 256, &to_256, &[])
+        .expect_err("a ladder capped at 256 must refuse");
+    assert!(
+        capped.contains("256") && capped.contains("ceiling was 256"),
+        "names the cap: {capped}"
+    );
+
+    let refused = PagedKvPool::prefill_ladder_reaches_the_window(
+        true,
+        WINDOW,
+        &to_256,
+        &[(384, "LX overflow".into()), (512, "LX overflow".into())],
+    )
+    .expect_err("a ladder whose top rungs did not lower must refuse");
+    assert!(
+        refused.contains("rung m=384 did not lower: LX overflow")
+            && refused.contains("rung m=512 did not lower: LX overflow"),
+        "names each refusing rung and its reason: {refused}"
+    );
+
+    let full = [7u32, 128, 256, 384, 512];
+    assert_eq!(
+        PagedKvPool::prefill_ladder_reaches_the_window(true, WINDOW, &full, &[]),
+        Ok(())
+    );
+    // A model whose causal block stays sub-blocked bakes its own 128-row ladder by design.
+    assert_eq!(
+        PagedKvPool::prefill_ladder_reaches_the_window(false, 128, &[7, 63, 128], &[]),
+        Ok(())
+    );
 }

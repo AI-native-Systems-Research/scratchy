@@ -12786,9 +12786,17 @@ fn dump_wavefront_mega(
                 // ladder STARTS looking — not a value that has to be right. That is what demotes
                 // `KTIR_PREFILL_LEN` from a required flag to a diagnostic override, and what stops
                 // a model whose FFN blows the LX budget at the top width from failing the BUILD:
-                // it simply gets a shorter ladder. Still capped by the resident cache — and by the widest
-                // rung THIS model admits (`rung_admitted`).
-                admitted_ceiling.min(prefix_len.get())
+                // it simply gets a shorter ladder. Capped by the widest rung THIS model admits
+                // (`rung_admitted`), and by nothing else.
+                //
+                // ⛔ NOT BY THE RESIDENT CACHE (`prefix_len`, 256 by default). That cap dates from the
+                // unpaged cache, where a chunk's keys had to fit the baked prefix rows. A paged chunk
+                // writes the POOL, one page part per page (`EmittedOp::kv_slot_offset`), so its width is
+                // the pool's law (`PagedKvPool::PREFILL_CHUNK_SLOTS`, asserted equal to the ladder
+                // ceiling above) and not the cache's. MEASURED: with the cap, the 512-row ladder baked
+                // to 256 in silence — `PREFILL ladder = [..., 192, 256]` at load, and every TTFT cell
+                // equal to the 256-row build's.
+                admitted_ceiling
             } else {
                 // The EMU's ONE width, LX-derived from the model's own fp8
                 // gemms (`emu_prefill_lx_width`, module level): the old
@@ -12831,10 +12839,14 @@ fn dump_wavefront_mega(
         // applying them — so the 25 bakes run side by side and `commit_bake` then applies their effects
         // rung by rung, ascending, exactly as the serial loop did (the last rung that lowered is still
         // the ceiling).
+        //
+        // A rung that does not lower comes back as its `(width, reason)` instead, collected in the same
+        // ascending order at commit — what the window guard below names when the baked ladder stops
+        // short.
         type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
-        let per_rung: Vec<Option<RungBake>> = {
+        let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
-            prefill_rung_widths.par_iter().map(|&pl| -> Option<RungBake> {
+            prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
             let lowered = to_wavefront::lower_decode_to_wavefront(
                 fuf,
                 decode_asn_check,
@@ -12896,22 +12908,49 @@ fn dump_wavefront_mega(
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
                     );
-                    Some((lwd_p, r, fx))
+                    Ok((lwd_p, r, fx))
                 }
                 Err(e) if sendnn_superdsc => {
                     eprintln!(
                         "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e} \
                          (SKIPPED; a narrower rung still covers this width)"
                     );
-                    None
+                    Err((pl, e.to_string()))
                 }
                 Err(e) => panic!("[wavefront] {stem}: prefill (m={pl}) NOT LOWERED — {e}"),
             }
             }).collect()
         };
-        for (lwd_p, r, fx) in per_rung.into_iter().flatten() {
-            commit_bake(&lwd_p, fx);
-            prefill = Some(r);
+        let mut refused_rungs: Vec<(u32, String)> = Vec::new();
+        for rung in per_rung {
+            match rung {
+                Ok((lwd_p, r, fx)) => {
+                    commit_bake(&lwd_p, fx);
+                    prefill = Some(r);
+                }
+                Err(refused) => refused_rungs.push(refused),
+            }
+        }
+        // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
+        // the rungs codegen actually baked, never the const ladder. A short ladder runs, correctly and
+        // slowly, with nothing anywhere saying so; see `PagedKvPool::prefill_ladder_reaches_the_window`.
+        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+            let baked: Vec<u32> = superdsc_prefill_rungs
+                .borrow()
+                .iter()
+                .map(|(m, _)| *m)
+                .collect();
+            let window = scratchy_subtile::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
+            if let Err(e) =
+                scratchy_subtile::sdsc_abstract::PagedKvPool::prefill_ladder_reaches_the_window(
+                    rung_admitted(window),
+                    prefill_m,
+                    &baked,
+                    &refused_rungs,
+                )
+            {
+                panic!("[spyre-superdsc] {stem}: {e}");
+            }
         }
 
         // ── PREFIX-CAPABLE PREFILL BUNDLE ── one more bake of the WIDEST rung, this time with a full
