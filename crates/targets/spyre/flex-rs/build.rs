@@ -2,19 +2,15 @@
 //! binding (see its own file header). Unconditional by default — flex-rs is
 //! the only senlib path in the workspace, so its shim must build whenever
 //! anything actually links against real senlib, with no separate opt-in.
-//! (This is now the ONLY build script in the spyre tree: the old
-//! `scratchy-target-spyre/build.rs` was a vestige of the deleted
-//! `spyre_sdk_abi.cpp` C++ seam — it compiled nothing and linked nothing,
-//! because the `sendnn` feature it gated on no longer existed.)
+//! This is the only build script in the spyre tree.
 //!
 //! This links ONLY against `senlib` (+ its own transitive deps: flightlog,
 //! boost). It does NOT link `libflex.so` or any `sendnn_*` library — this
 //! crate has no `flex::` dependency at all, by design.
 //!
 //! `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile (cargo check/clippy only —
-//! a link will fail): the same escape hatch the old C++ seam's build script
-//! used, so a laptop with no Spyre SDK headers/libs stays checkable without a
-//! second, flex-rs-specific toggle to remember.
+//! a link will fail): the escape hatch that keeps a laptop with no Spyre SDK
+//! headers/libs checkable.
 
 use std::env;
 use std::path::PathBuf;
@@ -34,9 +30,8 @@ fn main() {
     // Link only senlib itself + its own real transitive deps (verified via
     // `ldd libsenlib.so` on the pod: flightlog + this boost set). No `flex`,
     // no `sendnn_*` — this crate has zero dependence on libflex.so. Emitted
-    // whether or not we compile below, matching spyre_sdk_abi.cpp's own
-    // `emit_link_flags` split (a real build with the shim skipped fails
-    // loudly at link time instead of silently missing symbols).
+    // whether or not we compile below, so a real build with the shim skipped
+    // fails loudly at link time instead of silently missing symbols.
     for l in [
         "senlib",
         "flightlog",

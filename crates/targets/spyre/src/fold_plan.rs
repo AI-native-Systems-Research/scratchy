@@ -1848,8 +1848,7 @@ mod tests {
     }
 
     /// The composed answer for a BATCHED launch: each op resolves its own request's cursor and page.
-    /// This was pinned through the C ABI while one existed; the executor now calls exactly these
-    /// functions, so it is pinned here.
+    /// The executor calls exactly these functions, so the answers are pinned here.
     #[test]
     fn a_batched_launch_resolves_each_request_s_own_cursor_and_page() {
         let mut s = SessionKv {

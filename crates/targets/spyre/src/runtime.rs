@@ -1,55 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The typed card surface: streams, device addresses, and launches, held as
-//! **flex-rs's own Rust types** — no C ABI between this crate and its runtime.
+//! The typed card surface: streams, device addresses, launches, and the card's memory capacity —
+//! flex-rs's own Rust types held directly, with no C ABI between this crate and its runtime.
 //!
-//! This module is what `sdk_abi.rs` + `fxa_rust_abi.rs` used to be: a 14-symbol
-//! `fxa_*` C ABI that existed only because the runtime *used to be* C++
-//! (`csrc/spyre_sdk_abi.cpp`, since deleted). Rust declared the symbols,
-//! Rust defined them, and every consumer was workspace Rust — a
-//! Rust→C-ABI→Rust bridge whose only remaining function was to hide flex-rs's
-//! surface behind `*mut c_void` handles, rc integers, and per-call
-//! `CString`/`Vec`/`Box` ceremony. It is gone; the player now holds
-//! `Arc<RuntimeContext>`-backed [`Stream`]s and `Arc<CompositeAddress>`-backed
-//! [`DevAddr`]s directly.
+//! Errors are typed ([`HwError`]) and carry the refusing layer's own error; addresses are owned
+//! `Arc<CompositeAddress>` values, not raw pointers; stream creation reports the bring-up or
+//! context refusal; and [`DevAddr::from_chunk`] is infallible because building a descriptor value
+//! cannot fail.
 //!
-//! What the collapse buys beyond the deletion: errors are `Result`s carrying
-//! real `Display` payloads (not `-1`/`-2` ints that collapsed distinct
-//! failures), addresses are owned values (not raw pointers with a
-//! `Box::into_raw` dance), stream creation returns the bring-up error instead
-//! of a bare `None`, and `DevAddr::from_chunk` is infallible because building
-//! a descriptor value cannot fail.
-//!
-//! The laws the old seam carried are preserved here verbatim in spirit:
-//! - [`Stream::h2d`] takes its transfer length FROM THE SLICE — the
-//!   over-read that motivated it is unrepresentable, not documented against.
+//! Laws this surface holds:
+//! - [`Stream::h2d`] takes its transfer length FROM THE SLICE — the over-read that motivated it
+//!   is unrepresentable, not documented against.
 //! - STREAM CREATION IS SERIALIZED — see the ⛔ doc on [`Stream::create`].
-//! - Session-lifetime device handles are leaked ON PURPOSE at their drop
-//!   sites (`OpProg`/`Executor` in [`crate::superdsc_exec`]) — see the ⛔ doc
-//!   on [`DevAddr`].
-//! - One process-wide `RuntimeContext`, built lazily by [`init_runtime`] /
-//!   [`Stream::create`] / [`DevAddr::alloc`], over the real senlib scheduler.
+//! - Session-lifetime device handles are leaked ON PURPOSE at their drop sites (`OpProg`/
+//!   `Executor` in [`crate::superdsc_exec`]) — see the ⛔ doc on [`DevAddr`].
+//! - One process-wide `RuntimeContext`, built lazily by [`init_runtime`] / [`Stream::create`] /
+//!   [`DevAddr::alloc`], over the real senlib scheduler.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use flex_rs::address::{ByteOffset, ByteSize, Chunk, CompositeAddress, LogicalAddress, RegionId};
-use flex_rs::allocator::{AllocationDirective, FlexAllocator, FlexAllocatorInit};
+use flex_rs::allocator::{
+    AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
+    FlexAllocatorInit,
+};
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
 use flex_rs::dma::{DmaDirection, DmaParams, DmaShaping, HostVirtualAddress};
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::memory_region::{DomainId, MemoryType};
-use flex_rs::runtime::RuntimeContext;
+use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
-    SchedulerBackendConfig, SenlibHardwareSubmit, SenlibQueueCapacity, create_scheduler,
+    SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
+    create_scheduler,
 };
 use flex_rs::stream::{
     RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, StreamId,
 };
 use flex_rs::topology::populate_domain_topology;
 
-type RuntimeInit = Result<Arc<RuntimeContext>, String>;
+type RuntimeInit = Result<Arc<RuntimeContext>, Arc<BringUpError>>;
 
 fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
     static CELL: OnceLock<Mutex<Option<RuntimeInit>>> = OnceLock::new();
@@ -58,28 +49,24 @@ fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
 
 /// Idempotent bring-up: real senlib device init (`flex_shim_init_runtime`)
 /// then a real `RuntimeContext` over a `Pf` backend + a real `FlexAllocator`
-/// whose address resolution is `FlexAllocatorAddressResolver` (production,
-/// no longer an unreachable island — see `flex_rs::scheduler` module doc).
+/// whose address resolution is `FlexAllocatorAddressResolver` (production —
+/// see the `flex_rs::scheduler` module doc).
 ///
-/// Single on-card domain (`DomainId(0)`), matching the C++ shim's own
-/// `fxa_alloc`, which passed `domain_ids = {0}` unconditionally: neither
-/// side has ever asked the topology which domain is real (see that
-/// function's own ⛔ comment about the bimodal-latency investigation);
-/// this module does not invent a multi-domain topology query that has no
-/// call site anywhere else in this codebase either.
-fn build_runtime() -> Result<Arc<RuntimeContext>, String> {
+/// Single on-card domain (`DomainId(0)`), unconditionally: nothing in this codebase has ever
+/// asked the topology which domain is real, and this module does not invent a multi-domain
+/// topology query that has no call site anywhere else.
+fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
     let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(0) };
     if rc != 0 {
-        return Err(format!("flex_shim_init_runtime failed: rc={rc}"));
+        return Err(BringUpError::ShimInit(rc));
     }
 
     // Real single on-card domain, sized off the card's actual HBM capacity
     // and RCU core count — `flex::populateDomainTopology`
     // (`device_memory_topology.cpp`), ported natively as
-    // `topology::populate_domain_topology`. No longer the 32 GiB/32-core
-    // placeholder this used to be (see git history): that shape caused a
-    // real `FlexAllocator` OOM during hardware testing, traced to this
-    // function undersizing/oversizing the domain relative to the real card.
+    // `topology::populate_domain_topology`. A hardcoded placeholder here once
+    // mis-sized the domain and caused a real `FlexAllocator` OOM during
+    // hardware testing — the capacity must come from the card, not a literal.
     // SAFETY: `flex_shim_init_runtime` above already succeeded, so the
     // device handle this reads from is live.
     let device_memory_size = unsafe { flex_rs::senlib_ffi::flex_senlib_device_memory_size() };
@@ -88,7 +75,7 @@ fn build_runtime() -> Result<Arc<RuntimeContext>, String> {
     let init = FlexAllocatorInit::default();
     let dma = DeviceMemoryAllocator::new(flex_rs::allocator::DEVICE_ALIGNMENT);
     let allocator = Arc::new(Mutex::new(
-        FlexAllocator::new(init, topo, dma).map_err(|e| e.to_string())?,
+        FlexAllocator::new(init, topo, dma).map_err(BringUpError::AllocatorInit)?,
     ));
 
     let addr_resolver: Arc<dyn DeviceAddressResolver> =
@@ -112,23 +99,25 @@ fn build_runtime() -> Result<Arc<RuntimeContext>, String> {
         &DeviceKind::Pf,
         SchedulerBackendConfig::Real(hw, capacity, addr_resolver, iommu_mapper),
     )
-    .map_err(|e| format!("create_scheduler: {e:?}"))?;
+    .map_err(BringUpError::Scheduler)?;
 
-    RuntimeContext::create(None, scheduler, allocator).map_err(|e| e.to_string())
+    RuntimeContext::create(None, scheduler, allocator).map_err(BringUpError::Context)
 }
 
-fn get_or_init_runtime() -> Result<Arc<RuntimeContext>, String> {
+fn get_or_init_runtime() -> Result<Arc<RuntimeContext>, Arc<BringUpError>> {
     let mut guard = runtime_cell().lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        *guard = Some(build_runtime());
+        // The failure is cached on purpose: bring-up costs seconds, so a card that refused once
+        // must not be re-probed by every subsequent `Stream::create` / `DevAddr::alloc`.
+        *guard = Some(build_runtime().map_err(Arc::new));
     }
     guard.as_ref().unwrap().clone()
 }
 
 /// Bring the process-wide flex runtime up (idempotent, ~5.7s cold). `Err` carries the
 /// bring-up failure verbatim.
-pub fn init_runtime() -> Result<(), String> {
-    get_or_init_runtime().map(|_| ())
+pub fn init_runtime() -> Result<(), HwError> {
+    get_or_init_runtime().map(|_| ()).map_err(HwError::BringUp)
 }
 
 /// Kick the runtime bring-up on a detached background thread (overlaps host weight load).
@@ -141,8 +130,14 @@ pub fn prewarm_runtime() {
 }
 
 /// Tear the whole RuntimeContext down — the one-shot leak probe. BREAKS every live session.
-pub fn runtime_reset() -> Result<(), String> {
-    RuntimeContext::reset().map_err(|e| e.to_string())
+///
+/// Also drops this module's cached handle, so the next [`init_runtime`] / [`Stream::create`] /
+/// [`DevAddr::alloc`] rebuilds a fresh runtime rather than failing `NotCreated` against the dead
+/// context for the rest of the process.
+pub fn runtime_reset() -> Result<(), HwError> {
+    RuntimeContext::reset().map_err(HwError::Reset)?;
+    *runtime_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    Ok(())
 }
 
 /// `flex::PROG_OFFSET_BASE` — the device VA base every `job_bin_ptr` is rebased by at launch.
@@ -280,10 +275,12 @@ impl CardMemory {
     }
 }
 
-/// Every failure a [`Stream`] call can report. Distinct failures stay distinct: the runtime's own
+/// Every failure the card surface can report. Distinct failures stay distinct: the runtime's own
 /// refusal ([`HwError::Stream`]), the H2D length door refusing BEFORE submission
-/// ([`HwError::OverrunsRegion`]), and the handle outliving its runtime ([`HwError::StreamGone`])
-/// are three different facts, not three renderings of `rc=-1`.
+/// ([`HwError::OverrunsRegion`]), the handle outliving its runtime ([`HwError::StreamGone`]),
+/// bring-up ([`HwError::BringUp`]), stream creation ([`HwError::StreamCreate`]), allocation
+/// ([`HwError::Alloc`]) and reset ([`HwError::Reset`]) are different facts, not renderings of
+/// `rc=-1`.
 #[derive(Debug)]
 pub enum HwError {
     /// The runtime rejected the launch, or `synchronize()` rethrew a deferred device error.
@@ -292,6 +289,15 @@ pub enum HwError {
     OverrunsRegion { len: u64, region: u64 },
     /// The stream no longer exists in its runtime: destroyed, or the `RuntimeContext` was reset.
     StreamGone,
+    /// Constructing the process-wide runtime failed. The failure is cached, so every later
+    /// caller reports the same bring-up refusal.
+    BringUp(Arc<BringUpError>),
+    /// `RuntimeContext::create_stream` refused the new stream.
+    StreamCreate(RuntimeContextError),
+    /// A device-memory allocation was refused.
+    Alloc(AllocError),
+    /// `RuntimeContext::reset` refused.
+    Reset(RuntimeContextError),
 }
 
 impl fmt::Display for HwError {
@@ -308,19 +314,68 @@ impl fmt::Display for HwError {
                 "the stream no longer exists in its runtime (destroyed, or the RuntimeContext was \
                  reset)"
             ),
+            Self::BringUp(e) => write!(f, "runtime bring-up failed: {e}"),
+            Self::StreamCreate(e) => write!(f, "{e}"),
+            Self::Alloc(e) => write!(f, "{e}"),
+            Self::Reset(e) => write!(f, "{e}"),
         }
     }
 }
 impl std::error::Error for HwError {}
 
+/// Why the process-wide runtime could not be constructed — the refusing layer's own error.
+#[derive(Debug)]
+pub enum BringUpError {
+    /// `flex_shim_init_runtime` — the senlib device init — returned a nonzero rc.
+    ShimInit(i32),
+    /// `FlexAllocator::new` refused the domain topology.
+    AllocatorInit(FlexAllocatorError),
+    /// `create_scheduler` refused the device kind / chip.
+    Scheduler(SchedulerFactoryError),
+    /// `RuntimeContext::create` refused.
+    Context(RuntimeContextError),
+}
+
+impl fmt::Display for BringUpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShimInit(rc) => write!(f, "flex_shim_init_runtime failed: rc={rc}"),
+            Self::AllocatorInit(e) => write!(f, "{e}"),
+            Self::Scheduler(e) => write!(f, "{e}"),
+            Self::Context(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for BringUpError {}
+
+/// Why a device-memory allocation was refused — the refusing layer's own error.
+#[derive(Debug)]
+pub enum AllocError {
+    /// `AllocationDirective::new` refused the placement.
+    Directive(AllocationDirectiveError),
+    /// The runtime's allocator handle could not be fetched — the context is inactive.
+    Context(RuntimeContextError),
+    /// `FlexAllocator::allocate` refused the size.
+    Allocator(FlexAllocatorError),
+}
+
+impl fmt::Display for AllocError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directive(e) => write!(f, "{e}"),
+            Self::Context(e) => write!(f, "{e}"),
+            Self::Allocator(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for AllocError {}
+
 /// One created `flex::RuntimeStream`. Dropping it destroys the stream, which drains the
 /// scheduler's per-stream fence deques (the resident-session leak fix recreates one per forward).
 ///
-/// `Send` by construction now, not by `unsafe impl`: the handle is an `Arc` clone of the shared
-/// `RuntimeContext` plus a `StreamId` — both plain shared state — where the old C-ABI handle was a
-/// `Box` behind `*mut c_void` that nothing could prove. The stream is only ever used from the
-/// session's own thread, but the session moves across worker threads between forwards, exactly as
-/// the C++ session pointer did.
+/// `Send` by construction: the handle is an `Arc` clone of the shared `RuntimeContext` plus a
+/// `StreamId` — both plain shared state. The stream is only ever used from the session's own
+/// thread, but the session moves across worker threads between forwards.
 pub struct Stream {
     rt: Arc<RuntimeContext>,
     id: StreamId,
@@ -333,12 +388,10 @@ pub struct Stream {
 /// measured on granite-3.1-8b: `prefill ladder: 20 rung(s) ready in 6.19s wall — built in parallel`
 /// — so twenty-odd threads enter that function at once on every load.
 ///
-/// MEASURED (against the C++ seam this module replaced): model load aborts intermittently, roughly
-/// one run in three, with `Signal Received: 6` and NO message, symbolized (`addr2line` on the
-/// backtrace the abort prints) to `fxa_stream_create ← Executor::prepare ← SuperDscSession::new_inner`.
-/// The C++ wrapper already caught every exception and returned null, so flex was ABORTING
-/// INTERNALLY — nothing can be caught or retried, and the process dies before serving a single
-/// token, taking a `scr batch` run's output file with it.
+/// MEASURED: model load aborts intermittently, roughly one run in three, with `Signal Received: 6`
+/// and NO message — the abort fires inside flex during concurrent stream creation (reached from
+/// `Executor::prepare` ← `SuperDscSession::new_inner`), so nothing can be caught or retried, and
+/// the process dies before serving a single token, taking a `scr batch` run's output file with it.
 ///
 /// A concurrent lazy-init plus a runtime call with no documented thread-safety is the shape of that
 /// abort, so the calls are taken one at a time. The cost is bounded and small — 20 creations against
@@ -349,22 +402,22 @@ impl Stream {
     /// Create a dedicated stream: `Normal` priority, `STRICT_ORDERING` — the values every scratchy
     /// session has ever run. The knobs flex-rs exposes (`RuntimeContext::create_stream` takes
     /// priority and mode) are the door when a caller needs otherwise (#500).
-    pub fn create() -> Result<Stream, String> {
+    pub fn create() -> Result<Stream, HwError> {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
         let _serialize = STREAM_CREATE.lock().unwrap_or_else(|e| e.into_inner());
-        let rt = get_or_init_runtime()?;
+        let rt = get_or_init_runtime().map_err(HwError::BringUp)?;
         let id = rt
             .create_stream(
                 RuntimeStreamPriority::Normal,
                 RuntimeStreamMode::StrictOrdering,
             )
-            .map_err(|e| format!("stream_create: {e}"))?;
+            .map_err(HwError::StreamCreate)?;
         Ok(Stream { rt, id })
     }
 
     /// The live `RuntimeStream` this handle names. `Err(StreamGone)` after the stream was destroyed
-    /// or the runtime reset — the states the old seam reported as a bare null/`-1`.
+    /// or the runtime reset.
     fn live(&self) -> Result<Arc<RuntimeStream>, HwError> {
         match self.rt.get_stream(self.id) {
             Ok(Some(s)) => Ok(s),
@@ -378,27 +431,22 @@ impl Stream {
 
     /// ⛔⛔⛔ ASYNC H2D OF `bytes` INTO `addr`. THE LENGTH IS THE HOST SLICE'S — THERE IS NO OTHER FORM.
     ///
-    /// This is the only door, and that is the point. It replaces an
-    /// `h2d_raw(host: *const u8, size: u64, addr)` whose `size` came from a DIFFERENT OBJECT than
-    /// `host` — and every one of its four callers sourced that size from `addr.total_size()`, the
-    /// DEVICE region's alignment-padded extent. Whenever the pad exceeded the host buffer, the DMA
-    /// pinned past its end.
+    /// This is the only door, and that is the point. A raw pointer plus an independent length
+    /// cannot be made safe by documentation: a caller can source the length from a DIFFERENT
+    /// object than the buffer, and when it comes from `addr.total_size()` — the DEVICE region's
+    /// alignment-padded extent — the DMA pins past the host buffer's end whenever the pad exceeds
+    /// it. That over-read was real (`alloc_ops_at` sending `addr.total_size()` bytes out of
+    /// `op.code.init_binary`), though it was NOT the cause of the failure that found it — see
+    /// that function, where a granite-3.1-8b program's VFIO pin returned `EFAULT` and cost
+    /// prefill rung m=11; fixing the length alone moved that failure zero bytes.
     ///
-    /// That over-read was real: `alloc_ops_at` sent `addr.total_size()` bytes out of
-    /// `op.code.init_binary`. It was NOT, however, the cause of the failure that found it — see that
-    /// function, where a granite-3.1-8b program's VFIO pin returned `EFAULT` and cost prefill rung
-    /// m=11. Fixing the length alone moved that failure zero bytes. Both are defects; only one was
-    /// the bug being chased, and this doc used to claim otherwise.
-    ///
-    /// A raw pointer plus an independent length cannot be made safe by documentation — the old form
-    /// said "`host` must point at `size` readable bytes" and four callers still got it wrong. A
-    /// slice carries its own length, so the over-read is now UNREPRESENTABLE: a caller that wants
+    /// A slice carries its own length, so the over-read is UNREPRESENTABLE: a caller that wants
     /// fewer bytes than the region slices the buffer, and the slice bound is the proof.
     ///
     /// The device side is the other half of the same pairing, so it is checked here rather than
     /// trusted: a transfer LONGER than the region would write past what was allocated. That refusal
-    /// is [`HwError::OverrunsRegion`] — a distinct variant, not a sentinel rc, so a caller rendering
-    /// the error cannot confuse "we refused" with "the card refused".
+    /// is [`HwError::OverrunsRegion`] — a distinct variant, so a caller rendering the error cannot
+    /// confuse "we refused" with "the card refused".
     pub fn h2d(&self, bytes: &[u8], addr: &DevAddr) -> Result<(), HwError> {
         let region = addr.total_size();
         if bytes.len() as u64 > region {
@@ -473,75 +521,65 @@ impl Drop for Stream {
     fn drop(&mut self) {
         // `destroy_stream` synchronizes (draining the scheduler's per-stream fence deques — the
         // leak fix `predict` relies on when it recreates the stream each forward) and itself
-        // logs-and-swallows any deferred error, exactly like the C++ `destroyStream` it replaces.
+        // logs-and-swallows any deferred error.
         let _ = self.rt.destroy_stream(self.id);
     }
 }
 
-/// One chunk's identity — what a shifted or sliced sub-address is built from.
+/// One chunk's identity — what a shifted or sliced sub-address is built from. The fields are
+/// flex-rs's own newtypes, so a chunk cannot be rebuilt with a region id in the offset's place
+/// or a domain silently truncated.
 #[derive(Clone, Copy, Debug)]
 pub struct Chunk0 {
-    pub region: u64,
-    pub offset: u64,
-    pub size: u64,
-    pub domain: u64,
-}
-
-/// Which device memory type an allocation lands in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MemKind {
-    Tensor,
-    Program,
+    pub region: RegionId,
+    pub offset: ByteOffset,
+    pub size: ByteSize,
+    pub domain: DomainId,
 }
 
 /// An owned `flex::CompositeAddress` — the descriptor of a device allocation or window.
 ///
 /// ⛔ DEVICE REGIONS ARE NEVER FREED, ONLY DESCRIBED. Dropping a `DevAddr` releases the descriptor
 /// value (an `Arc<CompositeAddress>` refcount); the underlying device memory lives until process
-/// exit, matching the C++ executor which never freed regions. Freeing a region would additionally
-/// need a live `RuntimeContext`'s allocator, and the handles that would free at shutdown OUTLIVE
-/// the runtime that could free them — which is why session-lifetime handles are `mem::forget`d ON
-/// PURPOSE at their drop sites (`OpProg`/`Executor` in [`crate::superdsc_exec`]; see the ⛔ doc
-/// there — MEASURED as `RUN_RC=255` after perfect runs when the old C++ destructor ran at
-/// shutdown). Per-step windows (`shifted`/`window`, built per layer per launch) keep dying as
-/// owned values while the runtime is alive, exactly as they always have.
+/// exit. Freeing a region needs a live `RuntimeContext`'s allocator, and the handles that would
+/// free at shutdown OUTLIVE the runtime that could free them — which is why session-lifetime
+/// handles are `mem::forget`d ON PURPOSE at their drop sites (`OpProg`/`Executor` in
+/// [`crate::superdsc_exec`]; see the ⛔ doc there). Per-step windows (`shifted`/`window`, built
+/// per layer per launch) drop normally as owned values while the runtime is alive.
 ///
 /// `Send` by construction: the descriptor is plain shared data.
 pub struct DevAddr(Arc<CompositeAddress>);
 
 impl DevAddr {
-    /// Allocate `nbytes` of device memory in the given kind. The region is never freed (see the
-    /// struct doc); this handle describes it.
-    pub fn alloc(nbytes: u64, kind: MemKind) -> Result<DevAddr, String> {
-        let rt = get_or_init_runtime()?;
+    /// Allocate `nbytes` of device memory of the given [`MemoryType`]. The region is never freed
+    /// (see the struct doc); this handle describes it.
+    pub fn alloc(nbytes: u64, kind: MemoryType) -> Result<DevAddr, HwError> {
+        let rt = get_or_init_runtime().map_err(HwError::BringUp)?;
         let directive = AllocationDirective::new(
             flex_rs::domain::PlacementPolicy::Bind,
             vec![DomainId(0)],
             None,
-            match kind {
-                MemKind::Program => MemoryType::Program,
-                MemKind::Tensor => MemoryType::Tensor,
-            },
+            kind,
         )
-        .map_err(|e| format!("alloc({nbytes} B): {e}"))?;
+        .map_err(|e| HwError::Alloc(AllocError::Directive(e)))?;
         let allocator = rt
             .get_allocator()
-            .map_err(|e| format!("alloc({nbytes} B): {e}"))?;
+            .map_err(|e| HwError::Alloc(AllocError::Context(e)))?;
         let mut guard = allocator.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .allocate(ByteSize(nbytes), &directive)
             .map(|a| DevAddr(Arc::new(a)))
-            .map_err(|e| format!("alloc({nbytes} B): {e}"))
+            .map_err(|e| HwError::Alloc(AllocError::Allocator(e)))
     }
 
     /// A new single-chunk address naming the window (region, offset, size, domain) — the shifted
     /// per-layer base / sliced-DMA form. Infallible: building a descriptor value cannot fail.
     pub fn from_chunk(c: Chunk0) -> DevAddr {
-        let addr = LogicalAddress::new(RegionId(c.region), ByteOffset(c.offset));
+        let addr = LogicalAddress::new(c.region, c.offset);
         let chunk = Chunk {
             addr,
-            size: ByteSize(c.size),
-            domain_id: DomainId(c.domain as u32),
+            size: c.size,
+            domain_id: c.domain,
         };
         DevAddr(Arc::new(CompositeAddress::from_chunk(chunk)))
     }
@@ -557,21 +595,25 @@ impl DevAddr {
     pub fn chunk0(&self) -> Option<Chunk0> {
         let c0 = self.0.chunks().first()?;
         Some(Chunk0 {
-            region: c0.addr.region_id.0,
-            offset: c0.addr.offset.0,
-            size: c0.size.0,
-            domain: c0.domain_id.0 as u64,
+            region: c0.addr.region_id,
+            offset: c0.addr.offset,
+            size: c0.size,
+            domain: c0.domain_id,
         })
     }
 
-    /// A shifted single-chunk window `sh` bytes into this region (size = remaining bytes, the
-    /// same `c0.size > sh ? c0.size - sh : c0.size` rule the C++ per-layer advance used).
+    /// A shifted single-chunk window `sh` bytes into this region — size = the bytes remaining
+    /// past `sh`, or the whole chunk when `sh` is beyond it.
     pub fn shifted(&self, sh: u64) -> Option<DevAddr> {
         let c0 = self.chunk0()?;
-        let nsz = if c0.size > sh { c0.size - sh } else { c0.size };
+        let nsz = if c0.size.0 > sh {
+            ByteSize(c0.size.0 - sh)
+        } else {
+            c0.size
+        };
         Some(DevAddr::from_chunk(Chunk0 {
             region: c0.region,
-            offset: c0.offset + sh,
+            offset: ByteOffset(c0.offset.0 + sh),
             size: nsz,
             domain: c0.domain,
         }))
@@ -582,8 +624,8 @@ impl DevAddr {
         let c0 = self.chunk0()?;
         Some(DevAddr::from_chunk(Chunk0 {
             region: c0.region,
-            offset: c0.offset + off,
-            size: len,
+            offset: ByteOffset(c0.offset.0 + off),
+            size: ByteSize(len),
             domain: c0.domain,
         }))
     }

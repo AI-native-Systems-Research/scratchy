@@ -53,10 +53,10 @@ jobs:
       CUDA_COMPUTE_CAP: "90"
       SCRATCHY_SKIP_CUDA_KERNELS: "1"
       # Same idea for the spyre side: `--workspace` also builds
-      # scratchy-target-spyre (and its flex-rs path dep), whose build scripts
-      # compile C++ against the IBM Spyre SDK headers. The runner has no SDK,
+      # scratchy-target-spyre (and its flex-rs path dep), whose build script
+      # compiles C++ against the IBM Spyre SDK headers. The runner has no SDK,
       # so skip the C++ shim compile — check/clippy don't link it. This is the
-      # escape hatch both build scripts document for exactly this case.
+      # escape hatch that build script documents for exactly this case.
       SCRATCHY_SKIP_SENDNN_CXX: "1"
     steps:
       - uses: actions/checkout@v7

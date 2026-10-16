@@ -21,11 +21,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+use flex_rs::memory_region::MemoryType;
 use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::fold_plan::{self, Bytes, OpKv, RowIdx, RowPage, SessionKv, SlotPos, UniformPages};
-use crate::runtime::{DevAddr, HwError, MemKind, Stream};
+use crate::runtime::{DevAddr, HwError, Stream};
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
 
@@ -269,32 +270,26 @@ struct OpProg {
     kv: OpKv,
 }
 
-/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS LEAKED ON PURPOSE, BECAUSE IT OUTLIVES THE RUNTIME THAT
-/// COULD FREE IT.
+/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE, BECAUSE IT OUTLIVES THE
+/// RUNTIME THAT COULD FREE IT. Per-step windows (`shifted`, built per layer per launch) are NOT:
+/// they drop as owned values while the runtime is alive.
 ///
-/// MEASURED 2026-08-12: every run ended `RUN_RC=255` **after** `Batch complete: N succeeded, 0 failed`
-/// — `RAS::FLEXALLOCATOR::AddressNotFound — deallocate: CompositeAddress not found in allocation_map`,
-/// thrown out of `flex::CompositeAddress::~CompositeAddress` into `__cxa_call_terminate`. Exit codes
-/// became lies: any gate that reads `$?` calls a perfect run a failure.
+/// It is a LIFETIME ORDER problem, not an ownership-kind one. These handles are dropped during
+/// PROCESS SHUTDOWN, by which point the runtime context and its allocator are gone: freeing then
+/// would look the address up in an empty map and throw out of a destructor — and a destructor is
+/// implicitly `noexcept`, so that throw is `std::terminate`. MEASURED 2026-08-12: every run ended
+/// `RUN_RC=255` **after** `Batch complete: N succeeded, 0 failed` — exit codes calling perfect
+/// runs failures.
 ///
-/// It is a LIFETIME ORDER problem, not an ownership-kind one. The deleted `sdsc_shim.cpp` deleted
-/// chunk-built sub-addresses ~120x per forward (`sdsc_dma_slice`) and never aborted, because those died
-/// inside a session object while the flex runtime was still up. These handles are dropped during
-/// PROCESS SHUTDOWN instead, by which point the runtime context and its allocator are gone, so the
-/// destructor looks the address up in an empty map and throws. `fxa_addr_free`'s `catch (...)` cannot
-/// save it: a destructor is implicitly `noexcept`, so the throw calls `std::terminate` directly.
-///
-/// Leaking is CORRECT here, not a workaround: the device region lives until process exit either way
-/// (the C++ executor never freed regions), so all that leaks is a descriptor, once, at shutdown.
-///
-/// The C++ destructor that threw is gone — the handle is now an `Arc` over a plain descriptor value
-/// (`runtime::DevAddr`), whose drop cannot reach the allocator — but the `forget` stays: it costs
-/// nothing and keeps this law's shape independent of whatever a future `DevAddr` drop might learn
-/// to do.
+/// Leaking is CORRECT here, not a workaround: the device region lives until process exit either
+/// way, so all that leaks is a descriptor value, once, at shutdown. Today's `runtime::DevAddr` is
+/// an `Arc` over a plain descriptor whose drop cannot reach the allocator — the `forget` stays
+/// anyway: it costs nothing and keeps this law's shape independent of whatever a future
+/// `DevAddr` drop might learn to do.
 ///
 /// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step windows
-/// (`shifted`, built per layer per launch) must keep dying as owned values — they drop while the
-/// runtime is alive, and at ~120 per forward a leaked descriptor each grows without bound.
+/// (`shifted`, built per layer per launch) must keep dying as owned values — at ~120 per forward a
+/// leaked descriptor each grows without bound.
 impl Drop for OpProg {
     fn drop(&mut self) {
         std::mem::forget(self.addr.take());
@@ -1467,7 +1462,7 @@ impl Executor {
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(bytes, MemKind::Tensor)
+                DevAddr::alloc(bytes, MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -1483,7 +1478,7 @@ impl Executor {
                 self.weight_bank_bytes[b].max(128)
             };
             self.weight_bank_addr[b] =
-                Some(DevAddr::alloc(bytes, MemKind::Tensor).map_err(|e| {
+                Some(DevAddr::alloc(bytes, MemoryType::Tensor).map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -1690,7 +1685,7 @@ impl Executor {
                         )
                     })?;
                 let head = img.bootstrap();
-                let addr = DevAddr::alloc(img.alloc_bytes(), MemKind::Program).map_err(|e| {
+                let addr = DevAddr::alloc(img.alloc_bytes(), MemoryType::Program).map_err(|e| {
                     anyhow!(
                         "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
                         img.alloc_bytes(),
@@ -2419,7 +2414,7 @@ impl Executor {
                     let _ = writeln!(
                         out,
                         "[segaddr] {who} seg{i} region={} offset={} size={} shift={}",
-                        c.region, c.offset, c.size, off[i]
+                        c.region.0, c.offset.0, c.size.0, off[i]
                     );
                 }
                 _ => {
@@ -2433,9 +2428,9 @@ impl Executor {
                 let _ = writeln!(
                     out,
                     "[segaddr] {who} seg7/PROG region={} offset={} size={} (binary {} B)",
-                    c.region,
-                    c.offset,
-                    c.size,
+                    c.region.0,
+                    c.offset.0,
+                    c.size.0,
                     op.code.init_binary.len()
                 );
             }
@@ -3411,7 +3406,7 @@ impl Executor {
         self.seg_aliased[i] = true;
         debug!(
             "[sdsc-superdsc] alias_seg(seg{i}): dst now SHARES src's region ({} B)",
-            c0.size
+            c0.size.0
         );
         // ⭐⭐ AND THE WEIGHT SEGMENT'S EXTRA BANKS — because they ARE the weight segment. Aliasing
         // seg1 while leaving a bank pointing at this session's own (zero-filled) region would give

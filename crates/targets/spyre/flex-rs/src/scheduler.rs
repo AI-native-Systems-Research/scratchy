@@ -4757,6 +4757,21 @@ pub enum SchedulerFactoryError {
     MismatchedBackendConfig,
 }
 
+impl std::fmt::Display for SchedulerFactoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedChipVersion(chip) => {
+                write!(f, "unsupported SPYRE_CHIP version: {chip}")
+            }
+            Self::UnsupportedDeviceKind(kind) => write!(f, "unsupported device kind: {kind}"),
+            Self::MismatchedBackendConfig => {
+                write!(f, "scheduler backend config does not match the device kind")
+            }
+        }
+    }
+}
+impl std::error::Error for SchedulerFactoryError {}
+
 /// Port of `RuntimeSchedulerFactory::createScheduler` (which internally
 /// dispatches to `createRealScheduler`/`createMockScheduler`).
 pub fn create_scheduler(

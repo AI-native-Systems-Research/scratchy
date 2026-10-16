@@ -68,9 +68,8 @@ pub mod manifest;
 #[cfg(feature = "spyre-emu")]
 pub mod runner;
 /// The typed card surface over flex-rs: streams, device addresses, launches, and the card's
-/// memory capacity — `Arc<RuntimeContext>`-backed handles, no C ABI. This is what the deleted
-/// `sdk_abi.rs`/`fxa_rust_abi.rs` pair used to be (see the module doc for what the collapse
-/// bought). Behind `spyre-hw` (it links the SDK via flex-rs's cxx-shim).
+/// memory capacity — `Arc<RuntimeContext>`-backed handles, no C ABI. Behind `spyre-hw` (it
+/// links the SDK via flex-rs's cxx-shim).
 #[cfg(feature = "spyre-hw")]
 pub mod runtime;
 /// The worker-facing session wrapper over [`superdsc_exec`] (f32 in, f32 logits out).
