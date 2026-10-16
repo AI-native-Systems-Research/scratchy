@@ -264,11 +264,12 @@ These favour one side or the other and must travel with any published number.
   quantization rungs to concrete per-engine artifacts: see
   [`CLAUDE_CODE_BENCH.md`](CLAUDE_CODE_BENCH.md), which carries the Claude Code
   comparison's pins, disclosures and blocked cells. Its method is promoted into
-  this file as a §7 once that epic's phase 5 lands. Two of these asymmetries
-  come from the trace replay itself
-  ([What the replay enforces](CLAUDE_CODE_BENCH.md#what-the-replay-enforces-lane-a)).
-  It clears scratchy's prefix cache before every repeat, which ollama offers no
-  way to do. And it sends a session's overlapping requests one at a time.
+  this file as a §7 once that epic's phase 5 lands. The trace replay adds one
+  of its own
+  ([What the replay enforces](CLAUDE_CODE_BENCH.md#what-the-replay-enforces-lane-a)):
+  it sends a session's overlapping requests one at a time. It clears both
+  engines' prefix caches before every pass, but differently: scratchy has a
+  reset endpoint, while ollama has to unload and reload the model.
 
 ## 5. Running it
 

@@ -41,13 +41,17 @@ in the leaderboard's Lane A shape (`site/build_leaderboard.py` validates it):
         --out run-laneA.json
 
 One engine per invocation: alternating engines across repeats is the runner's
-job, not this tool's. A run that cannot be trusted is written with
-`status: "void"` and the reason, and exits non-zero. That covers a session
-too long for the engine's context window, a request counter that disagrees
-with what was sent, a prefix cache that survived its reset, and a turn that
-returned no tokens or no content, timed out, answered 4xx, was cut short at
-max_tokens, or counted a prompt shorter than the recording's by more than the
-tolerance.
+job, not this tool's. One warm-up pass runs before the measured repeats and is
+reported beside them, never in them (`--no-warmup` skips it). Every pass starts
+with the engine's prefix cache cleared: scratchy through its reset endpoint,
+ollama by unloading and reloading the model.
+
+A run that cannot be trusted is written with `status: "void"` and the reason,
+and exits non-zero. That covers a session too long for the engine's context
+window, a request counter that disagrees with what was sent, a cache reset that
+failed or a cache that survived it, and a turn that returned no tokens or no
+content, timed out, answered 4xx, was cut short at max_tokens, or counted a
+prompt shorter than the recording's by more than the tolerance.
 Standard library only.
 """
 
@@ -492,11 +496,16 @@ TURN_PATH = "/v1/messages"
 # What each engine's server offers the replay's checks. Data, not a code path:
 # the replay itself is the same for both.
 #   counts_requests  reports `requests_served` on /server_info (#161 fairness rule 7)
-#   reset_path       clears the prefix cache; POSTed before every repeat
+#   reset            how its prefix cache is cleared before every pass: "post"
+#                    POSTs `reset_path`; "reload" unloads the model and loads it
+#                    again, the only way ollama has, since its cache lives in the
+#                    process holding the model (#551). None: it cannot be cleared.
 ENGINES = {
-    "scratchy": {"counts_requests": True, "reset_path": "/reset_prefix_cache"},
-    "ollama": {"counts_requests": False, "reset_path": None},
+    "scratchy": {"counts_requests": True, "reset": "post", "reset_path": "/reset_prefix_cache"},
+    "ollama": {"counts_requests": False, "reset": "reload", "reset_path": None},
 }
+# How often a reload checks ollama's /api/ps for the model to leave or return.
+RELOAD_POLL_S = 0.25
 # Provenance a run names for both engines. It comes from flags: the tool cannot
 # discover it, and the validator requires both sides' values on every run.
 PER_ENGINE_PROVENANCE = ("kv_cache_dtype", "quantization", "checkpoint_revision")
@@ -526,8 +535,7 @@ TURN_METRICS = {
 # part of it (#161 fairness rule 3). A longer prompt is only counted.
 PROMPT_SHORTFALL_TOKENS = 64
 PROMPT_SHORTFALL_FRACTION = 0.05
-# Disclosure ids. The first two are declared in site/data/leaderboard/board.json;
-# the other three are not yet (#441).
+# Disclosure ids, declared in site/data/leaderboard/board.json (#176).
 DISCLOSE_KV = "kv-dtype-unmatched"
 DISCLOSE_QUANT = "quantizer-differs"
 DISCLOSE_NO_COUNTER = "requests-served-unavailable"
@@ -537,6 +545,10 @@ DISCLOSE_SERIAL = "replay-serialized"
 
 class TurnFailed(Exception):
     """A turn the run cannot average in: it voids the run."""
+
+
+class ResetFailed(Exception):
+    """A prefix-cache reset that did not happen: it voids the run."""
 
 
 def percentile(xs, q):
@@ -797,6 +809,73 @@ def served_context_length(endpoint, model):
     return n if isinstance(n, int) else None
 
 
+def _call(method, url, body=None, timeout=10):
+    """_http, with a connection failure as a status string rather than an exception."""
+    try:
+        return _http(method, url, body=body, timeout=timeout)
+    except (OSError, http.client.HTTPException) as e:
+        return f"{type(e).__name__}: {e}", None
+
+
+def ollama_loaded(endpoint, model):
+    """Whether ollama's GET /api/ps lists `model` as loaded. Raises ResetFailed."""
+    status, ps = _call("GET", endpoint.rstrip("/") + "/api/ps")
+    if status != 200 or not isinstance(ps, dict):
+        raise ResetFailed(f"GET /api/ps answered {status}")
+    return any(m.get("name") == model or m.get("model") == model
+               for m in ps.get("models") or [] if isinstance(m, dict))
+
+
+def ollama_reload(endpoint, model, timeout_s):
+    """Clear ollama's prefix cache by unloading `model` and loading it again.
+
+    The cache lives in the process that holds the model, so a reload is the only
+    way to clear it (#551). A request's own `keep_alive: 0` unloads even when the
+    server runs with OLLAMA_KEEP_ALIVE=-1; `keep_alive: -1` then keeps the
+    reloaded model resident. Both steps wait on /api/ps rather than a fixed
+    sleep. Returns the seconds the load took. Raises ResetFailed.
+    """
+    url = endpoint.rstrip("/") + "/api/generate"
+    for keep_alive, want_loaded, step in ((0, False, "unload"), (-1, True, "load")):
+        t0 = time.monotonic()
+        body = json.dumps({"model": model, "keep_alive": keep_alive}).encode()
+        status, reply = _call("POST", url, body=body, timeout=timeout_s)
+        if status != 200:
+            error = reply.get("error") if isinstance(reply, dict) else None
+            raise ResetFailed(f"{step} of {model!r} answered {status}"
+                              + (f": {error}" if error else ""))
+        while ollama_loaded(endpoint, model) != want_loaded:
+            if time.monotonic() - t0 > timeout_s:
+                raise ResetFailed(f"{model!r} still {'not ' if want_loaded else ''}loaded "
+                                  f"{timeout_s:.0f}s after the {step}")
+            time.sleep(RELOAD_POLL_S)
+    return time.monotonic() - t0
+
+
+def make_reset(engine, endpoint, *, reset_cache_url=None, model=None, timeout_s=600):
+    """(how the prefix cache is reset, a function that resets it, the URL it
+    POSTs to or None) for one run.
+
+    The function returns the seconds the reset took and raises ResetFailed.
+    (None, None, None) when this engine's cache cannot be cleared.
+    """
+    if reset_cache_url or ENGINES[engine]["reset"] == "post":
+        url = reset_cache_url or endpoint.rstrip("/") + ENGINES[engine]["reset_path"]
+
+        def post():
+            t0 = time.monotonic()
+            status, _ = _call("POST", url, body=b"{}")
+            if status not in (200, 204):
+                raise ResetFailed(f"POST {url} answered {status}")
+            return time.monotonic() - t0
+
+        return f"POST {url}", post, url
+    if ENGINES[engine]["reset"] == "reload":
+        return (f"unload and reload {model}",
+                lambda: ollama_reload(endpoint, model, timeout_s), None)
+    return None, None, None
+
+
 def send_turn(endpoint, turn, *, temperature, served_model=None, timeout_s=600):
     """Replay one turn and time it. Raises TurnFailed."""
     scheme, host, port, base = endpoint
@@ -916,14 +995,20 @@ def prompt_shortfall(recorded, replayed):
 
 
 def aggregate(samples, *, engine, model, repeat):
-    """(measurements, gaps, by_turn_index) from every replayed turn of every repeat.
+    """(measurements, gaps, by_turn_index) from every replayed turn of every pass.
 
-    Each stat is over every (repeat, turn) value, and `stat.samples` says how
-    many; `n` is the repeat count, the page's "×reps". The board takes series
-    points as [x, y] pairs, so the
-    series carries each turn index's p50, and `by_turn_index` (written to the
-    .turns.json artifact) carries its p50 and p99.
+    Each stat is over every (repeat, turn) value of the measured repeats, and
+    `stat.samples` says how many; `n` is the repeat count, the page's "×reps".
+    The board takes series points as [x, y] pairs, so the series carries each
+    turn index's p50, and `by_turn_index` (written to the .turns.json artifact)
+    carries its p50 and p99.
+
+    The warm-up pass is never in any of that. It is reported beside it, as the
+    same metrics under a `pass: warmup` facet with n 1: the cost of the first
+    session after the engine starts, which is a different thing (#551).
     """
+    warm = [t for t in samples if t["warmup"]]
+    samples = [t for t in samples if not t["warmup"]]
     base = {"lane": "A", "engine": engine, "model": model}
     measurements, gaps, by_turn_index = [], [], {}
     classes = {tc: [t for t in samples if t["turn_class"] == tc] for tc in TURN_CLASSES[1:]}
@@ -967,6 +1052,11 @@ def aggregate(samples, *, engine, model, repeat):
     gaps.append({**base, "metric": "spec_accept_rate", "state": "not-run",
                  "reason": "the Anthropic stream reports no draft acceptance; the replay "
                            "cannot measure it"})
+
+    for metric in TURN_METRICS:
+        if values := [t[metric] for t in warm if t[metric] is not None]:
+            measurements.append({**base, "metric": metric, "n": 1, "stat": _stat(values),
+                                 "facet": {"pass": "warmup"}})
     return measurements, gaps, by_turn_index
 
 
@@ -994,34 +1084,39 @@ def check_endpoint(up, endpoint, engine, *, ollama_version, context_length, mode
     return ollama_version, context_length or reported
 
 
-def replay_turns(up, turns, *, repeat, temperature, served_model, timeout_s, reset_url,
-                 resets_count, log):
-    """(samples, requests sent, void reason or None) for `repeat` passes over `turns`.
+def replay_turns(up, turns, *, repeat, warmup, temperature, served_model, timeout_s,
+                 reset, reset_name, resets_count, resets, log):
+    """(samples, requests sent, void reason or None) for the passes over `turns`.
 
-    Stops at the first turn that voids the run: nothing after it is averaged in.
+    With `warmup`, pass 0 runs first: a whole pass before the measured repeats
+    1..`repeat`, so one-time work in a freshly started engine lands there and not
+    in repeat 1 (#551). `reset`, when there is one, clears the prefix cache before
+    every pass, the warm-up included, so each pass starts cold; how long each
+    reset took is appended to `resets`. Stops at the first turn that voids the
+    run: nothing after it is averaged in.
     """
     sent, samples = 0, []
-    for r in range(1, repeat + 1):
-        if reset_url:
+    for r in range(0 if warmup else 1, repeat + 1):
+        name = "warm-up" if r == 0 else f"repeat {r}"
+        if reset:
+            sent += resets_count
             try:
-                status, _ = _http("POST", reset_url, body=b"{}")
-            except (OSError, http.client.HTTPException) as e:
-                status = f"{type(e).__name__}: {e}"
-            sent += int(resets_count)
-            if status not in (200, 204):
-                return samples, sent, f"cache reset {reset_url} answered {status}"
+                resets.append({"repeat": r, "seconds": round(reset(), 3)})
+            except ResetFailed as e:
+                return samples, sent, f"{name}: cache reset ({reset_name}) failed: {e}"
+            log(f"[r{r}] {reset_name}: {resets[-1]['seconds']}s")
         for i, t in enumerate(turns, 1):
-            where = f"repeat {r} turn {i} (seq {t['seq']})"
+            where = f"{name} turn {i} (seq {t['seq']})"
             sent += 1
             try:
                 timing = send_turn(up, t, temperature=temperature, served_model=served_model,
                                    timeout_s=timeout_s)
             except TurnFailed as e:
                 return samples, sent, f"{where}: {e}"
-            if reset_url and i == 1 and timing["cache_read_input_tokens"]:
+            if reset and i == 1 and timing["cache_read_input_tokens"]:
                 return samples, sent, (
                     f"{where}: read {timing['cache_read_input_tokens']} prompt tokens from "
-                    f"the prefix cache right after {reset_url} cleared it, so this repeat "
+                    f"the prefix cache right after {reset_name} cleared it, so this pass "
                     "did not start cold")
             recorded_out = t["recorded"].get("output_tokens")
             cut = timing["stop_reason"] == "max_tokens"
@@ -1038,7 +1133,8 @@ def replay_turns(up, turns, *, repeat, temperature, served_model, timeout_s, res
                     f"the recording had {recorded_prompt}, {short} tokens short — more than the "
                     f"{PROMPT_SHORTFALL_TOKENS}-token / {PROMPT_SHORTFALL_FRACTION:.0%} "
                     "tolerance, so part of the prompt was dropped (#161 fairness rule 3)")
-            sample = {"repeat": r, "turn_index": i, "seq": t["seq"],
+            # `repeat` 0 is the warm-up; `warmup` says so without knowing that.
+            sample = {"repeat": r, "warmup": r == 0, "turn_index": i, "seq": t["seq"],
                       "turn_class": t["turn_class"], "in_flight": t["in_flight"],
                       "recorded_output_tokens": recorded_out,
                       "recorded_prompt_tokens": recorded_prompt, **timing}
@@ -1052,8 +1148,13 @@ def replay_turns(up, turns, *, repeat, temperature, served_model, timeout_s, res
 
 def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung,
                      scratchy_sha, ollama_version, context_length, engine_provenance,
-                     temperature, cache_reset, served_model, disclosed):
-    """The run's provenance block, every key the leaderboard requires."""
+                     temperature, cache_reset, resets, warmup, served_model, disclosed):
+    """The run's provenance block, every key the leaderboard requires.
+
+    The turn counts below are over the measured repeats; the warm-up pass is
+    reported on its own.
+    """
+    samples = [t for t in samples if not t["warmup"]]
     differs = [t for t in samples if None not in (t["prompt_tokens"], t["recorded_prompt_tokens"])
                and t["prompt_tokens"] != t["recorded_prompt_tokens"]]
     return {
@@ -1084,7 +1185,14 @@ def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung
             # own for this, so it travels with the corpus it describes.
             "replay": {
                 "concurrency": 1,
+                # How the cache was cleared before every pass (None: it was not),
+                # and how long each clear took: an ollama reload loads the
+                # weights again, so a slow one shows up here, outside the turns.
                 "cache_reset": cache_reset,
+                "cache_reset_seconds": resets,
+                # One pass before the measured repeats, kept out of every
+                # headline cell; False when --no-warmup skipped it.
+                "warmup": warmup,
                 "served_model": served_model,
                 "unstreamed_turns": sum(1 for t in samples if t["unstreamed"]),
                 "max_tokens_turns": sum(1 for t in samples if t["stop_reason"] == "max_tokens"),
@@ -1100,9 +1208,11 @@ def build_provenance(manifest, corpus, turns, skipped, samples, *, machine, rung
 def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engine_provenance,
            repeat=3, temperature=0.0, ollama_version=None, context_length=None,
            served_model=None, server_info_url=None, reset_cache_url=None, timeout_s=600,
-           run_id=None, log=lambda msg: print(msg, file=sys.stderr, flush=True)):
+           warmup=True, run_id=None, log=lambda msg: print(msg, file=sys.stderr, flush=True)):
     """Replay `corpus` against `endpoint` and return (run, turns detail).
 
+    One warm-up pass, unless `warmup` is False, then `repeat` measured passes,
+    each after a prefix-cache reset where the engine allows one.
     `engine_provenance` maps each PER_ENGINE_PROVENANCE key to a per-engine dict.
     Configuration problems raise SystemExit before anything is sent. A run that
     cannot be trusted comes back with status "void" and a `void` reason.
@@ -1124,18 +1234,19 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engi
         raise SystemExit(f"{corpus}: manifest names agent {manifest.get('agent')!r} "
                          f"{manifest.get('agent_version')!r}, not a Claude Code version")
     classify(turns)
+    model_name = served_model or turns[0]["body"].get("model")
     ollama_version, context_length = check_endpoint(
         up, endpoint, engine, ollama_version=ollama_version, context_length=context_length,
-        model_name=served_model or turns[0]["body"].get("model"))
+        model_name=model_name)
 
-    reset_path = ENGINES[engine]["reset_path"]
-    reset_url = reset_cache_url or (reset_path and endpoint.rstrip("/") + reset_path)
+    reset_name, reset, reset_url = make_reset(engine, endpoint, reset_cache_url=reset_cache_url,
+                                              model=model_name, timeout_s=timeout_s)
     info_url = server_info_url or endpoint.rstrip("/") + "/server_info"
     disclosed = [d for d, applies in (
         (DISCLOSE_KV, len(set(engine_provenance["kv_cache_dtype"].values())) > 1),
         (DISCLOSE_QUANT, len(set(engine_provenance["quantization"].values())) > 1),
         (DISCLOSE_SERIAL, any(t["in_flight"] for t in turns)),
-        (DISCLOSE_NO_RESET, not reset_url),
+        (DISCLOSE_NO_RESET, reset is None),
     ) if applies]
 
     void = None
@@ -1152,12 +1263,16 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engi
         else:
             disclosed.append(DISCLOSE_NO_COUNTER)
 
-    samples, sent = [], 0
+    samples, sent, resets = [], 0, []
     if not void:
-        resets_count = bool(reset_url) and urlsplit(reset_url).netloc == urlsplit(info_url).netloc
+        # Requests one reset adds to `requests_served`: a POST to the counting
+        # server is one. A reload goes to ollama, which has no counter to match.
+        resets_count = int(bool(reset_url)
+                           and urlsplit(reset_url).netloc == urlsplit(info_url).netloc)
         samples, sent, void = replay_turns(
-            up, turns, repeat=repeat, temperature=temperature, served_model=served_model,
-            timeout_s=timeout_s, reset_url=reset_url, resets_count=resets_count, log=log)
+            up, turns, repeat=repeat, warmup=warmup, temperature=temperature,
+            served_model=served_model, timeout_s=timeout_s, reset=reset,
+            reset_name=reset_name, resets_count=resets_count, resets=resets, log=log)
     served_after = requests_served(info_url) if served_before is not None else None
     if not void and served_before is not None:
         if served_after is None or served_after - served_before != sent:
@@ -1169,8 +1284,8 @@ def replay(corpus, endpoint, *, engine, model, machine, rung, scratchy_sha, engi
         manifest, corpus, turns, skipped, samples, machine=machine, rung=rung,
         scratchy_sha=scratchy_sha, ollama_version=ollama_version,
         context_length=context_length, engine_provenance=engine_provenance,
-        temperature=temperature, cache_reset=bool(reset_url), served_model=served_model,
-        disclosed=disclosed)
+        temperature=temperature, cache_reset=reset_name, resets=resets, warmup=warmup,
+        served_model=served_model, disclosed=disclosed)
     run = {"schema": SCHEMA, "run_id": run_id or f"laneA-{engine}-{model}-{machine}-{rung}",
            "lane": "A", "status": "published", "provenance": prov,
            "measurements": [], "gaps": [], "ablations": []}
@@ -1198,15 +1313,16 @@ def cmd_replay(args):
                            for k in PER_ENGINE_PROVENANCE},
         served_model=args.served_model, server_info_url=args.server_info_url,
         reset_cache_url=args.reset_cache_url, timeout_s=args.timeout_s,
-        run_id=args.run_id or out.stem)
+        warmup=not args.no_warmup, run_id=args.run_id or out.stem)
     turns_path = out.with_name(out.stem + ".turns.json")
     run["provenance"]["artifacts"] = [turns_path.name]
     out.parent.mkdir(parents=True, exist_ok=True)
     turns_path.write_text(json.dumps(detail, indent=2) + "\n")
     out.write_text(json.dumps(run, indent=2) + "\n")
     tc = run["provenance"]["trace_corpus"]
-    print(f"{tc['turns']} turns x {args.repeat} replayed, {tc['skipped']} requests skipped, "
-          f"{tc['replay']['unstreamed_turns']} unstreamed; wrote {out} and {turns_path}",
+    warm = "" if args.no_warmup else " after a warm-up pass"
+    print(f"{tc['turns']} turns x {args.repeat} replayed{warm}, {tc['skipped']} requests "
+          f"skipped, {tc['replay']['unstreamed_turns']} unstreamed; wrote {out} and {turns_path}",
           file=sys.stderr)
     if run["status"] == "void":
         raise SystemExit(f"VOID: {run['void']}")
@@ -1235,11 +1351,16 @@ def main(argv=None):
     a.add_argument("--model", required=True, help="leaderboard model id, e.g. gemma-4-12b-it")
     a.add_argument("--machine", required=True, help="leaderboard machine id, e.g. m5max-64")
     a.add_argument("--rung", required=True, help="leaderboard rung id, e.g. R1")
-    a.add_argument("--repeat", type=int, default=3, help="passes over the corpus (default 3)")
+    a.add_argument("--repeat", type=int, default=3,
+                   help="measured passes over the corpus (default 3)")
+    a.add_argument("--no-warmup", action="store_true",
+                   help="skip the warm-up pass before the measured ones (recorded in provenance)")
     a.add_argument("--out", required=True, help="Lane A run JSON to write")
     a.add_argument("--run-id", help="run_id (default: the --out file's stem)")
     a.add_argument("--temperature", type=float, default=0.0, help="pinned sampling (default 0.0)")
-    a.add_argument("--served-model", help="model name to send (default: as recorded)")
+    a.add_argument("--served-model",
+                   help="model name to send, and on ollama the model reloaded to clear its "
+                        "cache (default: as recorded)")
     a.add_argument("--scratchy-sha", required=True, help="commit the scratchy side was built from")
     a.add_argument("--ollama-version",
                    help="the ollama side's version (default: asked of an ollama endpoint)")
@@ -1251,8 +1372,9 @@ def main(argv=None):
     a.add_argument("--server-info-url",
                    help="where requests_served is read (default: <endpoint>/server_info)")
     a.add_argument("--reset-cache-url",
-                   help="POSTed before each repeat to clear the prefix cache (default for "
-                        "scratchy, which cannot opt out: <endpoint>/reset_prefix_cache)")
+                   help="POSTed before each pass to clear the prefix cache, in place of the "
+                        "engine's own reset (scratchy: POST <endpoint>/reset_prefix_cache; "
+                        "ollama: unload and reload the model). Neither can be turned off")
     a.add_argument("--timeout-s", type=float, default=600,
                    help="per-turn ceiling; a timeout voids the run (default 600)")
     a.set_defaults(func=cmd_replay)

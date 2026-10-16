@@ -385,27 +385,34 @@ class FakeAnthropic(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # State is read and written through type(self), so a subclass keeps its own.
+
     def do_GET(self):
+        cls = type(self)
         if self.path == "/server_info":
-            self._send(200, {"requests_served": FakeAnthropic.served,
+            self._send(200, {"requests_served": cls.served,
                              "system_env": {"vllm_version": "0.1.0"}})
             return
-        FakeAnthropic.served += 1
+        cls.served += 1
         if self.path == "/v1/models":
             self._send(200, {"data": [{"id": "gemma", "max_model_len": 32768}]})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        cls = type(self)
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
-        if FakeAnthropic.counting or not self.path.startswith("/v1/messages"):
-            FakeAnthropic.served += 1
+        if cls.counting or not self.path.startswith("/v1/messages"):
+            cls.served += 1
         if self.path == "/reset_prefix_cache":
-            FakeAnthropic.resets += 1
+            cls.resets += 1
             self._send(200, {})
             return
-        FakeAnthropic.seen.append((self.path, self.headers.items(), body))
-        reply = FakeAnthropic.reply(body)
+        if not self.path.startswith("/v1/messages"):
+            self._send(404, {"error": "not found"})
+            return
+        cls.seen.append((self.path, self.headers.items(), body))
+        reply = cls.reply(body)
         if isinstance(reply, int):
             self._send(reply, {"type": "error", "error": {"message": "prompt is too long"}})
             return
@@ -418,6 +425,59 @@ class FakeAnthropic(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"%x\r\n%s\r\n" % (len(ev), ev))
             self.wfile.flush()
         self.wfile.write(b"0\r\n\r\n")
+
+
+class FakeOllama(FakeAnthropic):
+    """An ollama-shaped engine: no request counter, no reset endpoint, and a
+    prefix cache that lives as long as the loaded model.
+
+    It remembers every prompt it has served since the model was last loaded, and
+    serves a prompt it has seen as a cache hit. Unloading the model
+    (`keep_alive: 0` on /api/generate) forgets them, which is the only way to
+    clear it. `reloads` counts loads; `loadable` lists the models it knows.
+    """
+
+    loaded = set()
+    loadable = {"gemma"}
+    cached = set()
+    reloads = 0
+    hits = []
+
+    def do_GET(self):
+        if self.path == "/api/version":
+            self._send(200, {"version": "0.40.4"})
+        elif self.path == "/api/ps":
+            self._send(200, {"models": [{"name": m, "model": m} for m in sorted(self.loaded)]})
+        elif self.path == "/v1/models":
+            # ollama reports no window; the replay is told it by --context-length.
+            self._send(200, {"data": [{"id": "gemma"}]})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/generate":
+            return super().do_POST()
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+        model = body.get("model")
+        if model not in self.loadable:
+            self._send(404, {"error": f"model '{model}' not found"})
+            return
+        if body.get("keep_alive") == 0:
+            FakeOllama.loaded.discard(model)
+            FakeOllama.cached.clear()
+        else:
+            FakeOllama.loaded.add(model)
+            FakeOllama.reloads += 1
+        self._send(200, {"model": model, "done": True})
+
+
+def _ollama_reply(body):
+    """The stream FakeOllama sends: a cache hit when it has served this prompt before."""
+    key = json.dumps(body["messages"], sort_keys=True)
+    hit = key in FakeOllama.cached
+    FakeOllama.cached.add(key)
+    FakeOllama.hits.append(hit)
+    return _stream(input_tokens=1 if hit else 100, cache_read=99 if hit else 0)
 
 
 def _user(text):
@@ -493,6 +553,22 @@ def write_corpus(root, recorded_output_tokens=5, recorded_input_tokens=100, conc
     return root
 
 
+def board_problems(run):
+    """What site/build_leaderboard.py's validator (#176) says about one run.
+
+    Coverage of the other cells is the whole board's concern, not one run's, so
+    only problems naming this run count.
+    """
+    sys.path.insert(0, str(VALIDATOR.parent))  # it imports its sibling charts.py
+    spec = importlib.util.spec_from_file_location("build_leaderboard", VALIDATOR)
+    lb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lb)
+    board = json.loads(BOARD.read_text())
+    board["runs"] = [run]
+    lb.index(board)
+    return [p for p in lb.validate(board) if p.startswith(run["run_id"])]
+
+
 PER_ENGINE = {
     "kv_cache_dtype": {"scratchy": "bf16", "ollama": "f16"},
     "quantization": {"scratchy": "mlx-affine-b4-g64", "ollama": "Q4_K_M"},
@@ -520,8 +596,10 @@ class ReplayTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _replay(self, corpus=None, **kw):
+        # No warm-up unless a test asks: most tests are about one measured pass,
+        # and the warm-up has tests of its own.
         args = dict(engine="scratchy", model="gemma-4-12b-it", machine="m5max-64", rung="R1",
-                    repeat=1, scratchy_sha="abc123", ollama_version="0.40.0",
+                    repeat=1, warmup=False, scratchy_sha="abc123", ollama_version="0.40.0",
                     engine_provenance=PER_ENGINE, run_id="test-laneA", log=lambda msg: None)
         args.update(kw)
         return cc_trace.replay(corpus or self.corpus, self.url, **args)
@@ -542,7 +620,10 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual([t["seq"] for t in detail["turns"]], [1, 4, 5, 6, 7] * 2)
         # scratchy's prefix cache is cleared before every repeat, without being asked.
         self.assertEqual(FakeAnthropic.resets, 2)
-        self.assertEqual((tc["replay"]["cache_reset"], tc["replay"]["concurrency"]), (True, 1))
+        self.assertEqual((tc["replay"]["cache_reset"], tc["replay"]["concurrency"]),
+                         (f"POST {self.url}/reset_prefix_cache", 1))
+        self.assertEqual([r["repeat"] for r in tc["replay"]["cache_reset_seconds"]], [1, 2])
+        self.assertIs(tc["replay"]["warmup"], False)
         # 10 turns plus 2 resets, every one counted by the engine.
         self.assertEqual((detail["sent"], len(FakeAnthropic.seen)), (12, 10))
         # Recorded with two requests open at once, replayed one at a time: disclosed.
@@ -745,33 +826,171 @@ class ReplayTest(unittest.TestCase):
                          {"scratchy": "a", "ollama": "b@c"})
         self.assertEqual(FakeAnthropic.seen, [])
 
+    def test_warmup_is_reported_beside_the_headline_never_in_it(self):
+        # The warm-up pass is slow, as a freshly started engine is; the measured
+        # passes are not. Nothing slow may reach a headline cell.
+        warm_ttft = 5.0
+        calls = []
+
+        def reply(body):
+            calls.append(1)
+            first_pass = len(calls) <= 5
+            return [(warm_ttft if first_pass and i == 0 else 0, ev)
+                    for i, (_, ev) in enumerate(_stream())]
+
+        FakeAnthropic.reply = staticmethod(reply)
+        run, detail = self._replay(repeat=2, warmup=True)
+        self.assertEqual(run["status"], "published", run.get("void"))
+        # One warm-up pass, then the two measured ones, a reset before each.
+        self.assertEqual([t["repeat"] for t in detail["turns"]], [0] * 5 + [1] * 5 + [2] * 5)
+        self.assertEqual([t["warmup"] for t in detail["turns"]], [True] * 5 + [False] * 10)
+        self.assertEqual(FakeAnthropic.resets, 3)
+        replay = run["provenance"]["trace_corpus"]["replay"]
+        self.assertIs(replay["warmup"], True)
+        self.assertEqual([r["repeat"] for r in replay["cache_reset_seconds"]], [0, 1, 2])
+        # Turn counts in provenance are over the measured passes only.
+        self.assertEqual(replay["prompt_tokens_differ_turns"], 0)
+        # Headline cells: the measured passes, n = 2, and none of the 5 s turns.
+        for m in run["measurements"]:
+            if (m.get("facet") or {}).get("pass") == "warmup":
+                continue
+            self.assertEqual(m["n"], 2, m)
+            if m["metric"] in ("ttft_ms", "turn_e2e_ms", "e2e_star_ms"):
+                self.assertLess(m["stat"]["p99"], warm_ttft * 1000, m)
+        [ttft] = self._meas(run, "ttft_ms")
+        self.assertEqual(ttft["stat"]["samples"], 10)
+        # The warm-up sits beside them under its own facet, n = 1, with the 5 s in it.
+        warm = {m["metric"]: m for m in run["measurements"]
+                if m.get("facet") == {"pass": "warmup"}}
+        self.assertEqual(set(warm), set(cc_trace.TURN_METRICS))
+        self.assertTrue(all(m["n"] == 1 and "series" not in m for m in warm.values()))
+        self.assertEqual(warm["ttft_ms"]["stat"]["samples"], 5)
+        self.assertGreaterEqual(warm["ttft_ms"]["stat"]["median"], warm_ttft * 1000)
+
+    def test_a_failed_reset_voids_the_run(self):
+        run, detail = self._replay(reset_cache_url=self.url + "/no-such-reset")
+        self.assertEqual(run["status"], "void")
+        self.assertIn("cache reset", run["void"])
+        self.assertIn("404", run["void"])
+        self.assertEqual(detail["turns"], [])
+
+
     @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
                          "site/build_leaderboard.py is not in this checkout (#176)")
     def test_output_passes_the_leaderboard_validator(self):
-        sys.path.insert(0, str(VALIDATOR.parent))  # it imports its sibling charts.py
-        spec = importlib.util.spec_from_file_location("build_leaderboard", VALIDATOR)
-        lb = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(lb)
-
-        def problems(run):
-            board = json.loads(BOARD.read_text())
-            board["runs"] = [run]
-            lb.index(board)
-            # Coverage of the other cells is the whole board's concern, not one run's.
-            return [p for p in lb.validate(board) if p.startswith(run["run_id"])]
-
-        # Not full coverage: a recording with no overlapping requests, because a
-        # run from one that has them (every real Claude Code session) names
-        # `replay-serialized`, which the board does not declare yet. #441 adds it
-        # and a test for that run.
-        run, _ = self._replay(self._corpus("serial", concurrent=False), repeat=3)
+        # A recording with overlapping requests, as every real Claude Code
+        # session has, so the run names `replay-serialized`; and a warm-up pass.
+        run, _ = self._replay(repeat=3, warmup=True)
         self.assertEqual(run["status"], "published", run.get("void"))
-        self.assertEqual(problems(run), [])
+        self.assertIn(cc_trace.DISCLOSE_SERIAL, run["provenance"]["disclosed"])
+        self.assertEqual(board_problems(run), [])
         broken = json.loads(json.dumps(run))
         del broken["provenance"]["checkpoint_revision"]
-        self.assertTrue(any("'checkpoint_revision'" in p for p in problems(broken)))
+        self.assertTrue(any("'checkpoint_revision'" in p for p in board_problems(broken)))
         void = dict(run, status="void", void="test")
-        self.assertTrue(problems(void))
+        self.assertTrue(board_problems(void))
+
+
+class OllamaReplayTest(unittest.TestCase):
+    """The same replay against an ollama-shaped engine, whose cache only a reload clears."""
+
+    def setUp(self):
+        FakeOllama.served = 0
+        FakeOllama.resets = 0
+        FakeOllama.counting = True
+        FakeOllama.seen = []
+        FakeOllama.loaded = {"gemma"}
+        FakeOllama.loadable = {"gemma"}
+        FakeOllama.cached = set()
+        FakeOllama.reloads = 0
+        FakeOllama.hits = []
+        FakeOllama.reply = staticmethod(_ollama_reply)
+        self.engine = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
+        self.engine.daemon_threads = True
+        self.url = f"http://127.0.0.1:{_serve(self.engine)}"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.corpus = write_corpus(Path(self.tmp.name) / "corpus")
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.engine.server_close()
+        self.tmp.cleanup()
+
+    def _replay(self, **kw):
+        args = dict(engine="ollama", model="gemma-4-12b-it", machine="m5max-64", rung="R1",
+                    repeat=3, scratchy_sha="abc123", context_length=32768,
+                    engine_provenance=PER_ENGINE, run_id="test-laneA-ollama",
+                    log=lambda msg: None)
+        args.update(kw)
+        return cc_trace.replay(self.corpus, self.url, **args)
+
+    def test_every_pass_starts_cold_after_a_reload(self):
+        run, detail = self._replay()
+        self.assertEqual(run["status"], "published", run.get("void"))
+        # A reload before the warm-up and before each of the 3 measured passes.
+        self.assertEqual(FakeOllama.reloads, 4)
+        self.assertEqual(FakeOllama.loaded, {"gemma"})
+        # Turn 1 of every pass re-reads its whole prompt, as scratchy's does.
+        for r in range(4):
+            [first] = [t for t in detail["turns"] if t["repeat"] == r and t["turn_index"] == 1]
+            self.assertEqual(first["reprefill_ratio"], 1.0, r)
+        # No pass is served from the previous one's cache.
+        self.assertEqual(FakeOllama.hits, [False] * 20)
+        prov = run["provenance"]
+        self.assertEqual(prov["trace_corpus"]["replay"]["cache_reset"], "unload and reload gemma")
+        self.assertEqual(len(prov["trace_corpus"]["replay"]["cache_reset_seconds"]), 4)
+        self.assertNotIn(cc_trace.DISCLOSE_NO_RESET, prov["disclosed"])
+        self.assertIn(cc_trace.DISCLOSE_NO_COUNTER, prov["disclosed"])
+        self.assertEqual(prov["ollama_version"], "0.40.4")
+
+    def test_without_the_reload_the_cache_would_carry_over(self):
+        # The control: the same engine with nothing clearing its cache serves the
+        # second pass from the first's, which is what #551 measured.
+        for _ in range(2):
+            for body in conversation():
+                _ollama_reply(body)
+        self.assertEqual(FakeOllama.hits, [False] * 5 + [True] * 5)
+
+    def test_a_reload_of_the_wrong_model_voids_the_run(self):
+        run, detail = self._replay(served_model="no-such-model")
+        self.assertEqual(run["status"], "void")
+        self.assertIn("unload of 'no-such-model' answered 404", run["void"])
+        self.assertIn("not found", run["void"])
+        self.assertEqual((detail["turns"], FakeOllama.seen), ([], []))
+
+    def test_a_cache_that_survives_the_reload_voids_the_run(self):
+        # A reload that leaves the cache behind: what the cold-start check exists for.
+        FakeOllama.reply = staticmethod(lambda body: _stream(input_tokens=1, cache_read=99))
+        run, detail = self._replay()
+        self.assertEqual(run["status"], "void")
+        self.assertIn("warm-up turn 1", run["void"])
+        self.assertIn("did not start cold", run["void"])
+
+    def test_a_model_that_never_comes_back_voids_the_run(self):
+        # The load is accepted, but the model never shows in /api/ps.
+        original = FakeOllama.do_POST
+
+        def lost(handler):
+            original(handler)
+            FakeOllama.loaded.clear()
+
+        FakeOllama.do_POST = lost
+        try:
+            run, _ = self._replay(timeout_s=0.5)
+        finally:
+            FakeOllama.do_POST = original
+        self.assertEqual(run["status"], "void")
+        self.assertIn("still not loaded", run["void"])
+
+    @unittest.skipUnless(VALIDATOR.exists() and BOARD.exists(),
+                         "site/build_leaderboard.py is not in this checkout (#176)")
+    def test_output_passes_the_leaderboard_validator(self):
+        # Every disclosure an ollama run can name, and a warm-up pass.
+        run, _ = self._replay()
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertIn(cc_trace.DISCLOSE_NO_COUNTER, run["provenance"]["disclosed"])
+        self.assertIn(cc_trace.DISCLOSE_SERIAL, run["provenance"]["disclosed"])
+        self.assertEqual(board_problems(run), [])
 
 
 class HelperTest(unittest.TestCase):

@@ -375,12 +375,28 @@ rise by exactly the number of requests the replay sent (see the section above).
 ollama has no such counter, so its runs carry the `requests-served-unavailable`
 disclosure.
 
-**Every repeat starts cold on scratchy.** Before each repeat, the replay clears
-scratchy's prefix cache (`POST /reset_prefix_cache`). This is the default and
-cannot be turned off. If the first turn after a reset still reads tokens from
-the cache, the run is void. ollama has no way to clear its cache, so its repeats
-after the first may start warm, and its runs carry the `prefix-cache-not-reset`
-disclosure.
+**Every pass starts cold, on both engines.** A replay sends the same prompts on
+every repeat, so a cache left over from the last repeat would serve almost every
+turn of the next. Before each pass, the replay clears the engine's prefix cache.
+On scratchy that is `POST /reset_prefix_cache`. ollama has no such endpoint, but
+its cache lives in the process that holds the model, so the replay unloads the
+model and loads it again, waiting on `/api/ps` both times (#551). Neither reset
+can be turned off. A reset that fails, or a first turn that still reads tokens
+from the cache right after one, voids the run. The run records how long each
+reset took (`cache_reset_seconds`), since an ollama reload loads the weights
+again. Before #551, ollama was never reset, and its runs from then carry the
+`prefix-cache-not-reset` disclosure.
+
+**A warm-up pass, reported separately.** The first requests a freshly started
+ollama served were slower than the same requests after a reload, with the cache
+cold both times: 6.8 s against 4.5 s on turn 1 (#551). That is one-time work in
+the process, which loading the model does not trigger. So before the measured
+repeats, the replay runs one whole warm-up pass on each engine, then resets the
+cache so repeat 1 starts cold. The warm-up is never in a headline cell or its
+`n`. It is reported beside them as the same metrics under a `pass: warmup`
+facet with `n` 1, and as `repeat` 0 in `.turns.json`: it is the cost of a user's
+first session after starting the engine, which is a different measurement.
+`--no-warmup` skips it, and the run says so (`replay.warmup: false`).
 
 **Overlapping requests are replayed one at a time.** Claude Code sometimes sends
 a side request while a turn is still running. The recording keeps that
@@ -388,8 +404,9 @@ a side request while a turn is still running. The recording keeps that
 without the contention the live session had. A run whose recording had overlap
 carries the `replay-serialized` disclosure.
 
-Those three disclosure ids are not declared in the leaderboard's `board.json`
-yet (#441), so a run that names one fails validation until they are.
+The leaderboard's `board.json` (#176) declares the replay's disclosures
+(`requests-served-unavailable`, `prefix-cache-not-reset`, `replay-serialized`),
+and its validator exempts the `pass: warmup` facet from Lane A's minimum `n`.
 
 ## Blocked
 
