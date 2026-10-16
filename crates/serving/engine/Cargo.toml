@@ -8,6 +8,7 @@ description = "Engine core loop and request lifecycle for vLLM Rust port"
 [features]
 default = []
 multiproc = ["scratchy-serving-transport/multiproc"]
+guided-decoding = ["dep:llguidance", "dep:serde_json", "dep:toktrie", "dep:toktrie_hf_tokenizers"]
 
 [dependencies]
 scratchy-core-common = { workspace = true }
@@ -20,3 +21,7 @@ thiserror = { workspace = true }
 tokenizers = { workspace = true }
 inventory = { workspace = true }
 anyhow = { workspace = true }
+llguidance = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+toktrie = { workspace = true, optional = true }
+toktrie_hf_tokenizers = { workspace = true, optional = true }

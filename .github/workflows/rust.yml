@@ -224,12 +224,16 @@ jobs:
       # release changes which tokens a grammar allows, not the API. No backend
       # feature: the guide masks token ids on the CPU, and the tests build
       # their tokenizer inline. `guided-decoding` only adds code, so this is a
-      # superset of the featureless run.
+      # superset of the featureless run. scratchy-core-model rides along: its
+      # tests and test targets need no hardware either, and no other step
+      # compiles them.
       - name: Clippy (guided-decoding test targets)
-        run: cargo clippy -p scratchy-core-model --all-targets --features guided-decoding -- -D warnings
+        run: cargo clippy -p scratchy-serving-engine -p scratchy-core-model --all-targets
+          --features scratchy-serving-engine/guided-decoding -- -D warnings
 
       - name: Guided-decoding grammar tests
-        run: cargo test -p scratchy-core-model --features guided-decoding
+        run: cargo test -p scratchy-serving-engine -p scratchy-core-model
+          --features scratchy-serving-engine/guided-decoding
 
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.

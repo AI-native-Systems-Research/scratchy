@@ -15,8 +15,6 @@
 pub mod attention_metadata;
 pub mod baked_tokenizer;
 pub mod embedding;
-#[cfg(feature = "guided-decoding")]
-pub mod grammar;
 pub mod hub;
 pub mod lora;
 pub mod process_group;
