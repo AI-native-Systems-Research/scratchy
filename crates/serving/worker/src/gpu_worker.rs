@@ -6174,7 +6174,22 @@ impl Worker for MetalWorker {
         // only to the working-set term and then floor at `maxBufferLength`:
         // applying util to maxBufferLength too would push the budget below
         // the weight footprint on this box and falsely trip the OOM guard.
-        let working_set = metal_device.device.recommendedMaxWorkingSetSize() as usize;
+        // ...and Apple's figure overstates what the GPU driver wires at its default limit
+        // (`gpu_wired_limit_bytes`): gemma-4-26b on a 36 GiB M3 Pro budgeted 25.3 GiB of a
+        // reported 28.08 GiB, and its first 8×4096-token batch faulted out of memory once the
+        // system's wired memory neared 24 GiB, the limit macOS sets there. Size from the smaller.
+        let recommended = metal_device.device.recommendedMaxWorkingSetSize() as usize;
+        let wired_limit = scratchy_target_metal::device::gpu_wired_limit_bytes()
+            .and_then(|b| usize::try_from(b).ok());
+        let working_set = recommended.min(wired_limit.unwrap_or(usize::MAX));
+        if working_set < recommended {
+            info!(
+                "ScratchyWorker(metal): working set {:.2} GiB, the GPU wired limit, below the \
+                 {:.2} GiB Metal recommends",
+                working_set as f64 / 1_073_741_824.0,
+                recommended as f64 / 1_073_741_824.0,
+            );
+        }
         // Budget = recommended working set × `gpu_memory_utilization` — the
         // same utilization-governed sizing every other backend uses.
         //
