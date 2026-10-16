@@ -33,10 +33,21 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
 /// both normalize at hidden 2048 (2b) and 4096 (8b), decode rows 1 and a prefill rung's
-/// width. (M, D_MODEL). The kernel states its sum ceiling-safe for the f16 the ladder
+/// width; gemma-4 at 12b/31b normalizes at hidden 3840 — the ONE delivery width that is
+/// not a power of two, so its `1/cols` has no exact f16/f32 spelling and the constant
+/// reaches the program only as its f16 image. A shape set without it passed while every
+/// 3840 chain was refused, which is how the gemma-4 divergence shipped. (M, D_MODEL).
+/// The kernel states its sum ceiling-safe for the f16 the ladder
 /// runs it in (`rmsnorm.py`'s module doc — LegalizeTypes erases any widening), so every
 /// width is splicable and byte-compared.
-const SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
+const SHAPES: &[(u32, u32)] = &[
+    (1, 2048),
+    (1, 4096),
+    (31, 2048),
+    (64, 4096),
+    (1, 3840),
+    (19, 3840),
+];
 
 #[test]
 fn spliced_rmsnorm_lowers_through_the_door() {

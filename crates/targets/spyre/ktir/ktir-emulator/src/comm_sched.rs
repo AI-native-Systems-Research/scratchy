@@ -1906,15 +1906,26 @@ pub fn rmsnorm_scalar_sticks(ops: &[Operation<'static>]) -> std::collections::Ha
         if sa != sb {
             continue;
         }
-        // The divisor is exactly `1/cols` for the squared tile — checked
-        // numerically against the square's own trailing dim, the door's law: a
-        // different multiplier makes the program something other than a mean of
-        // squares, and this walk must not claim its sticks.
+        // The divisor is `1/cols` for the squared tile — checked numerically
+        // against the square's own trailing dim, the door's law: a different
+        // multiplier makes the program something other than a mean of squares,
+        // and this walk must not claim its sticks. The multiplier is stated as
+        // the constant's f16 image — the f16 grid is the only one an f16-typed
+        // program constant lands on, the same law the parity test's eps check
+        // states — which equals exact `1/cols` exactly when cols is a power of
+        // two. A non-power-of-two width (gemma-4's 3840) can therefore state
+        // only f16(1/cols), so both spellings are admitted; every other
+        // multiplier differs from both by far more than an f16 ulp and stays
+        // refused.
         let cols = match sq.result_type {
             Some(IrType::Tensor { dims, .. }) if !dims.is_empty() => dims[dims.len() - 1] as f64,
             _ => continue,
         };
-        if (inv_d as f32) != (1.0f64 / cols) as f32 {
+        let inv_cols = (1.0f64 / cols) as f32;
+        let inv_cols_f16 =
+            crate::codec::f16_units_to_f32(&crate::codec::f32_to_f16_units(&[inv_cols]))[0];
+        let inv_d = inv_d as f32;
+        if inv_d != inv_cols && inv_d != inv_cols_f16 {
             continue;
         }
         for v in [sq.result, scale.result, add.result].into_iter().flatten() {

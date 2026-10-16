@@ -592,16 +592,25 @@ fn rmsnorm_chain_from(
             ));
         }
     };
-    // fp32-representable reciprocals of powers of two are exact, and every `D_MODEL` here is one; the
-    // comparison is done in f32 so a producer that splatted an f32 `1/N` matches bit-for-bit.
-    if (inv_d as f32) != (1.0f64 / cols) as f32 {
+    // The multiplier is `1/cols`, stated as the constant's f16 image — the f16 grid is the only one
+    // an f16-typed program constant lands on, the same law the parity test's eps check states —
+    // which equals exact `1/cols` exactly when cols is a power of two (the comparison is done in
+    // f32 so a producer that splatted an f32 `1/N` still matches bit-for-bit). A non-power-of-two
+    // width (gemma-4's 3840) can state only f16(1/cols), so both spellings are admitted; every
+    // other multiplier differs from both by far more than an f16 ulp and is still refused below.
+    let inv_cols = (1.0f64 / cols) as f32;
+    let inv_cols_f16 =
+        ktir_core::codec::f16_units_to_f32(&ktir_core::codec::f32_to_f16_units(&[inv_cols]))[0];
+    let inv_d_f32 = inv_d as f32;
+    if inv_d_f32 != inv_cols && inv_d_f32 != inv_cols_f16 {
         return err(format!(
             "{}: the rmsnorm's divisor is {inv_d}, but this tile reduces {cols} columns and a mean \
-             needs 1/{cols} = {}. `assemble_rmsnorm` binds `1/cols` itself at the reserved \
-             `RMS_INVCOLS_TID`, so lowering this as an rmsnorm would substitute a DIFFERENT constant \
-             for the one the program states.",
+             needs 1/{cols} = {} (or its f16 image {}). `assemble_rmsnorm` binds `1/cols` itself at \
+             the reserved `RMS_INVCOLS_TID`, so lowering this as an rmsnorm would substitute a \
+             DIFFERENT constant for the one the program states.",
             f.name,
-            1.0f64 / cols
+            1.0f64 / cols,
+            inv_cols_f16
         ));
     }
 
