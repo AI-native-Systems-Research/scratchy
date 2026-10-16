@@ -2986,6 +2986,271 @@ pub fn staged_rope_rows<F: RopeForm>(
     Ok(out)
 }
 
+/// The synth weight staging — ONE product, THREE consumers: the emulator's
+/// resident bytes (`new_multi` moves them in) and the reference legs' per-node
+/// materialization ([`StagedWeightView`]). The staged bytes ARE the round trip
+/// the reference used to re-derive per node — an fp8 payload's codes are
+/// `e4m3(synth · FP8_SYNTH_SCALE)`, so decoding a code through the e4m3 table
+/// is bit-identical to round-tripping the synth value it was minted from; an
+/// f16 weight's bytes are its folded image — so a staging defect cannot hide
+/// on one leg only. `only` filters the staged set (the covering-depth slice
+/// stages just the weights the kept launches read); `None` stages everything.
+pub(crate) struct StagedWeights {
+    pub bytes: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)>,
+    /// The GEMM weights — staged in the on-disk `[cols, rows]` order the
+    /// kernel's transpose-B indexing maps read (the manifest's own
+    /// `gemm_weight` law; see `numeric_gate`'s staging block for the
+    /// measured cost of binding the logical order instead).
+    pub gemm: std::collections::HashSet<u32>,
+    /// The fp8 scale rows — never materialized by the reference (`eval_node`
+    /// ignores the ws row; its multiplier rides the fold lists' `ws_eff`).
+    pub scale_rows: std::collections::HashSet<u32>,
+}
+
+impl StagedWeights {
+    /// The reference legs' zero-copy window over this staging.
+    pub(crate) fn view(&self) -> StagedWeightView<'_> {
+        StagedWeightView {
+            bytes: &self.bytes,
+            gemm: &self.gemm,
+            scale_rows: &self.scale_rows,
+        }
+    }
+}
+
+/// The reference legs' window over the staged bytes: the golden and the
+/// teacher-forced walk materialize a node's weight operands from the SAME
+/// product the emulator binds, per node and transiently — each weight is read
+/// by exactly one node, so the reference holds no weight f32 beyond the node
+/// it is evaluating (the full-depth staging of every weight as f32 was the
+/// gate's memory bomb: ~96 GB for the 12b).
+pub(crate) struct StagedWeightView<'a> {
+    pub bytes: &'a [(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)],
+    pub gemm: &'a std::collections::HashSet<u32>,
+    pub scale_rows: &'a std::collections::HashSet<u32>,
+}
+
+impl StagedWeightView<'_> {
+    /// The f32 image of staged weight `tid` in the LOGICAL `[rows, cols]`
+    /// order `eval_node` reads — `None` for anything the reference does not
+    /// materialize: a non-weight, a weight the covering filter dropped, or a
+    /// scale row (never read; the fold lists carry its multiplier).
+    fn materialize(&self, tid: usize, rows: usize, cols: usize) -> Option<Vec<f32>> {
+        if self.scale_rows.contains(&(tid as u32)) {
+            return None;
+        }
+        let (_, bytes, dt, _) = self.bytes.iter().find(|(t, ..)| *t == tid)?;
+        let gemm = self.gemm.contains(&(tid as u32));
+        let n = rows * cols;
+        let mut out = Vec::with_capacity(n);
+        match dt {
+            scratchy_tensors::DType::Fp8E4m3 => {
+                if gemm {
+                    for l in 0..rows {
+                        for j in 0..cols {
+                            out.push(ktir_core::codec::e4m3_to_f32(bytes[j * rows + l]));
+                        }
+                    }
+                } else {
+                    out.extend(bytes.iter().map(|&c| ktir_core::codec::e4m3_to_f32(c)));
+                }
+            }
+            _ => {
+                let decode = |pair: &[u8]| half::f16::from_le_bytes([pair[0], pair[1]]).to_f32();
+                if gemm {
+                    for l in 0..rows {
+                        for j in 0..cols {
+                            out.push(decode(&bytes[(j * rows + l) * 2..]));
+                        }
+                    }
+                } else {
+                    for e in 0..n {
+                        out.push(decode(&bytes[e * 2..]));
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Stage the synth weights (the loop `numeric_gate` ran inline before the
+/// truncation rework, extracted so the DBG oracle's golden states the SAME
+/// law). `only` = the tids to stage (the covering bound set); `None` = all of
+/// `weight_ids`.
+fn stage_synth_weights<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    weight_ids: &std::collections::HashSet<u32>,
+    only: Option<&std::collections::HashSet<u64>>,
+) -> StagedWeights {
+    use scratchy_subtile::lower::GemmWeight;
+    // ── The fp8 operand classification, off the IR the lowering itself read ──
+    let mut fp8_payloads: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut scale_rows: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for node in &ir.nodes {
+        match &node.op {
+            SubOp::MatmulTile { weight, .. }
+                if matches!(weight, GemmWeight::Fp8Dynamic) && node.inputs.len() == 3 =>
+            {
+                fp8_payloads.insert(node.inputs[1].tensor.index() as u32);
+                scale_rows.insert(node.inputs[2].tensor.index() as u32);
+            }
+            // `[rows, routing, experts(, w_scale)]` — the 4th operand marks the
+            // 8-bit expert bank (the gathered matmulfp8 the K-pair law names).
+            SubOp::ExpertMatmul { .. } if node.inputs.len() == 4 => {
+                fp8_payloads.insert(node.inputs[2].tensor.index() as u32);
+                scale_rows.insert(node.inputs[3].tensor.index() as u32);
+            }
+            // `[rows, over, weight(, w_scale)]` — same law for the all-rows form.
+            SubOp::AllRowsMatmul if node.inputs.len() == 4 => {
+                fp8_payloads.insert(node.inputs[2].tensor.index() as u32);
+                scale_rows.insert(node.inputs[3].tensor.index() as u32);
+            }
+            _ => {}
+        }
+    }
+    // ── The fold pre-scales: the same lists the staging states ──
+    let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
+    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
+    let fold_scale = |tid: u32| -> f32 {
+        sm_folds
+            .iter()
+            .find(|(_, w, _)| *w == tid)
+            .map(|(_, _, s)| *s)
+            .or_else(|| {
+                attn_folds
+                    .iter()
+                    .find(|(_, wq, wk, _)| *wq == tid || *wk == tid)
+                    .map(|(_, _, _, s)| *s)
+            })
+            .unwrap_or(1.0)
+    };
+    // ── The GEMM weight classification — the SAME law the manifest's
+    //    `gemm_weight` set stamps (`codegen.rs`: the source a MatmulTile binds
+    //    as `inputs[1]`; bundle codes for the expert forms) and
+    //    `spyre_load.rs`'s emulator branch stages by: a GEMM weight's Arg is
+    //    bound with the SWAPPED shape `[cols, rows]` and bytes in the on-disk
+    //    `[n, k]` order the kernel's transpose-B indexing maps read ("the KTIR
+    //    emulator path keeps the buffer VERBATIM as `[n, k]`"); every other
+    //    weight — norms, the fp8 scale rows — is verbatim at its own
+    //    `[rows, cols]`. Binding the logical order instead is not a small
+    //    error: the transpose-B maps resolve a DIFFERENT matrix and every GEMM
+    //    output diverges at rel ~1 (measured: 518 of 522 granite tensors, all
+    //    fp8-chained, the clean prefix passing). ──
+    let mut gemm_weights: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for node in &ir.nodes {
+        match &node.op {
+            SubOp::MatmulTile { .. } => {
+                gemm_weights.insert(node.inputs[1].tensor.index() as u32);
+            }
+            SubOp::ExpertMatmul { .. } | SubOp::AllRowsMatmul => {
+                gemm_weights.insert(node.inputs[2].tensor.index() as u32);
+            }
+            _ => {}
+        }
+    }
+    let mut bytes: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> =
+        Vec::with_capacity(weight_ids.len());
+    for &tid in weight_ids {
+        if let Some(only) = only
+            && !only.contains(&(tid as u64))
+        {
+            continue;
+        }
+        let t = ir.tensors[tid as usize];
+        let (rows, cols) = (t.rows as usize, t.cols as usize);
+        let n = rows * cols;
+        let gemm = gemm_weights.contains(&tid);
+        let shape = if gemm {
+            vec![cols, rows]
+        } else {
+            vec![rows, cols]
+        };
+        // The golden's flat order is the LOGICAL `[rows, cols]` row-major
+        // (`eval_node` reads `w[l * n + j]`); a GEMM weight's device bytes are the
+        // ON-DISK `[cols, rows]` order — `buffer[j * rows + l]` holds `W[l, j]` —
+        // so the GEMM arms below walk `l` inner over `j` outer and everything else
+        // walks the flat order straight through. The ws rows are ones
+        // (permutation-invariant) and keep the verbatim shape, matching the
+        // loader's non-GEMM branch.
+        let b = if scale_rows.contains(&tid) {
+            // fold / FP8_SYNTH_SCALE — the payload's normalizing constant comes
+            // back out here (see the payload arm below): the golden never reads
+            // this row, the emulator's dequant multiplies by it, so
+            // (synth × C) × (fold / C) = the folded ideal. C = 512 keeps BOTH
+            // sides out of subnormal range: the payload's smallest nonzero synth
+            // value (0.1/197 ≈ 5.1e-4) lands at 0.26 in e4m3 normals, and
+            // fold/C stays above f16's normal floor (6.1e-5) for every fold scale
+            // the models ship.
+            let s = half::f16::from_f32(fold_scale(tid) / FP8_SYNTH_SCALE);
+            let mut b = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                b.extend_from_slice(&s.to_le_bytes());
+            }
+            b
+        } else if fp8_payloads.contains(&tid) {
+            // fp8 folds ride the ws row (a payload cannot absorb a scale — that is
+            // a requantize), so the payload carries no fold factor. The codes are
+            // the logical values × FP8_SYNTH_SCALE: at C=1 the ±0.05 synth values
+            // are e4m3 SUBNORMAL (normals start at 2^-6 = 0.0156 — half the synth
+            // range falls below), quantizing at 10-25% rel error instead of the
+            // ~3% the 3-bit mantissa gives. The real path never hits that trap:
+            // its codes are per-channel scaled into normal range with the
+            // magnitude riding the ws row — C restores that shape for the probe,
+            // and the ws arm above divides it back out.
+            let mut b = Vec::with_capacity(n);
+            if gemm {
+                for j in 0..cols {
+                    for l in 0..rows {
+                        b.push(ktir_core::codec::f32_to_e4m3(
+                            dbg_synth_val(tid as usize, l * cols + j) * FP8_SYNTH_SCALE,
+                        ));
+                    }
+                }
+            } else {
+                for e in 0..n {
+                    b.push(ktir_core::codec::f32_to_e4m3(
+                        dbg_synth_val(tid as usize, e) * FP8_SYNTH_SCALE,
+                    ));
+                }
+            }
+            b
+        } else {
+            let mut b = Vec::with_capacity(n * 2);
+            let push = |b: &mut Vec<u8>, v: f32| {
+                let f = half::f16::from_f32(v);
+                b.extend_from_slice(&f.to_le_bytes());
+            };
+            if gemm {
+                for j in 0..cols {
+                    for l in 0..rows {
+                        push(
+                            &mut b,
+                            dbg_synth_val(tid as usize, l * cols + j) * fold_scale(tid),
+                        );
+                    }
+                }
+            } else {
+                for e in 0..n {
+                    push(&mut b, dbg_synth_val(tid as usize, e) * fold_scale(tid));
+                }
+            }
+            b
+        };
+        let dt = if fp8_payloads.contains(&tid) {
+            scratchy_tensors::DType::Fp8E4m3
+        } else {
+            scratchy_tensors::DType::F16
+        };
+        bytes.push((tid as usize, b, dt, shape));
+    }
+    StagedWeights {
+        bytes,
+        gemm: gemm_weights,
+        scale_rows,
+    }
+}
+
 /// DEBUG-ONLY numeric bisection oracle (codegen gates on `SCRATCHY_SUPERDSC_DBG`).
 /// Runs `eval_dag` on the SAME deterministic synthetic sources the worker
 /// self-test will bind, and writes, into `<body_bundle_dir>/dbg/`:
@@ -3011,20 +3276,32 @@ pub fn staged_rope_rows<F: RopeForm>(
 /// ([`numeric_gate`]) compares them against the emulator's own run IN-PROCESS —
 /// the same values, no files — so the gate needs no environment variable and
 /// cannot be skipped by forgetting to set one.
-pub fn eval_golden_buffers<F: RopeForm>(
+pub(crate) fn eval_golden_buffers<F: RopeForm>(
     ir: &SubtileIR<F>,
     staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
+    // The staged bytes the per-node materialization decodes — the SAME
+    // product the emulator binds (see [`StagedWeightView`]). The fold
+    // pre-scales the reference used to apply to weight sources live in the
+    // bytes now (they were minted with them), so there is no weight f32 in
+    // `src_vals` at all: each node materializes its own operands, evals, and
+    // drops them.
+    weights: &StagedWeightView<'_>,
+    // The covering bound set — `None` evaluates the whole graph (the DBG
+    // oracle's full-depth golden); `Some` skips every node whose output the
+    // truncated bundle does not bind, and leaves every non-bound tensor's
+    // buffer unallocated.
+    covering: Option<&std::collections::HashSet<u64>>,
 ) -> Vec<Vec<f32>> {
     let nsrc = ir.num_sources as usize;
     // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO — BOTH KINDS. A weight-folded ScalarMul has no
     // device op, so the bundle under test never applies its multiplier as a node — the scale
     // enters through the staged weight bytes. The golden must model exactly that or every
-    // comparison diverges at the first folded node: pre-scale each fold target's synthetic
-    // source by its multiplier (what `stage_bound_weights` does to the real bytes) and SKIP
-    // the folded nodes in the eval walk (what `lower_one_node`'s HostRouted arm does to the
-    // tape). An attention-scale fold's node is NOT skipped — it still runs, at the scale the
-    // splice's rewrite gave the real program (1.0) — so the golden evaluates it at 1.0 over
-    // the pre-scaled W_q/W_k, which is bit-for-bit the folded bundle's contract.
+    // comparison diverges at the first folded node: the bytes carry the pre-scaled product
+    // (what `stage_bound_weights` does to the real bytes) and the eval walk SKIPS the folded
+    // nodes (what `lower_one_node`'s HostRouted arm does to the tape). An attention-scale
+    // fold's node is NOT skipped — it still runs, at the scale the splice's rewrite gave the
+    // real program (1.0) — so the golden evaluates it at 1.0 over the pre-scaled W_q/W_k
+    // (in the staged bytes), which is bit-for-bit the folded bundle's contract.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -3055,13 +3332,24 @@ pub fn eval_golden_buffers<F: RopeForm>(
     // there the tables are one row and the pattern agrees with the run-time
     // staging by construction.
     let rope_table_half = rope_table_periods(ir);
+    // ⭐ WEIGHT SOURCES STAY EMPTY — materialized per node from the staged
+    // bytes (see `weights`), never held as f32 beyond the node reading them;
+    // a source the covering slice does not bind stays empty with its readers
+    // skipped below. The fold pre-scales the reference used to apply to
+    // weight sources live in the bytes now (they were minted with them), so
+    // there is nothing to pre-scale here.
+    let staged_weight = |id: usize| {
+        weights.scale_rows.contains(&(id as u32)) || weights.bytes.iter().any(|(t, ..)| *t == id)
+    };
     let mut src_vals: Vec<Vec<f32>> = (0..nsrc)
         .map(|id| {
-            let t = ir.tensors[id];
-            let n = (t.rows as usize) * (t.cols as usize);
-            if let Some(v) = staged_rope.get(&(id as u32)) {
+            if staged_weight(id) || covering.is_some_and(|c| !c.contains(&(id as u64))) {
+                Vec::new()
+            } else if let Some(v) = staged_rope.get(&(id as u32)) {
                 v.clone()
             } else {
+                let t = ir.tensors[id];
+                let n = (t.rows as usize) * (t.cols as usize);
                 match rope_table_half.get(&(id as u32)) {
                     Some(&half) => (0..n).map(|j| dbg_synth_val(id, j % half)).collect(),
                     None => (0..n).map(|j| dbg_synth_val(id, j)).collect(),
@@ -3069,36 +3357,6 @@ pub fn eval_golden_buffers<F: RopeForm>(
             }
         })
         .collect();
-    for (_, tid, scale) in &scalarmul_folds {
-        if let Some(src) = src_vals.get_mut(*tid as usize) {
-            for v in src.iter_mut() {
-                *v *= scale;
-            }
-        }
-    }
-    for (_, w_q, w_k, sqrt_scale) in &attn_folds {
-        // ⭐ THE PRE-SCALE LANDS ONLY ON A DENSE TARGET. The fold targets the producer's
-        // LAST input — the weight for a dense matmul (which the ideal product READS, so
-        // the pre-scale IS the fold) or the ws row for an fp8 one (which the ideal
-        // product ignores; the fp8 matmul's quant model below carries the multiplier
-        // through its `ws_eff` — the same row the staged bytes ride). Pre-scaling the
-        // fp8 PAYLOAD instead was the earlier spelling: it fixed the attention outputs
-        // (measured: e = g/8, rel 0.874 on granite) but left every producer tid itself
-        // unfolded against the bundle's ws-carrying programs — each o_proj/down output
-        // then diverged by exactly the residual fold scale (measured: e = g·0.22).
-        for target in [w_q, w_k] {
-            let dense_weight = ir.nodes.iter().any(|p| {
-                matches!(p.op, SubOp::MatmulTile { .. })
-                    && p.inputs.len() == 2
-                    && p.inputs[1].tensor.index() as u32 == *target
-            });
-            if dense_weight && let Some(src) = src_vals.get_mut(*target as usize) {
-                for v in src.iter_mut() {
-                    *v *= sqrt_scale;
-                }
-            }
-        }
-    }
     // ⭐⭐ THE F16 STICK, STATED FOR THE GOLDEN TOO. Every value the bundle's
     // programs exchange lives on an f16 stick — `run_step` binds each source
     // as `DType::F16` and every intermediate's segment is f16 — so the
@@ -3164,17 +3422,57 @@ pub fn eval_golden_buffers<F: RopeForm>(
         |v: f32| ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(v * FP8_SYNTH_SCALE));
     // eval_dag minus the folded nodes — the same per-node `eval_node`/`scatter` pair it runs,
     // with the fold's nodes skipped so the golden describes the FOLDED bundle's semantics.
+    // A tensor the covering slice does not bind keeps NO buffer (its readers
+    // are skipped with it); an empty source slot stays empty.
     let mut bufs: Vec<Vec<f32>> = ir
         .tensors
         .iter()
-        .map(|t| vec![0f32; (t.rows * t.cols) as usize])
+        .enumerate()
+        .map(|(t, meta)| {
+            if covering.is_some_and(|c| !c.contains(&(t as u64))) {
+                Vec::new()
+            } else {
+                vec![0f32; (meta.rows * meta.cols) as usize]
+            }
+        })
         .collect();
     for (s, src) in src_refs.iter().enumerate() {
-        bufs[s].copy_from_slice(src);
+        if src.is_empty() {
+            bufs[s] = Vec::new();
+        } else {
+            bufs[s].copy_from_slice(src);
+        }
     }
     for node in &ir.nodes {
         if folded_node(node.id) {
             continue;
+        }
+        // The covering slice: a node whose output the truncated bundle does
+        // not bind is not part of the graph under test — skip it (its inputs
+        // and outputs stay unallocated; nothing bound reads them).
+        if covering.is_some_and(|c| !c.contains(&(node.output.tensor.index() as u64))) {
+            continue;
+        }
+        // ⭐ THE PER-NODE WEIGHT MATERIALIZATION — the node's weight operands
+        // decoded from the staged bytes (the emulator's own product) for
+        // exactly this eval, then dropped: each weight is read by exactly one
+        // node, so the reference never holds a weight's f32 beyond the node
+        // it is evaluating. A staged weight's slot is empty by construction
+        // (weights never enter the source staging), and `materialize` is
+        // `None` for everything else — non-weights keep their staged values.
+        let mut saved_weights: Vec<(usize, Vec<f32>)> = Vec::new();
+        for r in &node.inputs {
+            let w = r.tensor.index();
+            let (rows, cols) = {
+                let t = ir.tensors[w];
+                (t.rows as usize, t.cols as usize)
+            };
+            if let Some(vals) = weights.materialize(w, rows, cols)
+                && saved_weights.iter().all(|(t, _)| *t != w)
+            {
+                saved_weights.push((w, std::mem::take(&mut bufs[w])));
+                bufs[w] = vals;
+            }
         }
         // An attention-folded node evaluates at the REWRITTEN scale (1.0): the real program
         // the golden must track was minted from the rewritten node, and evaluating the
@@ -3209,7 +3507,12 @@ pub fn eval_golden_buffers<F: RopeForm>(
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
         // The payload swap is temporary and per node: `eval_node` reads `inputs[1]` and
-        // ignores the ws row, so the round trip is the only change it can see.
+        // ignores the ws row, so the round trip is the only change it can see. A payload
+        // materialized above IS the round trip already (the staged codes are
+        // `e4m3(synth·C)`; decoding one through the table is bit-identical to
+        // `e4m3_rt` on the raw synth) — re-tripping it would quantize the decoded
+        // value a second time at the same scale, so only an UNstaged payload (one
+        // the byte staging does not own) takes the round-trip re-eval.
         if let SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..
@@ -3217,10 +3520,12 @@ pub fn eval_golden_buffers<F: RopeForm>(
             && node_ref.inputs.len() == 3
         {
             let w_tid = node_ref.inputs[1].tensor.index();
-            let saved = std::mem::take(&mut bufs[w_tid]);
-            bufs[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
-            out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
-            bufs[w_tid] = saved;
+            if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
+                let saved = std::mem::take(&mut bufs[w_tid]);
+                bufs[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
+                out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &bufs);
+                bufs[w_tid] = saved;
+            }
             let ws_eff = half::f16::from_f32(
                 ws_fold(node_ref.inputs[2].tensor.index() as u32) / FP8_SYNTH_SCALE,
             )
@@ -3261,6 +3566,11 @@ pub fn eval_golden_buffers<F: RopeForm>(
                 &out,
                 shape,
             );
+        }
+        // The materialized weight slots go back to empty — the reference holds
+        // no weight f32 past the node that read it.
+        for (w, saved) in saved_weights {
+            bufs[w] = saved;
         }
     }
     bufs
@@ -3392,6 +3702,12 @@ fn teacher_forced_walk<F: RopeForm>(
     // their row states the fold's law — the walk's LAST row against the
     // emulator's row 0 — never the full-stick plain law.
     lm_head_folded: &std::collections::HashSet<u64>,
+    // The staged bytes the walk materializes each node's weight operands
+    // from (same view, same law as `eval_golden_buffers`), and the covering
+    // slice — a node whose output the truncated bundle does not bind is not
+    // part of the graph under test.
+    weights: &StagedWeightView<'_>,
+    covering: Option<&std::collections::HashSet<u64>>,
 ) -> (Vec<Vec<f32>>, Vec<TeacherForcedRow>) {
     let nsrc = ir.num_sources as usize;
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
@@ -3427,13 +3743,15 @@ fn teacher_forced_walk<F: RopeForm>(
         |v: f32| ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(v * FP8_SYNTH_SCALE));
     // The walk's own array holds ONLY the walk's products: every source slot
     // stays EMPTY and is pointer-swapped in from `golden` per node (see the
-    // loop), and the golden's own products are read from `golden` itself.
+    // loop), and the golden's own products are read from `golden` itself. A
+    // tensor the covering slice does not bind keeps no buffer either — its
+    // producers are skipped below.
     let mut tf: Vec<Vec<f32>> = ir
         .tensors
         .iter()
         .enumerate()
         .map(|(t, meta)| {
-            if t < nsrc {
+            if t < nsrc || covering.is_some_and(|c| !c.contains(&(t as u64))) {
                 Vec::new()
             } else {
                 vec![0f32; (meta.rows * meta.cols) as usize]
@@ -3443,6 +3761,12 @@ fn teacher_forced_walk<F: RopeForm>(
     let mut rows: Vec<TeacherForcedRow> = Vec::new();
     for (ni, node) in ir.nodes.iter().enumerate() {
         if folded_node(node.id) {
+            continue;
+        }
+        // The covering slice, same law as the golden's walk: a node whose
+        // output the truncated bundle does not bind is not part of the graph
+        // under test.
+        if covering.is_some_and(|c| !c.contains(&(node.output.tensor.index() as u64))) {
             continue;
         }
         let mut attn_node;
@@ -3466,9 +3790,26 @@ fn teacher_forced_walk<F: RopeForm>(
         // The source relay: the golden's staged sources move into `tf` for
         // this node's eval and move back before anything else can read
         // `golden` — pointer swaps, never copies, so the walk's weight
-        // footprint is zero.
+        // footprint is zero. The golden's WEIGHT slots arrive empty (its own
+        // walk materialized per node and dropped), so this node's weight
+        // operands materialize here the same way — the same staged bytes,
+        // the same per-node transience.
         for s in 0..nsrc {
             std::mem::swap(&mut golden[s], &mut tf[s]);
+        }
+        let mut saved_weights: Vec<(usize, Vec<f32>)> = Vec::new();
+        for r in &node.inputs {
+            let w = r.tensor.index();
+            let (rows, cols) = {
+                let t = ir.tensors[w];
+                (t.rows as usize, t.cols as usize)
+            };
+            if let Some(vals) = weights.materialize(w, rows, cols)
+                && saved_weights.iter().all(|(t, _)| *t != w)
+            {
+                saved_weights.push((w, std::mem::take(&mut tf[w])));
+                tf[w] = vals;
+            }
         }
         let mut tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
         if let SubOp::MatmulTile {
@@ -3478,10 +3819,14 @@ fn teacher_forced_walk<F: RopeForm>(
             && node_ref.inputs.len() == 3
         {
             let w_tid = node_ref.inputs[1].tensor.index();
-            let saved = std::mem::take(&mut tf[w_tid]);
-            tf[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
-            tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
-            tf[w_tid] = saved;
+            // Same law as the golden's arm: a materialized payload IS the
+            // round trip already; only an unstaged payload re-evaluates.
+            if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
+                let saved = std::mem::take(&mut tf[w_tid]);
+                tf[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
+                tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, &tf);
+                tf[w_tid] = saved;
+            }
             let ws_eff = half::f16::from_f32(
                 ws_fold(node_ref.inputs[2].tensor.index() as u32) / FP8_SYNTH_SCALE,
             )
@@ -3489,6 +3834,11 @@ fn teacher_forced_walk<F: RopeForm>(
             for v in tf_out.iter_mut() {
                 *v *= ws_eff;
             }
+        }
+        // The materialized slots drop BEFORE the relay-out, so the swap moves
+        // empty ↔ empty and no weight f32 outlives the node that read it.
+        for (w, saved) in saved_weights {
+            tf[w] = saved;
         }
         for s in 0..nsrc {
             std::mem::swap(&mut golden[s], &mut tf[s]);
@@ -3607,7 +3957,12 @@ pub fn write_eval_golden<F: RopeForm>(
     let dbg = dir.join("dbg");
     std::fs::create_dir_all(dbg.join("golden"))?;
     let nsrc = ir.num_sources as usize;
-    let bufs = eval_golden_buffers(ir, staged_rope);
+    // The full-depth staging (`None` — the DBG oracle states the whole
+    // graph's law), with the golden materializing each node's weights from
+    // it per node: the same product, the same values, no all-weights f32.
+    let staged = stage_synth_weights(ir, weight_ids, None);
+    let view = staged.view();
+    let bufs = eval_golden_buffers(ir, staged_rope, &view, None);
     // The scales manifest's skip set — the same folded-node predicate the walk used.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -3751,6 +4106,10 @@ pub fn numeric_gate<F: RopeForm>(
     cap: u32,
     fp: &str,
     prefill: Option<&PrefillGate>,
+    // The class-covering truncation this gate run judges (`None` = full
+    // depth). `groups` must already BE the truncated bundle's groups when
+    // this is `Some` — the twin `covering_twin_groups` mints.
+    trunc: Option<&GateTrunc>,
 ) -> Result<(), String> {
     use scratchy_subtile::lower::GemmWeight;
     // ⛔ KEEP IN STEP with `eval_node`'s no-host-reference arms: an op listed
@@ -3815,22 +4174,44 @@ pub fn numeric_gate<F: RopeForm>(
     // law change: every other consumer keeps the original, and a bundle whose
     // prefix is live (decode, a prefix-capable rung) never enters this arm.
     let ir_owned;
-    let ir: &SubtileIR<F> = if prefill.is_some() {
+    let ir: &SubtileIR<F> = if prefill.is_some() || trunc.is_some() {
         ir_owned = {
             let mut g = ir.clone();
-            for n in &mut g.nodes {
-                if matches!(
-                    &n.op,
-                    SubOp::AttnDecode {
-                        producer:
-                            scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                        ..
+            if prefill.is_some() {
+                for n in &mut g.nodes {
+                    if matches!(
+                        &n.op,
+                        SubOp::AttnDecode {
+                            producer:
+                                scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+                            ..
+                        }
+                    ) {
+                        for idx in [1usize, 2usize] {
+                            if let Some(r) = n.inputs.get_mut(idx) {
+                                r.region.rows =
+                                    scratchy_subtile::subtile_ir::Range::new(r.region.rows.start, 0);
+                            }
+                        }
                     }
-                ) {
-                    for idx in [1usize, 2usize] {
-                        if let Some(r) = n.inputs.get_mut(idx) {
-                            r.region.rows =
-                                scratchy_subtile::subtile_ir::Range::new(r.region.rows.start, 0);
+                }
+            }
+            if let Some(t) = trunc {
+                // ⭐ THE TAIL SEAM RETARGET — the same view-law shape as the
+                // dead-prefix re-slice above. The full-depth IR's suffix ops
+                // read the LAST launch's hidden-out; the truncated bundle's
+                // suffix reads the KEPT prefix's last hidden-out
+                // (`unroll_layers`' own suffix binding for the truncated
+                // twin). Every hidden-out of every launch shares one shape,
+                // so the retarget rewrites only the input's tid and carries
+                // the region verbatim — the golden then evaluates the tail
+                // over exactly the product the twin's programs consume.
+                for n in &mut g.nodes {
+                    for r in &mut n.inputs {
+                        if r.tensor.index() as u32 == t.suffix_rebind.0 {
+                            r.tensor = scratchy_subtile::subtile_ir::TensorId::from_index(
+                                t.suffix_rebind.1 as usize,
+                            );
                         }
                     }
                 }
@@ -3841,31 +4222,8 @@ pub fn numeric_gate<F: RopeForm>(
     } else {
         ir
     };
-    // ── The fp8 operand classification, off the IR the lowering itself read ──
-    let mut fp8_payloads: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut scale_rows: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for node in &ir.nodes {
-        match &node.op {
-            SubOp::MatmulTile { weight, .. }
-                if matches!(weight, GemmWeight::Fp8Dynamic) && node.inputs.len() == 3 =>
-            {
-                fp8_payloads.insert(node.inputs[1].tensor.index() as u32);
-                scale_rows.insert(node.inputs[2].tensor.index() as u32);
-            }
-            // `[rows, routing, experts(, w_scale)]` — the 4th operand marks the
-            // 8-bit expert bank (the gathered matmulfp8 the K-pair law names).
-            SubOp::ExpertMatmul { .. } if node.inputs.len() == 4 => {
-                fp8_payloads.insert(node.inputs[2].tensor.index() as u32);
-                scale_rows.insert(node.inputs[3].tensor.index() as u32);
-            }
-            // `[rows, over, weight(, w_scale)]` — same law for the all-rows form.
-            SubOp::AllRowsMatmul if node.inputs.len() == 4 => {
-                fp8_payloads.insert(node.inputs[2].tensor.index() as u32);
-                scale_rows.insert(node.inputs[3].tensor.index() as u32);
-            }
-            _ => {}
-        }
-    }
+    // ── The fold list the scales manifest's skip set states ──
+    let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     // ── The taint map: which tensors' values cross an fp8 payload's grid ──
     let mut tainted: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for node in &ir.nodes {
@@ -3881,136 +4239,69 @@ pub fn numeric_gate<F: RopeForm>(
             tainted.insert(node.output.tensor.index() as u32);
         }
     }
-    // ── The fold pre-scales: the same lists the golden and the staging state ──
-    let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
-    let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
-    let fold_scale = |tid: u32| -> f32 {
-        sm_folds
-            .iter()
-            .find(|(_, w, _)| *w == tid)
-            .map(|(_, _, s)| *s)
-            .or_else(|| {
-                attn_folds
-                    .iter()
-                    .find(|(_, wq, wk, _)| *wq == tid || *wk == tid)
-                    .map(|(_, _, _, s)| *s)
-            })
-            .unwrap_or(1.0)
-    };
-    // ── The GEMM weight classification — the SAME law the manifest's `gemm_weight`
-    //    set stamps (`codegen.rs`: the source a MatmulTile binds as `inputs[1]`;
-    //    bundle codes for the expert forms) and `spyre_load.rs`'s emulator branch
-    //    stages by: a GEMM weight's Arg is bound with the SWAPPED shape
-    //    `[cols, rows]` and bytes in the on-disk `[n, k]` order the kernel's
-    //    transpose-B indexing maps read ("the KTIR emulator path keeps the buffer
-    //    VERBATIM as `[n, k]`"); every other weight — norms, the fp8 scale rows —
-    //    is verbatim at its own `[rows, cols]`. Binding the logical order instead
-    //    is not a small error: the transpose-B maps resolve a DIFFERENT matrix and
-    //    every GEMM output diverges at rel ~1 (measured: 518 of 522 granite
-    //    tensors, all fp8-chained, the clean prefix passing). ──
-    let mut gemm_weights: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for node in &ir.nodes {
-        match &node.op {
-            SubOp::MatmulTile { .. } => {
-                gemm_weights.insert(node.inputs[1].tensor.index() as u32);
+    // ⭐ THE COVERING SLICE'S BOUND SET — every tid the (possibly truncated)
+    // bundle's programs READ OR WRITE at the PLACE-ID level (`groups` here IS
+    // the truncated twin's own groups when truncating; the full bundle's
+    // otherwise). The readback declaration below filters the golden tids on
+    // this set — a stick demands a shape derivable from the launch IR
+    // (`resident::build`'s `ids` walk), but the golden set can name tensors
+    // the reroll folded out of every launch (measured: parity-tiny states
+    // 142 golden tids against 130 launch output bindings), and those ghosts
+    // have no view anywhere, so declaring them refuses the session at
+    // construction. They were never observable and stay uncompared, exactly
+    // as before — `build_spec`'s own produced/consumed sets are computed
+    // from the same bindings this filter reads.
+    let bound: std::collections::HashSet<u64> = groups
+        .iter()
+        .flat_map(|g| g.programs.iter())
+        .flat_map(|p| p.args.iter())
+        .map(|(_, id)| u64::from(id.tid()))
+        .collect();
+    // ⭐⭐ AND THE NODE-LEVEL COVERING = THE BOUND SET'S BACKWARD CLOSURE over
+    //    the (tail-retargeted) IR. The bound set alone is NOT closed at the
+    //    node level: a value the fusion SSA-forwards inside a segment has no
+    //    PlaceId anywhere (measured: the tiny's t149, a RmsNorm output whose
+    //    only consumer is a Reshape — the reshape is pure addressing, so the
+    //    norm's product rides SSA into the next program and t149 never
+    //    becomes a stick), yet the reference MUST still compute it — the
+    //    kept consumer gathers the slot. One reverse pass over the
+    //    topologically ordered nodes closes it transitively: a consumer is
+    //    visited before every one of its producers, so keeping an output
+    //    keeps its inputs, all the way back to the sources. The staging, the
+    //    probe sources and the golden/walk node skips all filter on this one
+    //    set — a node the closure does not hold is not an ancestor of
+    //    anything the twin can observe, and nothing kept reads it.
+    let covering_owned: Option<std::collections::HashSet<u64>> = trunc.map(|_| {
+        let mut keep = bound.clone();
+        for node in ir.nodes.iter().rev() {
+            if keep.contains(&(node.output.tensor.index() as u64)) {
+                for r in &node.inputs {
+                    keep.insert(r.tensor.index() as u64);
+                }
             }
-            SubOp::ExpertMatmul { .. } | SubOp::AllRowsMatmul => {
-                gemm_weights.insert(node.inputs[2].tensor.index() as u32);
-            }
-            _ => {}
         }
-    }
-    // ── Synth weights: staged once, moved into the session's HBM ──
-    let mut weights: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> =
-        Vec::with_capacity(weight_ids.len());
-    for &tid in weight_ids {
-        let t = ir.tensors[tid as usize];
-        let (rows, cols) = (t.rows as usize, t.cols as usize);
-        let n = rows * cols;
-        let gemm = gemm_weights.contains(&tid);
-        let shape = if gemm {
-            vec![cols, rows]
-        } else {
-            vec![rows, cols]
-        };
-        // The golden's flat order is the LOGICAL `[rows, cols]` row-major
-        // (`eval_node` reads `w[l * n + j]`); a GEMM weight's device bytes are the
-        // ON-DISK `[cols, rows]` order — `buffer[j * rows + l]` holds `W[l, j]` —
-        // so the GEMM arms below walk `l` inner over `j` outer and everything else
-        // walks the flat order straight through. The ws rows are ones
-        // (permutation-invariant) and keep the verbatim shape, matching the
-        // loader's non-GEMM branch.
-        let bytes = if scale_rows.contains(&tid) {
-            // fold / FP8_SYNTH_SCALE — the payload's normalizing constant comes
-            // back out here (see the payload arm below): the golden never reads
-            // this row, the emulator's dequant multiplies by it, so
-            // (synth × C) × (fold / C) = the folded ideal. C = 512 keeps BOTH
-            // sides out of subnormal range: the payload's smallest nonzero synth
-            // value (0.1/197 ≈ 5.1e-4) lands at 0.26 in e4m3 normals, and
-            // fold/C stays above f16's normal floor (6.1e-5) for every fold scale
-            // the models ship.
-            let s = half::f16::from_f32(fold_scale(tid) / FP8_SYNTH_SCALE);
-            let mut b = Vec::with_capacity(n * 2);
-            for _ in 0..n {
-                b.extend_from_slice(&s.to_le_bytes());
-            }
-            b
-        } else if fp8_payloads.contains(&tid) {
-            // fp8 folds ride the ws row (a payload cannot absorb a scale — that is
-            // a requantize), so the payload carries no fold factor. The codes are
-            // the logical values × FP8_SYNTH_SCALE: at C=1 the ±0.05 synth values
-            // are e4m3 SUBNORMAL (normals start at 2^-6 = 0.0156 — half the synth
-            // range falls below), quantizing at 10-25% rel error instead of the
-            // ~3% the 3-bit mantissa gives. The real path never hits that trap:
-            // its codes are per-channel scaled into normal range with the
-            // magnitude riding the ws row — C restores that shape for the probe,
-            // and the ws arm above divides it back out.
-            let mut b = Vec::with_capacity(n);
-            if gemm {
-                for j in 0..cols {
-                    for l in 0..rows {
-                        b.push(ktir_core::codec::f32_to_e4m3(
-                            dbg_synth_val(tid as usize, l * cols + j) * FP8_SYNTH_SCALE,
-                        ));
-                    }
-                }
-            } else {
-                for e in 0..n {
-                    b.push(ktir_core::codec::f32_to_e4m3(
-                        dbg_synth_val(tid as usize, e) * FP8_SYNTH_SCALE,
-                    ));
-                }
-            }
-            b
-        } else {
-            let mut b = Vec::with_capacity(n * 2);
-            let push = |b: &mut Vec<u8>, v: f32| {
-                let f = half::f16::from_f32(v);
-                b.extend_from_slice(&f.to_le_bytes());
-            };
-            if gemm {
-                for j in 0..cols {
-                    for l in 0..rows {
-                        push(
-                            &mut b,
-                            dbg_synth_val(tid as usize, l * cols + j) * fold_scale(tid),
-                        );
-                    }
-                }
-            } else {
-                for e in 0..n {
-                    push(&mut b, dbg_synth_val(tid as usize, e) * fold_scale(tid));
-                }
-            }
-            b
-        };
-        let dt = if fp8_payloads.contains(&tid) {
-            scratchy_tensors::DType::Fp8E4m3
-        } else {
-            scratchy_tensors::DType::F16
-        };
-        weights.push((tid as usize, bytes, dt, shape));
-    }
+        keep
+    });
+    let covering: Option<&std::collections::HashSet<u64>> = covering_owned.as_ref();
+    // ── Synth weights: staged ONCE for both legs — the emulator's resident
+    //    bytes (moved into the session's HBM below) and the reference legs'
+    //    per-node materialization (the clone the view borrows: `new_multi`
+    //    moves the staging's own bytes, and the golden and the walk both
+    //    outlive the session). The covering filter stages just the weights
+    //    the kept launches read (measured shape: the 12b's full staging is
+    //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
+    //    the one transient double, and the slice keeps both sides small. ──
+    let StagedWeights {
+        bytes: emu_weights,
+        gemm,
+        scale_rows,
+    } = stage_synth_weights(ir, weight_ids, covering);
+    let weights_ref = emu_weights.clone();
+    let view = StagedWeightView {
+        bytes: &weights_ref,
+        gemm: &gemm,
+        scale_rows: &scale_rows,
+    };
     // ── The probe sources: synth at the IR shape, scales as ones, the mask
     //    keeping the prefix region's rows valid (the reference's own key set) ──
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
@@ -4028,7 +4319,11 @@ pub fn numeric_gate<F: RopeForm>(
     };
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
-        if weight_ids.contains(&tid) {
+        // The covering slice: a source only the dropped launches read is not
+        // part of the graph under test. The reserved-tid sources appended
+        // below (the scalars, the mask) stay UNfiltered — the twin's programs
+        // bind them exactly as the full bundle does.
+        if weight_ids.contains(&tid) || covering.is_some_and(|c| !c.contains(&(tid as u64))) {
             continue;
         }
         let t = ir.tensors[tid as usize];
@@ -4169,28 +4464,15 @@ pub fn numeric_gate<F: RopeForm>(
     // segments. `run_step`'s per-pass `outputs` stays the real readback mechanism;
     // `results` here only states what this session exists to observe.
     //
-    // ⚔ AND ONLY THE GOLDEN TIDS THE LAUNCHES ACTUALLY BIND. A stick is
-    // allocated per declared result, and a stick demands a shape derivable from
-    // the launch IR (`resident::build`'s `ids` walk) — but the golden set can
-    // name tensors the reroll folded out of every launch (measured: parity-tiny
-    // states 142 golden tids against 130 launch output bindings), and those
-    // ghosts have no view anywhere, so declaring them refuses the session at
-    // construction. They were never observable and stay uncompared, exactly as
-    // before — `build_spec`'s own produced/consumed sets are computed from the
-    // same bindings this filter reads.
-    let bound: std::collections::HashSet<u64> = groups
-        .iter()
-        .flat_map(|g| g.programs.iter())
-        .flat_map(|p| p.args.iter())
-        .map(|(_, id)| u64::from(id.tid()))
-        .collect();
+    // ⚔ AND ONLY THE GOLDEN TIDS THE LAUNCHES ACTUALLY BIND — the `bound`
+    // set computed above the staging (the covering slice's own filter).
     let results: Vec<u64> = golden_tids
         .iter()
         .copied()
         .filter(|t| bound.contains(t))
         .collect();
     let refs: Vec<(&[bundle::LaunchGroup<'static>], &[u64])> = vec![(groups, &results)];
-    let mut session = crate::runner::SpyreSession::new_multi(&refs, weights)
+    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
         .map_err(|e| format!("gate session: {e}"))?;
     let observables = session.observable_tids(0);
     let compare: Vec<(u64, usize)> = golden_tids
@@ -4213,7 +4495,7 @@ pub fn numeric_gate<F: RopeForm>(
     // ── Compare at the floor, against the in-memory reference ──
     // `mut`: the teacher-forced walk borrows the golden's staged sources
     // through it (pointer-swapped per node, restored before return).
-    let mut eval_bufs = eval_golden_buffers(ir, &staged_rope);
+    let mut eval_bufs = eval_golden_buffers(ir, &staged_rope, &view, covering);
     const CLEAN_TOL: f32 = 5e-3;
     // The fp8 chains' slack over CLEAN_TOL: the quant model makes the e4m3 grid and
     // the ws mulf COMMON to both sides and the f16-stick model puts every exchanged
@@ -4366,7 +4648,8 @@ pub fn numeric_gate<F: RopeForm>(
     //    short to region-slice) falls back to the total at the same
     //    tolerance — the pre-split rule — so no compared tensor escapes
     //    judgment.
-    let (walk_tf, split) = teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted, &folded);
+    let (walk_tf, split) =
+        teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted, &folded, &view, covering);
     drop(walk_tf);
     let mut local_by_tid: std::collections::HashMap<u64, f32> =
         std::collections::HashMap::with_capacity(split.len());
@@ -4430,7 +4713,15 @@ pub fn numeric_gate<F: RopeForm>(
                 .iter()
                 .filter_map(|(t, _)| out.get(t).map(|v| (*t, v.clone())))
                 .collect();
-            let (tf, _rows) = teacher_forced_walk(ir, &mut eval_bufs, &overlay, &tainted, &folded);
+            let (tf, _rows) = teacher_forced_walk(
+                ir,
+                &mut eval_bufs,
+                &overlay,
+                &tainted,
+                &folded,
+                &view,
+                covering,
+            );
             let tail = compare.len() - (compare.len() / 10).clamp(1, compare.len() / 2);
             let mut tracks: Vec<f32> = Vec::new();
             let mut contracts: Vec<f32> = Vec::new();
@@ -4495,14 +4786,21 @@ pub fn numeric_gate<F: RopeForm>(
             samples.join(" | ")
         ));
     }
+    let mut scope = String::new();
+    if let Some(p) = prefill {
+        scope.push_str(&format!(" [prefill mq={}]", p.mq));
+    }
+    if let Some(t) = trunc {
+        scope.push_str(&format!(
+            " [class-covering {}/{} layers]",
+            t.layers.0, t.layers.1
+        ));
+    }
     eprintln!(
         "[spyre-superdsc] NUMERIC GATE PASS {fp}: {} tensors at the floor (worst local \
          clean {worst_local_clean:.4}, worst local fp8-chained {worst_local_fp8:.4}; worst \
-         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}){}",
-        compare.len(),
-        prefill
-            .map(|p| format!(" [prefill mq={}]", p.mq))
-            .unwrap_or_default()
+         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}){scope}",
+        compare.len()
     );
     Ok(())
 }
@@ -6389,6 +6687,7 @@ pub use scratchy_subtile::superdsc_error::SuperDscError;
 /// 25 of 30 layers addressed through the wrong class's KV stride, faulting the card at the first
 /// decode step. The class split is not an optimization; it is the only shape whose launch table
 /// can address a hybrid model.
+#[derive(Clone)]
 pub struct RolledBody {
     /// ONE layer's ops, baked at the class's layer-0 offsets.
     pub ops: Vec<EmittedOp>,
@@ -6426,6 +6725,7 @@ impl RolledBody {
 /// `hidden_out_tid` and the next body's `hidden_in_tid` onto the prefix's hidden buffer,
 /// so the host neither copies nor addresses them (see the pre-pass in
 /// `lower_subtile_tape_to_ktir`).
+#[derive(Clone)]
 pub struct RolledSuperDsc {
     pub prefix: Vec<EmittedOp>,
     /// ONE entry per attention class, in the order [`bundle::RerollMeta::bodies`] bakes.
@@ -6576,6 +6876,114 @@ pub fn unroll_layers(rolled: &RolledSuperDsc) -> Vec<EmittedOp> {
         ops.push(op);
     }
     ops
+}
+
+/// The gate's truncation law: how deep a slice of the roll the numeric gate
+/// runs, and the one edge the slice retargets. `layers` = (kept, total) — the
+/// PASS line names it. `suffix_rebind` = (the IR tid the full-depth suffix
+/// reads as its residual input, the truncated graph's last kept hidden tid) —
+/// the golden's IR clone rewires exactly this pair, mirroring the rebind
+/// `unroll_layers` applied to the twin's own suffix bindings.
+#[derive(Clone, Copy, Debug)]
+pub struct GateTrunc {
+    pub layers: (u32, u32),
+    pub suffix_rebind: (u32, u32),
+}
+
+/// ⭐ THE CLASS-COVERING DEPTH — the smallest prefix of the launch sequence
+/// that sees every body class AND every class transition the full sequence
+/// contains, floored at 2 so a single-class roll still exercises the
+/// body→body residual rebind seam, and capped at the sequence itself: a
+/// transition the prefix cannot cover (measured: the parity-tiny's six
+/// launches s,s,s,s,s,g never see g→s) runs at FULL depth — the identity
+/// rebind, and a built-in equivalence test for the truncation machinery.
+///
+/// The residual seam is why transitions count at all: launch `li`'s
+/// hidden-in binds launch `li-1`'s hidden-out (`unroll_layers`), and the
+/// suffix binds the last kept launch's — a slice that never crosses a class
+/// boundary would leave that rebinding law untested for every shape the
+/// model actually runs. MEASURED anchors: gemma-4-12b (s×5,g repeating)
+/// covers at 7/48; a single-class granite at 2/40; the parity-tiny at 6/6.
+pub fn class_covering_depth(launches: &[(u8, u32)]) -> usize {
+    let total = launches.len();
+    if total <= 2 {
+        return total;
+    }
+    let mut classes = std::collections::HashSet::new();
+    let mut transitions = std::collections::HashSet::new();
+    for (i, &(b, _)) in launches.iter().enumerate() {
+        classes.insert(b);
+        if i + 1 < launches.len() {
+            transitions.insert((b, launches[i + 1].0));
+        }
+    }
+    let mut seen_classes = std::collections::HashSet::new();
+    let mut seen_transitions = std::collections::HashSet::new();
+    for (i, &(b, _)) in launches.iter().enumerate() {
+        seen_classes.insert(b);
+        if i > 0 {
+            seen_transitions.insert((launches[i - 1].0, b));
+        }
+        if seen_classes.len() == classes.len() && seen_transitions.len() == transitions.len() {
+            return (i + 1).max(2).min(total);
+        }
+    }
+    total
+}
+
+/// ⭐ THE CLASS-COVERING TWIN — the shipped bundle's per-op groups sliced to
+/// the covering depth: the SAME roll, the SAME unroll law, the SAME grouping
+/// (`FoldGrouping::Split`, the spelling every bake in `codegen.rs` uses), with
+/// only the launch sequence truncated. The suffix rebind falls out of
+/// `unroll_layers`' own loop — the twin's last kept launch IS its `last()` —
+/// so the slice cannot drift from how the shipped bundle was constructed.
+/// `None` when the roll is already covering at full depth: the caller runs
+/// the shipped groups with no truncation (the identity rebind).
+///
+/// The twin is cheap by construction: the programs are interned
+/// (`ktir_tokens::ProgramInterner`), so re-unrolling K launches is K copies
+/// of the ARGS over one shared program per op — the same cost shape the bake
+/// itself pays, at K/total of the depth.
+pub fn covering_twin_groups(
+    rolled: &RolledSuperDsc,
+) -> Result<Option<(Vec<bundle::LaunchGroup<'static>>, GateTrunc)>, SuperDscError> {
+    let total = rolled.launches.len();
+    let k = class_covering_depth(&rolled.launches);
+    if k >= total {
+        return Ok(None);
+    }
+    // The rebind pair, in the FULL IR's own tid domain — the domain the
+    // golden's IR clone rewires. The full-depth suffix reads the LAST
+    // launch's hidden-out (`unroll_layers`' own suffix rewrite, a per-layer
+    // tid — not the rolled domain's abstract `suffix_in_tid`); the twin's
+    // suffix reads the k-1'th launch's. Every launch's hidden-out shares
+    // one shape, so the clone swaps the tid and carries the region.
+    let hidden_of = |li: usize| -> Option<u32> {
+        let &(body, iter) = rolled.launches.get(li)?;
+        rolled
+            .bodies
+            .get(body as usize)
+            .and_then(|b| rolled.per_layer.get(&b.hidden_out_tid))
+            .and_then(|ids| ids.get(iter as usize))
+            .copied()
+    };
+    let trunc = GateTrunc {
+        layers: (k as u32, total as u32),
+        suffix_rebind: (
+            hidden_of(total - 1).unwrap_or(rolled.suffix_in_tid),
+            hidden_of(k - 1).unwrap_or(rolled.suffix_in_tid),
+        ),
+    };
+    let mut twin = rolled.clone();
+    // The layout, per-layer map and body tables stay FULL — the kept
+    // launches' lookups hit their real entries, and nothing in the twin
+    // reads a launch past the cut. Only the sequence truncates.
+    twin.launches.truncate(k);
+    twin.launch_w.truncate(k);
+    twin.launch_kv.truncate(k);
+    let ops = unroll_layers(&twin);
+    let groups = ktir_groups(&ops, FoldGrouping::Split)?;
+    Ok(Some((groups, trunc)))
 }
 
 /// ⭐⭐⭐ THIS BUNDLE'S LAUNCH GROUPS: ITS PROGRAMS, IN LAUNCH ORDER.

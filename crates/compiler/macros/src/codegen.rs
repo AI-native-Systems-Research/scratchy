@@ -11707,7 +11707,20 @@ fn dump_wavefront_mega(
                                             //    the gate IS the bake's contract. A PREFIX-CAPABLE
                                             //    prefill bundle (ActiveCap::FULL — the
                                             //    continuation chunks) still skips loudly: its
-                                            //    resident-prefix mask law is the next rung. ──
+                                            //    resident-prefix mask law is the next rung.
+                                            //    ⭐ THE CLASS-COVERING TWIN: the gate judges the
+                                            //    smallest prefix of launches that covers every
+                                            //    body class AND every class transition (floor 2)
+                                            //    — the reroll's classes are the programs, so a
+                                            //    covered prefix exercises every program and every
+                                            //    boundary the bundle ships; the tail is rebound
+                                            //    to the kept prefix's last hidden-out and the
+                                            //    golden/walk/staging all filter on the twin's
+                                            //    bound set. A graph the law cannot truncate
+                                            //    (short bundles, or a transition the prefix
+                                            //    cannot cover) gates its OWN full depth — the
+                                            //    identity rebind is the built-in equivalence
+                                            //    test. ──
                                             #[cfg(feature = "spyre-emu")]
                                             {
                                                 let prefill_gate = prefill_classes.map(
@@ -11721,31 +11734,68 @@ fn dump_wavefront_mega(
                                                 );
                                                 let run_gate =
                                                     |prefill: Option<&superdsc::PrefillGate>| {
-                                                        match superdsc::with_emitted_groups(
-                                                            &bfp,
-                                                            |groups| {
-                                                                superdsc::numeric_gate(
-                                                                    groups,
+                                                        // The twin's own groups, fresh from the
+                                                        // truncated unroll — the same interned
+                                                        // programs the bundle's first K launches
+                                                        // bind, so the emulator session runs
+                                                        // exactly the classes under test.
+                                                        let twin =
+                                                            superdsc::covering_twin_groups(&rolled)
+                                                                .unwrap_or_else(|e| {
+                                                                    panic!(
+                                                                        "[spyre-superdsc] {base}: \
+                                                                         covering twin for {bfp} \
+                                                                         failed to lower — {e}"
+                                                                    )
+                                                                });
+                                                        match twin {
+                                                            Some((twin_groups, trunc)) => {
+                                                                match superdsc::numeric_gate(
+                                                                    &twin_groups,
                                                                     &krg,
                                                                     &weight_ids,
                                                                     cap,
                                                                     &bfp,
                                                                     prefill,
-                                                                )
-                                                            },
-                                                        ) {
-                                                            Some(Ok(())) => {}
-                                                            Some(Err(e)) => panic!(
-                                                                "[spyre-superdsc] {base}: \
-                                                                 NUMERIC GATE REFUSED for \
-                                                                 bundle {bfp} — {e}"
-                                                            ),
-                                                            None => eprintln!(
-                                                                "[spyre-superdsc] {base}: NUMERIC \
-                                                                 GATE could not borrow {bfp}'s \
-                                                                 launch groups (not Ready) — \
-                                                                 UNCHECKED"
-                                                            ),
+                                                                    Some(&trunc),
+                                                                ) {
+                                                                    Ok(()) => {}
+                                                                    Err(e) => panic!(
+                                                                        "[spyre-superdsc] {base}: \
+                                                                         NUMERIC GATE REFUSED for \
+                                                                         bundle {bfp} — {e}"
+                                                                    ),
+                                                                }
+                                                            }
+                                                            None => {
+                                                                match superdsc::with_emitted_groups(
+                                                                    &bfp,
+                                                                    |groups| {
+                                                                        superdsc::numeric_gate(
+                                                                            groups,
+                                                                            &krg,
+                                                                            &weight_ids,
+                                                                            cap,
+                                                                            &bfp,
+                                                                            prefill,
+                                                                            None,
+                                                                        )
+                                                                    },
+                                                                ) {
+                                                                    Some(Ok(())) => {}
+                                                                    Some(Err(e)) => panic!(
+                                                                        "[spyre-superdsc] {base}: \
+                                                                         NUMERIC GATE REFUSED for \
+                                                                         bundle {bfp} — {e}"
+                                                                    ),
+                                                                    None => eprintln!(
+                                                                        "[spyre-superdsc] {base}: NUMERIC \
+                                                                         GATE could not borrow {bfp}'s \
+                                                                         launch groups (not Ready) — \
+                                                                         UNCHECKED"
+                                                                    ),
+                                                                }
+                                                            }
                                                         }
                                                     };
                                                 match prefill_mq {
