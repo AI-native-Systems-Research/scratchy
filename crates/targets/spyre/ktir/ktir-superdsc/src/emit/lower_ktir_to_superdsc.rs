@@ -1166,6 +1166,69 @@ pub fn elementwise(
     )])
 }
 
+/// ⛔⛔⛔ EVERY OPERAND A COLUMN-BLOCKED PIECE NAMES IS ADDRESSED AT THAT PIECE's WINDOW — the class law,
+/// checked on what was EMITTED, not on what a body meant to emit.
+///
+/// The front end column-tiles a wide pointwise node into pieces that share one output tensor
+/// (`subtile_ir.rs`: `Elementwise(Silu | Mul | Add)`, `ScalarMul`, `SiluMul`; the MoE expert path's
+/// `ExpertGatedAct`). Each piece's [`Region`]s state their corner; a body that drops it emits every
+/// piece at the buffer base, and the columns past the first piece are never written. That happened
+/// twice: `elementwise` (the gemma-4 12b gated-act product, half zero) and `scalarmul_scaled` (granite's
+/// logits past column 8191, never written). Both bodies passed every test of their own, because each
+/// test asked the body and the body agreed with itself.
+///
+/// So this asks the emission. For every op of the node and every operand binding naming a tensor the
+/// program windows at a column corner, the binding's `offset_elems` must be that window's corner in
+/// the tensor's storage ([`chunk_corner`]); the node's ops must start at least one write at the
+/// output's corner. A body that ignores `c_start` cannot produce a bundle: the door returns this `Err`
+/// and the bake fails naming the op.
+///
+/// A whole-tensor node (every corner 0) passes without looking, so nothing that is not column-blocked
+/// pays for it.
+pub fn column_windows_are_honoured(
+    name: &str,
+    r: &[Region],
+    ops: &[EmittedOp],
+) -> Result<(), Error> {
+    let windowed: Vec<&Region> = r.iter().filter(|x| x.c_start != 0).collect();
+    if windowed.is_empty() {
+        return Ok(());
+    }
+    for x in windowed {
+        let rows = x.v_rows;
+        let want = chunk_corner(rows, x).into_raw_elems();
+        let buf = x.name();
+        let mut seen = false;
+        for op in ops {
+            for b in op.arg_bindings.iter().filter(|b| b.buffer == buf) {
+                seen = true;
+                if b.offset_elems != want {
+                    return err(format!(
+                        "{name}: op `{}` addresses t{} at element {} of its buffer, but the program \
+                         windows that tensor at column {} — element {want} of its `[{rows}, {}]` \
+                         storage. A column-blocked piece that does not address its own window \
+                         recomputes another piece's columns and leaves its own unwritten.",
+                        op.op_name,
+                        x.tid,
+                        b.offset_elems,
+                        x.c_start,
+                        x.c_start + x.c_len,
+                    ));
+                }
+            }
+        }
+        if x.is_out && !seen {
+            return err(format!(
+                "{name}: the program writes t{} at column window {}..{}, and no emitted op names it",
+                x.tid,
+                x.c_start,
+                x.c_start + x.c_len,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ WHERE A COLUMN-BLOCKED PIECE's WINDOW STARTS in its stick-blocked `[rows, full]` storage — the
 /// device element offset of column `out.c_start`, `(c/64)·(rows·64)`, through the address nest. The ONE
 /// spelling for every pointwise body whose pieces share one output tensor (`elementwise`'s dense arm,
@@ -5769,6 +5832,51 @@ mod elementwise_tests {
             }
             assert_eq!(covered, VOCAB, "rows {rows}: the pieces cover the row once");
         }
+    }
+
+    /// ⛔ THE CLASS GUARD SEES THE EMISSION. Every column-tiled body that honours its corner passes
+    /// `column_windows_are_honoured` (elementwise, silumul and scalarmul at the MLP chunk, scalarmul at
+    /// a logits piece), and the SAME ops with one operand moved back to the buffer base — the shape both
+    /// measured defects emitted — are refused naming the op and the tensor.
+    #[test]
+    fn the_column_window_guard_passes_honoured_pieces_and_refuses_a_piece_at_the_base() {
+        let (r, ..) = mlp_chunks();
+        let mut sym = 0i64;
+        let ew = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None).unwrap();
+        column_windows_are_honoured("mul_s23", &r, &ew).expect("elementwise honours its window");
+        let sm =
+            silumul("silumul_s23", &r, &mut sym, None).unwrap_or_else(|e| panic!("{}", e.message));
+        column_windows_are_honoured("silumul_s23", &r, &sm).expect("silumul honours its window");
+        let logits = vec![
+            chunked(5, 1, 8192, 8192, 49155, false),
+            chunked(7, 1, 8192, 8192, 49155, true),
+        ];
+        let mut ops = scalarmul_scaled(
+            "scalarmul_s1",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &logits,
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{}", e.message));
+        column_windows_are_honoured("scalarmul_s1", &logits, &ops)
+            .expect("the logits piece honours its window");
+        // The old emission: the output written at the base.
+        let out = ops[0]
+            .arg_bindings
+            .iter_mut()
+            .find(|b| b.buffer == logits[1].name())
+            .expect("the output's binding");
+        out.offset_elems = 0;
+        let Err(e) = column_windows_are_honoured("scalarmul_s1", &logits, &ops) else {
+            panic!("a piece written at the buffer base must be refused")
+        };
+        assert!(
+            e.message.contains("t7") && e.message.contains("column 8192"),
+            "names the tensor and its window: {}",
+            e.message
+        );
     }
 
     /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,

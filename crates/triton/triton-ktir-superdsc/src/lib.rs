@@ -289,7 +289,13 @@ fn emit_regions(
             });
         }
     };
-    out.map_err(|e| Error {
+    // ⛔ Every body here is held to the column windows its program states, the spyre door's law
+    // (`column_windows_are_honoured`); a whole-tensor node passes without looking.
+    out.and_then(|ops| {
+        emit::lower_ktir_to_superdsc::column_windows_are_honoured(name, regions, &ops)?;
+        Ok(ops)
+    })
+    .map_err(|e| Error {
         stage: "ktir-superdsc",
         message: format!("{e:?}"),
     })
