@@ -447,6 +447,21 @@
       "id": "thermal-order",
       "text": "This is a laptop: a long run heats the SoC, so whichever engine is measured second can be throttled, corrupting both its energy and its latency. Arms cool to a fixed idle state between runs, engine order alternates across repeats, and the starting thermal state is recorded per cell.",
       "source": "#161 fairness rule 6"
+    },
+    {
+      "id": "requests-served-unavailable",
+      "text": "ollama has no server-side request counter, so on its rows the proof that the engine under test served the traffic is the replay's own count. scratchy's rows are checked against its requests_served counter, and a mismatch voids the run.",
+      "source": "#161 fairness rule 7; emitted by cc_trace.py replay (#440)"
+    },
+    {
+      "id": "prefix-cache-not-reset",
+      "text": "ollama offers no way to clear its prefix cache between repeats, so from the second repeat on its first turn can start warm, while scratchy's cache is reset before every repeat. Turn 1 is comparable across engines only on the first repeat.",
+      "source": "emitted by cc_trace.py replay (#440)"
+    },
+    {
+      "id": "replay-serialized",
+      "text": "Claude Code sent some requests at the same time while recording. The replay sends them one after another, so the effect of concurrent requests is not measured.",
+      "source": "emitted by cc_trace.py replay (#440)"
     }
   ],
   "status": {
