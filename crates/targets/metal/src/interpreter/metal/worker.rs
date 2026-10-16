@@ -2523,6 +2523,85 @@ mod tests {
         assert_eq!(borrower.arena[2].length(), 128 * 1024);
     }
 
+    /// With a residency set and a [`SparsePlan`], a lender's slots the host does not read are
+    /// sparse. A borrower's slot the host reads takes none of them: it gets a full buffer of its
+    /// own, while the slots it does not read take the lender's. What it allocates is what the
+    /// budget prices for the same layouts ([`unlent_readable_bytes`]).
+    ///
+    /// [`unlent_readable_bytes`]: scratchy_core_common::lend::unlent_readable_bytes
+    #[test]
+    fn a_host_read_slot_takes_no_lent_sparse_buffer_and_is_priced_as_allocated() {
+        use crate::interpreter::metal::__re::MTLBuffer as _;
+        use crate::interpreter::metal::__re::MTLDevice as _;
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+        let residency = crate::residency::MetalResidencySet::new(&device);
+        let tile = device.sparseTileSizeInBytesForSparsePageSize(crate::sparse_kv::PAGE) as u64;
+        let (weights, allocator) = build_test_weights();
+        let runtime = empty_runtime(&device, 1);
+        let tapes = vec![build_synthetic_tape(1)];
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
+        let build = |layout: &ArenaLayout, host_slots: Vec<u32>, lent: &LentActivation| {
+            let plan = SparsePlan {
+                bucket_arena: vec![Box::leak(layout.clone().into_boxed_slice())],
+                host_slots,
+            };
+            MetalWorker::<TestWeights>::new_with_residency(
+                device.clone(),
+                layout,
+                &tapes,
+                &pipelines,
+                &sources(&weights, &allocator, &tapes),
+                &runtime,
+                Some(&residency),
+                None,
+                lent,
+                Some(&plan),
+            )
+            .expect("worker builds")
+        };
+        // The lender reads none of its slots on the host, so both are sparse.
+        let lender_layout = vec![4 * tile, tile];
+        let lender = build(&lender_layout, vec![], &LentActivation::default());
+        let lent = lender.activation();
+        assert!(
+            lent.arena
+                .iter()
+                .all(|a| matches!(a, Activation::Sparse(_)))
+        );
+        // The borrower reads slot 0 on the host. `lend` would pair it with the lender's 4-tile
+        // sparse slot; slot 1 fits the 1-tile one; slot 2 fits neither.
+        let borrower_layout = vec![4 * tile, tile, 2 * tile];
+        let borrower = build(&borrower_layout, vec![0], &lent);
+        let address = |b: &Buffer| b.gpuAddress();
+        let is_lent = |b: &Buffer| lender.arena.iter().any(|l| address(l) == address(b));
+        let mine = borrower.activation();
+        // The host-read slot: a full buffer of its own, not the lender's sparse one.
+        assert!(!is_lent(&borrower.arena[0]));
+        assert!(matches!(mine.arena[0], Activation::Full(_)));
+        assert_eq!(borrower.arena[0].length() as u64, 4 * tile);
+        // A slot the host does not read takes the lender's sparse buffer.
+        assert_eq!(address(&borrower.arena[1]), address(&lender.arena[1]));
+        // Bytes allocated == bytes priced.
+        let allocated: u64 = (borrower.arena.iter())
+            .filter(|b| !is_lent(b))
+            .map(|b| b.length() as u64)
+            .sum();
+        let priced = scratchy_core_common::lend::unlent_readable_bytes(
+            &borrower_layout,
+            &lender_layout,
+            |i| i == 0,
+            |j| matches!(lent.arena[j], Activation::Full(_)),
+        );
+        assert_eq!(allocated, priced);
+        assert_eq!(priced, 6 * tile);
+    }
+
     #[test]
     fn arena_shape_mismatch_errors() {
         let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {

@@ -62,13 +62,14 @@ use scratchy_target_metal::dtype::DType as GpuDType;
 #[cfg(feature = "metal")]
 use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
 #[cfg(feature = "metal")]
+use scratchy_target_metal::interpreter::metal::TerminalReads;
+#[cfg(feature = "metal")]
 use scratchy_target_metal::kv_cache::KvCachePool;
 
 /// Who reads an MTP head's logits: its argmax runs on the GPU, on the forward's own command buffer.
 /// Its device and its arena price both take it.
 #[cfg(feature = "metal")]
-const HEAD_TERMINAL_READS: scratchy_target_metal::interpreter::metal::TerminalReads =
-    scratchy_target_metal::interpreter::metal::TerminalReads::Gpu;
+const HEAD_TERMINAL_READS: TerminalReads = TerminalReads::Gpu;
 
 // The CUDA `Worker` lives in `scratchy-target-cuda`; re-exported here for
 // back-compat so callers naming `gpu_worker::{CudaWorker, CudaWorkerFactory}`
@@ -6773,7 +6774,7 @@ impl Worker for MetalWorker {
                             lent: Default::default(),
                             // Its verify seed is an argmax the host runs over the logits.
                             terminal_reads:
-                                scratchy_target_metal::interpreter::metal::TerminalReads::Host,
+                                TerminalReads::Host,
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread
