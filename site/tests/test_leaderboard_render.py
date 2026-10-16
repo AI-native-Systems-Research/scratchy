@@ -7,10 +7,13 @@ hovering — so they survive editing the prose.
 """
 
 import copy
+import json
 import re
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
+from pathlib import Path
 
 import fixture
 
@@ -408,6 +411,45 @@ class BuildRefusesBadData(unittest.TestCase):
         html, problems, _ = L.page(HEADER, fixture.indexed(b))
         self.assertIsNone(html)
         self.assertTrue(problems)
+
+
+class VariantPage(unittest.TestCase):
+    """A second page over the same board: its own runs, title and notice."""
+
+    def variant(self, spec):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / "runs").mkdir()
+        for p in (L.DATA / "runs").glob("*.json"):
+            run = json.loads(p.read_text())
+            run["status"] = "published"
+            (d / "runs" / p.name).write_text(json.dumps(run))
+        (d / "page.json").write_text(json.dumps(spec))
+        return d
+
+    def test_variant_reads_its_own_runs_and_shows_its_notice(self):
+        b = L.load(variant=self.variant(
+            {"title": "Smoke page", "notice": {"label": "Smoke test.", "text": "Not a result."}}))
+        html, problems, _ = L.page(HEADER, b)
+        self.assertEqual(problems, [])
+        self.assertFalse(L.is_example(b))
+        self.assertIn("<strong>Smoke test.</strong> Not a result.", html)
+        self.assertIn("<title>Smoke page", html)
+
+    def test_variant_shares_the_board(self):
+        b = L.load(variant=self.variant({}))
+        self.assertEqual(b["disclosures"], L.load()["disclosures"])
+        self.assertEqual(b["expects"], L.load()["expects"])
+
+    def test_variant_page_json_may_not_change_the_board(self):
+        with self.assertRaises(SystemExit):
+            L.load(variant=self.variant({"expects": {}}))
+
+    def test_committed_smoke_page_json_is_valid(self):
+        spec = json.loads((L.SMOKE / "page.json").read_text())
+        self.assertLessEqual(set(spec), L.VARIANT_KEYS)
+        self.assertTrue(spec["notice"]["label"] and spec["notice"]["text"])
 
 
 if __name__ == "__main__":

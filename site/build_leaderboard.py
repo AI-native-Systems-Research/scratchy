@@ -26,6 +26,7 @@ that is what lets an incomplete board render without inventing placeholders:
 Standalone: site/build_leaderboard.py [out.html]
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -34,6 +35,10 @@ import charts
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data" / "leaderboard"
+# The smoke-test page: its own runs over the same board (see `load`). Built only
+# when it has runs, and not linked from the site menu.
+SMOKE = HERE / "data" / "leaderboard-smoke"
+VARIANT_KEYS = {"title", "tagline", "notice"}
 REPO = "https://github.com/AI-native-Systems-Research/scratchy"
 
 SCHEMA = 1
@@ -100,17 +105,30 @@ MODULES = ["ui-shell", "select"]
 
 # ------------------------------------------------------------------------ load
 
-def load(data_dir=None):
+def load(data_dir=None, variant=None):
     """Read board.json plus every runs/*.json into one dict.
 
     Indexing happens here so `validate()` and the renderers share one view of
     which cell a record belongs to.
+
+    `variant` is a second page over the same board: a folder with its own
+    `runs/` and a `page.json` that may change only the title, the tagline and a
+    notice. The board itself is never copied, so the two pages cannot disagree
+    on what a cell, a metric or a disclosure is.
     """
     data_dir = Path(data_dir or DATA)
     board = json.loads((data_dir / "board.json").read_text())
-    board["runs"] = [
-        json.loads(p.read_text()) for p in sorted((data_dir / "runs").glob("*.json"))
-    ]
+    runs_dir = data_dir / "runs"
+    if variant:
+        variant = Path(variant)
+        spec = json.loads((variant / "page.json").read_text())
+        if set(spec) - VARIANT_KEYS:
+            raise SystemExit(f"{variant}/page.json: unknown key(s) "
+                             f"{sorted(set(spec) - VARIANT_KEYS)}")
+        board.update({k: spec[k] for k in ("title", "tagline") if k in spec})
+        board["_notice"] = spec.get("notice")
+        runs_dir = variant / "runs"
+    board["runs"] = [json.loads(p.read_text()) for p in sorted(runs_dir.glob("*.json"))]
     index(board)
     return board
 
@@ -201,7 +219,7 @@ def validate(board):
     # 1. shape and referential integrity
     if board.get("schema") != SCHEMA:
         p.append(f"board.json: schema is {board.get('schema')!r}, expected {SCHEMA}")
-    for k in set(board) - BOARD_KEYS - {"runs", "_cells", "_gaps"}:
+    for k in set(board) - BOARD_KEYS - {"runs", "_cells", "_gaps", "_notice"}:
         p.append(f"board.json: unknown key {k!r}")
     for lane, spec in lanes.items():
         for mid in spec.get("owns", []):
@@ -1055,6 +1073,12 @@ def page(header, board):
             'hatched and watermarked for the same reason: no value on this page is '
             'a measurement yet.</div>'
         )
+    elif board.get("_notice"):
+        n = board["_notice"]
+        banner = (
+            f'<div class="lbbanner" role="note"><strong>{charts.esc(n["label"])}</strong> '
+            f'{charts.esc(n["text"])}</div>'
+        )
 
     out = PAGE
     for key, val in {
@@ -1093,8 +1117,8 @@ def page(header, board):
     return out, [], counts
 
 
-def build(out_path, header):
-    board = load()
+def build(out_path, header, variant=None):
+    board = load(variant=variant)
     out, problems, counts = page(header, board)
     if problems:
         for p in problems:
@@ -1116,8 +1140,13 @@ def main():
     sys.path.insert(0, str(HERE))
     from build import header_html  # the one definition of the site chrome
 
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "_site/leaderboard.html"
-    build(out, header_html("", active="leaderboard.html"))
+    a = argparse.ArgumentParser(description="Build the leaderboard page.")
+    a.add_argument("out", nargs="?", default=HERE / "_site/leaderboard.html",
+                   help="where to WRITE the page (runs are read from the data folder)")
+    a.add_argument("--variant", metavar="DIR",
+                   help=f"build a second page from DIR's runs/ and page.json, e.g. {SMOKE}")
+    args = a.parse_args()
+    build(Path(args.out), header_html("", active="leaderboard.html"), variant=args.variant)
 
 
 PAGE = r"""<!doctype html>

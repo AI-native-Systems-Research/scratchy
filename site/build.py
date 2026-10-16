@@ -303,6 +303,10 @@ def main():
 
     build_archs.build(SITE / "architectures.html", header_html("", active="architectures.html"))
     build_leaderboard.build(SITE / "leaderboard.html", header_html("", active="leaderboard.html"))
+    if any((build_leaderboard.SMOKE / "runs").glob("*.json")):
+        build_leaderboard.build(SITE / "leaderboard-smoke.html",
+                                header_html("", active="leaderboard.html"),
+                                variant=build_leaderboard.SMOKE)
 
     # Both run, and neither short-circuits the other: one build should report
     # every problem it can see, not just the first kind.

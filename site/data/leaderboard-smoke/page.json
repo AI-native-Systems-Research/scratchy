@@ -1,0 +1,8 @@
+{
+  "title": "Launch Claude Smoke Test",
+  "tagline": "One short recorded session, replayed on both engines, to prove the measuring chain works end to end.",
+  "notice": {
+    "label": "Smoke test.",
+    "text": "These numbers come from one 6-turn toy session (a one-line bug fix), recorded once and replayed on each engine to check that recording, replay and this page work together. They are not a benchmark result. Every cell not measured here says why. The real results go on the main leaderboard."
+  }
+}
