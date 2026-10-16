@@ -76,6 +76,10 @@ APPLICABILITY_STATES = {"live": "live", **GAP_STATES}
 ATTRIBUTIONS = {"optimization", "architecture"}
 RUN_STATUSES = {"published", "example"}
 TURN_CLASSES = ("all", "tool-call", "file-write")
+# The one facet a lane's minimum n does not apply to: the replay's warm-up, one
+# pass before the measured repeats (#551). It is one pass by definition, and as
+# a facet it never enters a headline cell or the coverage grid.
+WARMUP_FACET = {"pass": "warmup"}
 
 # Unknown keys are errors, not no-ops: a typo in a data file must not silently
 # do nothing. Mirrors the schema-2 aggregate's filtered-key discipline.
@@ -321,7 +325,7 @@ def validate(board):
             if not isinstance(n, int) or n < 1:
                 p.append(f"{tag}: n is {n!r}")
             else:
-                if n < lanes[lane].get("min_n", 1):
+                if n < lanes[lane].get("min_n", 1) and m.get("facet") != WARMUP_FACET:
                     p.append(
                         f"{tag}: n={n} is below lane {lane}'s declared minimum "
                         f"{lanes[lane]['min_n']}"

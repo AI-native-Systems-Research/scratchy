@@ -128,6 +128,24 @@ class Check4StatShape(unittest.TestCase):
         self.assertTrue(
             any("below lane B's declared minimum 5" in p for p in got), got)
 
+    def test_a_warmup_facet_is_exempt_from_the_minimum_and_nothing_else(self):
+        def warmup(stat):
+            def m(b):
+                ms = b["runs"][0]["measurements"]
+                ms.append(dict(ms[0], n=1, facet={"pass": "warmup"}, stat=stat))
+            return m
+
+        self.assertEqual(only(warmup({"median": 800, "p10": 700, "p90": 900})), [])
+        # Its stat is still checked, and only that facet is exempt.
+        got = only(warmup({"median": 500, "p10": 90, "p90": 110}))
+        self.assertTrue(any("does not hold" in p for p in got), got)
+
+        def other_facet(b):
+            ms = b["runs"][0]["measurements"]
+            ms.append(dict(ms[0], n=1, facet={"pass": "cold"}))
+        got = only(other_facet)
+        self.assertTrue(any("below lane A's declared minimum" in p for p in got), got)
+
     def test_series_without_points(self):
         def m(b):
             b["runs"][0]["measurements"][0]["series"] = {"x": "turn_index",

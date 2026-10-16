@@ -455,8 +455,8 @@
     },
     {
       "id": "prefix-cache-not-reset",
-      "text": "ollama offers no way to clear its prefix cache between repeats, while scratchy's cache is reset before every repeat. A replay sends the same prompts on every repeat, so from the second repeat on, every ollama turn can be served almost entirely from its cache. ollama's figures on such a run are therefore optimistic, and only the first repeat compares the two engines fairly. Unloading and reloading the model between repeats clears the cache; the replayer does not do that yet.",
-      "source": "emitted by cc_trace.py replay (#440)"
+      "text": "This engine's prefix cache was not cleared between repeats. A replay sends the same prompts on every repeat, so from the second repeat on, its turns can be served almost entirely from cache while the other engine starts each repeat cold. Its figures on such a run are optimistic, and only the first repeat compares the two engines fairly. The replayer now clears both engines' caches before every pass (scratchy through its reset endpoint, ollama by unloading and reloading the model, #551), so only runs from before that fix carry this disclosure.",
+      "source": "emitted by cc_trace.py replay (#440) when it cannot clear an engine's cache; #551"
     },
     {
       "id": "replay-serialized",
