@@ -517,6 +517,38 @@ pub fn pointwise_fits_untiled(rows: u32, cols: u32, n_inputs: u32) -> bool {
     pointwise_untiled_slice_bytes(rows, cols, n_inputs).is_some()
 }
 
+/// Whether a `[rows, cols]` fp16 ROW reduction (`max`/`sum` over `cols`) runs WITHOUT time-tiling — the
+/// very tile op the reduce builder (`reduce_opspec_off`) tiles, asked before the op is. A caller cuts a
+/// reduction this answers `false` for: a chunk reduction's time trips do not combine on card (see
+/// `attn`'s `no_chunk_op_is_time_tiled`).
+pub fn reduce_fits_untiled(rows: u32, cols: u32) -> bool {
+    let Ok(stick) = StickExtent::<Fp16>::new(cols) else {
+        return false;
+    };
+    let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction,
+        is_stick,
+        df: Df::Fp16,
+    };
+    crate::ir::island::tile_op::TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims: vec![
+            dim("mb", rows, false, false),
+            dim("out", stick.elems(), true, true),
+            dim("y", 1, false, false),
+        ],
+        df: Df::Fp16,
+    }
+    .tile(
+        crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
+        crate::work::distribute_cores,
+        "out",
+    )
+    .is_ok_and(|t| t.time_tile.is_none())
+}
+
 /// The bytes of ONE core's slice of that op's fp16 `[rows, cols]` output under the tiler's own work
 /// division — what a core-local LX pin for it must hold ([`BundleLayout::synth_lx_core_local`]). `None`
 /// when the op would be time-tiled, which a core-local tensor cannot be.
@@ -1311,6 +1343,22 @@ pub fn pointwise_chunk_out_offset(cols_start: u32) -> u32 {
 /// A no-op (and byte-identical emission) for every bundle that declares no LX intermediates.
 fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
     let Some(l) = layout else { return };
+    mark_lx_residency(op, l);
+    if op
+        .args
+        .last()
+        .is_some_and(|o| l.lx_pin(o.arg_name()).is_some() && !l.lx_core_local(o.arg_name()))
+    {
+        op.iter = WorkPlan::replicate(op.iter.dims());
+    }
+}
+
+/// The allocation half of the residency consult: every operand whose name is LX-pinned gets its LX
+/// [`Allocation`]. `emit_sdsc_tiled` runs it for EVERY op, so a matmul or a reduction reading a core-local
+/// tensor (a prompt chunk's PV and row sum over the probabilities) is marked like a pointwise op is —
+/// and then held to the read law. Allocations only: a replicated producer's PLAN is set by the pointwise
+/// door ([`apply_lx_residency`]), before its folds are taken from it.
+fn mark_lx_residency(op: &mut OpSpec, l: &BundleLayout) {
     for a in op.args.iter_mut() {
         if l.lx_pin(a.arg_name()).is_some() {
             a.set_allocation(if l.lx_core_local(a.arg_name()) {
@@ -1319,13 +1367,6 @@ fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
                 Allocation::Lx
             });
         }
-    }
-    if op
-        .args
-        .last()
-        .is_some_and(|o| l.lx_pin(o.arg_name()).is_some() && !l.lx_core_local(o.arg_name()))
-    {
-        op.iter = WorkPlan::replicate(op.iter.dims());
     }
 }
 
@@ -1361,10 +1402,12 @@ fn core_local_reads_agree(
             )));
         }
         let plan = &op.iter;
-        let slice_bytes = plan
-            .dims()
+        // The OPERAND's per-core slice — its own axes, not the op's whole iteration space (a PV also iterates
+        // the head dim its probabilities operand does not have).
+        let slice_bytes = v
+            .layout
             .iter()
-            .map(|d| u64::from(plan.per_core_extent(d.name)))
+            .map(|&d| u64::from(plan.per_core_extent(d)))
             .product::<u64>()
             * u64::from(v.df.word_length());
         let (_, pin_bytes) = l.lx_pin(name).unwrap_or_default();
@@ -1374,15 +1417,34 @@ fn core_local_reads_agree(
                  past its {pin_bytes}-byte pin"
             )));
         }
-        let signature = format!(
-            "{:?} split {:?} on {} cores",
-            plan.dims()
-                .iter()
-                .map(|d| (d.name, d.size))
-                .collect::<Vec<_>>(),
-            plan.splits(),
-            plan.cores_used().get()
-        );
+        // ⭐ THE SLICE EACH CORE HOLDS, AXIS BY AXIS OF THIS OPERAND — not the op's whole plan. A matmul and a
+        // pointwise op never share a plan (their iteration spaces differ), yet a `{mb:32}` PV and a `{mb:32}`
+        // exp hand core `c` the same rows of the probabilities and all of its columns; that per-core slice,
+        // read off the emitter's own core→slice decomposition along the operand's own axes in order, is
+        // exactly what makes a core-local read correct.
+        let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
+        let slices = core_to_wk_slice(plan, &dims);
+        // Unit axes (extent 1) are skipped: a rank-3 view with a phantom `y` of 1 (the reduce builder's
+        // offset slice) holds exactly the elements the rank-2 view does.
+        let per_core: Vec<Vec<(u32, String)>> = (0..plan.cores_used().get().max(1))
+            .map(|c| {
+                v.layout
+                    .iter()
+                    .filter(|&&d| plan.extent(d) > 1)
+                    .map(|&d| {
+                        (
+                            plan.per_core_extent(d),
+                            slices
+                                .get(&c.to_string())
+                                .and_then(|s| s.get(d))
+                                .map(|i| format!("{i:?}"))
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let signature = format!("per-core slices {per_core:?}");
         l.record_lx_division(name, op_name, signature)
             .map_err(SuperDscError)?;
     }
@@ -2094,6 +2156,18 @@ pub fn emit_sdsc_tiled(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, SuperDscError> {
+    // Every op kind passes the residency consult here, not only the pointwise door — a byte-identical
+    // no-op for an op that names no LX-pinned tensor.
+    let marked;
+    let op = match layout {
+        Some(l) if op.args.iter().any(|a| l.lx_pin(a.arg_name()).is_some()) => {
+            let mut o = op.clone();
+            mark_lx_residency(&mut o, l);
+            marked = o;
+            &marked
+        }
+        _ => op,
+    };
     let time = op.time();
     let inner = emit_sdsc(op_name, op, folds, layout)?;
     if time == 1 {

@@ -387,6 +387,15 @@ pub(crate) fn run_prefill_batch(
         head_dim: hd,
         num_q_heads: nqh,
         mq_pad,
+        // The causal mask laid out as the emitter's new-token block reads it — the SAME law, on the same
+        // three facts the bake keyed it on: the rung's rows, the head dim, and whether rows are requests.
+        causal_heads_per_block: scratchy_subtile::sdsc_abstract::NewBlockForm::of(
+            mq as u32,
+            hd as u32,
+            per_request.is_some(),
+        )
+        .mask_heads_per_block(nqh as u32, (sh.kv_dim / sh.head_dim) as u32)
+            as usize,
         rope_theta: sh.rope_theta,
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
@@ -1429,6 +1438,8 @@ pub(crate) fn superdsc_forward_chunk(
             head_dim: hd,
             num_q_heads: h / hd,
             mq_pad: 64,
+            // One row: always the sub-blocked form (`NewBlockForm::of(1, …)`), whose block is every head.
+            causal_heads_per_block: h / hd,
             rope_theta: sh.rope_theta,
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],
