@@ -2243,3 +2243,69 @@ fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
         op_output: Vec::new(),
     }
 }
+
+/// ⛔⛔⛔ A CONTINUATION'S PROGRAM IS FLAT IN ITS ROWS — the whole-chunk form, pinned at the door's own
+/// guard and across row counts. The per-row arm it replaced held `mq` row bodies (granite-2b at 256
+/// rows: 94.7 s to lower; at 512, never finished). Eight times the rows must not grow the program, both
+/// widths must pass the door's guard, and a program that windows its query per row must be refused.
+#[test]
+fn a_continuation_programs_size_does_not_grow_with_its_rows() {
+    let ops_at = |mq: u32| {
+        let s = AttnShape {
+            geom: (32, 8, 64),
+            mq,
+            cap: 256,
+            rung: 0,
+            rope_appended: true,
+        };
+        let ir = attn_ir(s, 0.015625);
+        let node = ir.nodes.last().unwrap();
+        let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
+        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
+            .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
+        let k = spliced.ktir.expect("spliced op carries its program");
+        assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
+        ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
+            "continuation",
+            &k.func,
+            mq,
+            32,
+        )
+        .unwrap_or_else(|e| panic!("mq={mq}: {}", e.message));
+        k.func.ops_deep().len()
+    };
+    let (small, wide) = (ops_at(31), ops_at(256));
+    assert!(
+        wide <= small,
+        "8x the rows grew the program: 31 rows {small} ops, 256 rows {wide} ops"
+    );
+    // The door's refusal, on a REAL unrolled program: decode windows its query once for each of its 32
+    // heads, so the same program presented as ONE head over two rows windows its query 32 times for
+    // one head — exactly the shape a per-row unroll has, which the guard exists to refuse.
+    let decode = AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    };
+    let ir = attn_ir(decode, 0.015625);
+    let node = ir.nodes.last().unwrap();
+    let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
+    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap())
+        .expect("the decode splice compiles")
+        .ktir
+        .expect("spliced op carries its program");
+    use ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows;
+    assert!(
+        attn_program_is_flat_in_rows("decode", &unrolled.func, 1, 32).is_ok(),
+        "decode's one row is exempt"
+    );
+    let refused = attn_program_is_flat_in_rows("unrolled", &unrolled.func, 2, 1)
+        .expect_err("32 query windows for one head over two rows must be refused");
+    assert!(
+        refused.message.contains("unrolls per row") && refused.message.contains("2-row"),
+        "names the row count and the cause: {}",
+        refused.message
+    );
+}

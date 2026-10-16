@@ -2147,6 +2147,47 @@ pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
     })
 }
 
+/// ⛔⛔⛔ AN ATTENTION PROGRAM'S SIZE MUST NOT GROW WITH ITS ROWS — the bake refuses a per-row unroll.
+///
+/// The continuation arm was a `tl.static_range(0, MQ)` of per-row bodies, each with its own `[qi + 1,
+/// HD]` causal tiles: `MQ` bodies whose tiles summed to `MQ²/2` rows. Its program, and every pass that
+/// walks it, grew with the rows: MEASURED on granite-2b, 94.7 s to lower at 256 rows (the bake's
+/// widest compile) and a build-script thread past 25 min at 102 GB without finishing at 512. The bundle
+/// was correct; only the build paid.
+///
+/// So the check is on the LOWERED program, at the door, for every multi-row attention: the number of
+/// windows it takes of its query `q` (parameter 0), regions included so a loop the front end failed to
+/// fold still counts its body. A whole-chunk head reads its query ONCE, so the program takes at most
+/// one window per head (`heads` — the grid is unrolled into the program, so every head's body is in
+/// it); a per-row form takes one per head PER ROW. That is the property a raw op-count bound cannot
+/// state, because a program's absolute size also scales with its heads and head dim. Decode
+/// (`mq == 1`) has one row, so the two forms coincide there.
+pub fn attn_program_is_flat_in_rows(
+    name: &str,
+    f: &IRFunction<'static>,
+    mq: u32,
+    heads: u32,
+) -> Result<(), Error> {
+    if mq <= 1 {
+        return Ok(());
+    }
+    let Some((q, _)) = f.arguments.first() else {
+        return err(format!(
+            "{name}: an attention program with no parameters — its query is parameter 0"
+        ));
+    };
+    let tiles = param_tiles_deep(f, q);
+    if tiles > heads as usize {
+        return err(format!(
+            "{name}: a {mq}-row attention program over {heads} head(s) takes {tiles} windows of its \
+             query, where a whole-chunk head takes one — it unrolls per row, so its size, its \
+             lowering and every pass over it grow with its rows. State the chunk whole: one score tile \
+             per segment and the causal triangle in the mask."
+        ));
+    }
+    Ok(())
+}
+
 /// The rows of one parameter's buffer the program actually READS — every `ktdp.construct_access_tile`
 /// over any view of it, as the widest row extent; `0` when it takes no window at all.
 ///
@@ -3360,6 +3401,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the door this file's header describes — not a record the producer filled in beside it.
     let ops_in = attn_operands(_name, k, r, geom)?;
     let mq = ops_in.mq;
+    attn_program_is_flat_in_rows(_name, &k.func, mq, geom.nqh())?;
     let (k_id, v_id) = (ops_in.k_id, ops_in.v_id);
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     let cap = ops_in.cap;
