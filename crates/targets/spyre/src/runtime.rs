@@ -515,6 +515,45 @@ impl Stream {
         .with_pipeline_barrier(pipeline_barrier);
         stream.launch_compute(params, None).map_err(HwError::Stream)
     }
+
+    /// N compute launches as ONE submission — one doorbell for the whole list (the vendor's
+    /// multi-CB branch; see `flex_rs::stream::RuntimeStream::launch_compute_batch` for the
+    /// semantics, including why `pipeline_barrier` is the OR of what the caller would have
+    /// passed per op). Device-side order is the list order, same as N `compute` calls.
+    ///
+    /// ⛔ THE ITEMS OWN THEIR HANDLES. A batch outlives the loop that builds it (the whole
+    /// rung is collected, then flushed once), and that loop's shifted bases and `&DevAddr`
+    /// borrows are loop-local — so an item carries `DevAddr` clones (descriptor refcounts,
+    /// see [`DevAddr`]'s Clone note) rather than borrows.
+    ///
+    /// `kernel_name` and `tensor_byte_offsets` are not per-item parameters: the only caller
+    /// of this door launches exactly the shape `compute` launches at its every call site —
+    /// `kernel_name=""` and no tensor byte offsets, matching torch-spyre's
+    /// JobPlanStepCompute (the resident binary runs by its bootstrap address; dxp does not
+    /// apply `tensor_byte_offsets` to per-op addresses). Widening this to a general batch
+    /// door means growing [`BatchedCompute`], not a new method.
+    pub fn compute_batch(
+        &self,
+        launches: &[BatchedCompute],
+        pipeline_barrier: bool,
+    ) -> Result<(), HwError> {
+        let stream = self.live()?;
+        let params: Vec<ComputeParams> = launches
+            .iter()
+            .map(|l| {
+                ComputeParams::new(
+                    l.prog.0.clone(),
+                    l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
+                    KernelName(String::new()),
+                    BootstrapOffset(l.bootstrap_offset),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        stream
+            .launch_compute_batch(params, pipeline_barrier, None)
+            .map_err(HwError::Stream)
+    }
 }
 
 impl Drop for Stream {
@@ -529,6 +568,19 @@ impl Drop for Stream {
 /// The byte types [`DevAddr`]'s signature speaks, re-exported so the player imports every device
 /// address type from this one module — the typed card surface hands out the types it takes.
 pub use flex_rs::address::{ByteOffset, ByteSize};
+
+/// One entry of a [`Stream::compute_batch`] list — the owned handles one compute launch
+/// needs. The handles are owned (not borrowed) because a batch outlives the loop that
+/// builds it; see `compute_batch`'s ⛔ note. Field semantics match [`Stream::compute`]'s
+/// parameters of the same names.
+pub struct BatchedCompute {
+    /// The program allocation (segment 7) the bootstrap offset is relative to.
+    pub prog: DevAddr,
+    /// POSITIONAL — entry i backs the program's logical segment i.
+    pub tensor_allocs: Vec<DevAddr>,
+    /// Offset within the program allocation where kernel execution begins.
+    pub bootstrap_offset: u64,
+}
 
 /// One chunk's identity — what a shifted or sliced sub-address is built from. The fields are
 /// flex-rs's own newtypes, so a chunk cannot be rebuilt with a region id in the offset's place
@@ -552,6 +604,13 @@ pub struct Chunk0 {
 /// per layer per launch) drop normally as owned values while the runtime is alive.
 ///
 /// `Send` by construction: the descriptor is plain shared data.
+///
+/// `Clone` is a descriptor refcount bump and nothing more: the field is an `Arc`, the
+/// underlying device memory is never freed (see above), so two handles describe the same
+/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::compute_batch`])
+/// needs it — a batch item outlives the loop that built its shifted bases, so it must own its
+/// handles instead of borrowing them.
+#[derive(Clone)]
 pub struct DevAddr(Arc<CompositeAddress>);
 
 impl DevAddr {

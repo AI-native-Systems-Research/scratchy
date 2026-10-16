@@ -170,6 +170,22 @@ pub enum RuntimeStreamError {
         chunk_index: usize,
         offset: u64,
     },
+    /// A batch submission (`launch_compute_batch`) with zero operations. No
+    /// C++ analog exists to port — the vendor has no batch-compute entry
+    /// point at all (that is the gap the batch path fills) — and an empty
+    /// list would ring no doorbell and complete nothing, which can only be
+    /// a caller bug. Refused rather than silently "succeeding".
+    EmptyBatch(&'static str),
+    /// A batch submission (`launch_compute_batch`) whose element `index`
+    /// failed the per-op validation every `launch_compute` performs. The
+    /// batch's loop-local context (which op of which list) is gone by the
+    /// time the list is validated as a unit, so the index rides the error —
+    /// a caller that dumps per-op launch context on failure (the player's
+    /// fault path) can name the entry that was refused.
+    BatchElement {
+        index: usize,
+        source: Box<RuntimeStreamError>,
+    },
 }
 
 impl std::fmt::Display for RuntimeStreamError {
@@ -205,6 +221,12 @@ impl std::fmt::Display for RuntimeStreamError {
                 f,
                 "{operation}: ChunkOffsetNotAligned (chunk {chunk_index} offset {offset:#x} is not 128-byte aligned)"
             ),
+            Self::EmptyBatch(who) => {
+                write!(f, "{who}: batch submission had zero operations")
+            }
+            Self::BatchElement { index, source } => {
+                write!(f, "batch element {index}: {source}")
+            }
         }
     }
 }
@@ -597,6 +619,81 @@ impl RuntimeStream {
             Self::each_chunk_128_byte_aligned(address, "RuntimeOperationCompute")?;
         }
         let pipeline_barrier = params.pipeline_barrier();
+        let op = SubmittedOperation {
+            kind: RuntimeOperationKind::Compute,
+            pipeline_barrier,
+            payload: Box::new(params),
+        };
+        self.launch_operation(op, user_cb)
+    }
+
+    /// The batch form of [`Self::launch_compute`]: N compute ops submitted as
+    /// ONE `SubmittedOperation` — one shared pipeline barrier, one completion
+    /// callback (one `in_flight` increment), and, below the scheduler, one
+    /// doorbell for the whole list.
+    ///
+    /// There is no C++ `launchOperationComputeBatch` to port — the vendor's
+    /// graph-free compute path submits one op at a time, which is exactly why
+    /// the multi-CB branch of `submitToHardware` (`QueueControlBlocksSBF` +
+    /// its grouped `onCbComplete`) had no compute caller. This method is that
+    /// caller, and it takes the submission shape the vendor already uses for
+    /// its own multi-element submissions — the whole list as one operation
+    /// with ONE barrier and ONE shared callback, the same shape
+    /// [`Self::launch_legacy_p2p_data_exchange`] gives the P2P exchange and
+    /// the chunked-DMA path gives a multi-CB transfer.
+    ///
+    /// BARRIER SEMANTICS. `pipeline_barrier` is the list's barrier, not any
+    /// element's: the scheduler sees one operation and makes one
+    /// `maybe_set_barrier` decision — the one the FIRST op would have gotten
+    /// — so the caller must pass the OR of the per-op barriers it would
+    /// otherwise have requested. For an all-compute list this is equivalent
+    /// to per-op barriers: `issue_barrier` waits on the OTHER pipelines'
+    /// fences (it drains and waits on their deques), the producer is
+    /// single-threaded and pushes nothing between the elements, so the fence
+    /// set is identical at every position — the first true barrier drains it
+    /// and every later one would wait on nothing. Device-side order is the
+    /// list order: the CB ring is FIFO and the batch's CBs are consecutive,
+    /// under the same STRICT_ORDERING stream. Each element's own
+    /// `ComputeParams::pipeline_barrier` field is inert on this path (there
+    /// is no per-element barrier on a one-operation submission — the C++
+    /// composite-op precedent sets the barrier on the composite, not the
+    /// children).
+    ///
+    /// Validation is [`Self::launch_compute`]'s, applied to every element,
+    /// with the failing element's index wrapped in
+    /// [`RuntimeStreamError::BatchElement`] so a caller with per-op context
+    /// can still name the entry that was refused. An empty list is refused
+    /// outright ([`RuntimeStreamError::EmptyBatch`]) — it would ring no
+    /// doorbell and complete nothing.
+    pub fn launch_compute_batch(
+        self: &Arc<Self>,
+        params: Vec<crate::compute::ComputeParams>,
+        pipeline_barrier: bool,
+        user_cb: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<(), RuntimeStreamError> {
+        if params.is_empty() {
+            return Err(RuntimeStreamError::EmptyBatch("RuntimeOperationCompute"));
+        }
+        for (index, p) in params.iter().enumerate() {
+            Self::contain_one_or_more_chunks(p.device_address(), "RuntimeOperationCompute")
+                .map_err(|e| RuntimeStreamError::BatchElement {
+                    index,
+                    source: Box::new(e),
+                })?;
+            Self::each_chunk_128_byte_aligned(p.device_address(), "RuntimeOperationCompute")
+                .map_err(|e| RuntimeStreamError::BatchElement {
+                    index,
+                    source: Box::new(e),
+                })?;
+            for address in p.tensor_allocs() {
+                Self::each_chunk_128_byte_aligned(address, "RuntimeOperationCompute").map_err(
+                    |e| RuntimeStreamError::BatchElement {
+                        index,
+                        source: Box::new(e),
+                    },
+                )?;
+            }
+        }
         let op = SubmittedOperation {
             kind: RuntimeOperationKind::Compute,
             pipeline_barrier,

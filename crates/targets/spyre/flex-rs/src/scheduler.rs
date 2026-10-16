@@ -546,6 +546,31 @@ pub trait SchedulerBackend: Send + Sync {
         op: &ComputeParams,
         callback: CompletionCallback,
     );
+    /// The multi-CB form of [`Self::submit_compute`]: N compute ops as ONE
+    /// submission group. The vendor's hardware path is batch-shaped end to
+    /// end — `ControlBlockStream::QueueControlBlocksSBF(src, num_blocks)`
+    /// takes a CB *array*, `submitToHardware` gates capacity and raises the
+    /// in-flight budget per *CB*, and `onCbComplete` fires the user callback
+    /// once per *group* (counting invocations against `total_num_cbs`) —
+    /// but every graph-free compute caller in this port submitted exactly
+    /// one op, so that machinery only ever ran at `num_cbs = 1`. This is
+    /// the batch branch's first compute caller: one capacity gate over N
+    /// CBs, one tag per CB (never shared — `prepare_cbs` acquires
+    /// `ops.len()` leases), the budget raised N times and lowered once per
+    /// CB as its response arrives, and ONE doorbell for the whole group
+    /// (`launch_cbs`). Device-side ordering is untouched: the CB ring is
+    /// FIFO and the group's CBs are consecutive, so they run in the order
+    /// of `ops` exactly as N single submissions would.
+    ///
+    /// Deliberately a required method, not a default that loops
+    /// [`Self::submit_compute`]: the one-doorbell grouping IS the contract,
+    /// and a default would let a future backend silently un-batch it.
+    fn submit_compute_batch(
+        &self,
+        state: &Arc<SchedulerState>,
+        ops: &[ComputeParams],
+        callback: CompletionCallback,
+    );
     fn submit_fill(
         &self,
         state: &Arc<SchedulerState>,
@@ -639,6 +664,11 @@ pub struct MockBackend {
     pub throw_on_dma: Mutex<bool>,
     pub throw_on_compute: Mutex<bool>,
     pub barrier_calls: Mutex<Vec<RuntimeOperationKind>>,
+    /// Op counts of every `submit_compute_batch` call, in order — the
+    /// batch-path counterpart of `barrier_calls`, so a test can assert a
+    /// submission crossed the backend as ONE batch of N ops rather than N
+    /// `submit_compute` calls.
+    pub compute_batches: Mutex<Vec<usize>>,
     no_capacity: NoCapacity,
 }
 
@@ -661,6 +691,7 @@ impl Default for MockBackend {
             throw_on_dma: Mutex::new(false),
             throw_on_compute: Mutex::new(false),
             barrier_calls: Mutex::new(Vec::new()),
+            compute_batches: Mutex::new(Vec::new()),
             no_capacity: NoCapacity,
         }
     }
@@ -671,6 +702,11 @@ impl MockBackend {
     /// Port of `MockRuntimeScheduler::barrierCount`.
     pub fn barrier_count(&self) -> usize {
         self.barrier_calls.lock().unwrap().len()
+    }
+
+    /// The op counts of every `submit_compute_batch` call so far, in order.
+    pub fn compute_batch_sizes(&self) -> Vec<usize> {
+        self.compute_batches.lock().unwrap().clone()
     }
 }
 
@@ -716,6 +752,34 @@ impl SchedulerBackend for MockBackend {
         // (`mock_runtime_scheduler.cpp:302,341`).
         state.inc_in_flight(PipelineId::Compute);
         state.dec_in_flight(PipelineId::Compute);
+        callback(Ok(()));
+    }
+
+    fn submit_compute_batch(
+        &self,
+        state: &Arc<SchedulerState>,
+        ops: &[ComputeParams],
+        callback: CompletionCallback,
+    ) {
+        if *self.throw_on_compute.lock().unwrap() {
+            callback(Err(mock_error(
+                "MockRuntimeScheduler: submitCompute configured to throw",
+            )));
+            return;
+        }
+        self.compute_batches.lock().unwrap().push(ops.len());
+        // Same synchronous bracket as `submit_compute` above, but the budget
+        // moves once per CB — the real grouped callback decrements once per CB
+        // (`recordPipelineProfiler`), and `submit_to_hardware`'s contract is
+        // that the in-flight budget counts CBs, not calls. The mock completes
+        // synchronously, so the whole bracket runs back down to zero before
+        // returning, exactly like the single-op mock's immediate inc/dec pair.
+        for _ in ops {
+            state.inc_in_flight(PipelineId::Compute);
+        }
+        for _ in ops {
+            state.dec_in_flight(PipelineId::Compute);
+        }
         callback(Ok(()));
     }
 
@@ -3786,6 +3850,40 @@ impl SchedulerBackend for PfBackend {
         );
     }
 
+    /// The multi-CB form of [`Self::submit_compute`] (contract:
+    /// [`SchedulerBackend::submit_compute_batch`]): the whole list goes
+    /// through ONE `submitToHardware` group at `num_cbs = ops.len()` — one
+    /// capacity gate, one grouped completion callback, one tag per op, and
+    /// one doorbell. A build failure names its CB's index, so a refused
+    /// submission can be attributed to the op that caused it.
+    fn submit_compute_batch(
+        &self,
+        state: &Arc<SchedulerState>,
+        ops: &[ComputeParams],
+        callback: CompletionCallback,
+    ) {
+        let resolver = self.addr_resolver.as_ref();
+        submit_to_hardware(
+            state,
+            self.response_worker(),
+            self.capacity.as_ref(),
+            PipelineId::Compute,
+            ops.len() as u64,
+            callback,
+            |tags| {
+                let mut cbs = Vec::with_capacity(ops.len());
+                for (i, (op, tag)) in ops.iter().zip(tags.iter()).enumerate() {
+                    cbs.push(
+                        build_compute_cb(resolver, op, *tag).map_err(|e| {
+                            mock_error(&format!("submit_compute_batch: CB {i}: {e}"))
+                        })?,
+                    );
+                }
+                Ok(cbs)
+            },
+        );
+    }
+
     /// Port of `PfRuntimeScheduler::submitFill` (`pf_runtime_scheduler.cpp:261-276`):
     /// build a real fill CB and submit it on DMAI or DMAO per
     /// `fill.use_dmai`.
@@ -3974,6 +4072,36 @@ impl SchedulerBackend for VfBackend {
             |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
         );
     }
+    /// The multi-CB form of [`Self::submit_compute`] — same shape as PF's
+    /// (the two C++ classes share `submitToHardware`); see
+    /// [`SchedulerBackend::submit_compute_batch`] for the contract.
+    fn submit_compute_batch(
+        &self,
+        state: &Arc<SchedulerState>,
+        ops: &[ComputeParams],
+        callback: CompletionCallback,
+    ) {
+        let resolver = self.addr_resolver.as_ref();
+        submit_to_hardware(
+            state,
+            self.response_worker(),
+            self.capacity.as_ref(),
+            PipelineId::Compute,
+            ops.len() as u64,
+            callback,
+            |tags| {
+                let mut cbs = Vec::with_capacity(ops.len());
+                for (i, (op, tag)) in ops.iter().zip(tags.iter()).enumerate() {
+                    cbs.push(
+                        build_compute_cb(resolver, op, *tag).map_err(|e| {
+                            mock_error(&format!("submit_compute_batch: CB {i}: {e}"))
+                        })?,
+                    );
+                }
+                Ok(cbs)
+            },
+        );
+    }
     /// Port of `VfRuntimeScheduler::submitFill`: same real fill CB as PF.
     fn submit_fill(
         &self,
@@ -4134,6 +4262,17 @@ impl RuntimeScheduler {
     pub fn mock_barrier_count(&self) -> Option<usize> {
         match &self.backend {
             Backend::Mock(m) => Some(m.barrier_count()),
+            _ => None,
+        }
+    }
+
+    /// Test-only accessor: the op counts of every `submit_compute_batch`
+    /// call, in order — only meaningful when this scheduler wraps
+    /// `Backend::Mock`.
+    #[cfg(test)]
+    pub fn mock_compute_batch_sizes(&self) -> Option<Vec<usize>> {
+        match &self.backend {
+            Backend::Mock(m) => Some(m.compute_batch_sizes()),
             _ => None,
         }
     }
@@ -4445,7 +4584,41 @@ impl SchedulerHandle for RuntimeScheduler {
                 Ok(())
             }
             K::Compute => {
-                let compute = match op.payload.downcast::<ComputeParams>() {
+                // The batch form first: a whole list of compute ops submitted
+                // as ONE operation (payload = the full `Vec`, built by
+                // `RuntimeStream::launch_compute_batch`). One
+                // `schedule_pipelined` call means one barrier decision, one
+                // fence, and one backend submit carrying every CB — the
+                // multi-CB branch of `submitToHardware`. The barrier decision
+                // is exactly the one the FIRST op of the list would get (same
+                // kind, same stream, same last-pipeline comparison), and an
+                // all-compute list has no pipeline switch inside it, so ONE
+                // head barrier with the OR of the per-op requests is
+                // equivalent to per-op barriers: `issue_barrier` drains the
+                // OTHER pipelines' fence deques and waits on them, and the
+                // single-threaded producer pushes no ops mid-list, so the
+                // fence set is identical at every position — the first
+                // barrier drains it and any later ones would wait on nothing.
+                let payload = match op.payload.downcast::<Vec<ComputeParams>>() {
+                    Ok(ops) => {
+                        self.schedule_pipelined(
+                            PipelinedOp {
+                                id: stream_id,
+                                mode,
+                                kind: op.kind,
+                                requested_barrier,
+                                pipeline_override: None,
+                            },
+                            &*ops,
+                            completion,
+                            |backend, state, ops, cb| backend.submit_compute_batch(state, ops, cb),
+                        );
+                        return Ok(());
+                    }
+                    // Hand the box back for the single-op downcast below.
+                    Err(payload) => payload,
+                };
+                let compute = match payload.downcast::<ComputeParams>() {
                     Ok(v) => v,
                     // The C++ `schedule` is a set of type-safe overloads over
                     // concrete `RuntimeOperation*` types, so "the payload was
@@ -4462,7 +4635,8 @@ impl SchedulerHandle for RuntimeScheduler {
                     // `Err` return.
                     Err(_) => {
                         completion(Err(mock_error(
-                            "schedule: Compute payload was not ComputeParams",
+                            "schedule: Compute payload was neither ComputeParams nor a \
+                             ComputeParams batch (Vec<ComputeParams>)",
                         )));
                         return Ok(());
                     }
@@ -5459,5 +5633,192 @@ mod factory_tests {
             err,
             SchedulerFactoryError::UnsupportedDeviceKind("gpu".to_string())
         );
+    }
+}
+
+/// Tests for the multi-CB compute batch — the vendor's batch branch
+/// (`QueueControlBlocksSBF` + `submitToHardware`'s grouped completion) given its first
+/// compute caller. Nothing here ports a C++ test: the vendor has no batch-compute entry
+/// point (its graph-free path submits one op at a time — the very gap the batch path
+/// closes), so these are native assertions of the port's own contract:
+///
+/// * a batch of N and N single submissions drive the same scheduler state — same barrier
+///   count, in-flight budget fully discharged, stream healthy at `synchronize`;
+/// * the batch crosses the backend as ONE `submit_compute_batch(N)` call, not N
+///   `submit_compute` calls;
+/// * `launch_compute`'s per-op validation holds per element, with the failing element's
+///   index wrapped ([`RuntimeStreamError::BatchElement`]);
+/// * an empty batch is refused before anything is scheduled.
+#[cfg(test)]
+mod compute_batch_tests {
+    use super::*;
+    use crate::address::{ByteOffset, ByteSize, LogicalAddress, RegionId};
+    use crate::compute::{BootstrapOffset, ComputeParams, KernelName};
+    use crate::memory_region::DomainId;
+    use crate::stream::{
+        DeviceId, RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority,
+    };
+
+    fn dummy_addr(region: u64) -> Arc<CompositeAddress> {
+        let chunk = Chunk::new(
+            LogicalAddress::new(RegionId(region), ByteOffset(0)),
+            ByteSize(4096),
+            DomainId(0),
+        );
+        Arc::new(CompositeAddress::from_chunk(chunk))
+    }
+
+    /// A single-chunk address whose chunk offset is NOT 128-byte aligned.
+    fn misaligned_addr(region: u64) -> Arc<CompositeAddress> {
+        let chunk = Chunk::new(
+            LogicalAddress::new(RegionId(region), ByteOffset(4)),
+            ByteSize(4096),
+            DomainId(0),
+        );
+        Arc::new(CompositeAddress::from_chunk(chunk))
+    }
+
+    fn dummy_compute(seed: u64) -> ComputeParams {
+        ComputeParams::new(
+            dummy_addr(seed),
+            vec![dummy_addr(seed + 1)],
+            KernelName(String::new()),
+            BootstrapOffset(0),
+            vec![ByteOffset(0)],
+        )
+    }
+
+    fn mock_stream(mode: RuntimeStreamMode) -> (Arc<RuntimeScheduler>, Arc<RuntimeStream>) {
+        let sched = RuntimeScheduler::new(Backend::Mock(MockBackend::default()));
+        let stream = RuntimeStream::new(
+            sched.clone(),
+            DeviceId(0),
+            RuntimeStreamPriority::Normal,
+            mode,
+        );
+        (sched, stream)
+    }
+
+    /// THE EQUIVALENCE: three ops as one batch and the same three as single submissions
+    /// leave the same scheduler state. Per-op barriers [false, true, false] and the batch's
+    /// OR produce the same single barrier — the one true barrier is all either side can
+    /// express for an all-compute list (a barrier drains the OTHER pipelines' fences; a
+    /// second would wait on nothing). The batch must cross the backend as ONE call
+    /// carrying 3 ops; both sides end synchronized with the in-flight budget — which
+    /// counts CBs, not calls — fully discharged.
+    #[test]
+    fn batch_of_three_equals_three_singles() {
+        let flags = [false, true, false];
+
+        let (sched_s, stream_s) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        for (i, flag) in flags.iter().enumerate() {
+            stream_s
+                .launch_compute(dummy_compute(i as u64).with_pipeline_barrier(*flag), None)
+                .unwrap();
+        }
+        stream_s.synchronize().unwrap();
+
+        let (sched_b, stream_b) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let ops: Vec<ComputeParams> = flags
+            .iter()
+            .enumerate()
+            .map(|(i, flag)| dummy_compute(i as u64).with_pipeline_barrier(*flag))
+            .collect();
+        stream_b
+            .launch_compute_batch(ops, flags.iter().any(|f| *f), None)
+            .unwrap();
+        stream_b.synchronize().unwrap();
+
+        assert_eq!(
+            sched_s.mock_barrier_count(),
+            sched_b.mock_barrier_count(),
+            "one head barrier with the OR must equal the per-op barriers"
+        );
+        assert_eq!(
+            sched_b.mock_compute_batch_sizes(),
+            Some(vec![3]),
+            "the whole list must cross the backend as ONE batch call"
+        );
+        assert_eq!(
+            sched_s.mock_compute_batch_sizes(),
+            Some(Vec::new()),
+            "the single-op path must not touch the batch entry point"
+        );
+        for sched in [&sched_s, &sched_b] {
+            assert_eq!(
+                sched.state.current_in_flight(PipelineId::Compute),
+                0,
+                "the in-flight budget must be fully discharged"
+            );
+            assert_eq!(sched.state.current_in_flight(PipelineId::AsyncDmaI), 0);
+            assert_eq!(sched.state.current_in_flight(PipelineId::AsyncDmaO), 0);
+        }
+    }
+
+    /// A failing batch submission routes through the completion callback, exactly like
+    /// the per-op path (`ComputeFenceResolvedOnSubmitFailure`'s shape): no synchronous
+    /// error, the stream enters its error state, `synchronize()` rethrows the deferred
+    /// error.
+    #[test]
+    fn batch_submit_failure_surfaces_at_synchronize() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        sched.mock_set_throw_on_compute(true);
+        let ops: Vec<ComputeParams> = (0..3).map(dummy_compute).collect();
+        stream.launch_compute_batch(ops, false, None).unwrap();
+        let err = stream.synchronize().unwrap_err();
+        assert!(
+            matches!(err, RuntimeStreamError::Deferred(_)),
+            "expected a deferred error, got {err:?}"
+        );
+        assert_eq!(
+            sched.mock_compute_batch_sizes(),
+            Some(Vec::new()),
+            "a thrown batch must not be recorded as submitted"
+        );
+    }
+
+    /// Per-element validation keeps `launch_compute`'s contract and names the failing
+    /// element's index — a caller with per-op context (the player's fault dump) can still
+    /// name the entry that was refused.
+    #[test]
+    fn batch_element_validation_names_the_refused_entry() {
+        let (_sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let mut ops: Vec<ComputeParams> = (0..3).map(dummy_compute).collect();
+        ops[1] = ComputeParams::new(
+            misaligned_addr(9),
+            vec![dummy_addr(10)],
+            KernelName(String::new()),
+            BootstrapOffset(0),
+            vec![ByteOffset(0)],
+        );
+        let err = stream.launch_compute_batch(ops, false, None).unwrap_err();
+        match err {
+            RuntimeStreamError::BatchElement { index, source } => {
+                assert_eq!(index, 1, "the misaligned element must be named");
+                assert!(
+                    matches!(*source, RuntimeStreamError::ChunkOffsetNotAligned { .. }),
+                    "expected the underlying alignment error, got {source:?}"
+                );
+            }
+            other => panic!("expected BatchElement, got {other:?}"),
+        }
+    }
+
+    /// An empty batch is refused before anything is scheduled — it would ring no doorbell
+    /// and complete nothing, which can only be a caller bug.
+    #[test]
+    fn empty_batch_is_refused() {
+        let (sched, stream) = mock_stream(RuntimeStreamMode::StrictOrdering);
+        let err = stream
+            .launch_compute_batch(Vec::new(), false, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeStreamError::EmptyBatch(_)),
+            "expected EmptyBatch, got {err:?}"
+        );
+        assert_eq!(sched.mock_barrier_count(), Some(0));
+        assert_eq!(sched.mock_compute_batch_sizes(), Some(Vec::new()));
+        // The refusal never incremented the stream's in-flight count: nothing to wait for.
+        stream.synchronize().unwrap();
     }
 }
