@@ -50,6 +50,7 @@ mod op_abi;
 // ⚠️ TEMPORARY bake-time instrumentation — strip with its call sites before landing.
 mod pc;
 pub mod superdsc_bake;
+pub mod dxp_cache;
 /// Path shims kept from `scratchy-subtile`'s lib so the moved lowering
 /// keeps its existing `crate::…` references: the modules themselves
 /// live under `ir::island` / `ir::bridge`.

@@ -395,8 +395,8 @@ fn verify_canonical_matmul_kernel(
     let (bm, bk) = (a_ty.dims().unwrap()[0], a_ty.dims().unwrap()[1]);
     let bn = b_ty.dims().unwrap()[1];
 
-    let a_desc = descriptor_of(index, a_ld)?;
-    let b_desc = descriptor_of(index, b_ld)?;
+    let a_desc = descriptor_of(index, &a_ld.operands)?;
+    let b_desc = descriptor_of(index, &b_ld.operands)?;
     let (m, k) = desc_shape2(index, a_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
     // B's descriptor extents, framed by the orientation: plain B is `[k, ns]`, a `.T`
@@ -504,7 +504,7 @@ fn verify_canonical_matmul_kernel(
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
-    let c_desc = descriptor_of(index, store)?;
+    let c_desc = descriptor_of(index, &store.operands)?;
     check_desc_c(index, c_desc, m, ns, bm, bn)?;
 
     // Base-pointer provenance: the emitted DFIR has NO pointer arguments -- buffers
@@ -516,7 +516,7 @@ fn verify_canonical_matmul_kernel(
             "kernel has fewer than 3 arguments (need distinct A/B/C buffers)",
         ));
     }
-    let base = |d: &Op| d.operands.first().copied();
+    let base = |d: &OpHead| d.operands.first().copied();
     if base(a_desc) != Some(args[0])
         || base(b_desc) != Some(args[1])
         || base(c_desc) != Some(args[2])
@@ -722,8 +722,8 @@ fn verify_canonical_fp8_matmul_kernel(
     // peeled chain). The descriptor and the block are checked against THESE extents.
     let bn = b_ty.dims().unwrap()[0];
 
-    let a_desc = descriptor_of(index, a_ld)?;
-    let b_desc = descriptor_of(index, b_ld)?;
+    let a_desc = descriptor_of(index, &a_ld.operands)?;
+    let b_desc = descriptor_of(index, &b_ld.operands)?;
     let (m, k) = desc_shape2(index, a_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
     let (w_r, w_c) = desc_shape2(index, b_desc)
@@ -852,7 +852,7 @@ fn verify_canonical_fp8_matmul_kernel(
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
-    let c_desc = descriptor_of(index, store)?;
+    let c_desc = descriptor_of(index, &store.operands)?;
     check_desc_c(index, c_desc, m, bn, bm, bn)?;
 
     // ⭐⭐⭐ POSITIONAL BINDING: A=arg0, W=arg1, ws=arg2, C=arg3. The emitted DFIR binds
@@ -868,7 +868,7 @@ fn verify_canonical_fp8_matmul_kernel(
             args.len()
         )));
     }
-    let base = |d: &Op| d.operands.first().copied();
+    let base = |d: &OpHead| d.operands.first().copied();
     if base(a_desc) != Some(args[0]) || base(b_desc) != Some(args[1]) {
         return Err(refuse(
             "A/W descriptors do not read the function's first two arguments in order \
@@ -889,7 +889,7 @@ fn verify_canonical_fp8_matmul_kernel(
                 && o.result() != Some(b_load)
         })
         .expect("counted three loads");
-    let ws_desc = descriptor_of(index, ws_ld)?;
+    let ws_desc = descriptor_of(index, &ws_ld.operands)?;
     if base(ws_desc) != Some(args[2]) {
         return Err(refuse(
             "the scale load does not read arg2; the W8A8 door binds w_scale as the THIRD \
@@ -1115,8 +1115,8 @@ fn verify_canonical_paged_matmul_kernel(
     }
     let (rows, hd) = (g_dims[0], g_dims[1]);
 
-    let a_desc = descriptor_of(index, a_ld)?;
-    let v_desc = descriptor_of(index, gather)?;
+    let a_desc = descriptor_of(index, &a_ld.operands)?;
+    let v_desc = descriptor_of(index, &gather.operands)?;
     let (m, a_cols) = desc_shape2(index, a_desc)
         .ok_or_else(|| refuse("A descriptor M/K are not compile-time constants"))?;
     // The V table is `[V, HEAD_DIM]`: V rows in the pool, HEAD_DIM the contraction's N.
@@ -1238,7 +1238,7 @@ fn verify_canonical_paged_matmul_kernel(
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
-    let c_desc = descriptor_of(index, store)?;
+    let c_desc = descriptor_of(index, &store.operands)?;
     check_desc(index, c_desc, "C", m, hd, bm, hd)?;
 
     // ⭐⭐⭐ POSITIONAL BINDING: A=arg0, V=arg1, ids=arg2, O=arg3. The emitted DFIR binds
@@ -1254,8 +1254,8 @@ fn verify_canonical_paged_matmul_kernel(
             args.len()
         )));
     }
-    let base = |d: &Op| d.operands.first().copied();
-    let ids_desc = descriptor_of(index, ids_ld)?;
+    let base = |d: &OpHead| d.operands.first().copied();
+    let ids_desc = descriptor_of(index, &ids_ld.operands)?;
     if base(a_desc) != Some(args[0])
         || base(v_desc) != Some(args[1])
         || base(ids_desc) != Some(args[2])
@@ -1357,7 +1357,7 @@ fn verify_canonical_paged_matmul_kernel(
 /// contiguous row-major, so a non-standard stride would be silently ignored.
 fn check_desc(
     index: &DefIndex,
-    d: &Op,
+    d: &OpHead,
     nm: &str,
     d0: i64,
     d1: i64,
@@ -1384,7 +1384,7 @@ fn check_desc(
 /// window (`s0 < d0` would be a store that runs past its buffer, and is refused).
 /// Everything else about C is the strict form: contiguous row-major, the full `n`,
 /// the `[m, n]` block.
-fn check_desc_c(index: &DefIndex, d: &Op, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
+fn check_desc_c(index: &DefIndex, d: &OpHead, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
     let (s0, s1) =
         desc_shape2(index, d).ok_or_else(|| refuse("C has non-constant shape/strides"))?;
     if s0 < m || s1 != ns {
@@ -1397,7 +1397,14 @@ fn check_desc_c(index: &DefIndex, d: &Op, m: i64, ns: i64, bm: i64, bn: i64) -> 
 }
 
 /// The strides/block half of [`check_desc`], shared by the strict and windowed forms.
-fn check_desc_common(index: &DefIndex, d: &Op, nm: &str, d1: i64, b0: i64, b1: i64) -> Result<()> {
+fn check_desc_common(
+    index: &DefIndex,
+    d: &OpHead,
+    nm: &str,
+    d1: i64,
+    b0: i64,
+    b1: i64,
+) -> Result<()> {
     let (t0, t1) = desc_strides2(index, d)
         .ok_or_else(|| refuse(format!("{nm} has non-constant shape/strides")))?;
     if t0 != d1 || t1 != 1 {
@@ -1417,9 +1424,8 @@ fn check_desc_common(index: &DefIndex, d: &Op, nm: &str, d1: i64, b0: i64, b1: i
 }
 
 /// The `tt.make_tensor_descriptor` behind an access op's `desc` operand.
-fn descriptor_of<'a>(index: &'a DefIndex, access: &Op) -> Result<&'a Op> {
-    let desc = access
-        .operands
+fn descriptor_of<'a>(index: &'a DefIndex, access_operands: &[Ssa]) -> Result<&'a OpHead> {
+    let desc = access_operands
         .first()
         .copied()
         .ok_or_else(|| refuse("an access op with no descriptor operand"))?;
@@ -1432,7 +1438,7 @@ fn descriptor_of<'a>(index: &'a DefIndex, access: &Op) -> Result<&'a Op> {
 /// `tt.make_tensor_descriptor %base, [%s0, %s1], [%t0, %t1]` -- the operands are
 /// base, then the shape values, then the stride values, so the split is at the
 /// declared rank (from the block type).
-fn desc_shape_strides(index: &DefIndex, d: &Op) -> Option<(Vec<i64>, Vec<i64>)> {
+fn desc_shape_strides(index: &DefIndex, d: &OpHead) -> Option<(Vec<i64>, Vec<i64>)> {
     let rank = d.result_type()?.rank();
     if rank == 0 || d.operands.len() < 1 + 2 * rank {
         return None;
@@ -1448,7 +1454,7 @@ fn desc_shape_strides(index: &DefIndex, d: &Op) -> Option<(Vec<i64>, Vec<i64>)> 
     Some((shape, strides))
 }
 
-fn desc_shape2(index: &DefIndex, d: &Op) -> Option<(i64, i64)> {
+fn desc_shape2(index: &DefIndex, d: &OpHead) -> Option<(i64, i64)> {
     let (s, _) = desc_shape_strides(index, d)?;
     if s.len() != 2 {
         return None;
@@ -1456,7 +1462,7 @@ fn desc_shape2(index: &DefIndex, d: &Op) -> Option<(i64, i64)> {
     Some((s[0], s[1]))
 }
 
-fn desc_strides2(index: &DefIndex, d: &Op) -> Option<(i64, i64)> {
+fn desc_strides2(index: &DefIndex, d: &OpHead) -> Option<(i64, i64)> {
     let (_, t) = desc_shape_strides(index, d)?;
     if t.len() != 2 {
         return None;

@@ -49,7 +49,7 @@ static ROWS: [Row; 20] = [
     row("launch"),   // launch_index
     row("render"),   // render_dxp_input — ONE pass, shared by the dump and the staging loop
     row("stage"),    // stage/reserve/write/submit per group
-    row("cachit"),   // disk-cache hits (supply_cached true)
+    row("cachit"),   // groups settled without staging (`BakeQueue::adopt` true: memo, twin or disk)
     row("registry"), // emitted() inserts: calls = bundles, items = ops retained
 ];
 

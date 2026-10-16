@@ -586,7 +586,11 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             }
 
             let new_shape: Vec<i64> = order.iter().map(|d| block_shape[*d as usize]).collect();
-            let mut new_tile = tile.clone();
+            // The rewritten ops start from the MODULE's own tile and load (the index holds only
+            // their heads, and these two are written back whole).
+            let tile_path = find_path_of_result(module, tile_v).expect("the tile has a path");
+            let load_path = find_path_of_result(module, src).expect("the load has a path");
+            let mut new_tile = walk::at(module, &tile_path).expect("tile path").clone();
             let tile_out = new_tile.results[0];
             new_tile.result_types[0] = IrType::AccessTile { dims: new_shape };
             new_tile.set_attr(
@@ -594,15 +598,13 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
                 Attr::AffineMap(order_map(rank, &order)),
             );
 
-            let mut new_load = load.clone();
+            let mut new_load = walk::at(module, &load_path).expect("load path").clone();
             new_load.results = trans.results.clone();
             new_load.result_types = trans.result_types.clone();
             new_load.operands = vec![tile_out];
 
             // Replace the trans in place with the new load, then delete the old
             // load and tile.
-            let tile_path = find_path_of_result(module, tile_v).expect("the tile has a path");
-            let load_path = find_path_of_result(module, src).expect("the load has a path");
             {
                 let idx = path.index();
                 let block = walk::block_mut(module, &path).expect("path");

@@ -759,7 +759,33 @@ impl Program {
     /// the `_<digit>` leaf warning in lib.rs) mirror this — keep them
     /// in lockstep.
     pub fn rename_dotted(&self, dotted: &str) -> String {
-        rename_dotted_under(&self.weight_leaf_renames, dotted)
+        self.weight_naming().rename_dotted(dotted)
+    }
+
+    /// The parts of this program that NAME its weights — see [`WeightNaming`].
+    pub fn weight_naming(&self) -> WeightNaming<'_> {
+        WeightNaming {
+            weights: &self.weights,
+            weight_leaf_renames: &self.weight_leaf_renames,
+            prelude: self.prelude,
+        }
+    }
+}
+
+/// ⭐ THE PARTS OF A [`Program`] THAT NAME ITS WEIGHTS, AND NOTHING ELSE — no tokens among them, so
+/// this view can be read from any thread, which a `&Program` cannot: its `LocalTable` holds
+/// `proc_macro2::Ident`s. The spyre bake's rungs are lowered in parallel and name their weights here.
+#[derive(Clone, Copy)]
+pub struct WeightNaming<'p> {
+    pub weights: &'p WeightTable,
+    pub weight_leaf_renames: &'p [(String, String)],
+    pub prelude: Prelude,
+}
+
+impl WeightNaming<'_> {
+    /// [`Program::rename_dotted`].
+    pub fn rename_dotted(&self, dotted: &str) -> String {
+        rename_dotted_under(self.weight_leaf_renames, dotted)
     }
 }
 

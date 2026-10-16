@@ -22,10 +22,19 @@ pub fn weight_field_name(
     id: WeightId,
     index: Option<UnrollIndex>,
 ) -> syn::Ident {
-    let stem = program.weights.path(id).join("_");
-    let ident = match index {
+    format_ident!("{}", weight_field_stem(&program.weights, id, index))
+}
+
+/// [`weight_field_name`]'s spelling as a plain `String` — for code that must not hold a token (the
+/// spyre bake's parallel rungs: a `proc_macro2::Ident` cannot cross threads).
+pub fn weight_field_stem(
+    weights: &crate::classified::WeightTable,
+    id: WeightId,
+    index: Option<UnrollIndex>,
+) -> String {
+    let stem = weights.path(id).join("_");
+    match index {
         Some(i) => format!("{stem}_{}", i.0),
         None => stem,
-    };
-    format_ident!("{}", ident)
+    }
 }

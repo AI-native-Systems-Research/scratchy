@@ -66,6 +66,10 @@ half = { workspace = true }
 flex-rs = { path = "flex-rs", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# The persistent dxp cache's content keys (`dxp_cache`) — the version the workspace already builds.
+sha2 = "0.11"
+# `graph_wiring` lowers the unrolled graph's nodes in parallel.
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The KTIR emulator (RFC 0682) — Spyre's hardware-free execution path, only pulled by `spyre-emu`.

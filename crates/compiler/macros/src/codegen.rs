@@ -57,7 +57,7 @@ use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
 /// `model.` prefix) can override via a future per-arch conventions
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(
-    program: &Program,
+    naming: crate::classified::WeightNaming<'_>,
     arch: &crate::arch_spec::DeclaredArchSpec,
     id: WeightId,
     index: Option<UnrollIndex>,
@@ -71,7 +71,7 @@ fn safetensors_prefix(
     // manifest; translate `_<digit>` suffixes back to `.<digit>`
     // for the on-disk safetensors key (which uses Python-attribute
     // dotted form, including numeric submodule indices).
-    let segs: Vec<String> = program
+    let segs: Vec<String> = naming
         .weights
         .path(id)
         .iter()
@@ -87,9 +87,9 @@ fn safetensors_prefix(
     // longest-key-wins matching on the dotted DSL path
     // (`Program::rename_dotted`), applied BEFORE the vision subtree
     // resolution below so renamed segments flow into subtree paths.
-    let joined = program.rename_dotted(&segs.join("."));
+    let joined = naming.rename_dotted(&segs.join("."));
     let segs: Vec<String> = joined.split('.').map(str::to_string).collect();
-    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
+    let is_vision = matches!(naming.prelude, crate::classified::Prelude::Vision);
     if is_vision {
         // The per-arch vision layout is a REQUIRED declaration
         // (`const SAFETENSORS` on the carrier mod) — enforced at
@@ -166,18 +166,33 @@ pub(crate) fn lent_weight_prefix(
         let role = crate::quantization::embed_table_role(program, fuf);
         let segs: Vec<&str> = role.split('.').collect();
         let id = program.weights.find(&segs)?;
-        Some(safetensors_prefix(program, &model.arch, id, None))
+        Some(safetensors_prefix(
+            program.weight_naming(),
+            &model.arch,
+            id,
+            None,
+        ))
     };
     match w {
         LentWeight::LmHead if !borrowed("lm_head") => None,
         LentWeight::LmHead if !model.tie_word_embeddings => {
             let id = program.weights.find(&["lm_head"])?;
-            Some(safetensors_prefix(program, &model.arch, id, None))
+            Some(safetensors_prefix(
+                program.weight_naming(),
+                &model.arch,
+                id,
+                None,
+            ))
         }
         // A head with an embedding of its own names its target's apart.
         LentWeight::EmbedTokens if program.weights.find(&["target_embed_tokens"]).is_some() => {
             let id = program.weights.find(&["target_embed_tokens"])?;
-            Some(safetensors_prefix(program, &model.arch, id, None))
+            Some(safetensors_prefix(
+                program.weight_naming(),
+                &model.arch,
+                id,
+                None,
+            ))
         }
         LentWeight::EmbedTokens | LentWeight::LmHead => embed_prefix(),
     }
@@ -998,7 +1013,7 @@ fn plan_field_load(
     let prefixes: Vec<String> = accessor
         .source_weights
         .iter()
-        .map(|(id, idx)| safetensors_prefix(program, &model.arch, *id, *idx))
+        .map(|(id, idx)| safetensors_prefix(program.weight_naming(), &model.arch, *id, *idx))
         .collect();
 
     if is_marlin {
@@ -2185,7 +2200,7 @@ fn expert_input_probe(
         })?;
     let width = node.outputs.first()?.last()?.clone();
     let k = *crate::weight_vocab::eval_shape_with(&vec![width], &model.bounds)?.first()? as usize;
-    let prefix = safetensors_prefix(program, &model.arch, id, index);
+    let prefix = safetensors_prefix(program.weight_naming(), &model.arch, id, index);
     let packed_cols = match storage {
         crate::quantization::StorageFormat::Dense => k,
         crate::quantization::StorageFormat::Affine { bits, .. } => {
@@ -9545,11 +9560,12 @@ fn superdsc_bundle_tokens() -> proc_macro2::TokenStream {
     match scratchy_target_spyre::superdsc_bake::finish_global() {
         Ok(Some(stats)) => eprintln!(
             "[spyre] the device compiler built {} launch group(s) inline during the emit ({:.1} MB \
-             of device code); {} skipped as byte-identical to one already compiled; peak staging \
-             {:.1} MB",
+             of device code); {} skipped as byte-identical to one already compiled; {} kept from \
+             an earlier build; peak staging {:.1} MB",
             stats.groups,
             stats.device_bytes as f64 / 1048576.0,
             stats.memo_hits,
+            stats.disk_hits,
             stats.peak_staged_bytes as f64 / 1048576.0,
         ),
         Ok(None) => {}
@@ -9574,9 +9590,10 @@ fn superdsc_bundle_tokens() -> proc_macro2::TokenStream {
     // ⭐ ONE INTERNER FOR THE WHOLE EMISSION — every bundle's launches reach the same 33-ish
     // programs, so they share one set of `const` items rather than each carrying its own copy.
     let mut interner = crate::ktir_tokens::ProgramInterner::default();
+    let mut places_interner = PlacesInterner::default();
     for b in &bundles {
         let fp = proc_macro2::Literal::string(&b.fp);
-        let layout = layout_tokens(&b.layout);
+        let layout = layout_tokens(&b.layout, &mut places_interner);
         let groups = b
             .groups
             .iter()
@@ -9605,10 +9622,12 @@ fn superdsc_bundle_tokens() -> proc_macro2::TokenStream {
             }
         });
     }
-    // The programs are `const` items, so they must precede the `inventory::submit!`s that name them.
+    // The programs are `const` items and the placement tables `static`s; both precede the
+    // `inventory::submit!`s that name them.
     let programs = interner.items();
+    let tables = places_interner.items();
     let preamble = crate::ktir_tokens::preamble();
-    out = quote! { #preamble #(#programs)* #out };
+    out = quote! { #preamble #(#programs)* #(#tables)* #out };
     eprintln!(
         "[spyre-superdsc] baked {} bundle(s) / {n_groups} launch group(s) / {} distinct program(s) \
          / {:.1} MB of device code into the binary as Rust structs",
@@ -9862,10 +9881,55 @@ fn kernel_weight_tokens(
     }
 }
 
+/// ⭐ ONE `static` PER DISTINCT PLACEMENT TABLE — the rungs of a ladder share one resident layout, so
+/// most bundles' tables are the same table. MEASURED on granite-2b: the 223 bundles carried 223 tables
+/// (~1,550 placements each, 76 MB of the 100 MB generated source) and only 102 were distinct.
+///
+/// Keyed by the table's rendered tokens — which ARE its value — so two tables share a `static` only
+/// when every placement in them is the same.
+#[cfg(feature = "spyre")]
+#[derive(Default)]
+struct PlacesInterner {
+    seen: std::collections::HashMap<String, proc_macro2::Ident>,
+    items: Vec<proc_macro2::TokenStream>,
+}
+
+#[cfg(feature = "spyre")]
+impl PlacesInterner {
+    /// The `static` naming `places`, defined on first sight.
+    fn ident(
+        &mut self,
+        places: &[scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Placement],
+    ) -> proc_macro2::Ident {
+        let rows: Vec<proc_macro2::TokenStream> = places.iter().map(placement_tokens).collect();
+        let body = quote! { [#(#rows),*] };
+        let key = body.to_string();
+        if let Some(id) = self.seen.get(&key) {
+            return id.clone();
+        }
+        let id = proc_macro2::Ident::new(
+            &format!("__SDSC_PLACES_{}", self.items.len()),
+            proc_macro2::Span::call_site(),
+        );
+        let n = proc_macro2::Literal::usize_unsuffixed(places.len());
+        self.items.push(quote! {
+            static #id: [::scratchy_target_spyre::bundle_code::Placement; #n] = #body;
+        });
+        self.seen.insert(key, id.clone());
+        id
+    }
+
+    /// The `static` items to place ahead of the bundles that name them.
+    fn items(&self) -> &[proc_macro2::TokenStream] {
+        &self.items
+    }
+}
+
 /// The whole memory plan.
 #[cfg(feature = "spyre")]
 fn layout_tokens(
     l: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout<'_>,
+    places_interner: &mut PlacesInterner,
 ) -> proc_macro2::TokenStream {
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout {
         segment_bytes,
@@ -9886,7 +9950,7 @@ fn layout_tokens(
     let wbanks = weight_bank_bytes
         .iter()
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
-    let places = places.iter().map(placement_tokens);
+    let places = places_interner.ident(places);
     let kws = kernel_weights.iter().map(kernel_weight_tokens);
     // f32 literals: `Literal::f32_suffixed` round-trips the exact value, which matters — these are
     // the granite ScalarMul multipliers, and a rounded one is a quietly wrong model.
@@ -9930,7 +9994,7 @@ fn layout_tokens(
             segment_bytes: [#(#segs),*],
             weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
             weight_tail: #tail,
-            places: ::std::borrow::Cow::Borrowed(&[#(#places),*]),
+            places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
@@ -10700,9 +10764,46 @@ fn dump_wavefront_mega(
         // this one. Baked at the widest rung, so a single bundle covers any start <= cap.
         let superdsc_prefill_prefix_fp: std::cell::RefCell<Option<String>> =
             std::cell::RefCell::new(None);
+        // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
+        // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
+        // shared state at all, and can run on any thread, while the expansion still sees exactly the
+        // writes, in exactly the order, that a serial loop made.
+        enum BakeEffect {
+            PrefillPrefixFp(String),
+            PrefillRung {
+                mq: u32,
+                fp: String,
+            },
+            PrefillFp(String),
+            DecodeRung {
+                rows: u32,
+                cap: u32,
+                fp: String,
+            },
+            DecodeFp(String),
+            FoldCensus {
+                base: String,
+                folds: Vec<(u32, f32)>,
+            },
+            Wiring {
+                slot: Option<WiringSlot>,
+                gk: scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
+                decode_position: u32,
+                man: String,
+            },
+        }
+        /// What one bake returns: its manifest, nodes, sengraph json and launch groups.
+        type BakeOut = (String, Vec<(String, String)>, String, GroupGraphs);
+        /// Which half of `wiring_tokens` a bake's wiring lands in, if either.
+        enum WiringSlot {
+            Decode,
+            Prefill,
+        }
+        // The bake names weights through this view, never through `program` — see `WeightNaming`.
+        let weight_naming = program.weight_naming();
         // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
         // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
-        let emit_bundle =
+        let emit_bundle_deferred =
             |lwd: &to_wavefront::LoweredDecode,
              base: String,
              // The capacity THIS bundle is baked for. Decode cap buckets vary it;
@@ -10718,7 +10819,8 @@ fn dump_wavefront_mega(
              // rung is a wider bake of the same tape, and reading the env knob here
              // would tell every rung it was one row.
              decode_rows: u32|
-             -> (String, Vec<(String, String)>, String, GroupGraphs) {
+             -> (BakeOut, Vec<BakeEffect>) {
+                let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
                 // The decode ladder's ONE-REQUEST rung: a CONCRETE single-row decode. `seq_sym`
                 // must be absent because the symbolic CB batch ALSO passes `decode_rows = 1`,
@@ -10758,7 +10860,7 @@ fn dump_wavefront_mega(
                 let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
-                    return (String::new(), Vec::new(), String::new(), Vec::new());
+                    return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
                 }
                 // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
                 // op-graph JSON (the DeepTools toolchain compiles + runs it on the
@@ -11284,7 +11386,30 @@ fn dump_wavefront_mega(
                                             // per-page body under them); every other prefill bake
                                             // keeps its single body.
                                             if !is_prefill || chunk_ceiling.is_some() {
-                                                for (rung, rung_chunk, rung_swept) in ladder {
+                                                // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
+                                                // its own sweep/chunk, reading nothing another rung
+                                                // writes — so they lower in parallel and are recorded in
+                                                // ladder order (the vectors are sorted below either way).
+                                                // The rung's own layout rides back with its record: the
+                                                // one-layout check reads the ceiling's layout, which
+                                                // holds interior cells and stays on this thread.
+                                                type RungRecord = (
+                                                    superdsc::bundle::LadderRung<'static>,
+                                                    (
+                                                        superdsc::bundle::SweptCols,
+                                                        scratchy_target_spyre::fold_plan::RungReach,
+                                                    ),
+                                                    (
+                                                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+                                                        Option<u32>,
+                                                        superdsc::BundleLayout,
+                                                    ),
+                                                );
+                                                let per_rung: Vec<Option<RungRecord>> = {
+                                                    use rayon::prelude::*;
+                                                    ladder
+                                                        .into_par_iter()
+                                                        .map(|(rung, rung_chunk, rung_swept)| -> Option<RungRecord> {
                                                     match superdsc::lower_subtile_tape_to_superdsc(
                                                         &tape_rolled,
                                                         &krg,
@@ -11299,20 +11424,6 @@ fn dump_wavefront_mega(
                                                         // single unrolled one. Without this each of the
                                                         // three interior rungs pays the same 40x.
                                                         Ok(rr) => {
-                                                            // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung
-                                                            // reading a staged input from elsewhere is a
-                                                            // build failure, never a wrong constant.
-                                                            if let Err(e) =
-                                                                superdsc::ladder_stages_one_layout(
-                                                                    &rolled.layout,
-                                                                    &rr.layout,
-                                                                )
-                                                            {
-                                                                panic!(
-                                                                    "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?}: {e}",
-                                                                    rung.get()
-                                                                );
-                                                            }
                                                             let rung_unrolled = if card {
                                                                 Vec::new()
                                                             } else {
@@ -11430,39 +11541,62 @@ fn dump_wavefront_mega(
                                                                 let rung_folds = rfps
                                                                     .iter()
                                                                     .all(|fp| folds_of(fp));
-                                                                decode_rungs.push(
-                                                                superdsc::bundle::LadderRung {
+                                                                let rec = superdsc::bundle::LadderRung {
                                                                     active_cap: superdsc::bundle::SweptCols::new(rung_swept),
                                                                     bodies: rung_fps(&rfps),
                                                                     bodies_fused: std::borrow::Cow::Owned(rfused),
-                                                                },
-                                                            );
-                                                                rung_reach.push((
-                                                                    superdsc::bundle::SweptCols::new(
-                                                                        rung_swept,
+                                                                };
+                                                                // Read off the rung record itself: the
+                                                                // record the runtime loads — any class's
+                                                                // twin counts.
+                                                                let fused_twin =
+                                                                    rec.bodies_fused.iter().any(|f| !f.is_none());
+                                                                Some((
+                                                                    rec,
+                                                                    (
+                                                                        superdsc::bundle::SweptCols::new(rung_swept),
+                                                                        scratchy_target_spyre::fold_plan::RungReach {
+                                                                            folds: rung_folds,
+                                                                            chunk: rung_chunk.is_some(),
+                                                                            fused_twin,
+                                                                        },
                                                                     ),
-                                                                    scratchy_target_spyre::fold_plan::RungReach {
-                                                                        folds: rung_folds,
-                                                                        chunk: rung_chunk.is_some(),
-                                                                        // Read off the rung just pushed:
-                                                                        // the record the runtime loads —
-                                                                        // any class's twin counts.
-                                                                        fused_twin: decode_rungs
-                                                                            .last()
-                                                                            .is_some_and(|r| {
-                                                                                r.bodies_fused
-                                                                                    .iter()
-                                                                                    .any(|f| !f.is_none())
-                                                                            }),
-                                                                    },
-                                                                ));
+                                                                    (rung, rung_chunk, rr.layout),
+                                                                ))
+                                                            } else {
+                                                                None
                                                             }
                                                         }
-                                                        Err(e) => eprintln!(
-                                                            "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
-                                                            rung.get()
-                                                        ),
+                                                        Err(e) => {
+                                                            eprintln!(
+                                                                "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
+                                                                rung.get()
+                                                            );
+                                                            None
+                                                        }
                                                     }
+                                                        })
+                                                        .collect()
+                                                };
+                                                for (rec, reach, (rung, rung_chunk, layout)) in
+                                                    per_rung.into_iter().flatten()
+                                                {
+                                                    // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung reading a
+                                                    // staged input from elsewhere is a build failure,
+                                                    // never a wrong constant.
+                                                    if let Err(e) =
+                                                        superdsc::ladder_stages_one_layout(
+                                                            &rolled.layout,
+                                                            &layout,
+                                                        )
+                                                    {
+                                                        panic!(
+                                                            "[spyre-superdsc] {base}: ladder rung active_cap={} chunk={rung_chunk:?}: {e}",
+                                                            rung.get()
+                                                        );
+                                                    }
+                                                    decode_rungs.push(rec);
+                                                    rung_reach.push(reach);
                                                 }
                                             }
                                             decode_rungs.sort_by_key(|r| r.active_cap);
@@ -11828,47 +11962,46 @@ fn dump_wavefront_mega(
                                             // The PREFIX-CAPABLE prefill bundle: the one continuation
                                             // chunks (start>0) must use, since they DO have resident KV
                                             // to attend. One bundle covers every start<=cap.
-                                            *superdsc_prefill_prefix_fp.borrow_mut() = Some(bfp);
+                                            fx.push(BakeEffect::PrefillPrefixFp(bfp));
                                             prefill_fp_stamped = true;
                                         } else if let Some(mq) = prefill_mq {
                                             // Ladder rung (deduped on mq: a rebake of the same width
                                             // must not double-enter). The TOP rung additionally lands in
                                             // `superdsc_prefill_fp` — the single-bundle prefill slot —
                                             // which the rung loop below arranges by baking it FIRST.
-                                            {
-                                                let mut r = superdsc_prefill_rungs.borrow_mut();
-                                                if !r.iter().any(|(m, _)| *m == mq) {
-                                                    r.push((mq, bfp.clone()));
-                                                }
-                                            }
+                                            fx.push(BakeEffect::PrefillRung {
+                                                mq,
+                                                fp: bfp.clone(),
+                                            });
                                             // Rungs bake ASCENDING, so the LAST write is the widest
                                             // -- the ceiling the worker treats as its single prefill
                                             // bundle. Unconditional: non-superdsc bakes exactly one.
-                                            *superdsc_prefill_fp.borrow_mut() = Some(bfp);
+                                            fx.push(BakeEffect::PrefillFp(bfp));
                                             prefill_fp_stamped = true;
                                         } else {
-                                            {
-                                                let mut r = superdsc_decode_rungs.borrow_mut();
-                                                // ⛔ AN EMPTY fp IS A SKIPPED RUNG, NOT A REGISTERED
-                                                // ONE: the batch-ladder contract is that a rung whose
-                                                // emit failed simply does not appear, so the worker
-                                                // falls to the next narrower rung. Registering it
-                                                // with `""` would hand the selector a bundle nobody
-                                                // emitted.
-                                                if bfp.is_empty() {
-                                                    eprintln!(
-                                                        "[spyre-superdsc] {base}: decode batch rung \
-                                                         seqs={decode_rows} NOT BAKED (emit failed \
-                                                         above) — SKIPPED; that batch runs on a \
-                                                         narrower rung, in more than one forward"
-                                                    );
-                                                } else if !r.iter().any(|(n, _, _)| *n == decode_rows) {
-                                                    // `cap` IS this body's swept extent: `bfp` is the
-                                                    // CEILING rung (the interior sweep rungs go to
-                                                    // `sk_bucket_rungs`), and `ActiveCap::FULL` resolves
-                                                    // to `cap`.
-                                                    r.push((decode_rows, cap, bfp.clone()));
-                                                }
+                                            // ⛔ AN EMPTY fp IS A SKIPPED RUNG, NOT A REGISTERED
+                                            // ONE: the batch-ladder contract is that a rung whose
+                                            // emit failed simply does not appear, so the worker
+                                            // falls to the next narrower rung. Registering it
+                                            // with `""` would hand the selector a bundle nobody
+                                            // emitted.
+                                            if bfp.is_empty() {
+                                                eprintln!(
+                                                    "[spyre-superdsc] {base}: decode batch rung \
+                                                     seqs={decode_rows} NOT BAKED (emit failed \
+                                                     above) — SKIPPED; that batch runs on a \
+                                                     narrower rung, in more than one forward"
+                                                );
+                                            } else {
+                                                // `cap` IS this body's swept extent: `bfp` is the
+                                                // CEILING rung (the interior sweep rungs go to
+                                                // `sk_bucket_rungs`), and `ActiveCap::FULL` resolves
+                                                // to `cap`.
+                                                fx.push(BakeEffect::DecodeRung {
+                                                    rows: decode_rows,
+                                                    cap,
+                                                    fp: bfp.clone(),
+                                                });
                                             }
                                             // The one-request bundle stays THE decode bundle for
                                             // every path that predates the ladder.
@@ -11886,7 +12019,7 @@ fn dump_wavefront_mega(
                                             // discriminator the superdsc block above uses to exclude
                                             // that symbolic tape.
                                             if decode_rows <= 1 && seq_sym.is_none() {
-                                                *superdsc_fp.borrow_mut() = Some(bfp);
+                                                fx.push(BakeEffect::DecodeFp(bfp));
                                             }
                                         }
                                         }
@@ -11972,32 +12105,10 @@ fn dump_wavefront_mega(
                 {
                     let mut folds = gk.weight_scale_folds.clone();
                     folds.sort_unstable_by_key(|(tid, _)| *tid);
-                    let mut census = weight_fold_census.borrow_mut();
-                    match &*census {
-                        None => *census = Some((base.clone(), folds)),
-                        Some((ref_label, ref_folds)) if *ref_folds == folds => {}
-                        Some((ref_label, ref_folds)) => {
-                            let show = |f: &[(u32, f32)]| {
-                                f.iter()
-                                    .map(|(t, s)| format!("t{t}×{s}"))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            };
-                            panic!(
-                                "[spyre] {base}: its ScalarMul weight folds disagree with \
-                                 {ref_label}'s — every program this model bakes runs over ONE set \
-                                 of staged weight bytes, so a fold one program recognizes and \
-                                 another runs as an op is a double-applied (or never-applied) \
-                                 multiplier. {base} folds [{}]; {ref_label} folds [{}]. The \
-                                 recognition is structural (shared weight, shared producer, \
-                                 sliced read), so a disagreement means the two graphs' producer \
-                                 structure differs around a folded ScalarMul — refuse rather \
-                                 than serve silently-wrong logits.",
-                                show(&folds),
-                                show(ref_folds),
-                            );
-                        }
-                    }
+                    fx.push(BakeEffect::FoldCensus {
+                        base: base.clone(),
+                        folds,
+                    });
                 }
                 // The programs ride the bundle (`bundle_code::bundle(fp)`), not a per-node text.
                 let nodes: Vec<(String, String)> = Vec::new();
@@ -12052,14 +12163,20 @@ fn dump_wavefront_mega(
                                 format!("{{\"id\":{i},\"role\":\"prefix_v\",\"layer\":{layer}}}")
                             }
                             SourceBinding::Weight { id, index } => {
-                                let name =
-                                    crate::emit::weight_field_name(program, WeightId(*id), *index)
-                                        .to_string();
+                                let name = crate::emit::weight_field_stem(
+                                    weight_naming.weights,
+                                    WeightId(*id),
+                                    *index,
+                                );
                                 let (wbase, _) = split_base_layer(&name);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let is_gemm = gemm_weight.contains(&i);
-                                let disk =
-                                    safetensors_prefix(program, &model.arch, WeightId(*id), *index);
+                                let disk = safetensors_prefix(
+                                    weight_naming,
+                                    &model.arch,
+                                    WeightId(*id),
+                                    *index,
+                                );
                                 // lm_head weight binding — resolve the tie decision HERE, at
                                 // bake (compile) time, from the SAME `tie_word_embeddings` flag
                                 // the metal `FieldLoad::LinearTiedToEmbedding` path uses. TIED
@@ -12093,14 +12210,20 @@ fn dump_wavefront_mega(
                                 // fp8 per-channel weight_scale: SAME disk prefix as the weight (worker loads
                                 // `{disk}.weight_scale`), role "weight_scale", resident like a weight. Its own
                                 // resident placement is registered under `{wbase}.weight_scale` by the layout.
-                                let name =
-                                    crate::emit::weight_field_name(program, WeightId(*id), *index)
-                                        .to_string();
+                                let name = crate::emit::weight_field_stem(
+                                    weight_naming.weights,
+                                    WeightId(*id),
+                                    *index,
+                                );
                                 let (wbase, _) = split_base_layer(&name);
                                 let scale_base = format!("{wbase}.weight_scale");
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk =
-                                    safetensors_prefix(program, &model.arch, WeightId(*id), *index);
+                                let disk = safetensors_prefix(
+                                    weight_naming,
+                                    &model.arch,
+                                    WeightId(*id),
+                                    *index,
+                                );
                                 let loc_json = match base_to_loc.get(&scale_base) {
                                     Some(li) => format!(
                                         "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
@@ -12120,13 +12243,19 @@ fn dump_wavefront_mega(
                                 // `tensor` discriminant says which staged tensor fills the
                                 // source. `is_gemm` follows the tensor: codes are gemm
                                 // operands, scales and gains are not.
-                                let name =
-                                    crate::emit::weight_field_name(program, WeightId(*id), *index)
-                                        .to_string();
+                                let name = crate::emit::weight_field_stem(
+                                    weight_naming.weights,
+                                    WeightId(*id),
+                                    *index,
+                                );
                                 let (wbase, _) = split_base_layer(&name);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk =
-                                    safetensors_prefix(program, &model.arch, WeightId(*id), *index);
+                                let disk = safetensors_prefix(
+                                    weight_naming,
+                                    &model.arch,
+                                    WeightId(*id),
+                                    *index,
+                                );
                                 let which = tensor.name();
                                 let is_gemm = tensor.is_gemm_operand();
                                 let loc_json = match base_to_loc.get(&wbase) {
@@ -12165,8 +12294,6 @@ fn dump_wavefront_mega(
                 // So emit values of spyre's OWN types instead, exactly as
                 // metal is handed statics of the metal runtime's types.
                 {
-                    let w = emit_superdsc_wiring(&gk, lwd, model, cap.saturating_sub(1), &man);
-                    let mut slot = wiring_tokens.borrow_mut();
                     // Tensor ids are PER PROGRAM: the prefill graph numbers its
                     // own. Keeping only one would bind decode ids into prefill
                     // launches, so both are kept and the worker selects.
@@ -12200,16 +12327,113 @@ fn dump_wavefront_mega(
                     // Stamped per call, so a failed WIDER rung cannot overwrite a
                     // narrower rung's good wiring either: the last successful prefill
                     // call has the last word, which under the ascending bake order is
-                    // the widest rung that actually lowered.
-                    if is_prefill {
-                        if prefill_fp_stamped {
-                            slot.1 = Some(w);
-                        }
+                    // the widest rung that actually lowered (`commit_bake` applies the
+                    // calls' effects in that order however the rungs were baked).
+                    let slot = if is_prefill {
+                        prefill_fp_stamped.then_some(WiringSlot::Prefill)
                     } else if seq_sym.is_none() && decode_rows == primary_m {
-                        slot.0 = Some(w);
+                        Some(WiringSlot::Decode)
+                    } else {
+                        None
+                    };
+                    fx.push(BakeEffect::Wiring {
+                        slot,
+                        gk,
+                        decode_position: cap.saturating_sub(1),
+                        man: man.clone(),
+                    });
+                }
+                ((man, nodes, sengraph_json, group_graphs), fx)
+            };
+        // Apply one bake's effects, in the order the bake recorded them. Serial, and the only code
+        // that touches the expansion's shared state.
+        let commit_bake = |lwd: &to_wavefront::LoweredDecode, fx: Vec<BakeEffect>| {
+            for e in fx {
+                match e {
+                    BakeEffect::PrefillPrefixFp(fp) => {
+                        *superdsc_prefill_prefix_fp.borrow_mut() = Some(fp)
+                    }
+                    // Ladder rung (deduped on mq: a rebake of the same width must not double-enter).
+                    BakeEffect::PrefillRung { mq, fp } => {
+                        let mut r = superdsc_prefill_rungs.borrow_mut();
+                        if !r.iter().any(|(m, _)| *m == mq) {
+                            r.push((mq, fp));
+                        }
+                    }
+                    BakeEffect::PrefillFp(fp) => *superdsc_prefill_fp.borrow_mut() = Some(fp),
+                    BakeEffect::DecodeRung { rows, cap, fp } => {
+                        let mut r = superdsc_decode_rungs.borrow_mut();
+                        if !r.iter().any(|(n, _, _)| *n == rows) {
+                            r.push((rows, cap, fp));
+                        }
+                    }
+                    BakeEffect::DecodeFp(fp) => *superdsc_fp.borrow_mut() = Some(fp),
+                    BakeEffect::FoldCensus { base, folds } => {
+                        let mut census = weight_fold_census.borrow_mut();
+                        match &*census {
+                            None => *census = Some((base, folds)),
+                            Some((ref_label, ref_folds)) if *ref_folds == folds => {}
+                            Some((ref_label, ref_folds)) => {
+                                let show = |f: &[(u32, f32)]| {
+                                    f.iter()
+                                        .map(|(t, s)| format!("t{t}×{s}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                };
+                                panic!(
+                                    "[spyre] {base}: its ScalarMul weight folds disagree with \
+                                     {ref_label}'s — every program this model bakes runs over ONE set \
+                                     of staged weight bytes, so a fold one program recognizes and \
+                                     another runs as an op is a double-applied (or never-applied) \
+                                     multiplier. {base} folds [{}]; {ref_label} folds [{}]. The \
+                                     recognition is structural (shared weight, shared producer, \
+                                     sliced read), so a disagreement means the two graphs' producer \
+                                     structure differs around a folded ScalarMul — refuse rather \
+                                     than serve silently-wrong logits.",
+                                    show(&folds),
+                                    show(ref_folds),
+                                );
+                            }
+                        }
+                    }
+                    // The wiring is built HERE, on the expansion's own thread: it is a token stream,
+                    // and tokens do not cross threads.
+                    BakeEffect::Wiring {
+                        slot,
+                        gk,
+                        decode_position,
+                        man,
+                    } => {
+                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
+                        let mut s = wiring_tokens.borrow_mut();
+                        match slot {
+                            Some(WiringSlot::Prefill) => s.1 = Some(w),
+                            Some(WiringSlot::Decode) => s.0 = Some(w),
+                            None => {}
+                        }
                     }
                 }
-                (man, nodes, sengraph_json, group_graphs)
+            }
+        };
+        let emit_bundle =
+            |lwd: &to_wavefront::LoweredDecode,
+             base: String,
+             cap: u32,
+             seq_sym: Option<(&'static str, u32)>,
+             prefill_mq: Option<u32>,
+             active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+             decode_rows: u32| {
+                let (r, fx) = emit_bundle_deferred(
+                    lwd,
+                    base,
+                    cap,
+                    seq_sym,
+                    prefill_mq,
+                    active_cap,
+                    decode_rows,
+                );
+                commit_bake(lwd, fx);
+                r
             };
 
         // Decode bundle (m = KTIR_M, default 1): the worker's fast per-token path.
@@ -12313,7 +12537,15 @@ fn dump_wavefront_mega(
             // request axis walks past its kv head into the next one's keys — silently, and only for
             // the highest rows of the widest rung. `PagedKvPool` const-asserts that its widest rung
             // is `ROWS`, so the two cannot drift: changing either one alone is a `cargo build` error.
-            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS {
+            //
+            // ⭐ WIDEST FIRST. The widest rung's per-page fold is the bake's longest dxp group (2,156
+            // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
+            // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
+            // free here: `decode_rung_lits` sorts the ladder by width before baking it.
+            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
+                .into_iter()
+                .rev()
+            {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     decode_asn_check,
@@ -12526,9 +12758,17 @@ fn dump_wavefront_mega(
         } else {
             Some(prefill_m).filter(|&v| v > 1).into_iter().collect()
         };
-        type PrefillPick = (String, Vec<(String, String)>, String, GroupGraphs);
+        type PrefillPick = BakeOut;
         let mut prefill: Option<PrefillPick> = None;
-        for pl in prefill_rung_widths {
+        // ⭐ THE RUNGS ARE BAKED IN PARALLEL AND COMMITTED IN ORDER. Each rung is a whole-model lowering
+        // that reads nothing another rung writes — `emit_bundle_deferred` records its effects instead of
+        // applying them — so the 25 bakes run side by side and `commit_bake` then applies their effects
+        // rung by rung, ascending, exactly as the serial loop did (the last rung that lowered is still
+        // the ceiling).
+        type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
+        let per_rung: Vec<Option<RungBake>> = {
+            use rayon::prelude::*;
+            prefill_rung_widths.par_iter().map(|&pl| -> Option<RungBake> {
             let lowered = to_wavefront::lower_decode_to_wavefront(
                 fuf,
                 decode_asn_check,
@@ -12555,7 +12795,7 @@ fn dump_wavefront_mega(
             );
             match lowered {
                 Ok(lwd_p) => {
-                    prefill = Some(emit_bundle(
+                    let (r, fx) = emit_bundle_deferred(
                         &lwd_p,
                         format!("ktir_prefill_{stem_id}"),
                         prefix_len.get(),
@@ -12589,14 +12829,23 @@ fn dump_wavefront_mega(
                         // together; that combination is not what this flag selects.
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
-                    ));
+                    );
+                    Some((lwd_p, r, fx))
                 }
-                Err(e) if sendnn_superdsc => eprintln!(
-                    "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e} \
-                     (SKIPPED; a narrower rung still covers this width)"
-                ),
+                Err(e) if sendnn_superdsc => {
+                    eprintln!(
+                        "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e} \
+                         (SKIPPED; a narrower rung still covers this width)"
+                    );
+                    None
+                }
                 Err(e) => panic!("[wavefront] {stem}: prefill (m={pl}) NOT LOWERED — {e}"),
             }
+            }).collect()
+        };
+        for (lwd_p, r, fx) in per_rung.into_iter().flatten() {
+            commit_bake(&lwd_p, fx);
+            prefill = Some(r);
         }
 
         // ── PREFIX-CAPABLE PREFILL BUNDLE ── one more bake of the WIDEST rung, this time with a full
