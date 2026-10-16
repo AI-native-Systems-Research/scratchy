@@ -200,7 +200,7 @@ struct RequestState {
     pooler_output: Option<EmbeddingData>,
 }
 
-/// Prompt-side token counts for one request, carried on every [`StreamDelta`].
+/// Token counts for one request, carried on every [`StreamDelta`].
 ///
 /// A streaming response has to report usage from the delta stream — it never
 /// sees a `UsageInfo`. `cached_tokens` is the prefix-cache hit, which the
@@ -214,6 +214,12 @@ pub struct StreamUsage {
     /// Prompt tokens served from the prefix cache. Block-aligned, so it
     /// slightly understates logical reuse and never overstates it.
     pub cached_tokens: u32,
+    /// Tokens generated so far for this choice, this step's included — the
+    /// count the `request finished` log reports. Cumulative, so the last delta
+    /// a consumer sees carries the total. Not the sum of the deltas'
+    /// `new_token_ids`: a step whose text a tool parser is still buffering
+    /// sends no delta at all, and its tokens reach no consumer any other way.
+    pub completion_tokens: u32,
 }
 
 /// A delta sent to a streaming response.
@@ -235,7 +241,7 @@ pub struct StreamDelta {
     pub tool_call_deltas: Option<Vec<DeltaToolCall>>,
     /// Reasoning content delta (for streaming reasoning parsing).
     pub reasoning: Option<String>,
-    /// Prompt-side token counts, repeated on every delta — see [`StreamUsage`].
+    /// Token counts, repeated on every delta — see [`StreamUsage`].
     pub usage: StreamUsage,
 }
 
@@ -2472,6 +2478,7 @@ impl AsyncEngine {
                     usage: StreamUsage {
                         prompt_tokens: req_state.num_prompt_tokens,
                         cached_tokens: req_state.num_cached_tokens,
+                        completion_tokens: req_state.generated_token_ids.len() as u32,
                     },
                 });
                 ended.push(id.clone());
@@ -2515,14 +2522,16 @@ impl AsyncEngine {
             };
 
             // Send streaming delta if applicable.
-            // Prompt-side counts, stamped on every delta this step emits. Read
-            // once here so the literals below stay uniform: which of them fires
+            // Token counts, stamped on every delta this step emits. Read once
+            // here so the literals below stay uniform: which of them fires
             // first depends on reasoning/tool-parser state, so there is no single
             // "first delta" to special-case. `num_cached_tokens` is already set
             // for this step (above), and the scheduler fixes it at admission.
+            // `generated_token_ids` already holds this step's tokens (above).
             let usage = StreamUsage {
                 prompt_tokens: req_state.num_prompt_tokens,
                 cached_tokens: req_state.num_cached_tokens,
+                completion_tokens: req_state.generated_token_ids.len() as u32,
             };
 
             if let Some(tx) = &req_state.stream_tx {
@@ -2979,14 +2988,16 @@ impl AsyncEngine {
         });
 
         // Send streaming delta if applicable.
-        // Prompt-side counts, stamped on every delta this step emits. Read
-        // once here so the literals below stay uniform: which of them fires
+        // Token counts, stamped on every delta this step emits. Read once
+        // here so the literals below stay uniform: which of them fires
         // first depends on reasoning/tool-parser state, so there is no single
         // "first delta" to special-case. `num_cached_tokens` is already set
         // for this step (above), and the scheduler fixes it at admission.
+        // `generated_token_ids` already holds this step's tokens (above).
         let usage = StreamUsage {
             prompt_tokens: req_state.num_prompt_tokens,
             cached_tokens: req_state.num_cached_tokens,
+            completion_tokens: req_state.generated_token_ids.len() as u32,
         };
 
         if let Some(tx) = &req_state.stream_tx {
@@ -4099,7 +4110,7 @@ mod tests {
     use scratchy_serving_engine::executor::NoopExecutor;
     use scratchy_serving_transport::messages::PauseMode;
 
-    fn make_test_request_state(
+    pub(super) fn make_test_request_state(
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
     ) -> RequestState {
         RequestState {
@@ -5613,7 +5624,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// Helper: build a minimal vocab for reasoning parser tests.
-    fn reasoning_test_vocab() -> std::collections::HashMap<String, u32> {
+    pub(super) fn reasoning_test_vocab() -> std::collections::HashMap<String, u32> {
         let mut vocab = std::collections::HashMap::new();
         vocab.insert("<think>".to_string(), 100);
         vocab.insert("</think>".to_string(), 101);
@@ -6268,5 +6279,94 @@ mod tests {
             result.contains("THINKING"),
             "merged kwargs should have enable_thinking=true"
         );
+    }
+
+    /// The tool-parsed path and the reasoning-parsed one each drop the deltas of the steps the
+    /// tool parser buffers. The count still reaches the end of the stream: the last delta reports
+    /// every generated token, as the `request finished` log does.
+    #[test]
+    fn test_streaming_buffered_tool_call_reports_every_token() {
+        for reasoning in [false, true] {
+            let (deltas, generated) = super::test_support::buffered_tool_call_deltas(reasoning);
+            let summed: u32 = deltas.iter().map(|d| d.new_token_ids.len() as u32).sum();
+            assert!(
+                summed < generated,
+                "reasoning={reasoning}: the parser must buffer some steps for this to test anything \
+                 ({summed} of {generated} tokens on deltas)"
+            );
+            let last = deltas.last().expect("a delta");
+            assert!(last.finish_reason.is_some(), "reasoning={reasoning}");
+            assert_eq!(
+                last.usage.completion_tokens, generated,
+                "reasoning={reasoning}"
+            );
+        }
+    }
+}
+
+/// Engine-produced delta streams for the HTTP encoders' tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// The deltas the engine streams for a qwen3_coder tool call the parser buffers for most of
+    /// its steps — run through phases 1 and 3 as the step loop does — with the number of tokens
+    /// generated. `reasoning` puts a reasoning parser in front, with a short thought first.
+    ///
+    /// The buffered steps send no delta, so the deltas' `new_token_ids` add up to fewer tokens
+    /// than were generated: a consumer has to read the count from [`StreamUsage`].
+    pub(crate) fn buffered_tool_call_deltas(reasoning: bool) -> (Vec<StreamDelta>, u32) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests = HashMap::new();
+        let mut state = super::tests::make_test_request_state(Some(tx));
+        state.tool_parser_state = Some(
+            crate::tool_parser::get_tool_parser("qwen3_coder")
+                .unwrap()
+                .create_streaming_state(),
+        );
+        let mut pieces: Vec<(Vec<u32>, &str)> = Vec::new();
+        if reasoning {
+            let parser = crate::reasoning_parser::Qwen3ReasoningParser::new(
+                &super::tests::reasoning_test_vocab(),
+            )
+            .unwrap();
+            state.reasoning_parser_state = Some(parser.create_streaming_state());
+            pieces.push((vec![10], "I will run ls."));
+            pieces.push((vec![101, 11], "\n</think>\n\n"));
+        }
+        requests.insert("req-1".to_string(), state);
+        pieces.extend([
+            (vec![12], "<tool_call>\n"),
+            (vec![13], "<function=Bash>\n"),
+            (vec![14], "<parameter=command>\n"),
+            (vec![15], "ls -la"),
+            (vec![16], "\n</parameter>\n"),
+            (vec![17], "</function>\n"),
+            (vec![18], "</tool_call>"),
+        ]);
+
+        let generated = pieces.iter().map(|(ids, _)| ids.len() as u32).sum();
+        let last = pieces.len() - 1;
+        for (i, (ids, text)) in pieces.into_iter().enumerate() {
+            let outputs = vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: ids,
+                finish_reason: (i == last).then_some(FinishReason::Stop),
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            }];
+            AsyncEngine::process_outputs_phase1(&mut requests, &outputs);
+            let detok = vec![Some((None, Some(text.to_string())))];
+            AsyncEngine::process_outputs_phase3(&mut requests, outputs, detok);
+        }
+        let mut deltas = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            deltas.push(delta);
+        }
+        (deltas, generated)
     }
 }
