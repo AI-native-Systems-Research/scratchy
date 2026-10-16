@@ -644,7 +644,9 @@ fn arguments_text(value: PartialValue<'_>) -> Option<Cow<'_, str>> {
     if value.complete {
         return serde_json::from_str(value.raw).ok().map(Cow::Owned);
     }
-    // Drop a trailing partial escape — at most a `\uXXXX\uXX` surrogate half-pair.
+    // Drop a trailing unfinished escape. The longest is a surrogate pair missing
+    // its last digit, `\uXXXX\uXXX` (11 bytes): a lone high surrogate doesn't
+    // decode either, so the whole pair waits.
     (0..=value.raw.len().min(12)).find_map(|cut| {
         let head = value.raw.get(..value.raw.len() - cut)?;
         serde_json::from_str(&format!("{head}\""))
@@ -3175,8 +3177,9 @@ mod tests {
     fn test_json_parsers_stream_one_char_at_a_time() {
         let args = r#"{"q": "café 😀 ü }]", "n": [1, {"k": null}]}"#;
         let expected = serde_json::json!({"q": "café 😀 ü }]", "n": [1, {"k": null}]});
-        // As a JSON-encoded string too: the decoded text must come out whole.
-        let encoded = serde_json::to_string(args).unwrap();
+        // As a JSON-encoded string too, written by hand: `serde_json::to_string`
+        // leaves non-ASCII as plain UTF-8, so it would carry no `\u` escape.
+        let encoded = r#""{\"q\": \"café 😀 ü }]\", \"n\": [1, {\"k\": null}]}""#;
         let cases: [(&dyn ToolCallParser, String); 4] = [
             (
                 &LlamaJsonToolParser::new(),
@@ -3212,6 +3215,40 @@ mod tests {
             assert_streamed(&calls[0], "f1", expected.clone());
             assert_streamed(&calls[1], "f2", expected.clone());
         }
+    }
+
+    /// String-encoded arguments cut inside an escape: the text before the
+    /// escape must already have gone out, not wait for the escape to finish.
+    /// The longest unfinished escape is 11 bytes (`\ud83d\ude0`, a surrogate
+    /// pair missing its last digit), which `arguments_text` must look past.
+    #[test]
+    fn test_hermes_streaming_sends_text_before_an_unfinished_escape() {
+        let tokens = [
+            "<tool_call>",
+            r#"{"name": "f", "arguments": "{\"q\": \"ab\u00"#,
+            r#"e9 cd\ud83d\ude0"#,
+            r#"0\"}"}"#,
+            "</tool_call>",
+        ];
+        let mut state = HermesToolParser::new().create_streaming_state();
+        let mut accumulated = String::new();
+        let mut sent = Vec::new();
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            let mut args = String::new();
+            if let ToolParserDelta::ToolCalls(deltas) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for d in deltas {
+                    args.push_str(d.function_arguments.as_deref().unwrap_or(""));
+                }
+            }
+            sent.push(args);
+        }
+        assert_eq!(sent[1], r#"{"q": "ab"#, "{sent:?}");
+        assert_eq!(sent[2], "é cd", "{sent:?}");
+        assert_eq!(sent.concat(), r#"{"q": "abé cd😀"}"#, "{sent:?}");
     }
 
     /// `"arguments": null` falls through to `"parameters"`, as in
