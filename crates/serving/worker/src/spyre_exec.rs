@@ -1088,7 +1088,11 @@ impl Worker for SpyreWorker {
                         scratchy_subtile::sdsc_abstract::BatchChunk::of(
                             c,
                             seqs.get(),
-                            (nqh / (sh.kv_dim / sh.head_dim.max(1)).max(1)) as u32,
+                            // The GQA ratio off the SAME pool the chunk law above read — the bake
+                            // keyed the batch chunk's row blocks on the program's own `nqh / nkvh`,
+                            // and `pool` is the one spelling of `nkvh` this function holds (the
+                            // model's own two numbers).
+                            (nqh / pool.nkvh.max(1)) as u32,
                         )
                     })
                     .ok_or_else(|| {
