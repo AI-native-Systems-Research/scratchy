@@ -2452,10 +2452,11 @@ mod weight_copy_tests {
 /// The segment budget's verdict is a field of every baked layout (`WeightTail`), so whether a model's
 /// weights spilled is a property of the binary, not of a serve log. MEASURED on granite-3.1-8b fp16:
 /// padding its gate/up to 224 sticks pushed the weight set past 16 GiB, spilled the 400 MiB tied
-/// embedding into seg6, put 12,000 MB of per-session copies on the card, and that build decoded
-/// 18–26% slower than the unpadded one that fits. That model is the one this crate's CI scope
-/// bakes (`scratchy-models/granite-3.1-8b-instruct`), so a width or layout change that pushes it
-/// back over the region fails here, at `cargo test`, instead of on a card.
+/// embedding into seg6, and put 12,000 MB of per-session copies on the card — memory and load time,
+/// found in a serve log (the decode slowdown that build also had was the pad's own trip count, not
+/// the spill; see `WeightTail`). That model is the one this crate's CI scope bakes
+/// (`scratchy-models/granite-3.1-8b-instruct`), so a width or layout change that pushes it back over
+/// the region fails here, at `cargo test`, instead of on a card.
 #[cfg(test)]
 mod weight_tail_tests {
     use scratchy_target_spyre::bundle_code::{WeightTail, bundle, registered_fps};

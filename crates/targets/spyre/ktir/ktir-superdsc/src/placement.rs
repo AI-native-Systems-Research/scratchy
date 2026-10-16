@@ -109,10 +109,15 @@ pub const WEIGHT_SPILL_SEGS: [usize; 1] = [6];
 /// colour, so it cannot be aliased between bundles: every borrowing session gets its own copy of the
 /// tail (granite-3.1-8b fp16 padded its gate/up to 224 sticks, spilled its 400 MiB tied embedding
 /// into seg6, and reserved 12,000 MB of copies across 30 sessions — 28,644 MB against 15,683 MB
-/// unspilled). That build also decoded 18–26% slower than the unpadded one that fits (how the loss
-/// splits between the pad and the spill is not measured), and nothing at `cargo build` said it had
-/// spilled: the bake's own line goes to a stderr that cargo swallows on success. So the verdict is a field of the bundle, every consumer matches on it, and a model whose
-/// weights are meant to fit pins it in a test.
+/// unspilled). Nothing at `cargo build` said it had spilled: the bake's own line goes to a stderr
+/// that cargo swallows on success. So the verdict is a field of the bundle, every consumer matches on
+/// it, and a model whose weights are meant to fit pins it in a test.
+///
+/// ⚠️ WHAT THE SPILL COSTS IS MEMORY AND LOAD, NOT DECODE TIME — MEASURED. That padded build decoded
+/// 18–26% slower, and a keyed `SCRATCHY_SDSC_GROUP_TIME` split of one 10k-context step put all of it
+/// (49.1 of 49.6 ms) in the MLP group: 224 sticks on 32 cores is 7 sticks a core, a prime, so each of
+/// gate and up ran 7 one-stick trips where 200 sticks on 25 cores runs 4 two-stick trips. The suffix
+/// that reads the spilled embedding ran 3.37 ms a step against 3.35 ms in place.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum WeightTail {
     /// Every weight sits in the weight segment: it fits one device region.

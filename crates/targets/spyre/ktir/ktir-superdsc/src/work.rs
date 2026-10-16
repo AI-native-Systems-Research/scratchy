@@ -160,6 +160,11 @@ pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
     // 200 sticks) already split onto 25 of 32: the pad was +12% of the model's largest weights, streamed
     // every token, to buy the last 7 cores. Below half the machine the pad pays; at or above it the
     // unpadded split stands.
+    //
+    // MEASURED, and the bytes were the smaller half of it: a keyed GROUP_TIME split of one 10k-context
+    // 8b decode step put the whole 49 ms the pad cost in the MLP group. 224 sticks on 32 cores is 7
+    // sticks a core — a prime — so each of gate and up was time-tiled into 7 one-stick trips, where
+    // 200 sticks on 25 cores is 8 a core and runs 4 two-stick trips.
     let full = sticks.next_multiple_of(MAX_CORES);
     if cur * 2 < MAX_CORES && (full - sticks) * 8 <= sticks {
         return full * FP16_ELEMS_PER_STICK;
