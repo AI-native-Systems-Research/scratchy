@@ -1679,8 +1679,8 @@ pub fn eval_node<F: RopeForm>(
         // its V input + the paged-cache write are GPU-only.
         SubOp::RopeRotate { head_dim, _form: _ } | SubOp::RopeAppend { head_dim, .. } => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
-            let (cos, _, cc) = gather(&node.inputs[1], graph, bufs);
-            let (sin, _, sc) = gather(&node.inputs[2], graph, bufs);
+            let (cos, cr, cc) = gather(&node.inputs[1], graph, bufs);
+            let (sin, sr, sc) = gather(&node.inputs[2], graph, bufs);
             debug_assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
             let hd = head_dim.get() as usize;
             let half = hd / 2;
@@ -1688,24 +1688,55 @@ pub fn eval_node<F: RopeForm>(
             debug_assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
             debug_assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
             let heads = cols / hd;
+            // ⭐ ROW- AND HEAD-ALIGNED TABLE READS, BY THE SOURCE'S OWN SHAPE. A real
+            // tape's cos/sin source is `[m, cols]` — one row per query row, each the
+            // row's own position's table tiled across heads to the rope's full width
+            // (`to_wavefront`'s `cos_sin` pushes exactly that shape, and both runtimes
+            // stage it: `rope_cos_sin_kind(position[row])` then `tile_rotary_row`) — so
+            // row `r`'s rotation reads row `r`'s table at the head's own slice. The old
+            // `cos[d]`-for-every-row form is right only at m == 1 (one row, and the
+            // period-half probe synth makes even a wrong read agree); at m > 1 it
+            // rotates every row by ROW 0's angles. A `[1, hd]` source (the fixtures'
+            // single head table) stays broadcast across rows and heads. Any other
+            // width has no staging law — panic rather than silently misread.
+            let table_row = |tr: usize, r: usize| if tr == 1 { 0 } else { r };
+            let table_base = |tc: usize, h: usize| {
+                if tc == cols {
+                    h * hd
+                } else if tc == hd {
+                    0
+                } else {
+                    panic!(
+                        "rope cos/sin source width {tc} is neither the rope's own width \
+                         ({cols}) nor one head_dim ({hd}) — no staging law to read it by"
+                    )
+                }
+            };
             let mut out = x.clone();
             for r in 0..rows {
+                let (crow, srow) = (table_row(cr as usize, r), table_row(sr as usize, r));
                 for h in 0..heads {
                     let base = r * cols + h * hd;
+                    let (coff, soff) = (
+                        crow * cc as usize + table_base(cc as usize, h),
+                        srow * sc as usize + table_base(sc as usize, h),
+                    );
                     for d in 0..half {
                         let x0 = x[base + d];
                         let x1 = x[base + half + d];
-                        // Apply the cos/sin table ELEMENT-WISE (cos[d] for the first half,
-                        // cos[d+half] for the second), matching the SuperDSC on-card RoPE
-                        // (`out = x*cos + rotate_half(x)*sin`, where the pointwise mul reads
-                        // the full [hd] table per element). For REAL rope_cos_sin tables the
-                        // two halves are duplicated (cos[d+half]==cos[d]), so this is a NO-OP
-                        // for every real run; it only matters when cos/sin are NOT duplicated
-                        // (the selftest's synthetic sources), where the old `cos[d]`-for-both
-                        // form made the eval_dag golden diverge from the faithful on-card
-                        // lowering (the spurious t341 RopeRotate cos≈0.45 selftest artifact).
-                        out[base + d] = x0 * cos[d] - x1 * sin[d];
-                        out[base + half + d] = x0 * sin[d + half] + x1 * cos[d + half];
+                        // Apply the cos/sin table ELEMENT-WISE (cos[base + d] for the first
+                        // half, cos[base + half + d] for the second), matching the SuperDSC
+                        // on-card RoPE (`out = x*cos + rotate_half(x)*sin`, where the pointwise
+                        // mul reads the full [hd] table per element). For REAL rope_cos_sin
+                        // tables the two halves are duplicated (cos[d+half]==cos[d]), so this
+                        // is a NO-OP for every real run; it only matters when cos/sin are NOT
+                        // duplicated (the selftest's synthetic sources), where the old
+                        // `cos[d]`-for-both form made the eval_dag golden diverge from the
+                        // faithful on-card lowering (the spurious t341 RopeRotate cos≈0.45
+                        // selftest artifact).
+                        out[base + d] = x0 * cos[coff + d] - x1 * sin[soff + d];
+                        out[base + half + d] =
+                            x0 * sin[soff + half + d] + x1 * cos[coff + half + d];
                     }
                 }
             }
