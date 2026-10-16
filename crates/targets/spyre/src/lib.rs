@@ -25,6 +25,8 @@ pub use scratchy_spyre_bundle as bundle_code;
 /// Run a bundle this binary did not bake — see the module docs.
 #[cfg(feature = "spyre-hw")]
 pub mod bundle_run;
+/// dxp's compiled groups, kept across builds under a key that names the compiler as well as the input.
+pub mod dxp_cache;
 /// Where a launched op reads and writes KV: the shim launch loop's per-op, per-page offset
 /// arithmetic, lifted out of C++. No SDK dependency and no feature gate — it is arithmetic, so it
 /// builds and is tested on any host, including one with no Spyre toolchain.
@@ -50,7 +52,6 @@ mod op_abi;
 // ⚠️ TEMPORARY bake-time instrumentation — strip with its call sites before landing.
 mod pc;
 pub mod superdsc_bake;
-pub mod dxp_cache;
 /// Path shims kept from `scratchy-subtile`'s lib so the moved lowering
 /// keeps its existing `crate::…` references: the modules themselves
 /// live under `ir::island` / `ir::bridge`.
