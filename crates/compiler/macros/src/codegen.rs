@@ -8793,11 +8793,43 @@ fn refuse_if_wiring_disagrees_with_manifest(
     }
 }
 
-// ── The rotary-class VALUE law ──
+// ── The rotary-class VALUE law, shared by the wiring's tokens and the gate ──
 // The wiring bakes `RotaryKind` TOKENS (`rot_kind` in `emit_superdsc_wiring`
-// re-spells this value). Hoisting the class to a VALUE here is what lets a
-// second consumer spell the same class without re-deriving it — the tokens
-// are derived from the value, never re-derived inline.
+// re-spells this value); the bake-time numeric gate's prefill probe stages
+// `rope_cos_sin_kind` rows by the SAME value (`PrefillGate`). One law, two
+// consumers — the baked table and the gate's staged rows cannot drift apart.
+
+/// The model's attention head dim by the bounds the tape was lowered at —
+/// `head_dim` where the arch declares it, the `hidden/heads` quotient where it
+/// does not (the same fallback the emitter itself uses).
+#[cfg(feature = "spyre")]
+fn superdsc_model_head_dim(model: &ModelParams) -> u64 {
+    let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
+    let heads = b("num_attention_heads").max(1);
+    match b("head_dim") {
+        0 => b("hidden_size") / heads,
+        v => v,
+    }
+}
+
+/// `rope_theta`, scalars first, NO default — the same refusal the wiring bakes
+/// (a silent 1e4 would disagree with llama-3.2's 500000: fluent, subtly
+/// wrong output).
+#[cfg(feature = "spyre")]
+fn superdsc_model_rope_theta(model: &ModelParams) -> f64 {
+    model
+        .scalars
+        .get("rope_theta")
+        .copied()
+        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+        .unwrap_or_else(|| {
+            panic!(
+                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
+                 default; the baked table would silently disagree with the checkpoint",
+                model.source_stem
+            )
+        })
+}
 
 /// The rotary class a `local`-flagged source serves, as a VALUE: sliding
 /// sources take the local class's base frequency (falling back to the model's
@@ -8948,9 +8980,10 @@ fn emit_superdsc_wiring(
     // lowered at, so the baked table and the bundle cannot disagree. A uniform
     // model has `local: false` everywhere and `global_head_dim == head_dim`
     // with no partial factor, which folds to the base `Default` class.
-    // The class VALUE is one law (`superdsc_rotary_kind` above); the tokens
-    // below are its spelling — derived, never re-derived, so no second
-    // consumer of the class can drift from the baked table.
+    // The class VALUE is one law (`superdsc_rotary_kind` above), shared with
+    // the bake-time numeric gate's prefill probe; the tokens below are its
+    // spelling — derived, never re-derived, so the wiring's baked tables and
+    // the gate's staged rows cannot disagree.
     let rot_kind = |local: bool| -> proc_macro2::TokenStream {
         match superdsc_rotary_kind(model, hd, f64::from(theta), local) {
             scratchy_target_spyre::wiring::RotaryKind::Default {
@@ -11578,6 +11611,52 @@ fn dump_wavefront_mega(
                                                     },
                                                 },
                                             );
+                                            // The prefill probe's rotary classes, from the SAME
+                                            // bindings the wiring bakes its classes from — one
+                                            // value law (`superdsc_rotary_kind`), two consumers
+                                            // (the wiring's baked tokens, the gate's staged rows).
+                                            // Carries the rung's mq so the gate's PrefillGate and
+                                            // the DBG golden below share one construction.
+                                            // (mq, cos rows, sin rows) — each row list naming
+                                            // (source row, rotary kind).
+                                            type PrefillRotaryClasses = (
+                                                u32,
+                                                Vec<(
+                                                    u32,
+                                                    scratchy_target_spyre::wiring::RotaryKind,
+                                                )>,
+                                                Vec<(
+                                                    u32,
+                                                    scratchy_target_spyre::wiring::RotaryKind,
+                                                )>,
+                                            );
+                                            let prefill_classes: Option<PrefillRotaryClasses> =
+                                                prefill_mq.map(|mq| {
+                                                let hd = superdsc_model_head_dim(model);
+                                                let theta = superdsc_model_rope_theta(model);
+                                                let mut rotary_cos = Vec::new();
+                                                let mut rotary_sin = Vec::new();
+                                                for (i, b) in lwd.bindings.iter().enumerate() {
+                                                    let (want_cos, local) = match b {
+                                                        crate::to_wavefront::SourceBinding::Cos { local } => {
+                                                            (true, *local)
+                                                        }
+                                                        crate::to_wavefront::SourceBinding::Sin { local } => {
+                                                            (false, *local)
+                                                        }
+                                                        _ => continue,
+                                                    };
+                                                    let kind =
+                                                        superdsc_rotary_kind(model, hd, theta, local);
+                                                    let pair = (i as u32, kind);
+                                                    if want_cos {
+                                                        rotary_cos.push(pair)
+                                                    } else {
+                                                        rotary_sin.push(pair)
+                                                    }
+                                                }
+                                                (mq, rotary_cos, rotary_sin)
+                                            });
                                             // ── NUMERIC BISECTION oracle (opt-in SCRATCHY_SUPERDSC_DBG):
                                             //    eval_dag golden + synthetic source shapes so
                                             //    SPYRE_SUPERDSC_SELFTEST localizes the first divergent op.
@@ -11591,8 +11670,13 @@ fn dump_wavefront_mega(
                                                 // the bisection oracle cannot drift from the
                                                 // gate's own golden. Decode: an empty map, the
                                                 // period-half contract.
-                                                let staged_rope =
-                                                    std::collections::HashMap::default();
+                                                let staged_rope = prefill_classes
+                                                    .as_ref()
+                                                    .map(|(_, cs, sn)| {
+                                                        superdsc::staged_rope_rows(&krg, cs, sn)
+                                                            .unwrap_or_default()
+                                                    })
+                                                    .unwrap_or_default();
                                                 match superdsc::write_eval_golden(
                                                     &krg,
                                                     &weight_ids,
@@ -11609,48 +11693,77 @@ fn dump_wavefront_mega(
                                                 }
                                             }
                                             // ⭐⭐⭐ THE NUMERIC GATE — "if there is garbage, it
-                                            //    cannot compile." Every DECODE bundle this bake
-                                            //    produced runs on the emulator with the synthetic
-                                            //    probe and is compared against the reference
-                                            //    semantics of the same dsl_math
-                                            //    (`eval_golden_buffers`); divergence beyond the
-                                            //    quant floor is a PANIC — the build refuses to
-                                            //    ship the bundle. No env var: under `-Fspyre-emu`
-                                            //    the gate IS the bake's contract. Prefill bundles
-                                            //    (m>1) skip loudly — their clamped-triangle mask
-                                            //    law is the next rung. ──
+                                            //    cannot compile." Every DECODE bundle AND every
+                                            //    PREFIX-FREE PREFILL RUNG (ActiveCap::NONE — the
+                                            //    first-chunk programs) this bake produced runs on
+                                            //    the emulator and is compared against the
+                                            //    reference semantics of the same dsl_math
+                                            //    (`eval_golden_buffers`), the prefill arm staging
+                                            //    the runtime's OWN first-chunk law (the [mq, mq]
+                                            //    clamped triangle, per-position rope rows, the
+                                            //    dead-prefix view); divergence beyond the quant
+                                            //    floor is a PANIC — the build refuses to ship
+                                            //    the bundle. No env var: under `-Fspyre-emu`
+                                            //    the gate IS the bake's contract. A PREFIX-CAPABLE
+                                            //    prefill bundle (ActiveCap::FULL — the
+                                            //    continuation chunks) still skips loudly: its
+                                            //    resident-prefix mask law is the next rung. ──
                                             #[cfg(feature = "spyre-emu")]
-                                            match prefill_mq {
-                                                None => {
-                                                    match superdsc::with_emitted_groups(
-                                                        &bfp,
-                                                        |groups| {
-                                                            superdsc::numeric_gate(
-                                                                groups,
-                                                                &krg,
-                                                                &weight_ids,
-                                                                cap,
-                                                                &bfp,
-                                                            )
-                                                        },
-                                                    ) {
-                                                        Some(Ok(())) => {}
-                                                        Some(Err(e)) => panic!(
-                                                            "[spyre-superdsc] {base}: NUMERIC GATE \
-                                                             REFUSED for bundle {bfp} — {e}"
-                                                        ),
-                                                        None => eprintln!(
-                                                            "[spyre-superdsc] {base}: NUMERIC GATE \
-                                                             could not borrow {bfp}'s launch groups \
-                                                             (not Ready) — UNCHECKED"
-                                                        ),
+                                            {
+                                                let prefill_gate = prefill_classes.map(
+                                                    |(mq, rotary_cos, rotary_sin)| {
+                                                        superdsc::PrefillGate {
+                                                            mq,
+                                                            rotary_cos,
+                                                            rotary_sin,
+                                                        }
+                                                    },
+                                                );
+                                                let run_gate =
+                                                    |prefill: Option<&superdsc::PrefillGate>| {
+                                                        match superdsc::with_emitted_groups(
+                                                            &bfp,
+                                                            |groups| {
+                                                                superdsc::numeric_gate(
+                                                                    groups,
+                                                                    &krg,
+                                                                    &weight_ids,
+                                                                    cap,
+                                                                    &bfp,
+                                                                    prefill,
+                                                                )
+                                                            },
+                                                        ) {
+                                                            Some(Ok(())) => {}
+                                                            Some(Err(e)) => panic!(
+                                                                "[spyre-superdsc] {base}: \
+                                                                 NUMERIC GATE REFUSED for \
+                                                                 bundle {bfp} — {e}"
+                                                            ),
+                                                            None => eprintln!(
+                                                                "[spyre-superdsc] {base}: NUMERIC \
+                                                                 GATE could not borrow {bfp}'s \
+                                                                 launch groups (not Ready) — \
+                                                                 UNCHECKED"
+                                                            ),
+                                                        }
+                                                    };
+                                                match prefill_mq {
+                                                    None => run_gate(None),
+                                                    Some(_)
+                                                        if active_cap
+                                                            == superdsc::ActiveCap::NONE =>
+                                                    {
+                                                        run_gate(prefill_gate.as_ref())
                                                     }
+                                                    Some(mq) => eprintln!(
+                                                        "[spyre-superdsc] {base}: NUMERIC GATE \
+                                                         SKIP prefill bundle {bfp} (mq={mq}, \
+                                                         prefix-capable) — the continuation-chunk \
+                                                         mask law (resident prefix ∘ [mq, mq] \
+                                                         triangle) is the next rung; UNCHECKED"
+                                                    ),
                                                 }
-                                                Some(mq) => eprintln!(
-                                                    "[spyre-superdsc] {base}: NUMERIC GATE SKIP \
-                                                     prefill bundle {bfp} (mq={mq}) — the m>1 \
-                                                     mask law is the next rung; UNCHECKED"
-                                                ),
                                             }
                                             eprintln!(
                                                 "[spyre-superdsc] {base}: 3 bundles baked — prefix {pfp} / body {bfp} + {} class(es), {} launch(es) \

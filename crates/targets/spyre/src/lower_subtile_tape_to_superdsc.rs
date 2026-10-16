@@ -3386,6 +3386,12 @@ fn teacher_forced_walk<F: RopeForm>(
     golden: &mut [Vec<f32>],
     emu: &std::collections::HashMap<u64, Vec<f32>>,
     tainted: &std::collections::HashSet<u32>,
+    // The lm-head tail fold's tids (`is_prefill_lm_head_tail` — the splice's
+    // own predicate): their program product is ONE row (row 0 of a stick the
+    // IR sizes at [mq, cols] and the program never fills past row 0), so
+    // their row states the fold's law — the walk's LAST row against the
+    // emulator's row 0 — never the full-stick plain law.
+    lm_head_folded: &std::collections::HashSet<u64>,
 ) -> (Vec<Vec<f32>>, Vec<TeacherForcedRow>) {
     let nsrc = ir.num_sources as usize;
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
@@ -3515,23 +3521,51 @@ fn teacher_forced_walk<F: RopeForm>(
                     node.output.region,
                     shape,
                 );
-                rows.push(TeacherForcedRow {
-                    tid,
-                    node: ni,
-                    op: node.op.name(),
-                    fp8: tainted.contains(&(tid as u32)),
-                    local: rel_l1(&e_region, &tf_out),
-                    inherited: rel_l1(&tf_out, &g_region),
-                });
-                // The teacher's pin: downstream nodes see the EMULATOR's
-                // value, not the golden's product.
-                scratchy_subtile::subtile_ir::scatter(
-                    &mut tf,
-                    node.output.tensor,
-                    node.output.region,
-                    &e_region,
-                    shape,
-                );
+                // ⭐ A FOLDED tail tid states the FOLD'S OWN LAW here too: the
+                // program's product is ONE row (row 0 of the readback — the
+                // stick above it is sized by the IR and never written), so the
+                // row compares the emulator's row 0 against this walk's LAST
+                // row (the `selector_lastrow_col` extraction the lowering
+                // pins) and the teacher's pin is skipped: every row-bearing
+                // consumer of a folded tid is itself folded (row-less by the
+                // readback-length check above), so there is nothing
+                // downstream to teacher-force with the emu's value.
+                let rcols = node.output.region.cols.len as usize;
+                if lm_head_folded.contains(&tid)
+                    && rcols > 0
+                    && tf_out.len() % rcols == 0
+                    && e_region.len() >= rcols
+                {
+                    let e_row = &e_region[..rcols];
+                    let tf_row = &tf_out[tf_out.len() - rcols..];
+                    let g_row = &g_region[g_region.len() - rcols..];
+                    rows.push(TeacherForcedRow {
+                        tid,
+                        node: ni,
+                        op: node.op.name(),
+                        fp8: tainted.contains(&(tid as u32)),
+                        local: rel_l1(e_row, tf_row),
+                        inherited: rel_l1(tf_row, g_row),
+                    });
+                } else {
+                    rows.push(TeacherForcedRow {
+                        tid,
+                        node: ni,
+                        op: node.op.name(),
+                        fp8: tainted.contains(&(tid as u32)),
+                        local: rel_l1(&e_region, &tf_out),
+                        inherited: rel_l1(&tf_out, &g_region),
+                    });
+                    // The teacher's pin: downstream nodes see the EMULATOR's
+                    // value, not the golden's product.
+                    scratchy_subtile::subtile_ir::scatter(
+                        &mut tf,
+                        node.output.tensor,
+                        node.output.region,
+                        &e_region,
+                        shape,
+                    );
+                }
             }
         }
         if let Some((_, folded_tid, folded_region)) = fold_alias
@@ -3684,14 +3718,31 @@ pub fn write_eval_golden<F: RopeForm>(
 /// guess at a floor (the pre-model 8e-2 was: it let real 5% defects through
 /// on granite).
 ///
-/// SCOPE (v2a): DECODE bundles only — the m=1 probe the gate law names. A
-/// prefill bundle is refused by the CALLER with a loud skip line, not here:
-/// its mask is the `[mq, mq]` clamped causal triangle, a law the next rung
-/// pins. Graphs containing ops `eval_node` has no host reference for (the MoE
-/// router/expert family, the KV codec) are SKIPPED with a line naming the
-/// first such op and the fingerprint — the reference for those families is
-/// the next rung, and a silent skip would be a hole; a panicking one would
-/// break every MoE bake that works today.
+/// SCOPE (v3): DECODE bundles (the m=1 probe) and PREFIX-FREE prefill rungs
+/// (ActiveCap::NONE, the first-chunk programs): the gate stages the run-time
+/// forward's OWN first-chunk law — the `[mq, mq]` clamped causal triangle and
+/// the per-position rotary rows — and compares against the golden with the
+/// rope tables read row-aligned and the lm-head tail's m=1 fold stated as the
+/// last-row law. A PREFIX-CAPABLE prefill bundle (ActiveCap::FULL — the
+/// continuation chunks) is still refused by the CALLER with a loud skip line:
+/// its resident-prefix mask law is the next rung. Graphs containing ops
+/// `eval_node` has no host reference for (the MoE router/expert family, the KV
+/// codec) are SKIPPED with a line naming the first such op and the fingerprint
+/// — the reference for those families is the next rung, and a silent skip
+/// would be a hole; a panicking one would break every MoE bake that works
+/// today.
+#[cfg(feature = "spyre-emu")]
+pub struct PrefillGate {
+    /// The bundle's query-row count — the rung it was baked at.
+    pub mq: u32,
+    /// `(tid, kind)` for every cos source the tape declares, then every sin
+    /// source — the wiring's own rotary-class law (a hybrid arch's sliding and
+    /// global classes carry different tables), so the gate stages exactly the
+    /// tables the wiring names.
+    pub rotary_cos: Vec<(u32, crate::wiring::RotaryKind)>,
+    pub rotary_sin: Vec<(u32, crate::wiring::RotaryKind)>,
+}
+
 #[cfg(feature = "spyre-emu")]
 pub fn numeric_gate<F: RopeForm>(
     groups: &[bundle::LaunchGroup<'static>],
@@ -3699,6 +3750,7 @@ pub fn numeric_gate<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     cap: u32,
     fp: &str,
+    prefill: Option<&PrefillGate>,
 ) -> Result<(), String> {
     use scratchy_subtile::lower::GemmWeight;
     // ⛔ KEEP IN STEP with `eval_node`'s no-host-reference arms: an op listed
@@ -3749,6 +3801,46 @@ pub fn numeric_gate<F: RopeForm>(
         );
         return Ok(());
     }
+    // ── The prefill golden: the splice's DEAD-PREFIX law, restated for eval ──
+    // A prefix-free rung (ActiveCap::NONE) lowers its AttnDecode with SWEPT == 0:
+    // the prefix segment "keeps its VIEW and drops its compute" (`lower_attn`),
+    // so the program attends only the chunk's own new block through the one-pass
+    // arm. eval_node derives the query positions from the CONCATENATED input
+    // region rows, and `lower_region` pins a SameForwardRopeAppend prefix at
+    // `valid_len - 1` rows (>= 1) — the DECODE contract, where the runtime length
+    // mask bounds the sweep to that same extent. The rung consumes no length mask
+    // for the prefix (the one-pass arm reads only the `[mq, mq]` triangle), so the
+    // golden must see the prefix as the splice does: DEAD. The clone re-slices
+    // those input regions to 0 rows — a gate-local VIEW of the same IR, never a
+    // law change: every other consumer keeps the original, and a bundle whose
+    // prefix is live (decode, a prefix-capable rung) never enters this arm.
+    let ir_owned;
+    let ir: &SubtileIR<F> = if prefill.is_some() {
+        ir_owned = {
+            let mut g = ir.clone();
+            for n in &mut g.nodes {
+                if matches!(
+                    &n.op,
+                    SubOp::AttnDecode {
+                        producer:
+                            scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+                        ..
+                    }
+                ) {
+                    for idx in [1usize, 2usize] {
+                        if let Some(r) = n.inputs.get_mut(idx) {
+                            r.region.rows =
+                                scratchy_subtile::subtile_ir::Range::new(r.region.rows.start, 0);
+                        }
+                    }
+                }
+            }
+            g
+        };
+        &ir_owned
+    } else {
+        ir
+    };
     // ── The fp8 operand classification, off the IR the lowering itself read ──
     let mut fp8_payloads: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut scale_rows: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -3924,13 +4016,16 @@ pub fn numeric_gate<F: RopeForm>(
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
     // per [`rope_table_periods`] — not as flat noise.
     let rope_table_half = rope_table_periods(ir);
-    // ⭐ THE STAGED ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
-    // the golden's source buffers read this map here, and the emulator's
-    // probe binds join it at the prefill rung, so a staging defect cannot
-    // hide on one side only. Decode stages nothing here and keeps the
-    // period-half synth below — its tables are one row, where the periodic
-    // pattern and the run-time staging agree by construction.
-    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = Default::default();
+    // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
+    // this product feeds the emulator's probe binds below AND the golden's
+    // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
+    // on one side only. Decode stages nothing here and keeps the period-half
+    // synth below — its tables are one row, where the periodic pattern and
+    // the run-time staging agree by construction.
+    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
+        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
+        None => Default::default(),
+    };
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
         if weight_ids.contains(&tid) {
@@ -3940,6 +4035,8 @@ pub fn numeric_gate<F: RopeForm>(
         let n = (t.rows as usize) * (t.cols as usize);
         let vals = if scale_rows.contains(&tid) {
             vec![1.0; n]
+        } else if let Some(v) = staged_rope.get(&tid) {
+            v.clone()
         } else if let Some(&half) = rope_table_half.get(&tid) {
             (0..n)
                 .map(|j| dbg_synth_val(tid as usize, j % half))
@@ -3978,24 +4075,50 @@ pub fn numeric_gate<F: RopeForm>(
     // prefixes read their region directly (the mask parameter is truncated
     // away for them), so a tape with no rope-append prefix keeps the
     // all-valid default — the bind is then simply unused.
-    let valid_prefix = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::AttnDecode {
-                producer:
-                    scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                ..
-            } if n.inputs.len() >= 5 => Some(n.inputs[1].region.rows.len as usize),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(cap as usize);
-    sources.push((
-        u64::from(ir.tensors.len() as u32),
-        crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
-        vec![1, cap as usize],
-    ));
+    if let Some(pg) = prefill {
+        // ⭐ THE PREFILL MASK, BY THE RUNTIME'S OWN LAW: the forward's emu
+        // staging binds a `[mq, mq]` clamped causal triangle — the same two
+        // calls the worker's `forward_chunk` composes (`ChunkRows::row_logical_pos`
+        // over `prefill_causal_col_valid`, the SSOT the one-pass kernel's own
+        // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
+        // real, so the clamp is the identity and the golden, which has no
+        // pad-row law, sees exactly the rows the program reads. ⛔ NOT
+        // `new_block_mask`: that is the card's `[mq, mq_pad]` stick-padded
+        // layout — a different tensor than the one-pass kernel consumes.
+        let mq = pg.mq as usize;
+        let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
+            std::num::NonZeroU32::new(pg.mq).expect("a prefill rung bakes mq > 1"),
+        );
+        let mut m = vec![0.0f32; mq * mq];
+        for r in 0..mq {
+            let pos = chunk.row_logical_pos(r, mq);
+            for c in 0..mq {
+                if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
+                    m[r * mq + c] = -1.0e38;
+                }
+            }
+        }
+        sources.push((u64::from(ir.tensors.len() as u32), m, vec![mq, mq]));
+    } else {
+        let valid_prefix = ir
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                SubOp::AttnDecode {
+                    producer:
+                        scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+                    ..
+                } if n.inputs.len() >= 5 => Some(n.inputs[1].region.rows.len as usize),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(cap as usize);
+        sources.push((
+            u64::from(ir.tensors.len() as u32),
+            crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
+            vec![1, cap as usize],
+        ));
+    }
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
     // registry name of the op that first produces it (`SubOp::name`, so no
@@ -4117,14 +4240,78 @@ pub fn numeric_gate<F: RopeForm>(
     // Every judged tensor's verdict, kept for the refusal dump — the numbers the
     // loop already computed, so a refusal can carry its full per-layer curve.
     let mut verdicts: Vec<ComparedVerdict> = Vec::with_capacity(compare.len());
+    // ⭐ THE LM-HEAD TAIL FOLD'S TIDS — by the splice's own predicate, the same
+    // four conjuncts the lowering read (`is_prefill_lm_head_tail`), so the gate
+    // states the fold the program actually carries, not a re-derived guess.
+    // Prefill only: a decode bundle (rows-are-requests, m=1) never folds.
+    let mut folded: std::collections::HashSet<u64> = if prefill.is_some() {
+        ir.nodes
+            .iter()
+            .filter(|n| scratchy_triton_splice::is_prefill_lm_head_tail(n, ir, false))
+            .map(|n| n.output.tensor.index() as u64)
+            .collect()
+    } else {
+        Default::default()
+    };
+    // ⭐ THE RESULT RIDES THE FOLD — keyed on the structural fact, not set
+    // membership: the result joins the folded law iff the splice's own
+    // `tensor_feeds_result_through_row_local_ops` holds from a FOLDED node's
+    // output to the result — the same predicate that admitted the fold, so
+    // nothing un-folded can ride in. The front end column-chunks a wide
+    // pointwise tail op past the predicate's width conjunct
+    // (`n_blocks(out_cols, nb)` chunks Silu/Mul/Add/ScalarMul/SiluMul —
+    // measured: granite's 49155-wide logits ScalarMul is 7 region-slice
+    // nodes of 8192 cols, so none matches and the tail op stays un-folded,
+    // the splice's documented cost-only shape: "row 0 is still right ...
+    // the device pays mq−1 rows of reads of unwritten logits for
+    // nothing"). Those chunks still scale the folded matmul's row-0 (=
+    // LAST-row) product — row-locally, guaranteed by this same walk — so
+    // the RESULT's row 0 is the fold's product and its rows 1+ are the
+    // dead stick: it takes the same last-row-vs-row-0 law (measured on the
+    // granite refusal dump: last-row rel 0.00049 at the fp8 floor, rows
+    // 1-30 exactly zero; the plain law reads 1.0136). A no-op when the
+    // tail's own op matched whole-region (gemma's TanhSoftCap already put
+    // the result in the set).
+    if ir.nodes.iter().any(|n| {
+        folded.contains(&(n.output.tensor.index() as u64))
+            && scratchy_triton_splice::tensor_feeds_result_through_row_local_ops(
+                ir,
+                n.output.tensor,
+            )
+    }) {
+        folded.insert(ir.result.index() as u64);
+    }
     for &(tid, _) in &compare {
-        let g = &eval_bufs[tid as usize];
+        let g_full = &eval_bufs[tid as usize];
         let e = match out.get(&tid) {
             Some(v) => v,
             None => {
                 failures.push(format!("t{tid}: no readback"));
                 continue;
             }
+        };
+        // The fold is a documented transform, not a defect: the splice lowers
+        // the result-width tail to m=1 (the last-row extraction feeding the
+        // re-lowered ops), so those tids' program product is ONE row — row 0
+        // of a readback whose STICK the IR still sizes at [mq, cols] (the
+        // program never writes past row 0; measured: t302's stick read back
+        // 19 rows with rows 1-18 all zero). The compare states the fold's own
+        // law — the golden's LAST row against the emu's row 0 (the
+        // `selector_lastrow_col` extraction the lowering pins) — so a fold
+        // that grabs the WRONG row still diverges. A tid that comes back
+        // shorter than one row without matching the predicate takes the plain
+        // law below, which refuses.
+        let mq_rows = prefill.map(|p| p.mq as usize).unwrap_or(1);
+        let tail_fold = folded.contains(&tid)
+            && !g_full.is_empty()
+            && !e.is_empty()
+            && g_full.len().is_multiple_of(mq_rows)
+            && g_full.len() / mq_rows <= e.len();
+        let (g, e): (&[f32], &[f32]) = if tail_fold {
+            let cols = g_full.len() / mq_rows;
+            (&g_full[g_full.len() - cols..], &e[..cols])
+        } else {
+            (g_full, e)
         };
         let n = g.len().min(e.len());
         if n == 0 {
@@ -4179,7 +4366,7 @@ pub fn numeric_gate<F: RopeForm>(
     //    short to region-slice) falls back to the total at the same
     //    tolerance — the pre-split rule — so no compared tensor escapes
     //    judgment.
-    let (walk_tf, split) = teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted);
+    let (walk_tf, split) = teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted, &folded);
     drop(walk_tf);
     let mut local_by_tid: std::collections::HashMap<u64, f32> =
         std::collections::HashMap::with_capacity(split.len());
@@ -4243,7 +4430,7 @@ pub fn numeric_gate<F: RopeForm>(
                 .iter()
                 .filter_map(|(t, _)| out.get(t).map(|v| (*t, v.clone())))
                 .collect();
-            let (tf, _rows) = teacher_forced_walk(ir, &mut eval_bufs, &overlay, &tainted);
+            let (tf, _rows) = teacher_forced_walk(ir, &mut eval_bufs, &overlay, &tainted, &folded);
             let tail = compare.len() - (compare.len() / 10).clamp(1, compare.len() / 2);
             let mut tracks: Vec<f32> = Vec::new();
             let mut contracts: Vec<f32> = Vec::new();
@@ -4311,8 +4498,11 @@ pub fn numeric_gate<F: RopeForm>(
     eprintln!(
         "[spyre-superdsc] NUMERIC GATE PASS {fp}: {} tensors at the floor (worst local \
          clean {worst_local_clean:.4}, worst local fp8-chained {worst_local_fp8:.4}; worst \
-         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4})",
-        compare.len()
+         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}){}",
+        compare.len(),
+        prefill
+            .map(|p| format!(" [prefill mq={}]", p.mq))
+            .unwrap_or_default()
     );
     Ok(())
 }

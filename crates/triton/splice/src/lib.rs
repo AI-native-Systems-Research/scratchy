@@ -629,7 +629,9 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// The prefill lm-head tail predicate, stated ONCE — every consumer of the fold
-/// (the `lower_all` rewrite and the one-op `lower`'s routing echo below) reads
+/// (the `lower_all` rewrite, the one-op `lower`'s routing echo below, and the
+/// bake-time numeric gate's tail compare, which states the fold's last-row law
+/// against the golden) reads
 /// the SAME four conjuncts, because the width test alone was falsified by the
 /// gemma-4 parity fixture (vocab 512), whose GLOBAL-layer q projection is ALSO
 /// 512 cols (4 heads × hd 128) — the fold fired on every global layer's Q, and
@@ -637,7 +639,7 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
 /// rows are dead, and only the result's ancestors are the tail. The walk is
 /// [`tensor_feeds_result_through_row_local_ops`] (main's own law).
-fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -1149,6 +1151,11 @@ fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -
 
 /// Does tensor `t` feed `ir.result` through ROW-LOCAL consumers only (or is it the result)?
 ///
+/// Pub for the spyre numeric gate, which keys its result-riding fold law on this
+/// same walk — the admission predicate itself, not a re-derived guess: the result
+/// takes the fold's one-row compare iff a FOLDED node's output reaches it through
+/// this walk, so nothing un-folded can ride in.
+///
 /// The prefill lm-head fold must fire ONLY on the result's own tail. The width test alone
 /// (`cols == result_cols`) was falsified by the gemma-4 parity fixture (vocab 512): its
 /// GLOBAL-layer q projection is also 512 cols (4 heads × hd 128), so the fold fired there
@@ -1163,7 +1170,7 @@ fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -
 /// `0..=i`), so every one of its rows is live and folding to one row corrupts the layer.
 /// Rope is excluded from the row-local set deliberately: `RopeAppend` also writes the
 /// paged KV cache, a consumer the prefill graph cannot see.
-fn tensor_feeds_result_through_row_local_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
+pub fn tensor_feeds_result_through_row_local_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     t: scratchy_subtile::subtile_ir::TensorId,
 ) -> bool {
