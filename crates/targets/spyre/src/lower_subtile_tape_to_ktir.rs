@@ -430,15 +430,43 @@ pub(crate) fn oproj_edges<F: RopeForm>(ir: &SubtileIR<F>) -> Result<OprojEdges, 
 /// graph with no attention node has nothing to chunk.
 pub fn admitted_chunk<F: RopeForm>(ir: &SubtileIR<F>, requested: Option<u32>) -> Option<u32> {
     let pages = requested?;
+    ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(attn_pool(ir)?, pages).map(|_| pages)
+}
+
+/// The paged KV pool this graph's attention reads — `None` for a graph with no attention node.
+fn attn_pool<F: RopeForm>(ir: &SubtileIR<F>) -> Option<ktir_superdsc::sdsc_abstract::PagedKvPool> {
     let geom = ir.nodes.iter().find_map(|n| match &n.op {
         SubOp::AttnDecode { geom, .. } => Some(*geom),
         _ => None,
     })?;
-    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+    Some(ktir_superdsc::sdsc_abstract::PagedKvPool::new(
         geom.nkvh().get() as usize,
         geom.hd().get() as usize,
-    );
-    ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).map(|_| pages)
+    ))
+}
+
+/// ⭐ THE CHUNK LADDER THIS GRAPH's GEOMETRY ADMITS for a body of `requests` request rows, ascending —
+/// [`ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for`] at the graph's own pool (one request for a
+/// body whose rows share a history, the batch width for a decode batch). Empty where the chunk is not
+/// expressible at all, which keeps the per-page fold, as [`admitted_chunk`]'s `None` does.
+pub fn admitted_chunk_ladder<F: RopeForm>(ir: &SubtileIR<F>, requests: u32) -> Vec<u32> {
+    attn_pool(ir).map_or_else(Vec::new, |pool| {
+        ktir_superdsc::sdsc_abstract::ChunkScratch::ladder_for(pool, requests)
+    })
+}
+
+/// ⭐ A LADDER CHUNK's SWEPT EXTENT PER REQUEST — the rung key the body selector compares the live
+/// context against ([`ktir_superdsc::sdsc_abstract::ChunkScratch::swept_per_request`]). `pages` comes off
+/// [`admitted_chunk_ladder`] at the same `requests`; `None` for a chunk this pool refuses, which the bake
+/// turns into a build failure (a rung its own ladder never offered), never a guessed extent.
+pub fn chunk_swept_per_request<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    pages: u32,
+    requests: u32,
+) -> Option<u32> {
+    attn_pool(ir)
+        .and_then(|pool| ktir_superdsc::sdsc_abstract::ChunkScratch::of_chunk(pool, pages))
+        .map(|c| c.swept_per_request(requests))
 }
 
 /// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
@@ -468,21 +496,11 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // (`!is_prefill && decode_rows == 1 && seq_sym.is_none()` in the `#[forward]` emission):
     // a CONCRETE single-row decode, never a symbolic batch template and never a prefill chunk.
     one_request_decode: bool,
-    // The split-KV chunk this rung bakes — the ladder's own bake fact, `Some` ONLY on a ONE-REQUEST body:
-    // the one-request decode rung, or a prompt chunk's prefix (see `BundleAttnParams::chunk_pages`).
+    // The split-KV chunk this rung bakes — the ladder's own bake fact: the one-request decode rung, a
+    // prompt chunk's prefix, or a decode BATCH, whose chunk holds every request's pages end to end
+    // (`ktir_superdsc::sdsc_abstract::BatchChunk`; see `BundleAttnParams::chunk_pages`).
     chunk_pages: Option<u32>,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
-    // ⛔ A CHUNK ATTENDS ONE REQUEST'S PAGES, so a body whose rows are REQUESTS cannot carry it. A
-    // prompt chunk's rows are one request's consecutive positions sharing ONE resident history — the
-    // same single page map the one-request decode gathers — so both take it.
-    if let Some(pages) = chunk_pages
-        && rows_are_requests
-    {
-        return Err(SuperDscError(format!(
-            "a split-KV chunk of {pages} page(s) was asked of a bake whose rows are requests — a chunk \
-             attends ONE request's pages, so a batched body cannot carry it"
-        )));
-    }
     // The fold's node set, taken once: a node is folded iff the attention-fold recognition named
     // it (which is also why the door's `scale_folded` is a fact about the program, not a
     // restatement of one of its values — see `BundleAttnParams::scale_folded`).

@@ -1812,6 +1812,9 @@ impl Executor {
             gathers: crate::wiring::GathersKv::of_launch_groups(
                 self.list(sel).iter().map(|o| o.kv.gathered),
             ),
+            // Same authority, same reason: whether this body re-launches a page fold is the
+            // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by).
+            folds: self.list(sel).iter().any(|o| o.kv.page_fold),
         })
     }
 
@@ -3612,6 +3615,7 @@ pub struct StepBody {
     sel: ListSel,
     swept: SweptCols,
     gathers: crate::wiring::GathersKv,
+    folds: bool,
 }
 
 impl StepBody {
@@ -3629,6 +3633,15 @@ impl StepBody {
     /// groups (`bundle::KvShifts::gathered`).
     pub const fn gathers(self) -> crate::wiring::GathersKv {
         self.gathers
+    }
+
+    /// ⭐ WHETHER **THIS** BODY IS A SPLIT-KV CHUNK — it gathers and carries no page fold, so it attends
+    /// exactly its own chunk in one launch and the host stages the CHUNK's index and mask, not the
+    /// fold's. On a decode batch this is what separates a chunk rung from the gathered fold below and
+    /// past it — both gather, and staging one's table for the other reads real block numbers from the
+    /// wrong layout.
+    pub const fn chunk(self) -> bool {
+        self.gathers.get() && !self.folds
     }
 }
 

@@ -1023,6 +1023,38 @@ impl Worker for SpyreWorker {
                 let swept = step.swept();
                 let gathers_kv = step.gathers();
                 let bake_gathers_kv = gathers_kv.get();
+                // ⭐⭐⭐ WHEN THE BODY IS A BATCH CHUNK, ITS LAW — read off the selected body's own swept
+                // extent (`J` pages per request) at this rung's width, the inverse of what the bake
+                // keyed the rung by (`ChunkScratch::swept_per_request`). Both the index table and the
+                // per-row mask below come from it, so neither can describe another chunk.
+                let batch_chunk: Option<scratchy_subtile::sdsc_abstract::BatchChunk> = if step
+                    .chunk()
+                {
+                    let law = scratchy_subtile::sdsc_abstract::ChunkScratch::of_batch(
+                        pool,
+                        seqs.get(),
+                        swept.get(),
+                    )
+                    .and_then(|c| {
+                        scratchy_subtile::sdsc_abstract::BatchChunk::of(
+                            c,
+                            seqs.get(),
+                            (nqh / (sh.kv_dim / sh.head_dim.max(1)).max(1)) as u32,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        werr(format!(
+                            "decode batch: the selected body is a split-KV chunk sweeping {} slot(s) \
+                             per request at {} row(s), which is no batch chunk this pool admits — the \
+                             bake and the host disagree about the chunk",
+                            swept.get(),
+                            seqs.get()
+                        ))
+                    })?;
+                    Some(law)
+                } else {
+                    None
+                };
                 // THE LIVE ROWS ONLY, built by the slot map's own walk — one token and one
                 // `BatchRow` per LIVE slot, in slot order, and nothing invented for the padding
                 // slots. `run_prefill_batch` widens this to the rung (`LaunchRows`), where a padding
@@ -1208,7 +1240,7 @@ impl Worker for SpyreWorker {
                 // block 0, a REAL address (row 0's first page), so a fallback would give the whole batch
                 // row 0's keys — fluent and wrong, which is the corruption this path exists to remove.
                 let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> =
-                    if bake_gathers_kv {
+                    if bake_gathers_kv && batch_chunk.is_none() {
                         let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
                         werr(
                             "decode batch: this bundle emits a GATHERED KV read, but a physical page \
@@ -1319,8 +1351,46 @@ impl Worker for SpyreWorker {
                     } else {
                         None
                     };
+                // ⭐⭐⭐ A BATCH CHUNK BODY's TABLE: every row's page map laid end to end at the chunk's
+                // `J` pages each — the same law its mask is staged by. The entry factor is the
+                // session's, exactly as for the fold's table above.
+                let kv_blocks = match batch_chunk {
+                    Some(bc) => {
+                        let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
+                            werr(
+                                "decode batch: this body gathers its chunk, but a physical page is not \
+                                 a whole number of STICK BLOCKS — no integer index can name a page \
+                                 boundary"
+                                    .to_string(),
+                            )
+                        })?;
+                        Some(
+                            scratchy_subtile::sdsc_abstract::batch_chunk_index_table(
+                                bc, &page_maps, per_page,
+                            )
+                            .ok_or_else(|| {
+                                werr(format!(
+                                    "decode batch: could not build the batch chunk's index table from \
+                                     {} installed page map(s) — not one map per row of the {}-row rung, \
+                                     a map past the chunk's {} page(s) per request, an empty map, or an \
+                                     entry past int32",
+                                    page_maps.len(),
+                                    bc.requests(),
+                                    bc.pages_per_request(),
+                                ))
+                            })?,
+                        )
+                    }
+                    None => kv_blocks,
+                };
+                // ⭐ THE PREFIX LAYOUT THE SELECTED BODY READS: the batch chunk's one row block, or the
+                // gathered fold's declared pass grid.
+                let prefix = match batch_chunk {
+                    Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
+                    None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
+                };
                 let rows = run_prefill_batch(
-                    Some((&rows_in, fold)),
+                    Some((&rows_in, prefix)),
                     kv_blocks.as_deref(),
                     &sh,
                     sess,

@@ -69,6 +69,12 @@ pub enum PrefixSource<'a, Valid: Fn(usize) -> bool> {
         fold: scratchy_subtile::sdsc_abstract::DeclaredFold,
         histories: &'a [scratchy_subtile::sdsc_abstract::KvHistory],
     },
+    /// A decode batch's split-KV chunk: ONE per-row block every row block reads, staged straight to
+    /// f16 by the batch chunk's own law.
+    Chunk {
+        chunk: scratchy_subtile::sdsc_abstract::BatchChunk,
+        histories: &'a [scratchy_subtile::sdsc_abstract::KvHistory],
+    },
 }
 
 /// A forward's ARGUMENTS — the data its kernels compute FROM.
@@ -151,6 +157,20 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                     histories,
                     inp.mask_neg,
                 ),
+            ),
+            PrefixSource::Chunk { chunk, histories } => Staged::F16(
+                scratchy_subtile::sdsc_abstract::batch_chunk_mask_f16(
+                    *chunk,
+                    histories,
+                    inp.mask_neg,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "batch chunk mask: {} histories for a {}-request chunk — one per request row",
+                        histories.len(),
+                        chunk.requests()
+                    )
+                })?,
             ),
         });
     }
