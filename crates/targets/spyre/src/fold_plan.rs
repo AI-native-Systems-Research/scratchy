@@ -299,6 +299,11 @@ impl std::ops::Add for Bytes {
 pub struct OpKv {
     /// `kv_request`: whose KV this op touches. 0 for every op of an unbatched bundle.
     pub request: u64,
+    /// `kv_slot_offset`: slots past the write cursor where this op's KV starts — a whole number of pages,
+    /// non-zero only for a later PAGE PART of a prefill window wider than one page. Added to the cursor
+    /// by [`op_slot_pos`], so the part's page is resolved from the block table like any other; a page the
+    /// request does not hold makes the launch skip the group ([`OpAim::UnheldPage`]).
+    pub slot_offset: u64,
     /// `kv_page_fold`: this group folds ONE page of resident prefix and is re-launched per page.
     pub page_fold: bool,
     /// `slot_write`: this op appends the new token's KV at the write cursor.
@@ -721,9 +726,14 @@ impl LaunchPages {
 }
 
 /// The write cursor an op uses — [`RequestSlot::resolve`], reached from an op instead of from a
-/// request index. One arithmetic, so the two cannot drift.
+/// request index, plus the op's own [`OpKv::slot_offset`]. One arithmetic, so the two cannot drift.
+///
+/// ⭐ THE OFFSET IS ADDED HERE, ONCE, and every term below reads the sum: a page part's write slot
+/// within its page (the offset is whole pages, so it is the cursor's own) and its page (`p` pages past
+/// the cursor's) both follow from the one position, exactly as a cursor that had advanced that far.
 pub fn op_slot_pos(op: &OpKv, s: &SessionKv, launch: SlotPos) -> SlotPos {
-    RequestSlot::resolve(s, RowIdx::from_launch_row(op.request), launch).pos()
+    let at = RequestSlot::resolve(s, RowIdx::from_launch_row(op.request), launch).pos();
+    SlotPos::of_launch(at.get() + op.slot_offset as i64)
 }
 
 /// Whether this op's group is the prefix fold — re-launched once per resident page.
@@ -1128,24 +1138,38 @@ pub fn slot_write_delta(op: &OpKv, pos: SlotPos) -> Bytes {
 /// ⛔ A GATHERED op takes NONE — the same law as [`fold_delta`]'s gathered arm. Its index entries are
 /// absolute stick-block numbers that already carry every page, so the write cursor's page base on top
 /// composes two bases and gathers another page's keys with a clean bake.
-pub fn nonfold_page_delta(op: &OpKv, s: &SessionKv, pos: SlotPos, caller_base: Bytes) -> Bytes {
+///
+/// ⭐ `None` IS "THIS PAGE PART HAS NO PAGE" — and only a page part can say it. An op with an
+/// [`OpKv::slot_offset`] addresses the page `pos` (cursor + offset) falls in, which is NOT the caller's
+/// base: that is the cursor's own page, i.e. part 0's, so falling back to it would write the part's rows
+/// over part 0's keys. A part whose page the row does not hold is a short last chunk's padding past the
+/// request's pages; nothing reads it, so the launch skips the group ([`OpAim::UnheldPage`]).
+pub fn nonfold_page_delta(
+    op: &OpKv,
+    s: &SessionKv,
+    pos: SlotPos,
+    caller_base: Bytes,
+) -> Option<Bytes> {
     if !s.paged || is_paged_fold(op, s) || op.gathered {
-        return Bytes(0);
+        return Some(Bytes(0));
+    }
+    let lp = if s.page_slots.get() != 0 {
+        pos.get() / s.page_slots.get()
+    } else {
+        0
+    };
+    let page = RowPage::of(s, RowIdx::from_launch_row(op.request), lp);
+    if op.slot_offset > 0 {
+        return page.map(|rp| page_base_bytes(s, rp));
     }
     if op.request > 0 {
-        let lp = if s.page_slots.get() != 0 {
-            pos.get() / s.page_slots.get()
-        } else {
-            0
-        };
         // ⭐ THE `None` ARM IS THE CALLER'S BASE, NOT ZERO — and that distinction is the whole bug this type
         // family exists to prevent. A tagged op asking for a page its row does not hold keeps the base the caller
         // computed (which is inside the pool and belongs to this launch); it does NOT get absolute page 0, which
         // is row 0's keys. The old code could not express the difference because both were `Bytes(0)`.
-        RowPage::of(s, RowIdx::from_launch_row(op.request), lp)
-            .map_or(caller_base, |rp| page_base_bytes(s, rp))
+        Some(page.map_or(caller_base, |rp| page_base_bytes(s, rp)))
     } else {
-        caller_base
+        Some(caller_base)
     }
 }
 
@@ -1177,7 +1201,31 @@ pub struct SegDeltas {
     pub intermediate: Bytes,
 }
 
-/// THE port's entry point: the segment shifts for op `op` on pass `rep`.
+/// ⭐ WHAT ONE LAUNCH OF AN OP DOES — aim at these shifts, or not launch at all.
+///
+/// A TYPED OUTCOME, not a sentinel shift: the only way an op cannot be aimed is a page part whose page
+/// the request does not hold, and the only right answer to that is to skip the group. A zero delta would
+/// mean "stay where the caller put you" — part 0's page — and write the part's rows over part 0's keys.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpAim {
+    /// Launch with these segment shifts.
+    At(SegDeltas),
+    /// ⛔ SKIP THIS GROUP: a page part ([`OpKv::slot_offset`]) whose page the request does not hold — a
+    /// short last chunk's padding rows past the request's pages, which nothing will read.
+    UnheldPage,
+}
+
+impl OpAim {
+    /// The shifts, when the op launches.
+    pub fn deltas(self) -> Option<SegDeltas> {
+        match self {
+            OpAim::At(d) => Some(d),
+            OpAim::UnheldPage => None,
+        }
+    }
+}
+
+/// THE port's entry point: the segment shifts for op `op` on pass `rep` — or [`OpAim::UnheldPage`].
 pub fn seg_deltas(
     op: &OpKv,
     s: &SessionKv,
@@ -1189,8 +1237,11 @@ pub fn seg_deltas(
     pages_per_request: UniformPages,
     launch: SlotPos,
     caller_page_base: Bytes,
-) -> SegDeltas {
+) -> OpAim {
     let pos = op_slot_pos(op, s, launch);
+    let Some(page) = nonfold_page_delta(op, s, pos, caller_page_base) else {
+        return OpAim::UnheldPage;
+    };
     let mut kv = Bytes(0);
     let mut mask = Bytes(0);
     // Only a fold pass moves within the intermediate segment, and only when the emitter baked its
@@ -1203,13 +1254,13 @@ pub fn seg_deltas(
         intermediate = intermediate + i;
     }
     kv = kv + slot_write_delta(op, pos);
-    kv = kv + nonfold_page_delta(op, s, pos, caller_page_base);
+    kv = kv + page;
     kv = kv + slab_delta(op, pos);
-    SegDeltas {
+    OpAim::At(SegDeltas {
         kv,
         mask,
         intermediate,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1334,6 +1385,12 @@ mod tests {
         assert_eq!(no_chunk_has_a_fused_twin(&[fold, fold, chunk]), Ok(()));
     }
     use super::*;
+
+    /// The shifts of an op that launches — every op of these fixtures but a page part with no page.
+    fn launched(aim: OpAim) -> SegDeltas {
+        aim.deltas()
+            .expect("this op holds its page, so it launches")
+    }
 
     /// A paged session with two requests holding distinct physical pages.
     fn sess() -> SessionKv {
@@ -1711,14 +1768,14 @@ mod tests {
             },
             OpKv::default(),
         ] {
-            let d = seg_deltas(
+            let d = launched(seg_deltas(
                 &op,
                 &s,
                 1,
                 UniformPages::of(&s).expect("fixture rows agree"),
                 SlotPos::of_launch(300),
                 Bytes(0),
-            );
+            ));
             assert_eq!(d.intermediate, Bytes(0), "non-fold op {op:?}");
         }
     }
@@ -1863,7 +1920,7 @@ mod tests {
         // position 300 is page 1 of request 1 => physical 10.
         assert_eq!(
             nonfold_page_delta(&tagged, &s, SlotPos::of_launch(300), Bytes(4242)),
-            Bytes(10000)
+            Some(Bytes(10000))
         );
         let untagged = OpKv {
             request: 0,
@@ -1871,7 +1928,7 @@ mod tests {
         };
         assert_eq!(
             nonfold_page_delta(&untagged, &s, SlotPos::of_launch(300), Bytes(4242)),
-            Bytes(4242)
+            Some(Bytes(4242))
         );
         let fold = OpKv {
             request: 1,
@@ -1880,7 +1937,7 @@ mod tests {
         };
         assert_eq!(
             nonfold_page_delta(&fold, &s, SlotPos::of_launch(300), Bytes(4242)),
-            Bytes(0),
+            Some(Bytes(0)),
             "a fold op takes its page from the fold pass, not from here"
         );
         let gathered = OpKv {
@@ -1889,8 +1946,124 @@ mod tests {
         };
         assert_eq!(
             nonfold_page_delta(&gathered, &s, SlotPos::of_launch(300), Bytes(4242)),
-            Bytes(0),
+            Some(Bytes(0)),
             "a gathered op's entries are absolute — the write page's base on top lands in neither"
+        );
+    }
+
+    /// ⭐ A PAGE PART RESOLVES THE PAGE ITS OFFSET LANDS IN — never the caller's base, which is part 0's.
+    ///
+    /// A 512-row prompt window's cache write is two parts, offsets 0 and 256. Launched at cursor 256 (page
+    /// 1 of a request holding `[3, 7, 9]`), part 0 keeps the caller's base and part 1 lands on page 2 —
+    /// physical 9. Both write at slot 0 of their page: the offset is whole pages.
+    #[test]
+    fn a_page_part_resolves_its_own_page_through_the_block_table() {
+        let mut s = SessionKv {
+            paged: true,
+            page_slots: PageSlots::per_page(256),
+            page_stride_bytes: Bytes(1000),
+            ..Default::default()
+        };
+        s.install_row(
+            RowIdx::from_launch_row(0),
+            SlotPos::of_launch(256),
+            &[3, 7, 9],
+        );
+        let per = UniformPages::of(&s).expect("one row");
+        let part = |p: u64| OpKv {
+            slot_write: true,
+            page_slots: 256,
+            slot_stride_bytes: 128,
+            slot_offset: p * 256,
+            ..Default::default()
+        };
+        let caller = Bytes(7000); // the launch's own page: page 1, physical 7
+        let at = |p| {
+            launched(seg_deltas(
+                &part(p),
+                &s,
+                0,
+                per,
+                SlotPos::of_launch(256),
+                caller,
+            ))
+        };
+        assert_eq!(
+            at(0).kv,
+            Bytes(7000),
+            "part 0 keeps the caller's page, slot 0"
+        );
+        assert_eq!(
+            at(1).kv,
+            Bytes(9000),
+            "part 1 is page 2 = physical 9, slot 0"
+        );
+        assert_eq!(
+            op_slot_pos(&part(1), &s, SlotPos::of_launch(256)),
+            SlotPos::of_launch(512),
+            "the offset rides the cursor"
+        );
+        // The Kᵀ re-transpose's part is no slot write but takes the same page.
+        let kt = OpKv {
+            slot_offset: 256,
+            ..Default::default()
+        };
+        assert_eq!(
+            launched(seg_deltas(&kt, &s, 0, per, SlotPos::of_launch(256), caller)).kv,
+            Bytes(9000)
+        );
+    }
+
+    /// ⛔ A PAGE PART WHOSE PAGE THE REQUEST DOES NOT HOLD IS SKIPPED — a typed outcome, not part 0's page.
+    ///
+    /// A short last chunk at cursor 512 of a request holding three pages: part 1 is padding on page 3,
+    /// which the request does not hold. Aiming it at the caller's base would write 256 padding rows over
+    /// part 0's real keys; a zero delta would mean the same. The only answer is not to launch.
+    #[test]
+    fn a_page_part_past_the_requests_pages_is_skipped_not_aimed_at_part_0() {
+        let mut s = SessionKv {
+            paged: true,
+            page_slots: PageSlots::per_page(256),
+            page_stride_bytes: Bytes(1000),
+            ..Default::default()
+        };
+        s.install_row(
+            RowIdx::from_launch_row(0),
+            SlotPos::of_launch(512),
+            &[3, 7, 9],
+        );
+        let per = UniformPages::of(&s).expect("one row");
+        let part1 = OpKv {
+            slot_write: true,
+            page_slots: 256,
+            slot_stride_bytes: 128,
+            slot_offset: 256,
+            ..Default::default()
+        };
+        assert_eq!(
+            seg_deltas(&part1, &s, 0, per, SlotPos::of_launch(512), Bytes(9000)),
+            OpAim::UnheldPage
+        );
+        assert_eq!(
+            nonfold_page_delta(&part1, &s, SlotPos::of_launch(768), Bytes(9000)),
+            None
+        );
+        // Part 0 of the same chunk still launches, on the caller's page.
+        let part0 = OpKv {
+            slot_offset: 0,
+            ..part1
+        };
+        assert_eq!(
+            launched(seg_deltas(
+                &part0,
+                &s,
+                0,
+                per,
+                SlotPos::of_launch(512),
+                Bytes(9000)
+            ))
+            .kv,
+            Bytes(9000)
         );
     }
 
@@ -1931,18 +2104,19 @@ mod tests {
         // And the composite the shim actually calls agrees. Stated as its parts rather than a literal,
         // because a non-fold op also carries its request's page base and hard-coding the sum hides
         // which term moved: the point is that the slab term is request 1's slab 4, not the launch's 1.
-        let d = seg_deltas(
+        let d = launched(seg_deltas(
             &op,
             &s,
             0,
             UniformPages::of(&s).expect("fixture rows agree"),
             SlotPos::of_launch(100),
             Bytes(0),
-        );
+        ));
         let own = op_slot_pos(&op, &s, SlotPos::of_launch(100));
         assert_eq!(
             d.kv,
-            slab_delta(&op, own) + nonfold_page_delta(&op, &s, own, Bytes(0)),
+            slab_delta(&op, own)
+                + nonfold_page_delta(&op, &s, own, Bytes(0)).expect("no page part, so a page"),
             "the launch's slab would contribute 8192 here instead of {}",
             4 * 8192
         );
@@ -1968,14 +2142,14 @@ mod tests {
             fold_requests: 1,
             ..s.clone()
         };
-        let d = seg_deltas(
+        let d = launched(seg_deltas(
             &cachewr,
             &solo,
             0,
             UniformPages::of(&s).expect("fixture rows agree"),
             SlotPos::of_launch(300),
             Bytes(5000),
-        );
+        ));
         assert_eq!(d.kv, Bytes(44 * 128 + 5000));
         assert_eq!(d.mask, Bytes(0));
 
@@ -1984,14 +2158,14 @@ mod tests {
             request: 1,
             ..cachewr
         };
-        let d = seg_deltas(
+        let d = launched(seg_deltas(
             &batched,
             &s,
             0,
             UniformPages::of(&s).expect("fixture rows agree"),
             SlotPos::of_launch(0),
             Bytes(5000),
-        );
+        ));
         assert_eq!(
             d.kv,
             Bytes(44 * 128 + 10000),
@@ -2026,7 +2200,14 @@ mod tests {
             slot_stride_bytes: 128,
             ..Default::default()
         };
-        let d = seg_deltas(&w, &s, 0, per, SlotPos::of_launch(0), Bytes(5000));
+        let d = launched(seg_deltas(
+            &w,
+            &s,
+            0,
+            per,
+            SlotPos::of_launch(0),
+            Bytes(5000),
+        ));
         assert_eq!(d.kv, Bytes(44 * 128 + 10000));
         assert_eq!(d.mask, Bytes(0));
 
@@ -2036,7 +2217,7 @@ mod tests {
             ..Default::default()
         };
         let per2 = UniformPages::sweeping(2, &s).expect("a two-page sweep fits");
-        let d = seg_deltas(&f, &s, 1, per2, SlotPos::of_launch(0), Bytes(0));
+        let d = launched(seg_deltas(&f, &s, 1, per2, SlotPos::of_launch(0), Bytes(0)));
         assert_eq!(d.kv, Bytes(6000));
         assert_eq!(d.mask, Bytes(256 * 2));
 
@@ -2073,7 +2254,7 @@ mod tests {
             slot_stride_bytes: 128,
             ..Default::default()
         };
-        let d = seg_deltas(&w, &s, 0, per, SlotPos::of_launch(0), Bytes(0));
+        let d = launched(seg_deltas(&w, &s, 0, per, SlotPos::of_launch(0), Bytes(0)));
         // Position 900 is slot 132 of page 3; request 3 holds ONE page, so page 3 is outside its map
         // and falls back to the pool base, leaving just the slot term.
         assert_eq!(d.kv, Bytes(132 * 128));

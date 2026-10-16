@@ -322,6 +322,11 @@ pub struct KvShifts {
     pub page_slots: u32,
     /// Which request's KV this group addresses (batched decode). `0` when unbatched.
     pub request: u32,
+    /// Slots past the launch's write cursor where this group's KV starts — a whole number of pages,
+    /// non-zero only for a later PAGE PART of a prefill window wider than one page. The runtime resolves
+    /// the group's page at `cursor + slot_offset` through the request's block table, and SKIPS the group
+    /// when the request holds no such page. `0` for every other group.
+    pub slot_offset: u32,
     /// This is the group the runtime re-launches once per page of resident KV.
     pub page_fold: bool,
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per

@@ -10079,16 +10079,18 @@ fn launch_tokens(
         slab_stride_bytes,
         page_slots,
         request,
+        slot_offset,
         page_fold,
         batched_requests,
         gathered,
         fold_rows,
     } = kv;
-    let [slot, slab, slots, req] = [
+    let [slot, slab, slots, req, slot_off] = [
         *slot_stride_bytes,
         *slab_stride_bytes,
         *page_slots,
         *request,
+        *slot_offset,
     ]
     .map(proc_macro2::Literal::u32_unsuffixed);
     let fold_rows = match fold_rows {
@@ -10121,6 +10123,7 @@ fn launch_tokens(
                 slab_stride_bytes: #slab,
                 page_slots: #slots,
                 request: #req,
+                slot_offset: #slot_off,
                 page_fold: #page_fold,
                 batched_requests: #batched_requests,
                 gathered: #gathered,

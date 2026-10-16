@@ -423,6 +423,7 @@ impl OpProg {
             addr: None,
             kv: OpKv {
                 request: kv.request as u64,
+                slot_offset: kv.slot_offset as u64,
                 page_fold: kv.page_fold,
                 slot_write: kv.slot_write(),
                 page_slots: kv.page_slots as u64,
@@ -2454,7 +2455,7 @@ impl Executor {
                          admit a uniform {n_fold_pages}-page sweep"
                     );
                 };
-                let delta = fold_plan::seg_deltas(
+                let aim = fold_plan::seg_deltas(
                     &op.kv,
                     &self.fold,
                     rep,
@@ -2462,6 +2463,12 @@ impl Executor {
                     SlotPos::of_launch(slot_pos.0),
                     kv_page_base,
                 );
+                // ⛔ A PAGE PART WITH NO PAGE DOES NOT LAUNCH — a short last chunk's padding past the
+                // request's pages. Its rows are never read, and the only base left to aim it at is the
+                // cursor's own page, which is part 0's keys.
+                let Some(delta) = aim.deltas() else {
+                    continue;
+                };
                 off[SEG_KV.get()] += delta.kv.0;
                 // The mask has its own segment precisely so a fold can shift it without disturbing
                 // the running softmax state or any other activation.
@@ -2535,8 +2542,22 @@ impl Executor {
                 // ordering them against EACH OTHER buys nothing; only the last has to settle before
                 // the Kᵀ restickify and the next layer read what they wrote. Drop the barrier ONLY
                 // between consecutive slot-writes; STRICT_ORDERING still holds the stream in order.
-                let next_is_slot_write =
-                    op.kv.slot_write && ops.get(oi + 1).is_some_and(|n| n.kv.slot_write);
+                // ⛔ AND ONLY WHEN THE NEXT ONE LAUNCHES. A page part skipped for want of a page leaves
+                // THIS write as the last before the readers, so it must settle like any other last one.
+                let next_is_slot_write = op.kv.slot_write
+                    && ops.get(oi + 1).is_some_and(|n| {
+                        n.kv.slot_write
+                            && fold_plan::seg_deltas(
+                                &n.kv,
+                                &self.fold,
+                                0,
+                                per,
+                                SlotPos::of_launch(slot_pos.0),
+                                kv_page_base,
+                            )
+                            .deltas()
+                            .is_some()
+                    });
                 let barrier = !next_is_slot_write;
 
                 // Match torch-spyre's JobPlanStepCompute EXACTLY: kernel_name="" (NOT the mlir
