@@ -152,8 +152,21 @@ pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
     // The ≤1/8 padding test keeps this from firing where it would BACKFIRE: k_proj/v_proj are 8
     // sticks (n=512), and padding those to 32 would quadruple their weight to buy 4× cores — a wash
     // at best. Only a wide, awkward width (lm_head) passes.
+    //
+    // ⭐ AND ONLY WHERE THE UNPADDED SPLIT LEAVES MOST OF THE MACHINE IDLE. The pad is weight bytes, and
+    // at decode every weight byte is streamed every step: it buys cores, and cores are only worth bytes
+    // while the gemm strands on a fraction of the machine. The lm_head's prime 769 sticks split onto ONE
+    // core (8 after the floor pad) — 4% more bytes for 4× the cores. granite-3.1-8b's gate/up (12800 =
+    // 200 sticks) already split onto 25 of 32: the pad was +12% of the model's largest weights, streamed
+    // every token, to buy the last 7 cores. Below half the machine the pad pays; at or above it the
+    // unpadded split stands.
+    //
+    // MEASURED, and the bytes were the smaller half of it: a keyed GROUP_TIME split of one 10k-context
+    // 8b decode step put the whole 49 ms the pad cost in the MLP group. 224 sticks on 32 cores is 7
+    // sticks a core — a prime — so each of gate and up was time-tiled into 7 one-stick trips, where
+    // 200 sticks on 25 cores is 8 a core and runs 4 two-stick trips.
     let full = sticks.next_multiple_of(MAX_CORES);
-    if (full - sticks) * 8 <= sticks {
+    if cur * 2 < MAX_CORES && (full - sticks) * 8 <= sticks {
         return full * FP16_ELEMS_PER_STICK;
     }
     if cur >= UTIL_FLOOR_CORES {
