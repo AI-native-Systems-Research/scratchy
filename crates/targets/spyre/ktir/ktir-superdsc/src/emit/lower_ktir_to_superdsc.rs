@@ -3416,12 +3416,14 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // than `PAGES_MAX` pages, or a footprint past `u32`. A chunk is a gathered read, so it demands the
     // same `gathers_kv` the placement reserved the index under: a chunk without it would gather through
     // an index no placement holds.
+    // A batch's rows are requests over their own runs of the chunk (`sdsc_abstract::BatchChunk`), which
+    // `assemble_attn` mints from this chunk and the width — so the row kind decides the mask's READ, not
+    // whether a chunk is admissible.
     let chunk: Option<crate::sdsc_abstract::ChunkScratch> = chunk_pages.map(|pages| {
         assert!(
-            gathers_kv && !rows_are_requests,
-            "attention {_name}: a split-KV chunk of {pages} page(s) is a one-request gathered read — it \
-             needs `gathers_kv` (the index placement) and a single-row body; gathers_kv={gathers_kv}, \
-             rows_are_requests={rows_are_requests}"
+            gathers_kv,
+            "attention {_name}: a split-KV chunk of {pages} page(s) is a gathered read — it needs \
+             `gathers_kv` (the index placement); rows_are_requests={rows_are_requests}"
         );
         let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
         crate::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).unwrap_or_else(|| {

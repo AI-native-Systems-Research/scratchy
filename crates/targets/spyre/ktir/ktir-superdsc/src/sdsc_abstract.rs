@@ -7130,6 +7130,245 @@ pub fn chunk_gather_index_table(
     keys.chain(values).collect()
 }
 
+/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK OVER A DECODE BATCH — one [`ChunkScratch`] holding EVERY request's pages
+/// end to end, and the per-row mask that keeps each request on its own keys.
+///
+/// The batched bundle frames its rows head-major (`h·B + r`), so a kv head's `gqa·B` query rows are
+/// ONE contiguous operand of the token stream — the same operand a prompt chunk's `gqa·mq` rows are.
+/// A chunk whose pages are every request's pages laid end to end (request `r` at chunk pages
+/// `[r·J, (r+1)·J)`, `J` = [`Self::pages_per_request`]) therefore runs the solo chunk's ops unchanged at
+/// `mq = B`: each row block scores every request's keys, and the mask silences the cross-request
+/// blocks — a row is valid only on its own request's slots, and only on the slots that request holds.
+///
+/// ⛔ WHY NOT ONE CHUNK PER REQUEST. A request's `gqa` rows are STRIDED by `B` in the head-major token
+/// stream, and a row slice of a taller multi-stick buffer is incoherent ([`ChunkRowBlocks`]), so the
+/// per-request form needs a row permute in and out of every layer, or a `y`-batched multi-stick
+/// matmul — the measured-incoherent shape. This form costs `B×` the score-side work of `B` separate
+/// chunks and needs neither.
+///
+/// ⛔⛔ ONE LAW, TWO READERS. The emitter adds the mask in the score matmul's epilogue as a CLONE of the
+/// score block's own output operand — per row, at offset 0 in every row block — so the device reads
+/// mask element `(row, slot)` at the score block's own stick-blocked offset. The host stages it with
+/// [`batch_chunk_mask_f16`], which writes through [`Self::mask_elem`]; its rows are the row block's
+/// rows ([`ChunkRowBlocks::rows`]) and row `i` belongs to request `i % B` ([`Self::row_request`]) in
+/// both block forms. Nothing else describes these bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BatchChunk {
+    chunk: ChunkScratch,
+    requests: u32,
+    blocks: ChunkRowBlocks,
+}
+
+impl BatchChunk {
+    /// ⭐ THE PAGES ONE REQUEST HOLDS IN A BATCH RUNG, ascending — the batch's chunk ladder is
+    /// `requests × J` for each `J` here that fits [`ChunkScratch::PAGES_MAX`].
+    ///
+    /// ⛔ IT STARTS AT TWO, for the solo ladder's reason ([`ChunkScratch::LADDER`]): within one page the
+    /// per-page body and its sweep rungs bound the sweep at a stick's granularity and gather nothing.
+    /// ⭐ AND IT STEPS BY ONE PAGE TO 8. Every padded page is gathered and attended `B` times over (once
+    /// per request's rows), so the step is the waste: the canonical batched cell (conc-8, ~1.05k-token
+    /// prompts, 256 out) crosses 5 → 6 pages per request, which a power-of-two step would round to 8.
+    pub const PAGES_PER_REQUEST: [u32; 15] = [2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32];
+
+    /// THE ONE DOOR. `None` unless the chunk is a whole number of pages per request (at least one) —
+    /// the layout [`Self::page_list`] and [`Self::slot_of`] read.
+    pub const fn of(chunk: ChunkScratch, requests: u32, gqa: u32) -> Option<BatchChunk> {
+        if requests == 0 || gqa == 0 || !chunk.pages().is_multiple_of(requests) {
+            return None;
+        }
+        if chunk.pages() < requests {
+            return None;
+        }
+        Some(BatchChunk {
+            chunk,
+            requests,
+            blocks: chunk.row_blocks(gqa, requests),
+        })
+    }
+
+    pub const fn chunk(self) -> ChunkScratch {
+        self.chunk
+    }
+
+    /// The batch width — the rung's request rows, padding included.
+    pub const fn requests(self) -> u32 {
+        self.requests
+    }
+
+    /// `J`: the pages request `r` occupies, at chunk pages `[r·J, (r+1)·J)`.
+    pub const fn pages_per_request(self) -> u32 {
+        self.chunk.pages() / self.requests
+    }
+
+    /// The slots one request's run of the chunk spans — the extent the body selector compares the
+    /// batch's live context against ([`ChunkScratch::swept_per_request`]).
+    pub const fn slots_per_request(self) -> u32 {
+        self.pages_per_request() * PagedKvPool::PAGE_SLOTS as u32
+    }
+
+    /// Rows of the ONE mask block every row block reads — a row block's own rows.
+    pub const fn mask_rows(self) -> u32 {
+        self.blocks.rows()
+    }
+
+    /// Columns of the mask block — every slot of the chunk.
+    pub const fn mask_cols(self) -> u32 {
+        self.chunk.slots()
+    }
+
+    /// Elements of the mask block.
+    pub const fn mask_elems(self) -> usize {
+        self.mask_rows() as usize * self.mask_cols() as usize
+    }
+
+    /// WHICH REQUEST row `row` of a row block is — `row % B` in both block forms: a kv head's block
+    /// is its group's heads stacked, each head's `B` request rows contiguous (`h·B + r`), and a query
+    /// head's block is that one head's `B` rows.
+    pub const fn row_request(self, row: u32) -> u32 {
+        row % self.requests
+    }
+
+    /// The `(request, request-local slot)` chunk slot `slot` holds. `None` past the chunk.
+    pub const fn slot_of(self, slot: u32) -> Option<(u32, u32)> {
+        if slot >= self.chunk.slots() {
+            return None;
+        }
+        let per = self.slots_per_request();
+        Some((slot / per, slot % per))
+    }
+
+    /// ⭐ THE MASK BLOCK's ELEMENT OFFSET of `(row, slot)` — RowBlocked `[mask_rows, mask_cols]`, the
+    /// score block's own arrangement (`(c/64)·(rows·64) + r·64 + c%64`), because the epilogue operand is
+    /// a clone of the score output. `None` outside the block.
+    pub const fn mask_elem(self, row: u32, slot: u32) -> Option<usize> {
+        if row >= self.mask_rows() || slot >= self.mask_cols() {
+            return None;
+        }
+        let (stick, rows) = (POOL_STICK as usize, self.mask_rows() as usize);
+        let (r, c) = (row as usize, slot as usize);
+        Some((c / stick) * (rows * stick) + r * stick + c % stick)
+    }
+
+    /// ⭐ THE CHUNK's PAGE LIST — every request's own map in LOGICAL order, laid end to end at
+    /// `J` pages each: a map shorter than `J` repeats ITS OWN last page (never another request's, and the
+    /// mask silences the repeat), a map longer than `J` is a body the selector should not have chosen
+    /// and is refused. `maps` is one map per request row, padding rows included, in row order.
+    pub fn page_list(self, maps: &[Vec<i64>]) -> Option<Vec<i64>> {
+        if maps.len() != self.requests as usize {
+            return None;
+        }
+        let j = self.pages_per_request() as usize;
+        let mut pages = Vec::with_capacity(self.chunk.pages() as usize);
+        for m in maps {
+            let last = *m.last()?;
+            if m.len() > j {
+                return None;
+            }
+            pages.extend((0..j).map(|p| m.get(p).copied().unwrap_or(last)));
+        }
+        Some(pages)
+    }
+}
+
+impl ChunkScratch {
+    /// ⭐ THE CHUNK LADDER A BODY OF `requests` REQUEST ROWS BAKES, in chunk pages, ascending — the
+    /// one-request [`Self::LADDER`] at one request (a prompt chunk's rows are ONE request), and
+    /// `requests × J` for every `J` of [`BatchChunk::PAGES_PER_REQUEST`] within [`Self::PAGES_MAX`]
+    /// above it. Only widths [`Self::of_chunk`] admits at this pool.
+    pub fn ladder_for(pool: PagedKvPool, requests: u32) -> Vec<u32> {
+        let widths: Vec<u32> = if requests <= 1 {
+            Self::LADDER.to_vec()
+        } else {
+            BatchChunk::PAGES_PER_REQUEST
+                .iter()
+                .map(|&j| j * requests)
+                .filter(|&t| t <= Self::PAGES_MAX)
+                .collect()
+        };
+        widths
+            .into_iter()
+            .filter(|&t| Self::of_chunk(pool, t).is_some())
+            .collect()
+    }
+
+    /// ⭐ THE SLOTS ONE REQUEST OF THIS CHUNK SPANS when the body's rows are `requests` requests — the
+    /// rung's swept extent, which the body selector compares the batch's live context against. The
+    /// whole chunk at one request; `J · PAGE_SLOTS` for a batch ([`BatchChunk::slots_per_request`]).
+    pub const fn swept_per_request(self, requests: u32) -> u32 {
+        if requests <= 1 {
+            self.slots()
+        } else {
+            (self.pages / requests) * PagedKvPool::PAGE_SLOTS as u32
+        }
+    }
+
+    /// ⭐ THE BATCH CHUNK A HOST RUNS for a selected body whose swept extent is `swept` slots per
+    /// request at `requests` rows — [`Self::swept_per_request`] inverted, so the chunk the host stages
+    /// for is the chunk the emitter baked. `None` when `swept` is not a whole number of pages, or the
+    /// product is not a chunk this pool admits.
+    pub const fn of_batch(pool: PagedKvPool, requests: u32, swept: u32) -> Option<ChunkScratch> {
+        let per = PagedKvPool::PAGE_SLOTS as u32;
+        if requests == 0 || !swept.is_multiple_of(per) {
+            return None;
+        }
+        Self::of_chunk(pool, (swept / per) * requests)
+    }
+}
+
+/// ⭐⭐⭐ WHAT A DECODE BATCH's PREFIX MASK IS LAID OUT FOR — decided by the BODY the step runs, so it is
+/// one value carrying that body's own geometry: the gathered per-page fold's declared pass grid, or the
+/// batch chunk's law. Staging one form for the other body is silent (an additive byte the body reads
+/// from the other layout is a validity it was never given), so the host cannot hold the geometry of
+/// one and stage the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchPrefix {
+    /// One block per declared fold pass — [`decode_batch_prefix_mask_f16`].
+    Fold(DeclaredFold),
+    /// One row block every row block reads — [`batch_chunk_mask_f16`].
+    Chunk(BatchChunk),
+}
+
+/// ⭐⭐⭐ THE BATCH CHUNK's PER-ROW MASK, in the device's own f16 — one [`BatchChunk::mask_rows`] ×
+/// [`BatchChunk::mask_cols`] block, read by every row block at offset 0.
+///
+/// Row `i` is request `i % B`'s; it is VALID (0) exactly at the chunk slots of that request's own run
+/// whose request-local slot its history holds, and `mask_neg` everywhere else — every other request's
+/// run, the request's own padded tail, and the hole a shared write slot leaves. `hists` is one history
+/// per request row (padding rows carry live 0's, from the launch's own rows) in row order. `None` on a
+/// history count that is not the batch width.
+pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) -> Option<Vec<u8>> {
+    if hists.len() != bc.requests() as usize {
+        return None;
+    }
+    let neg = half::f16::from_f32(mask_neg).to_le_bytes();
+    let zero = half::f16::from_f32(0.0).to_le_bytes();
+    let mut m: Vec<u8> = neg.repeat(bc.mask_elems());
+    let per = bc.slots_per_request();
+    for row in 0..bc.mask_rows() {
+        let r = bc.row_request(row);
+        let hist = &hists[r as usize];
+        for run in hist.runs() {
+            let (lo, hi) = (run.start().get().min(per), run.end().get().min(per));
+            for local in lo..hi {
+                let e = bc.mask_elem(row, r * per + local)?;
+                m[e * 2..e * 2 + 2].copy_from_slice(&zero);
+            }
+        }
+    }
+    Some(m)
+}
+
+/// ⭐⭐⭐ THE BATCH CHUNK's INDEX TABLE — [`chunk_gather_index_table`] over [`BatchChunk::page_list`],
+/// so the entries the copies read and the runs the mask validates are one layout. `maps` is one page
+/// map per request row (padding rows carry live 0's), in row order.
+pub fn batch_chunk_index_table(
+    bc: BatchChunk,
+    maps: &[Vec<i64>],
+    per_page: EntriesPerPage,
+) -> Option<Vec<GatherEntry>> {
+    chunk_gather_index_table(bc.chunk(), &bc.page_list(maps)?, per_page)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GatherRows {
     nkvh: u32,

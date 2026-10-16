@@ -10190,15 +10190,43 @@ fn dump_wavefront_mega(
                     // ladder with a chunk in it cannot prove a fallback and its bake panics:
                     // granite-8b under `spyre-emu` did, the moment hd=128 was admitted. Off-card the
                     // body stays the per-page fold, as it was.
-                    let chunk_ceiling: Option<u32> =
-                        if cfg!(feature = "spyre-hw") && (one_request || prompt_chunk_prefix) {
-                            scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk(
-                                &krg,
-                                Some(ktir_superdsc::sdsc_abstract::ChunkScratch::PAGES_MAX),
+                    //
+                    // ⭐⭐⭐ AND A DECODE BATCH RUNG ATTENDS EVERY REQUEST's CONTEXT IN ONE PASS TOO: one
+                    // chunk holding the requests' pages end to end, each row masked to its own run
+                    // (`BatchChunk`). Its ladder is `B × J` pages (`ChunkScratch::ladder_for`), so its
+                    // ceiling is the widest `B × J` within `PAGES_MAX` — and past it the per-page fold
+                    // keeps serving, as the fallback proof below requires.
+                    let batch_rows = !is_prefill && decode_rows > 1 && seq_sym.is_none();
+                    // The requests a chunk's rows are: the batch width, or ONE for a body whose rows
+                    // share a history (the one-request decode, a prompt chunk's positions).
+                    let chunk_requests = if batch_rows { decode_rows } else { 1 };
+                    let chunk_ladder: Vec<u32> = if cfg!(feature = "spyre-hw")
+                        && (one_request || prompt_chunk_prefix || batch_rows)
+                    {
+                        scratchy_target_spyre::lower_subtile_tape_to_ktir::admitted_chunk_ladder(
+                            &krg,
+                            chunk_requests,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let chunk_ceiling: Option<u32> = chunk_ladder.last().copied();
+                    // A chunk rung's swept extent PER REQUEST — what `select_body` compares the live
+                    // context against. The whole chunk at one request; `J` pages for a batch.
+                    let chunk_swept = |pages: u32| -> u32 {
+                        scratchy_target_spyre::lower_subtile_tape_to_ktir::chunk_swept_per_request(
+                            &krg,
+                            pages,
+                            chunk_requests,
+                        )
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "[spyre-superdsc] {base}: a {pages}-page chunk rung at \
+                                 {chunk_requests} request row(s) is not a chunk this graph's attention \
+                                 admits — the ladder named a rung `admitted_chunk_ladder` did not offer"
                             )
-                        } else {
-                            None
-                        };
+                        })
+                    };
                     match ValidatedGraph::new(&krg) {
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
@@ -10390,14 +10418,10 @@ fn dump_wavefront_mega(
                                                 superdsc::bundle::LadderRung<'static>,
                                             > = vec![superdsc::bundle::LadderRung {
                                                 // A chunk body sweeps its whole chunk, so its rung
-                                                // is the chunk's slots — what `select_body` compares
-                                                // the live context against.
+                                                // is the chunk's slots PER REQUEST — what
+                                                // `select_body` compares the live context against.
                                                 active_cap: superdsc::bundle::SweptCols::new(
-                                                    chunk_ceiling.map_or(cap, |pages| {
-                                                        pages
-                                                            * ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS
-                                                                as u32
-                                                    }),
+                                                    chunk_ceiling.map_or(cap, chunk_swept),
                                                 ),
                                                 body: sib(Some(bfp.clone())),
                                                 body_fused: sib(bod_fused.clone()),
@@ -10438,14 +10462,16 @@ fn dump_wavefront_mega(
                                             }
                                             .into_iter()
                                             .map(|r| (r, None, r.get()));
-                                            // ⭐ PAST ONE PAGE, THE ONE-REQUEST LADDER IS CHUNK WIDTHS:
-                                            // every chunk rung lowers the program at its one-page sweep
-                                            // (`FULL`) and differs only in the chunk it attends, so its
-                                            // swept extent is `pages * PAGE_SLOTS`. Within one page it
-                                            // keeps the sweep rungs AND the per-page body at the page
-                                            // itself (`FULL`, no chunk, `cap` slots) — the canonical
+                                            // ⭐ PAST ONE PAGE, THE LADDER IS CHUNK WIDTHS: every chunk
+                                            // rung lowers the program at its one-page sweep (`FULL`) and
+                                            // differs only in the chunk it attends, so its swept extent
+                                            // is the chunk's slots per request (`chunk_swept`). Within one
+                                            // page it keeps the sweep rungs AND the per-page body at the
+                                            // page itself (`FULL`, no chunk, `cap` slots) — the canonical
                                             // short chat's bodies, byte for byte (`ChunkScratch::LADDER`
-                                            // says why the chunk starts at two pages).
+                                            // says why the chunk starts at two pages) — and on a batch
+                                            // rung that per-page body is the FOLD every context past the
+                                            // widest chunk falls back to.
                                             let ladder: Vec<(
                                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
                                                 Option<u32>,
@@ -10458,7 +10484,7 @@ fn dump_wavefront_mega(
                                                         cap,
                                                     )))
                                                     .chain(
-                                                        ktir_superdsc::sdsc_abstract::ChunkScratch::LADDER
+                                                        chunk_ladder
                                                             .iter()
                                                             .copied()
                                                             .filter(|&pages| Some(pages) != chunk_ceiling)
@@ -10466,9 +10492,7 @@ fn dump_wavefront_mega(
                                                                 (
                                                                     scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                                                     Some(pages),
-                                                                    pages
-                                                                        * ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS
-                                                                            as u32,
+                                                                    chunk_swept(pages),
                                                                 )
                                                             }),
                                                     )

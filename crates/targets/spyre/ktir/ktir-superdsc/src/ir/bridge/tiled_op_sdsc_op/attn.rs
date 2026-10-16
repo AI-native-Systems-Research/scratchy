@@ -1742,6 +1742,22 @@ struct ChunkBufs {
     cexp: String,
 }
 
+/// ⭐⭐⭐ WHOSE HISTORY A CHUNK's ROWS ATTEND — the one fact that separates the batch chunk from the solo
+/// and prompt chunks, and it decides exactly two things: how the prefix validity is read, and whether
+/// the value leg's contraction is divided across the cores.
+#[derive(Clone, Copy)]
+enum ChunkHistory {
+    /// Every row shares ONE resident history — the one-request decode (one row per head) and a prompt
+    /// chunk's consecutive positions. The validity is one broadcast row over the chunk's logical slots.
+    Shared,
+    /// Every row is a separate REQUEST, over its own run of the chunk's pages ([`BatchChunk`]). The
+    /// validity is per row: ONE `[rows, slots]` block, read by every row block at offset 0, in the score
+    /// block's own arrangement.
+    ///
+    /// [`BatchChunk`]: crate::sdsc_abstract::BatchChunk
+    Requests(crate::sdsc_abstract::BatchChunk),
+}
+
 /// What one layer's split-KV chunk attends with: its geometry, the pool planes and index it gathers
 /// through, the query and mask it scores, and the buffers it writes.
 struct ChunkAttn<'a> {
@@ -1749,9 +1765,11 @@ struct ChunkAttn<'a> {
     nqh: u32,
     hd: u32,
     gqa: u32,
-    // Query rows per head: 1 at decode, the prompt chunk's width at prefill.
+    // Query rows per head: 1 at decode, the prompt chunk's width at prefill, the batch width for a
+    // batched decode.
     mq: u32,
     chunk: crate::sdsc_abstract::ChunkScratch,
+    history: ChunkHistory,
     index: &'a str,
     kct: &'a str,
     vc: &'a str,
@@ -1817,6 +1835,7 @@ fn assemble_attn_chunk(
         gqa,
         mq,
         chunk,
+        history,
         index,
         kct,
         vc,
@@ -1848,6 +1867,23 @@ fn assemble_attn_chunk(
     // group's `gqa·mq` rows are contiguous in `qs`), one per QUERY HEAD above it (only a head's own rows
     // are) — see `ChunkRowBlocks`. At one slab every op, name and offset is the per-kv-head form.
     let blocks = chunk.row_blocks(gqa, mq);
+    // ⛔ A BATCH CHUNK's LAW MUST DESCRIBE THIS VERY CHUNK AT THIS VERY WIDTH: the host stages the mask
+    // block and the page list from it, so a law for another chunk or another request count is a mask
+    // whose rows and runs are some other body's — fluent, wrong, and silent.
+    if let ChunkHistory::Requests(bc) = history
+        && (bc.chunk() != chunk || bc.requests() != mq || bc.mask_rows() != blocks.rows())
+    {
+        return Err(SuperDscError(format!(
+            "attention chunk o{t}: the batch chunk law describes a {}-page chunk over {} request(s) with \
+             {}-row mask blocks, but this body attends a {}-page chunk at {mq} row(s) per head with \
+             {}-row blocks",
+            bc.chunk().pages(),
+            bc.requests(),
+            bc.mask_rows(),
+            chunk.pages(),
+            blocks.rows(),
+        )));
+    }
     let (b_rows, nslab) = (blocks.rows(), chunk.plane().slabs());
     let blk_rows = RowCount::of_head_major_rows(b_rows);
     // Block `b`'s ops are named for its kv head at one slab, its query head above it.
@@ -1905,12 +1941,21 @@ fn assemble_attn_chunk(
 
     // ── (2) SCORE per row block, then each row's max over its whole chunk ──
     let mask_h = hm(pmask);
+    // ⭐ HOW THE PREFIX VALIDITY IS READ. A shared history is one broadcast row (`mb` collapsed); a batch
+    // chunk's rows are separate requests, so the epilogue reads a FULL `[rows, slots]` block — the score
+    // block's own operand cloned, per row, at offset 0 in every row block (`BatchChunk::mask_elem` is
+    // the arrangement the host stages it in).
+    let mask_dims: &[(&str, Scale)] = match history {
+        ChunkHistory::Shared => &[("mb", Scale::RedNonStick)],
+        ChunkHistory::Requests(_) => &[],
+    };
     for b in 0..blocks.count() {
         let (kvh, h0) = (blocks.kv_head(b), blocks.first_head(b) * mq);
         let kc = corner(chunk.kernel_corner(kvh), "a kv head's kernel block")?;
         let rc = corner(blocks.corner(b), "a row block's score block")?;
         // `sc_b = Q_b · Kᵗ_kvh + mask` — the mask is the broadcast prefix-validity row over the chunk's
-        // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue.
+        // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue; for a
+        // batch chunk, the per-row block (`mask_dims` above).
         //
         // At one slab Q is the group's `[gqa·mq, hd]` rows of `qs` read flat. Above it the block is one
         // query head and Q is that head's own `[mq, hd]` block of the token stream — the fold's per-head
@@ -1954,7 +1999,7 @@ fn assemble_attn_chunk(
             &mask_h,
             DevOff::ZERO,
             EpilogueOpFunc::StridedAdd,
-            &[("mb", Scale::RedNonStick)],
+            mask_dims,
             true,
             sym_id_base,
             layout,
@@ -2125,7 +2170,11 @@ fn assemble_attn_chunk(
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
     // the buffer it writes: part `p` writes `run_o` when `p` is even. An even part count leaves the sum
     // in `otmp`, and one copy brings it home below.
-    let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.value_parts(mq > 1).collect();
+    // ⭐ A DECODE's VALUE LEG — one request row per head, or a batch's `B` — divides its contraction
+    // across the cores (`ContractionSplit` below), so no core's V slice nears LX and it stays ONE part;
+    // only a prompt chunk's rows-divided PV is cut.
+    let decode_values = mq == 1 || matches!(history, ChunkHistory::Requests(_));
+    let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.value_parts(!decode_values).collect();
     // ⭐ ABOVE ONE SLAB THE VALUE LEG IS ONE OP PER (QUERY HEAD, SLAB), ONE STICK OF `out` EACH — the
     // fold's own card-proven hd=128 form. ONE op per head with `out = hd` writes `run_o` incoherently above
     // one stick (MEASURED on granite-3.1-8b: fluent nonsense, bisected to exactly that collapse — see the
@@ -2179,9 +2228,10 @@ fn assemble_attn_chunk(
                 // ⭐ AT DECODE THE CONTRACTION IS DIVIDED ACROSS THE CORES (`ContractionSplit`): the output
                 // is one stick of `gqa` rows (one row per head above one slab), so the planner would give
                 // it only its rows and every core would read this kv head's WHOLE V. A prompt chunk has
-                // `gqa·mq` rows to divide and keeps the planned split.
+                // `gqa·mq` rows to divide and keeps the planned split. A BATCH chunk's `gqa·B` rows are
+                // still a few dozen, against a contraction `B` requests deep — the decode form.
                 let k_part = BlockCols::of_chunk_part(*part);
-                let k = if mq == 1 {
+                let k = if decode_values {
                     MatK::of_chunk_decode_values(k_part)
                 } else {
                     MatK::of_kv_window(k_part)
@@ -3033,6 +3083,40 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             })?;
             l.synth_lx_core_local(out_id.synth(R::ChunkESub), slice);
         }
+        // ⭐ WHOSE HISTORY THE ROWS ATTEND — from the same `rows_are_requests` the per-page fold reads its
+        // per-row mask under. A batch's law is minted HERE, from this chunk and this width, so the host's
+        // staging (which reads the same law off the selected body's swept extent) cannot describe a
+        // different layout; a chunk that is not a whole number of pages per request is a build failure.
+        let history = if rows_are_requests {
+            let bc =
+                crate::sdsc_abstract::BatchChunk::of(chunk, mq, nqh / nkvh).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "attention o{t}: a {}-page batch chunk is not a whole number of pages for each \
+                         of its {mq} request row(s)",
+                        chunk.pages()
+                    ))
+                })?;
+            // ⛔ AND THE MASK BLOCK MUST LIE INSIDE THE MASK's OWN PLACEMENT. Every row block reads it at
+            // offset 0, so a block past the placement reads the next activation's bytes as validity — an
+            // additive mask, where an unstaged zero is VALID. The placement is the bundle's, so this is a
+            // bake fact; refused here it is a build failure, never a row attending another's keys.
+            if let Some(l) = layout
+                && let Some(crate::place::PlaceId::Act(tid)) = l.id_of(pmask)
+                && let Some(p) = l.placements.get(&tid)
+                && p.size < bc.mask_elems() as u64 * 2
+            {
+                return Err(SuperDscError(format!(
+                    "attention o{t}: the batch chunk's mask block ({} x {} fp16) is past the mask's {} B \
+                     placement",
+                    bc.mask_rows(),
+                    bc.mask_cols(),
+                    p.size
+                )));
+            }
+            ChunkHistory::Requests(bc)
+        } else {
+            ChunkHistory::Shared
+        };
         assemble_attn_chunk(
             &mut ops,
             ChunkAttn {
@@ -3042,6 +3126,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 gqa: nqh / nkvh,
                 mq,
                 chunk,
+                history,
                 index,
                 kct,
                 vc,

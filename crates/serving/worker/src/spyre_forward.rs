@@ -61,9 +61,11 @@ pub(crate) fn run_prefill_batch(
     // mask needs the geometry the fold will step it by.
     // `None` for a prompt chunk, whose rows share `start` and read one broadcast row — and whose launch
     // declares no fold, so there is no decode-shaped value for it to carry.
+    // ⭐ AND WHEN THE STEP's BODY IS A BATCH CHUNK, ITS LAW INSTEAD OF THE FOLD's GRID: the mask is then
+    // ONE per-row block every row block reads (`BatchPrefix::Chunk`), not a block per pass.
     per_request: Option<(
         &scratchy_subtile::sdsc_abstract::LiveBatch,
-        scratchy_subtile::sdsc_abstract::DeclaredFold,
+        scratchy_subtile::sdsc_abstract::BatchPrefix,
     )>,
     // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE — global stick-block numbers, one per (launch row, logical page),
     // built by the caller in the SAME loop that installs the page maps.
@@ -148,7 +150,7 @@ pub(crate) fn run_prefill_batch(
     // mirrored in some aspects and not others.
     let per_request: Option<(
         scratchy_subtile::sdsc_abstract::LaunchRows<'_>,
-        scratchy_subtile::sdsc_abstract::DeclaredFold,
+        scratchy_subtile::sdsc_abstract::BatchPrefix,
     )> = match per_request {
         Some((rows, fold)) => {
             if rows.live() != real {
@@ -301,7 +303,14 @@ pub(crate) fn run_prefill_batch(
     // pass per (request, page) and `fold_delta` steps the mask one block per pass.
     let histories = per_request.as_ref().map(|(rows, _)| rows.mask_histories());
     let prefix_src = match (&per_request, &histories) {
-        (Some((_, fold)), Some(hs)) => {
+        // ⭐ A BATCH CHUNK BODY: one per-row block, from the law the emitter baked the read with.
+        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc))), Some(hs)) => {
+            Some(scratchy_target_spyre::forward_tape::PrefixSource::Chunk {
+                chunk: *bc,
+                histories: hs,
+            })
+        }
+        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold))), Some(hs)) => {
             use scratchy_subtile::sdsc_abstract::PrefixMaskShape;
             // THE SAME SHAPE THE EMITTER READ, from the pool's page width — the emitter blocks the
             // mask by a PAGE, so deriving it from this launch's `cap` is the drift
