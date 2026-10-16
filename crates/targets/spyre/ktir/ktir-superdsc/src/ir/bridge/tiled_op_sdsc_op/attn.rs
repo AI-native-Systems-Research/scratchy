@@ -1745,14 +1745,33 @@ fn assemble_attn_block(
 }
 
 /// The split-KV chunk's own buffer NAMES — the gather scratches and the per-kv-head wide blocks.
+/// The LX-resident gather's tensors: the law, and each leg's core-local tensor names by
+/// [`crate::sdsc_abstract::ChunkLx::lx_tensor`]. Kᵗ's exist only with its witness
+/// ([`crate::sdsc_abstract::ChunkLx::keys`], a chunk with no tail).
+struct ChunkLxBufs {
+    form: crate::sdsc_abstract::ChunkLx,
+    keys: Option<(crate::sdsc_abstract::ChunkKeysLx, Vec<String>)>,
+    v: Vec<String>,
+}
+
+impl ChunkLxBufs {
+    /// Where one V copy lands: its core-local tensor, or V's tail scratch.
+    fn dest<'a>(names: &'a [String], tail: &'a str, d: crate::sdsc_abstract::LxDest) -> &'a str {
+        match d {
+            crate::sdsc_abstract::LxDest::Lx(i) => names[i as usize].as_str(),
+            crate::sdsc_abstract::LxDest::Tail => tail,
+        }
+    }
+}
+
 struct ChunkBufs {
     gkt: String,
     gv: String,
-    // ⭐ THE V SCRATCH IN LX, where the chunk's geometry lets the copy's division be PV's
-    // (`ChunkScratch::value_lx`): one core-local tensor per (part, kv head), indexed by
-    // `ChunkValueLx::lx_tensor`. `gv` then holds only the tail's pages, if there is a tail. `None` keeps
-    // the HBM scratch for the whole chunk.
-    gv_lx: Option<(crate::sdsc_abstract::ChunkValueLx, Vec<String>)>,
+    // ⭐ THE GATHER IN LX, where the chunk's geometry lets the copies' division be the score's and PV's
+    // (`ChunkScratch::lx_form`): one core-local tensor per (part, kv head) per leg, indexed by
+    // `ChunkLx::lx_tensor`. `gkt` and `gv` then hold only the tail's pages, if there is a tail. `None`
+    // keeps the HBM scratches for the whole chunk.
+    lx: Option<ChunkLxBufs>,
     csc: String,
     cesub: String,
     cexp: String,
@@ -2273,24 +2292,34 @@ fn assemble_attn_chunk(
     };
 
     // ── (1) THE GATHER: every page's Kᵗ and V blocks, kv-head-major, into the two scratches. V's copies
-    //    read V's own slab-major index run above one slab (`ChunkScratch::value_copies`). Where V stays in
-    //    LX (`cb.gv_lx`), V reads its own part-major run: a whole part's copy lands in its (part, kv head)
-    //    core-local tensor, and a tail copy in the tail's HBM scratch. ──
-    let v_copies: Vec<(&str, crate::sdsc_abstract::GatherCopy)> = match &cb.gv_lx {
-        None => chunk
-            .value_copies()
-            .map(|cp| (cb.gv.as_str(), cp))
-            .collect(),
-        Some((vlx, names)) => vlx
-            .copies()
-            .map(|(dest, cp)| match dest {
-                crate::sdsc_abstract::ValueDest::Lx(i) => (names[i as usize].as_str(), cp),
-                crate::sdsc_abstract::ValueDest::Tail => (cb.gv.as_str(), cp),
-            })
-            .collect(),
+    //    read V's own slab-major index run above one slab (`ChunkScratch::value_copies`). Where the gather
+    //    stays in LX (`cb.lx`), both legs read ONE part-major run: a whole part's copy lands in its leg's
+    //    (part, kv head) core-local tensor, and a tail copy in its leg's tail HBM scratch. ──
+    type Copies<'c> = Vec<(&'c str, crate::sdsc_abstract::GatherCopy)>;
+    let (k_copies, v_copies): (Copies<'_>, Copies<'_>) = match &cb.lx {
+        None => (
+            chunk.copies().map(|cp| (cb.gkt.as_str(), cp)).collect(),
+            chunk
+                .value_copies()
+                .map(|cp| (cb.gv.as_str(), cp))
+                .collect(),
+        ),
+        Some(lx) => (
+            // Kᵗ stays in LX only with its witness (`ChunkLx::keys`, a chunk with no tail); otherwise
+            // it is the whole-chunk HBM leg, read through its own head-major run.
+            match &lx.keys {
+                Some((keys, kt)) => keys
+                    .copies()
+                    .map(|(i, cp)| (kt[i as usize].as_str(), cp))
+                    .collect(),
+                None => chunk.copies().map(|cp| (cb.gkt.as_str(), cp)).collect(),
+            },
+            lx.form
+                .copies()
+                .map(|(d, cp)| (ChunkLxBufs::dest(&lx.v, &cb.gv, d), cp))
+                .collect(),
+        ),
     };
-    let k_copies: Vec<(&str, crate::sdsc_abstract::GatherCopy)> =
-        chunk.copies().map(|cp| (cb.gkt.as_str(), cp)).collect();
     for (name, src, copies) in [
         (format!("attn_cgkt_o{t}"), kct, k_copies),
         (format!("attn_cgv_o{t}"), vc, v_copies),
@@ -2331,27 +2360,63 @@ fn assemble_attn_chunk(
         // batch chunk, the per-row block (`mask_dims` above). Q is the row block's own operand
         // (`row_block_query`).
         let (m, a, a_off) = row_block_query(blocks, b, mq, nqh, hd, qs);
-        ops.push(assemble_matmul_off_with_epilogue(
-            &format!("attn_csc_{}_o{t}", blk_name(b)),
-            m,
-            MatN::of_kv_window(width),
-            MatK::of_head_dim(hd),
-            MatY::unbatched(),
-            bmm_form,
-            &a,
-            a_off,
-            &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
-            kc,
-            &rb(&cb.csc, b_rows, slots),
-            rc,
-            &mask_h,
-            DevOff::ZERO,
-            EpilogueOpFunc::StridedAdd,
-            mask_dims,
-            true,
-            sym_id_base,
-            layout,
-        ));
+        let Some((keys, kt)) = cb.lx.as_ref().and_then(|lx| lx.keys.as_ref()) else {
+            ops.push(assemble_matmul_off_with_epilogue(
+                &format!("attn_csc_{}_o{t}", blk_name(b)),
+                m,
+                MatN::of_kv_window(width),
+                MatK::of_head_dim(hd),
+                MatY::unbatched(),
+                bmm_form,
+                &a,
+                a_off,
+                &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
+                kc,
+                &rb(&cb.csc, b_rows, slots),
+                rc,
+                &mask_h,
+                DevOff::ZERO,
+                EpilogueOpFunc::StridedAdd,
+                mask_dims,
+                true,
+                sym_id_base,
+                layout,
+            ));
+            continue;
+        };
+        // ⭐ WHERE Kᵗ STAYS IN LX, ONE SCORE PER (row block, part). Each fills its part's columns of the
+        // block's score row block and adds its part's columns of the mask, reading its (part, kv head)
+        // core-local Kᵗ at the pin. Each part's slots are divided across the cores one stick each,
+        // exactly as its copy delivered them (`emit`'s core-local read law proves it per op). Kᵗ stays
+        // in LX only with its witness (`ChunkLx::keys`, a chunk with no tail), so every part is whole.
+        let form = keys.form();
+        for (p, part) in chunk.slot_parts(form.part_pages()).enumerate() {
+            let k_name = kt[form.lx_tensor(p as u32, kvh) as usize].as_str();
+            let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
+            ops.push(assemble_matmul_off_with_epilogue(
+                &format!("attn_csc_{}_k{p}_o{t}", blk_name(b)),
+                m,
+                // Its COLUMNS divided across the cores, rows whole (`OutputSplit` says why): core `c`
+                // holds only slot stick `c` of the part's Kᵗ.
+                MatN::of_chunk_decode_scores(BlockCols::of_chunk_part(part)),
+                MatK::of_head_dim(hd),
+                MatY::unbatched(),
+                bmm_form,
+                &a,
+                a_off,
+                &Stk::<KernelTag>::kernel(hd as usize, part.slots() as usize, k_name),
+                DevOff::ZERO,
+                &rb(&cb.csc, b_rows, slots),
+                pc,
+                &mask_h,
+                DevOff::of_chunk_corner(part.row_corner()),
+                EpilogueOpFunc::StridedAdd,
+                mask_dims,
+                true,
+                sym_id_base,
+                layout,
+            ));
+        }
     }
     // ⭐ THE STABILIZER IS EACH ROW's OWN MAX, ONE OP PER KV HEAD — the stick-major `[gqa, slots]` max,
     // the same form as the denominators' sum below (both card-verified per row by reading the chunk's
@@ -2621,16 +2686,16 @@ fn assemble_attn_chunk(
     // across the cores (`ContractionSplit` below), so no core's V slice nears LX and it stays ONE part;
     // only a prompt chunk's rows-divided PV is cut.
     let decode_values = mq == 1 || matches!(history, ChunkHistory::Requests(_));
-    // ⭐ AN LX-RESIDENT V IS CUT INTO ITS OWN PARTS (`ChunkValueLx::part_pages`), one copy per (part, kv
+    // ⭐ AN LX-RESIDENT V IS CUT INTO ITS OWN PARTS (`ChunkLx::part_pages`), one copy per (part, kv
     // head): each whole part's PV reads that part's core-local tensor, and the tail reads the HBM scratch.
     // The parts fold through the same ping-pong.
-    let parts: Vec<crate::sdsc_abstract::ChunkPart> = match &cb.gv_lx {
+    let parts: Vec<crate::sdsc_abstract::ChunkPart> = match &cb.lx {
         None => chunk.value_parts(!decode_values).collect(),
-        Some((vlx, _)) => chunk.slot_parts(vlx.part_pages()).collect(),
+        Some(lx) => chunk.slot_parts(lx.form.part_pages()).collect(),
     };
     // ⛔ The LX form is minted only for the one-request decode, whose PV divides its contraction across
     // the cores. That division is the one each part's tensor is laid out for.
-    if cb.gv_lx.is_some() && !decode_values {
+    if cb.lx.is_some() && !decode_values {
         return Err(SuperDscError(format!(
             "attention chunk o{t}: an LX-resident value scratch needs the decode value leg, whose \
              contraction is divided across the cores"
@@ -2648,18 +2713,18 @@ fn assemble_attn_chunk(
             for (p, part) in parts.iter().enumerate() {
                 // An LX-resident part is its (part, kv head) core-local tensor, read at its pin (no
                 // corner). The tail is kv head `kvh`'s block of the tail's HBM scratch.
-                let (v_name, kc) = match &cb.gv_lx {
+                let (v_name, kc) = match &cb.lx {
                     None => (
                         cb.gv.as_str(),
                         corner(part.value_corner(kvh, s), "a kv head's value block")?,
                     ),
-                    Some((vlx, names)) if (p as u32) < vlx.lx_parts() => (
-                        names[vlx.lx_tensor(p as u32, kvh) as usize].as_str(),
+                    Some(lx) if (p as u32) < lx.form.lx_parts() => (
+                        lx.v[lx.form.lx_tensor(p as u32, kvh) as usize].as_str(),
                         DevOff::ZERO,
                     ),
-                    Some((vlx, _)) => (
+                    Some(lx) => (
                         cb.gv.as_str(),
-                        corner(vlx.tail_corner(kvh), "a kv head's tail value block")?,
+                        corner(lx.form.tail_corner(kvh), "a kv head's tail value block")?,
                     ),
                 };
                 let rc = corner(
@@ -3863,7 +3928,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         };
         let red_cut = reduction_part_pages(chunk, b_rows) < chunk.pages();
         let n_red = if prompt { lx_parts + 2 } else { 0 }.max(if red_cut { 3 } else { 0 });
-        // ⭐ THE V SCRATCH STAYS IN LX for the ONE-REQUEST decode at the geometry `value_lx` admits — the
+        // ⭐ THE GATHER STAYS IN LX for the ONE-REQUEST decode at the geometry `lx_form` admits — the
         // decode PV divides its contraction across the cores (`ContractionSplit`), which is the division the
         // copy already has there. A prompt chunk's PV divides its rows, and a batch chunk's rows are other
         // requests: both keep the HBM scratch. The host stages the table from the same `(chunk, rows)`.
@@ -3874,33 +3939,55 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             crate::sdsc_abstract::ChunkRowKind::Prompt
         };
-        let gv_lx = chunk.value_lx(chunk_rows).map(|vlx| {
-            let names = (0..vlx.lx_tensors())
+        let lx = chunk.lx_form(chunk_rows).map(|form| ChunkLxBufs {
+            form,
+            keys: form.keys().map(|keys| {
+                let names = (0..form.lx_tensors())
+                    .map(|i| syn(R::GatherKtLx(i)))
+                    .collect();
+                (keys, names)
+            }),
+            v: (0..form.lx_tensors())
                 .map(|i| syn(R::GatherVLx(i)))
-                .collect();
-            (vlx, names)
+                .collect(),
         });
         let cb = ChunkBufs {
             gkt: syn(R::GatherKt),
             gv: syn(R::GatherV),
-            gv_lx,
+            lx,
             csc: syn(R::ChunkSc),
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
             red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
         };
         if let Some(l) = layout {
-            l.synth(out_id.synth(R::GatherKt), &chunk.footprint_dims());
-            match &cb.gv_lx {
-                None => l.synth(out_id.synth(R::GatherV), &chunk.footprint_dims()),
-                Some((vlx, _)) => {
-                    // One core-local pin per (part, kv head), each one entry per core:
-                    // `lx_bytes_per_core` in all, 512 KiB at granite-2b's 64-page rung.
-                    for i in 0..vlx.lx_tensors() {
-                        l.synth_lx_core_local(out_id.synth(R::GatherVLx(i)), vlx.per_core_bytes());
+            match &cb.lx {
+                None => {
+                    for r in [R::GatherKt, R::GatherV] {
+                        l.synth(out_id.synth(r), &chunk.footprint_dims());
                     }
-                    if vlx.tail_pages() > 0 {
-                        l.synth(out_id.synth(R::GatherV), &vlx.tail_footprint_dims());
+                }
+                Some(lx) => {
+                    // One core-local pin per (part, kv head) per LX leg, each one entry per core:
+                    // `lx_bytes_per_core` a leg, 1 MiB for both at granite-2b's 64-page rung. A chunk
+                    // with a tail keeps Kᵗ whole in HBM (`ChunkLx::keys`) and V's tail in HBM.
+                    for i in 0..lx.form.lx_tensors() {
+                        l.synth_lx_core_local(
+                            out_id.synth(R::GatherVLx(i)),
+                            lx.form.per_core_bytes(),
+                        );
+                        if lx.keys.is_some() {
+                            l.synth_lx_core_local(
+                                out_id.synth(R::GatherKtLx(i)),
+                                lx.form.per_core_bytes(),
+                            );
+                        }
+                    }
+                    if lx.keys.is_none() {
+                        l.synth(out_id.synth(R::GatherKt), &chunk.footprint_dims());
+                    }
+                    if lx.form.tail_pages() > 0 {
+                        l.synth(out_id.synth(R::GatherV), &lx.form.tail_footprint_dims());
                     }
                 }
             }

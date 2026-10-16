@@ -337,7 +337,7 @@ pub fn assemble_gather_copy(
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
-    // PV contracts it (`ChunkScratch::value_lx`). The copy keeps its own one-entry-per-core division; the
+    // PV contracts it (`ChunkScratch::lx_form`). The copy keeps its own one-entry-per-core division; the
     // read law holds the PV to it. No-op for an HBM scratch.
     crate::emit::apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());

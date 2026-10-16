@@ -148,6 +148,31 @@ pub(crate) fn matmul_split_map_contraction(
     map
 }
 
+/// ⭐ THE COLUMNS-FIRST SPLITTER — every core a whole-stick run of `out`, rows and contraction whole.
+///
+/// Reached only through [`crate::sdsc_abstract::OutputSplit::ColumnsAcrossCores`] (a part of the
+/// split-KV chunk's one-request score, which writes its columns of a wider score block). The cores
+/// divide the columns alone: the largest divisor of the output's stick count within the core budget,
+/// so every core's run is whole sticks of the operand's own format.
+pub(crate) fn matmul_split_map_columns(
+    dims: &[crate::superdsc_opspec::ItDim],
+    max_cores: u32,
+) -> std::collections::BTreeMap<&'static str, u32> {
+    use crate::work::FP16_ELEMS_PER_STICK;
+    let (n, stick) = dims
+        .iter()
+        .find(|d| d.name == OutAxis::NAME)
+        .map(|d| (d.size, d.df.elems_per_stick()))
+        .unwrap_or((1, FP16_ELEMS_PER_STICK));
+    let sticks = n.div_ceil(stick).max(1);
+    let split = crate::work::core_split(sticks, max_cores);
+    let mut map = std::collections::BTreeMap::new();
+    if split > 1 {
+        map.insert(OutAxis::NAME, split);
+    }
+    map
+}
+
 /// The work-division splitter signature `TileOp::tile` consumes — the type a rung regime's
 /// [`super::walk::RungRegime::split_map`] answers with.
 pub(crate) type SplitMapFn =

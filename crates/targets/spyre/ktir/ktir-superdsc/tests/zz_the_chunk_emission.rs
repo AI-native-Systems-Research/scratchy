@@ -69,33 +69,51 @@ fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp>
 }
 
 /// ⭐ THE WHOLE POINT: one launch attends every page, with the SAME compute ops at every chunk width.
-/// Only two things grow with it:
+/// Only three things grow with it:
 ///   * the gather's copies, one per index stick;
-///   * the decode value leg, one op per (kv head, part). Past 8 pages its parts are the LX value
-///     leg's (`ChunkValueLx`): 8 pages each plus a 4-page tail. An even part count adds one copy home
+///   * the decode score, one op per (kv head, part);
+///   * the decode value leg, one op per (kv head, part). An even part count adds one copy home
 ///     (`attn_covsum`).
+///
+/// Past 8 pages both legs' parts are the LX gather's (`ChunkLx`): 8 pages each plus a 4-page tail.
 #[test]
 fn the_chunk_op_count_is_independent_of_its_width() {
     let pool = PagedKvPool::new(NKVH as usize, HD as usize);
     let value_leg = |n: &str| n.starts_with("attn_cov_") || n.starts_with("attn_covsum_");
+    let score = |n: &str| n.starts_with("attn_csc_");
     let counts: Vec<(u32, usize)> = ChunkScratch::LADDER
         .iter()
         .map(|&j| {
             let ops = emit_chunk(j);
-            let parts = ChunkScratch::of_chunk(pool, j)
+            let lx = ChunkScratch::of_chunk(pool, j)
                 .unwrap()
-                .value_lx(ChunkRowKind::OneRequest)
-                .map_or(1, |v| v.lx_parts() + u32::from(v.tail_pages() > 0));
+                .lx_form(ChunkRowKind::OneRequest);
+            let parts = lx.map_or(1, |v| v.lx_parts() + u32::from(v.tail_pages() > 0));
             let values = ops.iter().filter(|(n, _)| value_leg(n)).count();
             assert_eq!(
                 values as u32,
                 NKVH * parts + u32::from(parts.is_multiple_of(2)),
                 "{j} page(s): {parts} value part(s)"
             );
+            // The score is cut into parts only where Kᵗ stays in LX (a chunk with no tail).
+            let score_parts = if lx.is_some_and(|v| v.keys().is_some()) {
+                parts
+            } else {
+                1
+            };
+            let scores = ops.iter().filter(|(n, _)| score(n)).count();
+            assert_eq!(
+                scores as u32,
+                NKVH * score_parts,
+                "{j} page(s): {score_parts} score part(s)"
+            );
             let compute = ops
                 .iter()
                 .filter(|(n, _)| {
-                    !n.starts_with("attn_cgkt_") && !n.starts_with("attn_cgv_") && !value_leg(n)
+                    !n.starts_with("attn_cgkt_")
+                        && !n.starts_with("attn_cgv_")
+                        && !value_leg(n)
+                        && !score(n)
                 })
                 .count();
             (j, compute)
@@ -204,6 +222,47 @@ fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
                 1,
                 "{name} at {j} page(s), prompt chunk: split {}",
                 v["numWkSlicesPerDim_"]
+            );
+        }
+    }
+}
+
+/// ⛔ A DECODE SCORE PART DIVIDES ITS COLUMNS ALONE. Where Kᵗ stays in LX (a whole number of 8-page
+/// parts, `ChunkLx::keys`) the one-request score is one op per (kv head, part), each writing its
+/// columns of the wider score block. Every part keeps its rows whole and hands each core one whole
+/// stick of its columns, 32 cores per 8-page part: one per Kᵗ copy entry.
+#[test]
+fn the_decode_score_parts_divide_their_columns_alone() {
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let keys_in_lx = |j: u32| {
+        ChunkScratch::of_chunk(pool, j)
+            .unwrap()
+            .lx_form(ChunkRowKind::OneRequest)
+            .is_some_and(|v| v.keys().is_some())
+    };
+    for &j in ChunkScratch::LADDER.iter().filter(|&&j| keys_in_lx(j)) {
+        for (name, v) in emit_chunk(j)
+            .iter()
+            .filter(|(n, _)| n.starts_with("attn_csc_g"))
+        {
+            let p: u32 = name
+                .split("_k")
+                .nth(1)
+                .and_then(|s| s.split('_').next())
+                .unwrap()
+                .parse()
+                .unwrap();
+            let sticks = 8u32.min(j - 8 * p) * 256 / 64;
+            let s = &v["numWkSlicesPerDim_"];
+            assert_eq!(
+                (
+                    s["out"].as_u64().unwrap_or(1),
+                    s["mb"].as_u64().unwrap_or(1),
+                    s["in"].as_u64().unwrap_or(1),
+                    v["numCoresUsed_"].as_u64(),
+                ),
+                (u64::from(sticks), 1, 1, Some(u64::from(sticks))),
+                "{name} at {j} page(s): split {s}"
             );
         }
     }
@@ -590,22 +649,25 @@ fn a_whole_stick_prompt_chunk_forms_its_causal_block_per_kv_head() {
     }
 }
 
-/// ⭐⭐⭐ THE ONE-REQUEST DECODE's GATHERED V NEVER TOUCHES HBM, PART BY PART, AT EVERY RUNG FROM 8 PAGES.
+/// ⭐⭐⭐ THE ONE-REQUEST DECODE's GATHERED Kᵗ AND V NEVER TOUCH HBM, PART BY PART, AT EVERY RUNG FROM 8
+/// PAGES.
 ///
-/// The value leg is cut into 8-page parts, one copy per (part, kv head): one entry per core, and the
-/// part's PV contraction split hands core `c` exactly entry `c`'s 64 slots. So each such copy writes
-/// its own core-local LX tensor, and that part's PV reads its KERNEL from the same pin. Both are
-/// LX-only, with one start address on every core.
+/// Both legs are cut into 8-page parts, one copy per (part, kv head) per leg: one entry per core. The
+/// part's score divides its slots, and its PV its contraction, so that core `c` gets exactly entry
+/// `c`'s 64 slots. So each such copy writes its own core-local LX tensor, and that part's score or PV
+/// reads its KERNEL from the same pin. Both are LX-only, with one start address on every core.
 ///
-/// A 4-page tail keeps the HBM scratch: one kv head's tail is 16 entries, and dxp refuses an index
-/// shorter than one stick. Its PV is an HBM part on 16 cores.
+/// A chunk with a 4-page tail keeps V's tail in HBM: one kv head's tail is 16 entries, and dxp refuses
+/// an index shorter than one stick, so its PV is an HBM part. Its Kᵗ stays whole in HBM, one score over
+/// the whole chunk (`ChunkLx::keys`).
 ///
-/// That the ladder emits at all is the build-time proof the divisions agree. The read law compares the
-/// TENSOR's per-core blocks, under the copy's `[mb, out]` and the matmul's `[in, out]`.
+/// That the ladder emits at all is the build-time proof the divisions agree. The read law compares
+/// each core's slice in the TENSOR's device layout, across the copy's `[mb, out]`, PV's `[in, out]`,
+/// and the score's stick-major Kᵗ.
 ///
-/// Below 8 pages, and every prompt chunk, keeps the HBM scratch.
+/// Below 8 pages, and every prompt chunk, keeps the HBM scratches.
 #[test]
-fn the_decode_value_leg_reads_each_part_kernel_from_lx() {
+fn the_decode_gather_legs_read_each_part_kernel_from_lx() {
     let lx_only = |v: &serde_json::Value| {
         v["memOrg_"]
             .as_object()
@@ -634,7 +696,7 @@ fn the_decode_value_leg_reads_each_part_kernel_from_lx() {
             ChunkRowKind::Prompt
         };
         for &j in &ChunkScratch::LADDER {
-            let vlx = ChunkScratch::of_chunk(pool, j).unwrap().value_lx(rows);
+            let vlx = ChunkScratch::of_chunk(pool, j).unwrap().lx_form(rows);
             assert_eq!(vlx.is_some(), mq == 1 && j >= 8, "{j} page(s), mq {mq}");
             let (parts, tail) = vlx.map_or((0, 0), |v| (v.lx_parts(), v.tail_pages()));
             if let Some(v) = vlx {
@@ -643,61 +705,84 @@ fn the_decode_value_leg_reads_each_part_kernel_from_lx() {
                 assert!(v.lx_bytes_per_core() <= 512 * 1024);
             }
             let ops = emit_chunk_in_layout(j, mq);
-            // Every LX copy and every LX part's PV, keyed by the pin they meet at.
-            let mut copy_pins = Vec::new();
-            let mut hbm_copies = 0;
-            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cgv_")) {
-                let body = &v["dscs_"][0][name];
-                let out = body["labeledDs_"].as_array().unwrap().last().unwrap();
-                if lx_only(out) {
-                    copy_pins.push(pin(body, out).expect("one pin on every core"));
-                } else {
-                    hbm_copies += 1;
+            let mut all_pins = std::collections::BTreeSet::new();
+            for (copy, consumer) in [("attn_cgkt_", "attn_csc_"), ("attn_cgv_", "attn_cov_")] {
+                // Every LX copy and every LX part's consumer, keyed by the pin they meet at.
+                let mut copy_pins = Vec::new();
+                let mut hbm_copies = 0;
+                for (name, v) in ops.iter().filter(|(n, _)| n.starts_with(copy)) {
+                    let body = &v["dscs_"][0][name];
+                    let out = body["labeledDs_"].as_array().unwrap().last().unwrap();
+                    if lx_only(out) {
+                        copy_pins.push(pin(body, out).expect("one pin on every core"));
+                    } else {
+                        hbm_copies += 1;
+                    }
                 }
-            }
-            let mut value_pins = Vec::new();
-            let mut hbm_parts = 0;
-            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cov_")) {
-                let body = &v["dscs_"][0][name];
-                let kernel = body["labeledDs_"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|l| l["dsType_"] == "KERNEL")
-                    .expect("PV's kernel");
-                if lx_only(kernel) {
-                    value_pins.push(pin(body, kernel).expect("one pin on every core"));
-                } else {
-                    hbm_parts += 1;
+                let mut read_pins = Vec::new();
+                let mut hbm_parts = 0;
+                for (name, v) in ops.iter().filter(|(n, _)| n.starts_with(consumer)) {
+                    let body = &v["dscs_"][0][name];
+                    let kernel = body["labeledDs_"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|l| l["dsType_"] == "KERNEL")
+                        .expect("the consumer's kernel");
+                    if lx_only(kernel) {
+                        read_pins.push(pin(body, kernel).expect("one pin on every core"));
+                    } else {
+                        hbm_parts += 1;
+                    }
                 }
-            }
-            let lx_tensors = (parts * NKVH) as usize;
-            assert_eq!(copy_pins.len(), lx_tensors, "{j} page(s), mq {mq}");
-            assert_eq!(value_pins.len(), lx_tensors, "{j} page(s), mq {mq}");
-            // Each pin is written by exactly one copy and read by exactly one PV.
-            let (mut c, mut v) = (copy_pins.clone(), value_pins.clone());
-            c.sort();
-            v.sort();
-            assert_eq!(
-                c, v,
-                "{j} page(s): every LX part's copy and PV meet at one pin"
-            );
-            let distinct: std::collections::BTreeSet<&String> = copy_pins.iter().collect();
-            assert_eq!(
-                distinct.len(),
-                lx_tensors,
-                "{j} page(s): one pin per (part, kv head)"
-            );
-            if vlx.is_some() {
-                // The tail: the remaining copies are HBM, flat across kv heads (32 entries each), and
-                // each kv head's tail PV is one HBM part.
-                assert_eq!(hbm_copies, (tail * 4 * NKVH / 32) as usize, "{j} page(s)");
+                // Kᵗ stays in LX only on a chunk with no tail (`ChunkLx::keys`); V wherever there is
+                // an LX form at all.
+                let keys = copy == "attn_cgkt_";
+                let leg_in_lx = vlx.is_some_and(|v| !keys || v.keys().is_some());
+                let lx_tensors = if leg_in_lx {
+                    (parts * NKVH) as usize
+                } else {
+                    0
+                };
                 assert_eq!(
-                    hbm_parts,
-                    if tail > 0 { NKVH as usize } else { 0 },
-                    "{j} page(s)"
+                    copy_pins.len(),
+                    lx_tensors,
+                    "{copy} at {j} page(s), mq {mq}"
                 );
+                assert_eq!(
+                    read_pins.len(),
+                    lx_tensors,
+                    "{consumer} at {j} page(s), mq {mq}"
+                );
+                // Each pin is written by exactly one copy and read by exactly one consumer.
+                let (mut c, mut r) = (copy_pins.clone(), read_pins.clone());
+                c.sort();
+                r.sort();
+                assert_eq!(
+                    c, r,
+                    "{copy} at {j} page(s): copy and consumer meet at one pin"
+                );
+                for p in &copy_pins {
+                    assert!(all_pins.insert(p.clone()), "{j} page(s): pin {p} shared");
+                }
+                if leg_in_lx {
+                    // The tail: the remaining copies are HBM, flat across kv heads (32 entries each),
+                    // and each kv head's tail consumer is one HBM part.
+                    assert_eq!(hbm_copies, (tail * 4 * NKVH / 32) as usize, "{copy} at {j}");
+                    let tails = if tail > 0 { NKVH as usize } else { 0 };
+                    assert_eq!(hbm_parts, tails, "{consumer} at {j} page(s)");
+                } else if vlx.is_some() {
+                    // Kᵗ whole in HBM beside an LX V: every copy HBM, one score per kv head.
+                    assert_eq!(hbm_copies, j as usize, "{copy} at {j}");
+                    assert_eq!(hbm_parts, NKVH as usize, "{consumer} at {j} page(s)");
+                }
             }
+            let legs = vlx.map_or(0, |v| 1 + u32::from(v.keys().is_some()));
+            assert_eq!(
+                all_pins.len(),
+                (legs * parts * NKVH) as usize,
+                "{j} page(s)"
+            );
         }
     }
     // granite-8b's two feature slabs keep the HBM scratch at every rung.
@@ -706,22 +791,22 @@ fn the_decode_value_leg_reads_each_part_kernel_from_lx() {
         assert!(
             ChunkScratch::of_chunk(pool8, j)
                 .unwrap()
-                .value_lx(ChunkRowKind::OneRequest)
+                .lx_form(ChunkRowKind::OneRequest)
                 .is_none()
         );
     }
 }
 
-/// ⭐ THE V RUN's ORDER IS ONE LAW FOR THE COPIES AND THE HOST. Word `c` of a whole part's stick names
-/// slot run `c` of that part, the run its PV hands core `c`. The tail is the flat chunk order over the
-/// tail's pages, and the run covers every (kv head, page, block) of the chunk exactly once. The host's
-/// table puts V's run after K's, in this order, and each copy reads exactly its own stick of it.
+/// ⭐ THE RUN's ORDER IS ONE LAW FOR BOTH LEGS' COPIES AND THE HOST. Word `c` of a whole part's stick
+/// names slot run `c` of that part, the run its score and PV both hand core `c`. The tail is the flat
+/// chunk order over the tail's pages, and the run covers every (kv head, page, block) of the chunk
+/// exactly once. The host's table is this one run, and each copy reads exactly its own stick of it.
 #[test]
-fn the_value_lx_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
+fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
     let pool = PagedKvPool::new(NKVH as usize, HD as usize);
     for &j in ChunkScratch::LADDER.iter().filter(|&&j| j >= 8) {
         let chunk = ChunkScratch::of_chunk(pool, j).unwrap();
-        let vlx = chunk.value_lx(ChunkRowKind::OneRequest).unwrap();
+        let vlx = chunk.lx_form(ChunkRowKind::OneRequest).unwrap();
         let eph = chunk.entries_per_head_page();
         let mut seen = std::collections::BTreeSet::new();
         for e in 0..chunk.entries() {
@@ -746,11 +831,24 @@ fn the_value_lx_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             }
         }
         assert_eq!(seen.len(), chunk.entries() as usize);
-        // Each copy reads its own stick of V's run, which starts after K's.
+        // Each LX copy reads its own stick of the LX run: the ONE run both legs share when Kᵗ stays in
+        // LX, else V's run after Kᵗ's own head-major one.
+        let base = if vlx.keys().is_some() {
+            0
+        } else {
+            chunk.index_sticks()
+        };
         let sticks: Vec<u32> = vlx.copies().map(|(_, cp)| cp.stick()).collect();
-        let want: Vec<u32> = (chunk.index_sticks()..2 * chunk.index_sticks()).collect();
+        let want: Vec<u32> = (base..base + chunk.index_sticks()).collect();
         assert_eq!(sticks, want, "{j} page(s)");
-        // And the host's table carries both runs at these rows, but only K's for a prompt chunk.
+        // Kᵗ's own copies (with its witness) read the same sticks and write tensor `stick`.
+        if let Some(keys) = vlx.keys() {
+            let k: Vec<(u32, u32)> = keys.copies().map(|(i, cp)| (i, cp.stick())).collect();
+            let want: Vec<(u32, u32)> = (0..chunk.index_sticks()).map(|j| (j, j)).collect();
+            assert_eq!(k, want, "{j} page(s)");
+        }
+        // And the host's table is that run (after Kᵗ's own when Kᵗ is in HBM): the prompt chunk's
+        // same entries, part-major.
         let pages: Vec<i64> = (0..j as i64).collect();
         // A one-layer pool's page is `nkvh * PAGE_SLOTS / POOL_STICK` stick blocks.
         let per_page = ktir_superdsc::sdsc_abstract::gather_entries_per_page(
@@ -765,7 +863,6 @@ fn the_value_lx_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             per_page,
         )
         .unwrap();
-        assert_eq!(one.len() as u32, 2 * chunk.entries(), "{j} page(s)");
         let prompt = ktir_superdsc::sdsc_abstract::chunk_gather_index_table(
             chunk,
             ChunkRowKind::Prompt,
@@ -774,10 +871,75 @@ fn the_value_lx_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
         )
         .unwrap();
         assert_eq!(prompt.len() as u32, chunk.entries(), "{j} page(s)");
+        let n = chunk.entries() as usize;
+        let one = if vlx.keys().is_some() {
+            assert_eq!(one.len(), n, "{j} page(s): one run");
+            one
+        } else {
+            assert_eq!(one.len(), 2 * n, "{j} page(s): Kᵗ's run, then V's");
+            assert_eq!(
+                &one[..n],
+                &prompt[..],
+                "{j} page(s): Kᵗ's run is head-major"
+            );
+            one[n..].to_vec()
+        };
+        let (mut a, mut b) = (one.clone(), prompt.clone());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "{j} page(s): the same entries, reordered");
+        // One whole part and no tail is the one width where part-major IS head-major.
+        if vlx.lx_parts() > 1 || vlx.tail_pages() > 0 {
+            assert_ne!(one, prompt, "{j} page(s): part-major, not head-major");
+        } else {
+            assert_eq!(one, prompt, "{j} page(s): one part is the head-major order");
+        }
+    }
+}
+
+/// ⛔ A Kᵗ LX FORM WITH A TAIL IS UNREPRESENTABLE — the bake-time lockout of the measured card fault.
+/// granite-2b's 12- and 20-page rungs (a 4-page tail) faulted with Kᵗ in LX (`HMI=STORE` in the next kv
+/// head's score block, see `ChunkLx::keys`). The only door to the Kᵗ LX form (`ChunkKeysLx`) refuses
+/// exactly the tail rungs, at every rung of both shipped granite pools. The bundles those rungs bake
+/// gather and score Kᵗ in HBM: no Kᵗ copy writes LX, and the score is one op per kv head.
+#[test]
+fn a_tail_rung_cannot_mint_keys_in_lx() {
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    for &j in &ChunkScratch::LADDER {
+        let Some(lx) = ChunkScratch::of_chunk(pool, j)
+            .unwrap()
+            .lx_form(ChunkRowKind::OneRequest)
+        else {
+            continue;
+        };
         assert_eq!(
-            &one[..prompt.len()],
-            &prompt[..],
-            "{j} page(s): K's run is unchanged"
+            lx.keys().is_some(),
+            lx.tail_pages() == 0,
+            "{j} page(s): tail {}",
+            lx.tail_pages()
+        );
+        if lx.tail_pages() == 0 {
+            continue;
+        }
+        let ops = emit_chunk_in_layout(j, 1);
+        for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cgkt_")) {
+            let out = v["dscs_"][0][name]["labeledDs_"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            assert!(
+                out["memOrg_"].as_object().unwrap().contains_key("hbm"),
+                "{name} at {j} page(s): a tail rung's Kᵗ copy writes LX"
+            );
+        }
+        assert_eq!(
+            ops.iter()
+                .filter(|(n, _)| n.starts_with("attn_csc_"))
+                .count(),
+            NKVH as usize,
+            "{j} page(s): one whole-chunk score per kv head"
         );
     }
 }

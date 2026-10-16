@@ -247,9 +247,10 @@ pub enum SynthRole {
     Acc(u32),
     LBlk(u32),
     LAcc(u32),
-    // ── the split-KV chunk's LX-resident V, one core-local tensor per kv head
-    //    (`ChunkScratch::value_lx`): a core-local pin holds one slice at one address, so kv heads cannot
-    //    share one tensor at offsets ──
+    // ── the split-KV chunk's LX-resident Kᵗ and V, one core-local tensor per (part, kv head)
+    //    (`ChunkScratch::lx_form`): a core-local pin holds one slice at one address, so parts and kv heads
+    //    cannot share one tensor at offsets ──
+    GatherKtLx(u32),
     GatherVLx(u32),
 }
 
@@ -341,6 +342,7 @@ impl fmt::Display for SynthRole {
             Self::Acc(i) => write!(f, "acc{i}"),
             Self::LBlk(i) => write!(f, "lblk{i}"),
             Self::LAcc(i) => write!(f, "lacc{i}"),
+            Self::GatherKtLx(i) => write!(f, "gktlx{i}"),
             Self::GatherVLx(h) => write!(f, "gvlx{h}"),
         }
     }

@@ -795,7 +795,7 @@ struct ChunkKeys {
     resident: usize,
     mapped: u32,
     /// Whose rows the body attends with. It decides the value leg's entry order
-    /// (`ChunkScratch::value_lx`), and the bake took it from the same fact.
+    /// (`ChunkScratch::lx_form`), and the bake took it from the same fact.
     rows: scratchy_subtile::sdsc_abstract::ChunkRowKind,
 }
 

@@ -1436,13 +1436,17 @@ fn mark_lx_residency(op: &mut OpSpec, l: &BundleLayout) {
 ///   * hand every core the SAME slice OF THAT TENSOR as the first op on it did
 ///     ([`BundleLayout::record_lx_division`]).
 ///
-/// ⭐ THE SLICE IS THE TENSOR's, NOT THE OP's. Two ops of different kinds name a tensor's axes
-/// differently — a gather copy writes its destination as `[mb, out]`, the matmul that contracts it reads
-/// the same bytes as its KERNEL `[in, out]` — and divide dims the tensor does not have (a matmul's rows).
-/// So the signature is read off the operand's OWN axes (stick axis first, then the rest in layout order,
-/// unit axes dropped): each axis's extent and split, and which slice of each axis every core holds. Two
-/// ops agree exactly when core `c` holds the same block of the tensor under both. For two ops of one
-/// shape (`esub` → `exp`) that is the op-level comparison it always was.
+/// ⭐ THE SLICE IS THE TENSOR's BYTES, NOT THE OP's AXES. Two ops of different kinds name a tensor's
+/// axes differently and in different orders:
+///   * a gather copy writes its destination as `[mb, out]`;
+///   * the PV that contracts it reads the same bytes as its KERNEL `[in, out]`;
+///   * the score reads a Kᵗ copy's bytes as a stick-major `[in, out]` kernel, whose stick axis is the
+///     copy's row axis.
+///
+/// Ops also divide dims the tensor does not have, such as a matmul's rows. So the signature is the
+/// tensor's own DEVICE layout: where each core's slice starts, as an HBM operand would address it, and
+/// how many bytes it holds. Two ops agree exactly when core `c` holds the same bytes of the tensor under
+/// both. For two ops of one shape (`esub` → `exp`) that is the op-level comparison it always was.
 ///
 /// Any other op is a build `Err` naming the tensor — never fluent garbage on card.
 fn core_local_reads_agree(
@@ -1468,14 +1472,8 @@ fn core_local_reads_agree(
             )));
         }
         let plan = &op.iter;
-        // The operand's own axes, stick axis first, unit axes dropped — see the doc above. Its per-core
-        // slice is along these, not the op's whole iteration space (a PV also iterates the head dim its
-        // probabilities operand does not have).
-        let axes: Vec<&'static str> = std::iter::once(v.stick)
-            .chain(v.layout.iter().copied().filter(|d| *d != v.stick))
-            .filter(|d| plan.extent(d) > 1)
-            .collect();
-        let slice_bytes = axes
+        let slice_bytes = v
+            .layout
             .iter()
             .map(|d| u64::from(plan.per_core_extent(d)))
             .product::<u64>()
@@ -1487,33 +1485,33 @@ fn core_local_reads_agree(
                  past its {pin_bytes}-byte pin"
             )));
         }
-        // ⭐ THE SLICE EACH CORE HOLDS, AXIS BY AXIS OF THIS OPERAND — not the op's whole plan. A matmul and a
-        // pointwise op never share a plan (their iteration spaces differ), yet a `{mb:32}` PV and a `{mb:32}`
-        // exp hand core `c` the same rows of the probabilities and all of its columns; that per-core slice,
-        // read off the emitter's own core→slice decomposition along the operand's own axes, is exactly what
-        // makes a core-local read correct. Unit axes (extent 1) are skipped: a rank-3 view with a phantom
-        // `y` of 1 (the reduce builder's offset slice) holds exactly the elements the rank-2 view does.
+        // Where each core's slice starts in the tensor's device layout: the very per-core START an HBM
+        // operand of this view would carry (`per_core_addr` over `view_stick_layout`, at base 0).
+        let as_hbm = ArgView {
+            is_input: v.is_input,
+            name: v.name,
+            role: v.role,
+            scale: v.scale,
+            device_dims: v.device_dims,
+            layout: v.layout,
+            stick: v.stick,
+            allocation: Allocation::Hbm,
+            offset_elems: v.offset_elems,
+            df: v.df,
+            row_blocked: v.row_blocked,
+            device_extent: v.device_extent,
+        };
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
-        let wk = core_to_wk_slice(plan, &dims);
-        let per_core: Vec<Vec<crate::superdsc_opspec::SliceIndex>> =
-            (0..plan.cores_used().get().max(1))
-                .map(|c| {
-                    axes.iter()
-                        .map(|d| {
-                            wk.get(&c.to_string())
-                                .and_then(|s| s.get(d))
-                                .copied()
-                                .unwrap_or(crate::superdsc_opspec::SliceIndex::UNSPLIT)
-                        })
-                        .collect()
-                })
-                .collect();
-        let signature = format!(
-            "axes {:?}, each core's block {per_core:?}",
-            axes.iter()
-                .map(|d| (plan.extent(d), plan.split_of(d).max(1)))
-                .collect::<Vec<_>>(),
-        );
+        let corners = per_core_addr(
+            0,
+            &as_hbm,
+            &view_stick_layout(&as_hbm, plan),
+            plan,
+            &crate::work::core_to_wk_slice(plan, &dims),
+            0,
+            plan.cores_used().get(),
+        )?;
+        let signature = format!("each core's {slice_bytes} B slice at {corners:?}");
         l.record_lx_division(name, op_name, signature)
             .map_err(SuperDscError)?;
     }
