@@ -873,16 +873,19 @@ mod tests {
     #[test]
     fn test_available_space_queries_real_fs() {
         let dir = tempfile::tempdir().unwrap();
-        let got = available_space(dir.path()).expect("a real dir has queryable free space");
-
         // On macOS/APFS the purgeable-aware "important usage" figure is always
         // >= the statvfs figure `fs2` reports (it counts reclaimable space on
         // top); on Linux the two are identical. It must never *under*-report,
         // which is exactly the bug that failed downloads that would succeed.
-        let statvfs = fs2::available_space(dir.path()).unwrap();
+        // Other processes write to the same disk, so statvfs is read on both
+        // sides of the query: the free space it saw lies between the two.
+        let before = fs2::available_space(dir.path()).unwrap();
+        let got = available_space(dir.path()).expect("a real dir has queryable free space");
+        let after = fs2::available_space(dir.path()).unwrap();
+        let statvfs = before.min(after);
         assert!(
             got >= statvfs,
-            "available_space {got} under-reported vs statvfs {statvfs}"
+            "available_space {got} under-reported vs statvfs {before}..{after}"
         );
     }
 }
