@@ -65,7 +65,7 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
         for &j in &ChunkScratch::LADDER {
             let ops = emit(j, mq);
             let count = |stem: &str| ops.iter().filter(|(n, _)| n.starts_with(stem)).count() as u32;
-            for stem in ["attn_csc_h", "attn_cbmax_h", "attn_cbsum_h"] {
+            for stem in ["attn_csc_h", "attn_cbmax_h"] {
                 assert_eq!(
                     count(stem),
                     NQH,
@@ -77,11 +77,35 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
                 0,
                 "no per-kv-head score above one slab"
             );
+            // A prompt chunk walks its probabilities through LX in equal page parts (each one `esub`, `exp`,
+            // row sum and one PV per slab); decode keeps one whole-chunk sum and value part. The part count is
+            // read off head 0's own `esub`s, and every head must carry the same.
             let parts = if mq > 1 {
-                j.div_ceil(ChunkScratch::VALUE_PART_PAGES)
+                count("attn_cesub_h0_s")
             } else {
                 1
             };
+            if mq > 1 {
+                assert!(
+                    parts >= j.div_ceil(ChunkScratch::VALUE_PART_PAGES) && j.is_multiple_of(parts),
+                    "{j} page(s): {parts} probability parts must be equal whole-page parts of at most \
+                     {} pages",
+                    ChunkScratch::VALUE_PART_PAGES
+                );
+                for stem in ["attn_cesub_h", "attn_cexp_h", "attn_cbsum_h"] {
+                    assert_eq!(
+                        count(stem),
+                        NQH * parts,
+                        "{stem}* at {j} page(s): one per (query head, probability part)"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    count("attn_cbsum_h"),
+                    NQH,
+                    "attn_cbsum_h* at {j} page(s), decode: one per query head"
+                );
+            }
             assert_eq!(
                 count("attn_cov_h"),
                 NQH * NSLAB * parts,
