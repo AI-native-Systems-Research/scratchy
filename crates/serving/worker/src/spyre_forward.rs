@@ -123,8 +123,9 @@ pub(crate) fn run_prefill_batch(
     use scratchy_subtile::sdsc_abstract::{ChunkRows, decode_prefix_col_valid};
     // ⭐ NO `hd` HERE ANY MORE. The one head-count question this function asked (`h / hd`) is now
     // the bake's own `Geometry::nqh` — the quotient was the head count only for a square Q
-    // projection, and a hybrid-attention arch (gemma-4) has none. `Shared::head_dim` stays for
-    // the sendnn pool sizing, which is a KV-width question, not a head-count one.
+    // projection, and a hybrid-attention arch (gemma-4) has none. The sendnn pool sizing is a
+    // KV-width question, and it reads `Loaded`'s own two numbers through the threaded
+    // `PagedKvPool` — `Shared` carries no head geometry at all.
     let (h, vocab) = (sh.hidden, sh.vocab);
     // The bundle is baked for EXACTLY m=prefill_m query rows, so run at prefill_m: the `real`
     // prompt tokens fill rows [0..real), rows [real..prefill_m) are PAD. A PROMPT CHUNK's pad row
@@ -1999,8 +2000,6 @@ pub(crate) fn run_request_step(
     let sh = Shared {
         embed_tokens: &model.embed_tokens,
         hidden: model.hidden,
-        #[cfg(feature = "spyre-hw")]
-        head_dim: model.head_dim,
         vocab: model.vocab,
     };
     // ⭐ THE PAGED-KV POOL'S GEOMETRY, from the model's own two numbers — the same spelling the

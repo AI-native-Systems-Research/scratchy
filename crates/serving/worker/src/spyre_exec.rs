@@ -757,7 +757,6 @@ impl Worker for SpyreWorker {
                 let sh = Shared {
                     embed_tokens: &model.embed_tokens,
                     hidden: model.hidden,
-                    head_dim: model.head_dim,
                     vocab: model.vocab,
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
