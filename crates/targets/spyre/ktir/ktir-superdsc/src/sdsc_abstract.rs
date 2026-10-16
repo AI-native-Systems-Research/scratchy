@@ -6679,22 +6679,30 @@ impl PageScratch {
 /// all `mq_pad` columns — the split-KV chunk's own form — it is a fixed handful of ops at any width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewBlockForm {
-    /// Stick-wide sub-blocks folded per query head: decode, every batch, and every prompt rung that is
-    /// not a whole number of sticks.
+    /// Stick-wide sub-blocks folded per query head: decode, every batch, every prompt rung that is not a
+    /// whole number of sticks, and every head dim past [`NewBlockForm::CHUNK_MAX_SLABS`].
     SubBlocks,
-    /// One block per kv head over all `mq_pad` columns: a prompt chunk whose width is a whole number of
-    /// sticks (so its new-V block is exactly `mq_pad` rows and PV can contract it whole), at a head dim
-    /// of one stick (the chunk's own `[rows, slots]` blocks, see [`ChunkScratch`]).
+    /// One block per chunk ROW BLOCK ([`ChunkRowBlocks`]: a kv head at one feature slab, a query head
+    /// above it) over all `mq_pad` columns: a prompt chunk whose width is a whole number of sticks (so
+    /// its new-V block is exactly `mq_pad` rows and PV can contract it whole) — the split-KV chunk's own
+    /// `[rows, slots]` blocks, see [`ChunkScratch`].
     Chunk,
 }
 
 impl NewBlockForm {
+    /// ⭐ THE WIDEST HEAD DIM, IN FEATURE SLABS, THE CHUNK FORM IS BUILT AT: one slab (granite-2b) and two
+    /// (granite-8b) — the two whose per-row-block score and per-slab value forms the split-KV chunk runs
+    /// on card. A wider head dim (the gemma bakes' 256 and 512) keeps the sub-blocks byte for byte.
+    pub const CHUNK_MAX_SLABS: u32 = 2;
+
     /// The form a launch of `mq` rows at head dim `hd` takes; `rows_are_requests` is a decode batch.
     pub const fn of(mq: u32, hd: u32, rows_are_requests: bool) -> NewBlockForm {
         if !rows_are_requests
             && mq >= POOL_STICK
             && mq.is_multiple_of(POOL_STICK)
-            && hd == POOL_STICK
+            && hd.is_multiple_of(POOL_STICK)
+            && hd / POOL_STICK >= 1
+            && hd / POOL_STICK <= Self::CHUNK_MAX_SLABS
         {
             NewBlockForm::Chunk
         } else {
@@ -6705,13 +6713,14 @@ impl NewBlockForm {
     /// ⭐ QUERY HEADS PER STAGED CAUSAL-MASK BLOCK. The mask is staged as consecutive blocks of this many
     /// heads' rows, each block `mq_pad / 64` stick-wide column groups of those rows: the stick-major layout
     /// of a `[heads·mq, mq_pad]` tensor. The sub-blocks read one stick of ALL heads (`nqh`); the chunk form
-    /// reads one kv head's `[gqa·mq, mq_pad]` block whole, and dxp rebuilds a stick-blocked operand's group
-    /// stride from the op's own row count — so that block must be laid out at ITS row count (`gqa`). Same
-    /// total size either way, and byte-identical at one stick (`mq_pad == 64`), where the two coincide.
-    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: u32) -> u32 {
+    /// reads one row block's `[heads·mq, mq_pad]` block whole ([`ChunkRowBlocks::heads_per_block`]: a kv
+    /// head's `gqa` at one slab, one query head above it), and dxp rebuilds a stick-blocked operand's group
+    /// stride from the op's own row count — so that block must be laid out at ITS row count. Same total
+    /// size either way, and byte-identical at one stick (`mq_pad == 64`), where the forms coincide.
+    pub const fn mask_heads_per_block(self, nqh: u32, nkvh: u32, hd: u32) -> u32 {
         match self {
             NewBlockForm::SubBlocks => nqh,
-            NewBlockForm::Chunk => nqh / nkvh,
+            NewBlockForm::Chunk => ChunkRowBlocks::heads_per_block(nqh / nkvh, hd / POOL_STICK),
         }
     }
 }
@@ -7018,23 +7027,7 @@ impl ChunkScratch {
 
     /// ⭐ HOW THE CHUNK's WIDE INTERMEDIATES ARE CUT INTO ROW BLOCKS — see [`ChunkRowBlocks`].
     pub const fn row_blocks(self, gqa: u32, mq: u32) -> ChunkRowBlocks {
-        if self.plane.slabs() == 1 {
-            ChunkRowBlocks {
-                blocks: self.nkvh(),
-                rows: gqa * mq,
-                heads: gqa,
-                gqa,
-                slots: self.slots(),
-            }
-        } else {
-            ChunkRowBlocks {
-                blocks: self.nkvh() * gqa,
-                rows: mq,
-                heads: 1,
-                gqa,
-                slots: self.slots(),
-            }
-        }
+        ChunkRowBlocks::of_group(self.nkvh(), gqa, mq, self.plane.slabs(), self.slots())
     }
 }
 
@@ -7060,6 +7053,26 @@ pub struct ChunkRowBlocks {
 }
 
 impl ChunkRowBlocks {
+    /// Query heads one row block covers, from the feature slab count: the whole GQA group at one slab,
+    /// one query head above it. The ONE law the chunk scratch's blocks, the causal new block's, and the
+    /// host's causal-mask staging ([`NewBlockForm::mask_heads_per_block`]) all read.
+    pub const fn heads_per_block(gqa: u32, slabs: u32) -> u32 {
+        if slabs == 1 { gqa } else { 1 }
+    }
+
+    /// The row blocks of `nkvh` GQA groups of `gqa` query heads, `mq` rows a head, at `slabs` feature
+    /// slabs, each block `slots` columns wide.
+    pub const fn of_group(nkvh: u32, gqa: u32, mq: u32, slabs: u32, slots: u32) -> ChunkRowBlocks {
+        let heads = Self::heads_per_block(gqa, slabs);
+        ChunkRowBlocks {
+            blocks: nkvh * gqa / heads,
+            rows: heads * mq,
+            heads,
+            gqa,
+            slots,
+        }
+    }
+
     pub const fn count(self) -> u32 {
         self.blocks
     }

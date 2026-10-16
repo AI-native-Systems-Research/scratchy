@@ -317,6 +317,11 @@ fn a_wide_prompt_chunk_cuts_its_probabilities_into_untiled_parts() {
 /// (`BundleLayout::synth_lx_core_local`) only reaches the descriptors through one. Every caller-bound
 /// operand is placed (an undeclared name is a build error); `assemble_attn` declares its own scratches.
 fn emit_chunk_in_layout(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
+    emit_chunk_in_layout_at::<HD>(pages, mq)
+}
+
+/// [`emit_chunk_in_layout`] at head dim `D` — 128 is granite-3.1-8b's geometry (same heads, two slabs).
+fn emit_chunk_in_layout_at<const D: u32>(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
     use ktir_superdsc::place::PlaceId;
     use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
     let mut layout = BundleLayout::default();
@@ -340,14 +345,14 @@ fn emit_chunk_in_layout(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)>
             },
         );
     }
-    let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
+    let geom = AttnGeometry::<NQH, NKVH, D>::minted();
     let rows = if mq == 1 {
         attn_bundle_rows(geom, 1, true).expect("the one-request decode rung")
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
-        .expect("a chunk granite-2b admits");
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, D as usize), pages)
+        .expect("a chunk granite admits");
     let mut sym = 0i64;
     let ops = assemble_attn(
         0,
@@ -381,11 +386,6 @@ fn emit_chunk_in_layout(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)>
 /// the work exactly as its `esub` did — the emitter refuses any op that does not.
 #[test]
 fn the_chunk_probabilities_stay_in_lx_between_esub_and_exp() {
-    let lx_only = |v: &serde_json::Value| {
-        v["memOrg_"]
-            .as_object()
-            .is_some_and(|m| m.len() == 1 && m.contains_key("lx"))
-    };
     for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
         for &j in &ChunkScratch::LADDER {
             let ops = emit_chunk_in_layout(j, mq);
@@ -400,41 +400,99 @@ fn the_chunk_probabilities_stay_in_lx_between_esub_and_exp() {
                 ]);
             }
             for (stem, at) in checks {
-                let mine: Vec<&(String, serde_json::Value)> =
-                    ops.iter().filter(|(n, _)| n.starts_with(stem)).collect();
-                assert!(!mine.is_empty(), "{stem}* at {j} page(s), mq {mq}");
-                for (name, v) in mine {
-                    let body = &v["dscs_"][0][name];
-                    let lds = body["labeledDs_"].as_array().expect("labeled operands");
-                    let lds =
-                        if at == "out" { lds.last() } else { lds.first() }.expect("an operand");
-                    assert!(
-                        lx_only(lds),
-                        "{name} at {j} page(s), mq {mq}: cesub is {}",
-                        lds["memOrg_"]
-                    );
-                    let idx = lds["ldsIdx_"].as_u64();
-                    let alloc = body["scheduleTree_"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|n| n["nodeType_"] == "allocate" && n["ldsIdx_"].as_u64() == idx)
-                        .expect("cesub's allocate node");
-                    assert_eq!(alloc["component_"], "lx", "{name}");
-                    let starts: std::collections::BTreeSet<String> =
-                        alloc["startAddressCoreCorelet_"]["data_"]
-                            .as_object()
-                            .into_iter()
-                            .flatten()
-                            .map(|(_, a)| a.to_string())
-                            .collect();
-                    assert_eq!(
-                        starts.len(),
-                        1,
-                        "{name} at {j} page(s), mq {mq}: cesub starts at {starts:?} — one pin on \
-                         every core"
-                    );
-                }
+                assert_core_local_lx(&ops, stem, at, &format!("{j} page(s), mq {mq}"));
+            }
+        }
+    }
+}
+
+/// Every op named `stem*` reads (`at == "in"`, its first operand) or writes (`"out"`, its last) an
+/// LX-only operand at ONE start address on every core — a core-local pin.
+fn assert_core_local_lx(ops: &[(String, serde_json::Value)], stem: &str, at: &str, ctx: &str) {
+    let mine: Vec<&(String, serde_json::Value)> =
+        ops.iter().filter(|(n, _)| n.starts_with(stem)).collect();
+    assert!(!mine.is_empty(), "{stem}* at {ctx}");
+    for (name, v) in mine {
+        let body = &v["dscs_"][0][name];
+        let lds = body["labeledDs_"].as_array().expect("labeled operands");
+        let lds = if at == "out" { lds.last() } else { lds.first() }.expect("an operand");
+        assert!(
+            lds["memOrg_"]
+                .as_object()
+                .is_some_and(|m| m.len() == 1 && m.contains_key("lx")),
+            "{name} at {ctx}: its {at} operand is {}",
+            lds["memOrg_"]
+        );
+        let idx = lds["ldsIdx_"].as_u64();
+        let alloc = body["scheduleTree_"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|n| n["nodeType_"] == "allocate" && n["ldsIdx_"].as_u64() == idx)
+            .expect("the operand's allocate node");
+        assert_eq!(alloc["component_"], "lx", "{name}");
+        let starts: std::collections::BTreeSet<String> = alloc["startAddressCoreCorelet_"]["data_"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(_, a)| a.to_string())
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "{name} at {ctx}: starts at {starts:?} — one pin on every core"
+        );
+    }
+}
+
+/// ⭐⭐⭐ AT HEAD DIM 128 (granite-3.1-8b) A WHOLE-STICK PROMPT CHUNK IS CUT PER QUERY HEAD — the causal
+/// block and the resident chunk alike — and keeps its probabilities in LX. Above one slab only one head's
+/// `[mq, hd]` rows are a contiguous operand (`ChunkRowBlocks`), so every block is a query head: one score /
+/// max / esub / exp / sum per head over its whole `[mq, mq_pad]` causal block, and one PV per (head, slab).
+/// That every rung of the ladder emits at both prompt widths is the build-time proof that each PV divides
+/// its work as the `exp` it reads from LX did.
+#[test]
+fn an_hd128_prompt_chunk_is_cut_per_query_head_and_keeps_its_probabilities_in_lx() {
+    const HD128: u32 = 128;
+    let slabs = (HD128 / 64) as usize;
+    for mq in [128, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
+        for &j in &ChunkScratch::LADDER {
+            let ops = emit_chunk_in_layout_at::<HD128>(j, mq);
+            let ctx = format!("hd 128, {j} page(s), mq {mq}");
+            let count = |stem: &str| ops.iter().filter(|(n, _)| n.starts_with(stem)).count();
+            for stem in [
+                "attn_ncsc_h",
+                "attn_ncbmax_h",
+                "attn_ncesub_h",
+                "attn_ncexp_h",
+                "attn_ncbsum_h",
+            ] {
+                assert_eq!(
+                    count(stem),
+                    NQH as usize,
+                    "{stem}* at {ctx}: one per query head"
+                );
+            }
+            assert_eq!(
+                count("attn_ncov_h"),
+                NQH as usize * slabs,
+                "attn_ncov_h* at {ctx}: one per (query head, slab)"
+            );
+            assert_eq!(count("attn_ncsc_g"), 0, "{ctx}: no per-kv-head block");
+            assert_eq!(
+                count("attn_nsc_h"),
+                0,
+                "{ctx}: no sub-blocked new-block score"
+            );
+            for (stem, at) in [
+                ("attn_ncesub_h", "out"),
+                ("attn_cesub_h", "out"),
+                ("attn_cexp_h", "in"),
+                ("attn_cexp_h", "out"),
+                ("attn_cbsum_h", "in"),
+                ("attn_cov_h", "in"),
+            ] {
+                assert_core_local_lx(&ops, stem, at, &ctx);
             }
         }
     }

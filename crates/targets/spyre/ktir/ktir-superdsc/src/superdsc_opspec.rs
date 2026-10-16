@@ -57,11 +57,11 @@ pub const ACTIVE_CORELETS: u32 = 1;
 
 // ───────────────────────────────────────────────────────────────────────────
 // LX scratchpad capacity — the binding limit for the time-tiling (coarse_tile)
-// pass. SINGLE SOURCE OF TRUTH, shared with the wire module. A per-core tile
-// that does not fit `USABLE_LX_BYTES` is an on-card DtException 1535
-// (register-file / scratchpad over-subscription, L3DlOpsScheduler) — the whole
-// point of the typed [`TimeTile`] witness is to turn that into a `cargo build`
-// `Err` BEFORE the bundle is ever baked.
+// pass. SINGLE SOURCE OF TRUTH, shared with the wire module. The pass fits every
+// op it tiles inside `USABLE_LX_BYTES`, and the typed [`TimeTile`] witness makes a
+// shape that cannot fit a `cargo build` `Err` BEFORE the bundle is ever baked.
+// ⛔ It is NOT a law that every op's per-core slab must fit: an unbatched fp16
+// matmul is handed to dxp whole and dxp stages it ([`MatmulStaging`], measured).
 // ───────────────────────────────────────────────────────────────────────────
 
 /// LX scratchpad bytes PER CORE on dd2 = 2 MiB. Confirmed against torch-spyre
@@ -1157,6 +1157,51 @@ impl WorkPlan {
             red.name,
             red_sticks.min(N)
         )))
+    }
+}
+
+/// ⭐⭐⭐ WHO STAGES A MATMUL's OPERANDS THROUGH LX — dxp itself, or this frontend's LX-fit time trips.
+///
+/// torch-spyre never time-tiles a dense matmul in its frontend. It hands DeepTools ONE SuperDSC per matmul
+/// over the cost model's whole per-core slab, with HBM operands and a time factor of 1, and lets dxp stage
+/// the slab through the fifth of LX it keeps for itself ("DeepTools handles the actual scheduling of data
+/// movement between DDR and the scratchpad, including double-buffering"). This frontend instead cut every
+/// projection whose per-core slab overflowed [`USABLE_LX_BYTES`] into `out` trips
+/// ([`WorkPlan::time_tile_for_lx`]) and pre-unrolled each trip into its own descriptor
+/// (`concrete_trips`). The activation carries no `out`, so EVERY trip re-staged the same activation slab
+/// from HBM: granite-3.1-8b's gate at 256 prompt rows was 14 trips, each re-reading its core's
+/// 64 × 4096 slab (512 KiB). The o_proj + MLP group ran 5.9 ms per layer per chunk, about half of the
+/// prompt's time.
+///
+/// MEASURED, one card, ABAB, `scr serve --no-prefix-caching`, docs prompts, greedy, frontend trips →
+/// [`MatmulStaging::Dxp`]:
+///   * granite-3.1-8b fp16: TTFT −9 % at ~10k tokens (20.57 → 18.67 s) to −14 % at 137; decode ITL p50
+///     −6.8 % at ~10k (272.0 → 253.5 ms); the short chat's ITL −11.5 % (178.4 → 157.8 ms). Replies are
+///     byte-identical on every natural prompt from ~200 to ~10k tokens.
+///   * granite-3.1-2b fp16: TTFT −3 … −6 % at every length, decode at parity. Where a reply moved, the
+///     true model (HF fp32, teacher-forced) scores the two equally: mean NLL change +0.02 nats/token over
+///     the moved cells.
+///   * dxp baked every shape of both models — none needed the frontend's fit.
+///
+/// ⛔ ONLY AN UNBATCHED fp16 MATMUL TAKES IT. A `y`-batched matmul keeps the frontend trips: its kernel
+/// is per batch and its forms are the card-proven ones. fp8 keeps them too, because its untiled form has
+/// not been measured on card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatmulStaging {
+    /// ONE descriptor over the whole per-core slab, HBM operands, no frontend trips; dxp stages it.
+    Dxp,
+    /// The frontend's LX-fit time trips ([`WorkPlan::divide_and_time_tile_for_lx`]).
+    FrontendTrips,
+}
+
+impl MatmulStaging {
+    /// The staging a matmul of `batch` kernel batches over `df` operands takes.
+    pub const fn of(batch: u32, df: Df) -> MatmulStaging {
+        if batch <= 1 && matches!(df, Df::Fp16) {
+            MatmulStaging::Dxp
+        } else {
+            MatmulStaging::FrontendTrips
+        }
     }
 }
 

@@ -11337,13 +11337,13 @@ fn dump_wavefront_mega(
         /// at pod load), so a rung added here must be proven to lower on every spyre model first.
         ///
         /// ⭐ ABOVE [`SUB_BLOCKED_PREFILL_CEILING`] A RUNG IS BAKED ONLY WHERE ITS CAUSAL BLOCK IS CHUNK-FORMED
-        /// (`NewBlockForm::of(rung, head_dim, false) == Chunk`: whole sticks at head dim 64). A wider chunk
+        /// (`NewBlockForm::of(rung, head_dim, false) == Chunk`: whole sticks at head dim 64 or 128). A wider chunk
         /// re-streams the weights half as often, but sub-blocked per query head its causal block grows with
         /// the width and gives that back. MEASURED, granite-3.1-2b fp16, one card, ABAB:
         ///   10k TTFT  sub-blocked: 13.6 s at 128 rows → 13.0 s at 256 (and ~1k got SLOWER, 0.90 → 0.94 s)
         ///             chunk-formed: 12.8 s at 128 → **11.3 s at 256**; ~1k 0.73 s, ~400 tokens 0.27 s
-        /// So 2b-class models get 192 and 256, and a model whose causal block stays sub-blocked (granite-8b
-        /// at hd=128, the gemma bakes) keeps its 128-row ladder byte for byte.
+        /// So granite-2b and granite-8b (hd=128, cut per query head) get 192 and 256, and a model whose
+        /// causal block stays sub-blocked (the gemma bakes, hd ≥ 256) keeps its 128-row ladder byte for byte.
         const PREFILL_RUNGS: [u32; 25] = [
             7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112,
             128, 192, 256,

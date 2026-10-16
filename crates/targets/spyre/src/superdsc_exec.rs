@@ -142,7 +142,7 @@ struct Diag {
     /// pipeline_barrier + the stream's STRICT_ORDERING guarantee the dataflow, and the drain cost
     /// ~11% of decode (pod-confirmed coherent without it: 24.7 → 27.4 tok/s).
     perop_sync: bool,
-    /// `SCRATCHY_SDSC_GROUP_TIME`: per-op-index device time. Needs a drain to attribute anything,
+    /// `SCRATCHY_SDSC_GROUP_TIME`: per-launch-group device time. Needs a drain to attribute anything,
     /// so it costs what the per-op sync costs — a MEASUREMENT MODE, not something to leave on.
     group_time: bool,
     /// `SCRATCHY_SDSC_SUBMIT_TIME`: host enqueue cost per launch, with NO drain, so the pipeline is
@@ -217,12 +217,15 @@ impl Diag {
     }
 }
 
-/// Accumulators the timing modes write into. Process-wide, like the C++ statics — the run is one
-/// model, so op indices do not collide across bundles in a way that misleads.
+/// Accumulators the timing modes write into. Process-wide, like the C++ statics.
 #[derive(Default)]
 struct Timers {
-    /// Per op index: (total ms, launches).
-    group_ms: BTreeMap<usize, (f64, u64)>,
+    /// Per launch group, keyed by its LABEL (`bundle fp/group_i`, the launch mark's own name): (total
+    /// ms, launches). ⛔ NOT by group index — groups are cut at a fixed descriptor count, so index `i`
+    /// holds different ops in every chunk-width bundle (granite-8b's 36-page prompt bundle runs its
+    /// cache write in `group_9` and its MLP in `group_10`; a narrower rung's MLP lands lower), and a
+    /// per-index total summed across those bundles attributed the MLP's time to the cache write.
+    group_ms: BTreeMap<String, (f64, u64)>,
     group_calls: u64,
     submit_ms: f64,
     prep_ms: f64,
@@ -2337,7 +2340,7 @@ impl Executor {
                     let _ = stream.synchronize();
                     let ms = gt0.elapsed().as_secs_f64() * 1e3;
                     let mut t = timers();
-                    let e = t.group_ms.entry(oi).or_insert((0.0, 0));
+                    let e = t.group_ms.entry(op.label()).or_insert((0.0, 0));
                     e.0 += ms;
                     e.1 += 1;
                     t.group_calls += 1;
@@ -3678,16 +3681,17 @@ fn report_group_time(t: &Timers) {
     let mut top: Vec<_> = t
         .group_ms
         .iter()
-        .map(|(i, (ms, n))| (*ms, *i, *n))
+        .map(|(label, (ms, n))| (*ms, label.as_str(), *n))
         .collect();
     top.sort_by(|a, b| b.0.total_cmp(&a.0));
     eprintln!(
-        "[sdsc-grouptime] top ops by total ms (of {total:.1} ms over {} launches)",
+        "[sdsc-grouptime] top groups by total ms (of {total:.1} ms over {} launches)",
         t.group_calls
     );
-    for (ms, i, n) in top.iter().take(20) {
+    // Every group: a prompt spans one bundle per chunk width, each with its own groups.
+    for (ms, label, n) in &top {
         eprintln!(
-            "[sdsc-grouptime]   op {i:<5}  {ms:8.1} ms total  {:6.3} ms/launch  {n:6} launches  \
+            "[sdsc-grouptime]   {label:<40}  {ms:8.1} ms total  {:6.3} ms/launch  {n:6} launches  \
              {:5.1}%",
             ms / *n as f64,
             100.0 * ms / total.max(1e-9)
