@@ -986,8 +986,8 @@ impl ControlBlockWire {
 pub struct ResponseBlockWire {
     ret_word: u64,
     /// The TIMESTAMP section, `TS_SECTION..PW_SECTION` (bytes 8..28) as five little-endian 32-bit
-    /// words — the per-section device cycle counts hardware writes for every completed CB. Kept raw:
-    /// see [`Self::timestamps`] for why the slots are not named here.
+    /// words — event snapshots of one wrapping cycle counter, never durations. See the
+    /// [`Self::dmai_cycles`] family for the card-measured semantics.
     ts_words: [u32; 5],
     /// The POWER-MEASUREMENT word at `PW_SECTION..APP_SECTION` (bytes 28..32) — the vendor's
     /// `ResponseBlockWrapper::power()`.
@@ -1065,13 +1065,57 @@ impl ResponseBlockWire {
 
     /// The TIMESTAMP section verbatim: five raw 32-bit device cycle counts, `TS1..TS5` in wire
     /// order (`TimeStampSectionSBF`; libaiupti's activity enum calls them `CYCLES_TS1..TS5`
-    /// "cycle count events"). The vendor's `ResponseBlockWrapper` exposes semantic accessors —
-    /// `dmai_cycles()`/`dmao_cycles()`/`prep_cmpt_cycles()`/`exec_cmpt_cycles()`/
-    /// `total_cmpt_cycles()` — but the mapping from slot to name lives in a `.cpp` senlib does not
-    /// ship. Name a slot only with a card measurement behind it: an H2D CB lights the DMA-in slot,
-    /// a D2H CB the DMA-out slot, a compute CB the CMPT slots, and the patterns are disjoint.
+    /// "cycle count events"). They are event snapshots of one free-running wrapping counter, not
+    /// durations — see the [`Self::dmai_cycles`] family for the card-measured semantics, and
+    /// never sum these raw.
     pub const fn timestamps(self) -> [u32; 5] {
         self.ts_words
+    }
+
+    /// ⭐ THE TS SLOTS' CARD-MEASURED SEMANTICS (dd2, granite-3.1-2b fp8, PR #523's on-card run):
+    /// the five words are snapshots of ONE free-running u32 cycle counter (rate ≈
+    /// `CYCLES_PER_USEC` — 1012 cyc/µs cross-checked on card against the phase-line wall clock),
+    /// taken at `word[0]` = CB start / DMA-in start, `word[1]` = DMA-in end (**exactly equal to
+    /// `word[0]` on every CB with no DMA-in — every compute CB**), `word[2]` = CMPT start,
+    /// `word[3]` = CMPT end, `word[4]` = CB end. Slots a CB does not write read zero: an H2D CB
+    /// zeroes words 3-4, a D2H CB zeroes words 0-2. A phase duration is therefore the WRAPPING
+    /// difference of its pair — the counter wraps every ~4.2 s, and a per-CB duration (≤ ~1M
+    /// cycles) is far under the wrap, so `wrapping_sub` is exact. The vendor's
+    /// `ResponseBlockWrapper` names these same five phases (`dmai_cycles()` … `total_cmpt_cycles()`)
+    /// but ships no `.cpp`, so these accessors carry the measurement, not a transcription.
+    ///
+    /// On a D2H CB, `dmai_cycles`/`prep_cmpt_cycles`/`exec_cmpt_cycles` difference zeroed slots
+    /// and are meaningless; on a compute CB, `dmao_cycles` is the ~9-cycle writeback tail. Use
+    /// the pair that matches the CB's pipeline.
+    pub const fn dmai_cycles(self) -> u32 {
+        self.ts_words[1].wrapping_sub(self.ts_words[0])
+    }
+
+    /// The CMPT queue+prep wait: `word[2] - word[1]`, from DMA-in end to the compute engine
+    /// picking the CB up. On a pipelined stream this includes waiting behind the previous CB's
+    /// execution — consecutive compute CBs overlap exactly this way (the next CB's prep runs
+    /// during the previous CB's exec). See [`Self::dmai_cycles`] for the full measured layout.
+    pub const fn prep_cmpt_cycles(self) -> u32 {
+        self.ts_words[2].wrapping_sub(self.ts_words[1])
+    }
+
+    /// The compute engine's execution: `word[3] - word[2]`. The number that sums to the device
+    /// span of a forward (cross-checked on card: Σ exec over a forward's CBs ≈ its
+    /// `[sdsc-phase] compute` wall time). See [`Self::dmai_cycles`].
+    pub const fn exec_cmpt_cycles(self) -> u32 {
+        self.ts_words[3].wrapping_sub(self.ts_words[2])
+    }
+
+    /// The CB's last phase: `word[4] - word[3]` — the D2H duration on a D2H CB, the ~9-cycle
+    /// writeback tail on a compute CB. See [`Self::dmai_cycles`].
+    pub const fn dmao_cycles(self) -> u32 {
+        self.ts_words[4].wrapping_sub(self.ts_words[3])
+    }
+
+    /// The CB's whole CMPT residency: `word[4] - word[1]` = prep + exec + tail (== the full CB
+    /// span on compute CBs, where `word[1] == word[0]`). See [`Self::dmai_cycles`].
+    pub const fn total_cmpt_cycles(self) -> u32 {
+        self.ts_words[4].wrapping_sub(self.ts_words[1])
     }
 
     /// The POWER-MEASUREMENT word (`ResponseBlockWrapper::power()`).
@@ -1716,6 +1760,26 @@ mod tests {
         let rb = ResponseBlockWire::from_bytes(&bytes);
         assert_eq!(rb.timestamps(), [0; 5]);
         assert_eq!(rb.power(), 1);
+    }
+
+    /// The phase accessors take WRAPPING differences, because the counter wraps every ~4.2 s of
+    /// card time: words straddling a wrap must difference to the small true gap, which plain
+    /// subtraction would misread as ~4.29e9.
+    #[test]
+    fn response_block_ts_phase_differences_wrap() {
+        let mut bytes = [0u8; RB_NUM_BYTES];
+        // CB start and dmai end equal (every compute CB), then prep end, cmpt end and CB end
+        // straddling the u32 wrap.
+        let ts = [4_294_967_000u32, 4_294_967_000, 4_294_967_295, 90, 100];
+        for (i, v) in ts.iter().enumerate() {
+            bytes[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let rb = ResponseBlockWire::from_bytes(&bytes);
+        assert_eq!(rb.dmai_cycles(), 0);
+        assert_eq!(rb.prep_cmpt_cycles(), 295);
+        assert_eq!(rb.exec_cmpt_cycles(), 91);
+        assert_eq!(rb.dmao_cycles(), 10);
+        assert_eq!(rb.total_cmpt_cycles(), 396);
     }
 
     // ── the QGI/HMI app section (bytes 32..64) ────────────────────────────────────────────────────

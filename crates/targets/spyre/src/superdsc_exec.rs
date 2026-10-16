@@ -226,20 +226,42 @@ impl Diag {
     }
 }
 
-/// Five raw TS slots plus a CB count, accumulated. The slots stay UNNAMED on purpose: the vendor's
-/// `ResponseBlockWrapper` maps them onto dmai/dmao/prep/exec/total cycles in a `.cpp` senlib does
-/// not ship, so a name goes on a slot only with a card measurement behind it.
+/// One pipeline's harvested TS-phase durations plus a CB count, NAMED per the card-measured slot
+/// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::dmai_cycles`] and siblings: the
+/// five TS words are event snapshots of one wrapping cycle counter, so a phase duration is the
+/// wrapping difference of its pair — never a raw sum, which is why this holds durations and not
+/// slot totals). `exec` is the headline — the compute engine's own time, which sums to a
+/// forward's device span; `prep` is the queue+prep wait behind earlier CBs on a pipelined
+/// stream; `tail` is the writeback tail on compute CBs and the D2H duration on D2H CBs.
 #[derive(Default)]
 struct RbCycles {
-    slots: [u64; 5],
+    dmai: u64,
+    prep: u64,
+    exec: u64,
+    tail: u64,
     cbs: u64,
 }
 
 impl RbCycles {
-    fn add(&mut self, ts: [u32; 5]) {
-        for (s, v) in self.slots.iter_mut().zip(ts) {
-            *s += v as u64;
-        }
+    /// A compute CB: every phase is its own (`dmai` is exactly 0 — the card writes the same
+    /// snapshot to words 0 and 1 when there is no DMA-in).
+    fn add_compute(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.dmai += rb.dmai_cycles() as u64;
+        self.prep += rb.prep_cmpt_cycles() as u64;
+        self.exec += rb.exec_cmpt_cycles() as u64;
+        self.tail += rb.dmao_cycles() as u64;
+        self.cbs += 1;
+    }
+
+    /// An H2D CB: only its DMA-in pair is meaningful (words 3-4 read zero).
+    fn add_dmai(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.dmai += rb.dmai_cycles() as u64;
+        self.cbs += 1;
+    }
+
+    /// A D2H CB: only its DMA-out pair is meaningful (words 0-2 read zero).
+    fn add_dmao(&mut self, rb: flex_rs::control_block_wire::ResponseBlockWire) {
+        self.tail += rb.dmao_cycles() as u64;
         self.cbs += 1;
     }
 }
@@ -2739,9 +2761,28 @@ impl Executor {
         // so they accumulate wherever they arrive, attribution-free.
         for e in &entries {
             match e.pipeline {
-                flex_rs::scheduler::PipelineId::AsyncDmaI => t.rb_dmai.add(e.timestamps),
-                flex_rs::scheduler::PipelineId::AsyncDmaO => t.rb_dmao.add(e.timestamps),
+                flex_rs::scheduler::PipelineId::AsyncDmaI => t.rb_dmai.add_dmai(e.rb),
+                flex_rs::scheduler::PipelineId::AsyncDmaO => t.rb_dmao.add_dmao(e.rb),
                 flex_rs::scheduler::PipelineId::Compute => {}
+            }
+        }
+        // PIN THE MAPPING ON-CARD: raw per-CB records for the first few forwards, verbatim. The
+        // aggregates below blend forwards (prefill and decode CBs differ) and cannot decide the
+        // slot-to-name mapping; these can — an H2D CB lights the dmai slots, a D2H the dmao
+        // slots, a compute CB the rest, and only same-domain slot pairs difference to durations.
+        if t.rb_steps <= 3 {
+            for e in entries
+                .iter()
+                .filter(|e| !matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute))
+            {
+                eprintln!(
+                    "[sdsc-rbtime] fwd {} {:?} id {} slots {:?} power {}",
+                    t.rb_steps,
+                    e.pipeline,
+                    e.id,
+                    e.rb.timestamps(),
+                    e.rb.power()
+                );
             }
         }
         entries.retain(|e| matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute));
@@ -2759,10 +2800,28 @@ impl Executor {
             );
             return;
         }
+        let zipped: Vec<_> = entries.iter().zip(seq).collect();
+        if t.rb_steps <= 3 {
+            let n = zipped.len();
+            for (i, (e, ((rung, oi), label))) in zipped
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i < 20 || *i + 8 >= n)
+            {
+                eprintln!(
+                    "[sdsc-rbtime] fwd {} op ({rung},{oi}) rec {i} id {} slots {:?} power {}  {}",
+                    t.rb_steps,
+                    e.id,
+                    e.rb.timestamps(),
+                    e.rb.power(),
+                    label
+                );
+            }
+        }
         let mut new_cbs = 0u64;
-        for (e, ((rung, oi), label)) in entries.iter().zip(seq) {
+        for (e, ((rung, oi), label)) in zipped {
             let acc = t.rb_cycles.entry((rung, oi)).or_default();
-            acc.cycles.add(e.timestamps);
+            acc.cycles.add_compute(e.rb);
             new_cbs += 1;
             if acc.label.is_empty() {
                 acc.label = label;
@@ -3825,47 +3884,45 @@ fn report_group_time(t: &Timers) {
 }
 
 /// The RB-timestamp report: per-op device cycles, harvested from the response blocks at
-/// completion (no drain), cumulative across the run. The five TS slots print RAW — the
-/// slot-to-name mapping (dmai/dmao/prep_cmpt/exec_cmpt/total_cmpt) is a card measurement, not an
-/// assumption; the per-pipeline pattern identifies it (an H2D CB lights one slot, a D2H CB
-/// another, a compute CB the rest).
+/// completion (no drain), cumulative across the run. Phases are named per the card-measured slot
+/// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::exec_cmpt_cycles`] and siblings):
+/// `exec` is the compute engine's own time, `prep` the queue+prep wait behind earlier CBs — on a
+/// pipelined stream consecutive CBs overlap (the next CB's prep runs during the previous CB's
+/// exec), so Σ exec, not Σ total, is the stream's device span.
 fn report_rb_time(t: &Timers) {
-    let total: u64 = t
-        .rb_cycles
-        .values()
-        .map(|a| a.cycles.slots.iter().sum::<u64>())
-        .sum();
-    let dma_total: u64 = t
-        .rb_dmai
-        .slots
-        .iter()
-        .chain(t.rb_dmao.slots.iter())
-        .sum::<u64>();
+    let exec_total: u64 = t.rb_cycles.values().map(|a| a.cycles.exec).sum();
+    let prep_total: u64 = t.rb_cycles.values().map(|a| a.cycles.prep).sum();
+    let dma_total = t.rb_dmai.dmai + t.rb_dmao.tail;
     eprintln!(
-        "[sdsc-rbtime] device cycles by op (of {total} compute + {dma_total} dma cycles over {} \
-         compute CBs, {} forwards) — TS slots raw [1 2 3 4 5]",
+        "[sdsc-rbtime] device exec cycles by op (of {exec_total} exec + {prep_total} prep + \
+         {dma_total} dma cycles over {} compute CBs, {} forwards)",
         t.rb_cbs, t.rb_steps
     );
     let mut top: Vec<_> = t
         .rb_cycles
         .iter()
-        .map(|(k, a)| (a.cycles.slots.iter().sum::<u64>(), *k, a))
+        .map(|(k, a)| (a.cycles.exec, *k, a))
         .collect();
     top.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (cyc, (rung, oi), a) in top.iter().take(20) {
         eprintln!(
-            "[sdsc-rbtime]   op ({rung},{oi:<3}) {:>12} cyc total  {:>9} cyc/cb  {:6} cbs  \
-             slots {:?}  {}",
+            "[sdsc-rbtime]   op ({rung},{oi:<3}) {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
+             prep {:>12}  {}",
             cyc,
             cyc / a.cycles.cbs.max(1),
             a.cycles.cbs,
-            a.cycles.slots,
+            a.cycles.prep,
             a.label
         );
     }
     eprintln!(
-        "[sdsc-rbtime]   dmai: {} cb, slots {:?}  |  dmao: {} cb, slots {:?}",
-        t.rb_dmai.cbs, t.rb_dmai.slots, t.rb_dmao.cbs, t.rb_dmao.slots
+        "[sdsc-rbtime]   dmai: {} cb, {} cyc ({} cyc/cb)  |  dmao: {} cb, {} cyc ({} cyc/cb)",
+        t.rb_dmai.cbs,
+        t.rb_dmai.dmai,
+        t.rb_dmai.dmai / t.rb_dmai.cbs.max(1),
+        t.rb_dmao.cbs,
+        t.rb_dmao.tail,
+        t.rb_dmao.tail / t.rb_dmao.cbs.max(1),
     );
 }
 

@@ -2270,8 +2270,7 @@ impl ResponseWorker {
             crate::rb_telemetry::record(crate::rb_telemetry::RbTiming {
                 id,
                 pipeline,
-                timestamps: received_response.timestamps(),
-                power: received_response.power(),
+                rb: received_response,
             });
         }
 
