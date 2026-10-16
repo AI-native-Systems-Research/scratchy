@@ -2900,7 +2900,7 @@ fn emit_arch_dispatcher(
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
             followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-        ) -> crate::__gpu::OwnedTensor {
+        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::std::string::String> {
             match w {
                 #(#forward_with_followup_arms)*
             }
@@ -3197,7 +3197,7 @@ fn emit_arch_dispatcher(
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
                 followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-            ) -> crate::__gpu::OwnedTensor {
+            ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::std::string::String> {
                 let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
                 let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
                 unsafe { forward_with_metal_followup(self, ctx, device, num_tokens, followup) }

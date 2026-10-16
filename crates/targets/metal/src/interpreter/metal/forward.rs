@@ -447,6 +447,9 @@ pub enum ForwardError {
     /// through: its caller grows them first (`SparseRegistry::reach`), or the forward would read
     /// un-wired memory.
     KvNotMapped { block: u32, mapped: usize },
+    /// A speculative step's chain says it kept more drafts than it made: a word the GPU wrote,
+    /// past what the host may read the step's tokens through.
+    KeptPastDrafts { kept: usize, drafts: usize },
 }
 
 impl std::fmt::Display for ForwardError {
@@ -492,6 +495,10 @@ impl std::fmt::Display for ForwardError {
                 f,
                 "MetalWorkerPool::forward: block {block} is past the {mapped} blocks the \
                  TurboQuant KV stores are mapped through (`SparseRegistry::reach` them first)"
+            ),
+            Self::KeptPastDrafts { kept, drafts } => write!(
+                f,
+                "MetalWorkerPool::forward: a speculative step kept {kept} of its {drafts} drafts"
             ),
         }
     }
