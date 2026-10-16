@@ -76,10 +76,9 @@ pub enum SynthRole {
     ChunkESub,
     ChunkExp,
     // One-stick partial reductions of a chunk whose row max / denominator is cut into parts (`[rows, 64]`,
-    // like the online-softmax state), combined part after part.
-    ChunkRedA,
-    ChunkRedB,
-    ChunkRedC,
+    // like the online-softmax state), combined part after part. INDEXED: a prompt chunk's denominator
+    // holds one partial per probability part.
+    ChunkRed(u32),
     // ── the CHUNK-FORMED causal new-token block's wide buffers (`NewBlockForm::Chunk`) — the same
     //    `[nkvh][gqa·mq][mq_pad]` whole-block law as the chunk's ──
     NewChunkSc,
@@ -142,9 +141,7 @@ impl fmt::Display for SynthRole {
             Self::ChunkSc => f.write_str("csc"),
             Self::ChunkESub => f.write_str("cesub"),
             Self::ChunkExp => f.write_str("cexp"),
-            Self::ChunkRedA => f.write_str("creda"),
-            Self::ChunkRedB => f.write_str("credb"),
-            Self::ChunkRedC => f.write_str("credc"),
+            Self::ChunkRed(i) => write!(f, "cred{i}"),
             Self::NewChunkSc => f.write_str("ncsc"),
             Self::NewChunkESub => f.write_str("ncesub"),
             Self::NewChunkExp => f.write_str("ncexp"),

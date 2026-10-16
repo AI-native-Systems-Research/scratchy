@@ -1740,8 +1740,9 @@ struct ChunkBufs {
     csc: String,
     cesub: String,
     cexp: String,
-    /// One-stick partial reductions, for a chunk whose row max / denominator is cut into parts.
-    red: [String; 3],
+    /// One-stick partial reductions: three for a row max / denominator cut into parts, one per probability
+    /// part plus two accumulators for a prompt chunk's denominator. Declared only when used.
+    red: Vec<String>,
 }
 
 /// What one layer's split-KV chunk attends with: its geometry, the pool planes and index it gathers
@@ -1971,6 +1972,33 @@ fn assemble_new_block_chunk(
         ));
     }
     no_chunk_op_is_time_tiled(&ops[first_op..], t)
+}
+
+/// The per-core LX a prompt chunk's two core-local probability scratches (`cesub`, `cexp`) may pin together:
+/// a third of the 2 MiB scratchpad, leaving the rest to the landings of the ops reading and writing HBM
+/// around them (the score part `esub` reads, the V part the PV reads).
+const PROMPT_LX_PIN_BUDGET: u64 = 768 * 1024;
+
+/// Pages per part of a PROMPT chunk's probabilities ([`assemble_attn_chunk`]'s LX loop): the fewest EQUAL
+/// whole-page parts where, at `g_rows` rows per kv head, `esub` and the row sum each run in one trip, the PV
+/// part contracts at most [`ChunkScratch::VALUE_PART_PAGES`] (the K dxp verifies), and one core's slices of
+/// `cesub` and `cexp` fit [`PROMPT_LX_PIN_BUDGET`]. One page at worst. ONE place, so the caller that pins the
+/// scratches and the body that cuts the parts read the same number.
+///
+/// [`ChunkScratch::VALUE_PART_PAGES`]: crate::sdsc_abstract::ChunkScratch::VALUE_PART_PAGES
+fn prompt_lx_part_pages(chunk: crate::sdsc_abstract::ChunkScratch, g_rows: u32) -> u32 {
+    let page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    (1..=chunk.pages())
+        .filter(|n| chunk.pages().is_multiple_of(*n))
+        .map(|n| chunk.pages() / n)
+        .find(|&pp| {
+            let cols = pp * page_slots;
+            pp <= crate::sdsc_abstract::ChunkScratch::VALUE_PART_PAGES
+                && crate::emit::reduce_fits_untiled(g_rows, cols)
+                && crate::emit::pointwise_untiled_slice_bytes(g_rows, cols, 2)
+                    .is_some_and(|b| 2 * b <= PROMPT_LX_PIN_BUDGET)
+        })
+        .unwrap_or(1)
 }
 
 /// Pages per part of a chunk's ROW REDUCTIONS (each kv head's max and denominator): the fewest EQUAL
@@ -2300,6 +2328,26 @@ fn assemble_attn_chunk(
         ));
     }
 
+    // A one-slab prompt chunk only: there every block is a whole kv head (the caller pins `cexp` by the
+    // same condition). Above one slab the per-query-head form below keeps its probabilities in HBM.
+    if mq > 1 && blocks.per_kv_head() {
+        prompt_probabilities_in_lx(
+            ops,
+            PromptProbs {
+                t,
+                hd,
+                blocks,
+                q_rows,
+                chunk,
+                bmm_form,
+                bufs,
+                cb,
+            },
+            sym_id_base,
+            layout,
+        )?;
+        return no_chunk_op_is_time_tiled(&ops[first_op..], t);
+    }
     // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
     //
     // ⭐ THE PROBABILITIES IN SLOT PARTS — the fewest EQUAL whole-page parts whose `[gqa·mq, part]`
@@ -2529,6 +2577,229 @@ fn assemble_attn_chunk(
         layout,
     ));
     no_chunk_op_is_time_tiled(&ops[first_op..], t)
+}
+
+/// A prompt chunk's probability phase's operands — see [`prompt_probabilities_in_lx`].
+struct PromptProbs<'a> {
+    t: u32,
+    hd: u32,
+    /// One block per kv head (one slab) — the caller's gate.
+    blocks: crate::sdsc_abstract::ChunkRowBlocks,
+    q_rows: u32,
+    chunk: crate::sdsc_abstract::ChunkScratch,
+    bmm_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    bufs: &'a BlockBufs,
+    cb: &'a ChunkBufs,
+}
+
+/// ⭐⭐⭐ A PROMPT CHUNK'S PROBABILITIES NEVER LEAVE LX — THREE HBM PASSES OVER THE SCORE BLOCK, NOT SIX.
+///
+/// After the score (written to HBM), its row max (read once) and the online merge, each kv head's chunk is
+/// walked in [`prompt_lx_part_pages`] parts, and in each part every op divides the work the same way — each
+/// core its own `gqa·mq / 32` rows and all of the part's columns (`{mb:32}`, the PV's own split too):
+///   * `esub` reads the score part from HBM into a core-local `cesub`;
+///   * `exp` reads `cesub` into a core-local `cexp`;
+///   * the row sum reduces `cexp` into the part's one-stick partial;
+///   * the PV contracts `cexp` with the part's V block and folds onto the output through the same
+///     `stridedadd` ping-pong the value parts always used.
+///
+/// The probabilities are never written to or read back from HBM. That is the reference's own form, and the
+/// emitter's core-local read law proves at build that each core reads exactly the slice it wrote. The
+/// partials then add into the denominator. MEASURED before this (granite-2b fp16, 256 rows, ~10k tokens): the
+/// chunk's attention group was 59% of prefill, HBM-bound at ~135 GB/s over six passes.
+fn prompt_probabilities_in_lx(
+    ops: &mut Vec<EmittedOp>,
+    a: PromptProbs<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    let PromptProbs {
+        t,
+        hd,
+        blocks,
+        q_rows,
+        chunk,
+        bmm_form,
+        bufs,
+        cb,
+    } = a;
+    use crate::addr::DevOff;
+    use crate::superdsc_opspec::EpilogueOpFunc;
+    // One slab only (the caller's gate): every block is a whole kv head's `gqa·mq` rows.
+    let g_rows = blocks.rows();
+    let stick = BlockCols::of_one_stick(Lanes::FP16);
+    let all_rows = RowCount::of_head_major_rows(q_rows);
+    let grp_rows = RowCount::of_head_major_rows(g_rows);
+    let row_step = |h: u32| DevOff::from_view_step(h * stick.get());
+    let corner = |c: Option<crate::sdsc_abstract::ChunkCorner>, what: &str| {
+        c.map(DevOff::of_chunk_corner).ok_or_else(|| {
+            SuperDscError(format!(
+                "attention chunk o{t}: {what} lies outside the {}-page chunk scratch",
+                chunk.pages()
+            ))
+        })
+    };
+    // `ocorr` reads the PRE-update `run_o`, so it precedes every value matmul (the fold block's order).
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_cocorr_o{t}"),
+        "multiply",
+        all_rows,
+        BlockCols::of_head_dim(hd),
+        &[
+            In::full(&hm(&bufs.run_o)).ew(),
+            In::col(&hm(&bufs.corr)).ew(),
+        ],
+        &hm(&bufs.otmp),
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
+        .slot_parts(prompt_lx_part_pages(chunk, g_rows))
+        .collect();
+    let n = parts.len();
+    for b in 0..blocks.count() {
+        // At one slab block `b` IS kv head `b`, its rows the `b`-th `gqa·mq` of the stream.
+        let (kvh, h0) = (blocks.kv_head(b), b * g_rows);
+        for (p, part) in parts.iter().enumerate() {
+            let pc = corner(part.probs_corner(blocks, b), "a kv head's score part")?;
+            let kc = corner(part.value_corner(kvh, 0), "a kv head's value part")?;
+            let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_cesub_g{kvh}_s{p}_o{t}"),
+                "subtract",
+                grp_rows,
+                pw,
+                &[
+                    In::sliced(&rb(&cb.csc, g_rows, ps), pc).ew(),
+                    In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                ],
+                &rb(&cb.cesub, g_rows, ps),
+                DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("attn_cexp_g{kvh}_s{p}_o{t}"),
+                "exp",
+                grp_rows,
+                pw,
+                &[In::sliced(&rb(&cb.cesub, g_rows, ps), DevOff::ZERO).ew()],
+                &rb(&cb.cexp, g_rows, ps),
+                DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
+            // One part: the whole chunk's sum, straight into the denominator.
+            let sum_into = if n == 1 { &bufs.bsum } else { &cb.red[p] };
+            ops.push(assemble_reduce_off(
+                &format!("attn_cbsum_g{kvh}_s{p}_o{t}"),
+                "sum",
+                grp_rows,
+                pw,
+                &rb(&cb.cexp, g_rows, ps),
+                DevOff::ZERO,
+                &hm(sum_into),
+                row_step(h0),
+                sym_id_base,
+                layout,
+            ));
+            let (out, addend) = if p % 2 == 0 {
+                (&bufs.run_o, &otmp_h)
+            } else {
+                (&bufs.otmp, &run_o_h)
+            };
+            // `run_o_g = P_g · V_g + otmp_g` — the `stridedadd` epilogue is the online-softmax update.
+            ops.push(assemble_matmul_off_maybe_epilogue(
+                &format!("attn_cov_g{kvh}_k{p}_o{t}"),
+                MatM::of_head_major_rows(g_rows),
+                MatN::of_head_dim(hd),
+                MatK::of_kv_window(pw),
+                MatY::unbatched(),
+                bmm_form,
+                &rb(&cb.cexp, g_rows, ps),
+                DevOff::ZERO,
+                &Stk::<KernelTag>::kernel(ps as usize, hd as usize, &cb.gv),
+                kc,
+                &rb(out, q_rows, hd),
+                row_step(h0),
+                Some((addend, row_step(h0))),
+                EpilogueOpFunc::StridedAdd,
+                &[],
+                false,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    if n.is_multiple_of(2) {
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_covsum_o{t}"),
+            "identity",
+            all_rows,
+            BlockCols::of_head_dim(hd),
+            &[In::full(&otmp_h).ew()],
+            &run_o_h,
+            DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+    }
+    // The partials add into the denominator, never in place: alternating between the two accumulators
+    // past the part buffers, the last add landing in `bsum`.
+    let mut acc = cb.red[0].as_str();
+    for p in 1..n {
+        let out = if p + 1 == n {
+            bufs.bsum.as_str()
+        } else if p % 2 == 1 {
+            cb.red[n].as_str()
+        } else {
+            cb.red[n + 1].as_str()
+        };
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("attn_cbsum_k{p}_o{t}"),
+            "add",
+            all_rows,
+            stick,
+            &[In::full(&hm(acc)).ew(), In::full(&hm(&cb.red[p])).ew()],
+            &hm(out),
+            DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        acc = out;
+    }
+    // run_l = run_l*corr + bsum — the fold block's own pair.
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_clcorr_o{t}"),
+        "multiply",
+        all_rows,
+        stick,
+        &[
+            In::full(&hm(&bufs.run_l)).ew(),
+            In::full(&hm(&bufs.corr)).ew(),
+        ],
+        &hm(&bufs.ltmp),
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_cladd_o{t}"),
+        "add",
+        all_rows,
+        stick,
+        &[
+            In::full(&hm(&bufs.ltmp)).ew(),
+            In::full(&hm(&bufs.bsum)).ew(),
+        ],
+        &hm(&bufs.run_l),
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    Ok(())
 }
 
 /// ⛔⛔⛔ NO SPLIT-KV CHUNK OP IS TIME-TILED — a bake refusal naming each op that is, never a card run.
@@ -3367,45 +3638,70 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                  gather with no staged index reads block 0 for every page"
             ))
         })?;
+        // The row blocks the body cuts every wide op into (`ChunkRowBlocks`): a kv head's `gqa·mq` rows at
+        // one slab, a query head's `mq` above it.
+        let blocks = chunk.row_blocks(nqh / nkvh, mq);
+        let b_rows = blocks.rows();
+        // A PROMPT chunk at one slab keeps its probabilities in LX from `esub` through the PV (the body's
+        // step 4′); decode, and a prompt chunk above one slab, keep the form they have.
+        let prompt = mq > 1 && blocks.per_kv_head();
+        let lx_parts = if prompt {
+            chunk.pages() / prompt_lx_part_pages(chunk, b_rows)
+        } else {
+            0
+        };
+        let red_cut = reduction_part_pages(chunk, b_rows) < chunk.pages();
+        let n_red = if prompt { lx_parts + 2 } else { 0 }.max(if red_cut { 3 } else { 0 });
         let cb = ChunkBufs {
             gkt: syn(R::GatherKt),
             gv: syn(R::GatherV),
             csc: syn(R::ChunkSc),
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
-            red: [syn(R::ChunkRedA), syn(R::ChunkRedB), syn(R::ChunkRedC)],
+            red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
         };
         if let Some(l) = layout {
             for r in [R::GatherKt, R::GatherV] {
                 l.synth(out_id.synth(r), &chunk.footprint_dims());
             }
-            // Every query ROW's scores over the chunk — `nqh·mq` rows, the token stream's own.
-            for r in [R::ChunkSc, R::ChunkExp] {
-                l.synth(out_id.synth(r), &[nqh * mq, chunk.slots()]);
+            // Every query ROW's scores over the chunk — `nqh·mq` rows, the token stream's own; a decode
+            // chunk's probabilities too.
+            l.synth(out_id.synth(R::ChunkSc), &[nqh * mq, chunk.slots()]);
+            if !prompt {
+                l.synth(out_id.synth(R::ChunkExp), &[nqh * mq, chunk.slots()]);
             }
-            // ⭐ `esub`'s output is CORE-LOCAL LX: one core's slice of one row block's probability part —
-            // what the tiler hands a core of that `[rows, part]` op (`ChunkRowBlocks`: a kv head's
-            // `gqa·mq` rows at one slab, a query head's `mq` above it). See the body's step (4).
-            let b_rows = chunk.row_blocks(nqh / nkvh, mq).rows();
-            // The partial reductions exist only when the chunk's reductions are cut into parts, so every
-            // bundle that needs none is laid out exactly as before.
-            if reduction_part_pages(chunk, b_rows) < chunk.pages() {
-                for r in [R::ChunkRedA, R::ChunkRedB, R::ChunkRedC] {
-                    l.synth(
-                        out_id.synth(r),
-                        &[nqh * mq, BlockCols::of_one_stick(Lanes::FP16).get()],
-                    );
-                }
+            // The partial reductions exist only where they are used, so every bundle that needs none is
+            // laid out exactly as before.
+            for i in 0..n_red {
+                l.synth(
+                    out_id.synth(R::ChunkRed(i)),
+                    &[nqh * mq, BlockCols::of_one_stick(Lanes::FP16).get()],
+                );
             }
-            let part = softmax_part_pages(chunk, b_rows)
-                * crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-            let slice = crate::emit::pointwise_untiled_slice_bytes(b_rows, part, 2).ok_or_else(|| {
-                SuperDscError(format!(
-                    "attention o{t}: a one-page probability part of {b_rows} rows is time-tiled, so its \
-                     esub output has no core-local slice to pin in LX"
-                ))
-            })?;
-            l.synth_lx_core_local(out_id.synth(R::ChunkESub), slice);
+            // ⭐ CORE-LOCAL LX, each pin one core's slice of one row block's probability part under its own
+            // producer's division — `esub`'s always, and a one-slab prompt chunk's `exp` too. See the body's
+            // step 4.
+            let part_pages = if prompt {
+                prompt_lx_part_pages(chunk, b_rows)
+            } else {
+                softmax_part_pages(chunk, b_rows)
+            };
+            let cols = part_pages * crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+            let pins: &[(R, u32)] = if prompt {
+                &[(R::ChunkESub, 2), (R::ChunkExp, 1)]
+            } else {
+                &[(R::ChunkESub, 2)]
+            };
+            for &(r, inputs) in pins {
+                let slice = crate::emit::pointwise_untiled_slice_bytes(b_rows, cols, inputs)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "attention o{t}: a {part_pages}-page probability part of {b_rows} rows is \
+                             time-tiled, so it has no core-local slice to pin in LX"
+                        ))
+                    })?;
+                l.synth_lx_core_local(out_id.synth(r), slice);
+            }
         }
         assemble_attn_chunk(
             &mut ops,

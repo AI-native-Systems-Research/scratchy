@@ -243,24 +243,28 @@ fn a_prompt_chunk_attends_every_row_of_every_head_in_one_pass() {
             narrowest,
             "{j} page(s): the prompt chunk's ops outside the gather grow with the chunk"
         );
-        // ⛔ THE VALUE LEG IS CUT ALONG K, AND EVERY PART CONTRACTS AT MOST `VALUE_PART_PAGES` PAGES —
-        // the whole-chunk PV at 384 rows is what dxp refused to verify.
-        let parts = j.div_ceil(ChunkScratch::VALUE_PART_PAGES);
-        let pv: Vec<&(String, serde_json::Value)> = ops
-            .iter()
-            .filter(|(n, _)| n.starts_with("attn_cov_g"))
-            .collect();
-        assert_eq!(
-            pv.len() as u32,
-            NKVH * parts,
-            "{j} page(s): {parts} value part(s) per kv head"
-        );
-        for (name, v) in pv {
-            let k = v["dscs_"][0][name]["N_"]["in_"].as_u64().unwrap_or(0);
-            assert!(
-                k > 0 && k <= u64::from(ChunkScratch::VALUE_PART_PAGES * 256),
-                "{name} at {j} page(s): contracts {k} slots"
+        // ⛔ THE VALUE LEG IS CUT ALONG K, EVERY PART CONTRACTS AT MOST `VALUE_PART_PAGES` PAGES — the
+        // whole-chunk PV at 384 rows is what dxp refused to verify — and each kv head's parts cover its
+        // chunk exactly once. (A prompt chunk's value parts are its probability parts, which stay in LX.)
+        let mut parts = 0u32;
+        for kvh in 0..NKVH {
+            let mine = format!("attn_cov_g{kvh}_");
+            let mut covered = 0u64;
+            let mut n = 0u32;
+            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with(&mine)) {
+                let k = v["dscs_"][0][name]["N_"]["in_"].as_u64().unwrap_or(0);
+                assert!(
+                    k > 0 && k <= u64::from(ChunkScratch::VALUE_PART_PAGES * 256),
+                    "{name} at {j} page(s): contracts {k} slots"
+                );
+                covered += k;
+                n += 1;
+            }
+            assert_eq!(
+                covered, slots,
+                "{mine}* at {j} page(s) contract {covered} slots"
             );
+            parts = n;
         }
         assert_eq!(
             ops.iter().any(|(n, _)| n.starts_with("attn_covsum_")),
@@ -385,7 +389,17 @@ fn the_chunk_probabilities_stay_in_lx_between_esub_and_exp() {
     for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
         for &j in &ChunkScratch::LADDER {
             let ops = emit_chunk_in_layout(j, mq);
-            for (stem, at) in [("attn_cesub_g", "out"), ("attn_cexp_g", "in")] {
+            // A prompt chunk keeps its probabilities in LX all the way: exp writes them there and the
+            // row sum and the PV read them there. Decode writes exp's output to HBM as before.
+            let mut checks = vec![("attn_cesub_g", "out"), ("attn_cexp_g", "in")];
+            if mq > 1 {
+                checks.extend([
+                    ("attn_cexp_g", "out"),
+                    ("attn_cbsum_g", "in"),
+                    ("attn_cov_g", "in"),
+                ]);
+            }
+            for (stem, at) in checks {
                 let mine: Vec<&(String, serde_json::Value)> =
                     ops.iter().filter(|(n, _)| n.starts_with(stem)).collect();
                 assert!(!mine.is_empty(), "{stem}* at {j} page(s), mq {mq}");
