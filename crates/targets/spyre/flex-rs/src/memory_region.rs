@@ -627,26 +627,54 @@ mod ported_cxx_tests {
         // Regression test for the free_index tie-break bug: free a block at
         // the HIGHER offset first, then one at the LOWER offset, both the
         // same size. The real C++ `free_sizes_` multimap returns the
-        // first-inserted (offset-1024) entry via `lower_bound`
+        // first-inserted (offset-2048) entry via `lower_bound`
         // (`acquisition_strategy.hpp:153-157`); an ascending-start-offset
         // tie-break would wrongly return the offset-0 entry instead.
-        let mut region = region_none(0, 2048);
+        //
+        // The two freed blocks must be NON-ADJACENT, separated by a block
+        // that stays occupied: `freeBlock` coalesces with an adjacent free
+        // neighbor (`memory_types.cpp:98-117`), so freeing two touching
+        // same-size blocks never leaves two same-size `free_sizes_` entries
+        // for the tie-break to choose between. The earlier version of this
+        // test freed the two halves of one 2048-byte region — the second
+        // free merged them back into a single [0, 2048) free block, the
+        // final `find_best_fit` returned offset 0 because there was no tie
+        // left to break, and the test failed against its own expectation
+        // (issue #536). The middle allocation below keeps the freed pair
+        // apart so both frees land as separate size-1024 entries.
+        let mut region = region_none(0, 3072);
         let c1 = region.find_best_fit(ByteSize(1024)).unwrap();
         let alloc_low = region.allocate_block(c1, ByteSize(1024)).unwrap();
         let c2 = region.find_best_fit(ByteSize(1024)).unwrap();
-        let alloc_high = region.allocate_block(c2, ByteSize(1024)).unwrap();
+        let alloc_mid = region.allocate_block(c2, ByteSize(1024)).unwrap();
+        let c3 = region.find_best_fit(ByteSize(1024)).unwrap();
+        let alloc_high = region.allocate_block(c3, ByteSize(1024)).unwrap();
         assert_eq!(alloc_low.start(), ByteOffset(0));
-        assert_eq!(alloc_high.start(), ByteOffset(1024));
+        assert_eq!(alloc_mid.start(), ByteOffset(1024));
+        assert_eq!(alloc_high.start(), ByteOffset(2048));
 
-        // Free higher offset first, then lower offset — both size 1024.
+        // Free higher offset first, then lower offset — both size 1024, and
+        // neither free coalesces (each freed block's neighbor on the other
+        // free's side is the still-occupied middle block).
         region.free_block(alloc_high).unwrap();
         region.free_block(alloc_low).unwrap();
+        let free_starts: Vec<u64> = region
+            .blocks()
+            .iter()
+            .filter(|b| b.is_free())
+            .map(|b| b.start().0)
+            .collect();
+        assert_eq!(
+            free_starts,
+            vec![0, 2048],
+            "precondition: two separate 1024-byte free blocks, not one merged block"
+        );
 
-        // FIFO order means the offset-1024 free block (freed first) must be
+        // FIFO order means the offset-2048 free block (freed first) must be
         // returned, not the offset-0 one (freed second), despite offset-0
         // sorting first by start.
         let best = region.find_best_fit(ByteSize(1024)).unwrap();
-        assert_eq!(best.start(), ByteOffset(1024));
+        assert_eq!(best.start(), ByteOffset(2048));
     }
 
     // ---- MemoryRegion: construction ----

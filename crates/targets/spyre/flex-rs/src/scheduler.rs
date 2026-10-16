@@ -5044,7 +5044,12 @@ mod resolve_single_chunk_tests {
         let resolver = FixedResolver {
             segment: 3,
             base: DevicePhysicalAddress(0x1_0000_0000),
-            region_size: crate::address::ByteSize(4096),
+            // The region must actually contain the chunk: [0x1000, 0x2000)
+            // spans exactly 8192 B from the region's start, and
+            // `resolve_single_chunk`'s I1 containment check rejects a chunk
+            // that runs past its backing region (issue #536 — this fixture
+            // used to declare 4096, predating that check).
+            region_size: crate::address::ByteSize(8192),
         };
         let chunk = Chunk::new(
             LogicalAddress::new(RegionId(1), ByteOffset(0x1000)),
@@ -5079,7 +5084,10 @@ mod resolve_single_chunk_tests {
         let resolver = FixedResolver {
             segment: 7,
             base: DevicePhysicalAddress(0x2_0000_0000),
-            region_size: crate::address::ByteSize(4096),
+            // 8192 so the region contains this chunk's [0x100, 0x1100)
+            // span — see the I1 containment note on the fixture above
+            // (issue #536: the old 4096 declaration failed the check).
+            region_size: crate::address::ByteSize(8192),
         };
         let chunk = Chunk::new(
             LogicalAddress::new(RegionId(1), ByteOffset(0x100)),

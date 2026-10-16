@@ -182,15 +182,17 @@ impl Default for AllocationDirective {
 pub enum AllocationDirectiveError {
     /// Neither `domain_ids` nor `near` was provided.
     NoPlacementTarget,
-    /// A `near` directive was provided with zero chunks. Unreachable through
-    /// this port's own `CompositeAddress::from_chunks`/`from_chunk`
-    /// constructors (they panic eagerly on an empty chunk list — see
-    /// `address.rs`'s own documented invariant), but kept as a distinct,
-    /// checked variant to mirror the real C++'s separate
-    /// `.ValidationError("empty_chunks")` throw site
-    /// (`flex_allocator.cpp:48-51`), which is a genuine runtime check there
-    /// (the C++ `CompositeAddress` does *not* reject empty chunks at its own
-    /// construction — only this later check does).
+    /// A `near` directive was provided with zero chunks. Port of the real
+    /// C++'s separate `.ValidationError("empty_chunks")` throw site
+    /// (`flex_allocator.cpp:48-51`) — and, like that C++ check, genuinely
+    /// reachable: `CompositeAddress::from_chunks` accepts an empty chunk
+    /// list (matching the C++ vector constructor's total lack of an
+    /// empty-input check, `allocation_address.hpp:186-189`), so the empty
+    /// address constructs fine and THIS check is the rejection site. (An
+    /// earlier version of this port panicked eagerly inside `from_chunks`,
+    /// which briefly made this variant unreachable; that panic has no C++
+    /// counterpart and was removed — see
+    /// `from_chunks_with_empty_vector_does_not_panic` in `address.rs`.)
     NearDirectiveEmptyChunks,
     /// A `near` chunk had zero size.
     NearDirectiveZeroSizeChunk,
@@ -455,6 +457,40 @@ impl FlexAllocator {
         };
         allocator.pre_allocate_regions(init.max_regions, init.num_program_regions)?;
         Ok(allocator)
+    }
+
+    /// Test-only stand-in for the real C++ tests' device-backed
+    /// `FlexAllocator` fixture: the same construction as [`Self::new`] minus
+    /// `pre_allocate_regions` — the one constructor step that reaches real
+    /// senlib (`allocate_new_region` → `DeviceMemoryAllocator::try_allocate`;
+    /// this crate deliberately offers no mock seam there, see the
+    /// mock-seam note at the bottom of this file). The tests that consume
+    /// this (`runtime.rs::tests`) never allocate through the allocator —
+    /// their `NullScheduler` completes every operation immediately and the
+    /// tests exercise only context/stream bookkeeping — so an empty
+    /// `regions` list is the whole fixture they need. The real C++ suite
+    /// constructs a genuine device-backed allocator instead, which this
+    /// crate cannot do in a unit test (senlib does not link on a test host)
+    /// — the documented reason the `AllocatorAllocMemory`-class cases are
+    /// not ported. Absent outside `cfg(test)`: production callers must go
+    /// through [`Self::new`] and its full region pre-allocation.
+    #[cfg(test)]
+    pub(crate) fn new_without_regions(
+        init: FlexAllocatorInit,
+        topology: DeviceTopology,
+        device_allocator: DeviceMemoryAllocator,
+    ) -> Self {
+        Self {
+            regions: Vec::new(),
+            allocation_map: HashMap::new(),
+            region_selection_order: init.region_order,
+            block_strategy: init.block_strategy,
+            topology,
+            device_allocator,
+            next_tensor_segment_id: 0,
+            allocation_counter: 0,
+            memory_pressure_callback: None,
+        }
     }
 
     /// Port of `FlexAllocator::registerMemoryPressureCallback`
@@ -1944,15 +1980,30 @@ mod near_directive_tests {
     }
 
     // Port of FlexAllocatorNearDirectiveTest.NearDirectiveEmptyChunksThrows.
-    // In the real C++, `CompositeAddress{empty_chunks}` succeeds (it is only the
-    // subsequent `AllocationDirective` constructor that rejects it); this
-    // port's `CompositeAddress::from_chunks` itself enforces the >=1-chunk
-    // invariant eagerly (`address.rs`'s own documented invariant), so the
-    // equivalent "throws" observation is a panic one call earlier.
+    // The real C++ throw is in the `AllocationDirective` constructor
+    // (`flex_allocator.cpp:48-51`, `.ValidationError("empty_chunks")`), NOT
+    // in `CompositeAddress`: the C++ vector constructor accepts an empty
+    // chunk list (`allocation_address.hpp:186-189`), and this port's
+    // `from_chunks` now matches that (see
+    // `from_chunks_with_empty_vector_does_not_panic` in `address.rs`). An
+    // earlier version of this port panicked eagerly inside `from_chunks` and
+    // this test pinned that extra check via `#[should_panic]`; it now ports
+    // the real observation — the empty address constructs fine, and the
+    // directive construction is what rejects it (issue #536's "did not
+    // panic as expected" failure).
     #[test]
-    #[should_panic(expected = "CompositeAddress requires at least one chunk")]
     fn near_directive_empty_chunks_throws() {
-        let _ = CompositeAddress::from_chunks(vec![]);
+        let empty_addr = CompositeAddress::from_chunks(vec![]);
+        assert_eq!(
+            AllocationDirective::new(
+                PlacementPolicy::Bind,
+                vec![],
+                Some(empty_addr),
+                MemoryType::Tensor
+            )
+            .unwrap_err(),
+            AllocationDirectiveError::NearDirectiveEmptyChunks
+        );
     }
 
     // Port of FlexAllocatorNearDirectiveTest.NearDirectiveZeroSizeChunkThrows.
