@@ -4,7 +4,7 @@
 //!
 //! This is the worker-facing wrapper: f32 host buffers in, f32 logits out, names as `t{id}` (the
 //! SubtileIR tensor id). The work is [`crate::superdsc_exec`]'s, which drives the card through the
-//! one C-ABI seam in [`crate::sdk_abi`].
+//! typed flex-rs surface in [`crate::runtime`].
 //!
 //! ⛔ THE SENGRAPH PATH IS GONE. The offline_decoder `GraphLoader`/`Predict` families (`SpyreSession`
 //! / `GroupedSession` and their C++ shim) were the pre-SuperDSC bring-up path and had no live
@@ -315,7 +315,7 @@ impl SuperDscSession {
     /// Kick the process-wide device bring-up (~5.7s) on a background thread so it overlaps host-side
     /// weight load instead of sitting on the critical path inside prepare.
     pub fn prewarm_runtime() {
-        crate::sdk_abi::prewarm_runtime();
+        crate::runtime::prewarm_runtime();
     }
 
     /// Whether this bundle's resident cache is PAGED.

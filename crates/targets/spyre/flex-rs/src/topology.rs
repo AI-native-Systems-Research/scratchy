@@ -59,7 +59,7 @@ impl DeviceTopology {
 /// RCU core on the card showing affinity to it. `device_memory_size` is the
 /// real per-card HBM capacity (`flex_senlib_device_memory_size()`, i.e.
 /// `DeviceHandle::GetDmpaSize()`), not a placeholder — callers must not
-/// invent one (see `fxa_rust_abi.rs::build_runtime`'s prior 32 GiB
+/// invent one (see scratchy-target-spyre's `runtime.rs::build_runtime`'s prior 32 GiB
 /// placeholder, which this replaces).
 pub fn populate_domain_topology(device_memory_size: u64) -> DeviceTopology {
     // SAFETY: static senlib query, no bring-up prerequisite — see this

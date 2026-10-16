@@ -1107,7 +1107,7 @@ impl SpyreWorker {
                 // 32 rows needs ~15 GB, the constant said 8, and the arithmetic in the refusal never
                 // mentioned the card at all. On a 128 GB part that refusal is pure fiction.
                 //
-                // 🛑 THE SAME GUESS HAS ALREADY BEEN PAID FOR ONE LAYER DOWN. `fxa_rust_abi::build_runtime`
+                // 🛑 THE SAME GUESS HAS ALREADY BEEN PAID FOR ONE LAYER DOWN. `runtime::build_runtime`
                 // sized the allocator's domain off a 32 GiB placeholder until a real `FlexAllocator` OOM on
                 // hardware found it; the fix was to ask the card
                 // (`flex_senlib_device_memory_size` → `DeviceHandle::GetDmpaSize`). The KV pool kept its own
@@ -1123,7 +1123,7 @@ impl SpyreWorker {
                 // ⛔ `None` REFUSES, IT DOES NOT FALL BACK. A capacity query that fails and quietly returns
                 // to 8 GiB is the defect restored under a log line, and a *plausible* default is worse than
                 // none — it sizes a real allocation the card may not serve.
-                let card_bytes = scratchy_target_spyre::fxa_rust_abi::device_memory_bytes()
+                let card_bytes = scratchy_target_spyre::runtime::device_memory_bytes()
                     .ok_or_else(|| {
                         werr(
                             "could not read the Spyre card's memory capacity \

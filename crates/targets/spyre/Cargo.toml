@@ -11,7 +11,7 @@ description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR targ
 # its `sdsc_abstract` law types (mask stride / fold pages / mask blocks / int stride) rather than
 # u64s, and owns the `flex-rs` dependency — flex-rs's build.rs cc-compiles its senlib shim, which
 # only exists on a Spyre host, so flex-rs must NOT be pulled into a cuda/metal/emit-only build.
-# `fxa_rust_abi`, the only module that touches flex-rs, is gated on this same feature.
+# `runtime`, the only module that touches flex-rs, is gated on this same feature.
 #
 # THE FEATURE TIERS. Cargo features are ADDITIVE, so a device is chosen by naming it, never by
 # turning something off. One hidden tier carries the shared facts; the two a user names are SIBLINGS.
@@ -58,10 +58,11 @@ scratchy-layers = { path = "../../layers" }
 # names (`AffineQuantEmbedding`, `AffineQuantLinear`, `Nvfp4Linear`).
 scratchy-quantizations = { path = "../../models/quantization" }
 half = { workspace = true }
-# Native Rust port of flex. In-tree crate; the ONLY fxa_* implementation
-# (see fxa_rust_abi.rs) — pure Rust so it compiles on any host regardless
+# Native Rust port of flex. In-tree crate; the card surface's only
+# backing (see runtime.rs) — pure Rust so it compiles on any host regardless
 # of `spyre-hw`; its own cxx-shim only compiles/links when built on a real
-# Spyre host (gated by FLEX_RS_BUILD_CXX_SHIM, not a Cargo feature).
+# Spyre host (its C++ compile is skipped only by the SCRATCHY_SKIP_SENDNN_CXX
+# check-only escape hatch, never by a Cargo feature).
 flex-rs = { path = "flex-rs", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

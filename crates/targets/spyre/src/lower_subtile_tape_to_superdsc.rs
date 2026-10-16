@@ -1238,7 +1238,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 //
                 // A row may hold as many pages as ONE POOL can, and a pool is a single flex region
                 // (`bundle::MAX_SEGMENT_BYTES` — the same cap the runtime budget takes from
-                // `card_bytes.max_single_allocation()`, which `fxa_rust_abi` guards equal to it).
+                // `card_bytes.max_single_allocation()`, which `runtime` guards equal to it).
                 // The reservation is that cap over the model's own page bytes, so it covers every
                 // pool any card can budget for and MEMORY binds at runtime, exactly as it does on
                 // metal: a bigger budget, a wider card or a denser page (fp8 KV) raises the served

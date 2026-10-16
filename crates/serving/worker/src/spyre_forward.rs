@@ -1236,8 +1236,8 @@ pub(crate) fn superdsc_forward_chunk(
                 // (`prefill ladder: 20 rung(s) ready in 6.19s wall — built in parallel`). Dead code whose
                 // DOC described the opposite of what the binary did.
                 //
-                // ⭐ AND IT WAS NOT HARMLESS: creating a session mid-run is exactly what `fxa_stream_create`
-                // aborts on when it races (see `sdk_abi::Stream::create`), so a state that cannot occur was
+                // ⭐ AND IT WAS NOT HARMLESS: creating a session mid-run is exactly what `runtime::Stream::create`
+                // aborts on when it races (see its ⛔ doc), so a state that cannot occur was
                 // also the state a reader would blame for that abort — which is precisely what I did for an
                 // hour. A dead path is a lie about what the program can do.
             }

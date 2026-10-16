@@ -307,13 +307,13 @@ pub(crate) struct SuperDscBundle {
     // was being paid anyway: `prefill ladder: 20 rung(s) ready in 6.19s wall — built in parallel`.
     //
     // ⭐ A DEAD PATH IS A LIE ABOUT WHAT THE PROGRAM CAN DO, and this one cost real time: creating a session
-    // mid-run is exactly what `fxa_stream_create` aborts on under concurrency, so when that abort appeared
+    // mid-run is exactly what `runtime::Stream::create` aborts on under concurrency, so when that abort appeared
     // the dead build was the first thing I blamed — for an hour, before the log's own zero
     // `PREFILL_PATH` lines showed the abort was at LOAD. Deleting it removes a state the program cannot
     // reach and a wrong answer a reader can reach.
     //
     // If deferred rung building is ever wanted again, it must be built where the OTHER sessions are (at
-    // load, serialized — see `sdk_abi::Stream::create`), not from inside a forward.
+    // load, serialized — see `runtime::Stream::create`), not from inside a forward.
     /// `(mq, session)` for the ONE prefill bundle baked with a full resident-prefix sweep — the bundle
     /// a CONTINUATION chunk (`start > 0`) must run on, because it has resident KV to attend.
     ///

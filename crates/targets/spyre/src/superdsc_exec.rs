@@ -2,7 +2,7 @@
 //! The resident SuperDSC executor — the live on-silicon run path, in Rust.
 //!
 //! The SuperDSC emitter produces a dxp device bundle (one device program per launch group + the
-//! placement manifest). This module runs it DIRECTLY on the AIU through [`crate::sdk_abi`]: the
+//! placement manifest). This module runs it DIRECTLY on the AIU through [`crate::runtime`]: the
 //! program, the packed weights and the paged KV pool are allocated ONCE in [`Executor::prepare`]
 //! and live on-card; each [`Executor::predict`] DMAs only the (small) activations in and the
 //! logits out — weights and KV are NEVER re-uploaded. That residency is the whole perf point.
@@ -13,19 +13,20 @@
 //! ⛔ WHAT LIVES WHERE. Nothing here computes a KV address: which request an op touches, how many
 //! passes its group takes and what that shifts each segment base by are all [`crate::fold_plan`]'s,
 //! which owns the page maps and the write cursors. The bundle's own shape is
-//! [`crate::bundle_code`]'s, byte conversion is [`crate::sen_convert`]/[`crate::stage_weight`]'s, and the SDK calls are
-//! [`crate::sdk_abi`]'s. This module is the sequencing: what to allocate, what to launch, in what
+//! [`crate::bundle_code`]'s, byte conversion is [`crate::sen_convert`]/[`crate::stage_weight`]'s, and the card
+//! surface is [`crate::runtime`]'s. This module is the sequencing: what to allocate, what to launch, in what
 //! order, with which base.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+use flex_rs::memory_region::MemoryType;
 use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::fold_plan::{self, Bytes, OpKv, RowIdx, RowPage, SessionKv, SlotPos, UniformPages};
-use crate::sdk_abi::{DevAddr, MemKind, Stream};
+use crate::runtime::{DevAddr, HwError, Stream};
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
 
@@ -269,27 +270,27 @@ struct OpProg {
     kv: OpKv,
 }
 
-/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS LEAKED ON PURPOSE, BECAUSE IT OUTLIVES THE RUNTIME THAT
-/// COULD FREE IT.
+/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE. Per-step windows
+/// (`shifted`, built per layer per launch) are NOT: they drop as owned values while the
+/// runtime is alive.
 ///
-/// MEASURED 2026-08-12: every run ended `RUN_RC=255` **after** `Batch complete: N succeeded, 0 failed`
-/// — `RAS::FLEXALLOCATOR::AddressNotFound — deallocate: CompositeAddress not found in allocation_map`,
-/// thrown out of `flex::CompositeAddress::~CompositeAddress` into `__cxa_call_terminate`. Exit codes
-/// became lies: any gate that reads `$?` calls a perfect run a failure.
+/// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
+/// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
+/// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
+/// today — the context in `runtime::runtime_cell` is a `static` that is never dropped, and
+/// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
+/// `runtime_reset` (the leak probe) tears the context down MID-PROCESS, and a future
+/// `DevAddr` drop that learns to free must not find session handles betting on drop order
+/// versus that.
 ///
-/// It is a LIFETIME ORDER problem, not an ownership-kind one. The deleted `sdsc_shim.cpp` deleted
-/// chunk-built sub-addresses ~120x per forward (`sdsc_dma_slice`) and never aborted, because those died
-/// inside a session object while the flex runtime was still up. These handles are dropped during
-/// PROCESS SHUTDOWN instead, by which point the runtime context and its allocator are gone, so the
-/// destructor looks the address up in an empty map and throws. `fxa_addr_free`'s `catch (...)` cannot
-/// save it: a destructor is implicitly `noexcept`, so the throw calls `std::terminate` directly.
+/// The law predates this Rust surface: in the C++ runtime, the allocator was torn down before
+/// these handles, and the throw out of a `noexcept` destructor turned perfect runs into
+/// `RUN_RC=255` (measured 2026-08-12 — every run ended 255 **after** `Batch complete:
+/// N succeeded, 0 failed`).
 ///
-/// Leaking is CORRECT here, not a workaround: the device region lives until process exit either way
-/// (the C++ executor never freed regions), so all that leaks is a descriptor, once, at shutdown.
-///
-/// ⛔ DO NOT "SIMPLIFY" THIS BY DELETING `impl Drop for DevAddr` in `sdk_abi.rs`. The per-step windows
-/// (`shifted`, built per layer per launch) must keep freeing — they drop while the runtime is alive,
-/// exactly as the old shim's did, and at ~120 per forward a leaked descriptor each grows without bound.
+/// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step
+/// windows (`shifted`, built per layer per launch) must keep dying as owned values — at ~120
+/// per forward a leaked descriptor each grows without bound.
 impl Drop for OpProg {
     fn drop(&mut self) {
         std::mem::forget(self.addr.take());
@@ -1384,8 +1385,7 @@ impl Executor {
             *from = Instant::now();
         };
 
-        crate::sdk_abi::init_runtime()
-            .map_err(|rc| anyhow!("flex runtime init failed (rc={rc})"))?;
+        crate::runtime::init_runtime().map_err(|e| anyhow!("flex runtime init failed: {e}"))?;
         lap("runtime-init", &mut t0);
         // A DEDICATED created stream (not the default): predict destroys and recreates it each
         // forward to DRAIN the RuntimeScheduler's per-stream fence deques, which are otherwise
@@ -1394,7 +1394,7 @@ impl Executor {
         // The resident program/weight/KV allocations live on the runtime, not the stream, so
         // recreating it leaves them intact.
         self.stream =
-            Some(Stream::create().ok_or_else(|| anyhow!("prepare: could not create a stream"))?);
+            Some(Stream::create().map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?);
         lap("stream-create", &mut t0);
 
         // ── Programs. Each op's device binary gets its OWN Program-segment alloc + H2D ONCE; they
@@ -1463,8 +1463,8 @@ impl Executor {
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(bytes, MemKind::Tensor)
-                    .ok_or_else(|| anyhow!("prepare: seg{i} alloc of {bytes} B failed"))?,
+                DevAddr::alloc(bytes, MemoryType::Tensor)
+                    .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
         // ⭐ AND ONE REGION PER EXTRA WEIGHT BANK, immediately after the weight segment's own —
@@ -1479,8 +1479,11 @@ impl Executor {
                 self.weight_bank_bytes[b].max(128)
             };
             self.weight_bank_addr[b] =
-                Some(DevAddr::alloc(bytes, MemKind::Tensor).ok_or_else(|| {
-                    anyhow!("prepare: weight bank {} alloc of {bytes} B failed", b + 1)
+                Some(DevAddr::alloc(bytes, MemoryType::Tensor).map_err(|e| {
+                    anyhow!(
+                        "prepare: weight bank {} alloc of {bytes} B failed: {e}",
+                        b + 1
+                    )
                 })?);
         }
         lap("seg-alloc", &mut t0);
@@ -1563,7 +1566,7 @@ impl Executor {
             let src = whole_shadow(&self.seg_host[i], addr, i)?;
             stream
                 .h2d(src, addr)
-                .map_err(|rc| anyhow!("prepare: seg{i} H2D rc={rc}"))?;
+                .map_err(|e| anyhow!("prepare: seg{i} H2D: {e}"))?;
         }
         // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own conditions — it is the same
         // segment, so "borrowed" and "nothing bound" mean the same thing for it.
@@ -1578,13 +1581,13 @@ impl Executor {
                 let src = whole_shadow(&self.weight_bank_host[b], addr, NUM_SEGMENTS + b)?;
                 stream
                     .h2d(src, addr)
-                    .map_err(|rc| anyhow!("prepare: weight bank {} H2D rc={rc}", b + 1))?;
+                    .map_err(|e| anyhow!("prepare: weight bank {} H2D: {e}", b + 1))?;
             }
         }
         lap("tensor-h2d", &mut t0);
         self.stream_ref()?
             .synchronize()
-            .map_err(|rc| anyhow!("prepare: sync rc={rc}"))?;
+            .map_err(|e| anyhow!("prepare: sync: {e}"))?;
         lap("sync", &mut t0);
         self.prepared = true;
 
@@ -1674,23 +1677,22 @@ impl Executor {
                 // while the launch used a bare `-`).
                 let img = op
                     .code
-                    .prog_image(crate::sdk_abi::prog_offset_base())
+                    .prog_image(crate::runtime::prog_offset_base())
                     .ok_or_else(|| {
                         anyhow!(
                             "program job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x}",
                             op.code.job_bin_ptr,
-                            crate::sdk_abi::prog_offset_base()
+                            crate::runtime::prog_offset_base()
                         )
                     })?;
                 let head = img.bootstrap();
-                let addr =
-                    DevAddr::alloc(img.alloc_bytes(), MemKind::Program).ok_or_else(|| {
-                        anyhow!(
-                            "program alloc of {} B ({head} B prologue + {} B image) failed",
-                            img.alloc_bytes(),
-                            img.image_bytes()
-                        )
-                    })?;
+                let addr = DevAddr::alloc(img.alloc_bytes(), MemoryType::Program).map_err(|e| {
+                    anyhow!(
+                        "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
+                        img.alloc_bytes(),
+                        img.image_bytes()
+                    )
+                })?;
                 // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
                 //
                 // A BAKED program is `Cow::Borrowed(&'static [u8])`, which lives in the executable's
@@ -1728,7 +1730,7 @@ impl Executor {
                     .ok_or_else(|| anyhow!("program window at {head} B unaddressable"))?;
                 self.stream_ref()?
                     .h2d(staged, &dst)
-                    .map_err(|rc| anyhow!("program H2D rc={rc}"))?;
+                    .map_err(|e| anyhow!("program H2D: {e}"))?;
                 op.addr = Some(addr);
             }
             // ⛔ BEFORE `pinnable` DROPS. The H2Ds above are asynchronous, so the staging buffers
@@ -1737,7 +1739,7 @@ impl Executor {
             if !pinnable.is_empty() {
                 self.stream_ref()?
                     .synchronize()
-                    .map_err(|rc| anyhow!("program H2D sync rc={rc}"))?;
+                    .map_err(|e| anyhow!("program H2D sync: {e}"))?;
             }
             // How much of a list is `.rodata`-backed says how much of the program set the copy above
             // is load-bearing for — 1-of-many and all-of-many are different stories about the bake,
@@ -1849,7 +1851,7 @@ impl Executor {
         // Their binaries must land before the first launch.
         self.stream_ref()?
             .synchronize()
-            .map_err(|rc| anyhow!("split-body sync rc={rc}"))?;
+            .map_err(|e| anyhow!("split-body sync: {e}"))?;
         self.split_bodies_ready = true;
         debug!(
             "[sdsc-superdsc] allocated {} split decode bodies (a fold that re-launches needs them)",
@@ -2193,13 +2195,13 @@ impl Executor {
                 // correctly. `ProgImage` is now the one door: see `LaunchGroup::prog_image`.
                 let bootstrap = op
                     .code
-                    .prog_image(crate::sdk_abi::prog_offset_base())
+                    .prog_image(crate::runtime::prog_offset_base())
                     .ok_or_else(|| {
                         anyhow!(
                             "op {oi}: job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x} — it names no \
                              bootstrap offset at all",
                             op.code.job_bin_ptr,
-                            crate::sdk_abi::prog_offset_base()
+                            crate::runtime::prog_offset_base()
                         )
                     })?
                     .bootstrap();
@@ -2236,11 +2238,11 @@ impl Executor {
                 // faults — and that mis-attribution cost a session: `job_bin_ptr=0x1c00000000` was
                 // read off a prefill op and carried onto a decode fault whose bootstrap nobody had
                 // measured. A fault path is not a mode, so this has no knob.
-                let fault = |rc: i32| -> anyhow::Error {
+                let fault = |e: HwError| -> anyhow::Error {
                     self.dump_launch_site("FAULT(submit-refused)", &ta, op, prog, bootstrap, &off);
                     let sweep = self.prog_images_sweep("FAULT", ops);
                     eprint!("{sweep}");
-                    launch_err(rc)
+                    launch_err(e)
                 };
                 // ⭐ DATES THE DIVERGENCE. The fault path's readback runs after the abend, on a stream
                 // that may no longer answer; this one runs on a healthy stream immediately before the
@@ -2413,7 +2415,7 @@ impl Executor {
                     let _ = writeln!(
                         out,
                         "[segaddr] {who} seg{i} region={} offset={} size={} shift={}",
-                        c.region, c.offset, c.size, off[i]
+                        c.region.0, c.offset.0, c.size.0, off[i]
                     );
                 }
                 _ => {
@@ -2421,15 +2423,15 @@ impl Executor {
                 }
             }
         }
-        let base = crate::sdk_abi::prog_offset_base();
+        let base = crate::runtime::prog_offset_base();
         match prog.chunk0() {
             Some(c) => {
                 let _ = writeln!(
                     out,
                     "[segaddr] {who} seg7/PROG region={} offset={} size={} (binary {} B)",
-                    c.region,
-                    c.offset,
-                    c.size,
+                    c.region.0,
+                    c.offset.0,
+                    c.size.0,
                     op.code.init_binary.len()
                 );
             }
@@ -2537,16 +2539,16 @@ impl Executor {
         let head = op
             .code
             .job_bin_ptr
-            .saturating_sub(crate::sdk_abi::prog_offset_base());
+            .saturating_sub(crate::runtime::prog_offset_base());
         let Some(win) = prog.window(head, baked.len() as u64) else {
             return "progimg: program window unaddressable".to_string();
         };
         let mut host = vec![0u8; baked.len()];
-        if let Err(rc) = stream.d2h(&mut host, &win) {
-            return format!("progimg: D2H rc={rc} — THE READBACK ITSELF FAILED, no verdict");
+        if let Err(e) = stream.d2h(&mut host, &win) {
+            return format!("progimg: D2H: {e} — THE READBACK ITSELF FAILED, no verdict");
         }
-        if let Err(rc) = stream.synchronize() {
-            return format!("progimg: D2H sync rc={rc} — THE READBACK ITSELF FAILED, no verdict");
+        if let Err(e) = stream.synchronize() {
+            return format!("progimg: D2H sync: {e} — THE READBACK ITSELF FAILED, no verdict");
         }
         // The header as dip writes it and `QGHeader` reads it (`dip/dip.cpp:77-91`, `senulator/qg.h`):
         // `u8[0]` is `SW_VER`, bits 21:8 are the flit count EXCLUDING the header's own flit
@@ -2681,7 +2683,7 @@ impl Executor {
         let t_stream0 = Instant::now();
         self.stream = None; // drop = destroyStream
         self.stream =
-            Some(Stream::create().ok_or_else(|| anyhow!("predict: stream recreate failed"))?);
+            Some(Stream::create().map_err(|e| anyhow!("predict: stream recreate failed: {e}"))?);
 
         let t0 = Instant::now();
         let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
@@ -2755,12 +2757,12 @@ impl Executor {
                 .as_ref()
                 .unwrap()
                 .d2h(host, src)
-                .map_err(|rc| anyhow!("logits D2H rc={rc}"))?;
+                .map_err(|e| anyhow!("logits D2H: {e}"))?;
         }
         let t2b = Instant::now();
         self.stream_ref()?
             .synchronize()
-            .map_err(|rc| anyhow!("predict: sync rc={rc}"))?;
+            .map_err(|e| anyhow!("predict: sync: {e}"))?;
 
         if d.phase_time {
             let t3 = Instant::now();
@@ -2807,7 +2809,7 @@ impl Executor {
             if t.forwards == n {
                 let before = vmrss_kb();
                 self.stream = None;
-                let _ = crate::sdk_abi::runtime_reset();
+                let _ = crate::runtime::runtime_reset();
                 let after = vmrss_kb();
                 eprintln!(
                     "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
@@ -2959,7 +2961,7 @@ impl Executor {
             if runs.is_empty() {
                 stream
                     .h2d(whole_shadow(&self.seg_host[i], addr, i)?, addr)
-                    .map_err(|rc| anyhow!("preamble H2D seg{i} rc={rc}"))?;
+                    .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?;
             } else {
                 for (a, b) in runs {
                     let win = addr
@@ -2967,7 +2969,7 @@ impl Executor {
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
                     stream
                         .h2d(&self.seg_host[i][a as usize..b as usize], &win)
-                        .map_err(|rc| anyhow!("preamble H2D seg{i} window rc={rc}"))?;
+                        .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?;
                 }
             }
         }
@@ -3092,7 +3094,7 @@ impl Executor {
         self.launch_ops(sel, zero, SeqPos(0), Bytes(0), 1, bank)?;
         self.stream_ref()?
             .synchronize()
-            .map_err(|rc| anyhow!("run_prefix_only sync rc={rc}"))
+            .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
     }
 
     /// The FULL forward for the selftest: prefix → body×iters (per-layer advance + in-place hidden
@@ -3110,7 +3112,7 @@ impl Executor {
         self.launch_forward(SeqPos(0))?;
         self.stream_ref()?
             .synchronize()
-            .map_err(|rc| anyhow!("run_full sync rc={rc}"))?;
+            .map_err(|e| anyhow!("run_full sync: {e}"))?;
         Ok(true)
     }
 
@@ -3148,10 +3150,10 @@ impl Executor {
         if host >= dev {
             stream
                 .d2h(&mut seg_host[i][..dev as usize], addr)
-                .map_err(|rc| anyhow!("seg{i} D2H rc={rc}"))?;
+                .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
             stream
                 .synchronize()
-                .map_err(|rc| anyhow!("seg{i} D2H sync rc={rc}"))?;
+                .map_err(|e| anyhow!("seg{i} D2H sync: {e}"))?;
             return Ok(dev as usize);
         }
         if !addr.is_single_chunk() {
@@ -3166,10 +3168,10 @@ impl Executor {
                 .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
             stream
                 .d2h(&mut seg_host[i][..host as usize], &win)
-                .map_err(|rc| anyhow!("seg{i} D2H rc={rc}"))?;
+                .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
             stream
                 .synchronize()
-                .map_err(|rc| anyhow!("seg{i} D2H sync rc={rc}"))?;
+                .map_err(|e| anyhow!("seg{i} D2H sync: {e}"))?;
         }
         debug!(
             "[sdsc-superdsc] read seg{i} CLAMPED to its host shadow: {host} of {dev} B D2H'd \
@@ -3262,11 +3264,11 @@ impl Executor {
                 .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
             stream
                 .h2d(&zeros[..sz as usize], &win)
-                .map_err(|rc| anyhow!("zero H2D rc={rc}"))?;
+                .map_err(|e| anyhow!("zero H2D: {e}"))?;
             // The window must outlive the transfer.
             stream
                 .synchronize()
-                .map_err(|rc| anyhow!("zero sync rc={rc}"))?;
+                .map_err(|e| anyhow!("zero sync: {e}"))?;
             off += sz;
         }
         Ok(())
@@ -3309,10 +3311,10 @@ impl Executor {
         let stream = self.stream_ref()?;
         stream
             .h2d(&self.seg_host[i][..data.len()], &win)
-            .map_err(|rc| anyhow!("write_seg_prefix H2D seg{i} rc={rc}"))?;
+            .map_err(|e| anyhow!("write_seg_prefix H2D seg{i}: {e}"))?;
         stream
             .synchronize()
-            .map_err(|rc| anyhow!("write_seg_prefix sync seg{i} rc={rc}"))
+            .map_err(|e| anyhow!("write_seg_prefix sync seg{i}: {e}"))
     }
 
     /// Overwrite the WHOLE tensor segment from raw sen-fp16 bytes + H2D it. The counterpart of
@@ -3328,10 +3330,10 @@ impl Executor {
         let stream = self.stream_ref()?;
         stream
             .h2d(src, addr)
-            .map_err(|rc| anyhow!("write_seg H2D rc={rc}"))?;
+            .map_err(|e| anyhow!("write_seg H2D: {e}"))?;
         stream
             .synchronize()
-            .map_err(|rc| anyhow!("write_seg sync rc={rc}"))
+            .map_err(|e| anyhow!("write_seg sync: {e}"))
     }
 
     /// Point THIS session's segment `seg` at `owner`'s DEVICE region so the two SHARE it outright
@@ -3398,15 +3400,14 @@ impl Executor {
             .chunk0()
             .filter(|_| src.is_single_chunk())
             .ok_or_else(|| anyhow!("alias_seg(seg{i}): src region is MULTI-CHUNK — REFUSING"))?;
-        self.seg_addr[i] = Some(
-            DevAddr::from_chunk(c0).ok_or_else(|| anyhow!("alias_seg(seg{i}): rebuild failed"))?,
-        );
+        // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
+        self.seg_addr[i] = Some(DevAddr::from_chunk(c0));
         // The borrowed segment is marked so this session's preamble can never H2D its own stale
         // host shadow over the owner's live data.
         self.seg_aliased[i] = true;
         debug!(
             "[sdsc-superdsc] alias_seg(seg{i}): dst now SHARES src's region ({} B)",
-            c0.size
+            c0.size.0
         );
         // ⭐⭐ AND THE WEIGHT SEGMENT'S EXTRA BANKS — because they ARE the weight segment. Aliasing
         // seg1 while leaving a bank pointing at this session's own (zero-filled) region would give
@@ -3452,9 +3453,8 @@ impl Executor {
                             b + 1
                         )
                     })?;
-                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0).ok_or_else(|| {
-                    anyhow!("alias_seg(seg{i}): weight bank {} rebuild failed", b + 1)
-                })?);
+                // Infallible by construction: `DevAddr::from_chunk` builds a descriptor value.
+                self.weight_bank_addr[b] = Some(DevAddr::from_chunk(bc0));
                 self.weight_bank_aliased[b] = true;
             }
         }
@@ -3644,8 +3644,8 @@ fn bind_ops(code: &'static bundle::BundleCode<'static>) -> Ops {
         .collect()
 }
 
-fn launch_err(rc: i32) -> anyhow::Error {
-    anyhow!("compute launch rc={rc}")
+fn launch_err(e: HwError) -> anyhow::Error {
+    anyhow!("compute launch: {e}")
 }
 
 /// Process RSS in KB (for the flex-leak reset probe).

@@ -25,7 +25,8 @@
 //! UPDATE (2026-08-15): `flex_senlib_query_topology` was never implemented in
 //! `cxx-shim/flex_shim.cpp` (no such symbol exists in the real SDK either —
 //! see the "REAL LINK-TARGET AUDIT" below) and real-hardware testing hit a
-//! `FlexAllocator` OOM traced to `fxa_rust_abi.rs::build_runtime()` sizing its
+//! `FlexAllocator` OOM traced to scratchy's runtime bring-up
+//! (`scratchy-target-spyre`'s `runtime::build_runtime`) sizing its
 //! single domain off a 32 GiB placeholder instead of the card's real HBM
 //! capacity. It is replaced below by `flex_senlib_device_memory_size`, a
 //! one-line real call (`DeviceHandle::GetDmpaSize()`) matching exactly what
@@ -246,11 +247,11 @@ unsafe extern "C" {
 // symbol, each a one-line marshal onto the real
 // `flex::DeviceHandle`/`senlib::ControlBlockInterface`/
 // `senlib::ResponseBlockInterface` methods cited in this file's and
-// `senlib_ffi_scheduler.rs`'s doc comments. It links against the real
-// `libflex.so`/senlib on the pod (`/opt/ibm/spyre/{runtime,senlib}/lib`) and
-// is compiled by `build.rs` only when `FLEX_RS_BUILD_CXX_SHIM=1` is set in
-// the environment (unset on this laptop, which has none of the SDK headers
-// — `cargo check`/`build`/`clippy` here never invoke a C++ compiler).
+// `senlib_ffi_scheduler.rs`'s doc comments. It is compiled by flex-rs's
+// `build.rs` unconditionally by default and links against the real senlib
+// on the pod (`/opt/ibm/spyre/senlib/lib`, plus its own transitive deps);
+// `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile for check/clippy on a
+// machine without the SDK headers (a link then fails loudly).
 //
 // `flex_shim_cbi_for_pipeline`/`flex_shim_rbi_for_pipeline` (new, in
 // `senlib_ffi_scheduler.rs`) are the shim entry points that turn a

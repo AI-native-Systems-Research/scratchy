@@ -4728,7 +4728,8 @@ impl fmt::Display for ThroughputStat {
 /// `FLEX_DEVICE` setting in this crate's simplified single-process model, so
 /// `device_kind` folds both steps into the one three-way
 /// [`crate::flex_config::DeviceKind`] this crate already uses everywhere
-/// else backend choice matters (e.g. `fxa_rust_abi.rs`, which this factory
+/// else backend choice matters (e.g. scratchy-target-spyre's `runtime.rs`,
+/// which this factory
 /// exists to stop hardcoding `Backend::Pf` unconditionally).
 pub enum SchedulerBackendConfig {
     Real(
@@ -4755,6 +4756,21 @@ pub enum SchedulerFactoryError {
     /// `device_kind` (e.g. `Mock` device kind with `Real` config).
     MismatchedBackendConfig,
 }
+
+impl std::fmt::Display for SchedulerFactoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedChipVersion(chip) => {
+                write!(f, "unsupported SPYRE_CHIP version: {chip}")
+            }
+            Self::UnsupportedDeviceKind(kind) => write!(f, "unsupported device kind: {kind}"),
+            Self::MismatchedBackendConfig => {
+                write!(f, "scheduler backend config does not match the device kind")
+            }
+        }
+    }
+}
+impl std::error::Error for SchedulerFactoryError {}
 
 /// Port of `RuntimeSchedulerFactory::createScheduler` (which internally
 /// dispatches to `createRealScheduler`/`createMockScheduler`).
