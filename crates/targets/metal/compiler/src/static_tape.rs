@@ -46,6 +46,10 @@ use scratchy_target_metal::tape::lowered::{
 /// ([`aot::baked_library`]): one entry of the model's kernel table (`__tape_cmds::KERNELS`), naming
 /// its [`BakedKernel`](scratchy_target_metal::tape::lowered::BakedKernel) in the build's
 /// `__metal_bake` module ([`kernel_ref`]).
+///
+/// And the bodies' per-command arrays — indices, fences, cache-liveness — are bytes: the model's
+/// [`TapeBytes`](scratchy_target_metal::tape::lowered::TapeBytes) (`__tape_cmds::BYTES`), one
+/// embedded file each body's slices view into ([`Self::tape_arrays`]).
 #[derive(Default)]
 pub struct CommandPool {
     index: std::collections::HashMap<GatedCommand, CommandIx>,
@@ -55,6 +59,14 @@ pub struct CommandPool {
     bindings: Parts<&'static [Binding]>,
     named_kernels: std::collections::HashSet<PipelineKey>,
     kernels: Vec<PipelineKey>,
+    bytes: Vec<u8>,
+}
+
+/// The views of one tape body's per-command arrays into its model's `__tape_cmds::BYTES`.
+struct TapeArrays {
+    ixs: TokenStream,
+    barrier_before: TokenStream,
+    cache_live: TokenStream,
 }
 
 /// Each distinct value of one command field, as a `const` of its own.
@@ -89,7 +101,7 @@ impl<T: std::hash::Hash + Eq + Copy + serde::Serialize> Parts<T> {
 }
 
 impl CommandPool {
-    fn intern(&mut self, cmd: &GatedCommand) -> Result<TokenStream, BakeDefect> {
+    fn intern(&mut self, cmd: &GatedCommand) -> Result<CommandIx, BakeDefect> {
         let ix = match self.index.get(cmd) {
             Some(&ix) => ix,
             None => {
@@ -119,11 +131,26 @@ impl CommandPool {
                     r.map_err(|e| BakeDefect(format!("serialize command: {e}")))
                 };
                 let kernel = tok(crate::const_tokens::const_tokens(&kernel))?;
-                let gemm_dims = tok(crate::const_tokens::const_tokens(&gemm_dims))?;
-                let gate = tok(crate::const_tokens::const_tokens(&gate))?;
-                let id = quote::format_ident!("C{}", ix.0);
+                // ⛔ INLINE IN `TABLE`, EVERY `Option` TYPED. A `const` per command (131k across
+                // the catalog) paid rustc's per-item work on each one. Inline in one body, an
+                // untyped `None`/`Some` is an inference variable apiece, and a body's inference
+                // grows faster than its length. Spelled with its type, an `Option` costs neither.
+                let gemm_dims = match gemm_dims {
+                    None => quote!(::core::option::Option::<__tl::GemmDims>::None),
+                    Some(d) => {
+                        let d = tok(crate::const_tokens::const_tokens(&d))?;
+                        quote!(::core::option::Option::<__tl::GemmDims>::Some(#d))
+                    }
+                };
+                let gate = match gate {
+                    None => quote!(::core::option::Option::<__tl::RuntimeGate>::None),
+                    Some(g) => {
+                        let g = tok(crate::const_tokens::const_tokens(&g))?;
+                        quote!(::core::option::Option::<__tl::RuntimeGate>::Some(#g))
+                    }
+                };
                 self.table.push(quote! {
-                    pub(super) const #id: __tl::GatedCommand = __tl::GatedCommand {
+                    __tl::GatedCommand {
                         command: __tl::LoweredCommand {
                             kernel: #kernel,
                             library: #library,
@@ -134,14 +161,47 @@ impl CommandPool {
                             gemm_dims: #gemm_dims,
                         },
                         gate: #gate,
-                    };
+                    }
                 });
                 self.index.insert(*cmd, ix);
                 ix
             }
         };
-        let ix = proc_macro2::Literal::u16_unsuffixed(ix.0);
-        Ok(quote! { I(#ix) })
+        Ok(ix)
+    }
+
+    /// `body`'s per-command arrays, appended to the model's tape bytes, as the slices that view
+    /// them: its commands' indices (interned), little-endian at an even offset, then its fences and
+    /// its cache-liveness flags a byte each.
+    fn tape_arrays(&mut self, body: &LoweredMetalTape) -> Result<TapeArrays, BakeDefect> {
+        let ixs = (body.commands.iter())
+            .map(|c| self.intern(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !self.bytes.len().is_multiple_of(2) {
+            self.bytes.push(0);
+        }
+        let view = |at: usize, len: usize, view: &str| {
+            let (at, len) = (
+                proc_macro2::Literal::usize_unsuffixed(at),
+                proc_macro2::Literal::usize_unsuffixed(len),
+            );
+            let view = quote::format_ident!("{view}");
+            quote!(__tape_cmds::BYTES.#view(#at, #len))
+        };
+        let ixs_view = view(self.bytes.len(), ixs.len(), "command_ixs");
+        self.bytes
+            .extend(ixs.iter().flat_map(|ix| ix.0.to_le_bytes()));
+        let fences = view(self.bytes.len(), body.barrier_before.len(), "fences");
+        self.bytes
+            .extend(body.barrier_before.iter().map(|&f| f as u8));
+        let flags = view(self.bytes.len(), body.cache_live.len(), "flags");
+        self.bytes
+            .extend(body.cache_live.iter().map(|&live| u8::from(live)));
+        Ok(TapeArrays {
+            ixs: ixs_view,
+            barrier_before: fences,
+            cache_live: flags,
+        })
     }
 
     /// Add the baked kernels `commands` name for tape `variant` at activation `dtype` to the
@@ -177,20 +237,21 @@ impl CommandPool {
         let aliases = crate::const_tokens::alias_preamble();
         let table = self.table;
         let len = proc_macro2::Literal::usize_unsuffixed(table.len());
-        let ids = (0..table.len()).map(|i| quote::format_ident!("C{i}"));
         let kernels: Vec<TokenStream> = self.kernels.iter().map(kernel_ref).collect();
         let kernels_len = proc_macro2::Literal::usize_unsuffixed(kernels.len());
         let parts = (self.constants.items.iter())
             .chain(&self.dispatches.items)
             .chain(&self.bindings.items);
+        let bytes_len = proc_macro2::Literal::usize_unsuffixed(self.bytes.len());
+        let bytes = out_dir_file("tape-bytes", "bin", &self.bytes);
         quote! {
             #[cfg(feature = "metal")]
             mod __tape_cmds {
                 #aliases
                 #(#parts)*
-                #(#table)*
-                pub(super) static TABLE: [__tl::GatedCommand; #len] = [ #(#ids),* ];
+                pub(super) static TABLE: [__tl::GatedCommand; #len] = [ #(#table),* ];
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
+                pub(super) static BYTES: __tl::TapeBytes<#bytes_len> = __tl::TapeBytes(*#bytes);
             }
             #[cfg(feature = "metal")]
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
@@ -276,21 +337,26 @@ pub fn bake_module() -> TokenStream {
     }
 }
 
-/// `metallib` as a file under the build's `OUT_DIR`, named by its content (models sharing a batch
-/// share the file), and the `include_bytes!` that embeds it: rustc reads the bytes rather than
-/// lexing them as a literal.
+/// `metallib` as a file under the build's `OUT_DIR`, models sharing a batch sharing the file, and
+/// the `include_bytes!` that embeds it.
 fn metallib_file(metallib: &[u8]) -> TokenStream {
+    out_dir_file("metal-bake", "metallib", metallib)
+}
+
+/// `bytes` as a file in `dir` under the build's `OUT_DIR`, named by its content, and the
+/// `include_bytes!` that embeds it: rustc reads the bytes rather than lexing them as a literal.
+fn out_dir_file(dir: &str, ext: &str, bytes: &[u8]) -> TokenStream {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let out = std::env::var("OUT_DIR").expect("the metal bake writes its metallibs under OUT_DIR");
+    let out = std::env::var("OUT_DIR").expect("the metal bake writes its files under OUT_DIR");
     let fnv = |h: u64, &b: &u8| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
-    let hash = metallib.iter().fold(0xcbf2_9ce4_8422_2325, fnv);
-    let name = format!("metal-bake/{hash:016x}-{}.metallib", metallib.len());
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325, fnv);
+    let name = format!("{dir}/{hash:016x}-{}.{ext}", bytes.len());
     let path = std::path::Path::new(&out).join(&name);
     if !path.exists() {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
-        std::fs::create_dir_all(path.parent().expect("metal-bake dir"))
-            .and_then(|()| std::fs::write(&tmp, metallib))
+        std::fs::create_dir_all(path.parent().expect("the file's dir"))
+            .and_then(|()| std::fs::write(&tmp, bytes))
             .and_then(|()| std::fs::rename(&tmp, &path))
             .unwrap_or_else(|e| panic!("metal bake: write {}: {e}", path.display()));
     }
@@ -481,11 +547,15 @@ pub fn bake_bucket_tapes(
         let body_ix = match seen.get(&body).copied() {
             Some(ix) => ix,
             None => {
-                let cmd_refs = (body.commands.iter())
-                    .map(|c| pool.intern(c))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let TapeArrays {
+                    ixs,
+                    barrier_before,
+                    cache_live,
+                } = pool.tape_arrays(&body)?;
                 let rest = LoweredMetalTape {
                     commands: TapeCommands::EMPTY,
+                    barrier_before: &[],
+                    cache_live: &[],
                     ..body
                 };
                 let rest_toks = tok("tape", crate::const_tokens::const_tokens(&rest))?;
@@ -497,8 +567,10 @@ pub fn bake_bucket_tapes(
                     static #ident: __tl::LoweredMetalTape = __tl::LoweredMetalTape {
                         commands: __tl::TapeCommands {
                             table: &__tape_cmds::TABLE,
-                            ixs: { use __ti::CommandIx as I; &[ #(#cmd_refs),* ] },
+                            ixs: #ixs,
                         },
+                        barrier_before: #barrier_before,
+                        cache_live: #cache_live,
                         ..#rest_toks
                     };
                 });

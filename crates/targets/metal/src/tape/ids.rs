@@ -197,7 +197,11 @@ macro_rules! u32_newtype {
 /// A command's position in its tape's command table ([`crate::tape::lowered::TapeCommands`]):
 /// two bytes per command a tape runs, where a reference would be eight plus a load-time fixup. A
 /// table too large for it is refused ([`Self::of`]), never truncated.
+///
+/// `repr(transparent)`: a baked model's tapes view their indices straight out of its tape bytes
+/// ([`crate::tape::lowered::TapeBytes::command_ixs`]).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
+#[repr(transparent)]
 pub struct CommandIx(pub u16);
 
 impl CommandIx {

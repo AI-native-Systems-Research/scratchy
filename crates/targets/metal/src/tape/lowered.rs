@@ -1415,19 +1415,80 @@ pub fn baked<T>(v: Vec<T>) -> &'static [T] {
 /// `Ordered` — ordering is all they need, and the flush `Device` forces
 /// costs real decode time where it isn't needed (measured −30 ms TTFT
 /// @ 2048-tok on M4 Llama-3.2-3B-4bit, gemma-4-26b conc decode ~5-10%).
+///
+/// `repr(u8)`: a baked model's tapes view their fences straight out of its tape bytes
+/// ([`TapeBytes::fences`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[repr(u8)]
 pub enum Fence {
     /// No fence.
     #[default]
-    None,
+    None = 0,
     /// Ordering only (WAR/WAW): no later dispatch may start before the
     /// prior one's dispatch stage completes. Emitted as a
     /// `Dispatch→Dispatch` barrier with `MTL4VisibilityOptions::None`.
-    Ordered,
+    Ordered = 1,
     /// RAW: a reader must OBSERVE a prior dispatch's write. Emitted as a
     /// `Dispatch→Dispatch` barrier with `MTL4VisibilityOptions::Device`
     /// (memory-coherent).
-    Coherent,
+    Coherent = 2,
+}
+
+/// ⭐ A BAKED MODEL'S PER-COMMAND TAPE ARRAYS, AS BYTES. Each tape body lists, per command it runs,
+/// the command's [`CommandIx`], the [`Fence`] before it and whether a cache-writes-only forward
+/// plays it. Spelled as Rust literals, those three arrays were a third of the whole bake's tokens,
+/// every one of them type-checked and const-evaluated by rustc's single-threaded front end. The
+/// bake writes a model's arrays into one file it embeds with `include_bytes!`, which rustc reads
+/// rather than lexes, and each body's slices view into it: still `&'static [T]`, still a
+/// compile-time constant.
+///
+/// `align(2)`: [`Self::command_ixs`] reads `u16`s, at the even offsets the bake pads them to.
+#[repr(C, align(2))]
+pub struct TapeBytes<const N: usize>(pub [u8; N]);
+
+// The bake writes command indices little-endian, and the view reads them in place.
+const _: () = assert!(cfg!(target_endian = "little"));
+
+impl<const N: usize> TapeBytes<N> {
+    /// The `len` command indices at byte `at`.
+    pub const fn command_ixs(&'static self, at: usize, len: usize) -> &'static [CommandIx] {
+        assert!(
+            at.is_multiple_of(2) && at + 2 * len <= N,
+            "command indices outside the tape bytes"
+        );
+        // SAFETY: `at..at + 2 * len` is in bounds and 2-aligned (asserted, in an `align(2)` array);
+        // any two bytes are a `u16`, `CommandIx` is a `repr(transparent)` `u16`, and the target is
+        // little-endian, as the bake wrote them.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().add(at).cast(), len) }
+    }
+
+    /// The `len` fences at byte `at`. A byte that is no [`Fence`] fails the build.
+    pub const fn fences(&'static self, at: usize, len: usize) -> &'static [Fence] {
+        assert!(at + len <= N, "fences outside the tape bytes");
+        let mut i = 0;
+        while i < len {
+            assert!(
+                self.0[at + i] <= Fence::Coherent as u8,
+                "a tape byte that is no fence"
+            );
+            i += 1;
+        }
+        // SAFETY: in bounds (asserted); every byte is a `Fence` discriminant (asserted), and
+        // `Fence` is a `repr(u8)`.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().add(at).cast(), len) }
+    }
+
+    /// The `len` flags at byte `at`. A byte that is no `bool` fails the build.
+    pub const fn flags(&'static self, at: usize, len: usize) -> &'static [bool] {
+        assert!(at + len <= N, "flags outside the tape bytes");
+        let mut i = 0;
+        while i < len {
+            assert!(self.0[at + i] <= 1, "a tape byte that is no bool");
+            i += 1;
+        }
+        // SAFETY: in bounds (asserted); every byte is 0 or 1 (asserted), a `bool`.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().add(at).cast(), len) }
+    }
 }
 
 /// A tape's commands: positions in a command table. The tapes a model bakes share one table
