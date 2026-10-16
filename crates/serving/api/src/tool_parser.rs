@@ -12,6 +12,7 @@
 //!
 //! Port of: `vllm/entrypoints/openai/tool_parsers/` (subset)
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -519,9 +520,9 @@ struct PartialValue<'a> {
 /// A JSON object or array that may still be arriving, read in one pass.
 #[derive(Debug)]
 struct PartialContainer<'a> {
-    /// Top-level members in order: `(raw key, value)` for an object, `("", element)`
-    /// for an array. The last one may be unfinished.
-    members: Vec<(&'a str, PartialValue<'a>)>,
+    /// Top-level members in order: `(Some(raw key), value)` for an object,
+    /// `(None, element)` for an array. The last one may be unfinished.
+    members: Vec<(Option<&'a str>, PartialValue<'a>)>,
     /// Byte offset just past the closing `}`/`]`, once it has arrived.
     end: Option<usize>,
 }
@@ -530,15 +531,15 @@ impl<'a> PartialContainer<'a> {
     fn member(&self, key: &str) -> Option<PartialValue<'a>> {
         self.members
             .iter()
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| *k == Some(key))
             .map(|(_, v)| *v)
     }
 }
 
 /// Read the object or array at the start of `text` without needing it to be
-/// finished. Unlike [`partial_json_parse`], this invents nothing: every value
-/// is a slice of `text`, so a later read of a longer `text` only ever extends
-/// it, and `complete` says whether its closing character has actually arrived.
+/// finished. Nothing is filled in to make the text parse: every value is a
+/// slice of `text`, so a later read of a longer `text` only ever extends it,
+/// and `complete` says whether its closing character has actually arrived.
 fn scan_partial_container(text: &str) -> Option<PartialContainer<'_>> {
     let bytes = text.as_bytes();
     let is_object = match bytes.first() {
@@ -551,7 +552,7 @@ fn scan_partial_container(text: &str) -> Option<PartialContainer<'_>> {
     let (mut in_string, mut escaped) = (false, false);
     // The member being read: its key (objects only) and where its value starts.
     // An array element has no key, so its value can start right away.
-    let (mut key_start, mut key, mut value_start) = (None, "", None);
+    let (mut key_start, mut key, mut value_start) = (None, None, None);
     let mut expect_value = !is_object;
     // Structural characters are all ASCII, so byte offsets are char boundaries.
     for (i, &b) in bytes.iter().enumerate() {
@@ -563,7 +564,7 @@ fn scan_partial_container(text: &str) -> Option<PartialContainer<'_>> {
             } else if b == b'"' {
                 in_string = false;
                 if let Some(ks) = key_start.take() {
-                    key = &text[ks + 1..i];
+                    key = Some(&text[ks + 1..i]);
                 }
             }
             continue;
@@ -610,7 +611,7 @@ fn scan_partial_container(text: &str) -> Option<PartialContainer<'_>> {
                     },
                 ));
             }
-            (key, expect_value) = ("", !is_object);
+            (key, expect_value) = (None, !is_object);
             if depth == 0 {
                 return Some(PartialContainer {
                     members,
@@ -632,30 +633,34 @@ fn scan_partial_container(text: &str) -> Option<PartialContainer<'_>> {
     Some(PartialContainer { members, end: None })
 }
 
-/// The arguments text a value stands for: its raw JSON, or the decoded text
-/// when the model sent the arguments as a JSON-encoded string (the shape
-/// [`json_value_to_tool_call`] unwraps). An unfinished string decodes up to
-/// its last whole character, so the result only ever grows.
-fn arguments_text(value: PartialValue<'_>) -> Option<String> {
+/// The arguments text a value stands for: its raw JSON, borrowed, or the
+/// decoded text when the model sent the arguments as a JSON-encoded string
+/// (the shape [`json_value_to_tool_call`] unwraps). An unfinished string
+/// decodes up to its last whole character, so the result only ever grows.
+fn arguments_text(value: PartialValue<'_>) -> Option<Cow<'_, str>> {
     if !value.raw.starts_with('"') {
-        return Some(value.raw.to_string());
+        return Some(Cow::Borrowed(value.raw));
     }
     if value.complete {
-        return serde_json::from_str(value.raw).ok();
+        return serde_json::from_str(value.raw).ok().map(Cow::Owned);
     }
     // Drop a trailing partial escape — at most a `\uXXXX\uXX` surrogate half-pair.
     (0..=value.raw.len().min(12)).find_map(|cut| {
         let head = value.raw.get(..value.raw.len() - cut)?;
-        serde_json::from_str(&format!("{head}\"")).ok()
+        serde_json::from_str(&format!("{head}\""))
+            .ok()
+            .map(Cow::Owned)
     })
 }
 
-/// How far one tool call has streamed: whether its name went out, and how
-/// many bytes of its arguments text.
+/// How far one tool call has streamed.
 #[derive(Debug, Default)]
-struct StreamedCallProgress {
-    name_sent: bool,
-    args_sent: usize,
+enum StreamedCallProgress {
+    /// Nothing sent yet: the name's closing quote has not arrived.
+    #[default]
+    AwaitingName,
+    /// The name went out, and this many bytes of the arguments text.
+    Streaming { args_sent: usize },
 }
 
 /// The delta a tool call written as `{"name": …, "arguments"|"parameters": …}`
@@ -680,16 +685,19 @@ fn stream_json_call(
         function_name: None,
         function_arguments: None,
     };
-    if !progress.name_sent {
-        // The raw text of a string still missing its closing quote does not
-        // parse, so this waits for that quote and no longer.
-        let name = call.member("name")?;
-        delta.function_name = Some(serde_json::from_str(name.raw).ok()?);
-        delta.id = Some(format!("call_{}", Uuid::new_v4().simple()));
-        delta.call_type = Some("function".to_string());
-        delta.function_arguments = Some(String::new());
-        progress.name_sent = true;
-    }
+    let mut args_sent = match *progress {
+        StreamedCallProgress::Streaming { args_sent } => args_sent,
+        StreamedCallProgress::AwaitingName => {
+            // The raw text of a string still missing its closing quote does
+            // not parse, so this waits for that quote and no longer.
+            let name = call.member("name")?;
+            delta.function_name = Some(serde_json::from_str(name.raw).ok()?);
+            delta.id = Some(format!("call_{}", Uuid::new_v4().simple()));
+            delta.call_type = Some("function".to_string());
+            delta.function_arguments = Some(String::new());
+            0
+        }
+    };
     // Llama 3.x writes `"parameters"`; take it when `"arguments"` is absent or
     // null, as `json_value_to_tool_call` does (a value starting `n` is `null`
     // on its way in).
@@ -698,11 +706,12 @@ fn stream_json_call(
         _ => call.member("parameters"),
     };
     if let Some(text) = args.and_then(arguments_text)
-        && let Some(fragment) = text.get(progress.args_sent..).filter(|f| !f.is_empty())
+        && let Some(fragment) = text.get(args_sent..).filter(|f| !f.is_empty())
     {
         delta.function_arguments = Some(fragment.to_string());
-        progress.args_sent = text.len();
+        args_sent = text.len();
     }
+    *progress = StreamedCallProgress::Streaming { args_sent };
     (delta.function_name.is_some() || delta.function_arguments.is_some()).then_some(delta)
 }
 
@@ -735,75 +744,6 @@ fn tool_calls_or_none(deltas: Vec<DeltaToolCall>) -> ToolParserDelta {
     } else {
         ToolParserDelta::ToolCalls(deltas)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Partial JSON helper
-// ---------------------------------------------------------------------------
-
-/// Attempt to parse potentially incomplete JSON by closing open braces/brackets.
-///
-/// Tries parsing as-is first, then attempts to fix by appending closing
-/// characters for unmatched `{` and `[`.
-pub fn partial_json_parse(input: &str) -> Option<serde_json::Value> {
-    // Try parsing as-is first.
-    if let Ok(v) = serde_json::from_str(input) {
-        return Some(v);
-    }
-
-    // Track unmatched delimiters in order (outside strings).
-    let mut delimiter_stack: Vec<char> = Vec::new();
-    let mut in_string = false;
-    let mut prev_backslash = false;
-
-    for ch in input.chars() {
-        if in_string {
-            if ch == '\\' && !prev_backslash {
-                prev_backslash = true;
-                continue;
-            }
-            if ch == '"' && !prev_backslash {
-                in_string = false;
-            }
-            prev_backslash = false;
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => delimiter_stack.push('{'),
-            '}' => {
-                delimiter_stack.pop();
-            }
-            '[' => delimiter_stack.push('['),
-            ']' => {
-                delimiter_stack.pop();
-            }
-            _ => {}
-        }
-        prev_backslash = false;
-    }
-
-    if delimiter_stack.is_empty() && !in_string {
-        return None; // Not fixable by closing delimiters.
-    }
-
-    // Try closing the string if we're inside one, then close delimiters
-    // in reverse order (innermost first).
-    let mut fixed = input.to_string();
-
-    if in_string {
-        fixed.push('"');
-    }
-
-    for &delim in delimiter_stack.iter().rev() {
-        match delim {
-            '{' => fixed.push('}'),
-            '[' => fixed.push(']'),
-            _ => {}
-        }
-    }
-
-    serde_json::from_str(&fixed).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2971,27 +2911,6 @@ mod tests {
         );
     }
 
-    // -- Partial JSON tests --
-
-    #[test]
-    fn test_partial_json_incomplete() {
-        let input = r#"{"name": "f", "arguments": {"q": "he"#;
-        let result = partial_json_parse(input);
-        assert!(result.is_some());
-        let val = result.unwrap();
-        assert_eq!(val["name"], "f");
-        assert_eq!(val["arguments"]["q"], "he");
-    }
-
-    #[test]
-    fn test_partial_json_complete() {
-        let input = r#"{"name": "f", "arguments": {"q": "hello"}}"#;
-        let result = partial_json_parse(input);
-        assert!(result.is_some());
-        let val = result.unwrap();
-        assert_eq!(val["name"], "f");
-    }
-
     // -- Hermes streaming tests --
 
     #[test]
@@ -3245,6 +3164,66 @@ mod tests {
             "</tool_call>",
         ];
         let calls = stream_calls(&HermesToolParser::new(), &tokens);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_streamed(&calls[0], "f", serde_json::json!({"a": 1}));
+    }
+
+    /// Every parser fed one character at a time: each cut lands inside a
+    /// name, a key, a `\u` escape (one of them half of a surrogate pair), a
+    /// multi-byte character, and a string holding `}` and `]`.
+    #[test]
+    fn test_json_parsers_stream_one_char_at_a_time() {
+        let args = r#"{"q": "café 😀 ü }]", "n": [1, {"k": null}]}"#;
+        let expected = serde_json::json!({"q": "café 😀 ü }]", "n": [1, {"k": null}]});
+        // As a JSON-encoded string too: the decoded text must come out whole.
+        let encoded = serde_json::to_string(args).unwrap();
+        let cases: [(&dyn ToolCallParser, String); 4] = [
+            (
+                &LlamaJsonToolParser::new(),
+                format!(
+                    r#"<|python_tag|>{{"name": "f1", "parameters": {args}}}; {{"name": "f2", "arguments": {encoded}}}"#
+                ),
+            ),
+            (
+                &HermesToolParser::new(),
+                format!(
+                    "<tool_call>\n{{\"name\": \"f1\", \"arguments\": {args}}}\n</tool_call>\n\
+                     <tool_call>\n{{\"name\": \"f2\", \"arguments\": {encoded}}}\n</tool_call>"
+                ),
+            ),
+            (
+                &JambaToolParser::new(),
+                format!(
+                    r#"<tool_calls>[{{"name": "f1", "arguments": {args}}}, {{"name": "f2", "arguments": {encoded}}}]</tool_calls>"#
+                ),
+            ),
+            (
+                &GraniteToolParser::new(),
+                format!(
+                    r#"<|tool_call|>[{{"name": "f1", "arguments": {args}}}, {{"name": "f2", "arguments": {encoded}}}]"#
+                ),
+            ),
+        ];
+        for (parser, text) in cases {
+            let chars: Vec<String> = text.chars().map(String::from).collect();
+            let tokens: Vec<&str> = chars.iter().map(String::as_str).collect();
+            let calls = stream_calls(parser, &tokens);
+            assert_eq!(calls.len(), 2, "{text}: {calls:?}");
+            assert_streamed(&calls[0], "f1", expected.clone());
+            assert_streamed(&calls[1], "f2", expected.clone());
+        }
+    }
+
+    /// `"arguments": null` falls through to `"parameters"`, as in
+    /// `json_value_to_tool_call`.
+    #[test]
+    fn test_llama_streaming_null_arguments_then_parameters() {
+        let tokens = [
+            "{\"name\": \"f\", \"arguments\": nu",
+            "ll, \"parameters\": {\"a\"",
+            ": 1}}",
+        ];
+        let calls = stream_calls(&LlamaJsonToolParser::new(), &tokens);
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_streamed(&calls[0], "f", serde_json::json!({"a": 1}));
     }
