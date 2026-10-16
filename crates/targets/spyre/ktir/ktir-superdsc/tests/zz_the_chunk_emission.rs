@@ -2,7 +2,9 @@
 //! The split-KV chunk body's emission, from the shipped `assemble_attn` at granite-3.1-2b's geometry.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+};
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
@@ -66,16 +68,35 @@ fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp>
     .unwrap_or_else(|e| panic!("pages={pages}: assemble_attn refused: {}", e.0))
 }
 
-/// ⭐ THE WHOLE POINT: one launch attends every page, with the SAME compute ops at every chunk width —
-/// only the gather's copies (one per index stick) grow with it.
+/// ⭐ THE WHOLE POINT: one launch attends every page, with the SAME compute ops at every chunk width.
+/// Only two things grow with it:
+///   * the gather's copies, one per index stick;
+///   * the decode value leg, one op per (kv head, part). Past 8 pages its parts are the LX value
+///     leg's (`ChunkValueLx`): 8 pages each plus a 4-page tail. An even part count adds one copy home
+///     (`attn_covsum`).
 #[test]
 fn the_chunk_op_count_is_independent_of_its_width() {
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let value_leg = |n: &str| n.starts_with("attn_cov_") || n.starts_with("attn_covsum_");
     let counts: Vec<(u32, usize)> = ChunkScratch::LADDER
         .iter()
         .map(|&j| {
-            let compute = emit_chunk(j)
+            let ops = emit_chunk(j);
+            let parts = ChunkScratch::of_chunk(pool, j)
+                .unwrap()
+                .value_lx(ChunkRowKind::OneRequest)
+                .map_or(1, |v| v.lx_parts() + u32::from(v.tail_pages() > 0));
+            let values = ops.iter().filter(|(n, _)| value_leg(n)).count();
+            assert_eq!(
+                values as u32,
+                NKVH * parts + u32::from(parts.is_multiple_of(2)),
+                "{j} page(s): {parts} value part(s)"
+            );
+            let compute = ops
                 .iter()
-                .filter(|(n, _)| !n.starts_with("attn_cgkt_") && !n.starts_with("attn_cgv_"))
+                .filter(|(n, _)| {
+                    !n.starts_with("attn_cgkt_") && !n.starts_with("attn_cgv_") && !value_leg(n)
+                })
                 .count();
             (j, compute)
         })
@@ -128,6 +149,8 @@ fn the_chunk_reductions_are_per_row_on_stick_blocked_operands() {
 /// contraction-first split hands the cores whole-stick runs of the chunk instead (dxp PSUM-accumulates
 /// the partials into the shared output) — as many cores as whole sticks allow: the largest divisor of the
 /// chunk's `4·pages` sticks within the 32-core budget (8 at two pages, 32 from eight). The rows stay whole.
+/// Past 8 pages the value leg is cut into the LX value leg's parts. Each 8-page part is 32 sticks on
+/// 32 cores, one per copy entry. A 4-page tail is 16 sticks on 16 cores.
 /// A prompt chunk's value leg has `gqa·mq` rows to divide and keeps the planner's split, contraction whole.
 #[test]
 fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
@@ -139,19 +162,32 @@ fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
             v["numCoresUsed_"].as_u64(),
         )
     };
-    for &j in &ChunkScratch::LADDER {
-        let sticks = u64::from(j * 256 / 64);
-        let most = (1..=32u64.min(sticks))
+    let most = |sticks: u64| {
+        (1..=32u64.min(sticks))
             .rev()
             .find(|s| sticks.is_multiple_of(*s))
-            .unwrap_or(1);
+            .unwrap_or(1)
+    };
+    for &j in &ChunkScratch::LADDER {
+        // The slots of value part `p` (parts named `_k{p}_`, one part named without a suffix).
+        let part_sticks = |name: &str| -> u64 {
+            let p = name
+                .split("_k")
+                .nth(1)
+                .and_then(|s| s.split('_').next())
+                .map_or(0, |s| s.parse::<u64>().unwrap());
+            let per = if j >= 8 { 8 } else { u64::from(j) };
+            let pages = per.min(u64::from(j) - p * per);
+            pages * 256 / 64
+        };
         for (name, v) in emit_chunk(j)
             .iter()
             .filter(|(n, _)| n.starts_with("attn_cov_g"))
         {
+            let m = most(part_sticks(name));
             assert_eq!(
                 splits(v),
-                (most, 1, Some(most)),
+                (m, 1, Some(m)),
                 "{name} at {j} page(s): split {}",
                 v["numWkSlicesPerDim_"]
             );
@@ -554,15 +590,22 @@ fn a_whole_stick_prompt_chunk_forms_its_causal_block_per_kv_head() {
     }
 }
 
-/// ⭐⭐⭐ WHERE THE COPY's DIVISION IS PV's, THE GATHERED V NEVER TOUCHES HBM — granite-2b's 8-page decode
-/// chunk. There copy `h` IS kv head `h`'s whole chunk, one entry per core, and the decode PV's
-/// contraction split hands core `c` exactly entry `c`'s 64 slots. So each V copy writes kv head `h`'s own
-/// core-local LX tensor and PV `h` reads its KERNEL from that same pin, both LX-only, one start address
-/// on every core. That the ladder emits at all is the build-time proof the two divisions agree (the read
-/// law compares the TENSOR's per-core blocks, under the copy's `[mb, out]` and the matmul's `[in, out]`).
-/// Every other rung, and every prompt chunk, keeps the HBM scratch.
+/// ⭐⭐⭐ THE ONE-REQUEST DECODE's GATHERED V NEVER TOUCHES HBM, PART BY PART, AT EVERY RUNG FROM 8 PAGES.
+///
+/// The value leg is cut into 8-page parts, one copy per (part, kv head): one entry per core, and the
+/// part's PV contraction split hands core `c` exactly entry `c`'s 64 slots. So each such copy writes
+/// its own core-local LX tensor, and that part's PV reads its KERNEL from the same pin. Both are
+/// LX-only, with one start address on every core.
+///
+/// A 4-page tail keeps the HBM scratch: one kv head's tail is 16 entries, and dxp refuses an index
+/// shorter than one stick. Its PV is an HBM part on 16 cores.
+///
+/// That the ladder emits at all is the build-time proof the divisions agree. The read law compares the
+/// TENSOR's per-core blocks, under the copy's `[mb, out]` and the matmul's `[in, out]`.
+///
+/// Below 8 pages, and every prompt chunk, keeps the HBM scratch.
 #[test]
-fn the_eight_page_decode_value_leg_reads_its_kernel_from_lx() {
+fn the_decode_value_leg_reads_each_part_kernel_from_lx() {
     let lx_only = |v: &serde_json::Value| {
         v["memOrg_"]
             .as_object()
@@ -585,38 +628,36 @@ fn the_eight_page_decode_value_leg_reads_its_kernel_from_lx() {
     };
     let pool = PagedKvPool::new(NKVH as usize, HD as usize);
     for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
+        let rows = if mq == 1 {
+            ChunkRowKind::OneRequest
+        } else {
+            ChunkRowKind::Prompt
+        };
         for &j in &ChunkScratch::LADDER {
-            let lx = mq == 1
-                && ChunkScratch::of_chunk(pool, j)
-                    .unwrap()
-                    .value_lx()
-                    .is_some();
-            assert_eq!(lx, mq == 1 && j == 8, "{j} page(s), mq {mq}");
+            let vlx = ChunkScratch::of_chunk(pool, j).unwrap().value_lx(rows);
+            assert_eq!(vlx.is_some(), mq == 1 && j >= 8, "{j} page(s), mq {mq}");
+            let (parts, tail) = vlx.map_or((0, 0), |v| (v.lx_parts(), v.tail_pages()));
+            if let Some(v) = vlx {
+                assert_eq!((v.part_pages(), parts * 8 + tail), (8, j));
+                assert!(tail == 0 || tail == 4, "{j} page(s): tail {tail}");
+                assert!(v.lx_bytes_per_core() <= 512 * 1024);
+            }
             let ops = emit_chunk_in_layout(j, mq);
-            let copies: Vec<&(String, serde_json::Value)> = ops
-                .iter()
-                .filter(|(n, _)| n.starts_with("attn_cgv_"))
-                .collect();
-            let values: Vec<&(String, serde_json::Value)> = ops
-                .iter()
-                .filter(|(n, _)| n.starts_with("attn_cov_"))
-                .collect();
+            // Every LX copy and every LX part's PV, keyed by the pin they meet at.
             let mut copy_pins = Vec::new();
-            for (name, v) in &copies {
+            let mut hbm_copies = 0;
+            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cgv_")) {
                 let body = &v["dscs_"][0][name];
                 let out = body["labeledDs_"].as_array().unwrap().last().unwrap();
-                assert_eq!(
-                    lx_only(out),
-                    lx,
-                    "{name} at {j} page(s), mq {mq}: {}",
-                    out["memOrg_"]
-                );
-                if lx {
+                if lx_only(out) {
                     copy_pins.push(pin(body, out).expect("one pin on every core"));
+                } else {
+                    hbm_copies += 1;
                 }
             }
             let mut value_pins = Vec::new();
-            for (name, v) in &values {
+            let mut hbm_parts = 0;
+            for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_cov_")) {
                 let body = &v["dscs_"][0][name];
                 let kernel = body["labeledDs_"]
                     .as_array()
@@ -624,20 +665,38 @@ fn the_eight_page_decode_value_leg_reads_its_kernel_from_lx() {
                     .iter()
                     .find(|l| l["dsType_"] == "KERNEL")
                     .expect("PV's kernel");
-                assert_eq!(lx_only(kernel), lx, "{name} at {j} page(s), mq {mq}");
-                if lx {
+                if lx_only(kernel) {
                     value_pins.push(pin(body, kernel).expect("one pin on every core"));
+                } else {
+                    hbm_parts += 1;
                 }
             }
-            if lx {
-                // One copy and one PV per kv head, the same eight pins, each distinct.
-                assert_eq!(copies.len(), NKVH as usize);
+            let lx_tensors = (parts * NKVH) as usize;
+            assert_eq!(copy_pins.len(), lx_tensors, "{j} page(s), mq {mq}");
+            assert_eq!(value_pins.len(), lx_tensors, "{j} page(s), mq {mq}");
+            // Each pin is written by exactly one copy and read by exactly one PV.
+            let (mut c, mut v) = (copy_pins.clone(), value_pins.clone());
+            c.sort();
+            v.sort();
+            assert_eq!(
+                c, v,
+                "{j} page(s): every LX part's copy and PV meet at one pin"
+            );
+            let distinct: std::collections::BTreeSet<&String> = copy_pins.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                lx_tensors,
+                "{j} page(s): one pin per (part, kv head)"
+            );
+            if vlx.is_some() {
+                // The tail: the remaining copies are HBM, flat across kv heads (32 entries each), and
+                // each kv head's tail PV is one HBM part.
+                assert_eq!(hbm_copies, (tail * 4 * NKVH / 32) as usize, "{j} page(s)");
                 assert_eq!(
-                    copy_pins, value_pins,
-                    "copy h and PV h meet at kv head h's pin"
+                    hbm_parts,
+                    if tail > 0 { NKVH as usize } else { 0 },
+                    "{j} page(s)"
                 );
-                let distinct: std::collections::BTreeSet<&String> = copy_pins.iter().collect();
-                assert_eq!(distinct.len(), NKVH as usize);
             }
         }
     }
@@ -647,8 +706,78 @@ fn the_eight_page_decode_value_leg_reads_its_kernel_from_lx() {
         assert!(
             ChunkScratch::of_chunk(pool8, j)
                 .unwrap()
-                .value_lx()
+                .value_lx(ChunkRowKind::OneRequest)
                 .is_none()
+        );
+    }
+}
+
+/// ⭐ THE V RUN's ORDER IS ONE LAW FOR THE COPIES AND THE HOST. Word `c` of a whole part's stick names
+/// slot run `c` of that part, the run its PV hands core `c`. The tail is the flat chunk order over the
+/// tail's pages, and the run covers every (kv head, page, block) of the chunk exactly once. The host's
+/// table puts V's run after K's, in this order, and each copy reads exactly its own stick of it.
+#[test]
+fn the_value_lx_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    for &j in ChunkScratch::LADDER.iter().filter(|&&j| j >= 8) {
+        let chunk = ChunkScratch::of_chunk(pool, j).unwrap();
+        let vlx = chunk.value_lx(ChunkRowKind::OneRequest).unwrap();
+        let eph = chunk.entries_per_head_page();
+        let mut seen = std::collections::BTreeSet::new();
+        for e in 0..chunk.entries() {
+            let (kvh, page, block) = vlx.entry_coord(e);
+            assert!(
+                kvh < NKVH && page < j && block < eph,
+                "{j} page(s), entry {e}"
+            );
+            assert!(
+                seen.insert((kvh, page, block)),
+                "{j} page(s): entry {e} repeats"
+            );
+            if e < vlx.lx_tensors() * 32 {
+                let (op, c) = (e / 32, e % 32);
+                let (part, h) = (op / NKVH, op % NKVH);
+                assert_eq!(vlx.lx_tensor(part, h), op);
+                assert_eq!(
+                    (kvh, page * eph + block),
+                    (h, part * 8 * eph + c),
+                    "{j} page(s)"
+                );
+            }
+        }
+        assert_eq!(seen.len(), chunk.entries() as usize);
+        // Each copy reads its own stick of V's run, which starts after K's.
+        let sticks: Vec<u32> = vlx.copies().map(|(_, cp)| cp.stick()).collect();
+        let want: Vec<u32> = (chunk.index_sticks()..2 * chunk.index_sticks()).collect();
+        assert_eq!(sticks, want, "{j} page(s)");
+        // And the host's table carries both runs at these rows, but only K's for a prompt chunk.
+        let pages: Vec<i64> = (0..j as i64).collect();
+        // A one-layer pool's page is `nkvh * PAGE_SLOTS / POOL_STICK` stick blocks.
+        let per_page = ktir_superdsc::sdsc_abstract::gather_entries_per_page(
+            32 * pool.stick_block_bytes(),
+            pool,
+        )
+        .unwrap();
+        let one = ktir_superdsc::sdsc_abstract::chunk_gather_index_table(
+            chunk,
+            ChunkRowKind::OneRequest,
+            &pages,
+            per_page,
+        )
+        .unwrap();
+        assert_eq!(one.len() as u32, 2 * chunk.entries(), "{j} page(s)");
+        let prompt = ktir_superdsc::sdsc_abstract::chunk_gather_index_table(
+            chunk,
+            ChunkRowKind::Prompt,
+            &pages,
+            per_page,
+        )
+        .unwrap();
+        assert_eq!(prompt.len() as u32, chunk.entries(), "{j} page(s)");
+        assert_eq!(
+            &one[..prompt.len()],
+            &prompt[..],
+            "{j} page(s): K's run is unchanged"
         );
     }
 }

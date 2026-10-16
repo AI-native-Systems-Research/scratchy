@@ -7105,27 +7105,49 @@ impl ChunkScratch {
     /// copy costs only its bytes (10.74 µs per 512 KiB, no per-op constant), and it moves every byte
     /// twice before PV reads it a third time — so the bytes are the lever, not the op count.
     ///
-    /// `Some` exactly where the copy's division IS the decode PV's, core for core:
-    ///   * ONE feature slab — V's entry order is K's, a kv head's chunk is `[slots, hd]` row-major, and an
-    ///     entry (`hd * POOL_STICK` elements at `hd == POOL_STICK`) is 64 slots, one stick of PV's
-    ///     contraction;
-    ///   * `entries_per_row == ENTRIES_PER_OP == MAX_CORES` — copy `h` is kv head `h`'s whole chunk, its
-    ///     `mb` divides into one entry per core, and PV's contraction-across-cores split
-    ///     (`slots / POOL_STICK == MAX_CORES` sticks) gives core `c` exactly entry `c`'s 64 slots.
+    /// ⭐ THE VALUE LEG IN PARTS OF ONE COPY EACH. A copy is one index stick of 32 entries, one per
+    /// core; a decode PV divides its contraction across the cores one stick each. They are the same
+    /// division exactly when one (kv head, part) is one copy: a part of [`ChunkValueLx::part_pages`]
+    /// pages (`ENTRIES_PER_OP / entries_per_head_page`, 8 at granite-2b). So the chunk's value leg is
+    /// cut into parts of that many pages. Each part's V copy writes one core-local tensor per kv head,
+    /// and that part's PV reads its KERNEL there, every part folding onto the last through the value
+    /// leg's own `run_o`/`otmp` ping-pong.
     ///
-    /// At granite-3.1-2b (8 kv heads, hd 64) that is the 8-page chunk. Every other geometry keeps the HBM
-    /// scratch — `None` is the existing form, not a refusal. Whether the two divisions really agree is
-    /// still proven per op at build, by `emit`'s core-local read law.
-    pub const fn value_lx(self) -> Option<ChunkValueLx> {
+    /// A chunk that is not a whole number of parts ends in a TAIL of fewer pages (4 on the 4-page
+    /// ladder). One kv head's tail is fewer than 32 entries, and dxp refuses a copy whose index is
+    /// shorter than one stick: the element-arrangement fold `entries / 32` comes out 0 (`factor_ = 0`,
+    /// `Must be >= 1`, measured on granite-2b fp8's one-page rung). So the tail keeps the HBM scratch,
+    /// copied flat across kv heads as today, and its PV is a narrower HBM part (16 cores at 4 pages).
+    ///
+    /// `Some` exactly where:
+    ///   * the rows are ONE REQUEST's decode ([`ChunkRowKind::OneRequest`]). Only that PV divides its
+    ///     contraction across the cores; a prompt chunk divides its rows, and a batch chunk's rows are
+    ///     other requests;
+    ///   * the chunk has ONE feature slab, so V's entries are 64-slot runs of a `[slots, hd]` block;
+    ///   * `ENTRIES_PER_OP == MAX_CORES` and a part is a whole number of pages;
+    ///   * there is at least one full part;
+    ///   * the tail is a whole number of index sticks across the kv heads.
+    ///
+    /// Everything else keeps the HBM scratch. `None` is the existing form, not a refusal. The bake
+    /// proves per op that the copy's and PV's divisions agree (`emit`'s core-local read law). The host
+    /// reads the entry order from this same value ([`chunk_gather_index_table`]).
+    pub const fn value_lx(self, rows: ChunkRowKind) -> Option<ChunkValueLx> {
         let one_stick = CopyDims::ENTRIES_PER_OP;
-        if self.plane.slabs() == 1
-            && self.entries_per_row() == one_stick
-            && one_stick == crate::superdsc_opspec::MAX_CORES
+        let eph = self.entries_per_head_page();
+        if !matches!(rows, ChunkRowKind::OneRequest)
+            || self.plane.slabs() != 1
+            || one_stick != crate::superdsc_opspec::MAX_CORES
+            || eph == 0
+            || !one_stick.is_multiple_of(eph)
         {
-            Some(ChunkValueLx { chunk: self })
-        } else {
-            None
+            return None;
         }
+        let part_pages = one_stick / eph;
+        let tail_pages = self.pages % part_pages;
+        if self.pages < part_pages || !(self.nkvh() * tail_pages * eph).is_multiple_of(one_stick) {
+            return None;
+        }
+        Some(ChunkValueLx { chunk: self })
     }
 
     /// The index stick V's run starts at: 0 at one slab, where V's entry order IS K's and the two gathers
@@ -7174,29 +7196,146 @@ pub struct ChunkValueLx {
     chunk: ChunkScratch,
 }
 
+/// WHOSE ROWS a chunk attends with — the fact that decides its value leg's form
+/// ([`ChunkScratch::value_lx`]). Both ends know it: the bake from the body it lowers, the host from
+/// the body it stages a table for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChunkRowKind {
+    /// One request's decode: one query row per head.
+    OneRequest,
+    /// A prompt chunk's consecutive positions over its resident prefix.
+    Prompt,
+    /// A decode batch: every row is another request ([`BatchChunk`]).
+    Batch,
+}
+
+/// Where one V copy of an LX-resident value leg lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValueDest {
+    /// Core-local LX tensor `i` ([`ChunkValueLx::lx_tensor`]), every core's entry at its pin.
+    Lx(u32),
+    /// The tail's HBM scratch, at the copy's own destination entry.
+    Tail,
+}
+
 impl ChunkValueLx {
     pub const fn chunk(self) -> ChunkScratch {
         self.chunk
     }
 
-    /// One core's slice of one kv head's gathered V — one entry, which is also the KERNEL slice that
-    /// core's PV contracts. The core-local LX pin of each kv head's V.
+    /// Pages per LX part: one kv head's part is one index stick of entries.
+    pub const fn part_pages(self) -> u32 {
+        CopyDims::ENTRIES_PER_OP / self.chunk.entries_per_head_page()
+    }
+
+    /// Whole LX parts in the chunk.
+    pub const fn lx_parts(self) -> u32 {
+        self.chunk.pages / self.part_pages()
+    }
+
+    /// Pages past the last whole part. Those stay in HBM; see [`ChunkScratch::value_lx`].
+    pub const fn tail_pages(self) -> u32 {
+        self.chunk.pages % self.part_pages()
+    }
+
+    /// The core-local tensors, one per (part, kv head).
+    pub const fn lx_tensors(self) -> u32 {
+        self.lx_parts() * self.chunk.nkvh()
+    }
+
+    /// The tensor holding part `part`'s V for kv head `kvh`.
+    pub const fn lx_tensor(self, part: u32, kvh: u32) -> u32 {
+        part * self.chunk.nkvh() + kvh
+    }
+
+    /// One core's slice of one (part, kv head) tensor. That is one entry, which is also the KERNEL
+    /// slice that core's PV contracts, so it is each tensor's core-local pin.
     pub const fn per_core_bytes(self) -> u64 {
         self.chunk.plane.entry_bytes()
     }
 
-    /// The V copies, one per kv head: copy `h` reads index stick `value_index_base + h` (the same stick
-    /// and entries as [`ChunkScratch::value_copies`]' op `h`, so the host's table is unchanged) and lands
-    /// at offset 0 of kv head `h`'s OWN core-local tensor — every core's entry at its pin.
-    pub fn copies(self) -> impl Iterator<Item = (u32, GatherCopy)> {
-        let base = self.chunk.value_index_base();
+    /// LX one core holds for the whole value leg: every part of every kv head.
+    pub const fn lx_bytes_per_core(self) -> u64 {
+        self.lx_tensors() as u64 * self.per_core_bytes()
+    }
+
+    /// The tail's entries for one kv head.
+    const fn tail_entries_per_head(self) -> u32 {
+        self.tail_pages() * self.chunk.entries_per_head_page()
+    }
+
+    /// The tail's HBM scratch shape, `[nkvh, tail block]`. That is one kv head's tail pages, laid
+    /// out like the full scratch's head blocks.
+    pub const fn tail_footprint_dims(self) -> [u32; 2] {
+        [
+            self.chunk.nkvh(),
+            (self.tail_pages() as u64 * self.chunk.plane.head_block_elems()) as u32,
+        ]
+    }
+
+    /// Element offset of kv head `kvh`'s block in the tail scratch, which is the tail PV's kernel
+    /// base. `None` past the head count or when there is no tail.
+    pub const fn tail_corner(self, kvh: u32) -> Option<ChunkCorner> {
+        if kvh >= self.chunk.nkvh() || self.tail_pages() == 0 {
+            return None;
+        }
+        let off = kvh as u64 * self.tail_footprint_dims()[1] as u64;
+        if off > u32::MAX as u64 {
+            return None;
+        }
+        Some(ChunkCorner(off as u32))
+    }
+
+    /// The index stick V's run starts at. V reads its own run after K's, because its order is
+    /// part-major and K's is head-major.
+    pub const fn index_base(self) -> u32 {
+        self.chunk.index_sticks()
+    }
+
+    /// ⭐ THE V RUN's ENTRY ORDER — `(kv head, page, block)` for V entry `e`. This is the one law the
+    /// copies (destination) and the host's table (source) both read.
+    ///   * The whole parts come first, PART-MAJOR. Stick `p * nkvh + h` is kv head `h`'s part `p`, and
+    ///     its word `c` is page `p * part_pages + c / eph`, block `c % eph`. That is slot run `c` of the
+    ///     part, the run the part's PV hands core `c`.
+    ///   * Then the tail, flat across kv heads exactly as [`ChunkScratch::entry_coord`] lays out a
+    ///     chunk of the tail's pages.
+    pub const fn entry_coord(self, e: u32) -> (u32, u32, u32) {
+        let (stick, eph) = (CopyDims::ENTRIES_PER_OP, self.chunk.entries_per_head_page());
+        let lx_entries = self.lx_tensors() * stick;
+        if e < lx_entries {
+            let (op, c) = (e / stick, e % stick);
+            let (part, kvh) = (op / self.chunk.nkvh(), op % self.chunk.nkvh());
+            (kvh, part * self.part_pages() + c / eph, c % eph)
+        } else {
+            let t = e - lx_entries;
+            let per_head = self.tail_entries_per_head();
+            let (kvh, r) = (t / per_head, t % per_head);
+            (kvh, self.lx_parts() * self.part_pages() + r / eph, r % eph)
+        }
+    }
+
+    /// The V copies, one per index stick of V's run, in run order. Each comes with where it lands:
+    ///   * a whole part's copy writes its (part, kv head) tensor at offset 0;
+    ///   * a tail copy writes the tail scratch at its flat destination entry.
+    pub fn copies(self) -> impl Iterator<Item = (ValueDest, GatherCopy)> {
+        let (base, lx) = (self.index_base(), self.lx_tensors());
         self.chunk.copies().map(move |c| {
-            let kvh = c.stick;
+            let j = c.stick;
+            let dest = if j < lx {
+                ValueDest::Lx(j)
+            } else {
+                ValueDest::Tail
+            };
+            let dest_entry = if j < lx {
+                0
+            } else {
+                (j - lx) * CopyDims::ENTRIES_PER_OP
+            };
             (
-                kvh,
+                dest,
                 GatherCopy {
-                    stick: c.stick + base,
-                    dest_entry: 0,
+                    stick: j + base,
+                    dest_entry,
                     ..c
                 },
             )
@@ -7355,9 +7494,14 @@ impl ChunkPart {
 /// ([`ChunkScratch::value_entry_coord`]), starting at [`ChunkScratch::value_index_base`] — the stick the
 /// V copies read from. At one slab the orders agree and V reads K's run.
 ///
+/// ⭐ AND WHERE THE VALUE LEG STAYS IN LX ([`ChunkScratch::value_lx`] at these `rows`), V's run is its
+/// own: part-major, in [`ChunkValueLx::entry_coord`]'s order. The copies read the same order. The bake
+/// and this table take the form from the same `(chunk, rows)`, so neither can pick another.
+///
 /// `None` on an empty page list or an entry that leaves `i32`.
 pub fn chunk_gather_index_table(
     scratch: ChunkScratch,
+    rows: ChunkRowKind,
     pages: &[i64],
     per_page: EntriesPerPage,
 ) -> Option<Vec<GatherEntry>> {
@@ -7367,9 +7511,15 @@ pub fn chunk_gather_index_table(
         GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
     };
     let keys = (0..scratch.entries()).map(|e| entry(scratch.entry_coord(e)));
-    let values = (0..scratch.entries())
-        .filter(|_| scratch.value_index_base() > 0)
-        .map(|e| entry(scratch.value_entry_coord(e)));
+    let values: Vec<Option<GatherEntry>> = match scratch.value_lx(rows) {
+        Some(vlx) => (0..scratch.entries())
+            .map(|e| entry(vlx.entry_coord(e)))
+            .collect(),
+        None => (0..scratch.entries())
+            .filter(|_| scratch.value_index_base() > 0)
+            .map(|e| entry(scratch.value_entry_coord(e)))
+            .collect(),
+    };
     keys.chain(values).collect()
 }
 
@@ -7609,7 +7759,12 @@ pub fn batch_chunk_index_table(
     maps: &[Vec<i64>],
     per_page: EntriesPerPage,
 ) -> Option<Vec<GatherEntry>> {
-    chunk_gather_index_table(bc.chunk(), &bc.page_list(maps)?, per_page)
+    chunk_gather_index_table(
+        bc.chunk(),
+        ChunkRowKind::Batch,
+        &bc.page_list(maps)?,
+        per_page,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
