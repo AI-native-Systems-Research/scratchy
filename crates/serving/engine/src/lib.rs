@@ -10,12 +10,15 @@
 //! * [`executor`] -- The `Executor` trait defining the interface to GPU workers.
 //!   During the transition, Python workers implement this via PyO3.
 //! * [`error`] -- Engine-specific error types.
+//! * `grammar` -- Grammar-guided constrained decoding (`guided-decoding` feature).
 
 pub mod core_client;
 pub mod engine_core;
 pub mod error;
 pub mod executor;
 pub mod gpu_budget;
+#[cfg(feature = "guided-decoding")]
+pub mod grammar;
 pub mod input_batch;
 pub mod spec_decode;
 pub mod worker;

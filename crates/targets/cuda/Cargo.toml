@@ -20,7 +20,7 @@ cuda = ["dep:cudarc", "scratchy-tensors/cuda", "scratchy-ir/cuda", "scratchy-vis
 nccl = ["cuda", "cudarc/nccl", "scratchy-ir/nccl", "scratchy-vision/nccl", "scratchy-forward-compiler/nccl"]
 # Constrained / structured decoding (llguidance grammars) in the CUDA worker.
 # Enabled via scratchy-serving-worker's matching feature (the cli/e2e default chain).
-guided-decoding = ["scratchy-core-model/guided-decoding"]
+guided-decoding = ["scratchy-serving-engine/guided-decoding"]
 
 [dependencies]
 scratchy-tensors = { path = "../../tensors" }

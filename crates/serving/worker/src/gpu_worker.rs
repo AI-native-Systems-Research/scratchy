@@ -357,11 +357,11 @@ pub struct MetalWorker {
     /// the first time a request with a grammar is scheduled and dropped
     /// when the request finishes. Empty (zero overhead) otherwise.
     #[cfg(feature = "guided-decoding")]
-    grammar_states: HashMap<String, scratchy_core_model::grammar::GrammarGuide>,
+    grammar_states: HashMap<String, scratchy_serving_engine::grammar::GrammarGuide>,
     /// Shared llguidance parser factory, lazily built from the model's
     /// `tokenizer.json` the first time a grammar request appears.
     #[cfg(feature = "guided-decoding")]
-    grammar_factory: Option<std::sync::Arc<scratchy_core_model::grammar::LlgParserFactory>>,
+    grammar_factory: Option<std::sync::Arc<scratchy_serving_engine::grammar::LlgParserFactory>>,
     /// Compiled grammar-mask kernel (forces disallowed logits to -inf
     /// before argmax). Built alongside `argmax_kernels` at load_model.
     #[cfg(feature = "guided-decoding")]
@@ -1117,7 +1117,7 @@ impl MetalWorker {
                 return;
             }
         };
-        match scratchy_core_model::grammar::build_parser_factory(&bytes) {
+        match scratchy_serving_engine::grammar::build_parser_factory(&bytes) {
             Ok(factory) => {
                 info!("guided-decoding: built grammar parser factory from tokenizer.json");
                 self.grammar_factory = Some(factory);
@@ -6232,7 +6232,7 @@ impl Worker for MetalWorker {
                 if let Some(ref grammar) = params.guided_grammar {
                     self.ensure_grammar_factory();
                     if let Some(ref factory) = self.grammar_factory {
-                        match scratchy_core_model::grammar::GrammarGuide::from_guided_grammar(
+                        match scratchy_serving_engine::grammar::GrammarGuide::from_guided_grammar(
                             grammar, factory,
                         ) {
                             Ok(guide) => {

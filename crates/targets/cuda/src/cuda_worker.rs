@@ -1604,10 +1604,10 @@ pub struct CudaWorker {
     pending_commit: Option<PendingCommit>,
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
-    grammar_states: HashMap<String, scratchy_core_model::grammar::GrammarGuide>,
+    grammar_states: HashMap<String, scratchy_serving_engine::grammar::GrammarGuide>,
     /// Parser factory for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
-    grammar_factory: Option<std::sync::Arc<scratchy_core_model::grammar::LlgParserFactory>>,
+    grammar_factory: Option<std::sync::Arc<scratchy_serving_engine::grammar::LlgParserFactory>>,
     /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
     logits_pipeline: Option<LogitsProcessorPipeline>,
     /// Grammar mask processor (separate from pipeline — needs backup logits).
@@ -1962,7 +1962,7 @@ impl CudaWorker {
             }
         };
 
-        match scratchy_core_model::grammar::build_parser_factory(&tokenizer_bytes) {
+        match scratchy_serving_engine::grammar::build_parser_factory(&tokenizer_bytes) {
             Ok(factory) => {
                 info!("ScratchyWorker: grammar parser factory built");
                 self.grammar_factory = Some(factory);
@@ -2573,7 +2573,7 @@ impl CudaWorker {
         sampling_params_map: &HashMap<String, SamplingParams>,
         #[cfg(feature = "guided-decoding")] grammar_states: &mut HashMap<
             String,
-            scratchy_core_model::grammar::GrammarGuide,
+            scratchy_serving_engine::grammar::GrammarGuide,
         >,
         grammar_processor: &GrammarMaskProcessor,
         allowed_token_ids_processor: &AllowedTokenIdsProcessor,
@@ -5321,7 +5321,7 @@ impl CudaWorker {
                 if let Some(ref grammar) = params.guided_grammar
                     && let Some(ref factory) = self.grammar_factory
                 {
-                    match scratchy_core_model::grammar::GrammarGuide::from_guided_grammar(
+                    match scratchy_serving_engine::grammar::GrammarGuide::from_guided_grammar(
                         grammar, factory,
                     ) {
                         Ok(guide) => {
@@ -7124,7 +7124,7 @@ impl CudaWorker {
         logits_pipeline: Option<&mut LogitsProcessorPipeline>,
         #[cfg(feature = "guided-decoding")] grammar_states: &mut HashMap<
             String,
-            scratchy_core_model::grammar::GrammarGuide,
+            scratchy_serving_engine::grammar::GrammarGuide,
         >,
         grammar_processor: &mut GrammarMaskProcessor,
         allowed_token_ids_processor: &mut AllowedTokenIdsProcessor,
