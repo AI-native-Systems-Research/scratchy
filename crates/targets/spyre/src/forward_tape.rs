@@ -330,9 +330,9 @@ pub fn broadcast_prefix_mask(cap: usize, mask_neg: f32, valid: impl Fn(usize) ->
 ///
 /// ⭐ IN BLOCKS OF `heads_per_block` HEADS ([`NewBlockForm::mask_heads_per_block`]): `nqh / heads_per_block`
 /// blocks, each `nsub` stick-wide column groups of its `heads_per_block·mq` rows. All `nqh` (one block) is
-/// the sub-blocked form above; one kv head's `gqa` is the chunk-formed new block, which reads a kv head's
-/// whole `[gqa·mq, mq_pad]` block and so needs it laid out at that row count. The total and the bytes at
-/// `nsub == 1` are the same either way.
+/// the sub-blocked form above; the chunk-formed new block reads one row block's whole `[heads·mq, mq_pad]`
+/// block — a kv head's `gqa` heads at one feature slab, one query head above it — and so needs it laid out
+/// at that row count. The total and the bytes at `nsub == 1` are the same either way.
 ///
 /// [`NewBlockForm::mask_heads_per_block`]: scratchy_subtile::sdsc_abstract::NewBlockForm::mask_heads_per_block
 pub fn causal_tiled(

@@ -394,7 +394,7 @@ pub(crate) fn run_prefill_batch(
             hd as u32,
             per_request.is_some(),
         )
-        .mask_heads_per_block(nqh as u32, (sh.kv_dim / sh.head_dim) as u32)
+        .mask_heads_per_block(nqh as u32, (sh.kv_dim / sh.head_dim) as u32, hd as u32)
             as usize,
         rope_theta: sh.rope_theta,
         embed_tokens: sh.embed_tokens,

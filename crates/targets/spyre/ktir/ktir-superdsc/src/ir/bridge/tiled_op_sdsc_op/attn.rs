@@ -1783,35 +1783,110 @@ struct ChunkAttn<'a> {
     cb: &'a ChunkBufs,
 }
 
-/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — EVERY resident page of ONE request attended in ONE pass, folded onto the
-/// new-token seed: the reference's decode structure (`spyre_inference`'s
-/// `batched_decode_head_major_kernel`: gather the chunk's pages, ONE score and ONE value matmul over the
-/// whole chunk, then reduce the row max and the denominators across the pages).
-///
-/// ⛔ WHAT IT REPLACES: the per-page fold, `SlotWindow::sweep(active_cap)` re-launched once per resident
-/// page, each launch 4 windows × (8 per-kv-head score matmuls + 11 softmax ops + 8 per-kv-head value
-/// matmuls) = 108 ops. Per resident page per layer that is ~80 µs of serialized op glue on granite-2b
-/// (the decode slope this exists to remove). Here a chunk of up to [`ChunkScratch::PAGES_MAX`] pages costs:
-///
-/// * gather: one copy per index stick, for K and for V (the card-proven copy op, [`ChunkScratch::copies`]
-///   and [`ChunkScratch::value_copies`]);
-/// * per ROW BLOCK ([`ChunkRowBlocks`]: a kv head at one feature slab, a query head above it): score,
-///   row max, sub, exp, row sum, and the value leg — one op, or one per slab above one slab;
-/// * shared over every head: the fold block's own merge ops (`newm`, `corrsub`, `corre`, `mset`, `ocorr`,
-///   `lcorr`, `ladd`).
-///
-/// The same count at every chunk width — the slope is in the gather's copies and the ops' own widths.
-///
-/// ⛔ EACH ROW BLOCK'S WIDE DATA IS A WHOLE `[rows, slots]` BLOCK ([`ChunkRowBlocks::corner`]), never a
-/// row slice of a taller multi-stick buffer — dxp rebuilds a stick-blocked operand's group stride from the
-/// op's own `N_`. The narrow running stats stay in the shared `[nqh, stick]` buffers, whose row slices are
-/// flat at one stick and therefore exact.
-///
-/// [`ChunkRowBlocks`]: crate::sdsc_abstract::ChunkRowBlocks
-/// [`ChunkRowBlocks::corner`]: crate::sdsc_abstract::ChunkRowBlocks::corner
-///
-/// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
-/// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
+/// ⭐ ROW BLOCK `b`'s QUERY OPERAND for a score matmul — one law for the split-KV chunk's score and the
+/// chunk-formed causal block's. At one slab the block is a GQA group and Q is its `[gqa·mq, hd]` rows of
+/// `qs` read flat. Above it the block is one query head and Q is that head's own `[mq, hd]` block of the
+/// token stream — the fold's per-head score form (`ScoreArm::PerHead`): the WHOLE head dim contracted in
+/// one UNBATCHED op. (A two-stick contraction under a `y`-batch is the measured-incoherent shape;
+/// unbatched it is gemma-4's full-attention score.)
+fn row_block_query(
+    blocks: crate::sdsc_abstract::ChunkRowBlocks,
+    b: u32,
+    mq: u32,
+    nqh: u32,
+    hd: u32,
+    qs: &str,
+) -> (
+    MatM,
+    Stk<crate::sdsc_abstract::RowBlockedTag>,
+    crate::addr::DevOff,
+) {
+    use crate::sdsc_abstract::{OperandPlacement, QueryRowCount};
+    if blocks.per_kv_head() {
+        (
+            MatM::of_head_major_rows(blocks.rows()),
+            rb(qs, nqh * mq, hd),
+            crate::addr::DevOff::from_view_step(
+                blocks.first_head(b) * mq * BlockCols::of_one_stick(Lanes::FP16).get(),
+            ),
+        )
+    } else {
+        let rows = QueryRowCount::of_mq(mq);
+        (
+            MatM::of_query_rows(rows),
+            rb(qs, mq, hd),
+            OperandPlacement::of_token_stream(rows, nqh, hd, blocks.first_head(b), 0, 0).off(),
+        )
+    }
+}
+
+/// ⭐ ROW BLOCK `b`'s VALUE LEG at feature slab `s` — one law for the split-KV chunk's PV and the
+/// chunk-formed causal block's. At one slab: ONE op per block, `out = hd`, landing at the block's rows of
+/// the `[q_rows, hd]` output. Above it: ONE op per (query head, slab), one stick of `out` each, landing in
+/// slab `s`'s plane at the head's rows — the fold's own card-proven hd=128 form. ONE op per head with
+/// `out = hd` writes `run_o` incoherently above one stick (MEASURED on granite-3.1-8b: fluent nonsense,
+/// bisected to exactly that collapse — see the fold's value leg).
+#[derive(Clone, Copy)]
+struct RowBlockValue {
+    m: MatM,
+    n: MatN,
+    /// The V kernel's columns: the whole head dim at one slab, one stick above it.
+    v_cols: u32,
+    /// The block's rows of the output, in slab `s`'s plane above one slab.
+    out_off: crate::addr::DevOff,
+}
+
+impl RowBlockValue {
+    /// The value ops per row block: one at one slab, one per slab above it.
+    fn slabs(blocks: crate::sdsc_abstract::ChunkRowBlocks, hd: u32) -> u32 {
+        if blocks.per_kv_head() {
+            1
+        } else {
+            hd / BlockCols::of_one_stick(Lanes::FP16).get()
+        }
+    }
+
+    fn of(
+        blocks: crate::sdsc_abstract::ChunkRowBlocks,
+        b: u32,
+        s: u32,
+        mq: u32,
+        q_rows: u32,
+        hd: u32,
+    ) -> RowBlockValue {
+        let stick = BlockCols::of_one_stick(Lanes::FP16).get();
+        let h0 = blocks.first_head(b) * mq;
+        if blocks.per_kv_head() {
+            RowBlockValue {
+                m: MatM::of_head_major_rows(blocks.rows()),
+                n: MatN::of_head_dim(hd),
+                v_cols: hd,
+                out_off: crate::addr::DevOff::from_view_step(h0 * stick),
+            }
+        } else {
+            RowBlockValue {
+                m: MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
+                n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
+                v_cols: stick,
+                out_off: Nest::new(&["row", "feat"], &[q_rows, hd], Df::Fp16)
+                    .view()
+                    .at(Idx::<crate::addr::Row>::n(h0))
+                    .slab(s)
+                    .dev(),
+            }
+        }
+    }
+}
+
+/// Row block `b`'s op-name stem: its kv head at one slab, its query head above it.
+fn row_block_name(blocks: crate::sdsc_abstract::ChunkRowBlocks, b: u32) -> String {
+    if blocks.per_kv_head() {
+        format!("g{}", blocks.kv_head(b))
+    } else {
+        format!("h{}", blocks.first_head(b))
+    }
+}
+
 /// The chunk-formed causal new-token block's operands ([`NewBlockForm::Chunk`]) — see
 /// [`assemble_new_block_chunk`].
 ///
@@ -1821,7 +1896,10 @@ struct NewChunkAttn<'a> {
     nqh: u32,
     nkvh: u32,
     hd: u32,
-    gqa: u32,
+    /// The row blocks the block is cut into ([`ChunkRowBlocks`]): a kv head at one slab, a query head above.
+    ///
+    /// [`ChunkRowBlocks`]: crate::sdsc_abstract::ChunkRowBlocks
+    blocks: crate::sdsc_abstract::ChunkRowBlocks,
     /// The chunk's rows per head — equal to `mq_pad` by [`NewBlockForm::of`]'s own condition.
     ///
     /// [`NewBlockForm::of`]: crate::sdsc_abstract::NewBlockForm::of
@@ -1838,24 +1916,28 @@ struct NewChunkAttn<'a> {
     exp: &'a str,
 }
 
-/// ⭐⭐⭐ THE CAUSAL NEW-TOKEN BLOCK AS ONE BLOCK PER KV HEAD — the split-KV chunk's own form, over the chunk's
-/// own `mq_pad` keys, SEEDING the online softmax that the resident prefix then folds onto.
+/// ⭐⭐⭐ THE CAUSAL NEW-TOKEN BLOCK AS ONE BLOCK PER ROW BLOCK — the split-KV chunk's own form, over the
+/// chunk's own `mq_pad` keys, SEEDING the online softmax that the resident prefix then folds onto.
 ///
 /// The sub-blocked form sweeps the block one 64-key window at a time, per QUERY head, so its op count
 /// grows with the chunk's width — at 256 prompt rows it costs about what halving the chunk count saves in
-/// weight streaming (see [`NewBlockForm`]). Here each kv head runs a fixed set over its whole
-/// `[gqa·mq, mq_pad]` block, at any width:
-///   * score `Q_g · Kᵗ_g + cmask_g` — `new_kt`'s kv-head block is already the `[hd, mq_pad]` kernel (the
+/// weight streaming (see [`NewBlockForm`]). Here each row block (a kv head's GQA group at one feature slab,
+/// one query head above it — the chunk's [`ChunkRowBlocks`]) runs a fixed set over its whole
+/// `[rows, mq_pad]` block, at any width:
+///   * score `Q_b · Kᵗ_kvh + cmask_b` — `new_kt`'s kv-head block is already the `[hd, mq_pad]` kernel (the
 ///     restickifies above fill it), and the causal mask rides in the matmul's epilogue as the full
-///     per-row addend it is (staged by kv head, [`NewBlockForm::mask_heads_per_block`]);
+///     per-row addend it is (staged by row block, [`NewBlockForm::mask_heads_per_block`]);
 ///   * each row's max STRAIGHT into `run_m` — the seed has no prior state to merge with;
 ///   * `esub` into a CORE-LOCAL LX scratch and `exp` out of it (the chunk's own residency, #501);
-///   * each row's sum straight into `run_l`, and `P_g · V_g` straight into `run_o`. `new_v`'s kv-head block
-///     is exactly `mq` = `mq_pad` rows (RoPE packs it `[nkvh][mq][hd]`), so the PV contracts it whole.
+///   * each row's sum straight into `run_l`, and `P_b · V_kvh` straight into `run_o` — one op per slab
+///     above one slab ([`RowBlockValue`]). `new_v`'s kv-head block is exactly `mq` = `mq_pad` rows (RoPE
+///     packs it `[nkvh][mq][hd]`), so the PV contracts it whole.
 ///
-/// Every wide buffer is a WHOLE `[gqa·mq, mq_pad]` block per kv head (`[nkvh][gqa·mq][mq_pad]`), the
+/// Every wide buffer is a WHOLE `[rows, mq_pad]` block per row block (`[blocks][rows][mq_pad]`), the
 /// chunk's law: dxp rebuilds a stick-blocked operand's group stride from the op's own row count, so a row
 /// slice of a taller multi-stick buffer is read wrong on card ([`ChunkScratch::rows_corner`]).
+///
+/// [`ChunkRowBlocks`]: crate::sdsc_abstract::ChunkRowBlocks
 ///
 /// [`NewBlockForm`]: crate::sdsc_abstract::NewBlockForm
 /// [`NewBlockForm::mask_heads_per_block`]: crate::sdsc_abstract::NewBlockForm::mask_heads_per_block
@@ -1871,7 +1953,7 @@ fn assemble_new_block_chunk(
         nqh,
         nkvh,
         hd,
-        gqa,
+        blocks,
         mq,
         cols,
         qs,
@@ -1888,28 +1970,33 @@ fn assemble_new_block_chunk(
     use crate::superdsc_opspec::EpilogueOpFunc;
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let slots = cols.get();
-    let (g_rows, q_rows) = (gqa * mq, nqh * mq);
+    let (g_rows, q_rows) = (blocks.rows(), nqh * mq);
     let grp_rows = RowCount::of_head_major_rows(g_rows);
-    // A kv head's query rows are the contiguous `[kvh·gqa·mq, …)` of the head-major token stream; in the
-    // one-stick `qs` and state buffers that is a single-stick view step.
+    // A row block's query rows are the contiguous `[first_head·mq, …)` of the head-major token stream; in
+    // the one-stick state buffers that is a single-stick view step.
     let row_step = |h: u32| DevOff::from_view_step(h * stick.get());
     // The whole-block laws, each from its nest's own footprint.
     let wide = crate::addr::Nest::new(&["row", "slot"], &[g_rows, slots], Df::Fp16);
     let kt = crate::addr::Nest::new(&["feat", "slot"], &[hd, slots], Df::Fp16);
     let vv = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16);
     let first_op = ops.len();
-    for kvh in 0..nkvh {
-        let h0 = kvh * g_rows;
-        let blk = wide.block(kvh).dev();
+    for b in 0..blocks.count() {
+        let (kvh, h0, bn) = (
+            blocks.kv_head(b),
+            blocks.first_head(b) * mq,
+            row_block_name(blocks, b),
+        );
+        let blk = wide.block(b).dev();
+        let (m, q, q_off) = row_block_query(blocks, b, mq, nqh, hd, qs);
         ops.push(assemble_matmul_off_with_epilogue(
-            &format!("attn_ncsc_g{kvh}_o{t}"),
-            MatM::of_head_major_rows(g_rows),
+            &format!("attn_ncsc_{bn}_o{t}"),
+            m,
             MatN::of_kv_window(cols),
             MatK::of_head_dim(hd),
             MatY::unbatched(),
             bmm_form,
-            &rb(qs, q_rows, hd),
-            row_step(h0),
+            &q,
+            q_off,
             &Stk::<KernelTag>::kernel(hd as usize, slots as usize, new_kt),
             kt.block(kvh).dev(),
             &rb(sc, g_rows, slots),
@@ -1923,7 +2010,7 @@ fn assemble_new_block_chunk(
             layout,
         ));
         ops.push(assemble_reduce_off(
-            &format!("attn_ncbmax_g{kvh}_o{t}"),
+            &format!("attn_ncbmax_{bn}_o{t}"),
             "max",
             grp_rows,
             cols,
@@ -1935,7 +2022,7 @@ fn assemble_new_block_chunk(
             layout,
         ));
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_ncesub_g{kvh}_o{t}"),
+            &format!("attn_ncesub_{bn}_o{t}"),
             "subtract",
             grp_rows,
             cols,
@@ -1949,7 +2036,7 @@ fn assemble_new_block_chunk(
             layout,
         ));
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_ncexp_g{kvh}_o{t}"),
+            &format!("attn_ncexp_{bn}_o{t}"),
             "exp",
             grp_rows,
             cols,
@@ -1960,7 +2047,7 @@ fn assemble_new_block_chunk(
             layout,
         ));
         ops.push(assemble_reduce_off(
-            &format!("attn_ncbsum_g{kvh}_o{t}"),
+            &format!("attn_ncbsum_{bn}_o{t}"),
             "sum",
             grp_rows,
             cols,
@@ -1971,23 +2058,37 @@ fn assemble_new_block_chunk(
             sym_id_base,
             layout,
         ));
-        // The seed: no prior output to fold, so no epilogue.
-        ops.push(assemble_matmul_off(
-            &format!("attn_ncov_g{kvh}_o{t}"),
-            MatM::of_head_major_rows(g_rows),
-            MatN::of_head_dim(hd),
-            MatK::of_kv_window(cols),
-            MatY::unbatched(),
-            bmm_form,
-            &rb(exp, g_rows, slots),
-            blk,
-            &Stk::<KernelTag>::kernel(slots as usize, hd as usize, new_v),
-            vv.view().at(Idx::<Head>::n(kvh)).dev(),
-            &rb(&bufs.run_o, q_rows, hd),
-            row_step(h0),
-            sym_id_base,
-            layout,
-        ));
+        // The seed: no prior output to fold, so no epilogue. Above one slab, one op per slab of V.
+        let n_slabs = RowBlockValue::slabs(blocks, hd);
+        for s in 0..n_slabs {
+            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+            let v_off = if n_slabs == 1 {
+                vv.view().at(Idx::<Head>::n(kvh)).dev()
+            } else {
+                vv.view().at(Idx::<Head>::n(kvh)).slab(s).dev()
+            };
+            let slab = if n_slabs == 1 {
+                String::new()
+            } else {
+                format!("s{s}")
+            };
+            ops.push(assemble_matmul_off(
+                &format!("attn_ncov_{bn}{slab}_o{t}"),
+                v.m,
+                v.n,
+                MatK::of_kv_window(cols),
+                MatY::unbatched(),
+                bmm_form,
+                &rb(exp, g_rows, slots),
+                blk,
+                &Stk::<KernelTag>::kernel(slots as usize, v.v_cols as usize, new_v),
+                v_off,
+                &rb(&bufs.run_o, q_rows, hd),
+                v.out_off,
+                sym_id_base,
+                layout,
+            ));
+        }
     }
     no_chunk_op_is_time_tiled(&ops[first_op..], t)
 }
@@ -2047,6 +2148,35 @@ fn softmax_part_pages(chunk: crate::sdsc_abstract::ChunkScratch, b_rows: u32) ->
         .unwrap_or(1)
 }
 
+/// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — EVERY resident page of ONE request attended in ONE pass, folded onto the
+/// new-token seed: the reference's decode structure (`spyre_inference`'s
+/// `batched_decode_head_major_kernel`: gather the chunk's pages, ONE score and ONE value matmul over the
+/// whole chunk, then reduce the row max and the denominators across the pages).
+///
+/// ⛔ WHAT IT REPLACES: the per-page fold, `SlotWindow::sweep(active_cap)` re-launched once per resident
+/// page, each launch 4 windows × (8 per-kv-head score matmuls + 11 softmax ops + 8 per-kv-head value
+/// matmuls) = 108 ops. Per resident page per layer that is ~80 µs of serialized op glue on granite-2b
+/// (the decode slope this exists to remove). Here a chunk of up to [`ChunkScratch::PAGES_MAX`] pages costs:
+///
+/// * gather: one copy per index stick, for K and for V (the card-proven copy op, [`ChunkScratch::copies`]
+///   and [`ChunkScratch::value_copies`]);
+/// * per ROW BLOCK ([`ChunkRowBlocks`]: a kv head at one feature slab, a query head above it): score,
+///   row max, sub, exp, row sum, and the value leg — one op, or one per slab above one slab;
+/// * shared over every head: the fold block's own merge ops (`newm`, `corrsub`, `corre`, `mset`, `ocorr`,
+///   `lcorr`, `ladd`).
+///
+/// The same count at every chunk width — the slope is in the gather's copies and the ops' own widths.
+///
+/// ⛔ EACH ROW BLOCK'S WIDE DATA IS A WHOLE `[rows, slots]` BLOCK ([`ChunkRowBlocks::corner`]), never a
+/// row slice of a taller multi-stick buffer — dxp rebuilds a stick-blocked operand's group stride from the
+/// op's own `N_`. The narrow running stats stay in the shared `[nqh, stick]` buffers, whose row slices are
+/// flat at one stick and therefore exact.
+///
+/// [`ChunkRowBlocks`]: crate::sdsc_abstract::ChunkRowBlocks
+/// [`ChunkRowBlocks::corner`]: crate::sdsc_abstract::ChunkRowBlocks::corner
+///
+/// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
+/// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
 fn assemble_attn_chunk(
     ops: &mut Vec<EmittedOp>,
     a: ChunkAttn<'_>,
@@ -2110,16 +2240,10 @@ fn assemble_attn_chunk(
             blocks.rows(),
         )));
     }
-    let (b_rows, nslab) = (blocks.rows(), chunk.plane().slabs());
+    let b_rows = blocks.rows();
     let blk_rows = RowCount::of_head_major_rows(b_rows);
     // Block `b`'s ops are named for its kv head at one slab, its query head above it.
-    let blk_name = |b: u32| {
-        if blocks.per_kv_head() {
-            format!("g{}", blocks.kv_head(b))
-        } else {
-            format!("h{}", blocks.first_head(b))
-        }
-    };
+    let blk_name = |b: u32| row_block_name(blocks, b);
     // A one-stick row offset in a `[rows, stick]` buffer (or, at one slab, in `qs`) is a single-stick
     // view step.
     let row_step = |h: u32| DevOff::from_view_step(h * stick.get());
@@ -2176,39 +2300,14 @@ fn assemble_attn_chunk(
         ChunkHistory::Requests(_) => &[],
     };
     for b in 0..blocks.count() {
-        let (kvh, h0) = (blocks.kv_head(b), blocks.first_head(b) * mq);
+        let kvh = blocks.kv_head(b);
         let kc = corner(chunk.kernel_corner(kvh), "a kv head's kernel block")?;
         let rc = corner(blocks.corner(b), "a row block's score block")?;
         // `sc_b = Q_b · Kᵗ_kvh + mask` — the mask is the broadcast prefix-validity row over the chunk's
         // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue; for a
-        // batch chunk, the per-row block (`mask_dims` above).
-        //
-        // At one slab Q is the group's `[gqa·mq, hd]` rows of `qs` read flat. Above it the block is one
-        // query head and Q is that head's own `[mq, hd]` block of the token stream — the fold's per-head
-        // score form (`ScoreArm::PerHead`): the WHOLE head dim contracted in one UNBATCHED op. (A
-        // two-stick contraction under a `y`-batch is the measured-incoherent shape; unbatched it is
-        // gemma-4's full-attention score.)
-        let (m, a, a_off) = if blocks.per_kv_head() {
-            (
-                MatM::of_head_major_rows(b_rows),
-                rb(qs, q_rows, hd),
-                row_step(h0),
-            )
-        } else {
-            (
-                MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
-                rb(qs, mq, hd),
-                crate::sdsc_abstract::OperandPlacement::of_token_stream(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                    nqh,
-                    hd,
-                    blocks.first_head(b),
-                    0,
-                    0,
-                )
-                .off(),
-            )
-        };
+        // batch chunk, the per-row block (`mask_dims` above). Q is the row block's own operand
+        // (`row_block_query`).
+        let (m, a, a_off) = row_block_query(blocks, b, mq, nqh, hd, qs);
         ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_csc_{}_o{t}", blk_name(b)),
             m,
@@ -2373,14 +2472,15 @@ fn assemble_attn_chunk(
         ));
     }
 
-    // A one-slab prompt chunk only: there every block is a whole kv head (the caller pins `cexp` by the
-    // same condition). Above one slab the per-query-head form below keeps its probabilities in HBM.
-    if mq > 1 && blocks.per_kv_head() {
+    // A prompt chunk keeps its probabilities in LX (the caller pins `cexp` by the same condition); decode —
+    // one request, or a batch chunk whose `mq` rows are separate requests — keeps the form below.
+    if mq > 1 && matches!(history, ChunkHistory::Shared) {
         prompt_probabilities_in_lx(
             ops,
             PromptProbs {
                 t,
                 hd,
+                mq,
                 blocks,
                 q_rows,
                 chunk,
@@ -2499,26 +2599,15 @@ fn assemble_attn_chunk(
     // only a prompt chunk's rows-divided PV is cut.
     let decode_values = mq == 1 || matches!(history, ChunkHistory::Requests(_));
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.value_parts(!decode_values).collect();
-    // ⭐ ABOVE ONE SLAB THE VALUE LEG IS ONE OP PER (QUERY HEAD, SLAB), ONE STICK OF `out` EACH — the
-    // fold's own card-proven hd=128 form. ONE op per head with `out = hd` writes `run_o` incoherently above
-    // one stick (MEASURED on granite-3.1-8b: fluent nonsense, bisected to exactly that collapse — see the
-    // fold's value leg). Each op contracts its head's probabilities against slab `s` of the slab-major V
-    // scratch and lands in slab `s`'s plane of `run_o` at the head's rows. At one slab the op is the
-    // per-kv-head one, unchanged.
-    let out_slabs = if blocks.per_kv_head() { 1 } else { nslab };
+    // ⭐ ABOVE ONE SLAB THE VALUE LEG IS ONE OP PER (QUERY HEAD, SLAB) (`RowBlockValue`): each op contracts
+    // its head's probabilities against slab `s` of the slab-major V scratch and lands in slab `s`'s plane of
+    // `run_o` at the head's rows. At one slab the op is the per-kv-head one, unchanged.
+    let out_slabs = RowBlockValue::slabs(blocks, hd);
     for b in 0..blocks.count() {
-        let (kvh, h0, bn) = (blocks.kv_head(b), blocks.first_head(b) * mq, blk_name(b));
+        let (kvh, bn) = (blocks.kv_head(b), blk_name(b));
         for s in 0..out_slabs {
-            // `run_o`'s rows `h0..` in slab `s`'s plane — a single-stick view step at one slab.
-            let o_off = if blocks.per_kv_head() {
-                row_step(h0)
-            } else {
-                crate::addr::Nest::new(&["row", "feat"], &[q_rows, hd], Df::Fp16)
-                    .view()
-                    .at(Idx::<crate::addr::Row>::n(h0))
-                    .slab(s)
-                    .dev()
-            };
+            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+            let o_off = v.out_off;
             for (p, part) in parts.iter().enumerate() {
                 let kc = corner(part.value_corner(kvh, s), "a kv head's value block")?;
                 let rc = corner(
@@ -2540,15 +2629,7 @@ fn assemble_attn_chunk(
                 } else {
                     format!("attn_cov_{bn}{slab}_k{p}_o{t}")
                 };
-                let (m, n, v_cols) = if blocks.per_kv_head() {
-                    (MatM::of_head_major_rows(b_rows), MatN::of_head_dim(hd), hd)
-                } else {
-                    (
-                        MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
-                        MatN::of_head_slab(FeatIdx::SLAB_FEATS),
-                        stick.get(),
-                    )
-                };
+                let RowBlockValue { m, n, v_cols, .. } = v;
                 // ⭐ AT DECODE THE CONTRACTION IS DIVIDED ACROSS THE CORES (`ContractionSplit`): the output
                 // is one stick of `gqa` rows (one row per head above one slab), so the planner would give
                 // it only its rows and every core would read this kv head's WHOLE V. A prompt chunk has
@@ -2633,7 +2714,8 @@ fn assemble_attn_chunk(
 struct PromptProbs<'a> {
     t: u32,
     hd: u32,
-    /// One block per kv head (one slab) — the caller's gate.
+    mq: u32,
+    /// The chunk's row blocks: a kv head at one slab, a query head above it.
     blocks: crate::sdsc_abstract::ChunkRowBlocks,
     q_rows: u32,
     chunk: crate::sdsc_abstract::ChunkScratch,
@@ -2644,14 +2726,16 @@ struct PromptProbs<'a> {
 
 /// ⭐⭐⭐ A PROMPT CHUNK'S PROBABILITIES NEVER LEAVE LX — THREE HBM PASSES OVER THE SCORE BLOCK, NOT SIX.
 ///
-/// After the score (written to HBM), its row max (read once) and the online merge, each kv head's chunk is
-/// walked in [`prompt_lx_part_pages`] parts, and in each part every op divides the work the same way — each
-/// core its own `gqa·mq / 32` rows and all of the part's columns (`{mb:32}`, the PV's own split too):
+/// After the score (written to HBM), its row max (read once) and the online merge, each row block's chunk
+/// (a kv head's at one slab, a query head's above it) is walked in [`prompt_lx_part_pages`] parts, and in
+/// each part every op divides the work the same way — each core its own `rows / 32` rows and all of the
+/// part's columns (`{mb:32}`, the PV's own split too):
 ///   * `esub` reads the score part from HBM into a core-local `cesub`;
 ///   * `exp` reads `cesub` into a core-local `cexp`;
 ///   * the row sum reduces `cexp` into the part's one-stick partial;
-///   * the PV contracts `cexp` with the part's V block and folds onto the output through the same
-///     `stridedadd` ping-pong the value parts always used.
+///   * the PV contracts `cexp` with the part's V block — one op per feature slab above one slab
+///     ([`RowBlockValue`]) — and folds onto the output through the same `stridedadd` ping-pong the value
+///     parts always used.
 ///
 /// The probabilities are never written to or read back from HBM. That is the reference's own form, and the
 /// emitter's core-local read law proves at build that each core reads exactly the slice it wrote. The
@@ -2666,6 +2750,7 @@ fn prompt_probabilities_in_lx(
     let PromptProbs {
         t,
         hd,
+        mq,
         blocks,
         q_rows,
         chunk,
@@ -2675,7 +2760,7 @@ fn prompt_probabilities_in_lx(
     } = a;
     use crate::addr::DevOff;
     use crate::superdsc_opspec::EpilogueOpFunc;
-    // One slab only (the caller's gate): every block is a whole kv head's `gqa·mq` rows.
+    // A row block's rows: a kv head's `gqa·mq` at one slab, a query head's `mq` above it.
     let g_rows = blocks.rows();
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let all_rows = RowCount::of_head_major_rows(q_rows);
@@ -2709,15 +2794,19 @@ fn prompt_probabilities_in_lx(
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
     let n = parts.len();
+    let n_slabs = RowBlockValue::slabs(blocks, hd);
     for b in 0..blocks.count() {
-        // At one slab block `b` IS kv head `b`, its rows the `b`-th `gqa·mq` of the stream.
-        let (kvh, h0) = (blocks.kv_head(b), b * g_rows);
+        // Block `b`'s rows are the `first_head(b)·mq`-th on of the head-major stream.
+        let (kvh, h0, bn) = (
+            blocks.kv_head(b),
+            blocks.first_head(b) * mq,
+            row_block_name(blocks, b),
+        );
         for (p, part) in parts.iter().enumerate() {
-            let pc = corner(part.probs_corner(blocks, b), "a kv head's score part")?;
-            let kc = corner(part.value_corner(kvh, 0), "a kv head's value part")?;
+            let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
             let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cesub_g{kvh}_s{p}_o{t}"),
+                &format!("attn_cesub_{bn}_s{p}_o{t}"),
                 "subtract",
                 grp_rows,
                 pw,
@@ -2731,7 +2820,7 @@ fn prompt_probabilities_in_lx(
                 layout,
             ));
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cexp_g{kvh}_s{p}_o{t}"),
+                &format!("attn_cexp_{bn}_s{p}_o{t}"),
                 "exp",
                 grp_rows,
                 pw,
@@ -2744,7 +2833,7 @@ fn prompt_probabilities_in_lx(
             // One part: the whole chunk's sum, straight into the denominator.
             let sum_into = if n == 1 { &bufs.bsum } else { &cb.red[p] };
             ops.push(assemble_reduce_off(
-                &format!("attn_cbsum_g{kvh}_s{p}_o{t}"),
+                &format!("attn_cbsum_{bn}_s{p}_o{t}"),
                 "sum",
                 grp_rows,
                 pw,
@@ -2760,27 +2849,37 @@ fn prompt_probabilities_in_lx(
             } else {
                 (&bufs.otmp, &run_o_h)
             };
-            // `run_o_g = P_g · V_g + otmp_g` — the `stridedadd` epilogue is the online-softmax update.
-            ops.push(assemble_matmul_off_maybe_epilogue(
-                &format!("attn_cov_g{kvh}_k{p}_o{t}"),
-                MatM::of_head_major_rows(g_rows),
-                MatN::of_head_dim(hd),
-                MatK::of_kv_window(pw),
-                MatY::unbatched(),
-                bmm_form,
-                &rb(&cb.cexp, g_rows, ps),
-                DevOff::ZERO,
-                &Stk::<KernelTag>::kernel(ps as usize, hd as usize, &cb.gv),
-                kc,
-                &rb(out, q_rows, hd),
-                row_step(h0),
-                Some((addend, row_step(h0))),
-                EpilogueOpFunc::StridedAdd,
-                &[],
-                false,
-                sym_id_base,
-                layout,
-            ));
+            // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update. One
+            // op per slab above one slab, each reading the same core-local `cexp`.
+            for s in 0..n_slabs {
+                let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+                let kc = corner(part.value_corner(kvh, s), "a kv head's value part")?;
+                let slab = if n_slabs == 1 {
+                    String::new()
+                } else {
+                    format!("s{s}")
+                };
+                ops.push(assemble_matmul_off_maybe_epilogue(
+                    &format!("attn_cov_{bn}{slab}_k{p}_o{t}"),
+                    v.m,
+                    v.n,
+                    MatK::of_kv_window(pw),
+                    MatY::unbatched(),
+                    bmm_form,
+                    &rb(&cb.cexp, g_rows, ps),
+                    DevOff::ZERO,
+                    &Stk::<KernelTag>::kernel(ps as usize, v.v_cols as usize, &cb.gv),
+                    kc,
+                    &rb(out, q_rows, hd),
+                    v.out_off,
+                    Some((addend, v.out_off)),
+                    EpilogueOpFunc::StridedAdd,
+                    &[],
+                    false,
+                    sym_id_base,
+                    layout,
+                ));
+            }
         }
     }
     if n.is_multiple_of(2) {
@@ -3495,13 +3594,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             syn(R::NewChunkExp),
         );
         let cols = BlockCols::of_new_block(mq_pad_t.cols());
-        let g_rows = gqa * mq;
+        // The chunk's own row blocks over the new block's `mq_pad` columns: a kv head at one slab, a query
+        // head above it.
+        let blocks = crate::sdsc_abstract::ChunkRowBlocks::of_group(
+            nkvh,
+            gqa,
+            mq,
+            hd / BlockCols::of_one_stick(Lanes::FP16).get(),
+            cols.get(),
+        );
+        let g_rows = blocks.rows();
         if let Some(l) = layout {
             for r in [R::NewChunkSc, R::NewChunkExp] {
                 l.synth(out_id.synth(r), &[nqh * mq, cols.get()]);
             }
-            // ⭐ `esub`'s output never leaves LX — one core's slice of one kv head's block, reused head after
-            // head, exactly as the chunk's `cesub`.
+            // ⭐ `esub`'s output never leaves LX — one core's slice of one row block, reused block after
+            // block, exactly as the chunk's `cesub`.
             let slice = crate::emit::pointwise_untiled_slice_bytes(g_rows, cols.get(), 2)
                 .ok_or_else(|| {
                     SuperDscError(format!(
@@ -3519,7 +3627,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 nqh,
                 nkvh,
                 hd,
-                gqa,
+                blocks,
                 mq,
                 cols,
                 qs,
@@ -3692,9 +3800,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // one slab, a query head's `mq` above it.
         let blocks = chunk.row_blocks(nqh / nkvh, mq);
         let b_rows = blocks.rows();
-        // A PROMPT chunk at one slab keeps its probabilities in LX from `esub` through the PV (the body's
-        // step 4′); decode, and a prompt chunk above one slab, keep the form they have.
-        let prompt = mq > 1 && blocks.per_kv_head();
+        // A PROMPT chunk keeps its probabilities in LX from `esub` through the PV (the body's step 4′);
+        // decode keeps the form it has. ⛔ A batch chunk's `mq` is its request count, not a prompt's width:
+        // its rows are separate requests and it keeps the decode form (`ChunkHistory::Requests`).
+        let prompt = mq > 1 && !rows_are_requests;
         let lx_parts = if prompt {
             chunk.pages() / prompt_lx_part_pages(chunk, b_rows)
         } else {
