@@ -5674,15 +5674,27 @@ mod tests {
 
     #[test]
     fn tiled_matmul_concrete_unrolls() {
-        // 64×16384×2048 batch1 overflows LX (2.42 MiB > 1.68 MiB) → time-tiled.
-        // The A term is only 256 KiB so out-tiling brings it under LX (a wide-K
-        // shape would Err instead); the cost split fills 32 cores via out×32.
-        let emitted = assemble_matmul(
+        // 64×16384×2048 at TWO kernel batches overflows LX → time-tiled. A `y`-batched matmul keeps
+        // the frontend's LX trips (`MatmulStaging::FrontendTrips`); the same shape UNBATCHED is handed
+        // to dxp whole, in one descriptor, which this asserts first.
+        let whole = assemble_matmul(
             "matmul_o7",
             64,
             16384,
             2048,
             1,
+            &rb("a", 64, 2048),
+            &Stk::<KernelTag>::kernel(2048, 16384, "w"),
+            &rb("o", 64, 16384),
+            None,
+        );
+        assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
+        let emitted = assemble_matmul(
+            "matmul_o7",
+            64,
+            16384,
+            2048,
+            2,
             &rb("a", 64, 2048),
             &Stk::<KernelTag>::kernel(2048, 16384, "w"),
             &rb("o", 64, 16384),

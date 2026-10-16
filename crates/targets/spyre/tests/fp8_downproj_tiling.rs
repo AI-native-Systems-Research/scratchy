@@ -15,7 +15,7 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
     SharedKernelBmmForm, matmul_opspec_off_operands,
 };
 use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
-use scratchy_subtile::superdsc_opspec::{Df, Fp16};
+use scratchy_subtile::superdsc_opspec::{Df, Fp16, WorkPlan};
 
 fn time_tiled(m: u32, n: u32, k: u32) -> bool {
     matmul_opspec_off_operands::<Fp16>(
@@ -51,35 +51,47 @@ fn only_the_8b_fp8_down_proj_needs_more_than_one_trip() {
 }
 
 /// The one-byte operand accounting changes how the same op is TILED, which is what made it emittable
-/// when the tiler had previously refused it. Both formats emit today (the refusal was at the older,
-/// coarser out_per_time), but fp16 needs strictly more trips for the same work — the residency fix is
-/// load-bearing, not cosmetic.
+/// when the tiler had previously refused it. The SAME plan with its operands charged two bytes an element
+/// needs strictly more trips (or does not fit at all) — the residency fix is load-bearing, not cosmetic.
+/// (fp16 itself no longer takes the frontend's trips: an unbatched fp16 matmul is handed to dxp whole,
+/// `MatmulStaging::Dxp`, so the two-byte charge is evaluated on the fp8 op's own plan.)
 #[test]
 fn charging_fp8_operands_two_bytes_costs_the_8b_down_proj_extra_trips() {
     let (m, n, k) = (31u32, 4096u32, 12800u32);
-    let trips = |df| {
-        matmul_opspec_off_operands::<Fp16>(
-            MatM::of_token_rows(m),
-            MatN::of_out_features(n),
-            MatK::of_in_features(k),
-            MatY::unbatched(),
-            SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-            "a",
-            "w",
-            "o",
-            0,
-            0,
-            0,
-            df,
-        )
-        .expect("emittable")
-        .time_tile
-        .map(|t| t.count())
-        .unwrap_or(1)
+    let op = matmul_opspec_off_operands::<Fp16>(
+        MatM::of_token_rows(m),
+        MatN::of_out_features(n),
+        MatK::of_in_features(k),
+        MatY::unbatched(),
+        SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
+        "a",
+        "w",
+        "o",
+        0,
+        0,
+        0,
+        Df::Fp8,
+    )
+    .expect("emittable");
+    let fp8 = op.time_tile.map(|t| t.count()).unwrap_or(1);
+    // The per-core resident set (activation slab + weight slab + output) at two bytes an element.
+    let two_bytes = |p: &WorkPlan, out_per_time: u32| {
+        let (mb, kc, opt) = (
+            u64::from(p.per_core_extent("mb")),
+            u64::from(p.per_core_extent("in")),
+            u64::from(out_per_time),
+        );
+        2 * (mb * kc + kc * opt + mb * opt)
     };
-    let (fp8, fp16) = (trips(Df::Fp8), trips(Df::Fp16));
-    assert!(
-        fp8 < fp16,
-        "one-byte operands must need FEWER trips: fp8={fp8} fp16={fp16}"
-    );
+    match op.iter.time_tile_for_lx(two_bytes, "out") {
+        Ok(tt) => {
+            let fp16_charge = tt.map(|t| t.count()).unwrap_or(1);
+            assert!(
+                fp8 < fp16_charge,
+                "one-byte operands must need FEWER trips: fp8={fp8}, charged two bytes={fp16_charge}"
+            );
+        }
+        // Charged two bytes the same plan does not fit at any trip count — the refusal the fix removed.
+        Err(_) => assert!(fp8 > 1, "the fp8 down_proj is multi-trip at K=12800"),
+    }
 }

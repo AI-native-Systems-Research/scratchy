@@ -9,8 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
-    Role, Scale, StickExtent, TensorArg, WorkPlan,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MatmulStaging, MaxCores, OpFunc,
+    OpInfo, OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -336,16 +336,27 @@ where
         dims: dims.clone(),
         df: operand_df,
     };
-    // ── LX-fit TIME-TILING (the coarse_tile pass) ───────────────────────────
+    // ── LX-fit TIME-TILING (the coarse_tile pass), for the matmuls that keep it ──
     // After the spatial work-division, decide whether the per-core resident set
     // (A + W + O, fp16=2 B, INCLUDING the batch/x factor — KERNEL `w` dominates
     // and is NOT divided by the mb split) fits the USABLE_LX scratchpad. If not,
     // tile the OUTPUT stick dim `out` in TIME. "doesn't fit even when tiled" is a
-    // build `Err` (the DtException-1535 guard), NOT an on-card crash.
-    let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, splitter, OutAxis::NAME)
-        .map_err(|e| e.0)?;
-    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    // build `Err`, NOT an on-card crash.
+    // ⭐ WHO STAGES IT THROUGH LX ([`MatmulStaging`]): an unbatched fp16 matmul is handed to dxp WHOLE —
+    // the cost model's split and nothing more, torch-spyre's form — and every other one takes the
+    // frontend's LX-fit time trips.
+    let (plan, time_tile) = match MatmulStaging::of(batch, operand_df) {
+        MatmulStaging::Dxp => (
+            WorkPlan::divide(&tile_op.dims, MaxCores::<MAX_CORES>, splitter)?,
+            None,
+        ),
+        MatmulStaging::FrontendTrips => {
+            let tiled = tile_op
+                .tile(MaxCores::<MAX_CORES>, splitter, OutAxis::NAME)
+                .map_err(|e| e.0)?;
+            (tiled.plan, tiled.time_tile)
+        }
+    };
 
     // The CANONICAL matmul dim set is EXACTLY {mb(M), in(K), out(N), x(batch)} — NO
     // phantom `y` (verified against torch-spyre's own test_coarse_tiling.py:1330-1343:

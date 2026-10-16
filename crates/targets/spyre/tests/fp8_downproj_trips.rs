@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The 8b fp8 `down_proj`'s TRIPS must tile its output exactly — disjoint, and covering it.
+//! The 8b `down_proj` shape's TRIPS must tile its output exactly — disjoint, and covering it.
 //!
-//! This op is multi-trip only at granite-3.1-8b's `K=12800`; granite-3.1-2b's `K=8192` fits in one, so
-//! the per-trip output advance has never executed on hardware. A wrong advance writes trips on top of
-//! each other or past the tensor, and the symptom would be a partially-correct MLP output every layer
-//! — output that stays fluent and drifts, which is what 8b does.
+//! ⭐ An unbatched fp16 matmul is now handed to dxp whole (`MatmulStaging::Dxp`), so the dense
+//! `down_proj` is ONE descriptor and has no trips. The advance below is the one every matmul that KEEPS
+//! the frontend's LX trips (a `y`-batched one, an fp8 one) runs, checked at the same K=12800 contraction.
+//! A wrong advance writes trips on top of each other or past the tensor, and the symptom would be a
+//! partially-correct output every layer — output that stays fluent and drifts.
 //!
 //! The check is on the ADDRESSES the emitter bakes, via `concrete_trips`, not on a re-derivation of
 //! them: every trip's OUTPUT start is read back out of its dataspace.
@@ -20,28 +21,23 @@
 //! what makes it a gate rather than a false alarm.)
 
 use ktir_superdsc::emit::rb;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
-use scratchy_subtile::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, QueryRowCount, Stk};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_matmul;
+use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
 
-/// Core-0 start address of each trip's OUTPUT dataspace, in elements.
-fn trip_output_starts(m: u32, n: u32, k: u32) -> Vec<i64> {
-    let mut sym = 0i64;
-    let e = assemble_matmul_off(
+/// Core-0 start address of each trip's OUTPUT dataspace, in elements, for the shape at `batch` kernel
+/// batches. Unbatched, an fp16 matmul is handed to dxp whole (`MatmulStaging::Dxp`), so it is ONE trip;
+/// a `y`-batched one keeps the frontend's LX trips — the only fp16 matmuls whose advance still runs.
+fn trip_output_starts(m: u32, n: u32, k: u32, batch: u32) -> Vec<i64> {
+    let e = assemble_matmul(
         "dp",
-        MatM::of_token_rows(m),
-        MatN::of_out_features(n),
-        MatK::of_in_features(k),
-        MatY::unbatched(),
-        // Token rows, never a request batch: the row-kind boundary yields the proven walk.
-        SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
+        m,
+        n,
+        k,
+        batch,
         &rb("a", m, k),
-        scratchy_subtile::addr::DevOff::ZERO,
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-        scratchy_subtile::addr::DevOff::ZERO,
         &rb("o", m, n),
-        scratchy_subtile::addr::DevOff::ZERO,
-        &mut sym,
         None,
     );
     concrete_trips(&e)
@@ -69,7 +65,10 @@ fn trip_output_starts(m: u32, n: u32, k: u32) -> Vec<i64> {
 /// silently-wrong output the emitter's own comment warns about at "design risk #4".
 #[test]
 fn the_8b_down_proj_trips_advance_and_do_not_alias() {
-    let starts = trip_output_starts(31, 4096, 12800);
+    // Unbatched it is dxp-staged, one descriptor: nothing to advance.
+    assert_eq!(trip_output_starts(31, 4096, 12800, 1).len(), 1);
+    // At two kernel batches the same K=12800 contraction takes the reduction-split repair AND trips.
+    let starts = trip_output_starts(31, 4096, 12800, 2);
     assert!(
         starts.len() > 1,
         "this shape must be multi-trip, got {} trip(s)",
@@ -101,5 +100,5 @@ fn the_8b_down_proj_trips_advance_and_do_not_alias() {
 /// not a comment that can drift.
 #[test]
 fn the_2b_down_proj_is_a_single_trip() {
-    assert_eq!(trip_output_starts(31, 2048, 8192).len(), 1);
+    assert_eq!(trip_output_starts(31, 2048, 8192, 1).len(), 1);
 }

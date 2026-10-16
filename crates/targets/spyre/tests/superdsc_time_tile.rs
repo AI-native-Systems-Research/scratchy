@@ -611,23 +611,18 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
     );
 }
 
+/// ⭐ THROUGH THE REAL CHAIN, A DENSE MATMUL NODE IS ONE UNTILED DESCRIPTOR — `MatmulStaging::Dxp`.
+///
+/// `rows_are_requests` is TRUE: 64 rows that are 64 separate requests may NOT fold to the last row
+/// (every row's logits are sampled), so this vocab-wide tail is the widest unbatched matmul a decode
+/// batch emits. It used to time-tile at m=64; dxp now stages it whole, and the bundle still builds.
 #[test]
-fn tiled_matmul_trips_do_not_alias_and_advance() {
-    // 64×16384×2048 batch1 → time>1 (proven tiled in tiled_bundle_mlir test).
-    //
-    // ⛔ THROUGH THE REAL CHAIN, BECAUSE A HAND-BUILT DESCRIPTOR IS NO LONGER A BUNDLE. This used to
-    // call `assemble_matmul` and hand the descriptor straight to `emit_bundle`; after the
+fn an_unbatched_fp16_matmul_is_one_descriptor() {
+    // ⛔ THROUGH THE REAL CHAIN, BECAUSE A HAND-BUILT DESCRIPTOR IS NO LONGER A BUNDLE: after the
     // `SubtileIR → KTIR → SuperDSC` split a bundle is built from PROGRAMS (`ktir_groups` on
     // `-Fspyre-emu`, `ktir_groups_via_superdsc` on `-Fspyre-hw`), and an op carrying a descriptor and
-    // no program is refused by both — deliberately, since the only path to SuperDSC is through a KTIR
-    // program. So the fixture is the SubtileIR node the descriptor came from, and the two halves are
-    // read where each now exists: `time`/trips off the LOWERED descriptor, the bundle off the
-    // PROGRAMS. Nothing about the assertions changes.
-    //
-    // `rows_are_requests` is TRUE for exactly the reason this test exists: 64 rows that are 64
-    // separate requests may NOT fold to the last row (every row's logits are sampled), so the
-    // vocab-wide tail time-tiles at m=64 — which is addressable only because these trips advance
-    // instead of aliasing.
+    // no program is refused by both. So the fixture is the SubtileIR node, `time` is read off the
+    // LOWERED descriptor, and the bundle off the PROGRAMS.
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
     let (programs, layout) =
@@ -642,6 +637,37 @@ fn tiled_matmul_trips_do_not_alias_and_advance() {
             dscs.iter().map(|o| &o.op_name).collect::<Vec<_>>()
         )
     };
+    assert_eq!(e.time, 1, "an unbatched fp16 matmul is staged by dxp");
+    assert_eq!(superdsc::concrete_trips(e).len(), 1);
+    // SAFETY: single-threaded test; the multi-op stitch opt-in only.
+    unsafe { std::env::set_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP", "1") };
+    let r = superdsc::emit_bundle(
+        &programs,
+        Some(&layout),
+        superdsc::FoldGrouping::Split,
+        None,
+    );
+    unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
+    assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");
+}
+
+#[test]
+fn tiled_matmul_trips_do_not_alias_and_advance() {
+    // A `y`-batched matmul keeps the frontend's LX trips (`MatmulStaging::FrontendTrips`): at two
+    // kernel batches 64×16384×2048 is time>1 (proven tiled in tiled_bundle_mlir test). Its trips must
+    // be addressable — advancing instead of aliasing.
+    let e = superdsc::assemble_matmul(
+        "matmul_o7",
+        64,
+        16384,
+        2048,
+        2,
+        &emit::rb("a", 64, 2048),
+        &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
+        &emit::rb("o", 64, 16384),
+        None,
+    );
+    let e = &e;
     assert!(e.time > 1);
     // Concrete trips: every OUTPUT per-core address is UNIQUE across all trips
     // (#50 — real per-core bases + per-trip stride mean trips never alias).
@@ -670,29 +696,6 @@ fn tiled_matmul_trips_do_not_alias_and_advance() {
         uniq.len(),
         out_addrs.len(),
         "no two (trip,core) OUTPUT writes alias"
-    );
-    // GUARD #14 LIFTED by #50: write_bundle_cached no longer REFUSES a time-tiled
-    // bundle (it now only refuses an ALIASING one — which the disjointness above
-    // proves this is not). A tiled op pre-unrolls to N>1 files, so it still trips
-    // the SEPARATE multi-op stitch GUARD #16; opt into that (its own on-card
-    // concern) to isolate that #14 itself is gone. SCRATCHY_SUPERDSC_ALLOW_TILED is
-    // NO LONGER required.
-    let tmp = std::env::temp_dir().join("superdsc_50_tiled_cache");
-    let _ = std::fs::remove_dir_all(&tmp);
-    // SAFETY: single-threaded test; set the multi-op (stitch) opt-in only.
-    unsafe { std::env::set_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP", "1") };
-    let r = superdsc::emit_bundle(
-        &programs,
-        Some(&layout),
-        superdsc::FoldGrouping::Split,
-        // A single tiled matmul: no attention node, so nothing for the four attention facts
-        // to describe.
-        None,
-    );
-    unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
-    assert!(
-        r.is_ok(),
-        "tiled bundle no longer refused for tiling (GUARD #14 lifted by #50): {r:?}"
     );
 }
 
@@ -836,13 +839,12 @@ fn impossibly_large_matmul_is_build_err() {
     );
 }
 
-// (iv-a) ── a tiled op's bundle.mlir has scf.for + affine.apply + symbolic addr ──
+// (iv-a) ── a tiled op's bundle.mlir is a concrete unroll ──
 //
-// 64×16384×2048 batch1: the cost model fills 32 cores splitting `out` ×32 →
-// per_core_out=512 (8 sticks). Per-core resident (A 256 KiB + W 2 MiB + O) =
-// 2.42 MiB > 1.68 MiB usable LX → MUST time-tile. The A (input) term is only
-// 256 KiB so out-tiling DOES bring it under LX (unlike a wide-K shape, which
-// would Err). time=2 → out_per_time=256, resident ≈ 1.34 MiB.
+// 64×16384×2048 at TWO kernel batches: a `y`-batched matmul keeps the frontend's LX
+// trips (`MatmulStaging::FrontendTrips`), and its per-core resident set (the batch
+// factor included) overflows the 1.68 MiB usable LX → MUST time-tile. The same
+// shape unbatched is handed to dxp whole (`an_unbatched_fp16_matmul_is_one_descriptor`).
 #[test]
 fn tiled_bundle_mlir_is_concrete_unroll() {
     // CONCRETE-UNROLL (task #53): a time=N tiled op pre-unrolls into N FLAT
@@ -854,7 +856,7 @@ fn tiled_bundle_mlir_is_concrete_unroll() {
         64,
         16384,
         2048,
-        1,
+        2,
         &emit::rb("a", 64, 2048),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
         &emit::rb("o", 64, 16384),
