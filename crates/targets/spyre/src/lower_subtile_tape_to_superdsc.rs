@@ -198,7 +198,7 @@ pub use ktir_superdsc::reserved_tids::{
 // facts.
 pub use ktir_superdsc::placement::{
     BundleLayout, RetileDescriptor, SegRole, SynthAlloc, TensorPlacement, WEIGHT_SPILL_SEGS,
-    align128, syn, synth_footprint_bytes,
+    WeightTail, align128, syn, synth_footprint_bytes,
 };
 // ⭐⭐⭐ AND THE EMITTER ITSELF NOW LIVES IN `ktir_superdsc::emit` — `emit_sdsc`/`emit_sdsc_tiled`, the
 // whole `assemble_*` family, `pw1`/`pw2`, `ArgBinding`/`EmittedOp`, `bmm_site` and the SFP constant
@@ -704,11 +704,15 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .map(|p| align128(p.offset + p.size))
         .max()
         .unwrap_or(0);
-    let weight_bank_bytes = if per_layer_block_end <= bundle::MAX_SEGMENT_BYTES {
-        spill_weight_tail(&mut placements, &mut seg_bytes, &per_layer_tids)?;
-        Vec::new()
+    let (weight_bank_bytes, weight_tail) = if per_layer_block_end <= bundle::MAX_SEGMENT_BYTES {
+        let tail = spill_weight_tail(&mut placements, &mut seg_bytes, &per_layer_tids)?;
+        (Vec::new(), tail)
     } else {
-        bank_weight_segment(&mut placements, &mut seg_bytes, per_layer_ext)?
+        // A bank holds the tail like any other weight, so nothing is spilled.
+        (
+            bank_weight_segment(&mut placements, &mut seg_bytes, per_layer_ext)?,
+            WeightTail::InPlace,
+        )
     };
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
     // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
@@ -1666,6 +1670,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         ids,
         segment_bytes: seg_bytes,
         weight_bank_bytes,
+        weight_tail,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
         weight_scale_folds: weight_scale_folds
@@ -1721,15 +1726,23 @@ pub fn compute_bundle_layout<F: RopeForm>(
 /// region's base in slot 1 — but it needs the weight segment to become a *bank* of regions (staging,
 /// H2D and `alias_seg_from` all per bank), and it is NOT built here. Dense fp16 therefore still tops
 /// out where 40 layers of weights top out; this is what unblocks the tail, not a 30B.
+///
+/// ⭐ THE VERDICT IS RETURNED, AND BAKED — and [`weight_tail_of_placements`] is its proof. [`WeightTail::Spilled`] names the slot and the tail's
+/// extent, which is the runtime's whole copy work list — so the decision travels in the bundle as a
+/// typed fact instead of being re-derived from where the placements sit.
 fn spill_weight_tail(
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
     seg_bytes: &mut [u64; 7],
     per_layer_tids: &std::collections::BTreeSet<u32>,
-) -> Result<(), SuperDscError> {
+) -> Result<WeightTail, SuperDscError> {
     let w_seg = SegRole::Weight.segment();
     if seg_bytes[w_seg] <= bundle::MAX_SEGMENT_BYTES {
-        return Ok(()); // the overwhelming case: nothing moves, nothing is re-offset.
+        return Ok(WeightTail::InPlace); // the overwhelming case: nothing moves, nothing is re-offset.
     }
+    // ⛔ ONE SLOT, BY THE ARRAY'S TYPE. `WeightTail::Spilled` names one segment; a second declared
+    // slot would let the tail split across two, which that verdict cannot state. This pattern is
+    // irrefutable only while the table has exactly one row, so growing it is a compile error here.
+    let [spill_slot] = WEIGHT_SPILL_SEGS;
     // The weight segment's own high-water, recomputed from what REMAINS after each move. The
     // original packing bumped `seg_bytes` cumulatively, so the high-water is the max end — taking
     // the trailing placement lowers it to the next one's end and never leaves a hole.
@@ -1787,23 +1800,21 @@ fn spill_weight_tail(
             )));
         }
         let sz = placements[&tid].size;
-        // First declared slot with room for it. `MAX_SEGMENT_BYTES` binds the spill slot too — it is
-        // a device region like any other — so this cannot trade one over-size segment for another.
-        let Some(&spill) = WEIGHT_SPILL_SEGS
-            .iter()
-            .find(|&&s| align128(seg_bytes[s]) + sz <= bundle::MAX_SEGMENT_BYTES)
-        else {
+        // The slot must have room for it. `MAX_SEGMENT_BYTES` binds the spill slot too — it is a
+        // device region like any other — so this cannot trade one over-size segment for another.
+        let spill = spill_slot;
+        if align128(seg_bytes[spill]) + sz > bundle::MAX_SEGMENT_BYTES {
             return Err(SuperDscError(format!(
-                "seg{w_seg} packs {} B, {} B past the {} B one device region can hold, and every \
-                 declared spill slot {WEIGHT_SPILL_SEGS:?} is too full to take t{tid} ({sz} B). The \
-                 tail that CAN move is already moved: what is left is the per-layer block, and the \
-                 rolled body advances exactly one segment's base per layer, so it cannot be split \
-                 without making the weight segment a bank of regions (see `spill_weight_tail`).",
+                "seg{w_seg} packs {} B, {} B past the {} B one device region can hold, and the \
+                 spill slot seg{spill} is too full to take t{tid} ({sz} B). The tail that CAN move \
+                 is already moved: what is left is the per-layer block, and the rolled body \
+                 advances exactly one segment's base per layer, so it cannot be split without \
+                 making the weight segment a bank of regions (see `spill_weight_tail`).",
                 seg_bytes[w_seg],
                 seg_bytes[w_seg] - bundle::MAX_SEGMENT_BYTES,
                 bundle::MAX_SEGMENT_BYTES,
             )));
-        };
+        }
         // Land above whatever the slot already holds — which is NOTHING, because this runs before
         // the intermediate coloring, so the first spilled tensor sits at offset 0 and the colored
         // intermediates pack above it. That is deliberate and load-bearing: the runtime hands each
@@ -1831,7 +1842,104 @@ fn spill_weight_tail(
             .collect::<Vec<_>>()
             .join(", "),
     );
-    Ok(())
+    // The slot held nothing before the first move (this runs before the intermediate coloring), so
+    // its high-water now is exactly the tail's extent `[0, bytes)`.
+    Ok(WeightTail::Spilled {
+        segment: spill_slot as u32,
+        bytes: seg_bytes[spill_slot],
+    })
+}
+
+/// The weight-tail verdict as the PLACEMENTS state it: the spill slot some WEIGHT sits in, and the
+/// high-water of the weights there. What [`spill_weight_tail`] returned must equal this once every
+/// placement is final, which `bake_layout` proves before the verdict is baked.
+fn weight_tail_of_placements(
+    placements: &std::collections::BTreeMap<u32, TensorPlacement>,
+) -> WeightTail {
+    let [spill_slot] = WEIGHT_SPILL_SEGS;
+    placements
+        .values()
+        .filter(|p| p.segment == spill_slot && matches!(p.role, SegRole::Weight))
+        .map(|p| align128(p.offset + p.size))
+        .max()
+        .map_or(WeightTail::InPlace, |bytes| WeightTail::Spilled {
+            segment: spill_slot as u32,
+            bytes,
+        })
+}
+
+#[cfg(test)]
+mod weight_tail_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// granite-3.1-8b's weight segment as the layout packs it: 40 per-layer blocks, then the final
+    /// norm, then the 51200-wide tied embedding, in tid order.
+    fn granite_8b(
+        per_layer_block: u64,
+    ) -> (BTreeMap<u32, TensorPlacement>, [u64; 7], BTreeSet<u32>) {
+        let w = SegRole::Weight.segment();
+        let mut placements = BTreeMap::new();
+        let mut seg_bytes = [0u64; 7];
+        let mut per_layer = BTreeSet::new();
+        let sizes = (0..40u32)
+            .map(|t| (t, per_layer_block))
+            .chain([(40, 8_192), (41, 51_200 * 4_096 * 2)]);
+        for (tid, size) in sizes {
+            let offset = align128(seg_bytes[w]);
+            placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Weight,
+                    segment: w,
+                    bank: 0,
+                    offset,
+                    size,
+                },
+            );
+            seg_bytes[w] = align128(offset + size);
+            if tid < 40 {
+                per_layer.insert(tid);
+            }
+        }
+        (placements, seg_bytes, per_layer)
+    }
+
+    /// The padded 8b (gate/up at 14336) packs 177 MiB past one region: the embedding spills, and the
+    /// verdict names the slot and the tail's extent — which the placements state too.
+    #[test]
+    fn the_padded_8b_spills_its_embedding_and_the_verdict_says_so() {
+        let (mut placements, mut seg_bytes, per_layer) = granite_8b(423_641_088);
+        assert!(seg_bytes[SegRole::Weight.segment()] > bundle::MAX_SEGMENT_BYTES);
+        let tail = spill_weight_tail(&mut placements, &mut seg_bytes, &per_layer).unwrap();
+        assert_eq!(
+            tail,
+            WeightTail::Spilled {
+                segment: 6,
+                bytes: 419_430_400
+            }
+        );
+        assert_eq!((placements[&41].segment, placements[&41].offset), (6, 0));
+        assert_eq!(placements[&40].segment, SegRole::Weight.segment());
+        assert_eq!(weight_tail_of_placements(&placements), tail);
+    }
+
+    /// Unpadded (gate/up at 12800), the same model fits one region and nothing moves.
+    #[test]
+    fn the_unpadded_8b_keeps_its_tail_in_place() {
+        let (mut placements, mut seg_bytes, per_layer) =
+            granite_8b(423_641_088 - 2 * 4_096 * 1_536 * 2);
+        let before = placements.clone();
+        let tail = spill_weight_tail(&mut placements, &mut seg_bytes, &per_layer).unwrap();
+        assert_eq!(tail, WeightTail::InPlace);
+        assert_eq!(weight_tail_of_placements(&placements), WeightTail::InPlace);
+        assert!(
+            placements
+                .iter()
+                .all(|(t, p)| (p.segment, p.offset) == (before[t].segment, before[t].offset))
+        );
+    }
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -3310,6 +3418,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         placements,
         segment_bytes,
         weight_bank_bytes,
+        weight_tail,
         kernel_weights,
         scalarmul_scales,
         weight_scale_folds,
@@ -3387,10 +3496,20 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
     audit_layout_addresses(&places, &segment_bytes, weight_bank_bytes, "<layout>");
+    // ⭐ AND THE TAIL VERDICT IS THE PLACEMENTS' OWN. The runtime copies `[0, bytes)` of the named
+    // slot into every borrowing session and nothing else, so a verdict that disagreed with where the
+    // weights actually sit would hand a session a zero-filled embedding (argmax 0 every token) or
+    // copy scratch over its own. Both come from this one pass; this is the proof they agree.
+    let placed_tail = weight_tail_of_placements(placements);
+    assert_eq!(
+        *weight_tail, placed_tail,
+        "the segment budget's weight-tail verdict disagrees with the weight placements"
+    );
 
     bundle::BundleLayout {
         segment_bytes,
         weight_bank_bytes: std::borrow::Cow::Owned(weight_bank_bytes.clone()),
+        weight_tail: *weight_tail,
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(
             kernel_weights
@@ -4401,8 +4520,18 @@ fn ktir_groups_via_superdsc(
                 })
         })
         .unwrap_or(-1);
+    // The segment budget's verdict rides the identity for the same reason `mq` does: on a green
+    // build the bake's own SEGMENT BUDGET line is never printed, and a spilled tail is a load-time
+    // and device-memory cost that nothing else at build time names.
+    let weight_tail = match layout.map(|l| l.weight_tail).unwrap_or_default() {
+        WeightTail::InPlace => "\"in_place\"".to_string(),
+        WeightTail::Spilled { segment, bytes } => {
+            format!("{{\"spilled\":{{\"segment\":{segment},\"bytes\":{bytes}}}}}")
+        }
+    };
     let id_json = format!(
-        "{{\"fp\":\"{fp}\",\"mq\":{mq},\"programs\":{},\"descriptors\":{},\"per_program\":[{}]}}\n",
+        "{{\"fp\":\"{fp}\",\"mq\":{mq},\"weight_tail\":{weight_tail},\"programs\":{},\
+         \"descriptors\":{},\"per_program\":[{}]}}\n",
         ops.len(),
         sdsc_ops.len(),
         progs

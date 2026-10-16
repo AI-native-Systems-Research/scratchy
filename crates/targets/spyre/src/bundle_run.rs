@@ -414,6 +414,8 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     let layout = crate::bundle_code::BundleLayout {
         segment_bytes,
         weight_bank_bytes: std::borrow::Cow::Owned(Vec::new()),
+        // No weight tail to spill: a single-kernel bundle's parameters are one region each.
+        weight_tail: crate::bundle_code::WeightTail::InPlace,
         places: std::borrow::Cow::Owned(places),
         kernel_weights: std::borrow::Cow::Owned(Vec::new()),
         // The producer's scalar registry. `layout::for_node` fills it for an rmsnorm epsilon or a

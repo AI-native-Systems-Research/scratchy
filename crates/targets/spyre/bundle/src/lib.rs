@@ -140,6 +140,9 @@ pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
 /// not name.
 pub use ktir_superdsc::place::{PlaceId, SynthRole};
+/// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
+/// same reason as [`PlaceId`]: both ends read the one type.
+pub use ktir_superdsc::placement::WeightTail;
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +211,10 @@ pub struct BundleLayout<'a> {
     /// coordinate rather than another segment (there is no free segment slot: 0/3 are
     /// intermediates+activations, 2 is KV, 4 logits, 5+6 intermediate COLORS).
     pub weight_bank_bytes: Cow<'a, [u64]>,
+    /// ⭐ WHERE THE NON-PER-LAYER WEIGHT TAIL LIVES — the bake's verdict, not the runtime's inference.
+    /// [`WeightTail::Spilled`] is the work list every borrowing session's tail copy reads; see
+    /// [`WeightTail`] for why this is a field.
+    pub weight_tail: WeightTail,
     /// Every placed tensor, in a deterministic order.
     pub places: Cow<'a, [Placement]>,
     /// The matmul kernel weights that must be staged tiled.

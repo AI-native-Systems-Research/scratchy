@@ -9565,6 +9565,7 @@ fn layout_tokens(
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout {
         segment_bytes,
         weight_bank_bytes,
+        weight_tail,
         places,
         kernel_weights,
         scalarmul_scales,
@@ -9597,10 +9598,27 @@ fn layout_tokens(
         quote! { (#from, #to) }
     });
     let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
+    // The segment budget's verdict, as a variant: every reader matches on it.
+    let tail = match weight_tail {
+        scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
+            quote! { ::scratchy_target_spyre::bundle_code::WeightTail::InPlace }
+        }
+        scratchy_target_spyre::bundle_code::WeightTail::Spilled { segment, bytes } => {
+            let segment = proc_macro2::Literal::u32_unsuffixed(*segment);
+            let bytes = proc_macro2::Literal::u64_unsuffixed(*bytes);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::WeightTail::Spilled {
+                    segment: #segment,
+                    bytes: #bytes,
+                }
+            }
+        }
+    };
     quote! {
         ::scratchy_target_spyre::bundle_code::BundleLayout {
             segment_bytes: [#(#segs),*],
             weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
+            weight_tail: #tail,
             places: ::std::borrow::Cow::Borrowed(&[#(#places),*]),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),

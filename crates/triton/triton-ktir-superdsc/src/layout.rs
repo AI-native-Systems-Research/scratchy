@@ -48,7 +48,7 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, regions};
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{
-    BundleLayout, SegRole, SynthAlloc, TensorPlacement, align128, synth_footprint_bytes,
+    BundleLayout, SegRole, SynthAlloc, TensorPlacement, WeightTail, align128, synth_footprint_bytes,
 };
 use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
 use ktir_superdsc::superdsc_opspec::Df;
@@ -495,6 +495,8 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No banking: banks exist for a weight segment too big for one device region, and one
         // Triton kernel's parameters are one region each.
         weight_bank_bytes: Vec::new(),
+        // No spilled tail, for the same reason: every parameter is its own region.
+        weight_tail: WeightTail::InPlace,
         // No matmul KERNEL re-tile descriptors. These are built ONLY from a `DeviceTileLayout`
         // witness so the shim's re-tile and the emitter's per-core address read one layout; an
         // entry invented here would be a second, unwitnessed layout. `Program::Matmul` on a

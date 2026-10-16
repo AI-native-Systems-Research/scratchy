@@ -101,6 +101,28 @@ pub enum SegRole {
 /// `spill_weight_tail` records, but not built here.
 pub const WEIGHT_SPILL_SEGS: [usize; 1] = [6];
 
+/// ⭐ WHERE THE WEIGHT SEGMENT'S NON-PER-LAYER TAIL LIVES, as the bake decided it: the segment budget's
+/// verdict, carried in the baked layout as a typed fact rather than left for the runtime to infer
+/// from where the placements happen to sit.
+///
+/// ⛔ A SPILLED TAIL IS NOT FREE, AND IT WAS FOUND IN A SERVE LOG. The spill slot is an intermediate
+/// colour, so it cannot be aliased between bundles: every borrowing session gets its own copy of the
+/// tail (granite-3.1-8b fp16 padded its gate/up to 224 sticks, spilled its 400 MiB tied embedding
+/// into seg6, and reserved 12,000 MB of copies across 30 sessions — 28,644 MB against 15,683 MB
+/// unspilled). That build also decoded 18–26% slower than the unpadded one that fits (how the loss
+/// splits between the pad and the spill is not measured), and nothing at `cargo build` said it had
+/// spilled: the bake's own line goes to a stderr that cargo swallows on success. So the verdict is a field of the bundle, every consumer matches on it, and a model whose
+/// weights are meant to fit pins it in a test.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub enum WeightTail {
+    /// Every weight sits in the weight segment: it fits one device region.
+    #[default]
+    InPlace,
+    /// The tail was moved to `segment` (one of [`WEIGHT_SPILL_SEGS`]) at `[0, bytes)`, which every
+    /// borrowing session has to be handed its own copy of.
+    Spilled { segment: u32, bytes: u64 },
+}
+
 // ⛔⛔⛔ THERE IS NO `MAX_PAGES_PER_REQUEST` AND NO `MAX_FOLD_PASSES`, AND THE GUARD THAT TIED THEM
 // TO THE ROW CONST IS GONE WITH ALL THREE.
 //
@@ -182,6 +204,9 @@ pub struct BundleLayout {
     /// `bundle::Placement::bank` and `bank_weight_segment`.
     #[serde(default)]
     pub weight_bank_bytes: Vec<u64>,
+    /// ⭐ THE SEGMENT BUDGET'S VERDICT on the non-per-layer weight tail — see [`WeightTail`].
+    #[serde(default)]
+    pub weight_tail: WeightTail,
     /// Matmul KERNEL weights → their device-tile [`RetileDescriptor`] (built ONLY via
     /// `DeviceTileLayout`, the same witness the per-core address uses). The PT array
     /// reads the device TILE layout `[out/64, in, 64]`, NOT the row-major flat bytes;

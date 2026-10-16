@@ -89,9 +89,9 @@ fn adopt_from_owner(
 /// The segments this bundle spilled weights into and HOW MANY BYTES of each the spill occupies —
 /// [`adopt_from_owner`]'s work list, empty for every model whose weights fit one segment.
 ///
-/// Derived from the LAYOUT and the bound weight ids rather than from a baked flag: a spill slot is a
-/// declared [`WEIGHT_SPILL_SEGS`] segment that some bound WEIGHT is actually placed in. Asking the
-/// two sources that already exist keeps this from drifting out of step with the emitter's decision.
+/// Read off the bake's own verdict, `layout.weight_tail`, which the emitter proved equal to its weight
+/// placements before baking it (`bake_layout`). The match has no wildcard: a new kind of tail is a
+/// compile error here, not a session that silently skips its copy.
 ///
 /// ⛔ THE LENGTH IS NOT A DETAIL — it is what stops this from corrupting the borrower's scratch. The
 /// spill slot is ALSO an intermediate color segment, and a prefill rung's intermediates are WIDER
@@ -105,22 +105,12 @@ fn adopt_from_owner(
 #[cfg(feature = "spyre-hw")]
 fn spilled_weight_spans(
     layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
-    weight_ids: impl IntoIterator<Item = usize>,
 ) -> Vec<(i64, usize)> {
-    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::WEIGHT_SPILL_SEGS;
-    let mut spans: std::collections::BTreeMap<i64, usize> = Default::default();
-    for id in weight_ids {
-        let Some(p) = layout.place_of_tid(id as u32) else {
-            continue;
-        };
-        if !WEIGHT_SPILL_SEGS.contains(&(p.segment as usize)) {
-            continue;
-        }
-        let end = (p.offset + p.size) as usize;
-        let e = spans.entry(p.segment as i64).or_insert(0);
-        *e = (*e).max(end);
+    use scratchy_target_spyre::bundle_code::WeightTail;
+    match layout.weight_tail {
+        WeightTail::InPlace => Vec::new(),
+        WeightTail::Spilled { segment, bytes } => vec![(segment as i64, bytes as usize)],
     }
-    spans.into_iter().collect()
 }
 
 use crate::error::ExecutorResult;
@@ -295,20 +285,25 @@ fn resident_source_ids(
 }
 
 /// The tensor ids of the spilled weight tail — the companion of [`spilled_weight_spans`], which
-/// carries the same decision as byte ranges. Both read it off the layout so neither can drift from
-/// the emitter. Card-only, for the same reason [`spilled_weight_spans`] is.
+/// carries the same decision as byte ranges. Both key on the bake's verdict, `layout.weight_tail`:
+/// a bound weight is in the tail exactly when it is placed in the slot that verdict names.
+/// Card-only, for the same reason [`spilled_weight_spans`] is.
 #[cfg(feature = "spyre-hw")]
 fn spilled_weight_tail_tids(
     layout: &scratchy_target_spyre::bundle_code::BundleLayout<'static>,
     weight_ids: impl IntoIterator<Item = usize>,
 ) -> Vec<u32> {
-    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::WEIGHT_SPILL_SEGS;
+    use scratchy_target_spyre::bundle_code::WeightTail;
+    let slot = match layout.weight_tail {
+        WeightTail::InPlace => return Vec::new(),
+        WeightTail::Spilled { segment, .. } => segment,
+    };
     weight_ids
         .into_iter()
         .filter(|id| {
             layout
                 .place_of_tid(*id as u32)
-                .is_some_and(|p| WEIGHT_SPILL_SEGS.contains(&(p.segment as usize)))
+                .is_some_and(|p| p.segment == slot)
         })
         .map(|id| id as u32)
         .collect()
@@ -986,7 +981,7 @@ impl SpyreWorker {
                 // later on): which weights the emitter spilled out of the weight segment, as byte
                 // spans to copy and as ids to declare resident. Empty for every model whose weights
                 // fit one segment, which makes every use of it below a no-op.
-                let spill_spans = spilled_weight_spans(&code.layout, weights.iter().map(|w| w.0));
+                let spill_spans = spilled_weight_spans(&code.layout);
                 let spill_tids =
                     spilled_weight_tail_tids(&code.layout, weights.iter().map(|w| w.0));
                 // Model dims from the SAME decode parse the other sessions read: vocab +
@@ -2449,5 +2444,38 @@ mod weight_copy_tests {
             vec![oproj_row(9, &[1, 2, 3, 4]), oproj_row(to as usize, &[5, 6])],
             "a refusal leaves the staged rows alone"
         );
+    }
+}
+
+/// ⭐ THE WEIGHT SETS THIS BINARY CARRIES FIT ONE DEVICE REGION — read off the bundles it baked.
+///
+/// The segment budget's verdict is a field of every baked layout (`WeightTail`), so whether a model's
+/// weights spilled is a property of the binary, not of a serve log. MEASURED on granite-3.1-8b fp16:
+/// padding its gate/up to 224 sticks pushed the weight set past 16 GiB, spilled the 400 MiB tied
+/// embedding into seg6, put 12,000 MB of per-session copies on the card, and that build decoded
+/// 18–26% slower than the unpadded one that fits. That model is the one this crate's CI scope
+/// bakes (`scratchy-models/granite-3.1-8b-instruct`), so a width or layout change that pushes it
+/// back over the region fails here, at `cargo test`, instead of on a card.
+#[cfg(test)]
+mod weight_tail_tests {
+    use scratchy_target_spyre::bundle_code::{WeightTail, bundle, registered_fps};
+
+    #[test]
+    fn every_baked_bundle_keeps_its_weight_tail_in_the_weight_segment() {
+        let fps = registered_fps();
+        assert!(
+            !fps.is_empty(),
+            "the build scope names a model, so this binary carries its bundles"
+        );
+        for fp in fps {
+            let code = bundle(fp).expect("a registered fingerprint resolves");
+            assert_eq!(
+                code.layout.weight_tail,
+                WeightTail::InPlace,
+                "bundle {fp} spilled its weight tail: its weight set no longer fits one device \
+                 region (segment bytes {:?})",
+                code.layout.segment_bytes,
+            );
+        }
     }
 }
