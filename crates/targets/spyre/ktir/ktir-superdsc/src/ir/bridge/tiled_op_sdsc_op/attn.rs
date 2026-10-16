@@ -1748,6 +1748,10 @@ fn assemble_attn_block(
 struct ChunkBufs {
     gkt: String,
     gv: String,
+    // ⭐ THE V SCRATCH IN LX, where the chunk's geometry lets the copy's division be PV's
+    // (`ChunkScratch::value_lx`): one core-local tensor per kv head, which REPLACES `gv` for the gather and
+    // the value leg. `None` keeps the HBM scratch.
+    gv_lx: Option<(crate::sdsc_abstract::ChunkValueLx, Vec<String>)>,
     csc: String,
     cesub: String,
     cexp: String,
@@ -2268,22 +2272,25 @@ fn assemble_attn_chunk(
     };
 
     // ── (1) THE GATHER: every page's Kᵗ and V blocks, kv-head-major, into the two scratches. V's copies
-    //    read V's own slab-major index run above one slab (`ChunkScratch::value_copies`). ──
-    for (name, src, dst, copies) in [
-        (
-            format!("attn_cgkt_o{t}"),
-            kct,
-            cb.gkt.as_str(),
-            chunk.copies().collect::<Vec<_>>(),
-        ),
-        (
-            format!("attn_cgv_o{t}"),
-            vc,
-            cb.gv.as_str(),
-            chunk.value_copies().collect::<Vec<_>>(),
-        ),
+    //    read V's own slab-major index run above one slab (`ChunkScratch::value_copies`). Where V stays in
+    //    LX (`cb.gv_lx`), copy `h` lands in kv head `h`'s own core-local tensor instead. ──
+    let v_copies: Vec<(&str, crate::sdsc_abstract::GatherCopy)> = match &cb.gv_lx {
+        None => chunk
+            .value_copies()
+            .map(|cp| (cb.gv.as_str(), cp))
+            .collect(),
+        Some((vlx, names)) => vlx
+            .copies()
+            .map(|(h, cp)| (names[h as usize].as_str(), cp))
+            .collect(),
+    };
+    let k_copies: Vec<(&str, crate::sdsc_abstract::GatherCopy)> =
+        chunk.copies().map(|cp| (cb.gkt.as_str(), cp)).collect();
+    for (name, src, copies) in [
+        (format!("attn_cgkt_o{t}"), kct, k_copies),
+        (format!("attn_cgv_o{t}"), vc, v_copies),
     ] {
-        for cp in copies {
+        for (dst, cp) in copies {
             let mut op = crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
                 &format!("{name}_s{}", cp.stick()),
                 src,
@@ -2610,6 +2617,15 @@ fn assemble_attn_chunk(
     // only a prompt chunk's rows-divided PV is cut.
     let decode_values = mq == 1 || matches!(history, ChunkHistory::Requests(_));
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk.value_parts(!decode_values).collect();
+    // ⛔ AN LX-RESIDENT V IS ONE PART: each kv head's whole chunk is one core-local tensor whose slice per
+    // core is one contraction stick, so a K-cut part would read a sub-block the pin does not lay out.
+    if cb.gv_lx.is_some() && (parts.len() != 1 || !decode_values) {
+        return Err(SuperDscError(format!(
+            "attention chunk o{t}: an LX-resident value scratch needs the decode value leg in ONE part, \
+             but this body cuts it into {} part(s) (decode_values = {decode_values})",
+            parts.len()
+        )));
+    }
     // ⭐ ABOVE ONE SLAB THE VALUE LEG IS ONE OP PER (QUERY HEAD, SLAB) (`RowBlockValue`): each op contracts
     // its head's probabilities against slab `s` of the slab-major V scratch and lands in slab `s`'s plane of
     // `run_o` at the head's rows. At one slab the op is the per-kv-head one, unchanged.
@@ -2620,7 +2636,14 @@ fn assemble_attn_chunk(
             let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
             let o_off = v.out_off;
             for (p, part) in parts.iter().enumerate() {
-                let kc = corner(part.value_corner(kvh, s), "a kv head's value block")?;
+                // An LX-resident V is kv head `kvh`'s own core-local tensor, read at its pin (no corner).
+                let (v_name, kc) = match &cb.gv_lx {
+                    None => (
+                        cb.gv.as_str(),
+                        corner(part.value_corner(kvh, s), "a kv head's value block")?,
+                    ),
+                    Some((_, names)) => (names[kvh as usize].as_str(), DevOff::ZERO),
+                };
                 let rc = corner(
                     part.probs_corner(blocks, b),
                     "a row block's probability block",
@@ -2662,7 +2685,7 @@ fn assemble_attn_chunk(
                     bmm_form,
                     &rb(&cb.cexp, b_rows, slots),
                     rc,
-                    &Stk::<KernelTag>::kernel(part.slots() as usize, v_cols as usize, &cb.gv),
+                    &Stk::<KernelTag>::kernel(part.slots() as usize, v_cols as usize, v_name),
                     kc,
                     &rb(out, q_rows, hd),
                     o_off,
@@ -3822,17 +3845,35 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         };
         let red_cut = reduction_part_pages(chunk, b_rows) < chunk.pages();
         let n_red = if prompt { lx_parts + 2 } else { 0 }.max(if red_cut { 3 } else { 0 });
+        // ⭐ THE V SCRATCH STAYS IN LX for the ONE-REQUEST decode at the geometry `value_lx` admits — the
+        // decode PV divides its contraction across the cores (`ContractionSplit`), which is the division the
+        // copy already has there. A prompt chunk's PV divides its rows, and a batch chunk's rows are other
+        // requests: both keep the HBM scratch.
+        let gv_lx = chunk
+            .value_lx()
+            .filter(|_| mq == 1 && !rows_are_requests)
+            .map(|vlx| {
+                let names = (0..chunk.nkvh()).map(|h| syn(R::GatherVLx(h))).collect();
+                (vlx, names)
+            });
         let cb = ChunkBufs {
             gkt: syn(R::GatherKt),
             gv: syn(R::GatherV),
+            gv_lx,
             csc: syn(R::ChunkSc),
             cesub: syn(R::ChunkESub),
             cexp: syn(R::ChunkExp),
             red: (0..n_red).map(|i| syn(R::ChunkRed(i))).collect(),
         };
         if let Some(l) = layout {
-            for r in [R::GatherKt, R::GatherV] {
-                l.synth(out_id.synth(r), &chunk.footprint_dims());
+            l.synth(out_id.synth(R::GatherKt), &chunk.footprint_dims());
+            match &cb.gv_lx {
+                None => l.synth(out_id.synth(R::GatherV), &chunk.footprint_dims()),
+                Some((vlx, _)) => {
+                    for h in 0..chunk.nkvh() {
+                        l.synth_lx_core_local(out_id.synth(R::GatherVLx(h)), vlx.per_core_bytes());
+                    }
+                }
             }
             // Every query ROW's scores over the chunk — `nqh·mq` rows, the token stream's own; a decode
             // chunk's probabilities too.

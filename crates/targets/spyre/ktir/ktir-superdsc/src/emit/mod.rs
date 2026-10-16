@@ -1398,7 +1398,7 @@ pub fn pointwise_chunk_out_offset(cols_start: u32) -> u32 {
 /// producer keeps its own division, and `emit_sdsc_tiled` holds every op touching the tensor to it.
 ///
 /// A no-op (and byte-identical emission) for every bundle that declares no LX intermediates.
-fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
+pub(crate) fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>) {
     let Some(l) = layout else { return };
     mark_lx_residency(op, l);
     if op
@@ -1432,8 +1432,17 @@ fn mark_lx_residency(op: &mut OpSpec, l: &BundleLayout) {
 ///   * have DECLARED it core-local (its view's allocation) — an op that reaches the pinned name without
 ///     the residency consult would address LX bytes as HBM;
 ///   * run UNTILED — a trip-sliced op walks a different slice per trip, and the pin holds one;
-///   * fit one core's slice inside the pin;
-///   * divide the work EXACTLY as the first op on the tensor did ([`BundleLayout::record_lx_division`]).
+///   * fit one core's slice OF THAT TENSOR inside the pin;
+///   * hand every core the SAME slice OF THAT TENSOR as the first op on it did
+///     ([`BundleLayout::record_lx_division`]).
+///
+/// ⭐ THE SLICE IS THE TENSOR's, NOT THE OP's. Two ops of different kinds name a tensor's axes
+/// differently — a gather copy writes its destination as `[mb, out]`, the matmul that contracts it reads
+/// the same bytes as its KERNEL `[in, out]` — and divide dims the tensor does not have (a matmul's rows).
+/// So the signature is read off the operand's OWN axes (stick axis first, then the rest in layout order,
+/// unit axes dropped): each axis's extent and split, and which slice of each axis every core holds. Two
+/// ops agree exactly when core `c` holds the same block of the tensor under both. For two ops of one
+/// shape (`esub` → `exp`) that is the op-level comparison it always was.
 ///
 /// Any other op is a build `Err` naming the tensor — never fluent garbage on card.
 fn core_local_reads_agree(
@@ -1459,12 +1468,16 @@ fn core_local_reads_agree(
             )));
         }
         let plan = &op.iter;
-        // The OPERAND's per-core slice — its own axes, not the op's whole iteration space (a PV also iterates
-        // the head dim its probabilities operand does not have).
-        let slice_bytes = v
-            .layout
+        // The operand's own axes, stick axis first, unit axes dropped — see the doc above. Its per-core
+        // slice is along these, not the op's whole iteration space (a PV also iterates the head dim its
+        // probabilities operand does not have).
+        let axes: Vec<&'static str> = std::iter::once(v.stick)
+            .chain(v.layout.iter().copied().filter(|d| *d != v.stick))
+            .filter(|d| plan.extent(d) > 1)
+            .collect();
+        let slice_bytes = axes
             .iter()
-            .map(|&d| u64::from(plan.per_core_extent(d)))
+            .map(|d| u64::from(plan.per_core_extent(d)))
             .product::<u64>()
             * u64::from(v.df.word_length());
         let (_, pin_bytes) = l.lx_pin(name).unwrap_or_default();
@@ -1477,31 +1490,30 @@ fn core_local_reads_agree(
         // ⭐ THE SLICE EACH CORE HOLDS, AXIS BY AXIS OF THIS OPERAND — not the op's whole plan. A matmul and a
         // pointwise op never share a plan (their iteration spaces differ), yet a `{mb:32}` PV and a `{mb:32}`
         // exp hand core `c` the same rows of the probabilities and all of its columns; that per-core slice,
-        // read off the emitter's own core→slice decomposition along the operand's own axes in order, is
-        // exactly what makes a core-local read correct.
+        // read off the emitter's own core→slice decomposition along the operand's own axes, is exactly what
+        // makes a core-local read correct. Unit axes (extent 1) are skipped: a rank-3 view with a phantom
+        // `y` of 1 (the reduce builder's offset slice) holds exactly the elements the rank-2 view does.
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
-        let slices = core_to_wk_slice(plan, &dims);
-        // Unit axes (extent 1) are skipped: a rank-3 view with a phantom `y` of 1 (the reduce builder's
-        // offset slice) holds exactly the elements the rank-2 view does.
-        let per_core: Vec<Vec<(u32, String)>> = (0..plan.cores_used().get().max(1))
-            .map(|c| {
-                v.layout
-                    .iter()
-                    .filter(|&&d| plan.extent(d) > 1)
-                    .map(|&d| {
-                        (
-                            plan.per_core_extent(d),
-                            slices
-                                .get(&c.to_string())
+        let wk = core_to_wk_slice(plan, &dims);
+        let per_core: Vec<Vec<crate::superdsc_opspec::SliceIndex>> =
+            (0..plan.cores_used().get().max(1))
+                .map(|c| {
+                    axes.iter()
+                        .map(|d| {
+                            wk.get(&c.to_string())
                                 .and_then(|s| s.get(d))
-                                .map(|i| format!("{i:?}"))
-                                .unwrap_or_default(),
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        let signature = format!("per-core slices {per_core:?}");
+                                .copied()
+                                .unwrap_or(crate::superdsc_opspec::SliceIndex::UNSPLIT)
+                        })
+                        .collect()
+                })
+                .collect();
+        let signature = format!(
+            "axes {:?}, each core's block {per_core:?}",
+            axes.iter()
+                .map(|d| (plan.extent(d), plan.split_of(d).max(1)))
+                .collect::<Vec<_>>(),
+        );
         l.record_lx_division(name, op_name, signature)
             .map_err(SuperDscError)?;
     }

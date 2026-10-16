@@ -9785,6 +9785,10 @@ fn synth_role_tokens(
         R::XSScratch => quote! { #b::XSScratch },
         R::XRaw => quote! { #b::XRaw },
         R::XDqA => quote! { #b::XDqA },
+        R::GatherVLx(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(*h);
+            quote! { #b::GatherVLx(#h) }
+        }
     }
 }
 

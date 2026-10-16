@@ -1002,6 +1002,7 @@ mod place_id_tests {
             Acc(0),
             LBlk(0),
             LAcc(0),
+            GatherVLx(0),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for r in roles {

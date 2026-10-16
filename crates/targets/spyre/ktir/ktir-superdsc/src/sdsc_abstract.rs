@@ -7098,6 +7098,36 @@ impl ChunkScratch {
         })
     }
 
+    /// ⭐⭐⭐ THE VALUE LEG's LX FORM — the gathered V never touches HBM: each V copy lands in the
+    /// scratchpad of the core that contracts it, and that core's PV reads its KERNEL slice from there.
+    /// The reference's decode does exactly this (its V gather writes `Tensor2_lx` and PV reads
+    /// `Tensor1_lx`, the two split identically, core `c` ↔ entry `c`). Measured on granite-3.1-8b: one
+    /// copy costs only its bytes (10.74 µs per 512 KiB, no per-op constant), and it moves every byte
+    /// twice before PV reads it a third time — so the bytes are the lever, not the op count.
+    ///
+    /// `Some` exactly where the copy's division IS the decode PV's, core for core:
+    ///   * ONE feature slab — V's entry order is K's, a kv head's chunk is `[slots, hd]` row-major, and an
+    ///     entry (`hd * POOL_STICK` elements at `hd == POOL_STICK`) is 64 slots, one stick of PV's
+    ///     contraction;
+    ///   * `entries_per_row == ENTRIES_PER_OP == MAX_CORES` — copy `h` is kv head `h`'s whole chunk, its
+    ///     `mb` divides into one entry per core, and PV's contraction-across-cores split
+    ///     (`slots / POOL_STICK == MAX_CORES` sticks) gives core `c` exactly entry `c`'s 64 slots.
+    ///
+    /// At granite-3.1-2b (8 kv heads, hd 64) that is the 8-page chunk. Every other geometry keeps the HBM
+    /// scratch — `None` is the existing form, not a refusal. Whether the two divisions really agree is
+    /// still proven per op at build, by `emit`'s core-local read law.
+    pub const fn value_lx(self) -> Option<ChunkValueLx> {
+        let one_stick = CopyDims::ENTRIES_PER_OP;
+        if self.plane.slabs() == 1
+            && self.entries_per_row() == one_stick
+            && one_stick == crate::superdsc_opspec::MAX_CORES
+        {
+            Some(ChunkValueLx { chunk: self })
+        } else {
+            None
+        }
+    }
+
     /// The index stick V's run starts at: 0 at one slab, where V's entry order IS K's and the two gathers
     /// share one run; after K's [`Self::index_sticks`] above it, where V is slab-major
     /// ([`Self::value_entry_coord`]).
@@ -7134,6 +7164,43 @@ impl ChunkScratch {
     /// ⭐ HOW THE CHUNK's WIDE INTERMEDIATES ARE CUT INTO ROW BLOCKS — see [`ChunkRowBlocks`].
     pub const fn row_blocks(self, gqa: u32, mq: u32) -> ChunkRowBlocks {
         ChunkRowBlocks::of_group(self.nkvh(), gqa, mq, self.plane.slabs(), self.slots())
+    }
+}
+
+/// ⭐ A CHUNK WHOSE VALUE LEG STAYS IN LX — minted only by [`ChunkScratch::value_lx`], so a copy or a
+/// pin of this form exists only where the copy's division is PV's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkValueLx {
+    chunk: ChunkScratch,
+}
+
+impl ChunkValueLx {
+    pub const fn chunk(self) -> ChunkScratch {
+        self.chunk
+    }
+
+    /// One core's slice of one kv head's gathered V — one entry, which is also the KERNEL slice that
+    /// core's PV contracts. The core-local LX pin of each kv head's V.
+    pub const fn per_core_bytes(self) -> u64 {
+        self.chunk.plane.entry_bytes()
+    }
+
+    /// The V copies, one per kv head: copy `h` reads index stick `value_index_base + h` (the same stick
+    /// and entries as [`ChunkScratch::value_copies`]' op `h`, so the host's table is unchanged) and lands
+    /// at offset 0 of kv head `h`'s OWN core-local tensor — every core's entry at its pin.
+    pub fn copies(self) -> impl Iterator<Item = (u32, GatherCopy)> {
+        let base = self.chunk.value_index_base();
+        self.chunk.copies().map(move |c| {
+            let kvh = c.stick;
+            (
+                kvh,
+                GatherCopy {
+                    stick: c.stick + base,
+                    dest_entry: 0,
+                    ..c
+                },
+            )
+        })
     }
 }
 

@@ -554,6 +554,105 @@ fn a_whole_stick_prompt_chunk_forms_its_causal_block_per_kv_head() {
     }
 }
 
+/// ⭐⭐⭐ WHERE THE COPY's DIVISION IS PV's, THE GATHERED V NEVER TOUCHES HBM — granite-2b's 8-page decode
+/// chunk. There copy `h` IS kv head `h`'s whole chunk, one entry per core, and the decode PV's
+/// contraction split hands core `c` exactly entry `c`'s 64 slots. So each V copy writes kv head `h`'s own
+/// core-local LX tensor and PV `h` reads its KERNEL from that same pin, both LX-only, one start address
+/// on every core. That the ladder emits at all is the build-time proof the two divisions agree (the read
+/// law compares the TENSOR's per-core blocks, under the copy's `[mb, out]` and the matmul's `[in, out]`).
+/// Every other rung, and every prompt chunk, keeps the HBM scratch.
+#[test]
+fn the_eight_page_decode_value_leg_reads_its_kernel_from_lx() {
+    let lx_only = |v: &serde_json::Value| {
+        v["memOrg_"]
+            .as_object()
+            .is_some_and(|m| m.len() == 1 && m.contains_key("lx"))
+    };
+    // The one start address an operand's allocate node gives every core, or `None` if they differ.
+    let pin = |body: &serde_json::Value, lds: &serde_json::Value| -> Option<String> {
+        let idx = lds["ldsIdx_"].as_u64();
+        let alloc = body["scheduleTree_"]
+            .as_array()?
+            .iter()
+            .find(|n| n["nodeType_"] == "allocate" && n["ldsIdx_"].as_u64() == idx)?;
+        assert_eq!(alloc["component_"], "lx");
+        let starts: std::collections::BTreeSet<String> = alloc["startAddressCoreCorelet_"]["data_"]
+            .as_object()?
+            .values()
+            .map(|a| a.to_string())
+            .collect();
+        (starts.len() == 1).then(|| starts.into_iter().next().unwrap())
+    };
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
+        for &j in &ChunkScratch::LADDER {
+            let lx = mq == 1
+                && ChunkScratch::of_chunk(pool, j)
+                    .unwrap()
+                    .value_lx()
+                    .is_some();
+            assert_eq!(lx, mq == 1 && j == 8, "{j} page(s), mq {mq}");
+            let ops = emit_chunk_in_layout(j, mq);
+            let copies: Vec<&(String, serde_json::Value)> = ops
+                .iter()
+                .filter(|(n, _)| n.starts_with("attn_cgv_"))
+                .collect();
+            let values: Vec<&(String, serde_json::Value)> = ops
+                .iter()
+                .filter(|(n, _)| n.starts_with("attn_cov_"))
+                .collect();
+            let mut copy_pins = Vec::new();
+            for (name, v) in &copies {
+                let body = &v["dscs_"][0][name];
+                let out = body["labeledDs_"].as_array().unwrap().last().unwrap();
+                assert_eq!(
+                    lx_only(out),
+                    lx,
+                    "{name} at {j} page(s), mq {mq}: {}",
+                    out["memOrg_"]
+                );
+                if lx {
+                    copy_pins.push(pin(body, out).expect("one pin on every core"));
+                }
+            }
+            let mut value_pins = Vec::new();
+            for (name, v) in &values {
+                let body = &v["dscs_"][0][name];
+                let kernel = body["labeledDs_"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|l| l["dsType_"] == "KERNEL")
+                    .expect("PV's kernel");
+                assert_eq!(lx_only(kernel), lx, "{name} at {j} page(s), mq {mq}");
+                if lx {
+                    value_pins.push(pin(body, kernel).expect("one pin on every core"));
+                }
+            }
+            if lx {
+                // One copy and one PV per kv head, the same eight pins, each distinct.
+                assert_eq!(copies.len(), NKVH as usize);
+                assert_eq!(
+                    copy_pins, value_pins,
+                    "copy h and PV h meet at kv head h's pin"
+                );
+                let distinct: std::collections::BTreeSet<&String> = copy_pins.iter().collect();
+                assert_eq!(distinct.len(), NKVH as usize);
+            }
+        }
+    }
+    // granite-8b's two feature slabs keep the HBM scratch at every rung.
+    let pool8 = PagedKvPool::new(8, 128);
+    for &j in &ChunkScratch::LADDER {
+        assert!(
+            ChunkScratch::of_chunk(pool8, j)
+                .unwrap()
+                .value_lx()
+                .is_none()
+        );
+    }
+}
+
 /// ⛔ A CORE-LOCAL TENSOR TAKES ONE WORK DIVISION: the first op's is recorded, the same one again stands,
 /// and any other is refused — the build-time half of "each core holds only what its own producer wrote".
 #[test]

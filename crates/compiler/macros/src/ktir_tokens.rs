@@ -453,6 +453,10 @@ fn synth_role_tokens(
             let j = proc_macro2::Literal::u32_unsuffixed(j);
             quote! { #path::ECombP(#j) }
         }
+        R::GatherVLx(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(h);
+            quote! { #path::GatherVLx(#h) }
+        }
         other => {
             let v = variant(format!("{other:?}"));
             quote! { #path::#v }

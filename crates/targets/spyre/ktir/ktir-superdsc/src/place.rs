@@ -242,11 +242,15 @@ pub enum SynthRole {
     RunM,
     RunL,
     RunO,
-    // ── K-split / down-projection blocking (the only INDEXED roles) ──
+    // ── K-split / down-projection blocking ──
     Blk(u32),
     Acc(u32),
     LBlk(u32),
     LAcc(u32),
+    // ── the split-KV chunk's LX-resident V, one core-local tensor per kv head
+    //    (`ChunkScratch::value_lx`): a core-local pin holds one slice at one address, so kv heads cannot
+    //    share one tensor at offsets ──
+    GatherVLx(u32),
 }
 
 impl fmt::Display for SynthRole {
@@ -337,6 +341,7 @@ impl fmt::Display for SynthRole {
             Self::Acc(i) => write!(f, "acc{i}"),
             Self::LBlk(i) => write!(f, "lblk{i}"),
             Self::LAcc(i) => write!(f, "lacc{i}"),
+            Self::GatherVLx(h) => write!(f, "gvlx{h}"),
         }
     }
 }
