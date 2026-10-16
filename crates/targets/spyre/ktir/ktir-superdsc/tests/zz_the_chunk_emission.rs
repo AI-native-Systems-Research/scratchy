@@ -269,7 +269,7 @@ fn the_decode_score_parts_divide_their_columns_alone() {
 }
 
 /// ⭐⭐⭐ A PROMPT CHUNK'S PREFIX IS THE SAME CHUNK OVER EVERY ROW: at the shipped prompt-chunk width
-/// (`PREFILL_CHUNK_SLOTS` rows per head, 256 → `gqa·256 = 1024` query rows per kv head) each kv head's
+/// (`PREFILL_CHUNK_SLOTS` rows per head, 512 → `gqa·512 = 2048` query rows per kv head) each kv head's
 /// score, row max and denominator span all of its rows over the whole chunk, the op count outside the
 /// gather does not grow with the chunk, and nothing is a fold op — every row of every head in one
 /// launch, nothing per page.

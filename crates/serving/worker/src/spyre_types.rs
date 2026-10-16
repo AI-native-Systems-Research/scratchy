@@ -594,6 +594,18 @@ impl ReqState {
         BlockTable::map_row(&self.kv_hist, ctx.host, want, ctx.part)
     }
 
+    /// ⭐ THE MAP A PREFILL CHUNK BINDS — [`Self::page_map`] with every page the chunk's `write` lands in
+    /// backed by a host block (see [`BlockTable::map_chunk`]): a window wider than a page writes more
+    /// than the one page holding the history's next slot.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) fn chunk_page_map(
+        &self,
+        ctx: PageMapCtx<'_>,
+        write: scratchy_subtile::sdsc_abstract::ChunkWrite,
+    ) -> Option<BlockTable> {
+        BlockTable::map_chunk(&self.kv_hist, ctx.host, write, ctx.part)
+    }
+
     /// ⭐ WHAT THE SCHEDULER MUST KNOW ABOUT THIS REQUEST'S KV, both halves at once — the slots to
     /// allocate blocks for, and the leading tokens a token-indexed prefix cache may claim.
     ///

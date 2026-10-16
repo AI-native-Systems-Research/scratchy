@@ -1056,8 +1056,12 @@ pub(crate) fn superdsc_forward_chunk(
                 // stride every reader derives; choosing the write SLOT changes one number, on the host, at
                 // every head dim.
                 //
-                // `chunk_room` still clips the REAL rows to the page, because one launch resolves ONE page
-                // table and rows past the boundary would be written where nothing reads them back.
+                // `chunk_room` still clips the REAL rows to the chunk's WINDOW: a window starting at a page
+                // boundary may span `PREFILL_WINDOW_PAGES` whole pages (its cache write is one part per page,
+                // each resolving its own page), and one starting mid-page stays inside that page, because a
+                // part's rows past its page end would be written where nothing reads them back. A padded
+                // window wider than a page always starts at a page boundary — `chunk_write_start` steps it
+                // back there.
                 let padded = scratchy_subtile::sdsc_abstract::SlotCount::new(if use_prefix {
                     cap_m as u32
                 } else {
@@ -1132,9 +1136,10 @@ pub(crate) fn superdsc_forward_chunk(
                 // mask marks them valid, and the row attends K/V computed from padding.
                 //
                 // Which case a chunk is in is decided by arithmetic, not luck: `chunk_write_start` steps BACK
-                // so the full `cap_m`-row padded write fits inside one page, hence `room >= cap_m` after it,
-                // hence `chunk_len < rung_m` ONLY when `real_total - off` is — the LAST chunk. So the tail
-                // pads harmlessly and every mid-prompt chunk is exact.
+                // so the full `cap_m`-row padded write fits inside its window (one page, or whole pages from
+                // a page boundary), hence `room >= cap_m` after it, hence `chunk_len < rung_m` ONLY when
+                // `real_total - off` is — the LAST chunk. So the tail pads harmlessly and every mid-prompt
+                // chunk is exact.
                 //
                 // 🛑 A STRICTER VERSION OF THIS GUARD SHIPPED AND WAS A REGRESSION. It demanded
                 // `chunk_len == rung_m` for EVERY chunk, which refused the final chunk of every long prompt
@@ -1165,8 +1170,17 @@ pub(crate) fn superdsc_forward_chunk(
                 }
                 // Whichever bundle this chunk runs on, it is its OWN session: give it the request's
                 // pages before it writes any K/V, or it writes them into whatever its create-time
-                // map points at.
-                bind_request_pages(pf, req, ctx)?;
+                // map points at. EVERY page the chunk writes, not only the one holding the history's
+                // next slot: a window wider than a page writes one part per page, each aimed at its own
+                // page through this map.
+                bind_chunk_pages(
+                    pf,
+                    req,
+                    placed.wrote(scratchy_subtile::sdsc_abstract::SlotCount::new(
+                        chunk_len as u32,
+                    )),
+                    ctx,
+                )?;
                 // Only the chunk that FINISHES THE PROMPT feeds the sampler — its folded tail
                 // is the first generated token's distribution. Every other chunk skips the
                 // logits D2H, a mid-prompt wave's last chunk included: its tail belongs to a
@@ -2110,7 +2124,8 @@ pub(crate) fn run_request_step(
             // - mid-wave chunks are rung-exact — the placement leaves `room >= cap_m`, so
             //   `chunk_len = (tok_end - tok).min(cap_m).min(room)` is the rung width for
             //   every chunk but a wave's LAST, and that one is exempt from the extent guard;
-            // - a wave-final chunk's padding stays in the page holding its real tail, is
+            // - a wave-final chunk's padding stays in the window holding its real tail (a
+            //   page part past its last real row has no page and is skipped), is
             //   never recorded in `kv_hist`, and is overwritten by the next wave's first
             //   chunk before any row can attend it (`chunk_write_start` is monotone, so the
             //   next chunk's padded window starts no earlier and covers it) — the same

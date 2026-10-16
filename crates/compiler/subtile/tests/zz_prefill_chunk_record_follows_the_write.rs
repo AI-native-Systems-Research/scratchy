@@ -59,8 +59,9 @@ fn replay_prefill(total: usize, cap_m: usize) -> KvHistory {
 fn a_prompts_history_ends_exactly_at_its_token_count() {
     // 96 is the width the 8b's prefix bundle actually bakes and the width that produced the measured
     // 514-vs-450; 64 and 128 are the neighbouring rungs, and 256 divides the page so it never steps back
-    // (the case that hid the defect — it must stay right too).
-    for cap_m in [64usize, 96, 128, 256] {
+    // (the case that hid the defect — it must stay right too). 384 and 512 span two pages: their padded
+    // window steps back to a page START, and 512 (the shipped prefix width) never needs to.
+    for cap_m in [64usize, 96, 128, 256, 384, 512] {
         for total in 1usize..=2200 {
             let hist = replay_prefill(total, cap_m);
             assert_eq!(
@@ -77,7 +78,7 @@ fn a_prompts_history_ends_exactly_at_its_token_count() {
 
 #[test]
 fn b_the_slot_past_the_last_token_is_not_valid() {
-    for cap_m in [64usize, 96, 128, 256] {
+    for cap_m in [64usize, 96, 128, 256, 384, 512] {
         // The lengths that cross a page boundary are the ones that step back; 260..280 and 510..530
         // straddle the first and second boundaries at PAGE_SLOTS == 256.
         for total in (1usize..=40)
@@ -151,7 +152,7 @@ fn c_a_contiguous_prompt_is_one_run_however_many_times_it_stepped_back() {
     // Stepping back re-writes slots the request already holds, so it must not fragment the history: a
     // hole would be masked valid by `col < p` reasoning elsewhere, and a fragmented representation of a
     // contiguous history breaks the uniqueness `KvHistory` documents.
-    for cap_m in [64usize, 96, 128] {
+    for cap_m in [64usize, 96, 128, 384, 512] {
         for total in [96usize, 256, 257, 450, 512, 731, 800, 1143, 1839] {
             let hist = replay_prefill(total, cap_m);
             assert_eq!(

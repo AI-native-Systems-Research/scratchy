@@ -10348,11 +10348,16 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// the width and gives that back. MEASURED, granite-3.1-2b fp16, one card, ABAB:
 ///   10k TTFT  sub-blocked: 13.6 s at 128 rows → 13.0 s at 256 (and ~1k got SLOWER, 0.90 → 0.94 s)
 ///             chunk-formed: 12.8 s at 128 → **11.3 s at 256**; ~1k 0.73 s, ~400 tokens 0.27 s
-/// So granite-2b and granite-8b (hd=128, cut per query head) get 192 and 256, and a model whose
+/// So granite-2b and granite-8b (hd=128, cut per query head) get 192 through 512, and a model whose
 /// causal block stays sub-blocked (the gemma bakes, hd ≥ 256) keeps its 128-row ladder byte for byte.
-const PREFILL_RUNGS: [u32; 25] = [
+///
+/// ⭐ 384 AND 512 SPAN TWO PAGES. Their cache write is cut into page parts at emission (each part
+/// aimed at its own page through the block table — `EmittedOp::kv_slot_offset`), which is what
+/// lets a chunk outgrow the page: the weights are re-streamed once per chunk, so a 10k prompt's
+/// 40 chunks of 256 become 20 of 512.
+const PREFILL_RUNGS: [u32; 27] = [
     7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112, 128,
-    192, 256,
+    192, 256, 384, 512,
 ];
 /// The widest rung a SUB-BLOCKED causal block is baked at (see [`PREFILL_RUNGS`]). Read only by
 /// the `#[cfg(feature = "spyre")]` ladder in `dump_wavefront_mega` — no test reads it, so it is

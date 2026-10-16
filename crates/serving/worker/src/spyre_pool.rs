@@ -191,6 +191,44 @@ pub(crate) fn bind_request_pages(
     bind_request_pages_at(session, req, LaunchSlot::solo(), at, ctx)
 }
 
+/// Point a PREFILL CHUNK's session at the pages it reads AND every page it writes — `write` is the run
+/// the chunk is about to write ([`ChunkStart::wrote`](scratchy_subtile::sdsc_abstract::ChunkStart::wrote)).
+///
+/// [`bind_request_pages`] backs only the page holding the history's next slot, which is every page a
+/// chunk of at most one page writes. A wider window's cache write is cut into page parts, each resolving
+/// its own page through this map, so each of those pages needs a host block of its own — and a part
+/// whose page lies past the chunk's last real row finds none and is skipped by the launch.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn bind_chunk_pages(
+    session: &mut SuperDscSession,
+    req: &ReqState,
+    write: scratchy_subtile::sdsc_abstract::ChunkWrite,
+    ctx: PageMapCtx<'_>,
+) -> ExecutorResult<()> {
+    if !session.is_paged() {
+        return Ok(());
+    }
+    let at = scratchy_subtile::sdsc_abstract::BatchSlot::solo(&req.kv_hist);
+    let map = req.chunk_page_map(ctx, write).ok_or_else(|| {
+        werr(format!(
+            "superdsc paged: cannot map the pages a prefill chunk writes ({:?}): the host granted {} \
+             block(s). Every page the chunk writes must be a host block — the scheduler allocates this \
+             step's tokens' pages, which hold every real row of every chunk of the step",
+            write.run(),
+            ctx.host.len(),
+        ))
+    })?;
+    session
+        .set_block_table(
+            scratchy_target_spyre::fold_plan::LaunchSlotIdx::of_launch(
+                LaunchSlot::solo().index() as i64
+            ),
+            i64::from(at.get()),
+            &map.as_i64(),
+        )
+        .map_err(|e| werr(format!("superdsc paged: set_block_table: {e}")))
+}
+
 /// Install ONE LAUNCH SLOT: which pool row it addresses, which pages, and the KV slot it writes at.
 ///
 /// The row is passed rather than read off a request because a launch has slots a request does not own —
