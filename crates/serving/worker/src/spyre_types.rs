@@ -437,11 +437,6 @@ impl SuperDscBundle {
 pub(crate) struct Shared<'a> {
     pub(crate) embed_tokens: &'a [f32],
     pub(crate) hidden: usize,
-    /// spyre-hw ONLY (the sendnn prefill/batch paths size pool entries with it).
-    /// The KTIR path reads no model-wide head dim — each cos/sin source carries
-    /// its own `RotaryKind`, and per-layer KV widths come off `LayerWiring`.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) head_dim: usize,
     pub(crate) vocab: usize,
     // ⛔ NO `rope_theta` HERE — same law as `kv_dim` below on `Loaded`. A hybrid-
     // attention arch has no single θ: each cos/sin source carries its own
