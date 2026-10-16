@@ -256,6 +256,15 @@ pub struct ResidentExecutor {
 // executors on two threads could race its `Rc<AffineExpr>` refcounts.)
 unsafe impl Send for ResidentExecutor {}
 
+// The executor's HBM — the memory every borrowed weight view wraps — goes with it, so
+// retire the generation those views were minted under before anything can dispatch one.
+#[cfg(metal)]
+impl Drop for ResidentExecutor {
+    fn drop(&mut self) {
+        crate::metal::RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl ResidentExecutor {
     /// Plan `spec` into segments, derive every tensor's shape from the IR, and
     /// allocate ONE persistent HBM stick per tensor (stable address across
@@ -297,6 +306,10 @@ impl ResidentExecutor {
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         force_native: bool,
     ) -> Result<Self, String> {
+        // A new resident HBM: every borrowed weight view minted over a previous one is
+        // now stale (see `metal::RESIDENT_GEN`), and is discarded rather than dispatched.
+        #[cfg(metal)]
+        crate::metal::RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if programs.is_empty() {
             return Err("resident: new_multi needs at least one program".into());
         }

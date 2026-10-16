@@ -1560,10 +1560,25 @@ fn resolve_gemm_bt_operand(
     let fp8 = want_b_fp8 && b_dtype == DType::Fp8E4m3;
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
+        // An f16 or fp8 weight is read IN PLACE when Metal can map its resident allocation
+        // (a borrowed view — no second copy of the weight); otherwise it is copied.
+        // SAFETY (both borrows): the view is dispatched only while its RESIDENT_GEN is live
+        // and the allocation still sits where it was wrapped (both checked on every cache
+        // hit below); resident weights are not written after staging.
+        let borrow = |elem_bytes: usize| {
+            let (alloc, off) = hbm.allocation_at(addr)?;
+            unsafe { UnifiedBuffer::borrow_weight(&engine.device, alloc, off, count, elem_bytes) }
+        };
         if want_b_f16 && b_dtype == DType::F16 {
+            if let Some(view) = borrow(2) {
+                return Ok(view);
+            }
             let raw = hbm.read_bytes(addr, count * bpe as usize);
             engine.unified_f16_from_raw(&raw)
         } else if fp8 {
+            if let Some(view) = borrow(1) {
+                return Ok(view);
+            }
             let raw = hbm.read_bytes(addr, count);
             engine.unified_fp8_from_raw(&raw)
         } else {
@@ -1589,8 +1604,20 @@ fn resolve_gemm_bt_operand(
         fp8,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
-        WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(buf);
+        // A borrowed view is served only while it still wraps the LIVE allocation: same
+        // resident generation, and the tile's bytes still at the address it was minted
+        // over. Anything else is rebuilt (an owned copy is always valid).
+        let live = buf.is_current()
+            && (!buf.is_borrowed()
+                || ctx
+                    .hbm
+                    .borrow()
+                    .allocation_at(addr)
+                    .is_some_and(|(alloc, off)| std::ptr::eq(alloc[off..].as_ptr(), buf.host)));
+        if live {
+            WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(buf);
+        }
     }
     let buf = std::rc::Rc::new(build()?);
     WEIGHT_CACHE.with(|c| {
@@ -3991,12 +4018,29 @@ impl Drop for AlignedAlloc {
 #[cfg(metal)]
 pub struct UnifiedBuffer {
     mtl: std::mem::ManuallyDrop<MtlBuf>,
-    alloc: std::mem::ManuallyDrop<AlignedAlloc>,
+    /// The page-aligned block this buffer OWNS — `None` for a BORROWED view (a no-copy
+    /// wrap of memory someone else owns: a resident weight's emulator HBM allocation, see
+    /// [`UnifiedBuffer::borrow_weight`]), which is never freed or pooled from here.
+    alloc: std::mem::ManuallyDrop<Option<AlignedAlloc>>,
+    /// Host address of element 0: the owned block's head, or the view's tile start.
+    host: *mut u8,
+    /// Byte offset of element 0 within `mtl` — 0 for an owned buffer; a view's tile
+    /// offset into the allocation it wraps (bound as `gpuAddress() + offset`).
+    offset: usize,
+    /// [`RESIDENT_GEN`] a borrowed view was minted under; a view from an older
+    /// generation may wrap freed memory and is never dispatched. 0 for owned buffers.
+    generation: u64,
     len: usize,
-    /// Element width in bytes: 4 (f32, the default) or 2 (f16 weight buffers, the
-    /// `KTIR_F16_WEIGHTS` path). `len` is always the ELEMENT count, never bytes.
+    /// Element width in bytes: 4 (f32, the default), 2 (f16 weight buffers, the
+    /// `KTIR_F16_WEIGHTS` path) or 1 (fp8 codes). `len` is the ELEMENT count, never bytes.
     elem_bytes: usize,
 }
+
+/// Generation of the resident HBM the borrowed weight views wrap: bumped whenever a
+/// resident executor is built or dropped (its allocations come or go). A cached view from
+/// an older generation is discarded unused — see [`UnifiedBuffer::borrow_weight`].
+#[cfg(metal)]
+pub static RESIDENT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The reusable half of a [`UnifiedBuffer`]: the page-aligned host block and the
 /// Metal buffer mapped over *that exact pointer and length*. The two are only ever
@@ -4040,12 +4084,18 @@ impl Drop for UnifiedBuffer {
     fn drop(&mut self) {
         // SAFETY: both fields are ManuallyDrop, taken exactly once here, and never
         // read again (this is the only Drop impl and `self` dies immediately after).
-        let parts = unsafe {
-            BufferParts {
-                mtl: std::mem::ManuallyDrop::take(&mut self.mtl),
-                alloc: std::mem::ManuallyDrop::take(&mut self.alloc),
-            }
+        let (mtl, alloc) = unsafe {
+            (
+                std::mem::ManuallyDrop::take(&mut self.mtl),
+                std::mem::ManuallyDrop::take(&mut self.alloc),
+            )
         };
+        // A borrowed view owns no memory: releasing its Metal buffer (deallocator None)
+        // is the whole teardown — the wrapped allocation belongs to someone else.
+        let Some(alloc) = alloc else {
+            return;
+        };
+        let parts = BufferParts { mtl, alloc };
         let bytes = parts.alloc.layout.size();
         // `try_with`, not `with`: a buffer can outlive the pool itself during thread
         // teardown, once the TLS slots are destroyed. There is nothing to recycle into
@@ -4104,9 +4154,13 @@ impl UnifiedBuffer {
         if let Some(parts) = recycled {
             // SAFETY: `ptr` is the head of this pair's own `bytes`-long allocation.
             unsafe { std::ptr::write_bytes(parts.alloc.ptr, 0, bytes) };
+            let host = parts.alloc.ptr;
             return Ok(Self {
                 mtl: std::mem::ManuallyDrop::new(parts.mtl),
-                alloc: std::mem::ManuallyDrop::new(parts.alloc),
+                alloc: std::mem::ManuallyDrop::new(Some(parts.alloc)),
+                host,
+                offset: 0,
+                generation: 0,
                 len,
                 elem_bytes,
             });
@@ -4130,7 +4184,10 @@ impl UnifiedBuffer {
         .ok_or("UnifiedBuffer: newBufferWithBytesNoCopy returned nil")?;
         Ok(Self {
             mtl: std::mem::ManuallyDrop::new(mtl),
-            alloc: std::mem::ManuallyDrop::new(AlignedAlloc { ptr, layout }),
+            alloc: std::mem::ManuallyDrop::new(Some(AlignedAlloc { ptr, layout })),
+            host: ptr,
+            offset: 0,
+            generation: 0,
             len,
             elem_bytes,
         })
@@ -4160,7 +4217,7 @@ impl UnifiedBuffer {
         let b = Self::new_sized(device, len, 2)?;
         // SAFETY: backing alloc holds >= len*2 live bytes; we own it exclusively here.
         unsafe {
-            std::ptr::copy_nonoverlapping(raw.as_ptr(), b.alloc.ptr, raw.len());
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), b.host, raw.len());
         }
         Ok(b)
     }
@@ -4168,6 +4225,7 @@ impl UnifiedBuffer {
     /// A 1-byte `float8_e4m3fn` CODE buffer from the weight's raw HBM bytes, copied
     /// verbatim — the fp8-B GEMM (`KTIR_B_FP8`) widens each code to `half` while
     /// staging, so the resident weight is its own 1-byte encoding, not a 4-byte decode.
+    /// The fallback when [`borrow_weight`](Self::borrow_weight) cannot wrap the allocation.
     fn fp8_from_raw(
         device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
         raw: &[u8],
@@ -4175,9 +4233,74 @@ impl UnifiedBuffer {
         let b = Self::new_sized(device, raw.len(), 1)?;
         // SAFETY: backing alloc holds >= raw.len() live bytes; we own it exclusively here.
         unsafe {
-            std::ptr::copy_nonoverlapping(raw.as_ptr(), b.alloc.ptr, raw.len());
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), b.host, raw.len());
         }
         Ok(b)
+    }
+
+    /// A BORROWED, NO-COPY view of `len` elements of `elem_bytes` each (1 = fp8 codes,
+    /// 2 = f16) at byte `off` inside `alloc` — a resident weight's own emulator HBM
+    /// allocation — or `None` when `alloc` cannot be wrapped (Metal maps only page-aligned,
+    /// page-multiple memory), leaving the caller to copy ([`fp8_from_raw`](Self::fp8_from_raw)
+    /// / [`f16_from_raw`](Self::f16_from_raw)).
+    ///
+    /// ⭐ WHY: the copy made every GEMM weight resident TWICE — once in HBM, once in the
+    /// GEMM cache. MEASURED gemma-4-12b fp8 emu: ~12 GB of the 34 GB peak footprint.
+    ///
+    /// # Safety
+    /// The view reads `alloc` in place for as long as it lives, so `alloc` must outlive
+    /// every dispatch of it and must not be written meanwhile. The resident weight cache
+    /// upholds this: views carry the [`RESIDENT_GEN`] they were minted under, and a hit
+    /// from an older generation (whose HBM may be freed) is discarded, never dispatched.
+    unsafe fn borrow_weight(
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        alloc: &[u8],
+        off: usize,
+        len: usize,
+        elem_bytes: usize,
+    ) -> Option<Self> {
+        use objc2_metal::{MTLDevice, MTLResourceOptions};
+        const PAGE: usize = 16 * 1024; // Apple Silicon page size
+        let base = alloc.as_ptr() as *mut u8;
+        let bytes = len * elem_bytes;
+        if !(base as usize).is_multiple_of(PAGE)
+            || !alloc.len().is_multiple_of(PAGE)
+            || off + bytes > alloc.len()
+        {
+            return None;
+        }
+        // SAFETY: `base` is page-aligned and `alloc.len()` page-multiple, live per the
+        // caller's contract; deallocator None — the HBM owns and frees the memory.
+        let mtl = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(
+                std::ptr::NonNull::new(base as *mut std::ffi::c_void)?,
+                alloc.len(),
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        }?;
+        Some(Self {
+            mtl: std::mem::ManuallyDrop::new(mtl),
+            alloc: std::mem::ManuallyDrop::new(None),
+            // SAFETY: `off + bytes <= alloc.len()` was checked above.
+            host: unsafe { base.add(off) },
+            offset: off,
+            generation: RESIDENT_GEN.load(std::sync::atomic::Ordering::Relaxed),
+            len,
+            elem_bytes,
+        })
+    }
+
+    /// True for a borrowed no-copy view (see [`borrow_weight`](Self::borrow_weight)).
+    fn is_borrowed(&self) -> bool {
+        self.alloc.is_none()
+    }
+
+    /// Whether this buffer may be dispatched: always for an owned buffer; for a borrowed
+    /// view only while the resident HBM generation it wraps is still the live one.
+    fn is_current(&self) -> bool {
+        self.alloc.is_some()
+            || self.generation == RESIDENT_GEN.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// True for an f16 (half, 2-byte) buffer; false for the default f32 buffer.
@@ -4193,12 +4316,12 @@ impl UnifiedBuffer {
     pub fn as_slice(&self) -> &[f32] {
         debug_assert_eq!(self.elem_bytes, 4, "as_slice() on an f16 UnifiedBuffer");
         // SAFETY: alloc holds len f32s of live, aligned, initialized memory.
-        unsafe { std::slice::from_raw_parts(self.alloc.ptr as *const f32, self.len) }
+        unsafe { std::slice::from_raw_parts(self.host as *const f32, self.len) }
     }
     pub fn as_mut_slice(&mut self) -> &mut [f32] {
         debug_assert_eq!(self.elem_bytes, 4, "as_mut_slice() on an f16 UnifiedBuffer");
         // SAFETY: as above; &mut self gives exclusive access.
-        unsafe { std::slice::from_raw_parts_mut(self.alloc.ptr as *mut f32, self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.host as *mut f32, self.len) }
     }
 }
 
@@ -5081,16 +5204,21 @@ impl NaxGemm {
             (false, false) => (self.block_n, self.block_m, self.threads),
         };
         let e_mtl = e.unwrap_or(b); // dummy when binop==0 (never dereferenced)
+        // A borrowed weight view wraps resident HBM in place; one minted under an older
+        // resident generation may wrap freed memory, so it is refused, never dispatched.
+        if !b.is_current() {
+            return Err("metal: stale borrowed weight view (resident HBM was rebuilt)".into());
+        }
         // A/B/C/E are already resident `UnifiedBuffer`s — no readback, the caller
         // reads `c` directly. See [`mtl4::dispatch`]'s doc for why this returns
         // wall-clock elapsed rather than `GPUStartTime`/`GPUEndTime` (MTL4 command
-        // buffers don't expose those).
+        // buffers don't expose those). B binds at its view offset (0 unless borrowed).
         let elapsed = mtl4::dispatch(
             &self.device,
             pipe,
             &[
                 mtl4::Arg::Buffer(&a.mtl),
-                mtl4::Arg::Buffer(&b.mtl),
+                mtl4::Arg::BufferAt(&b.mtl, b.offset as u64),
                 mtl4::Arg::Buffer(&c.mtl),
                 mtl4::Arg::Bytes(bytemuck_u32(&dims)),
                 mtl4::Arg::Buffer(&e_mtl.mtl),
@@ -6065,6 +6193,72 @@ kernel void mpp_probe(
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A BORROWED fp8 view — a no-copy wrap of a page-aligned allocation, bound at a tile
+    /// offset that is NOT page-aligned (an N-tile of a resident weight) — computes the
+    /// same bits as an owned copy of that tile's codes, and is refused (never dispatched)
+    /// once the resident generation it was minted under is retired.
+    #[test]
+    fn a_borrowed_fp8_view_matches_its_owned_copy_and_dies_with_its_generation()
+    -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping borrowed-view test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
+        if !ctx.has_fp8_b_pipelines() {
+            eprintln!("not a NAX device — no fp8-B pipelines, skipping");
+            return Ok(());
+        }
+        const PAGE: usize = 16 * 1024;
+        let (m, k, n) = (19usize, 384usize, 96usize);
+        let tile_off = 7 * k; // rows [7, 7 + n) of a taller weight: mid-page start
+        let total = 3 * PAGE;
+        assert!(tile_off + n * k <= total);
+        let layout = std::alloc::Layout::from_size_align(total, PAGE).unwrap();
+        // SAFETY: non-zero layout; the block is freed at the end of the test, after the
+        // view (and every dispatch of it) is gone.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        let block = unsafe { std::slice::from_raw_parts_mut(base, total) };
+        for (i, b) in block.iter_mut().enumerate() {
+            let c = ((i * 29 + i / 5) % 256) as u8;
+            *b = if c & 0x7F == 0x7F { c & 0xF7 } else { c };
+        }
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
+        let ua = ctx.unified_from(&a)?;
+        let owned = ctx.unified_fp8_from_raw(&block[tile_off..tile_off + n * k])?;
+        // SAFETY: `block` outlives the view, and nothing writes it while the view lives.
+        let view = unsafe { UnifiedBuffer::borrow_weight(&ctx.device, block, tile_off, n * k, 1) }
+            .ok_or("a page-aligned, page-multiple block must be borrowable")?;
+        assert!(view.is_borrowed() && view.is_fp8());
+        let mut c_owned = ctx.unified(m * n)?;
+        let mut c_view = ctx.unified(m * n)?;
+        ctx.matmul_unified(
+            m,
+            k,
+            n,
+            &ua,
+            &owned,
+            &mut c_owned,
+            None,
+            Epilogue::NONE,
+            true,
+        )?;
+        ctx.matmul_unified(m, k, n, &ua, &view, &mut c_view, None, Epilogue::NONE, true)?;
+        for (i, (w, g)) in c_owned.as_slice().iter().zip(c_view.as_slice()).enumerate() {
+            assert_eq!(w.to_bits(), g.to_bits(), "borrowed vs owned at element {i}");
+        }
+        RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ctx.matmul_unified(m, k, n, &ua, &view, &mut c_view, None, Epilogue::NONE, true)
+                .is_err(),
+            "a view from a retired generation must never be dispatched"
+        );
+        drop(view);
+        // SAFETY: the view is dropped; `base` came from `alloc_zeroed(layout)`.
+        unsafe { std::alloc::dealloc(base, layout) };
         Ok(())
     }
 

@@ -462,11 +462,21 @@ pub(crate) fn stage_bound_weights(
     // emptied every completion in `22a8f469`. Asked of the GENERATED wiring
     // now, which carries the same per-id extents the manifest did.
     wiring: &scratchy_target_spyre::wiring::Wiring,
+    // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
+    // (no copy) at its last binding instead of copying it while the original stays alive.
+    alloc: &mut SpyreAllocator,
 ) -> ExecutorResult<Vec<(usize, Vec<u8>, SDType, Vec<usize>)>> {
     let _t_load = std::time::Instant::now();
     let mut weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)> = Vec::new();
     let _take_s = 0f64;
-    for bw in bound {
+    // The LAST binding of each buffer — a buffer two bindings share (a tied head, k=v) is
+    // copied for every binding but its last, which takes it.
+    let last_binding: std::collections::HashMap<*const u8, usize> = bound
+        .iter()
+        .enumerate()
+        .map(|(i, bw)| (gpu_tensor_bytes(&bw.tensor).as_ptr(), i))
+        .collect();
+    for (bi, bw) in bound.iter().enumerate() {
         let is_gemm = bw.is_gemm;
         let s_id = bw.id as usize;
         // ⭐⭐⭐ `[rows, cols]` COMES FROM THE BAKE, NOT FROM THE TENSOR'S OWN DIMS.
@@ -499,7 +509,18 @@ pub(crate) fn stage_bound_weights(
         // and nothing else. `raw_name` survives only for the card path's size diagnostic below.
         #[cfg(feature = "spyre-hw")]
         let raw_name = scratchy_target_spyre::bundle_code::PlaceId::Act((s_id) as u32);
-        let bytes = gpu_tensor_bytes(&bw.tensor).to_vec();
+        let bytes = {
+            let src = gpu_tensor_bytes(&bw.tensor);
+            let (ptr, len) = (src.as_ptr(), src.len());
+            if last_binding.get(&ptr) == Some(&bi) {
+                // SAFETY: this is the buffer's last binding and staging is its last reader
+                // in the load — nothing reads through `bw.tensor` (or any tensor viewing
+                // the same buffer) after this point.
+                unsafe { alloc.take(ptr, len) }.unwrap_or_else(|| src.to_vec())
+            } else {
+                src.to_vec()
+            }
+        };
         let dt = bw.tensor.dtype();
         // The sengraph emits every GEMM `MatMul` with `transpose_b=false`, so the
         // bound `ModelInput` must be the logical `[in, out] = [k, n]` (= on-disk
@@ -930,7 +951,7 @@ impl SpyreWorker {
             bound.len(),
             wirings.decode.tensor_shapes.len()
         );
-        let weights = stage_bound_weights(&bound, &wirings.decode)?;
+        let weights = stage_bound_weights(&bound, &wirings.decode, gw.allocator_mut())?;
         tracing::info!(
             "[weights] staged {} weight(s) for the session",
             weights.len()

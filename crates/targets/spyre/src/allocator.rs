@@ -22,6 +22,25 @@ impl SpyreAllocator {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Hand the buffer at `ptr` (exactly `len` bytes) to the caller as an owned `Vec`,
+    /// WITHOUT copying — `Box<[u8]>::into_vec` reuses the allocation. `None` when no
+    /// buffer this allocator owns starts at `ptr` with that length.
+    ///
+    /// ⭐ WHY: staging a checkpoint used to COPY every tensor out of these buffers while
+    /// they stayed alive, so for the length of the load the weights existed twice.
+    /// MEASURED gemma-4-12b fp8 emu: a 36 GB load peak for a 12 GB checkpoint.
+    ///
+    /// # Safety
+    /// Every `GpuTensor` viewing this buffer is left dangling: the caller must not read
+    /// through any of them after the take (the allocator no longer owns the memory).
+    pub unsafe fn take(&mut self, ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+        let i = self
+            .allocs
+            .iter()
+            .position(|b| std::ptr::eq(b.as_ptr(), ptr) && b.len() == len)?;
+        Some(self.allocs.swap_remove(i).into_vec())
+    }
 }
 
 /// Device-memory witness for the host-backed Spyre allocator. The buffers are
