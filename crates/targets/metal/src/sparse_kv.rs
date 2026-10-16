@@ -520,6 +520,14 @@ impl SparseRegistry {
         (self.stores.iter_mut()).try_for_each(|s| s.release(run.clone(), mapper))
     }
 
+    /// The blocks every registered store has mapped — what a step can name without mapping more —
+    /// or `None` with none registered.
+    pub fn backed(&self) -> Option<usize> {
+        (self.stores.iter())
+            .map(|s| s.mapped.load(Ordering::Relaxed))
+            .min()
+    }
+
     /// Map every store through `blocks` blocks, on `mapper`. Whether any mapped a step.
     pub fn reach(&mut self, blocks: usize, mapper: &Arc<KvMapper>) -> Result<bool, String> {
         if self.apart.is_some() {

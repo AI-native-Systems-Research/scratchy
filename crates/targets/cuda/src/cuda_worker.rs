@@ -3248,6 +3248,7 @@ impl CudaWorker {
             kv_extent: HashMap::new(),
             // As metal: slot == token here, so there is no pool-wide reach to report.
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: None,
         })
     }

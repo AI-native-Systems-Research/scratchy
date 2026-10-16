@@ -103,6 +103,10 @@ pub struct ModelRunnerOutput {
     /// `None` for every backend whose KV is token-addressed (cuda/metal): there the write slot IS the token
     /// count and a new request's own allocation already covers it.
     pub kv_pool_reach: Option<scratchy_core_common::KvSlotSpan>,
+    /// HOW MANY BLOCKS OF EACH KV STORE THE WORKER HAS BACKED WITH MEMORY after this step. `Some` only from
+    /// a worker that declared [`scratchy_core_common::KvBacking::OnFirstUse`] (metal), for the allocator to
+    /// spend the prefix cache's free blocks before a block that would map more.
+    pub kv_backed: Option<scratchy_core_common::KvBackedBlocks>,
 
     /// Deferred D2H resolver. When present, `sampled_token_ids` contains
     /// placeholders. Call `resolve()` to synchronize the D2H transfer and
@@ -154,6 +158,7 @@ impl ModelRunnerOutput {
             pooler_output: None,
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: None,
         }
     }
@@ -226,6 +231,7 @@ impl ModelRunnerOutput {
             pooler_output: None,
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: None,
         }
     }
@@ -254,6 +260,7 @@ impl ModelRunnerOutput {
             pooler_output: None,
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: None,
         }
     }
@@ -280,6 +287,7 @@ impl ModelRunnerOutput {
             pooler_output: None,
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: Some(D2hResolve::Tokens(resolver)),
         }
     }
@@ -353,6 +361,12 @@ pub trait Executor: Send {
     /// tracker, beside [`Self::kv_addressing`].
     fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
         scratchy_core_common::HybridKvStores::Shared
+    }
+
+    /// Forwarded from [`crate::worker::Worker::kv_backing`], asked when the engine builds the block
+    /// tracker, beside [`Self::hybrid_kv_stores`].
+    fn kv_backing(&self) -> scratchy_core_common::KvBacking {
+        scratchy_core_common::KvBacking::Allocated
     }
 
     /// ⭐ HOW THE WORKER'S RECURRENT-STATE SNAPSHOTS SHARE THE KV BUDGET — asked once, when the
@@ -489,6 +503,7 @@ impl Executor for NoopExecutor {
             pooler_output: None,
             kv_extent: HashMap::new(),
             kv_pool_reach: None,
+            kv_backed: None,
             d2h_resolver: None,
         })
     }

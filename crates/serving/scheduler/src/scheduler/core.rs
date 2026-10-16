@@ -17,7 +17,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use scratchy_core_common::multimodal::MultimodalData;
-use scratchy_core_common::{BlockKind, HybridKvStores, Request, RequestStatus};
+use scratchy_core_common::{
+    BlockKind, HybridKvStores, KvBackedBlocks, KvBacking, Request, RequestStatus,
+};
 use scratchy_core_config::{SchedulerConfig, SchedulerPolicy, SpansConfig};
 use tracing::warn;
 
@@ -125,6 +127,11 @@ pub trait KVCacheManagerOps: Send {
     /// Defaulted to a no-op so a tracker that does not need it says nothing — the value only means anything
     /// where a batched step appends every row at one shared slot.
     fn set_kv_pool_reach(&mut self, _reach: scratchy_core_common::KvSlotSpan) {}
+
+    /// HOW MANY BLOCKS OF EACH KV STORE THE WORKER HAS BACKED, reported after each step by a worker that
+    /// declared [`scratchy_core_common::KvBacking::OnFirstUse`]. Defaulted to a no-op: only the hybrid
+    /// path tells a cached free block from a never-used one by it.
+    fn set_kv_backed(&mut self, _backed: scratchy_core_common::KvBackedBlocks) {}
 
     /// THIS STEP'S SHARED WRITE-SLOT DEPTH — the max over every request about to run, set once before any of
     /// them is allocated. Defaulted to a no-op for the same reason as above: it means nothing where KV is
@@ -293,15 +300,27 @@ pub struct SimpleBlockTracker {
     /// free block IDs). Full groups take the lowest IDs and hold them; sliding
     /// groups recycle their just-freed low IDs immediately, so the **max
     /// allocated block ID stays ~`full_blocks + Σ window_blocks`** plus the
-    /// kept prompt windows (`hybrid_kept`). This is the
+    /// kept prompt windows (`hybrid_kept`) and, where every block is allocated
+    /// up front, the cache ended requests leave (`Freed::Cached`). This is the
     /// load-bearing adaptation to scratchy's substrate: lockstep
     /// `grow_to_cover` residency is keyed on the max block ID, so an unbounded
     /// (FIFO, free-to-back) ID would commit the whole pool resident and
     /// re-create the OOM this project exists to fix. One per block space
     /// (`SwaGroup::space`), each numbering its own blocks; empty on the non-SWA
-    /// path. Per-block state (`ref_cnt`, `hybrid_id_to_key`, `hybrid_kept`) is
-    /// indexed by `space_slot`.
+    /// path. Per-block state (`ref_cnt`, `hybrid_id_to_key`, `hybrid_kept`,
+    /// `free_seq`) is indexed by `space_slot`.
     hybrid_spaces: Vec<BlockSpace>,
+
+    /// Per `space_slot`: the sequence number of the block's latest free on the
+    /// hybrid path. A free-list entry holding another one is stale.
+    free_seq: Vec<u64>,
+
+    /// The next `free_seq` to hand out.
+    next_free_seq: u64,
+
+    /// How the worker backs the hybrid path's blocks with memory — declared
+    /// when the tracker is built ([`Self::with_kv_backing`]).
+    kv_backing: KvBacking,
 
     /// Hybrid prefix cache: namespaced per group. `(group_id, block_hash) ->
     /// block_id`. A full group and a sliding group with identical token content
@@ -401,13 +420,35 @@ struct SwaGroup {
     space: usize,
 }
 
+/// Where a freed block of the hybrid path waits to be handed out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freed {
+    /// No request is likely to reuse it (never used, or slid out of a running
+    /// request's window): handed out lowest ID first, so a sliding group
+    /// recycles its own out-of-window blocks and the store's highest block
+    /// stays near the working set.
+    Recycled,
+    /// The cache a request leaves when it ends: handed out only once no backed
+    /// recycled block is left (`pop_free`), least recently freed first, so it
+    /// outlives other requests' traffic while the store has room for it (#330).
+    Cached,
+}
+
 /// One block space of the hybrid path: the block IDs one KV store is addressed
 /// with (`SwaGroup::space`).
 #[derive(Debug, Default)]
 struct BlockSpace {
-    /// Free IDs, lowest first. Stale entries (a block touched for reuse keeps
-    /// its heap slot) are skipped on pop.
-    free_min: BinaryHeap<Reverse<usize>>,
+    /// `Freed::Recycled` IDs, lowest first, each with the `free_seq` it was
+    /// freed under. Stale entries (the block was touched for reuse, or freed
+    /// again since) are skipped on pop.
+    free_min: BinaryHeap<Reverse<(usize, u64)>>,
+    /// `Freed::Cached` IDs, least recently freed first, each with its
+    /// `free_seq`. Stale entries are skipped the same way.
+    cached_lru: VecDeque<(usize, u64)>,
+    /// Under [`KvBacking::OnFirstUse`], the IDs the worker last reported backed
+    /// (`KvBackedBlocks`): a recycled block past them maps memory a cached one
+    /// does not, so the cached one goes first.
+    backed: usize,
     /// IDs in use (`ref_cnt > 0`), the null block excluded.
     used: usize,
     /// IDs in use that only kept prompt windows hold
@@ -467,6 +508,9 @@ impl SimpleBlockTracker {
             spans_config: SpansConfig::from_env(),
             swa_groups: None,
             hybrid_spaces: Vec::new(),
+            free_seq: Vec::new(),
+            next_free_seq: 1,
+            kv_backing: KvBacking::Allocated,
             hybrid_hash_to_id: HashMap::new(),
             hybrid_id_to_key: HashMap::new(),
             hybrid_req_hashes: HashMap::new(),
@@ -536,11 +580,13 @@ impl SimpleBlockTracker {
         self.total_blocks = num_blocks;
         self.ref_cnt = vec![0; num_spaces * num_blocks];
         self.kept_refs = vec![0; num_spaces * num_blocks];
+        // Every block starts free under `free_seq` 0.
+        self.free_seq = vec![0; num_spaces * num_blocks];
         // Block 0 of each space = null (held out of the free set); data blocks
         // are 1..num_blocks.
         self.hybrid_spaces = (0..num_spaces)
             .map(|_| BlockSpace {
-                free_min: (1..num_blocks).map(Reverse).collect(),
+                free_min: (1..num_blocks).map(|id| Reverse((id, 0))).collect(),
                 ..Default::default()
             })
             .collect();
@@ -620,6 +666,19 @@ impl SimpleBlockTracker {
     /// the worker's first report left every earlier allocation on the token-addressed rule.
     pub fn sharing_one_write_slot(mut self) -> Self {
         self.addressing = scratchy_core_common::KvAddressing::OneSharedWriteSlot;
+        self
+    }
+
+    /// DECLARE HOW THE WORKER BACKS THE HYBRID PATH'S BLOCKS WITH MEMORY. Under
+    /// [`KvBacking::OnFirstUse`] a never-used block past what the worker last
+    /// reported backed ([`KVCacheManagerOps::set_kv_backed`]) is handed out
+    /// only once no cached one is left, so the prefix cache never maps memory
+    /// of its own; nothing is backed until the first report.
+    ///
+    /// ⛔ DECLARED, NOT INFERRED from whether a report has arrived, which is
+    /// false until a step has run (see [`scratchy_core_common::KvAddressing`]).
+    pub fn with_kv_backing(mut self, backing: KvBacking) -> Self {
+        self.kv_backing = backing;
         self
     }
 
@@ -1093,23 +1152,49 @@ impl SimpleBlockTracker {
         self.ref_cnt[block_id] += 1;
     }
 
-    /// Pop `count` lowest free block IDs of block space `space` (hybrid path).
-    /// Returns `None` if the space can't satisfy the request (callers
-    /// capacity-check first; this is the defensive guard).
+    /// The IDs of block space `space` backed by memory: every one under
+    /// [`KvBacking::Allocated`], those the worker last reported under
+    /// [`KvBacking::OnFirstUse`].
+    fn backed(&self, space: usize) -> usize {
+        match self.kv_backing {
+            KvBacking::Allocated => self.total_blocks,
+            KvBacking::OnFirstUse => self.hybrid_spaces[space].backed,
+        }
+    }
+
+    /// The next free block of block space `space` to hand out: the lowest
+    /// recycled one while it is backed, then the least recently freed cached
+    /// one, and only once none is left a recycled one the worker must back
+    /// first. Skips STALE entries: a block touched for cache reuse
+    /// (`touch_hybrid_block`) or freed again since keeps its old entry. Mirrors
+    /// `allocate_fresh_blocks`'s lazy free-queue skip.
+    fn pop_free(&mut self, space: usize) -> Option<usize> {
+        let backed = self.backed(space);
+        loop {
+            let st = &mut self.hybrid_spaces[space];
+            let recycle = matches!(st.free_min.peek(), Some(&Reverse((id, _))) if id < backed);
+            let entry = if recycle || st.cached_lru.is_empty() {
+                st.free_min.pop()?.0
+            } else {
+                st.cached_lru.pop_front()?
+            };
+            if self.live_free_entry(space, entry) {
+                return Some(entry.0);
+            }
+        }
+    }
+
+    /// Pop `count` free block IDs of block space `space` (hybrid path), in
+    /// `pop_free` order. Returns `None` if the space can't satisfy the request
+    /// (callers capacity-check first; this is the defensive guard).
     fn alloc_hybrid_fresh(&mut self, space: usize, count: usize) -> Option<Vec<usize>> {
         if self.space_free(space) < count {
             return None;
         }
         let mut ids = Vec::with_capacity(count);
         while ids.len() < count {
-            let Reverse(id) = self.hybrid_spaces[space].free_min.pop()?;
+            let id = self.pop_free(space)?;
             let slot = self.space_slot(space, id);
-            // Skip STALE heap entries: a block touched for cache reuse
-            // (`touch_hybrid_block`) keeps its old heap slot but has ref_cnt > 0.
-            // Mirrors `allocate_fresh_blocks`'s lazy free-queue skip.
-            if self.ref_cnt[slot] > 0 {
-                continue;
-            }
             self.ref_cnt[slot] = 1;
             self.hybrid_spaces[space].used += 1;
             // Lazy eviction: if this recycled block was still hash-mapped, drop
@@ -1128,11 +1213,14 @@ impl SimpleBlockTracker {
     }
 
     /// Return `blocks` of block space `space` to that space (hybrid path),
-    /// skipping the null block. Freed IDs go back into the space's
-    /// lowest-free-first heap so a sliding group reuses its own low IDs
-    /// immediately — the bound on the max block ID.
-    fn free_hybrid_blocks(&mut self, space: usize, blocks: &[usize]) {
-        for &b in blocks {
+    /// skipping the null block. A block freed as [`Freed::Recycled`], or one
+    /// with no cache entry, goes back into the space's lowest-free-first heap so
+    /// a sliding group reuses its own low IDs immediately — the bound on the max
+    /// block ID. One freed as [`Freed::Cached`] queues behind every earlier one,
+    /// a request's last block first as vLLM frees them, so its prefix is
+    /// evicted last.
+    fn free_hybrid_blocks(&mut self, space: usize, blocks: &[usize], freed: Freed) {
+        for &b in blocks.iter().rev() {
             if b == Self::NULL_BLOCK {
                 continue;
             }
@@ -1141,12 +1229,45 @@ impl SimpleBlockTracker {
                 debug_assert!(t.ref_cnt[slot] > 0, "double-free of block {b}");
                 t.ref_cnt[slot] -= 1;
                 if t.ref_cnt[slot] == 0 {
+                    let seq = t.next_free_seq;
+                    t.next_free_seq += 1;
+                    t.free_seq[slot] = seq;
+                    let cached = freed == Freed::Cached && t.hybrid_id_to_key.contains_key(&slot);
                     let space_state = &mut t.hybrid_spaces[space];
                     space_state.used -= 1;
-                    space_state.free_min.push(Reverse(b));
+                    if cached {
+                        space_state.cached_lru.push_back((b, seq));
+                    } else {
+                        space_state.free_min.push(Reverse((b, seq)));
+                    }
                 }
             });
         }
+        self.drop_stale_free_entries(space);
+    }
+
+    /// Drop block space `space`'s stale free-list entries once either list
+    /// holds more than twice the space's blocks, so blocks touched and freed
+    /// again and again never grow them without bound.
+    fn drop_stale_free_entries(&mut self, space: usize) {
+        let limit = 2 * self.total_blocks;
+        if self.hybrid_spaces[space].cached_lru.len() > limit {
+            let mut lru = std::mem::take(&mut self.hybrid_spaces[space].cached_lru);
+            lru.retain(|&entry| self.live_free_entry(space, entry));
+            self.hybrid_spaces[space].cached_lru = lru;
+        }
+        if self.hybrid_spaces[space].free_min.len() > limit {
+            let mut heap = std::mem::take(&mut self.hybrid_spaces[space].free_min);
+            heap.retain(|&Reverse(entry)| self.live_free_entry(space, entry));
+            self.hybrid_spaces[space].free_min = heap;
+        }
+    }
+
+    /// Whether free-list entry `(id, seq)` of block space `space` still names
+    /// a free block's latest free.
+    fn live_free_entry(&self, space: usize, (id, seq): (usize, u64)) -> bool {
+        let slot = self.space_slot(space, id);
+        self.ref_cnt[slot] == 0 && self.free_seq[slot] == seq
     }
 
     /// vLLM `SlidingWindowManager.remove_skipped_blocks`: free the blocks that
@@ -1210,7 +1331,7 @@ impl SimpleBlockTracker {
                 blocks[i] = Self::NULL_BLOCK;
             }
         }
-        self.free_hybrid_blocks(grp.space, &removed);
+        self.free_hybrid_blocks(grp.space, &removed, Freed::Recycled);
         if !kept.is_empty() {
             let slots: Vec<usize> = (kept.into_iter())
                 .map(|b| self.space_slot(grp.space, b))
@@ -1232,12 +1353,12 @@ impl SimpleBlockTracker {
         self.free_kept(kept);
     }
 
-    /// Free kept blocks, given as `space_slot`s.
+    /// Free kept blocks, given as `space_slot`s, as the cache they are.
     fn free_kept(&mut self, slots: Vec<usize>) {
         for slot in slots {
             let (space, id) = self.slot_block(slot);
             self.tallied(space, slot, |t| t.kept_refs[slot] -= 1);
-            self.free_hybrid_blocks(space, &[id]);
+            self.free_hybrid_blocks(space, &[id], Freed::Cached);
         }
     }
 
@@ -1684,6 +1805,28 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         self.kv_pool_reach = Some(reach);
     }
 
+    fn set_kv_backed(&mut self, backed: KvBackedBlocks) {
+        let Some(groups) = &self.swa_groups else {
+            return;
+        };
+        let global = groups[SwaGroup::global_index(groups)].space;
+        debug_assert_eq!(
+            matches!(backed, KvBackedBlocks::GlobalApart { .. }),
+            self.hybrid_spaces.len() == 2,
+            "a {backed:?} report for {} block spaces",
+            self.hybrid_spaces.len()
+        );
+        for (space, st) in self.hybrid_spaces.iter_mut().enumerate() {
+            let blocks = match backed {
+                KvBackedBlocks::Shared(blocks) => blocks,
+                KvBackedBlocks::GlobalApart { global: blocks, .. } if space == global => blocks,
+                KvBackedBlocks::GlobalApart { pool, .. } => pool,
+            };
+            // A report one step old under async scheduling: what is backed only grows.
+            st.backed = st.backed.max(blocks);
+        }
+    }
+
     fn allocate_slots(
         &mut self,
         request: &Request,
@@ -1941,13 +2084,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             self.req_to_hashes.remove(request_id);
             self.hybrid_req_hashes.remove(request_id);
 
-            // Hybrid path: return each group's (non-null) blocks to the shared
-            // pool via the lowest-free-first heap. The null block is filtered.
+            // Hybrid path: return each group's (non-null) blocks to its block
+            // space as the request's cache. The null block is filtered.
             // Group-namespaced hash mappings persist (lazy eviction on realloc).
             if let Some(groups) = &self.swa_groups {
                 let spaces: Vec<usize> = groups.iter().map(|g| g.space).collect();
                 for (space, group) in spaces.into_iter().zip(&block_ids_groups) {
-                    self.free_hybrid_blocks(space, group);
+                    self.free_hybrid_blocks(space, group, Freed::Cached);
                 }
                 let kept = self.hybrid_kept.remove(request_id).unwrap_or_default();
                 self.free_kept(kept);
@@ -2173,6 +2316,11 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         self.hybrid_hash_to_id.clear();
         self.hybrid_id_to_key.clear();
         self.hybrid_req_hashes.clear();
+        // With no cache entry left, every cached free block is a recycled one.
+        for st in &mut self.hybrid_spaces {
+            let cached = std::mem::take(&mut st.cached_lru);
+            st.free_min.extend(cached.into_iter().map(Reverse));
+        }
         true
     }
 
@@ -2859,6 +3007,13 @@ impl Scheduler {
         // ⛔ FORWARDED, NOT STORED. The allocator is what reads it, and a copy on the scheduler would be a
         // second home for one number — which is the shape every defect in this area has had.
         self.kv_cache.set_kv_pool_reach(reach);
+    }
+
+    /// HOW MANY BLOCKS OF EACH KV STORE THE WORKER HAS BACKED WITH MEMORY, as it last reported —
+    /// forwarded to the allocator, which hands out the prefix cache's free blocks before a never-used
+    /// block past them.
+    pub fn set_kv_backed(&mut self, backed: KvBackedBlocks) {
+        self.kv_cache.set_kv_backed(backed);
     }
 
     /// The step that carried `saves` reported back, so its recurrent-state snapshots hold their
@@ -5363,6 +5518,112 @@ mod tests {
         }
     }
 
+    /// A `hybrid_req` whose `n` tokens start at `first`.
+    fn hybrid_req_at(id: &str, n: usize, first: u32) -> Request {
+        let mut r = hybrid_req(id, n);
+        r.prompt_token_ids = (first..first + n as u32).collect();
+        r.all_token_ids = r.prompt_token_ids.clone();
+        r
+    }
+
+    /// Look `r` up, allocate the rest of its prompt and seal it, as one prefill step does.
+    fn hybrid_prefill(t: &mut SimpleBlockTracker, mut r: Request) {
+        let (p, matched) = t.get_computed_blocks(&r);
+        r.num_computed_tokens = p;
+        let rest = r.num_prompt_tokens - p;
+        t.allocate_slots(&r, rest as usize, 0, &matched).unwrap();
+        r.num_computed_tokens = r.num_prompt_tokens;
+        t.seal(&r);
+    }
+
+    #[test]
+    fn test_hybrid_ended_requests_cache_outlives_other_requests_blocks() {
+        // #330: r1 ends and r2 takes blocks from the same stores. Lowest ID first handed r2 r1's
+        // freed blocks and erased its cache. Where every block is allocated up front, r2 now takes
+        // never-used blocks and r1's prompt is reused. Where blocks are mapped as the pool reaches
+        // them, r2 spends r1's cache before any block past what is mapped, so the cache never maps
+        // memory of its own.
+        for backing in [KvBacking::Allocated, KvBacking::OnFirstUse] {
+            let mut t = caching_hybrid_apart(512, 64).with_kv_backing(backing);
+            hybrid_prefill(&mut t, hybrid_req("r1", 200));
+            let backed = (
+                t.max_allocated_block_id(0) + 1,
+                t.max_allocated_block_id(1) + 1,
+            );
+            assert_eq!(backed, (14, 8), "r1's 13 sliding and 7 global blocks");
+            t.set_kv_backed(KvBackedBlocks::GlobalApart {
+                pool: backed.0,
+                global: backed.1,
+            });
+            t.free("r1");
+            hybrid_prefill(&mut t, hybrid_req_at("r2", 64, 50_000));
+            let reach = (t.max_allocated_block_id(0), t.max_allocated_block_id(1));
+            let reused = t.get_computed_blocks(&hybrid_req("r3", 200)).0;
+            match backing {
+                KvBacking::Allocated => {
+                    assert_eq!(reused, 192, "r1's prompt");
+                    assert_eq!(reach, (16, 8), "r2 took never-used blocks");
+                }
+                KvBacking::OnFirstUse => {
+                    assert!(
+                        reach.0 < backed.0 && reach.1 < backed.1,
+                        "{reach:?} maps more"
+                    );
+                    assert!(reused < 192, "r2 spent r1's cache");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hybrid_cache_hit_moves_blocks_to_the_back_of_the_lru() {
+        // r1 ends, then r2; r3 extends r1's prompt, reusing its blocks, and ends last. A filler
+        // that takes every never-used block and 4 cached ones evicts the least recently freed:
+        // r2's, not the blocks r1 freed first and r3 freed again.
+        let mut t = caching_hybrid_apart(40, 64);
+        hybrid_prefill(&mut t, hybrid_req("r1", 64));
+        t.free("r1");
+        hybrid_prefill(&mut t, hybrid_req_at("r2", 64, 50_000));
+        t.free("r2");
+        let r3 = hybrid_req("r3", 96);
+        assert_eq!(t.get_computed_blocks(&r3).0, 64, "r3 extends r1's prompt");
+        hybrid_prefill(&mut t, r3);
+        t.free("r3");
+        // Of the sliding store's 39 blocks, r2 and r3 left 4 + 6 cached: 29 were never used.
+        hybrid_prefill(&mut t, hybrid_req_at("filler", (29 + 4) * 16, 900_000));
+        assert_eq!(
+            t.get_computed_blocks(&hybrid_req("r1", 64)).0,
+            32,
+            "r1's prompt"
+        );
+        assert_eq!(
+            t.get_computed_blocks(&hybrid_req_at("r2", 64, 50_000)).0,
+            0,
+            "r2's prompt, evicted first"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_free_lists_stay_bounded_under_repeated_hits() {
+        // Each turn hits the last one's cache and ends, freeing those blocks again and leaving their
+        // older free-list entries stale. Dropped once a list passes twice the store's blocks, they
+        // never pile up; resetting the prefix cache recycles every cached block.
+        let mut t = caching_hybrid_apart(64, 64);
+        for turn in 0..500 {
+            let id = format!("turn{turn}");
+            hybrid_prefill(&mut t, hybrid_req(&id, 96));
+            t.free(&id);
+            for st in &t.hybrid_spaces {
+                let lens = (st.cached_lru.len(), st.free_min.len());
+                assert!(lens.0 <= 128 && lens.1 <= 128, "turn {turn}: {lens:?}");
+            }
+        }
+        assert_eq!(t.get_computed_blocks(&hybrid_req("again", 96)).0, 64);
+        t.reset_prefix_cache();
+        assert!(t.hybrid_spaces.iter().all(|st| st.cached_lru.is_empty()));
+        assert_eq!(t.num_free_blocks(), 63, "no leak/double-free");
+    }
+
     #[test]
     fn test_hybrid_groups_null_pad_and_distinctness() {
         // gemma4-shaped: 1 full (bs 32) + 2 sliding (window 64, bs 16) over ONE
@@ -7068,6 +7329,7 @@ mod tests {
         max_num_seqs: usize,
         stores: HybridKvStores,
         caching: bool,
+        backing: KvBacking,
     ) -> Scheduler {
         let cfg = SchedulerConfig {
             max_num_batched_tokens: 2048,
@@ -7082,7 +7344,7 @@ mod tests {
         let mut groups = vec![(false, 0usize, 32usize)];
         groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
         tracker.enable_hybrid(pool, groups, stores);
-        Scheduler::new(&cfg, 32768, Box::new(tracker))
+        Scheduler::new(&cfg, 32768, Box::new(tracker.with_kv_backing(backing)))
     }
 
     fn request_from(id: &str, first_token: u32, prompt_len: u32, max_tokens: u32) -> Request {
@@ -7354,7 +7616,7 @@ mod tests {
     /// after checking that every sliding group still holds the window the first recomputed token
     /// reads.
     fn resend_after_long_reply(stores: HybridKvStores, prompt_len: u32, reply: u32) -> u32 {
-        let mut sched = gemma4_scheduler(2634, 1, stores, true);
+        let mut sched = gemma4_scheduler(2634, 1, stores, true, KvBacking::Allocated);
         sched.add_request(request_from("r1", 0, prompt_len, reply));
         while sched.has_unfinished_requests() {
             step_and_sample(&mut sched, reply);
@@ -7409,6 +7671,84 @@ mod tests {
         }
     }
 
+    /// #330's traffic through a gemma-4 scheduler on a 27,000-block pool: r1 (1,418/300) with three
+    /// 2,000-token prompts decoding long replies; once r1 ends, 256 more steps, then r1's prompt
+    /// again. Under [`KvBacking::OnFirstUse`] the worker reports each step what it has mapped,
+    /// growing like metal's stores (128 blocks at least, doubling). Returns what the resend reused.
+    fn resend_while_others_decode(stores: HybridKvStores, backing: KvBacking) -> u32 {
+        let pool = 27_000;
+        let mut sched = gemma4_scheduler(pool, 256, stores, true, backing);
+        sched.add_request(request_from("r1", 0, 1418, 300));
+        for i in 1..=3 {
+            sched.add_request(request_from(&format!("o{i}"), i * 100_000, 2000, 100_000));
+        }
+        // Blocks mapped per store, `[pool, global]`.
+        let mut mapped = [0usize; 2];
+        // One step and the engine's part. Whether r1 ended in it.
+        let mut step = |sched: &mut Scheduler| {
+            let out = sched.schedule();
+            let mut r1_ended = false;
+            let tables = (out.scheduled_new_reqs.iter())
+                .map(|r| &r.block_ids)
+                .chain(out.scheduled_cached_reqs.new_block_ids.iter().flatten());
+            for table in tables {
+                for (g, ids) in table.iter().enumerate() {
+                    let store = usize::from(g == 0 && stores == HybridKvStores::GlobalApart);
+                    let highest = ids.iter().copied().max().unwrap_or(0);
+                    if highest >= mapped[store] {
+                        mapped[store] = (highest + 1)
+                            .next_multiple_of(128)
+                            .max(2 * mapped[store])
+                            .min(pool);
+                    }
+                }
+            }
+            sched.set_kv_backed(match stores {
+                HybridKvStores::Shared => KvBackedBlocks::Shared(mapped[0]),
+                HybridKvStores::GlobalApart => KvBackedBlocks::GlobalApart {
+                    pool: mapped[0],
+                    global: mapped[1],
+                },
+            });
+            for id in out.num_scheduled_tokens.keys() {
+                let r = sched.get_request(id).unwrap();
+                if r.num_computed_tokens as usize >= r.num_tokens() {
+                    sched.append_output_tokens(id, &[7]);
+                    let max = sched.get_request(id).unwrap().sampling_params.max_tokens;
+                    if Some(sched.get_request(id).unwrap().num_output_tokens() as u32) >= max {
+                        sched.finish_requests(&[id.as_str()], RequestStatus::FinishedLengthCapped);
+                        r1_ended |= id == "r1";
+                    }
+                }
+            }
+            r1_ended
+        };
+        while !step(&mut sched) {}
+        for _ in 0..256 {
+            step(&mut sched);
+        }
+        sched.add_request(request_from("r1 again", 0, 1418, 1));
+        step(&mut sched);
+        sched.get_request("r1 again").unwrap().num_cached_tokens as u32
+    }
+
+    #[test]
+    fn test_hybrid_prompt_resent_while_others_decode_hits_prefix_cache() {
+        // #330: lowest ID first handed an ended request's freed blocks to the next ones the others
+        // asked for, so its prompt sent again reused nothing. With every block allocated up front
+        // it now reuses all but its last partial block under either layout. With blocks mapped as
+        // the pool reaches them, the cache only lives in what is mapped: on metal's layout for
+        // Gemma 4 (`GlobalApart`), the TurboQuant store's last doubling holds the others' new
+        // global blocks and the prompt is reused too. Shared, the others' growth needs the space
+        // r1's cache holds, which is evicted before the pool maps more.
+        for stores in BOTH_STORES {
+            let reused = resend_while_others_decode(stores, KvBacking::Allocated);
+            assert_eq!(reused, 1408, "{stores:?}");
+        }
+        let reused = resend_while_others_decode(HybridKvStores::GlobalApart, KvBacking::OnFirstUse);
+        assert_eq!(reused, 1408, "mapped as reached");
+    }
+
     /// One of #317's A/B cells: `prompts` distinct `prompt_len`-token prompts, `users` at a time,
     /// each replying `reply_len` tokens.
     #[derive(Clone, Copy)]
@@ -7439,7 +7779,7 @@ mod tests {
     /// `cell` on the gemma-4 layout over a `pool`-block pool, with the global group's KV where
     /// `stores` puts it.
     fn run_317_cell(stores: HybridKvStores, caching: bool, pool: usize, cell: Cell) -> CellRun {
-        let mut sched = gemma4_scheduler(pool, 256, stores, caching);
+        let mut sched = gemma4_scheduler(pool, 256, stores, caching, KvBacking::Allocated);
         let mut next = 0u32;
         let add = |sched: &mut Scheduler, next: &mut u32| {
             let id = format!("r{next}");

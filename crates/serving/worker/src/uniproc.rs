@@ -100,9 +100,12 @@ impl Executor for UniProcExecutor {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> EngineResult<ModelRunnerOutput> {
-        self.worker
+        let mut output = (self.worker)
             .execute_model(scheduler_output)
-            .map_err(|e| scratchy_serving_engine::error::EngineError::Executor(e.to_string()))
+            .map_err(|e| scratchy_serving_engine::error::EngineError::Executor(e.to_string()))?;
+        // The step has mapped what it names before returning, so what is backed now covers it.
+        output.kv_backed = self.worker.kv_backed();
+        Ok(output)
     }
 
     fn spec_decode_backend(
@@ -123,6 +126,10 @@ impl Executor for UniProcExecutor {
 
     fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
         self.worker.hybrid_kv_stores()
+    }
+
+    fn kv_backing(&self) -> scratchy_core_common::KvBacking {
+        self.worker.kv_backing()
     }
 
     /// Straight through to the worker, which allocated them.
