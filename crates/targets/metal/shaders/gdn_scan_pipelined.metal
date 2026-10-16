@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Gated-DeltaNet prefill scan: the software-pipelined block-staged kernel.
+// Gated-DeltaNet prefill scan, and Mamba-2's selective one: the software-pipelined
+// block-staged kernel.
 //
 // The design is omlx Kernel P's (omlx/custom_kernels/qwen35_prefill/gdn.py,
 // `gated_delta_pipelined`, Apache-2.0) — the proven prefill mapping for this
@@ -47,7 +48,8 @@
 // snapshot's entry — a block ends at a save's row, so the store sits between
 // blocks and the per-token loop is the plain step's.
 //
-// Baked constants (every compile sets every one; slots 0–4 are the scan's):
+// Baked constants (every compile sets every one; slots 0–7 are numbered as the simd scan's,
+// whose drafts (8) and pipelined-rows flag (9) this kernel has not):
 //   GDN_PIPE_NUM_K_HEADS (H), GDN_PIPE_NUM_V_HEADS (HV),
 //   GDN_PIPE_HEAD_K (K), GDN_PIPE_HEAD_V (head_v), GDN_PIPE_SCALE,
 //   GDN_PIPE_TB (tokens per block; multiple of 4).
@@ -68,11 +70,19 @@ SCRATCHY_CONSTANT(uint, GDN_PIPE_NUM_V_HEADS, 1);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_PIPE_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_PIPE_SCALE, 4);
-SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 5);
+SCRATCHY_CONSTANT(uint, GDN_PIPE_TB, 10);
 // Set on the twin that runs beside the simd scan, in a step that also replays or records
 // (`route_gdn`): it takes only a plain sequence of more than one row — a prefill chunk — and
 // leaves the rest, a verify step's or a decode's row, to the simd scan.
-SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_PIPE_BESIDE_SIMD, 6);
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_PIPE_BESIDE_SIMD, 11);
+// Mamba-2's selective scan (Nemotron-H) over the same state layout — `gdn_scan_simd`'s
+// `GDN_SCAN_MAMBA` form, a head's [head_dim, state] matrix the value rows, its group the key
+// head: a `conv_out` row is x | B | C, `a` the in-projection row whose dt column of each head
+// `GDN_PIPE_A_STRIDE` / `_OFFSET` slice, no norms, and per token S = decay·S + (x·dt)·B,
+// y = S·C + D·x, D the `d_skip` per head.
+SCRATCHY_CONSTANT_OPTIONAL(bool, GDN_PIPE_MAMBA, 5);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_PIPE_A_STRIDE, 6);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDN_PIPE_A_OFFSET, 7);
 
 template <typename T>
 [[kernel]] void gdn_scan_pipelined(
@@ -86,6 +96,7 @@ template <typename T>
     const device uint*  gdn_step      [[buffer(7)]],
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
+    const device float* d_skip        [[buffer(10)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_threadgroup]])
 {
@@ -171,10 +182,14 @@ template <typename T>
   threadgroup float den_s[TB];
 
   const device float* qk_base = conv_out + uint(bos) * conv_dim;
-  const uint qk_off = i_h * K;  // q's offset in the row; k's is +key_dim
-  // v's section starts at 2*key_dim; a value row's offset within it is the
-  // GLOBAL row vr (row0 + rg), already spanning heads.
-  const device float* v_base = qk_base + 2u * key_dim;
+  // The row's sections: q | k | v, Mamba-2's x | B | C (C its q, B its k, x its v).
+  const uint col_q = GDN_PIPE_MAMBA ? value_dim + key_dim : 0u;
+  const uint col_k = GDN_PIPE_MAMBA ? value_dim : key_dim;
+  const uint col_v = GDN_PIPE_MAMBA ? 0u : 2u * key_dim;
+  const uint qk_off = i_h * K;  // this key head's q (and k) within its section
+  // A value row's offset within v's section is the GLOBAL row vr (row0 + rg),
+  // already spanning heads.
+  const device float* v_base = qk_base + col_v;
 
   // Register prefetch of one block: the thread's share of the k and q
   // float4s (TB*KR*4 each — each lane owns four, channels 4*(lane+8*i)),
@@ -197,7 +212,7 @@ template <typename T>
         const uint lane = (p % (KR * 4)) / 4;                             \
         const uint i = p % 4;                                             \
         const device float4* kf = (const device float4*)(                 \
-            qk_base + (uint(T0N) + t) * conv_dim + key_dim + qk_off +     \
+            qk_base + (uint(T0N) + t) * conv_dim + col_k + qk_off +       \
             4u * (lane + 8u * i));                                        \
         pk[j] = *kf;                                                      \
       }                                                                   \
@@ -210,7 +225,7 @@ template <typename T>
         const uint lane = (p % (KR * 4)) / 4;                             \
         const uint i = p % 4;                                             \
         const device float4* qf = (const device float4*)(                 \
-            qk_base + (uint(T0N) + t) * conv_dim + qk_off +               \
+            qk_base + (uint(T0N) + t) * conv_dim + col_q + qk_off +       \
             4u * (lane + 8u * i));                                        \
         pq[j] = *qf;                                                      \
       }                                                                   \
@@ -224,8 +239,11 @@ template <typename T>
       }                                                                   \
     }                                                                     \
     if (tid < uint(ttn)) {                                                \
-      pg = float(a[(uint(bos) + uint(T0N) + tid) * HV + i_hv]);           \
-      pb = float(b[(uint(bos) + uint(T0N) + tid) * HV + i_hv]);           \
+      const uint tok = uint(bos) + uint(T0N) + tid;                       \
+      pg = float(a[GDN_PIPE_A_STRIDE_SET                                  \
+                       ? tok * GDN_PIPE_A_STRIDE + GDN_PIPE_A_OFFSET + i_hv \
+                       : tok * HV + i_hv]);                               \
+      pb = GDN_PIPE_MAMBA ? 0.0f : float(b[tok * HV + i_hv]);             \
     }                                                                     \
   }
 
@@ -271,7 +289,8 @@ template <typename T>
 
     // ── The block's prep: a token's norms by 8 lanes (the channel split and
     // butterfly the rows' lanes would use), q scaled in place, and its gating.
-    for (uint w = tid; w < tt * KR; w += NT) {
+    // Mamba-2 has no norms; its gating keeps the token's dt.
+    for (uint w = tid; !GDN_PIPE_MAMBA && w < tt * KR; w += NT) {
       const uint t = w / KR, l = w % KR;
       float4 kc[4], qc[4];
       _Pragma("unroll")
@@ -303,7 +322,7 @@ template <typename T>
       const float av = g_s[tid] + dtb;
       const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
       dec_s[tid] = exp(sp * neg_a);
-      den_s[tid] = exp(-b_s[tid]) + 1.0f;
+      den_s[tid] = GDN_PIPE_MAMBA ? sp : exp(-b_s[tid]) + 1.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -319,6 +338,31 @@ template <typename T>
       for (uint i = 0; i < 4; i++) {
         kc[i] = k_s[t][seg][i];
         qn[i] = q_s[t][seg][i];
+      }
+      if (GDN_PIPE_MAMBA) {
+        // S = decay·S + (x·dt)·B; y = S·C + D·x — `gdn_scan_simd`'s Mamba-2 step.
+        const float x0 = v_s[t][rg], x1 = v_s[t][rg + RS];
+        const float xdt0 = x0 * den, xdt1 = x1 * den;
+        float2 o0 = 0.0f, o1 = 0.0f;
+        _Pragma("unroll")
+        for (uint i = 0; i < 4; i++) {
+          st0[i] = decay * st0[i] + xdt0 * kc[i];
+          st1[i] = decay * st1[i] + xdt1 * kc[i];
+          o0 += float2(dot(st0[i].xy, qn[i].xy), dot(st0[i].zw, qn[i].zw));
+          o1 += float2(dot(st1[i].xy, qn[i].xy), dot(st1[i].zw, qn[i].zw));
+        }
+        float y0 = o0.x + o0.y, y1 = o1.x + o1.y;
+        _Pragma("unroll")
+        for (uint m = 4; m >= 1; m /= 2) {
+          y0 += simd_shuffle_xor(y0, m);
+          y1 += simd_shuffle_xor(y1, m);
+        }
+        if (seg == 0u) {
+          const float dsk = d_skip[i_hv];
+          o[(uint(bos) + t0 + t) * value_dim + vr] = y0 + dsk * x0;
+          o[(uint(bos) + t0 + t) * value_dim + vr + RS] = y1 + dsk * x1;
+        }
+        continue;
       }
       const float k_inv = kinv_s[t][seg];
 

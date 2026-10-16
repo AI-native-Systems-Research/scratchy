@@ -1164,7 +1164,7 @@ fn route_gdn(
 ) -> Vec<GatedCommand> {
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling, RuntimeGate};
-    if !matches!(step, MetalStep::GatedDeltaNet(..)) {
+    if !matches!(step, MetalStep::GatedDeltaNet(..) | MetalStep::Mamba2(..)) {
         return cmds;
     }
     let known = GdnStepsKnown::at(p, bucket_m);
@@ -1172,7 +1172,8 @@ fn route_gdn(
     let hv = p.gdn_head_v_dim;
     let pipelines = p.gdn_head_k_dim == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
-    // A plain step's scan: the simd scan's geometry (0-4), not its drafts (8) nor their lanes.
+    // A plain step's scan: the simd scan's geometry (0-4) and Mamba-2's selective form (5-7), not
+    // its drafts (8) nor their lanes.
     let pipelined = |scan: &LoweredCommand| LoweredCommand {
         kernel: KernelId::GatedDeltaNet,
         library: "gdn_scan_pipelined",
@@ -1181,7 +1182,7 @@ fn route_gdn(
             (scan.constants.iter())
                 .filter(|c| c.index != GDN_SCAN_DRAFTS_SLOT)
                 .copied()
-                .chain([ConstantValue::uint(5, GDN_PIPE_TB)])
+                .chain([ConstantValue::uint(GDN_PIPE_TB_SLOT, GDN_PIPE_TB)])
                 .collect(),
         ),
         dispatch: DispatchShape {
@@ -6511,9 +6512,11 @@ const GDN_SCAN_DRAFTS_SLOT: u16 = 8;
 /// than one row (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): set on a geometry the pipelined scan covers.
 const GDN_SCAN_PLAIN_ROWS_PIPELINED_SLOT: u16 = 9;
 
-/// The pipelined scan's constant slot of its twin beside the simd scan (`GDN_PIPE_BESIDE_SIMD`),
-/// which takes only plain sequences of more than one row.
-const GDN_PIPE_BESIDE_SIMD_SLOT: u16 = 6;
+/// The pipelined scan's constant slots of its block (`GDN_PIPE_TB`) and of its twin beside the
+/// simd scan (`GDN_PIPE_BESIDE_SIMD`), which takes only plain sequences of more than one row:
+/// past the simd scan's, whose slots below its drafts it shares.
+const GDN_PIPE_TB_SLOT: u16 = 10;
+const GDN_PIPE_BESIDE_SIMD_SLOT: u16 = 11;
 
 /// How a recurrent mixer's scan gates and updates its state: GDN's gated delta rule, its gate
 /// inputs `a` / `b` their own `[T, heads]` activations; Mamba-2's selective scan, `dt` a column
@@ -8735,7 +8738,7 @@ mod tests {
         );
         assert_eq!(
             constants(3),
-            [geometry, &[ConstantValue::uint(5, GDN_PIPE_TB)][..]].concat()
+            [geometry, &[ConstantValue::uint(10, GDN_PIPE_TB)][..]].concat()
         );
         // The simd scan leaves a prefill chunk's rows to the pipelined scan, whose twin beside it
         // takes only those.
@@ -8876,12 +8879,13 @@ mod tests {
         );
     }
 
-    /// A Mamba-2 layer lowers to the GDN kernels in their Mamba-2 forms, ungated at every
-    /// bucket (a decode step is the same chain over one row a sequence): the conv over the
+    /// A Mamba-2 layer lowers to the GDN kernels in their Mamba-2 forms: the conv over the
     /// in-projection's `xBC` columns with its bias; the gating then the per-thread scan (state
-    /// 16), or the simd scan reading `dt` off the row itself (state 128); the gate-before-norm
-    /// per group. The constants and bindings are the ones `tests/mamba2_test.rs` dispatches
-    /// against its CPU reference. Pure-CPU lowering checks.
+    /// 16, ungated: a decode step is the same chain over one row a sequence), or — state 128 —
+    /// the simd scan reading `dt` off the row itself on a decode step and the pipelined scan in
+    /// its selective form on every other; the gate-before-norm per group. The constants and
+    /// bindings are the ones `tests/mamba2_test.rs` dispatches against its CPU reference.
+    /// Pure-CPU lowering checks.
     #[test]
     fn mamba2_lowers_the_gdn_kernels_in_their_mamba2_forms() {
         use ConstantValue as C;
@@ -9034,31 +9038,73 @@ mod tests {
             assert_eq!(norm[1], (1, scan[0].1.clone()));
             assert_eq!(norm[2..], named(&[(2, "arena 0"), (3, "GdnNorm")]));
 
-            // The real checkpoints' state: the simd scan, dt at the row's last 64 columns.
+            // The real checkpoints' state: dt at the row's last 64 columns. A decode step's one
+            // row a sequence is the simd scan's; every other step — a prefill chunk — the
+            // pipelined scan's, in its selective form (state 128, head_dim 64: its geometry).
             let real = lowered((8, 64, 128, 64), bucket_m);
             let functions: Vec<_> = real.iter().map(|c| (c.command.function, c.gate)).collect();
-            assert_eq!(
-                functions,
-                [
+            let routed: &[_] = match bucket_m {
+                1 => &[
                     ("gdn_conv1d_varlen_bf16", None),
                     ("gdn_scan_simd_bf16", None),
                     ("gdn_rms_norm_gated_bf16", None),
-                ]
-            );
+                ],
+                _ => &[
+                    ("gdn_conv1d_varlen_bf16", None),
+                    ("gdn_scan_simd_bf16", Some(RuntimeGate::OnlyIfDecodeStep)),
+                    (
+                        "gdn_scan_pipelined_bf16",
+                        Some(RuntimeGate::UnlessDecodeStep),
+                    ),
+                    ("gdn_rms_norm_gated_bf16", None),
+                ],
+            };
+            assert_eq!(functions, routed);
             let (inner, conv_dim) = (64 * 64, 64 * 64 + 2 * 8 * 128);
             let row = inner + conv_dim + 64;
-            let simd_constants = [
+            let geometry = [
                 C::uint(0, 8),
                 C::uint(1, 64),
                 C::uint(2, 128),
                 C::uint(3, 64),
                 C::float(4, 128f32.powf(-0.5)),
-                C::uint(8, 0),
-                C::boolean(5, true),
-                C::uint(6, row),
-                C::uint(7, inner + conv_dim),
             ];
+            let simd_constants = [
+                &geometry[..],
+                &[
+                    C::uint(8, 0),
+                    C::boolean(5, true),
+                    C::uint(6, row),
+                    C::uint(7, inner + conv_dim),
+                    C::boolean(9, true),
+                ],
+            ]
+            .concat();
             assert_eq!(real[1].command.constants, simd_constants);
+            if bucket_m > 1 {
+                // The pipelined scan: the simd scan's selective form at 5-7, its block at 10;
+                // the simd scan's bindings, `D` at 10 among them.
+                let pipe = &real[2].command;
+                let pipe_constants = [
+                    &geometry[..],
+                    &[
+                        C::boolean(5, true),
+                        C::uint(6, row),
+                        C::uint(7, inner + conv_dim),
+                        C::uint(10, GDN_PIPE_TB),
+                    ],
+                ]
+                .concat();
+                assert_eq!(pipe.constants, pipe_constants);
+                assert_eq!(pipe.bindings, real[1].command.bindings);
+                assert_eq!(
+                    (
+                        pipe.dispatch.threadgroups,
+                        pipe.dispatch.threads_per_threadgroup
+                    ),
+                    ((64 * 64 / 32, 1, 1), (128, 1, 1))
+                );
+            }
             let simd = binds(&real[1]);
             assert_eq!(simd[2..4], named(&[(2, "arena 0"), (3, "arena 0")]));
             assert_eq!(
@@ -9074,7 +9120,7 @@ mod tests {
                 (d.threadgroups, d.threads_per_threadgroup),
                 ((1, 64 * 64 / 4, 1), (32, 4, 1))
             );
-            let d = &real[2].command.dispatch;
+            let d = &real[real.len() - 1].command.dispatch;
             assert_eq!(
                 (d.threadgroups, d.threads_per_threadgroup),
                 ((bucket_m * 8, 1, 1), (256, 1, 1))
