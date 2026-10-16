@@ -181,15 +181,19 @@ fn send_request(
     let mut last_choices_time: Option<Instant> = None;
     // Why the stream says the request failed, if it does: the first one wins.
     let mut failure: Option<String> = None;
+    // Whether the server closed the answer (`data: [DONE]`): a read error after that ends a
+    // finished request, not a failed one.
+    let mut done = false;
 
     loop {
         let n = match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => {
+            Err(e) if !done => {
                 failure.get_or_insert_with(|| format!("stream read failed: {e}"));
                 break;
             }
+            Err(_) => break,
         };
         buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
 
@@ -201,6 +205,7 @@ fn send_request(
             for line in event.lines() {
                 let line = line.trim();
                 if line == "data: [DONE]" {
+                    done = true;
                     continue;
                 }
                 if let Some(data) = line.strip_prefix("data: ")
@@ -292,12 +297,12 @@ fn has_choices(chunk: &serde_json::Value) -> bool {
         .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
 }
 
-/// Why a streamed chunk says its request failed: an `error` object (an SSE error event), or a
-/// choice finished `abort` or `error`. `None` for any other chunk, `stop` and `length` included:
-/// a request may stop early on its own (oMLX stops at EOS despite `ignore_eos`), so the token
-/// count alone says nothing.
+/// Why a streamed chunk says its request failed: an `error` object (an SSE error event; a null
+/// one is no error), or a choice finished `abort` or `error`. `None` for any other chunk, `stop`
+/// and `length` included: a request may stop early on its own (oMLX stops at EOS despite
+/// `ignore_eos`), so the token count alone says nothing.
 fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
-    if let Some(err) = chunk.get("error") {
+    if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
         let message = err["message"]
             .as_str()
             .map_or_else(|| err.to_string(), str::to_string);
@@ -1475,10 +1480,60 @@ mod tests {
             None
         );
         assert_eq!(chunk_failure(&c(r#"{"choices":[{"text":"x"}]}"#)), None);
+        // A null error is no error.
+        assert_eq!(
+            chunk_failure(&c(r#"{"error":null,"choices":[{"text":"x"}]}"#)),
+            None
+        );
         assert_eq!(
             chunk_failure(&c(r#"{"choices":[],"usage":{"completion_tokens":4}}"#)),
             None
         );
+    }
+
+    /// A stream that breaks off mid-answer failed; one that breaks off only after `[DONE]` finished.
+    /// The server here streams one token in a chunked body it closes without the final empty
+    /// chunk, so the client's read ends in an error rather than EOF.
+    #[test]
+    fn a_read_error_fails_a_request_only_before_done() {
+        use std::io::{Read as _, Write as _};
+        let served = |done: bool| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let mut events = String::from(
+                    "data: {\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}\n\n",
+                );
+                if done {
+                    events += "data: [DONE]\n\n";
+                }
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                            transfer-encoding: chunked\r\n\r\n";
+                let body = format!("{:x}\r\n{events}\r\n", events.len());
+                s.write_all(head.as_bytes()).unwrap();
+                s.write_all(body.as_bytes()).unwrap();
+                s.flush().unwrap();
+                // Dropped here with no `0\r\n\r\n`: the body ends unterminated.
+            });
+            let client = Client {
+                agent: crate::http::agent(false),
+                api_url: format!("http://127.0.0.1:{port}/v1/completions"),
+                model: "m".into(),
+                api_key: None,
+                ignore_eos: false,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+            };
+            let result = send_request(&client, "p", 4, "r", Instant::now());
+            server.join().unwrap();
+            result.success
+        };
+        assert!(!served(false), "a stream broken off before [DONE] failed");
+        assert!(served(true), "a stream broken off after [DONE] finished");
     }
 
     fn req(output_tokens: usize, chunks: usize, ttft: f64, e2el: f64) -> RequestResult {
