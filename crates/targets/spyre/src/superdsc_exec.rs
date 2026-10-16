@@ -22,11 +22,12 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use flex_rs::memory_region::MemoryType;
+use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::fold_plan::{self, Bytes, OpKv, RowIdx, RowPage, SessionKv, SlotPos, UniformPages};
-use crate::runtime::{ByteOffset, ByteSize, DevAddr, HwError, Stream};
+use crate::runtime::{BatchedCompute, ByteOffset, ByteSize, DevAddr, HwError, Stream};
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
 
@@ -135,6 +136,21 @@ struct LaunchWhere {
     n_fold_pages: i64,
     /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
     weight_bank: usize,
+}
+
+/// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
+/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::compute_batch`]
+/// — the vendor's multi-CB branch). The site context rides alongside the item because the per-op
+/// `fault` closure dumps from loop locals (`ta`/`off`/the fold rep), which are gone by flush time:
+/// a refused flush rebuilds the offending entry's dump from these, and the flex-rs error names the
+/// entry index it refused.
+struct PendingLaunch {
+    item: BatchedCompute,
+    /// Which op of the rung (`oi`) and which fold rep produced this entry.
+    op_index: usize,
+    rep: i64,
+    /// The per-segment shifts this entry launched with — what `dump_launch_site` prints.
+    off: [u64; NUM_SEGMENTS],
 }
 
 struct Diag {
@@ -2126,6 +2142,24 @@ impl Executor {
             target
         });
 
+        // ⛔ NO KNOB OF ITS OWN — THE BATCH IS THE PATH. Every launch this rung would make is
+        // collected below and paid as ONE doorbell at the end (the vendor's multi-CB branch;
+        // `Stream::compute_batch`). The five knobs that sync or submit MID-RUNG cannot see a
+        // pending batch — a drain between ops of an unflushed rung observes nothing — so each of
+        // them falls back to this function's per-op submission, bit for bit: `repeat_probe`
+        // (double-submits per op), `perop_sync`/`group_time` (drain per op), `prefix_time`
+        // (drains at a rotating MID-RUNG group), `optrace` (drains + D2H after each op).
+        // `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read program
+        // memory or host state this rung's compute ops never write, and `submit_time` measures
+        // the flush itself as the enqueue.
+        let collect =
+            !(d.repeat_probe || d.perop_sync || d.group_time || d.prefix_time || d.optrace);
+        let mut pending: Vec<PendingLaunch> = Vec::new();
+        // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
+        // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
+        // fences on the first true barrier and waits on nothing after; the ring stays FIFO).
+        let mut batch_barrier = false;
+
         for (oi, op) in ops.iter().enumerate() {
             // ── PAGE FOLD ── Run this group once per page of resident prefix, rebased each time to
             //    that page's KV and that page's validity row. The fold ACCUMULATES into the running
@@ -2389,10 +2423,33 @@ impl Executor {
                     // The launch sequence the post-synchronize drain zips against: entry i is the
                     // i-th compute CB of this forward in submission order, keyed by (rung length,
                     // op index) so prefix/body/suffix op numbers cannot average into each other.
+                    // Recorded before the collect branch so a batched rung's ops land here in the
+                    // same submission order its single doorbell emits them in.
                     timers().rb_seq.push(((ops.len(), oi), op.label()));
                 }
 
-                if d.submit_time {
+                if collect {
+                    // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
+                    // its handles because the shifted bases and `ta` borrows above are rep-local.
+                    let st0 = Instant::now();
+                    pending.push(PendingLaunch {
+                        item: BatchedCompute {
+                            prog: prog.clone(),
+                            tensor_allocs: ta.iter().map(|a| (*a).clone()).collect(),
+                            bootstrap_offset: bootstrap,
+                        },
+                        op_index: oi,
+                        rep,
+                        off,
+                    });
+                    batch_barrier |= barrier;
+                    if d.submit_time {
+                        // Prep is still per-op; the enqueue it feeds is now the rung's single
+                        // flush, timed there — so only the prep half accumulates here.
+                        let mut t = timers();
+                        t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
+                    }
+                } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
                     let st0 = Instant::now();
@@ -2451,6 +2508,74 @@ impl Executor {
 
             if d.optrace {
                 self.optrace(oi)?;
+            }
+        }
+
+        // ── THE RUNG'S ONE DOORBELL ──
+        // Everything the loop staged goes to the card as ONE submission: one capacity gate, one
+        // grouped completion, one `QueueControlBlocksSBF`. The CB ring is FIFO, so the device
+        // sees exactly the sequence the per-op path would have submitted — fewer doorbells,
+        // same order, same dataflow (the head barrier carries the OR of the per-op barriers;
+        // see `Stream::compute_batch`).
+        if !pending.is_empty() {
+            // Split the site context from the items once, at the boundary: the items are what
+            // the doorbell takes, the context is what a refusal dumps.
+            let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
+                Vec::with_capacity(pending.len());
+            let items: Vec<BatchedCompute> = pending
+                .drain(..)
+                .map(|p| {
+                    sites.push((p.op_index, p.rep, p.off));
+                    p.item
+                })
+                .collect();
+            let stream = self.stream_ref()?;
+            let st0 = Instant::now();
+            let r = stream.compute_batch(&items, batch_barrier);
+            let st1 = Instant::now();
+            if let Err(e) = r {
+                // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
+                // The loop locals the per-op `fault` closure dumps from are gone here, so the
+                // offending entry's site is rebuilt from what the batch carries: flex-rs wraps
+                // the failing element's index when it has one; a refusal that names no element
+                // (shutdown, capacity) still gets the sweep and the rung's shape.
+                if let HwError::Stream(RuntimeStreamError::BatchElement { index, .. }) = &e
+                    && let Some(&(oi, rep, off)) = sites.get(*index)
+                {
+                    let ta: Vec<&DevAddr> = items[*index].tensor_allocs.iter().collect();
+                    // ⛔ ONE WRITE — same single-`format!` discipline as `[progverify]`.
+                    let one = format!(
+                        "[flush] refused at batch entry {index} (op {oi}, rep {rep}) of {} \
+                         staged launch(es)\n",
+                        items.len()
+                    );
+                    eprint!("{one}");
+                    self.dump_launch_site(
+                        "FAULT(batch-flush)",
+                        &ta,
+                        &ops[oi],
+                        &items[*index].prog,
+                        items[*index].bootstrap_offset,
+                        &off,
+                    );
+                }
+                let sweep = self.prog_images_sweep("FAULT", ops);
+                eprint!("{sweep}");
+                return Err(launch_err(e).context(format!(
+                    "rung flush refused: {} launch(es), one doorbell, barrier={batch_barrier}",
+                    items.len()
+                )));
+            }
+            if d.submit_time {
+                // The flush IS the enqueue the loop's per-op prep times fed: one submit call
+                // for the whole rung, so `submit_calls` counts doorbells, not ops, on this
+                // path — the honest answer to "what does one doorbell cost" is the flush.
+                let mut t = timers();
+                t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
+                t.submit_calls += 1;
+                if batch_barrier {
+                    t.barrier_launches += 1;
+                }
             }
         }
         Ok(())
