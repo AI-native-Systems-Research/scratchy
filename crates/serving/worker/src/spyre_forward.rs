@@ -414,13 +414,21 @@ pub(crate) fn run_prefill_batch(
         mq_pad,
         // The causal mask laid out as the emitter's new-token block reads it — the SAME law, on the same
         // three facts the bake keyed it on: the rung's rows, the head dim, and whether rows are requests.
+        // The head dim and the kv-head count come off the SAME baked geometry the head count above did
+        // (`nqh`, off `b.wiring`): the emitter keyed the form on the program's own head dim, and the
+        // chunk form's slab ceiling (≤ 2 slabs, i.e. head dim ≤ 128) is a UNIFORM model's one head dim —
+        // a hybrid-attention arch's every class exceeds it, so the sub-block count (`nqh`) is what all
+        // of its classes read.
         causal_heads_per_block: scratchy_subtile::sdsc_abstract::NewBlockForm::of(
             mq as u32,
-            hd as u32,
+            b.wiring.geometry.head_dim,
             per_request.is_some(),
         )
-        .mask_heads_per_block(nqh as u32, (sh.kv_dim / sh.head_dim) as u32, hd as u32)
-            as usize,
+        .mask_heads_per_block(
+            nqh as u32,
+            b.wiring.geometry.kv_dim / b.wiring.geometry.head_dim,
+            b.wiring.geometry.head_dim,
+        ) as usize,
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
         positions: &positions,
@@ -807,7 +815,10 @@ struct ChunkKeys {
 /// — page 0's keys, fluently wrong.
 fn chunk_index_table(
     what: &str,
-    sh: &Shared<'_>,
+    // ⭐ THE POOL'S GEOMETRY, threaded from `Loaded` — `Shared` carries no kv width BY DESIGN (a
+    // hybrid-attention arch has no single one), and the pool is the one lawful model-wide use (see
+    // `Loaded::kv_dim`). The same two numbers the batched-decode site reads off the model.
+    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
     session: &SuperDscSession,
     step: scratchy_target_spyre::superdsc_exec::StepBody,
     req: &ReqState,
@@ -829,10 +840,6 @@ fn chunk_index_table(
             scratchy_subtile::sdsc_abstract::ChunkScratch::PAGES_MAX
         )));
     }
-    // The pool geometry the entry factor needs — `kv_dim / head_dim`, `head_dim`, the same two numbers
-    // the batched site reads off the model.
-    let pool =
-        scratchy_subtile::sdsc_abstract::PagedKvPool::new(sh.kv_dim / sh.head_dim, sh.head_dim);
     let per_page = session.gather_entries_per_page(pool).ok_or_else(|| {
         werr(format!(
             "{what}: this bundle emits a GATHERED KV read, but a physical page is not a whole number \
@@ -894,6 +901,9 @@ pub(crate) fn superdsc_forward_chunk(
     // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
     // reserved range.
     ctx: PageMapCtx<'_>,
+    // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
+    // `run_request_step` off `Loaded`'s own two numbers).
+    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 ) -> ExecutorResult<Vec<Vec<f32>>> {
     let n = toks.len();
     if n == 0 {
@@ -1177,7 +1187,7 @@ pub(crate) fn superdsc_forward_chunk(
                 })?;
                 let kv_blocks = chunk_index_table(
                     "prompt chunk",
-                    sh,
+                    pool,
                     pf,
                     step,
                     req,
@@ -1464,7 +1474,7 @@ pub(crate) fn superdsc_forward_chunk(
         // token's page too.
         let kv_blocks = chunk_index_table(
             "solo decode",
-            sh,
+            pool,
             session,
             step,
             req,
@@ -1483,8 +1493,10 @@ pub(crate) fn superdsc_forward_chunk(
             // launches, so its wiring's geometry is the count the placement was sized by.
             num_q_heads: b.wiring.geometry.nqh as usize,
             mq_pad: 64,
-            // One row: always the sub-blocked form (`NewBlockForm::of(1, …)`), whose block is every head.
-            causal_heads_per_block: h / hd,
+            // One row: always the sub-blocked form (`NewBlockForm::of(1, …)`), whose block is every
+            // head — the SAME baked count as `num_q_heads` above, never the `h / hd` quotient (that is
+            // the head count only for a square Q projection; see the site above).
+            causal_heads_per_block: b.wiring.geometry.nqh as usize,
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],
             positions: &[p as u32],
@@ -1618,6 +1630,9 @@ pub(crate) fn forward_chunk(
     // The host's list + the pool's owner split: every bind DERIVES this request's page map, and the map's
     // fully-masked and hole pages come from the range the host is never told about.
     ctx: PageMapCtx<'_>,
+    // The pool's geometry, threaded from the model — one spelling, handed to
+    // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
+    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 ) -> ExecutorResult<Vec<Vec<f32>>> {
     {
         let SendnnSession::SuperDsc(sb) = session;
@@ -1648,6 +1663,7 @@ pub(crate) fn forward_chunk(
             start,
             toks,
             ctx,
+            pool,
         );
     }
 }
@@ -1987,6 +2003,15 @@ pub(crate) fn run_request_step(
         head_dim: model.head_dim,
         vocab: model.vocab,
     };
+    // ⭐ THE PAGED-KV POOL'S GEOMETRY, from the model's own two numbers — the same spelling the
+    // batched-decode site reads (`spyre_exec`'s `PagedKvPool::new(model.kv_dim / model.head_dim, …)`),
+    // threaded to the chunk paths because `Shared` deliberately carries no kv width: a hybrid-attention
+    // arch has no single one, and the pool is the one lawful model-wide use (see `Loaded::kv_dim`).
+    #[cfg(feature = "spyre-hw")]
+    let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+        model.kv_dim / model.head_dim,
+        model.head_dim,
+    );
     // A decode step runs on the smallest cap bucket whose capacity covers the last position
     // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.
     // `start + n` (not `pos + 1`) because `b` is fixed for the whole step below.
@@ -2122,6 +2147,8 @@ pub(crate) fn run_request_step(
             chunk,
             #[cfg(feature = "spyre-hw")]
             ctx,
+            #[cfg(feature = "spyre-hw")]
+            pool,
         )?;
         last = rows.into_iter().next_back().unwrap_or_default();
         pos += chunk.len();
