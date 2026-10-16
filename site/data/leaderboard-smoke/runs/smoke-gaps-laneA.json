@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "run_id": "smoke-gaps-laneA",
+  "lane": "A",
+  "status": "published",
+  "provenance": {
+    "machine": "m5max-64",
+    "rung": "R1"
+  },
+  "measurements": [],
+  "gaps": [
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "smoke test: only the SMOKE-throwaway corpus, recorded on qwen3.6-35b-a3b, was replayed",
+      "issue": 166
+    }
+  ],
+  "ablations": []
+}

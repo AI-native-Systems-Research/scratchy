@@ -1,0 +1,528 @@
+{
+  "schema": 1,
+  "run_id": "smoke-laneA-scratchy-qwen36",
+  "lane": "A",
+  "status": "published",
+  "provenance": {
+    "machine": "m5max-64",
+    "rung": "R1",
+    "scratchy_sha": "34a3a2d4acccdc82f07fd525e20b5a05eae33e16",
+    "claude_version": "2.1.301",
+    "ollama_version": "0.40.4",
+    "context_length_tokens": 65536,
+    "kv_cache_dtype": {
+      "scratchy": "turboquant",
+      "ollama": "f16"
+    },
+    "quantization": {
+      "scratchy": "mlx-affine-b4-g64-qembed",
+      "ollama": "nvfp4"
+    },
+    "checkpoint_revision": {
+      "scratchy": "mlx-community/Qwen3.6-35B-A3B-4bit@38740b847e4cb78f352aba30aa41c76e08e6eb46",
+      "ollama": "qwen3.6:35b@sha256:9e493bcc7d47b9cae704e368d1421871c15b30bb76d11223e96d2a7a6a6a56aa"
+    },
+    "sampling": {
+      "temperature": 0.0
+    },
+    "trace_corpus": {
+      "id": "SMOKE-throwaway",
+      "claude_version": "2.1.301",
+      "recorded_engine": {
+        "name": "scratchy",
+        "version": "0.1.0"
+      },
+      "turns": 6,
+      "skipped": 5,
+      "skipped_by_reason": {
+        "not a turn": 5
+      },
+      "turns_recorded_in_flight": 0,
+      "max_in_flight": 0,
+      "turn_classes": {
+        "tool-call": 4,
+        "file-write": 1
+      },
+      "max_recorded_prompt_tokens": 21799,
+      "replay": {
+        "concurrency": 1,
+        "cache_reset": true,
+        "served_model": null,
+        "unstreamed_turns": 0,
+        "max_tokens_turns": 0,
+        "prompt_tokens_differ_turns": 0,
+        "prompt_shortfall_tolerance": {
+          "tokens": 64,
+          "fraction": 0.05
+        }
+      }
+    },
+    "disclosed": [
+      "kv-dtype-unmatched",
+      "quantizer-differs"
+    ],
+    "artifacts": [
+      "smoke-laneA-scratchy-qwen36.turns.json"
+    ]
+  },
+  "measurements": [
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "n": 3,
+      "stat": {
+        "median": 112.1367,
+        "p10": 103.9193,
+        "p90": 3940.0152,
+        "p99": 4012.8247,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            3969.7044
+          ],
+          [
+            2,
+            112.3793
+          ],
+          [
+            3,
+            104.5261
+          ],
+          [
+            4,
+            115.5331
+          ],
+          [
+            5,
+            105.2852
+          ],
+          [
+            6,
+            103.4243
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "n": 3,
+      "stat": {
+        "median": 115.4881,
+        "p10": 105.9461,
+        "p90": 3965.4631,
+        "p99": 4015.9418,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "n": 3,
+      "stat": {
+        "median": 104.5261,
+        "p10": 104.2104,
+        "p90": 109.0978,
+        "p99": 110.1264,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "tpot_ms",
+      "n": 3,
+      "stat": {
+        "median": 7.3412,
+        "p10": 4.2191,
+        "p90": 12.4067,
+        "p99": 12.6588,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            12.4531
+          ],
+          [
+            2,
+            9.9692
+          ],
+          [
+            3,
+            5.2642
+          ],
+          [
+            4,
+            9.2739
+          ],
+          [
+            5,
+            4.6043
+          ],
+          [
+            6,
+            4.2053
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "tpot_ms",
+      "n": 3,
+      "stat": {
+        "median": 9.9643,
+        "p10": 4.6046,
+        "p90": 12.4464,
+        "p99": 12.6737,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "tpot_ms",
+      "n": 3,
+      "stat": {
+        "median": 5.2642,
+        "p10": 5.2567,
+        "p90": 5.4066,
+        "p99": 5.4387,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "turn_e2e_ms",
+      "n": 3,
+      "stat": {
+        "median": 506.1131,
+        "p10": 383.0986,
+        "p90": 4270.7558,
+        "p99": 4332.4039,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            4299.2448
+          ],
+          [
+            2,
+            381.222
+          ],
+          [
+            3,
+            950.5584
+          ],
+          [
+            4,
+            384.9484
+          ],
+          [
+            5,
+            519.9258
+          ],
+          [
+            6,
+            490.3271
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "turn_e2e_ms",
+      "n": 3,
+      "stat": {
+        "median": 457.6672,
+        "p10": 381.4901,
+        "p90": 4295.1749,
+        "p99": 4334.801,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "turn_e2e_ms",
+      "n": 3,
+      "stat": {
+        "median": 950.5584,
+        "p10": 949.5959,
+        "p90": 961.8659,
+        "p99": 964.4101,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "reprefill_ratio",
+      "n": 3,
+      "stat": {
+        "median": 0.0054,
+        "p10": 0.004,
+        "p90": 1.0,
+        "p99": 1.0,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            1.0
+          ],
+          [
+            2,
+            0.0066
+          ],
+          [
+            3,
+            0.0043
+          ],
+          [
+            4,
+            0.007
+          ],
+          [
+            5,
+            0.0041
+          ],
+          [
+            6,
+            0.004
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "reprefill_ratio",
+      "n": 3,
+      "stat": {
+        "median": 0.0068,
+        "p10": 0.0041,
+        "p90": 1.0,
+        "p99": 1.0,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "reprefill_ratio",
+      "n": 3,
+      "stat": {
+        "median": 0.0043,
+        "p10": 0.0043,
+        "p90": 0.0043,
+        "p99": 0.0043,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "e2e_star_ms",
+      "n": 3,
+      "stat": {
+        "median": 637.6581,
+        "p10": 292.038,
+        "p90": 4300.5777,
+        "p99": 4379.6046,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            4328.9219
+          ],
+          [
+            2,
+            401.2022
+          ],
+          [
+            3,
+            783.2189
+          ],
+          [
+            4,
+            282.4628
+          ],
+          [
+            5,
+            800.1318
+          ],
+          [
+            6,
+            490.3095
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "e2e_star_ms",
+      "n": 3,
+      "stat": {
+        "median": 609.9945,
+        "p10": 283.8307,
+        "p90": 4324.8727,
+        "p99": 4383.2684,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "e2e_star_ms",
+      "n": 3,
+      "stat": {
+        "median": 783.2189,
+        "p10": 782.5577,
+        "p90": 806.4754,
+        "p99": 811.7081,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "n": 3,
+      "stat": {
+        "median": 120.4841,
+        "p10": 47.7631,
+        "p90": 249.1508,
+        "p99": 282.2214,
+        "samples": 18
+      },
+      "facet": {
+        "granularity": "chunk"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "n": 3,
+      "stat": {
+        "median": 138.2861,
+        "p10": 111.7132,
+        "p90": 249.7453,
+        "p99": 284.5619,
+        "samples": 12
+      },
+      "facet": {
+        "granularity": "chunk",
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "n": 3,
+      "stat": {
+        "median": 116.9876,
+        "p10": 115.9747,
+        "p90": 214.455,
+        "p99": 236.3851,
+        "samples": 3
+      },
+      "facet": {
+        "granularity": "chunk",
+        "turn_class": "file-write"
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "state": "blocked",
+      "issue": 208,
+      "reason": "Anthropic SSE deltas carry text, not token counts, so per-token ITL is not on the wire; see the granularity=chunk facet"
+    },
+    {
+      "lane": "A",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "spec_accept_rate",
+      "state": "not-run",
+      "reason": "the Anthropic stream reports no draft acceptance; the replay cannot measure it"
+    }
+  ],
+  "ablations": []
+}

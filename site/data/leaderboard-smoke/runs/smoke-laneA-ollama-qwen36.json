@@ -1,0 +1,530 @@
+{
+  "schema": 1,
+  "run_id": "smoke-laneA-ollama-qwen36",
+  "lane": "A",
+  "status": "published",
+  "provenance": {
+    "machine": "m5max-64",
+    "rung": "R1",
+    "scratchy_sha": "34a3a2d4acccdc82f07fd525e20b5a05eae33e16",
+    "claude_version": "2.1.301",
+    "ollama_version": "0.40.4",
+    "context_length_tokens": 65536,
+    "kv_cache_dtype": {
+      "scratchy": "turboquant",
+      "ollama": "f16"
+    },
+    "quantization": {
+      "scratchy": "mlx-affine-b4-g64-qembed",
+      "ollama": "nvfp4"
+    },
+    "checkpoint_revision": {
+      "scratchy": "mlx-community/Qwen3.6-35B-A3B-4bit@38740b847e4cb78f352aba30aa41c76e08e6eb46",
+      "ollama": "qwen3.6:35b@sha256:9e493bcc7d47b9cae704e368d1421871c15b30bb76d11223e96d2a7a6a6a56aa"
+    },
+    "sampling": {
+      "temperature": 0.0
+    },
+    "trace_corpus": {
+      "id": "SMOKE-throwaway",
+      "claude_version": "2.1.301",
+      "recorded_engine": {
+        "name": "scratchy",
+        "version": "0.1.0"
+      },
+      "turns": 6,
+      "skipped": 5,
+      "skipped_by_reason": {
+        "not a turn": 5
+      },
+      "turns_recorded_in_flight": 0,
+      "max_in_flight": 0,
+      "turn_classes": {
+        "tool-call": 4,
+        "file-write": 1
+      },
+      "max_recorded_prompt_tokens": 21799,
+      "replay": {
+        "concurrency": 1,
+        "cache_reset": false,
+        "served_model": "qwen3.6:35b",
+        "unstreamed_turns": 0,
+        "max_tokens_turns": 0,
+        "prompt_tokens_differ_turns": 18,
+        "prompt_shortfall_tolerance": {
+          "tokens": 64,
+          "fraction": 0.05
+        }
+      }
+    },
+    "disclosed": [
+      "kv-dtype-unmatched",
+      "quantizer-differs",
+      "prefix-cache-not-reset",
+      "requests-served-unavailable"
+    ],
+    "artifacts": [
+      "smoke-laneA-ollama-qwen36.turns.json"
+    ]
+  },
+  "measurements": [
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "n": 3,
+      "stat": {
+        "median": 58.2432,
+        "p10": 36.4814,
+        "p90": 349.6019,
+        "p99": 5800.8783,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            57.7671
+          ],
+          [
+            2,
+            59.052
+          ],
+          [
+            3,
+            58.7193
+          ],
+          [
+            4,
+            36.8403
+          ],
+          [
+            5,
+            59.813
+          ],
+          [
+            6,
+            53.482
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "n": 3,
+      "stat": {
+        "median": 58.4095,
+        "p10": 36.3337,
+        "p90": 696.3785,
+        "p99": 6165.7003,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "n": 3,
+      "stat": {
+        "median": 58.7193,
+        "p10": 42.0055,
+        "p90": 147.1665,
+        "p99": 167.0672,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "tpot_ms",
+      "n": 3,
+      "stat": {
+        "median": 7.1954,
+        "p10": 6.3792,
+        "p90": 8.108,
+        "p99": 9.8392,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            6.3829
+          ],
+          [
+            2,
+            7.1783
+          ],
+          [
+            3,
+            7.7626
+          ],
+          [
+            4,
+            6.5053
+          ],
+          [
+            5,
+            7.4382
+          ],
+          [
+            6,
+            7.5728
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "tpot_ms",
+      "n": 3,
+      "stat": {
+        "median": 6.7817,
+        "p10": 6.3716,
+        "p90": 8.0665,
+        "p99": 9.9623,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "tpot_ms",
+      "n": 3,
+      "stat": {
+        "median": 7.7626,
+        "p10": 6.7884,
+        "p90": 8.0293,
+        "p99": 8.0893,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "turn_e2e_ms",
+      "n": 3,
+      "stat": {
+        "median": 611.3594,
+        "p10": 452.8292,
+        "p90": 2200.6546,
+        "p99": 6904.7165,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            611.9585
+          ],
+          [
+            2,
+            724.2763
+          ],
+          [
+            3,
+            585.9594
+          ],
+          [
+            4,
+            469.8795
+          ],
+          [
+            5,
+            435.2684
+          ],
+          [
+            6,
+            1993.6683
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "turn_e2e_ms",
+      "n": 3,
+      "stat": {
+        "median": 609.9488,
+        "p10": 437.7771,
+        "p90": 1384.3529,
+        "p99": 7075.0037,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "turn_e2e_ms",
+      "n": 3,
+      "stat": {
+        "median": 585.9594,
+        "p10": 506.0392,
+        "p90": 673.6387,
+        "p99": 693.3666,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "reprefill_ratio",
+      "n": 3,
+      "stat": {
+        "median": 0.0002,
+        "p10": 0.0,
+        "p90": 0.011,
+        "p99": 0.8319,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            0.0002
+          ],
+          [
+            2,
+            0.0002
+          ],
+          [
+            3,
+            0.0002
+          ],
+          [
+            4,
+            0.0
+          ],
+          [
+            5,
+            0.0002
+          ],
+          [
+            6,
+            0.0002
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "reprefill_ratio",
+      "n": 3,
+      "stat": {
+        "median": 0.0002,
+        "p10": 0.0,
+        "p90": 0.011,
+        "p99": 0.8912,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "reprefill_ratio",
+      "n": 3,
+      "stat": {
+        "median": 0.0002,
+        "p10": 0.0001,
+        "p90": 0.0042,
+        "p99": 0.0051,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "e2e_star_ms",
+      "n": 3,
+      "stat": {
+        "median": 800.3115,
+        "p10": 201.1416,
+        "p90": 1265.7234,
+        "p99": 6133.296,
+        "samples": 18
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            236.3249
+          ],
+          [
+            2,
+            248.2135
+          ],
+          [
+            3,
+            1060.0973
+          ],
+          [
+            4,
+            153.9901
+          ],
+          [
+            5,
+            1265.1425
+          ],
+          [
+            6,
+            750.1751
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "e2e_star_ms",
+      "n": 3,
+      "stat": {
+        "median": 270.7616,
+        "p10": 160.726,
+        "p90": 1266.8851,
+        "p99": 6485.0708,
+        "samples": 12
+      },
+      "facet": {
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "e2e_star_ms",
+      "n": 3,
+      "stat": {
+        "median": 1060.0973,
+        "p10": 917.7051,
+        "p90": 1182.9413,
+        "p99": 1210.5812,
+        "samples": 3
+      },
+      "facet": {
+        "turn_class": "file-write"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "n": 3,
+      "stat": {
+        "median": 205.4767,
+        "p10": 23.2011,
+        "p90": 311.8049,
+        "p99": 337.0597,
+        "samples": 18
+      },
+      "facet": {
+        "granularity": "chunk"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "n": 3,
+      "stat": {
+        "median": 205.4767,
+        "p10": 24.0954,
+        "p90": 302.7558,
+        "p99": 304.9326,
+        "samples": 12
+      },
+      "facet": {
+        "granularity": "chunk",
+        "turn_class": "tool-call"
+      }
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "n": 3,
+      "stat": {
+        "median": 327.2349,
+        "p10": 253.2933,
+        "p90": 336.7046,
+        "p99": 338.8352,
+        "samples": 3
+      },
+      "facet": {
+        "granularity": "chunk",
+        "turn_class": "file-write"
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "itl_p99_ms",
+      "state": "blocked",
+      "issue": 208,
+      "reason": "Anthropic SSE deltas carry text, not token counts, so per-token ITL is not on the wire; see the granularity=chunk facet"
+    },
+    {
+      "lane": "A",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "spec_accept_rate",
+      "state": "not-run",
+      "reason": "the Anthropic stream reports no draft acceptance; the replay cannot measure it"
+    }
+  ],
+  "ablations": []
+}

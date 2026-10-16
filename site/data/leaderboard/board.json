@@ -455,7 +455,7 @@
     },
     {
       "id": "prefix-cache-not-reset",
-      "text": "ollama offers no way to clear its prefix cache between repeats, so from the second repeat on its first turn can start warm, while scratchy's cache is reset before every repeat. Turn 1 is comparable across engines only on the first repeat.",
+      "text": "ollama offers no way to clear its prefix cache between repeats, while scratchy's cache is reset before every repeat. A replay sends the same prompts on every repeat, so from the second repeat on, every ollama turn can be served almost entirely from its cache. ollama's figures on such a run are therefore optimistic, and only the first repeat compares the two engines fairly. Unloading and reloading the model between repeats clears the cache; the replayer does not do that yet.",
       "source": "emitted by cc_trace.py replay (#440)"
     },
     {
