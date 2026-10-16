@@ -667,7 +667,16 @@ fn reduce(
             let mut sorted = ds.clone();
             sorted.sort_unstable();
             for &d in sorted.iter().rev() {
-                let cur = Tile::compute(data.clone(), tile.dtype, shape.clone());
+                // ⛔ NO RE-ROUND OF THE AXIS INPUT: it already sits on its producer's
+                // grid — the first axis's is the operand as landed, every later axis's
+                // the previous fold's partials (rounded per round by the fold's own
+                // law). Re-rounding it to the storage dtype pushes a DLF16-landed
+                // operand back through IEEE f16. MEASURED (gemma-4-12b emu prefill,
+                // layer 0's Σx²): the rmsnorm square lands DLF16 at up to 115,968, the
+                // re-round made every x² > 65504 inf, 4 of 19 rows summed to inf,
+                // `rsqrt` zeroed them and the stream was NaN by layer 13 — while the
+                // card's DLF16 accumulator holds those rows (≤ 4.5e8 of its 8.58e9).
+                let cur = Tile::from_decoded(data.clone(), tile.dtype, shape.clone(), None, None);
                 let (folded, fshape) = tree_fold(&cur, Some(d), &reducer, ctx, env)?;
                 data = folded;
                 shape = fshape;
@@ -2058,6 +2067,32 @@ mod tests {
         let op = ops.with_region(op, body);
         run(&[op], &mut ctx).unwrap();
         assert_eq!(get_tile(&ctx, r).as_f32().to_vec(), vec![6.0, 15.0]);
+    }
+
+    /// The gemma-4-12b first-norm shape: an F16 square landed on the DLF16 grid with an
+    /// element past IEEE f16's 65504. The fma-class sum folds it on the DLF16
+    /// accumulator — the row stays finite — instead of re-rounding the input to IEEE f16
+    /// (inf) before the fold. The ordinary row is unaffected.
+    #[test]
+    fn a_dlf16_landed_operand_past_f16_range_sums_finite() {
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        let sq = Tile::compute_dlf16(
+            vec![100_000.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0],
+            DType::F16,
+            vec![2, 4],
+        );
+        ctx.set_value(ops.ssa("%sq"), Value::Tile(sq));
+        let r = ops.ssa("%r");
+        let op = ops.op(Some("%r"), OpKind::LinalgReduce, &["%sq"]);
+        let op = ops.attr(op, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+        let op = ops.attr(op, AttrKey::Dim, Attr::Int(1));
+        run(&[op], &mut ctx).unwrap();
+        // The fast fold's pairing: (x0 + x2, x1 + x3), then their sum — each round DLF16.
+        let d = crate::codec::round_dlf16;
+        let row0 = d(d(d(100_000.0) + 1.0) + d(1.0 + 1.0));
+        assert!(row0.is_finite());
+        assert_eq!(get_tile(&ctx, r).as_f32().to_vec(), vec![row0, 10.0]);
     }
 
     #[test]
