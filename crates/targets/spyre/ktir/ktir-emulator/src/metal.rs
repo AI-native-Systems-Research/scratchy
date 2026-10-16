@@ -507,6 +507,9 @@ struct WeightKey {
     /// (the `KTIR_F16_WEIGHTS` path), `false` for f32. Keeps the two encodings of
     /// the same weight from colliding when a process A/B-toggles the flag.
     f16: bool,
+    /// `true` for a 1-byte fp8 CODE buffer (the `KTIR_B_FP8` GEMM's operand), so an fp8
+    /// weight's codes and its f32 decode never collide.
+    fp8: bool,
 }
 
 /// Max distinct weight buffers held resident at once. SmolLM2-135M has on the
@@ -514,7 +517,11 @@ struct WeightKey {
 /// cycles through many distinct weights. On overflow the cache is cleared (a
 /// simple, correct eviction — the next pass repopulates the working set).
 #[cfg(metal)]
-const WEIGHT_CACHE_MAX: usize = 512;
+// ⛔ THE CAP MUST HOLD A WHOLE PASS'S WEIGHT SET. Every pass reads every weight tile, so a
+// cap below the working set clears mid-pass and EVERY later pass misses (thrash). 512 was
+// sized for SmolLM2-135M; MEASURED gemma-4-12b fp8 = 537 distinct tiles per pass (N-tiled
+// slices included) → 151 hits / 537 misses per pass, 30-54 s of re-decode per step.
+const WEIGHT_CACHE_MAX: usize = 8192;
 
 /// Whether to store the resident GPU WEIGHT (B) operand as f16 (half) rather than
 /// f32 — the weight-streaming win. ON by default; `KTIR_NO_F16_WEIGHTS` disables it.
@@ -945,15 +952,20 @@ pub fn run_matmul_loop_gpu(
         // runners) the engine has no f16 pipeline, so stay f32 — never produce an
         // f16 buffer the kernel can't consume (that was the metal.rs unwrap panic).
         let want_b_f16 = use_nax && f16_weights_enabled() && engine.has_f16_b_pipelines();
+        // fp8 B (the weight's own codes) on the NAX GPU path whenever the engine compiled
+        // the `KTIR_B_FP8` pipelines — the AMX branches read f32 in place and never see it.
+        let want_b_fp8 = use_nax && engine.has_fp8_b_pipelines();
         let gemm = GemmResolveCtx {
             ctx,
             engine,
             want_b_f16,
+            want_b_fp8,
         };
         let gemm_a = GemmResolveCtx {
             ctx,
             engine,
             want_b_f16: false, // A (activation) is always f32 in
+            want_b_fp8: false,
         };
         let _t_res = std::time::Instant::now();
         let ua = resolve_gemm_operand_unified_off(
@@ -1033,7 +1045,7 @@ pub fn run_matmul_loop_gpu(
         // primitive, so the diff is ~0 (a useful self-check that out is real).
         // Skip the CPU cross-check when B is an f16 buffer (the f32 `as_slice()`
         // view is invalid); the f16-B path is validated by the golden e2e tests.
-        if std::env::var_os("KTIR_GEMM_CHECK").is_some() && !ub.is_f16() {
+        if std::env::var_os("KTIR_GEMM_CHECK").is_some() && !ub.is_f16() && !ub.is_fp8() {
             let cpu = if info.transpose_b {
                 crate::blas::sgemm_rowmajor_bt(m, k, n, ua.as_slice(), ub.as_slice())
             } else {
@@ -1277,6 +1289,9 @@ pub(crate) struct GemmResolveCtx<'a> {
     /// f16 B only on the NAX GPU path (the flag AND f16 pipelines); every other
     /// path keeps f32 B — see the `want_b_f16` derivation at the call site.
     pub want_b_f16: bool,
+    /// fp8 B (the weight's own 1-byte codes) on the NAX GPU path when the engine
+    /// compiled the `KTIR_B_FP8` pipelines; an fp8 weight otherwise decodes to f32.
+    pub want_b_fp8: bool,
 }
 
 /// Resolve a GEMM operand to a resident [`UnifiedBuffer`].
@@ -1317,6 +1332,9 @@ fn resolve_gemm_operand_unified_off(
         ctx,
         engine,
         want_b_f16,
+        // A plain-layout operand is never an fp8 weight (those are on-disk `[n,k]`,
+        // resolved by `resolve_gemm_bt_operand`), so the fp8-B law has nothing to say here.
+        want_b_fp8: _,
     } = *gemm;
     let n = rows * cols;
     let elem_off = row_off * cols;
@@ -1373,6 +1391,7 @@ fn resolve_gemm_operand_unified_off(
                 fingerprint,
                 col_off: 0,
                 f16: want_b_f16 && b_dtype == DType::F16,
+                fp8: false,
             };
             // Fast path: a hit returns the cached buffer with no further HBM work.
             if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
@@ -1425,6 +1444,8 @@ fn resolve_gemm_weight_slice(
         ctx,
         engine,
         want_b_f16,
+        // A strided `[k,n]` column slice is never an fp8 weight (see the plain resolver).
+        want_b_fp8: _,
     } = *gemm;
     let elem = match ctx.get_value(root)? {
         crate::ir::Value::Index(s) => *s,
@@ -1474,6 +1495,7 @@ fn resolve_gemm_weight_slice(
         fingerprint,
         col_off,
         f16: want_b_f16 && b_dtype == DType::F16,
+        fp8: false,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1511,6 +1533,7 @@ fn resolve_gemm_bt_operand(
         ctx,
         engine,
         want_b_f16,
+        want_b_fp8,
     } = *gemm;
     let elem = match ctx.get_value(root)? {
         crate::ir::Value::Index(s) => *s,
@@ -1528,13 +1551,21 @@ fn resolve_gemm_bt_operand(
     // byte addr = elem·bpe(dtype) — an fp8 weight is 1 byte per element.
     let addr = (elem + elem_off) * bpe;
     let count = n * k;
-    // f16: copy the contiguous raw f16 block verbatim (half the bytes). f32: decode
-    // at the view's own element type — an fp8 weight decodes one BYTE per element.
+    // f16: copy the contiguous raw f16 block verbatim (half the bytes). fp8 on the
+    // fp8-B GEMM: copy the 1-byte codes verbatim — the kernel widens them exactly.
+    // Otherwise decode to f32 at the view's own element type.
+    // ⭐ MEASURED (gemma-4-12b fp8 emu, M5 Max): the f32 decode made the resident
+    // weight cache 4 B/element — ~48 GB for 12B parameters — so every pass re-decoded
+    // (cache thrash) or paged (cache hit), 40-160 s per step; the codes are 12 GB.
+    let fp8 = want_b_fp8 && b_dtype == DType::Fp8E4m3;
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
         if want_b_f16 && b_dtype == DType::F16 {
             let raw = hbm.read_bytes(addr, count * bpe as usize);
             engine.unified_f16_from_raw(&raw)
+        } else if fp8 {
+            let raw = hbm.read_bytes(addr, count);
+            engine.unified_fp8_from_raw(&raw)
         } else {
             let decoded = hbm.read_decoded(addr, count, b_dtype);
             engine.unified_from(&decoded)
@@ -1555,6 +1586,7 @@ fn resolve_gemm_bt_operand(
         fingerprint,
         col_off: n_off,
         f16: want_b_f16 && b_dtype == DType::F16,
+        fp8,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4133,9 +4165,29 @@ impl UnifiedBuffer {
         Ok(b)
     }
 
+    /// A 1-byte `float8_e4m3fn` CODE buffer from the weight's raw HBM bytes, copied
+    /// verbatim — the fp8-B GEMM (`KTIR_B_FP8`) widens each code to `half` while
+    /// staging, so the resident weight is its own 1-byte encoding, not a 4-byte decode.
+    fn fp8_from_raw(
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+        raw: &[u8],
+    ) -> Result<Self, String> {
+        let b = Self::new_sized(device, raw.len(), 1)?;
+        // SAFETY: backing alloc holds >= raw.len() live bytes; we own it exclusively here.
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), b.alloc.ptr, raw.len());
+        }
+        Ok(b)
+    }
+
     /// True for an f16 (half, 2-byte) buffer; false for the default f32 buffer.
     pub fn is_f16(&self) -> bool {
         self.elem_bytes == 2
+    }
+
+    /// True for a 1-byte fp8 (e4m3fn code) buffer.
+    pub fn is_fp8(&self) -> bool {
+        self.elem_bytes == 1
     }
 
     pub fn as_slice(&self) -> &[f32] {
@@ -4177,6 +4229,10 @@ struct NarrowN {
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
     bt_f16b: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+    >,
+    /// fp8-B (`KTIR_B_FP8`) transpose-B narrow-N — an fp8 weight is always on-disk `[n,k]`.
+    bt_fp8b: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
     >,
 }
@@ -4259,6 +4315,19 @@ pub struct NaxGemm {
         >,
     >,
     pipeline_sm_bt_f16b: Option<
+        objc2::rc::Retained<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        >,
+    >,
+    /// fp8-B (`KTIR_B_FP8`) transpose-B variants, full-block and small-M — NAX-only.
+    /// B is the weight's 1-byte e4m3fn codes, widened to `half` while staging; selected
+    /// by `matmul_unified` when the B `UnifiedBuffer` is fp8.
+    pipeline_bt_fp8b: Option<
+        objc2::rc::Retained<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+        >,
+    >,
+    pipeline_sm_bt_fp8b: Option<
         objc2::rc::Retained<
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
         >,
@@ -4412,6 +4481,12 @@ impl NaxGemm {
     /// `matmul_unified` an f16 B buffer.
     pub fn has_f16_b_pipelines(&self) -> bool {
         self.pipeline_bt_f16b.is_some() && self.pipeline_f16b.is_some()
+    }
+
+    /// Whether this engine compiled the fp8-B (`KTIR_B_FP8`) transpose-B pipelines —
+    /// NAX devices only. Callers check it before handing `matmul_unified` an fp8 B.
+    pub fn has_fp8_b_pipelines(&self) -> bool {
+        self.pipeline_bt_fp8b.is_some() && self.pipeline_sm_bt_fp8b.is_some()
     }
 
     /// `force_nax`: `None` = auto by device, `Some(true)` = NAX, `Some(false)` =
@@ -4585,15 +4660,44 @@ impl NaxGemm {
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|e| format!("metal: {kname} narrow-N pipeline failed (tb={tb}): {e:?}"))
         };
+        // fp8-B (`KTIR_B_FP8=1`) transpose-B variants, NAX-only, built from source (no AOT
+        // stem encodes fp8b, so an `aot` hit would bind the f32-B pipeline to a byte buffer).
+        // `defs` carries the block-shape defines (`KTIR_SGS_M`/`KTIR_SGS_N`) of the variant.
+        let build_fp8b = |defs: &str| -> Result<
+            objc2::rc::Retained<
+                objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
+            >,
+            String,
+        > {
+            let full = format!("#define KTIR_TRANSPOSE_B 1\n#define KTIR_B_FP8 1\n{defs}{src}");
+            let library = device
+                .newLibraryWithSource_options_error(&NSString::from_str(&full), Some(&opts))
+                .map_err(|e| format!("metal: {kname} fp8b compile failed ({defs:?}): {e:?}"))?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str(kname))
+                .ok_or_else(|| format!("metal: kernel {kname} not found"))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|e| format!("metal: {kname} fp8b pipeline failed ({defs:?}): {e:?}"))
+        };
         let narrow_n = if is_nax {
             Some(NarrowN {
                 plain: build_narrow(0, 0)?,
                 bt: build_narrow(1, 0)?,
                 plain_f16b: build_narrow(0, 1)?,
                 bt_f16b: build_narrow(1, 1)?,
+                bt_fp8b: build_fp8b("#define KTIR_SGS_N 1\n")?,
             })
         } else {
             None
+        };
+        let (pipeline_bt_fp8b, pipeline_sm_bt_fp8b) = if is_nax {
+            (
+                Some(build_fp8b("")?),
+                Some(build_fp8b("#define KTIR_SGS_M 1\n")?),
+            )
+        } else {
+            (None, None)
         };
         let (pipeline_sm, pipeline_sm_bt) = if is_nax {
             (
@@ -4693,6 +4797,8 @@ impl NaxGemm {
             pipeline_bt_f16b,
             pipeline_sm_f16b,
             pipeline_sm_bt_f16b,
+            pipeline_bt_fp8b,
+            pipeline_sm_bt_fp8b,
             scratch: std::cell::RefCell::new(Scratch::default()),
             block_m,
             block_n,
@@ -4914,12 +5020,33 @@ impl NaxGemm {
         // The f16-B and small-M variants are Option (None on tiers/configs that
         // didn't compile them); NEVER unwrap — a missing variant returns Err so the
         // caller falls back to the interpreter K-loop instead of aborting the process.
-        let pipe = match (narrow, transpose_b, b_f16) {
-            (Some(nn), true, true) => &nn.bt_f16b,
-            (Some(nn), true, false) => &nn.bt,
-            (Some(nn), false, true) => &nn.plain_f16b,
-            (Some(nn), false, false) => &nn.plain,
-            _ => match (small, transpose_b, b_f16) {
+        // fp8-B: the weight's 1-byte e4m3fn codes, widened to `half` while staging. An fp8
+        // weight is always the on-disk `[n,k]`, so only transpose-B variants exist.
+        let fp8_pipe = if b.is_fp8() {
+            if !transpose_b {
+                return Err("metal: fp8-B GEMM needs transpose-B (an fp8 weight is [n,k])".into());
+            }
+            Some(match (narrow, small) {
+                (Some(nn), _) => &nn.bt_fp8b,
+                (None, true) => self
+                    .pipeline_sm_bt_fp8b
+                    .as_ref()
+                    .ok_or("metal: small-M fp8-B pipeline unavailable")?,
+                (None, false) => self
+                    .pipeline_bt_fp8b
+                    .as_ref()
+                    .ok_or("metal: fp8-B pipeline unavailable")?,
+            })
+        } else {
+            None
+        };
+        let pipe = match (fp8_pipe, narrow, transpose_b, b_f16) {
+            (Some(p), ..) => p,
+            (None, Some(nn), true, true) => &nn.bt_f16b,
+            (None, Some(nn), true, false) => &nn.bt,
+            (None, Some(nn), false, true) => &nn.plain_f16b,
+            (None, Some(nn), false, false) => &nn.plain,
+            (None, None, ..) => match (small, transpose_b, b_f16) {
                 (true, true, true) => self
                     .pipeline_sm_bt_f16b
                     .as_ref()
@@ -5016,6 +5143,13 @@ impl NaxGemm {
 
         let dims = [1u32, n as u32, k as u32];
         let codes = [epi.binop, epi.act];
+        // The GEMV kernel has no fp8-B variant: binding fp8 codes to its f32-B pipeline
+        // would read four codes as one float. Refuse instead (decode routes the tiled kernel).
+        if b.is_fp8() {
+            return Err(
+                "metal: gemv has no fp8-B variant — route fp8 B through matmul_unified".into(),
+            );
+        }
         let pipe = match (transpose_b, b.is_f16()) {
             (true, true) => &self.gemv_pipeline_bt_f16b,
             (true, false) => &self.gemv_pipeline_bt,
@@ -5096,6 +5230,11 @@ impl NaxGemm {
     /// operand under [`f16_weights_enabled`].
     fn unified_f16_from_raw(&self, raw: &[u8]) -> Result<UnifiedBuffer, String> {
         UnifiedBuffer::f16_from_raw(&self.device, raw)
+    }
+    /// A resident fp8 code buffer for the `KTIR_B_FP8` GEMM — see
+    /// [`UnifiedBuffer::fp8_from_raw`].
+    fn unified_fp8_from_raw(&self, raw: &[u8]) -> Result<UnifiedBuffer, String> {
+        UnifiedBuffer::fp8_from_raw(&self.device, raw)
     }
     /// Build an f16 (half) [`UnifiedBuffer`] from host f32 `data` by rounding each
     /// element to f16 — for benchmarks / tests that need an f16 B operand to feed
@@ -5873,6 +6012,59 @@ kernel void mpp_probe(
             "simdgroup transpose-B matches the bt oracle across {} shapes ✓",
             TRANSPOSE_B_SHAPES.len()
         );
+        Ok(())
+    }
+
+    /// fp8-B (`KTIR_B_FP8`): the weight's 1-byte e4m3fn codes, widened to `half` while
+    /// staging, must give the SAME bits as staging the decoded f32 weight — every e4m3fn
+    /// value is exactly an f16 value, so the staged tile is identical. Covers the decode
+    /// narrow-N grid (m=1), a prefill width (m=19) and a full multi-block shape, over
+    /// codes spanning sign, subnormals (exp 0) and the top exponent (NaN codes excluded).
+    #[test]
+    fn nax_matmul_unified_fp8_b_is_bit_identical_to_f32_b() -> Result<(), String> {
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping fp8-B test");
+            return Ok(());
+        }
+        let ctx = NaxGemm::new()?;
+        if !ctx.has_fp8_b_pipelines() {
+            eprintln!("not a NAX device — no fp8-B pipelines, skipping");
+            return Ok(());
+        }
+        for (m, k, n) in [
+            (1usize, 256usize, 640usize),
+            (19, 384, 320),
+            (160, 512, 512),
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.07).collect();
+            let codes: Vec<u8> = (0..n * k)
+                .map(|i| {
+                    let c = ((i * 37 + i / 7) % 256) as u8;
+                    if c & 0x7F == 0x7F { c & 0xF7 } else { c }
+                })
+                .collect();
+            let b: Vec<f32> = codes
+                .iter()
+                .map(|&c| crate::codec::e4m3_to_f32(c))
+                .collect();
+            let ua = ctx.unified_from(&a)?;
+            let ub_f32 = ctx.unified_from(&b)?;
+            let ub_fp8 = ctx.unified_fp8_from_raw(&codes)?;
+            assert!(ub_fp8.is_fp8(), "B buffer must be fp8");
+            let mut uc_f32 = ctx.unified(m * n)?;
+            let mut uc_fp8 = ctx.unified(m * n)?;
+            for (ub, uc) in [(&ub_f32, &mut uc_f32), (&ub_fp8, &mut uc_fp8)] {
+                ctx.matmul_unified(m, k, n, &ua, ub, uc, None, Epilogue::NONE, true)?;
+            }
+            let (want, got) = (uc_f32.as_slice(), uc_fp8.as_slice());
+            for (i, (w, g)) in want.iter().zip(got).enumerate() {
+                assert_eq!(
+                    w.to_bits(),
+                    g.to_bits(),
+                    "fp8-B vs f32-B at ({m},{k},{n}) element {i}: {g} vs {w}"
+                );
+            }
+        }
         Ok(())
     }
 

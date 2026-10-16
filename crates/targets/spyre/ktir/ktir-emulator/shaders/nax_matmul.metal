@@ -22,12 +22,40 @@ constant constexpr uint SG_N   = 64;    // simdgroup sub-block cols (2 tiles of 
 #ifndef KTIR_B_F16
 #define KTIR_B_F16 0
 #endif
-#if KTIR_B_F16
+// KTIR_B_FP8=1 reads B as its 1-byte `float8_e4m3fn` CODES and widens each to `half`
+// while staging. Every e4m3fn value is exactly an f16 value (3-bit mantissa, exponents
+// 2^-9..2^8), so the staged tile — and the result — is bit-identical to staging the
+// decoded f32 weight; only the bytes streamed (and resident) drop 4x.
+#ifndef KTIR_B_FP8
+#define KTIR_B_FP8 0
+#endif
+#if KTIR_B_FP8
+typedef uchar  ktir_bt;
+typedef uchar4 ktir_bt4;
+// e4m3fn byte -> its exact half, by bit construction: a normal (exp e, mant m) is
+// half exp e+8 with mant m<<7; a subnormal m·2^-9 normalizes to half exp 6+p.
+inline half ktir_b_half(uchar b) {
+    ushort s = ushort(b & 0x80u) << 8;
+    uint e = (b >> 3) & 0xFu, m = b & 0x7u;
+    if (e == 0xFu && m == 0x7u) { return as_type<half>(ushort(s | 0x7E00u)); }
+    if (e != 0u) { return as_type<half>(ushort(s | ((e + 8u) << 10) | (m << 7))); }
+    if (m == 0u) { return as_type<half>(s); }
+    uint p = 31u - clz(m);
+    return as_type<half>(ushort(s | ((6u + p) << 10) | ((m << (10u - p)) & 0x3FFu)));
+}
+inline half4 ktir_b_half4(uchar4 v) {
+    return half4(ktir_b_half(v.x), ktir_b_half(v.y), ktir_b_half(v.z), ktir_b_half(v.w));
+}
+#elif KTIR_B_F16
 typedef half  ktir_bt;
 typedef half4 ktir_bt4;   // vector chunk type for the vectorized B loader
+inline half ktir_b_half(half v) { return v; }
+inline half4 ktir_b_half4(half4 v) { return v; }
 #else
 typedef float  ktir_bt;
 typedef float4 ktir_bt4;
+inline half ktir_b_half(float v) { return half(v); }
+inline half4 ktir_b_half4(float4 v) { return half4(v); }
 #endif
 constant constexpr uint SGS_M  = KTIR_SGS_M;  // simdgroup rows per threadgroup
 // SGS_N (simdgroup cols per threadgroup) is overridable so the host can compile a
@@ -175,17 +203,17 @@ inline float nax_epilogue(float v, float ev, uint binop, uint act) {
                 uint bidx = gn * K + gk0;                                       \
                 if (gn < N && gk0 + VW <= K && (bidx & (VW - 1u)) == 0u) {      \
                     ktir_bt4 v = *(device const ktir_bt4*)(b_in + bidx);       \
-                    *(threadgroup half4*)dst = half4(v);                      \
+                    *(threadgroup half4*)dst = ktir_b_half4(v);               \
                 } else if (gn < N) {                                            \
                     for (uint c = 0; c < VW; ++c)                               \
-                        dst[c] = (gk0 + c < K) ? half(b_in[gn * K + gk0 + c]) : half(0);\
+                        dst[c] = (gk0 + c < K) ? ktir_b_half(b_in[gn * K + gk0 + c]) : half(0);\
                 } else {                                                       \
                     *(threadgroup half4*)dst = half4(0);                      \
                 }                                                              \
             } else {                                                           \
                 for (uint c = 0; c < VW; ++c) {                                 \
                     uint gk = gk0 + c;                                          \
-                    dst[c] = (gn < N && gk < K) ? half(b_in[gk * N + gn]) : half(0);\
+                    dst[c] = (gn < N && gk < K) ? ktir_b_half(b_in[gk * N + gn]) : half(0);\
                 }                                                              \
             }                                                                  \
         }                                                                      \
