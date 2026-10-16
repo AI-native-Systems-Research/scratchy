@@ -270,26 +270,27 @@ struct OpProg {
     kv: OpKv,
 }
 
-/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE, BECAUSE IT OUTLIVES THE
-/// RUNTIME THAT COULD FREE IT. Per-step windows (`shifted`, built per layer per launch) are NOT:
-/// they drop as owned values while the runtime is alive.
+/// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE. Per-step windows
+/// (`shifted`, built per layer per launch) are NOT: they drop as owned values while the
+/// runtime is alive.
 ///
-/// It is a LIFETIME ORDER problem, not an ownership-kind one. These handles are dropped during
-/// PROCESS SHUTDOWN, by which point the runtime context and its allocator are gone: freeing then
-/// would look the address up in an empty map and throw out of a destructor — and a destructor is
-/// implicitly `noexcept`, so that throw is `std::terminate`. MEASURED 2026-08-12: every run ended
-/// `RUN_RC=255` **after** `Batch complete: N succeeded, 0 failed` — exit codes calling perfect
-/// runs failures.
+/// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
+/// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
+/// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
+/// today — the context in `runtime::runtime_cell` is a `static` that is never dropped, and
+/// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
+/// `runtime_reset` (the leak probe) tears the context down MID-PROCESS, and a future
+/// `DevAddr` drop that learns to free must not find session handles betting on drop order
+/// versus that.
 ///
-/// Leaking is CORRECT here, not a workaround: the device region lives until process exit either
-/// way, so all that leaks is a descriptor value, once, at shutdown. Today's `runtime::DevAddr` is
-/// an `Arc` over a plain descriptor whose drop cannot reach the allocator — the `forget` stays
-/// anyway: it costs nothing and keeps this law's shape independent of whatever a future
-/// `DevAddr` drop might learn to do.
+/// The law predates this Rust surface: in the C++ runtime, the allocator was torn down before
+/// these handles, and the throw out of a `noexcept` destructor turned perfect runs into
+/// `RUN_RC=255` (measured 2026-08-12 — every run ended 255 **after** `Batch complete:
+/// N succeeded, 0 failed`).
 ///
-/// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step windows
-/// (`shifted`, built per layer per launch) must keep dying as owned values — at ~120 per forward a
-/// leaked descriptor each grows without bound.
+/// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step
+/// windows (`shifted`, built per layer per launch) must keep dying as owned values — at ~120
+/// per forward a leaked descriptor each grows without bound.
 impl Drop for OpProg {
     fn drop(&mut self) {
         std::mem::forget(self.addr.take());

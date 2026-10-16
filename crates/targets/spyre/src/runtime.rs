@@ -124,7 +124,7 @@ pub fn init_runtime() -> Result<(), HwError> {
 pub fn prewarm_runtime() {
     std::thread::spawn(|| {
         if let Err(e) = get_or_init_runtime() {
-            tracing::error!("prewarm failed (will retry in prepare): {e}");
+            tracing::error!("prewarm failed (prepare will report it): {e}");
         }
     });
 }
@@ -541,10 +541,10 @@ pub struct Chunk0 {
 ///
 /// ⛔ DEVICE REGIONS ARE NEVER FREED, ONLY DESCRIBED. Dropping a `DevAddr` releases the descriptor
 /// value (an `Arc<CompositeAddress>` refcount); the underlying device memory lives until process
-/// exit. Freeing a region needs a live `RuntimeContext`'s allocator, and the handles that would
-/// free at shutdown OUTLIVE the runtime that could free them — which is why session-lifetime
-/// handles are `mem::forget`d ON PURPOSE at their drop sites (`OpProg`/`Executor` in
-/// [`crate::superdsc_exec`]; see the ⛔ doc there). Per-step windows (`shifted`/`window`, built
+/// exit. Freeing a region needs a live `RuntimeContext`'s allocator, which a plain descriptor drop
+/// cannot reach — and session-lifetime handles are `mem::forget`d ON PURPOSE at their drop sites
+/// (`OpProg`/`Executor` in [`crate::superdsc_exec`]; see the ⛔ doc there), so their drop never
+/// becomes load-bearing against runtime lifetime. Per-step windows (`shifted`/`window`, built
 /// per layer per launch) drop normally as owned values while the runtime is alive.
 ///
 /// `Send` by construction: the descriptor is plain shared data.
