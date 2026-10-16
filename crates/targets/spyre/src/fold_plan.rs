@@ -753,6 +753,67 @@ pub fn past_every_sweep(folds: &[bool]) -> usize {
         .unwrap_or(folds.len().saturating_sub(1))
 }
 
+/// ⭐ ONE VALUE PER ATTENTION CLASS, AND ONLY EVERY CLASS — the fold-fused twins of one body.
+///
+/// ⛔⛔⛔ A SET WITH A CLASS MISSING IS UNREPRESENTABLE, AND THAT IS THE POINT. The twins come off the
+/// meta as one `SiblingFp` per class, `none()` for a class that sits out, and the executor's loader
+/// FILTERED the sitting-out ones away before collecting. Two defects followed from that one filter:
+///   * a rung whose classes all sat out became an EMPTY list, the selector still handed it out, and
+///     class 0's lookup indexed past its end. MEASURED on granite-3.1-2b fp16 (pod nickm, post-#299
+///     main + #558): the first decode step panicked `index out of bounds: the len is 0 but the
+///     index is 0` in `superdsc_exec`'s `list()`, `RungFused` arm;
+///   * a rung where class 0 sat out and class 1 did not became a ONE-entry list, so class 0's
+///     lookup ran CLASS 1's ops: a different attention body, silently.
+///
+/// [`PerClass::of_every_class`] keeps a class's position or refuses the set. It is `Some` only when
+/// there is exactly one twin per class, so `class(c)` always names class `c`'s own twin.
+#[derive(Debug)]
+pub struct PerClass<T>(Vec<T>);
+
+impl<T> PerClass<T> {
+    /// The set of every class's value, in class order. `None` unless exactly `classes` values are
+    /// given and each is present.
+    pub fn of_every_class(
+        classes: usize,
+        each: impl IntoIterator<Item = Option<T>>,
+    ) -> Option<Self> {
+        let v: Vec<T> = each.into_iter().collect::<Option<Vec<T>>>()?;
+        (classes > 0 && v.len() == classes).then_some(PerClass(v))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Class `c`'s own value.
+    pub fn class(&self, c: usize) -> &T {
+        &self.0[c]
+    }
+
+    pub fn class_mut(&mut self, c: usize) -> &mut T {
+        &mut self.0[c]
+    }
+}
+
+/// The ladder's fold-fused rungs. Each rung, given as `(swept extent, class count, one optional twin
+/// per class)`, is kept with its twins in class order exactly when EVERY class has one
+/// ([`PerClass`]). A rung with any class sitting out is dropped, so the selector never hands it out:
+/// that context runs the split ladder, which can serve it (one launch per layer dearer).
+pub fn fused_rungs<C, T>(
+    rungs: impl IntoIterator<Item = (C, usize, Vec<Option<T>>)>,
+) -> Vec<(C, PerClass<T>)> {
+    rungs
+        .into_iter()
+        .filter_map(|(cap, classes, twins)| {
+            PerClass::of_every_class(classes, twins).map(|p| (cap, p))
+        })
+        .collect()
+}
+
 /// What a baked decode-ladder rung can serve past its own sweep — the two bake facts
 /// [`the_fallback_serves_any_length`] needs, read off the rung's emitted ops by the macro.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1157,6 +1218,51 @@ mod tests {
     // file's own history records ~100 commits of "the proofs hold" that were VACUOUS for exactly that reason, and
     // a test appended into it a moment ago reported "0 passed; 19 filtered out" rather than failing. A test that
     // cannot run is worse than no test: it reads as coverage.
+
+    /// ⛔ A RUNG WHOSE CLASSES ALL SIT OUT HAS NO FUSED BODY: it is dropped, so the selector never
+    /// returns it and the step runs the split ladder. The measured panic was the old loader making it
+    /// an empty list the selector still handed out.
+    #[test]
+    fn a_rung_whose_classes_all_sit_out_has_no_fused_body() {
+        use super::fused_rungs;
+        let r = fused_rungs([(256u32, 1, vec![None::<&str>]), (512, 2, vec![None, None])]);
+        assert!(r.is_empty(), "no rung with a sitting-out class survives");
+    }
+
+    /// ⛔ A CLASS NEVER RUNS ANOTHER CLASS's TWIN. With class 0 sitting out and class 1 not, the old
+    /// filter left `[class 1's ops]`, so class 0's lookup ran class 1's body. The rung must be dropped
+    /// instead, and a rung where every class has a twin keeps each at its own index.
+    #[test]
+    fn a_class_never_runs_another_class_s_fused_twin() {
+        use super::fused_rungs;
+        let r = fused_rungs([
+            (256u32, 2, vec![None, Some("class1@256")]),
+            (512, 2, vec![Some("class0@512"), Some("class1@512")]),
+        ]);
+        assert_eq!(
+            r.len(),
+            1,
+            "only the rung where every class has a twin is kept"
+        );
+        let (cap, twins) = &r[0];
+        assert_eq!(*cap, 512);
+        assert_eq!(twins.len(), 2);
+        assert_eq!(*twins.class(0), "class0@512");
+        assert_eq!(*twins.class(1), "class1@512");
+    }
+
+    /// A set with the wrong number of classes is no set: a meta stating fewer twins than bodies is
+    /// refused rather than indexed short.
+    #[test]
+    fn a_twin_set_must_name_every_class() {
+        use super::PerClass;
+        assert!(PerClass::of_every_class(2, [Some(1)]).is_none());
+        assert!(PerClass::of_every_class(0, Vec::<Option<u8>>::new()).is_none());
+        assert_eq!(
+            PerClass::of_every_class(1, [Some(7)]).map(|p| *p.class(0)),
+            Some(7)
+        );
+    }
 
     /// ⛔ A CONTEXT PAST EVERY SWEEP NEVER LANDS ON A CHUNK. The one-request ladder is the per-page sweep
     /// rungs (64, 128, the 256 page body — all folding) then the chunks (2..64 pages, none folding): past
