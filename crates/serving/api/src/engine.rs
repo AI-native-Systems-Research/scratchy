@@ -200,6 +200,17 @@ struct RequestState {
     pooler_output: Option<EmbeddingData>,
 }
 
+impl RequestState {
+    /// The token counts every delta sent for this request carries, as of now.
+    fn stream_usage(&self) -> StreamUsage {
+        StreamUsage {
+            prompt_tokens: self.num_prompt_tokens,
+            cached_tokens: self.num_cached_tokens,
+            completion_tokens: self.generated_token_ids.len() as u32,
+        }
+    }
+}
+
 /// Token counts for one request, carried on every [`StreamDelta`].
 ///
 /// A streaming response has to report usage from the delta stream — it never
@@ -2475,11 +2486,7 @@ impl AsyncEngine {
                     logprobs: None,
                     tool_call_deltas: None,
                     reasoning: None,
-                    usage: StreamUsage {
-                        prompt_tokens: req_state.num_prompt_tokens,
-                        cached_tokens: req_state.num_cached_tokens,
-                        completion_tokens: req_state.generated_token_ids.len() as u32,
-                    },
+                    usage: req_state.stream_usage(),
                 });
                 ended.push(id.clone());
             }
@@ -2528,11 +2535,7 @@ impl AsyncEngine {
             // "first delta" to special-case. `num_cached_tokens` is already set
             // for this step (above), and the scheduler fixes it at admission.
             // `generated_token_ids` already holds this step's tokens (above).
-            let usage = StreamUsage {
-                prompt_tokens: req_state.num_prompt_tokens,
-                cached_tokens: req_state.num_cached_tokens,
-                completion_tokens: req_state.generated_token_ids.len() as u32,
-            };
+            let usage = req_state.stream_usage();
 
             if let Some(tx) = &req_state.stream_tx {
                 // Track accumulated text and token IDs for reasoning/tool parsing.
@@ -2994,11 +2997,7 @@ impl AsyncEngine {
         // "first delta" to special-case. `num_cached_tokens` is already set
         // for this step (above), and the scheduler fixes it at admission.
         // `generated_token_ids` already holds this step's tokens (above).
-        let usage = StreamUsage {
-            prompt_tokens: req_state.num_prompt_tokens,
-            cached_tokens: req_state.num_cached_tokens,
-            completion_tokens: req_state.generated_token_ids.len() as u32,
-        };
+        let usage = req_state.stream_usage();
 
         if let Some(tx) = &req_state.stream_tx {
             // If tool parser state is active, route through it.
