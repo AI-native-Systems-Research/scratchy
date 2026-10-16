@@ -80,11 +80,7 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
             // A prompt chunk walks its probabilities through LX in equal page parts (each one `esub`, `exp`,
             // row sum and one PV per slab); decode keeps one whole-chunk sum and value part. The part count is
             // read off head 0's own `esub`s, and every head must carry the same.
-            let parts = if mq > 1 {
-                count("attn_cesub_h0_s")
-            } else {
-                1
-            };
+            let parts = if mq > 1 { count("attn_cesub_h0_s") } else { 1 };
             if mq > 1 {
                 assert!(
                     parts >= j.div_ceil(ChunkScratch::VALUE_PART_PAGES) && j.is_multiple_of(parts),
