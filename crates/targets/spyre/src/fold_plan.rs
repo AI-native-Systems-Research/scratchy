@@ -1896,8 +1896,22 @@ mod tests {
         };
         let per = UniformPages::of(&s).expect("fixture rows agree");
         for rep in 0..4 {
-            let d0 = seg_deltas(&chunk0, &s, rep, per, SlotPos::of_launch(100), Bytes(4242));
-            let d1 = seg_deltas(&chunk1, &s, rep, per, SlotPos::of_launch(100), Bytes(4242));
+            let d0 = launched(seg_deltas(
+                &chunk0,
+                &s,
+                rep,
+                per,
+                SlotPos::of_launch(100),
+                Bytes(4242),
+            ));
+            let d1 = launched(seg_deltas(
+                &chunk1,
+                &s,
+                rep,
+                per,
+                SlotPos::of_launch(100),
+                Bytes(4242),
+            ));
             assert_eq!(d0, d1, "rep {rep}: the tag reached an address");
             // And the terms are the gathered fold's own: no KV shift (absolute entries), the mask steps
             // by the rep, and the intermediate is unshifted (whole-batch regime, stride 0).
