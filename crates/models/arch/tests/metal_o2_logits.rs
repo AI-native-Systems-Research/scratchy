@@ -552,7 +552,8 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
                 n as u64,
                 None,
             )
-        },
+        }
+        .expect("forward"),
     };
     let t = out.as_gpu_tensor();
     let shape = t.shape().to_vec();

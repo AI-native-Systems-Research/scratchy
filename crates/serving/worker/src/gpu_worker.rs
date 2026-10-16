@@ -2195,6 +2195,8 @@ impl MetalWorker {
         chain: Arc<ChainBuffer>,
         req_ids: &[String],
         q_lens: &[usize],
+        // Whether the step is behind the speculative one before it (`spec_tail`).
+        behind: bool,
     ) -> ExecutorResult<ModelRunnerOutput> {
         let ([req_id], [rows]) = (req_ids, q_lens) else {
             return Err(ExecutorError::WorkerExecution(format!(
@@ -2202,6 +2204,10 @@ impl MetalWorker {
                 req_ids.len()
             )));
         };
+        let lead = (self.spec_tail.as_ref())
+            .filter(|tail| behind && tail.req_id == *req_id)
+            .map(|tail| Arc::clone(&tail.done));
+        let done = Arc::new(done);
         let spec = SpecFlight {
             req_id: req_id.clone(),
             first: 0,
@@ -2210,6 +2216,7 @@ impl MetalWorker {
             chain,
             accepted_at: layout.at[ChainLayout::ACCEPTED],
             drafts_at: layout.at[ChainLayout::DRAFTS],
+            lead,
         };
         self.input_batch.commit_in_flight_rows(req_id, *rows, *rows);
         self.spec_tail = Some(SpecTail {
@@ -2219,8 +2226,8 @@ impl MetalWorker {
             chain: Arc::clone(&spec.chain),
             accepted_at: spec.accepted_at,
             drafts_at: spec.drafts_at,
+            done: Arc::clone(&done),
         });
-        let done = Arc::new(done);
         let resolver: ::scratchy_serving_engine::executor::SpecResolver = {
             let (done, argmax, spec) = (Arc::clone(&done), Arc::clone(&argmax), spec.clone());
             Box::new(move || {
@@ -3770,7 +3777,8 @@ impl MetalWorker {
                 req.num_tokens as u64,
                 Some(followup),
             )
-        };
+        }
+        .map_err(BackendError::Backend)?;
         let _ = logits; // argmax_out is what we read
         if let Some(deferral) = deferral.as_mut() {
             let in_flight = deferral.take_in_flight().ok_or_else(|| {
@@ -4546,6 +4554,8 @@ struct SpecFlight {
     chain: Arc<ChainBuffer>,
     accepted_at: usize,
     drafts_at: usize,
+    /// The step this one is behind ([`SpecTail`]), whose chain its rows were selected by.
+    lead: Option<Arc<InFlight>>,
 }
 
 #[cfg(feature = "metal")]
@@ -4557,6 +4567,11 @@ impl SpecFlight {
         done: &InFlight,
         argmax: &ArgmaxSlot,
     ) -> Result<(Vec<u32>, Vec<u32>), ForwardError> {
+        // A step behind another selected its rows on the device by that one's chain: if that
+        // one failed, so does this one, its rows picked by words the failed step never wrote.
+        if let Some(lead) = &self.lead {
+            lead.wait()?;
+        }
         done.wait()?;
         let words = |at: usize, len: usize| -> Vec<u32> {
             // SAFETY: `at..at + 4 len` lies in the chain's sections, which the done command buffer
@@ -4573,7 +4588,15 @@ impl SpecFlight {
                 std::slice::from_raw_parts(base, len).to_vec()
             }
         };
+        // The count of drafts kept is the GPU's own word, and sizes an unchecked host read of the
+        // argmax buffer, which holds the step's `k + 1` rows: bound it by `k` first.
         let kept = words(self.accepted_at, 1)[0] as usize;
+        if kept > self.k {
+            return Err(ForwardError::KeptPastDrafts {
+                kept,
+                drafts: self.k,
+            });
+        }
         let out: Vec<u32> =
             scratchy_target_metal::mtl4_dispatch::read_slice(&argmax.out, self.first + kept + 1);
         Ok((out[self.first..].to_vec(), words(self.drafts_at, self.k)))
@@ -4590,6 +4613,8 @@ struct SpecTail {
     chain: Arc<ChainBuffer>,
     accepted_at: usize,
     drafts_at: usize,
+    /// Its command buffer, which a step behind it waits on before it reads its own.
+    done: Arc<InFlight>,
 }
 
 /// A step's [`ChainLayout`] buffer.
@@ -6741,9 +6766,9 @@ impl Worker for MetalWorker {
                 let spec9_block_size_thread = spec9_block_size;
                 let spec9_block_table_stride_thread = lock_block_table_stride;
                 let (v, spec9_seeds_out, spec9_drafts_out): (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) =
-                    std::thread::scope(|s| {
+                    std::thread::scope(|s| -> Result<_, String> {
                         let lockstep_handle =
-                        s.spawn(move || -> (Vec<u32>, Vec<Vec<u32>>) {
+                        s.spawn(move || -> Result<(Vec<u32>, Vec<Vec<u32>>), String> {
                         // Build shadow GpuDevice on draft_queue.
                         let mut shadow_device = GpuDevice {
                             device: mtl_device_clone,
@@ -6846,13 +6871,16 @@ impl Worker for MetalWorker {
                             deferred: None,
                             reads: Reads::Outputs,
                         };
+                        // A GPU failure fails the step, as the target's forward does, rather than
+                        // panicking this thread and, through its join, the executor's.
                         let logits = unsafe {
-                            dm.forward(
+                            dm.forward_with_metal_followup(
                                 scratchy_target_metal::ForwardCtxHandle::new(&ctx),
                                 scratchy_target_metal::ForwardDeviceHandle::new(&mut shadow_device),
                                 lock_num_tokens as u64,
+                                None,
                             )
-                        };
+                        }?;
 
                         // Phase-9: argmax of the last verify position
                         // per req IS draft's prediction of what target
@@ -6978,7 +7006,7 @@ impl Worker for MetalWorker {
                             Vec::new()
                         };
 
-                        (spec_seeds, spec_drafts)
+                        Ok((spec_seeds, spec_drafts))
                     });
 
                         let r = self
@@ -6993,7 +7021,7 @@ impl Worker for MetalWorker {
                         // join propagates any panic the lockstep thread
                         // raised; treat as worker execution failure.
                         let (spec_seeds, spec_drafts) =
-                            lockstep_handle.join().expect("lockstep thread panicked");
+                            lockstep_handle.join().expect("lockstep thread panicked")?;
                         let target_argmax = r.unwrap_or_else(|_| Vec::new());
                         if !spec_seeds.is_empty() && !target_argmax.is_empty() {
                             // Probe: compare draft's predicted bonus
@@ -7016,8 +7044,9 @@ impl Worker for MetalWorker {
                                 }
                             }
                         }
-                        (target_argmax, spec_seeds, spec_drafts)
-                    });
+                        Ok((target_argmax, spec_seeds, spec_drafts))
+                    })
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("draft forward: {e}")))?;
                 async_lockstep_done = true;
                 spec9_seeds_final = spec9_seeds_out;
                 spec9_drafts_final = spec9_drafts_out;
@@ -7050,6 +7079,7 @@ impl Worker for MetalWorker {
                     chain,
                     &req_ids_in_order,
                     &q_lens,
+                    behind,
                 );
             }
             let mut rows = Vec::with_capacity(num_reqs);

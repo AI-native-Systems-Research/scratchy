@@ -382,6 +382,9 @@ pub trait ScratchyWeights: Send + Sync {
     /// hook — non-metal builds and arches that haven't been
     /// re-emitted with the metal followup glue still build.
     ///
+    /// `Err` when the forward's command buffer failed on the GPU (an
+    /// out-of-memory, say): the executor fails the step and goes on.
+    ///
     /// # Safety
     /// Same as [`Self::forward`].
     #[cfg(feature = "metal")]
@@ -391,8 +394,8 @@ pub trait ScratchyWeights: Send + Sync {
         device: ForwardDeviceHandle<'_>,
         num_tokens: u64,
         _followup: Option<MetalForwardFollowup<'_>>,
-    ) -> OwnedTensor {
-        unsafe { self.forward(ctx, device, num_tokens) }
+    ) -> Result<OwnedTensor, String> {
+        Ok(unsafe { self.forward(ctx, device, num_tokens) })
     }
 
     /// The rotary cos/sin rows a forward at `positions` (one a token) reads in place of a
