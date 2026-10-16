@@ -2936,6 +2936,56 @@ pub fn rope_table_periods<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::H
 /// state it: the gate's staging bytes and the golden's e4m3 round trip.
 const FP8_SYNTH_SCALE: f32 = 512.0;
 
+/// The prefill rope rows, by the runtime's own law: row r is position r's
+/// table — `rope_cos_sin_kind((start + r))` at start == 0, the first chunk
+/// this rung exists for — tiled across heads to the source's full width, the
+/// same two calls the worker's emu forward binds (`forward_chunk`). ⭐ ONE
+/// LAW, BOTH LEGS: `numeric_gate` feeds this product to the emulator's probe
+/// binds AND to the golden's source buffers (`eval_golden_buffers`), so a
+/// staging defect cannot hide on one side only (measured: staging real rows
+/// into the emulator alone refused EVERY layer's RopeRotate/RopeAppend at
+/// local ~25 — the golden was still rotating by the period-half synth while
+/// the emulator rotated by the real tables). Real per-position rows are what
+/// make a row-misaligned kernel DIVERGE; the periodic synth both legs share
+/// at decode (one-row tables, where the two laws agree by construction)
+/// would hide it on both sides.
+pub fn staged_rope_rows<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    rotary_cos: &[(u32, crate::wiring::RotaryKind)],
+    rotary_sin: &[(u32, crate::wiring::RotaryKind)],
+) -> Result<std::collections::HashMap<u32, Vec<f32>>, String> {
+    let rope_table_half = rope_table_periods(ir);
+    let mut out = std::collections::HashMap::new();
+    for (classes, want_cos) in [(rotary_cos, true), (rotary_sin, false)] {
+        for &(tid, kind) in classes {
+            // The class the WIRING names must be the class the tape's rope ops
+            // read, or the staged table is the wrong law entirely.
+            if let Some(&half) = rope_table_half.get(&tid)
+                && kind.head_dim() as usize != 2 * half
+            {
+                return Err(format!(
+                    "prefill gate: cos/sin source t{tid} carries rotary class hd {} but the \
+                     rope ops reading it state head_dim {} — the wiring and the tape disagree",
+                    kind.head_dim(),
+                    2 * half
+                ));
+            }
+            let t = ir.tensors[tid as usize];
+            let (rows, cols) = (t.rows as usize, t.cols as usize);
+            let chd = kind.head_dim() as usize;
+            let mut buf = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                let (c, s) = crate::manifest::rope_cos_sin_kind(r as u32, kind);
+                let row =
+                    crate::forward_tape::tile_rotary_row(if want_cos { &c } else { &s }, cols, chd);
+                buf[r * cols..(r + 1) * cols].copy_from_slice(&row);
+            }
+            out.insert(tid, buf);
+        }
+    }
+    Ok(out)
+}
+
 /// DEBUG-ONLY numeric bisection oracle (codegen gates on `SCRATCHY_SUPERDSC_DBG`).
 /// Runs `eval_dag` on the SAME deterministic synthetic sources the worker
 /// self-test will bind, and writes, into `<body_bundle_dir>/dbg/`:
@@ -2961,7 +3011,10 @@ const FP8_SYNTH_SCALE: f32 = 512.0;
 /// ([`numeric_gate`]) compares them against the emulator's own run IN-PROCESS —
 /// the same values, no files — so the gate needs no environment variable and
 /// cannot be skipped by forgetting to set one.
-pub fn eval_golden_buffers<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<Vec<f32>> {
+pub fn eval_golden_buffers<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
+) -> Vec<Vec<f32>> {
     let nsrc = ir.num_sources as usize;
     // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO — BOTH KINDS. A weight-folded ScalarMul has no
     // device op, so the bundle under test never applies its multiplier as a node — the scale
@@ -2995,17 +3048,24 @@ pub fn eval_golden_buffers<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<Vec<f32>> {
             )
         })
         .collect();
-    // The rope cos/sin sources stage at their runtime contract — period-`half`,
-    // per [`rope_table_periods`] — the SAME staging the probe binds, so the two
-    // legs cannot drift.
+    // The rope cos/sin sources stage at their runtime contract: a PREFILL
+    // rung gets the REAL per-position rows (`staged_rope` — the same product
+    // the probe binds, so the two legs cannot drift; see that fn's doc), and
+    // decode keeps the period-`half` pattern per [`rope_table_periods`] —
+    // there the tables are one row and the pattern agrees with the run-time
+    // staging by construction.
     let rope_table_half = rope_table_periods(ir);
     let mut src_vals: Vec<Vec<f32>> = (0..nsrc)
         .map(|id| {
             let t = ir.tensors[id];
             let n = (t.rows as usize) * (t.cols as usize);
-            match rope_table_half.get(&(id as u32)) {
-                Some(&half) => (0..n).map(|j| dbg_synth_val(id, j % half)).collect(),
-                None => (0..n).map(|j| dbg_synth_val(id, j)).collect(),
+            if let Some(v) = staged_rope.get(&(id as u32)) {
+                v.clone()
+            } else {
+                match rope_table_half.get(&(id as u32)) {
+                    Some(&half) => (0..n).map(|j| dbg_synth_val(id, j % half)).collect(),
+                    None => (0..n).map(|j| dbg_synth_val(id, j)).collect(),
+                }
             }
         })
         .collect();
@@ -3508,11 +3568,12 @@ pub fn write_eval_golden<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     dir: &std::path::Path,
+    staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
 ) -> std::io::Result<()> {
     let dbg = dir.join("dbg");
     std::fs::create_dir_all(dbg.join("golden"))?;
     let nsrc = ir.num_sources as usize;
-    let bufs = eval_golden_buffers(ir);
+    let bufs = eval_golden_buffers(ir, staged_rope);
     // The scales manifest's skip set — the same folded-node predicate the walk used.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -3863,6 +3924,13 @@ pub fn numeric_gate<F: RopeForm>(
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
     // per [`rope_table_periods`] — not as flat noise.
     let rope_table_half = rope_table_periods(ir);
+    // ⭐ THE STAGED ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
+    // the golden's source buffers read this map here, and the emulator's
+    // probe binds join it at the prefill rung, so a staging defect cannot
+    // hide on one side only. Decode stages nothing here and keeps the
+    // period-half synth below — its tables are one row, where the periodic
+    // pattern and the run-time staging agree by construction.
+    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = Default::default();
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
         if weight_ids.contains(&tid) {
@@ -4022,7 +4090,7 @@ pub fn numeric_gate<F: RopeForm>(
     // ── Compare at the floor, against the in-memory reference ──
     // `mut`: the teacher-forced walk borrows the golden's staged sources
     // through it (pointer-swapped per node, restored before return).
-    let mut eval_bufs = eval_golden_buffers(ir);
+    let mut eval_bufs = eval_golden_buffers(ir, &staged_rope);
     const CLEAN_TOL: f32 = 5e-3;
     // The fp8 chains' slack over CLEAN_TOL: the quant model makes the e4m3 grid and
     // the ws mulf COMMON to both sides and the f16-stick model puts every exchanged

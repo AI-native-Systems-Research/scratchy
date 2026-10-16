@@ -8793,6 +8793,67 @@ fn refuse_if_wiring_disagrees_with_manifest(
     }
 }
 
+// ── The rotary-class VALUE law ──
+// The wiring bakes `RotaryKind` TOKENS (`rot_kind` in `emit_superdsc_wiring`
+// re-spells this value). Hoisting the class to a VALUE here is what lets a
+// second consumer spell the same class without re-deriving it — the tokens
+// are derived from the value, never re-derived inline.
+
+/// The rotary class a `local`-flagged source serves, as a VALUE: sliding
+/// sources take the local class's base frequency (falling back to the model's
+/// main θ, the precedence `rotary_local_load` uses); global sources take
+/// proportional partial rotary when the config declares it on a WIDER global
+/// head dim (gemma-4), else the base class.
+#[cfg(feature = "spyre")]
+fn superdsc_rotary_kind(
+    model: &ModelParams,
+    hd: u64,
+    theta: f64,
+    local: bool,
+) -> scratchy_target_spyre::wiring::RotaryKind {
+    let theta_bits = (theta as f32).to_bits();
+    if local {
+        let local_theta = model
+            .scalars
+            .get("rope_local_base_freq")
+            .copied()
+            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
+            .or_else(|| model.scalars.get("rope_theta").copied())
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .unwrap_or_else(|| {
+                panic!(
+                    "[superdsc-wiring] {}: no rope_local_base_freq for a local rotary source",
+                    model.source_stem
+                )
+            });
+        scratchy_target_spyre::wiring::RotaryKind::Default {
+            head_dim: hd as u32,
+            theta_bits: (local_theta as f32).to_bits(),
+        }
+    } else {
+        let g_hd = model
+            .bounds
+            .get("global_head_dim")
+            .map(|v| *v as u32)
+            .unwrap_or(hd as u32);
+        match model.scalars.get("global_partial_rotary_factor").copied() {
+            Some(f) if g_hd != hd as u32 && (f - 1.0).abs() > 1e-9 => {
+                scratchy_target_spyre::wiring::RotaryKind::Proportional {
+                    head_dim: g_hd,
+                    theta_bits,
+                    rotated: (f * g_hd as f64).round() as u32,
+                }
+            }
+            _ => scratchy_target_spyre::wiring::RotaryKind::Default {
+                // Uniform: the class is the base head dim and θ (g_hd == hd
+                // here whenever the factor is absent).
+                head_dim: g_hd,
+                theta_bits,
+            },
+        }
+    }
+}
+
 #[cfg(feature = "spyre")]
 fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
@@ -8887,61 +8948,34 @@ fn emit_superdsc_wiring(
     // lowered at, so the baked table and the bundle cannot disagree. A uniform
     // model has `local: false` everywhere and `global_head_dim == head_dim`
     // with no partial factor, which folds to the base `Default` class.
-    let rot_theta_bits = |theta: f64| u32l((theta as f32).to_bits());
+    // The class VALUE is one law (`superdsc_rotary_kind` above); the tokens
+    // below are its spelling — derived, never re-derived, so no second
+    // consumer of the class can drift from the baked table.
     let rot_kind = |local: bool| -> proc_macro2::TokenStream {
-        if local {
-            // The sliding class: full rotary at the base head dim and the local
-            // base frequency (falls back to the model's main θ, the same
-            // precedence `rotary_local_load` uses).
-            let hd = u32l(hd as u32);
-            let local_theta = model
-                .scalars
-                .get("rope_local_base_freq")
-                .copied()
-                .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-                .or_else(|| model.scalars.get("rope_theta").copied())
-                .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "[superdsc-wiring] {}: no rope_local_base_freq for a local rotary source",
-                        model.source_stem
-                    )
-                });
-            let tb = rot_theta_bits(local_theta);
-            quote! {
-                ::scratchy_target_spyre::wiring::RotaryKind::Default {
-                    head_dim: #hd, theta_bits: #tb,
-                }
-            }
-        } else {
-            // The global/base class: proportional partial rotary when the config
-            // declares `global_partial_rotary_factor` on a WIDER global head dim
-            // (gemma-4), else the base class.
-            let g_hd = model
-                .bounds
-                .get("global_head_dim")
-                .map(|v| *v as u32)
-                .unwrap_or(hd as u32);
-            match model.scalars.get("global_partial_rotary_factor").copied() {
-                Some(f) if g_hd != hd as u32 && (f - 1.0).abs() > 1e-9 => {
-                    let g_hd_lit = u32l(g_hd);
-                    let rotated = u32l((f * g_hd as f64).round() as u32);
-                    let tb = rot_theta_bits(f64::from(theta));
-                    quote! {
-                        ::scratchy_target_spyre::wiring::RotaryKind::Proportional {
-                            head_dim: #g_hd_lit, theta_bits: #tb, rotated: #rotated,
-                        }
+        match superdsc_rotary_kind(model, hd, f64::from(theta), local) {
+            scratchy_target_spyre::wiring::RotaryKind::Default {
+                head_dim,
+                theta_bits,
+            } => {
+                let hd_lit = u32l(head_dim);
+                let tb = u32l(theta_bits);
+                quote! {
+                    ::scratchy_target_spyre::wiring::RotaryKind::Default {
+                        head_dim: #hd_lit, theta_bits: #tb,
                     }
                 }
-                _ => {
-                    // Uniform: the class is the base head dim and θ (g_hd == hd
-                    // here whenever the factor is absent).
-                    let hd_lit = u32l(g_hd);
-                    let tb = rot_theta_bits(f64::from(theta));
-                    quote! {
-                        ::scratchy_target_spyre::wiring::RotaryKind::Default {
-                            head_dim: #hd_lit, theta_bits: #tb,
-                        }
+            }
+            scratchy_target_spyre::wiring::RotaryKind::Proportional {
+                head_dim,
+                theta_bits,
+                rotated,
+            } => {
+                let hd_lit = u32l(head_dim);
+                let tb = u32l(theta_bits);
+                let r = u32l(rotated);
+                quote! {
+                    ::scratchy_target_spyre::wiring::RotaryKind::Proportional {
+                        head_dim: #hd_lit, theta_bits: #tb, rotated: #r,
                     }
                 }
             }
@@ -11552,10 +11586,18 @@ fn dump_wavefront_mega(
                                             if let Some(dbg) =
                                                 superdsc::bundle::dbg_golden_dir(&bfp)
                                             {
+                                                // The DBG golden stages the SAME rope rows the
+                                                // gate does (`staged_rope_rows` — one law), so
+                                                // the bisection oracle cannot drift from the
+                                                // gate's own golden. Decode: an empty map, the
+                                                // period-half contract.
+                                                let staged_rope =
+                                                    std::collections::HashMap::default();
                                                 match superdsc::write_eval_golden(
                                                     &krg,
                                                     &weight_ids,
                                                     &dbg,
+                                                    &staged_rope,
                                                 ) {
                                                     Ok(()) => eprintln!(
                                                         "[spyre-superdsc] {base}: DBG golden written → {}/dbg",
