@@ -2176,12 +2176,22 @@ fn assemble_attn_chunk(
                         stick.get(),
                     )
                 };
+                // ⭐ AT DECODE THE CONTRACTION IS DIVIDED ACROSS THE CORES (`ContractionSplit`): the output
+                // is one stick of `gqa` rows (one row per head above one slab), so the planner would give
+                // it only its rows and every core would read this kv head's WHOLE V. A prompt chunk has
+                // `gqa·mq` rows to divide and keeps the planned split.
+                let k_part = BlockCols::of_chunk_part(*part);
+                let k = if mq == 1 {
+                    MatK::of_chunk_decode_values(k_part)
+                } else {
+                    MatK::of_kv_window(k_part)
+                };
                 // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update.
                 ops.push(assemble_matmul_off_maybe_epilogue(
                     &name,
                     m,
                     n,
-                    MatK::of_kv_window(BlockCols::of_chunk_part(*part)),
+                    k,
                     MatY::unbatched(),
                     bmm_form,
                     &rb(&cb.cexp, b_rows, slots),

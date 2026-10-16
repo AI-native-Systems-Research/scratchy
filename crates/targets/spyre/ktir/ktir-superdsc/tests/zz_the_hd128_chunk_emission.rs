@@ -94,6 +94,25 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
                     (Some(u64::from(mq)), Some(64)),
                     "{name} at {j} page(s): one head's rows, one stick of out — N_ = {n}"
                 );
+                // At decode the head's one row cannot be divided, so the CONTRACTION is — as many cores as
+                // the chunk's `4·pages` whole sticks allow (within 32), where the planner alone ran each
+                // value op on ONE core.
+                let k_split = v["numWkSlicesPerDim_"]["in"].as_u64().unwrap_or(1);
+                let sticks = u64::from(j * 256 / 64);
+                let most = (1..=32u64.min(sticks))
+                    .rev()
+                    .find(|s| sticks.is_multiple_of(*s))
+                    .unwrap_or(1);
+                assert_eq!(
+                    (k_split, v["numCoresUsed_"].as_u64()),
+                    if mq == 1 {
+                        (most, Some(most))
+                    } else {
+                        (1, v["numCoresUsed_"].as_u64())
+                    },
+                    "{name} at {j} page(s), mq {mq}: split {}",
+                    v["numWkSlicesPerDim_"]
+                );
             }
             for (name, v) in ops.iter().filter(|(n, _)| n.starts_with("attn_csc_h")) {
                 let n = &v["dscs_"][0][name]["N_"];

@@ -968,25 +968,51 @@ impl MatN {
     }
 }
 
-/// CONTRACTION EXTENT OF THIS MATMUL — the `in` (K) reduction stick extent.
+/// CONTRACTION EXTENT OF THIS MATMUL — the `in` (K) reduction stick extent, and whether the work
+/// division may split it across cores ([`ContractionSplit`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MatK(u32);
+pub struct MatK(u32, ContractionSplit);
+
+/// ⭐ WHETHER A MATMUL's CONTRACTION IS DIVIDED ACROSS CORES — a property of its K, stated at the door
+/// that names the K.
+///
+/// Every door keeps the matmul's own split policy ([`Self::Planned`]) except
+/// [`MatK::of_chunk_decode_values`]: the split-KV chunk's one-request value leg, whose output is a
+/// single stick of a handful of rows. The planner gives such an output its ROWS only — 4 cores at
+/// granite-2b's 4 GQA rows, ONE at granite-8b's per-head row — and every one of those cores contracts
+/// the WHOLE chunk, so each kv head's V is read once per row (measured off the emission). Splitting the
+/// contraction instead reads V once across every core, each contracting its own run of the chunk, and
+/// dxp PSUM-accumulates the partials into the shared output — the reduction split prefill's projections
+/// already run on card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContractionSplit {
+    /// The matmul's own work division (`matmul_split_map` and its regimes), unchanged.
+    Planned,
+    /// Every core takes a whole-stick run of the contraction; rows and output stay whole.
+    AcrossCores,
+}
 
 impl MatK {
     /// One head's feature width `hd` — the score matmul contracts Q·Kᵀ over it.
     pub const fn of_head_dim(hd: u32) -> MatK {
-        MatK(hd)
+        MatK(hd, ContractionSplit::Planned)
     }
     /// The score block's kv window — the value matmul contracts probabilities·V over it. Takes the
     /// block's own typed width, same reason as [`MatN::of_kv_window`].
     pub const fn of_kv_window(width: BlockCols) -> MatK {
-        MatK(width.get())
+        MatK(width.get(), ContractionSplit::Planned)
+    }
+    /// ⭐ THE SPLIT-KV CHUNK's ONE-REQUEST VALUE LEG — a part of the chunk, its contraction divided
+    /// across cores ([`ContractionSplit::AcrossCores`], which says why). Only the decode body takes it:
+    /// a prompt chunk's value leg has `gqa·mq` rows to divide and keeps [`Self::of_kv_window`].
+    pub const fn of_chunk_decode_values(width: BlockCols) -> MatK {
+        MatK(width.get(), ContractionSplit::AcrossCores)
     }
     /// Exactly ONE stick of contraction — the identity-kernel slab copies, whose A-side read is
     /// deliberately one stick so the copy has no plane term of its own to get wrong. The width is
     /// the machine's lane count, named by the zero-sized [`Lanes`] witness.
     pub const fn one_stick(lanes: Lanes) -> MatK {
-        MatK(lanes.n())
+        MatK(lanes.n(), ContractionSplit::Planned)
     }
     /// ONE HEAD-DIM SLAB of contraction — the score leg's Q·Kᵀ split by slab so that its
     /// contraction is one stick at EVERY head dim, which is what
@@ -996,14 +1022,18 @@ impl MatK {
     /// distinction [`BlockCols::of_head_slab`] already draws, and the reason this is not spelled
     /// `one_stick(Lanes)` at the call site.
     pub const fn of_head_slab(feats: SlabFeats) -> MatK {
-        MatK(feats.n())
+        MatK(feats.n(), ContractionSplit::Planned)
     }
     /// A projection's input features — K of `A[m,k]·W[k,n]` (or one K-split block of it).
     pub const fn of_in_features(k: u32) -> MatK {
-        MatK(k)
+        MatK(k, ContractionSplit::Planned)
     }
     pub const fn get(self) -> u32 {
         self.0
+    }
+    /// How the work division treats this contraction.
+    pub const fn split(self) -> ContractionSplit {
+        self.1
     }
 }
 
